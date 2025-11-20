@@ -26,6 +26,7 @@ class ToolMeta(BaseModel):
         title="工具别名",
         description="如果不同MCP Server中存在同名工具，允许通过此别名修改，从而解决名称冲突",
     )
+    tags: list[str] | None = Field(default=None, title="工具标签", description="用于对工具进行分类")
     # 不同MCP工具返回值并不统一，虽然其满足MCP标准的返回格式，但具体的原始内容命名仍然无法避免出现不一致的情况。通过object_mapper可以方便
     # 前端对其进行转换，以使用标准组件渲染解析。
     ret_object_mapper: dict | None = Field(
