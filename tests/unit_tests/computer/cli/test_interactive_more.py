@@ -68,7 +68,7 @@ class _Client:
         assert self.connected
         self.office_id = None
 
-    async def emit_update_mcp_config(self) -> None:  # noqa: D401
+    async def emit_update_config(self) -> None:  # noqa: D401
         self.updated += 1
 
 

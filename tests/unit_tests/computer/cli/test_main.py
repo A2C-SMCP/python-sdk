@@ -58,7 +58,6 @@ class FakeComputer:
 
 
 def test_run_impl_uses_default_computer_when_no_factory(monkeypatch: pytest.MonkeyPatch) -> None:
-
     # Patch Computer to our fake and _interactive_loop to a dummy coro
     monkeypatch.setattr(cli_main, "Computer", FakeComputer, raising=True)
     monkeypatch.setattr(cli_main, "_interactive_loop", DummyInteractive.coro, raising=True)
@@ -291,8 +290,8 @@ async def test_inputs_value_print_json_fallback(monkeypatch: pytest.MonkeyPatch)
     commands = [
         'inputs add {"id":"Z","type":"promptString","description":"d"}',
         'inputs value set Z {"x":1}',  # 设置为字典
-        'inputs value get Z',  # 获取时让 print_json 抛错
-        'exit',
+        "inputs value get Z",  # 获取时让 print_json 抛错
+        "exit",
     ]
 
     def _raise_print_json(*args: Any, **kwargs: Any) -> None:  # noqa: ANN001
@@ -374,35 +373,35 @@ async def test_cover_remaining_branches(tmp_path: Path, monkeypatch: pytest.Monk
         '{"cmd":"server add inline"}',  # 占位，下一行是真正的 add
         'server add {"name":"m1","type":"stdio","disabled":true,"forbidden_tools":[],"tool_meta":{},'
         '"server_parameters":{"command":"echo","args":[],"env":null,"cwd":null,"encoding":"utf-8","encoding_error_handler":"strict"}}',
-        'mcp',
+        "mcp",
         # start/stop 时 manager 未初始化
-        'start one',
-        'stop one',
+        "start one",
+        "stop one",
         # inputs add 用法
-        'inputs add',
+        "inputs add",
         # inputs update 用法 + @file 列表
-        'inputs update',
-        f'inputs update @{upd_file}',
+        "inputs update",
+        f"inputs update @{upd_file}",
         # inputs rm 用法 + rm 不存在
-        'inputs rm',
-        'inputs rm NOPE',
+        "inputs rm",
+        "inputs rm NOPE",
         # inputs get 用法
-        'inputs get',
+        "inputs get",
         # inputs value 顶层用法 + set 缺少参数 + set 不存在 id + get 不存在值
-        'inputs value',
-        'inputs value set',
-        'inputs value set NOPE 1',
-        'inputs value get NOPE',
+        "inputs value",
+        "inputs value set",
+        "inputs value set NOPE 1",
+        "inputs value get NOPE",
         # inputs value 未知子命令
-        'inputs value what',
+        "inputs value what",
         # socket connect 引导但 URL 为空，触发 URL required
-        'socket connect',
-        '',
+        "socket connect",
+        "",
         # socket join 带参数但尚未连接
-        'socket join o1 c1',
+        "socket join o1 c1",
         # socket leave 在未连接
-        'socket leave',
-        'exit',
+        "socket leave",
+        "exit",
     ]
 
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
@@ -847,7 +846,7 @@ class FakeSMCPClient:
         assert self.connected
         self.office_id = None
 
-    async def emit_update_mcp_config(self) -> None:
+    async def emit_update_config(self) -> None:
         self.updated += 1
 
 

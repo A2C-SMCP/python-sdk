@@ -27,7 +27,7 @@ async def test_emit_disallows_notify_and_client_events():
 
 
 @pytest.mark.asyncio
-async def test_emit_update_mcp_config_only_when_in_office(monkeypatch):
+async def test_emit_update_config_only_when_in_office(monkeypatch):
     """
     中文：仅当已加入房间（有 office_id）时触发 UPDATE_MCP_CONFIG_EVENT；未加入时不触发
     English: Fire UPDATE_MCP_CONFIG_EVENT only when office_id set; otherwise do nothing

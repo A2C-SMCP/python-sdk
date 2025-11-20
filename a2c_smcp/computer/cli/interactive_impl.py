@@ -174,7 +174,7 @@ async def interactive_loop(
                         await comp.aadd_or_aupdate_server(validated, session=session)
                         console.print("[green]✅ 服务器配置已添加/更新并正在启动 / Server config added/updated and starting[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                     except Exception as e:
                         console.print(f"[red]❌ 添加/更新服务器失败 / Failed to add/update server: {e}[/red]")
                 elif sub in {"rm", "remove"}:
@@ -184,7 +184,7 @@ async def interactive_loop(
                         await comp.aremove_server(parts[2])
                         console.print("[green]已移除配置 / Removed[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 else:
                     console.print("[yellow]未知的 server 子命令 / Unknown subcommand[/yellow]")
 
@@ -230,7 +230,7 @@ async def interactive_loop(
                         comp.update_inputs(models)
                         console.print("[green]Inputs 已更新 / Inputs updated[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 elif sub == "add":
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs add <json|@file.json>[/yellow]")
@@ -249,7 +249,7 @@ async def interactive_loop(
                             comp.add_or_update_input(TypeAdapter(MCPServerInputModel).validate_python(item))
                         console.print("[green]Input(s) 已添加/更新 / Added/Updated[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 elif sub in {"update"}:
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs update <json|@file.json>[/yellow]")
@@ -268,7 +268,7 @@ async def interactive_loop(
                             comp.add_or_update_input(item)
                         console.print("[green]Input(s) 已添加/更新 / Added/Updated[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 elif sub in {"rm", "remove"}:
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs rm <id>[/yellow]")
@@ -277,7 +277,7 @@ async def interactive_loop(
                         if ok:
                             console.print("[green]已移除 / Removed[/green]")
                             if smcp_client:
-                                await smcp_client.emit_update_mcp_config()
+                                await smcp_client.emit_update_config()
                         else:
                             console.print("[yellow]不存在的 id / Not found[/yellow]")
                 elif sub == "get":
@@ -400,7 +400,7 @@ async def interactive_loop(
                     if not smcp_client:
                         console.print("[yellow]未连接 Socket.IO，已跳过 / Not connected, skip[/yellow]")
                     else:
-                        await smcp_client.emit_update_mcp_config()
+                        await smcp_client.emit_update_config()
                         console.print("[green]已触发配置更新通知 / Update notification emitted[/green]")
                 else:
                     console.print("[yellow]未知的 notify 子命令 / Unknown subcommand[/yellow]")
