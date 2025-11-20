@@ -83,6 +83,11 @@ include = ["a2c_smcp/py.typed"]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
+[dependency-groups]
+build = [
+    "bump-my-version>=1.2.4",
+]
+
 [tool.poe.tasks]
 test = "pytest tests/unit_tests tests/integration_tests"
 test-cov = "pytest tests -m 'not e2e' --cov a2c_smcp --cov-report=term-missing --cov-fail-under=0 --cov-config=.coveragerc"
