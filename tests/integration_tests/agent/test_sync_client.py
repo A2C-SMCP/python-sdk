@@ -134,11 +134,7 @@ def test_agent_receives_enter_and_tools_sync(startup_and_shutdown_sync_smcp_serv
         socketio_path="/socket.io",
     )
 
-    agent.call(
-        JOIN_OFFICE_EVENT,
-        {"role": "agent", "office_id": office_id, "name": "robot-sync-1"},
-        namespace=SMCP_NAMESPACE,
-    )
+    agent.join_office(office_id=office_id, agent_name="robot-sync-1", namespace=SMCP_NAMESPACE)
 
     # 使用线程启动Computer客户端
     def run_computer_client() -> None:
@@ -191,11 +187,7 @@ def test_agent_tool_call_roundtrip_sync(startup_and_shutdown_sync_smcp_server):
         socketio_path="/socket.io",
     )
 
-    agent.call(
-        JOIN_OFFICE_EVENT,
-        {"role": "agent", "office_id": office_id, "name": "robot-sync-2"},
-        namespace=SMCP_NAMESPACE,
-    )
+    agent.join_office(office_id=office_id, agent_name="robot-sync-2", namespace=SMCP_NAMESPACE)
 
     # 使用线程启动Computer客户端
     def run_computer_client() -> None:
@@ -255,11 +247,7 @@ def test_agent_receives_update_config_sync(startup_and_shutdown_sync_smcp_server
         socketio_path="/socket.io",
     )
 
-    agent.call(
-        JOIN_OFFICE_EVENT,
-        {"role": "agent", "office_id": office_id, "name": "robot-sync-3"},
-        namespace=SMCP_NAMESPACE,
-    )
+    agent.join_office(office_id=office_id, agent_name="robot-sync-3", namespace=SMCP_NAMESPACE)
 
     # 使用线程启动Computer客户端
     def run_computer_client() -> None:

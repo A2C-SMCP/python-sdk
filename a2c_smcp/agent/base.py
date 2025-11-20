@@ -17,12 +17,16 @@ from mcp.types import CallToolResult, TextContent
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.types import AgentEventHandler, AsyncAgentEventHandler
 from a2c_smcp.smcp import (
+    JOIN_OFFICE_EVENT,
+    LEAVE_OFFICE_EVENT,
     EnterOfficeNotification,
+    EnterOfficeReq,
     GetDeskTopReq,
     GetDeskTopRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
+    LeaveOfficeReq,
     ToolCallReq,
     UpdateMCPConfigNotification,
 )
@@ -276,6 +280,35 @@ class BaseAgentClient(ABC):
 
         except Exception as e:
             logger.error(f"Error processing tools response: {e}")
+
+    async def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
+        """
+        加入一个Office（Socket.IO中的Room）
+        Join an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
+                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID and consistent with AgentID
+            agent_name (str): Agent名称，提供给前端展示用
+                            / Agent name, for frontend display
+            namespace (str | None): 命名空间 / Namespace
+        """
+        await self.emit(
+            JOIN_OFFICE_EVENT,
+            EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+            namespace=namespace,
+        )
+
+    async def leave_office(self, office_id: str, namespace: str | None = None) -> None:
+        """
+        离开一个Office（Socket.IO中的Room）
+        Leave an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID / Room ID
+            namespace (str | None): 命名空间 / Namespace
+        """
+        await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
 
     @abstractmethod
     def register_event_handlers(self) -> None:
@@ -535,6 +568,35 @@ class BaseAgentSyncClient(ABC):
 
         except Exception as e:
             logger.error(f"Error processing tools response: {e}")
+
+    def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
+        """
+        加入一个Office（Socket.IO中的Room）
+        Join an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
+                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID and consistent with AgentID
+            agent_name (str): Agent名称，提供给前端展示用
+                            / Agent name, for frontend display
+            namespace (str | None): 命名空间 / Namespace
+        """
+        self.emit(
+            JOIN_OFFICE_EVENT,
+            EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+            namespace=namespace,
+        )
+
+    def leave_office(self, office_id: str, namespace: str | None = None) -> None:
+        """
+        离开一个Office（Socket.IO中的Room）
+        Leave an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID / Room ID
+            namespace (str | None): 命名空间 / Namespace
+        """
+        self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
 
     @abstractmethod
     def register_event_handlers(self) -> None:

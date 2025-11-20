@@ -107,7 +107,7 @@ async def test_agent_receives_enter_and_tools(socketio_server, basic_server_port
     )
 
     # Agent 加入办公室 / Agent join office
-    await agent.call(
+    await agent.emit(
         JOIN_OFFICE_EVENT,
         {"role": "agent", "office_id": office_id, "name": "robot-1"},
         namespace=SMCP_NAMESPACE,
@@ -160,11 +160,7 @@ async def test_agent_tool_call_roundtrip(socketio_server, basic_server_port: int
         socketio_path="/socket.io",
     )
 
-    await agent.call(
-        "server:join_office",
-        {"role": "agent", "office_id": office_id, "name": "robot-2"},
-        namespace=SMCP_NAMESPACE,
-    )
+    await agent.join_office(office_id=office_id, agent_name="robot-2", namespace=SMCP_NAMESPACE)
 
     # 让Computer随后加入，确保Agent在场并能接收到enter通知
     await computer.connect(
@@ -219,11 +215,7 @@ async def test_agent_receives_update_config(socketio_server, basic_server_port: 
         socketio_path="/socket.io",
     )
 
-    await agent.call(
-        "server:join_office",
-        {"role": "agent", "office_id": office_id, "name": "robot-3"},
-        namespace=SMCP_NAMESPACE,
-    )
+    await agent.join_office(office_id=office_id, agent_name="robot-3", namespace=SMCP_NAMESPACE)
 
     # 让Computer随后加入，触发初次工具拉取 / Computer joins afterwards to trigger initial fetch
     await computer.connect(
