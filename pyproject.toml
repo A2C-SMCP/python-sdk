@@ -39,49 +39,16 @@ test = [
     "pytest-mock >=3.14.1,<4.0.0",
     "inline-snapshot >=0.27.2,<0.28.0",
     "pytest-dotenv >=0.5.2,<0.6.0",
-    "aiohttp >=3.12.15,<4.0.0"
+    "aiohttp >=3.12.15,<4.0.0",
+    "pexpect >=4.9.0,<5.0.0",
+    "werkzeug >=3.1.3,<4.0.0",
+    "requests >=2.32.5,<3.0.0",
+    "websocket-client >=1.8.0,<2.0.0"
 ]
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.4.1"
-ruff = "^0.12.9"
-mypy = "^1.17.1"
-poethepoet = "^0.37.0"
-
-
-[tool.poetry.group.test.dependencies]
-polyfactory = "^2.22.2"
-pytest-asyncio = "^1.1.0"
-pytest-cov = "^6.2.1"
-pytest-mock = "^3.14.1"
-inline-snapshot = "^0.27.2"
-pytest-dotenv = "^0.5.2"
-aiohttp = "^3.12.15"
-pexpect = "^4.9.0"
-werkzeug = "^3.1.3"
-requests = "^2.32.5"
-websocket-client = "^1.8.0"
-
-
-[tool.poetry.group.cli.dependencies]
-typer = "^0.17.4"
-rich = "^14.1.0"
-prompt-toolkit = "^3.0.52"
-
-# 添加 extras 部分定义可选依赖组
-
-[tool.poetry.group.build.dependencies]
-bump-my-version = "^1.2.3"
-
-# Poetry 特定配置：打包设置 / Poetry-specific configuration: packaging settings
-[tool.poetry]
-packages = [{include = "a2c_smcp"}]
-include = ["a2c_smcp/py.typed"]
-
-
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 build = [

@@ -1,10 +1,10 @@
 # 文件名: e2e-tests.yml / File name: e2e-tests.yml
 # 作者: JQQ / Author: JQQ
 # 创建日期: 2025/09/26 / Created: 2025/09/26
-# 最后修改日期: 2025/09/26 / Last Modified: 2025/09/26
+# 最后修改日期: 2025/11/20 / Last Modified: 2025/11/20
 # 版权: 2023 JQQ. All rights reserved. / Copyright: 2023 JQQ. All rights reserved.
-# 依赖: GitHub Actions, Python 3.11, Poetry, poethepoet / Deps: GitHub Actions, Python 3.11, Poetry, poethepoet
-# 描述: E2E 测试工作流，安装依赖后运行 `poetry run poe test-e2e` / Description: E2E test workflow that installs deps then runs `poetry run poe test-e2e`
+# 依赖: GitHub Actions, Python 3.11, uv, poethepoet / Deps: GitHub Actions, Python 3.11, uv, poethepoet
+# 描述: E2E 测试工作流，安装依赖后运行 `poe test-e2e` / Description: E2E test workflow that installs deps then runs `poe test-e2e`
 
 name: E2E Tests
 
@@ -32,43 +32,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 安装 Poetry（通过 pip 安装，避免无效的第三方 Action）
-      # Install Poetry via pip to avoid invalid third-party Action
-      - name: Install Poetry
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install poetry
-
-      - name: Configure Poetry
-        run: |
-          poetry config virtualenvs.create true --local
-          poetry config virtualenvs.in-project true --local
-
-      - name: Cache Poetry cache
-        uses: actions/cache@v4
+      # 安装 uv / Install uv
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          path: ~/.cache/pypoetry
-          key: ${{ runner.os }}-pypoetry-${{ hashFiles('**/poetry.lock', '**/pyproject.toml') }}-v2
-          restore-keys: |
-            ${{ runner.os }}-pypoetry-
+          enable-cache: true
 
+      # 缓存虚拟环境 .venv / Cache project virtualenv .venv
       - name: Cache virtualenv
         uses: actions/cache@v4
         with:
           path: .venv
-          key: ${{ runner.os }}-venv-3.11-${{ hashFiles('**/poetry.lock', '**/pyproject.toml') }}-v2
+          key: ${{ runner.os }}-venv-3.11-${{ hashFiles('**/uv.lock', '**/pyproject.toml') }}-v3
           restore-keys: |
             ${{ runner.os }}-venv-
 
+      # 安装依赖 / Install dependencies
       - name: Install dependencies
         run: |
-          poetry --version
-          # 同步安装：确保 dev/test/cli 组正确安装；避免缓存导致的缺失 / Sync install to ensure dev/test/cli groups are installed; avoid cache-induced misses
-          poetry install --no-interaction --with dev,test,cli --sync
+          uv --version
+          uv sync --extra dev --extra test --extra cli
 
+      # 运行 E2E 测试 / Run e2e tests
       - name: Run e2e tests
         run: |
-          poetry run poe test-e2e
+          uv run poe test-e2e
 
       # - name: Upload e2e logs
       #   if: always()
