@@ -640,3 +640,195 @@ async def test_aadd_or_aupdate_server_with_duplicate_tool(manager, monkeypatch):
     assert any(tool.name == "tool1" and tool.meta["a2c_tool_meta"].alias == "new_alias" for tool in tools_list) and any(
         tool.name == "tool1" and not tool.meta for tool in tools_list
     )
+
+
+@pytest.mark.asyncio
+async def test_acall_tool_with_vrl_context_injection(manager, monkeypatch):
+    """
+    测试：acall_tool在VRL转换时注入tool_name和parameters
+    Test: acall_tool injects tool_name and parameters during VRL transformation
+    """
+    import json
+    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
+    from mcp.types import TextContent
+
+    # 中文: 创建带VRL脚本的配置，脚本会提取tool_name和parameters
+    # English: Create config with VRL script that extracts tool_name and parameters
+    vrl_script = """
+    .context = {
+        "tool": .tool_name,
+        "params": .parameters
+    }
+    """
+
+    # 中文: 创建mock客户端，返回带内容的结果
+    # English: Create mock client that returns result with content
+    def vrl_test_factory(config: MCPServerConfig, message_handler=None) -> Any:
+        mock_result = CallToolResult(
+            content=[TextContent(text="test result", type="text")],
+            isError=False,
+        )
+        client = MockMCPClient([create_mock_tool("test_tool")], message_handler=message_handler)
+        client.call_tool = AsyncMock(return_value=mock_result)
+        return client
+
+    monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", vrl_test_factory)
+
+    # 中文: 创建配置并初始化
+    # English: Create config and initialize
+    config = StdioServerConfig(
+        name="vrl_test_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=MagicMock(spec=StdioServerParameters),
+    )
+
+    await manager.enable_auto_connect()
+    await manager.ainitialize([config])
+    await manager.astart_all()
+
+    # 中文: 调用工具，传入参数
+    # English: Call tool with parameters
+    test_params = {"query": "test query", "limit": 10}
+    result = await manager.acall_tool("vrl_test_server", "test_tool", test_params)
+
+    # 中文: 验证VRL转换结果包含tool_name和parameters
+    # English: Verify VRL transformation result contains tool_name and parameters
+    assert result.meta is not None
+    assert A2C_VRL_TRANSFORMED in result.meta
+
+    transformed = json.loads(result.meta[A2C_VRL_TRANSFORMED])
+    assert "context" in transformed
+    assert transformed["context"]["tool"] == "test_tool"
+    assert transformed["context"]["params"] == test_params
+
+
+@pytest.mark.asyncio
+async def test_acall_tool_vrl_conditional_on_tool_name(manager, monkeypatch):
+    """
+    测试：VRL脚本基于tool_name执行条件逻辑
+    Test: VRL script executes conditional logic based on tool_name
+    """
+    import json
+    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
+    from mcp.types import TextContent
+
+    # 中文: VRL脚本根据tool_name设置不同的result_type
+    # English: VRL script sets different result_type based on tool_name
+    vrl_script = """
+    if .tool_name == "search" {
+        .result_type = "search_result"
+        .query = .parameters.query
+    } else if .tool_name == "execute" {
+        .result_type = "execution_result"
+        .command = .parameters.cmd
+    } else {
+        .result_type = "unknown"
+    }
+    """
+
+    def conditional_vrl_factory(config: MCPServerConfig, message_handler=None) -> Any:
+        mock_result = CallToolResult(
+            content=[TextContent(text="result", type="text")],
+            isError=False,
+        )
+        client = MockMCPClient(
+            [create_mock_tool("search"), create_mock_tool("execute"), create_mock_tool("other")],
+            message_handler=message_handler,
+        )
+        client.call_tool = AsyncMock(return_value=mock_result)
+        return client
+
+    monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", conditional_vrl_factory)
+
+    config = StdioServerConfig(
+        name="conditional_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=MagicMock(spec=StdioServerParameters),
+    )
+
+    await manager.enable_auto_connect()
+    await manager.ainitialize([config])
+    await manager.astart_all()
+
+    # 中文: 测试search工具
+    # English: Test search tool
+    result1 = await manager.acall_tool("conditional_server", "search", {"query": "test"})
+    transformed1 = json.loads(result1.meta[A2C_VRL_TRANSFORMED])
+    assert transformed1["result_type"] == "search_result"
+    assert transformed1["query"] == "test"
+
+    # 中文: 测试execute工具
+    # English: Test execute tool
+    result2 = await manager.acall_tool("conditional_server", "execute", {"cmd": "ls"})
+    transformed2 = json.loads(result2.meta[A2C_VRL_TRANSFORMED])
+    assert transformed2["result_type"] == "execution_result"
+    assert transformed2["command"] == "ls"
+
+    # 中文: 测试其他工具
+    # English: Test other tool
+    result3 = await manager.acall_tool("conditional_server", "other", {})
+    transformed3 = json.loads(result3.meta[A2C_VRL_TRANSFORMED])
+    assert transformed3["result_type"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_acall_tool_vrl_with_nested_parameters(manager, monkeypatch):
+    """
+    测试：VRL脚本访问嵌套的parameters字段
+    Test: VRL script accesses nested parameters fields
+    """
+    import json
+    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
+    from mcp.types import TextContent
+
+    # 中文: VRL脚本访问嵌套的parameters
+    # English: VRL script accesses nested parameters
+    vrl_script = """
+    .user_info = {
+        "id": .parameters.user.id,
+        "name": .parameters.user.name
+    }
+    .options = .parameters.options
+    """
+
+    def nested_params_factory(config: MCPServerConfig, message_handler=None) -> Any:
+        mock_result = CallToolResult(
+            content=[TextContent(text="result", type="text")],
+            isError=False,
+        )
+        client = MockMCPClient([create_mock_tool("nested_tool")], message_handler=message_handler)
+        client.call_tool = AsyncMock(return_value=mock_result)
+        return client
+
+    monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", nested_params_factory)
+
+    config = StdioServerConfig(
+        name="nested_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=MagicMock(spec=StdioServerParameters),
+    )
+
+    await manager.enable_auto_connect()
+    await manager.ainitialize([config])
+    await manager.astart_all()
+
+    # 中文: 调用工具，传入嵌套参数
+    # English: Call tool with nested parameters
+    nested_params = {"user": {"id": 123, "name": "Alice"}, "options": {"enabled": True, "timeout": 30}}
+
+    result = await manager.acall_tool("nested_server", "nested_tool", nested_params)
+    transformed = json.loads(result.meta[A2C_VRL_TRANSFORMED])
+
+    assert transformed["user_info"]["id"] == 123
+    assert transformed["user_info"]["name"] == "Alice"
+    assert transformed["options"]["enabled"] is True
+    assert transformed["options"]["timeout"] == 30

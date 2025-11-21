@@ -394,13 +394,17 @@ class MCPServerManager:
                 else:
                     result.meta = {A2C_TOOL_META: tool_meta}
 
-            # 中文: 如果配置了VRL脚本，尝试对返回值进行转换
+            # 中文: 如果配置了VRL脚本,尝试对返回值进行转换
             # English: If VRL script is configured, try to transform the return value
             if config.vrl:
                 try:
-                    # 中文: 尝试将CallToolResult序列化为字典作为VRL的Event输入
-                    # English: Try to serialize CallToolResult to dict as VRL Event input
+                    # 中文: 将CallToolResult序列化为字典，并注入tool_name和parameters作为VRL的Event输入
+                    # English: Serialize CallToolResult to dict and inject tool_name and parameters as VRL Event input
                     event = result.model_dump(mode="json")
+                    # 中文: 注入工具调用的上下文信息
+                    # English: Inject tool call context information
+                    event["tool_name"] = tool_name
+                    event["parameters"] = parameters
 
                     # 中文: 执行VRL转换（使用系统本地时区）
                     # English: Execute VRL transformation (use system local timezone)
