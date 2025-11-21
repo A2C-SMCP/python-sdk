@@ -164,7 +164,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         try:
             logger.debug(f"Calling tool {tool_name} on computer {computer}")
             res = await self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=SMCP_NAMESPACE)
-            return CallToolResult.model_validate(res)
+            return CallToolResult.model_validate(res, by_name=True)
 
         except TimeoutError:
             # 发送取消请求

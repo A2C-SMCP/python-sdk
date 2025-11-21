@@ -205,7 +205,7 @@ def print_tools(tools: list[dict[str, Any]]) -> None:
     table = Table(title="工具列表 / Tools")
     table.add_column("Name")
     table.add_column("Description")
-    table.add_column("Has Return")
+    table.add_column("Json Return")
     for t in tools:
         table.add_row(t.get("name", ""), (t.get("description") or "")[:80], "Yes" if t.get("return_schema") else "No")
     console.print(table)

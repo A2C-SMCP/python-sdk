@@ -164,7 +164,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         try:
             logger.debug(f"Calling tool {tool_name} on computer {computer}")
             res = self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=SMCP_NAMESPACE)
-            return CallToolResult.model_validate(res)
+            return CallToolResult.model_validate(res, by_name=True)
 
         except TimeoutError:
             # 发送取消请求
@@ -268,7 +268,12 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             logger.error(f"Error in _on_computer_update_config: {e}")
 
     def get_desktop_from_computer(
-        self, computer: str, *, size: int | None = None, window: str | None = None, timeout: int = 20,
+        self,
+        computer: str,
+        *,
+        size: int | None = None,
+        window: str | None = None,
+        timeout: int = 20,
     ) -> GetDeskTopRet:
         """
         从指定计算机获取桌面信息
