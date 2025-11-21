@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     GET_DESKTOP_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    LIST_ROOM_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -31,6 +32,8 @@ from a2c_smcp.smcp import (
     GetDeskTopRet,
     GetToolsRet,
     LeaveOfficeNotification,
+    ListRoomReq,
+    SessionInfo,
     UpdateMCPConfigNotification,
 )
 from a2c_smcp.utils.logger import logger
@@ -306,3 +309,39 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             self.process_desktop_response(ret, computer)
         except Exception as e:
             logger.error(f"Error handling desktop updated notification: {e}")
+
+    def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
+        """
+        获取指定房间内的所有Computer信息
+        Get all computers info in the specified office
+
+        Args:
+            office_id (str): 房间ID / Office ID
+            timeout (int): 超时时间 / Timeout duration
+
+        Returns:
+            list[SessionInfo]: Computer信息列表 / List of computer info
+        """
+        agent_config = self.auth_provider.get_agent_config()
+        req = ListRoomReq(
+            robot_id=agent_config["agent_id"],
+            req_id=f"list_computers_{agent_config['agent_id']}_{office_id}",
+            office_id=office_id,
+        )
+
+        try:
+            logger.debug(f"Getting computers in office {office_id}")
+            response = self.call(LIST_ROOM_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
+
+            # 验证响应 / Validate response
+            if response.get("req_id") != req["req_id"]:
+                raise ValueError("Invalid response with mismatched req_id")
+
+            # 过滤出Computer角色的会话 / Filter sessions with computer role
+            all_sessions = response.get("sessions", [])
+            computers = [s for s in all_sessions if s.get("role") == "computer"]
+            return computers
+
+        except Exception as e:
+            logger.error(f"Failed to get computers in office {office_id}: {e}", exc_info=True)
+            raise

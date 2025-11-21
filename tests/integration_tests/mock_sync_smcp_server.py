@@ -25,6 +25,9 @@ from a2c_smcp.smcp import (
     GetDeskTopRet,
     GetToolsReq,
     GetToolsRet,
+    ListRoomReq,
+    ListRoomRet,
+    SessionInfo,
     SMCPTool,
     ToolCallReq,
     UpdateMCPConfigNotification,
@@ -40,6 +43,9 @@ class MockSyncSMCPNamespace(Namespace):
 
     def __init__(self) -> None:
         super().__init__(namespace=SMCP_NAMESPACE)
+        # 存储会话信息：sid -> {role, name, office_id}
+        # Store session info: sid -> {role, name, office_id}
+        self.sessions: dict[str, dict[str, Any]] = {}
 
     def trigger_event(self, event: str, *args: Any) -> Any:
         """触发事件，重写触发逻辑，将冒号转换为下划线"""
@@ -51,10 +57,22 @@ class MockSyncSMCPNamespace(Namespace):
 
     def on_disconnect(self, sid: str) -> None:
         logger.info(f"SocketIO Client {sid} disconnected")
+        # 清理会话信息 / Clean up session info
+        if sid in self.sessions:
+            del self.sessions[sid]
 
     def on_server_join_office(self, sid: str, data: EnterOfficeReq) -> tuple[bool, str | None]:
         """处理加入办公室请求"""
         logger.info(f"Computer/Agent {sid} 加入房间 {data['office_id']}")
+
+        # 存储会话信息 / Store session info
+        self.sessions[sid] = {
+            "sid": sid,
+            "role": data["role"],
+            "name": data["name"],
+            "office_id": data["office_id"],
+        }
+
         self.enter_room(sid, data["office_id"])
 
         # 广播进入办公室通知
@@ -127,6 +145,38 @@ class MockSyncSMCPNamespace(Namespace):
         computer = data.get("computer", sid)
         self.emit(UPDATE_DESKTOP_NOTIFICATION, {"computer": computer}, skip_sid=sid)
         return True, None
+
+    def on_server_list_room(self, sid: str, data: ListRoomReq) -> ListRoomRet:
+        """
+        列出指定房间内的所有会话信息
+        List all sessions in the specified room
+
+        Args:
+            sid (str): 发起者ID，一般是Agent / Initiator ID, usually Agent
+            data (ListRoomReq): 列出房间请求数据 / List room request data
+
+        Returns:
+            ListRoomRet: 房间内所有会话信息列表 / List of all session info in the room
+        """
+        office_id = data["office_id"]
+        req_id = data["req_id"]
+
+        logger.info(f"Agent {sid} 查询房间 {office_id} 的会话列表")
+
+        # 过滤出指定房间内的所有会话 / Filter all sessions in the specified room
+        sessions: list[SessionInfo] = []
+        for session_sid, session_data in self.sessions.items():
+            if session_data.get("office_id") == office_id:
+                session_info: SessionInfo = {
+                    "sid": session_data["sid"],
+                    "name": session_data["name"],
+                    "role": session_data["role"],
+                    "office_id": session_data["office_id"],
+                }
+                sessions.append(session_info)
+
+        logger.info(f"房间 {office_id} 中找到 {len(sessions)} 个会话")
+        return ListRoomRet(sessions=sessions, req_id=req_id)
 
 
 def create_sync_smcp_socketio() -> Server:

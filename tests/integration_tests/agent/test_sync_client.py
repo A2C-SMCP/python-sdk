@@ -307,6 +307,102 @@ def test_validate_emit_event_blocks_invalid():
         agent.call("agent:do_something", {})
 
 
+def test_get_computers_in_office_sync(startup_and_shutdown_sync_smcp_server):
+    """
+    中文：验证同步Agent可以获取房间内所有Computer的信息。
+    English: Verify sync Agent can get all computers info in the office.
+    """
+    port = startup_and_shutdown_sync_smcp_server
+    handler = _EH()
+    office_id = "office-sync-4"
+    auth = DefaultAgentAuthProvider(agent_id="robot-sync-4", office_id=office_id)
+    agent = SMCPAgentClient(auth_provider=auth, event_handler=handler)
+
+    # Agent连接并加入办公室 / Agent connects and joins office
+    agent.connect_to_server(
+        f"http://localhost:{port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    agent.join_office(office_id=office_id, agent_name="robot-sync-4", namespace=SMCP_NAMESPACE)
+
+    # 使用线程启动两个Computer客户端 / Start two Computer clients in threads
+    def run_computer_client(computer_name: str) -> None:
+        logger.info(f"Starting Computer Client: {computer_name}")
+        computer = Client()
+        computer.connect(
+            f"http://localhost:{port}",
+            namespaces=[SMCP_NAMESPACE],
+            socketio_path="/socket.io",
+        )
+        _join_office(computer, role="computer", office_id=office_id, name=computer_name)
+
+        # 等待断开信号 / Wait for disconnect signal
+        disconnect_event.wait()
+        computer.disconnect()
+
+    disconnect_event = threading.Event()
+    computer_thread1 = threading.Thread(target=run_computer_client, args=("comp-sync-04-1",))
+    computer_thread2 = threading.Thread(target=run_computer_client, args=("comp-sync-04-2",))
+    computer_thread1.start()
+    computer_thread2.start()
+
+    # 等待所有客户端加入完成 / Wait for all clients to join
+    time.sleep(1.0)
+
+    # 调用get_computers_in_office获取Computer列表 / Call get_computers_in_office to get computers list
+    computers = agent.get_computers_in_office(office_id)
+
+    # 验证返回的Computer数量 / Verify number of computers returned
+    assert len(computers) == 2, f"Expected 2 computers, got {len(computers)}"
+
+    # 验证所有返回的会话都是computer角色 / Verify all returned sessions are computer role
+    assert all(c["role"] == "computer" for c in computers), "All sessions should be computer role"
+
+    # 验证Computer名称 / Verify computer names
+    computer_names = {c["name"] for c in computers}
+    assert "comp-sync-04-1" in computer_names, "comp-sync-04-1 should be in the list"
+    assert "comp-sync-04-2" in computer_names, "comp-sync-04-2 should be in the list"
+
+    # 清理 / Cleanup
+    disconnect_event.set()
+    computer_thread1.join()
+    computer_thread2.join()
+    agent.disconnect()
+
+
+def test_get_computers_in_office_empty_sync(startup_and_shutdown_sync_smcp_server):
+    """
+    中文：验证当房间内没有Computer时，同步Agent返回空列表。
+    English: Verify sync Agent returns empty list when no computers in office.
+    """
+    port = startup_and_shutdown_sync_smcp_server
+    handler = _EH()
+    office_id = "office-sync-5"
+    auth = DefaultAgentAuthProvider(agent_id="robot-sync-5", office_id=office_id)
+    agent = SMCPAgentClient(auth_provider=auth, event_handler=handler)
+
+    # Agent连接并加入办公室 / Agent connects and joins office
+    agent.connect_to_server(
+        f"http://localhost:{port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    agent.join_office(office_id=office_id, agent_name="robot-sync-5", namespace=SMCP_NAMESPACE)
+
+    # 等待连接完成 / Wait for connection to complete
+    time.sleep(0.5)
+
+    # 调用get_computers_in_office，应该返回空列表 / Call get_computers_in_office, should return empty list
+    computers = agent.get_computers_in_office(office_id)
+
+    # 验证返回空列表 / Verify empty list is returned
+    assert len(computers) == 0, f"Expected 0 computers, got {len(computers)}"
+
+    # 清理 / Cleanup
+    agent.disconnect()
+
+
 def test_sync_agent_on_computer_enter_office_with_mock(startup_and_shutdown_sync_smcp_server):
     """
     中文：测试同步Agent Client能自动响应Computer Client的ENTER_OFFICE_EVENT。

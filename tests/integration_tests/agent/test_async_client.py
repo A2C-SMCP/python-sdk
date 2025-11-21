@@ -245,3 +245,99 @@ async def test_agent_receives_update_config(socketio_server, basic_server_port: 
 
     await agent.disconnect()
     await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_get_computers_in_office(socketio_server, basic_server_port: int):
+    """
+    中文：验证Agent可以获取房间内所有Computer的信息。
+    English: Verify Agent can get all computers info in the office.
+    """
+    # 创建多个Computer客户端 / Create multiple Computer clients
+    computer1 = AsyncClient()
+    computer2 = AsyncClient()
+
+    # 创建Agent客户端 / Create Agent client
+    handler = _EH()
+    office_id = "office-4"
+    auth = DefaultAgentAuthProvider(agent_id="robot-4", office_id=office_id)
+    agent = AsyncSMCPAgentClient(auth_provider=auth, event_handler=handler)
+
+    # Agent连接并加入办公室 / Agent connects and joins office
+    await agent.connect_to_server(
+        f"http://localhost:{basic_server_port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    await agent.join_office(office_id=office_id, agent_name="robot-4", namespace=SMCP_NAMESPACE)
+
+    # Computer1加入办公室 / Computer1 joins office
+    await computer1.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    await _join_office(computer1, role="computer", office_id=office_id, name="comp-04-1")
+
+    # Computer2加入办公室 / Computer2 joins office
+    await computer2.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    await _join_office(computer2, role="computer", office_id=office_id, name="comp-04-2")
+
+    # 等待所有客户端加入完成 / Wait for all clients to join
+    await asyncio.sleep(0.5)
+
+    # 调用get_computers_in_office获取Computer列表 / Call get_computers_in_office to get computers list
+    computers = await agent.get_computers_in_office(office_id)
+
+    # 验证返回的Computer数量 / Verify number of computers returned
+    assert len(computers) == 2, f"Expected 2 computers, got {len(computers)}"
+
+    # 验证所有返回的会话都是computer角色 / Verify all returned sessions are computer role
+    assert all(c["role"] == "computer" for c in computers), "All sessions should be computer role"
+
+    # 验证Computer名称 / Verify computer names
+    computer_names = {c["name"] for c in computers}
+    assert "comp-04-1" in computer_names, "comp-04-1 should be in the list"
+    assert "comp-04-2" in computer_names, "comp-04-2 should be in the list"
+
+    # 清理连接 / Cleanup connections
+    await agent.disconnect()
+    await computer1.disconnect()
+    await computer2.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_get_computers_in_office_empty(socketio_server, basic_server_port: int):
+    """
+    中文：验证当房间内没有Computer时，返回空列表。
+    English: Verify empty list is returned when no computers in office.
+    """
+    # 创建Agent客户端 / Create Agent client
+    handler = _EH()
+    office_id = "office-5"
+    auth = DefaultAgentAuthProvider(agent_id="robot-5", office_id=office_id)
+    agent = AsyncSMCPAgentClient(auth_provider=auth, event_handler=handler)
+
+    # Agent连接并加入办公室 / Agent connects and joins office
+    await agent.connect_to_server(
+        f"http://localhost:{basic_server_port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    await agent.join_office(office_id=office_id, agent_name="robot-5", namespace=SMCP_NAMESPACE)
+
+    # 等待连接完成 / Wait for connection to complete
+    await asyncio.sleep(0.3)
+
+    # 调用get_computers_in_office，应该返回空列表 / Call get_computers_in_office, should return empty list
+    computers = await agent.get_computers_in_office(office_id)
+
+    # 验证返回空列表 / Verify empty list is returned
+    assert len(computers) == 0, f"Expected 0 computers, got {len(computers)}"
+
+    # 清理连接 / Cleanup connections
+    await agent.disconnect()
