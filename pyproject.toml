@@ -26,6 +26,12 @@ cli = [
     "rich >=14.1.0,<15.0.0",
     "prompt-toolkit >=3.0.52,<4.0.0"
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
 dev = [
     "pytest >=8.4.1,<9.0.0",
     "ruff >=0.12.9,<0.13.0",
@@ -45,12 +51,6 @@ test = [
     "requests >=2.32.5,<3.0.0",
     "websocket-client >=1.8.0,<2.0.0"
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[dependency-groups]
 build = [
     "bump-my-version>=1.2.4",
 ]
