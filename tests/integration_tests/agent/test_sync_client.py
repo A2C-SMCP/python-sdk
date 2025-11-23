@@ -364,6 +364,20 @@ def test_get_computers_in_office_sync(startup_and_shutdown_sync_smcp_server):
     assert "comp-sync-04-1" in computer_names, "comp-sync-04-1 should be in the list"
     assert "comp-sync-04-2" in computer_names, "comp-sync-04-2 should be in the list"
 
+    # 从每个Computer获取工具列表 / Get tools list from each computer
+    for computer in computers:
+        computer_sid = computer["sid"]
+        logger.info(f"Getting tools from computer: {computer['name']} (sid: {computer_sid})")
+
+        # 调用get_tools_from_computer获取工具列表 / Call get_tools_from_computer to get tools list
+        tools_ret = agent.get_tools_from_computer(computer_sid)
+
+        # 验证返回结果 / Verify the result
+        assert tools_ret is not None, f"Failed to get tools from computer {computer['name']}"
+        assert tools_ret.get("tools"), "GetToolsRet should have 'tools' attribute"
+        assert tools_ret.get("req_id"), "GetToolsRet should have 'req_id' attribute"
+        logger.info(f"Successfully got {len(tools_ret['tools'])} tools from computer {computer['name']}")
+
     # 清理 / Cleanup
     disconnect_event.set()
     computer_thread1.join()

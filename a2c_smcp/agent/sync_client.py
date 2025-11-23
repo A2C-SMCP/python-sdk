@@ -190,7 +190,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         Get tools list from specified computer
 
         Args:
-            computer (str): 计算机ID / Computer ID
+            computer (str): 计算机SID / Computer SID
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
