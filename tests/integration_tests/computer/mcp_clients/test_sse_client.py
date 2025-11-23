@@ -149,7 +149,8 @@ async def test_invalid_state_operations(sse_server, sse_params: SseServerParamet
 
 @pytest.mark.asyncio
 async def test_sse_message_handler_receives_list_changed_notifications(
-    sse_server, sse_params: SseServerParameters,
+    sse_server,
+    sse_params: SseServerParameters,
 ) -> None:
     """
     中文: 验证在初始化 SseMCPClient 时传入 message_handler，能接收 listChanged 通知。

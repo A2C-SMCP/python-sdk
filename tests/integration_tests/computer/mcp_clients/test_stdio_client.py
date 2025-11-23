@@ -26,7 +26,8 @@ from a2c_smcp.computer.mcp_clients.stdio_client import StdioMCPClient
 
 @pytest.mark.asyncio
 async def test_state_transitions(
-    stdio_params: StdioServerParameters, track_state: tuple[Callable[[str, str], None], list[tuple[str, str]]],
+    stdio_params: StdioServerParameters,
+    track_state: tuple[Callable[[str, str], None], list[tuple[str, str]]],
 ) -> None:
     """测试客户端状态转换 Test client state transitions"""
     callback, history = track_state
@@ -155,7 +156,8 @@ async def test_invalid_state_operations(stdio_params: StdioServerParameters) -> 
 
 @pytest.mark.asyncio
 async def test_error_recovery(
-    stdio_params: StdioServerParameters, track_state: tuple[Callable[[str, str], None], list[tuple[str, str]]],
+    stdio_params: StdioServerParameters,
+    track_state: tuple[Callable[[str, str], None], list[tuple[str, str]]],
 ) -> None:
     """测试错误状态恢复 Test error recovery"""
     callback, history = track_state

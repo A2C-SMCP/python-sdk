@@ -401,6 +401,7 @@ async def test_manager_propagates_message_handler_to_clients():
     """验证 Manager 能将 message_handler 透传到具体 Client。
     Verify Manager forwards message_handler to concrete clients.
     """
+
     # 定义一个占位回调
     async def dummy_handler(*args, **kwargs):
         return None
@@ -649,8 +650,10 @@ async def test_acall_tool_with_vrl_context_injection(manager, monkeypatch):
     Test: acall_tool injects tool_name and parameters during VRL transformation
     """
     import json
-    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
+
     from mcp.types import TextContent
+
+    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
 
     # 中文: 创建带VRL脚本的配置，脚本会提取tool_name和parameters
     # English: Create config with VRL script that extracts tool_name and parameters
@@ -712,8 +715,10 @@ async def test_acall_tool_vrl_conditional_on_tool_name(manager, monkeypatch):
     Test: VRL script executes conditional logic based on tool_name
     """
     import json
-    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
+
     from mcp.types import TextContent
+
+    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
 
     # 中文: VRL脚本根据tool_name设置不同的result_type
     # English: VRL script sets different result_type based on tool_name
@@ -784,8 +789,10 @@ async def test_acall_tool_vrl_with_nested_parameters(manager, monkeypatch):
     Test: VRL script accesses nested parameters fields
     """
     import json
-    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
+
     from mcp.types import TextContent
+
+    from a2c_smcp.computer.mcp_clients.model import A2C_VRL_TRANSFORMED
 
     # 中文: VRL脚本访问嵌套的parameters
     # English: VRL script accesses nested parameters

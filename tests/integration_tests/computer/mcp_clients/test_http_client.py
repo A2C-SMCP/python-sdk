@@ -96,7 +96,8 @@ async def test_invalid_state_operations_basic(basic_server: Generator[None, None
 
 @pytest.mark.anyio
 async def test_http_message_handler_receives_list_changed_notifications(
-    basic_server: Generator[None, None, None], http_params: StreamableHttpParameters,
+    basic_server: Generator[None, None, None],
+    http_params: StreamableHttpParameters,
 ) -> None:
     """
     中文: 验证在初始化 HttpMCPClient 时传入 message_handler，能接收 listChanged 通知。

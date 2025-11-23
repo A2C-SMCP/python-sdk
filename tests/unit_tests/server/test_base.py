@@ -2,6 +2,7 @@
 """
 测试 a2c_smcp/server/base.py
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -70,6 +71,7 @@ async def test_on_disconnect_and_trigger_event_translate(ns, monkeypatch):
 
     # trigger_event 将 : 替换为 _，并调用父类 AsyncNamespace.trigger_event
     from socketio import AsyncNamespace
+
     parent = AsyncMock()
     # 使用 monkeypatch 临时替换，避免污染全局，影响后续集成测试的事件分发
     monkeypatch.setattr(AsyncNamespace, "trigger_event", parent, raising=True)

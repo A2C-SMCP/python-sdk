@@ -164,10 +164,12 @@ async def test_render_blob_and_unknown_and_render_exception():
     from mcp.types import BlobResourceContents, ReadResourceResult, TextResourceContents
 
     # Blob + 文本混合 -> 返回包含 URI 与文本（Blob 不追加文本）
-    detail_blob = ReadResourceResult(contents=[
-        BlobResourceContents(uri="window://R/blob", mimeType="application/octet-stream", blob="eHg="),
-        TextResourceContents(uri="window://R/blob", text="t1"),
-    ])
+    detail_blob = ReadResourceResult(
+        contents=[
+            BlobResourceContents(uri="window://R/blob", mimeType="application/octet-stream", blob="eHg="),
+            TextResourceContents(uri="window://R/blob", text="t1"),
+        ],
+    )
     # 为了触发 _render 的未知类型分支，先创建合法实例，再在运行期覆盖 contents
     detail_unknown = ReadResourceResult(contents=[TextResourceContents(uri="window://R/u", text="t2")])
     detail_unknown.contents = [object(), TextResourceContents(uri="window://R/u", text="t2")]

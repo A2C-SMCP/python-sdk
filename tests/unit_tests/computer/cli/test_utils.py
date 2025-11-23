@@ -30,7 +30,7 @@ class TestParseKvPairs:
 
     def test_json_non_object_should_error(self) -> None:
         with pytest.raises(ValueError):
-            parse_kv_pairs('[1,2,3]')
+            parse_kv_pairs("[1,2,3]")
         with pytest.raises(ValueError):
             parse_kv_pairs('"str"')
 

@@ -25,7 +25,7 @@ class StdioServerConfigFactory(ModelFactory[StdioServerConfig]):
     @classmethod
     def vrl(cls) -> str | None:
         """生成有效的VRL脚本或None / Generate valid VRL script or None"""
-        return cls.__random__.choice([None, '.result = "success"', '.transformed = true'])
+        return cls.__random__.choice([None, '.result = "success"', ".transformed = true"])
 
 
 class SseServerConfigFactory(ModelFactory[SseServerConfig]):
@@ -34,7 +34,7 @@ class SseServerConfigFactory(ModelFactory[SseServerConfig]):
     @classmethod
     def vrl(cls) -> str | None:
         """生成有效的VRL脚本或None / Generate valid VRL script or None"""
-        return cls.__random__.choice([None, '.result = "success"', '.transformed = true'])
+        return cls.__random__.choice([None, '.result = "success"', ".transformed = true"])
 
 
 class StreamableHttpServerConfigFactory(ModelFactory[StreamableHttpServerConfig]):
@@ -43,7 +43,7 @@ class StreamableHttpServerConfigFactory(ModelFactory[StreamableHttpServerConfig]
     @classmethod
     def vrl(cls) -> str | None:
         """生成有效的VRL脚本或None / Generate valid VRL script or None"""
-        return cls.__random__.choice([None, '.result = "success"', '.transformed = true'])
+        return cls.__random__.choice([None, '.result = "success"', ".transformed = true"])
 
 
 @pytest.mark.parametrize(

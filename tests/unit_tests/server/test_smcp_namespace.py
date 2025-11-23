@@ -330,7 +330,9 @@ class TestSMCPNamespace:
         ]
 
         # Mock get_session 返回 Agent 会话 / Mock get_session to return Agent session
-        smcp_namespace.get_session = AsyncMock(return_value={"sid": agent_sid, "name": "Test Agent", "role": "agent", "office_id": office_id})
+        smcp_namespace.get_session = AsyncMock(
+            return_value={"sid": agent_sid, "name": "Test Agent", "role": "agent", "office_id": office_id},
+        )
 
         # 使用 monkeypatch Mock aget_all_sessions_in_office
         # Use monkeypatch to mock aget_all_sessions_in_office

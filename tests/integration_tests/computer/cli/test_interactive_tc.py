@@ -55,6 +55,7 @@ class _Mgr:
     def get_server_config(self, name: str):  # noqa: D401
         class _Cfg:
             tool_meta = {}
+
         return _Cfg()
 
     async def acall_tool(self, server: str, tool: str, params: dict, timeout: float | None):  # noqa: D401

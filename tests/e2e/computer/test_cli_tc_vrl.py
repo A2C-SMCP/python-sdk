@@ -191,10 +191,8 @@ def test_tc_with_vrl_field_mapping(cli_proc: pexpect.spawn, tmp_path: Path) -> N
     assert "a2c_vrl_transformed" in out, f"VRL transformation marker not found in output:\n{out}"
     # VRL转换结果在meta中是JSON字符串，可能被转义，所以检查转义后的形式
     # VRL transformation result in meta is JSON string, may be escaped, so check escaped form
-    assert ('"status"' in out or "'status'" in out or '\\"status\\"' in out), (
-        f"VRL transformed 'status' field not found in output:\n{out}"
-    )
-    assert ('"success"' in out or "'success'" in out or '\\"success\\"' in out), (
+    assert '"status"' in out or "'status'" in out or '\\"status\\"' in out, f"VRL transformed 'status' field not found in output:\n{out}"
+    assert '"success"' in out or "'success'" in out or '\\"success\\"' in out, (
         f"VRL transformed 'success' value not found in output:\n{out}"
     )
 

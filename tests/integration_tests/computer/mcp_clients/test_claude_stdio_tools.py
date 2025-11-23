@@ -60,7 +60,7 @@ async def test_claude_mcp_tools_list_and_params() -> None:
                 "name": t.name,
                 "description": getattr(t, "description", None),
                 "inputSchema": schema,
-            }
+            },
         )
 
     # 打印用于人工查看（不作为断言依据） / print for manual inspection

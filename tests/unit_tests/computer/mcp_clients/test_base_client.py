@@ -65,11 +65,13 @@ class MockMCPClient(BaseMCPClient):
 # InitializeResult 相关的辅助类 / Helpers for InitializeResult related tests
 # ------------------------------
 
+
 class DummyParams(BaseModel):
     """
     中文: 伪造的参数模型，用于构造客户端实例。
     英文: Dummy parameter model used to construct client instance.
     """
+
     value: int = 1
 
 
@@ -340,6 +342,7 @@ async def test_enter_error_state_releases_resources(client):
 # ------------------------------
 # InitializeResult 相关测试 / Tests for InitializeResult logic
 # ------------------------------
+
 
 @pytest.mark.asyncio
 async def test_initialize_result_set_and_cleared_on_disconnect():

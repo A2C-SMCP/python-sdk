@@ -165,7 +165,7 @@ class MockSyncSMCPNamespace(Namespace):
 
         # 过滤出指定房间内的所有会话 / Filter all sessions in the specified room
         sessions: list[SessionInfo] = []
-        for session_sid, session_data in self.sessions.items():
+        for _session_sid, session_data in self.sessions.items():
             if session_data.get("office_id") == office_id:
                 session_info: SessionInfo = {
                     "sid": session_data["sid"],

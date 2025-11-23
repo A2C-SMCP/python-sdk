@@ -3,6 +3,7 @@
 测试 a2c_smcp/server/sync_namespace.py
 覆盖 enter_room/leave_room 及所有 on_* 分支
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -185,21 +186,25 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     assert kwargs.get("to") == "c1"
 
     # client get_tools：校验在同一房间并转发
-    ns.get_session = MagicMock(side_effect=[
-        {"role": "computer", "office_id": "room1"},  # computer sess
-        {"role": "agent", "office_id": "room1"},     # agent sess
-    ])
-    ns.call = MagicMock(return_value={
-        "req_id": "r3",
-        "tools": [
-            {
-                "name": "t1",
-                "description": "d",
-                "params_schema": {"type": "object", "properties": {}, "required": []},
-                "return_schema": None,
-            },
+    ns.get_session = MagicMock(
+        side_effect=[
+            {"role": "computer", "office_id": "room1"},  # computer sess
+            {"role": "agent", "office_id": "room1"},  # agent sess
         ],
-    })
+    )
+    ns.call = MagicMock(
+        return_value={
+            "req_id": "r3",
+            "tools": [
+                {
+                    "name": "t1",
+                    "description": "d",
+                    "params_schema": {"type": "object", "properties": {}, "required": []},
+                    "return_schema": None,
+                },
+            ],
+        },
+    )
     ret2 = ns.on_client_get_tools("a1", {"computer": "c1", "req_id": "r3", "robot_id": "a1"})
     assert isinstance(ret2, dict) and ret2["req_id"] == "r3" and isinstance(ret2.get("tools"), list)
     ns.call.assert_called_once()

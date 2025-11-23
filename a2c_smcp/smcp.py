@@ -102,6 +102,9 @@ class ToolMeta(TypedDict, total=False):
     # 工具别名，与 model.ToolMeta.alias 对齐，用于解决不同 Server 下工具重名冲突
     # Tool alias, align with model.ToolMeta.alias, used to resolve name conflicts across servers
     alias: NotRequired[str | None]
+    # 工具标签，用于对工具进行分类
+    # Tool tags, used to categorize tools
+    tags: NotRequired[list[str] | None]
 
 
 class BaseMCPServerConfig(TypedDict):

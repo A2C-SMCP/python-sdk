@@ -148,6 +148,7 @@ async def test_arun_command_timeout_and_error():
 @pytest.mark.asyncio
 async def test_ainput_prompt_with_provided_session_branches(monkeypatch):
     """覆盖 ainput_prompt 在提供 session 时的异常与返回分支。"""
+
     # 1) 提供 session 且抛出 KeyboardInterrupt -> 返回默认值
     class Sess1:
         async def prompt_async(self, *_, **__):
@@ -220,6 +221,7 @@ async def test_arun_command_json_fallback_and_exec_mode(tmp_path):
 @pytest.mark.asyncio
 async def test_ainput_pick_interrupt_with_invalid_default_multi(monkeypatch):
     """multi=True 且 default_index 越界时，KeyboardInterrupt 返回空列表。"""
+
     class DummySession:
         async def prompt_async(self, *args, **kwargs):
             raise KeyboardInterrupt()
@@ -236,6 +238,7 @@ async def test_ainput_pick_interrupt_with_invalid_default_multi(monkeypatch):
 @pytest.mark.asyncio
 async def test_ainput_pick_interrupt_with_invalid_default_single(monkeypatch):
     """multi=False 且 default_index 越界时，KeyboardInterrupt 返回空字符串。"""
+
     class DummySession:
         async def prompt_async(self, *args, **kwargs):
             raise EOFError()

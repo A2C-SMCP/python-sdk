@@ -66,6 +66,7 @@ class _FakeMgr:
     def get_server_config(self, name: str):  # noqa: D401
         class _Cfg:
             tool_meta = {}
+
         return _Cfg()
 
     # 新增: 兼容 Manager.get_tool_meta 新接口 / new API for merged tool meta
