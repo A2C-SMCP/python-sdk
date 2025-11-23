@@ -53,7 +53,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv --version
-          uv sync --extra dev --extra test --extra cli
+          uv sync --group dev --group test --extra cli
 
       # 运行测试（poe 在虚拟环境中调用）
       # Run tests through poe inside the venv

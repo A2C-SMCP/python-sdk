@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv --version
-          uv sync --extra dev --extra test --extra cli
+          uv sync --group dev --group test --extra cli
 
       # 运行 E2E 测试 / Run e2e tests
       - name: Run e2e tests
