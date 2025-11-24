@@ -199,6 +199,36 @@ def test_inputs_value_set_no_default_error(cli_proc: pexpect.spawn) -> None:
 
 
 @pytest.mark.e2e
+def test_inputs_value_set_command_type_error(cli_proc: pexpect.spawn) -> None:
+    """
+    中文: 测试对 command 类型的 input 执行 inputs value set <id> 时，应该提示不支持 default。
+    English: Test that inputs value set <id> on command type input shows no default support error.
+
+    步骤 Steps:
+      1) inputs add 一个 command 类型的 input
+      2) inputs value set <command-id> 应该提示 command 类型不支持 default
+    """
+    print("[test_start] test_inputs_value_set_command_type_error")
+    child = cli_proc
+
+    # 1) 添加一个 command 类型的 input / Add command type input
+    child.sendline('inputs add {"id": "CMD_INPUT", "type": "command", "description": "Command input", "command": "echo test"}')
+    time.sleep(0.3)
+    expect_prompt_stable(child, quiet=0.3, max_wait=10.0)
+
+    # 2) 尝试不带值设置，应该提示 command 类型不支持 default / Try to set without value, should show error
+    child.sendline("inputs value set CMD_INPUT")
+    time.sleep(0.3)
+    out = expect_prompt_stable(child, quiet=0.3, max_wait=10.0)
+    print(f"inputs value set (command type) output:\n{out}")
+    # 中文: 应该提示 command 类型不支持 default
+    # English: Should indicate command type has no default support
+    assert ("command" in out.lower() and ("不支持" in out or "no" in out.lower())) or "command type" in out.lower(), (
+        "应该提示 command 类型不支持 default / Should indicate command type no default"
+    )
+
+
+@pytest.mark.e2e
 def test_inputs_value_rm_and_clear(cli_proc: pexpect.spawn) -> None:
     """
     中文: 测试 inputs value rm 和 clear 命令。

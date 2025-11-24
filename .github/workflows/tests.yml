@@ -55,6 +55,12 @@ jobs:
           uv --version
           uv sync --group dev --group test --extra cli
 
+      # 运行 lint 检查（在测试之前确保代码质量）
+      # Run lint checks (ensure code quality before tests)
+      - name: Run lint
+        run: |
+          uv run poe lint
+
       # 运行测试（poe 在虚拟环境中调用）
       # Run tests through poe inside the venv
       - name: Run tests

@@ -4,7 +4,7 @@ requires-python = ">=3.11, <4.0"
 
 [[package]]
 name = "a2c-smcp"
-version = "0.1.2.dev0"
+version = "0.1.2rc0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -17,6 +17,7 @@ dependencies = [
 
 [package.optional-dependencies]
 cli = [
+    { name = "aiohttp" },
     { name = "prompt-toolkit" },
     { name = "rich" },
     { name = "typer" },
@@ -48,6 +49,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", marker = "extra == 'cli'", specifier = ">=3.12.15,<4.0.0" },
     { name = "mcp", specifier = "==1.15.0" },
     { name = "prompt-toolkit", marker = "extra == 'cli'", specifier = ">=3.0.52,<4.0.0" },
     { name = "pydantic", specifier = ">=2.11.7,<3.0.0" },

@@ -329,6 +329,15 @@ async def interactive_loop(
                                     if input_def is None:
                                         console.print("[yellow]不存在的 id / Not found[/yellow]")
                                         continue
+                                    from a2c_smcp.computer.mcp_clients.model import MCPServerCommandInput
+
+                                    if isinstance(input_def, MCPServerCommandInput):
+                                        console.print(
+                                            f"[yellow]Input '{target_id}' 是 command 类型，不支持 default 值 / is command type, "
+                                            f"no default support[/yellow]"
+                                        )
+                                        console.print("[dim]用法: inputs value set <id> <json|text>[/dim]")
+                                        continue
                                     if input_def.default is None:
                                         console.print(f"[yellow]Input '{target_id}' 没有 default 值 / has no default value[/yellow]")
                                         console.print("[dim]用法: inputs value set <id> <json|text>[/dim]")
