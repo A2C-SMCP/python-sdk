@@ -160,7 +160,7 @@ def test_create_tool_call_request():
     assert req["computer"] == computer
     assert req["tool_name"] == tool_name
     assert req["params"] == params
-    assert req["robot_id"] == agent_id
+    assert req["agent"] == agent_id
     assert req["timeout"] == timeout
     assert "req_id" in req
     assert len(req["req_id"]) == 32  # UUID hex 长度
@@ -183,7 +183,7 @@ def test_create_get_tools_request():
     # 验证返回的是字典且包含所有必需字段
     assert isinstance(req, dict)
     assert req["computer"] == computer
-    assert req["robot_id"] == agent_id
+    assert req["agent"] == agent_id
     assert "req_id" in req
     assert len(req["req_id"]) == 32  # UUID hex 长度
 
@@ -513,7 +513,7 @@ def test_sio_param_client_properties_accessible():
     assert hasattr(passed_client, "auth_provider")
     assert passed_client.auth_provider is not None
     agent_config = passed_client.auth_provider.get_agent_config()
-    assert agent_config["agent_id"] == agent_id
+    assert agent_config["agent"] == agent_id
     assert agent_config["office_id"] == office_id
 
     # 验证event_handler可访问 / Verify event_handler is accessible

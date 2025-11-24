@@ -72,7 +72,8 @@ class UvicornTestServer(uvicorn.Server):
             if hasattr(self, "_serve_task") and not self._serve_task.done():
                 self._serve_task.cancel()
                 try:
-                    await asyncio.wait_for(self._serve_task, timeout=1.0)
+                    # 中文: 减少超时时间到 0.2 秒以加快测试速度 / English: Reduce timeout to 0.2s to speed up tests
+                    await asyncio.wait_for(self._serve_task, timeout=0.2)
                 except (TimeoutError, asyncio.CancelledError):
                     pass
         else:

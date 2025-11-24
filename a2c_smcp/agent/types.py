@@ -36,7 +36,7 @@ class AgentConfig(TypedDict):
     Agent configuration information
     """
 
-    agent_id: str  # Agent唯一标识 / Agent unique identifier
+    agent: str  # Agent唯一标识 / Agent unique identifier
     office_id: str  # 办公室ID / Office ID
 
 

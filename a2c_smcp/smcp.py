@@ -46,7 +46,7 @@ UPDATE_DESKTOP_NOTIFICATION = "notify:update_desktop"
 
 
 class AgentCallData(TypedDict):
-    robot_id: str
+    agent: str  # agent name
     req_id: str
 
 

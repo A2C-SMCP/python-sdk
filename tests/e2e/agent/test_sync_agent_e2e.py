@@ -424,7 +424,7 @@ def test_sync_agent_sio_param_with_real_connection(server_endpoint: str, mock_co
 
         # 验证可以调用client的方法 / Verify can call client methods
         agent_config = passed_client.auth_provider.get_agent_config()
-        assert agent_config["agent_id"] == "test-agent-sio"
+        assert agent_config["agent"] == "test-agent-sio"
         assert agent_config["office_id"] == "office-sio-test"
 
         # 验证tools_received也收到了sio参数 / Verify tools_received also received sio param
@@ -561,7 +561,7 @@ def test_sync_agent_list_room(server_endpoint: str, mock_computer_client):
         result = agent_client.call(
             LIST_ROOM_EVENT,
             {
-                "robot_id": agent_sid,
+                "agent": agent_sid,
                 "req_id": "list_room_req_sync_e2e",
                 "office_id": office_id,
             },

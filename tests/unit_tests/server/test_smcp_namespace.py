@@ -270,8 +270,8 @@ class TestSMCPNamespace:
         agent_sid = "a_sid1"
         comp_name = "c1"
         comp_sid = "c_sid1"
-        sess_agent = {"role": "agent", "office_id": "room1"}
-        sess_comp = {"role": "computer", "office_id": "room1"}
+        sess_agent = {"role": "agent", "office_id": "room1", "name": agent_id}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
 
         smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent))
         smcp_namespace._name_to_sid_map = {comp_name: comp_sid, agent_id: agent_sid}
@@ -288,7 +288,7 @@ class TestSMCPNamespace:
         res = await smcp_namespace.on_client_tool_call(
             agent_id,
             {
-                "robot_id": agent_id,
+                "agent": agent_id,
                 "req_id": "r2",
                 "computer": comp_name,
                 "tool_name": "t1",
@@ -307,7 +307,7 @@ class TestSMCPNamespace:
         # cancel tool call：由 agent 发起，广播通知
         smcp_namespace.get_session = AsyncMock(return_value=sess_agent)
         smcp_namespace.emit = AsyncMock()
-        await smcp_namespace.on_server_tool_call_cancel(agent_id, {"robot_id": agent_id, "req_id": "r3"})
+        await smcp_namespace.on_server_tool_call_cancel(agent_id, {"agent": agent_id, "req_id": "r3"})
         smcp_namespace.emit.assert_awaited()
 
     @pytest.mark.asyncio
@@ -347,7 +347,7 @@ class TestSMCPNamespace:
         # 执行测试 / Execute test
         result = await smcp_namespace.on_server_list_room(
             agent_sid,
-            {"robot_id": agent_sid, "req_id": "req_123", "office_id": office_id},
+            {"agent": agent_sid, "req_id": "req_123", "office_id": office_id},
         )
 
         # 验证结果 / Verify result
@@ -379,7 +379,7 @@ class TestSMCPNamespace:
         with pytest.raises(AssertionError, match="Agent只能查询自己所在房间的会话信息"):
             await smcp_namespace.on_server_list_room(
                 agent_sid,
-                {"robot_id": agent_sid, "req_id": "req_456", "office_id": "office_B"},
+                {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
             )
 
     @pytest.mark.asyncio
@@ -412,7 +412,7 @@ class TestSMCPNamespace:
 
         result = await smcp_namespace.on_server_list_room(
             agent_sid,
-            {"robot_id": agent_sid, "req_id": "req_789", "office_id": office_id},
+            {"agent": agent_sid, "req_id": "req_789", "office_id": office_id},
         )
 
         # 验证结果：应该只包含 3 个有效会话（排除 unknown 角色）

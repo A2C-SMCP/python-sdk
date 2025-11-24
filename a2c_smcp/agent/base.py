@@ -106,7 +106,7 @@ class BaseAgentClient(ABC):
             computer=computer,
             tool_name=tool_name,
             params=params,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
             timeout=timeout,
         )
@@ -125,7 +125,7 @@ class BaseAgentClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         return GetToolsReq(
             computer=computer,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
         )
 
@@ -145,7 +145,7 @@ class BaseAgentClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         req: GetDeskTopReq = {
             "computer": computer,
-            "robot_id": agent_config["agent_id"],
+            "agent": agent_config["agent"],
             "req_id": uuid.uuid4().hex,
         }
         if size is not None:
@@ -394,7 +394,7 @@ class BaseAgentSyncClient(ABC):
             computer=computer,
             tool_name=tool_name,
             params=params,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
             timeout=timeout,
         )
@@ -413,7 +413,7 @@ class BaseAgentSyncClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         return GetToolsReq(
             computer=computer,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
         )
 
@@ -433,7 +433,7 @@ class BaseAgentSyncClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         req: GetDeskTopReq = {
             "computer": computer,
-            "robot_id": agent_config["agent_id"],
+            "agent": agent_config["agent"],
             "req_id": uuid.uuid4().hex,
         }
         if size is not None:

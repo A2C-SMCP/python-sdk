@@ -72,7 +72,7 @@ async def test_on_tool_call_error_handling():
 
     req = {
         "computer": "comp-abc",
-        "robot_id": "office-1",
+        "agent": "office-1",
         "req_id": "r1",
         "tool_name": "t1",
         "params": {"k": "v"},
@@ -128,7 +128,7 @@ async def test_on_get_config_serialization_three_types():
     client = SMCPComputerClient(computer=_FakeComputer(name="sid-xyz"))
     client.office_id = "office-1"
 
-    req = {"computer": "sid-xyz", "robot_id": "office-1", "req_id": "mock_req"}
+    req = {"computer": "sid-xyz", "agent": "office-1", "req_id": "mock_req"}
     ret = await client.on_get_config(req)
 
     # 结构校验 / Structure checks

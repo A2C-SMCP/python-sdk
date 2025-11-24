@@ -100,7 +100,7 @@ async def test_tc_json_calls_execute(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     # 安装伪 session 与 stdout
     cmd = (
-        'tc {"robot_id":"r","req_id":"r01","computer":"c","tool_name":"tool/x","params":{"a":1},"timeout":3}',
+        'tc {"agent":"r","req_id":"r01","computer":"c","tool_name":"tool/x","params":{"a":1},"timeout":3}',
         "exit",
     )
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(list(cmd)))

@@ -162,7 +162,7 @@ async def test_tool_call_roundtrip(socketio_server, basic_server_port: int):
     res = await agent.call(
         TOOL_CALL_EVENT,
         {
-            "robot_id": "robot-C",
+            "agent": "robot-C",
             "computer": "comp-C",
             "tool_name": "echo",
             "params": {"text": "hi"},
@@ -225,7 +225,7 @@ async def test_get_tools_success_same_office(socketio_server, basic_server_port:
         GET_TOOLS_EVENT,
         {
             "computer": "comp-D",
-            "robot_id": "robot-D",
+            "agent": "robot-D",
             "req_id": "req-002",
         },
         namespace=SMCP_NAMESPACE,
@@ -324,7 +324,7 @@ async def test_list_room_success(socketio_server, basic_server_port: int):
 
     # Agent 调用 list_room 事件 / Agent calls list_room event
     list_req: ListRoomReq = {
-        "robot_id": agent.sid,
+        "agent": agent.sid,
         "req_id": "list_req_1",
         "office_id": office_id,
     }
@@ -375,7 +375,7 @@ async def test_list_room_empty_office(socketio_server, basic_server_port: int):
     # Agent 查询自己所在的房间（只有自己）
     # Agent queries its own room (only itself)
     list_req: ListRoomReq = {
-        "robot_id": agent.sid,
+        "agent": agent.sid,
         "req_id": "list_req_empty",
         "office_id": office_id,
     }

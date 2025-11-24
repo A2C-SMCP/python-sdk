@@ -182,7 +182,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     # Agent 拉取工具列表 / Agent get tools
     agent_ret_tools = await async_agent_client.call(
         GET_TOOLS_EVENT,
-        {"computer": computer_name, "robot_id": agent_name, "req_id": "req-tools"},
+        {"computer": computer_name, "agent": agent_name, "req_id": "req-tools"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -192,7 +192,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     # Agent 拉取桌面 / Agent get desktop
     agent_ret_desktop = await async_agent_client.call(
         GET_DESKTOP_EVENT,
-        {"computer": computer_name, "robot_id": agent_name, "req_id": "req-desk"},
+        {"computer": computer_name, "agent": agent_name, "req_id": "req-desk"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -216,7 +216,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
             "tool_name": "echo",
             "params": {"x": 1},
             "timeout": 2,
-            "robot_id": agent_name,
+            "agent": agent_name,
             "req_id": "req-tc",
         },
         namespace=SMCP_NAMESPACE,
@@ -229,7 +229,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     # Agent 取消工具调用（广播通知给 Computer） / cancel tool call
     await async_agent_client.emit(
         CANCEL_TOOL_CALL_EVENT,
-        {"robot_id": agent_name, "req_id": "req-tc"},
+        {"agent": agent_name, "req_id": "req-tc"},
         namespace=SMCP_NAMESPACE,
     )
     assert await _wait_until(lambda: len(computer_events[CANCEL_TOOL_CALL_NOTIFICATION]) >= 1)

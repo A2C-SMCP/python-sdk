@@ -139,7 +139,7 @@ async def test_computer_receives_tool_call(computer, computer_server, basic_serv
         "computer": "test_computer",
         "tool_name": "test_tool",
         "params": {"param1": "value1"},
-        "robot_id": "test_office",
+        "agent": "test_office",
         "req_id": "test_req_id",
         "timeout": 10,
     }
@@ -205,7 +205,7 @@ async def test_computer_handles_get_tools_request(computer, computer_server, bas
     await client.join_office("test_office")
 
     # 模拟获取工具请求
-    get_tools_req = {"computer": "test_computer", "robot_id": "test_office", "req_id": "test_req_id"}
+    get_tools_req = {"computer": "test_computer", "agent": "test_office", "req_id": "test_req_id"}
 
     # 发送获取工具请求（模拟Agent的行为）
     await computer_server.emit(GET_TOOLS_EVENT, get_tools_req, namespace=SMCP_NAMESPACE, to=client.namespaces[SMCP_NAMESPACE])
@@ -240,7 +240,7 @@ async def test_computer_handles_tool_call_timeout(computer, computer_server, bas
         "computer": "test_computer",
         "tool_name": "test_tool",
         "params": {"param1": "value1"},
-        "robot_id": "test_office",
+        "agent": "test_office",
         "req_id": "test_req_id",
         "timeout": 10,
     }
@@ -318,7 +318,7 @@ async def test_computer_handles_get_config(computer_server: MockComputerServerNa
     # Use server-side namespace.call to request and await client's callback response
     computer_sid = client.namespaces[SMCP_NAMESPACE]
     logger.info(f"[DEBUG] Computer SID in GetComputerConfigReq: {computer_sid}")
-    req = {"computer": computer_name, "robot_id": "test_office"}
+    req = {"computer": computer_name, "agent": "test_office"}
     resp = await computer_server.call(
         GET_CONFIG_EVENT,
         req,

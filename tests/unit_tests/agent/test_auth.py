@@ -36,7 +36,7 @@ class TestDefaultAgentAuthProvider:
         assert provider.get_agent_id() == "test_agent"
 
         config = provider.get_agent_config()
-        assert config["agent_id"] == "test_agent"
+        assert config["agent"] == "test_agent"
         assert config["office_id"] == "test_office"
 
     def test_init_with_full_params(self) -> None:
@@ -103,7 +103,7 @@ class TestDefaultAgentAuthProvider:
 
         config = provider.get_agent_config()
         expected_config: AgentConfig = {
-            "agent_id": "test_agent_123",
+            "agent": "test_agent_123",
             "office_id": "test_office_456",
         }
         assert config == expected_config

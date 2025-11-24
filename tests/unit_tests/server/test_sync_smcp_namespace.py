@@ -160,9 +160,9 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     ns = SyncSMCPNamespace(_DummyAuthProv())
 
     # cancel 仅允许 agent
-    ns.get_session = MagicMock(return_value={"role": "agent"})
+    ns.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
     ns.emit = MagicMock()
-    ns.on_server_tool_call_cancel("a1", {"robot_id": "a1", "req_id": "r1"})
+    ns.on_server_tool_call_cancel("a1", {"agent": "a1", "req_id": "r1"})
     ns.emit.assert_called_once()
     args1, kwargs1 = ns.emit.call_args
     assert args1[0] == CANCEL_TOOL_CALL_NOTIFICATION
@@ -206,7 +206,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
             ],
         },
     )
-    ret2 = ns.on_client_get_tools("a1", {"computer": "c1", "req_id": "r3", "robot_id": "a1"})
+    ret2 = ns.on_client_get_tools("a1", {"computer": "c1", "req_id": "r3", "agent": "a1"})
     assert isinstance(ret2, dict) and ret2["req_id"] == "r3" and isinstance(ret2.get("tools"), list)
     ns.call.assert_called_once()
 
@@ -246,7 +246,7 @@ def test_on_server_list_room_success(monkeypatch):
     # 执行测试 / Execute test
     result = ns.on_server_list_room(
         agent_sid,
-        {"robot_id": agent_sid, "req_id": "req_123", "office_id": office_id},
+        {"agent": agent_sid, "req_id": "req_123", "office_id": office_id},
     )
 
     # 验证结果 / Verify result
@@ -282,7 +282,7 @@ def test_on_server_list_room_permission_denied():
     with pytest.raises(AssertionError, match="Agent只能查询自己所在房间的会话信息"):
         ns.on_server_list_room(
             agent_sid,
-            {"robot_id": agent_sid, "req_id": "req_456", "office_id": "office_B"},
+            {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
         )
 
 
@@ -317,7 +317,7 @@ def test_on_server_list_room_filters_invalid_sessions(monkeypatch):
 
     result = ns.on_server_list_room(
         agent_sid,
-        {"robot_id": agent_sid, "req_id": "req_789", "office_id": office_id},
+        {"agent": agent_sid, "req_id": "req_789", "office_id": office_id},
     )
 
     # 验证结果：应该只包含 3 个有效会话（排除 unknown 角色）

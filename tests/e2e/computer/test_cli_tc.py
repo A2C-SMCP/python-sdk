@@ -81,7 +81,7 @@ def test_tc_call_hello(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
     #    中文: Manager 会在所有已启动 server 中解析该工具名；我们前一步已确认 tools 中包含 hello。
     #    English: Manager resolves plain tool name across active servers; tools list already contains 'hello'.
     tc_payload = {
-        "robot_id": "bot-e2e",
+        "agent": "bot-e2e",
         "req_id": "req-e2e-hello",
         "computer": "ignored",
         "tool_name": "hello",
@@ -135,7 +135,7 @@ def test_tc_default_and_tool_both_false_then_error(cli_proc: pexpect.spawn, tmp_
 
     # 发送 tc（使用 mark_b）
     tc_payload = {
-        "robot_id": "r-e2e",
+        "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
         "tool_name": "mark_b",
@@ -187,7 +187,7 @@ def test_tc_tool_true_overrides_default(cli_proc: pexpect.spawn, tmp_path: Path)
     expect_prompt_stable(child, quiet=0.6, max_wait=15.0)
 
     tc_payload = {
-        "robot_id": "r-e2e",
+        "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
         "tool_name": "mark_b",
@@ -237,7 +237,7 @@ def test_tc_tool_unset_uses_default(cli_proc: pexpect.spawn, tmp_path: Path) -> 
     expect_prompt_stable(child, quiet=0.6, max_wait=15.0)
 
     tc_payload = {
-        "robot_id": "r-e2e",
+        "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
         "tool_name": "mark_b",

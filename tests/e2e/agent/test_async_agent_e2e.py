@@ -464,7 +464,7 @@ async def test_async_agent_list_room(async_socketio_server, async_server_port: i
         result = await agent_client.call(
             LIST_ROOM_EVENT,
             {
-                "robot_id": agent_sid,
+                "agent": agent_sid,
                 "req_id": "list_room_req_e2e",
                 "office_id": office_id,
             },

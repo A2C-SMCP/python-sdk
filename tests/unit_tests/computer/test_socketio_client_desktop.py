@@ -32,7 +32,7 @@ async def test_on_get_desktop_returns_expected(monkeypatch: pytest.MonkeyPatch) 
 
     req: GetDeskTopReq = {
         "computer": "comp-sid-1",
-        "robot_id": "office-1",
+        "agent": "office-1",
         "req_id": "rid-1",
         "desktop_size": 1,
     }

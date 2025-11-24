@@ -173,7 +173,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             # 发送取消请求
             # Send cancel request
             agent_config = self.auth_provider.get_agent_config()
-            cancel_data = AgentCallData(robot_id=agent_config["agent_id"], req_id=req["req_id"])
+            cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req["req_id"])
             self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=SMCP_NAMESPACE)
             return self.handle_tool_call_timeout(req["req_id"])
 
@@ -324,8 +324,8 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         """
         agent_config = self.auth_provider.get_agent_config()
         req = ListRoomReq(
-            robot_id=agent_config["agent_id"],
-            req_id=f"list_computers_{agent_config['agent_id']}_{office_id}",
+            agent=agent_config["agent"],
+            req_id=f"list_computers_{agent_config['agent']}_{office_id}",
             office_id=office_id,
         )
 

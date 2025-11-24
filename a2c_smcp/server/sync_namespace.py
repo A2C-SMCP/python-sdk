@@ -188,7 +188,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         assert session["role"] == "agent", "目前仅支持Agent调用取消ToolCall的操作"
 
         agent_call = TypeAdapter(AgentCallData).validate_python(data)
-        assert sid == agent_call["robot_id"], "取消工具调用的广播仅可以由对应Agent发出"
+        assert session.get("name") == agent_call["agent"], "取消工具调用的广播仅可以由对应Agent发出"
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
         office_id = session.get("office_id")

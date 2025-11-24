@@ -92,6 +92,8 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     """
 
     room = "office-1"
+    comp_name = "cmp-1"
+    agent_name = "age-1"
 
     # 准备通知捕获容器 / Prepare notification captures
     agent_events: dict[str, list[Any]] = {
@@ -164,26 +166,22 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     time.sleep(0.1)
 
     # 计算机先加入，Agent 后加入，Computer 应收到 Agent 加入的通知 / computer joins first, then agent joins
-    _join_office(computer_client, role="computer", name="cmp-1", office_id=room)
+    _join_office(computer_client, role="computer", name=comp_name, office_id=room)
 
     # 等待一下以确保 session 建立 / small wait to ensure session saved
     time.sleep(0.1)
 
-    _join_office(agent_client, role="agent", name="agt-1", office_id=room)
+    _join_office(agent_client, role="agent", name=agent_name, office_id=room)
 
     # Computer 应该收到 Agent 加入的通知 / Computer should receive agent join notification
     assert _wait_until(lambda: len(computer_events[ENTER_OFFICE_NOTIFICATION]) >= 1)
     assert computer_events[ENTER_OFFICE_NOTIFICATION][0]["office_id"] == room
     assert "agent" in computer_events[ENTER_OFFICE_NOTIFICATION][0]
 
-    # 获取正确的 namespace SID / Get correct namespace SID
-    computer_sid = computer_client.get_sid(namespace=SMCP_NAMESPACE)
-    agent_sid = agent_client.get_sid(namespace=SMCP_NAMESPACE)
-
     # Agent 拉取工具列表 / Agent get tools
     agent_ret_tools = agent_client.call(
         GET_TOOLS_EVENT,
-        {"computer": computer_sid, "robot_id": agent_sid, "req_id": "req-tools"},
+        {"computer": comp_name, "robot_id": agent_name, "req_id": "req-tools"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -193,7 +191,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     # Agent 拉取桌面 / Agent get desktop
     agent_ret_desktop = agent_client.call(
         GET_DESKTOP_EVENT,
-        {"computer": computer_sid, "robot_id": agent_sid, "req_id": "req-desk"},
+        {"computer": comp_name, "robot_id": agent_name, "req_id": "req-desk"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -201,9 +199,9 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     assert agent_ret_desktop.get("req_id") == "req-desk"
 
     # Computer 广播配置更新、工具列表更新、桌面更新 / updates broadcasting
-    computer_client.emit(UPDATE_CONFIG_EVENT, {"computer": computer_sid}, namespace=SMCP_NAMESPACE)
-    computer_client.emit(UPDATE_TOOL_LIST_EVENT, {"computer": computer_sid}, namespace=SMCP_NAMESPACE)
-    computer_client.emit(UPDATE_DESKTOP_EVENT, {"computer": computer_sid}, namespace=SMCP_NAMESPACE)
+    computer_client.emit(UPDATE_CONFIG_EVENT, {"computer": comp_name}, namespace=SMCP_NAMESPACE)
+    computer_client.emit(UPDATE_TOOL_LIST_EVENT, {"computer": comp_name}, namespace=SMCP_NAMESPACE)
+    computer_client.emit(UPDATE_DESKTOP_EVENT, {"computer": comp_name}, namespace=SMCP_NAMESPACE)
 
     assert _wait_until(lambda: len(agent_events[UPDATE_CONFIG_NOTIFICATION]) >= 1)
     assert _wait_until(lambda: len(agent_events[UPDATE_TOOL_LIST_NOTIFICATION]) >= 1)
@@ -213,11 +211,11 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     tool_call_ret = agent_client.call(
         TOOL_CALL_EVENT,
         {
-            "computer": computer_sid,
+            "computer": comp_name,
             "tool_name": "echo",
             "params": {"x": 1},
             "timeout": 2,
-            "robot_id": agent_sid,
+            "agent": agent_name,
             "req_id": "req-tc",
         },
         namespace=SMCP_NAMESPACE,
@@ -230,7 +228,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     # Agent 取消工具调用（广播通知给 Computer） / cancel tool call
     agent_client.emit(
         CANCEL_TOOL_CALL_EVENT,
-        {"robot_id": agent_sid, "req_id": "req-tc"},
+        {"agent": agent_name, "req_id": "req-tc"},
         namespace=SMCP_NAMESPACE,
     )
     assert _wait_until(lambda: len(computer_events[CANCEL_TOOL_CALL_NOTIFICATION]) >= 1)

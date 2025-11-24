@@ -117,7 +117,7 @@ def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_p
 
     # 2) 通过 tc 调用 B 的工具 mark_b，形成最近调用记录
     tool_req = {
-        "robot_id": "r-e2e",
+        "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
         "tool_name": "mark_b",  # 由 B server 提供
@@ -151,7 +151,7 @@ def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_p
     #    - A 的 fullscreen /dashboard 在最前（fullscreen 只取第一个）
     #    - 随后是 B 的 board 与 main（85 与 50）
     tool_req_a = {
-        "robot_id": "r-e2e",
+        "agent": "r-e2e",
         "req_id": "req-e2e-2",
         "computer": "client",
         "tool_name": "mark_a",  # 由 A server 提供
@@ -176,7 +176,7 @@ def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_p
 
     # 5) 再次调用 B 的工具 mark_b，验证顺序再次回到 B 优先
     tool_req_b2 = {
-        "robot_id": "r-e2e",
+        "agent": "r-e2e",
         "req_id": "req-e2e-3",
         "computer": "client",
         "tool_name": "mark_b",

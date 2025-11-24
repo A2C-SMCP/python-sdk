@@ -140,7 +140,7 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             dict: 工具调用结果的字典表示（JSON 可序列化）
         """
-        assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
         try:
             ret = await self.computer.aexecute_tool(
@@ -162,7 +162,7 @@ class SMCPComputerClient(AsyncClient):
         Args:
             data (GetToolsReq): 请求数据
         """
-        assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         mcp_tools = await self.computer.aget_available_tools()
@@ -180,7 +180,7 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             GetDeskTopRet: 桌面数据与 req_id。
         """
-        assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
         size = data.get("desktop_size")
         window_uri = data.get("window")
@@ -203,7 +203,7 @@ class SMCPComputerClient(AsyncClient):
             GetComputerConfigRet: SMCP 协议定义的 MCP 配置返回。SMCP formatted MCP configuration.
         """
         # 校验上下文一致性（中英双语）/ Validate context consistency (bilingual)
-        assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         servers: dict[str, dict] = {}
