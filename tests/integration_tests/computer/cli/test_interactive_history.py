@@ -55,7 +55,7 @@ async def test_history_basic_integration(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: _noop_ctx())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     # 伪造一条历史记录（直接调用专用于测试的方法）
     await _append_history(

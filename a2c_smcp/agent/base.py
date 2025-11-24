@@ -10,7 +10,7 @@
 
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 
@@ -198,7 +198,7 @@ class BaseAgentClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         assert data["office_id"] == agent_config["office_id"], "无效的办公室ID / Invalid office ID"
         assert data.get("computer"), "无效的计算机ID / Invalid computer ID"
-        return data["computer"]
+        return cast(str, data["computer"])
 
     async def handle_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -486,7 +486,7 @@ class BaseAgentSyncClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         assert data["office_id"] == agent_config["office_id"], "无效的办公室ID / Invalid office ID"
         assert data.get("computer"), "无效的计算机ID / Invalid computer ID"
-        return data["computer"]
+        return cast(str, data["computer"])
 
     def handle_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """

@@ -9,6 +9,7 @@
 """
 
 import copy
+from typing import cast
 
 from pydantic import TypeAdapter
 
@@ -58,7 +59,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         super().__init__(namespace=SMCP_NAMESPACE, auth_provider=auth_provider)
 
-    def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:  # type: ignore[override]
+    def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
         客户端加入房间，维护session中的sid/name/office_id字段（同步）
         Client joins room, maintain sid/name/office_id in session (sync)
@@ -97,12 +98,16 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         session["office_id"] = room
         self.save_session(sid, session)
 
+        # 注册name到sid的映射
+        # Register name-to-sid mapping
+        self._register_name(session["name"], sid)
+
         # 根据角色发送不同的通知 / Send different notifications based on role
         notification_data: EnterOfficeNotification = {"office_id": room}
         if session.get("role") == "computer":
-            notification_data["computer"] = sid
+            notification_data["computer"] = session.get("name")
         else:
-            notification_data["agent"] = sid
+            notification_data["agent"] = session.get("name")
 
         self.emit(
             ENTER_OFFICE_NOTIFICATION,
@@ -111,18 +116,26 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             room=room,
         )
 
-    def leave_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:  # type: ignore[override]
+    def leave_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
         在离开房间之前发布离开消息（同步）
         Publish leave message before leaving room (sync)
         """
         session = self.get_session(sid)
+
+        # 构建离开通知，使用name而不是sid
+        # Build leave notification using name instead of sid
+        client_name = session.get("name", "")
         notification = (
-            LeaveOfficeNotification(office_id=room, computer=sid)
+            LeaveOfficeNotification(office_id=room, computer=client_name)
             if session.get("role") == "computer"
-            else LeaveOfficeNotification(office_id=room, agent=sid)
+            else LeaveOfficeNotification(office_id=room, agent=client_name)
         )
         self.emit(LEAVE_OFFICE_NOTIFICATION, notification, skip_sid=sid, room=room)
+
+        # 注销name映射
+        # Unregister name mapping
+        self._unregister_name(sid)
 
         if "office_id" in session:
             del session["office_id"]
@@ -229,12 +242,22 @@ class SyncSMCPNamespace(SyncBaseNamespace):
 
         tool_call = TypeAdapter(dict).validate_python(data)
 
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_name = tool_call["computer"]
+        computer_sid = self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         # 使用 call 方法调用 Computer，等待返回结果 / Use call method to invoke Computer and wait for result
-        return self.call(
-            TOOL_CALL_EVENT,
-            tool_call,
-            to=tool_call["computer"],
-            namespace=SMCP_NAMESPACE,
+        return cast(
+            dict,
+            self.call(
+                TOOL_CALL_EVENT,
+                tool_call,
+                to=computer_sid,
+                namespace=SMCP_NAMESPACE,
+            ),
         )
 
     def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet:
@@ -242,7 +265,14 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         同步：获取指定Computer的工具列表（使用 Socket.IO 的 call 等待客户端返回）
         Sync: get tool list of specified Computer using Socket.IO call
         """
-        computer_sid = data["computer"]
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_sid = self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         session = self.get_session(computer_sid)
         assert session["role"] == "computer", "目前仅支持Computer获取工具列表"
 
@@ -254,7 +284,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         client_response = self.call(
             GET_TOOLS_EVENT,
             data,
-            to=data["computer"],
+            to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
 
@@ -267,7 +297,14 @@ class SyncSMCPNamespace(SyncBaseNamespace):
 
         要求：Agent 与 Computer 需在同一 office / Requirement: Agent and Computer must be in the same office
         """
-        computer_sid = data["computer"]
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_sid = self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         session = self.get_session(computer_sid)
         assert session["role"] == "computer", "目前仅支持Computer获取桌面"
 
@@ -279,7 +316,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         client_response = self.call(
             GET_DESKTOP_EVENT,
             data,
-            to=data["computer"],
+            to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
 

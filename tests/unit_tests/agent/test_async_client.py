@@ -151,11 +151,11 @@ async def test_emit_tool_call_timeout_sends_cancel(mock_call: AsyncMock, mock_em
     assert isinstance(res, CallToolResult)
     assert res.isError
 
-    # 第一个位置参数是事件名，第三个是命名空间
-    # First positional arg is event name, third is namespace
+    # mock捕获了self, event, data作为位置参数，namespace在kwargs中
+    # mock captures self, event, data as positional args, namespace in kwargs
     args, kwargs = mock_emit.call_args
-    assert args[0] == CANCEL_TOOL_CALL_EVENT
-    assert args[2] == SMCP_NAMESPACE
+    assert args[1] == CANCEL_TOOL_CALL_EVENT  # args[0]是self，args[1]是event
+    assert args[3] == SMCP_NAMESPACE
 
 
 @pytest.mark.asyncio

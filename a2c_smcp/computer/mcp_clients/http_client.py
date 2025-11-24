@@ -14,7 +14,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from a2c_smcp.computer.mcp_clients.base_client import BaseMCPClient
 
 
-class HttpMCPClient(BaseMCPClient):
+class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
     def __init__(
         self,
         params: StreamableHttpParameters,

@@ -88,6 +88,7 @@ class _EH(AgentEventHandler):
         self.leave_events.append(data)
 
     def on_computer_update_config(self, data: UpdateMCPConfigNotification, sio: SMCPAgentClient) -> None:
+        logger.info(f"[DEBUG] UpdateMCPConfigNotification received: computer={data.get('computer')}")
         self.update_events.append(data)
 
     def on_tools_received(self, computer: str, tools: list[SMCPTool], sio: SMCPAgentClient) -> None:
@@ -258,15 +259,19 @@ def test_agent_receives_update_config_sync(startup_and_shutdown_sync_smcp_server
             namespaces=[SMCP_NAMESPACE],
             socketio_path="/socket.io",
         )
-        _join_office(computer, role="computer", office_id=office_id, name="comp-sync-03")
+        computer_name = "comp-sync-03"
+        logger.info(f"[DEBUG] Computer name: {computer_name}")
+        _join_office(computer, role="computer", office_id=office_id, name=computer_name)
 
         # 等待初次工具拉取
         time.sleep(0.5)
 
         # 触发配置更新
+        computer_sid = computer.namespaces[SMCP_NAMESPACE]
+        logger.info(f"[DEBUG] Computer SID: {computer_sid}")
         ok, err = computer.call(
             "server:update_config",
-            {"computer": computer.namespaces[SMCP_NAMESPACE]},
+            {"computer": computer_sid},
             namespace=SMCP_NAMESPACE,
             timeout=3,
         )

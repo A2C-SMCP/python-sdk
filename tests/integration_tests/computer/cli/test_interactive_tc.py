@@ -90,7 +90,7 @@ async def test_tc_cmd_from_file_integration(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     comp.mcp_manager = _Mgr()
 
     await _interactive_loop(comp)

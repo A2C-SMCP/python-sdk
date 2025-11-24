@@ -3,7 +3,7 @@
 # @Author  : JQQ
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
-from typing import ClassVar, Literal, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAlias, runtime_checkable
 
 from mcp import StdioServerParameters, Tool
 from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from vrl_python import VRLRuntime
 
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
+
+if TYPE_CHECKING:
+    from a2c_smcp.computer.mcp_clients.base_client import STATES
 
 A2C_TOOL_META: str = "a2c_tool_meta"
 # VRL转换后的结果存储Key。用于在CallToolResult.meta中存储VRL处理后的数据。
@@ -166,7 +169,7 @@ MCPServerInput = MCPServerPromptStringInput | MCPServerPickStringInput | MCPServ
 
 @runtime_checkable
 class MCPClientProtocol(Protocol):
-    state: str
+    state: "STATES"
 
     async def aconnect(self) -> None:
         """连接MCP Server"""

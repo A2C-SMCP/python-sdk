@@ -266,16 +266,19 @@ class TestSMCPNamespace:
         smcp_namespace.server = mock_server
 
         # 准备会话：agent 与 computer 在同一房间
-        agent_sid = "a1"
-        comp_sid = "c1"
+        agent_id = "a1"
+        agent_sid = "a_sid1"
+        comp_name = "c1"
+        comp_sid = "c_sid1"
         sess_agent = {"role": "agent", "office_id": "room1"}
         sess_comp = {"role": "computer", "office_id": "room1"}
 
         smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent))
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, agent_id: agent_sid}
         smcp_namespace.call = AsyncMock(return_value={"tools": [], "req_id": "r1"})
 
         # get_tools 成功
-        ret = await smcp_namespace.on_client_get_tools(agent_sid, {"computer": comp_sid})
+        ret = await smcp_namespace.on_client_get_tools(agent_id, {"computer": comp_name})
         assert isinstance(ret, dict)
         assert "tools" in ret
 
@@ -283,11 +286,11 @@ class TestSMCPNamespace:
         smcp_namespace.get_session = AsyncMock(return_value=sess_agent)
         smcp_namespace.call = AsyncMock(return_value={"ok": True})
         res = await smcp_namespace.on_client_tool_call(
-            agent_sid,
+            agent_id,
             {
-                "robot_id": agent_sid,
+                "robot_id": agent_id,
                 "req_id": "r2",
-                "computer": comp_sid,
+                "computer": comp_name,
                 "tool_name": "t1",
                 "params": {},
                 "timeout": 5,
@@ -298,13 +301,13 @@ class TestSMCPNamespace:
         # update_config：由 computer 发起，广播通知
         smcp_namespace.get_session = AsyncMock(return_value=sess_comp)
         smcp_namespace.emit = AsyncMock()
-        await smcp_namespace.on_server_update_config(comp_sid, {"computer": comp_sid})
+        await smcp_namespace.on_server_update_config(comp_name, {"computer": comp_name})
         smcp_namespace.emit.assert_awaited()
 
         # cancel tool call：由 agent 发起，广播通知
         smcp_namespace.get_session = AsyncMock(return_value=sess_agent)
         smcp_namespace.emit = AsyncMock()
-        await smcp_namespace.on_server_tool_call_cancel(agent_sid, {"robot_id": agent_sid, "req_id": "r3"})
+        await smcp_namespace.on_server_tool_call_cancel(agent_id, {"robot_id": agent_id, "req_id": "r3"})
         smcp_namespace.emit.assert_awaited()
 
     @pytest.mark.asyncio

@@ -149,8 +149,8 @@ class TestSMCPAgentClient:
         # Verify cancel request was sent
         mock_emit.assert_called_once()
         args, kwargs = mock_emit.call_args
-        assert args[0] == CANCEL_TOOL_CALL_EVENT
-        assert args[2] == SMCP_NAMESPACE  # namespace 是第三个位置参数
+        assert args[1] == CANCEL_TOOL_CALL_EVENT
+        assert args[3] == SMCP_NAMESPACE  # namespace 是第三个位置参数
 
     @patch("socketio.Client.call")
     def test_get_tools_from_computer_success(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:

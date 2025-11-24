@@ -134,7 +134,7 @@ async def organize_desktop(
             continue  # 该服务器仅加入这一个，转下一个服务器
 
         # 否则按优先级加入多条直到 cap
-        for res, _prio, _fs, _idx, det in items:
+        for res, _, _, _, det in items:
             if len(result) >= cap:
                 break
             result.append(_render(res, det))

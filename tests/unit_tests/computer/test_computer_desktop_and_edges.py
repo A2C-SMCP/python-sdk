@@ -39,7 +39,7 @@ class _DummyClient:
 
 @pytest.mark.asyncio
 async def test_on_manager_change_tool_list_changed_triggers_emit(monkeypatch: pytest.MonkeyPatch) -> None:
-    comp = Computer(auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", auto_connect=False, auto_reconnect=False)
     # 绑定伪客户端
     client = _DummyClient()
     comp.socketio_client = client  # weakref setter
@@ -57,7 +57,7 @@ async def test_on_manager_change_tool_list_changed_triggers_emit(monkeypatch: py
 
 @pytest.mark.asyncio
 async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest.MonkeyPatch) -> None:
-    comp = Computer(auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", auto_connect=False, auto_reconnect=False)
     # 绑定伪客户端
     client = _DummyClient()
     comp.socketio_client = client
@@ -94,7 +94,7 @@ async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest
 
 @pytest.mark.asyncio
 async def test_on_manager_change_resource_updated_window_and_nonwindow() -> None:
-    comp = Computer(auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", auto_connect=False, auto_reconnect=False)
     client = _DummyClient()
     comp.socketio_client = client
 
@@ -114,7 +114,7 @@ async def test_on_manager_change_resource_updated_window_and_nonwindow() -> None
 
 @pytest.mark.asyncio
 async def test_acollect_window_uris_filters_and_none_manager(monkeypatch: pytest.MonkeyPatch) -> None:
-    comp = Computer(auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", auto_connect=False, auto_reconnect=False)
 
     # manager 未初始化 -> 返回空
     assert await comp._acollect_window_uris() == set()
@@ -138,7 +138,7 @@ async def test_boot_up_render_error_path(monkeypatch: pytest.MonkeyPatch) -> Non
     # 构造一个初始 server 配置
     cfg = StdioServerConfig(name="s", server_parameters=StdioServerParameters(command="/bin/echo"))
     # 注入自定义 Computer，覆写 _config_render.arender 抛出异常
-    comp = Computer(mcp_servers={cfg})
+    comp = Computer(name="test", mcp_servers={cfg})
 
     class _CR:
         async def arender(self, *_: Any, **__: Any) -> dict:
@@ -159,7 +159,7 @@ async def test_boot_up_render_error_path(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.asyncio
 async def test_arender_and_validate_server_exception_branch(monkeypatch: pytest.MonkeyPatch) -> None:
-    comp = Computer()
+    comp = Computer(name="test")
 
     class _CR:
         async def arender(self, *_: Any, **__: Any) -> dict:
@@ -173,7 +173,7 @@ async def test_arender_and_validate_server_exception_branch(monkeypatch: pytest.
 
 
 def test_get_input_and_remove_input_boundaries() -> None:
-    comp = Computer()
+    comp = Computer(name="test")
     # get_input 空字符串 -> None
     assert comp.get_input("") is None
     # remove_input 空字符串 -> False

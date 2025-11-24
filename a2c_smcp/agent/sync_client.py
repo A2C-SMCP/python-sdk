@@ -11,7 +11,7 @@
 from typing import Any
 
 from mcp.types import CallToolResult, TextContent
-from socketio import Client  # type: ignore[import-untyped]
+from socketio import Client
 
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentSyncClient
@@ -89,9 +89,9 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         # Validate event legality
         self.validate_emit_event(event)
 
-        # 调用父类方法
-        # Call parent class method
-        super().emit(event, data, namespace, callback)
+        # 调用 Client 的 emit 方法
+        # Call Client's emit method
+        Client.emit(self, event, data, namespace, callback)
 
     def call(self, event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
         """
@@ -111,9 +111,9 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         # Validate event legality
         self.validate_emit_event(event)
 
-        # 调用父类方法
-        # Call parent class method
-        return super().call(event, data, namespace, timeout)
+        # 调用 Client 的 call 方法
+        # Call Client's call method
+        return Client.call(self, event, data, namespace, timeout)
 
     def connect_to_server(
         self,
@@ -190,7 +190,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         Get tools list from specified computer
 
         Args:
-            computer (str): 计算机SID / Computer SID
+            computer (str): 计算机名称 / Computer Name
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
@@ -283,7 +283,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         Get desktop from specified computer
 
         Args:
-            computer (str): 计算机ID / Computer ID
+            computer (str): 计算机名称 / Computer Name
             size (int | None): 限制窗口数量 / Limit windows count
             window (str | None): 指定窗口URI / Specific window URI
             timeout (int): 超时时间 / Timeout
@@ -293,7 +293,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         response = self.call(GET_DESKTOP_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
-        return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])  # type: ignore[return-value]
+        return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])
 
     def _on_desktop_updated(self, data: dict) -> None:
         """

@@ -172,7 +172,7 @@ async def test_agent_tool_call_roundtrip(socketio_server, basic_server_port: int
 
     # 发起工具调用 / Emit tool call
     res = await agent.emit_tool_call(
-        computer=computer.namespaces[SMCP_NAMESPACE],
+        computer="comp-02",
         tool_name="echo",
         params={"text": "hi"},
         timeout=5,
@@ -232,7 +232,7 @@ async def test_agent_receives_update_config(socketio_server, basic_server_port: 
     # 由 Computer 触发更新配置 / Computer triggers update-config
     await computer.call(
         "server:update_config",
-        {"computer": computer.namespaces[SMCP_NAMESPACE]},
+        {"computer": "comp-03"},
         namespace=SMCP_NAMESPACE,
         timeout=3,
     )

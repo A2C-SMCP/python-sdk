@@ -11,7 +11,7 @@
 from typing import Any
 
 from mcp.types import CallToolResult, TextContent
-from socketio import AsyncClient  # type: ignore[import-untyped]
+from socketio import AsyncClient
 
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
@@ -86,9 +86,9 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         # Validate event legality
         self.validate_emit_event(event)
 
-        # 调用父类方法
-        # Call parent class method
-        await super().emit(event, data, namespace, callback)
+        # 调用 AsyncClient 的 emit 方法
+        # Call AsyncClient's emit method
+        await AsyncClient.emit(self, event, data, namespace, callback)
 
     async def call(self, event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
         """
@@ -108,9 +108,9 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         # Validate event legality
         self.validate_emit_event(event)
 
-        # 调用父类方法
-        # Call parent class method
-        return await super().call(event, data, namespace, timeout)
+        # 调用 AsyncClient 的 call 方法
+        # Call AsyncClient's call method
+        return await AsyncClient.call(self, event, data, namespace, timeout)
 
     # 事件合法性校验复用 BaseAgentClient.validate_emit_event
     # Reuse BaseAgentClient.validate_emit_event for event validation
@@ -190,7 +190,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         Async get tools list from specified computer
 
         Args:
-            computer (str): 计算机ID / Computer ID
+            computer (str): 计算机名称 / Computer Name
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
@@ -291,7 +291,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         response = await self.call(GET_DESKTOP_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
-        return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])  # type: ignore[return-value]
+        return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])
 
     async def _on_desktop_updated(self, data: dict) -> None:
         """

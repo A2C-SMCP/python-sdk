@@ -169,6 +169,7 @@ def _run_impl(
             comp_factory_obj = Computer
 
         comp = comp_factory_obj(
+            name="friday_hands",
             inputs=set(),
             mcp_servers=set(),
             auto_connect=auto_connect,
@@ -198,10 +199,10 @@ def _run_impl(
                     # 允许单个对象或数组
                     if isinstance(data, list):
                         raw_items = TypeAdapter(list[SMCPServerInputDict]).validate_python(data)
-                        models = {TypeAdapter(MCPServerInputModel).validate_python(item) for item in raw_items}
+                        models: set[MCPServerInputModel] = {TypeAdapter(MCPServerInputModel).validate_python(item) for item in raw_items}
                         comp.update_inputs(models)
                     else:
-                        item = TypeAdapter(SMCPServerInputDict).validate_python(data)
+                        item: SMCPServerInputDict = TypeAdapter(SMCPServerInputDict).validate_python(data)
                         comp.add_or_update_input(TypeAdapter(MCPServerInputModel).validate_python(item))
                     console.print("[green]已加载 Inputs 配置 / Inputs loaded[/green]")
                 except Exception as e:  # pragma: no cover
@@ -214,7 +215,7 @@ def _run_impl(
                     # 允许单个对象或数组
 
                     async def _add_server(cfg_obj: dict[str, Any]) -> None:
-                        validated = TypeAdapter(SMCPServerConfigDict).validate_python(cfg_obj)
+                        validated: dict[str, Any] = TypeAdapter(SMCPServerConfigDict).validate_python(cfg_obj)
                         await comp.aadd_or_aupdate_server(validated)
 
                     if isinstance(data, list):

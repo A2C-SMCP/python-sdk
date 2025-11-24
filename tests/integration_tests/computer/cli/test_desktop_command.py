@@ -72,7 +72,7 @@ async def test_cli_desktop_with_subscribe_resources_server() -> None:
     cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
     cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     # 为断言 desktop 的输出可调用 comp.get_desktop 再次核验
     await _interactive_loop(comp)
@@ -94,5 +94,5 @@ async def test_cli_help_contains_desktop() -> None:
     cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
     cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)

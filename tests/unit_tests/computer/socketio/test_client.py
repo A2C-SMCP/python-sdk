@@ -33,6 +33,7 @@ async def test_emit_update_config_only_when_in_office(monkeypatch):
     English: Fire UPDATE_MCP_CONFIG_EVENT only when office_id set; otherwise do nothing
     """
     client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "sid-123"
 
     sent = []
 
@@ -67,10 +68,10 @@ async def test_on_tool_call_error_handling():
 
     client = SMCPComputerClient(computer=computer)
     client.office_id = "office-1"
-    client.namespaces[SMCP_NAMESPACE] = "sid-abc"
+    client.computer.name = "comp-abc"
 
     req = {
-        "computer": "sid-abc",
+        "computer": "comp-abc",
         "robot_id": "office-1",
         "req_id": "r1",
         "tool_name": "t1",
@@ -111,7 +112,8 @@ async def test_on_get_config_serialization_three_types():
     )
 
     class _FakeComputer:
-        def __init__(self):
+        def __init__(self, name: str):
+            self.name = name
             self._mcp_servers = (stdio_cfg, sse_cfg, http_cfg)
             self._inputs = []
 
@@ -123,9 +125,8 @@ async def test_on_get_config_serialization_three_types():
         def mcp_servers(self):
             return self._mcp_servers
 
-    client = SMCPComputerClient(computer=_FakeComputer())
+    client = SMCPComputerClient(computer=_FakeComputer(name="sid-xyz"))
     client.office_id = "office-1"
-    client.namespaces[SMCP_NAMESPACE] = "sid-xyz"
 
     req = {"computer": "sid-xyz", "robot_id": "office-1", "req_id": "mock_req"}
     ret = await client.on_get_config(req)

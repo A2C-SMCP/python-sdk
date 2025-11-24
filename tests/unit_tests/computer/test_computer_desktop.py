@@ -50,7 +50,7 @@ async def test_get_desktop_calls_manager_and_organize(monkeypatch):
     monkeypatch.setattr("a2c_smcp.computer.computer.organize_desktop", mock_organize)
 
     # 实例化并启动 / Instantiate and boot
-    computer = Computer()
+    computer = Computer(name="test")
     await computer.boot_up()
 
     # 调用 get_desktop / Call get_desktop
@@ -75,7 +75,7 @@ async def test_get_desktop_when_manager_none_returns_empty():
     中文: 当 mcp_manager 尚未初始化时，get_desktop 返回空列表。
     English: Return empty list when mcp_manager is not initialized.
     """
-    computer = Computer()
+    computer = Computer(name="test")
     # 不调用 boot_up，保持 mcp_manager 为 None
     desktops = await computer.get_desktop()
     assert desktops == []

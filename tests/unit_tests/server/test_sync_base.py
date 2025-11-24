@@ -72,6 +72,7 @@ def test_on_disconnect_leaves_all_non_self_rooms():
     # rooms 返回多个，跳过与 sid 相同的房间
     ns.rooms = MagicMock(return_value=["sidX", "roomA", "roomB"])  # type: ignore[attr-defined]
     ns.leave_room = MagicMock()  # type: ignore[attr-defined]
+    ns.server = MagicMock()
 
     ns.on_disconnect("sidX")
 

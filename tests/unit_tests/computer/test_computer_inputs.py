@@ -10,7 +10,7 @@ from a2c_smcp.computer.mcp_clients.model import (
 
 
 def test_inputs_crud_and_set_uniqueness() -> None:
-    comp = Computer()
+    comp = Computer(name="test")
 
     # 初始为空
     assert comp.inputs == ()

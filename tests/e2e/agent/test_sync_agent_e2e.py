@@ -192,12 +192,9 @@ def test_sync_agent_tool_call(server_endpoint: str, mock_computer_client):
         # 等待连接稳定 / Wait for connection to stabilize
         time.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 调用 echo 工具 / Call echo tool
         result = agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer="test-computer-2",
             tool_name="echo",
             params={"message": "Hello, World!"},
             timeout=5,
@@ -210,7 +207,7 @@ def test_sync_agent_tool_call(server_endpoint: str, mock_computer_client):
 
         # 调用 add 工具 / Call add tool
         result = agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer="test-computer-2",
             tool_name="add",
             params={"a": 10, "b": 20},
             timeout=5,
@@ -266,11 +263,8 @@ def test_sync_agent_get_tools_and_desktop(server_endpoint: str, mock_computer_cl
 
         time.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 获取工具列表 / Get tools list
-        tools_response = agent_client.get_tools_from_computer(computer_sid, timeout=5)
+        tools_response = agent_client.get_tools_from_computer("test-computer-3", timeout=5)
 
         # 验证工具列表 / Verify tools list
         assert tools_response["req_id"] is not None
@@ -279,7 +273,7 @@ def test_sync_agent_get_tools_and_desktop(server_endpoint: str, mock_computer_cl
         assert tools_response["tools"][1]["name"] == "add"
 
         # 获取桌面信息 / Get desktop info
-        desktop_response = agent_client.get_desktop_from_computer(computer_sid, timeout=5)
+        desktop_response = agent_client.get_desktop_from_computer("test-computer-3", timeout=5)
 
         # 验证桌面信息 / Verify desktop info
         assert desktop_response["req_id"] is not None

@@ -64,5 +64,5 @@ async def test_inputs_value_crud_commands(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test_input_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)

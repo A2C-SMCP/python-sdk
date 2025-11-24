@@ -179,6 +179,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     # client tool_call：仅允许 agent，使用 call 等待响应
     ns.get_session = MagicMock(return_value={"role": "agent"})
     ns.call = MagicMock(return_value={"ok": True, "result": "success"})
+    ns.get_sid_by_name = MagicMock(return_value="c1")
     ret = ns.on_client_tool_call("a1", {"robot_id": "a1", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5})
     assert ret == {"ok": True, "result": "success"}
     ns.call.assert_called_once()

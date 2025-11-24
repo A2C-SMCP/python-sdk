@@ -158,6 +158,7 @@ async def test_async_integration_agent_receives_vrl_transformed_result(
     # 创建 Computer 实例
     # Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -201,7 +202,7 @@ async def test_async_integration_agent_receives_vrl_transformed_result(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-vrl-1")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播
         # Wait for event propagation
@@ -210,12 +211,13 @@ async def test_async_integration_agent_receives_vrl_transformed_result(
         # 4. 验证 Agent 收到工具列表
         # Verify Agent received tool list
         assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
-        computer_sid, tools = event_handler.tools_received_events[0]
+        computer_name, tools = event_handler.tools_received_events[0]
+        assert computer_name == "test", "回调工具列表时，使用的是computer name"
 
         # 5. Agent 调用工具
         # Agent calls tool
         result = await agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer=computer_name,
             tool_name="mark_a",
             params={},
             timeout=15,
@@ -331,6 +333,7 @@ async def test_async_integration_vrl_field_mapping_and_extraction(
     # 创建 Computer 实例
     # Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -371,7 +374,7 @@ async def test_async_integration_vrl_field_mapping_and_extraction(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-vrl-2")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播
         # Wait for event propagation
@@ -380,12 +383,13 @@ async def test_async_integration_vrl_field_mapping_and_extraction(
         # 4. 验证 Agent 收到工具列表
         # Verify Agent received tool list
         assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
-        computer_sid, tools = event_handler.tools_received_events[0]
+        computer_name, tools = event_handler.tools_received_events[0]
+        assert computer_name == "test", "回调工具列表时使用的是computer name"
 
         # 5. Agent 调用工具
         # Agent calls tool
         result = await agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer=computer_name,
             tool_name="mark_a",
             params={},
             timeout=15,
@@ -468,6 +472,7 @@ async def test_async_integration_vrl_preserves_original_result(
     # 创建 Computer 实例
     # Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -508,7 +513,7 @@ async def test_async_integration_vrl_preserves_original_result(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-vrl-3")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播
         # Wait for event propagation
@@ -517,12 +522,13 @@ async def test_async_integration_vrl_preserves_original_result(
         # 4. 验证 Agent 收到工具列表
         # Verify Agent received tool list
         assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
-        computer_sid, tools = event_handler.tools_received_events[0]
+        computer_name, tools = event_handler.tools_received_events[0]
+        assert computer_name == "test", "回调获取工具列表时使用的是 computer name"
 
         # 5. Agent 调用工具
         # Agent calls tool
         result = await agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer=computer_name,
             tool_name="mark_a",
             params={},
             timeout=15,

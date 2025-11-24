@@ -58,7 +58,7 @@ class ToolCallReq(AgentCallData):
 
 
 class GetToolsReq(AgentCallData):
-    computer: str
+    computer: str  # 计算机名称
 
 
 class SMCPTool(TypedDict):
@@ -87,11 +87,11 @@ class LeaveOfficeReq(TypedDict):
 
 
 class UpdateComputerConfigReq(TypedDict):
-    computer: str  # 机器人计算机sid
+    computer: str  # 机器人计算机自定义名称
 
 
 class GetComputerConfigReq(AgentCallData):
-    computer: str
+    computer: str  # 机器人计算机自定义名称
 
 
 class ToolMeta(TypedDict, total=False):
@@ -261,8 +261,8 @@ class EnterOfficeNotification(TypedDict, total=False):
     """Agent或者Computer加入房间的通知，需要向房间内其他人广播。广播时间为真实加入之后"""
 
     office_id: str
-    computer: str | None
-    agent: str | None
+    computer: str | None  # Computer Name
+    agent: str | None  # Agent Name
 
 
 class UpdateMCPConfigNotification(TypedDict, total=False):
@@ -270,7 +270,7 @@ class UpdateMCPConfigNotification(TypedDict, total=False):
     MCP配置更新的通知，需要向房间内其他人广播
     """
 
-    computer: str  # 被更新的Computer sid
+    computer: str  # 机器人计算机自定义名称
 
 
 class UpdateToolListNotification(TypedDict, total=False):
@@ -279,7 +279,7 @@ class UpdateToolListNotification(TypedDict, total=False):
     Notification of tool list update, should be broadcast to others in the room.
     """
 
-    computer: str  # 被更新的Computer sid / The computer SID whose tools changed
+    computer: str  # 机器人计算机自定义名称
 
 
 class GetDeskTopReq(AgentCallData, total=True):
@@ -287,7 +287,7 @@ class GetDeskTopReq(AgentCallData, total=True):
     获取当前Computer的桌面信息。
     """
 
-    computer: str
+    computer: str  # computer name
     desktop_size: NotRequired[int]  # 指定希望获取的桌面内容长度。如果不指定，则会全量返回，由调用方进行处理。
     window: NotRequired[str]  # 指定获取的WindowURI，如果不指定则由Desktop自动组织，如果指定，会尝试获取指定的Window
 

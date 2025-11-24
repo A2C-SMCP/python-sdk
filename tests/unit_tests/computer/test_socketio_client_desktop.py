@@ -25,11 +25,10 @@ class _DummyComputer(Computer):
 
 @pytest.mark.asyncio
 async def test_on_get_desktop_returns_expected(monkeypatch: pytest.MonkeyPatch) -> None:
-    comp = _DummyComputer(auto_connect=False, auto_reconnect=False)
+    comp = _DummyComputer(name="comp-sid-1", auto_connect=False, auto_reconnect=False)
     client = SMCPComputerClient(computer=comp)
     # 准备 office 情况
     client.office_id = "office-1"
-    client.namespaces[SMCP_NAMESPACE] = "comp-sid-1"
 
     req: GetDeskTopReq = {
         "computer": "comp-sid-1",
@@ -45,10 +44,9 @@ async def test_on_get_desktop_returns_expected(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.asyncio
 async def test_emit_refresh_desktop_emits(monkeypatch: pytest.MonkeyPatch) -> None:
-    comp = _DummyComputer(auto_connect=False, auto_reconnect=False)
+    comp = _DummyComputer(name="test", auto_connect=False, auto_reconnect=False)
     client = SMCPComputerClient(computer=comp)
     client.office_id = "office-1"
-    client.namespaces[SMCP_NAMESPACE] = "comp-sid-2"
 
     called: dict[str, Any] = {}
 
@@ -60,4 +58,4 @@ async def test_emit_refresh_desktop_emits(monkeypatch: pytest.MonkeyPatch) -> No
 
     await client.emit_refresh_desktop()
     assert called["event"] == UPDATE_DESKTOP_EVENT
-    assert called["data"]["computer"] == "comp-sid-2"
+    assert called["data"]["computer"] == "test"

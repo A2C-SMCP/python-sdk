@@ -77,16 +77,14 @@ class SMCPComputerClient(AsyncClient):
             raise ValueError("ComputerClient不允许发起client:*事件")  # pragma: no cover
         await super().emit(event, data, namespace, callback)
 
-    async def join_office(self, office_id: str, computer_name: str) -> None:
+    async def join_office(self, office_id: str) -> None:
         """
         加入一个Office（Socket.IO中的Room）
 
         Args:
             office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
-            computer_name (str): 计算机名称，需要注意在整体通信中，Computer的标识一般使用sid。computer_name是提供给前端展示用，
-                因此不般不作为唯一标识使用
         """
-        await self.emit(JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=computer_name))
+        await self.emit(JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name))
         self.office_id = office_id
 
     async def leave_office(self, office_id: str) -> None:
@@ -106,7 +104,7 @@ class SMCPComputerClient(AsyncClient):
         不需要传递当前的配置参数，因为Agnet会通过其它接口进行刷新
         """
         if self.office_id:
-            await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.namespaces[SMCP_NAMESPACE]))
+            await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def update_config(self) -> None:
         """
@@ -114,7 +112,7 @@ class SMCPComputerClient(AsyncClient):
 
         不需要传递当前的配置参数，因为Agnet会通过其它接口进行刷新
         """
-        await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.namespaces[SMCP_NAMESPACE]))
+        await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def emit_update_tool_list(self) -> None:
         """
@@ -122,7 +120,7 @@ class SMCPComputerClient(AsyncClient):
         When tool list changes, emit event to server; it will broadcast notify:update_tool_list.
         """
         if self.office_id:
-            await self.emit(UPDATE_TOOL_LIST_EVENT, UpdateComputerConfigReq(computer=self.namespaces[SMCP_NAMESPACE]))
+            await self.emit(UPDATE_TOOL_LIST_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def emit_refresh_desktop(self) -> None:
         """
@@ -130,7 +128,7 @@ class SMCPComputerClient(AsyncClient):
         Desktop refresh trigger: notify server when resources list/content changed; server will broadcast notify:update_desktop.
         """
         if self.office_id:
-            await self.emit(UPDATE_DESKTOP_EVENT, UpdateComputerConfigReq(computer=self.namespaces[SMCP_NAMESPACE]))
+            await self.emit(UPDATE_DESKTOP_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def on_tool_call(self, data: ToolCallReq) -> dict:
         """
@@ -143,7 +141,7 @@ class SMCPComputerClient(AsyncClient):
             dict: 工具调用结果的字典表示（JSON 可序列化）
         """
         assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
-        assert self.namespaces[SMCP_NAMESPACE] == data["computer"], "计算机标识不匹配"
+        assert self.computer.name == data["computer"], "计算机标识不匹配"
         try:
             ret = await self.computer.aexecute_tool(
                 req_id=data["req_id"],
@@ -165,7 +163,7 @@ class SMCPComputerClient(AsyncClient):
             data (GetToolsReq): 请求数据
         """
         assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
-        assert self.namespaces[SMCP_NAMESPACE] == data["computer"], "计算机标识不匹配"
+        assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         mcp_tools = await self.computer.aget_available_tools()
 
@@ -183,7 +181,7 @@ class SMCPComputerClient(AsyncClient):
             GetDeskTopRet: 桌面数据与 req_id。
         """
         assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
-        assert self.namespaces[SMCP_NAMESPACE] == data["computer"], "计算机标识不匹配"
+        assert self.computer.name == data["computer"], "计算机标识不匹配"
         size = data.get("desktop_size")
         window_uri = data.get("window")
         desktops = await self.computer.get_desktop(size=size, window_uri=window_uri)
@@ -206,7 +204,7 @@ class SMCPComputerClient(AsyncClient):
         """
         # 校验上下文一致性（中英双语）/ Validate context consistency (bilingual)
         assert self.office_id == data["robot_id"], "房间名称与Agent信息名称不匹配"
-        assert self.namespaces[SMCP_NAMESPACE] == data["computer"], "计算机标识不匹配"
+        assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         servers: dict[str, dict] = {}
         # 从 Computer 中获取初始化时传入的配置集合（不可变元组）
@@ -214,12 +212,12 @@ class SMCPComputerClient(AsyncClient):
         for cfg in self.computer.mcp_servers:
             # 使用强校验转换为协议定义（中英文）/ Validate strictly to protocol definition (bilingual)
             # 若类型不匹配，抛出异常，属于硬性 Bug / If mismatched, raise to surface a hard bug.
-            validated_server = TypeAdapter(SMCPServerConfigDict).validate_python(cfg.model_dump(mode="json"), from_attributes=True)
+            validated_server: dict = TypeAdapter(SMCPServerConfigDict).validate_python(cfg.model_dump(mode="json"), from_attributes=True)
             servers[cfg.name] = validated_server
 
         inputs: list[MCPServerInput] = []
         for i in self.computer.inputs:
-            validated_input = TypeAdapter(MCPServerInput).validate_python(i.model_dump(mode="json"), from_attributes=True)
+            validated_input: MCPServerInput = TypeAdapter(MCPServerInput).validate_python(i.model_dump(mode="json"), from_attributes=True)
             inputs.append(validated_input)
 
         # 端到端返回强校验（中英双语）/ End-to-end response strict validation (bilingual)

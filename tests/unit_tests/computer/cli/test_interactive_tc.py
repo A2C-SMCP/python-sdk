@@ -108,6 +108,7 @@ async def test_tc_json_calls_execute(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     # 构建 Computer 与 Manager 桩
     comp = Computer(
+        name="test_it_c",
         inputs=set(),
         mcp_servers=set(),
         auto_connect=False,
@@ -155,7 +156,7 @@ async def test_tc_from_file_and_no_manager_guard(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(cmds))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test_it_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     # 不设置 manager，用于覆盖提示分支
 
     await _interactive_loop(comp)

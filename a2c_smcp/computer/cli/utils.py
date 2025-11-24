@@ -20,6 +20,7 @@ from rich.table import Table
 
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.utils import console as console_util
+from a2c_smcp.smcp import SMCPTool
 
 # 使用全局 Console（引用模块属性，便于后续动态切换）
 # Use a global Console (module attribute reference for dynamic switching)
@@ -197,7 +198,7 @@ def print_status(comp: Computer) -> None:
     console.print(table)
 
 
-def print_tools(tools: list[dict[str, Any]]) -> None:
+def print_tools(tools: list[SMCPTool]) -> None:
     """
     中文: 打印工具列表。
     English: Print tools list.

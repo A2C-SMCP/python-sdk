@@ -162,8 +162,8 @@ async def test_tool_call_roundtrip(socketio_server, basic_server_port: int):
     res = await agent.call(
         TOOL_CALL_EVENT,
         {
-            "robot_id": agent.get_sid(SMCP_NAMESPACE),
-            "computer": computer.get_sid(SMCP_NAMESPACE),
+            "robot_id": "robot-C",
+            "computer": "comp-C",
             "tool_name": "echo",
             "params": {"text": "hi"},
             "req_id": "req-001",
@@ -224,8 +224,8 @@ async def test_get_tools_success_same_office(socketio_server, basic_server_port:
     res = await agent.call(
         GET_TOOLS_EVENT,
         {
-            "computer": computer.get_sid(SMCP_NAMESPACE),
-            "robot_id": agent.get_sid(SMCP_NAMESPACE),
+            "computer": "comp-D",
+            "robot_id": "robot-D",
             "req_id": "req-002",
         },
         namespace=SMCP_NAMESPACE,

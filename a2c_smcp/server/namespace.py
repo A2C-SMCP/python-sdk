@@ -9,6 +9,7 @@
 """
 
 import copy
+from typing import cast
 
 from pydantic import TypeAdapter
 
@@ -126,12 +127,16 @@ class SMCPNamespace(BaseNamespace):
         session["office_id"] = room
         await self.save_session(sid, session)
 
+        # 注册name到sid的映射
+        # Register name-to-sid mapping
+        await self._register_name(session["name"], sid)
+
         # 根据角色发送不同的通知 / Send different notifications based on role
         notification_data: EnterOfficeNotification = {"office_id": room}
         if session.get("role") == "computer":
-            notification_data["computer"] = sid
+            notification_data["computer"] = session.get("name")
         else:
-            notification_data["agent"] = sid
+            notification_data["agent"] = session.get("name")
 
         # 广播加入新房间的消息至房间内其它人
         # Broadcast join message to others in the room
@@ -154,17 +159,22 @@ class SMCPNamespace(BaseNamespace):
         """
         session = await self.get_session(sid)
 
-        # 构建离开通知
-        # Build leave notification
+        # 构建离开通知，使用name而不是sid
+        # Build leave notification using name instead of sid
+        client_name = session.get("name", "")
         notification = (
-            LeaveOfficeNotification(office_id=room, computer=sid)
+            LeaveOfficeNotification(office_id=room, computer=client_name)
             if session.get("role") == "computer"
-            else LeaveOfficeNotification(office_id=room, agent=sid)
+            else LeaveOfficeNotification(office_id=room, agent=client_name)
         )
 
         # 广播离开消息
         # Broadcast leave message
         await self.emit(LEAVE_OFFICE_NOTIFICATION, notification, skip_sid=sid, room=room)
+
+        # 注销name映射
+        # Unregister name mapping
+        await self._unregister_name(sid)
 
         # 维护session中的office_id字段
         # Maintain office_id field in session
@@ -254,7 +264,7 @@ class SMCPNamespace(BaseNamespace):
         assert session["role"] == "agent", "目前仅支持Agent调用取消ToolCall的操作"
 
         agent_call = TypeAdapter(AgentCallData).validate_python(data)
-        assert sid == agent_call["robot_id"], "取消工具调用的广播仅可以由对应Agent发出"
+        assert session.get("name") == agent_call["robot_id"], "取消工具调用的广播仅可以由对应Agent发出"
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
         office_id = session.get("office_id")
@@ -329,11 +339,21 @@ class SMCPNamespace(BaseNamespace):
 
         tool_call = TypeAdapter(ToolCallReq).validate_python(data)
 
-        return await self.call(
-            TOOL_CALL_EVENT,
-            tool_call,
-            to=tool_call["computer"],
-            timeout=tool_call["timeout"],
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_name = tool_call["computer"]
+        computer_sid = await self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
+        return cast(
+            dict,
+            await self.call(
+                TOOL_CALL_EVENT,
+                tool_call,
+                to=computer_sid,
+                timeout=tool_call["timeout"],
+            ),
         )
 
     async def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet:
@@ -343,12 +363,19 @@ class SMCPNamespace(BaseNamespace):
 
         Args:
             sid (str): 发起者的ID，一般是Agent / Initiator ID, usually Agent
-            data (GetToolsReq): 其中包含computer字段，指向Computer的sid / Contains computer field pointing to Computer's sid
+            data (GetToolsReq): 其中包含computer字段，指向Computer的Name / Contains computer field pointing to Computer's Name
 
         Returns:
             GetToolsRet: Computer的工具列表 / Computer's tool list
         """
-        computer_sid = data["computer"]
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_sid = await self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         session = await self.get_session(computer_sid)
         assert session["role"] == "computer", "目前仅支持Computer获取工具列表"
 
@@ -363,7 +390,7 @@ class SMCPNamespace(BaseNamespace):
         client_response = await self.call(
             GET_TOOLS_EVENT,
             data,
-            to=data["computer"],
+            to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
 
@@ -376,7 +403,14 @@ class SMCPNamespace(BaseNamespace):
 
         要求：Agent 与 Computer 需在同一 office。
         """
-        computer_sid = data["computer"]
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_sid = await self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         session = await self.get_session(computer_sid)
         assert session["role"] == "computer", "目前仅支持获取Computer桌面"
 
@@ -388,7 +422,7 @@ class SMCPNamespace(BaseNamespace):
         client_response = await self.call(
             GET_DESKTOP_EVENT,
             data,
-            to=data["computer"],
+            to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
         return TypeAdapter(GetDeskTopRet).validate_python(client_response)

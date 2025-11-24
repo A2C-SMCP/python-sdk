@@ -63,6 +63,8 @@ async def computer_server(basic_server_port: int) -> AsyncGenerator[MockComputer
 @pytest.mark.asyncio
 async def test_computer_join_and_leave_office(computer, computer_server: MockComputerServerNamespace, basic_server_port: int):
     """测试加入和离开办公室"""
+    computer_name = "test_computer"
+    computer.name = computer_name
     client = SMCPComputerClient(computer=computer)
     logger.info(f"client sid: {client.sid}")
 
@@ -82,8 +84,7 @@ async def test_computer_join_and_leave_office(computer, computer_server: MockCom
 
     # 加入办公室
     office_id = "test_office"
-    computer_name = "test_computer"
-    await client.join_office(office_id, computer_name)
+    await client.join_office(office_id)
     await asyncio.sleep(0.1)  # 等待事件处理，交出一下控制权
     assert computer_server.client_operations_record[client.namespaces[SMCP_NAMESPACE]] == ("enter_room", office_id)
 
@@ -105,6 +106,7 @@ async def test_computer_join_and_leave_office(computer, computer_server: MockCom
 @pytest.mark.asyncio
 async def test_computer_receives_tool_call(computer, computer_server, basic_server_port: int):
     """测试收到工具调用请求"""
+    computer.name = "test_computer"
     client = SMCPComputerClient(computer=computer)
     client_connected_event = asyncio.Event()
 
@@ -117,7 +119,7 @@ async def test_computer_receives_tool_call(computer, computer_server, basic_serv
             auth={"mock_header": "mock_value"},
             namespaces=[SMCP_NAMESPACE],
         )
-        await client.join_office("test_office", "test_computer")
+        await client.join_office("test_office")
         logger.debug("client connected and joined office")
         client_connected_event.set()
         try:
@@ -134,7 +136,7 @@ async def test_computer_receives_tool_call(computer, computer_server, basic_serv
 
     # 模拟工具调用请求
     tool_call_req = {
-        "computer": client.namespaces[SMCP_NAMESPACE],
+        "computer": "test_computer",
         "tool_name": "test_tool",
         "params": {"param1": "value1"},
         "robot_id": "test_office",
@@ -156,6 +158,8 @@ async def test_computer_receives_tool_call(computer, computer_server, basic_serv
 @pytest.mark.asyncio
 async def test_computer_sends_update_mcp_config(computer, computer_server, basic_server_port: int):
     """测试发送更新MCP配置事件"""
+    computer_name = "test_computer"
+    computer.name = computer_name
     client = SMCPComputerClient(computer=computer)
 
     await client.connect(
@@ -165,17 +169,21 @@ async def test_computer_sends_update_mcp_config(computer, computer_server, basic
         auth={"mock_header": "mock_value"},
         namespaces=[SMCP_NAMESPACE],
     )
-    await client.join_office("test_office", "test_computer")
+    logger.info(f"[DEBUG] Computer name: {computer_name}")
+    await client.join_office("test_office")
 
     # 发送更新MCP配置事件
     await client.update_config()
+
+    computer_sid = client.namespaces[SMCP_NAMESPACE]
+    logger.info(f"[DEBUG] Computer SID in UpdateComputerConfigReq: {computer_sid}")
 
     # 等待事件处理
     await asyncio.sleep(0.5)
 
     assert computer_server.client_operations_record[client.namespaces[SMCP_NAMESPACE]] == (
         "server_update_config",
-        {"computer": client.namespaces[SMCP_NAMESPACE]},
+        {"computer": computer.name},
     )
 
     await client.disconnect()
@@ -184,6 +192,7 @@ async def test_computer_sends_update_mcp_config(computer, computer_server, basic
 @pytest.mark.asyncio
 async def test_computer_handles_get_tools_request(computer, computer_server, basic_server_port: int):
     """测试处理获取工具请求"""
+    computer.name = "test_computer"
     client = SMCPComputerClient(computer=computer)
 
     await client.connect(
@@ -193,10 +202,10 @@ async def test_computer_handles_get_tools_request(computer, computer_server, bas
         auth={"mock_header": "mock_value"},
         namespaces=[SMCP_NAMESPACE],
     )
-    await client.join_office("test_office", "test_computer")
+    await client.join_office("test_office")
 
     # 模拟获取工具请求
-    get_tools_req = {"computer": client.namespaces[SMCP_NAMESPACE], "robot_id": "test_office", "req_id": "test_req_id"}
+    get_tools_req = {"computer": "test_computer", "robot_id": "test_office", "req_id": "test_req_id"}
 
     # 发送获取工具请求（模拟Agent的行为）
     await computer_server.emit(GET_TOOLS_EVENT, get_tools_req, namespace=SMCP_NAMESPACE, to=client.namespaces[SMCP_NAMESPACE])
@@ -211,6 +220,7 @@ async def test_computer_handles_get_tools_request(computer, computer_server, bas
 @pytest.mark.asyncio
 async def test_computer_handles_tool_call_timeout(computer, computer_server, basic_server_port: int):
     """测试工具调用超时处理"""
+    computer.name = "test_computer"
     # 配置模拟工具调用超时
     computer.mcp_manager.aexecute_tool = AsyncMock(side_effect=asyncio.TimeoutError)
 
@@ -223,11 +233,11 @@ async def test_computer_handles_tool_call_timeout(computer, computer_server, bas
         auth={"mock_header": "mock_value"},
         namespaces=[SMCP_NAMESPACE],
     )
-    await client.join_office("test_office", "test_computer")
+    await client.join_office("test_office")
 
     # 模拟工具调用请求（标记为应该超时）
     tool_call_req = {
-        "computer": client.namespaces[SMCP_NAMESPACE],
+        "computer": "test_computer",
         "tool_name": "test_tool",
         "params": {"param1": "value1"},
         "robot_id": "test_office",
@@ -253,6 +263,7 @@ async def test_computer_handles_tool_call_timeout(computer, computer_server, bas
 @pytest.mark.asyncio
 async def test_computer_handles_get_config(computer_server: MockComputerServerNamespace, basic_server_port: int):
     """测试处理获取MCP配置请求 / Handle GET_CONFIG_EVENT and validate response"""
+    computer_name = "test_computer"
     # 构造具备 mcp_servers 属性的 Computer 替身 / Fake Computer with mcp_servers
     stdio_cfg = StdioServerConfig(
         name="stdio-srv",
@@ -283,6 +294,10 @@ async def test_computer_handles_get_config(computer_server: MockComputerServerNa
         def inputs(self) -> list:
             return []
 
+        @property
+        def name(self) -> str:
+            return computer_name
+
         # 兼容其他测试中会用到的方法（此测试用例中不会调用）/ compatibility no-op
         aget_available_tools = AsyncMock(return_value=[])
         mcp_manager = MagicMock()
@@ -296,11 +311,14 @@ async def test_computer_handles_get_config(computer_server: MockComputerServerNa
         auth={"mock_header": "mock_value"},
         namespaces=[SMCP_NAMESPACE],
     )
-    await client.join_office("test_office", "test_computer")
+    logger.info(f"[DEBUG] Computer name: {computer_name}")
+    await client.join_office("test_office")
 
     # 通过服务端命名空间的 call，向客户端发起 GET_CONFIG_EVENT 并等待回调返回
     # Use server-side namespace.call to request and await client's callback response
-    req = {"computer": client.namespaces[SMCP_NAMESPACE], "robot_id": "test_office"}
+    computer_sid = client.namespaces[SMCP_NAMESPACE]
+    logger.info(f"[DEBUG] Computer SID in GetComputerConfigReq: {computer_sid}")
+    req = {"computer": computer_name, "robot_id": "test_office"}
     resp = await computer_server.call(
         GET_CONFIG_EVENT,
         req,
