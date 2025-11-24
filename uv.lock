@@ -4,7 +4,7 @@ requires-python = ">=3.11, <4.0"
 
 [[package]]
 name = "a2c-smcp"
-version = "0.1.1rc12"
+version = "0.1.1rc14"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -13,6 +13,7 @@ dependencies = [
     { name = "transitions" },
     { name = "tzlocal" },
     { name = "vrl-python" },
+    { name = "yarl" },
 ]
 
 [package.optional-dependencies]
@@ -57,6 +58,7 @@ requires-dist = [
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.17.4,<1.0.0" },
     { name = "tzlocal", specifier = ">=5.0.0,<6.0.0" },
     { name = "vrl-python", specifier = ">=0.1.0,<0.2.0" },
+    { name = "yarl", specifier = ">=1.22.0" },
 ]
 provides-extras = ["cli"]
 
