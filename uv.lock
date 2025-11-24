@@ -7,6 +7,7 @@ name = "a2c-smcp"
 version = "0.1.2rc0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "python-socketio" },
@@ -17,7 +18,6 @@ dependencies = [
 
 [package.optional-dependencies]
 cli = [
-    { name = "aiohttp" },
     { name = "prompt-toolkit" },
     { name = "rich" },
     { name = "typer" },
@@ -34,7 +34,6 @@ dev = [
     { name = "ruff" },
 ]
 test = [
-    { name = "aiohttp" },
     { name = "inline-snapshot" },
     { name = "pexpect" },
     { name = "polyfactory" },
@@ -49,7 +48,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", marker = "extra == 'cli'", specifier = ">=3.12.15,<4.0.0" },
+    { name = "aiohttp", specifier = ">=3.12.15,<4.0.0" },
     { name = "mcp", specifier = "==1.15.0" },
     { name = "prompt-toolkit", marker = "extra == 'cli'", specifier = ">=3.0.52,<4.0.0" },
     { name = "pydantic", specifier = ">=2.11.7,<3.0.0" },
@@ -71,7 +70,6 @@ dev = [
     { name = "ruff", specifier = ">=0.12.9,<0.13.0" },
 ]
 test = [
-    { name = "aiohttp", specifier = ">=3.12.15,<4.0.0" },
     { name = "inline-snapshot", specifier = ">=0.27.2,<0.28.0" },
     { name = "pexpect", specifier = ">=4.9.0,<5.0.0" },
     { name = "polyfactory", specifier = ">=2.22.2,<3.0.0" },
