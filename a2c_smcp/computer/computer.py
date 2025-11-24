@@ -367,7 +367,7 @@ class Computer(BaseComputer[PromptSession]):
         注意：更新 inputs 只会影响后续的渲染，不会自动对已激活的配置进行重新渲染/重启。
         如需应用到已存在的服务，可结合 aadd_or_aupdate_server 重新提交配置达到热更新效果。
         """
-        self._inputs = set(inputs or set())
+        self._inputs = inputs or set()
         # 复用传入或已有的会话，以便后续解析共享同一 Session
         # Reuse provided or existing session so subsequent resolving shares the same session
         sess = session or getattr(self._input_resolver, "session", None)

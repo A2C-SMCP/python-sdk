@@ -92,11 +92,14 @@ async def interactive_loop(
             help_table.add_row("start <name>|all", "启动客户端 / start client(s)")
             help_table.add_row("stop <name>|all", "停止客户端 / stop client(s)")
             help_table.add_row("inputs load <@file>", "从文件加载 inputs 定义 / load inputs")
+            help_table.add_row("inputs list", "查看当前inputs的定义 / show inputs")
             # 中文: 新增当前 inputs 值的增删改查命令
             # English: Add CRUD commands for current inputs values
             help_table.add_row("inputs value list", "列出当前 inputs 的缓存值 / list current cached input values")
             help_table.add_row("inputs value get <id>", "获取指定 id 的值 / get cached value by id")
-            help_table.add_row("inputs value set <id> <json|text>", "设置指定 id 的值 / set cached value by id")
+            help_table.add_row(
+                "inputs value set <id> [<json|text>]", "设置指定 id 的值（省略值则用 default）/ set cached value (omit to use default)"
+            )
             help_table.add_row("inputs value rm <id>", "删除指定 id 的值 / remove cached value by id")
             help_table.add_row("inputs value clear [<id>]", "清空全部或指定 id 的缓存 / clear all or one cached value")
             help_table.add_row("tc <json|@file>", "使用与 Socket.IO 一致的 JSON 结构调试工具 / debug tool with Socket.IO-compatible JSON")
@@ -313,15 +316,31 @@ async def interactive_loop(
                                     except Exception:
                                         console.print(repr(val))
                         elif vsub == "set":
-                            if len(parts) < 5:
-                                console.print("[yellow]用法: inputs value set <id> <json|text>[/yellow]")
+                            if len(parts) < 4:
+                                console.print("[yellow]用法: inputs value set <id> [<json|text>][/yellow]")
+                                console.print("[dim]提示: 如果不提供值，将使用 default 值 / Hint: omit value to use default[/dim]")
                             else:
                                 target_id = parts[3]
-                                payload = raw.split(" ", 4)[4]
-                                try:
-                                    data = json.loads(payload)
-                                except Exception:
-                                    data = payload
+                                # 中文: 如果只有 4 个部分（inputs value set <id>），则尝试使用 default 值
+                                # English: If only 4 parts (inputs value set <id>), try to use default value
+                                if len(parts) == 4:
+                                    # 获取 input 定义 / Get input definition
+                                    input_def = comp.get_input(target_id)
+                                    if input_def is None:
+                                        console.print("[yellow]不存在的 id / Not found[/yellow]")
+                                        continue
+                                    if input_def.default is None:
+                                        console.print(f"[yellow]Input '{target_id}' 没有 default 值 / has no default value[/yellow]")
+                                        console.print("[dim]用法: inputs value set <id> <json|text>[/dim]")
+                                        continue
+                                    data = input_def.default
+                                    console.print(f"[dim]使用 default 值 / Using default value: {repr(data)}[/dim]")
+                                else:
+                                    payload = raw.split(" ", 4)[4]
+                                    try:
+                                        data = json.loads(payload)
+                                    except Exception:
+                                        data = payload
                                 ok = comp.set_input_value(target_id, data)
                                 if ok:
                                     console.print("[green]已设置 / Set[/green]")
