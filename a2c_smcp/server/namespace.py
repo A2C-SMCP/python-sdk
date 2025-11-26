@@ -118,6 +118,18 @@ class SMCPNamespace(BaseNamespace):
                 logger.warning(f"Computer sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
                 return
 
+            # 检查房间内是否已有同名的Computer
+            # Check if there's already a Computer with the same name in the room
+            computer_name = session.get("name")
+            if computer_name:
+                participants = self.server.manager.get_participants(SMCP_NAMESPACE, room)
+                for participant_sid, _participant_eio_sid in participants:
+                    if participant_sid == sid:
+                        continue
+                    participant_session = await self.get_session(participant_sid)
+                    if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
+                        raise ValueError(f"Computer with name '{computer_name}' already exists in room '{room}'")
+
         # 加入新房间
         # Join new room
         await super().enter_room(sid, room)

@@ -459,3 +459,109 @@ class TestDefaultAuthenticationProvider:
         headers = []  # 空的headers列表
         result = await provider.authenticate(mock_sio, "agent_123", None, headers)
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_enter_room_computer_duplicate_name_raises_error(self, smcp_namespace, mock_server):
+        """
+        测试Computer重名检查：当房间内已存在同名Computer时，应抛出ValueError
+        Test Computer duplicate name check: should raise ValueError when same name exists in room
+        """
+        smcp_namespace.server = mock_server
+
+        # 设置房间内已有一个名为 "comp1" 的 Computer
+        # Setup: room already has a Computer named "comp1"
+        existing_computer_sid = "existing_sid"
+        existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
+
+        # 新的 Computer 也叫 "comp1"，尝试加入同一房间
+        # New Computer also named "comp1" tries to join the same room
+        new_computer_sid = "new_sid"
+        new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
+
+        # Mock get_participants 返回房间内已有的参与者
+        # Mock get_participants to return existing participant
+        mock_server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
+
+        # Mock get_session：第一次返回新Computer的session，第二次返回已存在Computer的session
+        # Mock get_session: first call returns new Computer's session, second returns existing Computer's session
+        smcp_namespace.get_session = AsyncMock(side_effect=[new_session, existing_session])
+        smcp_namespace.save_session = AsyncMock()
+
+        # 应该抛出 ValueError，提示重名
+        # Should raise ValueError indicating duplicate name
+        with pytest.raises(ValueError, match="Computer with name 'comp1' already exists in room 'room1'"):
+            await smcp_namespace.enter_room(new_computer_sid, "room1")
+
+    @pytest.mark.asyncio
+    async def test_enter_room_computer_different_name_succeeds(self, smcp_namespace, mock_server, monkeypatch):
+        """
+        测试Computer不同名可以成功加入：房间内已有Computer，但名字不同，应该成功
+        Test Computer with different name can join: room has Computer but different name, should succeed
+        """
+        from a2c_smcp.server.base import BaseNamespace
+
+        smcp_namespace.server = mock_server
+
+        # 房间内已有一个名为 "comp1" 的 Computer
+        # Room already has a Computer named "comp1"
+        existing_computer_sid = "existing_sid"
+        existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
+
+        # 新的 Computer 叫 "comp2"，名字不同
+        # New Computer named "comp2", different name
+        new_computer_sid = "new_sid"
+        new_session = {"role": "computer", "name": "comp2", "sid": new_computer_sid}
+
+        # Mock get_participants 返回房间内已有的参与者
+        mock_server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
+
+        # Mock get_session
+        smcp_namespace.get_session = AsyncMock(side_effect=[new_session, existing_session, new_session])
+        smcp_namespace.save_session = AsyncMock()
+        smcp_namespace.emit = AsyncMock()
+        smcp_namespace._register_name = AsyncMock()
+
+        # Mock 父类的 enter_room 方法
+        # Mock parent class enter_room method
+        monkeypatch.setattr(BaseNamespace, "enter_room", AsyncMock())
+
+        # 应该成功加入，不抛出异常
+        # Should succeed without raising exception
+        await smcp_namespace.enter_room(new_computer_sid, "room1")
+
+        # 验证 save_session 被调用
+        # Verify save_session was called
+        assert smcp_namespace.save_session.called
+
+    @pytest.mark.asyncio
+    async def test_enter_room_computer_same_sid_allowed(self, smcp_namespace, mock_server, monkeypatch):
+        """
+        测试同一个Computer重新加入（幂等操作）：同一个sid重复加入应该被允许
+        Test same Computer re-joining (idempotent): same sid rejoining should be allowed
+        """
+        from a2c_smcp.server.base import BaseNamespace
+
+        smcp_namespace.server = mock_server
+
+        # Computer 尝试重新加入同一房间
+        # Computer tries to rejoin the same room
+        computer_sid = "comp_sid"
+        session = {"role": "computer", "name": "comp1", "sid": computer_sid}
+
+        # Mock get_participants 返回自己
+        # Mock get_participants returns itself
+        mock_server.manager.get_participants.return_value = [(computer_sid, "eio_sid")]
+
+        smcp_namespace.get_session = AsyncMock(side_effect=[session, session])
+        smcp_namespace.save_session = AsyncMock()
+        smcp_namespace.emit = AsyncMock()
+        smcp_namespace._register_name = AsyncMock()
+
+        # Mock 父类的 enter_room 方法
+        monkeypatch.setattr(BaseNamespace, "enter_room", AsyncMock())
+
+        # 应该成功，不抛出异常（跳过自己的检查）
+        # Should succeed without exception (skip self-check)
+        await smcp_namespace.enter_room(computer_sid, "room1")
+
+        assert smcp_namespace.save_session.called

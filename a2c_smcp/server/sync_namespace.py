@@ -94,6 +94,17 @@ class SyncSMCPNamespace(SyncBaseNamespace):
                 )
                 return
 
+            # 检查房间内是否已有同名的Computer
+            # Check if there's already a Computer with the same name in the room
+            computer_name = session.get("name")
+            if computer_name:
+                for participant_sid, _participant_eio_sid in self.server.manager.get_participants(SMCP_NAMESPACE, room):
+                    if participant_sid == sid:
+                        continue
+                    participant_session = self.get_session(participant_sid)
+                    if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
+                        raise ValueError(f"Computer with name '{computer_name}' already exists in room '{room}'")
+
         super().enter_room(sid, room)
         session["office_id"] = room
         self.save_session(sid, session)

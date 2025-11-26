@@ -324,3 +324,98 @@ def test_on_server_list_room_filters_invalid_sessions(monkeypatch):
     # Verify result: should only contain 3 valid sessions (excluding unknown role)
     assert len(result["sessions"]) == 3
     assert all(s["role"] in ["computer", "agent"] for s in result["sessions"])
+
+
+def test_enter_room_computer_duplicate_name_raises_error(ns):
+    """
+    测试Computer重名检查：当房间内已存在同名Computer时，应抛出ValueError
+    Test Computer duplicate name check: should raise ValueError when same name exists in room
+    """
+    # 设置房间内已有一个名为 "comp1" 的 Computer
+    # Setup: room already has a Computer named "comp1"
+    existing_computer_sid = "existing_sid"
+    existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
+
+    # 新的 Computer 也叫 "comp1"，尝试加入同一房间
+    # New Computer also named "comp1" tries to join the same room
+    new_computer_sid = "new_sid"
+    new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
+
+    # Mock get_participants 返回房间内已有的参与者
+    # Mock get_participants to return existing participant
+    ns.server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
+
+    # Mock get_session：第一次返回新Computer的session，第二次返回已存在Computer的session
+    # Mock get_session: first call returns new Computer's session, second returns existing Computer's session
+    ns.get_session.side_effect = [new_session, existing_session]
+
+    # 应该抛出 ValueError，提示重名
+    # Should raise ValueError indicating duplicate name
+    with pytest.raises(ValueError, match="Computer with name 'comp1' already exists in room 'room1'"):
+        ns.enter_room(new_computer_sid, "room1")
+
+
+def test_enter_room_computer_different_name_succeeds(ns, monkeypatch):
+    """
+    测试Computer不同名可以成功加入：房间内已有Computer，但名字不同，应该成功
+    Test Computer with different name can join: room has Computer but different name, should succeed
+    """
+    from a2c_smcp.server.sync_base import SyncBaseNamespace
+
+    # 房间内已有一个名为 "comp1" 的 Computer
+    # Room already has a Computer named "comp1"
+    existing_computer_sid = "existing_sid"
+    existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
+
+    # 新的 Computer 叫 "comp2"，名字不同
+    # New Computer named "comp2", different name
+    new_computer_sid = "new_sid"
+    new_session = {"role": "computer", "name": "comp2", "sid": new_computer_sid}
+
+    # Mock get_participants 返回房间内已有的参与者
+    ns.server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
+
+    # Mock get_session
+    ns.get_session.side_effect = [new_session, existing_session, new_session]
+    ns._register_name = MagicMock()
+
+    # Mock 父类的 enter_room 方法
+    # Mock parent class enter_room method
+    monkeypatch.setattr(SyncBaseNamespace, "enter_room", MagicMock())
+
+    # 应该成功加入，不抛出异常
+    # Should succeed without raising exception
+    ns.enter_room(new_computer_sid, "room1")
+
+    # 验证 save_session 被调用
+    # Verify save_session was called
+    assert ns.save_session.called
+
+
+def test_enter_room_computer_same_sid_allowed(ns, monkeypatch):
+    """
+    测试同一个Computer重新加入（幂等操作）：同一个sid重复加入应该被允许
+    Test same Computer re-joining (idempotent): same sid rejoining should be allowed
+    """
+    from a2c_smcp.server.sync_base import SyncBaseNamespace
+
+    # Computer 尝试重新加入同一房间
+    # Computer tries to rejoin the same room
+    computer_sid = "comp_sid"
+    session = {"role": "computer", "name": "comp1", "sid": computer_sid}
+
+    # Mock get_participants 返回自己
+    # Mock get_participants returns itself
+    ns.server.manager.get_participants.return_value = [(computer_sid, "eio_sid")]
+
+    ns.get_session.side_effect = [session, session]
+    ns._register_name = MagicMock()
+
+    # Mock 父类的 enter_room 方法
+    monkeypatch.setattr(SyncBaseNamespace, "enter_room", MagicMock())
+
+    # 应该成功，不抛出异常（跳过自己的检查）
+    # Should succeed without exception (skip self-check)
+    ns.enter_room(computer_sid, "room1")
+
+    assert ns.save_session.called

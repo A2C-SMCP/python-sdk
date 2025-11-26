@@ -411,8 +411,13 @@ async def interactive_loop(
                     else:
                         # 如果指定了computer_name 会动态地修改运行时computer的name
                         comp.name = parts[3]
-                        await smcp_client.join_office(parts[2])
-                        console.print("[green]已加入房间 / Joined office[/green]")
+                        try:
+                            await smcp_client.join_office(parts[2])
+                            console.print("[green]已加入房间 / Joined office[/green]")
+                        except RuntimeError as e:
+                            console.print(f"[red]{e}[/red]")
+                        except Exception as e:
+                            console.print(f"[red]加入房间失败 / Failed to join office: {e}[/red]")
                 elif sub == "leave":
                     if not smcp_client or not getattr(smcp_client, "connected", False):
                         console.print("[yellow]未连接 / Not connected[/yellow]")

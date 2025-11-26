@@ -149,3 +149,72 @@ async def test_on_get_config_serialization_three_types():
     assert isinstance(servers["stdio-srv"]["server_parameters"], dict)
     assert isinstance(servers["sse-srv"]["server_parameters"], dict)
     assert isinstance(servers["http-srv"]["server_parameters"], dict)
+
+
+@pytest.mark.asyncio
+async def test_join_office_success():
+    """
+    测试成功加入房间：服务器返回 (True, None)
+    Test successful join office: server returns (True, None)
+    """
+    client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "test_computer"
+
+    # Mock call 方法返回成功结果
+    # Mock call method to return success result
+    client.call = AsyncMock(return_value=[True, None])
+
+    # 应该成功加入，不抛出异常
+    # Should succeed without exception
+    await client.join_office("office_123")
+
+    # 验证 office_id 被设置
+    # Verify office_id is set
+    assert client.office_id == "office_123"
+
+
+@pytest.mark.asyncio
+async def test_join_office_duplicate_name_raises_error():
+    """
+    测试加入房间失败（重名）：服务器返回 (False, error_msg)，应抛出 RuntimeError
+    Test join office fails (duplicate name): server returns (False, error_msg), should raise RuntimeError
+    """
+    client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "duplicate_name"
+
+    # Mock call 方法返回失败结果
+    # Mock call method to return failure result
+    error_msg = "Computer with name 'duplicate_name' already exists in room 'office_123'"
+    client.call = AsyncMock(return_value=[False, error_msg])
+
+    # 应该抛出 RuntimeError
+    # Should raise RuntimeError
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("office_123")
+
+    # office_id 不应该被设置
+    # office_id should not be set
+    assert client.office_id is None
+
+
+@pytest.mark.asyncio
+async def test_join_office_no_response_raises_error():
+    """
+    测试加入房间失败（无响应）：服务器返回 None 或空值，应抛出 RuntimeError
+    Test join office fails (no response): server returns None or empty, should raise RuntimeError
+    """
+    client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "test_computer"
+
+    # Mock call 方法返回 None
+    # Mock call method to return None
+    client.call = AsyncMock(return_value=None)
+
+    # 应该抛出 RuntimeError
+    # Should raise RuntimeError
+    with pytest.raises(RuntimeError, match="服务器未返回结果"):
+        await client.join_office("office_123")
+
+    # office_id 不应该被设置
+    # office_id should not be set
+    assert client.office_id is None

@@ -80,11 +80,28 @@ class SMCPComputerClient(AsyncClient):
     async def join_office(self, office_id: str) -> None:
         """
         加入一个Office（Socket.IO中的Room）
+        Join an Office (Room in Socket.IO)
 
         Args:
             office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
+                           / Room ID, in A2C-smcp protocol, OfficeID is Socket.IO RoomID and consistent with AgentID
+
+        Raises:
+            RuntimeError: 当加入房间失败时（例如重名）/ When joining room fails (e.g., duplicate name)
         """
-        await self.emit(JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name))
+        # 使用 call 方法等待服务器返回结果 / Use call method to wait for server response
+        result = await self.call(
+            JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name), namespace=SMCP_NAMESPACE
+        )
+
+        # 检查返回结果 / Check return result
+        if isinstance(result, (list, tuple)) and len(result) >= 2:
+            success, error_msg = result[0], result[1]
+            if not success:
+                raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
+        elif not result:
+            raise RuntimeError("加入房间失败：服务器未返回结果 / Failed to join office: No response from server")
+
         self.office_id = office_id
 
     async def leave_office(self, office_id: str) -> None:
