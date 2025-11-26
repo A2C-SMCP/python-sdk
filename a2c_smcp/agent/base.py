@@ -287,8 +287,8 @@ class BaseAgentClient(ABC):
         Join an Office (Room in Socket.IO)
 
         Args:
-            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
-                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID and consistent with AgentID
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID
+                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID
             agent_name (str): Agent名称，提供给前端展示用
                             / Agent name, for frontend display
             namespace (str | None): 命名空间 / Namespace
@@ -575,8 +575,8 @@ class BaseAgentSyncClient(ABC):
         Join an Office (Room in Socket.IO)
 
         Args:
-            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
-                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID and consistent with AgentID
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID
+                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID
             agent_name (str): Agent名称，提供给前端展示用
                             / Agent name, for frontend display
             namespace (str | None): 命名空间 / Namespace

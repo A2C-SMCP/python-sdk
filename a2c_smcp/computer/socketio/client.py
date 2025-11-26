@@ -83,26 +83,37 @@ class SMCPComputerClient(AsyncClient):
         Join an Office (Room in Socket.IO)
 
         Args:
-            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID，并且与 AgentID保持一致
-                           / Room ID, in A2C-smcp protocol, OfficeID is Socket.IO RoomID and consistent with AgentID
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID / Room ID, in A2C-smcp protocol,
+                OfficeID is Socket.IO RoomID
 
         Raises:
             RuntimeError: 当加入房间失败时（例如重名）/ When joining room fails (e.g., duplicate name)
         """
-        # 使用 call 方法等待服务器返回结果 / Use call method to wait for server response
-        result = await self.call(
-            JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name), namespace=SMCP_NAMESPACE
-        )
-
-        # 检查返回结果 / Check return result
-        if isinstance(result, (list, tuple)) and len(result) >= 2:
-            success, error_msg = result[0], result[1]
-            if not success:
-                raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
-        elif not result:
-            raise RuntimeError("加入房间失败：服务器未返回结果 / Failed to join office: No response from server")
-
+        # 提前设置 office_id，避免服务器广播事件时 office_id 仍为 None 的时序竞争问题
+        # Set office_id before sending request to avoid race condition when server broadcasts events
         self.office_id = office_id
+
+        try:
+            # 使用 call 方法等待服务器返回结果 / Use call method to wait for server response
+            result = await self.call(
+                JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name), namespace=SMCP_NAMESPACE
+            )
+
+            # 检查返回结果 / Check return result
+            if isinstance(result, (list, tuple)) and len(result) >= 2:
+                success, error_msg = result[0], result[1]
+                if not success:
+                    # 加入失败，重置 office_id / Reset office_id on failure
+                    self.office_id = None
+                    raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
+            elif not result:
+                # 加入失败，重置 office_id / Reset office_id on failure
+                self.office_id = None
+                raise RuntimeError("加入房间失败：服务器未返回结果 / Failed to join office: No response from server")
+        except Exception:
+            # 发生异常时重置 office_id / Reset office_id on exception
+            self.office_id = None
+            raise
 
     async def leave_office(self, office_id: str) -> None:
         """
@@ -157,7 +168,7 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             dict: 工具调用结果的字典表示（JSON 可序列化）
         """
-        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
         try:
             ret = await self.computer.aexecute_tool(
@@ -179,7 +190,7 @@ class SMCPComputerClient(AsyncClient):
         Args:
             data (GetToolsReq): 请求数据
         """
-        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         mcp_tools = await self.computer.aget_available_tools()
@@ -197,7 +208,7 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             GetDeskTopRet: 桌面数据与 req_id。
         """
-        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
         size = data.get("desktop_size")
         window_uri = data.get("window")
@@ -220,7 +231,7 @@ class SMCPComputerClient(AsyncClient):
             GetComputerConfigRet: SMCP 协议定义的 MCP 配置返回。SMCP formatted MCP configuration.
         """
         # 校验上下文一致性（中英双语）/ Validate context consistency (bilingual)
-        assert self.office_id == data["agent"], "房间名称与Agent信息名称不匹配"
+        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
         assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         servers: dict[str, dict] = {}
