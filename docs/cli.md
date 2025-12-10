@@ -60,8 +60,24 @@ python -m a2c_smcp.computer.cli.main run --auto-connect true --auto-reconnect tr
    - 查看某个 input 的当前定义。
  - inputs list
    - 列出当前全部 inputs 定义。
+ - inputs value list
+   - 列出当前所有已解析的 inputs 缓存值（只包含已经解析或手动设置过的项）。
+ - inputs value get <id>
+   - 查看指定 id 的当前缓存值，若尚未解析则返回提示。
+ - inputs value set <id> [<json|text>]
+   - 设置指定 id 的当前值；当省略值参数时，将尝试使用该 input 定义中的 `default` 值（不支持 command 类型、且必须存在 default）。
+ - inputs value rm <id>
+   - 删除指定 id 的当前缓存值。
+ - inputs value clear [<id>]
+   - 清空全部或指定 id 的缓存值。
+- desktop [size] [window_uri]
+  - 获取当前 Desktop 信息，size 为可选数量上限，window_uri 为可选的特定 WindowURI 过滤条件。
+- tc <json|@file>
+  - 使用与 Socket.IO `ToolCallReq` 一致的 JSON 结构调试工具调用，直接走本地 MCP 执行链路，便于在无 Agent 的场景下排查问题。
+- history [n]
+  - 查看最近的工具调用历史记录（CLI 内部仅保存最近 10 条）；可选参数 n 限制输出条数。
 - socket connect <url>
-  - 连接到信令服务器（Socket.IO）。
+  - 连接到信令服务器（Socket.IO）。如果省略 `<url>`，CLI 会交互式询问 URL、auth 与 headers。
 - socket join <office_id> <computer_name>
   - 加入一个 office（房间）。成功后会接收与该 office 相关的事件。
 - socket leave
@@ -190,7 +206,47 @@ render {"env":"${input:MY_ENV_VALUE}","regions":"${input:REGION}"}
 render @./any.json
 ```
 
-7) 停止与移除
+7) 使用 inputs value 管理当前值
+```bash
+# 使用 default 值填充（当定义中存在 default，且类型不是 command）
+inputs value set MY_ENV_VALUE
+
+# 手动设置一个 JSON 或文本值
+inputs value set REGION "us-east-1"
+
+# 查看当前缓存值
+inputs value list
+inputs value get MY_ENV_VALUE
+```
+
+8) 获取 Desktop 信息
+```bash
+# 获取最多 10 个窗口的 Desktop 概览
+desktop 10
+
+# 仅获取指定 WindowURI 对应的窗口
+desktop window://my_window
+```
+
+9) 使用 tc 调试工具调用
+```bash
+# 直接传入 JSON
+tc {"computer": "local", "agent": "debug-agent", "req_id": "dbg-1", "tool_name": "echo", "params": {"text": "hello"}, "timeout": 30}
+
+# 或从文件加载与 Socket.IO 一致的 ToolCallReq JSON
+tc @./tool_call_req.json
+```
+
+10) 查看调用历史
+```bash
+# 查看最近所有历史（最多 10 条）
+history
+
+# 只看最近 3 条
+history 3
+```
+
+11) 停止与移除
 ```bash
 stop all
 server rm my-stdio-server
