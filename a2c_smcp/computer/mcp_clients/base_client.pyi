@@ -10,7 +10,7 @@ from collections.abc import Awaitable
 from collections.abc import Callable as Callable
 from contextlib import AsyncExitStack
 from enum import StrEnum
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from mcp import ClientSession
 from mcp import Tool as Tool
@@ -20,7 +20,11 @@ from pydantic import BaseModel as BaseModel
 from transitions.core import EventData
 from transitions.extensions.asyncio import AsyncMachine, AsyncTransitionConfigDict
 
-from a2c_smcp.utils import async_property
+from a2c_smcp.utils.async_property import async_property
+
+# 泛型参数，用于约束 MCP Server 参数类型
+# Generic parameter for constraining MCP Server parameter types
+ParamsT = TypeVar("ParamsT", bound=BaseModel)
 
 class STATES(StrEnum):
     initialized = "initialized"
@@ -32,8 +36,8 @@ TRANSITIONS: list[AsyncTransitionConfigDict]
 
 class A2CAsyncMachine(AsyncMachine): ...
 
-class BaseMCPClient(ABC):
-    params: BaseModel
+class BaseMCPClient(ABC, Generic[ParamsT]):
+    params: ParamsT
     _aexit_stack: AsyncExitStack
     machine: A2CAsyncMachine
     _async_session: ClientSession | None
@@ -48,7 +52,7 @@ class BaseMCPClient(ABC):
 
     def __init__(
         self,
-        params: BaseModel,
+        params: ParamsT,
         state_change_callback: Callable[[str, str], None | Awaitable[None]] | None = None,
         message_handler: MessageHandlerFnT | None = None,
     ) -> None: ...

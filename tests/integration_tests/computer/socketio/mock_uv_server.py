@@ -50,7 +50,7 @@ class UvicornTestServer(uvicorn.Server):
     async def startup(self, sockets: list | None = None) -> None:
         """Override uvicorn startup"""
         await super().startup(sockets=sockets)
-        self.config.setup_event_loop()
+        # self.config.setup_event_loop()  # 从0.36版本开始，不再需要这个方法
         self._startup_done.set()
 
     async def up(self) -> None:
@@ -72,7 +72,8 @@ class UvicornTestServer(uvicorn.Server):
             if hasattr(self, "_serve_task") and not self._serve_task.done():
                 self._serve_task.cancel()
                 try:
-                    await asyncio.wait_for(self._serve_task, timeout=1.0)
+                    # 中文: 减少超时时间到 0.2 秒以加快测试速度 / English: Reduce timeout to 0.2s to speed up tests
+                    await asyncio.wait_for(self._serve_task, timeout=0.2)
                 except (TimeoutError, asyncio.CancelledError):
                     pass
         else:

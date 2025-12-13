@@ -10,19 +10,23 @@
 
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.types import AgentEventHandler, AsyncAgentEventHandler
 from a2c_smcp.smcp import (
+    JOIN_OFFICE_EVENT,
+    LEAVE_OFFICE_EVENT,
     EnterOfficeNotification,
+    EnterOfficeReq,
     GetDeskTopReq,
     GetDeskTopRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
+    LeaveOfficeReq,
     ToolCallReq,
     UpdateMCPConfigNotification,
 )
@@ -102,7 +106,7 @@ class BaseAgentClient(ABC):
             computer=computer,
             tool_name=tool_name,
             params=params,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
             timeout=timeout,
         )
@@ -121,7 +125,7 @@ class BaseAgentClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         return GetToolsReq(
             computer=computer,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
         )
 
@@ -141,7 +145,7 @@ class BaseAgentClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         req: GetDeskTopReq = {
             "computer": computer,
-            "robot_id": agent_config["agent_id"],
+            "agent": agent_config["agent"],
             "req_id": uuid.uuid4().hex,
         }
         if size is not None:
@@ -194,7 +198,7 @@ class BaseAgentClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         assert data["office_id"] == agent_config["office_id"], "无效的办公室ID / Invalid office ID"
         assert data.get("computer"), "无效的计算机ID / Invalid computer ID"
-        return data["computer"]
+        return cast(str, data["computer"])
 
     async def handle_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -276,6 +280,35 @@ class BaseAgentClient(ABC):
 
         except Exception as e:
             logger.error(f"Error processing tools response: {e}")
+
+    async def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
+        """
+        加入一个Office（Socket.IO中的Room）
+        Join an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID
+                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID
+            agent_name (str): Agent名称，提供给前端展示用
+                            / Agent name, for frontend display
+            namespace (str | None): 命名空间 / Namespace
+        """
+        await self.emit(
+            JOIN_OFFICE_EVENT,
+            EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+            namespace=namespace,
+        )
+
+    async def leave_office(self, office_id: str, namespace: str | None = None) -> None:
+        """
+        离开一个Office（Socket.IO中的Room）
+        Leave an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID / Room ID
+            namespace (str | None): 命名空间 / Namespace
+        """
+        await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
 
     @abstractmethod
     def register_event_handlers(self) -> None:
@@ -361,7 +394,7 @@ class BaseAgentSyncClient(ABC):
             computer=computer,
             tool_name=tool_name,
             params=params,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
             timeout=timeout,
         )
@@ -380,7 +413,7 @@ class BaseAgentSyncClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         return GetToolsReq(
             computer=computer,
-            robot_id=agent_config["agent_id"],
+            agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
         )
 
@@ -400,7 +433,7 @@ class BaseAgentSyncClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         req: GetDeskTopReq = {
             "computer": computer,
-            "robot_id": agent_config["agent_id"],
+            "agent": agent_config["agent"],
             "req_id": uuid.uuid4().hex,
         }
         if size is not None:
@@ -453,7 +486,7 @@ class BaseAgentSyncClient(ABC):
         agent_config = self.auth_provider.get_agent_config()
         assert data["office_id"] == agent_config["office_id"], "无效的办公室ID / Invalid office ID"
         assert data.get("computer"), "无效的计算机ID / Invalid computer ID"
-        return data["computer"]
+        return cast(str, data["computer"])
 
     def handle_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -535,6 +568,35 @@ class BaseAgentSyncClient(ABC):
 
         except Exception as e:
             logger.error(f"Error processing tools response: {e}")
+
+    def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
+        """
+        加入一个Office（Socket.IO中的Room）
+        Join an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID
+                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID
+            agent_name (str): Agent名称，提供给前端展示用
+                            / Agent name, for frontend display
+            namespace (str | None): 命名空间 / Namespace
+        """
+        self.emit(
+            JOIN_OFFICE_EVENT,
+            EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+            namespace=namespace,
+        )
+
+    def leave_office(self, office_id: str, namespace: str | None = None) -> None:
+        """
+        离开一个Office（Socket.IO中的Room）
+        Leave an Office (Room in Socket.IO)
+
+        Args:
+            office_id (str): 房间ID / Room ID
+            namespace (str | None): 命名空间 / Namespace
+        """
+        self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
 
     @abstractmethod
     def register_event_handlers(self) -> None:

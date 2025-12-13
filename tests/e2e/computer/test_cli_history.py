@@ -71,7 +71,7 @@ def test_history_after_tc(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
     # 4) 通过 tc 触发一次调用（固定 req_id 以便断言）
     req_id = "req-e2e-history-1"
     tc_payload = {
-        "robot_id": "bot-e2e",
+        "agent": "bot-e2e",
         "req_id": req_id,
         "computer": "ignored",
         "tool_name": "hello",

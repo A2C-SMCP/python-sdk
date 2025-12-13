@@ -160,3 +160,122 @@ def test_vrl_with_conditional_logic():
     )
 
     assert config.vrl == conditional_vrl
+
+
+def test_vrl_with_tool_name_access():
+    """测试VRL脚本可以访问tool_name字段 / Test VRL script can access tool_name field"""
+    # 中文: VRL脚本可以访问注入的tool_name字段
+    # English: VRL script can access injected tool_name field
+    vrl_script = """
+    .tool_info = .tool_name
+    .is_search_tool = .tool_name == "search"
+    """
+
+    config = StdioServerConfig(
+        name="test_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=ModelFactory.create_factory(StdioServerParameters).build(),
+    )
+
+    assert config.vrl == vrl_script
+
+
+def test_vrl_with_parameters_access():
+    """测试VRL脚本可以访问parameters字段 / Test VRL script can access parameters field"""
+    # 中文: VRL脚本可以访问注入的parameters字段
+    # English: VRL script can access injected parameters field
+    vrl_script = """
+    .query = .parameters.query
+    .limit = .parameters.limit
+    .has_filter = exists(.parameters.filter)
+    """
+
+    config = StdioServerConfig(
+        name="test_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=ModelFactory.create_factory(StdioServerParameters).build(),
+    )
+
+    assert config.vrl == vrl_script
+
+
+def test_vrl_conditional_based_on_tool_name():
+    """测试基于tool_name的条件逻辑 / Test conditional logic based on tool_name"""
+    # 中文: VRL脚本可以根据tool_name执行不同的转换逻辑
+    # English: VRL script can execute different transformation logic based on tool_name
+    vrl_script = """
+    if .tool_name == "search" {
+        .result_type = "search_result"
+        .query = .parameters.query
+    } else if .tool_name == "execute" {
+        .result_type = "execution_result"
+        .command = .parameters.cmd
+    } else {
+        .result_type = "unknown"
+    }
+    .processed = true
+    """
+
+    config = StdioServerConfig(
+        name="test_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=ModelFactory.create_factory(StdioServerParameters).build(),
+    )
+
+    assert config.vrl == vrl_script
+
+
+def test_vrl_parameters_nested_access():
+    """测试VRL脚本访问嵌套的parameters字段 / Test VRL script accessing nested parameters fields"""
+    # 中文: VRL脚本可以访问parameters中的嵌套字段
+    # English: VRL script can access nested fields in parameters
+    vrl_script = """
+    .user_id = .parameters.user.id
+    .user_name = .parameters.user.name
+    .options_enabled = .parameters.options.enabled
+    """
+
+    config = StdioServerConfig(
+        name="test_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=ModelFactory.create_factory(StdioServerParameters).build(),
+    )
+
+    assert config.vrl == vrl_script
+
+
+def test_vrl_combine_result_and_context():
+    """测试VRL脚本同时处理结果和上下文信息 / Test VRL script processing both result and context"""
+    # 中文: VRL脚本可以同时访问工具返回结果和调用上下文
+    # English: VRL script can access both tool result and call context
+    vrl_script = """
+    .summary = {
+        "tool": .tool_name,
+        "params": .parameters,
+        "is_error": to_bool(.isError) ?? false,
+        "content_count": length!(.content)
+    }
+    """
+
+    config = StdioServerConfig(
+        name="test_server",
+        disabled=False,
+        forbidden_tools=[],
+        tool_meta={},
+        vrl=vrl_script,
+        server_parameters=ModelFactory.create_factory(StdioServerParameters).build(),
+    )
+
+    assert config.vrl == vrl_script

@@ -142,6 +142,12 @@ class MCPServerManager:
                     await self._arestart_server(config.name)
                 else:
                     raise RuntimeError(f"Server {config.name} is active. Stop it before updating config")
+            else:
+                # 配置存在但客户端未激活，更新配置并根据 auto_connect 决定是否启动
+                # Config exists but client is not active, update config and start if auto_connect is enabled
+                self._servers_config[config.name] = config
+                if self._auto_connect:
+                    await self._astart_client(config.name)
         else:
             self._servers_config[config.name] = config
             if self._auto_connect:
@@ -197,7 +203,7 @@ class MCPServerManager:
     async def astart_all(self) -> None:
         """启动所有启用的服务器"""
         async with self._lock:
-            logger.debug(f"Manager Start all async task: {asyncio.current_task().get_name()}")
+            logger.debug(f"Manager Start all async task: {asyncio.current_task()}")
             for server_name in self._servers_config:
                 if not self._servers_config[server_name].disabled:
                     await self._astart_client(server_name)
@@ -253,7 +259,7 @@ class MCPServerManager:
     async def astop_all(self) -> None:
         """停止所有客户端"""
         async with self._lock:
-            logger.debug(f"Manager Stop all async task: {asyncio.current_task().get_name()}")
+            logger.debug(f"Manager Stop all async task: {asyncio.current_task()}")
             await self._astop_all()
 
     def _clear_all(self) -> None:
@@ -388,13 +394,17 @@ class MCPServerManager:
                 else:
                     result.meta = {A2C_TOOL_META: tool_meta}
 
-            # 中文: 如果配置了VRL脚本，尝试对返回值进行转换
+            # 中文: 如果配置了VRL脚本,尝试对返回值进行转换
             # English: If VRL script is configured, try to transform the return value
             if config.vrl:
                 try:
-                    # 中文: 尝试将CallToolResult序列化为字典作为VRL的Event输入
-                    # English: Try to serialize CallToolResult to dict as VRL Event input
+                    # 中文: 将CallToolResult序列化为字典，并注入tool_name和parameters作为VRL的Event输入
+                    # English: Serialize CallToolResult to dict and inject tool_name and parameters as VRL Event input
                     event = result.model_dump(mode="json")
+                    # 中文: 注入工具调用的上下文信息
+                    # English: Inject tool call context information
+                    event["tool_name"] = tool_name
+                    event["parameters"] = parameters
 
                     # 中文: 执行VRL转换（使用系统本地时区）
                     # English: Execute VRL transformation (use system local timezone)

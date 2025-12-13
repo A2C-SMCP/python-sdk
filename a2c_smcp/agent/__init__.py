@@ -35,12 +35,10 @@ __all__ = [
     # 认证相关 / Authentication related
     "AgentAuthProvider",
     "DefaultAgentAuthProvider",
-
     # 客户端实现 / Client implementations
     "BaseAgentClient",
     "SMCPAgentClient",
     "AsyncSMCPAgentClient",
-
     # 类型定义 / Type definitions
     "AgentConfig",
     "AgentEventHandler",

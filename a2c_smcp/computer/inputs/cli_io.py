@@ -38,18 +38,19 @@ async def ainput_prompt(
     prompt_text = f"{message} " + (f"[default: {repr(default)}] " if default is not None else "")
     # 中文: 若未提供 session，说明在交互循环外部调用，为避免与 a2c> 冲突，强制换行并启用 raw。
     # English: If no session provided (outside interactive loop), start on a new line and enable raw to avoid conflicts.
+    value: str
     if session is None:
         prompt_text = "\n" + prompt_text
         with patch_stdout(raw=True):
             try:
-                value = await sess.prompt_async(prompt_text, is_password=password)
+                value = str(await sess.prompt_async(prompt_text, is_password=password))
             except (EOFError, KeyboardInterrupt):
                 return default or ""
     else:
         # 中文: 复用交互循环的 session，不额外换行；由外层 prompt_toolkit 负责正确重绘与光标管理。
         # English: Reuse interactive loop session; no extra newline; rely on outer prompt_toolkit for redraw/cursor.
         try:
-            value = await sess.prompt_async(prompt_text, is_password=password)
+            value = str(await sess.prompt_async(prompt_text, is_password=password))
         except (EOFError, KeyboardInterrupt):
             return default or ""
     if value == "" and default is not None:
@@ -135,19 +136,20 @@ async def arun_command(
     parse: 'raw' | 'lines' | 'json'
     """
     if shell:
-        create = asyncio.create_subprocess_shell
-        args = command
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     else:
-        create = asyncio.create_subprocess_exec
         # 简化处理：当 shell=False 时仅将 command 作为可执行名，不拆分参数
-        args = command
-
-    proc = await create(
-        args,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+        proc = await asyncio.create_subprocess_exec(
+            command,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
     try:
         if timeout:

@@ -16,7 +16,7 @@ async def test_arender_and_validate_server_missing_input_keeps_original() -> Non
     因此应成功返回校验后的模型，且 env 中仍保留占位符字符串。
     覆盖 computer.py 中对未定义输入的 warning 日志路径。
     """
-    comp = Computer(inputs=[], mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=[], mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     params = StdioServerParameters(
         command="echo",
@@ -38,7 +38,7 @@ async def test_boot_up_render_error_keeps_original_config(monkeypatch: pytest.Mo
     """
     让渲染器抛出异常，覆盖 boot_up 中的异常分支（115-118），应当保留原配置继续初始化。
     """
-    comp = Computer(inputs=[], mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=[], mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     params = StdioServerParameters(
         command="echo",

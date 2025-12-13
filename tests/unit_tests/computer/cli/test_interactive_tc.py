@@ -66,6 +66,7 @@ class _FakeMgr:
     def get_server_config(self, name: str):  # noqa: D401
         class _Cfg:
             tool_meta = {}
+
         return _Cfg()
 
     # 新增: 兼容 Manager.get_tool_meta 新接口 / new API for merged tool meta
@@ -99,7 +100,7 @@ async def test_tc_json_calls_execute(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     # 安装伪 session 与 stdout
     cmd = (
-        'tc {"robot_id":"r","req_id":"r01","computer":"c","tool_name":"tool/x","params":{"a":1},"timeout":3}',
+        'tc {"agent":"r","req_id":"r01","computer":"c","tool_name":"tool/x","params":{"a":1},"timeout":3}',
         "exit",
     )
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(list(cmd)))
@@ -107,6 +108,7 @@ async def test_tc_json_calls_execute(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     # 构建 Computer 与 Manager 桩
     comp = Computer(
+        name="test_it_c",
         inputs=set(),
         mcp_servers=set(),
         auto_connect=False,
@@ -154,7 +156,7 @@ async def test_tc_from_file_and_no_manager_guard(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(cmds))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test_it_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     # 不设置 manager，用于覆盖提示分支
 
     await _interactive_loop(comp)

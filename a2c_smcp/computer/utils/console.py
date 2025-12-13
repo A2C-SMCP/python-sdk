@@ -3,6 +3,7 @@
 - 统一提供一个可被全局引用的 rich.Console 实例。
 - 支持在运行时切换 no_color 以适配非 TTY/IDE 控制台。
 """
+
 from __future__ import annotations
 
 from rich.console import Console

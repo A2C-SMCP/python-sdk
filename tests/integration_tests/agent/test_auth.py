@@ -41,7 +41,7 @@ def test_default_agent_auth_provider_basic():
 
     # 验证 Agent 配置
     config = auth.get_agent_config()
-    assert config["agent_id"] == agent_id
+    assert config["agent"] == agent_id
     assert config["office_id"] == office_id
 
 

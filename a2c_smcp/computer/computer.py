@@ -35,13 +35,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
 from mcp.shared.session import RequestResponder
-from mcp.types import (
-    CallToolResult,
-    ResourceListChangedNotification,
-    ResourceUpdatedNotification,
-    TextContent,
-    ToolListChangedNotification,
-)
+from mcp.types import CallToolResult, ResourceListChangedNotification, ResourceUpdatedNotification, TextContent, ToolListChangedNotification
 from prompt_toolkit import PromptSession
 from pydantic import BaseModel, TypeAdapter
 
@@ -65,6 +59,7 @@ if TYPE_CHECKING:
 class Computer(BaseComputer[PromptSession]):
     def __init__(
         self,
+        name: str,
         inputs: set[MCPServerInput] | None = None,
         mcp_servers: set[MCPServerConfig] | None = None,
         auto_connect: bool = True,
@@ -90,6 +85,7 @@ class Computer(BaseComputer[PromptSession]):
             auto_reconnect (bool): 是否自动重连。Whether to auto reconnect.
             confirm_callback (Callable[[str, str, str, dict], bool] | None): 工具调用二次确认回调
         """
+        self.name = name
         self.mcp_manager: MCPServerManager | None = None
         self._inputs: set[MCPServerInput] = set(inputs or set())
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
@@ -106,7 +102,7 @@ class Computer(BaseComputer[PromptSession]):
 
         # 中文: 工具调用历史（仅保存最近10条），使用 asyncio.Lock 确保跨协程安全
         # English: Tool call history (keep last 10). Protected by asyncio.Lock for cross-coroutine safety
-        self._tool_call_history = deque(maxlen=10)
+        self._tool_call_history: deque = deque(maxlen=10)
         self._tool_call_history_lock = asyncio.Lock()
         # 窗口缓存（仅记录满足 WindowURI 的资源 URI，避免无关资源导致刷新）
         # Windows cache (only URIs that conform to WindowURI to avoid irrelevant refresh triggers)
@@ -189,7 +185,7 @@ class Computer(BaseComputer[PromptSession]):
         目前仅处理工具列表变化：若存在 Socket.IO 连接，则向服务端发送 UPDATE_TOOL_LIST_EVENT。
         其它变化类型暂未实现，打印 Warning 日志。
         """
-        if isinstance(message.root, ToolListChangedNotification):
+        if isinstance(getattr(message, "root", None), ToolListChangedNotification):
             client = self.socketio_client
             if client is None:
                 logger.debug("Socket.IO 客户端不存在或已释放，忽略更新上报")
@@ -200,7 +196,7 @@ class Computer(BaseComputer[PromptSession]):
                 await client.emit_update_tool_list()
             except Exception as e:  # pragma: no cover
                 logger.error(f"上报工具变更失败: {e}")
-        elif isinstance(message.root, ResourceListChangedNotification):
+        elif isinstance(getattr(message, "root", None), ResourceListChangedNotification):
             # 仅当 window:// 集合发生变化时触发刷新；否则记录日志以便后续策略调整
             client = self.socketio_client
             if client is None:
@@ -234,14 +230,14 @@ class Computer(BaseComputer[PromptSession]):
                     "收到 ResourceListChangedNotification 但 WindowURI 未变化，跳过刷新 / "
                     "Resource list changed but WindowURI set unchanged, skip refresh",
                 )
-        elif isinstance(message.root, ResourceUpdatedNotification):
+        elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
             # 资源内容更新：若是 window:// 则直接触发刷新（不比较集合，降低延迟）
             client = self.socketio_client
             if client is None:
                 logger.debug("Socket.IO 客户端不存在或已释放，忽略桌面刷新上报")
                 return
             try:
-                uri = getattr(getattr(message.root, "params", None), "uri", None)
+                uri = getattr(getattr(getattr(message, "root", None), "params", None), "uri", None)
                 if uri is None or not is_window_uri(str(uri)):
                     logger.debug("收到资源更新但非 WindowURI，放行 / Non-window resource updated, ignore")
                     return
@@ -318,7 +314,7 @@ class Computer(BaseComputer[PromptSession]):
                 raw = server
                 rendered = await self._config_render.arender(raw, _resolve_input_by_id)
                 # 使用 TypeAdapter 将 union 类型解析为具体模型
-                validated = TypeAdapter(MCPServerConfig).validate_python(rendered)
+                validated: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(rendered)
             else:
                 raw = server.model_dump(mode="json")
                 rendered = await self._config_render.arender(raw, _resolve_input_by_id)
@@ -371,7 +367,7 @@ class Computer(BaseComputer[PromptSession]):
         注意：更新 inputs 只会影响后续的渲染，不会自动对已激活的配置进行重新渲染/重启。
         如需应用到已存在的服务，可结合 aadd_or_aupdate_server 重新提交配置达到热更新效果。
         """
-        self._inputs = set(inputs or set())
+        self._inputs = inputs or set()
         # 复用传入或已有的会话，以便后续解析共享同一 Session
         # Reuse provided or existing session so subsequent resolving shares the same session
         sess = session or getattr(self._input_resolver, "session", None)
@@ -544,6 +540,8 @@ class Computer(BaseComputer[PromptSession]):
         Returns:
             list[SMCPTool]: 工具列表。Tool list.
         """
+        if not self.mcp_manager:
+            raise RuntimeError("当前MCP Manger为空")
         # 从Manager获取全部工具
         tools = [t async for t in self.mcp_manager.available_tools()]
 
@@ -591,7 +589,9 @@ class Computer(BaseComputer[PromptSession]):
                         meta[k] = v
             if t.annotations:
                 meta["MCP_TOOL_ANNOTATION"] = json.dumps(t.annotations.model_dump(mode="json"))
-            return SMCPTool(name=t.name, description=t.description, params_schema=t.inputSchema, return_schema=t.outputSchema, meta=meta)
+            return SMCPTool(
+                name=t.name, description=t.description or "None", params_schema=t.inputSchema, return_schema=t.outputSchema, meta=meta
+            )
 
         mcp_tools = [convert_tool(t) for t in tools]
         return mcp_tools
@@ -610,6 +610,8 @@ class Computer(BaseComputer[PromptSession]):
         Returns:
             CallToolResult: MCP协议的标准返回
         """
+        if not self.mcp_manager:
+            raise RuntimeError("当前MCP Manager为空")
         # 中文: 统一记录输出，保证任何返回路径都能记录历史
         # English: Unify return to ensure we always record call history
         server_name, tool_name = await self.mcp_manager.avalidate_tool_call(tool_name, parameters)

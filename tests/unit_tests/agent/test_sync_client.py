@@ -149,8 +149,8 @@ class TestSMCPAgentClient:
         # Verify cancel request was sent
         mock_emit.assert_called_once()
         args, kwargs = mock_emit.call_args
-        assert args[0] == CANCEL_TOOL_CALL_EVENT
-        assert args[2] == SMCP_NAMESPACE  # namespace 是第三个位置参数
+        assert args[1] == CANCEL_TOOL_CALL_EVENT
+        assert args[3] == SMCP_NAMESPACE  # namespace 是第三个位置参数
 
     @patch("socketio.Client.call")
     def test_get_tools_from_computer_success(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
@@ -364,3 +364,78 @@ class TestSMCPAgentClient:
 
         with pytest.raises(AssertionError, match="无效的计算机ID"):
             client.validate_office_data(data)
+
+    @patch("socketio.Client.call")
+    def test_get_computers_in_office_success(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """测试成功获取房间内的Computer列表 / Test successfully get computers list in office"""
+        office_id = "test_office"
+        req_id = f"list_computers_test_agent_{office_id}"
+
+        # 模拟响应包含多个会话，包括computer和agent角色
+        # Mock response with multiple sessions including computer and agent roles
+        mock_response = {
+            "req_id": req_id,
+            "sessions": [
+                {"sid": "comp1", "role": "computer", "computer_id": "computer-1"},
+                {"sid": "comp2", "role": "computer", "computer_id": "computer-2"},
+                {"sid": "agent1", "role": "agent", "agent_id": "agent-1"},
+            ],
+        }
+        mock_call.return_value = mock_response
+
+        computers = client.get_computers_in_office(office_id)
+
+        # 验证只返回computer角色的会话 / Verify only computer role sessions are returned
+        assert len(computers) == 2
+        assert all(c["role"] == "computer" for c in computers)
+        assert computers[0]["computer_id"] == "computer-1"
+        assert computers[1]["computer_id"] == "computer-2"
+
+        # 验证调用参数 / Verify call arguments
+        mock_call.assert_called_once()
+
+    @patch("socketio.Client.call")
+    def test_get_computers_in_office_empty(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """测试房间内没有Computer时返回空列表 / Test return empty list when no computers in office"""
+        office_id = "test_office"
+        req_id = f"list_computers_test_agent_{office_id}"
+
+        # 模拟响应只有agent角色，没有computer
+        # Mock response with only agent role, no computer
+        mock_response = {
+            "req_id": req_id,
+            "sessions": [
+                {"sid": "agent1", "role": "agent", "agent_id": "agent-1"},
+            ],
+        }
+        mock_call.return_value = mock_response
+
+        computers = client.get_computers_in_office(office_id)
+
+        # 验证返回空列表 / Verify empty list is returned
+        assert len(computers) == 0
+
+    @patch("socketio.Client.call")
+    def test_get_computers_in_office_invalid_response(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """测试响应req_id不匹配时抛出异常 / Test raise exception when response req_id mismatches"""
+        office_id = "test_office"
+
+        # 模拟响应的req_id不匹配
+        # Mock response with mismatched req_id
+        mock_response = {
+            "req_id": "wrong_req_id",
+            "sessions": [],
+        }
+        mock_call.return_value = mock_response
+
+        with pytest.raises(ValueError, match="Invalid response with mismatched req_id"):
+            client.get_computers_in_office(office_id)
+
+    @patch("socketio.Client.call")
+    def test_get_computers_in_office_timeout(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """测试请求超时时抛出异常 / Test raise exception on timeout"""
+        office_id = "test_office"
+        mock_call.side_effect = TimeoutError("Request timeout")
+
+        with pytest.raises(TimeoutError):
+            client.get_computers_in_office(office_id, timeout=1)

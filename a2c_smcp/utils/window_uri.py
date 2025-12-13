@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Any, Self
+from typing import Any, Self, cast
 
 from pydantic import AnyUrl, GetCoreSchemaHandler, GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
@@ -104,12 +104,12 @@ class WindowURI:
             return None
         raw = val
         try:
-            val = int(raw)
+            int_val = int(raw)
         except Exception as e:
             raise ValueError(f"Invalid priority value: {raw}") from e
-        if not (0 <= val <= 100):
+        if not (0 <= int_val <= 100):
             raise ValueError(f"priority must be in [0, 100], got: {val}")
-        return val
+        return int_val
 
     @cached_property
     def fullscreen(self) -> bool | None:
@@ -187,7 +187,7 @@ class WindowURI:
             if isinstance(value, cls):
                 return value
             try:
-                return cls(value)
+                return cls(cast(str, value))
             except Exception as e:
                 raise ValueError(f"Invalid WindowURI: {value}") from e
 

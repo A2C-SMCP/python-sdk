@@ -13,7 +13,7 @@ select = [
     "ANN", # flake8-annotations
     "COM", # flake8-commas: enforce trailing commas in multiline
 ]
-extend-ignore = ["UP009", "ANN401"]  # 忽略 UP009 ANN401(Any)
+extend-ignore = ["UP009", "ANN401", "COM812"]  # 忽略 UP009 ANN401(Any) COM812(与formatter冲突)
 
 [lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Unused imports

@@ -92,11 +92,14 @@ async def interactive_loop(
             help_table.add_row("start <name>|all", "启动客户端 / start client(s)")
             help_table.add_row("stop <name>|all", "停止客户端 / stop client(s)")
             help_table.add_row("inputs load <@file>", "从文件加载 inputs 定义 / load inputs")
+            help_table.add_row("inputs list", "查看当前inputs的定义 / show inputs")
             # 中文: 新增当前 inputs 值的增删改查命令
             # English: Add CRUD commands for current inputs values
             help_table.add_row("inputs value list", "列出当前 inputs 的缓存值 / list current cached input values")
             help_table.add_row("inputs value get <id>", "获取指定 id 的值 / get cached value by id")
-            help_table.add_row("inputs value set <id> <json|text>", "设置指定 id 的值 / set cached value by id")
+            help_table.add_row(
+                "inputs value set <id> [<json|text>]", "设置指定 id 的值（省略值则用 default）/ set cached value (omit to use default)"
+            )
             help_table.add_row("inputs value rm <id>", "删除指定 id 的值 / remove cached value by id")
             help_table.add_row("inputs value clear [<id>]", "清空全部或指定 id 的缓存 / clear all or one cached value")
             help_table.add_row("tc <json|@file>", "使用与 Socket.IO 一致的 JSON 结构调试工具 / debug tool with Socket.IO-compatible JSON")
@@ -169,12 +172,12 @@ async def interactive_loop(
                         data = json.loads(Path(payload[1:]).read_text(encoding="utf-8"))
                     else:
                         data = json.loads(payload)
-                    validated = TypeAdapter(SMCPServerConfigDict).validate_python(data)
+                    validated: dict[str, Any] = TypeAdapter(SMCPServerConfigDict).validate_python(data)
                     try:
                         await comp.aadd_or_aupdate_server(validated, session=session)
                         console.print("[green]✅ 服务器配置已添加/更新并正在启动 / Server config added/updated and starting[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                     except Exception as e:
                         console.print(f"[red]❌ 添加/更新服务器失败 / Failed to add/update server: {e}[/red]")
                 elif sub in {"rm", "remove"}:
@@ -184,7 +187,7 @@ async def interactive_loop(
                         await comp.aremove_server(parts[2])
                         console.print("[green]已移除配置 / Removed[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 else:
                     console.print("[yellow]未知的 server 子命令 / Unknown subcommand[/yellow]")
 
@@ -226,11 +229,11 @@ async def interactive_loop(
                     else:
                         data = json.loads(Path(parts[2][1:]).read_text(encoding="utf-8"))
                         raw_items = TypeAdapter(list[SMCPServerInputDict]).validate_python(data)
-                        models = {TypeAdapter(MCPServerInputModel).validate_python(item) for item in raw_items}
+                        models: set[MCPServerInputModel] = {TypeAdapter(MCPServerInputModel).validate_python(item) for item in raw_items}
                         comp.update_inputs(models)
                         console.print("[green]Inputs 已更新 / Inputs updated[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 elif sub == "add":
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs add <json|@file.json>[/yellow]")
@@ -249,7 +252,7 @@ async def interactive_loop(
                             comp.add_or_update_input(TypeAdapter(MCPServerInputModel).validate_python(item))
                         console.print("[green]Input(s) 已添加/更新 / Added/Updated[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 elif sub in {"update"}:
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs update <json|@file.json>[/yellow]")
@@ -268,7 +271,7 @@ async def interactive_loop(
                             comp.add_or_update_input(item)
                         console.print("[green]Input(s) 已添加/更新 / Added/Updated[/green]")
                         if smcp_client:
-                            await smcp_client.emit_update_mcp_config()
+                            await smcp_client.emit_update_config()
                 elif sub in {"rm", "remove"}:
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs rm <id>[/yellow]")
@@ -277,21 +280,21 @@ async def interactive_loop(
                         if ok:
                             console.print("[green]已移除 / Removed[/green]")
                             if smcp_client:
-                                await smcp_client.emit_update_mcp_config()
+                                await smcp_client.emit_update_config()
                         else:
                             console.print("[yellow]不存在的 id / Not found[/yellow]")
                 elif sub == "get":
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs get <id>[/yellow]")
                     else:
-                        item = comp.get_input(parts[2])
-                        if item is None:
+                        input_get_items = comp.get_input(parts[2])
+                        if input_get_items is None:
                             console.print("[yellow]不存在的 id / Not found[/yellow]")
                         else:
-                            console.print_json(data=item.model_dump(mode="json"))
+                            console.print_json(data=input_get_items.model_dump(mode="json"))
                 elif sub == "list":
-                    items = [i.model_dump(mode="json") for i in comp.inputs]
-                    console.print_json(data=items)
+                    input_items = [i.model_dump(mode="json") for i in comp.inputs]
+                    console.print_json(data=input_items)
                 elif sub == "value":
                     if len(parts) < 3:
                         console.print("[yellow]用法: inputs value <list|get|set|rm|clear> ...[/yellow]")
@@ -313,15 +316,40 @@ async def interactive_loop(
                                     except Exception:
                                         console.print(repr(val))
                         elif vsub == "set":
-                            if len(parts) < 5:
-                                console.print("[yellow]用法: inputs value set <id> <json|text>[/yellow]")
+                            if len(parts) < 4:
+                                console.print("[yellow]用法: inputs value set <id> [<json|text>][/yellow]")
+                                console.print("[dim]提示: 如果不提供值，将使用 default 值 / Hint: omit value to use default[/dim]")
                             else:
                                 target_id = parts[3]
-                                payload = raw.split(" ", 4)[4]
-                                try:
-                                    data = json.loads(payload)
-                                except Exception:
-                                    data = payload
+                                # 中文: 如果只有 4 个部分（inputs value set <id>），则尝试使用 default 值
+                                # English: If only 4 parts (inputs value set <id>), try to use default value
+                                if len(parts) == 4:
+                                    # 获取 input 定义 / Get input definition
+                                    input_def = comp.get_input(target_id)
+                                    if input_def is None:
+                                        console.print("[yellow]不存在的 id / Not found[/yellow]")
+                                        continue
+                                    from a2c_smcp.computer.mcp_clients.model import MCPServerCommandInput
+
+                                    if isinstance(input_def, MCPServerCommandInput):
+                                        console.print(
+                                            f"[yellow]Input '{target_id}' 是 command 类型，不支持 default 值 / is command type, "
+                                            f"no default support[/yellow]"
+                                        )
+                                        console.print("[dim]用法: inputs value set <id> <json|text>[/dim]")
+                                        continue
+                                    if input_def.default is None:
+                                        console.print(f"[yellow]Input '{target_id}' 没有 default 值 / has no default value[/yellow]")
+                                        console.print("[dim]用法: inputs value set <id> <json|text>[/dim]")
+                                        continue
+                                    data = input_def.default
+                                    console.print(f"[dim]使用 default 值 / Using default value: {repr(data)}[/dim]")
+                                else:
+                                    payload = raw.split(" ", 4)[4]
+                                    try:
+                                        data = json.loads(payload)
+                                    except Exception:
+                                        data = payload
                                 ok = comp.set_input_value(target_id, data)
                                 if ok:
                                     console.print("[green]已设置 / Set[/green]")
@@ -381,8 +409,15 @@ async def interactive_loop(
                     elif len(parts) < 4:
                         console.print("[yellow]用法: socket join <office_id> <computer_name>[/yellow]")
                     else:
-                        await smcp_client.join_office(parts[2], parts[3])
-                        console.print("[green]已加入房间 / Joined office[/green]")
+                        # 如果指定了computer_name 会动态地修改运行时computer的name
+                        comp.name = parts[3]
+                        try:
+                            await smcp_client.join_office(parts[2])
+                            console.print("[green]已加入房间 / Joined office[/green]")
+                        except RuntimeError as e:
+                            console.print(f"[red]{e}[/red]")
+                        except Exception as e:
+                            console.print(f"[red]加入房间失败 / Failed to join office: {e}[/red]")
                 elif sub == "leave":
                     if not smcp_client or not getattr(smcp_client, "connected", False):
                         console.print("[yellow]未连接 / Not connected[/yellow]")
@@ -400,7 +435,7 @@ async def interactive_loop(
                     if not smcp_client:
                         console.print("[yellow]未连接 Socket.IO，已跳过 / Not connected, skip[/yellow]")
                     else:
-                        await smcp_client.emit_update_mcp_config()
+                        await smcp_client.emit_update_config()
                         console.print("[green]已触发配置更新通知 / Update notification emitted[/green]")
                 else:
                     console.print("[yellow]未知的 notify 子命令 / Unknown subcommand[/yellow]")
@@ -479,8 +514,8 @@ async def interactive_loop(
                         except Exception:
                             n = None
                     history = await comp.aget_tool_call_history()
-                    items = list(history)[-n:] if n is not None and n > 0 else list(history)
-                    console.print_json(data=items)
+                    tc_items = list(history)[-n:] if n is not None and n > 0 else list(history)
+                    console.print_json(data=tc_items)
                 except Exception as e:  # pragma: no cover
                     console.print(f"[red]❌ 读取历史失败 / Failed to read history: {e}[/red]")
 

@@ -185,12 +185,9 @@ async def test_async_agent_tool_call(async_socketio_server, async_server_port: i
         # 等待连接稳定 / Wait for connection to stabilize
         await asyncio.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = async_mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 调用 echo 工具 / Call echo tool
         result = await agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer="test-computer-async-2",
             tool_name="echo",
             params={"message": "Hello, Async World!"},
             timeout=5,
@@ -203,7 +200,7 @@ async def test_async_agent_tool_call(async_socketio_server, async_server_port: i
 
         # 调用 add 工具 / Call add tool
         result = await agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer="test-computer-async-2",
             tool_name="add",
             params={"a": 15, "b": 25},
             timeout=5,
@@ -260,11 +257,8 @@ async def test_async_agent_get_tools_and_desktop(async_socketio_server, async_se
 
         await asyncio.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = async_mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 获取工具列表 / Get tools list
-        tools_response = await agent_client.get_tools_from_computer(computer_sid, timeout=5)
+        tools_response = await agent_client.get_tools_from_computer("test-computer-async-3", timeout=5)
 
         # 验证工具列表 / Verify tools list
         assert tools_response["req_id"] is not None
@@ -273,7 +267,7 @@ async def test_async_agent_get_tools_and_desktop(async_socketio_server, async_se
         assert tools_response["tools"][1]["name"] == "add"
 
         # 获取桌面信息 / Get desktop info
-        desktop_response = await agent_client.get_desktop_from_computer(computer_sid, timeout=5)
+        desktop_response = await agent_client.get_desktop_from_computer("test-computer-async-3", timeout=5)
 
         # 验证桌面信息 / Verify desktop info
         assert desktop_response["req_id"] is not None
@@ -392,14 +386,11 @@ async def test_async_agent_multiple_tool_calls(async_socketio_server, async_serv
 
         await asyncio.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = async_mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 连续调用多个工具 / Call multiple tools consecutively
         results = []
         for i in range(3):
             result = await agent_client.emit_tool_call(
-                computer=computer_sid,
+                computer="test-computer-async-5",
                 tool_name="add",
                 params={"a": i, "b": i + 1},
                 timeout=5,
@@ -412,6 +403,100 @@ async def test_async_agent_multiple_tool_calls(async_socketio_server, async_serv
             assert result.isError is False
             expected = i + (i + 1)
             assert f"Result: {expected}" in result.content[0].text
+
+    finally:
+        await agent_client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_async_agent_list_room(async_socketio_server, async_server_port: int, async_mock_computer_client):
+    """
+    中文:
+      - 验证异步 Agent 调用 LIST_ROOM 事件
+      - 验证返回房间内所有会话信息（Agent 和 Computer）
+      - 验证会话信息包含正确的 sid、name、role、office_id
+    English:
+      - Verify async Agent calls LIST_ROOM event
+      - Verify returns all session info in the room (Agent and Computer)
+      - Verify session info contains correct sid, name, role, office_id
+    """
+    from a2c_smcp.smcp import LIST_ROOM_EVENT
+
+    auth_provider = DefaultAgentAuthProvider(
+        agent_id="test-agent-async-list-room",
+        office_id="office-list-room-e2e",
+    )
+
+    agent_client = AsyncSMCPAgentClient(
+        auth_provider=auth_provider,
+        event_handler=None,
+    )
+
+    try:
+        # 连接并加入办公室 / Connect and join office
+        await agent_client.connect_to_server(f"http://127.0.0.1:{async_server_port}")
+        await asyncio.sleep(0.1)
+
+        office_id = "office-list-room-e2e"
+        await agent_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "name": "agent-list-test", "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+
+        # Computer 加入办公室 / Computer joins office
+        await async_mock_computer_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "name": "computer-list-test", "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+
+        # 等待连接稳定 / Wait for connection to stabilize
+        await asyncio.sleep(0.2)
+
+        # 获取 Agent 和 Computer 的 SID / Get Agent and Computer SID
+        agent_sid = agent_client.get_sid(namespace=SMCP_NAMESPACE)
+        computer_sid = async_mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
+
+        # 调用 LIST_ROOM 事件 / Call LIST_ROOM event
+        result = await agent_client.call(
+            LIST_ROOM_EVENT,
+            {
+                "agent": agent_sid,
+                "req_id": "list_room_req_e2e",
+                "office_id": office_id,
+            },
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+
+        # 验证返回结果 / Verify result
+        assert result is not None
+        assert "sessions" in result
+        assert "req_id" in result
+        assert result["req_id"] == "list_room_req_e2e"
+
+        # 验证会话列表 / Verify session list
+        sessions = result["sessions"]
+        assert len(sessions) == 2  # 1 Agent + 1 Computer
+
+        # 提取角色列表 / Extract role list
+        roles = [s["role"] for s in sessions]
+        assert "agent" in roles
+        assert "computer" in roles
+
+        # 验证 Agent 会话信息 / Verify Agent session info
+        agent_session = next(s for s in sessions if s["role"] == "agent")
+        assert agent_session["sid"] == agent_sid
+        assert agent_session["name"] == "agent-list-test"
+        assert agent_session["office_id"] == office_id
+
+        # 验证 Computer 会话信息 / Verify Computer session info
+        computer_session = next(s for s in sessions if s["role"] == "computer")
+        assert computer_session["sid"] == computer_sid
+        assert computer_session["office_id"] == office_id
 
     finally:
         await agent_client.disconnect()

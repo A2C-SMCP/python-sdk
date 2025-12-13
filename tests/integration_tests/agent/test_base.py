@@ -160,7 +160,7 @@ def test_create_tool_call_request():
     assert req["computer"] == computer
     assert req["tool_name"] == tool_name
     assert req["params"] == params
-    assert req["robot_id"] == agent_id
+    assert req["agent"] == agent_id
     assert req["timeout"] == timeout
     assert "req_id" in req
     assert len(req["req_id"]) == 32  # UUID hex 长度
@@ -183,7 +183,7 @@ def test_create_get_tools_request():
     # 验证返回的是字典且包含所有必需字段
     assert isinstance(req, dict)
     assert req["computer"] == computer
-    assert req["robot_id"] == agent_id
+    assert req["agent"] == agent_id
     assert "req_id" in req
     assert len(req["req_id"]) == 32  # UUID hex 长度
 
@@ -444,7 +444,7 @@ def test_sio_param_passed_to_handlers():
         "agent": None,
     }
     client.handle_computer_enter_office(enter_data)
-    
+
     assert len(handler.enter_clients) == 1
     assert handler.enter_clients[0] is client
     assert isinstance(handler.enter_clients[0], MockAgentClient)
@@ -456,7 +456,7 @@ def test_sio_param_passed_to_handlers():
         "agent": None,
     }
     client.handle_computer_leave_office(leave_data)
-    
+
     assert len(handler.leave_clients) == 1
     assert handler.leave_clients[0] is client
 
@@ -465,7 +465,7 @@ def test_sio_param_passed_to_handlers():
         "computer": "test-computer-3",
     }
     client.handle_computer_update_config(update_data)
-    
+
     assert len(handler.update_clients) == 1
     assert handler.update_clients[0] is client
 
@@ -483,7 +483,7 @@ def test_sio_param_passed_to_handlers():
         "req_id": "test-req-id",
     }
     client.process_tools_response(response, "test-computer-4")
-    
+
     assert len(handler.tools_clients) == 1
     assert handler.tools_clients[0] is client
 
@@ -508,18 +508,18 @@ def test_sio_param_client_properties_accessible():
 
     # 验证可以通过sio访问client属性 / Verify can access client properties via sio
     passed_client = handler.enter_clients[0]
-    
+
     # 验证auth_provider可访问 / Verify auth_provider is accessible
     assert hasattr(passed_client, "auth_provider")
     assert passed_client.auth_provider is not None
     agent_config = passed_client.auth_provider.get_agent_config()
-    assert agent_config["agent_id"] == agent_id
+    assert agent_config["agent"] == agent_id
     assert agent_config["office_id"] == office_id
-    
+
     # 验证event_handler可访问 / Verify event_handler is accessible
     assert hasattr(passed_client, "event_handler")
     assert passed_client.event_handler is handler
-    
+
     # 验证方法可调用 / Verify methods are callable
     assert hasattr(passed_client, "validate_emit_event")
     assert callable(passed_client.validate_emit_event)

@@ -256,7 +256,8 @@ def create_app(is_json_response_enabled=False, event_store: EventStore | None = 
 
     # Create the session manager
     security_settings = TransportSecuritySettings(
-        allowed_hosts=["127.0.0.1:*", "localhost:*"], allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
+        allowed_hosts=["127.0.0.1:*", "localhost:*"],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
     )
     session_manager = StreamableHTTPSessionManager(
         app=server,
@@ -525,7 +526,8 @@ def make_server_app() -> Starlette:
     """创建测试 Starlette app，带有 SSE 传输\nCreate test Starlette app with SSE transport"""
     # 配置测试安全设置 Configure security for testing
     security_settings: TransportSecuritySettings = TransportSecuritySettings(
-        allowed_hosts=["127.0.0.1:*", "localhost:*"], allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
+        allowed_hosts=["127.0.0.1:*", "localhost:*"],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
     )
     sse: SseServerTransport = SseServerTransport("/messages/", security_settings=security_settings)
     server: SseServerTest = SseServerTest()

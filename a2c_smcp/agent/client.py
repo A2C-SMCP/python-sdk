@@ -11,7 +11,7 @@
 from typing import Any
 
 from mcp.types import CallToolResult, TextContent
-from socketio import AsyncClient  # type: ignore[import-untyped]
+from socketio import AsyncClient
 
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     GET_DESKTOP_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    LIST_ROOM_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -31,6 +32,8 @@ from a2c_smcp.smcp import (
     GetDeskTopRet,
     GetToolsRet,
     LeaveOfficeNotification,
+    ListRoomReq,
+    SessionInfo,
     UpdateMCPConfigNotification,
 )
 from a2c_smcp.utils.logger import logger
@@ -83,9 +86,9 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         # Validate event legality
         self.validate_emit_event(event)
 
-        # 调用父类方法
-        # Call parent class method
-        await super().emit(event, data, namespace, callback)
+        # 调用 AsyncClient 的 emit 方法
+        # Call AsyncClient's emit method
+        await AsyncClient.emit(self, event, data, namespace, callback)
 
     async def call(self, event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
         """
@@ -105,9 +108,9 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         # Validate event legality
         self.validate_emit_event(event)
 
-        # 调用父类方法
-        # Call parent class method
-        return await super().call(event, data, namespace, timeout)
+        # 调用 AsyncClient 的 call 方法
+        # Call AsyncClient's call method
+        return await AsyncClient.call(self, event, data, namespace, timeout)
 
     # 事件合法性校验复用 BaseAgentClient.validate_emit_event
     # Reuse BaseAgentClient.validate_emit_event for event validation
@@ -164,13 +167,13 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         try:
             logger.debug(f"Calling tool {tool_name} on computer {computer}")
             res = await self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=SMCP_NAMESPACE)
-            return CallToolResult.model_validate(res)
+            return CallToolResult.model_validate(res, by_name=True)
 
         except TimeoutError:
             # 发送取消请求
             # Send cancel request
             agent_config = self.auth_provider.get_agent_config()
-            cancel_data = AgentCallData(robot_id=agent_config["agent_id"], req_id=req["req_id"])
+            cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req["req_id"])
             await self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=SMCP_NAMESPACE)
             return self.handle_tool_call_timeout(req["req_id"])
 
@@ -187,7 +190,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         Async get tools list from specified computer
 
         Args:
-            computer (str): 计算机ID / Computer ID
+            computer (str): 计算机名称 / Computer Name
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
@@ -288,7 +291,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         response = await self.call(GET_DESKTOP_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
-        return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])  # type: ignore[return-value]
+        return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])
 
     async def _on_desktop_updated(self, data: dict) -> None:
         """
@@ -305,3 +308,39 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             self.process_desktop_response(ret, computer)
         except Exception as e:
             logger.error(f"Error handling desktop updated notification: {e}")
+
+    async def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
+        """
+        异步获取指定房间内的所有Computer信息
+        Async get all computers info in the specified office
+
+        Args:
+            office_id (str): 房间ID / Office ID
+            timeout (int): 超时时间 / Timeout duration
+
+        Returns:
+            list[SessionInfo]: Computer信息列表 / List of computer info
+        """
+        agent_config = self.auth_provider.get_agent_config()
+        req = ListRoomReq(
+            agent=agent_config["agent"],
+            req_id=f"list_computers_{agent_config['agent']}_{office_id}",
+            office_id=office_id,
+        )
+
+        try:
+            logger.debug(f"Getting computers in office {office_id}")
+            response = await self.call(LIST_ROOM_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
+
+            # 验证响应 / Validate response
+            if response.get("req_id") != req["req_id"]:
+                raise ValueError("Invalid response with mismatched req_id")
+
+            # 过滤出Computer角色的会话 / Filter sessions with computer role
+            all_sessions = response.get("sessions", [])
+            computers = [s for s in all_sessions if s.get("role") == "computer"]
+            return computers
+
+        except Exception as e:
+            logger.error(f"Failed to get computers in office {office_id}: {e}", exc_info=True)
+            raise

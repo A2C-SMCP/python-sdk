@@ -65,7 +65,7 @@ async def test_cli_with_real_stdio(stdio_params: StdioServerParameters) -> None:
     cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
     cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     await _interactive_loop(comp)
 
@@ -101,7 +101,7 @@ async def test_cli_socket_connect_guided_inputs_without_real_network(monkeypatch
     cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
     cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)
 
     last: FakeSMCPClient = FakeSMCPClient.last  # type: ignore[assignment]
@@ -133,6 +133,7 @@ class _FakeComputer:
 
     def __init__(
         self,
+        name: str,
         inputs: set[Any] | None = None,
         mcp_servers: set[Any] | None = None,
         auto_connect: bool = True,
@@ -141,6 +142,7 @@ class _FakeComputer:
         input_resolver: Any | None = None,
     ) -> None:
         self.init_args = {
+            "name": name,
             "inputs": inputs,
             "mcp_servers": mcp_servers,
             "auto_connect": auto_connect,

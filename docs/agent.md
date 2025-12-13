@@ -101,7 +101,7 @@ class MyAuthProvider(AgentAuthProvider):
 
     def get_agent_config(self) -> AgentConfig:
         return AgentConfig(
-            agent_id=self.agent_id,
+            agent=self.agent_id,
             office_id=self.office_id
         )
 
@@ -119,16 +119,16 @@ from a2c_smcp.agent.types import AgentEventHandler
 from a2c_smcp.smcp import EnterOfficeNotification, LeaveOfficeNotification, UpdateMCPConfigNotification, SMCPTool
 
 class MyEventHandler:
-    def on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
+    def on_computer_enter_office(self, data: EnterOfficeNotification, client: SMCPAgentClient) -> None:
         print(f"Computer {data['computer']} joined office {data['office_id']}")
 
-    def on_computer_leave_office(self, data: LeaveOfficeNotification) -> None:
+    def on_computer_leave_office(self, data: LeaveOfficeNotification, client: SMCPAgentClient) -> None:
         print(f"Computer {data['computer']} left office {data['office_id']}")
 
-    def on_computer_update_config(self, data: UpdateMCPConfigNotification) -> None:
+    def on_computer_update_config(self, data: UpdateMCPConfigNotification, client: SMCPAgentClient) -> None:
         print(f"Computer {data['computer']} updated configuration")
 
-    def on_tools_received(self, computer: str, tools: list[SMCPTool]) -> None:
+    def on_tools_received(self, computer: str, tools: list[SMCPTool], client: SMCPAgentClient) -> None:
         print(f"Received {len(tools)} tools from computer {computer}")
         for tool in tools:
             print(f"  - {tool['name']}: {tool['description']}")
@@ -147,19 +147,19 @@ client = SMCPAgentClient(
 from a2c_smcp.agent.types import AsyncAgentEventHandler
 
 class MyAsyncEventHandler:
-    async def on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
+    async def on_computer_enter_office(self, data: EnterOfficeNotification, client: AsyncSMCPAgentClient) -> None:
         # 异步处理Computer加入事件
         await self.update_computer_registry(data['computer'])
 
-    async def on_computer_leave_office(self, data: LeaveOfficeNotification) -> None:
+    async def on_computer_leave_office(self, data: LeaveOfficeNotification, client: AsyncSMCPAgentClient) -> None:
         # 异步处理Computer离开事件
         await self.cleanup_computer_data(data['computer'])
 
-    async def on_computer_update_config(self, data: UpdateMCPConfigNotification) -> None:
+    async def on_computer_update_config(self, data: UpdateMCPConfigNotification, client: AsyncSMCPAgentClient) -> None:
         # 异步处理配置更新事件
         await self.refresh_computer_config(data['computer'])
 
-    async def on_tools_received(self, computer: str, tools: list[SMCPTool]) -> None:
+    async def on_tools_received(self, computer: str, tools: list[SMCPTool], client: AsyncSMCPAgentClient) -> None:
         # 异步处理工具列表接收事件
         await self.register_tools(computer, tools)
 
@@ -220,12 +220,50 @@ result: CallToolResult = await async_client.emit_tool_call(
 
 ```python
 # 同步获取工具列表
-tools_response = client.get_tools_from_computer("target_computer")
+tools_response = client.get_tools_from_computer("target_computer", timeout=20)
 print(f"Available tools: {len(tools_response['tools'])}")
 
 # 异步获取工具列表
-tools_response = await async_client.get_tools_from_computer("target_computer")
+tools_response = await async_client.get_tools_from_computer("target_computer", timeout=20)
 print(f"Available tools: {len(tools_response['tools'])}")
+```
+
+### 获取桌面信息 / Get Desktop Information
+
+```python
+# 同步获取桌面信息
+desktop_response = client.get_desktop_from_computer(
+    "target_computer",
+    size=10,  # 限制窗口数量
+    window="window://specific_window",  # 可选：指定窗口URI
+    timeout=20
+)
+print(f"Desktop windows: {len(desktop_response['desktops'])}")
+
+# 异步获取桌面信息
+desktop_response = await async_client.get_desktop_from_computer(
+    "target_computer",
+    size=10,
+    window="window://specific_window",
+    timeout=20
+)
+print(f"Desktop windows: {len(desktop_response['desktops'])}")
+```
+
+### 获取房间内的Computer列表 / Get Computers in Office
+
+```python
+from a2c_smcp.smcp import SessionInfo
+
+# 同步获取房间内的所有Computer
+computers: list[SessionInfo] = client.get_computers_in_office("my_office", timeout=20)
+for computer in computers:
+    print(f"Computer: {computer['name']} (sid: {computer['sid']})")
+
+# 异步获取房间内的所有Computer
+computers: list[SessionInfo] = await async_client.get_computers_in_office("my_office", timeout=20)
+for computer in computers:
+    print(f"Computer: {computer['name']} (sid: {computer['sid']})")
 ```
 
 ## 错误处理 / Error Handling
@@ -376,10 +414,10 @@ logger.setLevel(logging.DEBUG)
 
 # 在事件处理器中使用日志
 class LoggingEventHandler:
-    def on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
+    def on_computer_enter_office(self, data: EnterOfficeNotification, client: SMCPAgentClient) -> None:
         logger.info(f"Computer {data['computer']} entered office {data['office_id']}")
         
-    def on_tools_received(self, computer: str, tools: list[SMCPTool]) -> None:
+    def on_tools_received(self, computer: str, tools: list[SMCPTool], client: SMCPAgentClient) -> None:
         logger.debug(f"Received {len(tools)} tools from {computer}")
         for tool in tools:
             logger.debug(f"  Tool: {tool['name']}")

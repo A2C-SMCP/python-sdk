@@ -2,6 +2,7 @@
 """
 测试 a2c_smcp/server/sync_auth.py
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -26,6 +27,7 @@ def test_sync_authenticate_variants():
 
 # has_admin_permission 方法已被移除，管理员权限检查已集成到 authenticate 方法中
 # has_admin_permission method has been removed, admin permission check is now integrated into authenticate method
+
 
 def test_sync_admin_permission_integrated_in_authenticate():
     """测试管理员权限检查已集成到认证方法中 / Test admin permission check integrated in authenticate method"""

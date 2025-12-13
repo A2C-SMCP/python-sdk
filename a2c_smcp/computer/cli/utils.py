@@ -20,6 +20,7 @@ from rich.table import Table
 
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.utils import console as console_util
+from a2c_smcp.smcp import SMCPTool
 
 # 使用全局 Console（引用模块属性，便于后续动态切换）
 # Use a global Console (module attribute reference for dynamic switching)
@@ -121,23 +122,83 @@ def parse_kv_pairs(text: str | None) -> dict[str, Any] | None:
 
 def print_status(comp: Computer) -> None:
     """
-    中文: 打印服务器状态表。
-    English: Print servers status table.
+    中文: 打印系统状态，包括 MCP 服务器状态和 SocketIO 连接状态。
+    English: Print system status including MCP servers and SocketIO connection.
     """
+    # 中文: 打印 SocketIO 连接状态 / English: Print SocketIO connection status
+    client = comp.socketio_client
+    if client:
+        # 中文: 已连接，展示详细信息 / English: Connected, show details
+        conn_table = Table(title="SocketIO 连接状态 / SocketIO Connection Status", show_header=True)
+        conn_table.add_column("属性 / Property", style="cyan", no_wrap=True)
+        conn_table.add_column("值 / Value", style="green")
+
+        # 连接状态
+        is_connected = client.connected
+        conn_table.add_row(
+            "连接状态 / Connected",
+            "[green]✓ 已连接 / Connected[/green]" if is_connected else "[red]✗ 未连接 / Disconnected[/red]",
+        )
+
+        # 连接 URL
+        # 中文: 从 EngineIO 层获取连接 URL / English: Get connection URL from EngineIO layer
+        eio = getattr(client, "eio", None)
+        if eio:
+            base_url = getattr(eio, "base_url", "N/A")
+        else:
+            base_url = "N/A"
+        conn_table.add_row("Server URL", str(base_url))
+
+        # 客户端 ID (EngineIO SID)
+        # 中文: 客户端总 ID，区别于各 Namespace 的 SID / English: Client ID (EngineIO level), different from namespace SIDs
+        client_sid = getattr(eio, "sid", "N/A") if eio else "N/A"
+        conn_table.add_row("Client ID", str(client_sid))
+
+        # Office ID (房间)
+        office_id = getattr(client, "office_id", None)
+        conn_table.add_row(
+            "Office ID (房间)",
+            str(office_id) if office_id else "[dim]未加入 / Not joined[/dim]",
+        )
+
+        console.print(conn_table)
+        console.print()  # 空行分隔
+
+        # 中文: 打印所有已连接的 Namespace 信息 / English: Print all connected namespaces info
+        if client.namespaces:
+            ns_table = Table(title="Namespace 连接信息 / Namespace Connections", show_header=True)
+            ns_table.add_column("Namespace", style="cyan", no_wrap=True)
+            ns_table.add_column("SID", style="yellow")
+
+            for namespace, sid in client.namespaces.items():
+                ns_table.add_row(namespace, str(sid))
+
+            console.print(ns_table)
+            console.print()  # 空行分隔
+        else:
+            console.print("[dim]暂无 Namespace 连接 / No namespace connected[/dim]")
+            console.print()
+    else:
+        # 中文: 未连接 / English: Not connected
+        console.print("[yellow]SocketIO: 目前尚未连接 / Not connected yet[/yellow]")
+        console.print()
+
+    # 中文: 打印 MCP 服务器状态 / English: Print MCP servers status
     if not comp.mcp_manager:
-        console.print("[yellow]Manager 未初始化 / Manager not initialized[/yellow]")
+        console.print("[yellow]MCP Manager 未初始化 / MCP Manager not initialized[/yellow]")
         return
+
     rows = comp.mcp_manager.get_server_status()
-    table = Table(title="服务器状态 / Servers Status")
-    table.add_column("Name")
-    table.add_column("Active")
-    table.add_column("State")
+    table = Table(title="MCP 服务器状态 / MCP Servers Status")
+    table.add_column("Name", style="cyan")
+    table.add_column("Active", style="magenta")
+    table.add_column("State", style="yellow")
     for name, active, state in rows:
-        table.add_row(name, "Yes" if active else "No", state)
+        table.add_row(name, "[green]✓[/green]" if active else "[red]✗[/red]", state)
     console.print(table)
 
 
-def print_tools(tools: list[dict[str, Any]]) -> None:
+def print_tools(tools: list[SMCPTool]) -> None:
     """
     中文: 打印工具列表。
     English: Print tools list.
@@ -145,7 +206,7 @@ def print_tools(tools: list[dict[str, Any]]) -> None:
     table = Table(title="工具列表 / Tools")
     table.add_column("Name")
     table.add_column("Description")
-    table.add_column("Has Return")
+    table.add_column("Json Return")
     for t in tools:
         table.add_row(t.get("name", ""), (t.get("description") or "")[:80], "Yes" if t.get("return_schema") else "No")
     console.print(table)

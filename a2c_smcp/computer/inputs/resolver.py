@@ -81,7 +81,7 @@ class InputResolver(BaseInputResolver[PromptSession]):
         if cfg.default is not None and cfg.default in options:
             default_index = options.index(cfg.default)
         picked = await ainput_pick(msg, options, default_index=default_index, multi=False, session=session)
-        return picked or (cfg.default or "")
+        return str(picked) or (cfg.default or "")
 
     async def _aresolve_command(self, cfg: MCPServerCommandInput) -> Any:
         # 约定: command 为完整可执行字符串，由 shell 执行。args 如存在，暂不拼接，后续可扩展。

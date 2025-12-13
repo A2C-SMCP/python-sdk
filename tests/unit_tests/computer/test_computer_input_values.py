@@ -20,7 +20,7 @@ async def test_computer_input_values_crud_wrappers() -> None:
     # 中文: 准备一个包含一个输入定义的 Computer
     # English: Prepare a Computer with one input definition
     inputs = {MCPServerPromptStringInput(id="api_key", description="desc", default=None, password=True, type="promptString")}
-    comp = Computer(inputs=inputs)
+    comp = Computer(name="test", inputs=inputs)
 
     # 初始应为空 / empty initially
     assert comp.list_input_values() == {}

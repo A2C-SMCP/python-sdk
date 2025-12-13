@@ -14,7 +14,7 @@ from mcp.client.sse import sse_client
 from a2c_smcp.computer.mcp_clients.base_client import BaseMCPClient
 
 
-class SseMCPClient(BaseMCPClient):
+class SseMCPClient(BaseMCPClient[SseServerParameters]):
     def __init__(
         self,
         params: SseServerParameters,

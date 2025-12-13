@@ -135,6 +135,6 @@ class DefaultAgentAuthProvider(AgentAuthProvider):
         Get Agent configuration information
         """
         return AgentConfig(
-            agent_id=self._agent_id,
+            agent=self._agent_id,
             office_id=self._office_id,
         )

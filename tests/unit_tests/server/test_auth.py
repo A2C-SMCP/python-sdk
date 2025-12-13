@@ -2,6 +2,7 @@
 """
 测试 a2c_smcp/server/auth.py
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
@@ -38,6 +39,7 @@ async def test_authenticate_admin_ok_and_missing_or_wrong_key():
 
 # has_admin_permission 方法已被移除，管理员权限检查已集成到 authenticate 方法中
 # has_admin_permission method has been removed, admin permission check is now integrated into authenticate method
+
 
 @pytest.mark.asyncio
 async def test_admin_permission_integrated_in_authenticate():

@@ -93,6 +93,8 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     """
 
     room = "office-async-1"
+    computer_name = "cmp-async-1"
+    agent_name = "agt-async-1"
 
     # 准备通知捕获容器 / Prepare notification captures
     agent_events: dict[str, list[Any]] = {
@@ -165,26 +167,22 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     await asyncio.sleep(0.1)
 
     # 计算机先加入，Agent 后加入，Computer 应收到 Agent 加入的通知 / computer joins first, then agent joins
-    await _join_office(async_computer_client, role="computer", name="cmp-async-1", office_id=room)
+    await _join_office(async_computer_client, role="computer", name=computer_name, office_id=room)
 
     # 等待一下以确保 session 建立 / small wait to ensure session saved
     await asyncio.sleep(0.1)
 
-    await _join_office(async_agent_client, role="agent", name="agt-async-1", office_id=room)
+    await _join_office(async_agent_client, role="agent", name=agent_name, office_id=room)
 
     # Computer 应该收到 Agent 加入的通知 / Computer should receive agent join notification
     assert await _wait_until(lambda: len(computer_events[ENTER_OFFICE_NOTIFICATION]) >= 1)
     assert computer_events[ENTER_OFFICE_NOTIFICATION][0]["office_id"] == room
     assert "agent" in computer_events[ENTER_OFFICE_NOTIFICATION][0]
 
-    # 获取正确的 namespace SID / Get correct namespace SID
-    computer_sid = async_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-    agent_sid = async_agent_client.get_sid(namespace=SMCP_NAMESPACE)
-
     # Agent 拉取工具列表 / Agent get tools
     agent_ret_tools = await async_agent_client.call(
         GET_TOOLS_EVENT,
-        {"computer": computer_sid, "robot_id": agent_sid, "req_id": "req-tools"},
+        {"computer": computer_name, "agent": agent_name, "req_id": "req-tools"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -194,7 +192,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     # Agent 拉取桌面 / Agent get desktop
     agent_ret_desktop = await async_agent_client.call(
         GET_DESKTOP_EVENT,
-        {"computer": computer_sid, "robot_id": agent_sid, "req_id": "req-desk"},
+        {"computer": computer_name, "agent": agent_name, "req_id": "req-desk"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -202,9 +200,9 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     assert agent_ret_desktop.get("req_id") == "req-desk"
 
     # Computer 广播配置更新、工具列表更新、桌面更新 / updates broadcasting
-    await async_computer_client.emit(UPDATE_CONFIG_EVENT, {"computer": computer_sid}, namespace=SMCP_NAMESPACE)
-    await async_computer_client.emit(UPDATE_TOOL_LIST_EVENT, {"computer": computer_sid}, namespace=SMCP_NAMESPACE)
-    await async_computer_client.emit(UPDATE_DESKTOP_EVENT, {"computer": computer_sid}, namespace=SMCP_NAMESPACE)
+    await async_computer_client.emit(UPDATE_CONFIG_EVENT, {"computer": computer_name}, namespace=SMCP_NAMESPACE)
+    await async_computer_client.emit(UPDATE_TOOL_LIST_EVENT, {"computer": computer_name}, namespace=SMCP_NAMESPACE)
+    await async_computer_client.emit(UPDATE_DESKTOP_EVENT, {"computer": computer_name}, namespace=SMCP_NAMESPACE)
 
     assert await _wait_until(lambda: len(agent_events[UPDATE_CONFIG_NOTIFICATION]) >= 1)
     assert await _wait_until(lambda: len(agent_events[UPDATE_TOOL_LIST_NOTIFICATION]) >= 1)
@@ -214,11 +212,11 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     tool_call_ret = await async_agent_client.call(
         TOOL_CALL_EVENT,
         {
-            "computer": computer_sid,
+            "computer": computer_name,
             "tool_name": "echo",
             "params": {"x": 1},
             "timeout": 2,
-            "robot_id": agent_sid,
+            "agent": agent_name,
             "req_id": "req-tc",
         },
         namespace=SMCP_NAMESPACE,
@@ -231,7 +229,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
     # Agent 取消工具调用（广播通知给 Computer） / cancel tool call
     await async_agent_client.emit(
         CANCEL_TOOL_CALL_EVENT,
-        {"robot_id": agent_sid, "req_id": "req-tc"},
+        {"agent": agent_name, "req_id": "req-tc"},
         namespace=SMCP_NAMESPACE,
     )
     assert await _wait_until(lambda: len(computer_events[CANCEL_TOOL_CALL_NOTIFICATION]) >= 1)

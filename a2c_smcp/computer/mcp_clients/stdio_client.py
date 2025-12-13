@@ -12,7 +12,7 @@ from mcp.client.session import MessageHandlerFnT
 from a2c_smcp.computer.mcp_clients.base_client import BaseMCPClient
 
 
-class StdioMCPClient(BaseMCPClient):
+class StdioMCPClient(BaseMCPClient[StdioServerParameters]):
     def __init__(
         self,
         params: StdioServerParameters,

@@ -50,13 +50,13 @@ class DummyAsyncIterator:
 @pytest.mark.asyncio
 async def test_aget_available_tools(monkeypatch):
     # 构造mock工具/Build mock tool
-    tool = ToolFactory.build()
+    tool = ToolFactory.build(description="mock_desc")
     # 构造mock manager/Build mock manager
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.available_tools.return_value = DummyAsyncIterator([tool])
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     # 实例化Computer/Instantiate Computer
-    computer = Computer()
+    computer = Computer(name="test")
     await computer.boot_up()
     # 调用aget_available_tools/Call aget_available_tools
     tools = await computer.aget_available_tools()
@@ -96,7 +96,7 @@ async def test_aget_available_tools_meta_branches(monkeypatch):
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.available_tools.return_value = DummyAsyncIterator([tool1, tool2, tool3, tool4, tool5])
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
-    computer = Computer()
+    computer = Computer(name="test")
     await computer.boot_up()
     tools = await computer.aget_available_tools()
     assert len(tools) == 5
@@ -114,7 +114,7 @@ def test_mcp_servers_readonly(monkeypatch):
     mock_manager = MagicMock(spec=MCPServerManager)
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     config = StdioServerConfig(server_parameters=StdioServerParameters(command="echo"), name="test")
-    computer = Computer(mcp_servers={config})
+    computer = Computer(name="test", mcp_servers={config})
     servers = computer.mcp_servers
     # 检查类型/Check type
     assert isinstance(servers, tuple)
@@ -137,7 +137,7 @@ async def test_boot_up(monkeypatch):
     """
     mock_manager = MagicMock(spec=MCPServerManager)
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
-    computer = Computer()
+    computer = Computer(name="test")
     # boot_up 是异步方法
     await computer.boot_up()
     assert computer.mcp_manager is mock_manager
@@ -151,7 +151,7 @@ async def test_shutdown(monkeypatch):
     Test Computer.shutdown method.
     """
     mock_manager = MagicMock(spec=MCPServerManager)
-    computer = Computer()
+    computer = Computer(name="test")
     computer.mcp_manager = mock_manager
     await computer.shutdown()
     mock_manager.aclose.assert_called_once()
@@ -167,7 +167,7 @@ async def test_aenter(monkeypatch):
     mock_manager = MagicMock(spec=MCPServerManager)
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
 
-    async with Computer() as computer:
+    async with Computer(name="test") as computer:
         assert isinstance(computer, Computer)
         assert computer.mcp_manager is mock_manager
         mock_manager.ainitialize.assert_called_once()
@@ -181,7 +181,7 @@ async def test_aexit(monkeypatch):
     """
     mock_manager = MagicMock(spec=MCPServerManager)
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
-    async with Computer() as computer:
+    async with Computer(name="test") as computer:
         ...
     mock_manager.aclose.assert_called_once()
     assert computer.mcp_manager is None
@@ -203,7 +203,7 @@ async def test_aexecute_tool_auto_apply(monkeypatch):
     mock_result = MagicMock()
     mock_manager.acall_tool = AsyncMock(return_value=mock_result)
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
-    computer = Computer()
+    computer = Computer(name="test")
     await computer.boot_up()
     result = await computer.aexecute_tool("reqid", "tool", {"a": 1})
     assert result == mock_result
@@ -223,7 +223,7 @@ async def test_aexecute_tool_confirm_callback_apply(monkeypatch):
     mock_manager.acall_tool = AsyncMock(return_value=mock_result)
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     # confirm_callback返回True
-    computer = Computer(confirm_callback=lambda *_: True)
+    computer = Computer(name="test", confirm_callback=lambda *_: True)
     await computer.boot_up()
     result = await computer.aexecute_tool("reqid", "tool", {"a": 1})
     assert result == mock_result
@@ -240,7 +240,7 @@ async def test_aexecute_tool_confirm_callback_reject(monkeypatch):
     # get_tool_meta 返回 auto_apply=False，走 confirm_callback False 分支
     mock_manager.get_tool_meta = MagicMock(return_value=ToolMeta(auto_apply=False))
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
-    computer = Computer(confirm_callback=lambda *_: False)
+    computer = Computer(name="test", confirm_callback=lambda *_: False)
     await computer.boot_up()
     result = await computer.aexecute_tool("reqid", "tool", {"a": 1})
     assert result.content[0].text == "工具调用二次确认被拒绝，请稍后再试"
@@ -261,7 +261,7 @@ async def test_aexecute_tool_confirm_callback_timeout(monkeypatch):
     def raise_timeout(*_):
         raise TimeoutError()
 
-    computer = Computer(confirm_callback=raise_timeout)
+    computer = Computer(name="test", confirm_callback=raise_timeout)
     await computer.boot_up()
     result = await computer.aexecute_tool("reqid", "tool", {"a": 1})
     assert result.isError is True
@@ -283,7 +283,7 @@ async def test_aexecute_tool_confirm_callback_exception(monkeypatch):
     def raise_exc(*_):
         raise RuntimeError("fail")
 
-    computer = Computer(confirm_callback=raise_exc)
+    computer = Computer(name="test", confirm_callback=raise_exc)
     await computer.boot_up()
     result = await computer.aexecute_tool("reqid", "tool", {"a": 1})
     assert result.isError is True
@@ -301,7 +301,7 @@ async def test_aexecute_tool_no_confirm_callback(monkeypatch):
     # 使用 get_tool_meta 控制 auto_apply=False（无 confirm_callback 分支）
     mock_manager.get_tool_meta = MagicMock(return_value=ToolMeta(auto_apply=False))
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
-    computer = Computer()
+    computer = Computer(name="test")
     await computer.boot_up()
     result = await computer.aexecute_tool("reqid", "tool", {"a": 1})
     assert result.isError is True
@@ -332,7 +332,7 @@ async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(mo
 
     # Prepare computer with custom resolver
     resolver = DummyResolver({"cmd": "/bin/echo", "port": "9000"})
-    computer = Computer(input_resolver=resolver)
+    computer = Computer(name="test", input_resolver=resolver)
 
     # Raw config dict with placeholders
     cfg_dict: dict = {
@@ -373,7 +373,7 @@ async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
 
     # Prepare computer with resolver mapping empty (no placeholders used)
     resolver = DummyResolver({})
-    computer = Computer(input_resolver=resolver)
+    computer = Computer(name="test", input_resolver=resolver)
 
     # Model instance config
     cfg = StdioServerConfig(
@@ -403,7 +403,7 @@ async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatc
     # Resolver without required key -> will raise KeyError inside resolver,
     # but renderer will catch and keep original placeholder string
     resolver = DummyResolver({})
-    computer = Computer(input_resolver=resolver)
+    computer = Computer(name="test", input_resolver=resolver)
 
     cfg_dict: dict = {
         "type": "stdio",
@@ -433,7 +433,7 @@ async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatc
 async def test_aremove_server_delegates(monkeypatch):
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aremove_server = AsyncMock()
-    computer = Computer()
+    computer = Computer(name="test")
     computer.mcp_manager = mock_manager
 
     await computer.aremove_server("echo")
@@ -444,7 +444,7 @@ async def test_aremove_server_delegates(monkeypatch):
 def test_update_inputs_replaces_resolver_and_clears_cache():
     # Start with a dummy resolver to ensure it gets replaced
     resolver = DummyResolver({"a": 1})
-    computer = Computer(input_resolver=resolver)
+    computer = Computer(name="test", input_resolver=resolver)
 
     # Update to real pydantic inputs and ensure new resolver is used
     computer.update_inputs(
@@ -481,7 +481,7 @@ async def test_boot_up_renders_all_initial_servers(monkeypatch):
 
     # Use a dummy resolver to avoid interactive prompt, mapping 'cmd' to path
     resolver = DummyResolver({"cmd": "/bin/echo"})
-    computer = Computer(inputs=inputs, mcp_servers={cfg}, input_resolver=resolver)
+    computer = Computer(name="test", inputs=inputs, mcp_servers={cfg}, input_resolver=resolver)
 
     await computer.boot_up()
 

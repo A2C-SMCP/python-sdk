@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from enum import StrEnum
-from typing import cast
+from typing import Generic, TypeVar, cast
 
 from mcp import ClientSession, Tool
 from mcp.client.session import MessageHandlerFnT
@@ -21,6 +21,10 @@ from transitions.extensions import AsyncMachine
 from a2c_smcp.utils import WindowURI, is_window_uri
 from a2c_smcp.utils.async_property import async_property
 from a2c_smcp.utils.logger import logger
+
+# 泛型参数，用于约束 MCP Server 参数类型
+# Generic parameter for constraining MCP Server parameter types
+ParamsT = TypeVar("ParamsT", bound=BaseModel)
 
 
 class STATES(StrEnum):
@@ -91,10 +95,10 @@ class A2CAsyncMachine(AsyncMachine):
         return ret
 
 
-class BaseMCPClient(ABC):
+class BaseMCPClient(ABC, Generic[ParamsT]):
     def __init__(
         self,
-        params: BaseModel,
+        params: ParamsT,
         state_change_callback: Callable[[str, str], None | Awaitable[None]] | None = None,
         message_handler: MessageHandlerFnT | None = None,
     ) -> None:
@@ -102,14 +106,14 @@ class BaseMCPClient(ABC):
         基类初始化
 
         Attributes:
-            params (BaseModel): MCP Server启动参数
+            params (ParamsT): MCP Server启动参数
             state_change_callback (Callable[[str, str], None | Awaitable[None]]): 状态变化回调，兼容同步与异步
             message_handler (Callable[..., Awaitable[None]] | None):
                 自定义消息处理回调，符合 MCP ClientSession 的 message_handler 要求；若提供，则在构建 ClientSession 时传入。
                 Custom message handler callback compatible with MCP ClientSession's message_handler; if provided,
                     it will be passed when creating the ClientSession.
         """
-        self.params = params
+        self.params: ParamsT = params
         self._state_change_callback = state_change_callback
         # 私有属性：用于处理 ServerNotification（如 listChanged）的通用回调；在创建 ClientSession 时传入
         # Private attribute: general callback to handle ServerNotification (e.g., listChanged);

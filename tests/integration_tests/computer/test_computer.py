@@ -28,7 +28,7 @@ async def test_computer_aexecute_tool_success(stdio_params, sse_params, sse_serv
     """
     stdio_cfg = StdioServerConfig(name="stdio_server", server_parameters=stdio_params, tool_meta={"hello": ToolMeta(auto_apply=True)})
     sse_cfg = SseServerConfig(name="sse_server", server_parameters=sse_params)
-    computer = Computer(mcp_servers={stdio_cfg, sse_cfg})
+    computer = Computer(name="test", mcp_servers={stdio_cfg, sse_cfg})
     await computer.boot_up()
     # 获取可用工具/Get available tools
     tools = await computer.aget_available_tools()
@@ -52,7 +52,7 @@ async def test_computer_aexecute_tool_confirm_callback_called(stdio_params):
     # tool_meta为空/No auto_apply
     confirm_mock = MagicMock(return_value=True)
     stdio_cfg = StdioServerConfig(name="stdio_server", server_parameters=stdio_params, tool_meta={})
-    computer = Computer(mcp_servers={stdio_cfg}, confirm_callback=confirm_mock)
+    computer = Computer(name="test", mcp_servers={stdio_cfg}, confirm_callback=confirm_mock)
     await computer.boot_up()
     await computer.aget_available_tools()
     tool_name = "hello"
@@ -116,7 +116,7 @@ async def test_dynamic_add_with_inputs_and_tool_call(stdio_params) -> None:
     )
 
     # 初始化 Computer（auto_connect=true 便于动态添加后立即连接）
-    computer = Computer(auto_connect=True, input_resolver=resolver)
+    computer = Computer(name="test", auto_connect=True, input_resolver=resolver)
 
     # 动态添加
     await computer.aadd_or_aupdate_server(cfg_dict)
@@ -134,7 +134,7 @@ async def test_dynamic_update_forbid_tool_then_call_fails(stdio_params) -> None:
     """
     动态更新：先添加服务，后通过 forbidden_tools 禁用 hello 工具，随后调用应失败。
     """
-    computer = Computer(auto_connect=True, confirm_callback=lambda *_: True)
+    computer = Computer(name="test", auto_connect=True, confirm_callback=lambda *_: True)
     # 先添加（直接用模型，不涉及 inputs）
     cfg = StdioServerConfig(name="dyn_stdio2", server_parameters=stdio_params)
     await computer.aadd_or_aupdate_server(cfg)
@@ -157,7 +157,7 @@ async def test_dynamic_remove_then_tool_not_found(stdio_params) -> None:
     """
     动态移除：移除后再调用工具应失败（找不到工具）。
     """
-    computer = Computer(auto_connect=True, confirm_callback=lambda *_: True)
+    computer = Computer(name="test", auto_connect=True, confirm_callback=lambda *_: True)
     cfg = StdioServerConfig(name="dyn_stdio3", server_parameters=stdio_params)
     await computer.aadd_or_aupdate_server(cfg)
 
@@ -183,7 +183,7 @@ async def test_tool_call_history_records_success_and_order(stdio_params) -> None
     English: Verify history has records after successful calls with correct fields and order.
     """
     cfg = StdioServerConfig(name="hist_stdio", server_parameters=stdio_params, tool_meta={"hello": ToolMeta(auto_apply=True)})
-    computer = Computer(mcp_servers={cfg})
+    computer = Computer(name="test", mcp_servers={cfg})
     await computer.boot_up()
 
     # 进行两次调用/Two calls
@@ -212,7 +212,7 @@ async def test_tool_call_history_maxlen(stdio_params) -> None:
     English: Verify history keeps only last 10 records.
     """
     cfg = StdioServerConfig(name="hist_maxlen", server_parameters=stdio_params, tool_meta={"hello": ToolMeta(auto_apply=True)})
-    computer = Computer(mcp_servers={cfg})
+    computer = Computer(name="test", mcp_servers={cfg})
     await computer.boot_up()
 
     # 执行12次，maxlen=10后应只保留后10次/Execute 12 times, keep last 10
@@ -238,7 +238,7 @@ async def test_tool_call_history_confirm_callback_exception(stdio_params) -> Non
         raise RuntimeError("confirm failed")
 
     cfg = StdioServerConfig(name="hist_confirm_err", server_parameters=stdio_params, tool_meta={})
-    computer = Computer(mcp_servers={cfg}, confirm_callback=bad_confirm)
+    computer = Computer(name="test", mcp_servers={cfg}, confirm_callback=bad_confirm)
     await computer.boot_up()
 
     result = await computer.aexecute_tool("req-X", "hello", {"name": "Err"})

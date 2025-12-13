@@ -27,19 +27,11 @@ from a2c_smcp.server import AuthenticationProvider
 from socketio import AsyncServer
 
 class CustomAuthProvider(AuthenticationProvider):
-    async def get_agent_id(self, sio: AsyncServer, environ: dict) -> str:
-        # 实现获取agent_id的逻辑
-        # Implement agent_id retrieval logic
-        pass
-    
-    async def authenticate(self, sio: AsyncServer, agent_id: str, auth: dict | None, headers: list) -> bool:
+    async def authenticate(self, sio: AsyncServer, environ: dict, auth: dict | None, headers: list) -> bool:
         # 实现自定义认证逻辑
         # Implement custom authentication logic
-        pass
-    
-    async def has_admin_permission(self, sio: AsyncServer, agent_id: str, secret: str) -> bool:
-        # 实现管理员权限检查
-        # Implement admin permission check
+        # 可以从 environ、auth 或 headers 中提取认证信息
+        # Can extract authentication info from environ, auth or headers
         pass
 ```
 
@@ -58,10 +50,10 @@ auth_provider = DefaultAuthenticationProvider(
 )
 ```
 
-**新的接口特性 / New Interface Features:**
-- `get_agent_id()`: 由用户实现agent_id获取逻辑，可从FastAPI应用状态或其他源获取
-- `authenticate()`: 接收Socket.IO实例、agent_id、原始auth数据和原始headers列表
-- `has_admin_permission()`: 接收Socket.IO实例和agent_id参数
+**接口特性 / Interface Features:**
+- `authenticate()`: 接收Socket.IO实例、请求环境变量(environ)、原始auth数据和原始headers列表
+- 返回 `True` 表示认证成功，`False` 表示认证失败
+- 可以从 headers 中提取 API Key 等认证信息进行验证
 
 ### 2. 命名空间系统 / Namespace System
 
@@ -194,14 +186,7 @@ class DatabaseAuthProvider(AuthenticationProvider):
     def __init__(self, db_connection):
         self.db = db_connection
     
-    async def get_agent_id(self, sio: AsyncServer, environ: dict) -> str:
-        # 从请求中提取agent_id，例如从路径或查询参数
-        # Extract agent_id from request, e.g., from path or query parameters
-        if hasattr(sio, 'app') and hasattr(sio.app, 'state'):
-            return getattr(sio.app.state, 'agent_id', 'default_agent')
-        return 'default_agent'
-    
-    async def authenticate(self, sio: AsyncServer, agent_id: str, auth: dict | None, headers: list) -> bool:
+    async def authenticate(self, sio: AsyncServer, environ: dict, auth: dict | None, headers: list) -> bool:
         # 从headers中提取API密钥
         # Extract API key from headers
         api_key = None
@@ -220,12 +205,7 @@ class DatabaseAuthProvider(AuthenticationProvider):
         # 从数据库验证API密钥
         # Validate API key from database
         user = await self.db.get_user_by_api_key(api_key)
-        return user is not None and user.agent_id == agent_id
-    
-    async def has_admin_permission(self, sio: AsyncServer, agent_id: str, secret: str) -> bool:
-        # 检查数据库中的管理员权限
-        # Check admin permission in database
-        return await self.db.check_admin_permission(agent_id, secret)
+        return user is not None
 
 # 使用自定义认证
 # Use custom authentication
@@ -304,20 +284,20 @@ The Server module provides comprehensive error handling:
 Server模块设计为高度可扩展：
 
 1. **自定义认证** - 实现`AuthenticationProvider`接口，完全控制认证逻辑
-2. **灵活agent_id获取** - 通过`get_agent_id()`方法自定义agent_id获取逻辑
-3. **原始数据访问** - 直接访问原始auth数据和headers，无预处理
-4. **Socket.IO实例访问** - 在认证过程中可访问Socket.IO服务器实例
-5. **事件扩展** - 继承`SMCPNamespace`添加新事件
-6. **中间件** - 在基础类中添加中间件逻辑
+2. **原始数据访问** - 直接访问原始 environ、auth 数据和 headers，无预处理
+3. **Socket.IO实例访问** - 在认证过程中可访问Socket.IO服务器实例
+4. **事件扩展** - 继承`SMCPNamespace`添加新事件
+5. **中间件** - 在基础类中添加中间件逻辑
+6. **同步/异步支持** - 提供 `AuthenticationProvider`(异步) 和 `SyncAuthenticationProvider`(同步) 两种版本
 
 The Server module is designed to be highly extensible:
 
 1. **Custom Authentication** - Implement `AuthenticationProvider` interface with full control
-2. **Flexible agent_id Retrieval** - Customize agent_id retrieval logic via `get_agent_id()` method
-3. **Raw Data Access** - Direct access to raw auth data and headers without preprocessing
-4. **Socket.IO Instance Access** - Access Socket.IO server instance during authentication
-5. **Event Extension** - Inherit `SMCPNamespace` to add new events
-6. **Middleware** - Add middleware logic in base classes
+2. **Raw Data Access** - Direct access to raw environ, auth data and headers without preprocessing
+3. **Socket.IO Instance Access** - Access Socket.IO server instance during authentication
+4. **Event Extension** - Inherit `SMCPNamespace` to add new events
+5. **Middleware** - Add middleware logic in base classes
+6. **Sync/Async Support** - Provides both `AuthenticationProvider`(async) and `SyncAuthenticationProvider`(sync) versions
 
 ## 测试 / Testing
 
@@ -336,16 +316,16 @@ pytest tests/unit_tests/server/ --cov=a2c_smcp.server
 
 ## 注意事项 / Notes
 
-1. **线程安全** - 所有方法都是异步的，确保线程安全
+1. **线程安全** - 异步版本(`SMCPNamespace`)的所有方法都是异步的，确保线程安全；同步版本(`SyncSMCPNamespace`)适用于WSGI环境
 2. **内存管理** - 会话数据会自动清理，无需手动管理
 3. **性能优化** - 大量连接时建议使用Redis作为会话存储
 4. **日志记录** - 使用项目统一的logger进行日志记录
-5. **接口变更** - 新版本中`robot_id`已更名为`agent_id`，认证接口已简化
-6. **用户控制** - 用户现在对认证过程有更多控制权，包括agent_id获取和原始数据处理
+5. **认证接口** - `AuthenticationProvider.authenticate()` 接收 `(sio, environ, auth, headers)` 四个参数，返回布尔值表示认证结果
+6. **同步/异步选择** - 根据应用框架选择合适版本：FastAPI/Sanic 使用异步版本，Flask/Gunicorn 使用同步版本
 
-1. **Thread Safety** - All methods are asynchronous, ensuring thread safety
+1. **Thread Safety** - Async version(`SMCPNamespace`) methods are asynchronous ensuring thread safety; sync version(`SyncSMCPNamespace`) is for WSGI environments
 2. **Memory Management** - Session data is automatically cleaned up, no manual management needed
 3. **Performance Optimization** - For large numbers of connections, consider using Redis for session storage
 4. **Logging** - Uses the project's unified logger for logging
-5. **Interface Changes** - In the new version, `robot_id` has been renamed to `agent_id`, and authentication interface has been simplified
-6. **User Control** - Users now have more control over the authentication process, including agent_id retrieval and raw data processing
+5. **Authentication Interface** - `AuthenticationProvider.authenticate()` receives `(sio, environ, auth, headers)` four parameters, returns boolean for authentication result
+6. **Sync/Async Choice** - Choose appropriate version based on application framework: FastAPI/Sanic use async version, Flask/Gunicorn use sync version

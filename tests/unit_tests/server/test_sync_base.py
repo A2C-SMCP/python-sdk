@@ -2,6 +2,7 @@
 """
 测试 a2c_smcp/server/sync_base.py
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -57,6 +58,7 @@ def test_on_connect_success_and_failure_paths():
 
     def boom(*_a, **_k):
         raise RuntimeError("boom")
+
     err_auth.authenticate = boom  # type: ignore[assignment]
     ns_err = SyncBaseNamespace("/ns", err_auth)
     ns_err.server = server
@@ -70,6 +72,7 @@ def test_on_disconnect_leaves_all_non_self_rooms():
     # rooms 返回多个，跳过与 sid 相同的房间
     ns.rooms = MagicMock(return_value=["sidX", "roomA", "roomB"])  # type: ignore[attr-defined]
     ns.leave_room = MagicMock()  # type: ignore[attr-defined]
+    ns.server = MagicMock()
 
     ns.on_disconnect("sidX")
 
@@ -91,6 +94,7 @@ def test_trigger_event_replaces_colon_with_underscore(monkeypatch):
 
     # 直接在类上 monkeypatch 父类 Namespace.trigger_event
     from socketio import Namespace as _SNamespace
+
     monkeypatch.setattr(_SNamespace, "trigger_event", fake_trigger)
     ret = ns.trigger_event("a:b:c", 1, 2)
 

@@ -71,7 +71,7 @@ def test_sync_agent_get_desktop_and_update_flow(startup_and_shutdown_sync_smcp_s
         namespace=SMCP_NAMESPACE,
         socketio_path="/socket.io",
     )
-    agent.call(JOIN_OFFICE_EVENT, {"role": "agent", "office_id": office_id, "name": "robot-desktop-sync"}, namespace=SMCP_NAMESPACE)
+    agent.join_office(office_id=office_id, agent_name="robot-desktop-sync", namespace=SMCP_NAMESPACE)
 
     # 启动一个模拟 Computer 客户端
     disconnect = threading.Event()

@@ -171,6 +171,7 @@ async def test_manager_propagates_message_handler_to_clients(stdio_params, sse_p
     """集成测试：验证 Manager 能将 message_handler 透传到真实 Client。
     Integration: Verify Manager forwards message_handler to real clients.
     """
+
     async def dummy_handler(*args, **kwargs):
         return None
 

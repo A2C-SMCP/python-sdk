@@ -68,7 +68,7 @@ class _Client:
         assert self.connected
         self.office_id = None
 
-    async def emit_update_mcp_config(self) -> None:  # noqa: D401
+    async def emit_update_config(self) -> None:  # noqa: D401
         self.updated += 1
 
 
@@ -145,7 +145,7 @@ async def test_tools_and_inputs_update_single_and_list(tmp_path: Path, monkeypat
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     # 注入 tools 的桩实现
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test_im_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     async def _fake_tools() -> list[dict[str, Any]]:
         return [{"name": "t1", "description": "desc", "return_schema": {}}]
@@ -174,7 +174,7 @@ async def test_server_rm_and_start_stop_single_with_errors(monkeypatch: pytest.M
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test_im_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await comp.boot_up()
 
     # 准备第二段命令：rm + start/stop 单个 + 异常

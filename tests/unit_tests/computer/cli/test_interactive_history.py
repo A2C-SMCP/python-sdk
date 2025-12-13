@@ -51,7 +51,7 @@ async def test_history_default_and_limit(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     # 构建 Computer，并注入假的历史记录返回
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test_input_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     records = (
         {

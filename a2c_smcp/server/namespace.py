@@ -9,12 +9,14 @@
 """
 
 import copy
+from typing import cast
 
 from pydantic import TypeAdapter
 
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.base import BaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
+from a2c_smcp.server.utils import aget_all_sessions_in_office
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
@@ -35,6 +37,9 @@ from a2c_smcp.smcp import (
     GetToolsRet,
     LeaveOfficeNotification,
     LeaveOfficeReq,
+    ListRoomReq,
+    ListRoomRet,
+    SessionInfo,
     ToolCallReq,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
@@ -113,6 +118,18 @@ class SMCPNamespace(BaseNamespace):
                 logger.warning(f"Computer sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
                 return
 
+            # 检查房间内是否已有同名的Computer
+            # Check if there's already a Computer with the same name in the room
+            computer_name = session.get("name")
+            if computer_name:
+                participants = self.server.manager.get_participants(SMCP_NAMESPACE, room)
+                for participant_sid, _participant_eio_sid in participants:
+                    if participant_sid == sid:
+                        continue
+                    participant_session = await self.get_session(participant_sid)
+                    if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
+                        raise ValueError(f"Computer with name '{computer_name}' already exists in room '{room}'")
+
         # 加入新房间
         # Join new room
         await super().enter_room(sid, room)
@@ -122,12 +139,16 @@ class SMCPNamespace(BaseNamespace):
         session["office_id"] = room
         await self.save_session(sid, session)
 
+        # 注册name到sid的映射
+        # Register name-to-sid mapping
+        await self._register_name(session["name"], sid)
+
         # 根据角色发送不同的通知 / Send different notifications based on role
         notification_data: EnterOfficeNotification = {"office_id": room}
         if session.get("role") == "computer":
-            notification_data["computer"] = sid
+            notification_data["computer"] = session.get("name")
         else:
-            notification_data["agent"] = sid
+            notification_data["agent"] = session.get("name")
 
         # 广播加入新房间的消息至房间内其它人
         # Broadcast join message to others in the room
@@ -150,17 +171,22 @@ class SMCPNamespace(BaseNamespace):
         """
         session = await self.get_session(sid)
 
-        # 构建离开通知
-        # Build leave notification
+        # 构建离开通知，使用name而不是sid
+        # Build leave notification using name instead of sid
+        client_name = session.get("name", "")
         notification = (
-            LeaveOfficeNotification(office_id=room, computer=sid)
+            LeaveOfficeNotification(office_id=room, computer=client_name)
             if session.get("role") == "computer"
-            else LeaveOfficeNotification(office_id=room, agent=sid)
+            else LeaveOfficeNotification(office_id=room, agent=client_name)
         )
 
         # 广播离开消息
         # Broadcast leave message
         await self.emit(LEAVE_OFFICE_NOTIFICATION, notification, skip_sid=sid, room=room)
+
+        # 注销name映射
+        # Unregister name mapping
+        await self._unregister_name(sid)
 
         # 维护session中的office_id字段
         # Maintain office_id field in session
@@ -250,7 +276,7 @@ class SMCPNamespace(BaseNamespace):
         assert session["role"] == "agent", "目前仅支持Agent调用取消ToolCall的操作"
 
         agent_call = TypeAdapter(AgentCallData).validate_python(data)
-        assert sid == agent_call["robot_id"], "取消工具调用的广播仅可以由对应Agent发出"
+        assert session.get("name") == agent_call["agent"], "取消工具调用的广播仅可以由对应Agent发出"
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
         office_id = session.get("office_id")
@@ -325,11 +351,21 @@ class SMCPNamespace(BaseNamespace):
 
         tool_call = TypeAdapter(ToolCallReq).validate_python(data)
 
-        return await self.call(
-            TOOL_CALL_EVENT,
-            tool_call,
-            to=tool_call["computer"],
-            timeout=tool_call["timeout"],
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_name = tool_call["computer"]
+        computer_sid = await self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
+        return cast(
+            dict,
+            await self.call(
+                TOOL_CALL_EVENT,
+                tool_call,
+                to=computer_sid,
+                timeout=tool_call["timeout"],
+            ),
         )
 
     async def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet:
@@ -339,12 +375,19 @@ class SMCPNamespace(BaseNamespace):
 
         Args:
             sid (str): 发起者的ID，一般是Agent / Initiator ID, usually Agent
-            data (GetToolsReq): 其中包含computer字段，指向Computer的sid / Contains computer field pointing to Computer's sid
+            data (GetToolsReq): 其中包含computer字段，指向Computer的Name / Contains computer field pointing to Computer's Name
 
         Returns:
             GetToolsRet: Computer的工具列表 / Computer's tool list
         """
-        computer_sid = data["computer"]
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_sid = await self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         session = await self.get_session(computer_sid)
         assert session["role"] == "computer", "目前仅支持Computer获取工具列表"
 
@@ -359,7 +402,7 @@ class SMCPNamespace(BaseNamespace):
         client_response = await self.call(
             GET_TOOLS_EVENT,
             data,
-            to=data["computer"],
+            to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
 
@@ -372,9 +415,16 @@ class SMCPNamespace(BaseNamespace):
 
         要求：Agent 与 Computer 需在同一 office。
         """
-        computer_sid = data["computer"]
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid
+        # Get computer's sid by name
+        computer_sid = await self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
         session = await self.get_session(computer_sid)
-        assert session["role"] == "computer", "目前仅支持Computer获取桌面"
+        assert session["role"] == "computer", "目前仅支持获取Computer桌面"
 
         agent_session = await self.get_session(sid)
         computer_office_id = session.get("office_id")
@@ -384,7 +434,7 @@ class SMCPNamespace(BaseNamespace):
         client_response = await self.call(
             GET_DESKTOP_EVENT,
             data,
-            to=data["computer"],
+            to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
         return TypeAdapter(GetDeskTopRet).validate_python(client_response)
@@ -408,3 +458,43 @@ class SMCPNamespace(BaseNamespace):
             room=session.get("office_id"),
             skip_sid=sid,
         )
+
+    async def on_server_list_room(self, sid: str, data: ListRoomReq) -> ListRoomRet:
+        """
+        列出指定房间内的所有会话信息。Agent可以通过此事件查询房间内的所有Computer和Agent。
+        List all sessions in the specified room. Agent can query all Computers and Agents in the room via this event.
+
+        Args:
+            sid (str): 发起者ID，一般是Agent / Initiator ID, usually Agent
+            data (ListRoomReq): 列出房间请求数据，包含office_id和req_id / List room request data with office_id and req_id
+
+        Returns:
+            ListRoomRet: 房间内所有会话信息列表 / List of all session info in the room
+        """
+        # 验证请求数据 / Validate request data
+        list_room_req = TypeAdapter(ListRoomReq).validate_python(data)
+        office_id = list_room_req["office_id"]
+        req_id = list_room_req["req_id"]
+
+        # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission: ensure Agent is in the requested room
+        agent_session = await self.get_session(sid)
+        agent_office_id = agent_session.get("office_id")
+
+        assert agent_office_id == office_id, f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}"
+
+        # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
+        all_sessions = await aget_all_sessions_in_office(office_id, self.server)
+
+        # 转换为SessionInfo格式 / Convert to SessionInfo format
+        sessions: list[SessionInfo] = []
+        for session in all_sessions:
+            if session.get("role") in ["computer", "agent"]:
+                session_info: SessionInfo = {
+                    "sid": session.get("sid", ""),
+                    "name": session.get("name", ""),
+                    "role": session["role"],
+                    "office_id": session.get("office_id", ""),
+                }
+                sessions.append(session_info)
+
+        return ListRoomRet(sessions=sessions, req_id=req_id)

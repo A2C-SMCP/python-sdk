@@ -33,7 +33,7 @@ async def test_param_server_dynamic_update() -> None:
     )
     cfg = StdioServerConfig(name="param_server", server_parameters=params)
 
-    comp = Computer(inputs=set(), mcp_servers={cfg}, auto_connect=False, auto_reconnect=True)
+    comp = Computer(name="test", inputs=set(), mcp_servers={cfg}, auto_connect=False, auto_reconnect=True)
     async with comp:
         # 启动该 server
         await comp.mcp_manager.astart_client("param_server")

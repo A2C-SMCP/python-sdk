@@ -192,12 +192,9 @@ def test_sync_agent_tool_call(server_endpoint: str, mock_computer_client):
         # 等待连接稳定 / Wait for connection to stabilize
         time.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 调用 echo 工具 / Call echo tool
         result = agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer="test-computer-2",
             tool_name="echo",
             params={"message": "Hello, World!"},
             timeout=5,
@@ -210,7 +207,7 @@ def test_sync_agent_tool_call(server_endpoint: str, mock_computer_client):
 
         # 调用 add 工具 / Call add tool
         result = agent_client.emit_tool_call(
-            computer=computer_sid,
+            computer="test-computer-2",
             tool_name="add",
             params={"a": 10, "b": 20},
             timeout=5,
@@ -266,11 +263,8 @@ def test_sync_agent_get_tools_and_desktop(server_endpoint: str, mock_computer_cl
 
         time.sleep(0.2)
 
-        # 获取 Computer SID / Get Computer SID
-        computer_sid = mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
-
         # 获取工具列表 / Get tools list
-        tools_response = agent_client.get_tools_from_computer(computer_sid, timeout=5)
+        tools_response = agent_client.get_tools_from_computer("test-computer-3", timeout=5)
 
         # 验证工具列表 / Verify tools list
         assert tools_response["req_id"] is not None
@@ -279,7 +273,7 @@ def test_sync_agent_get_tools_and_desktop(server_endpoint: str, mock_computer_cl
         assert tools_response["tools"][1]["name"] == "add"
 
         # 获取桌面信息 / Get desktop info
-        desktop_response = agent_client.get_desktop_from_computer(computer_sid, timeout=5)
+        desktop_response = agent_client.get_desktop_from_computer("test-computer-3", timeout=5)
 
         # 验证桌面信息 / Verify desktop info
         assert desktop_response["req_id"] is not None
@@ -430,7 +424,7 @@ def test_sync_agent_sio_param_with_real_connection(server_endpoint: str, mock_co
 
         # 验证可以调用client的方法 / Verify can call client methods
         agent_config = passed_client.auth_provider.get_agent_config()
-        assert agent_config["agent_id"] == "test-agent-sio"
+        assert agent_config["agent"] == "test-agent-sio"
         assert agent_config["office_id"] == "office-sio-test"
 
         # 验证tools_received也收到了sio参数 / Verify tools_received also received sio param
@@ -507,6 +501,100 @@ def test_sync_agent_sio_param_in_leave_event(server_endpoint: str, mock_computer
 
         # 验证可以访问sid / Verify can access sid
         assert passed_client.get_sid(namespace=SMCP_NAMESPACE) is not None
+
+    finally:
+        agent_client.disconnect()
+
+
+def test_sync_agent_list_room(server_endpoint: str, mock_computer_client):
+    """
+    中文:
+      - 验证同步 Agent 调用 LIST_ROOM 事件
+      - 验证返回房间内所有会话信息（Agent 和 Computer）
+      - 验证会话信息包含正确的 sid、name、role、office_id
+    English:
+      - Verify sync Agent calls LIST_ROOM event
+      - Verify returns all session info in the room (Agent and Computer)
+      - Verify session info contains correct sid, name, role, office_id
+    """
+    from a2c_smcp.smcp import LIST_ROOM_EVENT
+
+    auth_provider = DefaultAgentAuthProvider(
+        agent_id="test-agent-sync-list-room",
+        office_id="office-list-room-sync-e2e",
+    )
+
+    agent_client = SMCPAgentClient(
+        auth_provider=auth_provider,
+        event_handler=None,
+    )
+
+    try:
+        # 连接并加入办公室 / Connect and join office
+        agent_client.connect_to_server(server_endpoint)
+        time.sleep(0.1)
+
+        office_id = "office-list-room-sync-e2e"
+        agent_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "name": "agent-list-sync-test", "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+
+        # Computer 加入办公室 / Computer joins office
+        mock_computer_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "name": "computer-list-sync-test", "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+
+        # 等待连接稳定 / Wait for connection to stabilize
+        time.sleep(0.2)
+
+        # 获取 Agent 和 Computer 的 SID / Get Agent and Computer SID
+        agent_sid = agent_client.get_sid(namespace=SMCP_NAMESPACE)
+        computer_sid = mock_computer_client.get_sid(namespace=SMCP_NAMESPACE)
+
+        # 调用 LIST_ROOM 事件 / Call LIST_ROOM event
+        result = agent_client.call(
+            LIST_ROOM_EVENT,
+            {
+                "agent": agent_sid,
+                "req_id": "list_room_req_sync_e2e",
+                "office_id": office_id,
+            },
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+
+        # 验证返回结果 / Verify result
+        assert result is not None
+        assert "sessions" in result
+        assert "req_id" in result
+        assert result["req_id"] == "list_room_req_sync_e2e"
+
+        # 验证会话列表 / Verify session list
+        sessions = result["sessions"]
+        assert len(sessions) == 2  # 1 Agent + 1 Computer
+
+        # 提取角色列表 / Extract role list
+        roles = [s["role"] for s in sessions]
+        assert "agent" in roles
+        assert "computer" in roles
+
+        # 验证 Agent 会话信息 / Verify Agent session info
+        agent_session = next(s for s in sessions if s["role"] == "agent")
+        assert agent_session["sid"] == agent_sid
+        assert agent_session["name"] == "agent-list-sync-test"
+        assert agent_session["office_id"] == office_id
+
+        # 验证 Computer 会话信息 / Verify Computer session info
+        computer_session = next(s for s in sessions if s["role"] == "computer")
+        assert computer_session["sid"] == computer_sid
+        assert computer_session["name"] == "computer-list-sync-test"
+        assert computer_session["office_id"] == office_id
 
     finally:
         agent_client.disconnect()

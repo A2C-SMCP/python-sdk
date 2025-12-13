@@ -30,7 +30,7 @@ def test_create_get_desktop_request_fields() -> None:
     base = _make_base_like(auth)
     req = base.create_get_desktop_request("comp-1", size=3, window="window://x")
     assert req["computer"] == "comp-1"
-    assert req["robot_id"] == "agent-1"
+    assert req["agent"] == "agent-1"
     assert isinstance(req["req_id"], str)
     assert req["desktop_size"] == 3
     assert req["window"] == "window://x"
@@ -66,7 +66,7 @@ def test_sync_agent_get_desktop_invokes_call(monkeypatch: pytest.MonkeyPatch) ->
     ret = client.get_desktop_from_computer("comp-1", size=2)
     assert called["event"] == GET_DESKTOP_EVENT
     assert called["data"]["computer"] == "comp-1"
-    assert called["data"]["robot_id"] == "agent-1"
+    assert called["data"]["agent"] == "agent-1"
     assert ret["desktops"] == ["window://a"]
 
 

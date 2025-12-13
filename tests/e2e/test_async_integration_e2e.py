@@ -138,6 +138,7 @@ async def test_async_integration_computer_agent_server_basic_flow(
 
     # 创建 Computer 实例 / Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -189,7 +190,7 @@ async def test_async_integration_computer_agent_server_basic_flow(
         print(f"[E2E] Computer connect took {time.time() - t4:.2f}s")
 
         t5 = time.time()
-        await computer_client.join_office(office_id, "test-computer-async-1")
+        await computer_client.join_office(office_id)
         print(f"[E2E] Computer join office took {time.time() - t5:.2f}s")
 
         # 3. 等待事件传播 / Wait for event propagation
@@ -266,6 +267,7 @@ async def test_async_integration_agent_call_computer_tool(
 
     # 创建 Computer 实例 / Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -303,7 +305,7 @@ async def test_async_integration_agent_call_computer_tool(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-async-2")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播 / Wait for event propagation
         await asyncio.sleep(1.0)
@@ -393,6 +395,7 @@ async def test_async_integration_computer_leave_notification(
 
     # 创建 Computer 实例 / Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -430,7 +433,7 @@ async def test_async_integration_computer_leave_notification(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-async-3")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播 / Wait for event propagation
         await asyncio.sleep(1.0)
@@ -499,6 +502,7 @@ async def test_async_integration_multiple_tool_calls(
 
     # 创建 Computer 实例 / Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -536,7 +540,7 @@ async def test_async_integration_multiple_tool_calls(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-async-4")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播 / Wait for event propagation
         await asyncio.sleep(1.0)
@@ -627,6 +631,7 @@ async def test_async_integration_desktop_sync_after_tool_call(
 
     # 创建 Computer 实例 / Create Computer instance
     computer = Computer(
+        name="test",
         mcp_servers={stdio_config},
         auto_connect=True,
     )
@@ -664,7 +669,7 @@ async def test_async_integration_desktop_sync_after_tool_call(
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
         )
-        await computer_client.join_office(office_id, "test-computer-async-5")
+        await computer_client.join_office(office_id)
 
         # 3. 等待事件传播 / Wait for event propagation
         await asyncio.sleep(1.0)

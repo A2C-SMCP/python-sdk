@@ -55,6 +55,7 @@ class _Mgr:
     def get_server_config(self, name: str):  # noqa: D401
         class _Cfg:
             tool_meta = {}
+
         return _Cfg()
 
     async def acall_tool(self, server: str, tool: str, params: dict, timeout: float | None):  # noqa: D401
@@ -89,7 +90,7 @@ async def test_tc_cmd_from_file_integration(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    comp = Computer(inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     comp.mcp_manager = _Mgr()
 
     await _interactive_loop(comp)

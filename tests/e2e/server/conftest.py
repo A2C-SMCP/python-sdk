@@ -273,6 +273,8 @@ async def async_agent_client(async_socketio_server, async_server_port: int):
     中文: 已连接到异步 Server 的 Agent 客户端。
     English: Connected Agent client (async).
     """
+    import asyncio
+
     client = socketio.AsyncClient()
     await client.connect(
         f"http://127.0.0.1:{async_server_port}",
@@ -285,8 +287,11 @@ async def async_agent_client(async_socketio_server, async_server_port: int):
     try:
         yield client
     finally:
+        # 中文: 等待一小段时间确保所有事件处理完成 / English: Wait briefly to ensure all events are processed
+        await asyncio.sleep(0.05)
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            # 中文: 使用超时避免长时间等待 / English: Use timeout to avoid long wait
+            await asyncio.wait_for(client.disconnect(), timeout=0.5)
 
 
 @pytest.fixture()
@@ -295,6 +300,8 @@ async def async_computer_client(async_socketio_server, async_server_port: int):
     中文: 已连接到异步 Server 的 Computer 客户端。
     English: Connected Computer client (async).
     """
+    import asyncio
+
     client = socketio.AsyncClient()
     await client.connect(
         f"http://127.0.0.1:{async_server_port}",
@@ -307,5 +314,8 @@ async def async_computer_client(async_socketio_server, async_server_port: int):
     try:
         yield client
     finally:
+        # 中文: 等待一小段时间确保所有事件处理完成 / English: Wait briefly to ensure all events are processed
+        await asyncio.sleep(0.05)
         with contextlib.suppress(Exception):
-            await client.disconnect()
+            # 中文: 使用超时避免长时间等待 / English: Use timeout to avoid long wait
+            await asyncio.wait_for(client.disconnect(), timeout=0.5)

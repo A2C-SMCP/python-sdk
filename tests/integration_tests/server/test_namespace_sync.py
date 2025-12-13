@@ -165,7 +165,7 @@ def test_leave_and_broadcast_sync(startup_and_shutdown_local_sync_server, sync_s
     computer.disconnect()
 
 
-def _run_computer_client_process(port: int, computer_sid_queue: multiprocessing.Queue, error_queue: multiprocessing.Queue) -> None:
+def _run_computer_client_process(port: int, computer_name_queue: multiprocessing.Queue, error_queue: multiprocessing.Queue) -> None:
     """在独立进程中运行Computer客户端"""
     computer = Client()
 
@@ -186,10 +186,11 @@ def _run_computer_client_process(port: int, computer_sid_queue: multiprocessing.
     try:
         computer.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         office_id = "office-sync-s3"
-        _join_office(computer, role="computer", office_id=office_id, name="comp-S3")
+        computer_name = "comp-S3"
+        _join_office(computer, role="computer", office_id=office_id, name=computer_name)
 
         # 将computer_sid发送给主进程
-        computer_sid_queue.put(computer.get_sid(SMCP_NAMESPACE))
+        computer_name_queue.put(computer_name)
 
         # 等待并处理GET_TOOLS_EVENT
         computer.wait()
@@ -201,16 +202,17 @@ def _run_computer_client_process(port: int, computer_sid_queue: multiprocessing.
 
 def _run_agent_client_process(
     port: int,
-    computer_sid: str,
+    computer_name: str,
     result_queue: multiprocessing.Queue,
     error_queue: multiprocessing.Queue,
 ) -> None:
     """在独立进程中运行Agent客户端"""
     try:
         agent = Client()
+        agent_id = "robot-S3"
         agent.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         office_id = "office-sync-s3"
-        _join_office(agent, role="agent", office_id=office_id, name="robot-S3")
+        _join_office(agent, role="agent", office_id=office_id, name=agent_id)
 
         # 确保连接稳定后再进行调用
         time.sleep(0.2)
@@ -218,7 +220,7 @@ def _run_agent_client_process(
         # 执行GET_TOOLS调用
         res = agent.call(
             GET_TOOLS_EVENT,
-            {"computer": computer_sid, "robot_id": agent.get_sid(SMCP_NAMESPACE), "req_id": "req-sync-1"},
+            {"computer": computer_name, "robot_id": agent_id, "req_id": "req-sync-1"},
             namespace=SMCP_NAMESPACE,
             timeout=15,
         )
@@ -236,14 +238,14 @@ def test_get_tools_success_sync(startup_and_shutdown_local_sync_server: Namespac
     """测试同步环境下获取工具列表，使用多进程避免GIL阻塞"""
 
     # 创建进程间通信队列
-    computer_sid_queue = multiprocessing.Queue()
+    computer_name_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
     error_queue = multiprocessing.Queue()
 
     # 1. 启动Computer客户端进程并获取computer_sid
     computer_process = multiprocessing.Process(
         target=_run_computer_client_process,
-        args=(sync_server_port, computer_sid_queue, error_queue),
+        args=(sync_server_port, computer_name_queue, error_queue),
         daemon=True,
     )
     computer_process.start()
@@ -251,7 +253,7 @@ def test_get_tools_success_sync(startup_and_shutdown_local_sync_server: Namespac
     try:
         # 等待获取computer_sid
         try:
-            computer_sid = computer_sid_queue.get(timeout=5)
+            computer_name = computer_name_queue.get(timeout=5)
         except Exception:
             # 检查是否有错误
             if not error_queue.empty():
@@ -260,12 +262,12 @@ def test_get_tools_success_sync(startup_and_shutdown_local_sync_server: Namespac
             else:
                 pytest.fail("获取Computer SID超时")
 
-        print(f"获取到Computer SID: {computer_sid}")
+        print(f"获取到Computer NAME: {computer_name}")
 
         # 2. 启动Agent客户端进程执行工具列表获取
         agent_process = multiprocessing.Process(
             target=_run_agent_client_process,
-            args=(sync_server_port, computer_sid, result_queue, error_queue),
+            args=(sync_server_port, computer_name, result_queue, error_queue),
             daemon=True,
         )
         agent_process.start()
@@ -383,8 +385,8 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
         res = agent.call(
             TOOL_CALL_EVENT,
             {
-                "robot_id": agent.get_sid(SMCP_NAMESPACE),
-                "computer": computer.get_sid(SMCP_NAMESPACE),
+                "robot_id": "robot-S5",
+                "computer": "comp-S5",
                 "tool_name": "echo",
                 "params": {"text": "hi"},
                 "req_id": "req-sync-2",
@@ -409,3 +411,128 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
         call_completed.set()
         computer_thread.join(timeout=5)
         agent.disconnect()
+
+
+def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server, sync_server_port: int):
+    """
+    中文：测试Computer重名检查：当房间内已存在同名Computer时，第二个Computer加入应失败
+    English: Test Computer duplicate name check: second Computer with same name should fail to join
+    """
+    computer1 = SimpleClient()
+    computer2 = SimpleClient()
+
+    try:
+        # 连接第一个 Computer
+        # Connect first Computer
+        computer1.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        office_id = "office-sync-dup-test"
+        computer_name = "duplicate-comp-sync"
+
+        # 第一个 Computer 成功加入
+        # First Computer joins successfully
+        ok, err = computer1.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": office_id, "name": computer_name},
+        )
+        assert ok and err is None, f"第一个Computer应该加入成功 / First Computer should join successfully, error: {err}"
+
+        # 连接第二个 Computer（同名）
+        # Connect second Computer (same name)
+        computer2.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+
+        # 第二个 Computer 尝试加入同一房间，应该失败
+        # Second Computer tries to join same room, should fail
+        ok2, err2 = computer2.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": office_id, "name": computer_name},
+        )
+
+        # 验证失败
+        # Verify failure
+        assert not ok2, "第二个同名Computer应该加入失败 / Second Computer with same name should fail to join"
+        assert err2 is not None, "应该返回错误信息 / Should return error message"
+        assert "already exists" in err2, f"错误信息应包含'already exists'，实际: {err2} / Error should contain 'already exists'"
+
+    finally:
+        computer1.disconnect()
+        computer2.disconnect()
+
+
+def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server, sync_server_port: int):
+    """
+    中文：测试不同名Computer可以加入：房间内已有Computer，但名字不同，应该成功
+    English: Test different name Computer can join: room has Computer but different name, should succeed
+    """
+    computer1 = SimpleClient()
+    computer2 = SimpleClient()
+
+    try:
+        # 连接第一个 Computer
+        # Connect first Computer
+        computer1.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        office_id = "office-sync-diff-name-test"
+
+        # 第一个 Computer 加入
+        # First Computer joins
+        ok, err = computer1.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": office_id, "name": "comp-sync-1"},
+        )
+        assert ok and err is None, f"第一个Computer应该加入成功 / First Computer should join successfully, error: {err}"
+
+        # 连接第二个 Computer（不同名）
+        # Connect second Computer (different name)
+        computer2.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+
+        # 第二个 Computer 加入同一房间，应该成功
+        # Second Computer joins same room, should succeed
+        ok2, err2 = computer2.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": office_id, "name": "comp-sync-2"},
+        )
+
+        # 验证成功
+        # Verify success
+        assert ok2, f"不同名Computer应该加入成功 / Different name Computer should succeed, error: {err2}"
+        assert err2 is None, "不应该有错误信息 / Should not have error message"
+
+    finally:
+        computer1.disconnect()
+        computer2.disconnect()
+
+
+def test_computer_switch_room_with_same_name_allowed(startup_and_shutdown_local_sync_server, sync_server_port: int):
+    """
+    中文：测试Computer切换房间：同一个Computer从一个房间切换到另一个房间应该成功
+    English: Test Computer switching rooms: same Computer switching from one room to another should succeed
+    """
+    computer = SimpleClient()
+
+    try:
+        # 连接 Computer
+        # Connect Computer
+        computer.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        computer_name = "switching-comp-sync"
+
+        # 加入第一个房间
+        # Join first room
+        ok, err = computer.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": "office-sync-room-1", "name": computer_name},
+        )
+        assert ok and err is None, f"加入第一个房间应该成功 / Joining first room should succeed, error: {err}"
+
+        # 切换到第二个房间（同名Computer）
+        # Switch to second room (same name Computer)
+        ok2, err2 = computer.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": "office-sync-room-2", "name": computer_name},
+        )
+
+        # 验证成功
+        # Verify success
+        assert ok2, f"Computer切换房间应该成功 / Computer switching rooms should succeed, error: {err2}"
+        assert err2 is None, "不应该有错误信息 / Should not have error message"
+
+    finally:
+        computer.disconnect()
