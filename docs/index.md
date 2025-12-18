@@ -377,6 +377,33 @@ class SMCPAgentClient(Client):
 ## Roadmap
 
 - 实现对错误处理模式的定义与实现
-- 实现对 Desktop 事件与数据结构的管理与落地，支持桌面信息获取与刷新通知。
-- 实现对 MCP 协议中 Prompts 的管理，方便Agent使用。
+- ✅ 已完成：实现对 Desktop 事件与数据结构的管理与落地，支持桌面信息获取与刷新通知。
+- 实现对 MCP 协议中 Prompts 的管理，方便Agent使用。  # 2025-12-18 更新： 现在实现的对Resource的映射也是按协议进行部分抽象映射，并不是将MCP协议的Resource部分全部封装返回。原则在于用户与Agent之间的环境还是要有绝对的隔离。因此Prompt可能短期也不会暴露，换句话说，Resource/Prompt是MCP协议内相对冗余的设计。需要尝试阉割
 - 实现与OpenTelemetry的集成，支持将A2C-SMCP调用链的数据连接到目前的用户请求调用链（触发A2C协议的请求）
+
+## MCP Resources 与 A2C-SMCP Desktop 的映射关系（现状）
+
+当前 A2C-SMCP **已使用并消费** MCP 协议的 Resources 能力，但该能力在 A2C-SMCP 中的对外呈现方式是**收敛为 Desktop（窗口）能力**，核心映射如下：
+
+- **MCP `resources/list` → A2C-SMCP `list_windows()`（window:// 子集）**
+  Computer 侧会通过 MCP Client 拉取资源列表，并仅保留满足 `window://` scheme 的 `Resource` 作为“可用窗口资源”。
+- **MCP `resources/read` → A2C-SMCP `get_window_detail()`（读取窗口内容）**
+  对单个窗口资源使用 MCP 的 `read_resource` 读取内容，用于组织与渲染桌面信息。
+- **MCP `resources/subscribe` + 资源变更通知 → A2C-SMCP 桌面刷新事件/通知**
+  当窗口资源列表变化（ResourceListChanged）或窗口资源内容更新（ResourceUpdated）时，Computer 侧会触发桌面刷新链路，并通过 SMCP 事件广播给 Agent，Agent 再按需拉取最新桌面。
+
+需要注意：当前实现主要面向 Desktop 场景，**仅对 `window://` 资源形成闭环**；MCP 中其它 scheme 的通用资源尚未在 SMCP 协议层以“资源级别事件/接口”对外暴露。
+
+### 补充：`window://` 数量与桌面组装规则（现状）
+
+- **一个 MCP Server 是否只能暴露一个 `window://`？**
+  不是。当前约定与实现均支持一个 MCP Server 暴露多个 `window://` 资源（通过 `window://{host}/{path...}` 区分不同窗口）。Computer 侧会从 `resources/list` 的返回中筛选出所有 `window://` 资源，并逐个进行订阅。
+
+- **Computer 如何用这些 window 资源组装 Desktop？**
+  Desktop 的生成是“跨 MCP Server 汇总 window 资源 → 读取每个 window 的内容 → 按策略排序/裁剪 → 渲染为字符串列表”的流程，对外通过 `client:get_desktop` 返回。
+
+- **桌面组装的主要原则（当前策略实现）**
+  - **size 截断**：若传入 `desktop_size`，则全局按数量上限截断；`desktop_size<=0` 直接返回空。
+  - **server 优先级**：优先展示最近发生工具调用的 MCP Server（按工具调用历史倒序去重），其余 server 再按名称稳定排序。
+  - **server 内窗口排序**：同一 server 内按 `WindowURI.priority` 降序；未提供 priority 默认为 0。
+  - **fullscreen 规则**：若某 server 存在 `fullscreen=true` 的窗口，则该 server 仅展示一个 fullscreen 窗口（多个 fullscreen 时仅第一个生效），然后进入下一个 server。
