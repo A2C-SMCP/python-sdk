@@ -455,6 +455,5 @@ def catch_all(event, *args):
 
 ## 参考
 
-- 协议事件: [事件规范](../specification/events.md)
-- 数据结构: [数据结构规范](../specification/data-structures.md)
-- API 参考: [Agent API](../reference/agent-api.md)
+- 协议事件: [事件规范](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/main/specification/events.md)
+- 数据结构: [数据结构规范](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/main/specification/data-structures.md)

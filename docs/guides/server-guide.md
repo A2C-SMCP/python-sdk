@@ -274,6 +274,6 @@ pytest tests/unit_tests/server/ --cov=a2c_smcp.server
 
 ## 参考
 
-- 协议事件定义: [事件规范](../specification/events.md)
-- 数据结构: [数据结构规范](../specification/data-structures.md)
-- 房间模型: [房间隔离模型](../specification/room-model.md)
+- 协议事件定义: [事件规范](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/main/specification/events.md)
+- 数据结构: [数据结构规范](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/main/specification/data-structures.md)
+- 房间模型: [房间隔离模型](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/main/specification/room-model.md)

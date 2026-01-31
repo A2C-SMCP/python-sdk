@@ -254,4 +254,4 @@ print(result)
 - [Server 使用指南](server-guide.md) - 搭建和配置信令服务器
 - [Computer 使用指南](computer-guide.md) - 管理 MCP 服务
 - [CLI 使用指南](cli-guide.md) - 使用命令行工具
-- [协议规范](../specification/index.md) - 了解协议细节
+- [协议规范](https://github.com/A2C-SMCP/a2c-smcp-protocol) - 了解协议细节
