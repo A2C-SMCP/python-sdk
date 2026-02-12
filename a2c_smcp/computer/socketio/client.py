@@ -168,7 +168,8 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             dict: 工具调用结果的字典表示（JSON 可序列化）
         """
-        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
+        # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
+        # Server guarantees request is from same office via session, no need to validate agent vs office_id here
         assert self.computer.name == data["computer"], "计算机标识不匹配"
         try:
             ret = await self.computer.aexecute_tool(
@@ -190,7 +191,8 @@ class SMCPComputerClient(AsyncClient):
         Args:
             data (GetToolsReq): 请求数据
         """
-        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
+        # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
+        # Server guarantees request is from same office via session, no need to validate agent vs office_id here
         assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         mcp_tools = await self.computer.aget_available_tools()
@@ -208,7 +210,8 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             GetDeskTopRet: 桌面数据与 req_id。
         """
-        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
+        # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
+        # Server guarantees request is from same office via session, no need to validate agent vs office_id here
         assert self.computer.name == data["computer"], "计算机标识不匹配"
         size = data.get("desktop_size")
         window_uri = data.get("window")
@@ -220,8 +223,8 @@ class SMCPComputerClient(AsyncClient):
         获取当前计算机的 MCP 配置（供 Agent 端刷新使用）。
         Get current machine MCP configuration for Agent refresh.
 
-        中文：校验房间与计算机标识后，收集并序列化所有 MCP Server 配置，返回 SMCP 协议定义的配置结构。
-        English: Validate office and computer identifiers, then collect and serialize all MCP server configs
+        中文：校验计算机标识后，收集并序列化所有 MCP Server 配置，返回 SMCP 协议定义的配置结构。
+        English: Validate computer identifier, then collect and serialize all MCP server configs
         into SMCP protocol defined structure.
 
         Args:
@@ -230,8 +233,8 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             GetComputerConfigRet: SMCP 协议定义的 MCP 配置返回。SMCP formatted MCP configuration.
         """
-        # 校验上下文一致性（中英双语）/ Validate context consistency (bilingual)
-        assert self.office_id == data["agent"], f"房间名称{self.office_id}与Agent信息{data['agent']}名称不匹配"
+        # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
+        # Server guarantees request is from same office via session, no need to validate agent vs office_id here
         assert self.computer.name == data["computer"], "计算机标识不匹配"
 
         servers: dict[str, dict] = {}
