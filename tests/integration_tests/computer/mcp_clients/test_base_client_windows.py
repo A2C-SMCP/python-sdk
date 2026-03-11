@@ -21,10 +21,10 @@ from a2c_smcp.computer.mcp_clients.stdio_client import StdioMCPClient
 
 
 @pytest.mark.asyncio
-async def test_list_windows_without_subscribe_returns_empty() -> None:
+async def test_list_windows_without_subscribe_returns_resources() -> None:
     """
-    中文: 针对仅 Resources 且不支持订阅的服务器，list_windows 应返回空列表。
-    英文: For Resources-only server without subscribe, list_windows should return an empty list.
+    中文: 针对仅 Resources 且不支持订阅的服务器，list_windows 仍应正常返回 window:// 资源。
+    英文: For Resources-only server without subscribe, list_windows should still return window:// resources.
     """
     server_py = Path(__file__).resolve().parents[2] / "computer" / "mcp_servers" / "resources_stdio_server.py"
     assert server_py.exists(), f"server script not found: {server_py}"
@@ -42,7 +42,9 @@ async def test_list_windows_without_subscribe_returns_empty() -> None:
 
     windows = await client.list_windows()
     assert isinstance(windows, list)
-    assert windows == [], "Without subscribe capability, list_windows should return []."
+    assert len(windows) >= 1, "Resources capability without subscribe should still list window:// resources."
+    uris = [str(r.uri) for r in windows]
+    assert all(u.startswith("window://") for u in uris)
 
     await client.adisconnect()
     await client._async_session_closed_event.wait()

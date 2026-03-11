@@ -11,7 +11,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp import ClientSession
-from mcp.types import Implementation, InitializeResult, ListToolsResult, ServerCapabilities
+from mcp.types import (
+    AnyUrl,
+    Implementation,
+    InitializeResult,
+    ListResourcesResult,
+    ListToolsResult,
+    Resource,
+    ResourcesCapability,
+    ServerCapabilities,
+)
 from pydantic import BaseModel
 from transitions.core import MachineError
 
@@ -393,3 +402,52 @@ async def test_initialize_result_cleared_on_error():
 
     # 应被清理 / should be cleared
     assert client.initialize_result is None
+
+
+# ------------------------------
+# list_windows 相关测试 / Tests for list_windows logic
+# ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_windows_without_subscribe_still_returns_resources(connected_client):
+    """
+    中文: 当 capabilities.resources 存在但 subscribe=False 时，list_windows 仍应正常列出 window:// 资源。
+    英文: When capabilities.resources exists but subscribe=False, list_windows should still list window:// resources.
+
+    Bug: list_windows 误将 resources.subscribe 作为前置门禁，subscribe=False 时直接返回空列表。
+    """
+    client_instance, _ = connected_client
+    mock_session = client_instance._async_session
+
+    # 设置 initialize_result，resources 存在但 subscribe=False
+    client_instance._initialize_result = InitializeResult(
+        protocolVersion="2025-06-18",
+        capabilities=ServerCapabilities(
+            resources=ResourcesCapability(subscribe=False, listChanged=False),
+        ),
+        serverInfo=Implementation(name="test", version="1.0.0"),
+    )
+
+    # mock list_resources 返回 window:// 资源
+    mock_session.list_resources = AsyncMock(
+        return_value=ListResourcesResult(
+            resources=[
+                Resource(uri=AnyUrl("window://test.host/main?priority=80"), name="Main Window"),
+                Resource(uri=AnyUrl("window://test.host/secondary?priority=20"), name="Secondary"),
+                Resource(uri=AnyUrl("https://example.com/not-a-window"), name="Not Window"),
+            ]
+        )
+    )
+
+    windows = await client_instance.list_windows()
+
+    # 应返回 2 个 window:// 资源，而非空列表
+    assert len(windows) == 2
+    uris = [str(r.uri) for r in windows]
+    assert all(u.startswith("window://") for u in uris)
+    # 按 priority 降序排列
+    assert "/main" in uris[0]
+    assert "/secondary" in uris[1]
+    # subscribe=False 时不应调用 subscribe_resource
+    mock_session.subscribe_resource.assert_not_called() if hasattr(mock_session, "subscribe_resource") else None

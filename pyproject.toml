@@ -1,6 +1,6 @@
 [project]
 name = "a2c-smcp"
-version = "0.1.2-rc1"
+version = "0.1.2"
 description = "The official Python Computer Client SDK for A2C-SMCP"
 authors = [
     {name = "JQQ", email = "jqq1716@gmail.com"}

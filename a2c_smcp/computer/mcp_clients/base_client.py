@@ -358,52 +358,51 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
     async def list_windows(self) -> list[Resource]:
         """
-        列出当前MCP服务可用的窗口资源列表。需要注意MCP Server如果想开启桌面模式必须打开 resources/subscribe
+        列出当前MCP服务可用的窗口资源列表。只要 MCP Server 声明了 resources 能力即可发现 window:// 资源。
+
+        subscribe 是可选增强：当 resources.subscribe=True 时，会自动订阅 window:// 资源的变更通知。
 
         同时开发者需要注意维护好 window:// 状态
 
         Returns:
             list[Resource]: 当前可用的窗口类资源
         """
-        if (
-            self.initialize_result
-            and self.initialize_result.capabilities.resources
-            and self.initialize_result.capabilities.resources.subscribe
-        ):
-            # Get available resources directly from client session
-            try:
-                asession = cast(ClientSession, await self.async_session)
-                # 中文: 支持分页获取资源；与 list_tools 一致，穷举所有页后再进行过滤与订阅
-                # 英文: Support pagination; same as list_tools, exhaust all pages then filter and subscribe
-                resources: list[Resource] = []
-                ret = await asession.list_resources()
-                if ret:
-                    resources.extend(ret.resources)
-                    while ret.nextCursor:
-                        ret = await asession.list_resources(cursor=ret.nextCursor)
-                        resources.extend(ret.resources)
-                # 返回满足WindowURI协议要求的Resource
-                # Return only resources that conform to WindowURI (window:// scheme)
-                filtered: list[tuple[Resource, int]] = []
-                for res in resources:
-                    # 类型守卫：快速判定并过滤非 window:// 资源
-                    if not is_window_uri(res.uri):
-                        continue
-                    # 解析优先级（缺省为0）
-                    uri = WindowURI(str(res.uri))
-                    prio = uri.priority if uri.priority is not None else 0
-                    filtered.append((res, prio))
+        # 只检查是否支持 resources 能力，不要求 subscribe
+        if not (self.initialize_result and self.initialize_result.capabilities.resources):
+            return []
 
-                # 同一 MCP 内按 priority 降序排序（仅在本客户端内比较）
-                filtered.sort(key=lambda x: x[1], reverse=True)
-                # 如果当前MCP Server开启了 resources 的订阅模式，则将过滤出来的Resources进行订阅
+        try:
+            asession = cast(ClientSession, await self.async_session)
+            # 中文: 支持分页获取资源；与 list_tools 一致，穷举所有页后再进行过滤与订阅
+            # 英文: Support pagination; same as list_tools, exhaust all pages then filter and subscribe
+            resources: list[Resource] = []
+            ret = await asession.list_resources()
+            if ret:
+                resources.extend(ret.resources)
+                while ret.nextCursor:
+                    ret = await asession.list_resources(cursor=ret.nextCursor)
+                    resources.extend(ret.resources)
+            # 返回满足WindowURI协议要求的Resource
+            # Return only resources that conform to WindowURI (window:// scheme)
+            filtered: list[tuple[Resource, int]] = []
+            for res in resources:
+                # 类型守卫：快速判定并过滤非 window:// 资源
+                if not is_window_uri(res.uri):
+                    continue
+                # 解析优先级（缺省为0）
+                uri = WindowURI(str(res.uri))
+                prio = uri.priority if uri.priority is not None else 0
+                filtered.append((res, prio))
+
+            # 同一 MCP 内按 priority 降序排序（仅在本客户端内比较）
+            filtered.sort(key=lambda x: x[1], reverse=True)
+            # subscribe 是可选增强：仅当 Server 声明支持订阅时才订阅 window:// 资源
+            if self.initialize_result.capabilities.resources.subscribe:
                 for r, _ in filtered:
                     await asession.subscribe_resource(r.uri)
-                return [r for r, _ in filtered]
-            except Exception as e:
-                logger.error(f"Error listing resources for connector {self.params.model_dump(mode='json')}: {e}")
-                return []
-        else:
+            return [r for r, _ in filtered]
+        except Exception as e:
+            logger.error(f"Error listing resources for connector {self.params.model_dump(mode='json')}: {e}")
             return []
 
     async def get_window_detail(self, resource: Resource | str) -> ReadResourceResult:
