@@ -4,4 +4,4 @@
 # @Author  : JQQ
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
-__version__: str = "0.1.2-rc1"
+__version__: str = "0.1.2-rc2"
