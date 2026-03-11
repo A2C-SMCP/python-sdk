@@ -23,10 +23,10 @@ from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 
 
 @pytest.mark.anyio
-async def test_manager_list_windows_aggregates_only_subscribe_server() -> None:
+async def test_manager_list_windows_aggregates_all_resource_servers() -> None:
     """
-    中文: Manager 应仅聚合开启 resources.subscribe 的服务的窗口；非订阅服务应返回空。
-    英文: Manager should aggregate windows only from servers with resources.subscribe enabled; non-subscribe returns empty.
+    中文: Manager 应聚合所有支持 resources 能力的服务的窗口，无论是否支持 subscribe。
+    英文: Manager should aggregate windows from all servers with resources capability, regardless of subscribe support.
     """
     base = Path(__file__).resolve().parents[2] / "computer" / "mcp_servers"
     sub_py = base / "resources_subscribe_stdio_server.py"
@@ -45,17 +45,16 @@ async def test_manager_list_windows_aggregates_only_subscribe_server() -> None:
 
     try:
         results = await manager.list_windows()
-        # 只应来自订阅服务 / Only from subscribe server
-        assert all(srv == "srv_sub" for srv, _ in results)
-        assert len(results) >= 1
+        # 两个服务都应返回窗口 / Both servers should return windows
+        server_names = {srv for srv, _ in results}
+        assert "srv_sub" in server_names
+        assert "srv_nosub" in server_names
+        assert len(results) >= 2
 
-        # 验证排序（dashboard priority=90 在 main priority=60 之前）
-        uris = [str(res.uri) for _, res in results]
-        assert any("/dashboard" in u for u in uris)
-        assert any("/main" in u for u in uris)
-        if len(uris) >= 2:
-            assert "/dashboard" in uris[0]
-            assert "/main" in uris[1]
+        # 验证订阅服务中包含 dashboard 和 main
+        sub_uris = [str(res.uri) for srv, res in results if srv == "srv_sub"]
+        assert any("/dashboard" in u for u in sub_uris)
+        assert any("/main" in u for u in sub_uris)
     finally:
         await manager.astop_all()
 

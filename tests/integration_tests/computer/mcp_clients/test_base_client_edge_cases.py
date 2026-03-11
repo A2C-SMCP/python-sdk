@@ -166,7 +166,16 @@ async def test_get_window_detail_ok_and_error() -> None:
     await client_err._create_session_success_event.wait()
 
     windows2 = await client_err.list_windows()
-    assert not windows2, "因为resources_read_error_stdio_server.py没有实现 subscribe 能力，因此直接返回空"
+    assert windows2, "resources_read_error_stdio_server.py 支持 resources 能力，应返回 window:// 资源"
+
+    # 测试 get_window_detail 的异常路径 / test error path of get_window_detail
+    detail_err = await client_err.get_window_detail(windows2[0])
+    # 异常时应返回包含错误信息的 ReadResourceResult / on error, should return ReadResourceResult with error text
+    assert detail_err.contents
+    assert "获取资源失败" in detail_err.contents[0].text
+
+    await client_err.adisconnect()
+    await client_err._async_session_closed_event.wait()
 
 
 # ------------------------------
