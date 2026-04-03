@@ -14,7 +14,9 @@ from socketio import Namespace
 
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.types import SID
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import ContextLogger, get_logger
+
+logger = get_logger("server")
 
 
 class SyncBaseNamespace(Namespace):
@@ -39,8 +41,9 @@ class SyncBaseNamespace(Namespace):
         客户端连接事件处理，包含认证逻辑（同步）
         Client connection event handler with authentication (sync)
         """
+        ctx = ContextLogger(logger, {"sid": sid, "ns": self.namespace})
         try:
-            logger.info(f"SocketIO Client {sid} connecting to {self.namespace}...")
+            ctx.info("Client connecting...")
 
             # 提取原始请求头
             # Extract raw request headers
@@ -52,10 +55,10 @@ class SyncBaseNamespace(Namespace):
             if not is_authenticated:
                 raise ConnectionRefusedError("Authentication failed")
 
-            logger.info(f"SocketIO Client {sid} connected successfully to {self.namespace}")
+            ctx.info("Client connected successfully")
             return True
         except Exception as e:
-            logger.error(f"Connection error for {sid}: {e}")
+            ctx.exception(f"Connection error: {e}")
             raise ConnectionRefusedError("Invalid connection request") from e
 
     def on_disconnect(self, sid: SID) -> None:

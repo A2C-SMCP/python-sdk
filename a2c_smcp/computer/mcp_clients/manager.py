@@ -17,7 +17,9 @@ from vrl_python import VRLRuntime
 from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger, truncate
+
+logger = get_logger("computer")
 
 
 class ToolNameDuplicatedError(Exception):
@@ -312,7 +314,7 @@ class MCPServerManager:
                     if display_name in (config.forbidden_tools or []) or original_tool_name in (config.forbidden_tools or []):
                         self._disabled_tools.add(display_name)
             except Exception as e:
-                logger.error(f"Error listing tools for {server_name}: {e}")
+                logger.error(f"Error listing tools for {server_name}: {e}", exc_info=True)
 
         # 构建最终映射（处理工具名冲突）
         for tool, sources in tool_sources.items():
@@ -337,7 +339,7 @@ class MCPServerManager:
             tuple[SERVER_NAME, TOOL_NAME]: 经过校验后的合法服务名与工具名
         """
         # 标记当前parameters尚未被使用
-        logger.debug(f"{parameters}未被检查。当前版本不支持Schema校验。")
+        logger.debug(f"{truncate(parameters)}未被检查。当前版本不支持Schema校验。")
         # 检查工具是否可用
         if tool_name in self._disabled_tools:
             raise PermissionError(f"Tool '{tool_name}' is disabled by configuration")
@@ -504,7 +506,7 @@ class MCPServerManager:
             try:
                 resources = await client.list_windows()
             except Exception as e:
-                logger.error(f"Error listing windows for {server_name}: {e}")
+                logger.error(f"Error listing windows for {server_name}: {e}", exc_info=True)
                 continue
 
             for res in resources:
@@ -530,7 +532,7 @@ class MCPServerManager:
             try:
                 resources = await client.list_windows()
             except Exception as e:
-                logger.error(f"Error listing windows for {server_name}: {e}")
+                logger.error(f"Error listing windows for {server_name}: {e}", exc_info=True)
                 continue
 
             for res in resources:

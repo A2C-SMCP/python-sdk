@@ -17,7 +17,9 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("computer")
 
 # 中文: 匹配占位符 ${input:xxx} 的正则
 # English: Regex to match placeholder ${input:xxx}
@@ -70,7 +72,7 @@ class ConfigRender:
                 logger.warning(f"未找到输入项: {input_id} / Input id not found: {input_id}")
                 return s
             except Exception as e:  # pragma: no cover
-                logger.error(f"解析输入失败: {input_id}, 错误: {e}")
+                logger.error(f"解析输入失败: {input_id}, 错误: {e}", exc_info=True)
                 return s
 
         # 否则逐个替换为其字符串表现形式
@@ -85,7 +87,7 @@ class ConfigRender:
                 logger.warning(f"未找到输入项: {input_id} / Input id not found: {input_id}")
                 continue
             except Exception as e:  # pragma: no cover
-                logger.error(f"解析输入失败: {input_id}, 错误: {e}")
+                logger.error(f"解析输入失败: {input_id}, 错误: {e}", exc_info=True)
                 continue
 
             # 将非字符串值转换为字符串嵌入

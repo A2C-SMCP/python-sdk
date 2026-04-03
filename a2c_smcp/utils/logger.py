@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # 直接从环境变量获取配置
 LOG_LEVEL = os.environ.get("A2C_SMCP_LOG_LEVEL", "info").lower()
@@ -65,3 +66,56 @@ else:
     # 静默模式：禁用日志
     logger.disabled = True
     logger.addHandler(logging.NullHandler())  # 防止无handler的警告
+
+
+def get_logger(module: str = "") -> logging.Logger:
+    """获取模块子 logger / Get a child logger for the given module.
+
+    子 logger 自动继承父 logger 的 handlers、level 和 formatter。
+    日志格式中 %(name)s 会自动显示为 a2c_smcp.agent / a2c_smcp.server 等。
+
+    Args:
+        module: 子模块名 (如 "agent", "server", "computer")。
+                空字符串返回根 a2c_smcp logger。
+    """
+    if module:
+        return logging.getLogger(f"a2c_smcp.{module}")
+    return logger
+
+
+class ContextLogger(logging.LoggerAdapter):
+    """在日志消息前附加结构化上下文标签。
+
+    用于在关键代码路径中注入瞬态上下文（如 SID、computer 名称、req_id），
+    方便多实例场景下的问题定位。
+
+    Usage::
+
+        ctx = ContextLogger(logger, {"sid": sid, "computer": name})
+        ctx.info("Tool call started")
+        # Output: [sid=abc123] [computer=my-pc] Tool call started
+    """
+
+    def process(self, msg: Any, kwargs: Any) -> tuple[Any, Any]:
+        if self.extra:
+            ctx = " ".join(f"[{k}={v}]" for k, v in self.extra.items() if v is not None)
+            if ctx:
+                msg = f"{ctx} {msg}"
+        return msg, kwargs
+
+
+def truncate(value: Any, max_len: int = 500) -> str:
+    """截断大文本用于安全日志输出 / Truncate large text for safe logging.
+
+    保留首尾各 max_len//2 字符，中间标注总长度。
+    适用于 LLM 项目中可能包含大量文本的工具参数和返回值。
+
+    Args:
+        value: 待截断的值，会先转为 str。
+        max_len: 最大允许长度，默认 500。
+    """
+    s = str(value)
+    if len(s) <= max_len:
+        return s
+    half = max_len // 2
+    return f"{s[:half]}...({len(s)} chars)...{s[-half:]}"

@@ -25,7 +25,9 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
 )
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("computer")
 
 
 class InputNotFoundError(KeyError):

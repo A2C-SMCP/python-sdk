@@ -20,7 +20,9 @@ from transitions.extensions import AsyncMachine
 
 from a2c_smcp.utils import WindowURI, is_window_uri
 from a2c_smcp.utils.async_property import async_property
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger, truncate
+
+logger = get_logger("computer")
 
 # 泛型参数，用于约束 MCP Server 参数类型
 # Generic parameter for constraining MCP Server parameter types
@@ -215,7 +217,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 # 任务被取消，完成上下文
                 logger.debug(f"Session keep-alive task cancelled: {asyncio.current_task().get_name()}")
         except Exception as e:
-            logger.error(f"Session keep-alive task error: {asyncio.current_task().get_name()}: {e}")
+            logger.error(f"Session keep-alive task error: {asyncio.current_task().get_name()}: {e}", exc_info=True)
             self._create_session_failure_event.set()
             await self.aerror()
 
@@ -232,20 +234,20 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
     # region 状态转换回调函数基类实现
     async def aprepare_connect(self, event: EventData) -> None:
         """连接准备操作（可重写）"""
-        logger.debug(f"Preparing connection with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Preparing connection with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def acan_connect(self, event: EventData) -> bool:
         """连接条件检查（可重写）"""
-        logger.debug(f"Checking connection conditions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Checking connection conditions with event: {event}\n\nserver params: {truncate(self.params)}")
         return True
 
     async def abefore_connect(self, event: EventData) -> None:
         """连接前操作（可重写）"""
-        logger.debug(f"Before connection actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Before connection actions with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def on_enter_connected(self, event: EventData) -> None:
         """进入已连接状态（可重写）"""
-        logger.debug(f"Entering connected state with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Entering connected state with event: {event}\n\nserver params: {truncate(self.params)}")
         self._session_keep_alive_task = asyncio.create_task(self._keep_alive_task())
         # 等待会话创建成功
         await self._create_session_success_event.wait()
@@ -256,25 +258,25 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
     async def aafter_connect(self, event: EventData) -> None:
         """连接后操作（可重写）"""
-        logger.debug(f"After connection actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"After connection actions with event: {event}\n\nserver params: {truncate(self.params)}")
         await self._trigger_state_change(event)
 
     async def aprepare_disconnect(self, event: EventData) -> None:
         """断开准备操作（可重写）"""
-        logger.debug(f"Preparing disconnection with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Preparing disconnection with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def acan_disconnect(self, event: EventData) -> bool:
         """断开条件检查（可重写）"""
-        logger.debug(f"Checking disconnection conditions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Checking disconnection conditions with event: {event}\n\nserver params: {truncate(self.params)}")
         return (await self.async_session) is not None
 
     async def abefore_disconnect(self, event: EventData) -> None:
         """断开前操作（可重写）"""
-        logger.debug(f"Before disconnection actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Before disconnection actions with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def on_enter_disconnected(self, event: EventData) -> None:
         """状态机进入断开状态时的回调（可重写）"""
-        logger.debug(f"Entering disconnected state with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Entering disconnected state with event: {event}\n\nserver params: {truncate(self.params)}")
         # 关闭异步会话，保证资源的正常释放
         logger.debug(f"Enter disconnected state async task: {asyncio.current_task().get_name()}")
         await self._close_task()
@@ -283,49 +285,49 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
     async def aafter_disconnect(self, event: EventData) -> None:
         """断开后操作（可重写）"""
-        logger.debug(f"After disconnection actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"After disconnection actions with event: {event}\n\nserver params: {truncate(self.params)}")
         await self._trigger_state_change(event)
 
     async def aprepare_error(self, event: EventData) -> None:
         """错误准备操作（可重写）"""
-        logger.debug(f"Preparing error with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Preparing error with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def acan_error(self, event: EventData) -> bool:
         """错误条件检查（可重写）"""
-        logger.debug(f"Checking error conditions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Checking error conditions with event: {event}\n\nserver params: {truncate(self.params)}")
         return True
 
     async def abefore_error(self, event: EventData) -> None:
         """错误前操作（可重写）"""
-        logger.debug(f"Before error actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Before error actions with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def on_enter_error(self, event: EventData) -> None:
         """状态机进入错误状态时的回调（可重写）"""
-        logger.debug(f"Entered error state with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Entered error state with event: {event}\n\nserver params: {truncate(self.params)}")
         # 将所有异步Event全部clear
         await self._close_task()
 
     async def aafter_error(self, event: EventData) -> None:
         """错误后操作（可重写）"""
-        logger.debug(f"After error actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"After error actions with event: {event}\n\nserver params: {truncate(self.params)}")
         await self._trigger_state_change(event)
 
     async def aprepare_initialize(self, event: EventData) -> None:
         """初始化准备操作（可重写）"""
-        logger.debug(f"Preparing initialization with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Preparing initialization with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def acan_initialize(self, event: EventData) -> bool:
         """初始化条件检查（可重写）"""
-        logger.debug(f"Checking initialization conditions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Checking initialization conditions with event: {event}\n\nserver params: {truncate(self.params)}")
         return True
 
     async def abefore_initialize(self, event: EventData) -> None:
         """初始化前操作（可重写）"""
-        logger.debug(f"Before initialization actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Before initialization actions with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def on_enter_initialized(self, event: EventData) -> None:
         """状态机进入初始化状态时的回调（可重写）"""
-        logger.debug(f"Entered initialized state with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"Entered initialized state with event: {event}\n\nserver params: {truncate(self.params)}")
         # 将所有异步Event全部clear
         self._create_session_success_event.clear()
         self._create_session_failure_event.clear()
@@ -334,7 +336,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
     async def aafter_initialize(self, event: EventData) -> None:
         """初始化后操作（可重写）"""
-        logger.debug(f"After initialization actions with event: {event}\n\nserver params: {self.params}")
+        logger.debug(f"After initialization actions with event: {event}\n\nserver params: {truncate(self.params)}")
         await self._trigger_state_change(event)
 
     async def list_tools(self) -> list[Tool]:
@@ -402,7 +404,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                     await asession.subscribe_resource(r.uri)
             return [r for r, _ in filtered]
         except Exception as e:
-            logger.error(f"Error listing resources for connector {self.params.model_dump(mode='json')}: {e}")
+            logger.error(f"Error listing resources for connector {truncate(self.params.model_dump(mode='json'))}: {e}", exc_info=True)
             return []
 
     async def get_window_detail(self, resource: Resource | str) -> ReadResourceResult:
@@ -427,7 +429,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
             return await asession.read_resource(uri_val)
         except Exception as e:
-            logger.error(f"Read window resource failed: {resource}: {e}")
+            logger.error(f"Read window resource failed: {resource}: {e}", exc_info=True)
             return ReadResourceResult(contents=[TextResourceContents(text="获取资源失败", uri=resource.uri)])
 
     async def call_tool(self, tool_name: str, params: dict) -> CallToolResult:
@@ -461,4 +463,4 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             except asyncio.CancelledError:
                 logger.debug("Session keep-alive task was cancelled")
             except Exception as e:
-                logger.error(f"Session keep-alive task failed: {e}")
+                logger.error(f"Session keep-alive task failed: {e}", exc_info=True)

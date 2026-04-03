@@ -36,7 +36,9 @@ from a2c_smcp.smcp import (
     SessionInfo,
     UpdateMCPConfigNotification,
 )
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import ContextLogger, get_logger
+
+logger = get_logger("agent")
 
 
 class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
@@ -163,9 +165,10 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             CallToolResult: MCP协议工具调用结果 / MCP protocol tool call result
         """
         req = self.create_tool_call_request(computer, tool_name, params, timeout)
+        ctx = ContextLogger(logger, {"computer": computer, "tool": tool_name, "req_id": req["req_id"]})
 
         try:
-            logger.debug(f"Calling tool {tool_name} on computer {computer}")
+            ctx.debug("Calling tool")
             res = await self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=SMCP_NAMESPACE)
             return CallToolResult.model_validate(res, by_name=True)
 
@@ -178,7 +181,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             return self.handle_tool_call_timeout(req["req_id"])
 
         except Exception as e:
-            logger.error(f"Tool call failed: {e}")
+            ctx.error(f"Tool call failed: {e}", exc_info=True)
             return CallToolResult(
                 content=[TextContent(text=f"工具调用失败 / Tool call failed: {str(e)}", type="text")],
                 isError=True,
@@ -253,7 +256,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             await self.handle_computer_leave_office(data)
 
         except Exception as e:
-            logger.error(f"Error in _on_computer_leave_office: {e}")
+            logger.error(f"Error in _on_computer_leave_office: {e}", exc_info=True)
 
     async def _on_computer_update_config(self, data: UpdateMCPConfigNotification) -> None:
         """
@@ -272,7 +275,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             await self.process_tools_response(tools_response, computer)
 
         except Exception as e:
-            logger.error(f"Error in _on_computer_update_config: {e}")
+            logger.error(f"Error in _on_computer_update_config: {e}", exc_info=True)
 
     async def get_desktop_from_computer(
         self,
@@ -307,7 +310,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             # 复用基类同步处理器（仅日志），未来可扩展异步回调
             self.process_desktop_response(ret, computer)
         except Exception as e:
-            logger.error(f"Error handling desktop updated notification: {e}")
+            logger.error(f"Error handling desktop updated notification: {e}", exc_info=True)
 
     async def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
         """

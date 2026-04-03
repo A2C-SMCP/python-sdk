@@ -27,7 +27,9 @@ from a2c_smcp.utils import WindowURI
 
 __all__ = ["organize_desktop"]
 
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("computer")
 
 
 async def organize_desktop(
@@ -115,7 +117,7 @@ async def organize_desktop(
             body = "\n\n".join(parts).strip()
             return f"{str(ri.uri)}\n\n{body}" if body else str(ri.uri)
         except Exception as e:
-            logger.error(f"发生未知异常: {e}")
+            logger.error(f"发生未知异常: {e}", exc_info=True)
             return str(ri.uri)
 
     result: list[str] = []

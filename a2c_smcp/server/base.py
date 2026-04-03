@@ -14,7 +14,9 @@ from socketio import AsyncNamespace
 
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.types import SID
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import ContextLogger, get_logger
+
+logger = get_logger("server")
 
 
 class BaseNamespace(AsyncNamespace):
@@ -51,8 +53,9 @@ class BaseNamespace(AsyncNamespace):
         Returns:
             bool: 是否允许连接 / Whether to allow connection
         """
+        ctx = ContextLogger(logger, {"sid": sid, "ns": self.namespace})
         try:
-            logger.info(f"SocketIO Client {sid} connecting to {self.namespace}...")
+            ctx.info("Client connecting...")
 
             # 提取原始请求头
             # Extract raw request headers
@@ -64,11 +67,11 @@ class BaseNamespace(AsyncNamespace):
             if not is_authenticated:
                 raise ConnectionRefusedError("Authentication failed")
 
-            logger.info(f"SocketIO Client {sid} connected successfully to {self.namespace}")
+            ctx.info("Client connected successfully")
             return True
 
         except Exception as e:
-            logger.error(f"Connection error for {sid}: {e}")
+            ctx.exception(f"Connection error: {e}")
             raise ConnectionRefusedError("Invalid connection request") from e
 
     async def on_disconnect(self, sid: SID) -> None:

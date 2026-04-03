@@ -44,7 +44,9 @@ from a2c_smcp.smcp import (
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
 )
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("server")
 
 
 class SMCPNamespace(BaseNamespace):

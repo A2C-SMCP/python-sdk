@@ -30,7 +30,9 @@ from a2c_smcp.smcp import (
     ToolCallReq,
     UpdateMCPConfigNotification,
 )
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("agent")
 
 
 class BaseAgentClient(ABC):
@@ -163,7 +165,7 @@ class BaseAgentClient(ABC):
             desktops = response.get("desktops", []) if isinstance(response, dict) else []
             logger.info(f"Received desktop from computer {computer}, windows={len(desktops)}")
         except Exception as e:
-            logger.error(f"Error processing desktop response: {e}")
+            logger.error(f"Error processing desktop response: {e}", exc_info=True)
 
     def handle_tool_call_timeout(self, req_id: str) -> CallToolResult:
         """
@@ -218,7 +220,7 @@ class BaseAgentClient(ABC):
                 await self.event_handler.on_computer_enter_office(data, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error handling computer enter office: {e}")
+            logger.error(f"Error handling computer enter office: {e}", exc_info=True)
 
     async def handle_computer_leave_office(self, data: LeaveOfficeNotification) -> None:
         """
@@ -238,7 +240,7 @@ class BaseAgentClient(ABC):
                 await self.event_handler.on_computer_leave_office(data, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error handling computer leave office: {e}")
+            logger.error(f"Error handling computer leave office: {e}", exc_info=True)
 
     async def handle_computer_update_config(self, data: UpdateMCPConfigNotification) -> None:
         """
@@ -258,7 +260,7 @@ class BaseAgentClient(ABC):
                 await self.event_handler.on_computer_update_config(data, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error handling computer update config: {e}")
+            logger.error(f"Error handling computer update config: {e}", exc_info=True)
 
     async def process_tools_response(self, response: GetToolsRet, computer: str) -> None:
         """
@@ -279,7 +281,7 @@ class BaseAgentClient(ABC):
                     await self.event_handler.on_tools_received(computer, tools, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error processing tools response: {e}")
+            logger.error(f"Error processing tools response: {e}", exc_info=True)
 
     async def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
         """
@@ -451,7 +453,7 @@ class BaseAgentSyncClient(ABC):
             desktops = response.get("desktops", []) if isinstance(response, dict) else []
             logger.info(f"Received desktop from computer {computer}, windows={len(desktops)}")
         except Exception as e:
-            logger.error(f"Error processing desktop response: {e}")
+            logger.error(f"Error processing desktop response: {e}", exc_info=True)
 
     def handle_tool_call_timeout(self, req_id: str) -> CallToolResult:
         """
@@ -506,7 +508,7 @@ class BaseAgentSyncClient(ABC):
                 self.event_handler.on_computer_enter_office(data, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error handling computer enter office: {e}")
+            logger.error(f"Error handling computer enter office: {e}", exc_info=True)
 
     def handle_computer_leave_office(self, data: LeaveOfficeNotification) -> None:
         """
@@ -526,7 +528,7 @@ class BaseAgentSyncClient(ABC):
                 self.event_handler.on_computer_leave_office(data, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error handling computer leave office: {e}")
+            logger.error(f"Error handling computer leave office: {e}", exc_info=True)
 
     def handle_computer_update_config(self, data: UpdateMCPConfigNotification) -> None:
         """
@@ -546,7 +548,7 @@ class BaseAgentSyncClient(ABC):
                 self.event_handler.on_computer_update_config(data, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error handling computer update config: {e}")
+            logger.error(f"Error handling computer update config: {e}", exc_info=True)
 
     def process_tools_response(self, response: GetToolsRet, computer: str) -> None:
         """
@@ -567,7 +569,7 @@ class BaseAgentSyncClient(ABC):
                     self.event_handler.on_tools_received(computer, tools, self)  # type: ignore[arg-type]
 
         except Exception as e:
-            logger.error(f"Error processing tools response: {e}")
+            logger.error(f"Error processing tools response: {e}", exc_info=True)
 
     def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
         """

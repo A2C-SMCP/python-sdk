@@ -48,7 +48,9 @@ from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
-from a2c_smcp.utils.logger import logger
+from a2c_smcp.utils.logger import get_logger, truncate
+
+logger = get_logger("computer")
 from a2c_smcp.utils.window_uri import is_window_uri
 
 if TYPE_CHECKING:
@@ -169,7 +171,7 @@ class Computer(BaseComputer[PromptSession]):
                 validated = type(server_cfg).model_validate(rendered)
                 validated_servers.append(validated)
             except Exception as e:
-                logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}")
+                logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 按稳妥策略: 保留原配置继续
                 validated_servers.append(server_cfg)
 
@@ -195,7 +197,7 @@ class Computer(BaseComputer[PromptSession]):
                 # Directly emit tool list update event
                 await client.emit_update_tool_list()
             except Exception as e:  # pragma: no cover
-                logger.error(f"上报工具变更失败: {e}")
+                logger.error(f"上报工具变更失败: {e}", exc_info=True)
         elif isinstance(getattr(message, "root", None), ResourceListChangedNotification):
             # 仅当 window:// 集合发生变化时触发刷新；否则记录日志以便后续策略调整
             client = self.socketio_client
@@ -205,7 +207,7 @@ class Computer(BaseComputer[PromptSession]):
             try:
                 new_windows = await self._acollect_window_uris()
             except Exception as e:  # pragma: no cover
-                logger.error(f"收集窗口资源失败，跳过刷新: {e}")
+                logger.error(f"收集窗口资源失败，跳过刷新: {e}", exc_info=True)
                 return
 
             if new_windows != self._windows_cache:
@@ -223,7 +225,7 @@ class Computer(BaseComputer[PromptSession]):
                 try:
                     await client.emit_refresh_desktop()
                 except Exception as e:  # pragma: no cover
-                    logger.error(f"上报桌面刷新失败: {e}")
+                    logger.error(f"上报桌面刷新失败: {e}", exc_info=True)
             else:
                 # 打印关键信息帮助开发者判断策略是否需要更新
                 logger.info(
@@ -245,7 +247,7 @@ class Computer(BaseComputer[PromptSession]):
             except Exception as e:  # pragma: no cover
                 logger.error(f"上报桌面刷新失败: {e}")
         else:
-            logger.warning(f"收到未处理的变化类型: {message}，当前版本仅处理工具列表变化")
+            logger.warning(f"收到未处理的变化类型: {truncate(message)}，当前版本仅处理工具列表变化")
 
     async def _acollect_window_uris(self) -> set[str]:
         """
@@ -322,7 +324,7 @@ class Computer(BaseComputer[PromptSession]):
             return validated
         except Exception as e:
             name = (server.get("name") if isinstance(server, dict) else getattr(server, "name", "unknown")) or "unknown"
-            logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}")
+            logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
             raise e
 
     async def aadd_or_aupdate_server(self, server: MCPServerConfig | dict[str, Any], *, session: PromptSession | None = None) -> None:
@@ -560,7 +562,7 @@ class Computer(BaseComputer[PromptSession]):
                 TypeAdapter(AttributeValue).validate_python(v)
                 return True
             except Exception as e:
-                logger.debug(f"非简单属性:{v}", exc_info=e)
+                logger.debug(f"非简单属性:{truncate(v)}", exc_info=e)
                 return False
 
         def convert_tool(t: Tool) -> SMCPTool:
@@ -641,7 +643,7 @@ class Computer(BaseComputer[PromptSession]):
                             isError=True,
                         )
                     except Exception as e:
-                        logger.error(f"工具确认回调，调用失败:{e}")
+                        logger.error(f"工具确认回调，调用失败:{e}", exc_info=True)
                         error_msg = str(e)
                         result = CallToolResult(
                             content=[TextContent(text=f"在工具调用二次确认时发生异常，异常信息：{e}", type="text")],

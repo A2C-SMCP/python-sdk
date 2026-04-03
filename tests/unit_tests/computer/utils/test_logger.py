@@ -265,3 +265,121 @@ def test_silent_mode_with_file(monkeypatch, tmp_path):
 
     # 验证无日志文件创建
     assert not log_file.exists()
+
+
+# ==================== get_logger 子 Logger 测试 ====================
+
+
+def test_get_logger_child(monkeypatch):
+    """子 logger 名称正确且输出包含模块标识"""
+    module, captured_output = reload_module(monkeypatch)
+
+    child = module.get_logger("agent")
+    assert child.name == "a2c_smcp.agent"
+
+    child.warning("agent test message")
+    output = captured_output.getvalue()
+    assert "- a2c_smcp.agent - WARNING - agent test message" in output
+
+
+def test_child_logger_inherits_config(monkeypatch):
+    """子 logger 继承父 logger 的 level"""
+    module, captured_output = reload_module(monkeypatch, {"A2C_SMCP_LOG_LEVEL": "warning"})
+
+    child = module.get_logger("server")
+    # 子 logger 未设置 level，应继承父 logger 的 WARNING
+    child.info("should not appear")
+    child.warning("should appear")
+
+    output = captured_output.getvalue()
+    assert "should not appear" not in output or output.count("should not appear") == 0
+    assert "should appear" in output
+
+
+def test_get_logger_empty_returns_root(monkeypatch):
+    """空字符串返回根 logger"""
+    module, _ = reload_module(monkeypatch)
+    root = module.get_logger("")
+    assert root.name == "a2c_smcp"
+    assert root is module.logger
+
+
+# ==================== ContextLogger 测试 ====================
+
+
+def test_context_logger_adapter(monkeypatch):
+    """ContextLogger 输出包含 [key=value] 标签"""
+    module, captured_output = reload_module(monkeypatch)
+
+    ctx = module.ContextLogger(module.logger, {"sid": "abc123", "computer": "my-pc"})
+    ctx.warning("test message")
+
+    output = captured_output.getvalue()
+    assert "[sid=abc123]" in output
+    assert "[computer=my-pc]" in output
+    assert "test message" in output
+
+
+def test_context_logger_none_values(monkeypatch):
+    """ContextLogger 过滤 None 值"""
+    module, captured_output = reload_module(monkeypatch)
+
+    ctx = module.ContextLogger(module.logger, {"sid": "abc", "computer": None})
+    ctx.warning("test")
+
+    output = captured_output.getvalue()
+    assert "[sid=abc]" in output
+    assert "computer" not in output
+
+
+def test_context_logger_empty_extra(monkeypatch):
+    """ContextLogger 无 extra 时不附加标签"""
+    module, captured_output = reload_module(monkeypatch)
+
+    ctx = module.ContextLogger(module.logger, {})
+    ctx.warning("plain message")
+
+    output = captured_output.getvalue()
+    assert "plain message" in output
+    assert "[" not in output.split("plain message")[0].split("WARNING")[-1]
+
+
+# ==================== truncate 测试 ====================
+
+
+def test_truncate_short_string(monkeypatch):
+    """短于 max_len 的字符串原样返回"""
+    module, _ = reload_module(monkeypatch)
+
+    result = module.truncate("hello", max_len=500)
+    assert result == "hello"
+
+
+def test_truncate_exact_length(monkeypatch):
+    """等于 max_len 的字符串原样返回"""
+    module, _ = reload_module(monkeypatch)
+
+    s = "x" * 500
+    result = module.truncate(s, max_len=500)
+    assert result == s
+
+
+def test_truncate_long_string(monkeypatch):
+    """长字符串被截断，保留首尾并标注总长度"""
+    module, _ = reload_module(monkeypatch)
+
+    s = "A" * 200 + "B" * 400 + "C" * 200
+    result = module.truncate(s, max_len=100)
+
+    assert len(result) < len(s)
+    assert result.startswith("A" * 50)
+    assert result.endswith("C" * 50)
+    assert "(800 chars)" in result
+
+
+def test_truncate_non_string(monkeypatch):
+    """非字符串值会先转为 str"""
+    module, _ = reload_module(monkeypatch)
+
+    result = module.truncate(12345)
+    assert result == "12345"
