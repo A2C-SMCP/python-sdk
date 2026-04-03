@@ -181,7 +181,7 @@ class BaseNamespace(AsyncNamespace):
         """
         # 尝试从不同的环境变量结构中获取headers
         # Try to get headers from different environment variable structures
-        headers: list = environ.get("asgi", {}).get("scope", {}).get("headers", [])
+        headers: list = environ.get("asgi.scope", {}).get("headers", [])
         if not headers:
             headers = environ.get("HTTP_HEADERS", [])
 

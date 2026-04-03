@@ -145,7 +145,7 @@ class SyncBaseNamespace(Namespace):
         从请求环境中提取原始请求头列表
         Extract raw request headers list from request environment
         """
-        headers: list = environ.get("asgi", {}).get("scope", {}).get("headers", [])
+        headers: list = environ.get("asgi.scope", {}).get("headers", [])
         if not headers:
             headers = environ.get("HTTP_HEADERS", [])
         return headers

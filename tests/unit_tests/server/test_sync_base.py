@@ -18,7 +18,8 @@ class _DummyAuthProv:
 
 
 def _mk_environ_with_headers(headers: list[tuple[bytes, bytes]]):
-    return {"asgi": {"scope": {"headers": headers}}}
+    """ASGI 模式下 environ 的 key 是扁平字符串 'asgi.scope'，而非嵌套 dict"""
+    return {"asgi.scope": {"headers": headers}}
 
 
 def test_extract_headers_from_asgi_and_fallback():

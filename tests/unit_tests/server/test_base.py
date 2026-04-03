@@ -28,8 +28,8 @@ async def test_on_connect_success_and_extract_headers_paths(ns):
     server = AsyncMock()
     server.app = MagicMock()
 
-    # 路径1：从 asgi.scope.headers
-    environ1 = {"asgi": {"scope": {"headers": [(b"k", b"v")]}}}
+    # 路径1：从 asgi.scope headers（ASGI 模式下 key 是扁平字符串 "asgi.scope"）
+    environ1 = {"asgi.scope": {"headers": [(b"k", b"v")]}}
     ns.server = server
     ok = await ns.on_connect("sid1", environ1, None)
     assert ok is True
@@ -48,6 +48,16 @@ async def test_on_connect_success_and_extract_headers_paths(ns):
 
 
 @pytest.mark.asyncio
+async def test_extract_headers_asgi_scope_flat_key():
+    """确保 _extract_headers 能从 ASGI 的扁平 key 'asgi.scope' 中提取 headers"""
+    expected = [(b"x-api-key", b"test123")]
+    # ASGI 模式下 environ 的真实结构
+    environ = {"asgi.scope": {"headers": expected}}
+    result = BaseNamespace._extract_headers(environ)
+    assert result == expected
+
+
+@pytest.mark.asyncio
 async def test_on_connect_auth_failed(ns):
     class BadAuth(DummyAuth):
         async def authenticate(self, *a, **k):  # noqa: ANN001, D401
@@ -56,7 +66,7 @@ async def test_on_connect_auth_failed(ns):
     ns_bad = BaseNamespace("/ns", BadAuth())
     ns_bad.server = AsyncMock()
     with pytest.raises(ConnectionRefusedError):
-        await ns_bad.on_connect("sidX", {"asgi": {"scope": {"headers": []}}}, None)
+        await ns_bad.on_connect("sidX", {"asgi.scope": {"headers": []}}, None)
 
 
 @pytest.mark.asyncio

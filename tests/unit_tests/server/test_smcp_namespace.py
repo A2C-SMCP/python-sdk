@@ -90,12 +90,10 @@ class TestSMCPNamespace:
         # Mock环境变量和认证数据
         # Mock environment variables and auth data
         environ = {
-            "asgi": {
-                "scope": {
-                    "headers": [
-                        (b"x-api-key", b"valid_key"),
-                    ],
-                },
+            "asgi.scope": {
+                "headers": [
+                    (b"x-api-key", b"valid_key"),
+                ],
             },
         }
 
@@ -112,12 +110,10 @@ class TestSMCPNamespace:
         # Mock环境变量和无效认证数据
         # Mock environment variables and invalid auth data
         environ = {
-            "asgi": {
-                "scope": {
-                    "headers": [
-                        (b"x-api-key", b"invalid_key"),
-                    ],
-                },
+            "asgi.scope": {
+                "headers": [
+                    (b"x-api-key", b"invalid_key"),
+                ],
             },
         }
 

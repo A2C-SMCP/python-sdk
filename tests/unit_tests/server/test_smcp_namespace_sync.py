@@ -64,12 +64,10 @@ class TestSyncSMCPNamespace:
         smcp_namespace.server = mock_server
 
         environ = {
-            "asgi": {
-                "scope": {
-                    "headers": [
-                        (b"x-api-key", b"valid_key"),
-                    ],
-                },
+            "asgi.scope": {
+                "headers": [
+                    (b"x-api-key", b"valid_key"),
+                ],
             },
         }
 
@@ -80,12 +78,10 @@ class TestSyncSMCPNamespace:
         smcp_namespace.server = mock_server
 
         environ = {
-            "asgi": {
-                "scope": {
-                    "headers": [
-                        (b"x-api-key", b"invalid_key"),
-                    ],
-                },
+            "asgi.scope": {
+                "headers": [
+                    (b"x-api-key", b"invalid_key"),
+                ],
             },
         }
 
