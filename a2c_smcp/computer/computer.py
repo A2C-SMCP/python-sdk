@@ -49,9 +49,9 @@ from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.logger import get_logger, truncate
+from a2c_smcp.utils.window_uri import is_window_uri
 
 logger = get_logger("computer")
-from a2c_smcp.utils.window_uri import is_window_uri
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
