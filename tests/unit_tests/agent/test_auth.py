@@ -82,7 +82,7 @@ class TestDefaultAgentAuthProvider:
         )
 
         headers = provider.get_connection_headers()
-        assert headers["x-api-key"] == "secret_key"
+        assert headers["access_token"] == "secret_key"
 
     def test_get_connection_headers_without_api_key(self) -> None:
         """测试不带API密钥的请求头 / Test headers without API key"""
@@ -92,7 +92,7 @@ class TestDefaultAgentAuthProvider:
         )
 
         headers = provider.get_connection_headers()
-        assert "x-api-key" not in headers
+        assert "access_token" not in headers
 
     def test_get_agent_config(self) -> None:
         """测试获取Agent配置 / Test get Agent configuration"""
@@ -119,4 +119,4 @@ class TestDefaultAgentAuthProvider:
 
         headers = provider.get_connection_headers()
         assert headers["X-Custom-Auth"] == "test_key"
-        assert "x-api-key" not in headers
+        assert "access_token" not in headers

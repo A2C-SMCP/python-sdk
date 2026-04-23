@@ -50,7 +50,7 @@ async def test_on_connect_success_and_extract_headers_paths(ns):
 @pytest.mark.asyncio
 async def test_extract_headers_asgi_scope_flat_key():
     """确保 _extract_headers 能从 ASGI 的扁平 key 'asgi.scope' 中提取 headers"""
-    expected = [(b"x-api-key", b"test123")]
+    expected = [(b"access_token", b"test123")]
     # ASGI 模式下 environ 的真实结构
     environ = {"asgi.scope": {"headers": expected}}
     result = BaseNamespace._extract_headers(environ)

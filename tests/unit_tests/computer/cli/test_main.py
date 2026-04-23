@@ -869,3 +869,109 @@ async def test_socket_and_notify_branches(monkeypatch: pytest.MonkeyPatch) -> No
 
     comp = Computer(name="test_main_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)
+
+
+# ---------------------------------------------------------------------------
+# 回归：CLI `--namespace` 必须透传到 SMCPComputerClient，并贯穿事件处理器注册。
+# Regression: CLI `--namespace` must propagate to SMCPComputerClient and drive
+# event handler registration. This test would fail on code prior to the fix
+# for the `--namespace` wire-up bug (handlers stayed on hardcoded `/smcp`).
+# ---------------------------------------------------------------------------
+
+
+def test_cli_namespace_flag_propagates_to_client_handler_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    中文：驱动真实 ``SMCPComputerClient``（只打桩 ``connect``），断言 CLI 传入的
+    ``--namespace /tf-custom`` 落到客户端构造器，并且所有事件处理器在该命名空间注册。
+    修复前：CLI 只把 namespace 传给 ``connect(namespaces=[...])``，构造器绑死在
+    ``/smcp``，因此 ``handlers['/smcp']`` 有 4 项事件、``handlers['/tf-custom']``
+    空缺 —— 该断言会失败。
+
+    English: Drive a real ``SMCPComputerClient`` with ``connect`` stubbed, and
+    assert that the CLI's ``--namespace /tf-custom`` reaches the constructor and
+    that every event handler is registered under that namespace. Pre-fix, the
+    CLI only passed namespace to ``connect(namespaces=[...])`` while the client
+    constructor stayed pinned on ``/smcp`` — so ``handlers['/smcp']`` held the
+    four client:* handlers and ``handlers['/tf-custom']`` was absent, making
+    this assertion fail.
+    """
+    from a2c_smcp.computer.socketio.client import SMCPComputerClient
+    from a2c_smcp.smcp import (
+        GET_CONFIG_EVENT,
+        GET_DESKTOP_EVENT,
+        GET_TOOLS_EVENT,
+        SMCP_NAMESPACE,
+        TOOL_CALL_EVENT,
+    )
+
+    custom_ns = "/tf-custom"
+    created_clients: list[SMCPComputerClient] = []
+
+    original_init = SMCPComputerClient.__init__
+
+    def spy_init(self: SMCPComputerClient, *a: Any, **kw: Any) -> None:
+        original_init(self, *a, **kw)
+        created_clients.append(self)
+
+    async def noop_connect(self: SMCPComputerClient, *a: Any, **kw: Any) -> None:
+        """不做真实网络连接 / no-op connect to avoid real network"""
+        return None
+
+    # 关闭 join_office 的服务端往返 / Short-circuit join_office
+    async def noop_join(self: SMCPComputerClient, office_id: str) -> None:
+        self.office_id = office_id
+
+    async def noop_leave(self: SMCPComputerClient, office_id: str) -> None:
+        self.office_id = None
+
+    async def noop_update(self: SMCPComputerClient) -> None:
+        return None
+
+    monkeypatch.setattr(SMCPComputerClient, "__init__", spy_init)
+    monkeypatch.setattr(SMCPComputerClient, "connect", noop_connect)
+    monkeypatch.setattr(SMCPComputerClient, "join_office", noop_join)
+    monkeypatch.setattr(SMCPComputerClient, "leave_office", noop_leave)
+    monkeypatch.setattr(SMCPComputerClient, "emit_update_config", noop_update)
+
+    # 立即退出交互 / Exit interactive loop immediately
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["exit"]))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+
+    cli_main.run(
+        auto_connect=False,
+        auto_reconnect=False,
+        url="http://localhost:1",
+        namespace=custom_ns,
+        auth=None,
+        headers=None,
+    )
+
+    # 至少应创建过一个客户端 / at least one client must have been created
+    assert created_clients, "CLI did not construct SMCPComputerClient"
+    client = created_clients[0]
+
+    # 1) 构造器接收到自定义 namespace / constructor received the custom namespace
+    assert client.namespace == custom_ns, (
+        f"Expected client namespace to be {custom_ns!r}, got {client.namespace!r}. "
+        "This means the CLI failed to forward --namespace into SMCPComputerClient(...)."
+    )
+
+    # 2) 事件处理器必须全部注册在自定义 namespace 下 / all handlers bound to custom ns
+    assert custom_ns in client.handlers, (
+        f"Expected handlers registered under {custom_ns!r}, "
+        f"but found namespaces: {list(client.handlers.keys())!r}"
+    )
+    assert SMCP_NAMESPACE not in client.handlers, (
+        "Handlers must NOT be registered under the default /smcp when CLI specifies a "
+        f"different namespace. Got: {list(client.handlers.keys())!r}"
+    )
+
+    registered = set(client.handlers[custom_ns].keys())
+    assert registered == {
+        TOOL_CALL_EVENT,
+        GET_TOOLS_EVENT,
+        GET_CONFIG_EVENT,
+        GET_DESKTOP_EVENT,
+    }, f"Unexpected event handlers under {custom_ns!r}: {registered!r}"

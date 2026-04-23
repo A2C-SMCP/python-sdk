@@ -37,7 +37,7 @@ def test_default_agent_auth_provider_basic():
 
     # 验证连接请求头
     headers = auth.get_connection_headers()
-    assert headers["x-api-key"] == api_key
+    assert headers["access_token"] == api_key
 
     # 验证 Agent 配置
     config = auth.get_agent_config()
@@ -68,7 +68,7 @@ def test_default_agent_auth_provider_with_custom_headers():
     headers = auth.get_connection_headers()
 
     # 验证 API 密钥头
-    assert headers["x-api-key"] == api_key
+    assert headers["access_token"] == api_key
 
     # 验证自定义头
     assert headers["X-Custom-Header"] == "custom-value"
@@ -96,7 +96,7 @@ def test_default_agent_auth_provider_with_custom_api_key_header():
 
     # 验证使用自定义头名称
     assert headers[custom_header_name] == api_key
-    assert "x-api-key" not in headers
+    assert "access_token" not in headers
 
 
 def test_default_agent_auth_provider_with_auth_data():
@@ -144,7 +144,7 @@ def test_default_agent_auth_provider_no_api_key():
     headers = auth.get_connection_headers()
 
     # 验证没有 API 密钥头
-    assert "x-api-key" not in headers
+    assert "access_token" not in headers
     assert len(headers) == 0
 
 

@@ -37,6 +37,10 @@ from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
 )
 
+# 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
+# Default auth HTTP header name for the SDK (consumers may override)
+DEFAULT_AUTH_HEADER_NAME = "access_token"
+
 
 class SMCPComputerClient(AsyncClient):
     """
@@ -44,18 +48,56 @@ class SMCPComputerClient(AsyncClient):
     如果在使用Socket.IO过程中，需要实现SMCP协议，则需要使用此客户端，不能仅仅使用原生AsyncClient
     """
 
-    def __init__(self, *args: Any, computer: Computer, **kwargs: Any) -> None:  # noqa: E112
+    def __init__(
+        self,
+        *args: Any,
+        computer: Computer,
+        namespace: str = SMCP_NAMESPACE,
+        auth_header_name: str = DEFAULT_AUTH_HEADER_NAME,
+        **kwargs: Any,
+    ) -> None:  # noqa: E112
+        """
+        初始化Computer侧Socket.IO客户端
+        Initialize Computer-side Socket.IO client
+
+        Args:
+            computer (Computer): 绑定的Computer实例 / Bound Computer instance
+            namespace (str): Socket.IO命名空间，默认 ``/smcp`` / Socket.IO namespace, default ``/smcp``
+            auth_header_name (str): 鉴权 HTTP header 名，默认 ``access_token``。
+                连接时若通过 headers 传入该字段，将作为鉴权凭据转发给 Server。/
+                Auth HTTP header name, default ``access_token``. When present in headers at connect time,
+                it is forwarded as credential to the Server.
+        """
         super().__init__(*args, **kwargs)
         self.computer = computer
+        # 实例级握手配置 / Per-instance handshake config
+        self._namespace = namespace
+        self._auth_header_name = auth_header_name
         # 将客户端以 weakref 方式绑定回 Computer，避免循环强引用
         self.computer.socketio_client = self
-        self.on(TOOL_CALL_EVENT, self.on_tool_call, namespace=SMCP_NAMESPACE)
-        self.on(GET_TOOLS_EVENT, self.on_get_tools, namespace=SMCP_NAMESPACE)
-        self.on(GET_CONFIG_EVENT, self.on_get_config, namespace=SMCP_NAMESPACE)
-        self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=SMCP_NAMESPACE)
+        self.on(TOOL_CALL_EVENT, self.on_tool_call, namespace=self._namespace)
+        self.on(GET_TOOLS_EVENT, self.on_get_tools, namespace=self._namespace)
+        self.on(GET_CONFIG_EVENT, self.on_get_config, namespace=self._namespace)
+        self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
         self.office_id: str | None = None
 
-    async def emit(self, event: str, data: Any = None, namespace: str | None = SMCP_NAMESPACE, callback: Any = None) -> None:
+    @property
+    def namespace(self) -> str:
+        """
+        返回当前实例使用的 Socket.IO 命名空间
+        Return the Socket.IO namespace used by this instance
+        """
+        return self._namespace
+
+    @property
+    def auth_header_name(self) -> str:
+        """
+        返回当前实例使用的鉴权 HTTP header 名
+        Return the auth HTTP header name used by this instance
+        """
+        return self._auth_header_name
+
+    async def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
         """
         相较于父类方法，提供一个event校验能力，在A2C-smcp协议内，Computer客户端不允许发起 notify:* 事件与 client:* 事件
 
@@ -75,7 +117,9 @@ class SMCPComputerClient(AsyncClient):
             raise ValueError("ComputerClient不允许使用notify:*事件")  # pragma: no cover
         if event.startswith("client:"):
             raise ValueError("ComputerClient不允许发起client:*事件")  # pragma: no cover
-        await super().emit(event, data, namespace, callback)
+        # 未显式传入时使用实例命名空间 / Fall back to instance namespace if not provided
+        effective_namespace = namespace if namespace is not None else self._namespace
+        await super().emit(event, data, effective_namespace, callback)
 
     async def join_office(self, office_id: str) -> None:
         """
@@ -96,7 +140,9 @@ class SMCPComputerClient(AsyncClient):
         try:
             # 使用 call 方法等待服务器返回结果 / Use call method to wait for server response
             result = await self.call(
-                JOIN_OFFICE_EVENT, EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name), namespace=SMCP_NAMESPACE
+                JOIN_OFFICE_EVENT,
+                EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
+                namespace=self._namespace,
             )
 
             # 检查返回结果 / Check return result

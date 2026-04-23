@@ -55,6 +55,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         auth_provider: AgentAuthProvider,
         event_handler: AgentEventHandler | None = None,
         *args: Any,
+        namespace: str = SMCP_NAMESPACE,
         **kwargs: Any,
     ) -> None:
         """
@@ -64,6 +65,10 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         Args:
             auth_provider (AgentAuthProvider): 认证提供者 / Authentication provider
             event_handler (AgentEventHandler | None): 事件处理器 / Event handler
+            namespace (str): Socket.IO命名空间，默认 ``/smcp``。
+                事件处理器注册与后续 emit/call 均使用此值 /
+                Socket.IO namespace, default ``/smcp``. Used for handler registration
+                and all subsequent emit/call sites.
             *args: Client构造参数 / Client constructor arguments
             **kwargs: Client构造参数 / Client constructor arguments
         """
@@ -72,9 +77,20 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         Client.__init__(self, *args, **kwargs)
         BaseAgentSyncClient.__init__(self, auth_provider, event_handler)
 
+        # 实例级命名空间 / Per-instance namespace
+        self._namespace = namespace
+
         # 注册事件处理器
         # Register event handlers
         self.register_event_handlers()
+
+    @property
+    def namespace(self) -> str:
+        """
+        返回当前实例使用的 Socket.IO 命名空间
+        Return the Socket.IO namespace used by this instance
+        """
+        return self._namespace
 
     def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
         """
@@ -120,7 +136,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
     def connect_to_server(
         self,
         url: str,
-        namespace: str = SMCP_NAMESPACE,
+        namespace: str | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -129,9 +145,20 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         Args:
             url (str): 服务器URL / Server URL
-            namespace (str): 命名空间 / Namespace
+            namespace (str | None): 命名空间；不传则沿用构造器传入的实例命名空间。
+                若显式传入新值，会同步更新实例命名空间并重新注册事件处理器，确保事件
+                订阅在正确的命名空间生效 /
+                Namespace; fall back to the instance namespace if omitted. When a new
+                value is provided explicitly, the instance namespace is updated and event
+                handlers are re-registered so that subscriptions bind to the right namespace.
             **kwargs: 连接参数 / Connection parameters
         """
+        # 若显式指定命名空间且与实例当前值不同，则更新并重新注册事件处理器
+        # If explicit namespace differs from instance, update and re-register handlers
+        if namespace is not None and namespace != self._namespace:
+            self._namespace = namespace
+            self.register_event_handlers()
+
         # 获取认证信息
         # Get authentication info
         auth_data = self.auth_provider.get_connection_auth()
@@ -142,7 +169,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         connect_kwargs = {
             "auth": auth_data,
             "headers": headers,
-            "namespaces": [namespace],
+            "namespaces": [self._namespace],
             **kwargs,
         }
 
@@ -169,7 +196,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         try:
             ctx.debug("Calling tool")
-            res = self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=SMCP_NAMESPACE)
+            res = self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=self._namespace)
             return CallToolResult.model_validate(res, by_name=True)
 
         except TimeoutError:
@@ -177,7 +204,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             # Send cancel request
             agent_config = self.auth_provider.get_agent_config()
             cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req["req_id"])
-            self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=SMCP_NAMESPACE)
+            self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=self._namespace)
             return self.handle_tool_call_timeout(req["req_id"])
 
         except Exception as e:
@@ -203,7 +230,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         try:
             logger.debug(f"Getting tools from computer {computer}")
-            response = self.call(GET_TOOLS_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
+            response = self.call(GET_TOOLS_EVENT, req, namespace=self._namespace, timeout=timeout)
 
             # 验证响应
             # Validate response
@@ -221,10 +248,10 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         注册SMCP协议事件处理器
         Register SMCP protocol event handlers
         """
-        self.on(ENTER_OFFICE_NOTIFICATION, self._on_computer_enter_office, namespace=SMCP_NAMESPACE)
-        self.on(LEAVE_OFFICE_NOTIFICATION, self._on_computer_leave_office, namespace=SMCP_NAMESPACE)
-        self.on(UPDATE_CONFIG_NOTIFICATION, self._on_computer_update_config, namespace=SMCP_NAMESPACE)
-        self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=SMCP_NAMESPACE)
+        self.on(ENTER_OFFICE_NOTIFICATION, self._on_computer_enter_office, namespace=self._namespace)
+        self.on(LEAVE_OFFICE_NOTIFICATION, self._on_computer_leave_office, namespace=self._namespace)
+        self.on(UPDATE_CONFIG_NOTIFICATION, self._on_computer_update_config, namespace=self._namespace)
+        self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=self._namespace)
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -293,7 +320,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         """
         req = self.create_get_desktop_request(computer, size=size, window=window)
         logger.debug(f"Getting desktop from computer {computer}, size={size}, window={window}")
-        response = self.call(GET_DESKTOP_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
+        response = self.call(GET_DESKTOP_EVENT, req, namespace=self._namespace, timeout=timeout)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
         return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])
@@ -334,7 +361,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         try:
             logger.debug(f"Getting computers in office {office_id}")
-            response = self.call(LIST_ROOM_EVENT, req, namespace=SMCP_NAMESPACE, timeout=timeout)
+            response = self.call(LIST_ROOM_EVENT, req, namespace=self._namespace, timeout=timeout)
 
             # 验证响应 / Validate response
             if response.get("req_id") != req["req_id"]:

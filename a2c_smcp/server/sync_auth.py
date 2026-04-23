@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 
 from socketio import Server
 
+from a2c_smcp.server.auth import DEFAULT_AUTH_HEADER_NAME
+
 
 class SyncAuthenticationProvider(ABC):
     """
@@ -43,7 +45,7 @@ class DefaultSyncAuthenticationProvider(SyncAuthenticationProvider):
     Default sync authentication provider
     """
 
-    def __init__(self, admin_secret: str | None = None, api_key_name: str = "x-api-key") -> None:
+    def __init__(self, admin_secret: str | None = None, api_key_name: str = DEFAULT_AUTH_HEADER_NAME) -> None:
         """
         初始化默认同步认证提供者
         Initialize default sync authentication provider

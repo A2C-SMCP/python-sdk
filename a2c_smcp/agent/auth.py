@@ -13,6 +13,10 @@ from typing import Any
 
 from a2c_smcp.agent.types import AgentConfig
 
+# 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
+# Default auth HTTP header name for the SDK (consumers may override)
+DEFAULT_AUTH_HEADER_NAME = "access_token"
+
 
 class AgentAuthProvider(ABC):
     """
@@ -76,7 +80,7 @@ class DefaultAgentAuthProvider(AgentAuthProvider):
         agent_id: str,
         office_id: str,
         api_key: str | None = None,
-        api_key_header: str = "x-api-key",
+        api_key_header: str = DEFAULT_AUTH_HEADER_NAME,
         extra_headers: dict[str, str] | None = None,
         auth_data: dict[str, Any] | None = None,
     ) -> None:

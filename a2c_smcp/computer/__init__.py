@@ -5,6 +5,6 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 from a2c_smcp.computer.computer import Computer
-from a2c_smcp.computer.socketio.client import SMCPComputerClient
+from a2c_smcp.computer.socketio.client import DEFAULT_AUTH_HEADER_NAME, SMCPComputerClient
 
-__all__ = ["Computer", "SMCPComputerClient"]
+__all__ = ["DEFAULT_AUTH_HEADER_NAME", "Computer", "SMCPComputerClient"]

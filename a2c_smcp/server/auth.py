@@ -12,6 +12,10 @@ from abc import ABC, abstractmethod
 
 from socketio import AsyncServer
 
+# 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
+# Default auth HTTP header name for the SDK (consumers may override)
+DEFAULT_AUTH_HEADER_NAME = "access_token"
+
 
 class AuthenticationProvider(ABC):
     """
@@ -43,7 +47,7 @@ class DefaultAuthenticationProvider(AuthenticationProvider):
     Default authentication provider, provides basic authentication logic implementation
     """
 
-    def __init__(self, admin_secret: str | None = None, api_key_name: str = "x-api-key") -> None:
+    def __init__(self, admin_secret: str | None = None, api_key_name: str = DEFAULT_AUTH_HEADER_NAME) -> None:
         """
         初始化默认认证提供者
         Initialize default authentication provider

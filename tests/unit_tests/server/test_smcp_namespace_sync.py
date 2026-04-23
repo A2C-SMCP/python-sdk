@@ -28,7 +28,7 @@ class MockSyncAuthProvider(SyncAuthenticationProvider):
             if isinstance(header, (list, tuple)) and len(header) >= 2:
                 header_name = header[0].decode("utf-8").lower() if isinstance(header[0], bytes) else str(header[0]).lower()
                 header_value = header[1].decode("utf-8") if isinstance(header[1], bytes) else str(header[1])
-                if header_name == "x-api-key" and header_value == "valid_key":
+                if header_name == "access_token" and header_value == "valid_key":
                     return True
         return False
 
@@ -66,7 +66,7 @@ class TestSyncSMCPNamespace:
         environ = {
             "asgi.scope": {
                 "headers": [
-                    (b"x-api-key", b"valid_key"),
+                    (b"access_token", b"valid_key"),
                 ],
             },
         }
@@ -80,7 +80,7 @@ class TestSyncSMCPNamespace:
         environ = {
             "asgi.scope": {
                 "headers": [
-                    (b"x-api-key", b"invalid_key"),
+                    (b"access_token", b"invalid_key"),
                 ],
             },
         }

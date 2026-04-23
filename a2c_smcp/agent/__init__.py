@@ -13,7 +13,7 @@ A2C-SMCP Agent module
 Provides Agent-side SMCP protocol client implementation, including both synchronous and asynchronous modes
 """
 
-from a2c_smcp.agent.auth import AgentAuthProvider, DefaultAgentAuthProvider
+from a2c_smcp.agent.auth import DEFAULT_AUTH_HEADER_NAME, AgentAuthProvider, DefaultAgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.sync_client import SMCPAgentClient
@@ -32,6 +32,8 @@ from a2c_smcp.agent.types import (
 )
 
 __all__ = [
+    # 常量 / Constants
+    "DEFAULT_AUTH_HEADER_NAME",
     # 认证相关 / Authentication related
     "AgentAuthProvider",
     "DefaultAgentAuthProvider",

@@ -185,9 +185,12 @@ def _run_impl(
                     console.print(f"[red]启动参数解析失败 / Failed to parse CLI params: {e}[/red]")
                     auth_dict = None
                     headers_dict = None
-                init_client = SMCPComputerClient(computer=comp)
+                # 将 CLI 指定的 namespace 透传给客户端实例，确保事件处理器绑定到正确命名空间
+                # Pass CLI-specified namespace to the client instance so event handlers bind to the right namespace
+                effective_namespace = namespace or SMCP_NAMESPACE
+                init_client = SMCPComputerClient(computer=comp, namespace=effective_namespace)
                 # 通过 CLI 指定命名空间，确保连接时建立对应 namespace 会话
-                await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[namespace])
+                await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
                 console.print("[green]已通过启动参数连接到 Socket.IO / Connected via CLI options[/green]")
 
             # 启动参数加载 inputs 与 servers 配置

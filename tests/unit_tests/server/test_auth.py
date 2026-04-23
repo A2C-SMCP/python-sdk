@@ -22,7 +22,7 @@ async def test_authenticate_admin_ok_and_missing_or_wrong_key():
     environ = {}
 
     # 正确 key
-    headers = [(b"x-api-key", b"admin_secret")]
+    headers = [(b"access_token", b"admin_secret")]
     ok = await prov.authenticate(sio, environ, None, headers)
     assert ok is True
 
@@ -32,7 +32,7 @@ async def test_authenticate_admin_ok_and_missing_or_wrong_key():
     assert ok2 is False
 
     # 错误 key
-    headers = [(b"x-api-key", b"wrong")]
+    headers = [(b"access_token", b"wrong")]
     ok3 = await prov.authenticate(sio, environ, None, headers)
     assert ok3 is False
 
@@ -50,11 +50,11 @@ async def test_admin_permission_integrated_in_authenticate():
     # 无管理员密钥配置的提供者
     # Provider without admin secret configured
     prov1 = DefaultAuthenticationProvider(None)
-    headers = [(b"x-api-key", b"any_key")]
+    headers = [(b"access_token", b"any_key")]
     assert await prov1.authenticate(sio, environ, None, headers) is False
 
     # 有管理员密钥配置的提供者
     # Provider with admin secret configured
     prov2 = DefaultAuthenticationProvider("admin_secret")
-    headers = [(b"x-api-key", b"admin_secret")]
+    headers = [(b"access_token", b"admin_secret")]
     assert await prov2.authenticate(sio, environ, None, headers) is True

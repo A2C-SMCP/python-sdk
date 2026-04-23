@@ -42,7 +42,7 @@ def test_on_connect_success_and_failure_paths():
     server.app.state.agent_id = "A"
     ns.server = server
 
-    environ = _mk_environ_with_headers([(b"x-api-key", b"ok")])
+    environ = _mk_environ_with_headers([(b"access_token", b"ok")])
     ok = ns.on_connect("sid1", environ, None)
     assert ok is True
 

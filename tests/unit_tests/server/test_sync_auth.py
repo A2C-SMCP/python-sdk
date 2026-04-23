@@ -18,11 +18,11 @@ def test_sync_authenticate_variants():
     sio = MagicMock()
     environ = {}
 
-    ok = prov.authenticate(sio, environ, None, [(b"x-api-key", b"adm")])
+    ok = prov.authenticate(sio, environ, None, [(b"access_token", b"adm")])
     assert ok is True
 
     assert prov.authenticate(sio, environ, None, []) is False
-    assert prov.authenticate(sio, environ, None, [(b"x-api-key", b"wrong")]) is False
+    assert prov.authenticate(sio, environ, None, [(b"access_token", b"wrong")]) is False
 
 
 # has_admin_permission 方法已被移除，管理员权限检查已集成到 authenticate 方法中
@@ -37,9 +37,9 @@ def test_sync_admin_permission_integrated_in_authenticate():
     # 无管理员密钥配置的提供者
     # Provider without admin secret configured
     prov1 = DefaultSyncAuthenticationProvider(None)
-    assert prov1.authenticate(sio, environ, None, [(b"x-api-key", b"any_key")]) is False
+    assert prov1.authenticate(sio, environ, None, [(b"access_token", b"any_key")]) is False
 
     # 有管理员密钥配置的提供者
     # Provider with admin secret configured
     prov2 = DefaultSyncAuthenticationProvider("adm")
-    assert prov2.authenticate(sio, environ, None, [(b"x-api-key", b"adm")]) is True
+    assert prov2.authenticate(sio, environ, None, [(b"access_token", b"adm")]) is True
