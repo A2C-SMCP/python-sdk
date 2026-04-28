@@ -392,6 +392,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 if not is_window_uri(res.uri):
                     continue
                 # 解析优先级（缺省为0）
+                # TODO(#11): v0.2 起 priority 不再来自 URI query，改读 res.annotations.priority (float [0,1])
                 uri = WindowURI(str(res.uri))
                 prio = uri.priority if uri.priority is not None else 0
                 filtered.append((res, prio))

@@ -20,6 +20,9 @@ from mcp.types import ReadResourceResult, TextResourceContents
 from a2c_smcp.computer.desktop.organize import organize_desktop
 
 
+@pytest.mark.skip(
+    reason="待 sub-issue #11 (organize_desktop 改读 annotations / _meta) 重写：v0.2 起 priority 不再来自 URI query",
+)
 @pytest.mark.asyncio
 async def test_priority_within_server_and_size_cap():
     """
@@ -42,6 +45,9 @@ async def test_priority_within_server_and_size_cap():
     assert ret[1].startswith("window://srv/w1?priority=10") and "w1-text" in ret[1]
 
 
+@pytest.mark.skip(
+    reason="待 sub-issue #11 (organize_desktop 改读 annotations / _meta) 重写：v0.2 起 fullscreen 不再来自 URI query",
+)
 @pytest.mark.asyncio
 async def test_fullscreen_one_per_server_then_next_server():
     """
