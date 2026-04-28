@@ -76,6 +76,7 @@ async def organize_desktop(
             continue
         try:
             wuri = WindowURI(str(res.uri))
+            # TODO(#11): v0.2 起 priority / fullscreen 改读 res.annotations.priority / res._meta.fullscreen
             prio = wuri.priority if wuri.priority is not None else 0
             fullscreen = bool(wuri.fullscreen) if wuri.fullscreen is not None else False
         except Exception:
