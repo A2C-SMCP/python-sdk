@@ -5,215 +5,346 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-组织策略单元测试
-Unit tests for desktop organizing policy
+组织策略单元测试 / Unit tests for desktop organizing policy
 
 仅测试 organize_desktop 的行为，不依赖 Computer。
 Only verify organize_desktop behavior, decoupled from Computer.
+
+v0.2 协议指南 §6.2 / §6.4：
+- priority 来自 ``Resource.annotations.priority``（float [0.0, 1.0]，缺省 0.0）
+- fullscreen 来自 ``Resource._meta['fullscreen']``（bool，缺省 False）
+- URI query 不再承载排序信息
 """
 
-from types import SimpleNamespace
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterator
+from typing import Any, cast
 
 import pytest
-from mcp.types import ReadResourceResult, TextResourceContents
-
-from a2c_smcp.computer.desktop.organize import organize_desktop
-
-
-@pytest.mark.skip(
-    reason="待 sub-issue #11 (organize_desktop 改读 annotations / _meta) 重写：v0.2 起 priority 不再来自 URI query",
+from mcp.types import (
+    Annotations,
+    BlobResourceContents,
+    ReadResourceResult,
+    Resource,
+    Role,
+    TextResourceContents,
 )
+from pydantic import AnyUrl
+
+import a2c_smcp.computer.desktop.organize as organize_mod
+from a2c_smcp.computer.desktop.organize import organize_desktop
+from a2c_smcp.computer.types import ToolCallRecord
+
+
+# 防御 test_logger.py 调用 logging.Logger.manager.loggerDict.clear() 后影响 caplog 捕获
+# Defend against test_logger.py clearing loggerDict so caplog still captures source-module logs
+@pytest.fixture(autouse=True)
+def attach_project_logger_to_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[None]:
+    src_logger = organize_mod.logger
+    prev_level = src_logger.level
+    prev_propagate = src_logger.propagate
+    src_logger.setLevel(logging.DEBUG)
+    src_logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        try:
+            src_logger.removeHandler(caplog.handler)
+        except Exception:
+            pass
+        src_logger.setLevel(prev_level)
+        src_logger.propagate = prev_propagate
+
+
+# -------------------------
+# 工具函数 / Helpers
+# -------------------------
+def _mk_resource(
+    uri: str,
+    *,
+    priority: float | None = None,
+    fullscreen: bool | None = None,
+    audience: list[str] | None = None,
+) -> Resource:
+    """
+    构建测试用 Window Resource，支持设置 annotations.priority / annotations.audience / _meta.fullscreen。
+    Build a test Window Resource with optional annotations.priority / annotations.audience / _meta.fullscreen.
+    """
+    annotations: Annotations | None = None
+    if priority is not None or audience is not None:
+        audience_typed = cast(list[Role], audience) if audience is not None else None
+        annotations = Annotations(priority=priority, audience=audience_typed)
+    extra: dict[str, Any] = {}
+    if fullscreen is not None:
+        extra["_meta"] = {"fullscreen": fullscreen}
+    return Resource(uri=AnyUrl(uri), name=uri.rsplit("/", 1)[-1], annotations=annotations, **extra)
+
+
+def _mk_detail(uri: str, text: str) -> ReadResourceResult:
+    return ReadResourceResult(contents=[TextResourceContents(text=text, uri=AnyUrl(uri))])
+
+
+def _mk_history(*servers: str) -> tuple[ToolCallRecord, ...]:
+    """构造最小可用的工具调用历史 / build minimal tool-call history."""
+    return tuple(
+        ToolCallRecord(
+            timestamp="2026-04-28T00:00:00Z",
+            req_id=f"req-{i}",
+            server=s,
+            tool="t",
+            parameters={},
+            timeout=None,
+            success=True,
+            error=None,
+        )
+        for i, s in enumerate(servers)
+    )
+
+
+# -------------------------
+# 核心组织规则 / Core ordering rules
+# -------------------------
 @pytest.mark.asyncio
-async def test_priority_within_server_and_size_cap():
-    """
-    - 同一服务器内按 priority 降序
-    - 全局 size 截断
-    """
-    # 资源详情：每个窗口都有一段不同的文本，便于断言渲染
-    d1 = ReadResourceResult(contents=[TextResourceContents(text="w1-text", uri="window://srv/w1?priority=10")])
-    d2 = ReadResourceResult(contents=[TextResourceContents(text="w2-text", uri="window://srv/w2?priority=90")])
-    d3 = ReadResourceResult(contents=[TextResourceContents(text="w3-text", uri="window://srv/w3")])
+async def test_priority_within_server_and_size_cap() -> None:
+    """同一服务器内按 priority 降序，全局按 size 截断。"""
+    uris = ["window://srv/w1", "window://srv/w2", "window://srv/w3"]
+    res1 = _mk_resource(uris[0], priority=0.1)
+    res2 = _mk_resource(uris[1], priority=0.9)
+    res3 = _mk_resource(uris[2])  # 缺省 0.0
 
     windows = [
-        ("srv", SimpleNamespace(uri="window://srv/w1?priority=10"), d1),
-        ("srv", SimpleNamespace(uri="window://srv/w2?priority=90"), d2),
-        ("srv", SimpleNamespace(uri="window://srv/w3"), d3),  # 默认0
+        ("srv", res1, _mk_detail(uris[0], "w1-text")),
+        ("srv", res2, _mk_detail(uris[1], "w2-text")),
+        ("srv", res3, _mk_detail(uris[2], "w3-text")),
     ]
     ret = await organize_desktop(windows=windows, size=2, history=tuple())
-    # 应优先 w2，再 w1；且渲染包含文本内容
-    assert ret[0].startswith("window://srv/w2?priority=90") and "w2-text" in ret[0]
-    assert ret[1].startswith("window://srv/w1?priority=10") and "w1-text" in ret[1]
+    assert ret[0].startswith(uris[1]) and "w2-text" in ret[0]
+    assert ret[1].startswith(uris[0]) and "w1-text" in ret[1]
+    assert len(ret) == 2
 
 
-@pytest.mark.skip(
-    reason="待 sub-issue #11 (organize_desktop 改读 annotations / _meta) 重写：v0.2 起 fullscreen 不再来自 URI query",
-)
 @pytest.mark.asyncio
-async def test_fullscreen_one_per_server_then_next_server():
-    """
-    - 若遇到 fullscreen=True 的窗口，则该 MCP 仅推入这一个；然后进入下一个 MCP
-    """
-    d_a1 = ReadResourceResult(contents=[TextResourceContents(uri="window://A/a1?priority=50", text="a1")])
-    d_a2 = ReadResourceResult(contents=[TextResourceContents(uri="window://A/a2?fullscreen=true&priority=10", text="a2-full")])
-    d_a3 = ReadResourceResult(contents=[TextResourceContents(uri="window://A/a3?priority=90", text="a3")])
-    d_b1 = ReadResourceResult(contents=[TextResourceContents(uri="window://B/b1?priority=5", text="b1")])
+async def test_fullscreen_one_per_server_then_next_server() -> None:
+    """fullscreen=True 时该 Server 仅推第一个 fullscreen 窗口，再进入下一个 Server。"""
+    a1 = _mk_resource("window://A/a1", priority=0.5)
+    a2 = _mk_resource("window://A/a2", priority=0.1, fullscreen=True)
+    a3 = _mk_resource("window://A/a3", priority=0.9)
+    b1 = _mk_resource("window://B/b1", priority=0.05)
     windows = [
-        ("A", SimpleNamespace(uri="window://A/a1?priority=50"), d_a1),
-        ("A", SimpleNamespace(uri="window://A/a2?fullscreen=true&priority=10"), d_a2),
-        ("A", SimpleNamespace(uri="window://A/a3?priority=90"), d_a3),
-        ("B", SimpleNamespace(uri="window://B/b1?priority=5"), d_b1),
+        ("A", a1, _mk_detail("window://A/a1", "a1")),
+        ("A", a2, _mk_detail("window://A/a2", "a2-full")),
+        ("A", a3, _mk_detail("window://A/a3", "a3")),
+        ("B", b1, _mk_detail("window://B/b1", "b1")),
     ]
-    # history 让 A 在前
-    history = ({"server": "A"},)
-    ret = await organize_desktop(windows=windows, size=None, history=history)
-    # A 只应输出 fullscreen 的 a2，然后进入 B
-    assert ret[0].startswith("window://A/a2?fullscreen=true&priority=10") and "a2-full" in ret[0]
-    assert any(x.startswith("window://B/b1?priority=5") and "b1" in x for x in ret)  # B 的内容随后加入
+    ret = await organize_desktop(windows=windows, size=None, history=_mk_history("A"))
+    assert ret[0].startswith("window://A/a2") and "a2-full" in ret[0]
+    assert any(x.startswith("window://B/b1") and "b1" in x for x in ret)
 
 
 @pytest.mark.asyncio
-async def test_server_order_by_recent_history():
-    """
-    - 服务器顺序按最近历史倒序优先
-    """
-    d_a = ReadResourceResult(contents=[TextResourceContents(uri="window://A/a1?priority=1", text="a")])
-    d_b = ReadResourceResult(contents=[TextResourceContents(uri="window://B/b1?priority=1", text="b")])
-    d_c = ReadResourceResult(contents=[TextResourceContents(uri="window://C/c1?priority=1", text="c")])
+async def test_server_order_by_recent_history() -> None:
+    """服务器顺序按最近历史倒序优先。"""
+    res_a = _mk_resource("window://A/a1", priority=0.01)
+    res_b = _mk_resource("window://B/b1", priority=0.01)
+    res_c = _mk_resource("window://C/c1", priority=0.01)
     windows = [
-        ("A", SimpleNamespace(uri="window://A/a1?priority=1"), d_a),
-        ("B", SimpleNamespace(uri="window://B/b1?priority=1"), d_b),
-        ("C", SimpleNamespace(uri="window://C/c1?priority=1"), d_c),
+        ("A", res_a, _mk_detail("window://A/a1", "a")),
+        ("B", res_b, _mk_detail("window://B/b1", "b")),
+        ("C", res_c, _mk_detail("window://C/c1", "c")),
     ]
-    # 最近使用顺序：C -> A（B 未使用）
-    history = (
-        {"server": "A"},
-        {"server": "C"},
-    )
+    # 最近顺序：A then C（C 最近）；B 未在历史中 -> 名字升序追加
+    history = _mk_history("A", "C")
     ret = await organize_desktop(windows=windows, size=None, history=history)
-    # C 在 A 前，剩余 B 按名称排序追加（B）
-    assert ret[0].startswith("window://C/c1?priority=1") and "c" in ret[0]
-    assert ret[1].startswith("window://A/a1?priority=1") and "a" in ret[1]
-    assert ret[2].startswith("window://B/b1?priority=1") and "b" in ret[2]
+    assert ret[0].startswith("window://C/c1")
+    assert ret[1].startswith("window://A/a1")
+    assert ret[2].startswith("window://B/b1")
 
 
 @pytest.mark.asyncio
-async def test_size_zero_returns_empty():
+async def test_size_zero_returns_empty() -> None:
     ret = await organize_desktop(windows=[], size=0, history=tuple())
     assert ret == []
 
 
+# -------------------------
+# §6.2 缺失值同义 / Missing-value equivalence
+# -------------------------
 @pytest.mark.asyncio
-async def test_skip_empty_contents_and_detail_exception():
-    """
-    空内容与 detail.contents 访问异常会被跳过。
-    Empty contents and exception when accessing detail.contents should be skipped.
-    """
-    from types import SimpleNamespace as NS
+async def test_missing_annotations_equivalent_to_zero_priority() -> None:
+    """annotations is None 与 annotations.priority is None 等价处理为 0.0。"""
+    res_high = _mk_resource("window://srv/high", priority=0.8)
+    res_no_anno = _mk_resource("window://srv/no_anno")  # 完全无 annotations
+    res_no_prio = _mk_resource("window://srv/no_prio", audience=["assistant"])  # 仅 audience，无 priority
+    windows = [
+        ("srv", res_no_anno, _mk_detail("window://srv/no_anno", "no_anno")),
+        ("srv", res_high, _mk_detail("window://srv/high", "high")),
+        ("srv", res_no_prio, _mk_detail("window://srv/no_prio", "no_prio")),
+    ]
+    ret = await organize_desktop(windows=windows, size=None, history=tuple())
+    # high 应排第一；其余两个均为 0.0，按稳定排序保持原始顺序
+    assert ret[0].startswith("window://srv/high")
+    assert {ret[1].split("\n")[0], ret[2].split("\n")[0]} == {"window://srv/no_anno", "window://srv/no_prio"}
 
-    from mcp.types import ReadResourceResult, TextResourceContents
 
-    # 空 contents -> 被跳过
+@pytest.mark.asyncio
+async def test_missing_meta_equivalent_to_no_fullscreen() -> None:
+    """_meta is None 与 _meta.fullscreen is None 等价处理为 False。"""
+    a = _mk_resource("window://srv/a", priority=0.5)  # 无 _meta
+    b = _mk_resource("window://srv/b", priority=0.9)  # 无 _meta
+    windows = [
+        ("srv", a, _mk_detail("window://srv/a", "a")),
+        ("srv", b, _mk_detail("window://srv/b", "b")),
+    ]
+    ret = await organize_desktop(windows=windows, size=None, history=tuple())
+    # 无 fullscreen，按 priority 降序
+    assert ret[0].startswith("window://srv/b")
+    assert ret[1].startswith("window://srv/a")
+
+
+# -------------------------
+# §6.4 越界与非法值 / Out-of-range and invalid values
+# -------------------------
+@pytest.mark.asyncio
+async def test_out_of_range_priority_treated_as_zero_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """priority 越界 [0.0, 1.0] 时记录 WARN，按 0.0 处理（绕过 Annotations 自带的范围校验测试 Computer 的兜底逻辑）。"""
+    # Annotations 构造期会强制 priority ∈ [0,1]；这里使用 model_construct 绕过校验，
+    # 模拟来自不规范 MCP Server 的越界值，验证 Computer 的兜底分支。
+    bad_anno = Annotations.model_construct(priority=2.0, audience=None)
+    over = Resource(uri=AnyUrl("window://srv/over"), name="over", annotations=bad_anno)
+    normal = _mk_resource("window://srv/normal", priority=0.5)
+    windows = [
+        ("srv", over, _mk_detail("window://srv/over", "over")),
+        ("srv", normal, _mk_detail("window://srv/normal", "normal")),
+    ]
+    with caplog.at_level(logging.WARNING):
+        ret = await organize_desktop(windows=windows, size=None, history=tuple())
+    # over 被 clamp 为 0.0，normal=0.5 在前
+    assert ret[0].startswith("window://srv/normal")
+    assert ret[1].startswith("window://srv/over")
+    assert any("priority" in m and ("越界" in m or "out-of-range" in m) for m in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_non_bool_fullscreen_treated_as_false_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """fullscreen 非布尔类型记录 WARN，按 False 处理。"""
+    bad = _mk_resource("window://srv/bad", priority=0.9)
+    bad.meta = {"fullscreen": "yes"}
+    other = _mk_resource("window://srv/other", priority=0.1)
+    windows = [
+        ("srv", bad, _mk_detail("window://srv/bad", "bad")),
+        ("srv", other, _mk_detail("window://srv/other", "other")),
+    ]
+    with caplog.at_level(logging.WARNING):
+        ret = await organize_desktop(windows=windows, size=None, history=tuple())
+    # bad 不被识别为 fullscreen；按 priority 降序：bad(0.9) 在前
+    assert ret[0].startswith("window://srv/bad")
+    assert ret[1].startswith("window://srv/other")
+    assert any("fullscreen" in m and ("非布尔" in m or "non-bool" in m) for m in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_audience_user_logs_warning_but_still_included(caplog: pytest.LogCaptureFixture) -> None:
+    """annotations.audience 不含 'assistant' 时记录 WARN 但仍纳入聚合（v0.2 行为）。"""
+    user_only = _mk_resource("window://srv/user", priority=0.5, audience=["user"])
+    windows = [("srv", user_only, _mk_detail("window://srv/user", "u"))]
+    with caplog.at_level(logging.WARNING):
+        ret = await organize_desktop(windows=windows, size=None, history=tuple())
+    assert len(ret) == 1 and ret[0].startswith("window://srv/user")
+    assert any("audience" in m and "assistant" in m for m in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_uri_query_no_longer_drives_ordering() -> None:
+    """v0.2 起，URI 中的 ?priority= / ?fullscreen= 不再影响排序（一律视为 0.0/False）。"""
+    a = _mk_resource("window://srv/a", priority=0.0)
+    a.uri = AnyUrl("window://srv/a?priority=99")
+    b = _mk_resource("window://srv/b", priority=0.7)
+    windows = [
+        ("srv", a, _mk_detail("window://srv/a?priority=99", "a")),
+        ("srv", b, _mk_detail("window://srv/b", "b")),
+    ]
+    ret = await organize_desktop(windows=windows, size=None, history=tuple())
+    # b 来自 annotations.priority=0.7 应排第一；a 的 URI query 被忽略
+    assert ret[0].startswith("window://srv/b")
+    assert ret[1].startswith("window://srv/a")
+
+
+# -------------------------
+# 容错分支 / Robustness branches
+# -------------------------
+@pytest.mark.asyncio
+async def test_skip_empty_contents_and_detail_exception() -> None:
+    """空内容与 detail.contents 访问异常会被跳过。"""
     empty_detail = ReadResourceResult(contents=[])
-    # 访问 contents 抛出异常 -> 被跳过
 
     class BadDetail:
-        def __getattribute__(self, name):
+        def __getattribute__(self, name: str) -> Any:
             if name == "contents":
                 raise RuntimeError("boom")
             return super().__getattribute__(name)
 
-    ok_detail = ReadResourceResult(contents=[TextResourceContents(text="ok", uri="window://S/ok")])
+    ok_detail = _mk_detail("window://S/ok", "ok")
 
-    windows = [
-        ("S", NS(uri="window://S/empty"), empty_detail),
-        ("S", NS(uri="window://S/bad"), BadDetail()),
-        ("S", NS(uri="window://S/ok"), ok_detail),
+    windows: list[tuple[str, Resource, ReadResourceResult]] = [
+        ("S", _mk_resource("window://S/empty"), empty_detail),
+        ("S", _mk_resource("window://S/bad"), BadDetail()),  # type: ignore[arg-type]
+        ("S", _mk_resource("window://S/ok"), ok_detail),
     ]
     ret = await organize_desktop(windows=windows, size=None, history=tuple())
-    # 仅保留 ok 窗口
     assert len(ret) == 1 and ret[0].startswith("window://S/ok") and "ok" in ret[0]
 
 
 @pytest.mark.asyncio
-async def test_invalid_window_uri_is_skipped():
-    """
-    非法的 URI 解析失败会被跳过。
-    Invalid WindowURI should be skipped when parsing fails.
-    """
-    from types import SimpleNamespace as NS
-
-    from mcp.types import ReadResourceResult, TextResourceContents
-
-    bad_detail = ReadResourceResult(contents=[TextResourceContents(text="bad", uri="bad://whatever")])
-    good_detail = ReadResourceResult(contents=[TextResourceContents(text="good", uri="window://G/good")])
+async def test_invalid_window_uri_is_skipped() -> None:
+    """非 window:// 协议的 URI 会被跳过。"""
+    good_detail = _mk_detail("window://G/good", "good")
+    bad_res = _mk_resource("dpe://G/bad", priority=0.5)
+    bad_detail = _mk_detail("dpe://G/bad", "bad")
+    good_res = _mk_resource("window://G/good", priority=0.5)
 
     windows = [
-        ("G", NS(uri=":::this_is_not_a_uri"), bad_detail),  # 将触发 WindowURI 解析失败
-        ("G", NS(uri="window://G/good"), good_detail),
+        ("G", bad_res, bad_detail),
+        ("G", good_res, good_detail),
     ]
     ret = await organize_desktop(windows=windows, size=None, history=tuple())
-    # 仅包含合法 URI
     assert len(ret) == 1 and ret[0].startswith("window://G/good") and "good" in ret[0]
 
 
 @pytest.mark.asyncio
-async def test_render_blob_and_unknown_and_render_exception():
-    """
-    渲染分支：
-    - BlobResourceContents -> 仅记录日志，不加入文本
-    - 未知类型 -> 仅记录错误日志
-    - 渲染异常 -> 捕获并回退为 URI 字符串
-    Rendering branches: Blob, unknown type, and exception fallback.
-    """
-    from types import SimpleNamespace as NS
-
-    from mcp.types import BlobResourceContents, ReadResourceResult, TextResourceContents
-
-    # Blob + 文本混合 -> 返回包含 URI 与文本（Blob 不追加文本）
+async def test_render_blob_and_unknown_and_render_exception() -> None:
+    """渲染分支：Blob 被记录但不拼接文本；未知类型记录 error；渲染异常回退为 URI。"""
     detail_blob = ReadResourceResult(
         contents=[
-            BlobResourceContents(uri="window://R/blob", mimeType="application/octet-stream", blob="eHg="),
-            TextResourceContents(uri="window://R/blob", text="t1"),
+            BlobResourceContents(uri=AnyUrl("window://R/blob"), mimeType="application/octet-stream", blob="eHg="),
+            TextResourceContents(uri=AnyUrl("window://R/blob"), text="t1"),
         ],
     )
-    # 为了触发 _render 的未知类型分支，先创建合法实例，再在运行期覆盖 contents
-    detail_unknown = ReadResourceResult(contents=[TextResourceContents(uri="window://R/u", text="t2")])
-    detail_unknown.contents = [object(), TextResourceContents(uri="window://R/u", text="t2")]
-    # 渲染异常：contents 不是可迭代对象 -> TypeError -> except 分支返回纯 URI
-    detail_exception = ReadResourceResult(contents=[TextResourceContents(uri="window://R/ex", text="ex")])
-    detail_exception.contents = 123  # 非可迭代
+    detail_unknown = _mk_detail("window://R/u", "t2")
+    detail_unknown.contents = [object(), TextResourceContents(uri=AnyUrl("window://R/u"), text="t2")]  # type: ignore[list-item]
+    detail_exception = _mk_detail("window://R/ex", "ex")
+    detail_exception.contents = 123  # type: ignore[assignment]
 
     windows = [
-        ("R", NS(uri="window://R/blob"), detail_blob),
-        ("R", NS(uri="window://R/u"), detail_unknown),
-        ("R", NS(uri="window://R/ex"), detail_exception),
+        ("R", _mk_resource("window://R/blob"), detail_blob),
+        ("R", _mk_resource("window://R/u"), detail_unknown),
+        ("R", _mk_resource("window://R/ex"), detail_exception),
     ]
     ret = await organize_desktop(windows=windows, size=None, history=tuple())
-    # 断言：
-    # 1) blob 项包含文本 t1（Blob 本身不拼接文本）
     assert any(x.startswith("window://R/blob") and "t1" in x for x in ret)
-    # 2) unknown 类型不影响已有文本 t2
     assert any(x.startswith("window://R/u") and "t2" in x for x in ret)
-    # 3) 渲染异常时仅返回 URI
     assert any(x == "window://R/ex" for x in ret)
 
 
 @pytest.mark.asyncio
-async def test_server_level_cap_breaks_iteration():
-    """
-    当第一个服务器已满足 size 上限时，后续服务器在服务器层级立即中断。
-    When cap reached after first server, loop breaks before processing later servers.
-    """
-    from types import SimpleNamespace as NS
-
-    from mcp.types import ReadResourceResult, TextResourceContents
-
-    d_a = ReadResourceResult(contents=[TextResourceContents(uri="window://A/a", text="a")])
-    d_b = ReadResourceResult(contents=[TextResourceContents(uri="window://B/b", text="b")])
+async def test_server_level_cap_breaks_iteration() -> None:
+    """当第一个服务器已满足 size 上限时，后续服务器在服务器层级立即中断。"""
+    a = _mk_resource("window://A/a", priority=0.1)
+    b = _mk_resource("window://B/b", priority=0.1)
     windows = [
-        ("A", NS(uri="window://A/a"), d_a),
-        ("B", NS(uri="window://B/b"), d_b),
+        ("A", a, _mk_detail("window://A/a", "a")),
+        ("B", b, _mk_detail("window://B/b", "b")),
     ]
-    # 使用 history 让 A 在前，size=1 使得在进入 B 时触发服务器层级的 break
-    ret = await organize_desktop(windows=windows, size=1, history=({"server": "A"},))
+    ret = await organize_desktop(windows=windows, size=1, history=_mk_history("A"))
     assert len(ret) == 1 and ret[0].startswith("window://A/a")
