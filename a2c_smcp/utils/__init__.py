@@ -10,9 +10,12 @@
 Export utilities
 """
 
+from .dpe_uri import DPEURI, is_dpe_uri
 from .window_uri import WindowURI, is_window_uri
 
 __all__ = [
+    "DPEURI",
     "WindowURI",
+    "is_dpe_uri",
     "is_window_uri",
 ]
