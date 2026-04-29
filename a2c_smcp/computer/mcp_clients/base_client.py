@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from transitions.core import EventData
 from transitions.extensions import AsyncMachine
 
-from a2c_smcp.utils import WindowURI, is_window_uri
+from a2c_smcp.utils import is_window_uri
 from a2c_smcp.utils.async_property import async_property
 from a2c_smcp.utils.logger import get_logger, truncate
 
@@ -386,15 +386,31 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                     resources.extend(ret.resources)
             # 返回满足WindowURI协议要求的Resource
             # Return only resources that conform to WindowURI (window:// scheme)
-            filtered: list[tuple[Resource, int]] = []
+            # v0.2 协议指南 §6.2 / §6.4：priority 来自 Resource.annotations.priority（float [0,1]，缺省 0.0）
+            # v0.2 protocol §6.2/§6.4: priority comes from Resource.annotations.priority (float [0,1], default 0.0)
+            filtered: list[tuple[Resource, float]] = []
             for res in resources:
                 # 类型守卫：快速判定并过滤非 window:// 资源
                 if not is_window_uri(res.uri):
                     continue
-                # 解析优先级（缺省为0）
-                # TODO(#11): v0.2 起 priority 不再来自 URI query，改读 res.annotations.priority (float [0,1])
-                uri = WindowURI(str(res.uri))
-                prio = uri.priority if uri.priority is not None else 0
+                annotations = getattr(res, "annotations", None)
+                prio_raw = getattr(annotations, "priority", None) if annotations is not None else None
+                if prio_raw is None:
+                    prio: float = 0.0
+                else:
+                    try:
+                        prio_f = float(prio_raw)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"annotations.priority 非数值类型，按 0.0 处理 / non-numeric priority, treat as 0.0: {prio_raw!r}",
+                        )
+                        prio_f = 0.0
+                    if not 0.0 <= prio_f <= 1.0:
+                        logger.warning(
+                            f"annotations.priority 越界 [0.0, 1.0]，按 0.0 处理 / out-of-range priority: {prio_f}",
+                        )
+                        prio_f = 0.0
+                    prio = prio_f
                 filtered.append((res, prio))
 
             # 同一 MCP 内按 priority 降序排序（仅在本客户端内比较）

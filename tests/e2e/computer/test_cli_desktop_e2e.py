@@ -45,10 +45,6 @@ def _server_cfg_for_script(name: str, script_rel_path: str) -> dict[str, Any]:
 
 
 @pytest.mark.e2e
-@pytest.mark.xfail(
-    reason="v0.2 WindowURI parser drops query; priority/fullscreen migration to annotations/_meta lands in #11",
-    strict=False,
-)
 def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
     """
     场景：

@@ -59,19 +59,26 @@ class TestServer(LowLevelServer):
 
 
 # 预置若干窗口资源 / preset window resources
+# v0.2: priority / fullscreen 通过 annotations / _meta 声明，不再放在 URI query 中
+# v0.2: priority/fullscreen are declared via annotations/_meta, no longer in URI query
 WINDOW_HOST = "example.desktop.subscribe.a"
 WINDOW_RESOURCES: list[types.Resource] = [
     types.Resource(
-        uri=f"window://{WINDOW_HOST}/main?priority=60",
+        uri=f"window://{WINDOW_HOST}/main",  # type: ignore[arg-type]
         name="Main Window",
         description="中文: 主窗口; 英文: Main window",
         mimeType="text/markdown",
+        annotations=types.Annotations(priority=0.6, audience=["assistant"]),
     ),
-    types.Resource(
-        uri=f"window://{WINDOW_HOST}/dashboard?priority=90&fullscreen=true",
-        name="Dashboard",
-        description="中文: 仪表盘; 英文: Dashboard",
-        mimeType="text/markdown",
+    types.Resource.model_validate(
+        {
+            "uri": f"window://{WINDOW_HOST}/dashboard",
+            "name": "Dashboard",
+            "description": "中文: 仪表盘; 英文: Dashboard",
+            "mimeType": "text/markdown",
+            "annotations": {"priority": 0.9, "audience": ["assistant"]},
+            "_meta": {"fullscreen": True},
+        },
     ),
 ]
 

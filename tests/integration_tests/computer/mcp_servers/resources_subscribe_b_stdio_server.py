@@ -34,18 +34,22 @@ class TestServer(LowLevelServer):
 
 
 WINDOW_HOST = "example.desktop.subscribe.b"
+# v0.2: priority 通过 annotations 声明，URI 回归纯标识符
+# v0.2: priority is declared via annotations; URIs are pure identifiers
 WINDOW_RESOURCES: list[types.Resource] = [
     types.Resource(
-        uri=f"window://{WINDOW_HOST}/main?priority=50",
+        uri=f"window://{WINDOW_HOST}/main",  # type: ignore[arg-type]
         name="Main-B",
         description="中文: B 主窗口; 英文: B main window",
         mimeType="text/markdown",
+        annotations=types.Annotations(priority=0.5, audience=["assistant"]),
     ),
     types.Resource(
-        uri=f"window://{WINDOW_HOST}/board?priority=85",
+        uri=f"window://{WINDOW_HOST}/board",  # type: ignore[arg-type]
         name="Board-B",
         description="中文: B 看板; 英文: B board",
         mimeType="text/markdown",
+        annotations=types.Annotations(priority=0.85, audience=["assistant"]),
     ),
 ]
 
