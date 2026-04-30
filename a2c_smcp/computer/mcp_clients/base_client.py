@@ -29,6 +29,17 @@ logger = get_logger("computer")
 ParamsT = TypeVar("ParamsT", bound=BaseModel)
 
 
+class MCPCapabilityNotSupportedError(Exception):
+    """
+    中文: MCP Server 未声明所需 capability（如 `resources`）。
+    英文: MCP Server did not declare a required capability (e.g. `resources`).
+
+    上层（`client:get_resources` / `client:get_dpe` 处理器）应映射为 wire-level `4015 MCP_CAPABILITY_NOT_SUPPORTED`。
+    Upper layers (`client:get_resources` / `client:get_dpe` handlers) should map this to wire-level
+    `4015 MCP_CAPABILITY_NOT_SUPPORTED`.
+    """
+
+
 class STATES(StrEnum):
     initialized = "initialized"
     connected = "connected"
@@ -357,6 +368,35 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 ret = await asession.list_tools(cursor=ret.nextCursor)
                 tools.extend(ret.tools)
         return tools
+
+    async def list_resources_page(self, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+        """
+        中文: 单页透传 MCP `resources/list`；不做 scheme 过滤、不订阅、不穷举翻页。
+        英文: Single-page transparent forward of MCP `resources/list`; no scheme filter, no subscription, no pagination exhaustion.
+
+        与 `list_windows()` 严格独立——本方法保持单页语义，调用方自行翻页。供 v0.2 `client:get_resources` 透传使用。
+        Strictly independent from `list_windows()` — this method preserves single-page semantics; callers paginate themselves.
+        Used by the v0.2 `client:get_resources` transparent-forward path.
+
+        Args:
+            cursor (str | None): MCP 翻页游标；首次调用传 None / Pagination cursor; pass None for the first page.
+
+        Returns:
+            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页) /
+                (resources on this page, next cursor — None when last page).
+
+        Raises:
+            MCPCapabilityNotSupportedError: MCP Server 未声明 `resources` 能力（→ 上层映射 4015）/
+                MCP Server did not declare `resources` capability (mapped to 4015 upstream).
+            ConnectionError: 客户端未连接 / Client not connected.
+        """
+        if self.state != STATES.connected:
+            raise ConnectionError("Not connected to server")
+        if not (self.initialize_result and self.initialize_result.capabilities.resources):
+            raise MCPCapabilityNotSupportedError("MCP Server did not declare 'resources' capability")
+        asession = cast(ClientSession, await self.async_session)
+        ret = await asession.list_resources(cursor=cursor) if cursor is not None else await asession.list_resources()
+        return list(ret.resources), ret.nextCursor
 
     async def list_windows(self) -> list[Resource]:
         """
