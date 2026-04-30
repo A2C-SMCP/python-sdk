@@ -14,9 +14,11 @@ from mcp.client.session import MessageHandlerFnT
 from mcp.types import CallToolResult, ReadResourceResult, Resource, Tool
 from vrl_python import VRLRuntime
 
+from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError
 from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
+from a2c_smcp.utils import DPEURI, WindowURI, is_dpe_uri, is_window_uri
 from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
@@ -25,6 +27,27 @@ logger = get_logger("computer")
 class ToolNameDuplicatedError(Exception):
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
+
+
+class HostConflictError(Exception):
+    """
+    中文: 注册期检测到 host 跨 MCP Server 冲突；新 server 注册被拒绝。
+    英文: Host conflict across MCP Servers detected at registration time; new server registration rejected.
+
+    协议依据 / Protocol reference:
+        a2c-smcp-protocol main HEAD §4.4 — host 跨 MCP Server MUST 唯一（注册期硬约束 fail-fast）。
+        wire-level 错误码由上层 `client:get_dpe` 处理器映射为 `4014 MCP_SERVER_NOT_FOUND`（顶层 flat
+        字段 `mcp_server_name`），本异常仅是 manager 层内部信号。
+    """
+
+    def __init__(self, host: str, conflicting_servers: tuple[SERVER_NAME, SERVER_NAME], *args: Any) -> None:
+        self.host = host
+        self.conflicting_servers = conflicting_servers
+        existing, attempted = conflicting_servers
+        super().__init__(
+            f"Host '{host}' already registered by server '{existing}'; rejecting registration of '{attempted}'",
+            *args,
+        )
 
 
 class MCPServerManager:
@@ -60,10 +83,161 @@ class MCPServerManager:
         self._message_handler: MessageHandlerFnT | None = message_handler
         # 内部锁防止并发修改
         self._lock = asyncio.Lock()
+        # host 反查索引: dpe:// + window:// scheme 下的 host → 拥有该 host 的 server 集合
+        # host reverse index: host (from dpe:// + window:// scheme) → set of owning server names
+        # 协议 §4.4 注册期 fail-fast 保证同一时刻 1 host 至多对应 1 server；用 set 容器仅是为了
+        # 1 server N hosts 拓扑下统一管理（清理时按 server 移除其全部 host 占用）
+        # Protocol §4.4 fail-fast guarantees ≤1 server per host at any time; the set container exists
+        # only because a single server may declare N hosts (cleanup must remove all host slots owned by it)
+        self._host_to_servers: dict[str, set[SERVER_NAME]] = defaultdict(set)
+        # 注册期 list_resources 临时失败的 server；冲突检测延后到下一次成功 list 时（§4.4 延迟检测语义）
+        # Servers whose registration-time list_resources failed transiently; conflict detection deferred
+        # until next successful list call (§4.4 delayed-detection semantics)
+        self._host_index_pending: set[SERVER_NAME] = set()
 
     def get_server_config(self, server_name: SERVER_NAME) -> MCPServerConfig:
         """通过名称获取服务配置"""
         return self._servers_config[server_name]
+
+    def find_server_by_host(self, host: str) -> SERVER_NAME | None:
+        """
+        中文: 通过 host 反查 MCP Server 名（v0.2 `client:get_dpe` 路由依据）。
+        英文: Reverse-lookup MCP server name by host (v0.2 `client:get_dpe` routing source).
+
+        协议 §4.4 注册期 fail-fast 保证 1 host 至多对应 1 server——返回 0 或 1 个名字。
+        Protocol §4.4 fail-fast guarantees ≤1 server per host — returns 0 or 1 name.
+
+        Args:
+            host (str): 待反查的 host / Host to look up.
+
+        Returns:
+            SERVER_NAME | None: 拥有该 host 的 server 名；未注册时返回 None（上层映射 4014）/
+                Owning server name; None when unknown (upper layer maps to 4014).
+        """
+        servers = self._host_to_servers.get(host)
+        if not servers:
+            return None
+        # 注册期 fail-fast 保证至多 1 个；多对 1 是不变量违反
+        # Fail-fast guarantees ≤1; >1 indicates an invariant violation
+        return next(iter(servers))
+
+    @staticmethod
+    def _extract_hosts_from_resources(resources: Iterable[Resource]) -> set[str]:
+        """
+        中文: 从 Resource URI 列表中收集 dpe:// + window:// 的 host 集合（其他 scheme 不参与 host 索引）。
+        英文: Collect host set from Resource URIs (only `dpe://` + `window://` schemes contribute).
+        """
+        hosts: set[str] = set()
+        for res in resources:
+            uri = str(res.uri)
+            if is_dpe_uri(uri):
+                try:
+                    hosts.add(DPEURI(uri).host)
+                except Exception as e:
+                    logger.warning(f"Skip dpe URI for host extraction: {uri} ({e})")
+            elif is_window_uri(uri):
+                try:
+                    hosts.add(WindowURI(uri).mcp_id)
+                except Exception as e:
+                    logger.warning(f"Skip window URI for host extraction: {uri} ({e})")
+        return hosts
+
+    async def _acollect_hosts_for_server(self, server_name: SERVER_NAME, client: MCPClientProtocol) -> set[str]:
+        """
+        中文: 穷举 `list_resources_page` 翻页，收集 server 当前声明的 host 集合。
+        英文: Exhaust `list_resources_page` pagination to gather the host set declared by the server.
+
+        - capability 缺失（未声明 `resources`）→ 返回空集，**不**视为故障（永久状态）
+        - 网络等其他异常 → 抛出，由调用方决定是否标 pending
+        - capability missing → return empty set, NOT treated as failure (permanent state)
+        - other exceptions → propagated; caller decides whether to mark pending
+        """
+        hosts: set[str] = set()
+        cursor: str | None = None
+        try:
+            while True:
+                page, cursor = await client.list_resources_page(cursor=cursor)
+                hosts.update(self._extract_hosts_from_resources(page))
+                if cursor is None:
+                    break
+        except MCPCapabilityNotSupportedError:
+            logger.debug(f"Server {server_name} did not declare 'resources' capability — contributes no hosts")
+            return set()
+        return hosts
+
+    def _detect_host_conflict(self, server_name: SERVER_NAME, hosts: set[str]) -> tuple[str, SERVER_NAME] | None:
+        """
+        中文: 检查 hosts 与现有索引的冲突。返回 (冲突 host, 占用该 host 的另一 server) 或 None。
+        英文: Check `hosts` against existing index. Returns (conflicting_host, existing_server) or None.
+
+        排除 `server_name` 自身——重启 / 重新注册同名 server 不视为冲突（前提是清理已发生）。
+        Excludes `server_name` itself — re-registering the same name is not a conflict (assuming cleanup ran).
+        """
+        for host in hosts:
+            existing = self._host_to_servers.get(host)
+            if existing:
+                others = existing - {server_name}
+                if others:
+                    return host, next(iter(others))
+        return None
+
+    def _register_hosts(self, server_name: SERVER_NAME, hosts: set[str]) -> None:
+        """中文: 把 hosts 写入反查索引。/ English: Write `hosts` into the reverse index."""
+        for host in hosts:
+            self._host_to_servers[host].add(server_name)
+
+    def _release_hosts(self, server_name: SERVER_NAME) -> None:
+        """中文: 注销 server 时释放其占用的所有 host 槽位。/ English: Release all host slots owned by `server_name`."""
+        empty_keys: list[str] = []
+        for host, owners in self._host_to_servers.items():
+            owners.discard(server_name)
+            if not owners:
+                empty_keys.append(host)
+        for host in empty_keys:
+            del self._host_to_servers[host]
+        self._host_index_pending.discard(server_name)
+
+    async def aretry_pending_host_index(self, server_name: SERVER_NAME) -> bool:
+        """
+        中文: 对处于 `host_index_pending` 状态的 server 重新尝试 host 收集与冲突检测。
+              冲突 → 注销 server + 抛 `HostConflictError`；成功 → 写索引并清除 pending；
+              本次仍失败 → 保留 pending 返回 False。
+        英文: Retry host collection + conflict detection for a server currently in `host_index_pending`.
+              On conflict → unregister server + raise `HostConflictError`; on success → write index
+              and clear pending; on transient failure → keep pending and return False.
+
+        供 v0.2 `client:get_resources` 处理器（#14）在成功完成 list 后回调，落实 §4.4 延迟检测语义。
+        Used by the v0.2 `client:get_resources` handler (#14) after a successful list, to enforce
+        §4.4 delayed-detection semantics.
+
+        Returns:
+            bool: True 表示 pending 已解除（含本身就不在 pending 集合的快速路径）；False 表示仍 pending。
+        """
+        async with self._lock:
+            if server_name not in self._host_index_pending:
+                return True
+            client = self._active_clients.get(server_name)
+            if not client:
+                # server 已不在 active 列表，pending 标记失去意义
+                self._host_index_pending.discard(server_name)
+                return True
+            try:
+                hosts = await self._acollect_hosts_for_server(server_name, client)
+            except Exception as e:
+                logger.warning(f"Retry host index for '{server_name}' still failing: {e}")
+                return False
+            conflict = self._detect_host_conflict(server_name, hosts)
+            if conflict:
+                conflict_host, existing = conflict
+                # 冲突 → 注销该 server（同步本次 active_clients + servers_config 状态）
+                # Conflict → unregister this server (sync active_clients + servers_config state)
+                await self._astop_client(server_name)
+                self._servers_config.pop(server_name, None)
+                self._host_index_pending.discard(server_name)
+                raise HostConflictError(conflict_host, (existing, server_name))
+            self._register_hosts(server_name, hosts)
+            self._host_index_pending.discard(server_name)
+            return True
 
     def get_tool_meta(self, server_name: SERVER_NAME, tool_name: TOOL_NAME) -> ToolMeta | None:
         """
@@ -234,11 +408,33 @@ class MCPServerManager:
         client = client_factory(config, message_handler=self._message_handler)
         await client.aconnect()
         self._active_clients[server_name] = client
+
+        # host 反查索引：注册期 fail-fast（§4.4 硬约束）。list 临时失败 → 标 pending，延迟检测
+        # Host reverse index: registration-time fail-fast (§4.4 hard constraint).
+        # Transient list failure → mark pending for delayed detection.
+        try:
+            hosts = await self._acollect_hosts_for_server(server_name, client)
+        except Exception as e:
+            logger.warning(
+                f"Server '{server_name}' registered but host index pending — list_resources failed: {e}",
+            )
+            self._host_index_pending.add(server_name)
+            hosts = set()
+        else:
+            conflict = self._detect_host_conflict(server_name, hosts)
+            if conflict:
+                conflict_host, existing = conflict
+                await client.adisconnect()
+                del self._active_clients[server_name]
+                raise HostConflictError(conflict_host, (existing, server_name))
+            self._register_hosts(server_name, hosts)
+
         try:
             await self._arefresh_tool_mapping()
         except ToolNameDuplicatedError as e:
             await client.adisconnect()
             del self._active_clients[server_name]
+            self._release_hosts(server_name)
             raise e
 
     async def astop_client(self, server_name: str) -> None:
@@ -251,6 +447,9 @@ class MCPServerManager:
         client = self._active_clients.pop(server_name, None)
         if client:
             await client.adisconnect()
+            # §4.4 注销即释放 host 占用，避免后注册的同 host server 出现"假冲突"
+            # §4.4 unregister releases host slots so a later same-host registration is not a "false conflict"
+            self._release_hosts(server_name)
             await self._arefresh_tool_mapping()
 
     async def _astop_all(self) -> None:
@@ -271,6 +470,8 @@ class MCPServerManager:
         self._tool_mapping.clear()
         self._alias_mapping.clear()
         self._disabled_tools.clear()
+        self._host_to_servers.clear()
+        self._host_index_pending.clear()
 
     async def aclose(self) -> None:
         """关闭所有连接（别名）"""

@@ -191,6 +191,10 @@ class MCPClientProtocol(Protocol):
         """列出当前MCP服务可用的窗口资源列表 / List window resources of the MCP server"""
         ...
 
+    async def list_resources_page(self, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+        """单页透传 MCP `resources/list` / Single-page transparent forward of MCP `resources/list`"""
+        ...
+
     async def get_window_detail(self, resource: Resource | str) -> ReadResourceResult:
         """获取当前Window的详细内容"""
         ...
