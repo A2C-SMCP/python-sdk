@@ -447,3 +447,20 @@ class ErrorPayload(TypedDict, total=False):
     capability: str
     # 诊断容器 / Diagnostic container
     details: dict[str, Any]
+
+
+# 协议错误码取值集合（flat ErrorPayload 顶层 code）/ Protocol error-code value set (flat ErrorPayload top-level code)
+_ERROR_CODE_VALUES: frozenset[int] = frozenset(int(c) for c in ErrorCode)
+
+
+def is_protocol_error_payload(data: object) -> bool:
+    """
+    判定 ``data`` 是否为协议级 **flat ErrorPayload**：顶层 ``code`` 属协议错误码，无嵌套 envelope。
+    Whether ``data`` is a protocol-level **flat ErrorPayload**: top-level ``code`` is a
+    protocol error code, no nested envelope.
+
+    server（透传判定）与 agent（抛 SMCPProtocolError）共用同一谓词，避免双重启发式漂移。
+    Shared by server (passthrough decision) and agent (raise SMCPProtocolError) to avoid
+    divergent heuristics. 协议依据 / Protocol: error-handling.md（禁止二次 unwrap）。
+    """
+    return isinstance(data, dict) and data.get("code") in _ERROR_CODE_VALUES

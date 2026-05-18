@@ -46,6 +46,7 @@ from a2c_smcp.smcp import (
     SessionInfo,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
+    is_protocol_error_payload,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -377,9 +378,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             to=computer_sid,
             namespace=SMCP_NAMESPACE,
         )
-        # flat ErrorPayload 透传（无嵌套 envelope，禁止二次 unwrap）/
-        # Pass flat ErrorPayload through (no nested envelope, no re-unwrap)
-        if isinstance(client_response, dict) and "code" in client_response:
+        # flat ErrorPayload 透传（无嵌套 envelope，禁止二次 unwrap；判定与 agent 侧统一）/
+        # Pass flat ErrorPayload through (no nested envelope; predicate shared with agent side)
+        if is_protocol_error_payload(client_response):
             return TypeAdapter(ErrorPayload).validate_python(client_response)
         return TypeAdapter(GetResourcesRet).validate_python(client_response)
 

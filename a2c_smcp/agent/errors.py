@@ -15,10 +15,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from a2c_smcp.smcp import ErrorCode, ErrorPayload
-
-# 协议级错误码集合（flat ErrorPayload 顶层 code）/ Set of protocol-level error codes (flat ErrorPayload top-level code)
-_PROTOCOL_ERROR_CODES: frozenset[int] = frozenset(int(c) for c in ErrorCode)
+from a2c_smcp.smcp import ErrorPayload, is_protocol_error_payload
 
 
 class SMCPProtocolError(Exception):
@@ -56,5 +53,5 @@ def raise_for_error_payload(response: Any) -> None:
     Args:
         response (Any): Socket.IO ack 返回值 / Socket.IO ack return value.
     """
-    if isinstance(response, dict) and response.get("code") in _PROTOCOL_ERROR_CODES:
+    if is_protocol_error_payload(response):
         raise SMCPProtocolError(cast(ErrorPayload, response))

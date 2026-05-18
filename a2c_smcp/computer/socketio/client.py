@@ -58,9 +58,14 @@ def _to_a2c_resource(res: Resource) -> A2CResource:
     中文: 将 MCP ``Resource`` 映射为 A2C 协议层 ``A2CResource``（snake_case mirror）。
     英文: Map an MCP ``Resource`` to the A2C protocol ``A2CResource`` (snake_case mirror).
 
-    透传原则：仅做 camelCase→snake_case 字段名规整，不做任何 scheme / 元数据层面的过滤。
-    Transparent forward: only camelCase→snake_case key normalization; no scheme/metadata filtering.
-    协议依据 / Protocol: a2c-smcp-protocol data-structures.md#A2CResource（v0.2 字段集固定）。
+    映射协议固定的 ``A2CResource`` 子集（``annotations`` 内含 ``audience`` /
+    ``priority`` / ``last_modified``）：仅做 camelCase→snake_case 字段名规整，
+    不按 scheme 或内容做过滤丢弃；MCP ``Resource.title`` / ``icons`` 按 v0.2
+    规范故意不纳入（A2CResource 字段集固定，非内容过滤）。
+    Maps the protocol-fixed ``A2CResource`` subset; camelCase→snake_case key
+    normalization only, no scheme/content-driven dropping. MCP ``Resource.title``
+    / ``icons`` are intentionally omitted per the v0.2 spec (fixed field set).
+    协议依据 / Protocol: a2c-smcp-protocol data-structures.md#A2CResource。
     """
     a2c: A2CResource = {"uri": str(res.uri), "name": res.name}
     if res.description is not None:
@@ -75,6 +80,12 @@ def _to_a2c_resource(res: Resource) -> A2CResource:
             ann["audience"] = list(res.annotations.audience)
         if res.annotations.priority is not None:
             ann["priority"] = res.annotations.priority
+        # last_modified：协议 ResourceAnnotations 已声明；防御式读取，兼容当前/未来 MCP 版本
+        # last_modified: declared by protocol ResourceAnnotations; defensive getattr
+        # so it works whether or not the installed MCP Annotations model carries it.
+        last_modified = getattr(res.annotations, "lastModified", None)
+        if last_modified is not None:
+            ann["last_modified"] = last_modified
         if ann:
             a2c["annotations"] = ann
     if res.meta is not None:
