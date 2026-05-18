@@ -300,8 +300,8 @@ async def test_skip_empty_contents_and_detail_exception() -> None:
 async def test_invalid_window_uri_is_skipped() -> None:
     """非 window:// 协议的 URI 会被跳过。"""
     good_detail = _mk_detail("window://G/good", "good")
-    bad_res = _mk_resource("dpe://G/bad", priority=0.5)
-    bad_detail = _mk_detail("dpe://G/bad", "bad")
+    bad_res = _mk_resource("custom-scheme://G/bad", priority=0.5)
+    bad_detail = _mk_detail("custom-scheme://G/bad", "bad")
     good_res = _mk_resource("window://G/good", priority=0.5)
 
     windows = [

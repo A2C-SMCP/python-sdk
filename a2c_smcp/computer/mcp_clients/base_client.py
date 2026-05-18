@@ -34,8 +34,8 @@ class MCPCapabilityNotSupportedError(Exception):
     中文: MCP Server 未声明所需 capability（如 `resources`）。
     英文: MCP Server did not declare a required capability (e.g. `resources`).
 
-    上层（`client:get_resources` / `client:get_dpe` 处理器）应映射为 wire-level `4015 MCP_CAPABILITY_NOT_SUPPORTED`。
-    Upper layers (`client:get_resources` / `client:get_dpe` handlers) should map this to wire-level
+    上层（`client:get_resources` 处理器）应映射为 wire-level `4015 MCP_CAPABILITY_NOT_SUPPORTED`。
+    Upper layers (`client:get_resources` handler) should map this to wire-level
     `4015 MCP_CAPABILITY_NOT_SUPPORTED`.
     """
 

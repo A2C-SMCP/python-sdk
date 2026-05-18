@@ -86,7 +86,7 @@ async def test_list_resources_page_first_page_no_cursor(connected_client):
     """
     _set_caps(connected_client, has_resources=True)
     mock_session = connected_client._async_session
-    res_a = Resource(uri=AnyUrl("dpe://com.example.docs/a.md"), name="a")
+    res_a = Resource(uri=AnyUrl("https://com.example.docs/a.md"), name="a")
     res_b = Resource(uri=AnyUrl("window://com.example.editor/main"), name="main")
     mock_session.list_resources = AsyncMock(
         return_value=ListResourcesResult(resources=[res_a, res_b], nextCursor="page-2"),
@@ -107,7 +107,7 @@ async def test_list_resources_page_with_cursor(connected_client):
     """
     _set_caps(connected_client, has_resources=True)
     mock_session = connected_client._async_session
-    res = Resource(uri=AnyUrl("dpe://com.example.docs/b.md"), name="b")
+    res = Resource(uri=AnyUrl("https://com.example.docs/b.md"), name="b")
     mock_session.list_resources = AsyncMock(
         return_value=ListResourcesResult(resources=[res], nextCursor=None),
     )
@@ -160,12 +160,11 @@ async def test_list_resources_page_not_connected_raises():
 @pytest.mark.asyncio
 async def test_list_resources_page_does_not_filter_by_scheme(connected_client):
     """
-    透明转发: 任意 scheme（dpe / window / 业务自定义）都应原样返回，由 Agent 自决过滤。
+    透明转发: 任意 scheme（window / 业务自定义）都应原样返回，由 Agent 自决过滤。
     """
     _set_caps(connected_client, has_resources=True)
     mock_session = connected_client._async_session
     items = [
-        Resource(uri=AnyUrl("dpe://h/a"), name="a"),
         Resource(uri=AnyUrl("window://h/b"), name="b"),
         Resource(uri=AnyUrl("https://example.com/c"), name="c"),
         Resource(uri=AnyUrl("custom-scheme://h/d"), name="d"),
