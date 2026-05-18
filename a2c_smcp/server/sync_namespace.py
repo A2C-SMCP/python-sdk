@@ -21,6 +21,7 @@ from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
     GET_DESKTOP_EVENT,
+    GET_RESOURCES_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     SMCP_NAMESPACE,
@@ -31,8 +32,11 @@ from a2c_smcp.smcp import (
     AgentCallData,
     EnterOfficeNotification,
     EnterOfficeReq,
+    ErrorPayload,
     GetDeskTopReq,
     GetDeskTopRet,
+    GetResourcesReq,
+    GetResourcesRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
@@ -42,6 +46,7 @@ from a2c_smcp.smcp import (
     SessionInfo,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
+    is_protocol_error_payload,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -334,6 +339,50 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         )
 
         return TypeAdapter(GetDeskTopRet).validate_python(client_response)
+
+    def on_client_get_resources(self, sid: str, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
+        """
+        同步：透明转发 ``client:get_resources`` 至目标 Computer（含 cursor 翻页）。
+        Sync: relay ``client:get_resources`` to the target Computer (with cursor pagination).
+
+        要求 Agent 与 Computer 在同一 office。Server 仅做路由；Computer 返回的 flat ErrorPayload
+        （4014 / 4015）原样回传，不做 GetResourcesRet 强转。
+        Requires Agent and Computer in the same office. Server only routes; a flat ErrorPayload
+        (4014 / 4015) from the Computer is passed through verbatim without GetResourcesRet coercion.
+
+        Args:
+            sid (str): 发起者ID，一般是Agent / Initiator ID, usually Agent
+            data (GetResourcesReq): 含 computer / mcp_server / 可选 cursor / req_id
+
+        Returns:
+            GetResourcesRet | ErrorPayload: 资源页或 flat 错误负载
+        """
+        computer_name = data["computer"]
+
+        # 通过name获取computer的sid / Get computer's sid by name
+        computer_sid = self.get_sid_by_name(computer_name)
+        if not computer_sid:
+            raise ValueError(f"Computer with name '{computer_name}' not found")
+
+        session = self.get_session(computer_sid)
+        assert session["role"] == "computer", "目前仅支持获取Computer资源列表"
+
+        agent_session = self.get_session(sid)
+        computer_office_id = session.get("office_id")
+        agent_office_id = agent_session.get("office_id")
+        assert computer_office_id == agent_office_id, "目前仅支持Agent获取自己房间内Computer的资源列表"
+
+        client_response = self.call(
+            GET_RESOURCES_EVENT,
+            data,
+            to=computer_sid,
+            namespace=SMCP_NAMESPACE,
+        )
+        # flat ErrorPayload 透传（无嵌套 envelope，禁止二次 unwrap；判定与 agent 侧统一）/
+        # Pass flat ErrorPayload through (no nested envelope; predicate shared with agent side)
+        if is_protocol_error_payload(client_response):
+            return TypeAdapter(ErrorPayload).validate_python(client_response)
+        return TypeAdapter(GetResourcesRet).validate_python(client_response)
 
     def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq) -> None:
         """

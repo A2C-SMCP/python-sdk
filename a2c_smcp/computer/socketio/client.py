@@ -5,14 +5,16 @@
 # @Software: PyCharm
 from typing import Any
 
-from mcp.types import CallToolResult
+from mcp.types import CallToolResult, Resource
 from pydantic import TypeAdapter
 from socketio import AsyncClient
 
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
 from a2c_smcp.smcp import (
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
+    GET_RESOURCES_EVENT,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
@@ -21,25 +23,74 @@ from a2c_smcp.smcp import (
     UPDATE_CONFIG_EVENT,
     UPDATE_DESKTOP_EVENT,
     UPDATE_TOOL_LIST_EVENT,
+    A2CResource,
     EnterOfficeReq,
+    ErrorCode,
+    ErrorPayload,
     GetComputerConfigReq,
     GetComputerConfigRet,
     GetDeskTopReq,
     GetDeskTopRet,
+    GetResourcesReq,
+    GetResourcesRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeReq,
     MCPServerInput,
+    ResourceAnnotations,
     ToolCallReq,
     UpdateComputerConfigReq,
 )
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
 )
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 # 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
 # Default auth HTTP header name for the SDK (consumers may override)
 DEFAULT_AUTH_HEADER_NAME = "access_token"
+
+
+def _to_a2c_resource(res: Resource) -> A2CResource:
+    """
+    中文: 将 MCP ``Resource`` 映射为 A2C 协议层 ``A2CResource``（snake_case mirror）。
+    英文: Map an MCP ``Resource`` to the A2C protocol ``A2CResource`` (snake_case mirror).
+
+    映射协议固定的 ``A2CResource`` 子集（``annotations`` 内含 ``audience`` /
+    ``priority`` / ``last_modified``）：仅做 camelCase→snake_case 字段名规整，
+    不按 scheme 或内容做过滤丢弃；MCP ``Resource.title`` / ``icons`` 按 v0.2
+    规范故意不纳入（A2CResource 字段集固定，非内容过滤）。
+    Maps the protocol-fixed ``A2CResource`` subset; camelCase→snake_case key
+    normalization only, no scheme/content-driven dropping. MCP ``Resource.title``
+    / ``icons`` are intentionally omitted per the v0.2 spec (fixed field set).
+    协议依据 / Protocol: a2c-smcp-protocol data-structures.md#A2CResource。
+    """
+    a2c: A2CResource = {"uri": str(res.uri), "name": res.name}
+    if res.description is not None:
+        a2c["description"] = res.description
+    if res.mimeType is not None:
+        a2c["mime_type"] = res.mimeType
+    if res.size is not None:
+        a2c["size"] = res.size
+    if res.annotations is not None:
+        ann: ResourceAnnotations = {}
+        if res.annotations.audience is not None:
+            ann["audience"] = list(res.annotations.audience)
+        if res.annotations.priority is not None:
+            ann["priority"] = res.annotations.priority
+        # last_modified：协议 ResourceAnnotations 已声明；防御式读取，兼容当前/未来 MCP 版本
+        # last_modified: declared by protocol ResourceAnnotations; defensive getattr
+        # so it works whether or not the installed MCP Annotations model carries it.
+        last_modified = getattr(res.annotations, "lastModified", None)
+        if last_modified is not None:
+            ann["last_modified"] = last_modified
+        if ann:
+            a2c["annotations"] = ann
+    if res.meta is not None:
+        a2c["_meta"] = res.meta
+    return a2c
 
 
 class SMCPComputerClient(AsyncClient):
@@ -79,6 +130,7 @@ class SMCPComputerClient(AsyncClient):
         self.on(GET_TOOLS_EVENT, self.on_get_tools, namespace=self._namespace)
         self.on(GET_CONFIG_EVENT, self.on_get_config, namespace=self._namespace)
         self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
+        self.on(GET_RESOURCES_EVENT, self.on_get_resources, namespace=self._namespace)
         self.office_id: str | None = None
 
     @property
@@ -299,4 +351,54 @@ class SMCPComputerClient(AsyncClient):
 
         # 端到端返回强校验（中英双语）/ End-to-end response strict validation (bilingual)
         ret = TypeAdapter(GetComputerConfigRet).validate_python({"servers": servers, "inputs": inputs})
+        return ret
+
+    async def on_get_resources(self, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
+        """
+        透明转发指定 MCP Server 的 ``resources/list``（含 cursor 翻页）。
+        Transparent forward of a MCP Server's ``resources/list`` (with cursor pagination).
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md#client:get_resources。
+        Computer 不做 scheme / 元数据过滤、不做跨 Server 聚合；翻页由 Agent 通过 cursor 控制。
+        Computer does no scheme/metadata filtering and no cross-server aggregation; pagination is Agent-driven.
+
+        错误语义（flat ErrorPayload，经 Socket.IO ack 第一参回传，无嵌套 envelope）/
+        Error semantics (flat ErrorPayload returned as the Socket.IO ack first arg, no nested envelope):
+          - ``mcp_server`` 未注册 → ``4014 MCP Server Not Found``
+          - 目标 Server 未声明 ``resources`` 能力 → ``4015 MCP Capability Not Supported``
+
+        Args:
+            data (GetResourcesReq): 请求数据（computer / mcp_server / 可选 cursor / req_id）。
+
+        Returns:
+            GetResourcesRet | ErrorPayload: 成功为资源页，失败为 flat ErrorPayload。
+        """
+        # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
+        # Server guarantees request is from same office via session, no need to validate agent vs office_id here
+        assert self.computer.name == data["computer"], "计算机标识不匹配"
+        mcp_server = data["mcp_server"]
+        cursor = data.get("cursor")
+        try:
+            resources, next_cursor = await self.computer.get_resources(mcp_server, cursor)
+        except MCPServerNotFoundError as e:
+            logger.warning(f"client:get_resources 引用未注册 MCP Server '{mcp_server}' / unregistered server: {e}")
+            return ErrorPayload(
+                code=int(ErrorCode.MCP_SERVER_NOT_FOUND),
+                message="MCP Server not registered",
+                mcp_server_name=mcp_server,
+            )
+        except MCPCapabilityNotSupportedError as e:
+            logger.warning(f"client:get_resources MCP Server '{mcp_server}' 未声明 resources 能力 / capability missing: {e}")
+            return ErrorPayload(
+                code=int(ErrorCode.MCP_CAPABILITY_NOT_SUPPORTED),
+                message="MCP Server does not support 'resources' capability",
+                mcp_server_name=mcp_server,
+                capability="resources",
+            )
+        ret: GetResourcesRet = {
+            "resources": [_to_a2c_resource(r) for r in resources],
+            "req_id": data["req_id"],
+        }
+        if next_cursor is not None:
+            ret["next_cursor"] = next_cursor
         return ret

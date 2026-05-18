@@ -15,11 +15,13 @@ from socketio import AsyncClient
 
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
+from a2c_smcp.agent.errors import raise_for_error_payload
 from a2c_smcp.agent.types import AsyncAgentEventHandler
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
     GET_DESKTOP_EVENT,
+    GET_RESOURCES_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
@@ -30,6 +32,7 @@ from a2c_smcp.smcp import (
     AgentCallData,
     EnterOfficeNotification,
     GetDeskTopRet,
+    GetResourcesRet,
     GetToolsRet,
     LeaveOfficeNotification,
     ListRoomReq,
@@ -322,6 +325,51 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
         return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])
+
+    async def get_resources(
+        self,
+        computer: str,
+        mcp_server: str,
+        cursor: str | None = None,
+        timeout: int = 20,
+    ) -> GetResourcesRet:
+        """
+        异步：透明转发获取指定 Computer 上某 MCP Server 的资源列表（含 cursor 翻页）。
+        Async: transparently get a MCP Server's resource list on the target Computer (with cursor pagination).
+
+        SDK **不**自动遍历翻页——cursor 由调用方控制：首次传 ``None``，响应含 ``next_cursor``
+        时由调用方决定是否带该 cursor 继续请求（协议指南 §5.3 第 3 点）。
+        The SDK does **not** auto-paginate — the cursor is caller-controlled: pass ``None`` first;
+        when the response carries ``next_cursor`` the caller decides whether to request again with it
+        (protocol guide §5.3 #3).
+
+        Args:
+            computer (str): 目标 Computer 名称 / Target Computer name
+            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
+            timeout (int): 超时时间（秒）/ Timeout in seconds
+
+        Returns:
+            GetResourcesRet: 资源页（含可选 next_cursor）/ Resource page (with optional next_cursor)
+
+        Raises:
+            SMCPProtocolError: ``4014`` MCP Server 未注册 / ``4015`` 未声明 ``resources`` 能力
+            ValueError: 响应 ``req_id`` 不匹配 / mismatched response ``req_id``
+        """
+        req = self.create_get_resources_request(computer, mcp_server, cursor)
+        logger.debug(f"Getting resources from computer {computer}, mcp_server={mcp_server}, cursor={cursor}")
+        response = await self.call(GET_RESOURCES_EVENT, req, namespace=self._namespace, timeout=timeout)
+        # flat ErrorPayload（4014 / 4015）→ 抛 SMCPProtocolError / raise SMCPProtocolError on flat ErrorPayload
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for resources")
+        ret: GetResourcesRet = {
+            "resources": response.get("resources", []),
+            "req_id": response["req_id"],
+        }
+        if response.get("next_cursor") is not None:
+            ret["next_cursor"] = response["next_cursor"]
+        return ret
 
     async def _on_desktop_updated(self, data: dict) -> None:
         """

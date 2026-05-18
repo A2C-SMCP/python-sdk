@@ -16,6 +16,7 @@ Provides Agent-side SMCP protocol client implementation, including both synchron
 from a2c_smcp.agent.auth import DEFAULT_AUTH_HEADER_NAME, AgentAuthProvider, DefaultAgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.agent.types import (
     AgentConfig,
@@ -41,6 +42,8 @@ __all__ = [
     "BaseAgentClient",
     "SMCPAgentClient",
     "AsyncSMCPAgentClient",
+    # 协议错误 / Protocol errors
+    "SMCPProtocolError",
     # 类型定义 / Type definitions
     "AgentConfig",
     "AgentEventHandler",

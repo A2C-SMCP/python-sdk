@@ -20,6 +20,7 @@ from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.smcp import (
     GET_RESOURCES_EVENT,
     ErrorCode,
+    is_protocol_error_payload,
 )
 
 
@@ -70,3 +71,34 @@ class TestEventConstants:
 
     def test_get_resources_event_string(self) -> None:
         assert GET_RESOURCES_EVENT == "client:get_resources"
+
+
+class TestIsProtocolErrorPayload:
+    """flat ErrorPayload 共享谓词 / shared flat-ErrorPayload predicate (server + agent)."""
+
+    def test_true_for_known_protocol_error_codes(self) -> None:
+        """顶层 code 属协议错误码 → True / top-level protocol code → True."""
+        assert is_protocol_error_payload({"code": 4014, "message": "x", "mcp_server_name": "s"})
+        assert is_protocol_error_payload({"code": 4015, "message": "x", "capability": "resources"})
+        assert is_protocol_error_payload({"code": 4008, "message": "x"})
+        # IntEnum 实例与 int 等值，亦应判定为 True / IntEnum value equals int
+        assert is_protocol_error_payload({"code": ErrorCode.MCP_SERVER_NOT_FOUND})
+
+    def test_false_for_success_payloads(self) -> None:
+        """GetResourcesRet 类成功响应无 code → False / success payload without code."""
+        assert not is_protocol_error_payload({"resources": [], "req_id": "r1"})
+        assert not is_protocol_error_payload({"resources": [{"uri": "window://h/p"}], "next_cursor": "c2"})
+
+    def test_false_for_non_protocol_or_missing_code(self) -> None:
+        """非协议错误码 / 缺 code / code=None → False / non-protocol or missing code."""
+        assert not is_protocol_error_payload({"code": 200})
+        assert not is_protocol_error_payload({"code": 9999})
+        assert not is_protocol_error_payload({"code": None})
+        assert not is_protocol_error_payload({"message": "no code field"})
+
+    def test_false_for_non_dict(self) -> None:
+        """非 dict（无嵌套 envelope 不解包）→ False / non-dict inputs."""
+        assert not is_protocol_error_payload(None)
+        assert not is_protocol_error_payload("4014")
+        assert not is_protocol_error_payload([{"code": 4014}])
+        assert not is_protocol_error_payload(4014)
