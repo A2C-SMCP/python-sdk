@@ -22,9 +22,30 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 # 协议规定的版本握手 query key / Protocol-defined version handshake query key
 A2C_VERSION_QUERY_KEY = "a2c_version"
 
-# SHOULD 默认 transports：首个握手走 HTTP polling，确保 4008 的 HTTP 400 body 可被读取
-# Default transports (SHOULD): first handshake on HTTP polling so the 4008 HTTP 400 body is readable
+# MUST 默认 transports：首个握手走 HTTP polling，确保 4008 的 HTTP 400 body 可被读取
+# （versioning.md §1：polling-first 自 v0.2.1 由 SHOULD 收紧为 MUST）
+# Default transports (MUST): first handshake on HTTP polling so the 4008 HTTP 400 body is
+# readable (versioning.md §1: polling-first tightened from SHOULD to MUST since v0.2.1)
 DEFAULT_HANDSHAKE_TRANSPORTS: list[str] = ["polling", "websocket"]
+
+
+def enforce_polling_first(transports: Any) -> tuple[Any, bool]:
+    """
+    落实 versioning.md §1 polling-first **MUST**：SDK 不静默放行调用方显式 WS-only。
+    Enforce versioning.md §1 polling-first **MUST**: the SDK never silently allows a
+    caller-forced WebSocket-only handshake.
+
+    判定：``transports`` 是非空序列且首元素不是 ``"polling"``（含 ``["websocket"]`` /
+    ``["websocket","polling"]``）→ 视为违反 §1，强制重注入
+    :data:`DEFAULT_HANDSHAKE_TRANSPORTS`（仍保留 websocket 供握手后升级），返回
+    ``(corrected, True)``；否则原样返回 ``(transports, False)``。
+
+    ``None`` / 空 / 已 polling-first → 不改动（python-socketio ``None`` 默认即 polling 优先）。
+    Returns ``(effective_transports, was_overridden)``.
+    """
+    if isinstance(transports, (list, tuple)) and len(transports) > 0 and transports[0] != "polling":
+        return list(DEFAULT_HANDSHAKE_TRANSPORTS), True
+    return transports, False
 
 
 def build_handshake_url(url: str, protocol_version: str) -> str:

@@ -42,7 +42,12 @@ from a2c_smcp.smcp import (
     SessionInfo,
     UpdateMCPConfigNotification,
 )
-from a2c_smcp.utils.handshake import DEFAULT_HANDSHAKE_TRANSPORTS, build_handshake_url, extract_4008_payload
+from a2c_smcp.utils.handshake import (
+    DEFAULT_HANDSHAKE_TRANSPORTS,
+    build_handshake_url,
+    enforce_polling_first,
+    extract_4008_payload,
+)
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
 logger = get_logger("agent")
@@ -184,6 +189,17 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             "transports": DEFAULT_HANDSHAKE_TRANSPORTS,
             **kwargs,
         }
+
+        # 协议 §1 polling-first MUST 护栏：调用方显式 WS-only 不静默放行
+        # Protocol §1 polling-first MUST guard: caller-forced WS-only is not silently allowed
+        effective_transports, overridden = enforce_polling_first(connect_kwargs.get("transports"))
+        if overridden:
+            logger.warning(
+                "调用方显式 WS-only transports 违反 versioning.md §1 polling-first MUST；已强制"
+                "重注入 polling-first（仍保留 websocket 供握手后升级）/ caller-forced WS-only "
+                "violates §1 polling-first MUST; re-injected polling-first",
+            )
+        connect_kwargs["transports"] = effective_transports
 
         logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
         try:

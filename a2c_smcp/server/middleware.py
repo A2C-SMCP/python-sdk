@@ -17,15 +17,26 @@ normative timing constraint).
 设计要点 / Design notes:
   - 纯 ASGI / WSGI 原生协议实现，**不依赖** ``socketio.AsyncServer`` 内部 hook
   - 路径作用域 **MUST** 仅命中 socketio HTTP 挂载前缀，避免误伤同一应用上的其它路由
-  - 仅处理 HTTP 传输（polling 握手）。默认 transports polling 优先，首个握手必为 HTTP，
-    故 WS-only 边角不在本中间件职责内——与协议 Python 参考实现（Starlette
-    ``BaseHTTPMiddleware``，亦仅 HTTP）的作用域一致
+  - ASGI 下 **MUST** 同时校验 ``http``（polling 握手）与 ``websocket``（直连 WS 握手）两类
+    scope——只校验 ``http`` 会让 ``transports=["websocket"]`` 客户端绕过版本闸门、击穿
+    传递性保证（versioning.md §5）。WS-only 不兼容拒绝形态（§5 R3，按运行栈能力二选一）：
+      * 栈支持 ASGI WebSocket Denial Response（uvicorn≥0.21 / hypercorn / daphne）→ 回与
+        polling 路径**字节一致**的 HTTP 400 + 4008 flat body + ``X-A2C-Error-Code: 4008``
+      * 不支持 → 以 WebSocket close code ``4900`` 关闭握手（**非** 4008，不同命名空间）
+  - WSGI 不拆分 http / websocket scope（WS 握手起始即普通 HTTP GET，``environ`` 携
+    ``QUERY_STRING`` 与 Upgrade 头），现有逻辑对 Upgrade 无关、仅看 PATH_INFO+QUERY_STRING，
+    故 WS-only over WSGI 天然走同一 400/4008 路径——该缺口本质 **ASGI 特有**
   - Pure ASGI / WSGI native protocol; does NOT depend on ``socketio.AsyncServer`` internals
   - Path scope MUST only match the socketio HTTP mount prefix (no collateral damage)
-  - HTTP transport only (polling handshake); aligned with the protocol's Python reference
-    impl (Starlette ``BaseHTTPMiddleware``, also HTTP-only)
+  - ASGI MUST validate BOTH ``http`` and ``websocket`` scopes (versioning.md §5);
+    WSGI inherently covers WS-only since it does not split scopes
 
-协议依据 / Protocol: a2c-smcp-protocol docs/specification/versioning.md (§连接握手流程 / §错误码)
+客户端已知限制 / Client-side known limitation (versioning.md §5 R4):
+  收到 WS close ``4900`` 后「改 polling 重连取回权威 4008」受限于 python-socketio 暴露 ws
+  close code 的能力；当前 SDK 在客户端侧以 §1 polling-first 护栏（见 utils/handshake.py
+  ``enforce_polling_first``）从源头规避 ``4900``，R4 自动重连取回 4008 暂不实现。
+
+协议依据 / Protocol: a2c-smcp-protocol docs/specification/versioning.md (§连接握手流程 / §5 / §错误码)
                       docs/specification/error-handling.md (§协议版本不匹配 4008)
 """
 
@@ -37,7 +48,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from a2c_smcp import PROTOCOL_VERSION
-from a2c_smcp.smcp import ErrorCode
+from a2c_smcp.smcp import WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE, ErrorCode
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.version import ProtocolVersion, is_compatible
 
@@ -121,6 +132,18 @@ def _response_headers_ascii(body: dict[str, Any]) -> list[tuple[str, str]]:
     return headers
 
 
+def _build_rejection(body: dict[str, Any]) -> tuple[bytes, list[tuple[bytes, bytes]]]:
+    """
+    构造拒绝响应的 (raw_body_bytes, ascii_headers_bytes)，**http 与 websocket denial-response
+    路径共用**，保证 4008 body 字节一致（单一事实源）。
+    Build (raw_body_bytes, ascii_headers_bytes) shared by the http and websocket
+    denial-response paths so the 4008 body is byte-identical (single source of truth).
+    """
+    raw = json.dumps(body).encode("utf-8")
+    headers = [(k.encode("latin-1"), v.encode("latin-1")) for k, v in _response_headers_ascii(body)]
+    return raw, headers
+
+
 class A2CProtocolVersionASGIMiddleware:
     """
     ASGI 协议版本握手中间件。包裹 ``socketio.ASGIApp``：
@@ -152,9 +175,11 @@ class A2CProtocolVersionASGIMiddleware:
         receive: Callable[[], Awaitable[dict[str, Any]]],
         send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        # 仅校验命中 socketio 前缀的 HTTP 握手；其它 scope / 路由原样透传
-        # Only validate HTTP handshakes on the socketio prefix; pass everything else through
-        if scope.get("type") != "http" or not _path_in_scope(scope.get("path", ""), self._prefix):
+        # 协议 §5 MUST：http（polling 握手）与 websocket（直连 WS 握手）两类 scope 均须校验；
+        # 其它 scope（lifespan 等）与非 socketio 前缀路由原样透传
+        # Protocol §5 MUST: validate BOTH http and websocket scopes; pass everything else through
+        scope_type = scope.get("type")
+        if scope_type not in ("http", "websocket") or not _path_in_scope(scope.get("path", ""), self._prefix):
             await self.app(scope, receive, send)
             return
 
@@ -163,20 +188,56 @@ class A2CProtocolVersionASGIMiddleware:
             query_string = query_string.decode("latin-1")
         verdict = check_a2c_version(query_string, self._server)
         if verdict is None:
+            # 兼容（含 WS-only 兼容）→ 校验后放行 / compatible (incl. WS-only) → pass through
             await self.app(scope, receive, send)
             return
 
         status, body = verdict
-        logger.warning(f"A2C handshake rejected: status={status} body={body}")
-        raw = json.dumps(body).encode("utf-8")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status,
-                "headers": [(k.encode("latin-1"), v.encode("latin-1")) for k, v in _response_headers_ascii(body)],
-            }
-        )
+        logger.warning(f"A2C handshake rejected: scope={scope_type} status={status} body={body}")
+        if scope_type == "http":
+            await self._reject_http(send, status, body)
+        else:
+            await self._reject_websocket(scope, receive, send, status, body)
+
+    @staticmethod
+    async def _reject_http(
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+        status: int,
+        body: dict[str, Any],
+    ) -> None:
+        """polling 握手拒绝：HTTP 400 + flat ErrorPayload（字节不变，与既有行为一致）。"""
+        raw, headers = _build_rejection(body)
+        await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": raw})
+
+    @staticmethod
+    async def _reject_websocket(
+        scope: dict[str, Any],
+        receive: Callable[[], Awaitable[dict[str, Any]]],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+        status: int,
+        body: dict[str, Any],
+    ) -> None:
+        """
+        直连 WS 握手拒绝（versioning.md §5 R3，按运行栈能力二选一）：
+        WS-only handshake rejection (versioning.md §5 R3, one of two by stack capability):
+
+        - 支持 ASGI WebSocket Denial Response（uvicorn≥0.21 / hypercorn / daphne）→ 在 WS
+          打开**之前**回与 polling 路径**字节一致**的 HTTP 400 + 4008 body + 同一 header
+        - 不支持 → 以 WebSocket close code ``4900`` 关闭（独立命名空间，非 4008）
+
+        ASGI 规范要求 denial-response 在收到 ``websocket.connect`` **之后**发出，故先消费
+        一次 receive；非 connect 事件（如 disconnect）直接返回。
+        """
+        event = await receive()
+        if event.get("type") != "websocket.connect":
+            return
+        if "websocket.http.response" in (scope.get("extensions") or {}):
+            raw, headers = _build_rejection(body)
+            await send({"type": "websocket.http.response.start", "status": status, "headers": headers})
+            await send({"type": "websocket.http.response.body", "body": raw})
+        else:
+            await send({"type": "websocket.close", "code": WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE})
 
 
 class A2CProtocolVersionWSGIMiddleware:

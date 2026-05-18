@@ -18,7 +18,9 @@ from collections.abc import AsyncGenerator
 
 import httpx
 import pytest
+import socketio
 from socketio import ASGIApp
+from socketio.exceptions import ConnectionError as SioConnectionError
 
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
@@ -131,3 +133,57 @@ async def test_list_room_session_info_contains_a2c_version(mw_server: int) -> No
         assert all(s.get("a2c_version") == PROTOCOL_VERSION for s in agents)
     finally:
         await agent.disconnect()
+
+
+@pytest.fixture
+async def incompatible_mw_server(basic_server_port: int) -> AsyncGenerator[int, None]:
+    """Server 协议版本 0.3.0，与 SDK 0.2.0 不兼容（用于 WS-only 拒绝端到端）。"""
+    sio = create_computer_test_socketio()
+    sio.eio.start_service_task = False
+    app = A2CProtocolVersionASGIMiddleware(
+        ASGIApp(sio, socketio_path=_SIO_PATH),
+        socketio_path=_SIO_PATH,
+        server_version="0.3.0",
+    )
+    server = UvicornTestServer(app, port=basic_server_port)
+    await server.up()
+    try:
+        yield basic_server_port
+    finally:
+        await server.down(force=True)
+
+
+@pytest.mark.asyncio
+async def test_ws_only_compatible_connects_end_to_end(mw_server: int) -> None:
+    """§测试建议 row 652：WS-only 直连 + 版本兼容 → websocket scope 被校验后放行，连接成功。"""
+    raw = socketio.AsyncClient()  # 裸客户端：绕过 SDK §1 护栏，真实走 websocket scope
+    try:
+        await raw.connect(
+            f"http://127.0.0.1:{mw_server}?a2c_version={PROTOCOL_VERSION}",
+            socketio_path=_SIO_PATH,
+            transports=["websocket"],
+            namespaces=[SMCP_NAMESPACE],
+        )
+        assert raw.connected is True
+    finally:
+        await raw.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_ws_only_incompatible_rejected_end_to_end(incompatible_mw_server: int) -> None:
+    """缺口闭合端到端反例：WS-only 直连 + 版本不兼容 → 中间件 websocket scope 校验拒绝，
+    连接绝不建立（此前 buggy 实现会放行 → 击穿传递性保证）。"""
+    raw = socketio.AsyncClient()
+    # client a2c_version=0.2.0 vs server 0.3.0 → MINOR 不匹配（不兼容）
+    try:
+        with pytest.raises(SioConnectionError):
+            await raw.connect(
+                f"http://127.0.0.1:{incompatible_mw_server}?a2c_version={PROTOCOL_VERSION}",
+                socketio_path=_SIO_PATH,
+                transports=["websocket"],
+                namespaces=[SMCP_NAMESPACE],
+            )
+        assert raw.connected is False
+    finally:
+        if raw.connected:  # 防御：万一意外连上也要清理，避免污染同进程后续用例
+            await raw.disconnect()

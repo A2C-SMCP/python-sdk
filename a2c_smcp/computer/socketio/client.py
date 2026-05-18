@@ -47,7 +47,12 @@ from a2c_smcp.smcp import (
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
 )
-from a2c_smcp.utils.handshake import DEFAULT_HANDSHAKE_TRANSPORTS, build_handshake_url, extract_4008_payload
+from a2c_smcp.utils.handshake import (
+    DEFAULT_HANDSHAKE_TRANSPORTS,
+    build_handshake_url,
+    enforce_polling_first,
+    extract_4008_payload,
+)
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -161,11 +166,19 @@ class SMCPComputerClient(AsyncClient):
         call site (CLI / interactive / tests) is automatically compliant without duplication.
 
         - 协议 MUST：自动从 ``PROTOCOL_VERSION`` 常量拼接 ``a2c_version``（保留调用方既有 query）
-        - transports 默认 polling 优先以保 4008 HTTP body 可读（调用方可覆盖）
+        - 协议 §1 polling-first MUST 护栏：调用方显式 WS-only 不静默放行，强制重注入 polling-first
         - 捕获 4008 → 主动 ``disconnect()`` → 抛 :class:`ProtocolVersionError`；非 4008 保持原异常
         """
         handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
         kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
+        effective_transports, overridden = enforce_polling_first(kwargs.get("transports"))
+        if overridden:
+            logger.warning(
+                "调用方显式 WS-only transports 违反 versioning.md §1 polling-first MUST；已强制"
+                "重注入 polling-first（仍保留 websocket 供握手后升级）/ caller-forced WS-only "
+                "violates §1 polling-first MUST; re-injected polling-first",
+            )
+        kwargs["transports"] = effective_transports
         logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
         try:
             await super().connect(handshake_url, *args, **kwargs)

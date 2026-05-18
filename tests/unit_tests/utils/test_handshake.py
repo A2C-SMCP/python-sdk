@@ -7,13 +7,19 @@
 
 - build_handshake_url：保留既有 query、无 query、去重防漂移、保留 path / fragment
 - extract_4008_payload：engineio 链式 args[1]（权威）、json.loads 回退、非 4008/非 JSON → None
+- enforce_polling_first：§1 polling-first MUST 护栏，WS-only 显式覆盖强制重注入
 """
 
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from a2c_smcp.utils.handshake import build_handshake_url, extract_4008_payload
+from a2c_smcp.utils.handshake import (
+    DEFAULT_HANDSHAKE_TRANSPORTS,
+    build_handshake_url,
+    enforce_polling_first,
+    extract_4008_payload,
+)
 
 
 class TestBuildHandshakeUrl:
@@ -69,3 +75,33 @@ class TestExtract4008Payload:
     )
     def test_non_json_returns_none(self, exc: Exception) -> None:
         assert extract_4008_payload(exc) is None
+
+
+class TestEnforcePollingFirst:
+    @pytest.mark.parametrize(
+        "transports",
+        [
+            ["websocket"],  # WS-only
+            ["websocket", "polling"],  # websocket 起始（首个握手仍是 WS）
+            ("websocket",),  # tuple 形态
+        ],
+    )
+    def test_ws_first_is_overridden(self, transports) -> None:
+        effective, overridden = enforce_polling_first(transports)
+        assert overridden is True
+        assert effective == DEFAULT_HANDSHAKE_TRANSPORTS
+        assert effective[0] == "polling"  # §1 polling-first MUST 落地
+
+    @pytest.mark.parametrize(
+        "transports",
+        [
+            ["polling", "websocket"],  # 默认，已合规
+            ["polling"],  # polling-only
+            None,  # python-socketio 默认（polling 优先）
+            [],  # 空 → 不改动
+        ],
+    )
+    def test_polling_first_or_none_untouched(self, transports) -> None:
+        effective, overridden = enforce_polling_first(transports)
+        assert overridden is False
+        assert effective is transports  # 原样返回，不复制不改写

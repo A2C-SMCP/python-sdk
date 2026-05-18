@@ -107,3 +107,42 @@ async def test_sync_agent_raises_protocol_version_error(incompatible_server: int
     with pytest.raises(ProtocolVersionError) as ei:
         await asyncio.to_thread(_connect)
     _assert_mismatch(ei.value)
+
+
+@pytest.fixture
+async def compatible_server(basic_server_port: int) -> AsyncGenerator[int, None]:
+    sio = create_computer_test_socketio()
+    sio.eio.start_service_task = False
+    app = A2CProtocolVersionASGIMiddleware(
+        ASGIApp(sio, socketio_path=_SIO_PATH),
+        socketio_path=_SIO_PATH,
+        server_version=PROTOCOL_VERSION,
+    )
+    server = UvicornTestServer(app, port=basic_server_port)
+    await server.up()
+    try:
+        yield basic_server_port
+    finally:
+        await server.down(force=True)
+
+
+@pytest.mark.asyncio
+async def test_explicit_ws_only_guarded_to_polling_first(compatible_server: int) -> None:
+    """§1 polling-first MUST 护栏端到端契约：调用方显式 transports=["websocket"] **不静默放行**
+    ——SDK 强制重注入 polling-first，连接仍成功（即未退化到 §5 WS-only 拒绝路径）。
+
+    护栏的判定逻辑（含 loud warning 触发条件）由 test_handshake.py::TestEnforcePollingFirst
+    确定性单测覆盖；此处只验证端到端契约：显式 WS-only 不导致连接失败。
+    """
+    auth = DefaultAgentAuthProvider(agent_id="robot-guard", office_id="office-guard")
+    agent = AsyncSMCPAgentClient(auth_provider=auth)
+    await agent.connect_to_server(
+        f"http://127.0.0.1:{compatible_server}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path=_SIO_PATH,
+        transports=["websocket"],  # 显式 WS-only：应被护栏纠正为 polling-first
+    )
+    try:
+        assert agent.connected is True  # 重注入 polling-first 后正常连通（未触发 §5 WS 拒绝）
+    finally:
+        await agent.disconnect()
