@@ -379,7 +379,7 @@ class SMCPComputerClient(AsyncClient):
         mcp_server = data["mcp_server"]
         cursor = data.get("cursor")
         try:
-            resources, next_cursor = await self.computer.aget_resources(mcp_server, cursor)
+            resources, next_cursor = await self.computer.get_resources(mcp_server, cursor)
         except MCPServerNotFoundError as e:
             logger.warning(f"client:get_resources 引用未注册 MCP Server '{mcp_server}' / unregistered server: {e}")
             return ErrorPayload(

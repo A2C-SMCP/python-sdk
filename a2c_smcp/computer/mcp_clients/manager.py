@@ -452,7 +452,7 @@ class MCPServerManager:
         server_name, tool_name = await self.avalidate_tool_call(tool_name, parameters)
         return await self.acall_tool(server_name, tool_name, parameters, timeout)
 
-    async def alist_resources(self, server_name: SERVER_NAME, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+    async def list_resources(self, server_name: SERVER_NAME, cursor: str | None = None) -> tuple[list[Resource], str | None]:
         """
         中文: 单页透传指定 MCP Server 的 `resources/list`，供 v0.2 `client:get_resources` 使用。
         英文: Single-page transparent forward of a server's `resources/list`, for v0.2 `client:get_resources`.

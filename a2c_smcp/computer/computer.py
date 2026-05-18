@@ -698,7 +698,7 @@ class Computer(BaseComputer[PromptSession]):
 
         return result
 
-    async def aget_resources(self, mcp_server: str, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+    async def get_resources(self, mcp_server: str, cursor: str | None = None) -> tuple[list[Resource], str | None]:
         """
         中文: 单页透传指定 MCP Server 的 `resources/list`，供 v0.2 `client:get_resources` 使用。
         英文: Single-page transparent forward of a server's `resources/list`, for v0.2 `client:get_resources`.
@@ -723,7 +723,7 @@ class Computer(BaseComputer[PromptSession]):
         """
         if not self.mcp_manager:
             raise RuntimeError("当前MCP Manager为空 / MCP Manager is not initialized")
-        return await self.mcp_manager.alist_resources(mcp_server, cursor)
+        return await self.mcp_manager.list_resources(mcp_server, cursor)
 
     async def get_desktop(self, size: int | None = None, window_uri: str | None = None) -> list[Desktop]:
         """
