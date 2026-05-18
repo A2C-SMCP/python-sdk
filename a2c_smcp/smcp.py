@@ -21,8 +21,7 @@ TOOL_CALL_EVENT = "client:tool_call"
 GET_CONFIG_EVENT = "client:get_config"
 GET_TOOLS_EVENT = "client:get_tools"
 GET_DESKTOP_EVENT = "client:get_desktop"
-# v0.2 新增：DPE 资源访问事件 / v0.2 added: DPE resource access events
-GET_DPE_EVENT = "client:get_dpe"
+# v0.2 新增：资源发现事件 / v0.2 added: resource discovery event
 GET_RESOURCES_EVENT = "client:get_resources"
 # 服务端事件 由server:开头的事件服务端执行
 JOIN_OFFICE_EVENT = "server:join_office"
@@ -346,8 +345,7 @@ class ListRoomRet(TypedDict):
 # =====================================================================
 # v0.2 协议新增 / v0.2 protocol additions
 # 协议来源 / Protocol source: A2C-SMCP/a2c-smcp-protocol v0.2.0
-#   - docs/specification/data-structures.md (GetDPE/GetResources)
-#   - docs/specification/dpe.md (ResolverHint)
+#   - docs/specification/data-structures.md
 #   - docs/specification/error-handling.md (ErrorCode 4006-4015)
 # =====================================================================
 
@@ -363,22 +361,9 @@ class ErrorCode(IntEnum):
     TOOL_AUTHORIZATION_FAILED = 4007
     # 协议版本握手 / Protocol version handshake
     PROTOCOL_VERSION_MISMATCH = 4008
-    # DPE 资源访问 / DPE resource access
-    DPE_RESOLVER_NOT_CONFIGURED = 4011
-    INVALID_DPE_URI = 4012
-    DPE_RESOLUTION_FAILED = 4013
+    # MCP Server 路由 / MCP Server routing
     MCP_SERVER_NOT_FOUND = 4014
     MCP_CAPABILITY_NOT_SUPPORTED = 4015
-
-
-# 4013 子分类，封闭枚举；Agent 据此分流处理（upstream_unavailable 可重试，其他不可重试）。
-# 4013 sub-category, closed enum; Agent dispatches by this (upstream_unavailable retryable, others not).
-DPEResolutionFailedCategory: TypeAlias = Literal[
-    "upstream_unavailable",
-    "invalid_dpe_mime",
-    "resolver_error",
-    "resolver_returned_invalid",
-]
 
 
 class ResourceAnnotations(TypedDict, total=False):
@@ -399,7 +384,7 @@ class A2CResource(TypedDict, total=False):
 
     元数据分工 / Metadata partition:
       - annotations: MCP 标准字段（priority/audience/last_modified）
-      - _meta:       A2C 扩展（fullscreen / DPE 业务字段 keywords / file_type / page_count / file_uri 等）
+      - _meta:       A2C 扩展（如 fullscreen 等业务字段）
     """
 
     uri: str
@@ -411,81 +396,10 @@ class A2CResource(TypedDict, total=False):
     _meta: dict[str, Any]
 
 
-class InlineContents(TypedDict, total=False):
-    """
-    DPE 内嵌内容（mimeType: application/vnd.a2c.dpe-inline+json）。
-    DPE inline contents.
-    """
-
-    kind: Literal["inline"]
-    mime_type: str
-    data: Any  # 内嵌 JSON 内容 / Inline JSON payload
-
-
-class ExternalContents(TypedDict, total=False):
-    """
-    DPE 外部 URI 内容（mimeType: application/vnd.a2c.dpe-uri+json）。
-    DPE external URI contents.
-    """
-
-    kind: Literal["external"]
-    mime_type: str
-    uri: str  # 上游 URI / Upstream URI
-
-
-# DPE Resolver 输入内容 discriminated union；kind 字段为鉴别器，跨 SDK 统一约束。
-# DPE Resolver input contents discriminated union; kind field is the discriminator (cross-SDK contract).
-ResolverContents: TypeAlias = InlineContents | ExternalContents
-
-
-class ResolverHint(TypedDict, total=False):
-    """
-    DPE Resolver 上下文提示。
-    DPE Resolver context hint.
-    """
-
-    mcp_server_name: str
-    mime_type: str
-
-
-class ResolvedResource(TypedDict, total=False):
-    """
-    DPE Resolver 输出：Agent 可访问的 URI 与可选元数据。
-    DPE Resolver output: Agent-accessible URI with optional metadata.
-    """
-
-    uri: str  # 任意 scheme（https / file / 业务自定义）/ Any scheme
-    mime_type: str
-    size: int  # 字节数 / Byte count
-
-
-class GetDPEReq(AgentCallData, total=True):
-    """
-    Agent 把 DPE URI 提交给 Computer，由业务 Resolver 转成访问 URI。
-    Agent submits DPE URI to Computer; business Resolver returns access URI.
-    """
-
-    computer: str
-    uri: str  # dpe://host/doc-ref（doc-ref 可单段或分段路径）
-    timeout: NotRequired[int]
-
-
-class GetDPERet(TypedDict, total=False):
-    """
-    业务 Resolver 输出的访问 URI 与可选元数据。
-    Business Resolver output: access URI with optional metadata.
-    """
-
-    uri: str
-    mime_type: NotRequired[str]
-    size: NotRequired[int]
-    req_id: str
-
-
 class GetResourcesReq(AgentCallData, total=True):
     """
-    透明转发 MCP 标准 resources/list；Agent 据此发现 dpe / window / 业务自定义 scheme 的资源。
-    Transparent forward of MCP resources/list; Agent discovers dpe/window/custom-scheme resources.
+    透明转发 MCP 标准 resources/list；Agent 据此发现 window / 业务自定义 scheme 的资源。
+    Transparent forward of MCP resources/list; Agent discovers window/custom-scheme resources.
     """
 
     computer: str
@@ -511,13 +425,11 @@ class ErrorPayload(TypedDict, total=False):
 
     分层语义 / Layer semantics:
       - HTTP 层（仅 4008）：HTTP 400 + flat body + X-A2C-Error-Code header
-      - Socket.IO ack 层（4011-4015 等）：ack callback 第一参 = flat dict
+      - Socket.IO ack 层（4014 / 4015 等）：ack callback 第一参 = flat dict
 
     分流字段顶层平铺 / Code-specific dispatch fields are top-level:
       - 4008: server_version / client_version
-      - 4013: category（DPEResolutionFailedCategory）
       - 4014: mcp_server_name
-      - 4012: dpe_uri
 
     details 是诊断容器；Agent MUST NOT 透传给最终用户（防泄露）。
     details is a diagnostic container; Agent MUST NOT propagate to end users.
@@ -528,10 +440,6 @@ class ErrorPayload(TypedDict, total=False):
     # 4008 / Protocol version mismatch
     server_version: str
     client_version: str
-    # 4013 / DPE resolution failed
-    category: DPEResolutionFailedCategory
-    # 4012 / Invalid DPE URI
-    dpe_uri: str
     # 4014 / MCP Server not found
     mcp_server_name: str
     # 诊断容器 / Diagnostic container
