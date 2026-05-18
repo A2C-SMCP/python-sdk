@@ -35,7 +35,14 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
 from mcp.shared.session import RequestResponder
-from mcp.types import CallToolResult, ResourceListChangedNotification, ResourceUpdatedNotification, TextContent, ToolListChangedNotification
+from mcp.types import (
+    CallToolResult,
+    Resource,
+    ResourceListChangedNotification,
+    ResourceUpdatedNotification,
+    TextContent,
+    ToolListChangedNotification,
+)
 from prompt_toolkit import PromptSession
 from pydantic import BaseModel, TypeAdapter
 
@@ -690,6 +697,33 @@ class Computer(BaseComputer[PromptSession]):
             )
 
         return result
+
+    async def aget_resources(self, mcp_server: str, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+        """
+        中文: 单页透传指定 MCP Server 的 `resources/list`，供 v0.2 `client:get_resources` 使用。
+        英文: Single-page transparent forward of a server's `resources/list`, for v0.2 `client:get_resources`.
+
+        Computer 仅作透传层：不做 scheme / 元数据过滤、不做跨 Server 聚合；翻页由调用方通过 cursor 控制。
+        Computer is a transparent layer: no scheme/metadata filtering, no cross-server aggregation;
+        pagination is caller-driven via cursor.
+
+        Args:
+            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name.
+            cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page.
+
+        Returns:
+            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页) /
+                (resources on this page, next cursor — None when last page).
+
+        Raises:
+            RuntimeError: MCP Manager 尚未初始化 / MCP Manager not initialized.
+            MCPServerNotFoundError: mcp_server 未注册（→ 处理器映射 4014）/ not registered (→ handler maps 4014).
+            MCPCapabilityNotSupportedError: 未声明 `resources` 能力（→ 处理器映射 4015）/
+                `resources` capability not declared (→ handler maps 4015).
+        """
+        if not self.mcp_manager:
+            raise RuntimeError("当前MCP Manager为空 / MCP Manager is not initialized")
+        return await self.mcp_manager.alist_resources(mcp_server, cursor)
 
     async def get_desktop(self, size: int | None = None, window_uri: str | None = None) -> list[Desktop]:
         """

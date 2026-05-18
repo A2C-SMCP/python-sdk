@@ -430,6 +430,7 @@ class ErrorPayload(TypedDict, total=False):
     分流字段顶层平铺 / Code-specific dispatch fields are top-level:
       - 4008: server_version / client_version
       - 4014: mcp_server_name
+      - 4015: mcp_server_name / capability
 
     details 是诊断容器；Agent MUST NOT 透传给最终用户（防泄露）。
     details is a diagnostic container; Agent MUST NOT propagate to end users.
@@ -440,7 +441,9 @@ class ErrorPayload(TypedDict, total=False):
     # 4008 / Protocol version mismatch
     server_version: str
     client_version: str
-    # 4014 / MCP Server not found
+    # 4014 / MCP Server not found；4015 / MCP Capability not supported
     mcp_server_name: str
+    # 4015 / 缺失的 capability 名（如 "resources"）/ Missing capability name (e.g. "resources")
+    capability: str
     # 诊断容器 / Diagnostic container
     details: dict[str, Any]

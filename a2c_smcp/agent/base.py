@@ -23,6 +23,7 @@ from a2c_smcp.smcp import (
     EnterOfficeReq,
     GetDeskTopReq,
     GetDeskTopRet,
+    GetResourcesReq,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
@@ -130,6 +131,30 @@ class BaseAgentClient(ABC):
             agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
         )
+
+    def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
+        """
+        创建获取资源请求对象（透明转发 MCP resources/list）
+        Create get-resources request object (transparent forward of MCP resources/list)
+
+        Args:
+            computer (str): 目标计算机ID / Target computer ID
+            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
+
+        Returns:
+            GetResourcesReq: 获取资源请求 / Get resources request
+        """
+        agent_config = self.auth_provider.get_agent_config()
+        req: GetResourcesReq = {
+            "computer": computer,
+            "mcp_server": mcp_server,
+            "agent": agent_config["agent"],
+            "req_id": uuid.uuid4().hex,
+        }
+        if cursor is not None:
+            req["cursor"] = cursor
+        return req
 
     def create_get_desktop_request(self, computer: str, *, size: int | None = None, window: str | None = None) -> GetDeskTopReq:
         """
@@ -418,6 +443,30 @@ class BaseAgentSyncClient(ABC):
             agent=agent_config["agent"],
             req_id=uuid.uuid4().hex,
         )
+
+    def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
+        """
+        创建获取资源请求对象（透明转发 MCP resources/list）
+        Create get-resources request object (transparent forward of MCP resources/list)
+
+        Args:
+            computer (str): 目标计算机ID / Target computer ID
+            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
+
+        Returns:
+            GetResourcesReq: 获取资源请求 / Get resources request
+        """
+        agent_config = self.auth_provider.get_agent_config()
+        req: GetResourcesReq = {
+            "computer": computer,
+            "mcp_server": mcp_server,
+            "agent": agent_config["agent"],
+            "req_id": uuid.uuid4().hex,
+        }
+        if cursor is not None:
+            req["cursor"] = cursor
+        return req
 
     def create_get_desktop_request(self, computer: str, *, size: int | None = None, window: str | None = None) -> GetDeskTopReq:
         """

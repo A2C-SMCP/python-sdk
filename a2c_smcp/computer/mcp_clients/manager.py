@@ -14,6 +14,7 @@ from mcp.client.session import MessageHandlerFnT
 from mcp.types import CallToolResult, ReadResourceResult, Resource, Tool
 from vrl_python import VRLRuntime
 
+from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
@@ -450,6 +451,33 @@ class MCPServerManager:
         """执行指定工具 与 acall_tool 的区别在于此方法支持使用alias别名进行调用。"""
         server_name, tool_name = await self.avalidate_tool_call(tool_name, parameters)
         return await self.acall_tool(server_name, tool_name, parameters, timeout)
+
+    async def alist_resources(self, server_name: SERVER_NAME, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+        """
+        中文: 单页透传指定 MCP Server 的 `resources/list`，供 v0.2 `client:get_resources` 使用。
+        英文: Single-page transparent forward of a server's `resources/list`, for v0.2 `client:get_resources`.
+
+        不做 scheme / 元数据过滤、不做跨 Server 聚合；翻页由调用方通过 cursor 控制。
+        No scheme/metadata filtering, no cross-server aggregation; pagination is caller-driven via cursor.
+
+        Args:
+            server_name (SERVER_NAME): 目标 MCP Server 名称 / Target MCP Server name.
+            cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page.
+
+        Returns:
+            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页) /
+                (resources on this page, next cursor — None when last page).
+
+        Raises:
+            MCPServerNotFoundError: server_name 未注册（→ 上层映射 4014）/
+                server_name not registered (mapped to 4014 upstream).
+            MCPCapabilityNotSupportedError: 目标 Server 未声明 `resources` 能力（→ 上层映射 4015）/
+                target server did not declare `resources` capability (mapped to 4015 upstream).
+        """
+        client = self._active_clients.get(server_name)
+        if client is None:
+            raise MCPServerNotFoundError(f"MCP Server '{server_name}' is not registered")
+        return await client.list_resources_page(cursor)
 
     def get_server_status(self) -> list[tuple[str, bool, str]]:
         """获取服务器状态列表"""
