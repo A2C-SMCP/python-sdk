@@ -9,6 +9,7 @@
 """
 
 from typing import Any
+from urllib.parse import parse_qs
 
 from socketio import AsyncNamespace
 
@@ -66,6 +67,15 @@ class BaseNamespace(AsyncNamespace):
             is_authenticated = await self.auth_provider.authenticate(self.server, environ, auth, headers)
             if not is_authenticated:
                 raise ConnectionRefusedError("Authentication failed")
+
+            # 记录协议版本（兼容性已由 HTTP 握手中间件保证）；仅供 server:list_room 展示与诊断
+            # Record protocol version (compatibility already enforced by the HTTP handshake
+            # middleware); for server:list_room display & diagnostics only
+            a2c_version = self._extract_a2c_version(environ)
+            if a2c_version:
+                session = await self.get_session(sid)
+                session["a2c_version"] = a2c_version
+                await self.save_session(sid, session)
 
             ctx.info("Client connected successfully")
             return True
@@ -186,3 +196,20 @@ class BaseNamespace(AsyncNamespace):
             headers = environ.get("HTTP_HEADERS", [])
 
         return headers
+
+    @staticmethod
+    def _extract_a2c_version(environ: dict) -> str | None:
+        """
+        从请求环境的 query string 中解析 ``a2c_version``（ASGI / WSGI 通用）。
+        Parse ``a2c_version`` from the request environ query string (ASGI / WSGI alike).
+
+        python-socketio 在 ASGI 与 WSGI 下均填充 ``QUERY_STRING``；附 ``asgi.scope`` 兜底。
+        python-socketio populates ``QUERY_STRING`` for both ASGI and WSGI; ``asgi.scope``
+        is a defensive fallback.
+        """
+        qs = environ.get("QUERY_STRING", "")
+        if not qs:
+            scope_qs = environ.get("asgi.scope", {}).get("query_string", b"")
+            qs = scope_qs.decode("latin-1") if isinstance(scope_qs, bytes) else (scope_qs or "")
+        values = parse_qs(qs).get("a2c_version")
+        return values[0] if values else None

@@ -8,9 +8,12 @@ from typing import Any
 from mcp.types import CallToolResult, Resource
 from pydantic import TypeAdapter
 from socketio import AsyncClient
+from socketio.exceptions import ConnectionError as SioConnectionError
 
+from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
+from a2c_smcp.exceptions import ProtocolVersionError
 from a2c_smcp.smcp import (
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
@@ -44,6 +47,7 @@ from a2c_smcp.smcp import (
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
 )
+from a2c_smcp.utils.handshake import DEFAULT_HANDSHAKE_TRANSPORTS, build_handshake_url, extract_4008_payload
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -148,6 +152,38 @@ class SMCPComputerClient(AsyncClient):
         Return the auth HTTP header name used by this instance
         """
         return self._auth_header_name
+
+    async def connect(self, url: str, *args: Any, **kwargs: Any) -> None:
+        """
+        覆盖 ``AsyncClient.connect``：注入协议版本握手，使所有调用点（CLI / 交互式 / 测试）
+        自动合规，无需各处重复拼接。
+        Override ``AsyncClient.connect`` to inject the protocol version handshake so every
+        call site (CLI / interactive / tests) is automatically compliant without duplication.
+
+        - 协议 MUST：自动从 ``PROTOCOL_VERSION`` 常量拼接 ``a2c_version``（保留调用方既有 query）
+        - transports 默认 polling 优先以保 4008 HTTP body 可读（调用方可覆盖）
+        - 捕获 4008 → 主动 ``disconnect()`` → 抛 :class:`ProtocolVersionError`；非 4008 保持原异常
+        """
+        handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
+        kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
+        logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
+        try:
+            await super().connect(handshake_url, *args, **kwargs)
+        except SioConnectionError as e:
+            payload = extract_4008_payload(e)
+            if payload is None:
+                # 非协议版本错误：保持原异常 / not a version error: preserve the original exception
+                raise
+            # 协议 MUST：先主动断开再抛异常，防止底层库自动重连触发 4008 死循环
+            # Protocol MUST: proactively disconnect before raising, preventing an auto-reconnect 4008 loop
+            await self.disconnect()
+            raise ProtocolVersionError(
+                client_version=payload.get("client_version"),
+                server_version=payload.get("server_version"),
+                min_supported=payload.get("min_supported"),
+                max_supported=payload.get("max_supported"),
+                message=payload.get("message", "Protocol version mismatch"),
+            ) from e
 
     async def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
         """

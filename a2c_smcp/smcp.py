@@ -428,7 +428,7 @@ class ErrorPayload(TypedDict, total=False):
       - Socket.IO ack 层（4014 / 4015 等）：ack callback 第一参 = flat dict
 
     分流字段顶层平铺 / Code-specific dispatch fields are top-level:
-      - 4008: server_version / client_version
+      - 4008: server_version / client_version / min_supported / max_supported
       - 4014: mcp_server_name
       - 4015: mcp_server_name / capability
 
@@ -438,9 +438,12 @@ class ErrorPayload(TypedDict, total=False):
 
     code: int  # ErrorCode value
     message: str
-    # 4008 / Protocol version mismatch
+    # 4008 / Protocol version mismatch（四字段对齐 error-handling.md §各错误码标准字段总表）
+    # 4008 fields aligned with error-handling.md §standard fields table
     server_version: str
     client_version: str
+    min_supported: str
+    max_supported: str
     # 4014 / MCP Server not found；4015 / MCP Capability not supported
     mcp_server_name: str
     # 4015 / 缺失的 capability 名（如 "resources"）/ Missing capability name (e.g. "resources")

@@ -10,6 +10,11 @@
 
 from .auth import DEFAULT_AUTH_HEADER_NAME, AuthenticationProvider, DefaultAuthenticationProvider
 from .base import BaseNamespace
+from .middleware import (
+    DEFAULT_SOCKETIO_PATH,
+    A2CProtocolVersionASGIMiddleware,
+    A2CProtocolVersionWSGIMiddleware,
+)
 from .namespace import SMCPNamespace
 from .sync_auth import DefaultSyncAuthenticationProvider, SyncAuthenticationProvider
 from .sync_base import SyncBaseNamespace
@@ -31,6 +36,10 @@ __all__ = [
     # 同步认证相关 / Sync authentication
     "SyncAuthenticationProvider",
     "DefaultSyncAuthenticationProvider",
+    # 协议版本握手中间件 / Protocol version handshake middleware
+    "DEFAULT_SOCKETIO_PATH",
+    "A2CProtocolVersionASGIMiddleware",
+    "A2CProtocolVersionWSGIMiddleware",
     # 基础类 / Base classes
     "BaseNamespace",
     "SMCPNamespace",

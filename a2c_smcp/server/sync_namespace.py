@@ -440,6 +440,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
                     "role": session["role"],
                     "office_id": session.get("office_id", ""),
                 }
+                # a2c_version 为 NotRequired：仅在握手时记录到则带出 / NotRequired: include only if recorded at handshake
+                if session.get("a2c_version"):
+                    session_info["a2c_version"] = session["a2c_version"]
                 sessions.append(session_info)
 
         return ListRoomRet(sessions=sessions, req_id=req_id)

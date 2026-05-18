@@ -12,11 +12,14 @@ from typing import Any
 
 from mcp.types import CallToolResult, TextContent
 from socketio import AsyncClient
+from socketio.exceptions import ConnectionError as SioConnectionError
 
+from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
 from a2c_smcp.agent.errors import raise_for_error_payload
 from a2c_smcp.agent.types import AsyncAgentEventHandler
+from a2c_smcp.exceptions import ProtocolVersionError
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
@@ -39,6 +42,7 @@ from a2c_smcp.smcp import (
     SessionInfo,
     UpdateMCPConfigNotification,
 )
+from a2c_smcp.utils.handshake import DEFAULT_HANDSHAKE_TRANSPORTS, build_handshake_url, extract_4008_payload
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
 logger = get_logger("agent")
@@ -167,17 +171,38 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         auth_data = self.auth_provider.get_connection_auth()
         headers = self.auth_provider.get_connection_headers()
 
-        # 合并连接参数
-        # Merge connection parameters
+        # 协议 MUST：自动从 PROTOCOL_VERSION 常量拼接 a2c_version（保留调用方既有 query）
+        # Protocol MUST: auto-append a2c_version from the PROTOCOL_VERSION constant (preserving caller query)
+        handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
+
+        # 合并连接参数；transports 默认 polling 优先以保 4008 HTTP body 可读（调用方可覆盖）
+        # Merge connect params; default transports polling-first so the 4008 HTTP body is readable (caller may override)
         connect_kwargs = {
             "auth": auth_data,
             "headers": headers,
             "namespaces": [self._namespace],
+            "transports": DEFAULT_HANDSHAKE_TRANSPORTS,
             **kwargs,
         }
 
-        logger.info(f"Connecting to SMCP server at {url}")
-        await self.connect(url, **connect_kwargs)
+        logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
+        try:
+            await self.connect(handshake_url, **connect_kwargs)
+        except SioConnectionError as e:
+            payload = extract_4008_payload(e)
+            if payload is None:
+                # 非协议版本错误：保持原异常 / not a version error: preserve the original exception
+                raise
+            # 协议 MUST：先主动断开再抛异常，防止底层库自动重连触发 4008 死循环
+            # Protocol MUST: proactively disconnect before raising, preventing an auto-reconnect 4008 loop
+            await self.disconnect()
+            raise ProtocolVersionError(
+                client_version=payload.get("client_version"),
+                server_version=payload.get("server_version"),
+                min_supported=payload.get("min_supported"),
+                max_supported=payload.get("max_supported"),
+                message=payload.get("message", "Protocol version mismatch"),
+            ) from e
         logger.info("Connected to SMCP server successfully")
 
     async def emit_tool_call(self, computer: str, tool_name: str, params: dict, timeout: int) -> CallToolResult:
