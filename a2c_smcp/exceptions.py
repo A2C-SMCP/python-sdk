@@ -62,3 +62,34 @@ class ProtocolVersionError(Exception):
             f"(client_version={self.client_version}, server_version={self.server_version}, "
             f"min_supported={self.min_supported}, max_supported={self.max_supported})"
         )
+
+
+class SMCPNamespaceError(Exception):
+    """
+    SMCP 命名空间路由/隔离校验失败（role / office(Room) / session 不匹配）。
+    SMCP namespace routing/isolation check failure (role / office(Room) / session mismatch).
+
+    适用范围 / Scope：Server 端 ``on_client_*`` / ``on_server_*`` 处理器，以及 Computer 端
+    socketio handler 的隔离校验——跨房间访问、错误角色发起、computer/agent 标识不匹配等。
+    Server-side ``on_client_*`` / ``on_server_*`` handlers and the Computer-side socketio
+    handler isolation checks — cross-room access, wrong-role initiation, computer/agent
+    identity mismatch, etc.
+
+    取代原先的 ``assert``：``assert`` 在 ``python -O`` / ``PYTHONOPTIMIZE`` 下被字节码整体
+    剥离，会令隔离校验被静默关闭（协议将房间隔离列为**不可违反约束**）。显式 ``raise``
+    保证校验在任何运行模式下均生效；属 sid/session 路由层拒绝，**非** 4014/4015 业务错误，
+    故沿用与同处理器既有路由失败一致的"抛异常"形态，不回 flat ErrorPayload。
+    Replaces the former ``assert``: ``assert`` is stripped wholesale under ``python -O`` /
+    ``PYTHONOPTIMIZE``, silently disabling the isolation check (the protocol lists room
+    isolation as an **inviolable constraint**). An explicit ``raise`` guarantees the check
+    holds in every run mode. This is a sid/session routing-layer rejection, **not** a
+    4014/4015 business error, so it keeps the same "raise" shape as the pre-existing
+    routing failures in the same handlers and does NOT return a flat ErrorPayload.
+
+    放置于顶层包：Server 与 Computer 客户端共用，避免 Computer 反向依赖 ``a2c_smcp.server``。
+    Placed at the top-level package: shared by both Server and Computer client, avoiding a
+    reverse dependency from the Computer client onto ``a2c_smcp.server``.
+
+    协议依据 / Protocol: docs/specification/error-handling.md（§通用错误码 403 / §4104 Cross Room Access）
+                          docs/specification/security.md（§房间隔离）
+    """

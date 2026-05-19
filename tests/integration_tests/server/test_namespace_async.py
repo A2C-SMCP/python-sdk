@@ -20,6 +20,7 @@ import pytest
 from mcp.types import CallToolResult, TextContent
 from socketio import AsyncClient
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
     GET_TOOLS_EVENT,
@@ -515,4 +516,98 @@ async def test_computer_switch_room_with_same_name_allowed(socketio_server, basi
     assert ok, f"Computer切换房间应该成功 / Computer switching rooms should succeed, error: {err}"
     assert err is None, "不应该有错误信息 / Should not have error message"
 
+
+# ======================================================================
+# GitHub #31：office/role 隔离负路径（显式 raise，-O 下亦生效）
+# GitHub #31: office/role isolation negative paths (explicit raise, holds under -O)
+#
+# 服务端与 UvicornTestServer 同进程，可直接以真实会话调用真实处理器，
+# 精确断言抛出 SMCPNamespaceError（而非依赖 ACK 超时的弱断言）。
+# Server runs in-process with UvicornTestServer, so the real handler can be
+# invoked with real sessions and precisely asserted to raise SMCPNamespaceError
+# (instead of a weak ACK-timeout assertion).
+# ======================================================================
+
+
+async def _connect_join(client: AsyncClient, port: int, role: Literal["computer", "agent"], office_id: str, name: str) -> str:
+    """连接 + 加入 office，返回服务端可见的 sid。/ Connect + join office, return server-side sid."""
+    await client.connect(
+        f"http://localhost:{port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    await _join_office(client, role=role, office_id=office_id, name=name)
+    return client.get_sid(namespace=SMCP_NAMESPACE)
+
+
+@pytest.mark.asyncio
+async def test_get_tools_cross_office_rejected(socketio_server, basic_server_port: int):
+    """跨房间 client:get_tools：Agent(office_A) 取 Computer(office_B) 工具 → SMCPNamespaceError。"""
+    agent = AsyncClient()
+    computer = AsyncClient()
+    agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-A", "robot-neg-1")
+    await _connect_join(computer, basic_server_port, "computer", "office-neg-B", "comp-neg-1")
+
+    with pytest.raises(SMCPNamespaceError, match="自己房间内Computer的工具列表"):
+        await socketio_server.on_client_get_tools(
+            agent_sid,
+            {"computer": "comp-neg-1", "agent": "robot-neg-1", "req_id": "neg-r1"},
+        )
+
+    await agent.disconnect()
     await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_get_resources_cross_office_rejected(socketio_server, basic_server_port: int):
+    """跨房间 client:get_resources（PR #29 来源场景）→ SMCPNamespaceError，不路由到 Computer。"""
+    agent = AsyncClient()
+    computer = AsyncClient()
+    agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-A2", "robot-neg-2")
+    await _connect_join(computer, basic_server_port, "computer", "office-neg-B2", "comp-neg-2")
+
+    with pytest.raises(SMCPNamespaceError, match="自己房间内Computer的资源列表"):
+        await socketio_server.on_client_get_resources(
+            agent_sid,
+            {"computer": "comp-neg-2", "agent": "robot-neg-2", "mcp_server": "any", "req_id": "neg-r2"},
+        )
+
+    await agent.disconnect()
+    await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_wrong_role_rejected(socketio_server, basic_server_port: int):
+    """错角色 client:tool_call：由 Computer 发起工具调用 → SMCPNamespaceError。"""
+    computer = AsyncClient()
+    comp_sid = await _connect_join(computer, basic_server_port, "computer", "office-neg-C", "comp-neg-3")
+
+    with pytest.raises(SMCPNamespaceError, match="目前仅支持Agent调用工具"):
+        await socketio_server.on_client_tool_call(
+            comp_sid,
+            {
+                "agent": "comp-neg-3",
+                "computer": "comp-neg-3",
+                "req_id": "neg-r3",
+                "tool_name": "t",
+                "params": {},
+                "timeout": 5,
+            },
+        )
+
+    await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_list_room_cross_office_rejected(socketio_server, basic_server_port: int):
+    """跨房间 server:list_room：Agent(office_A) 查询 office_B → SMCPNamespaceError，不泄露他房会话。"""
+    agent = AsyncClient()
+    agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-D", "robot-neg-4")
+
+    with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
+        await socketio_server.on_server_list_room(
+            agent_sid,
+            {"agent": "robot-neg-4", "req_id": "neg-r4", "office_id": "office-neg-OTHER"},
+        )
+
+    await agent.disconnect()

@@ -13,6 +13,7 @@ from typing import cast
 
 from pydantic import TypeAdapter
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.sync_base import SyncBaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
@@ -203,10 +204,12 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         Sync: broadcast tool call cancellation to other members in the room
         """
         session = self.get_session(sid)
-        assert session["role"] == "agent", "目前仅支持Agent调用取消ToolCall的操作"
+        if session["role"] != "agent":
+            raise SMCPNamespaceError("目前仅支持Agent调用取消ToolCall的操作")
 
         agent_call = TypeAdapter(AgentCallData).validate_python(data)
-        assert session.get("name") == agent_call["agent"], "取消工具调用的广播仅可以由对应Agent发出"
+        if session.get("name") != agent_call["agent"]:
+            raise SMCPNamespaceError("取消工具调用的广播仅可以由对应Agent发出")
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
         office_id = session.get("office_id")
@@ -223,7 +226,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         Sync: broadcast MCP config update
         """
         session = self.get_session(sid)
-        assert session["role"] == "computer", "目前仅支持Computer调用更新MCP配置的操作"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer调用更新MCP配置的操作")
 
         update_config = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
         self.emit(
@@ -239,7 +243,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         Sync: broadcast tool list update
         """
         session = self.get_session(sid)
-        assert session["role"] == "computer", "目前仅支持Computer上报工具列表变更"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer上报工具列表变更")
 
         update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
 
@@ -256,7 +261,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         Sync: respond to tool call, use call method to wait for Computer response
         """
         session = self.get_session(sid)
-        assert session["role"] == "agent", "目前仅支持Agent调用工具"
+        if session["role"] != "agent":
+            raise SMCPNamespaceError("目前仅支持Agent调用工具")
 
         tool_call = TypeAdapter(dict).validate_python(data)
 
@@ -292,12 +298,14 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             raise ValueError(f"Computer with name '{computer_name}' not found")
 
         session = self.get_session(computer_sid)
-        assert session["role"] == "computer", "目前仅支持Computer获取工具列表"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer获取工具列表")
 
         agent_session = self.get_session(sid)
         computer_office_id = session.get("office_id")
         agent_office_id = agent_session.get("office_id")
-        assert computer_office_id == agent_office_id, "目前仅支持Agent获取自己房间内Computer的工具列表"
+        if computer_office_id != agent_office_id:
+            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的工具列表")
 
         client_response = self.call(
             GET_TOOLS_EVENT,
@@ -324,12 +332,14 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             raise ValueError(f"Computer with name '{computer_name}' not found")
 
         session = self.get_session(computer_sid)
-        assert session["role"] == "computer", "目前仅支持Computer获取桌面"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer获取桌面")
 
         agent_session = self.get_session(sid)
         computer_office_id = session.get("office_id")
         agent_office_id = agent_session.get("office_id")
-        assert computer_office_id == agent_office_id, "目前仅支持Agent获取自己房间内Computer的桌面"
+        if computer_office_id != agent_office_id:
+            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的桌面")
 
         client_response = self.call(
             GET_DESKTOP_EVENT,
@@ -365,12 +375,14 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             raise ValueError(f"Computer with name '{computer_name}' not found")
 
         session = self.get_session(computer_sid)
-        assert session["role"] == "computer", "目前仅支持获取Computer资源列表"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持获取Computer资源列表")
 
         agent_session = self.get_session(sid)
         computer_office_id = session.get("office_id")
         agent_office_id = agent_session.get("office_id")
-        assert computer_office_id == agent_office_id, "目前仅支持Agent获取自己房间内Computer的资源列表"
+        if computer_office_id != agent_office_id:
+            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的资源列表")
 
         client_response = self.call(
             GET_RESOURCES_EVENT,
@@ -394,7 +406,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             data (UpdateComputerConfigReq): 载荷复用 UpdateConfigReq，仅需 computer 标识
         """
         session = self.get_session(sid)
-        assert session["role"] == "computer", "目前仅支持Computer上报桌面刷新"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer上报桌面刷新")
 
         update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
         self.emit(
@@ -425,7 +438,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         agent_session = self.get_session(sid)
         agent_office_id = agent_session.get("office_id")
 
-        assert agent_office_id == office_id, f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}"
+        if agent_office_id != office_id:
+            raise SMCPNamespaceError(f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}")
 
         # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
         all_sessions = get_all_sessions_in_office(office_id, self.server)

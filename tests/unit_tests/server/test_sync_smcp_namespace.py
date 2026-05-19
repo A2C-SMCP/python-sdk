@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server.sync_namespace import SyncSMCPNamespace
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
@@ -276,10 +277,9 @@ def test_on_server_list_room_permission_denied():
 
     ns.get_session = MagicMock(return_value=agent_session)
 
-    # 执行测试，应该抛出 AssertionError / Execute test, should raise AssertionError
-    import pytest
-
-    with pytest.raises(AssertionError, match="Agent只能查询自己所在房间的会话信息"):
+    # 执行测试，应该抛出 SMCPNamespaceError（隔离校验在 -O 下亦生效）
+    # Execute test, should raise SMCPNamespaceError (isolation holds even under -O)
+    with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
         ns.on_server_list_room(
             agent_sid,
             {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server import (
     AuthenticationProvider,
     DefaultAuthenticationProvider,
@@ -371,8 +372,9 @@ class TestSMCPNamespace:
 
         smcp_namespace.get_session = AsyncMock(return_value=agent_session)
 
-        # 执行测试，应该抛出 AssertionError / Execute test, should raise AssertionError
-        with pytest.raises(AssertionError, match="Agent只能查询自己所在房间的会话信息"):
+        # 执行测试，应该抛出 SMCPNamespaceError（隔离校验在 -O 下亦生效）
+        # Execute test, should raise SMCPNamespaceError (isolation holds even under -O)
+        with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
             await smcp_namespace.on_server_list_room(
                 agent_sid,
                 {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},

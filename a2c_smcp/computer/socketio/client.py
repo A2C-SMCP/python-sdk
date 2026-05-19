@@ -12,6 +12,7 @@ from socketio import AsyncClient
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.smcp import (
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
@@ -305,7 +306,8 @@ class SMCPComputerClient(AsyncClient):
         """
         # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
         # Server guarantees request is from same office via session, no need to validate agent vs office_id here
-        assert self.computer.name == data["computer"], "计算机标识不匹配"
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
         try:
             ret = await self.computer.aexecute_tool(
                 req_id=data["req_id"],
@@ -328,7 +330,8 @@ class SMCPComputerClient(AsyncClient):
         """
         # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
         # Server guarantees request is from same office via session, no need to validate agent vs office_id here
-        assert self.computer.name == data["computer"], "计算机标识不匹配"
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
 
         mcp_tools = await self.computer.aget_available_tools()
 
@@ -347,7 +350,8 @@ class SMCPComputerClient(AsyncClient):
         """
         # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
         # Server guarantees request is from same office via session, no need to validate agent vs office_id here
-        assert self.computer.name == data["computer"], "计算机标识不匹配"
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
         size = data.get("desktop_size")
         window_uri = data.get("window")
         desktops = await self.computer.get_desktop(size=size, window_uri=window_uri)
@@ -370,7 +374,8 @@ class SMCPComputerClient(AsyncClient):
         """
         # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
         # Server guarantees request is from same office via session, no need to validate agent vs office_id here
-        assert self.computer.name == data["computer"], "计算机标识不匹配"
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
 
         servers: dict[str, dict] = {}
         # 从 Computer 中获取初始化时传入的配置集合（不可变元组）
@@ -412,7 +417,8 @@ class SMCPComputerClient(AsyncClient):
         """
         # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
         # Server guarantees request is from same office via session, no need to validate agent vs office_id here
-        assert self.computer.name == data["computer"], "计算机标识不匹配"
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
         mcp_server = data["mcp_server"]
         cursor = data.get("cursor")
         try:
