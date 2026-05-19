@@ -5,9 +5,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from mcp import StdioServerParameters
 from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
+from mcp.types import Resource
 
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig, ToolMeta
-from a2c_smcp.computer.socketio.client import SMCPComputerClient
+from a2c_smcp.computer.socketio.client import SMCPComputerClient, _to_a2c_resource
 from a2c_smcp.smcp import SMCP_NAMESPACE, UPDATE_CONFIG_EVENT
 
 
@@ -218,3 +219,104 @@ async def test_join_office_no_response_raises_error():
     # office_id 不应该被设置
     # office_id should not be set
     assert client.office_id is None
+
+
+# ======================================================================
+# _to_a2c_resource —— MCP Resource → A2CResource snake_case 映射
+# _to_a2c_resource — MCP Resource → A2CResource snake_case mapping
+#
+# 回归护栏 / Regression guard for issue #32（PR #29 follow-up）：
+#   `_to_a2c_resource` 的整个 annotations 分支此前零测试覆盖；本组用例锁定
+#   audience/priority/last_modified 透传契约（含 forward-compat：MCP `Annotations`
+#   model_config=extra='allow'，未来 `lastModified` 字段必须经防御式 getattr 捕获）。
+#   The annotations branch of `_to_a2c_resource` was previously untested; these
+#   cases lock the audience/priority/last_modified passthrough contract, incl.
+#   the forward-compat path (MCP `Annotations` extra='allow' → defensive getattr).
+# 协议依据 / Protocol: a2c-smcp-protocol data-structures.md#A2CResource（透传 MCP annotations）
+# ======================================================================
+
+
+def test_to_a2c_resource_maps_last_modified_forward_compat() -> None:
+    """
+    中文：MCP 服务端透传 `lastModified`（MCP `Annotations` extra='allow' 的 forward-compat
+    字段）时，必须规整为 `annotations.last_modified`，且不得残留 camelCase 原键。
+    English: When the MCP server passes through `lastModified` (a forward-compat
+    field via MCP `Annotations` extra='allow'), it must be normalized to
+    `annotations.last_modified` with no leftover camelCase key.
+    """
+    res = Resource.model_validate(
+        {
+            "uri": "window://example.desktop/p1",
+            "name": "P1",
+            "annotations": {
+                "audience": ["user", "assistant"],
+                "priority": 0.7,
+                "lastModified": "2026-05-19T08:00:00Z",
+            },
+        },
+    )
+
+    mapped = _to_a2c_resource(res)
+
+    assert mapped["uri"] == str(res.uri)
+    assert mapped["name"] == "P1"
+    assert mapped["annotations"] == {
+        "audience": ["user", "assistant"],
+        "priority": 0.7,
+        "last_modified": "2026-05-19T08:00:00Z",
+    }
+    # camelCase 原键不得泄漏进协议层 / no camelCase key may leak into protocol layer
+    assert "lastModified" not in mapped["annotations"]
+
+
+def test_to_a2c_resource_full_field_mapping() -> None:
+    """
+    中文：覆盖完整字段分支——基础字段、camelCase→snake_case（mimeType→mime_type）、
+    `_meta` 透传、annotations（audience/priority）一并正确映射。
+    English: Cover the full field branch — base fields, camelCase→snake_case
+    (mimeType→mime_type), `_meta` passthrough and annotations (audience/priority).
+    """
+    res = Resource.model_validate(
+        {
+            "uri": "file://tmp/doc.md",
+            "name": "Doc",
+            "description": "a doc",
+            "mimeType": "text/markdown",
+            "size": 123,
+            "_meta": {"fullscreen": True},
+            "annotations": {"audience": ["user"], "priority": 0.3},
+        },
+    )
+
+    mapped = _to_a2c_resource(res)
+
+    assert mapped == {
+        "uri": "file://tmp/doc.md",
+        "name": "Doc",
+        "description": "a doc",
+        "mime_type": "text/markdown",
+        "size": 123,
+        "annotations": {"audience": ["user"], "priority": 0.3},
+        "_meta": {"fullscreen": True},
+    }
+    # MCP 原 camelCase 键不得出现 / original MCP camelCase key must be absent
+    assert "mimeType" not in mapped
+
+
+def test_to_a2c_resource_no_annotations_omits_optional_keys() -> None:
+    """
+    中文：可选字段缺失时不得注入空键——无 annotations 则不出现 `annotations` 键，
+    无 size/description/_meta 同理（避免下游误判"字段存在但为空"）。
+    English: Missing optional fields must not inject empty keys — no `annotations`
+    key when absent; same for size/description/_meta (avoid downstream
+    "present-but-empty" misreads).
+    """
+    res = Resource.model_validate({"uri": "window://h/x", "name": "X"})
+
+    mapped = _to_a2c_resource(res)
+
+    assert mapped == {"uri": "window://h/x", "name": "X"}
+    assert "annotations" not in mapped
+    assert "size" not in mapped
+    assert "description" not in mapped
+    assert "_meta" not in mapped
