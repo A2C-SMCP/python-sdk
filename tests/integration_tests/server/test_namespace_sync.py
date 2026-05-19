@@ -23,12 +23,16 @@ import pytest
 from socketio import Client, Namespace, SimpleClient
 from werkzeug.serving import make_server
 
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.agent.auth import DefaultAgentAuthProvider
+from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    LIST_ROOM_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -536,3 +540,37 @@ def test_computer_switch_room_with_same_name_allowed(startup_and_shutdown_local_
 
     finally:
         computer.disconnect()
+
+
+def test_list_room_session_info_contains_a2c_version_sync(
+    startup_and_shutdown_local_sync_server,
+    sync_server_port: int,
+) -> None:
+    """
+    中文：同步镜像 test_version_handshake_server::test_list_room_session_info_contains_a2c_version。
+    真实 SMCPAgentClient 连接时由 SDK 自动拼 ``a2c_version`` query → SyncSMCPNamespace.on_connect
+    经 sync_base._extract_a2c_version 记录到 session → server:list_room 的 SessionInfo 带出。
+    English: Sync mirror of the async handshake list_room test. The real sync SDK client
+    auto-appends ``a2c_version``; SyncSMCPNamespace records it at connect and emits it back
+    in the ``server:list_room`` SessionInfo.
+    """
+    office_id = "office-sync-handshake-ver"
+    auth = DefaultAgentAuthProvider(agent_id="robot-ver-sync", office_id=office_id)
+    agent = SMCPAgentClient(auth_provider=auth)
+    agent.connect_to_server(
+        f"http://localhost:{sync_server_port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    try:
+        agent.join_office(office_id=office_id, agent_name="robot-ver-sync", namespace=SMCP_NAMESPACE)
+        result = agent.call(
+            LIST_ROOM_EVENT,
+            {"agent": "robot-ver-sync", "req_id": "lr-sync-1", "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+        )
+        agents = [s for s in result["sessions"] if s["role"] == "agent"]
+        assert agents, "房间内应有 agent 会话 / room must contain the agent session"
+        assert all(s.get("a2c_version") == PROTOCOL_VERSION for s in agents)
+    finally:
+        agent.disconnect()

@@ -280,6 +280,14 @@ def _run_mock_computer_process(port: int, ready_q: multiprocessing.Queue, err_q:
     @computer.on(GET_RESOURCES_EVENT, namespace=SMCP_NAMESPACE)
     def _on_get_resources(data: dict) -> dict:  # noqa: ANN001
         mcp_server = data["mcp_server"]
+        if mcp_server == "does-not-exist":
+            # 镜像 async test_get_resources_unregistered_server_raises_4014：
+            # 未注册 server → flat 4014 ErrorPayload（无 capability 字段）
+            return {
+                "code": 4014,
+                "message": "MCP Server not found",
+                "mcp_server_name": "does-not-exist",
+            }
         if mcp_server == "no-res":
             return {
                 "code": 4015,
@@ -329,6 +337,16 @@ def _run_sync_agent_process(port: int, result_q: multiprocessing.Queue, err_q: m
             err_code = e.code
             capability = e.capability
 
+        # 镜像 async test_get_resources_unregistered_server_raises_4014：
+        # 未注册 server → flat 4014 ErrorPayload 经 SyncSMCPNamespace 透传 → SMCPProtocolError
+        err4014_code: int | None = None
+        err4014_server: str | None = None
+        try:
+            agent.get_resources(computer=_SYNC_COMPUTER, mcp_server="does-not-exist")
+        except SMCPProtocolError as e:
+            err4014_code = e.code
+            err4014_server = e.mcp_server_name
+
         result_q.put(
             {
                 "page1_next": page1.get("next_cursor"),
@@ -337,6 +355,8 @@ def _run_sync_agent_process(port: int, result_q: multiprocessing.Queue, err_q: m
                 "page2_uri": page2["resources"][0]["uri"],
                 "err_code": err_code,
                 "capability": capability,
+                "err4014_code": err4014_code,
+                "err4014_server": err4014_server,
             },
         )
         agent.disconnect()
@@ -378,6 +398,9 @@ def test_get_resources_sync_pagination_and_error_passthrough(sync_smcp_server: i
             # flat ErrorPayload（4015）经 SyncSMCPNamespace 原样透传 → SMCPProtocolError
             assert res["err_code"] == 4015
             assert res["capability"] == "resources"
+            # flat ErrorPayload（4014 未注册 server）同样透传 → SMCPProtocolError，含 mcp_server_name
+            assert res["err4014_code"] == 4014
+            assert res["err4014_server"] == "does-not-exist"
         finally:
             if agent_proc.is_alive():
                 agent_proc.terminate()
