@@ -330,6 +330,32 @@ class TestWSGIMiddleware:
         body = b"".join(mw({"PATH_INFO": "/health", "QUERY_STRING": ""}, sr))
         assert body == b"DOWNSTREAM"
 
+    def test_missing_version_no_4008_header(self) -> None:
+        # 镜像 ASGI test_missing_version_no_4008_header：缺失 a2c_version → 400，
+        # 但 400≠4008，rejection builder 不得附带 x-a2c-error-code 诊断 header。
+        def app(environ, start_response):  # pragma: no cover - 不应被调用
+            start_response("200 OK", [])
+            return [b"DOWNSTREAM"]
+
+        mw = A2CProtocolVersionWSGIMiddleware(app, socketio_path="/socket.io")
+        sr, cap = self._start_response_collector()
+        body = b"".join(mw({"PATH_INFO": "/socket.io/", "QUERY_STRING": ""}, sr))
+        assert cap["status"].startswith("400")
+        assert not any(k == "x-a2c-error-code" for k, _ in cap["headers"])
+        assert json.loads(body) == {"code": 400, "message": "Missing a2c_version query parameter"}
+
+    def test_prefix_pollution_not_matched(self) -> None:
+        # 镜像 ASGI test_prefix_pollution_not_matched：/socket.iofoo 不得被误判为
+        # socketio 前缀（PATH_INFO 精确前缀匹配），即使缺 a2c_version 也透传下游。
+        def app(environ, start_response):
+            start_response("200 OK", [])
+            return [b"DOWNSTREAM"]
+
+        mw = A2CProtocolVersionWSGIMiddleware(app, socketio_path="/socket.io")
+        sr, _ = self._start_response_collector()
+        body = b"".join(mw({"PATH_INFO": "/socket.iofoo", "QUERY_STRING": ""}, sr))
+        assert body == b"DOWNSTREAM"
+
     def test_ws_upgrade_incompatible_still_rejected(self) -> None:
         # WSGI 实测（勿假设）：WS-only over WSGI 起始即普通 HTTP GET（带 Upgrade 头）；
         # 中间件对 Upgrade 无关、仅看 PATH_INFO+QUERY_STRING → 仍走同一 400/4008，天然覆盖。
