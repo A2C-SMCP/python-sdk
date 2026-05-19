@@ -9,6 +9,7 @@
 """
 
 from typing import Any
+from urllib.parse import parse_qs
 
 from socketio import Namespace
 
@@ -54,6 +55,15 @@ class SyncBaseNamespace(Namespace):
             is_authenticated = self.auth_provider.authenticate(self.server, environ, auth, headers)
             if not is_authenticated:
                 raise ConnectionRefusedError("Authentication failed")
+
+            # 记录协议版本（兼容性已由 HTTP 握手中间件保证）；仅供 server:list_room 展示与诊断
+            # Record protocol version (compatibility already enforced by the HTTP handshake
+            # middleware); for server:list_room display & diagnostics only
+            a2c_version = self._extract_a2c_version(environ)
+            if a2c_version:
+                session = self.get_session(sid)
+                session["a2c_version"] = a2c_version
+                self.save_session(sid, session)
 
             ctx.info("Client connected successfully")
             return True
@@ -149,3 +159,16 @@ class SyncBaseNamespace(Namespace):
         if not headers:
             headers = environ.get("HTTP_HEADERS", [])
         return headers
+
+    @staticmethod
+    def _extract_a2c_version(environ: dict) -> str | None:
+        """
+        从请求环境的 query string 中解析 ``a2c_version``（ASGI / WSGI 通用）。
+        Parse ``a2c_version`` from the request environ query string (ASGI / WSGI alike).
+        """
+        qs = environ.get("QUERY_STRING", "")
+        if not qs:
+            scope_qs = environ.get("asgi.scope", {}).get("query_string", b"")
+            qs = scope_qs.decode("latin-1") if isinstance(scope_qs, bytes) else (scope_qs or "")
+        values = parse_qs(qs).get("a2c_version")
+        return values[0] if values else None

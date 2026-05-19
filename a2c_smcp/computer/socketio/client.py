@@ -9,6 +9,7 @@ from mcp.types import CallToolResult, Resource
 from pydantic import TypeAdapter
 from socketio import AsyncClient
 
+from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
 from a2c_smcp.smcp import (
@@ -43,6 +44,14 @@ from a2c_smcp.smcp import (
 )
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
+)
+from a2c_smcp.utils.handshake import (
+    DEFAULT_HANDSHAKE_TRANSPORTS,
+    HANDSHAKE_CONNECT_ERRORS,
+    apply_polling_first_guard,
+    build_handshake_url,
+    build_protocol_version_error,
+    extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -148,6 +157,34 @@ class SMCPComputerClient(AsyncClient):
         Return the auth HTTP header name used by this instance
         """
         return self._auth_header_name
+
+    async def connect(self, url: str, *args: Any, **kwargs: Any) -> None:
+        """
+        覆盖 ``AsyncClient.connect``：注入协议版本握手，使所有调用点（CLI / 交互式 / 测试）
+        自动合规，无需各处重复拼接。
+        Override ``AsyncClient.connect`` to inject the protocol version handshake so every
+        call site (CLI / interactive / tests) is automatically compliant without duplication.
+
+        - 协议 MUST：自动从 ``PROTOCOL_VERSION`` 常量拼接 ``a2c_version``（保留调用方既有 query）
+        - 协议 §1 polling-first MUST 护栏：调用方显式 WS-only 不静默放行，强制重注入 polling-first
+        - 捕获 4008 → 主动 ``disconnect()`` → 抛 :class:`ProtocolVersionError`；非 4008 保持原异常
+        """
+        handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
+        kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
+        # 协议 §1 polling-first MUST 护栏（统一接线，详见 handshake.apply_polling_first_guard）
+        kwargs["transports"] = apply_polling_first_guard(kwargs.get("transports"), logger)
+        logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
+        try:
+            await super().connect(handshake_url, *args, **kwargs)
+        except HANDSHAKE_CONNECT_ERRORS as e:
+            payload = extract_4008_payload(e)
+            if payload is None:
+                # 非协议版本错误：保持原异常 / not a version error: preserve the original exception
+                raise
+            # 协议 §4 MUST：先主动断开再抛异常，防止底层库自动重连触发 4008 死循环
+            # Protocol §4 MUST: proactively disconnect before raising (anti reconnect-loop)
+            await self.disconnect()
+            raise build_protocol_version_error(payload) from e
 
     async def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
         """

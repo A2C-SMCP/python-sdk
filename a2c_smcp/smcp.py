@@ -366,6 +366,20 @@ class ErrorCode(IntEnum):
     MCP_CAPABILITY_NOT_SUPPORTED = 4015
 
 
+# WebSocket close code（RFC 6455 私有段 4000-4999），用于 WS-only 直连握手按版本不匹配拒绝
+# （服务端运行栈不支持 ASGI WebSocket Denial Response 时的回退形态）。
+# WebSocket close code (RFC 6455 private range 4000-4999) for rejecting a WS-only direct
+# handshake on version mismatch, when the server stack lacks ASGI WebSocket Denial Response.
+#
+# **MUST NOT** 与 ``ErrorCode.PROTOCOL_VERSION_MISMATCH``（4008，ErrorPayload.code，承载于
+# HTTP 400 body）混用或互转——二者是**不同命名空间的不同值**，有意取不同数值，遵守
+# “4008 是 HTTP body code，MUST NOT 与 WS close code 混淆” 的协议铁律。``4900`` 不携带
+# 结构化 body（WS close reason ≤123 字节）。协议依据 / Protocol: versioning.md §5 / §4900。
+# MUST NOT be conflated/converted with ``ErrorCode.PROTOCOL_VERSION_MISMATCH`` (4008,
+# an ErrorPayload.code carried in the HTTP 400 body) — different namespaces, different values.
+WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE: int = 4900
+
+
 class ResourceAnnotations(TypedDict, total=False):
     """
     MCP Resource 标准 annotations（snake_case mirror）。
@@ -428,7 +442,7 @@ class ErrorPayload(TypedDict, total=False):
       - Socket.IO ack 层（4014 / 4015 等）：ack callback 第一参 = flat dict
 
     分流字段顶层平铺 / Code-specific dispatch fields are top-level:
-      - 4008: server_version / client_version
+      - 4008: server_version / client_version / min_supported / max_supported
       - 4014: mcp_server_name
       - 4015: mcp_server_name / capability
 
@@ -438,9 +452,12 @@ class ErrorPayload(TypedDict, total=False):
 
     code: int  # ErrorCode value
     message: str
-    # 4008 / Protocol version mismatch
+    # 4008 / Protocol version mismatch（四字段对齐 error-handling.md §各错误码标准字段总表）
+    # 4008 fields aligned with error-handling.md §standard fields table
     server_version: str
     client_version: str
+    min_supported: str
+    max_supported: str
     # 4014 / MCP Server not found；4015 / MCP Capability not supported
     mcp_server_name: str
     # 4015 / 缺失的 capability 名（如 "resources"）/ Missing capability name (e.g. "resources")
