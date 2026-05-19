@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from socketio import Client, Namespace, SimpleClient
+from socketio.exceptions import TimeoutError as SioTimeoutError
 from werkzeug.serving import make_server
 
 from a2c_smcp import PROTOCOL_VERSION
@@ -574,3 +575,72 @@ def test_list_room_session_info_contains_a2c_version_sync(
         assert all(s.get("a2c_version") == PROTOCOL_VERSION for s in agents)
     finally:
         agent.disconnect()
+
+
+# ======================================================================
+# GitHub #31：office/role 隔离负路径（同步镜像，黑盒）
+# GitHub #31: office/role isolation negative paths (sync mirror, black-box)
+#
+# 同步服务器运行于独立进程，只能黑盒验证：处理器显式 raise SMCPNamespaceError
+# → 不回 ACK → 客户端 .call() 超时（socketio TimeoutError）。跨房间用例额外
+# 断言 Computer 的事件处理器从未被调用，证明在 Server 路由前即被拒绝（非误判超时）。
+# The sync server runs in a separate process, so this is black-box: the handler
+# raises SMCPNamespaceError → no ACK → the client .call() times out. The
+# cross-room case additionally asserts the Computer handler was never invoked,
+# proving rejection happened at the Server before routing (not a spurious timeout).
+# ======================================================================
+
+
+def test_get_tools_cross_office_rejected_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
+    """跨房间 client:get_tools（同步）：office 不一致 → 拒绝且不路由到 Computer。"""
+    agent = Client()
+    computer = Client()
+    computer_invoked = threading.Event()
+
+    @computer.on(GET_TOOLS_EVENT, namespace=SMCP_NAMESPACE)
+    def _on_get_tools(data: dict) -> dict:  # pragma: no cover - 不应被调用 / must not be called
+        computer_invoked.set()
+        return {"tools": [], "req_id": data.get("req_id", "")}
+
+    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    try:
+        _join_office(agent, role="agent", office_id="office-sync-neg-A", name="robot-sneg-1")
+        _join_office(computer, role="computer", office_id="office-sync-neg-B", name="comp-sneg-1")
+
+        with pytest.raises(SioTimeoutError):
+            agent.call(
+                GET_TOOLS_EVENT,
+                {"computer": "comp-sneg-1", "agent": "robot-sneg-1", "req_id": "sneg-r1"},
+                namespace=SMCP_NAMESPACE,
+                timeout=3,
+            )
+        assert not computer_invoked.is_set(), "跨房间请求不得路由到 Computer / cross-room request must not reach Computer"
+    finally:
+        agent.disconnect()
+        computer.disconnect()
+
+
+def test_tool_call_wrong_role_rejected_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
+    """错角色 client:tool_call（同步）：Computer 发起工具调用 → 被拒绝（超时，无 ACK）。"""
+    computer = Client()
+    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    try:
+        _join_office(computer, role="computer", office_id="office-sync-neg-C", name="comp-sneg-2")
+
+        with pytest.raises(SioTimeoutError):
+            computer.call(
+                TOOL_CALL_EVENT,
+                {
+                    "agent": "comp-sneg-2",
+                    "computer": "comp-sneg-2",
+                    "req_id": "sneg-r2",
+                    "tool_name": "t",
+                    "params": {},
+                    "timeout": 5,
+                },
+                namespace=SMCP_NAMESPACE,
+                timeout=3,
+            )
+    finally:
+        computer.disconnect()
