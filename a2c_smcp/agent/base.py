@@ -8,12 +8,12 @@
 * 描述: Agent基础客户端抽象类（异步和同步版本）/ Agent base client abstract classes (async and sync versions)
 """
 
-import uuid
 from abc import ABC, abstractmethod
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 
+from a2c_smcp.agent import _request_builders as _rb
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.types import AgentEventHandler, AsyncAgentEventHandler
 from a2c_smcp.smcp import (
@@ -85,10 +85,7 @@ class BaseAgentClient(ABC):
         Raises:
             ValueError: 当事件不合法时 / When event is invalid
         """
-        if event.startswith("notify:"):
-            raise ValueError("AgentClient不允许使用notify:*事件 / AgentClient is not allowed to use notify:* events")
-        if event.startswith("agent:"):
-            raise ValueError("AgentClient不允许发起agent:*事件 / AgentClient is not allowed to initiate agent:* events")
+        _rb.validate_emit_event(event)
 
     def create_tool_call_request(self, computer: str, tool_name: str, params: dict, timeout: int) -> ToolCallReq:
         """
@@ -104,15 +101,7 @@ class BaseAgentClient(ABC):
         Returns:
             ToolCallReq: 工具调用请求 / Tool call request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        return ToolCallReq(
-            computer=computer,
-            tool_name=tool_name,
-            params=params,
-            agent=agent_config["agent"],
-            req_id=uuid.uuid4().hex,
-            timeout=timeout,
-        )
+        return _rb.build_tool_call_request(self.auth_provider.get_agent_config(), computer, tool_name, params, timeout)
 
     def create_get_tools_request(self, computer: str) -> GetToolsReq:
         """
@@ -125,12 +114,7 @@ class BaseAgentClient(ABC):
         Returns:
             GetToolsReq: 获取工具请求 / Get tools request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        return GetToolsReq(
-            computer=computer,
-            agent=agent_config["agent"],
-            req_id=uuid.uuid4().hex,
-        )
+        return _rb.build_get_tools_request(self.auth_provider.get_agent_config(), computer)
 
     def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
         """
@@ -145,16 +129,7 @@ class BaseAgentClient(ABC):
         Returns:
             GetResourcesReq: 获取资源请求 / Get resources request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        req: GetResourcesReq = {
-            "computer": computer,
-            "mcp_server": mcp_server,
-            "agent": agent_config["agent"],
-            "req_id": uuid.uuid4().hex,
-        }
-        if cursor is not None:
-            req["cursor"] = cursor
-        return req
+        return _rb.build_get_resources_request(self.auth_provider.get_agent_config(), computer, mcp_server, cursor)
 
     def create_get_desktop_request(self, computer: str, *, size: int | None = None, window: str | None = None) -> GetDeskTopReq:
         """
@@ -169,17 +144,7 @@ class BaseAgentClient(ABC):
         Returns:
             GetDeskTopReq: 获取桌面请求 / Get desktop request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        req: GetDeskTopReq = {
-            "computer": computer,
-            "agent": agent_config["agent"],
-            "req_id": uuid.uuid4().hex,
-        }
-        if size is not None:
-            req["desktop_size"] = size
-        if window is not None:
-            req["window"] = window
-        return req
+        return _rb.build_get_desktop_request(self.auth_provider.get_agent_config(), computer, size=size, window=window)
 
     def process_desktop_response(self, response: GetDeskTopRet, computer: str) -> None:
         """
@@ -397,10 +362,7 @@ class BaseAgentSyncClient(ABC):
         Raises:
             ValueError: 当事件不合法时 / When event is invalid
         """
-        if event.startswith("notify:"):
-            raise ValueError("AgentClient不允许使用notify:*事件 / AgentClient is not allowed to use notify:* events")
-        if event.startswith("agent:"):
-            raise ValueError("AgentClient不允许发起agent:*事件 / AgentClient is not allowed to initiate agent:* events")
+        _rb.validate_emit_event(event)
 
     def create_tool_call_request(self, computer: str, tool_name: str, params: dict, timeout: int) -> ToolCallReq:
         """
@@ -416,15 +378,7 @@ class BaseAgentSyncClient(ABC):
         Returns:
             ToolCallReq: 工具调用请求 / Tool call request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        return ToolCallReq(
-            computer=computer,
-            tool_name=tool_name,
-            params=params,
-            agent=agent_config["agent"],
-            req_id=uuid.uuid4().hex,
-            timeout=timeout,
-        )
+        return _rb.build_tool_call_request(self.auth_provider.get_agent_config(), computer, tool_name, params, timeout)
 
     def create_get_tools_request(self, computer: str) -> GetToolsReq:
         """
@@ -437,12 +391,7 @@ class BaseAgentSyncClient(ABC):
         Returns:
             GetToolsReq: 获取工具请求 / Get tools request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        return GetToolsReq(
-            computer=computer,
-            agent=agent_config["agent"],
-            req_id=uuid.uuid4().hex,
-        )
+        return _rb.build_get_tools_request(self.auth_provider.get_agent_config(), computer)
 
     def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
         """
@@ -457,16 +406,7 @@ class BaseAgentSyncClient(ABC):
         Returns:
             GetResourcesReq: 获取资源请求 / Get resources request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        req: GetResourcesReq = {
-            "computer": computer,
-            "mcp_server": mcp_server,
-            "agent": agent_config["agent"],
-            "req_id": uuid.uuid4().hex,
-        }
-        if cursor is not None:
-            req["cursor"] = cursor
-        return req
+        return _rb.build_get_resources_request(self.auth_provider.get_agent_config(), computer, mcp_server, cursor)
 
     def create_get_desktop_request(self, computer: str, *, size: int | None = None, window: str | None = None) -> GetDeskTopReq:
         """
@@ -481,17 +421,7 @@ class BaseAgentSyncClient(ABC):
         Returns:
             GetDeskTopReq: 获取桌面请求 / Get desktop request
         """
-        agent_config = self.auth_provider.get_agent_config()
-        req: GetDeskTopReq = {
-            "computer": computer,
-            "agent": agent_config["agent"],
-            "req_id": uuid.uuid4().hex,
-        }
-        if size is not None:
-            req["desktop_size"] = size
-        if window is not None:
-            req["window"] = window
-        return req
+        return _rb.build_get_desktop_request(self.auth_provider.get_agent_config(), computer, size=size, window=window)
 
     def process_desktop_response(self, response: GetDeskTopRet, computer: str) -> None:
         """
