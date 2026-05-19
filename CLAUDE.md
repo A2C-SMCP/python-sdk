@@ -64,8 +64,9 @@ SDK 实现了三个通过 Socket.IO 通信的协作组件：
 - `manager.py`: 编排多个 MCP 客户端
 
 **桌面/窗口系统** (`a2c_smcp/computer/desktop/`):
-- 将 MCP 服务器的 `window://` 资源聚合为统一的桌面视图
-- `a2c_smcp/utils/window_uri.py`: 窗口 URI 解析，支持优先级和全屏处理
+- 将 MCP 服务器的 `window://` 资源聚合为统一的桌面视图（仅聚合 `window://`，非 window 资源不进桌面）
+- `a2c_smcp/utils/window_uri.py`: 窗口 URI 解析（v0.2 起为**纯标识符**，不再解析 query）；
+  优先级/全屏从 `Resource.annotations` / `_meta` 读取，由 `desktop/organize.py` 组织
 
 **输入解析** (`a2c_smcp/computer/inputs/`):
 - MCP 服务器配置的占位符解析系统
@@ -87,6 +88,23 @@ Socket.IO 事件遵循以下前缀：
 1. `smcp.py` 中的事件常量
 2. 相关命名空间/客户端类中的处理方法
 3. 测试中的 Mock 服务器事件处理器
+
+### v0.2 协议新增 (a2c-smcp-protocol v0.2.0 GA)
+
+- **`client:get_resources`** (`GET_RESOURCES_EVENT`): Agent → Computer，透明转发 MCP
+  `resources/list`，支持 MCP 标准 `cursor` 翻页（SDK **不**自动遍历，cursor 由调用方控制）。
+  返回 `{resources, next_cursor?}`；错误以 flat `ErrorPayload` 返回（`4014` MCP Server 未注册 /
+  `4015` 未声明 `resources` 能力，无嵌套 envelope）。响应字段 camelCase→snake_case 规整
+  （如 `mimeType`→`mime_type`）。
+- **连接版本握手**: 客户端在 Socket.IO 连接 URL query 携带 `a2c_version`；Server 端由
+  `A2CProtocolVersionASGIMiddleware` 校验，不兼容返回 HTTP 400 + Socket.IO `4008`，并写入
+  `SessionInfo.a2c_version`（经 `server:list_room` 带出，仅展示/诊断）。不兼容客户端**连接被拒、
+  绝不建立**（versioning.md §4 死循环防御）。客户端强制 polling-first（显式 `transports=["websocket"]`
+  会被护栏纠正），确保 4008 可被还原归一为 `ProtocolVersionError`。
+- **URI 纯标识符化**: `window://` 不再在 URI query 携带 `priority`/`fullscreen`；元数据下沉到 MCP
+  `Resource.annotations`（`priority`/`audience`/`last_modified`）与 `_meta`（`fullscreen` 等 A2C 扩展）。
+- **DPE 已整体移除**: A2C-SMCP 控制面不再涉及 `client:get_dpe` / `dpe://` 解析；DPE 迁出至独立
+  [dpe-protocol](https://github.com/A2C-SMCP/dpe-protocol) 仓库。修改时勿重新引入 DPE 事件/类型。
 
 ## 测试结构
 

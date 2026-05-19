@@ -7,6 +7,55 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ## [Unreleased]
 
+> A2C-SMCP protocol **v0.2.0 GA** implementation. SDK package version bump to
+> `0.2.0` is performed separately at release cut. Tracking issue:
+> [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
+
+### Added
+- **Connection protocol-version handshake** (#17 / #18). Clients (Agent + Computer,
+  async + sync) auto-append `a2c_version` to the Socket.IO connect URL query;
+  `a2c_smcp.PROTOCOL_VERSION` (`"0.2.0"`) is the single source. Server-side
+  `a2c_smcp.server.A2CProtocolVersionASGIMiddleware` validates it: missing/invalid →
+  HTTP 400; incompatible (MAJOR.MINOR mismatch) → HTTP 400 + Socket.IO `4008`.
+  Incompatible clients are rejected and **never connect** (`versioning.md` §4
+  loop-defense); `4008` is normalized to `a2c_smcp.exceptions.ProtocolVersionError`.
+  Negotiated version is surfaced via `SessionInfo.a2c_version` through `server:list_room`.
+- **`client:get_resources` event** (#14, async + sync). Transparent passthrough of
+  MCP `resources/list` with caller-controlled `cursor` pagination (SDK does **not**
+  auto-paginate). Flat `ErrorPayload` on `4014` (MCP Server not found) / `4015`
+  (no `resources` capability). Response keys normalized camelCase→snake_case.
+- `base_client.list_resources_page` single-page passthrough API (#13).
+
+### Changed
+- **`window://` URI is now a pure identifier** (v0.2). `priority` / `audience` /
+  `last_modified` move to MCP `Resource.annotations`; `fullscreen` and other A2C
+  extensions move to `_meta`. `WindowURI` no longer parses query; `organize_desktop`
+  reads metadata from `annotations` / `_meta` (#9 / #11). Desktop aggregates
+  `window://` only — non-window resources never enter the desktop.
+- `Finder` removed in favor of the transparent `client:get_resources` event.
+- office/role isolation invariants in `on_client_*` now raise
+  `a2c_smcp.exceptions.SMCPNamespaceError` instead of `assert` (stripped under
+  `python -O`); async + sync namespaces aligned (#31).
+
+### Tests & Docs
+- `tests/e2e/test_v02_full_flow.py` (#20): real-process full chain over a real
+  Uvicorn ASGI server + real protocol-version middleware + real stdio MCP
+  subprocesses — covers handshake negotiation (compatible connects + `a2c_version`
+  recorded; incompatible rejected), `window://` desktop aggregation, `client:get_resources`
+  pagination with transparent passthrough, and the `client:tool_call` chain.
+- **4008 loop-defense test mapping** (#20): no dedicated `test_v02_handshake_loop.py`
+  is added — the `versioning.md` §4 infinite-reconnect-defense guarantee
+  ("incompatible client never connects") is already covered by
+  `tests/integration_tests/test_version_handshake_client.py`
+  (`assert *.connected is False`), and the exact `4008 → ProtocolVersionError`
+  normalization contract by `tests/unit_tests/test_handshake_4008_normalization.py`.
+  `tests/e2e/test_v02_full_flow.py::test_v02_full_flow_incompatible_handshake_rejected`
+  re-checks the guarantee at real-process level. Each layer asserts at its own
+  deterministic tier (non-flaky), so a separate redundant file would add no signal.
+- `README.md`: added the SDK ↔ A2C-SMCP protocol compatibility matrix and v0.2
+  protocol-MUST rules. `CLAUDE.md`: event-system conventions updated with the v0.2
+  events (`client:get_resources`, connection handshake) and URI/metadata changes.
+
 ### Removed
 - **DPE scope removed entirely** per a2c-smcp-protocol v0.2.0 GA decision
   (see [`a2c-smcp-protocol/CHANGELOG_DPE_REMOVAL.md`](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/main/CHANGELOG_DPE_REMOVAL.md)).
