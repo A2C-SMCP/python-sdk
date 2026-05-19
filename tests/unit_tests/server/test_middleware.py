@@ -177,6 +177,9 @@ class TestASGIMiddleware:
         assert json.loads(ws_body["body"])["code"] == 4008
         assert (b"x-a2c-error-code", b"4008") in ws_start["headers"]
         assert ws_start["headers"] == http_start["headers"]
+        # Group A：显式 Content-Length（确定性定界，修 🟡6 单一事实源）
+        cl = dict(http_start["headers"]).get(b"content-length")
+        assert cl == str(len(http_body["body"])).encode()
         assert called["hit"] is False
 
     @pytest.mark.asyncio
@@ -195,6 +198,25 @@ class TestASGIMiddleware:
         assert close["type"] == "websocket.close"
         assert close["code"] == WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE == 4900
         assert called["hit"] is False
+
+    @pytest.mark.asyncio
+    async def test_reject_websocket_non_connect_first_event_early_return(self, downstream_marker) -> None:
+        # ③ 覆盖 _reject_websocket 首事件 ≠ websocket.connect 的提前返回分支：
+        # 既不下发拒绝响应也不触下游（ASGI 规范要求 denial-response 在 connect 后发出）。
+        app, called = downstream_marker
+        mw = A2CProtocolVersionASGIMiddleware(app, socketio_path="/socket.io")
+        out = await _drive_asgi(
+            mw,
+            {
+                "type": "websocket",
+                "path": "/socket.io/",
+                "query_string": b"a2c_version=0.3.0",
+                "extensions": {"websocket.http.response": {}},
+            },
+            recv_events=[{"type": "websocket.disconnect"}],  # 首事件非 connect
+        )
+        assert out["messages"] == [], "首事件非 websocket.connect → 早返回，不得 send 任何消息"
+        assert called["hit"] is False, "早返回也绝不透传下游"
 
     @pytest.mark.asyncio
     async def test_ws_scope_compatible_passes_through(self, downstream_marker) -> None:
@@ -236,6 +258,34 @@ def test_ws_close_code_namespace_isolation() -> None:
     assert WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE == 4900
     assert WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE != int(ErrorCode.PROTOCOL_VERSION_MISMATCH)
     assert WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE not in {int(c) for c in ErrorCode}
+
+
+def test_build_rejection_single_source_of_truth() -> None:
+    # Group A / 🟡6：_build_rejection 是 ASGI-http / ASGI-ws-denial / WSGI 三路唯一事实源，
+    # 必含 Content-Length（显式定界），4008 必含 X-A2C-Error-Code。
+    from a2c_smcp.server.middleware import _build_rejection, _encode_headers
+
+    body = {
+        "code": 4008,
+        "message": "Protocol version mismatch",
+        "server_version": "0.2.0",
+        "client_version": "0.3.0",
+        "min_supported": "0.2.0",
+        "max_supported": "0.2.999",
+    }
+    raw, headers = _build_rejection(body)
+    hd = dict(headers)
+    assert hd["content-type"] == "application/json"
+    assert hd["content-length"] == str(len(raw))  # 显式定界，不依赖连接关闭
+    assert hd["x-a2c-error-code"] == "4008"
+    # WSGI 原生用 str 头；ASGI 经 _encode_headers 转 bytes —— 仅此一处差异，body 字节一致
+    assert _encode_headers(headers) == [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers]
+
+    # 非 4008（缺失/非法 400）不带 x-a2c-error-code，但仍带 content-length
+    raw2, headers2 = _build_rejection({"code": 400, "message": "Missing a2c_version query parameter"})
+    hd2 = dict(headers2)
+    assert "x-a2c-error-code" not in hd2
+    assert hd2["content-length"] == str(len(raw2))
 
 
 class TestWSGIMiddleware:

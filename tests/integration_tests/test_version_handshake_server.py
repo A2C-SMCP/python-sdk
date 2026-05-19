@@ -172,7 +172,15 @@ async def test_ws_only_compatible_connects_end_to_end(mw_server: int) -> None:
 @pytest.mark.asyncio
 async def test_ws_only_incompatible_rejected_end_to_end(incompatible_mw_server: int) -> None:
     """缺口闭合端到端反例：WS-only 直连 + 版本不兼容 → 中间件 websocket scope 校验拒绝，
-    连接绝不建立（此前 buggy 实现会放行 → 击穿传递性保证）。"""
+    连接绝不建立（此前 buggy 实现会放行 → 击穿传递性保证）。
+
+    边界说明（🟡4 / 已知限制，回应 code-review）：本 e2e 只断言**确定性保证**——连接被拒
+    （SioConnectionError + not connected）。"denial-response 4008 body 字节一致"无法在此
+    over-the-wire 断言，因 python-socketio 不向应用暴露 WS 关闭码/响应体；该字节一致性由
+    test_middleware.py::test_ws_denial_response_byte_identical_4008 在 ASGI 可调用层确定性
+    验证。与 versioning.md §5 R4（客户端收 4900 改 polling 重连取 4008，受 python-socketio
+    能力限制未实现）属同源已知限制。
+    """
     raw = socketio.AsyncClient()
     # client a2c_version=0.2.0 vs server 0.3.0 → MINOR 不匹配（不兼容）
     try:

@@ -124,24 +124,38 @@ def _coerce_server_version(server_version: str | ProtocolVersion) -> ProtocolVer
     return server_version if isinstance(server_version, ProtocolVersion) else ProtocolVersion.parse(server_version)
 
 
-def _response_headers_ascii(body: dict[str, Any]) -> list[tuple[str, str]]:
-    """4008 时附加冗余诊断 header ``X-A2C-Error-Code: 4008`` / add redundant diag header on 4008."""
-    headers = [("content-type", "application/json")]
-    if body.get("code") == _PROTOCOL_VERSION_MISMATCH:
-        headers.append(("x-a2c-error-code", str(_PROTOCOL_VERSION_MISMATCH)))
-    return headers
-
-
-def _build_rejection(body: dict[str, Any]) -> tuple[bytes, list[tuple[bytes, bytes]]]:
+def _build_rejection(body: dict[str, Any]) -> tuple[bytes, list[tuple[str, str]]]:
     """
-    构造拒绝响应的 (raw_body_bytes, ascii_headers_bytes)，**http 与 websocket denial-response
-    路径共用**，保证 4008 body 字节一致（单一事实源）。
-    Build (raw_body_bytes, ascii_headers_bytes) shared by the http and websocket
-    denial-response paths so the 4008 body is byte-identical (single source of truth).
+    构造拒绝响应的 ``(raw_body_bytes, str_headers)``——**ASGI http / ASGI websocket
+    denial-response / WSGI 三路唯一事实源**，保证 4008 响应字节一致。
+    Single source of truth for ASGI-http / ASGI-ws-denial-response / WSGI rejection
+    responses, guaranteeing a byte-identical 4008 response across all three.
+
+    **含 ``Content-Length``**：HTTP/1.1 响应若无 Content-Length 且非分块，则 body 仅靠
+    连接关闭定界——高负载/插桩下客户端读 body 与服务端关连接竞态时，aiohttp 会抛裸
+    ``RuntimeError("Connection closed.")`` 而非携 4008 的 ``ConnectionError``，使
+    versioning.md 传递性保证（被拒方 MUST 得知版本不匹配）在压力下失效。显式定界后
+    客户端精确读 N 字节、干净 EOF，4008 body 确定性可达。
+    Includes ``Content-Length`` so the response is explicitly framed; otherwise the
+    HTTP/1.1 body is delimited by connection close and a read/close race surfaces a
+    bare ``RuntimeError`` instead of the 4008-bearing ``ConnectionError``.
+
+    头以 ``str`` 返回（WSGI 原生即 str）；ASGI 侧经 :func:`_encode_headers` 转 bytes。
+    4008 附冗余诊断头 ``X-A2C-Error-Code``。
     """
     raw = json.dumps(body).encode("utf-8")
-    headers = [(k.encode("latin-1"), v.encode("latin-1")) for k, v in _response_headers_ascii(body)]
+    headers: list[tuple[str, str]] = [
+        ("content-type", "application/json"),
+        ("content-length", str(len(raw))),
+    ]
+    if body.get("code") == _PROTOCOL_VERSION_MISMATCH:
+        headers.append(("x-a2c-error-code", str(_PROTOCOL_VERSION_MISMATCH)))
     return raw, headers
+
+
+def _encode_headers(headers: list[tuple[str, str]]) -> list[tuple[bytes, bytes]]:
+    """ASGI 头需 bytes；WSGI 直接用 str —— 这是共享 :func:`_build_rejection` 之后两栈唯一差异点。"""
+    return [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers]
 
 
 class A2CProtocolVersionASGIMiddleware:
@@ -205,9 +219,9 @@ class A2CProtocolVersionASGIMiddleware:
         status: int,
         body: dict[str, Any],
     ) -> None:
-        """polling 握手拒绝：HTTP 400 + flat ErrorPayload（字节不变，与既有行为一致）。"""
+        """polling 握手拒绝：HTTP 400 + flat ErrorPayload（含 Content-Length，确定性定界）。"""
         raw, headers = _build_rejection(body)
-        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.start", "status": status, "headers": _encode_headers(headers)})
         await send({"type": "http.response.body", "body": raw})
 
     @staticmethod
@@ -234,7 +248,7 @@ class A2CProtocolVersionASGIMiddleware:
             return
         if "websocket.http.response" in (scope.get("extensions") or {}):
             raw, headers = _build_rejection(body)
-            await send({"type": "websocket.http.response.start", "status": status, "headers": headers})
+            await send({"type": "websocket.http.response.start", "status": status, "headers": _encode_headers(headers)})
             await send({"type": "websocket.http.response.body", "body": raw})
         else:
             await send({"type": "websocket.close", "code": WS_VERSION_HANDSHAKE_REJECTED_CLOSE_CODE})
@@ -276,8 +290,7 @@ class A2CProtocolVersionWSGIMiddleware:
 
         status, body = verdict
         logger.warning(f"A2C handshake rejected: status={status} body={body}")
-        raw = json.dumps(body).encode("utf-8")
-        headers = _response_headers_ascii(body)
-        headers.append(("content-length", str(len(raw))))
+        # 与 ASGI 两路共用 _build_rejection（含 Content-Length）；WSGI 原生用 str 头
+        raw, headers = _build_rejection(body)
         start_response(f"{status} Bad Request", headers)
         return [raw]

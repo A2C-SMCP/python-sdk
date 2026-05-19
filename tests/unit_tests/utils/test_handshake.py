@@ -10,13 +10,18 @@
 - enforce_polling_first：§1 polling-first MUST 护栏，WS-only 显式覆盖强制重注入
 """
 
+import logging
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from a2c_smcp.exceptions import ProtocolVersionError
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
+    apply_polling_first_guard,
     build_handshake_url,
+    build_protocol_version_error,
     enforce_polling_first,
     extract_4008_payload,
 )
@@ -105,3 +110,55 @@ class TestEnforcePollingFirst:
         effective, overridden = enforce_polling_first(transports)
         assert overridden is False
         assert effective is transports  # 原样返回，不复制不改写
+
+
+class TestApplyPollingFirstGuard:
+    """🟡2 收敛：三处 connect 站点共用此接线（含 loud warning），单一事实源单测。"""
+
+    def test_ws_only_override_warns_and_rewrites(self) -> None:
+        logger = logging.getLogger("t.guard")
+        logger.warning = MagicMock()  # type: ignore[method-assign]
+        out = apply_polling_first_guard(["websocket"], logger)
+        assert out == DEFAULT_HANDSHAKE_TRANSPORTS
+        assert out[0] == "polling"
+        logger.warning.assert_called_once()
+        assert "polling-first MUST" in logger.warning.call_args.args[0]
+
+    def test_polling_first_no_warn(self) -> None:
+        logger = logging.getLogger("t.guard2")
+        logger.warning = MagicMock()  # type: ignore[method-assign]
+        out = apply_polling_first_guard(["polling", "websocket"], logger)
+        assert out == ["polling", "websocket"]
+        logger.warning.assert_not_called()
+
+    def test_none_untouched_no_warn(self) -> None:
+        logger = logging.getLogger("t.guard3")
+        logger.warning = MagicMock()  # type: ignore[method-assign]
+        assert apply_polling_first_guard(None, logger) is None
+        logger.warning.assert_not_called()
+
+
+class TestBuildProtocolVersionError:
+    """🟡2 收敛：4008 flat ErrorPayload → ProtocolVersionError 字段映射单一事实源。"""
+
+    def test_full_payload_mapped(self) -> None:
+        e = build_protocol_version_error(
+            {
+                "code": 4008,
+                "message": "Protocol version mismatch",
+                "server_version": "0.3.0",
+                "client_version": "0.2.0",
+                "min_supported": "0.3.0",
+                "max_supported": "0.3.999",
+            }
+        )
+        assert isinstance(e, ProtocolVersionError)
+        assert e.client_version == "0.2.0" and e.server_version == "0.3.0"
+        assert e.min_supported == "0.3.0" and e.max_supported == "0.3.999"
+        assert "0.2.0" in str(e) and "0.3.0" in str(e)
+
+    def test_missing_fields_default_and_none(self) -> None:
+        e = build_protocol_version_error({"code": 4008})
+        assert e.client_version is None and e.server_version is None
+        assert e.min_supported is None and e.max_supported is None
+        assert e.message == "Protocol version mismatch"  # 默认 message

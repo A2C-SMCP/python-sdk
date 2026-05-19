@@ -8,12 +8,10 @@ from typing import Any
 from mcp.types import CallToolResult, Resource
 from pydantic import TypeAdapter
 from socketio import AsyncClient
-from socketio.exceptions import ConnectionError as SioConnectionError
 
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
-from a2c_smcp.exceptions import ProtocolVersionError
 from a2c_smcp.smcp import (
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
@@ -49,8 +47,10 @@ from a2c_smcp.smcp import (
 )
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
+    HANDSHAKE_CONNECT_ERRORS,
+    apply_polling_first_guard,
     build_handshake_url,
-    enforce_polling_first,
+    build_protocol_version_error,
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
@@ -171,32 +171,20 @@ class SMCPComputerClient(AsyncClient):
         """
         handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
         kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
-        effective_transports, overridden = enforce_polling_first(kwargs.get("transports"))
-        if overridden:
-            logger.warning(
-                "调用方显式 WS-only transports 违反 versioning.md §1 polling-first MUST；已强制"
-                "重注入 polling-first（仍保留 websocket 供握手后升级）/ caller-forced WS-only "
-                "violates §1 polling-first MUST; re-injected polling-first",
-            )
-        kwargs["transports"] = effective_transports
+        # 协议 §1 polling-first MUST 护栏（统一接线，详见 handshake.apply_polling_first_guard）
+        kwargs["transports"] = apply_polling_first_guard(kwargs.get("transports"), logger)
         logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
         try:
             await super().connect(handshake_url, *args, **kwargs)
-        except SioConnectionError as e:
+        except HANDSHAKE_CONNECT_ERRORS as e:
             payload = extract_4008_payload(e)
             if payload is None:
                 # 非协议版本错误：保持原异常 / not a version error: preserve the original exception
                 raise
-            # 协议 MUST：先主动断开再抛异常，防止底层库自动重连触发 4008 死循环
-            # Protocol MUST: proactively disconnect before raising, preventing an auto-reconnect 4008 loop
+            # 协议 §4 MUST：先主动断开再抛异常，防止底层库自动重连触发 4008 死循环
+            # Protocol §4 MUST: proactively disconnect before raising (anti reconnect-loop)
             await self.disconnect()
-            raise ProtocolVersionError(
-                client_version=payload.get("client_version"),
-                server_version=payload.get("server_version"),
-                min_supported=payload.get("min_supported"),
-                max_supported=payload.get("max_supported"),
-                message=payload.get("message", "Protocol version mismatch"),
-            ) from e
+            raise build_protocol_version_error(payload) from e
 
     async def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
         """

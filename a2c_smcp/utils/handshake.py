@@ -16,11 +16,25 @@ URL build and 4008 detection logic.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from socketio.exceptions import ConnectionError as SioConnectionError
+
+from a2c_smcp.exceptions import ProtocolVersionError
+
 # 协议规定的版本握手 query key / Protocol-defined version handshake query key
 A2C_VERSION_QUERY_KEY = "a2c_version"
+
+# 连接期需兜底捕获的异常集合（单一事实源，三处 connect 站点共用，杜绝拓宽 catch 三复制漂移）。
+# 拓宽理由：高负载/插桩下，4008 拒绝可能在 engineio 解析 body 前传输流崩溃，aiohttp 抛**裸**
+# ``RuntimeError("Connection closed.")``——它既非 ``socketio.exceptions.ConnectionError``
+# 也非内建 ``ConnectionError``（已实证 MRO），仅 ``except SioConnectionError`` 会让其逃逸、
+# 破坏 versioning.md 传递性保证。捕获后仅当 ``extract_4008_payload`` 实锤 4008 才归一为
+# ``ProtocolVersionError``，否则**原样重抛**——绝不把任意连接失败误判为版本错误。
+# Single source of truth for the connect-time fallback catch (shared by all 3 sites).
+HANDSHAKE_CONNECT_ERRORS: tuple[type[BaseException], ...] = (SioConnectionError, ConnectionError, RuntimeError)
 
 # MUST 默认 transports：首个握手走 HTTP polling，确保 4008 的 HTTP 400 body 可被读取
 # （versioning.md §1：polling-first 自 v0.2.1 由 SHOULD 收紧为 MUST）
@@ -46,6 +60,45 @@ def enforce_polling_first(transports: Any) -> tuple[Any, bool]:
     if isinstance(transports, (list, tuple)) and len(transports) > 0 and transports[0] != "polling":
         return list(DEFAULT_HANDSHAKE_TRANSPORTS), True
     return transports, False
+
+
+# §1 polling-first MUST 护栏的标准告警文案（双语，单一事实源）
+# Single source of the §1 polling-first guard warning text (bilingual).
+_POLLING_FIRST_GUARD_WARNING = (
+    "调用方显式 WS-only transports 违反 versioning.md §1 polling-first MUST；已强制重注入 "
+    "polling-first（仍保留 websocket 供握手后升级）/ caller-forced WS-only violates §1 "
+    "polling-first MUST; re-injected polling-first"
+)
+
+
+def apply_polling_first_guard(transports: Any, logger: logging.Logger) -> Any:
+    """
+    §1 polling-first MUST 护栏的**统一接线**：跑 :func:`enforce_polling_first`，被纠正时
+    发统一 loud warning，返回生效的 transports。三处 connect 站点共用，杜绝告警块三复制。
+    Unified wiring of the §1 polling-first guard (shared by all 3 connect sites): runs
+    :func:`enforce_polling_first`, emits a single loud warning on override, returns the
+    effective transports — eliminates the triplicated guard+warning block.
+    """
+    effective, overridden = enforce_polling_first(transports)
+    if overridden:
+        logger.warning(_POLLING_FIRST_GUARD_WARNING)
+    return effective
+
+
+def build_protocol_version_error(payload: dict[str, Any]) -> ProtocolVersionError:
+    """
+    由 4008 flat ErrorPayload 构造 :class:`ProtocolVersionError`（字段映射 + 默认 message，
+    单一事实源）。三处 connect 站点共用，杜绝构造逻辑三复制漂移。
+    Build :class:`ProtocolVersionError` from a 4008 flat ErrorPayload (field mapping +
+    default message) — single source shared by all 3 connect sites.
+    """
+    return ProtocolVersionError(
+        client_version=payload.get("client_version"),
+        server_version=payload.get("server_version"),
+        min_supported=payload.get("min_supported"),
+        max_supported=payload.get("max_supported"),
+        message=payload.get("message", "Protocol version mismatch"),
+    )
 
 
 def build_handshake_url(url: str, protocol_version: str) -> str:
