@@ -328,6 +328,57 @@ class TestParallelAsync:
             await drain_blob(call, "c", "h", concurrency=4, chunk_size=200)
         assert exc_info.value.reason == reason
 
+    @pytest.mark.asyncio
+    async def test_parallel_mixed_drift_and_range_race(self) -> None:
+        """混合 race：并发态某块 ``range`` + 另一块 ``sha256`` 漂移 → 应走 fallback（drift 优先）.
+        Mixed race: one chunk ``range`` + another sha256 drift → must fall back (drift wins).
+
+        反例覆盖 except* 双分支同时 raise 时 ExceptionGroup 漏逃 fallback 的潜在 race。
+        Regression for the except* dual-branch leak where fatal + recoverable co-exist."""
+        payload = b"a" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+        bad_sha = "0" * 64
+        phase = {"parallel": True}
+
+        async def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            end = min(offset + 200, 600)
+            if phase["parallel"]:
+                if offset == 200:
+                    return _make_blob_error("range")  # 可恢复信号 1 / recoverable signal 1
+                if offset == 400:
+                    # 可恢复信号 2（漂移）同时存在 / recoverable signal 2 (drift) co-exists
+                    return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=bad_sha)
+                phase["parallel"] = False  # 触发 fallback 后切到 serial 阶段
+                return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
+            # serial fallback 阶段：全部一致 / serial fallback phase: all consistent
+            return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
+
+        data, _ = await drain_blob(call, "c", "h", concurrency=4, chunk_size=200)
+        # fallback 成功还原完整字节 / fallback recovers the full payload
+        assert data == payload
+
+    @pytest.mark.asyncio
+    async def test_parallel_mixed_fatal_and_drift_prefers_fatal(self) -> None:
+        """混合 race：fatal (gone) + drift 同时触发 → fatal 优先（不可恢复隐藏会误导诊断）.
+        Mixed race: fatal (gone) + drift co-exist → fatal wins (hiding fatal would mislead diagnosis)."""
+        payload = b"x" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+        bad_sha = "0" * 64
+
+        async def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            end = min(offset + 200, 600)
+            if offset == 0:
+                return _make_ret(payload=payload, chunk_offset=0, end=end, total_size=600, sha256_hex=good_sha)
+            if offset == 200:
+                return _make_blob_error("gone")  # fatal
+            # offset == 400: drift 同时触发 / drift co-occurs
+            return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=bad_sha)
+
+        with pytest.raises(BlobTransferError) as exc_info:
+            await drain_blob(call, "c", "h", concurrency=4, chunk_size=200)
+        # fatal 必须暴露真实原因，而不是被 drift 掩盖 / fatal must surface, not be masked by drift
+        assert exc_info.value.reason == "gone"
+
 
 # ── Sync 镜像 / Sync mirror ──────────────────────────────────────────────
 

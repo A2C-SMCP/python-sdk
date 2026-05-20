@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -125,6 +126,52 @@ class TestCidValidationDefenseInDepth:
         store = ToolspoolBlobStore(tmp_path)
         cid = store.put(b"x", "text/plain")
         assert store.exists(cid) is True
+
+
+class TestConcurrentPutAtomicity:
+    """跨线程/进程并发 put 同 cid（同字节）不应抛 FileNotFoundError / 同名 tmp race.
+    Concurrent put of the same cid (same bytes) must not race on shared tmp filename."""
+
+    def test_concurrent_same_cid_no_race(self, tmp_path: Path) -> None:
+        """同 cid 的并发 put 在 N 个线程内一致 + 不抛异常（唯一 tmp 名前缀 + 幂等分支）.
+        Concurrent same-cid puts across N threads remain consistent and exception-free."""
+        store = ToolspoolBlobStore(tmp_path)
+        payload = b"contended bytes" * 100
+        expected_cid = hashlib.sha256(payload).hexdigest()
+
+        def put_once() -> str:
+            return store.put(payload, "application/octet-stream")
+
+        # 16 个并发线程 / 16 concurrent threads
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(executor.map(lambda _: put_once(), range(16)))
+
+        # 所有调用返回同一 cid（内容寻址）/ All return the same cid (content-addressed)
+        assert set(results) == {expected_cid}
+        # 物理 blob 文件仍只有一份 / Still exactly one blob file
+        assert list(store.iter_cids()) == [expected_cid]
+        # 字节可正确回读 / Bytes round-trip cleanly
+        bytes_out, _ = store.get(expected_cid)
+        assert bytes_out == payload
+
+    def test_concurrent_distinct_cids_independent(self, tmp_path: Path) -> None:
+        """不同 cid 并发 put 互不干扰，最终全部可读回.
+        Concurrent puts of distinct cids do not interfere; all readable afterwards."""
+        store = ToolspoolBlobStore(tmp_path)
+        payloads = [f"distinct-{i}".encode() * 50 for i in range(16)]
+
+        def put_one(payload: bytes) -> str:
+            return store.put(payload, "text/plain")
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            cids = list(executor.map(put_one, payloads))
+
+        # cid 集合与 payload 数量一致 / cid set size matches payload count
+        assert len(set(cids)) == len(payloads)
+        # 每个 cid 均可回读字节一致 / Each cid round-trips correctly
+        for cid, payload in zip(cids, payloads, strict=True):
+            bytes_out, _ = store.get(cid)
+            assert bytes_out == payload
 
 
 class TestMimeValidation:

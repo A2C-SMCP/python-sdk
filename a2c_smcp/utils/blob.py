@@ -40,8 +40,8 @@ import asyncio
 import base64
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from a2c_smcp.smcp import ErrorCode
@@ -312,18 +312,46 @@ async def _drain_parallel_async(
 
     # 步骤 3 / Step 3: TaskGroup 结构化并发；首个失败 → 自动取消所有在飞
     # TaskGroup gives us structured cancellation: first failure auto-cancels all pending
+    #
+    # 合并为单个 except* BaseException 集中分派 / Unified except* dispatcher:
+    # 双分支 raise（如 ``except* BlobTransferError`` + ``except* _RecoverableDrift`` 各自 raise）
+    # 在 race 下会让 fallback-able (range / drift) 与 fatal (invalid_handle / forbidden / gone)
+    # 并存时被重新包成 ExceptionGroup，外层 ``except (_RecoverableDrift, _RecoverableRange)``
+    # 不接 group 而漏走 serial fallback。集中扁平化处理消除该 race 漏洞。
+    # When two except* branches each raise, a race that produces both fatal and recoverable
+    # exceptions re-wraps them into a group that the outer plain-except cannot match; flattening
+    # the exception group eliminates that leak.
     try:
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(fetch(off)) for off in offsets]
-    except* BlobTransferError as eg:
-        # invalid_handle / forbidden / gone / range → 上层处理（range 也直接外抛由 drain_blob 转 fallback）
-        first_exc = eg.exceptions[0]
-        if isinstance(first_exc, BlobTransferError) and first_exc.reason == "range":
-            raise _RecoverableRange() from first_exc
-        raise first_exc from eg
-    except* _RecoverableDrift as eg:
-        # 任一块 sha256/total_size 漂移 → 串行 fallback 从 0 重读
-        raise _RecoverableDrift() from eg
+    except BaseExceptionGroup as eg:
+        flat = _flatten_exception_group(eg)
+        # 优先级 / Priority: fatal (invalid_handle / forbidden / gone) > range fallback > drift reread.
+        # 不可恢复的 fatal 必须先于可恢复信号抛出（否则隐藏了 4018 的真实原因）。
+        # Fatal must surface before recoverable signals to avoid hiding the true 4018 cause.
+        fatal: BlobTransferError | None = None
+        has_range = False
+        has_drift = False
+        for sub in flat:
+            if isinstance(sub, BlobTransferError):
+                if sub.reason == "range":
+                    has_range = True
+                else:
+                    # 任一非 range 的 BlobTransferError 即为 fatal
+                    # Any non-range BlobTransferError is fatal
+                    fatal = fatal or sub
+            elif isinstance(sub, _RecoverableDrift):
+                has_drift = True
+        if fatal is not None:
+            raise fatal from eg
+        if has_drift:
+            # drift 优先于 range：sha256/total_size 漂移说明源被改写，从 0 重读最稳妥
+            # drift wins over range: source was rewritten, restart from 0 is the safest
+            raise _RecoverableDrift() from eg
+        if has_range:
+            raise _RecoverableRange() from eg
+        # 未识别的异常 group → 原样抛 / Unrecognized group → re-raise
+        raise
 
     # 步骤 4 / Step 4: 聚合（每块已在 fetch 内校验协议错误 + 漂移）
     # Step 4: collect (each chunk already validated inside fetch)
@@ -362,27 +390,32 @@ def _drain_parallel_sync(
     first_chunk_len = len(chunks[0])
     offsets = list(range(first_chunk_len, total_size, chunk_size))
 
-    # 步骤 2-3 / Steps 2-3: ThreadPoolExecutor 并发拉取；首个失败立即取消其余（best-effort）
-    # First failure cancels best-effort; ThreadPoolExecutor cannot truly cancel running futures
+    # 步骤 2-3 / Steps 2-3: ThreadPoolExecutor 并发拉取；按 **完成顺序** 收集（``as_completed``）
+    # 而非提交顺序——与 async TaskGroup 「首个失败即可见」语义对齐，兑现协议 §3 并行红利。
+    # Collect by **completion order** via ``as_completed`` (not submit order) — aligns with the
+    # async TaskGroup "first failure visible immediately" semantics and realizes the protocol §3
+    # parallel-fail-fast dividend.
     results: dict[int, Mapping[str, Any]] = {}
     first_error: BaseException | None = None
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {executor.submit(call, computer, blob_handle, off, chunk_size): off for off in offsets}
-        for fut in list(futures):
+        for fut in as_completed(futures):
+            off = futures[fut]
             try:
                 ret = fut.result()
                 _raise_for_blob_error(ret)
                 if str(ret["sha256"]) != expected_sha or int(ret["total_size"]) != total_size:
                     first_error = _RecoverableDrift()
                     break
-                results[futures[fut]] = ret
+                results[off] = ret
             except BlobTransferError as e:
                 first_error = e
                 break
             except _RecoverableDrift as e:  # pragma: no cover — already wrapped above
                 first_error = e
                 break
-        # 取消其余 future（best-effort）/ Cancel remaining (best-effort)
+        # 取消其余 future（best-effort，ThreadPoolExecutor 无法真正终止已运行任务）
+        # Cancel remaining (best-effort; ThreadPoolExecutor cannot terminate in-flight work)
         for fut in futures:
             if not fut.done():
                 fut.cancel()
@@ -399,6 +432,21 @@ def _drain_parallel_sync(
 
 
 # ── 通用辅助 / Common helpers ────────────────────────────────────────────
+
+
+def _flatten_exception_group(eg: BaseExceptionGroup) -> Iterator[BaseException]:
+    """递归扁平化 ExceptionGroup → 叶子异常 / Recursively flatten ExceptionGroup into leaf exceptions.
+
+    TaskGroup 在并发态可能产生嵌套 group（fatal + recoverable 同时触发时）；扁平化后由调用方
+    集中分派优先级，避免 "outer plain ``except`` 不接 group 而漏走 fallback" 的隐蔽 race。
+    TaskGroup may produce nested groups in race scenarios; flattening lets the caller dispatch
+    priorities centrally without leaking through an outer plain-tuple ``except``.
+    """
+    for exc in eg.exceptions:
+        if isinstance(exc, BaseExceptionGroup):
+            yield from _flatten_exception_group(exc)
+        else:
+            yield exc
 
 
 def _raise_for_blob_error(payload: Mapping[str, Any]) -> None:

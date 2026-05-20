@@ -51,6 +51,7 @@ from a2c_smcp.computer.base import BaseComputer
 from a2c_smcp.computer.blob import (
     BlobResolver,
     BlobThresholds,
+    BlobTooLargeError,
     SkillBlobResolverPending,
     ToolspoolBlobResolver,
     ToolspoolBlobStore,
@@ -214,16 +215,32 @@ class Computer(BaseComputer[PromptSession]):
         Tool_call binary items that exceed the inline budget go through this entry, are written
         into ``.blobspool``, and the returned handle ships via ``_meta.a2c_blob_handle`` (#40).
 
+        防御纵深 / Defense in depth (协议 ``blob-transfer.md`` §3 + 设计 §4.4):
+            协议要求 too_large 在**铸造期**决断（不铸句柄、零字节传输；DoS 防御）。本入口即铸造期，
+            ``len(payload) > thresholds.too_large_cap`` → 抛 :class:`BlobTooLargeError`，**不写盘**。
+            上游 (#40) 应在其上再做内联预算 / 文本 vs 二进制路由判定；此处是兜底防御层。
+            Protocol mandates too_large decided at minting time (no handle, zero bytes — DoS guard).
+            This entry is that minting point; ``len(payload) > too_large_cap`` raises BlobTooLargeError
+            **without writing to disk**. Upstream (#40) handles inline-budget routing; this is the
+            fallback defense layer.
+
         Args:
             payload: 解码后的原始字节内容（**不是** base64）.
             mime: 内容 MIME（如 ``image/png``）.
 
         Returns:
             不透明 ``blob_handle`` 字符串.
+
+        Raises:
+            BlobTooLargeError: ``len(payload) > thresholds.too_large_cap`` —— 拒绝铸造，不写盘。
         """
         # 局部导入避免顶层循环：handle 编码 / Local import to avoid top-level cycles
         from a2c_smcp.computer.blob import encode_toolspool_handle
 
+        size = len(payload)
+        cap = self._blob_thresholds.too_large_cap
+        if size > cap:
+            raise BlobTooLargeError(size=size, cap=cap)
         cid = self._toolspool_store.put(payload, mime)
         return encode_toolspool_handle(cid=cid, mime=mime)
 

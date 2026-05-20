@@ -107,6 +107,22 @@ class BlobHandleGoneError(BlobHandleError):
     reason = "gone"
 
 
+class BlobTooLargeError(Exception):
+    """``mint_toolspool_handle`` 入参字节超 ``BlobThresholds.too_large_cap`` → 拒绝铸造.
+    Raised when ``mint_toolspool_handle`` payload exceeds ``too_large_cap`` → mint refused.
+
+    协议依据 / Protocol: ``blob-transfer.md`` §3 + ``skill.md`` §9「铸造期决断 too_large，不铸句柄」。
+    The protocol mandates too_large be decided at the **minting** channel: refuse to mint a handle
+    and emit zero bytes (DoS defense). 本异常是 tool_call 二进制旁路侧的对应抛错点（SKILL 通道走
+    ``4017 too_large``；本侧由 SDK 自决——铸造者就此拒绝，无协议错误码映射）。
+    """
+
+    def __init__(self, size: int, cap: int) -> None:
+        super().__init__(f"payload size {size} exceeds too_large_cap {cap}")
+        self.size = size
+        self.cap = cap
+
+
 # ── 公开 API / Public API ────────────────────────────────────────────────
 
 

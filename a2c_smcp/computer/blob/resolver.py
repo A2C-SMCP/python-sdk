@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from a2c_smcp.computer.blob.handle import BlobHandleError
+from a2c_smcp.computer.blob.handle import BlobHandleForbiddenError
 from a2c_smcp.computer.blob.toolspool import ToolspoolBlobStore
 
 
@@ -63,6 +63,14 @@ class ToolspoolBlobResolver:
 
     跨进程重启可解析：cid 在磁盘 → 成功；不在 → ``BlobHandleGoneError`` （协议 ``4018 gone``）。
     Survives Computer restarts: cid present on disk → success; absent → ``BlobHandleGoneError``.
+
+    TODO(v0.2.x+): ``resolve()`` 当前一次性 ``read_bytes()`` 读全量进内存，handler 再切片返回单块。
+    并行 ``concurrency=N`` 拉取大 blob 时瞬时占用 ≈ N × total_size。后续版本可引入 lazy 抽象
+    （mmap / seek+read），让 ``ResolvedBlob`` 暴露 ``slice(offset, length) → bytes`` 而不持有
+    全量字节。"无状态可重解析" 承诺不变，仅是内存峰值优化，非协议变更。
+    Future optimization (non-protocol): replace eager ``read_bytes()`` with a lazy slice view
+    (mmap / seek+read) so ``ResolvedBlob`` exposes per-chunk reads without holding the full
+    payload in memory. Stateless-reparseable contract unchanged.
     """
 
     def __init__(self, store: ToolspoolBlobStore) -> None:
@@ -96,9 +104,9 @@ class SkillBlobResolverPending:
     """
 
     def resolve(self, payload: dict[str, Any]) -> ResolvedBlob:
-        # noqa 标注：故意保留参数签名以 satisfy BlobResolver Protocol（runtime_checkable）。
+        # 故意保留参数签名以 satisfy BlobResolver Protocol（runtime_checkable）。
         # Signature preserved to satisfy the runtime_checkable BlobResolver Protocol.
         _ = payload
-        err = BlobHandleError("skill resolver pending #39 — kind=skill not wired in this PR")
-        err.reason = "forbidden"
-        raise err
+        # 用子类直 raise 比设值 ``.reason`` 更 DRY，避免脏化基类实例属性
+        # Subclass-raise is DRYer than mutating ``.reason`` on the base class instance
+        raise BlobHandleForbiddenError("skill resolver pending #39 — kind=skill not wired in this PR")

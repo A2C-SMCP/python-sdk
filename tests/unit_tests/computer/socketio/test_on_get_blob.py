@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.blob import (
-    BlobHandleError,
+    BlobHandleForbiddenError,
     encode_skill_handle,
     encode_toolspool_handle,
 )
@@ -211,9 +211,7 @@ class TestResolverInjection:
 
         class _DummyResolver:
             def resolve(self, payload: dict) -> object:
-                err = BlobHandleError("dummy")
-                err.reason = "forbidden"
-                raise err
+                raise BlobHandleForbiddenError("dummy")
 
         comp = Computer(
             name="comp-custom",
@@ -238,3 +236,38 @@ class TestMintToolspoolHandleHelper:
         assert "code" not in ret
         assert base64.b64decode(ret["blob"]) == b"hello, end-to-end"  # type: ignore[index]
         assert ret["mime_type"] == "text/markdown"  # type: ignore[index]
+
+
+class TestMintToolspoolTooLargeDefense:
+    """防御纵深：``mint_toolspool_handle`` 入参超 ``too_large_cap`` → 拒绝铸造，不写盘.
+    Defense in depth: payload over ``too_large_cap`` refuses to mint AND must not touch disk."""
+
+    def test_oversize_payload_raises_without_disk_write(self, tmp_path: Path) -> None:
+        from a2c_smcp.computer.blob import BlobThresholds, BlobTooLargeError
+
+        # 极低 cap 便于测试 / Very low cap for testing
+        comp = Computer(
+            name="comp-cap",
+            blob_cache_root=tmp_path,
+            blob_thresholds=BlobThresholds(too_large_cap=16),
+        )
+        store_cids_before = list(comp.toolspool_store.iter_cids())
+        with pytest.raises(BlobTooLargeError) as exc_info:
+            comp.mint_toolspool_handle(payload=b"this payload definitely exceeds 16 bytes", mime="text/plain")
+        assert exc_info.value.size == len(b"this payload definitely exceeds 16 bytes")
+        assert exc_info.value.cap == 16
+        # 关键不变量：拒绝铸造时不应写盘 / Critical invariant: refused mint must not write to disk
+        assert list(comp.toolspool_store.iter_cids()) == store_cids_before
+
+    def test_at_cap_boundary_mints_successfully(self, tmp_path: Path) -> None:
+        """边界：``len(payload) == cap`` 应允许（``> cap`` 才拒绝）.
+        Boundary: ``len(payload) == cap`` is allowed (strict ``>`` is the cutoff)."""
+        from a2c_smcp.computer.blob import BlobThresholds
+
+        comp = Computer(
+            name="comp-cap-eq",
+            blob_cache_root=tmp_path,
+            blob_thresholds=BlobThresholds(too_large_cap=8),
+        )
+        handle = comp.mint_toolspool_handle(payload=b"exactly8", mime="text/plain")
+        assert handle  # 铸造成功 / mint succeeded

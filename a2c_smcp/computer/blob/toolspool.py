@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -94,6 +95,12 @@ class ToolspoolBlobStore:
 
     def get(self, cid: str) -> tuple[bytes, str]:
         """按 ``cid`` 回查 / Look up by ``cid``.
+
+        TODO(v0.2.x+): 当前 ``read_bytes()`` 全量入内存。后续可暴露惰性读接口
+        （如 ``open_blob(cid) -> BinaryIO`` 或 ``read_slice(cid, offset, length)``），
+        让 resolver / handler 不再持有全量 payload，降低并发拉取大 blob 时的峰值占用。
+        Future: expose lazy reads (``open_blob`` / ``read_slice``) so callers needn't hold
+        the full payload in memory; reduces peak usage when concurrent chunks pull a large blob.
 
         Returns:
             (payload, mime): 字节内容与 MIME。
@@ -178,14 +185,27 @@ def _is_within(path: Path, parent: Path) -> bool:
     return True
 
 
+def _unique_tmp_path(path: Path) -> Path:
+    """生成进程/线程唯一的临时文件名（``<name>.<pid>.<uuid8>.tmp``）.
+    Build a process+thread-unique tmp filename to avoid cross-process collisions.
+
+    若多个 Computer 进程共享 ``cache_root`` 且并发写同一 cid（同字节内容），固定 ``<cid>.tmp``
+    会让两次写共用一个临时文件——第二次 ``os.replace`` 源已被前者 rename 走 → ``FileNotFoundError``。
+    Cross-process concurrent puts of the same cid (same bytes) would share a fixed ``<cid>.tmp``;
+    the second ``os.replace`` could find its source already renamed → ``FileNotFoundError``.
+    """
+    unique = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    return path.with_suffix(f"{path.suffix}.{unique}.tmp")
+
+
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """原子写：先写临时文件，再 rename 覆盖目标（POSIX 跨内核保证）/ Atomic write via rename."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    """原子写：先写**唯一**临时文件，再 rename 覆盖目标（POSIX 跨内核保证）/ Atomic write via unique tmp + rename."""
+    tmp = _unique_tmp_path(path)
     tmp.write_bytes(payload)
     os.replace(tmp, path)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _unique_tmp_path(path)
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
