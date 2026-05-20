@@ -240,6 +240,44 @@ class TestSkillsUpdatedAutoRefresh:
             await async_client._on_skills_updated({})
             mock_refresh.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_async_dispatches_on_skills_received(self, async_client: AsyncSMCPAgentClient) -> None:
+        """成功重拉后回调 on_skills_received，参数透传 / Hook fires with passthrough args (v0.2.1+)."""
+        skills = [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        hook = AsyncMock()
+        async_client.event_handler = hook  # type: ignore[assignment]
+        with patch.object(async_client, "get_skills", new=AsyncMock(return_value={"skills": skills, "req_id": "r"})):
+            await async_client._on_skills_updated({"computer": "comp-1"})
+            hook.on_skills_received.assert_awaited_once_with("comp-1", skills, async_client)
+
+    @pytest.mark.asyncio
+    async def test_async_skips_hook_when_event_handler_is_none(self, async_client: AsyncSMCPAgentClient) -> None:
+        """event_handler is None：不抛 / silent skip when event_handler absent."""
+        async_client.event_handler = None  # type: ignore[assignment]
+        with patch.object(async_client, "get_skills", new=AsyncMock(return_value={"skills": [], "req_id": "r"})):
+            await async_client._on_skills_updated({"computer": "comp-1"})  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_async_skips_hook_when_handler_missing_method(self, async_client: AsyncSMCPAgentClient) -> None:
+        """向后兼容：旧 handler 未实现 on_skills_received → hasattr 守卫静默跳过.
+        Backward-compat: legacy handler missing the method → hasattr guard skips silently."""
+        class _LegacyEH:
+            async def on_tools_received(self, *a: Any, **k: Any) -> None: ...
+
+        async_client.event_handler = _LegacyEH()  # type: ignore[assignment]
+        with patch.object(async_client, "get_skills", new=AsyncMock(return_value={"skills": [], "req_id": "r"})):
+            await async_client._on_skills_updated({"computer": "comp-1"})  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_async_hook_exception_does_not_propagate(self, async_client: AsyncSMCPAgentClient) -> None:
+        """hook 抛错被独立 try 捕获，不向上传播 / Hook errors isolated, not propagated."""
+        hook = AsyncMock()
+        hook.on_skills_received.side_effect = RuntimeError("hook boom")
+        async_client.event_handler = hook  # type: ignore[assignment]
+        with patch.object(async_client, "get_skills", new=AsyncMock(return_value={"skills": [], "req_id": "r"})):
+            await async_client._on_skills_updated({"computer": "comp-1"})  # must not raise
+            hook.on_skills_received.assert_awaited_once()
+
 
 # ── tool_call binary post-process ───────────────────────────────────
 
@@ -394,3 +432,37 @@ class TestSyncMirror:
         with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": [], "req_id": "r"})) as mock_refresh:
             sync_client._on_skills_updated({"computer": "comp-1"})
             mock_refresh.assert_called_once_with("comp-1")
+
+    def test_sync_dispatches_on_skills_received(self, sync_client: SMCPAgentClient) -> None:
+        """sync 镜像：成功重拉后回调 on_skills_received（v0.2.1+）.
+        Sync mirror: hook fires with passthrough args (v0.2.1+)."""
+        skills = [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        hook = MagicMock()
+        sync_client.event_handler = hook  # type: ignore[assignment]
+        with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": skills, "req_id": "r"})):
+            sync_client._on_skills_updated({"computer": "comp-1"})
+            hook.on_skills_received.assert_called_once_with("comp-1", skills, sync_client)
+
+    def test_sync_skips_hook_when_event_handler_is_none(self, sync_client: SMCPAgentClient) -> None:
+        """sync 镜像：event_handler is None → 静默跳过."""
+        sync_client.event_handler = None  # type: ignore[assignment]
+        with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": [], "req_id": "r"})):
+            sync_client._on_skills_updated({"computer": "comp-1"})  # must not raise
+
+    def test_sync_skips_hook_when_handler_missing_method(self, sync_client: SMCPAgentClient) -> None:
+        """sync 镜像：向后兼容旧 handler 缺方法时 hasattr 守卫静默跳过."""
+        class _LegacyEH:
+            def on_tools_received(self, *a: Any, **k: Any) -> None: ...
+
+        sync_client.event_handler = _LegacyEH()  # type: ignore[assignment]
+        with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": [], "req_id": "r"})):
+            sync_client._on_skills_updated({"computer": "comp-1"})  # must not raise
+
+    def test_sync_hook_exception_does_not_propagate(self, sync_client: SMCPAgentClient) -> None:
+        """sync 镜像：hook 抛错独立隔离不向上传播."""
+        hook = MagicMock()
+        hook.on_skills_received.side_effect = RuntimeError("hook boom")
+        sync_client.event_handler = hook  # type: ignore[assignment]
+        with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": [], "req_id": "r"})):
+            sync_client._on_skills_updated({"computer": "comp-1"})  # must not raise
+            hook.on_skills_received.assert_called_once()
