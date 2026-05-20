@@ -3,6 +3,7 @@
 # @Author  : JQQ
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
+import base64
 from typing import Any
 
 from mcp.types import CallToolResult, Resource
@@ -10,10 +11,16 @@ from pydantic import TypeAdapter
 from socketio import AsyncClient
 
 from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.computer.blob import (
+    BlobHandleError,
+    BlobHandleInvalidError,
+    decode_blob_handle,
+)
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
 from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.smcp import (
+    GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
@@ -29,6 +36,8 @@ from a2c_smcp.smcp import (
     EnterOfficeReq,
     ErrorCode,
     ErrorPayload,
+    GetBlobReq,
+    GetBlobRet,
     GetComputerConfigReq,
     GetComputerConfigRet,
     GetDeskTopReq,
@@ -141,6 +150,7 @@ class SMCPComputerClient(AsyncClient):
         self.on(GET_CONFIG_EVENT, self.on_get_config, namespace=self._namespace)
         self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
         self.on(GET_RESOURCES_EVENT, self.on_get_resources, namespace=self._namespace)
+        self.on(GET_BLOB_EVENT, self.on_get_blob, namespace=self._namespace)
         self.office_id: str | None = None
 
     @property
@@ -445,3 +455,92 @@ class SMCPComputerClient(AsyncClient):
         if next_cursor is not None:
             ret["next_cursor"] = next_cursor
         return ret
+
+    async def on_get_blob(self, data: GetBlobReq) -> GetBlobRet | ErrorPayload:
+        """
+        通用二进制拉取 / Generic binary pull.
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md#client:get_blob + blob-transfer.md。
+        无状态、幂等、可并行不同 ``chunk_offset``——Computer 不保留任何 session / cursor。
+        Stateless, idempotent, parallel-safe across ``chunk_offset``s — Computer keeps no
+        session / cursor state.
+
+        安全 / Security (blob-transfer.md §5.4):
+          - 句柄解码 + kind 派发 → resolver 重施铸造通道边界校验，**绝不**信任句柄内容
+          - 单块大小 clamp 到 ``BlobThresholds.chunk_max_bytes``，保证 base64+envelope ≤ Server buffer
+
+        错误语义（flat ErrorPayload，无嵌套 envelope）/ Errors (flat ErrorPayload):
+          - 4018 ``invalid_handle``：句柄格式非法 / 不识别 / kind 未注册 resolver
+          - 4018 ``forbidden``：resolver 重施鉴权失败（如 skill orphan / 沙箱拒绝）
+          - 4018 ``gone``：源已不可达（cid 已 GC / SKILL 卸载）
+          - 4018 ``range``：``chunk_offset`` < 0 或 > ``total_size``
+
+        Args:
+            data (GetBlobReq): ``computer`` / ``blob_handle`` / 可选 ``chunk_offset`` / 可选 ``max_chunk_bytes`` / ``req_id``。
+
+        Returns:
+            GetBlobRet | ErrorPayload: 成功为切片块（``base64`` 编码），失败为 flat ErrorPayload。
+        """
+        # office/role 隔离：Server 已保证同房间路由，但 ``computer`` 标识仍需匹配
+        # office/role isolation: Server guarantees same-room routing, but ``computer`` MUST match
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
+
+        handle = data["blob_handle"]
+        chunk_offset = data.get("chunk_offset", 0)
+        max_chunk_bytes_req = data.get("max_chunk_bytes")
+        max_chunk_bytes = self.computer.blob_thresholds.clamp_chunk(max_chunk_bytes_req)
+
+        # 1) 解码句柄 → kind 派发 / Decode handle → kind dispatch
+        try:
+            kind, payload = decode_blob_handle(handle)
+        except BlobHandleInvalidError as e:
+            logger.warning(f"client:get_blob invalid handle: {e}")
+            return _blob_error(reason="invalid_handle")
+
+        resolver = self.computer.blob_resolvers.get(kind)
+        if resolver is None:
+            logger.warning(f"client:get_blob no resolver for kind={kind!r}")
+            return _blob_error(reason="invalid_handle")
+
+        # 2) 解析（resolver 内部重施铸造通道边界校验）/ Resolve (resolver re-applies channel auth)
+        try:
+            resolved = resolver.resolve(payload)
+        except BlobHandleError as e:
+            reason = getattr(e, "reason", "forbidden")
+            logger.warning(f"client:get_blob resolver rejected handle: kind={kind}, reason={reason}, err={e}")
+            return _blob_error(reason=reason)
+
+        # 3) 范围校验 / Range check
+        if not isinstance(chunk_offset, int) or chunk_offset < 0 or chunk_offset > resolved.total_size:
+            logger.warning(
+                f"client:get_blob range out of bounds: offset={chunk_offset}, total_size={resolved.total_size}",
+            )
+            return _blob_error(reason="range")
+
+        # 4) 切片 + base64 编码（单块 ≤ clamp 后的 max_chunk_bytes）/ Slice + base64 (chunk ≤ clamp)
+        end = min(chunk_offset + max_chunk_bytes, resolved.total_size)
+        chunk = resolved.payload[chunk_offset:end]
+        eof = end == resolved.total_size
+        ret: GetBlobRet = {
+            "blob_handle": handle,
+            "mime_type": resolved.mime,
+            "total_size": resolved.total_size,
+            "sha256": resolved.sha256,
+            "chunk_offset": chunk_offset,
+            "eof": eof,
+            "blob": base64.b64encode(chunk).decode("ascii"),
+            "req_id": data["req_id"],
+        }
+        return ret
+
+
+def _blob_error(*, reason: str) -> ErrorPayload:
+    """构造 ``4018 Blob Not Accessible`` flat ErrorPayload，``reason`` 经 ``details`` 下沉。
+    Build ``4018`` flat ErrorPayload with ``reason`` under ``details`` (per error-handling.md §4018).
+    """
+    return ErrorPayload(
+        code=int(ErrorCode.BLOB_NOT_ACCESSIBLE),
+        message="Blob not accessible",
+        details={"reason": reason},
+    )

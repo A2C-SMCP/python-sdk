@@ -19,6 +19,7 @@ import pytest
 
 from a2c_smcp.computer.socketio.client import DEFAULT_AUTH_HEADER_NAME, SMCPComputerClient
 from a2c_smcp.smcp import (
+    GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
@@ -72,6 +73,7 @@ def test_computer_client_custom_namespace_registers_all_handlers() -> None:
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
         GET_RESOURCES_EVENT,
+        GET_BLOB_EVENT,
     }
 
 

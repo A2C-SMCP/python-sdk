@@ -899,6 +899,7 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
     """
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
     from a2c_smcp.smcp import (
+        GET_BLOB_EVENT,
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
         GET_RESOURCES_EVENT,
@@ -976,4 +977,5 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
         GET_RESOURCES_EVENT,
+        GET_BLOB_EVENT,
     }, f"Unexpected event handlers under {custom_ns!r}: {registered!r}"
