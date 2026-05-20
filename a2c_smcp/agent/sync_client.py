@@ -522,14 +522,28 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         return raw
 
     def _on_skills_updated(self, data: dict) -> None:
-        """同步：处理 SKILL 集合更新通知（v0.2.1 sync mirror）；默认自动重拉 ``client:get_skills``."""
+        """同步：处理 SKILL 集合更新通知（v0.2.1 sync mirror）；默认自动重拉 ``client:get_skills`` 并回调 ``on_skills_received``.
+
+        Sync mirror: default auto-refresh + ``on_skills_received`` dispatch; hook errors isolated.
+        """
         try:
             computer = data.get("computer")
             if not computer:
                 logger.warning("UPDATE_SKILLS_NOTIFICATION missing 'computer'")
                 return
             ret = self.get_skills(computer)
-            logger.info(f"Skills refreshed from computer {computer}: count={len(ret.get('skills', []))}")
+            skills = ret.get("skills", [])
+            logger.info(f"Skills refreshed from computer {computer}: count={len(skills)}")
+            # v0.2.1: 派发 on_skills_received（hook 异常独立隔离，不污染拉取链路）
+            # Dispatch on_skills_received; hook errors are isolated and never propagated.
+            if self.event_handler and hasattr(self.event_handler, "on_skills_received"):
+                try:
+                    self.event_handler.on_skills_received(computer, skills, self)
+                except Exception as hook_exc:
+                    logger.error(
+                        f"on_skills_received hook raised for computer {computer}: {hook_exc}",
+                        exc_info=True,
+                    )
         except Exception as e:
             logger.error(f"Error handling skills updated notification: {e}", exc_info=True)
 

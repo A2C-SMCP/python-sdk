@@ -578,10 +578,11 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         return raw
 
     async def _on_skills_updated(self, data: dict) -> None:
-        """处理 SKILL 集合更新通知（v0.2.1）：默认自动重拉 ``client:get_skills``.
+        """处理 SKILL 集合更新通知（v0.2.1）：默认自动重拉 ``client:get_skills`` 并回调 ``on_skills_received``.
 
-        Handle ``notify:update_skills``: default behavior re-fetches ``client:get_skills`` once
-        (mirrors the existing ``notify:update_*`` auto-refresh pattern).
+        Handle ``notify:update_skills``: default behavior re-fetches ``client:get_skills`` once and
+        dispatches ``on_skills_received`` to the configured event handler (mirrors the existing
+        ``notify:update_*`` auto-refresh pattern; hook errors are isolated and never propagated).
         """
         try:
             computer = data.get("computer")
@@ -589,7 +590,18 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
                 logger.warning("UPDATE_SKILLS_NOTIFICATION missing 'computer'")
                 return
             ret = await self.get_skills(computer)
-            logger.info(f"Skills refreshed from computer {computer}: count={len(ret.get('skills', []))}")
+            skills = ret.get("skills", [])
+            logger.info(f"Skills refreshed from computer {computer}: count={len(skills)}")
+            # v0.2.1: 派发 on_skills_received（hook 异常独立隔离，不污染拉取链路）
+            # Dispatch on_skills_received; hook errors are isolated and never propagated.
+            if self.event_handler and hasattr(self.event_handler, "on_skills_received"):
+                try:
+                    await self.event_handler.on_skills_received(computer, skills, self)
+                except Exception as hook_exc:
+                    logger.error(
+                        f"on_skills_received hook raised for computer {computer}: {hook_exc}",
+                        exc_info=True,
+                    )
         except Exception as e:
             logger.error(f"Error handling skills updated notification: {e}", exc_info=True)
 
