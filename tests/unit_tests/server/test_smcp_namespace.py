@@ -604,7 +604,7 @@ class TestV021ClientRoutesAndUpdateSkills:
     @pytest.mark.asyncio
     async def test_on_client_get_skills_relays_and_returns_typed_ret(self, routed_ns):
         ns, agent_sid, comp_name, comp_sid = routed_ns
-        ns.call.return_value = {"skills": [], "req_id": "r1"}
+        ns.call.return_value = {"skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}], "req_id": "r1"}
         ret = await ns.on_client_get_skills(agent_sid, {"agent": "agent-1", "req_id": "r1", "computer": comp_name})
         # call 携带正确事件名 + Computer 目标 SID / call must dispatch to right event + sid
         ns.call.assert_awaited_once()
@@ -612,8 +612,10 @@ class TestV021ClientRoutesAndUpdateSkills:
         assert args[0] == GET_SKILLS_EVENT
         assert kwargs["to"] == comp_sid
         assert kwargs["namespace"] == SMCP_NAMESPACE
-        # 成功响应经 TypeAdapter 校验 / Success validated by TypeAdapter
-        assert "skills" in ret
+        # 语义级断言：内容完整透传（拒绝 "TypeAdapter 把字段吃掉" 或 "被测函数 return data" 的退化）.
+        # Semantic-level assertion: contents passed through (catches TypeAdapter swallowing fields).
+        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        assert ret["req_id"] == "r1"
 
     @pytest.mark.asyncio
     async def test_on_client_get_skill_relays_body_branch(self, routed_ns):

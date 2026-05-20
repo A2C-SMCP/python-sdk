@@ -167,14 +167,16 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
 
     def test_on_client_get_skills_relays(self, routed_ns):
         ns, agent_sid, comp_name, comp_sid = routed_ns
-        ns.call.return_value = {"skills": [], "req_id": "r1"}
+        ns.call.return_value = {"skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}], "req_id": "r1"}
         ret = ns.on_client_get_skills(agent_sid, {"agent": "agent-1", "req_id": "r1", "computer": comp_name})
         ns.call.assert_called_once()
         args, kwargs = ns.call.call_args
         assert args[0] == GET_SKILLS_EVENT
         assert kwargs["to"] == comp_sid
         assert kwargs["namespace"] == SMCP_NAMESPACE
-        assert "skills" in ret
+        # 语义级断言：内容完整透传 / Semantic-level assertion: contents passed through
+        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        assert ret["req_id"] == "r1"
 
     def test_on_client_get_skill_relays(self, routed_ns):
         ns, agent_sid, comp_name, _comp_sid = routed_ns
@@ -212,6 +214,35 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         )
         assert ns.call.call_args[0][0] == GET_BLOB_EVENT
         assert ret["eof"] is True
+
+    def test_get_skill_4017_passthrough(self, routed_ns):
+        """``4017 traversal`` flat ErrorPayload 跨 sync 路由透传 / 4017 passes through sync routing.
+
+        显式镜像 async 同名用例，避免依赖 ``_relay_client_call`` 抽象等价性的间接证据。
+        Explicit sync mirror of async case; avoids relying solely on shared-helper equivalence."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {
+            "code": int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE),
+            "message": "Skill resource not accessible",
+            "details": {"reason": "traversal", "rel_path": "../etc"},
+        }
+        ret = ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "name": "user:x:y"},
+        )
+        assert ret["code"] == int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE)
+        assert ret["details"]["reason"] == "traversal"
+        assert ret["details"]["rel_path"] == "../etc"
+
+    def test_get_skill_4014_name_absent_passthrough(self, routed_ns):
+        """SKILL ``name`` 格式合法但 Registry 未命中复用 4014（sync mirror of async case）."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "skill not found"}
+        ret = ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "name": "user:no-such:skill"},
+        )
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
 
     def test_get_blob_4018_passthrough(self, routed_ns):
         """``4018 gone`` flat ErrorPayload 跨 sync 路由透传 / 4018 gone passes through sync routing."""
