@@ -9,7 +9,7 @@
 """
 
 import copy
-from typing import cast
+from typing import Any, cast
 
 from pydantic import TypeAdapter
 
@@ -21,23 +21,33 @@ from a2c_smcp.server.utils import aget_all_sessions_in_office
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
+    GET_BLOB_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
     UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
     EnterOfficeReq,
     ErrorPayload,
+    GetBlobReq,
+    GetBlobRet,
     GetDeskTopReq,
     GetDeskTopRet,
     GetResourcesReq,
     GetResourcesRet,
+    GetSkillReq,
+    GetSkillRet,
+    GetSkillsReq,
+    GetSkillsRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
@@ -456,42 +466,54 @@ class SMCPNamespace(BaseNamespace):
         )
         return TypeAdapter(GetDeskTopRet).validate_python(client_response)
 
-    async def on_client_get_resources(self, sid: str, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
-        """
-        透明转发 ``client:get_resources`` 至目标 Computer（含 cursor 翻页）。
-        Relay ``client:get_resources`` to the target Computer (with cursor pagination).
+    async def _relay_client_call(
+        self,
+        sid: str,
+        data: Any,
+        event: str,
+        ret_adapter: TypeAdapter[Any],
+    ) -> Any:
+        """通用 ``client:*`` 事件路由 / Generic ``client:*`` event router.
 
-        要求 Agent 与 Computer 在同一 office。Server 仅做路由，不解释资源语义；
-        Computer 返回的 flat ErrorPayload（4014 / 4015）原样回传，不做 GetResourcesRet 强转。
-        Requires Agent and Computer in the same office. Server only routes; a flat ErrorPayload
-        (4014 / 4015) from the Computer is passed through verbatim without GetResourcesRet coercion.
+        统一收敛 office/role 隔离校验、Computer SID 解析、flat ErrorPayload 透传，
+        让新事件 handler 缩到一行。
+        Unifies office/role isolation, Computer SID lookup, and flat-ErrorPayload pass-through,
+        so each new event handler is a one-liner.
+
+        协议依据 / Protocol: events.md 各 ``client:*`` 事件 + error-handling.md flat ErrorPayload.
 
         Args:
-            sid (str): 发起者ID，一般是Agent / Initiator ID, usually Agent
-            data (GetResourcesReq): 含 computer / mcp_server / 可选 cursor / req_id
+            sid: 发起者 SID（一般是 Agent）/ Initiator SID (usually Agent).
+            data: 请求负载，**MUST** 含 ``computer`` 字段 / payload MUST contain ``computer``.
+            event: 转发的 Socket.IO 事件名（``GET_*_EVENT`` 常量）/ Socket.IO event name to relay.
+            ret_adapter: 成功响应的 TypeAdapter（如 ``TypeAdapter(GetResourcesRet)``），用于强校验.
+                Pydantic TypeAdapter for the success-shape return.
 
         Returns:
-            GetResourcesRet | ErrorPayload: 资源页或 flat 错误负载
+            成功响应（按 ``ret_adapter`` 校验后的 TypedDict）或 flat ``ErrorPayload``。
+            Success TypedDict (validated) or flat ErrorPayload.
+
+        Raises:
+            ValueError: ``computer`` 名未找到对应 SID（4014 边界由 Computer 端铸造，Server 路由前直接拒绝）.
+            SMCPNamespaceError: ``role != "computer"`` 或跨房间访问（office_id 不一致）.
         """
         computer_name = data["computer"]
-
-        # 通过name获取computer的sid / Get computer's sid by name
         computer_sid = await self.get_sid_by_name(computer_name)
         if not computer_sid:
             raise ValueError(f"Computer with name '{computer_name}' not found")
 
         session = await self.get_session(computer_sid)
         if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持获取Computer资源列表")
+            raise SMCPNamespaceError(f"目前仅支持 Computer 响应 {event} / target SID is not a Computer")
 
         agent_session = await self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-        if computer_office_id != agent_office_id:
-            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的资源列表")
+        if session.get("office_id") != agent_session.get("office_id"):
+            raise SMCPNamespaceError(
+                f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
+            )
 
         client_response = await self.call(
-            GET_RESOURCES_EVENT,
+            event,
             data,
             to=computer_sid,
             namespace=SMCP_NAMESPACE,
@@ -500,7 +522,55 @@ class SMCPNamespace(BaseNamespace):
         # Pass flat ErrorPayload through (no nested envelope; predicate shared with agent side)
         if is_protocol_error_payload(client_response):
             return TypeAdapter(ErrorPayload).validate_python(client_response)
-        return TypeAdapter(GetResourcesRet).validate_python(client_response)
+        return ret_adapter.validate_python(client_response)
+
+    async def on_client_get_resources(self, sid: str, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
+        """
+        透明转发 ``client:get_resources`` 至目标 Computer（含 cursor 翻页）。
+        Relay ``client:get_resources`` to the target Computer (with cursor pagination).
+
+        Computer 返回的 flat ErrorPayload（4014 / 4015）原样回传，不做 GetResourcesRet 强转。
+        Flat ErrorPayload (4014 / 4015) from the Computer is passed through verbatim.
+        """
+        return cast(
+            "GetResourcesRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_RESOURCES_EVENT, TypeAdapter(GetResourcesRet)),
+        )
+
+    async def on_client_get_skills(self, sid: str, data: GetSkillsReq) -> GetSkillsRet | ErrorPayload:
+        """透明转发 ``client:get_skills`` 至目标 Computer / Relay ``client:get_skills``.
+
+        协议依据 / Protocol: events.md §client:get_skills；data-structures.md §GetSkillsRet（轻量元数据）.
+        """
+        return cast(
+            "GetSkillsRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_SKILLS_EVENT, TypeAdapter(GetSkillsRet)),
+        )
+
+    async def on_client_get_skill(self, sid: str, data: GetSkillReq) -> GetSkillRet | ErrorPayload:
+        """透明转发 ``client:get_skill`` 至目标 Computer / Relay ``client:get_skill``.
+
+        协议依据 / Protocol: events.md §client:get_skill；error-handling.md §4016 / §4017（``details.reason`` 透传）.
+        """
+        return cast(
+            "GetSkillRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_SKILL_EVENT, TypeAdapter(GetSkillRet)),
+        )
+
+    async def on_client_get_blob(self, sid: str, data: GetBlobReq) -> GetBlobRet | ErrorPayload:
+        """透明转发 ``client:get_blob`` 至目标 Computer / Relay ``client:get_blob``.
+
+        Server **不**重组 blob，按 ``computer`` 逐 ack 透传；并行红利（协议 §3）由 Agent 侧 drain 例程
+        通过对不同 ``chunk_offset`` 并发调用实现。
+        Server does NOT reassemble; each ``chunk_offset`` is a separate ack. Parallel dividend
+        (protocol §3) is realized by the Agent's drain routine issuing concurrent calls per offset.
+
+        协议依据 / Protocol: events.md §client:get_blob；blob-transfer.md §3 (parallel) / §5.4 (handle untrusted).
+        """
+        return cast(
+            "GetBlobRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_BLOB_EVENT, TypeAdapter(GetBlobRet)),
+        )
 
     async def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq) -> None:
         """
@@ -518,6 +588,32 @@ class SMCPNamespace(BaseNamespace):
         update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
         await self.emit(
             UPDATE_DESKTOP_NOTIFICATION,
+            {"computer": update_req["computer"]},
+            room=session.get("office_id"),
+            skip_sid=sid,
+        )
+
+    async def on_server_update_skills(self, sid: str, data: UpdateComputerConfigReq) -> None:
+        """将 ``server:update_skills`` 广播为 ``notify:update_skills`` / Broadcast SKILL set change.
+
+        Computer 在 SKILL 集合变化（增/删/物化更新）时触发；Server 转广播给同 office 内的 Agent，
+        Agent 据此自动重拉 ``client:get_skills``（仿既有 ``notify:update_*`` 自动刷新模式）。
+        Computer emits on SKILL set change; Server broadcasts to office; Agent auto re-fetches
+        ``client:get_skills`` (same pattern as other ``notify:update_*`` events).
+
+        载荷复用 ``UpdateComputerConfigReq``（仅 ``computer`` 字段，data-structures.md §UpdateComputerConfigReq
+        三事件族共用）。
+        Payload reuses ``UpdateComputerConfigReq`` (data-structures.md shared across 3 event families).
+
+        协议依据 / Protocol: events.md §server:update_skills / §notify:update_skills.
+        """
+        session = await self.get_session(sid)
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持 Computer 上报 SKILL 变更 / only Computers may emit update_skills")
+
+        update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
+        await self.emit(
+            UPDATE_SKILLS_NOTIFICATION,
             {"computer": update_req["computer"]},
             room=session.get("office_id"),
             skip_sid=sid,
