@@ -31,6 +31,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
@@ -47,6 +48,15 @@ from prompt_toolkit import PromptSession
 from pydantic import BaseModel, TypeAdapter
 
 from a2c_smcp.computer.base import BaseComputer
+from a2c_smcp.computer.blob import (
+    BlobResolver,
+    BlobThresholds,
+    BlobTooLargeError,
+    SkillBlobResolverPending,
+    ToolspoolBlobResolver,
+    ToolspoolBlobStore,
+    default_thresholds,
+)
 from a2c_smcp.computer.desktop.organize import organize_desktop
 from a2c_smcp.computer.inputs.render import ConfigRender
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
@@ -75,6 +85,9 @@ class Computer(BaseComputer[PromptSession]):
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: InputResolver | None = None,
+        blob_cache_root: Path | None = None,
+        blob_resolvers: dict[str, BlobResolver] | None = None,
+        blob_thresholds: BlobThresholds | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -93,6 +106,15 @@ class Computer(BaseComputer[PromptSession]):
             auto_connect (bool): 是否自动连接。Whether to auto connect.
             auto_reconnect (bool): 是否自动重连。Whether to auto reconnect.
             confirm_callback (Callable[[str, str, str, dict], bool] | None): 工具调用二次确认回调
+            blob_cache_root (Path | None): v0.2.1 通用二进制传输缓存根。默认 ``~/.a2c``；
+                ``.blobspool/`` 子目录将挂在其下。v0.2.1 milestone 内 #39 接管 SKILL Home 后会
+                统一为 SKILL Home 同级。Generic blob-transfer cache root; ``.blobspool/`` lives
+                here. To be replaced by SKILL Home sibling once #39 lands.
+            blob_resolvers (dict[str, BlobResolver] | None): kind → resolver 映射覆盖；缺省装配
+                ``toolspool`` (完整) 与 ``skill`` (#39 占位)。Kind → resolver override; defaults
+                wire ``toolspool`` (complete) and ``skill`` (#39 placeholder).
+            blob_thresholds (BlobThresholds | None): SKILL / blob 阈值（inline / too_large / chunk_max）；
+                缺省经环境变量覆盖。Threshold bundle; defaults honor env overrides.
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
@@ -116,6 +138,22 @@ class Computer(BaseComputer[PromptSession]):
         # 窗口缓存（仅记录满足 WindowURI 的资源 URI，避免无关资源导致刷新）
         # Windows cache (only URIs that conform to WindowURI to avoid irrelevant refresh triggers)
         self._windows_cache: set[str] = set()
+
+        # v0.2.1 通用二进制传输基础设施 / v0.2.1 generic blob-transfer infrastructure
+        # 协议依据 / Protocol: blob-transfer.md；设计 / Design: §4.3 / §4.4
+        self._blob_cache_root: Path = (blob_cache_root or Path.home() / ".a2c").expanduser().resolve()
+        self._blob_cache_root.mkdir(parents=True, exist_ok=True)
+        self._toolspool_store: ToolspoolBlobStore = ToolspoolBlobStore(self._blob_cache_root)
+        # 默认 resolver 装配：toolspool 完整、skill 占位（#39 接管后替换）
+        # Default resolver wiring: toolspool complete, skill placeholder (replaced by #39)
+        default_resolvers: dict[str, BlobResolver] = {
+            "toolspool": ToolspoolBlobResolver(self._toolspool_store),
+            "skill": SkillBlobResolverPending(),
+        }
+        if blob_resolvers is not None:
+            default_resolvers.update(blob_resolvers)
+        self._blob_resolvers: dict[str, BlobResolver] = default_resolvers
+        self._blob_thresholds: BlobThresholds = blob_thresholds or default_thresholds()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
     # The tool call record type is extracted to ToolCallRecord for reuse across modules
@@ -141,6 +179,70 @@ class Computer(BaseComputer[PromptSession]):
             client (AsyncClient | None): 要绑定的客户端，None 表示清空。
         """
         self._socketio_client_ref = weakref.ref(client) if client is not None else None
+
+    # ------------------------
+    # 通用二进制传输 / Generic blob transfer (v0.2.1)
+    # ------------------------
+    @property
+    def blob_resolvers(self) -> dict[str, BlobResolver]:
+        """``kind → BlobResolver`` 派发表（``client:get_blob`` handler 使用）.
+
+        Kind-to-resolver dispatch table consumed by the ``client:get_blob`` handler.
+        """
+        return self._blob_resolvers
+
+    @property
+    def blob_thresholds(self) -> BlobThresholds:
+        """SKILL / blob 阈值（inline budget / too_large cap / chunk max）.
+
+        Thresholds for inline budget, too-large cap, and chunk max bytes.
+        """
+        return self._blob_thresholds
+
+    @property
+    def toolspool_store(self) -> ToolspoolBlobStore:
+        """``.blobspool`` 内容寻址暂存（``tool_call`` 二进制旁路铸造时写入）.
+
+        Content-addressed ``.blobspool`` store; written when minting tool_call binary sideband.
+        """
+        return self._toolspool_store
+
+    def mint_toolspool_handle(self, payload: bytes, mime: str) -> str:
+        """铸造 ``kind=toolspool`` 不透明句柄并写盘 / Mint an opaque ``kind=toolspool`` handle.
+
+        ``tool_call`` 返回的超内联预算二进制 content item 通过此入口写入 ``.blobspool``，
+        返回的 handle 走 ``_meta.a2c_blob_handle`` 旁路交付 Agent（#40 接入）.
+        Tool_call binary items that exceed the inline budget go through this entry, are written
+        into ``.blobspool``, and the returned handle ships via ``_meta.a2c_blob_handle`` (#40).
+
+        防御纵深 / Defense in depth (协议 ``blob-transfer.md`` §3 + 设计 §4.4):
+            协议要求 too_large 在**铸造期**决断（不铸句柄、零字节传输；DoS 防御）。本入口即铸造期，
+            ``len(payload) > thresholds.too_large_cap`` → 抛 :class:`BlobTooLargeError`，**不写盘**。
+            上游 (#40) 应在其上再做内联预算 / 文本 vs 二进制路由判定；此处是兜底防御层。
+            Protocol mandates too_large decided at minting time (no handle, zero bytes — DoS guard).
+            This entry is that minting point; ``len(payload) > too_large_cap`` raises BlobTooLargeError
+            **without writing to disk**. Upstream (#40) handles inline-budget routing; this is the
+            fallback defense layer.
+
+        Args:
+            payload: 解码后的原始字节内容（**不是** base64）.
+            mime: 内容 MIME（如 ``image/png``）.
+
+        Returns:
+            不透明 ``blob_handle`` 字符串.
+
+        Raises:
+            BlobTooLargeError: ``len(payload) > thresholds.too_large_cap`` —— 拒绝铸造，不写盘。
+        """
+        # 局部导入避免顶层循环：handle 编码 / Local import to avoid top-level cycles
+        from a2c_smcp.computer.blob import encode_toolspool_handle
+
+        size = len(payload)
+        cap = self._blob_thresholds.too_large_cap
+        if size > cap:
+            raise BlobTooLargeError(size=size, cap=cap)
+        cid = self._toolspool_store.put(payload, mime)
+        return encode_toolspool_handle(cid=cid, mime=mime)
 
     async def boot_up(self, *, session: PromptSession | None = None) -> None:
         """
