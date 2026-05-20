@@ -566,7 +566,9 @@ async def test_get_resources_cross_office_rejected(socketio_server, basic_server
     agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-A2", "robot-neg-2")
     await _connect_join(computer, basic_server_port, "computer", "office-neg-B2", "comp-neg-2")
 
-    with pytest.raises(SMCPNamespaceError, match="自己房间内Computer的资源列表"):
+    # v0.2.1 #41 起，跨房间消息由 ``_relay_client_call`` 统一收敛，错误文案改为通用 "跨房间" 模板
+    # Since v0.2.1 #41, cross-office checks are centralized in ``_relay_client_call``
+    with pytest.raises(SMCPNamespaceError, match="跨房间"):
         await socketio_server.on_client_get_resources(
             agent_sid,
             {"computer": "comp-neg-2", "agent": "robot-neg-2", "mcp_server": "any", "req_id": "neg-r2"},

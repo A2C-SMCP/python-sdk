@@ -19,11 +19,16 @@ from a2c_smcp.server import (
     SMCPNamespace,
 )
 from a2c_smcp.smcp import (
+    GET_BLOB_EVENT,
     GET_DESKTOP_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     SMCP_NAMESPACE,
     UPDATE_DESKTOP_EVENT,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
     EnterOfficeReq,
+    ErrorCode,
     GetDeskTopReq,
     GetDeskTopRet,
     LeaveOfficeReq,
@@ -563,3 +568,218 @@ class TestDefaultAuthenticationProvider:
         await smcp_namespace.enter_room(computer_sid, "room1")
 
         assert smcp_namespace.save_session.called
+
+
+class TestV021ClientRoutesAndUpdateSkills:
+    """v0.2.1 #41：3 ``client:*`` 路由（``get_skills`` / ``get_skill`` / ``get_blob``）+ ``server:update_skills`` 广播.
+
+    v0.2.1 #41: 3 new ``client:*`` routes + ``server:update_skills`` broadcast.
+
+    覆盖统一 ``_relay_client_call`` 助手的关键不变量：
+      - Computer SID 解析（未注册 → ValueError，对齐 4014 边界）
+      - office/role 隔离 **显式 raise SMCPNamespaceError**（非 assert，对齐 #31 `-O` 加固）
+      - flat ErrorPayload 透传（无嵌套 envelope，不二次 unwrap；与 agent 侧 predicate 一致）
+    Covers the key invariants of the unified ``_relay_client_call`` helper.
+    """
+
+    @pytest.fixture
+    def routed_ns(self, smcp_namespace, mock_server):
+        """同 office 的 agent + computer，``call`` 默认返回成功响应（按事件特化覆盖）.
+        Agent + Computer in same office; ``call`` returns happy-path responses by default."""
+        smcp_namespace.server = mock_server
+        agent_sid = "a-sid"
+        comp_name = "c1"
+        comp_sid = "c-sid"
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = AsyncMock(
+            side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent),
+        )
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace.call = AsyncMock()
+        return smcp_namespace, agent_sid, comp_name, comp_sid
+
+    # ── 成功路径 / Happy paths ────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_on_client_get_skills_relays_and_returns_typed_ret(self, routed_ns):
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {"skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}], "req_id": "r1"}
+        ret = await ns.on_client_get_skills(agent_sid, {"agent": "agent-1", "req_id": "r1", "computer": comp_name})
+        # call 携带正确事件名 + Computer 目标 SID / call must dispatch to right event + sid
+        ns.call.assert_awaited_once()
+        args, kwargs = ns.call.call_args
+        assert args[0] == GET_SKILLS_EVENT
+        assert kwargs["to"] == comp_sid
+        assert kwargs["namespace"] == SMCP_NAMESPACE
+        # 语义级断言：内容完整透传（拒绝 "TypeAdapter 把字段吃掉" 或 "被测函数 return data" 的退化）.
+        # Semantic-level assertion: contents passed through (catches TypeAdapter swallowing fields).
+        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        assert ret["req_id"] == "r1"
+
+    @pytest.mark.asyncio
+    async def test_on_client_get_skill_relays_body_branch(self, routed_ns):
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {
+            "name": "user:x:y",
+            "rel_path": "SKILL.md",
+            "mime_type": "text/markdown",
+            "total_size": 5,
+            "sha256": "a" * 64,
+            "body": "# hi",
+            "req_id": "r2",
+        }
+        ret = await ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r2", "computer": comp_name, "name": "user:x:y"},
+        )
+        ns.call.assert_awaited_once()
+        assert ns.call.call_args[0][0] == GET_SKILL_EVENT
+        assert ret["body"] == "# hi"
+
+    @pytest.mark.asyncio
+    async def test_on_client_get_blob_relays_chunk(self, routed_ns):
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {
+            "blob_handle": "h",
+            "mime_type": "image/png",
+            "total_size": 3,
+            "sha256": "b" * 64,
+            "chunk_offset": 0,
+            "eof": True,
+            "blob": "AAAA",
+            "req_id": "r3",
+        }
+        ret = await ns.on_client_get_blob(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r3", "computer": comp_name, "blob_handle": "h"},
+        )
+        ns.call.assert_awaited_once()
+        assert ns.call.call_args[0][0] == GET_BLOB_EVENT
+        assert ret["eof"] is True
+
+    # ── flat ErrorPayload 透传 / Pass-through ────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_get_blob_4018_flat_error_passthrough(self, routed_ns):
+        """Computer 返回 ``4018 gone`` flat ErrorPayload → Server **原样**回传，不强转 ``GetBlobRet``.
+        Computer's flat 4018 → relayed verbatim without coercion to GetBlobRet."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.BLOB_NOT_ACCESSIBLE), "message": "Blob not accessible", "details": {"reason": "gone"}}
+        ns.call.return_value = err
+        ret = await ns.on_client_get_blob(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "blob_handle": "h"},
+        )
+        assert ret["code"] == int(ErrorCode.BLOB_NOT_ACCESSIBLE)
+        assert ret["details"]["reason"] == "gone"
+
+    @pytest.mark.asyncio
+    async def test_get_skill_4017_flat_error_passthrough(self, routed_ns):
+        """Computer 返回 ``4017 traversal`` → Server 透传."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {
+            "code": int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE),
+            "message": "Skill resource not accessible",
+            "details": {"reason": "traversal", "rel_path": "../etc"},
+        }
+        ns.call.return_value = err
+        ret = await ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "name": "user:x:y"},
+        )
+        assert ret["code"] == int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE)
+        assert ret["details"]["reason"] == "traversal"
+
+    @pytest.mark.asyncio
+    async def test_get_skill_4014_name_absent_passthrough(self, routed_ns):
+        """SKILL ``name`` 格式合法但 Registry 未命中复用 4014（协议 error-handling.md §SKILL）."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "skill not found"}
+        ns.call.return_value = err
+        ret = await ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "name": "user:no-such:skill"},
+        )
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    # ── 隔离 / Isolation ─────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_get_blob_computer_not_found_raises_value_error(self, smcp_namespace, mock_server):
+        """``computer`` 名未注册 → ``ValueError``（Server 路由前直接拒绝，4014 由 Computer 端归一）.
+        Unregistered ``computer`` → ValueError before routing (4014 minted by Computer side)."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {}
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "room1"})
+        with pytest.raises(ValueError, match="not found"):
+            await smcp_namespace.on_client_get_blob(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "absent", "blob_handle": "h"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
+        """跨房间访问 → **显式 raise SMCPNamespaceError**（非 assert，对齐 #31 `-O` 加固）.
+        Cross-office access → explicit raise SMCPNamespaceError (not assert, per #31)."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        sess_comp_room1 = {"role": "computer", "office_id": "room1", "name": "c1"}
+        sess_agent_room2 = {"role": "agent", "office_id": "room2", "name": "agent-1"}
+        smcp_namespace.get_session = AsyncMock(
+            side_effect=lambda sid: sess_comp_room1 if sid == comp_sid else sess_agent_room2,
+        )
+        with pytest.raises(SMCPNamespaceError, match="跨房间"):
+            await smcp_namespace.on_client_get_blob(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "c1", "blob_handle": "h"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_skills_target_role_not_computer_raises(self, smcp_namespace, mock_server):
+        """目标 SID role != computer → **显式 raise SMCPNamespaceError**.
+        Target SID with ``role != "computer"`` → explicit SMCPNamespaceError."""
+        smcp_namespace.server = mock_server
+        wrong_sid = "wrong-sid"
+        smcp_namespace._name_to_sid_map = {"agent-2": wrong_sid}
+        sess_wrong = {"role": "agent", "office_id": "room1", "name": "agent-2"}
+        smcp_namespace.get_session = AsyncMock(return_value=sess_wrong)
+        with pytest.raises(SMCPNamespaceError, match="Computer"):
+            await smcp_namespace.on_client_get_skills(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "agent-2"},
+            )
+
+    # ── 广播 / Broadcast ─────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_on_server_update_skills_broadcasts_notify(self, smcp_namespace, mock_server):
+        """Computer 发起 ``server:update_skills`` → Server 广播 ``notify:update_skills`` 到 office.
+        Computer-initiated ``server:update_skills`` → Server broadcasts ``notify:update_skills`` to office."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        comp_name = "c1"
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = AsyncMock(return_value=sess_comp)
+        smcp_namespace.emit = AsyncMock()
+        await smcp_namespace.on_server_update_skills(comp_sid, {"computer": comp_name})
+        smcp_namespace.emit.assert_awaited_once()
+        args, kwargs = smcp_namespace.emit.call_args
+        assert args[0] == UPDATE_SKILLS_NOTIFICATION
+        assert args[1] == {"computer": comp_name}
+        assert kwargs["room"] == "room1"
+        # 跳过发起者本人 / Skip the sender
+        assert kwargs["skip_sid"] == comp_sid
+
+    @pytest.mark.asyncio
+    async def test_on_server_update_skills_rejects_non_computer(self, smcp_namespace, mock_server):
+        """非 Computer 发起 ``server:update_skills`` → **显式 raise SMCPNamespaceError**.
+        Non-Computer ``server:update_skills`` → explicit SMCPNamespaceError."""
+        smcp_namespace.server = mock_server
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        smcp_namespace.get_session = AsyncMock(return_value=sess_agent)
+        smcp_namespace.emit = AsyncMock()
+        with pytest.raises(SMCPNamespaceError, match="Computer"):
+            await smcp_namespace.on_server_update_skills("a-sid", {"computer": "c1"})
+        smcp_namespace.emit.assert_not_awaited()

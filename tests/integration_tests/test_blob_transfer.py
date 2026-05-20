@@ -13,18 +13,17 @@
 测试分层 / Test layering:
   - Part 1 (in-process)：真实 Computer + 真实 drain_blob，跨 socketio 抽象层的 call adapter，
     覆盖跨抽象边界的串行/并行/大 payload/真实 base64+sha256 round-trip。
-  - Part 2 (real wire async)：真 Socket.IO transport + test-only Server 路由（mirror
-    on_client_get_resources，#41 正式接管前的占位）→ 跨真实 wire 端到端。
+  - Part 2 (real wire async)：真 Socket.IO transport + production Server 路由 (#41 已落地：
+    ``MockComputerServerNamespace`` 自带 ``on_client_get_blob``) → 跨真实 wire 端到端。
   - Part 3 (real wire sync mirror)：多进程 + SyncSMCPNamespace + drain_blob_sync 并行
     （ThreadPoolExecutor）+ flat ErrorPayload 透传。
 
-依赖范围说明 / Dependency scope note:
-  Server-side ``on_client_get_blob`` 路由属 #41 实现范围；本测试通过临时子类化
-  ``MockComputerServerNamespace`` 注入 test-only forwarder，确保 #38 的 wire 完整性在
-  #41 落地前即可验证；#41 接管后此 forwarder 可移除。
-  ``on_client_get_blob`` server routing belongs to #41; tests inject a test-only forwarder
-  by subclassing ``MockComputerServerNamespace`` so #38's wire integrity is verifiable
-  before #41 lands. After #41 lands, this forwarder is removable.
+#41 历史背景 / History note:
+  PR #44 (#38) 落地时 Server 还没有 ``on_client_get_blob`` 路由，测试曾通过 subclass 注入
+  test-only forwarder 验证 wire 完整性；#41 (PR ↓) 后 ``SMCPNamespace`` / ``SyncSMCPNamespace``
+  已携带 production 路由，本测试改用通用 mock 命名空间。
+  Before #41, this file injected a test-only forwarder; #41 ships production routing, so this
+  file now uses the standard mock namespaces.
 """
 
 from __future__ import annotations
@@ -253,39 +252,13 @@ class TestInProcThresholdsAndDefense:
 
 
 # ======================================================================
-# Part 2 — Real Socket.IO transport (async + test-local forwarder)
+# Part 2 — Real Socket.IO transport (async)
 # ======================================================================
-
-
-class _BlobCapableServerNamespace(MockComputerServerNamespace):
-    """注入 test-only ``on_client_get_blob`` forwarder（mirror ``on_client_get_resources``）.
-
-    Test-only ``on_client_get_blob`` forwarder; #41 ships the production version.
-    """
-
-    async def on_client_get_blob(self, sid: str, data: dict) -> dict:
-        """透明转发 client:get_blob 至目标 Computer / Transparent relay to target Computer."""
-        from a2c_smcp.smcp import is_protocol_error_payload
-
-        computer_name = data["computer"]
-        computer_sid = await self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name {computer_name!r} not found")
-        session = await self.get_session(computer_sid)
-        agent_session = await self.get_session(sid)
-        if session.get("office_id") != agent_session.get("office_id"):
-            from a2c_smcp.exceptions import SMCPNamespaceError
-
-            raise SMCPNamespaceError("跨房间访问被拒绝 / cross-office access denied")
-        client_response = await self.call(
-            GET_BLOB_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
-        )
-        if is_protocol_error_payload(client_response):
-            return dict(client_response)
-        return dict(client_response)
+#
+# #41 落地后 SMCPNamespace 已携带 ``on_client_get_blob`` production 路由；本节直接复用
+# 通用 ``MockComputerServerNamespace``（包装 ``SMCPNamespace`` 并附带操作录制），无需 test-only forwarder.
+# After #41, ``SMCPNamespace`` carries production routing; this section reuses the standard
+# ``MockComputerServerNamespace`` (which wraps ``SMCPNamespace`` with op recording).
 
 
 def _create_blob_test_socketio() -> AsyncServer:
@@ -296,7 +269,7 @@ def _create_blob_test_socketio() -> AsyncServer:
         ping_interval=10,
         async_handlers=True,
     )
-    sio.register_namespace(_BlobCapableServerNamespace())
+    sio.register_namespace(MockComputerServerNamespace())
     return sio
 
 
@@ -480,38 +453,10 @@ _SYNC_OFFICE = "office-blob-sync"
 _SYNC_COMPUTER = "comp-blob-sync"
 
 
-class _BlobCapableSyncServerNamespace(MockComputerServerSyncNamespace):
-    """同步版 test-only ``on_client_get_blob`` forwarder.
-    Sync test-only ``on_client_get_blob`` forwarder (mirror of async test counterpart)."""
-
-    def on_client_get_blob(self, sid: str, data: dict) -> dict:
-        from a2c_smcp.smcp import is_protocol_error_payload
-
-        computer_name = data["computer"]
-        computer_sid = self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name {computer_name!r} not found")
-        session = self.get_session(computer_sid)
-        agent_session = self.get_session(sid)
-        if session.get("office_id") != agent_session.get("office_id"):
-            from a2c_smcp.exceptions import SMCPNamespaceError
-
-            raise SMCPNamespaceError("跨房间访问被拒绝 / cross-office access denied")
-        client_response = self.call(
-            GET_BLOB_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
-        )
-        if is_protocol_error_payload(client_response):
-            return dict(client_response)
-        return dict(client_response)
-
-
 def _create_sync_blob_socketio_app():
-    """创建同步 Socket.IO + WSGI app；test-only blob forwarder.
+    """创建同步 Socket.IO + WSGI app（#41 production 路由已携带 ``on_client_get_blob``）.
 
-    Build a sync Socket.IO + WSGI app with the test-only blob forwarder.
+    Build a sync Socket.IO + WSGI app using the production ``SyncSMCPNamespace``-backed mock.
     """
     import socketio
 
@@ -519,7 +464,7 @@ def _create_sync_blob_socketio_app():
         async_mode="threading",
         cors_allowed_origins="*",
     )
-    sio.register_namespace(_BlobCapableSyncServerNamespace())
+    sio.register_namespace(MockComputerServerSyncNamespace())
     return sio, socketio.WSGIApp(sio, socketio_path="/socket.io")
 
 
