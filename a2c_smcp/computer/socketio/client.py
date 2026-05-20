@@ -392,15 +392,29 @@ class SMCPComputerClient(AsyncClient):
                 # Over hard cap: refuse to mint; convert to error (DoS defense)
                 logger.warning(f"on_tool_call binary item size {size} exceeds too_large_cap {too_large_cap}; skipping mint")
                 continue
+            # _meta 形状校验前置到 mint 之前，避免上游 MCP 工具 dump 出非 dict ``_meta``（如 None）
+            # 导致 ``.blobspool`` 落盘后无引用孤儿 cid（依赖后续 GC 清理）.
+            # Validate / prepare ``_meta`` BEFORE minting so non-dict ``_meta`` (e.g. ``None`` from
+            # some pydantic dumps) cannot leave an orphan cid in ``.blobspool``.
+            # ``dict.setdefault`` 对 ``None`` 不替换（返回原 ``None``），故必须显式处理三态：
+            # ``dict.setdefault`` does NOT replace ``None`` values, so handle three states explicitly:
+            existing_meta = item.get("_meta")
+            if existing_meta is None:
+                meta: dict[str, Any] = {}
+                item["_meta"] = meta
+            elif isinstance(existing_meta, dict):
+                meta = existing_meta
+            else:
+                logger.warning(
+                    f"on_tool_call skipping mint: item['_meta'] is not a dict ({type(existing_meta).__name__}); keeping inline",
+                )
+                continue
             try:
                 handle = self.computer.mint_toolspool_handle(payload_bytes, mime or "application/octet-stream")
             except Exception as e:  # noqa: BLE001 — 铸造失败不阻断整轮 tool_call，保留原始内联字节
                 logger.warning(f"on_tool_call mint failed for item size={size}: {e}; keeping inline")
                 continue
             # 写 _meta.a2c_blob_handle + 清空内联字节 / Write sideband, clear inline payload
-            meta = item.setdefault("_meta", {})
-            if not isinstance(meta, dict):
-                continue
             meta["a2c_blob_handle"] = handle
             meta["a2c_total_size"] = size
             meta["a2c_sha256"] = hashlib.sha256(payload_bytes).hexdigest()

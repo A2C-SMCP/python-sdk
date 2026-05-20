@@ -8,13 +8,13 @@
 * 描述: 异步Agent客户端实现 / Asynchronous Agent client implementation
 """
 
-import base64
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 from socketio import AsyncClient
 
 from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.agent import _blob_sideband as _sb
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
 from a2c_smcp.agent.errors import raise_for_error_payload
@@ -503,13 +503,13 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
                 computer,
                 response["blob_handle"],
             )
-            # 文本 MIME：UTF-8 解码回 body；解码失败保留 blob_handle 不还原（保守）
-            # Text MIME: decode as UTF-8 back to body; on decode failure keep blob_handle (conservative)
-            try:
-                ret["body"] = payload.decode("utf-8")
+            decoded = _sb.decode_text_body(payload)
+            if decoded is not None:
+                ret["body"] = decoded
                 ret.pop("blob_handle", None)
-            except UnicodeDecodeError as e:
-                logger.warning(f"get_skill text body decode failed for name={name!r}: {e}; keeping blob_handle")
+            else:
+                # 解码失败保留 blob_handle 让调用方走二进制路径 / Decode failure → keep handle for binary path
+                logger.warning(f"get_skill text body decode failed for name={name!r}; keeping blob_handle")
         return ret
 
     async def get_blob(
@@ -543,11 +543,9 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         Build a ``call`` adapter for :func:`drain_blob` bound to this client's socketio + namespace.
         """
-        agent_config = self.auth_provider.get_agent_config()
 
         async def _call(computer: str, blob_handle: str, chunk_offset: int, max_chunk_bytes: int) -> dict:
             req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
-            _ = agent_config  # closure pin
             ack = await self.call(GET_BLOB_EVENT, req, namespace=self._namespace)
             return cast(dict, ack)
 
@@ -560,31 +558,15 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         Scan content items for ``_meta.a2c_blob_handle``; drain via :func:`drain_blob` and inject
         ``data`` / ``blob`` back; strip ``_meta.a2c_*`` keys so caller sees a normal inline result.
 
-        协议依据 / Protocol: blob-transfer.md §5 + data-structures.md §BlobHandle 「MCP CallToolResult
-        content item ``_meta.a2c_blob_handle`` 旁路 + 对等 ``_meta.a2c_total_size`` / ``a2c_sha256``」.
+        协议依据 / Protocol: blob-transfer.md §5 + data-structures.md §BlobHandle.
 
-        Args:
-            raw: ``CallToolResult.model_dump(mode="json")`` 形态的 dict（Server ack 透传）.
-            computer: Computer 名（drain_blob call adapter 使用，仅诊断）.
-
-        Returns:
-            dict: 与入参同形但 content items 的二进制旁路已还原；非旁路 item 原样.
+        实现策略 / Strategy: 通过 :mod:`._blob_sideband` 纯函数收敛 async/sync 共享的结构变换，
+        本方法只保留 ``await drain_blob`` 与错误兜底两处真正异步差异.
+        Pure structural transforms live in ``_blob_sideband`` (#30 pattern); this method retains
+        only the ``await drain_blob`` differentiator and the per-item error-tolerance shell.
         """
-        if not isinstance(raw, dict):
-            return raw
-        content = raw.get("content")
-        if not isinstance(content, list):
-            return raw
         call = self._make_blob_call()
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            meta = item.get("_meta")
-            if not isinstance(meta, dict):
-                continue
-            handle = meta.get("a2c_blob_handle")
-            if not isinstance(handle, str) or not handle:
-                continue
+        for item, meta, handle in _sb.extract_sideband_handles(raw):
             try:
                 payload, _mime = await drain_blob(call, computer, handle)
             except Exception as e:  # noqa: BLE001 — 任何 drain 失败均原样保留 + 警告，避免吞噬整轮 tool_call
@@ -592,23 +574,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
                     f"tool_call binary sideband drain failed for handle={handle!r}: {e}; keeping _meta.a2c_blob_handle intact",
                 )
                 continue
-            # 按 item 类型回填字节 / Inject bytes back per item type.
-            # ImageContent / AudioContent: data (base64 str); EmbeddedResource.resource (BlobResourceContents): blob (base64 str).
-            b64 = base64.b64encode(payload).decode("ascii")
-            if "data" in item or item.get("type") in {"image", "audio"}:
-                item["data"] = b64
-            elif "resource" in item and isinstance(item["resource"], dict) and "blob" in item["resource"]:
-                item["resource"]["blob"] = b64
-            else:
-                # 兜底：写入顶层 ``data`` 与 ``blob`` 各一份，覆盖未知 content shape
-                # Fallback: write ``data`` and ``blob`` at top level to cover unknown shapes
-                item["data"] = b64
-            # 清理 _meta.a2c_* 字段（旁路完成后 Agent 不应感知）
-            # Strip _meta.a2c_* keys (post-drain the Agent shouldn't see sideband mechanics)
-            for k in [k for k in meta if k.startswith("a2c_")]:
-                meta.pop(k, None)
-            if not meta:
-                item.pop("_meta", None)
+            _sb.inject_payload_into_content_item(item, meta, payload)
         return raw
 
     async def _on_skills_updated(self, data: dict) -> None:

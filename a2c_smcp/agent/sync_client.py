@@ -8,13 +8,13 @@
 * 描述: 同步Agent客户端实现 / Synchronous Agent client implementation
 """
 
-import base64
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 from socketio import Client
 
 from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.agent import _blob_sideband as _sb
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentSyncClient
 from a2c_smcp.agent.errors import raise_for_error_payload
@@ -463,11 +463,12 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
                 computer,
                 response["blob_handle"],
             )
-            try:
-                ret["body"] = payload.decode("utf-8")
+            decoded = _sb.decode_text_body(payload)
+            if decoded is not None:
+                ret["body"] = decoded
                 ret.pop("blob_handle", None)
-            except UnicodeDecodeError as e:
-                logger.warning(f"get_skill text body decode failed for name={name!r}: {e}; keeping blob_handle")
+            else:
+                logger.warning(f"get_skill text body decode failed for name={name!r}; keeping blob_handle")
         return ret
 
     def get_blob(
@@ -490,11 +491,9 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
     def _make_blob_call(self) -> Any:
         """构造 :func:`drain_blob_sync` 的 ``call`` 适配器（sync mirror of async ``_make_blob_call``）."""
-        agent_config = self.auth_provider.get_agent_config()
 
         def _call(computer: str, blob_handle: str, chunk_offset: int, max_chunk_bytes: int) -> dict:
             req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
-            _ = agent_config
             ack = self.call(GET_BLOB_EVENT, req, namespace=self._namespace)
             return cast(dict, ack)
 
@@ -504,22 +503,14 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         """同步：扫描 ``CallToolResult`` content items 的 ``_meta.a2c_blob_handle`` 并 drain 还原.
 
         Sync mirror of async ``_resolve_tool_call_binary_sideband``. 协议依据 / Protocol: blob-transfer.md §5.
+
+        实现策略 / Strategy: 通过 :mod:`._blob_sideband` 共享纯函数，async/sync 仅在 ``drain_blob_sync``
+        与异常兜底处保留差异.
+        Pure structural transforms shared with async via ``_blob_sideband``; only the
+        ``drain_blob_sync`` call and per-item error shell differ.
         """
-        if not isinstance(raw, dict):
-            return raw
-        content = raw.get("content")
-        if not isinstance(content, list):
-            return raw
         call = self._make_blob_call()
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            meta = item.get("_meta")
-            if not isinstance(meta, dict):
-                continue
-            handle = meta.get("a2c_blob_handle")
-            if not isinstance(handle, str) or not handle:
-                continue
+        for item, meta, handle in _sb.extract_sideband_handles(raw):
             try:
                 payload, _mime = drain_blob_sync(call, computer, handle)
             except Exception as e:  # noqa: BLE001
@@ -527,17 +518,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
                     f"tool_call binary sideband drain failed for handle={handle!r}: {e}; keeping _meta.a2c_blob_handle intact",
                 )
                 continue
-            b64 = base64.b64encode(payload).decode("ascii")
-            if "data" in item or item.get("type") in {"image", "audio"}:
-                item["data"] = b64
-            elif "resource" in item and isinstance(item["resource"], dict) and "blob" in item["resource"]:
-                item["resource"]["blob"] = b64
-            else:
-                item["data"] = b64
-            for k in [k for k in meta if k.startswith("a2c_")]:
-                meta.pop(k, None)
-            if not meta:
-                item.pop("_meta", None)
+            _sb.inject_payload_into_content_item(item, meta, payload)
         return raw
 
     def _on_skills_updated(self, data: dict) -> None:

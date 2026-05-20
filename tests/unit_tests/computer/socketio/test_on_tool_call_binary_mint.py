@@ -178,6 +178,81 @@ class TestIsErrorPathUntouched:
         assert ret["structuredContent"]["error"] == "tool boom"
 
 
+class TestMetaShapeValidationBeforeMint:
+    """code-review #3：``_meta`` 形状校验前置到 mint 之前，避免孤儿 cid 落盘.
+
+    code-review #3: validate ``_meta`` shape BEFORE minting; non-dict ``_meta`` won't cause an
+    orphan cid in ``.blobspool``.
+
+    三态处理 / Three-state handling:
+      - ``_meta`` 缺失 → 创建新 dict（正常铸造路径 / normal mint path）
+      - ``_meta`` 已是 dict → 复用（正常铸造路径，merge sideband 字段 / merge sideband）
+      - ``_meta`` 非 None 非 dict（如 list / str）→ **跳过铸造**，保留 inline（无孤儿 cid 落盘）
+
+      Per reviewer #3 comment: ``dict.setdefault`` doesn't replace ``None``, so the original code
+      could mint to disk and then ``continue`` on the non-dict check, leaving orphan cids. We now
+      pre-validate and skip BEFORE minting.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_dict_meta_skips_mint_no_disk_write(
+        self,
+        computer: Computer,
+        client: SMCPComputerClient,
+    ) -> None:
+        """``item['_meta'] = "broken"``（字符串、非 dict 非 None）→ 跳过铸造、不写盘、保留 inline.
+        String ``_meta`` (non-dict, non-None) → skip mint, no disk write, keep inline."""
+        big_payload = b"Z" * 2048  # > inline_budget (128)
+        big_b64 = base64.b64encode(big_payload).decode("ascii")
+        # 构造非 dict 非 None 的 _meta（模拟上游 MCP 工具 dump 出脏数据的极端场景）
+        # Construct non-dict, non-None _meta (simulating upstream MCP tool dirty dump edge case)
+        result = CallToolResult(content=[TextContent(text="placeholder", type="text")], isError=False)
+        raw_template = {
+            "content": [{"type": "image", "data": big_b64, "mimeType": "image/png", "_meta": "not-a-dict"}],
+            "isError": False,
+        }
+        result.model_dump = lambda mode="json": raw_template  # type: ignore[method-assign,assignment]
+        computer.aexecute_tool = AsyncMock(return_value=result)  # type: ignore[method-assign]
+
+        cids_before = list(computer.toolspool_store.iter_cids())
+        ret = await client.on_tool_call(_req())
+        cids_after = list(computer.toolspool_store.iter_cids())
+
+        # 关键不变量：未铸造 → .blobspool 文件数不变（无孤儿 cid）
+        # Critical invariant: no mint → .blobspool count unchanged (no orphan cid)
+        assert cids_after == cids_before
+        # 内联 data 保留 / inline data preserved
+        item = ret["content"][0]
+        assert item["data"] == big_b64
+        # _meta 保留原样（未被覆写为 dict）/ _meta untouched (preserved as-is)
+        assert item["_meta"] == "not-a-dict"
+
+    @pytest.mark.asyncio
+    async def test_none_meta_treated_as_absent_mints_normally(
+        self,
+        computer: Computer,
+        client: SMCPComputerClient,
+    ) -> None:
+        """``item['_meta'] = None`` 视为缺失 → 创建新 dict + 正常铸造（与 ``_meta`` 完全缺失等价）.
+        ``_meta = None`` treated as absent → create fresh dict + mint normally."""
+        big_payload = b"N" * 2048
+        big_b64 = base64.b64encode(big_payload).decode("ascii")
+        result = CallToolResult(content=[TextContent(text="placeholder", type="text")], isError=False)
+        raw_template = {
+            "content": [{"type": "image", "data": big_b64, "mimeType": "image/png", "_meta": None}],
+            "isError": False,
+        }
+        result.model_dump = lambda mode="json": raw_template  # type: ignore[method-assign,assignment]
+        computer.aexecute_tool = AsyncMock(return_value=result)  # type: ignore[method-assign]
+
+        ret = await client.on_tool_call(_req())
+        item = ret["content"][0]
+        # 铸造成功 → inline 清空 + _meta.a2c_blob_handle 写入 / mint OK
+        assert item["data"] == ""
+        assert isinstance(item["_meta"], dict)
+        assert item["_meta"]["a2c_blob_handle"]
+
+
 class TestRoundTripWithComputerToolspool:
     @pytest.mark.asyncio
     async def test_mint_then_resolvable_via_on_get_blob(
