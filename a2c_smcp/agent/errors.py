@@ -24,9 +24,11 @@ class SMCPProtocolError(Exception):
     A2C-SMCP protocol-level error (flat ErrorPayload).
 
     当 Agent SDK 在 Socket.IO ack 中识别到 flat ErrorPayload（顶层含 ``code``）时抛出，
-    例如 ``client:get_resources`` 的 ``4014 MCP Server Not Found`` / ``4015 MCP Capability Not Supported``。
-    Raised when the Agent SDK detects a flat ErrorPayload (top-level ``code``) in a Socket.IO ack,
-    e.g. ``client:get_resources`` ``4014`` / ``4015``.
+    覆盖范围 / Covers:
+      - ``client:get_resources``：``4014`` / ``4015``（顶层平铺 ``mcp_server_name`` / ``capability``）
+      - ``client:get_skill[s]``：``4014`` 复用（SKILL ``name`` 合法但未命中）/ ``4016`` Invalid Name /
+        ``4017`` Skill Resource Not Accessible（v0.2.1 ``details.reason``）
+      - ``client:get_blob``：``4018 Blob Not Accessible``（v0.2.1 ``details.reason``）
 
     ``details`` 是诊断容器，Agent MUST NOT 透传给最终用户（防泄露）。
     ``details`` is a diagnostic container; the Agent MUST NOT propagate it to end users.
@@ -36,8 +38,15 @@ class SMCPProtocolError(Exception):
         self.payload: ErrorPayload = payload
         self.code: int = int(payload.get("code", -1))
         self.error_message: str = str(payload.get("message", ""))
+        # 4014 / 4015 顶层 code-specific 字段 / Top-level code-specific fields (4014 / 4015)
         self.mcp_server_name: str | None = payload.get("mcp_server_name")
         self.capability: str | None = payload.get("capability")
+        # 4016 / 4017 / 4018 details 容器（v0.2.1 起 code-specific 字段下沉到 details）
+        # details container for 4016 / 4017 / 4018 (since v0.2.1 code-specific fields live under details)
+        self.details: dict[str, Any] = dict(payload.get("details") or {})
+        # 4017 / 4018 共用 ``details.reason`` 开放枚举（解析方 MUST 容忍未知值兜底）
+        # ``details.reason`` open enum shared by 4017 / 4018; parsers MUST default to fail-safe on unknown
+        self.reason: str | None = self.details.get("reason")
         super().__init__(f"[{self.code}] {self.error_message}")
 
 

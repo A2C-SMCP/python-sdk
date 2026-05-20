@@ -24,7 +24,15 @@
 import uuid
 
 from a2c_smcp.agent.types import AgentConfig
-from a2c_smcp.smcp import GetDeskTopReq, GetResourcesReq, GetToolsReq, ToolCallReq
+from a2c_smcp.smcp import (
+    GetBlobReq,
+    GetDeskTopReq,
+    GetResourcesReq,
+    GetSkillReq,
+    GetSkillsReq,
+    GetToolsReq,
+    ToolCallReq,
+)
 
 
 def build_tool_call_request(
@@ -137,6 +145,69 @@ def build_get_desktop_request(
         req["desktop_size"] = size
     if window is not None:
         req["window"] = window
+    return req
+
+
+def build_get_skills_request(agent_config: AgentConfig, computer: str) -> GetSkillsReq:
+    """创建获取 SKILL 清单请求对象 / Create get-skills request object.
+
+    协议依据 / Protocol: a2c-smcp-protocol events.md §client:get_skills；data-structures.md §GetSkillsReq.
+    返回轻量元数据（不含 SKILL.md body）.
+    """
+    return GetSkillsReq(
+        agent=agent_config["agent"],
+        req_id=uuid.uuid4().hex,
+        computer=computer,
+    )
+
+
+def build_get_skill_request(
+    agent_config: AgentConfig,
+    computer: str,
+    name: str,
+    rel_path: str | None = None,
+) -> GetSkillReq:
+    """创建获取 SKILL 包内单个资源请求对象 / Create get-skill request object.
+
+    协议依据 / Protocol: events.md §client:get_skill；data-structures.md §GetSkillReq.
+    ``rel_path`` 缺省时由 Computer 端解析为 ``SKILL.md`` 入口；非默认时 MUST 相对、无 ``..``、无绝对路径
+    （沙箱由 Computer 端 reapply）.
+    """
+    req: GetSkillReq = {
+        "agent": agent_config["agent"],
+        "req_id": uuid.uuid4().hex,
+        "computer": computer,
+        "name": name,
+    }
+    if rel_path is not None:
+        req["rel_path"] = rel_path
+    return req
+
+
+def build_get_blob_request(
+    agent_config: AgentConfig,
+    computer: str,
+    blob_handle: str,
+    chunk_offset: int | None = None,
+    max_chunk_bytes: int | None = None,
+) -> GetBlobReq:
+    """创建通用二进制拉取单块请求对象 / Create get-blob chunk request object.
+
+    协议依据 / Protocol: events.md §client:get_blob；data-structures.md §GetBlobReq；
+    blob-transfer.md §3 (parallel-safe per offset).
+
+    ``chunk_offset`` 缺省 0；``max_chunk_bytes`` 缺省由 Computer clamp 到 ``BlobThresholds.chunk_max_bytes``.
+    """
+    req: GetBlobReq = {
+        "agent": agent_config["agent"],
+        "req_id": uuid.uuid4().hex,
+        "computer": computer,
+        "blob_handle": blob_handle,
+    }
+    if chunk_offset is not None:
+        req["chunk_offset"] = chunk_offset
+    if max_chunk_bytes is not None:
+        req["max_chunk_bytes"] = max_chunk_bytes
     return req
 
 

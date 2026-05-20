@@ -17,8 +17,11 @@ English: Unit tests for the shared Agent request-builder pure functions.
 import pytest
 
 from a2c_smcp.agent._request_builders import (
+    build_get_blob_request,
     build_get_desktop_request,
     build_get_resources_request,
+    build_get_skill_request,
+    build_get_skills_request,
     build_get_tools_request,
     build_tool_call_request,
     validate_emit_event,
@@ -89,3 +92,40 @@ def test_validate_emit_event_allows_valid_events(event: str) -> None:
     # 中文：合法事件应静默通过（无返回值、无异常）。
     # English: valid events pass silently (no return value, no exception).
     assert validate_emit_event(event) is None
+
+
+# ── v0.2.1 新增 / v0.2.1 additions ────────────────────────────────────────
+
+
+def test_build_get_skills_request_structure() -> None:
+    req = build_get_skills_request(_CFG, "comp-1")
+    assert req["computer"] == "comp-1"
+    assert req["agent"] == "agent-1"
+    assert isinstance(req["req_id"], str) and req["req_id"]
+
+
+def test_build_get_skill_request_omits_rel_path_by_default() -> None:
+    """rel_path 缺省时由 Computer 端解析为 SKILL.md / Default rel_path resolved server-side to SKILL.md."""
+    req = build_get_skill_request(_CFG, "comp-1", "user:x:y")
+    assert req["computer"] == "comp-1"
+    assert req["name"] == "user:x:y"
+    assert "rel_path" not in req
+
+
+def test_build_get_skill_request_includes_rel_path_when_given() -> None:
+    req = build_get_skill_request(_CFG, "comp-1", "user:x:y", rel_path="docs/intro.md")
+    assert req["rel_path"] == "docs/intro.md"
+
+
+def test_build_get_blob_request_omits_optionals_by_default() -> None:
+    """chunk_offset / max_chunk_bytes 缺省时由 Computer 端 clamp / Defaults clamped server-side."""
+    req = build_get_blob_request(_CFG, "comp-1", "opaque-handle")
+    assert req["blob_handle"] == "opaque-handle"
+    assert "chunk_offset" not in req
+    assert "max_chunk_bytes" not in req
+
+
+def test_build_get_blob_request_with_offset_and_max() -> None:
+    req = build_get_blob_request(_CFG, "comp-1", "opaque-handle", chunk_offset=65536, max_chunk_bytes=4096)
+    assert req["chunk_offset"] == 65536
+    assert req["max_chunk_bytes"] == 4096
