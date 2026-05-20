@@ -4,6 +4,7 @@
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
 import base64
+import hashlib
 from typing import Any
 
 from mcp.types import CallToolResult, Resource
@@ -308,11 +309,23 @@ class SMCPComputerClient(AsyncClient):
         """
         信令服务器通知计算机端，有工具调用请求
 
+        v0.2.1 二进制旁路 / Binary sideband:
+            返回前遍历 ``CallToolResult.content``，超内联预算（``BlobThresholds.inline_budget``）的
+            二进制 content item 经 :meth:`Computer.mint_toolspool_handle` 写入 ``.blobspool``、清空
+            内联 ``data`` / ``blob``、写 item ``_meta.a2c_blob_handle`` (+ ``a2c_total_size`` /
+            ``a2c_sha256``)。小尺寸二进制原样内联；工具失败仍走 MCP ``isError``。
+            Pre-return: oversize binary content items (per ``inline_budget``) are minted to
+            ``.blobspool``, inline ``data`` / ``blob`` cleared, and ``_meta.a2c_blob_handle`` etc.
+            written. Below-budget items inline as-is; tool failures still go via MCP ``isError``.
+
+        协议依据 / Protocol: blob-transfer.md §5（生产者通道接入契约）+ data-structures.md
+        §BlobHandle 「MCP CallToolResult content item ``_meta.a2c_blob_handle`` 旁路」.
+
         Args:
-            data (ToolCallReq): 请求数据
+            data (ToolCallReq): 请求数据 / request data.
 
         Returns:
-            dict: 工具调用结果的字典表示（JSON 可序列化）
+            dict: 工具调用结果的字典表示（JSON 可序列化，二进制旁路已铸造）.
         """
         # Server 通过 session 保证请求来自同一 office，无需在此验证 agent 与 office_id 的关系
         # Server guarantees request is from same office via session, no need to validate agent vs office_id here
@@ -326,10 +339,90 @@ class SMCPComputerClient(AsyncClient):
                 timeout=data["timeout"],
             )
             # 将 CallToolResult 转换为字典以便 JSON 序列化 / Convert CallToolResult to dict for JSON serialization
-            return ret.model_dump(mode="json")
+            raw = ret.model_dump(mode="json")
+            # v0.2.1 二进制旁路铸造（不动 isError 路径）/ v0.2.1 binary sideband minting (isError untouched)
+            self._mint_oversize_binary_content(raw)
+            return raw
         except Exception as e:
             error_result = CallToolResult(isError=True, structuredContent={"error": str(e), "error_type": type(e).__name__}, content=[])
             return error_result.model_dump(mode="json")
+
+    def _mint_oversize_binary_content(self, raw: dict) -> None:
+        """遍历 ``CallToolResult`` content items，超内联预算的二进制 item 铸造 toolspool 句柄.
+
+        Walk ``CallToolResult.content`` and mint a toolspool handle for any binary item whose
+        decoded payload exceeds ``BlobThresholds.inline_budget``. Replaces inline ``data`` / ``blob``
+        with ``_meta.a2c_blob_handle`` (+ ``a2c_total_size`` / ``a2c_sha256``).
+
+        协议依据 / Protocol: blob-transfer.md §5 + design §4.2 (Computer on_tool_call mint).
+        """
+        content = raw.get("content")
+        if not isinstance(content, list):
+            return
+        budget = self.computer.blob_thresholds.inline_budget
+        too_large_cap = self.computer.blob_thresholds.too_large_cap
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            # 提取候选字节字段 / Extract candidate bytes field
+            payload_b64: str | None = None
+            mime: str = str(item.get("mimeType") or "")
+            inline_key: str | None = None
+            # ImageContent / AudioContent：顶层 ``data`` (base64) + ``mimeType``
+            if isinstance(item.get("data"), str):
+                payload_b64 = item["data"]
+                inline_key = "data"
+            # EmbeddedResource.BlobResourceContents：``resource.blob`` (base64) + ``resource.mimeType``
+            elif isinstance(item.get("resource"), dict) and isinstance(item["resource"].get("blob"), str):
+                payload_b64 = item["resource"]["blob"]
+                inline_key = "resource.blob"
+                mime = str(item["resource"].get("mimeType") or mime)
+            if payload_b64 is None:
+                continue
+            try:
+                payload_bytes = base64.b64decode(payload_b64, validate=False)
+            except Exception:  # noqa: BLE001 — 非合法 base64 视为不铸造（直接保留原样）
+                continue
+            size = len(payload_bytes)
+            if size <= budget:
+                # 小尺寸：原样内联 / Below budget: keep inline
+                continue
+            if size > too_large_cap:
+                # 超绝对上限：Computer 端拒绝铸造，记 warning；上游 MCP 工具结果转 isError
+                # Over hard cap: refuse to mint; convert to error (DoS defense)
+                logger.warning(f"on_tool_call binary item size {size} exceeds too_large_cap {too_large_cap}; skipping mint")
+                continue
+            # _meta 形状校验前置到 mint 之前，避免上游 MCP 工具 dump 出非 dict ``_meta``（如 None）
+            # 导致 ``.blobspool`` 落盘后无引用孤儿 cid（依赖后续 GC 清理）.
+            # Validate / prepare ``_meta`` BEFORE minting so non-dict ``_meta`` (e.g. ``None`` from
+            # some pydantic dumps) cannot leave an orphan cid in ``.blobspool``.
+            # ``dict.setdefault`` 对 ``None`` 不替换（返回原 ``None``），故必须显式处理三态：
+            # ``dict.setdefault`` does NOT replace ``None`` values, so handle three states explicitly:
+            existing_meta = item.get("_meta")
+            if existing_meta is None:
+                meta: dict[str, Any] = {}
+                item["_meta"] = meta
+            elif isinstance(existing_meta, dict):
+                meta = existing_meta
+            else:
+                logger.warning(
+                    f"on_tool_call skipping mint: item['_meta'] is not a dict ({type(existing_meta).__name__}); keeping inline",
+                )
+                continue
+            try:
+                handle = self.computer.mint_toolspool_handle(payload_bytes, mime or "application/octet-stream")
+            except Exception as e:  # noqa: BLE001 — 铸造失败不阻断整轮 tool_call，保留原始内联字节
+                logger.warning(f"on_tool_call mint failed for item size={size}: {e}; keeping inline")
+                continue
+            # 写 _meta.a2c_blob_handle + 清空内联字节 / Write sideband, clear inline payload
+            meta["a2c_blob_handle"] = handle
+            meta["a2c_total_size"] = size
+            meta["a2c_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
+            # 清空内联载体 / Clear inline carrier
+            if inline_key == "data":
+                item["data"] = ""
+            elif inline_key == "resource.blob":
+                item["resource"]["blob"] = ""
 
     async def on_get_tools(self, data: GetToolsReq) -> GetToolsRet:
         """

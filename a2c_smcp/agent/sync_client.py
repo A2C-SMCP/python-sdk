@@ -8,12 +8,13 @@
 * 描述: 同步Agent客户端实现 / Synchronous Agent client implementation
 """
 
-from typing import Any
+from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 from socketio import Client
 
 from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.agent import _blob_sideband as _sb
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentSyncClient
 from a2c_smcp.agent.errors import raise_for_error_payload
@@ -21,8 +22,11 @@ from a2c_smcp.agent.types import AgentEventHandler
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
+    GET_BLOB_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
@@ -30,16 +34,21 @@ from a2c_smcp.smcp import (
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
+    GetBlobRet,
     GetDeskTopRet,
     GetResourcesRet,
+    GetSkillRet,
+    GetSkillsRet,
     GetToolsRet,
     LeaveOfficeNotification,
     ListRoomReq,
     SessionInfo,
     UpdateMCPConfigNotification,
 )
+from a2c_smcp.utils.blob import drain_blob_sync
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
     HANDSHAKE_CONNECT_ERRORS,
@@ -228,6 +237,8 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         try:
             ctx.debug("Calling tool")
             res = self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=self._namespace)
+            # v0.2.1：返回前 drain content items 的 _meta.a2c_blob_handle / drain binary sideband pre-return
+            res = self._resolve_tool_call_binary_sideband(res, computer)
             return CallToolResult.model_validate(res, by_name=True)
 
         except TimeoutError:
@@ -283,6 +294,8 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         self.on(LEAVE_OFFICE_NOTIFICATION, self._on_computer_leave_office, namespace=self._namespace)
         self.on(UPDATE_CONFIG_NOTIFICATION, self._on_computer_update_config, namespace=self._namespace)
         self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=self._namespace)
+        # v0.2.1 SKILL 集合更新自动重拉 / v0.2.1 auto-refresh on SKILL set change
+        self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -413,6 +426,112 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             self.process_desktop_response(ret, computer)
         except Exception as e:
             logger.error(f"Error handling desktop updated notification: {e}", exc_info=True)
+
+    def get_skills(self, computer: str, timeout: int = 20) -> GetSkillsRet:
+        """同步获取目标 Computer 的 SKILL 清单（v0.2.1 sync mirror of async ``get_skills``）."""
+        req = self.create_get_skills_request(computer)
+        logger.debug(f"Getting skills from computer {computer}")
+        response = self.call(GET_SKILLS_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for skills")
+        ret: GetSkillsRet = {"skills": response.get("skills", []), "req_id": response["req_id"]}
+        return ret
+
+    def get_skill(
+        self,
+        computer: str,
+        name: str,
+        rel_path: str | None = None,
+        timeout: int = 30,
+    ) -> GetSkillRet:
+        """同步获取 SKILL 包内单个资源（v0.2.1 sync mirror）；body 与 blob_handle 分支自动处理.
+
+        文本 MIME 的 blob_handle 自动 :func:`drain_blob_sync` 回填 body；二进制保留 blob_handle.
+        """
+        req = self.create_get_skill_request(computer, name, rel_path)
+        logger.debug(f"Getting skill {name!r} rel_path={rel_path!r} from computer {computer}")
+        response = self.call(GET_SKILL_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for skill")
+        ret: GetSkillRet = dict(response)  # type: ignore[assignment]
+        mime_type = str(response.get("mime_type", ""))
+        if "blob_handle" in response and "body" not in response and mime_type.startswith("text/"):
+            payload, _ = drain_blob_sync(
+                self._make_blob_call(),
+                computer,
+                response["blob_handle"],
+            )
+            decoded = _sb.decode_text_body(payload)
+            if decoded is not None:
+                ret["body"] = decoded
+                ret.pop("blob_handle", None)
+            else:
+                logger.warning(f"get_skill text body decode failed for name={name!r}; keeping blob_handle")
+        return ret
+
+    def get_blob(
+        self,
+        computer: str,
+        blob_handle: str,
+        *,
+        chunk_offset: int = 0,
+        max_chunk_bytes: int | None = None,
+        timeout: int = 30,
+    ) -> GetBlobRet:
+        """同步通用二进制拉取单块入口（sync mirror of async ``get_blob``，低层 API）."""
+        req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
+        logger.debug(f"Getting blob from computer {computer} offset={chunk_offset}")
+        response = self.call(GET_BLOB_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for blob")
+        return GetBlobRet(**response)
+
+    def _make_blob_call(self) -> Any:
+        """构造 :func:`drain_blob_sync` 的 ``call`` 适配器（sync mirror of async ``_make_blob_call``）."""
+
+        def _call(computer: str, blob_handle: str, chunk_offset: int, max_chunk_bytes: int) -> dict:
+            req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
+            ack = self.call(GET_BLOB_EVENT, req, namespace=self._namespace)
+            return cast(dict, ack)
+
+        return _call
+
+    def _resolve_tool_call_binary_sideband(self, raw: Any, computer: str) -> Any:
+        """同步：扫描 ``CallToolResult`` content items 的 ``_meta.a2c_blob_handle`` 并 drain 还原.
+
+        Sync mirror of async ``_resolve_tool_call_binary_sideband``. 协议依据 / Protocol: blob-transfer.md §5.
+
+        实现策略 / Strategy: 通过 :mod:`._blob_sideband` 共享纯函数，async/sync 仅在 ``drain_blob_sync``
+        与异常兜底处保留差异.
+        Pure structural transforms shared with async via ``_blob_sideband``; only the
+        ``drain_blob_sync`` call and per-item error shell differ.
+        """
+        call = self._make_blob_call()
+        for item, meta, handle in _sb.extract_sideband_handles(raw):
+            try:
+                payload, _mime = drain_blob_sync(call, computer, handle)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"tool_call binary sideband drain failed for handle={handle!r}: {e}; keeping _meta.a2c_blob_handle intact",
+                )
+                continue
+            _sb.inject_payload_into_content_item(item, meta, payload)
+        return raw
+
+    def _on_skills_updated(self, data: dict) -> None:
+        """同步：处理 SKILL 集合更新通知（v0.2.1 sync mirror）；默认自动重拉 ``client:get_skills``."""
+        try:
+            computer = data.get("computer")
+            if not computer:
+                logger.warning("UPDATE_SKILLS_NOTIFICATION missing 'computer'")
+                return
+            ret = self.get_skills(computer)
+            logger.info(f"Skills refreshed from computer {computer}: count={len(ret.get('skills', []))}")
+        except Exception as e:
+            logger.error(f"Error handling skills updated notification: {e}", exc_info=True)
 
     def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
         """

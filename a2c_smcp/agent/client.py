@@ -8,12 +8,13 @@
 * 描述: 异步Agent客户端实现 / Asynchronous Agent client implementation
 """
 
-from typing import Any
+from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
 from socketio import AsyncClient
 
 from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.agent import _blob_sideband as _sb
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
 from a2c_smcp.agent.errors import raise_for_error_payload
@@ -21,8 +22,11 @@ from a2c_smcp.agent.types import AsyncAgentEventHandler
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
+    GET_BLOB_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
@@ -30,16 +34,21 @@ from a2c_smcp.smcp import (
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
+    GetBlobRet,
     GetDeskTopRet,
     GetResourcesRet,
+    GetSkillRet,
+    GetSkillsRet,
     GetToolsRet,
     LeaveOfficeNotification,
     ListRoomReq,
     SessionInfo,
     UpdateMCPConfigNotification,
 )
+from a2c_smcp.utils.blob import drain_blob
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
     HANDSHAKE_CONNECT_ERRORS,
@@ -213,6 +222,20 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         异步发起SMCP工具调用
         Async initiate SMCP tool call
 
+        v0.2.1 二进制一致性 / Binary consistency:
+            返回前扫描 ``CallToolResult.content``，命中 ``_meta.a2c_blob_handle`` 的 content item
+            **自动** :func:`drain_blob` 还原全量字节、回填 ``data`` (ImageContent) 或 ``blob``
+            (EmbeddedResource.BlobResourceContents)，并清理 ``_meta`` 中的 ``a2c_*`` 字段——确保
+            上层拿到的是与小图内联路径**完全等价**的 ``CallToolResult``。
+            **不实现 = 大二进制工具结果静默变空**（协议关键破坏性点）。
+
+            Pre-return: scan ``CallToolResult.content`` and **automatically** drain items carrying
+            ``_meta.a2c_blob_handle`` so callers see binary-equivalent ``CallToolResult`` regardless
+            of inline-vs-handle routing. Skipping this would silently empty large binary outputs.
+
+        协议依据 / Protocol: blob-transfer.md §5 (生产者通道接入契约) +
+        data-structures.md §BlobHandle (载体随响应结构而异表).
+
         Args:
             computer (str): 远程计算机名称 / Remote computer name
             tool_name (str): 工具名称 / Tool name
@@ -220,7 +243,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
-            CallToolResult: MCP协议工具调用结果 / MCP protocol tool call result
+            CallToolResult: MCP协议工具调用结果（二进制旁路已还原）/ Result with binary sideband resolved.
         """
         req = self.create_tool_call_request(computer, tool_name, params, timeout)
         ctx = ContextLogger(logger, {"computer": computer, "tool": tool_name, "req_id": req["req_id"]})
@@ -228,6 +251,8 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         try:
             ctx.debug("Calling tool")
             res = await self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=self._namespace)
+            # v0.2.1：返回前 drain content items 的 _meta.a2c_blob_handle / drain binary sideband pre-return
+            res = await self._resolve_tool_call_binary_sideband(res, computer)
             return CallToolResult.model_validate(res, by_name=True)
 
         except TimeoutError:
@@ -283,6 +308,8 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         self.on(LEAVE_OFFICE_NOTIFICATION, self._on_computer_leave_office, namespace=self._namespace)
         self.on(UPDATE_CONFIG_NOTIFICATION, self._on_computer_update_config, namespace=self._namespace)
         self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=self._namespace)
+        # v0.2.1 SKILL 集合更新自动重拉（仿 notify:update_*）/ v0.2.1 auto-refresh on SKILL set change
+        self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
 
     async def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -414,6 +441,157 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             self.process_desktop_response(ret, computer)
         except Exception as e:
             logger.error(f"Error handling desktop updated notification: {e}", exc_info=True)
+
+    async def get_skills(self, computer: str, timeout: int = 20) -> GetSkillsRet:
+        """异步获取目标 Computer 的 SKILL 清单（v0.2.1，轻量元数据，不含 SKILL.md body）.
+
+        Async get the target Computer's SKILL inventory (lightweight metadata, no SKILL.md body).
+
+        协议依据 / Protocol: events.md §client:get_skills；data-structures.md §GetSkillsRet.
+
+        Raises:
+            SMCPProtocolError: ``4014`` SKILL ``name`` 复用（Computer 端 Registry 异常等罕见路径）
+            ValueError: 响应 ``req_id`` 不匹配
+        """
+        req = self.create_get_skills_request(computer)
+        logger.debug(f"Getting skills from computer {computer}")
+        response = await self.call(GET_SKILLS_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for skills")
+        ret: GetSkillsRet = {"skills": response.get("skills", []), "req_id": response["req_id"]}
+        return ret
+
+    async def get_skill(
+        self,
+        computer: str,
+        name: str,
+        rel_path: str | None = None,
+        timeout: int = 30,
+    ) -> GetSkillRet:
+        """异步获取 SKILL 包内单个资源（v0.2.1）.
+
+        响应分支自动还原 / Response branches auto-resolved:
+          - 文本内联 ``body`` → 直接返回（含 ``body`` 字段）
+          - 二进制或过大文本 ``blob_handle`` → **自动**通过 :func:`drain_blob` 拉取全量字节，
+            填回 ``body`` 字段（base64 解码后的字节用 ``latin-1`` 还原为 str 不安全；故仅文本类
+            MIME 才会回填 ``body``；二进制 MIME 保留 ``blob_handle`` 供调用方走 :func:`get_blob`
+            或 :func:`drain_blob` 自取字节）.
+
+        Branches: inline ``body`` returned as-is; ``blob_handle`` auto-drained via :func:`drain_blob`,
+        text MIME fills ``body``, binary MIME keeps ``blob_handle`` for caller's byte handling.
+
+        协议依据 / Protocol: events.md §client:get_skill；data-structures.md §GetSkillRet
+        （``body`` 与 ``blob_handle`` 恰一存在）.
+
+        Raises:
+            SMCPProtocolError: ``4014`` name 未命中 / ``4016`` name 格式非法 / ``4017`` rel_path 不可达
+        """
+        req = self.create_get_skill_request(computer, name, rel_path)
+        logger.debug(f"Getting skill {name!r} rel_path={rel_path!r} from computer {computer}")
+        response = await self.call(GET_SKILL_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for skill")
+        # body / blob_handle 恰一存在；blob_handle 分支按 MIME 决定是否自动 drain 回填 body
+        # Exactly one of body / blob_handle. blob_handle branch auto-drains for text MIME only.
+        ret: GetSkillRet = dict(response)  # type: ignore[assignment]
+        mime_type = str(response.get("mime_type", ""))
+        if "blob_handle" in response and "body" not in response and mime_type.startswith("text/"):
+            payload, _ = await drain_blob(
+                self._make_blob_call(),
+                computer,
+                response["blob_handle"],
+            )
+            decoded = _sb.decode_text_body(payload)
+            if decoded is not None:
+                ret["body"] = decoded
+                ret.pop("blob_handle", None)
+            else:
+                # 解码失败保留 blob_handle 让调用方走二进制路径 / Decode failure → keep handle for binary path
+                logger.warning(f"get_skill text body decode failed for name={name!r}; keeping blob_handle")
+        return ret
+
+    async def get_blob(
+        self,
+        computer: str,
+        blob_handle: str,
+        *,
+        chunk_offset: int = 0,
+        max_chunk_bytes: int | None = None,
+        timeout: int = 30,
+    ) -> GetBlobRet:
+        """异步通用二进制拉取**单块**入口（低层 API）.
+
+        Async generic binary single-chunk pull (low-level API).
+
+        用于需要细粒度控制 ``chunk_offset`` / ``max_chunk_bytes`` 的场景（如自定义并发 drain）.
+        For full-blob drain，调用方 SHOULD 使用 :func:`a2c_smcp.utils.blob.drain_blob`.
+
+        协议依据 / Protocol: events.md §client:get_blob；blob-transfer.md §3 (parallel-safe per offset).
+        """
+        req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
+        logger.debug(f"Getting blob from computer {computer} offset={chunk_offset}")
+        response = await self.call(GET_BLOB_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for blob")
+        return GetBlobRet(**response)
+
+    def _make_blob_call(self) -> Any:
+        """构造 :func:`drain_blob` 的 ``call`` 适配器（绑定本 client 的 socketio 与 namespace）.
+
+        Build a ``call`` adapter for :func:`drain_blob` bound to this client's socketio + namespace.
+        """
+
+        async def _call(computer: str, blob_handle: str, chunk_offset: int, max_chunk_bytes: int) -> dict:
+            req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
+            ack = await self.call(GET_BLOB_EVENT, req, namespace=self._namespace)
+            return cast(dict, ack)
+
+        return _call
+
+    async def _resolve_tool_call_binary_sideband(self, raw: Any, computer: str) -> Any:
+        """扫描 ``CallToolResult`` 字典中 content items 的 ``_meta.a2c_blob_handle``，
+        :func:`drain_blob` 还原全量字节并回填 ``data`` / ``blob``，清理 ``_meta.a2c_*``.
+
+        Scan content items for ``_meta.a2c_blob_handle``; drain via :func:`drain_blob` and inject
+        ``data`` / ``blob`` back; strip ``_meta.a2c_*`` keys so caller sees a normal inline result.
+
+        协议依据 / Protocol: blob-transfer.md §5 + data-structures.md §BlobHandle.
+
+        实现策略 / Strategy: 通过 :mod:`._blob_sideband` 纯函数收敛 async/sync 共享的结构变换，
+        本方法只保留 ``await drain_blob`` 与错误兜底两处真正异步差异.
+        Pure structural transforms live in ``_blob_sideband`` (#30 pattern); this method retains
+        only the ``await drain_blob`` differentiator and the per-item error-tolerance shell.
+        """
+        call = self._make_blob_call()
+        for item, meta, handle in _sb.extract_sideband_handles(raw):
+            try:
+                payload, _mime = await drain_blob(call, computer, handle)
+            except Exception as e:  # noqa: BLE001 — 任何 drain 失败均原样保留 + 警告，避免吞噬整轮 tool_call
+                logger.warning(
+                    f"tool_call binary sideband drain failed for handle={handle!r}: {e}; keeping _meta.a2c_blob_handle intact",
+                )
+                continue
+            _sb.inject_payload_into_content_item(item, meta, payload)
+        return raw
+
+    async def _on_skills_updated(self, data: dict) -> None:
+        """处理 SKILL 集合更新通知（v0.2.1）：默认自动重拉 ``client:get_skills``.
+
+        Handle ``notify:update_skills``: default behavior re-fetches ``client:get_skills`` once
+        (mirrors the existing ``notify:update_*`` auto-refresh pattern).
+        """
+        try:
+            computer = data.get("computer")
+            if not computer:
+                logger.warning("UPDATE_SKILLS_NOTIFICATION missing 'computer'")
+                return
+            ret = await self.get_skills(computer)
+            logger.info(f"Skills refreshed from computer {computer}: count={len(ret.get('skills', []))}")
+        except Exception as e:
+            logger.error(f"Error handling skills updated notification: {e}", exc_info=True)
 
     async def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
         """
