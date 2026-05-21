@@ -34,7 +34,9 @@ class TestToolspoolBlobResolver:
         resolver = ToolspoolBlobResolver(store)
         resolved = resolver.resolve({"cid": cid, "mime": "text/plain"})
         assert isinstance(resolved, ResolvedBlob)
-        assert resolved.payload == b"hello world"
+        # v0.2.1 #51: 走 lazy slice 接口断言（.payload shim 保留但 deprecated）
+        # Assert via lazy slice (the .payload shim is retained but deprecated).
+        assert resolved.slice(0, resolved.total_size) == b"hello world"
         assert resolved.mime == "text/plain"
         assert resolved.total_size == 11
         assert resolved.sha256 == hashlib.sha256(b"hello world").hexdigest()
@@ -88,3 +90,109 @@ class TestSkillBlobResolverPending:
     def test_protocol_runtime_checkable(self) -> None:
         resolver = SkillBlobResolverPending()
         assert isinstance(resolver, BlobResolver)
+
+
+class TestResolvedBlobLazySlice:
+    """``ResolvedBlob.slice()`` 边界契约（v0.2.1 #51）/ Boundary contract for ``slice()``.
+
+    覆盖：中段切片 / EOF probe / 越界 raise / length 自动截断 / 负数防御 / 兼容 shim.
+    """
+
+    @pytest.fixture
+    def resolved(self, tmp_path: Path) -> ResolvedBlob:
+        store = ToolspoolBlobStore(tmp_path)
+        cid = store.put(b"hello world", "text/plain")  # 11 bytes
+        return ToolspoolBlobResolver(store).resolve({"cid": cid, "mime": "text/plain"})
+
+    def test_mid_stream_slice(self, resolved: ResolvedBlob) -> None:
+        assert resolved.slice(2, 4) == b"llo "
+
+    def test_end_aligned_slice_at_eof(self, resolved: ResolvedBlob) -> None:
+        assert resolved.slice(5, 6) == b" world"
+
+    def test_offset_at_total_size_returns_empty(self, resolved: ResolvedBlob) -> None:
+        """EOF probe semantics: offset == total_size returns b"" (NOT a range error)."""
+        assert resolved.slice(11, 100) == b""
+
+    def test_offset_beyond_total_size_raises(self, resolved: ResolvedBlob) -> None:
+        with pytest.raises(ValueError, match="> total_size"):
+            resolved.slice(12, 1)
+
+    def test_length_zero_returns_empty(self, resolved: ResolvedBlob) -> None:
+        assert resolved.slice(3, 0) == b""
+
+    def test_length_over_remaining_auto_truncates(self, resolved: ResolvedBlob) -> None:
+        """length 超出剩余字节自动截断（不 raise）/ length over remaining auto-truncates."""
+        assert resolved.slice(8, 999) == b"rld"
+
+    def test_negative_offset_raises(self, resolved: ResolvedBlob) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            resolved.slice(-1, 5)
+
+    def test_negative_length_raises(self, resolved: ResolvedBlob) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            resolved.slice(0, -1)
+
+    def test_payload_shim_returns_full_bytes(self, resolved: ResolvedBlob) -> None:
+        """向后兼容 shim：.payload 等价 slice(0, total_size).
+        Back-compat shim: .payload equivalent to slice(0, total_size)."""
+        assert resolved.payload == b"hello world"
+
+
+class TestLazyMemoryFootprint:
+    """惰性切片不变量（v0.2.1 #51）：resolve() 不打开 blob body 文件.
+    Lazy invariant: ``resolve()`` reads metadata only; never opens the blob body file."""
+
+    def test_resolve_does_not_open_blob_body(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """resolve() 仅读 stat + mime sidecar；不打开 blob body 文件。
+        ``Path.read_text`` / ``Path.stat`` 走 ``os.open``，监控 ``builtins.open`` 不受干扰。
+        """
+        store = ToolspoolBlobStore(tmp_path)
+        big_payload = b"x" * (4 * 1024 * 1024)  # 4 MiB
+        cid = store.put(big_payload, "application/octet-stream")
+        resolver = ToolspoolBlobResolver(store)
+
+        real_open = open
+        opened_blob_paths: list[str] = []
+
+        def tracking_open(file, *args, **kwargs):  # type: ignore[no-untyped-def]
+            path_str = str(file)
+            # 仅记录 blob body（以 cid 结尾、非 .mime sidecar）
+            if path_str.endswith(cid) and not path_str.endswith(".mime"):
+                opened_blob_paths.append(path_str)
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", tracking_open)
+
+        # resolve() 只应读 stat + mime sidecar，不打开 blob body
+        resolved = resolver.resolve({"cid": cid, "mime": "application/octet-stream"})
+        assert opened_blob_paths == [], f"resolve() opened blob body unexpectedly: {opened_blob_paths}"
+
+        # slice() 必须打开 blob body（独立 fd）
+        chunk = resolved.slice(0, 1024)
+        assert len(opened_blob_paths) == 1, "slice() should open exactly once"
+        assert chunk == big_payload[:1024]
+
+    def test_multiple_slices_independent_fds(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """多次 slice 各自独立 open；每次 read 完即关闭.
+        Each slice() invocation opens an independent fd; closed via ``with``."""
+        store = ToolspoolBlobStore(tmp_path)
+        cid = store.put(b"abcdefghij" * 1024, "text/plain")  # 10 KiB
+        resolver = ToolspoolBlobResolver(store)
+
+        real_open = open
+        open_count = 0
+
+        def counting_open(file, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal open_count
+            path_str = str(file)
+            if path_str.endswith(cid) and not path_str.endswith(".mime"):
+                open_count += 1
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", counting_open)
+        resolved = resolver.resolve({"cid": cid, "mime": "text/plain"})
+        resolved.slice(0, 1024)
+        resolved.slice(1024, 1024)
+        resolved.slice(8192, 2048)
+        assert open_count == 3

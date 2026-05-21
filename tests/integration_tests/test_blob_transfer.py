@@ -251,6 +251,77 @@ class TestInProcThresholdsAndDefense:
         assert data == payload
 
 
+class TestInProcLazyInvariant:
+    """v0.2.1 #51 lazy slice 端到端不变量：每 chunk 一次独立 ``read_chunk`` + 累计字节 ≈ ``total_size``.
+
+    End-to-end lazy invariant (v0.2.1 #51): one ``read_chunk`` per chunk request; total bytes
+    read across all chunks ≈ ``total_size`` (NOT ``N × total_size``).
+
+    防 production ``on_get_blob`` / ``_process_get_blob`` 误回退到 ``resolved.payload[...]``：
+    - 单测仍过（``.payload`` shim 工作 → ``slice(0, total_size)``）
+    - 集成字节正确性测试仍过（base64 解码后 bytes 一致）
+    - 但每次 chunk 请求都触发**全文件读**，内存峰值悄悄回归到 v0.2.1 #51 之前
+
+    PR #52 fix-review 🟡1：reviewer 原方案 ``builtins.open count == 25`` 无法捕获此回退
+    （``.payload`` shim 仍走 ``read_chunk`` → 仍 25 次 open）；本测试改监控 ``read_chunk``
+    **累计字节数** 精确区分两种实现.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lazy_invariant_read_chunk_bytes_equal_total_size(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        computer_with_client: tuple[Computer, SMCPComputerClient],
+    ) -> None:
+        """drain N chunks → ``read_chunk`` 累计字节 ≈ ``total_size``，**非** ``N × total_size``.
+
+        Drain N chunks → cumulative bytes read via ``read_chunk`` ≈ ``total_size``,
+        NOT ``N × total_size`` (which would indicate ``.payload`` shim regression).
+        """
+        from a2c_smcp.computer.blob.toolspool import ToolspoolBlobStore
+
+        comp, cli = computer_with_client
+        total_size = 100 * 1024  # 100 KiB
+        chunk_size = 4096
+        expected_chunks = total_size // chunk_size  # 25
+
+        payload = bytes((i * 31 + 7) % 256 for i in range(total_size))
+        handle = comp.mint_toolspool_handle(payload=payload, mime="application/octet-stream")
+
+        # 监控 read_chunk 累计字节 + 调用次数
+        # Monitor read_chunk cumulative bytes + call count
+        real_read_chunk = ToolspoolBlobStore.read_chunk
+        cumulative_bytes = 0
+        call_count = 0
+
+        def tracking_read_chunk(self_store, cid, offset, length):  # type: ignore[no-untyped-def]
+            nonlocal cumulative_bytes, call_count
+            data = real_read_chunk(self_store, cid, offset, length)
+            cumulative_bytes += len(data)
+            call_count += 1
+            return data
+
+        monkeypatch.setattr(ToolspoolBlobStore, "read_chunk", tracking_read_chunk)
+
+        call = _make_in_proc_call(cli)
+        data, _ = await drain_blob(call, comp.name, handle, chunk_size=chunk_size)
+
+        # 字节正确性（基线 sanity，独立于 lazy 验证）
+        # Byte correctness (baseline sanity, independent of lazy verification)
+        assert data == payload
+
+        # 关键不变量：每 chunk 一次 read_chunk，累计字节恰好 == total_size
+        # Key invariant: one read_chunk per chunk request; cumulative bytes == total_size
+        assert call_count == expected_chunks, (
+            f"expected {expected_chunks} read_chunk calls (one per chunk), got {call_count}"
+        )
+        assert cumulative_bytes == total_size, (
+            f"LAZY INVARIANT VIOLATED: cumulative read_chunk bytes = {cumulative_bytes} "
+            f"(expected ≈ {total_size}). If ≈ {expected_chunks * total_size}, this indicates "
+            f"regression to .payload shim causing full-file read per chunk request."
+        )
+
+
 # ======================================================================
 # Part 2 — Real Socket.IO transport (async)
 # ======================================================================
@@ -526,29 +597,32 @@ def _run_sync_computer_process(
     handle_q: multiprocessing.Queue,
     err_q: multiprocessing.Queue,
 ) -> None:
-    """同步 mock Computer：自己暴露 client:get_blob handler（手动派发到 in-process resolver）.
+    """同步 mock Computer：复用 production ``_process_get_blob`` 核心逻辑.
 
-    Sync mock Computer: hosts ``client:get_blob`` handler in-process by dispatching to the
-    same blob infrastructure (Toolspool store + handle codec). This shows the sync wire path
-    can be exercised without depending on Computer's async-only socketio client."""
+    Sync mock Computer: reuses production ``_process_get_blob`` core; handler body is a
+    pass-through wrapper, eliminating duplicate sync/async sync mirror maintenance.
+
+    抽取自 PR #52 fix-review 🟡2：让 sync wire 测试与 async ``SMCPComputerClient.on_get_blob``
+    走同一份纯函数实现（production handler body 本是同步代码），不再手写 decode + dispatch
+    + slice 的镜像逻辑。
+    Per PR #52 fix-review 🟡2: sync wire mock and async ``SMCPComputerClient.on_get_blob``
+    now share a single pure-function implementation; the duplicated decode/dispatch/slice
+    mirror logic is eliminated.
+    """
     from pathlib import Path
 
-    from a2c_smcp.computer.blob import (
-        BlobHandleError,
-        BlobHandleInvalidError,
-        ToolspoolBlobResolver,
-        ToolspoolBlobStore,
-        decode_blob_handle,
-        encode_toolspool_handle,
-    )
+    from a2c_smcp.computer.computer import Computer
+    from a2c_smcp.computer.socketio.client import _process_get_blob
 
-    store = ToolspoolBlobStore(Path(cache_dir))
-    resolver = ToolspoolBlobResolver(store)
+    # 真 Computer 实例（自动管理 toolspool_store + blob_resolvers + blob_thresholds）
+    # Real Computer instance (auto-managed toolspool_store + blob_resolvers + blob_thresholds).
+    computer_inst = Computer(name=_SYNC_COMPUTER, blob_cache_root=Path(cache_dir))
 
     # 在进程内铸造句柄 / Mint handle within this process
     payload = b"sync mirror round trip" * 100  # ~2 KiB
-    cid = store.put(payload, "application/octet-stream")
-    handle = encode_toolspool_handle(cid=cid, mime="application/octet-stream")
+    handle = computer_inst.mint_toolspool_handle(
+        payload=payload, mime="application/octet-stream",
+    )
     expected_sha = hashlib.sha256(payload).hexdigest()
     handle_q.put({"handle": handle, "expected_sha": expected_sha, "size": len(payload)})
 
@@ -556,48 +630,9 @@ def _run_sync_computer_process(
 
     @computer.on(GET_BLOB_EVENT, namespace=SMCP_NAMESPACE)
     def _on_get_blob(data: dict) -> dict:
-        try:
-            kind, raw_payload = decode_blob_handle(data["blob_handle"])
-        except BlobHandleInvalidError:
-            return {
-                "code": int(ErrorCode.BLOB_NOT_ACCESSIBLE),
-                "message": "Blob not accessible",
-                "details": {"reason": "invalid_handle"},
-            }
-        if kind != "toolspool":
-            return {
-                "code": int(ErrorCode.BLOB_NOT_ACCESSIBLE),
-                "message": "Blob not accessible",
-                "details": {"reason": "invalid_handle"},
-            }
-        try:
-            resolved = resolver.resolve(raw_payload)
-        except BlobHandleError as e:
-            return {
-                "code": int(ErrorCode.BLOB_NOT_ACCESSIBLE),
-                "message": "Blob not accessible",
-                "details": {"reason": getattr(e, "reason", "forbidden")},
-            }
-        offset = int(data.get("chunk_offset", 0))
-        max_chunk = int(data.get("max_chunk_bytes") or 64 * 1024)
-        if offset < 0 or offset > resolved.total_size:
-            return {
-                "code": int(ErrorCode.BLOB_NOT_ACCESSIBLE),
-                "message": "Blob not accessible",
-                "details": {"reason": "range"},
-            }
-        end = min(offset + max_chunk, resolved.total_size)
-        chunk = resolved.payload[offset:end]
-        ret: GetBlobRet = {
-            "blob_handle": data["blob_handle"],
-            "mime_type": resolved.mime,
-            "total_size": resolved.total_size,
-            "sha256": resolved.sha256,
-            "chunk_offset": offset,
-            "eof": end == resolved.total_size,
-            "blob": base64.b64encode(chunk).decode("ascii"),
-            "req_id": data["req_id"],
-        }
+        # 复用 production 同步核心；不再手写 decode + dispatch + slice 逻辑
+        # Reuse production sync core; no more duplicated decode/dispatch/slice logic.
+        ret = _process_get_blob(data, computer_inst)
         return dict(ret)
 
     try:
