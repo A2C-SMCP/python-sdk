@@ -186,3 +186,105 @@ class TestMimeValidation:
         store = ToolspoolBlobStore(tmp_path)
         with pytest.raises(ValueError, match="mime"):
             store.put(b"x", "image/png;charset=中文")
+
+
+class TestStatAndReadChunk:
+    """``ToolspoolBlobStore.stat()`` + ``read_chunk()`` 惰性原语（v0.2.1 #51）.
+    Lazy primitive tests for ``stat()`` + ``read_chunk()`` (v0.2.1 #51)."""
+
+    def test_stat_returns_size_and_mime_without_reading_payload(self, tmp_path: Path) -> None:
+        """stat 只读 metadata，不读 payload bytes / stat reads metadata only."""
+        store = ToolspoolBlobStore(tmp_path)
+        payload = b"y" * (256 * 1024)
+        cid = store.put(payload, "application/octet-stream")
+        info = store.stat(cid)
+        assert info.size == 256 * 1024
+        assert info.mime == "application/octet-stream"
+
+    def test_read_chunk_mid_stream(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        payload = bytes(range(256)) * 4  # 1024 bytes, deterministic
+        cid = store.put(payload, "application/octet-stream")
+        chunk = store.read_chunk(cid, 100, 200)
+        assert chunk == payload[100:300]
+
+    def test_read_chunk_end_aligned(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        payload = b"a" * 1024
+        cid = store.put(payload, "text/plain")
+        chunk = store.read_chunk(cid, 1024 - 100, 100)
+        assert chunk == payload[-100:]
+
+    def test_read_chunk_past_eof_returns_empty(self, tmp_path: Path) -> None:
+        """``offset >= total_size`` → ``b""`` (mirrors Python file.read past EOF)."""
+        store = ToolspoolBlobStore(tmp_path)
+        payload = b"abc"
+        cid = store.put(payload, "text/plain")
+        assert store.read_chunk(cid, 3, 100) == b""
+        assert store.read_chunk(cid, 10, 100) == b""
+
+    def test_read_chunk_length_over_remaining_short_read(self, tmp_path: Path) -> None:
+        """``length > remaining`` → OS 自然短读（不 raise）."""
+        store = ToolspoolBlobStore(tmp_path)
+        payload = b"abcdef"  # 6 bytes
+        cid = store.put(payload, "text/plain")
+        assert store.read_chunk(cid, 3, 999) == b"def"
+
+    def test_read_chunk_length_zero_no_io(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """``length == 0`` → ``b""`` 无 I/O 触发 / no I/O when length is 0."""
+        store = ToolspoolBlobStore(tmp_path)
+        cid = store.put(b"hello", "text/plain")
+
+        def fail_open(*args, **kwargs):  # type: ignore[no-untyped-def]
+            pytest.fail("read_chunk(length=0) must not invoke open()")
+
+        monkeypatch.setattr("builtins.open", fail_open)
+        assert store.read_chunk(cid, 0, 0) == b""
+
+    def test_read_chunk_invalid_cid_raises(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        for forged in ("..", "../../etc/passwd", "not-hex" * 9, ""):
+            with pytest.raises(BlobHandleInvalidError):
+                store.read_chunk(forged, 0, 100)
+
+    def test_read_chunk_gone_cid_raises(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        missing = "a" * 64  # valid hex, no file
+        with pytest.raises(BlobHandleGoneError):
+            store.read_chunk(missing, 0, 100)
+
+    def test_read_chunk_negative_offset_raises(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        cid = store.put(b"hello", "text/plain")
+        with pytest.raises(ValueError, match="non-negative"):
+            store.read_chunk(cid, -1, 5)
+
+    def test_stat_invalid_cid_raises(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        with pytest.raises(BlobHandleInvalidError):
+            store.stat("not-hex")
+
+    def test_stat_gone_cid_raises(self, tmp_path: Path) -> None:
+        store = ToolspoolBlobStore(tmp_path)
+        missing = "b" * 64
+        with pytest.raises(BlobHandleGoneError):
+            store.stat(missing)
+
+    def test_concurrent_read_chunks_independent(self, tmp_path: Path) -> None:
+        """并发 read_chunk 各自独立 fd，结果可靠拼接为原文.
+        Concurrent read_chunk calls use independent fds; results reassemble to original."""
+        store = ToolspoolBlobStore(tmp_path)
+        payload = b"abcdefghij" * 1024  # 10 KiB, deterministic
+        cid = store.put(payload, "text/plain")
+        chunks_per_offset: dict[int, bytes] = {}
+
+        def fetch(offset: int) -> tuple[int, bytes]:
+            return offset, store.read_chunk(cid, offset, 1024)
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            offsets = list(range(0, len(payload), 1024))
+            for offset, chunk in pool.map(fetch, offsets):
+                chunks_per_offset[offset] = chunk
+
+        reassembled = b"".join(chunks_per_offset[off] for off in sorted(chunks_per_offset))
+        assert reassembled == payload

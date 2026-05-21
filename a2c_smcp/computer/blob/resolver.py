@@ -18,28 +18,85 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from a2c_smcp.computer.blob.handle import BlobHandleForbiddenError
 from a2c_smcp.computer.blob.toolspool import ToolspoolBlobStore
 
+# 惰性切片闭包类型 / Lazy slice closure type: (offset, length) -> bytes
+# Resolver 在 ``resolve()`` 中构造此闭包并注入 ResolvedBlob，handler 切片时按需回读。
+# Constructed by resolver inside ``resolve()``; invoked lazily by handler at slice time.
+_BlobSlicer = Callable[[int, int], bytes]
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class ResolvedBlob:
     """``blob_handle`` 解析后的资源描述符 / Resolved blob descriptor.
 
+    惰性切片视图（v0.2.1 #51）：``payload`` 不再驻留全量字节；``slice(offset, length)``
+    按需经 ``_slicer`` 闭包从源 seek+read。``resolve()`` 期间 O(1) 内存。
+    Lazy slice view (v0.2.1 #51): ``payload`` no longer holds full bytes; ``slice()`` reads
+    on demand via ``_slicer`` closure (seek+read). ``resolve()`` is O(1) memory.
+
     Attributes:
-        payload: 完整字节内容（解析期一次性 / 切片由 handler 完成）。Full raw bytes.
-        mime: 内容 MIME。
-        total_size: 资源总字节数（= ``len(payload)``，显式字段便于审计与单测断言）。
-        sha256: 全量 ``sha256`` 十六进制（由 resolver 自行算或回查既有 cid 值）。
+        mime: 内容 MIME（handle-authoritative，由 resolver 从句柄载荷透传）。
+            MIME from handle payload (authoritative).
+        total_size: 资源总字节数。Total resource size in bytes.
+        sha256: 全量 ``sha256`` 十六进制（kind=toolspool 即 cid）/ Full sha256 hex.
+        _slicer: closure ``(offset, length) -> bytes``；resolver 提供的惰性读闭包。
+            Resolver-supplied lazy-read closure; never None in valid construction.
+
+    Notes:
+        - ``frozen=True``：表达 "resolver 派发的不可变快照" 语义；handler MUST NOT mutate.
+        - ``eq=False``：closure 字段不参与 hash/equality（resolver 每次 resolve 创建新实例，
+          实例对比走 identity）。Closure field skipped in eq/hash; identity comparison.
     """
 
-    payload: bytes
     mime: str
     total_size: int
     sha256: str
+    _slicer: _BlobSlicer = field(repr=False)
+
+    def slice(self, offset: int, length: int) -> bytes:
+        """读取 ``[offset, offset+length)`` 字节区间，截断到 ``total_size``.
+        Read bytes in ``[offset, offset+length)``, clamped to ``total_size``.
+
+        边界语义 / Boundary semantics:
+          - ``offset == total_size`` → ``b""``（EOF probe，**非** range error）
+          - ``offset > total_size`` → ``ValueError``（调用方应先做范围校验）
+          - ``offset < 0`` or ``length < 0`` → ``ValueError``
+          - ``length == 0`` → ``b""``（无 I/O 触发）
+          - ``length`` 超出剩余 → 自动截断为 ``total_size - offset``（不 raise）
+
+        EOF probe 语义保留与 ``on_get_blob`` 严格 ``>`` 范围守卫一致，避免破坏 HTTP Range
+        风格的"探测末尾"客户端行为。
+        Preserves HTTP-Range-style probe semantics (offset == total_size returns empty,
+        offset > total_size raises) aligned with ``on_get_blob``'s strict ``>`` guard.
+        """
+        if offset < 0 or length < 0:
+            raise ValueError(f"offset/length must be non-negative: offset={offset}, length={length}")
+        if offset > self.total_size:
+            raise ValueError(f"offset {offset} > total_size {self.total_size}")
+        if length == 0 or offset == self.total_size:
+            return b""
+        actual = min(length, self.total_size - offset)
+        return self._slicer(offset, actual)
+
+    @property
+    def payload(self) -> bytes:
+        """向后兼容只读视图：等价 ``slice(0, total_size)``，**会触发一次全量读**.
+
+        新代码 SHOULD 改用 :meth:`slice` 避免内存放大；保留此属性仅为 v0.2.x 迁移期与
+        现有单测断言。计划于 v0.3 移除。
+        Back-compat shim; triggers a full read. New code SHOULD use :meth:`slice` to avoid
+        memory amplification. Retained for the v0.2.x migration window; removed in v0.3.
+
+        .. deprecated:: 0.2.1
+            Use :meth:`slice` instead.
+        """
+        return self.slice(0, self.total_size)
 
 
 @runtime_checkable
@@ -59,18 +116,19 @@ class BlobResolver(Protocol):
 
 
 class ToolspoolBlobResolver:
-    """``kind="toolspool"`` 解析器：按 ``cid`` 回查 ``.blobspool`` 暂存。
+    """``kind="toolspool"`` 解析器：按 ``cid`` 回查 ``.blobspool`` 暂存（惰性切片）.
 
     跨进程重启可解析：cid 在磁盘 → 成功；不在 → ``BlobHandleGoneError`` （协议 ``4018 gone``）。
     Survives Computer restarts: cid present on disk → success; absent → ``BlobHandleGoneError``.
 
-    TODO(v0.2.x+): ``resolve()`` 当前一次性 ``read_bytes()`` 读全量进内存，handler 再切片返回单块。
-    并行 ``concurrency=N`` 拉取大 blob 时瞬时占用 ≈ N × total_size。后续版本可引入 lazy 抽象
-    （mmap / seek+read），让 ``ResolvedBlob`` 暴露 ``slice(offset, length) → bytes`` 而不持有
-    全量字节。"无状态可重解析" 承诺不变，仅是内存峰值优化，非协议变更。
-    Future optimization (non-protocol): replace eager ``read_bytes()`` with a lazy slice view
-    (mmap / seek+read) so ``ResolvedBlob`` exposes per-chunk reads without holding the full
-    payload in memory. Stateless-reparseable contract unchanged.
+    惰性切片（v0.2.1 #51）：``resolve()`` 仅读 metadata（``stat()``），不读 payload 字节；
+    ``ResolvedBlob.slice(offset, length)`` 经 ``ToolspoolBlobStore.read_chunk`` 按需 seek+read。
+    并行 ``concurrency=N`` 拉取大 blob 时单 chunk 入内存，峰值与 ``total_size`` 解耦。
+    "无状态可重解析" 承诺不变，仅是内存峰值优化，非协议变更。
+    Lazy slice (v0.2.1 #51): ``resolve()`` reads metadata only via ``stat()``, never payload bytes;
+    ``ResolvedBlob.slice(offset, length)`` reads on demand via ``ToolspoolBlobStore.read_chunk``.
+    Concurrent fetches see per-chunk memory peak, decoupled from ``total_size``.
+    Stateless-reparseable contract unchanged.
     """
 
     def __init__(self, store: ToolspoolBlobStore) -> None:
@@ -79,15 +137,27 @@ class ToolspoolBlobResolver:
     def resolve(self, payload: dict[str, Any]) -> ResolvedBlob:
         cid = payload["cid"]
         mime_in_handle = payload["mime"]
-        # ToolspoolBlobStore.get 已做 cid 白名单 + realpath 越界防御 + GoneError 抛出
-        # store.get already validates cid + realpath + raises GoneError
-        raw, mime_on_disk = self._store.get(cid)
-        # cid 即 sha256，无需重算（store.get 已 fail-fast 路径校验）
-        # cid IS the sha256; no need to recompute (store.get already path-validated)
+        # stat 仅读元数据（size + sidecar mime）+ cid 白名单 + realpath 围栏 + GoneError/InvalidError 抛出
+        # stat reads metadata only (size + sidecar mime) + cid whitelist + realpath fence
+        info = self._store.stat(cid)
         # mime 以铸造时入参为准；磁盘旁路只作诊断，不参与协议返回
         # Handle-embedded mime is authoritative; disk sidecar is diagnostic only
-        _ = mime_on_disk
-        return ResolvedBlob(payload=raw, mime=mime_in_handle, total_size=len(raw), sha256=cid)
+        _ = info.mime
+        # 闭包捕获 store + cid；handler 每次 slice 调用都触发 seek+read（O(1) memory per call）
+        # Closure captures store + cid; each slice call triggers seek+read (O(1) memory per call).
+        store = self._store
+
+        def _slicer(offset: int, length: int) -> bytes:
+            return store.read_chunk(cid, offset, length)
+
+        # cid 即 sha256，无需重算（stat 已 fail-fast 路径校验）
+        # cid IS the sha256; no need to recompute (stat already path-validated).
+        return ResolvedBlob(
+            mime=mime_in_handle,
+            total_size=info.size,
+            sha256=cid,
+            _slicer=_slicer,
+        )
 
 
 class SkillBlobResolverPending:

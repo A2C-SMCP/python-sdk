@@ -586,15 +586,18 @@ def _run_sync_computer_process(
                 "message": "Blob not accessible",
                 "details": {"reason": "range"},
             }
-        end = min(offset + max_chunk, resolved.total_size)
-        chunk = resolved.payload[offset:end]
+        # v0.2.1 #51: 走 lazy slice 接口（与 production on_get_blob 同款），避免 .payload shim 触发全量读
+        # Use lazy slice (mirrors production on_get_blob), preventing .payload shim from forcing full-read.
+        remaining = resolved.total_size - offset
+        slice_len = min(max_chunk, remaining)
+        chunk = resolved.slice(offset, slice_len)
         ret: GetBlobRet = {
             "blob_handle": data["blob_handle"],
             "mime_type": resolved.mime,
             "total_size": resolved.total_size,
             "sha256": resolved.sha256,
             "chunk_offset": offset,
-            "eof": end == resolved.total_size,
+            "eof": offset + len(chunk) == resolved.total_size,
             "blob": base64.b64encode(chunk).decode("ascii"),
             "req_id": data["req_id"],
         }

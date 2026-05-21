@@ -612,9 +612,14 @@ class SMCPComputerClient(AsyncClient):
             return _blob_error(reason="range")
 
         # 4) 切片 + base64 编码（单块 ≤ clamp 后的 max_chunk_bytes）/ Slice + base64 (chunk ≤ clamp)
-        end = min(chunk_offset + max_chunk_bytes, resolved.total_size)
-        chunk = resolved.payload[chunk_offset:end]
-        eof = end == resolved.total_size
+        # v0.2.1 #51: 走 lazy slice，仅单 chunk 入内存（不再触发全量 read_bytes）
+        # Lazy slice (v0.2.1 #51): only one chunk in memory; no full-file read triggered.
+        remaining = resolved.total_size - chunk_offset
+        slice_len = min(max_chunk_bytes, remaining)
+        chunk = resolved.slice(chunk_offset, slice_len)
+        # eof 公式保留 len(chunk) 形式：与原 ``end == total_size`` 等价，对 OS 短读健壮.
+        # Preserve len(chunk) form: equivalent to original ``end == total_size``, robust to short-reads.
+        eof = chunk_offset + len(chunk) == resolved.total_size
         ret: GetBlobRet = {
             "blob_handle": handle,
             "mime_type": resolved.mime,
