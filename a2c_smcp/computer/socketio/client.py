@@ -574,63 +574,11 @@ class SMCPComputerClient(AsyncClient):
         Returns:
             GetBlobRet | ErrorPayload: 成功为切片块（``base64`` 编码），失败为 flat ErrorPayload。
         """
-        # office/role 隔离：Server 已保证同房间路由，但 ``computer`` 标识仍需匹配
-        # office/role isolation: Server guarantees same-room routing, but ``computer`` MUST match
-        if self.computer.name != data["computer"]:
-            raise SMCPNamespaceError("计算机标识不匹配")
-
-        handle = data["blob_handle"]
-        chunk_offset = data.get("chunk_offset", 0)
-        max_chunk_bytes_req = data.get("max_chunk_bytes")
-        max_chunk_bytes = self.computer.blob_thresholds.clamp_chunk(max_chunk_bytes_req)
-
-        # 1) 解码句柄 → kind 派发 / Decode handle → kind dispatch
-        try:
-            kind, payload = decode_blob_handle(handle)
-        except BlobHandleInvalidError as e:
-            logger.warning(f"client:get_blob invalid handle: {e}")
-            return _blob_error(reason="invalid_handle")
-
-        resolver = self.computer.blob_resolvers.get(kind)
-        if resolver is None:
-            logger.warning(f"client:get_blob no resolver for kind={kind!r}")
-            return _blob_error(reason="invalid_handle")
-
-        # 2) 解析（resolver 内部重施铸造通道边界校验）/ Resolve (resolver re-applies channel auth)
-        try:
-            resolved = resolver.resolve(payload)
-        except BlobHandleError as e:
-            reason = getattr(e, "reason", "forbidden")
-            logger.warning(f"client:get_blob resolver rejected handle: kind={kind}, reason={reason}, err={e}")
-            return _blob_error(reason=reason)
-
-        # 3) 范围校验 / Range check
-        if not isinstance(chunk_offset, int) or chunk_offset < 0 or chunk_offset > resolved.total_size:
-            logger.warning(
-                f"client:get_blob range out of bounds: offset={chunk_offset}, total_size={resolved.total_size}",
-            )
-            return _blob_error(reason="range")
-
-        # 4) 切片 + base64 编码（单块 ≤ clamp 后的 max_chunk_bytes）/ Slice + base64 (chunk ≤ clamp)
-        # v0.2.1 #51: 走 lazy slice，仅单 chunk 入内存（不再触发全量 read_bytes）
-        # Lazy slice (v0.2.1 #51): only one chunk in memory; no full-file read triggered.
-        remaining = resolved.total_size - chunk_offset
-        slice_len = min(max_chunk_bytes, remaining)
-        chunk = resolved.slice(chunk_offset, slice_len)
-        # eof 公式保留 len(chunk) 形式：与原 ``end == total_size`` 等价，对 OS 短读健壮.
-        # Preserve len(chunk) form: equivalent to original ``end == total_size``, robust to short-reads.
-        eof = chunk_offset + len(chunk) == resolved.total_size
-        ret: GetBlobRet = {
-            "blob_handle": handle,
-            "mime_type": resolved.mime,
-            "total_size": resolved.total_size,
-            "sha256": resolved.sha256,
-            "chunk_offset": chunk_offset,
-            "eof": eof,
-            "blob": base64.b64encode(chunk).decode("ascii"),
-            "req_id": data["req_id"],
-        }
-        return ret
+        # 核心逻辑抽取至模块级 ``_process_get_blob``，让同步 wire 测试 mock 与本 async wrapper
+        # 复用同一份实现，避免"两份同源 handler 逻辑双份维护"的脆弱点（PR #52 fix-review）.
+        # Core logic extracted to module-level ``_process_get_blob``, shared with sync wire mock,
+        # eliminating dual-maintenance of equivalent sync/async handler bodies (PR #52 fix-review).
+        return _process_get_blob(data, self.computer)
 
 
 def _blob_error(*, reason: str) -> ErrorPayload:
@@ -642,3 +590,86 @@ def _blob_error(*, reason: str) -> ErrorPayload:
         message="Blob not accessible",
         details={"reason": reason},
     )
+
+
+def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | ErrorPayload:
+    """通用二进制拉取的纯同步核心逻辑 / Pure synchronous core logic for ``client:get_blob``.
+
+    抽取自 :meth:`SMCPComputerClient.on_get_blob`（v0.2.1 #51 PR #52 fix-review）；让同步
+    ``socketio.Client`` wire 测试 mock 与 async ``SMCPComputerClient`` 复用同一份实现，
+    消除"两份同源 handler 逻辑双份维护"的脆弱点。``on_get_blob`` body 本是同步代码
+    （无 ``await``），抽取为纯函数零行为变更。
+    Extracted from :meth:`SMCPComputerClient.on_get_blob` so sync ``socketio.Client`` (test
+    wire mock) and async ``SMCPComputerClient`` share one implementation. The async handler's
+    body is pure-sync code (no ``await``); extraction is behavior-neutral.
+
+    完整协议依据 / 安全 / 错误语义文档保留在 :meth:`SMCPComputerClient.on_get_blob`.
+    Full protocol / security / error semantics docs are retained on the async wrapper.
+
+    Args:
+        data: ``GetBlobReq`` payload.
+        computer: 持有 ``name`` / ``blob_thresholds`` / ``blob_resolvers`` 的 ``Computer`` 实例.
+
+    Returns:
+        ``GetBlobRet`` (成功) 或 ``ErrorPayload`` (4018 invalid_handle / forbidden / gone / range).
+
+    Raises:
+        SMCPNamespaceError: ``computer.name`` 与 ``data["computer"]`` 不匹配（防御纵深，理论不可达）.
+    """
+    # office/role 隔离：Server 已保证同房间路由，但 ``computer`` 标识仍需匹配
+    # office/role isolation: Server guarantees same-room routing, but ``computer`` MUST match
+    if computer.name != data["computer"]:
+        raise SMCPNamespaceError("计算机标识不匹配")
+
+    handle = data["blob_handle"]
+    chunk_offset = data.get("chunk_offset", 0)
+    max_chunk_bytes_req = data.get("max_chunk_bytes")
+    max_chunk_bytes = computer.blob_thresholds.clamp_chunk(max_chunk_bytes_req)
+
+    # 1) 解码句柄 → kind 派发 / Decode handle → kind dispatch
+    try:
+        kind, payload = decode_blob_handle(handle)
+    except BlobHandleInvalidError as e:
+        logger.warning(f"client:get_blob invalid handle: {e}")
+        return _blob_error(reason="invalid_handle")
+
+    resolver = computer.blob_resolvers.get(kind)
+    if resolver is None:
+        logger.warning(f"client:get_blob no resolver for kind={kind!r}")
+        return _blob_error(reason="invalid_handle")
+
+    # 2) 解析（resolver 内部重施铸造通道边界校验）/ Resolve (resolver re-applies channel auth)
+    try:
+        resolved = resolver.resolve(payload)
+    except BlobHandleError as e:
+        reason = getattr(e, "reason", "forbidden")
+        logger.warning(f"client:get_blob resolver rejected handle: kind={kind}, reason={reason}, err={e}")
+        return _blob_error(reason=reason)
+
+    # 3) 范围校验 / Range check
+    if not isinstance(chunk_offset, int) or chunk_offset < 0 or chunk_offset > resolved.total_size:
+        logger.warning(
+            f"client:get_blob range out of bounds: offset={chunk_offset}, total_size={resolved.total_size}",
+        )
+        return _blob_error(reason="range")
+
+    # 4) 切片 + base64 编码（单块 ≤ clamp 后的 max_chunk_bytes）/ Slice + base64 (chunk ≤ clamp)
+    # v0.2.1 #51: 走 lazy slice，仅单 chunk 入内存（不再触发全量 read_bytes）
+    # Lazy slice (v0.2.1 #51): only one chunk in memory; no full-file read triggered.
+    remaining = resolved.total_size - chunk_offset
+    slice_len = min(max_chunk_bytes, remaining)
+    chunk = resolved.slice(chunk_offset, slice_len)
+    # eof 公式保留 len(chunk) 形式：与原 ``end == total_size`` 等价，对 OS 短读健壮.
+    # Preserve len(chunk) form: equivalent to original ``end == total_size``, robust to short-reads.
+    eof = chunk_offset + len(chunk) == resolved.total_size
+    ret: GetBlobRet = {
+        "blob_handle": handle,
+        "mime_type": resolved.mime,
+        "total_size": resolved.total_size,
+        "sha256": resolved.sha256,
+        "chunk_offset": chunk_offset,
+        "eof": eof,
+        "blob": base64.b64encode(chunk).decode("ascii"),
+        "req_id": data["req_id"],
+    }
+    return ret

@@ -143,8 +143,12 @@ class ToolspoolBlobResolver:
         # mime 以铸造时入参为准；磁盘旁路只作诊断，不参与协议返回
         # Handle-embedded mime is authoritative; disk sidecar is diagnostic only
         _ = info.mime
-        # 闭包捕获 store + cid；handler 每次 slice 调用都触发 seek+read（O(1) memory per call）
-        # Closure captures store + cid; each slice call triggers seek+read (O(1) memory per call).
+        # 闭包仅捕获 ``store + cid``（**不**捕获 self）：让 ``ResolvedBlob`` 反向引用最小化，
+        # 避免间接钉住 ``ToolspoolBlobResolver`` 实例，便于未来 ``ResolvedBlob`` 被长时缓存
+        # 场景下的 GC。每次 slice 调用都触发独立 seek+read（O(1) memory per call）.
+        # Capture ``store + cid`` only (NOT self): keeps ``ResolvedBlob``'s back-references
+        # minimal so it doesn't pin the ``ToolspoolBlobResolver`` instance — useful for
+        # future cached scenarios. Each slice call triggers independent seek+read.
         store = self._store
 
         def _slicer(offset: int, length: int) -> bytes:
