@@ -58,6 +58,11 @@
 - `marketplace:` / `user` 为净新增、无现有配置宿主，概念上正是 Claude Code marketplace 两层模型。把 git 源生命周期（clone/pull/孤儿/GC/autoUpdate）塞进 `MCPServerConfig`（传输/工具配置）= 范畴错误，且会把 SKILL 源意图泄进 `client:get_config`（违背协议理念 #2「对 Agent 暴露表面与 source 无关」）。
 - 混合方案使「三源各按本性管理、对 Agent 表面统一」，正合 `skill.md §8`「表面与 source 无关，机制细节按源不同（§5）」。
 
+> **`user` 源 DropIn 的两类根 + 与 active-workdir 的关系**（与 [`design-0.2.1-cli-marketplace-ux.md`](design-0.2.1-cli-marketplace-ux.md) §5.0/§5.1 对齐；上表「物化层」只画了第 ① 类）：
+> - ① 全局 `$A2C_SKILL_HOME/user/<skill>/`（SKILL Home 内）；② 每个 **workspace 登记工作目录** `<workdir>/.tfrobot/skills/<skill>/`（**就地发现、不 staging 进 SKILL Home**，与 marketplace clone 树相反）。两类都被 watcher 实时监控。
+> - 二者同属 CLI-UX 的**能力发现层**：跨**全部登记工作目录**全局并集、置最低优先级、**不随 active workdir 切换**。
+> - **关键澄清**：CLI-UX 新增的 `active-workdir 单根` 概念只作用于 settings.json / mcp.json 的「(B) 敏感+标量层」（trust / MCP 批准 / permissions / 标量），**不影响 SKILL 可见集**——Skill Registry 与 `get_skills`（§4.1/§5.1）返回的是 **workspace 全局稳定集**，与当前任务绑定的 active workdir 无关。本文档（Registry/staging/sandbox/协议传递）因此**不受** settings 聚合/版本/active-workdir 决策影响。
+
 ### 2.2 决策 ② marketplace git 源刷新/对账 → **Claude Code 对标（无 TTL）**
 
 - **eager add**：用户配置 git 源即时 `git clone --depth 1`（SSH→HTTPS 回退；`GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=''`；超时可配，默认 120s）。不走 `gh`。
@@ -213,7 +218,7 @@ blob_handle = base64url( msgpack({
 
 - 持有 `SkillRegistry`（仿持有 `mcp_manager`，`computer.py:98`）。
 - 扩展 `_on_manager_change`（`computer.py:187-257`，现仅 `window://`）：**并行**新增 `skill://` 分支——`ResourceListChanged` 重枚举 `skill://` 集合、`ResourceUpdated(skill://)` 重物化该 SKILL → 增量物化 → `emit_update_skills`。仿 `_acollect_window_uris`（`:259-271`）新增 `_acollect_skill_refs` 缓存对比（集合相同跳过，仅 DEBUG）。
-- 新增 marketplace/user 源本地探测（启动 reconcile + 显式 refresh 入口；机制 SDK 自决，与 `window://` 探测同构）。
+- 新增 marketplace/user 源本地探测（启动 reconcile + 显式 refresh 入口；机制 SDK 自决，与 `window://` 探测同构）。**`user` 源探测含全部登记工作目录的 `<workdir>/.tfrobot/skills/` watcher**（能力发现层、全局并集、不随 active workdir 切换；见 §2.1 注与 CLI-UX §5.0/§5.1）。
 - 委托方法 `get_skills` / `get_skill` / `get_blob`（仿 `get_resources` 委托 `manager`，但委托 `SkillRegistry`/`staging`/`sandbox`）。
 
 ### 5.2 mcp: 源枚举 `a2c_smcp/computer/mcp_clients/manager.py`

@@ -19,12 +19,12 @@
 | 3 | Marketplace 模型 | 1 git repo = 1 marketplace = N plugin = N skill | 仓库根需 `.tfrobot-plugin/marketplace.json` |
 | 4 | Manifest 路径 | `.tfrobot-plugin/marketplace.json` + 每 plugin 下 `plugin.json` | "claude" → "tfrobot" 命名 |
 | 5 | Install 语义 | Eager clone + **显式 install** | 与 CC 一致，与 #39 设计文档 §2.2 `auto_update` 解耦 |
-| 6 | Enable 颗粒度 | **仅 plugin 层**（一开一关，对应其下所有 skill） | CC 风格 |
+| 6 | Enable 颗粒度 | **仅 plugin 层**（一开一关，统辖其下**全部贡献**：所有 skill **+ 其携带的 MCP server config**） | CC 风格：disable = 整 plugin 下线（skills 隐藏 + bundled MCP server 停并摘除）；与 §7.1 步骤 5 对齐 |
 | 7 | Plugin 可携带 | skills + MCP server config | 不含 hooks/commands/agents/outputStyles |
 | 8 | 三源命名（协议 0.2.2 定稿） | marketplace: `<plugin>:<skill>`（2 段，**无 mp 前缀**）；mcp: `mcp:<server>:<skill>`（3 段）；user: `<skill>`（裸名 1 段） | 段数消歧；mp 溯源走 `A2CSkillRef.source`；冲突 install 层拦截（§2.1/§2.4） |
 | 9 | Trust 层 | **CC 风格**：首次 add `y/N`/`--trust`；信任由 settings.json policy 字段（`strictKnownMarketplaces`/`trustedMarketplaces`/`blockedMarketplaces`）load 时**计算**，**不**落物化文件 | 校正：CC 不在 known_marketplaces.json 存 trusted（§6.1） |
 | 10 | scope 分层 | user / project / local / flag / policy 五级（CC 完整对齐） | first-source-wins for policy |
-| 11 | 自发现路径 | 监控根（递归）：`$A2C_SKILL_HOME/user/`、`$CWD/.tfrobot/skills/`；发现单元：`<root>/<skill>/SKILL.md`（根下一级）；MCP 走 `_on_manager_change` 的 `skill://` | **不监** `marketplace/` clone 树（走显式 refresh，CC 同；详见 §8.3） |
+| 11 | 自发现路径 | 监控根（递归）：`$A2C_SKILL_HOME/user/`、**全部已登记工作目录** `<workdir>/.tfrobot/skills/`（skill 属能力层、跨全部登记目录全局并集、不随 active 切换）；发现单元：`<root>/<skill>/SKILL.md`（根下一级）；MCP 走 `_on_manager_change` 的 `skill://` | **不监** `marketplace/` clone 树（走显式 refresh，CC 同；详见 §5.0/§8.3） |
 | 12 | Git 实现 | `subprocess` 调 `git` CLI（SSH→HTTPS fallback、`GIT_TERMINAL_PROMPT=0`） | |
 | 13 | 进度反馈 | Rich 进度条 + 错误表格汇总 | 多 marketplace 批操作友好 |
 | 14 | Banner UX | 仅 `plugins=0 AND servers=0` 时出 | marketplace 数量不计入 |
@@ -41,7 +41,7 @@
 | 25 | MCP server 定义文件 | A2C **原生 schema**（`{servers,inputs}`）→ workspace/project `.tfrobot/mcp.json` + user `$XDG_CONFIG_HOME/a2c/mcp.json` | `server_parameters` 嵌套 + 治理字段与标准 `.mcp.json` 不兼容，**不同名混用**（§9.1） |
 | 26 | MCP 批准门控 | **全套 CC**：首见未知 server 弹批准框；`enableAllProjectMcpServers`/`enabledMcpjsonServers`/`disabledMcpjsonServers`；批准状态写 **local scope** | MCP 执行任意命令，每用户先批准（§9.2） |
 | 27 | inputs/env/secret | **完整对标 VS Code**：`${env:VAR}` + `${input:id}` + 预定义变量；`password:true` 走 **OS keyring**（`keyring` 库）；env 注入 `A2C_INPUT_<ID>`；`envFile`；**密钥永不落明文** | §9.3，含 headless 降级 |
-| 28 | scope 聚合 | **user 为主** + A2C **workspace 聚合多个工作目录**作 project/local 叠加层（非单一 `$CWD`） | A2C workspace 概念（§5.1 校正） |
+| 28 | scope 聚合 | **user 为主** + workspace **active workdir 单根**作 project/local（根随任务切换）+ **能力层**（`enabledPlugins`/`extraKnownMarketplaces`/skills）跨全部登记目录全局并集 | 访谈定稿；映射 CC `--add-dir`（详见 §5.0/§5.1） |
 
 ---
 
@@ -92,10 +92,10 @@
 
 直接 `<skill_name>`，无前缀。
 
-- 路径来源（**两个 DropIn 都生效**，按优先级合并）：
+- 路径来源（**所有 DropIn 都生效**，按优先级合并；完整布局见 §5.0）：
   1. `$A2C_SKILL_HOME/user/<skill_name>/SKILL.md`（全局个人 SKILL）
-  2. `$CWD/.tfrobot/skills/<skill_name>/SKILL.md`（项目本地 SKILL，可入 git）
-- 同名冲突：project 覆盖 user（CC user/project 一致语义）。
+  2. **全部已登记工作目录** `<workdir>/.tfrobot/skills/<skill_name>/SKILL.md`（项目本地 SKILL，可入 git）——skill 属**能力发现层**，跨全部登记工作目录**全局并集**（与 `enabledPlugins`/`extraKnownMarketplaces` 同层、置最低优先级、**不随 active workdir 切换**，见 §5.0/§5.1）。
+- 同名冲突：workspace skill 覆盖 user；登记工作目录间同名 → 按登记顺序后者覆盖 + WARN（§5.4）。
 
 ### 2.4 lexer 规则（a2c-smcp 协议 0.2.2 `skill.md §1` 定稿）
 
@@ -287,7 +287,7 @@ MCP server 走 **`<plugin>/mcp-servers/<name>.json`** 文件式（mcp-servers �
 | `plugin install <plugin>@<marketplace> [--version <v>]` | 安装单个 plugin。检查 MCP server 名冲突：bundled server name 已存在**且不归属本 plugin**（不在其 `bundledMcpServers` 记录里）→ **硬抛、原子失败、不留半装状态**（无 rename/force 逃生口）。`--version` 锁版本（暂用 git tag/SHA，v0.2.1 默认 latest）。 |
 | `plugin uninstall <plugin>@<marketplace> [--keep-servers]` | 卸载。默认 stop+remove plugin 携带的 MCP server；`--keep-servers` 保留 MCP server config。 |
 | `plugin enable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = true`；emit_update_skills。 |
-| `plugin disable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = false`；MCP server 不停（plugin 物化层还在，只是不暴露 skills）；emit_update_skills。 |
+| `plugin disable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = false`；**停掉并从生效 MCP 定义层摘除该 plugin 携带的 MCP server**（与 §7.1 步骤 5「禁用 plugin 不合并其 mcp_servers」对齐——禁用 = 整 plugin 贡献下线）；**物化层保留**（clone 树 + installed_plugins.json 记录不动），`enable` 可廉价复原（重新挂载 server + 暴露 skill），无需重 clone/重装；emit_update_skills（server 停所引发的 tools 变更经 `server:update_tool_list` 同步广播）。区别于 `uninstall`：disable 留 installed 记录、可一键回滚；uninstall 删 installed 记录、移除 server config。 |
 | `plugin list [--available] [--json]` | 默认列 installed enabled；`--available` 含 installed disabled + cloned-but-not-installed。 |
 | `plugin info <plugin>@<marketplace>` | 详情：version、commit SHA、install 路径、enabled 状态、skills[]、mcp_servers[]、inputs[]。 |
 
@@ -330,18 +330,63 @@ a2c-computer --json settings show --scope merged
 
 ## 5. 意图层 settings.json 与 Scope
 
+### 5.0 本地目录布局与路径解析（总览）
+
+> 本节是 §5（意图层 settings）、§6（物化文件）、§8.3（watcher 范围）的**路径地图**。`$A2C_SKILL_HOME` 的解析规则由姊妹文档
+> [`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md) §2.3 定稿，本文档**复用不改写**：
+> 默认 `$XDG_DATA_HOME/a2c/skills` → 回退 `~/.a2c/skills`；env 覆盖键 `A2C_SKILL_HOME`；**MUST NOT 跨用户共享 / 不放系统目录**（启动 fail-fast 校验）。
+
+```
+# ── Skill Home（$A2C_SKILL_HOME，物化与 user DropIn 同栖）──────────────
+$A2C_SKILL_HOME/                          # 默认 $XDG_DATA_HOME/a2c/skills → ~/.a2c/skills
+├── user/                                 # user 源 DropIn（★ 自发现 + watcher）
+│   └── <skill>/SKILL.md
+├── marketplace/                          # marketplace 源 clone 树（物化，✗ 不自发现，靠显式 refresh/install）
+│   └── <mp>/.tfrobot-plugin/marketplace.json + <plugin>/...
+├── known_marketplaces.json               # 物化记录，CLI 维护勿手编（§6.1）
+└── installed_plugins.json                # 物化记录（§6.2）
+
+# ── user scope 意图（主）────────────────────────────────────────────
+$XDG_CONFIG_HOME/a2c/                     # → ~/.config/a2c
+├── settings.json                         # user scope 意图/治理（§5.1）
+└── mcp.json                              # user scope MCP 定义（§9.1）
+
+# ── workspace 登记的工作目录 <workdir>（active 充当 project/local 单根；全部登记目录共献能力层）──
+<workdir>/.tfrobot/
+├── settings.json                         # project scope（入 git）
+├── settings.local.json                   # local scope（不入 git）
+├── skills/<skill>/SKILL.md               # project/local DropIn（★ 自发现 + watcher）
+├── mcp.json                              # project scope MCP 定义
+└── mcp.local.json                        # local scope MCP 定义
+```
+
+**自发现路径策略**（★ = 被 watcher 实时监控的发现根；其余靠显式操作）：
+
+| 源 | 发现路径 | 自发现 | 机制 |
+|---|---|---|---|
+| `user` | `$A2C_SKILL_HOME/user/` **+ 全部已登记 `<workdir>/.tfrobot/skills/`**（能力层全局，不随 active 切换） | ★ 是 | 文件 watcher，递归监控、过滤 `**/SKILL.md`（§8.3） |
+| `marketplace` | `$A2C_SKILL_HOME/marketplace/<mp>/<plugin>/...` | ✗ 否 | clone 树，仅经 `marketplace add/refresh` / `plugin install` 变更（§8.3 三条理由） |
+| `mcp` | 无本地路径（server 经 `skill://` resource 暴露） | ★ 是 | `manager` + `_on_manager_change`（无目录扫描） |
+
+- **发现单元**：`<root>/<skill>/SKILL.md`（根下**一级**，name = 目录 basename，单段无前缀）；深于一级的 `SKILL.md` 忽略（§8.3）。
+- **两层解析模型**（访谈定稿，取代旧「整份并集」；详见 §5.1 校正）：
+  - **(A) 能力发现层 = workspace 全局、始终生效**：`enabledPlugins`/`extraKnownMarketplaces`/skill DropIn 跨**全部已登记工作目录**取并集（置最低优先级），让 Agent 能力面**稳定、不随 active 跳变**。所有 `<workdir>/.tfrobot/skills/` 都是 user 源发现根，watcher 逐目录注册。= CC `--add-dir` 聚合集（机制一字不差）。
+  - **(B) active-workdir 单根层 = 随任务切换**：其余 project/local 键（trust policy / MCP 批准门控 / permissions / 全部标量）**只取 active workdir** 的 `.tfrobot/settings[.local].json`，**不跨目录并集** → 标量冲突天然消失、敏感键隔离。**无 active**（空闲/启动）时 project/local 全空，只用 user scope（+ A 层）。
+- **同名优先级**：能力层并集（最低）< `user` < active-workdir `project/local`；能力层内**登记目录间同名** → 按登记顺序后者覆盖 + WARN（§5.4）。
+- **钉死单根、不向上遍历**（照 CC，源码 `settings.ts` 把 root 硬钉为 `originalCwd`）：每个根仅取其**自身**的 `.tfrobot/`，**不**沿目录树向上合并祖先目录。CC 里只有 CLAUDE.md 类记忆文件才向上 walk（CLAUDE.md→文件系统根、skills/commands→git root、settings→不走，三套停止点各异）。A2C 的「多根」来自 **workspace 持久登记的工作目录集**（非目录树祖先遍历、非 ad-hoc `--add-dir`）；与 CC 的唯一两点适配：登记集**持久** + 主根**动态**（active 随任务切换）。
+
 ### 5.1 文件位置（按 scope 从低到高，high 覆盖 low）
 
-> **A2C scope = user 为主 + workspace 聚合**（校正自 #28）：A2C Computer 典型形态是常驻 daemon，并非 CC 那种"跑在单一 `$CWD` 代码库里"。A2C 引入 **workspace 概念**——workspace 管理**多个本地工作目录**，每个工作目录可贡献 project/local 层配置。所以下表 project/local 的 `$CWD` 实为「**workspace 当前/各工作目录**」；project scope 的有效值 = workspace 内各工作目录 `.tfrobot/settings.json` 的并集（key 级合并）。
+> **A2C scope = user 为主 + active-workdir 单根 + 能力层全局**（访谈定稿，校正 #28）：A2C Computer 是常驻 daemon、并非 CC 那种"跑在单一 `$CWD`"。workspace **持久登记**多个工作目录；任一时刻**至多一个 active workdir**（绑定当前 Agent 任务/调用）。解析分两层——**(A) 能力发现层**（`enabledPlugins`/`extraKnownMarketplaces`/skills）跨**全部登记工作目录**取并集、置最低优先级（稳定能力面）；**(B) 其余 project/local**（trust/MCP 批准/permissions/标量）**只取 active workdir 单根**、不跨目录并集（CC 单根语义、根随任务切换）。**无 active** 时 project/local 全空、仅 user scope + A 层。映射 CC：active workdir ≙ CC 主 cwd；其余登记目录 ≙ CC `--add-dir`（仅能力三件套、最低优先级）。
 
-| Scope | 文件 |
-|---|---|
-| addDirPluginSettings | 每个 `--add-dir <dir>` 目录下的 `<dir>/.tfrobot/settings[.local].json` |
-| user（**主**） | `$XDG_CONFIG_HOME/a2c/settings.json` → fallback `~/.config/a2c/settings.json` |
-| project（workspace 工作目录，可选叠加） | `<workdir>/.tfrobot/settings.json`（入 git、团队共享） |
-| local（workspace 工作目录，可选叠加） | `<workdir>/.tfrobot/settings.local.json`（不入 git） |
-| flag | `--settings <file>` 启动参数指定 |
-| policy | 四子源（first-source-wins，**不合并**） |
+| Scope（低→高） | 文件 / 来源 | 聚合范围 |
+|---|---|---|
+| 能力发现层（最低） | **全部已登记工作目录**的 `<workdir>/.tfrobot/settings[.local].json` | **仅** `enabledPlugins`+`extraKnownMarketplaces`（+ skills 走 DropIn）；跨全部登记目录并集（= CC `--add-dir`） |
+| user（**主**） | `$XDG_CONFIG_HOME/a2c/settings.json` → fallback `~/.config/a2c/settings.json` | 全键 |
+| project | **active workdir** 的 `<workdir>/.tfrobot/settings.json`（入 git、团队共享） | 全键、单根（不跨目录并集）；**无 active 时空** |
+| local | **active workdir** 的 `<workdir>/.tfrobot/settings.local.json`（不入 git） | 同上 |
+| flag | `--settings <file>` 启动参数指定 | 全键 |
+| policy（最高） | 四子源（first-source-wins，**不合并**） | 全键 |
 
 ### 5.2 policy 子源（first-source-wins）
 
@@ -365,7 +410,7 @@ a2c-computer --json settings show --scope merged
 ```jsonc
 {
   "$schema": "https://a2c-smcp.dev/schemas/computer-settings-0.2.1.json",
-  "version": 1,
+  // 注：settings.json 无 version 字段（复刻 CC：passthrough + 全可选，见 §5.6）
 
   // 声明：要哪些 marketplace
   "extraKnownMarketplaces": {
@@ -400,12 +445,36 @@ a2c-computer --json settings show --scope merged
 }
 ```
 
+### 5.3.1 字段规格（normative）
+
+> 上面 jsonc 是示例；下表是**规范**。「可写 scope」= CLI `settings set` / 手编可落盘的 scope（flag/policy 经 CLI **只读**，§4.5）。合并语义见 §5.4，版本/校验见 §5.6。
+
+| 字段 | 类型 | 可写 scope | 默认 | 约束 / 校验 | 合并 |
+|---|---|---|---|---|---|
+| `extraKnownMarketplaces` | `{ [name]: { source:{type:"git",url}, autoUpdate?:bool } }` | user/project/local | `{}` | `name` 唯一；git url 形态校验 | 对象递归深合并（嵌套 `source` 不整体替换） |
+| `enabledPlugins` | `{ [<plugin>@<mp>]: bool }` | user/project/local | `{}` | key 形如 `plugin@marketplace` | 对象递归深合并（值为 bool，同 key 高 scope 赢） |
+| `strictKnownMarketplaces` | `bool` | user/project/policy | `false` | 白名单模式开关 | 取最高 scope |
+| `trustedMarketplaces` | `string[]` | user/project/local/policy | `[]` | 元素 = marketplace name | array 拼接去重 |
+| `blockedMarketplaces` | `string[]` | user/project/policy | `[]` | 与 trusted 冲突时 **blocked 优先** | array 拼接去重 |
+| `enableAllProjectMcpServers` | `bool` | user/project/local | `false` | 批准本 workspace 全部共享 server | 取最高 scope |
+| `enabledMcpjsonServers` | `string[]` | local（批准写入处，#26） | `[]` | 元素 = server name | array 拼接去重 |
+| `disabledMcpjsonServers` | `string[]` | local | `[]` | 与 enabled 冲突 **disabled 优先** | array 拼接去重 |
+| `allowedMcpServers` | `string[]` | **policy only** | `[]` | 非 policy scope 出现 → 忽略+WARN（§5.6） | array 拼接去重 |
+| `deniedMcpServers` | `string[]` | **policy only** | `[]` | 同上；企业级拒绝名单 | array 拼接去重 |
+| `permissions.additionalDirectories` | `string[]` | user/project/local | `[]` | 绝对路径、**非**系统共享目录 | array 拼接去重 |
+
+- `$schema`：允许出现、仅供编辑器补全/校验，CLI **不消费**。
+- 「取最高 scope」标量字段不做合并，按 §5.1 优先级 high 覆盖 low。
+
 ### 5.4 合并规则（⚠️ 读/写两套语义相反，照 CC）
 
 **读合并**（启动加载，多 scope 叠加，`settingsMergeCustomizer`）：
-- **object 字段**（`enabledPlugins`/`extraKnownMarketplaces`/`enableAllProjectMcpServers` 等）：**key 级浅合并**——高 scope 同 key 覆盖、不同 key 并存。例：project `enabledPlugins["foo@mp"]=true`、local `=false` → 最终 **false**（local 赢）；project 另有 `bar@mp:true` 而 local 没提 → bar 保留。
+- **object/map 字段**（`enabledPlugins`/`extraKnownMarketplaces` 等）：**递归深合并**（lodash `mergeWith` 等价，照 CC `settingsMergeCustomizer`——customizer 只特判数组，其余交给默认递归合并）——逐层按 key 取并集，**只有同名叶子 key 才由高 scope 覆盖**；嵌套对象继续向下递归、**不整体替换**。
+  - 例 1（叶子覆盖）：project `enabledPlugins["foo@mp"]=true`、local `=false` → **false**（local 赢）；project 另有 `bar@mp:true` 而 local 没提 → bar 保留。
+  - 例 2（嵌套深合并，**与浅合并的关键区别**）：user `extraKnownMarketplaces["mp"]={source:…, autoUpdate:false}`、project 仅给 `{autoUpdate:true}` → 合并为 `{source:…, autoUpdate:true}`（**`source` 不丢**）；浅合并会把整个 `source` 替换掉。
+- **scalar 字段**（`strictKnownMarketplaces`/`enableAllProjectMcpServers` 等布尔/标量）：高 scope 整体覆盖（取最高 scope）。
 - **array 字段**（`enabledMcpjsonServers`/`trustedMarketplaces`/`permissions.additionalDirectories` 等）：**拼接去重** `uniq([...低, ...高])`（低 scope 在前）。
-- policy scope 内部 first-source-wins（不合并子源）。
+- policy scope 内部 first-source-wins（不合并子源；照 CC：remote > MDM > managed-settings.json[+.d/] > HKCU，只取最高且有内容者，再整体叠加进主链）。
 
 **写回单 scope**（CLI 改某一个 settings 文件，语义**相反**）：
 - **array 字段**：**直接替换**（不拼接）。
@@ -417,19 +486,33 @@ a2c-computer --json settings show --scope merged
 老 flag 现在喂的是 **MCP 定义层**（§9.1），不是 settings.json：
 
 ```
-启动时 MCP 定义合并顺序（高 → 低，§9.1 scope）：
-  1. policy（managed-mcp.json）   ← 最高
-  2. workspace local (.tfrobot/mcp.local.json)
-  3. workspace project (.tfrobot/mcp.json)
+MCP 定义合并顺序（高 → 低，§9.1 scope；同 §5.1 active-workdir 单根模型）：
+  1. policy（managed-mcp.json）            ← 最高
+  2. active workdir local (.tfrobot/mcp.local.json)
+  3. active workdir project (.tfrobot/mcp.json)
   4. user ($XDG_CONFIG_HOME/a2c/mcp.json)
-  5. --config / --inputs flag      ← 老接口，最低优先级
+  5. --config / --inputs flag             ← 老接口，最低优先级
   6. 默认值
 
-settings.json（意图/治理层）独立按 §5.4 五级 scope 合并。
+  注：MCP 定义层同构 settings 的 (B) 层——**只取 active workdir** 的 mcp.json/mcp.local.json，
+  **不**跨登记目录并集（无 active 时仅 user + flag + 默认）；批准门控随之一致。
+  与能力层（enabledPlugins/extraKnownMarketplaces/skills 全局并集）正交。
+
+settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 ```
 
 - `--config @servers.json` / `--inputs @inputs.json` 等价于在 MCP 定义层最低优先级注入；
 - 老脚本零迁移即可继续工作；新场景推荐 `.tfrobot/mcp.json` + settings.json + GitOps。
+
+### 5.6 校验与前向兼容（复刻 CC：passthrough + 全可选，无版本字段）
+
+> 决策（CC 源码核实）：CC 的 settings **没有** version 字段、**无**迁移 runner——前向兼容完全靠「**全字段 `.optional()` + 顶层 `.passthrough()`**」的加法式纪律（CC `types.ts` schema 头注释明言「unknown fields preserved … invalid settings simply not used but remain in the file」）。A2C settings.json **复刻此模型**：人编文件不背版本负担；`version` 只留在 **CLI 维护的物化文件**（§6.1/§6.2）。
+
+- **未知字段**：**静默保留**（passthrough，照 CC `SettingsSchema.passthrough()`）——未知顶层键不报错、不剥离、原样留在磁盘。`settings set` 是**单字段写**、不整体重写文件，未知键自然留存（升降级都不丢）。
+- **类型/取值校验**：`settings/schema.py` 以 TypedDict 定结构 + Pydantic 运行时校验（scope 枚举、git url 形态、`<plugin>@<mp>` key 形态等）。**单个已知键**校验失败 → 该键**被过滤不用**（回退默认）但**仍留在文件**，错误收进 `ValidationError[]` 经 `settings show` / 诊断命令呈现（照 CC：错误不阻断启动、不整文件作废，类比 CC Doctor/status；非法权限/MCP 规则逐条过滤而非整文件作废）。
+- **前向兼容靠加法**：新增字段一律 `Optional` + 给默认；**不**引入 `version` 协商、**不**写迁移逻辑（与 CC 一致）。语义变更走「新字段 + 旧字段降级读」的加法式演进。
+- **scope 越权**：policy-only 字段（`allowedMcpServers`/`deniedMcpServers`）出现在非 policy scope → 过滤不用 + 记 `ValidationError`（杜绝用户态自我提权）。
+- **vs 物化文件（§6.3）**：物化文件 CLI 维护、**带 `version`** + 损坏走 `.corrupt-<ts>.bak` 整文件降级；settings 是人编文件、**无 version** + 字段级容错（passthrough 保留、不备份、不整体清空）。
 
 ---
 
@@ -552,6 +635,8 @@ settings.json（意图/治理层）独立按 §5.4 五级 scope 合并。
  ResourceUpdated(skill://)]
 ```
 
+> **双广播**：上图是 **skill 维度**（emit_update_skills）。`plugin install/uninstall/enable/disable` 因统辖其携带的 MCP server config（决策 #6），同时会**起停 bundled MCP server**——server 起停引发的工具集变化经现有 `server:update_tool_list → notify:update_tool_list` 路径独立广播（与 skill emit 并行，互不替代）。即一次 `plugin disable` 触发**两条**通知：少了 skills（update_skills）+ 少了 tools（update_tool_list）。
+
 ### 8.2 Debounce 实现
 
 ```python
@@ -582,7 +667,7 @@ class SkillEventDebouncer:
 | 监控根（递归） | 发现单元 | 监控内容 | debounce |
 |---|---|---|---|
 | `$A2C_SKILL_HOME/user/` | `user/<skill>/SKILL.md` | 任意层 `SKILL.md` 增删改 | 300ms |
-| `$CWD/.tfrobot/skills/` | `.tfrobot/skills/<skill>/SKILL.md` | 任意层 `SKILL.md` 增删改 | 300ms |
+| **全部已登记工作目录** `<workdir>/.tfrobot/skills/`（能力层、逐目录注册递归 watcher、全局并集，§5.0） | `<workdir>/.tfrobot/skills/<skill>/SKILL.md` | 任意层 `SKILL.md` 增删改 | 300ms |
 | `$A2C_SKILL_HOME/marketplace/<mp>/...` （clone 树） | — | **不监** | — |
 | MCP `ResourceListChanged` / `ResourceUpdated(skill://)` | — | 现有 `_on_manager_change` 扩展（[`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md) §5.1） | 300ms |
 
@@ -611,17 +696,17 @@ class SkillEventDebouncer:
 
 **为何不复用标准 `.mcp.json`**：A2C `MCPServerConfig` 与业界 `.mcp.json` 结构不兼容——连接参数包在 `server_parameters` 下（标准是扁平 `{command,args,env}`）、`type` 用 `"streamable"`（标准 `"http"`）、timeout 是 ISO8601 字符串、且含 `forbidden_tools`/`tool_meta`/`vrl`/`disabled` 治理字段。同名 `.mcp.json` 会被 CC/VS Code 抢着按各自 schema 解析 → 静默误解析，比换名更危险。故 **A2C 用原生 schema + 自有文件名**。
 
-**文件位置（按 scope，对应 §5.1 workspace 聚合）**：
+**文件位置（按 scope，对应 §5.1 active-workdir 单根模型——MCP 定义同构 settings (B) 层）**：
 
 | Scope | 位置 | 备注 |
 |---|---|---|
 | user（**主**） | `$XDG_CONFIG_HOME/a2c/mcp.json` | daemon 常态主源 |
-| project | `<workdir>/.tfrobot/mcp.json` | 入 git、团队共享 |
-| local | `<workdir>/.tfrobot/mcp.local.json` | 不入 git |
+| project | **active workdir** `<workdir>/.tfrobot/mcp.json` | 入 git、团队共享；**单根、不跨目录并集**；无 active 时空 |
+| local | **active workdir** `<workdir>/.tfrobot/mcp.local.json` | 不入 git；同上 |
 | policy | managed 路径下 `managed-mcp.json` | 企业下发 |
 | flag | `--config @file`（老接口，最低优先级） | 兼容 |
 
-查找优先级 policy > local > project > user > flag（对齐 CC enterprise > local > project > user）。
+查找优先级 policy > active-local > active-project > user > flag（对齐 CC enterprise > local > project > user，A2C 主根随任务动态切换）。**无 active workdir** 时只取 user + flag + 默认；MCP server 定义**不**像能力层那样跨登记目录并集（敏感面隔离，与 §5.1 (B) 一致）。
 
 **schema（A2C 原生 `GetComputerConfigRet` 形状 + VS Code 风格扩展字段）**：
 
@@ -942,7 +1027,7 @@ a2c_smcp/computer/
 
 ### 13.1 单元
 
-- `settings/scope.py`：**读/写两套 merge 语义**——读时 object key 级浅合并 + array 拼接去重（低先）；写时 array 替换、`undefined` 删 key（§5.4）。`project=true`+`local=false`→false。
+- `settings/scope.py`：**读/写两套 merge 语义**——读时 object **递归深合并** + array 拼接去重（低先）；写时 array **整体替换**、`undefined` 删 key（§5.4）。`project=true`+`local=false`→false。
 - `settings/policy.py`：policy scope 四子源 first-source-wins（不合并）。
 - `settings/reconciler.py`：**additive-only**——missing→clone、sourceChanged→重 clone、`materialized∖declared`→**不动**（断言不删）；失败降级；`plugin gc` 列孤儿。
 - `settings/mcp_config.py`：`.tfrobot/mcp.json` 多 scope 加载优先级；门控 `pending`/`enabled`/`disabled` 判定；plugin-bundled 免批准。
@@ -1012,16 +1097,19 @@ A ⫫ B（并行）；C 依赖 A+B；D 依赖 A；E 依赖 A/B/C/D；F 依赖 A/
 - **Remote managed settings**：v0.2.1 仅留 stub；v0.2.2+ 实现 OAuth 拉取与 30 分钟 poll。
 - **Plugin version pinning**：v0.2.1 仅支持 latest（commit HEAD）；v0.2.2+ 支持 `<plugin>@<marketplace>@<version>` 三段语法。
 - **Plugin lifecycle hooks**（post_install/pre_uninstall 脚本）：默认禁用、`--allow-hooks` 显式开启；v0.2.1 不实现，留 manifest 字段位。
-- **inputs 值跨 workspace 分档**：v0.2.1 非密钥值用全局 `input-values.json`；是否按 workspace 工作目录分档（避免同 id 互覆盖）待 workspace 概念落地后定，schema 预留。
+- ✅ **workspace scope 聚合模型**（访谈定稿，§5.0/§5.1/§9.1）：持久登记多工作目录 + **active workdir 单根**（绑定当前 Agent 任务）作 project/local。**能力层**（`enabledPlugins`/`extraKnownMarketplaces`/skills）跨**全部登记目录**全局并集、置最低优先级（稳定能力面、不随 active 跳变）；其余 project/local 键（trust/MCP 批准/permissions/标量）+ **MCP server 定义**（§9.1 mcp.json）**只取 active workdir、不跨目录并集**（敏感面隔离）；无 active 时仅 user + 能力层。映射 CC：active≙主 cwd、其余登记目录≙`--add-dir`；A2C 仅「登记持久 + 主根动态」两点适配。**取代**早期 #28「整份并集」草案。
+- **inputs 值跨 workspace 分档**：v0.2.1 非密钥值用全局 `input-values.json`；workspace 概念已落地（§5.1），是否按 **active workdir** 分档（避免同 id 互覆盖）待 v0.2.2+ 定，schema 预留。
 - **Marketplace 中心化目录服务**：A2C 不维护；marketplace 只通过 git URL 添加。
 
 ---
 
 ## 16. 验收清单
 
-- [ ] `settings.json` 五级 scope **读/写两套 merge** 语义：测试覆盖每一组合（读：object 浅合并 + array 拼接去重；写：array 替换 + undefined 删 key）。
+- [ ] `settings.json` 五级 scope **读/写两套 merge** 语义：测试覆盖每一组合（读：object **递归深合并** + array 拼接去重；写：array 整体替换 + undefined 删 key）。深合并需含「嵌套对象 `source` 不被高 scope 整体替换」用例。
 - [ ] settings.json **只**含 `enabledPlugins`/`extraKnownMarketplaces`/MCP 门控/trust policy；**不含** MCP server 定义/inputs。
-- [ ] `.tfrobot/mcp.json` A2C 原生 schema 多 scope（user 主 + workspace 工作目录叠加）；`${env:}`/`${input:}`/`${workspaceFolder}` 替换 + `envFile`。
+- [ ] **workspace active-workdir 模型**（§5.1）：能力层（`enabledPlugins`/`extraKnownMarketplaces`/skills）跨全部登记目录全局并集；其余 project/local 键 + `mcp.json` 仅取 active workdir、切任务切根；无 active 时 project/local 空。测试覆盖：① 非 active 目录的 trust/MCP 批准**不**生效；② 非 active 目录的 plugin/skill **仍**可见（能力层）；③ active 切换后 project/local 随之切换。
+- [ ] settings.json **无 `version` 字段**（复刻 CC passthrough）；未知键静默保留、单字段校验失败仅过滤不用不拒载；`version` 仅存于物化文件（§6.1/§6.2）。
+- [ ] `.tfrobot/mcp.json` A2C 原生 schema 多 scope（user 主 + **active workdir 单根**，不跨目录并集；§9.1）；`${env:}`/`${input:}`/`${workspaceFolder}` 替换 + `envFile`。
 - [ ] **MCP 批准门控**：workspace 共享 server 首见 pending → 批准框 → 写 local；plugin-bundled 免批准；`enableAllProjectMcpServers`/`--approve-all-mcp` 生效。
 - [ ] **inputs/secret（VS Code 对标）**：解析链 env→keyring→明文 state→prompt→default；password 走 keyring 重启不再问；keyring 不可用降级 env，**绝不写明文**。
 - [ ] Trust：CC 风格 settings.json policy 字段计算（`strictKnownMarketplaces`/`trustedMarketplaces`/`blockedMarketplaces`）；known_marketplaces.json **无** trusted 字段。
