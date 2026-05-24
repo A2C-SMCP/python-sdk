@@ -334,7 +334,7 @@ a2c-computer --json settings show --scope merged
 
 > 本节是 §5（意图层 settings）、§6（物化文件）、§8.3（watcher 范围）的**路径地图**。`$A2C_SKILL_HOME` 的解析规则由姊妹文档
 > [`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md) §2.3 定稿，本文档**复用不改写**：
-> 默认 `$XDG_DATA_HOME/a2c/skills` → 回退 `~/.a2c/skills`；env 覆盖键 `A2C_SKILL_HOME`；**MUST NOT 跨用户共享 / 不放系统目录**（启动 fail-fast 校验）。
+> 默认 `$XDG_DATA_HOME/a2c/skills` → 回退 `~/.a2c/skills`；env 覆盖键 `A2C_SKILL_HOME`；跨用户隔离**对齐 CC**——每用户私有默认 + 创建时 `0o700` 防御性写，交 OS 权限保证，**不**做 path deny-list（§2.3 决策③；协议 §9.2 `MUST NOT 跨用户共享` 待校准）。
 
 ```
 # ── Skill Home（$A2C_SKILL_HOME，物化与 user DropIn 同栖）──────────────

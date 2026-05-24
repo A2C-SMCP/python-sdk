@@ -78,7 +78,8 @@
 - 解析顺序：显式配置/环境变量覆盖 → `$XDG_DATA_HOME/a2c/skills` → `~/.a2c/skills`。
 - env 覆盖键：`A2C_SKILL_HOME`（镜像 Claude Code `CLAUDE_CODE_PLUGIN_CACHE_DIR` 的「默认在用户 home + 可覆盖」范式）。
 - 布局：`<skill_home>/<source>/<...>/<skill>/`（协议 `skill.md §4` 推荐三级分组）。
-- 隔离铁律（协议 `skill.md §9.2`）：**MUST NOT 跨用户共享**，不放系统目录；多用户每用户独立 home；覆盖路径仍 MUST 非系统共享目录（启动时校验，违反 fail-fast）。
+- 隔离策略（**对齐 Claude Code**，协议 `skill.md §9.2`）：默认落**每用户私有**路径（home/XDG）+ 创建时 `0o700` 防御性写，把「不跨用户共享」交给 **OS 权限**保证——与 CC 对 `~/.claude` 的姿态一致（CC 不做属主/权限运行时校验、env 覆盖直接放行）。**不**做 path 前缀 deny-list：黑名单对「他人 home / 共享可写目录」天然拦不全，且 CC 亦不采用。env 覆盖到不可写位置时由 OS `mkdir` 自然 fail-fast。
+  > **协议取向待校准**：§9.2 现措辞 `MUST NOT 跨用户共享`，本实现按 CC 落实为「每用户默认 + `0o700` + 用户自负 env 覆盖」，**待**协议把该 MUST 校准为 SHOULD/部署层指引（协议侧由维护者推进）。如未来确需应用层硬强制（属主 + 权限位 + realpath + 父级遍历 + TOCTOU + 跨平台），另开专项 issue（cross-ask CC 结论：CC 把跨用户隔离视为 OS/部署层职责，仅对 `/tmp` bundled-skills 用 nonce+`O_NOFOLLOW` 加固，持久缓存不做）。
 
 **依据**：Claude Code 范本本就是「默认用户 home + env 覆盖」；工单 §8 点名容器/多实例必须有覆盖旋钮，否则同镜像多实例撞目录。XDG-first 为跨平台惯例。
 
@@ -207,7 +208,7 @@ blob_handle = base64url( msgpack({
 
 | 模块 | 职责 | Claude Code 范本对照 |
 |---|---|---|
-| `home.py` | SKILL Home 路径解析（§2.3）+ 隔离 fail-fast 校验 + `<source>/<...>/<skill>/` 布局 | `getMarketplacesCacheDir()` / `CLAUDE_CODE_PLUGIN_CACHE_DIR` |
+| `home.py` | SKILL Home 路径解析（§2.3）+ `0o700` 防御性写（隔离交 OS，对齐 CC，**非** deny-list）+ `<source>/<...>/<skill>/` 布局 | `getMarketplacesCacheDir()` / `CLAUDE_CODE_PLUGIN_CACHE_DIR` |
 | `naming.py` | name 合成 + lexer + MCP server 段规范化（`[^a-zA-Z0-9_-]→_`，**不实现** `claude.ai ` 特例）；非法 → `4016` | `normalizeNameForMCP()`（去特例） |
 | `registry.py` | Skill Registry：`name → A2CSkillRef`；O(1) 精确匹配；孤儿标记/恢复；校验失败不入册（记 ERROR，不硬报错） | `installed_plugins.json` 物化注册表 |
 | `staging.py` | 多 source 物化到统一本地安装目录（marketplace SKILL v1 §2 包结构）：`mcp:` 经 `manager` 枚举 `skill://` 按 `_meta.source∈{mounted,archive,resources}` 物化；`marketplace:` git clone/pull+对账；`user` DropIn 扫描 | `loadAndCacheMarketplace()` / `cacheMarketplaceFromGit()` |
@@ -236,7 +237,7 @@ blob_handle = base64url( msgpack({
 - `.skillenv` forbidden：任何 `rel_path` 命中 → `4017 forbidden`，存在/不存在**同 reason**（不泄漏存在性）。
 - `too_large` 不铸句柄：超上限 → `4017 too_large`，零字节。
 - 句柄不信任：`get_blob` 重施沙箱；伪造/篡改句柄不提权。
-- staging 隔离：SKILL Home 非系统共享目录（启动 fail-fast）。
+- staging 隔离：SKILL Home 默认每用户私有 + `0o700` 防御性写（隔离交 OS，对齐 CC；详见 §2.3 决策③）。
 - name 寻址：包根仅 Registry 经 name 解析，不从 name 推导 FS 路径。
 
 ---
@@ -297,7 +298,7 @@ GitHub Milestone「v0.2.1 SKILL 通道 + 通用二进制传输」+ parent tracki
 ## 9. 风险与依赖（对齐工单 §8）
 
 - **marketplace git 源**：网络拉取/缓存/对账失败降级（记 ERROR、不阻断其余 source、不向 Agent 硬报错）；首拉成本与对账策略见 §2.2（无 TTL，后台定时后置 backlog）。
-- **staging 目录隔离**：MUST NOT 跨用户共享；多用户每用户独立 home；覆盖路径仍校验非系统目录（§2.3）。
+- **staging 目录隔离**：默认每用户私有 home（home/XDG）+ `0o700` 防御性写，隔离交 OS（对齐 CC）；不做 path deny-list。协议 §9.2 `MUST NOT 跨用户共享` 待校准（§2.3 决策③）。
 - **底层 mcp 包**：沿用 0.2 锚定（`mcp >= 1.15.0`），`Resource._meta`/`annotations` 须可用（启动自检 fail-fast）。
 - **与 PR #33 无代码冲突**：本工单不碰 `server/middleware.py`/`utils/handshake.py`/`version.py`；无强依赖。
 

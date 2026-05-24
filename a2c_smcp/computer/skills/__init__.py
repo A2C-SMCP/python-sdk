@@ -12,7 +12,7 @@ staging / 意图层 reconciler / 沙箱。本提交（S1，#54）落地基础两
 Mirrors Claude Code marketplace local SKILL management. This change (S1, #54) lands the two
 foundational modules:
 
-- :mod:`a2c_smcp.computer.skills.home`   —— SKILL Home 解析 + 隔离 fail-fast + 安装目录布局
+- :mod:`a2c_smcp.computer.skills.home`   —— SKILL Home 解析 + `0o700` 防御性写（隔离交 OS，对齐 CC）+ 安装目录布局
 - :mod:`a2c_smcp.computer.skills.naming` —— name 合成 + 段数消歧 lexer + MCP server 段规范化
 
 协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §1 / §4 / §9.2。
@@ -22,17 +22,15 @@ from __future__ import annotations
 
 from a2c_smcp.computer.skills.home import (
     SKILL_HOME_ENV,
+    SKILL_HOME_MODE,
     SOURCE_MARKETPLACE,
     SOURCE_MCP,
     SOURCE_USER,
-    SkillHomeError,
-    SkillHomeIsolationError,
     ensure_skill_home,
     marketplace_skill_dir,
     mcp_skill_dir,
     resolve_skill_home,
     user_skill_dir,
-    validate_skill_home_isolation,
 )
 from a2c_smcp.computer.skills.naming import (
     MCP_SEGMENT,
@@ -50,17 +48,15 @@ from a2c_smcp.computer.skills.naming import (
 __all__ = [
     # home
     "SKILL_HOME_ENV",
+    "SKILL_HOME_MODE",
     "SOURCE_MARKETPLACE",
     "SOURCE_MCP",
     "SOURCE_USER",
-    "SkillHomeError",
-    "SkillHomeIsolationError",
     "ensure_skill_home",
     "marketplace_skill_dir",
     "mcp_skill_dir",
     "resolve_skill_home",
     "user_skill_dir",
-    "validate_skill_home_isolation",
     # naming
     "MCP_SEGMENT",
     "ParsedSkillName",

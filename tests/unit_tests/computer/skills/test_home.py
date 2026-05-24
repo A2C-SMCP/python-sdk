@@ -5,8 +5,8 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-SKILL Home 解析 / 隔离 / 布局单元测试（v0.2.1）
-Unit tests for SKILL Home resolution / isolation / layout (v0.2.1)
+SKILL Home 解析 / 布局 / 防御性写单元测试（v0.2.1）
+Unit tests for SKILL Home resolution / layout / defensive write (v0.2.1)
 
 协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §4 / §9.2。
 SDK 设计 / Design: python-sdk docs/design-0.2.1-skill-computer-management.md §2.3。
@@ -14,26 +14,26 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-skill-computer-management.md �
 测试意图 / Test intentions:
 - 解析优先级：A2C_SKILL_HOME > $XDG_DATA_HOME/a2c/skills > ~/.a2c/skills
 - XDG_DATA_HOME 相对值按 XDG 规范忽略；A2C_SKILL_HOME 空白忽略；~ 展开
-- 隔离铁律 fail-fast：系统 / 跨用户共享目录（含 macOS /private 别名）→ SkillHomeIsolationError
+- 跨用户隔离对齐 CC：不做 path deny-list（系统目录不再 fail-fast），隔离交给 OS 权限
+- ensure_skill_home 以 0o700 防御性创建（POSIX 校验权限位）；resolve 不落盘
 - <source>/<...>/<skill>/ 布局助手
-- resolve 不落盘；ensure_skill_home mkdir -p
 """
 
+import os
 from pathlib import Path
 
 import pytest
 
 from a2c_smcp.computer.skills.home import (
+    SKILL_HOME_MODE,
     SOURCE_MARKETPLACE,
     SOURCE_MCP,
     SOURCE_USER,
-    SkillHomeIsolationError,
     ensure_skill_home,
     marketplace_skill_dir,
     mcp_skill_dir,
     resolve_skill_home,
     user_skill_dir,
-    validate_skill_home_isolation,
 )
 
 
@@ -83,33 +83,13 @@ def test_resolve_does_not_create_directory(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 隔离铁律 fail-fast / isolation invariant
+# 跨用户隔离对齐 CC：不再 path deny-list（系统路径解析不抛错，隔离交给 OS）
+# CC-aligned isolation: no path deny-list (resolving a system path no longer raises)
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "system_path",
-    [
-        "/var/lib/a2c-skills",  # 协议明示反例
-        "/usr/share/a2c/skills",
-        "/etc/a2c",
-        "/opt/a2c/skills",
-        "/private/var/lib/a2c-skills",  # macOS /private 别名等价 /var/lib
-        "/private",  # macOS /private 是 / 的别名 → 剥离后即根，必须拦截（根判定须在剥离后）
-        "/",  # 文件系统根
-    ],
-)
-def test_validate_rejects_system_dirs(system_path: str) -> None:
-    with pytest.raises(SkillHomeIsolationError):
-        validate_skill_home_isolation(Path(system_path))
-
-
-def test_validate_accepts_user_dir(tmp_path: Path) -> None:
-    # tmp_path（linux /tmp/... 或 macOS /private/var/folders/...）非系统共享目录 → 通过
-    validate_skill_home_isolation(tmp_path.resolve())
-
-
-def test_resolve_rejects_system_override() -> None:
-    with pytest.raises(SkillHomeIsolationError):
-        resolve_skill_home({"A2C_SKILL_HOME": "/var/lib/a2c-skills"})
+def test_resolve_no_longer_rejects_system_paths() -> None:
+    # Route A：解析层不再对 /var/lib 等系统目录 fail-fast（隔离交给 OS 权限 / 部署层）。
+    # 仅校验「解析返回该路径」，不实际创建（避免触碰真实系统目录）。
+    assert resolve_skill_home({"A2C_SKILL_HOME": "/var/lib/a2c-skills"}) == Path("/var/lib/a2c-skills").resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +106,18 @@ def test_layout_helpers() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ensure_skill_home
+# ensure_skill_home：创建 + 0o700 防御性写
 # ---------------------------------------------------------------------------
 def test_ensure_skill_home_creates_directory(tmp_path: Path) -> None:
     target = tmp_path / "deep" / "skill-home"
     home = ensure_skill_home({"A2C_SKILL_HOME": str(target)})
     assert home == target.resolve()
     assert home.is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX 权限位语义；Windows 由 AppData ACL 承担")
+def test_ensure_skill_home_is_private_0700(tmp_path: Path) -> None:
+    target = tmp_path / "private-home"
+    home = ensure_skill_home({"A2C_SKILL_HOME": str(target)})
+    mode = home.stat().st_mode & 0o777
+    assert mode == SKILL_HOME_MODE  # 0o700：owner rwx，group/other 无权限
