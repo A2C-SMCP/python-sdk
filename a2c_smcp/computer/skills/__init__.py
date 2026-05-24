@@ -1,0 +1,75 @@
+# -*- coding: utf-8 -*-
+# filename: __init__.py
+# @Time    : 2026/05/24
+# @Author  : JQQ
+# @Email   : jqq1716@gmail.com
+# @Software: PyCharm
+"""
+Computer SKILL 子系统 / Computer SKILL subsystem（v0.2.1）
+
+对标 Claude Code marketplace 的本地 SKILL 管理：SKILL Home / 命名 lexer / Registry / 三源
+staging / 意图层 reconciler / 沙箱。本提交（S1，#54）落地基础两模块：
+Mirrors Claude Code marketplace local SKILL management. This change (S1, #54) lands the two
+foundational modules:
+
+- :mod:`a2c_smcp.computer.skills.home`   —— SKILL Home 解析 + 隔离 fail-fast + 安装目录布局
+- :mod:`a2c_smcp.computer.skills.naming` —— name 合成 + 段数消歧 lexer + MCP server 段规范化
+
+协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §1 / §4 / §9.2。
+"""
+
+from __future__ import annotations
+
+from a2c_smcp.computer.skills.home import (
+    SKILL_HOME_ENV,
+    SOURCE_MARKETPLACE,
+    SOURCE_MCP,
+    SOURCE_USER,
+    SkillHomeError,
+    SkillHomeIsolationError,
+    ensure_skill_home,
+    marketplace_skill_dir,
+    mcp_skill_dir,
+    resolve_skill_home,
+    user_skill_dir,
+    validate_skill_home_isolation,
+)
+from a2c_smcp.computer.skills.naming import (
+    MCP_SEGMENT,
+    ParsedSkillName,
+    SkillNameError,
+    SkillNameKind,
+    is_valid_skill_name,
+    normalize_mcp_server_segment,
+    parse_skill_name,
+    synthesize_marketplace_name,
+    synthesize_mcp_name,
+    synthesize_user_name,
+)
+
+__all__ = [
+    # home
+    "SKILL_HOME_ENV",
+    "SOURCE_MARKETPLACE",
+    "SOURCE_MCP",
+    "SOURCE_USER",
+    "SkillHomeError",
+    "SkillHomeIsolationError",
+    "ensure_skill_home",
+    "marketplace_skill_dir",
+    "mcp_skill_dir",
+    "resolve_skill_home",
+    "user_skill_dir",
+    "validate_skill_home_isolation",
+    # naming
+    "MCP_SEGMENT",
+    "ParsedSkillName",
+    "SkillNameError",
+    "SkillNameKind",
+    "is_valid_skill_name",
+    "normalize_mcp_server_segment",
+    "parse_skill_name",
+    "synthesize_marketplace_name",
+    "synthesize_mcp_name",
+    "synthesize_user_name",
+]
