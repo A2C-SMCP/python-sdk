@@ -161,12 +161,13 @@ class TestErrorPayloadReasons:
         assert ret["details"]["reason"] == "invalid_handle"  # type: ignore[index]
 
     @pytest.mark.asyncio
-    async def test_forbidden_from_skill_pending_resolver(self, client: SMCPComputerClient) -> None:
-        """skill resolver 占位（#39 接管前）→ ``forbidden`` / skill placeholder → forbidden."""
-        handle = encode_skill_handle(name="user:x:y", rel_path="SKILL.md")
+    async def test_gone_for_unregistered_skill(self, client: SMCPComputerClient) -> None:
+        """skill 句柄 name 未注册（空 Registry）→ ``gone``（#66：SkillBlobResolver 经 Registry 解析）.
+        Unregistered skill name → ``gone`` (Registry miss = channel revoked / source unavailable)."""
+        handle = encode_skill_handle(name="my-skill", rel_path="SKILL.md")
         ret = await client.on_get_blob(_req(handle))  # type: ignore[arg-type]
         assert ret["code"] == int(ErrorCode.BLOB_NOT_ACCESSIBLE)  # type: ignore[index]
-        assert ret["details"]["reason"] == "forbidden"  # type: ignore[index]
+        assert ret["details"]["reason"] == "gone"  # type: ignore[index]
 
     @pytest.mark.asyncio
     async def test_range_offset_negative(self, computer: Computer, client: SMCPComputerClient) -> None:

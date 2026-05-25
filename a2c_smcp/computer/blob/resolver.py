@@ -12,18 +12,22 @@
   - **重施铸造通道边界校验**（kind=skill → SKILL 沙箱；kind=toolspool → cid 白名单 + 路径围栏）；
   - 句柄内容**绝不**被直接信任（协议 ``blob-transfer.md`` §5.4）。
 
-#39 接管 / Handed over by #39: ``SkillBlobResolverPending`` 占位 → 被 ``SkillBlobResolver``
-（基于 Skill Registry + sandbox）替换；本 PR 仅提供 toolspool 完整实现 + skill 占位。
+#39 接管 / Handed over by #39 (#66): ``SkillBlobResolver``（基于 Skill Registry + sandbox + 消费字节
+视图）落地，取代早期 ``SkillBlobResolverPending`` 占位。
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from a2c_smcp.computer.blob.handle import BlobHandleForbiddenError
+from a2c_smcp.computer.blob.handle import BlobHandleForbiddenError, BlobHandleGoneError
 from a2c_smcp.computer.blob.toolspool import ToolspoolBlobStore
+from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.resource import resolve_skill_view
+from a2c_smcp.computer.skills.sandbox import SkillSandboxError
 
 # 惰性切片闭包类型 / Lazy slice closure type: (offset, length) -> bytes
 # Resolver 在 ``resolve()`` 中构造此闭包并注入 ResolvedBlob，handler 切片时按需回读。
@@ -164,23 +168,47 @@ class ToolspoolBlobResolver:
         )
 
 
-class SkillBlobResolverPending:
-    """``kind="skill"`` 解析器占位（PR #38 边界，#39 接管）.
+class SkillBlobResolver:
+    """``kind="skill"`` 解析器：name→Registry 解析包根 → ``rel_path`` 重跑 §6 沙箱 → 惰性切片回源.
 
-    Placeholder for ``kind="skill"`` resolution; the concrete implementation lands in #39 (Computer
-    SKILL subsystem) wiring up Skill Registry + sandbox. 本 PR 保留此占位是为了让 ``Computer``
-    层默认即拥有完整 kind 派发，#39 仅替换实现而无须改 handler。
+    无状态、确定性、幂等（设计 §4.3）：**忽略句柄内任何路径推导**（协议 ``blob-transfer.md`` §5.4
+    「不信任句柄内容」），仅以 ``name`` 经 :class:`SkillRegistry` O(1) 解析包根，再对 ``rel_path``
+    经 :func:`~a2c_smcp.computer.skills.resource.resolve_skill_view` **重跑沙箱**。``total_size`` /
+    ``sha256`` 基于消费字节（SKILL.md→frontmatter 剥离后 body；其它→原始字节），与 ``client:get_skill``
+    铸造期严格一致（设计 §4.4「资源字节三处一致」）。
+    Stateless / deterministic / idempotent: ignores any path embedded in the handle, resolves the
+    package root via ``name`` through the Registry, then re-runs the §6 sandbox on ``rel_path``.
+    ``total_size`` / ``sha256`` match the get_skill mint exactly (shared consumed-bytes view).
 
-    Behavior: ``resolve`` 一律抛 :class:`BlobHandleError`（``forbidden`` reason），等同
-    「resolver 未实现 → 视为铸造通道授权撤销」——保守且符合协议「不信任句柄」边界。
-    Raises ``BlobHandleError(reason="forbidden")``: until #39 plugs in, the channel is treated as
-    revoked — conservative and aligned with the "do not trust the handle" boundary.
+    §9.2 name 寻址防越权 / anti-escalation：包根**仅**由 Registry 经 name 解析；``resolve_skill_view``
+    只接受 ``root: Path``，绝不从 name/rel_path 推导 FS 路径。
+
+    错误映射（→ 协议 4018 ``details.reason``）/ Error mapping:
+      - Registry 未命中 / 孤儿 → :class:`BlobHandleGoneError`（``gone``：SKILL 已卸载 / 不可用）；
+      - 沙箱 ``not_found``（源文件铸造后消失）→ ``gone``；
+      - 沙箱 ``traversal`` / ``forbidden`` → :class:`BlobHandleForbiddenError`（``forbidden``）；
+      - msgpack 格式 / kind 不识别由 :func:`decode_blob_handle` 在更上层映射 ``invalid_handle``（不达此）。
     """
 
+    def __init__(self, registry: SkillRegistry) -> None:
+        self._registry = registry
+
     def resolve(self, payload: dict[str, Any]) -> ResolvedBlob:
-        # 故意保留参数签名以 satisfy BlobResolver Protocol（runtime_checkable）。
-        # Signature preserved to satisfy the runtime_checkable BlobResolver Protocol.
-        _ = payload
-        # 用子类直 raise 比设值 ``.reason`` 更 DRY，避免脏化基类实例属性
-        # Subclass-raise is DRYer than mutating ``.reason`` on the base class instance
-        raise BlobHandleForbiddenError("skill resolver pending #39 — kind=skill not wired in this PR")
+        name = payload["name"]
+        rel_path = payload["rel_path"]
+        ref = self._registry.resolve(name)
+        if ref is None:
+            # name 未注册 / 已孤儿 → 铸造通道授权已撤销，源不可服务（gone）。
+            raise BlobHandleGoneError(f"skill not resolvable: name={name!r} (unregistered or orphaned)")
+        root = Path(ref["path"])
+        try:
+            # get_blob 不传 too_large_cap：协议 4018 无 too_large 语义，超大资源由分块传输自然承载。
+            view = resolve_skill_view(root, rel_path)
+        except SkillSandboxError as e:
+            if e.reason == "not_found":
+                raise BlobHandleGoneError(f"skill resource gone: name={name!r} rel_path={rel_path!r}") from e
+            raise BlobHandleForbiddenError(
+                f"skill resource forbidden: name={name!r} rel_path={rel_path!r} reason={e.reason}",
+            ) from e
+        # view.slice 已满足 ``(offset, length) -> bytes`` 切片契约（含截断/边界校验），直接作 _slicer。
+        return ResolvedBlob(mime=view.mime, total_size=view.total_size, sha256=view.sha256, _slicer=view.slice)

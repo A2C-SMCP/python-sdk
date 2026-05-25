@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAlias, runtim
 from mcp import StdioServerParameters, Tool
 from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
 from mcp.types import CallToolResult, ReadResourceResult, Resource
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from vrl_python import VRLRuntime
 
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
@@ -198,3 +198,44 @@ class MCPClientProtocol(Protocol):
     async def get_window_detail(self, resource: Resource | str) -> ReadResourceResult:
         """获取当前Window的详细内容"""
         ...
+
+
+class GetSkillRet(BaseModel):
+    """
+    ``client:get_skill`` 响应的服务侧 Pydantic 校验模型（v0.2.1）/ Server-side validation model for the
+    ``client:get_skill`` response。
+
+    协议 ``data-structures.md §GetSkillRet`` / ``skill.md §9`` 规定 ``body`` 与 ``blob_handle``
+    **恰一存在**（exactly one）：文本且 ≤ 内联预算 → ``body``；二进制或过大文本 → ``blob_handle``。
+    本模型用 :meth:`_check_body_blob_xor` 在 Computer 返回前强制该不变量（服务侧自校验，父 #42 跨 PR
+    跟进项之一，明确合并到本 PR 范围）；smcp.py 的同名 ``GetSkillRet`` TypedDict 为线缆结构镜像。
+    The protocol mandates exactly one of ``body`` / ``blob_handle``; this model enforces that invariant
+    before the Computer returns. The TypedDict of the same name in smcp.py is the wire-shape mirror.
+
+    字段语义见 smcp.py ``GetSkillRet`` / Field semantics: see the smcp.py ``GetSkillRet`` TypedDict.
+    """
+
+    name: str
+    rel_path: str
+    mime_type: str
+    total_size: int
+    sha256: str
+    req_id: str
+    body: str | None = Field(default=None)
+    blob_handle: str | None = Field(default=None)
+
+    # extra="forbid"：服务侧自构造，多余字段即 SDK bug，应硬失败暴露。
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_body_blob_xor(self) -> "GetSkillRet":
+        """``body`` 与 ``blob_handle`` 恰一存在（XOR）/ Enforce exactly-one-of(body, blob_handle)。"""
+        has_body = self.body is not None
+        has_handle = self.blob_handle is not None
+        if has_body == has_handle:
+            both_or_neither = "both" if has_body else "neither"
+            raise ValueError(
+                f"GetSkillRet MUST carry exactly one of 'body' / 'blob_handle' (got {both_or_neither}); "
+                "protocol data-structures.md §GetSkillRet / skill.md §9",
+            )
+        return self

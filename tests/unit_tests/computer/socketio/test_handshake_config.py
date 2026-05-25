@@ -23,6 +23,8 @@ from a2c_smcp.smcp import (
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
@@ -74,6 +76,8 @@ def test_computer_client_custom_namespace_registers_all_handlers() -> None:
         GET_DESKTOP_EVENT,
         GET_RESOURCES_EVENT,
         GET_BLOB_EVENT,
+        GET_SKILLS_EVENT,
+        GET_SKILL_EVENT,
     }
 
 

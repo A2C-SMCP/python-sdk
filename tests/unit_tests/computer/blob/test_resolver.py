@@ -17,14 +17,25 @@ from pathlib import Path
 
 import pytest
 
-from a2c_smcp.computer.blob.handle import BlobHandleError, BlobHandleGoneError, BlobHandleInvalidError
+from a2c_smcp.computer.blob.handle import (
+    BlobHandleForbiddenError,
+    BlobHandleGoneError,
+    BlobHandleInvalidError,
+)
 from a2c_smcp.computer.blob.resolver import (
     BlobResolver,
     ResolvedBlob,
-    SkillBlobResolverPending,
+    SkillBlobResolver,
     ToolspoolBlobResolver,
 )
 from a2c_smcp.computer.blob.toolspool import ToolspoolBlobStore
+from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.resource import DEFAULT_SKILL_MIME
+from a2c_smcp.smcp import A2CSkillRef
+
+_SKILL_MD = "---\nname: demo\nversion: 1.2.3\n---\n# Demo\n\nbody line\n"
+_SKILL_BODY = "# Demo\n\nbody line\n"  # frontmatter 剥离后（闭合 --- 行之后）/ body after closing fence
+_NOTE_BYTES = b"plain note bytes\n"
 
 
 class TestToolspoolBlobResolver:
@@ -75,20 +86,87 @@ class TestToolspoolBlobResolver:
         assert isinstance(resolver, BlobResolver)
 
 
-class TestSkillBlobResolverPending:
-    """``kind=skill`` 占位实现：本 PR 边界，#39 接管后替换.
-    Placeholder for ``kind=skill``; replaced by #39 wiring up Registry + sandbox."""
+class TestSkillBlobResolver:
+    """``kind=skill`` 解析器：name→Registry 解析包根 → rel_path 重跑沙箱 → 惰性切片（#66）.
 
-    def test_resolve_raises_forbidden(self) -> None:
-        """未接入即视为「铸造通道授权撤销」→ forbidden（保守，符合协议「不信任句柄」边界）.
-        Until #39 plugs in, treat as channel revoked → forbidden (conservative, protocol-aligned)."""
-        resolver = SkillBlobResolverPending()
-        with pytest.raises(BlobHandleError) as exc_info:
-            resolver.resolve({"name": "user:x:y", "rel_path": "SKILL.md"})
-        assert exc_info.value.reason == "forbidden"
+    协议依据 / Protocol: blob-transfer.md §5.4「重跑铸造通道边界校验，不信任句柄内容」；
+    skill.md §9 安全模型；§4.4「资源字节三处一致」。
+    """
+
+    @pytest.fixture
+    def registry(self, tmp_path: Path) -> SkillRegistry:
+        """构造一个含 SKILL.md / 子资源 / .skillenv 的包根，注册进 Registry。"""
+        pkg = tmp_path / "home" / "mcp" / "srv" / "demo"
+        (pkg / "references").mkdir(parents=True)
+        (pkg / "SKILL.md").write_text(_SKILL_MD, encoding="utf-8")
+        (pkg / "references" / "note.txt").write_bytes(_NOTE_BYTES)
+        (pkg / ".skillenv").write_text("SECRET=1\n", encoding="utf-8")
+        reg = SkillRegistry()
+        ref: A2CSkillRef = {"name": "mcp:srv:demo", "source": "mcp:srv", "path": str(pkg)}
+        assert reg.register(ref) is True
+        return reg
+
+    def test_resolve_skill_md_strips_frontmatter(self, registry: SkillRegistry) -> None:
+        """SKILL.md：消费字节 = frontmatter 剥离后 body；sha256/total_size 与铸造期一致。"""
+        resolver = SkillBlobResolver(registry)
+        resolved = resolver.resolve({"name": "mcp:srv:demo", "rel_path": "SKILL.md"})
+        assert isinstance(resolved, ResolvedBlob)
+        expected = _SKILL_BODY.encode("utf-8")
+        assert resolved.slice(0, resolved.total_size) == expected
+        assert resolved.total_size == len(expected)
+        assert resolved.sha256 == hashlib.sha256(expected).hexdigest()
+        assert resolved.mime == DEFAULT_SKILL_MIME
+
+    def test_resolve_subresource_raw_bytes(self, registry: SkillRegistry) -> None:
+        """子资源：原始字节（不剥 frontmatter）；sha256 基于原始字节。"""
+        resolver = SkillBlobResolver(registry)
+        resolved = resolver.resolve({"name": "mcp:srv:demo", "rel_path": "references/note.txt"})
+        assert resolved.slice(0, resolved.total_size) == _NOTE_BYTES
+        assert resolved.total_size == len(_NOTE_BYTES)
+        assert resolved.sha256 == hashlib.sha256(_NOTE_BYTES).hexdigest()
+
+    def test_resolve_gone_when_name_unregistered(self, registry: SkillRegistry) -> None:
+        """name 未注册 → ``4018 gone``（铸造通道授权撤销）。"""
+        resolver = SkillBlobResolver(registry)
+        with pytest.raises(BlobHandleGoneError):
+            resolver.resolve({"name": "mcp:srv:nope", "rel_path": "SKILL.md"})
+
+    def test_resolve_gone_when_orphaned(self, registry: SkillRegistry) -> None:
+        """name 已孤儿 → ``4018 gone``（source 消失，不可服务）。"""
+        registry.mark_orphan("mcp:srv:demo")
+        resolver = SkillBlobResolver(registry)
+        with pytest.raises(BlobHandleGoneError):
+            resolver.resolve({"name": "mcp:srv:demo", "rel_path": "SKILL.md"})
+
+    def test_resolve_gone_when_file_missing(self, registry: SkillRegistry) -> None:
+        """rel_path 不存在（源文件铸造后消失）→ not_found → ``4018 gone``。"""
+        resolver = SkillBlobResolver(registry)
+        with pytest.raises(BlobHandleGoneError):
+            resolver.resolve({"name": "mcp:srv:demo", "rel_path": "references/missing.txt"})
+
+    @pytest.mark.parametrize("rel_path", ["../outside.txt", "../../etc/passwd", "references/../../escape"])
+    def test_resolve_forbidden_on_traversal(self, registry: SkillRegistry, rel_path: str) -> None:
+        """句柄内 rel_path 穿越 → 重跑沙箱拒绝 → ``4018 forbidden``（不信任句柄）。"""
+        resolver = SkillBlobResolver(registry)
+        with pytest.raises(BlobHandleForbiddenError):
+            resolver.resolve({"name": "mcp:srv:demo", "rel_path": rel_path})
+
+    def test_resolve_forbidden_on_skillenv(self, registry: SkillRegistry) -> None:
+        """``.skillenv`` 任何路径命中 → ``4018 forbidden``（即使句柄声称该路径）。"""
+        resolver = SkillBlobResolver(registry)
+        with pytest.raises(BlobHandleForbiddenError):
+            resolver.resolve({"name": "mcp:srv:demo", "rel_path": ".skillenv"})
+
+    def test_handle_path_is_re_sandboxed_not_trusted(self, registry: SkillRegistry, tmp_path: Path) -> None:
+        """反例：伪造句柄注入绝对路径逃逸 → 重跑沙箱拒绝，绝不按句柄路径直读。"""
+        resolver = SkillBlobResolver(registry)
+        secret = tmp_path / "outside-secret.txt"
+        secret.write_text("TOPSECRET", encoding="utf-8")
+        with pytest.raises(BlobHandleForbiddenError):
+            resolver.resolve({"name": "mcp:srv:demo", "rel_path": str(secret)})
 
     def test_protocol_runtime_checkable(self) -> None:
-        resolver = SkillBlobResolverPending()
+        resolver = SkillBlobResolver(SkillRegistry())
         assert isinstance(resolver, BlobResolver)
 
 
