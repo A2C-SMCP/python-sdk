@@ -25,6 +25,7 @@ from pathlib import Path
 
 from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextResourceContents
 
+import a2c_smcp.computer.skills.staging as staging_mod
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import stage_mcp_skills
 
@@ -161,6 +162,56 @@ async def test_stage_archive_path_traversal_rejected(tmp_path: Path) -> None:
     assert not (tmp_path / "evil.txt").exists()  # 未逃逸到 staging 之外
 
 
+async def test_stage_archive_symlink_member_rejected(tmp_path: Path) -> None:
+    # 恶意 tar：含 symlink 成员（指向 /etc/passwd）→ 拒绝 → 不入册（PR 主打安全特性的回归用例）
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        md = _skill_md().encode()
+        info = tarfile.TarInfo("SKILL.md")
+        info.size = len(md)
+        tar.addfile(info, io.BytesIO(md))
+        link = tarfile.TarInfo("evil-link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        tar.addfile(link)
+    res = _root("skill://h/my-skill", {"source": "archive", "archive_uri": "https://x/s.tgz", "archive_format": "tar.gz"})
+    reg = SkillRegistry()
+
+    names = await stage_mcp_skills(FakeManager([("srv", res)]), reg, tmp_path / "home", archive_fetch=_fetch_returning(buf.getvalue()))
+
+    assert names == []
+    assert len(reg) == 0
+
+
+async def test_stage_archive_extracted_size_cap(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    # 解压累计超上限 → 中止 → 不入册（炸弹防护）。临时把上限调到极小以触发。
+    monkeypatch.setattr(staging_mod, "MAX_EXTRACTED_BYTES", 8)
+    data = _make_targz({"SKILL.md": _skill_md().encode()})  # 远超 8 字节
+    res = _root("skill://h/my-skill", {"source": "archive", "archive_uri": "https://x/s.tgz", "archive_format": "tar.gz"})
+    reg = SkillRegistry()
+    names = await stage_mcp_skills(FakeManager([("srv", res)]), reg, tmp_path / "home", archive_fetch=_fetch_returning(data))
+    assert names == []
+    assert len(reg) == 0
+
+
+async def test_stage_archive_download_size_cap(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(staging_mod, "MAX_ARCHIVE_DOWNLOAD_BYTES", 4)
+    data = _make_targz({"SKILL.md": _skill_md().encode()})
+    res = _root("skill://h/my-skill", {"source": "archive", "archive_uri": "https://x/s.tgz", "archive_format": "tar.gz"})
+    reg = SkillRegistry()
+    names = await stage_mcp_skills(FakeManager([("srv", res)]), reg, tmp_path / "home", archive_fetch=_fetch_returning(data))
+    assert names == []
+
+
+async def test_stage_archive_member_count_cap(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(staging_mod, "MAX_ARCHIVE_MEMBERS", 1)
+    data = _make_targz({"SKILL.md": _skill_md().encode(), "a.txt": b"x"})  # 2 成员 > 1
+    res = _root("skill://h/my-skill", {"source": "archive", "archive_uri": "https://x/s.tgz", "archive_format": "tar.gz"})
+    reg = SkillRegistry()
+    names = await stage_mcp_skills(FakeManager([("srv", res)]), reg, tmp_path / "home", archive_fetch=_fetch_returning(data))
+    assert names == []
+
+
 # ── resources ──────────────────────────────────────────────────────────────────
 async def test_stage_resources_text_and_blob(tmp_path: Path) -> None:
     root_uri = "skill://h/my-skill"
@@ -211,6 +262,35 @@ async def test_missing_skill_md_not_registered(tmp_path: Path) -> None:
     names = await stage_mcp_skills(FakeManager([("srv", res)]), reg, tmp_path / "home")
     assert names == []
     assert len(reg) == 0
+
+
+async def test_in_run_name_collision_keeps_first(tmp_path: Path) -> None:
+    # 同一 run 内两个不同 SKILL 合成同 name（frontmatter.name 撞）→ 第二个按 §1.5 拒绝、保留先到者，
+    # 且不覆盖先到者磁盘文件（真冲突在 rename 落盘前拦截，验证 Item 1 修复）。
+    mount_a = tmp_path / "mount" / "a"
+    mount_a.mkdir(parents=True)
+    (mount_a / "SKILL.md").write_text(_skill_md(name="dup", description="first"), encoding="utf-8")
+    (mount_a / "a.txt").write_text("A", encoding="utf-8")
+    mount_b = tmp_path / "mount" / "b"
+    mount_b.mkdir(parents=True)
+    (mount_b / "SKILL.md").write_text(_skill_md(name="dup", description="second"), encoding="utf-8")
+    (mount_b / "b.txt").write_text("B", encoding="utf-8")
+
+    res_a = _root("skill://h/a", {"source": "mounted", "mount_dir": str(mount_a)})
+    res_b = _root("skill://h/b", {"source": "mounted", "mount_dir": str(mount_b)})
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(FakeManager([("srv", res_a), ("srv", res_b)]), reg, home)
+
+    assert names == ["mcp:srv:dup"]  # 仅第一个入册
+    assert len(reg) == 1
+    ref = reg.resolve("mcp:srv:dup")
+    assert ref is not None
+    assert ref["description"] == "first"  # 保留先到者
+    final = home / "mcp" / "srv" / "dup"
+    assert (final / "a.txt").exists()  # 先到者磁盘文件未被覆盖
+    assert not (final / "b.txt").exists()
 
 
 async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:

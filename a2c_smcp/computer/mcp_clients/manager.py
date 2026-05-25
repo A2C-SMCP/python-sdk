@@ -22,6 +22,10 @@ from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
 
+# SKILL 资源枚举翻页安全上界：防御恒非空 cursor（server bug / 恶意）导致的无限循环挂死物化。
+# Pagination safety bound for SKILL enumeration: guard against a never-terminating cursor hanging staging.
+_MAX_SKILL_LIST_PAGES = 1000
+
 
 class ToolNameDuplicatedError(Exception):
     def __init__(self, *args: Any) -> None:
@@ -570,10 +574,18 @@ class MCPServerManager:
                 continue
             try:
                 cursor: str | None = None
+                pages = 0
                 while True:
                     page, cursor = await client.list_resources_page(cursor)
                     results.extend((sname, res) for res in page if str(res.uri).startswith("skill://"))
+                    pages += 1
                     if not cursor:
+                        break
+                    if pages >= _MAX_SKILL_LIST_PAGES:
+                        logger.error(
+                            f"list_skill_resources: server {sname} exceeded {_MAX_SKILL_LIST_PAGES} pages "
+                            f"(non-terminating cursor?); aborting enumeration for this server",
+                        )
                         break
             except Exception as e:
                 # 未声明 resources 能力 / 连接异常 / 翻页失败 → 跳过该 server，不阻断其余

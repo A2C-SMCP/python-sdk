@@ -20,7 +20,8 @@ This module implements **mcp-source** materialization only (#59).
 2. 其中带 ``_meta.source∈{mounted,archive,resources}`` 者为 **SKILL 根**，按模式物化到
    ``<home>/mcp/<normalized-server>/<skill>/``（marketplace SKILL v1 §2 包结构）：
    - **mounted**：``_meta.mount_dir`` 本地目录 → 复制进 staging（自包含，避免符号链接绕过沙箱）；
-   - **archive**：HTTP 拉 ``_meta.archive_uri`` → 校验 ``archive_sha256``（若有）→ 安全解包（防穿越/拒符号链接）；
+   - **archive**：HTTP 拉 ``_meta.archive_uri`` → 校验 ``archive_sha256``（若有）+ 大小/解压/成员数上限（防 tar·zip bomb）
+     → 安全解包（防穿越/拒符号链接）；
    - **resources**：枚举 ``skill://<root>/**`` 子资源，逐个 ``resources/read``，按相对路径安全写入 staging。
 3. 读 staged ``SKILL.md`` 的 YAML frontmatter 作为元数据权威源（§3：不镜像进 ``_meta``）；
    包根目录名校正为 ``frontmatter.name``（§4）；
@@ -59,6 +60,12 @@ SKILL_MD = "SKILL.md"
 SKILL_URI_PREFIX = "skill://"
 _MCP_SOURCE_MODES = frozenset({"mounted", "archive", "resources"})
 
+# 归档安全上界（防 tar/zip bomb OOM；可信源模型下为安全网，默认宽松，后续可配置化）。
+# Archive safety bounds (bomb guard): generous defaults under the trusted-source model.
+MAX_ARCHIVE_DOWNLOAD_BYTES = 64 * 1024 * 1024  # 压缩态下载上限 / compressed download cap (64 MiB)
+MAX_EXTRACTED_BYTES = 256 * 1024 * 1024  # 解压累计字节上限 / cumulative uncompressed cap (256 MiB)
+MAX_ARCHIVE_MEMBERS = 10_000  # 成员数上限（防海量小文件 bomb）/ member-count cap
+
 # 物化所需的最小 manager 协议（便于测试注入 fake）/ Minimal manager protocol for materialization (mockable).
 ArchiveFetcher = Callable[[str], Awaitable[bytes]]
 
@@ -94,17 +101,41 @@ def parse_skill_frontmatter(skill_md_text: str) -> dict[str, Any]:
 
 # ── 安全解包 / safe extraction ──────────────────────────────────────────────
 def _resolved_member_target(dest: Path, member_name: str) -> Path:
-    """归一化并校验归档成员落点仍在 ``dest`` 内（防 ``..`` / 绝对路径穿越）/ Anti-traversal member target。"""
+    """
+    归一化并校验归档成员落点仍在 ``dest`` 内（防 ``..`` / 绝对路径穿越）/ Anti-traversal member target。
+
+    函数内对 ``dest`` 也 ``resolve()``，使不变量自洽——不依赖调用方传入已规范化路径（含 symlink 的 home 不误拒）。
+    Resolves ``dest`` too so the invariant is self-contained (no reliance on a pre-canonicalized dest).
+    """
+    dest = dest.resolve()
     target = (dest / member_name).resolve()
     if target != dest and dest not in target.parents:
         raise SkillStagingError(f"archive member escapes staging dir: {member_name!r}")
     return target
 
 
+def _copy_capped(src: Any, out: Any, already: int) -> int:
+    """分块复制并累计校验解压上限（防 bomb）/ Chunked copy enforcing the cumulative extraction cap。"""
+    total = already
+    while True:
+        chunk = src.read(1 << 16)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_EXTRACTED_BYTES:
+            raise SkillStagingError(f"archive exceeds extracted size limit ({MAX_EXTRACTED_BYTES} bytes)")
+        out.write(chunk)
+    return total
+
+
 def _extract_tar_gz(data: bytes, dest: Path) -> None:
-    """安全解 ``tar.gz``：拒符号/硬链接，逐成员校验落点 / Safe tar.gz extraction (reject links, guard paths)。"""
+    """安全解 ``tar.gz``：拒符号/硬链接、成员数上限、解压累计上限、逐成员校验落点 / Safe tar.gz extraction。"""
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-        for member in tar.getmembers():
+        members = tar.getmembers()
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise SkillStagingError(f"archive has too many members ({len(members)} > {MAX_ARCHIVE_MEMBERS})")
+        extracted_bytes = 0
+        for member in members:
             if member.issym() or member.islnk():
                 raise SkillStagingError(f"archive contains link member (rejected): {member.name!r}")
             target = _resolved_member_target(dest, member.name)
@@ -112,25 +143,34 @@ def _extract_tar_gz(data: bytes, dest: Path) -> None:
                 target.mkdir(parents=True, exist_ok=True)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                extracted = tar.extractfile(member)
-                if extracted is None:
+                fobj = tar.extractfile(member)
+                if fobj is None:
                     continue
-                with extracted as src, target.open("wb") as out:
-                    shutil.copyfileobj(src, out)
+                with fobj as src, target.open("wb") as out:
+                    extracted_bytes = _copy_capped(src, out, extracted_bytes)
             # 其它类型（设备/FIFO 等）一律忽略 / ignore device/fifo etc.
 
 
 def _extract_zip(data: bytes, dest: Path) -> None:
-    """安全解 ``zip``：逐成员校验落点 / Safe zip extraction (guard paths)。"""
+    """
+    安全解 ``zip``：成员数上限、解压累计上限、逐成员校验落点 / Safe zip extraction。
+
+    注：Python ``zipfile`` **不**还原 zip 内的符号链接（写为普通文件），故无需 tar 那样的链接拒绝分支；
+    落点校验已防穿越。Python zipfile does not restore in-zip symlinks, so no link-rejection branch is needed.
+    """
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for name in zf.namelist():
+        names = zf.namelist()
+        if len(names) > MAX_ARCHIVE_MEMBERS:
+            raise SkillStagingError(f"archive has too many members ({len(names)} > {MAX_ARCHIVE_MEMBERS})")
+        extracted_bytes = 0
+        for name in names:
             target = _resolved_member_target(dest, name)
             if name.endswith("/"):
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(name) as src, target.open("wb") as out:
-                    shutil.copyfileobj(src, out)
+                    extracted_bytes = _copy_capped(src, out, extracted_bytes)
 
 
 def _reset_dir(dest: Path) -> None:
@@ -142,12 +182,19 @@ def _reset_dir(dest: Path) -> None:
 
 # ── 三种 source 模式物化 / three materialization modes ──────────────────────
 async def _default_archive_fetch(url: str) -> bytes:
-    """默认归档拉取（aiohttp GET）/ Default archive fetch via aiohttp。测试可注入替身。"""
+    """默认归档拉取（aiohttp GET，流式累计上限防 OOM）/ Default archive fetch via aiohttp (size-capped stream)。"""
     import aiohttp
 
+    chunks: list[bytes] = []
+    total = 0
     async with aiohttp.ClientSession() as session, session.get(url) as resp:
         resp.raise_for_status()
-        return await resp.read()
+        async for chunk in resp.content.iter_chunked(1 << 16):
+            total += len(chunk)
+            if total > MAX_ARCHIVE_DOWNLOAD_BYTES:
+                raise SkillStagingError(f"archive exceeds download size limit ({MAX_ARCHIVE_DOWNLOAD_BYTES} bytes)")
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _materialize_mounted(meta: dict[str, Any], dest: Path) -> None:
@@ -172,6 +219,8 @@ async def _materialize_archive(meta: dict[str, Any], dest: Path, fetch: ArchiveF
     if fmt not in ("tar.gz", "zip"):
         raise SkillStagingError(f"unsupported archive_format: {fmt!r} (expect 'tar.gz' | 'zip')")
     data = await fetch(uri)
+    if len(data) > MAX_ARCHIVE_DOWNLOAD_BYTES:
+        raise SkillStagingError(f"archive exceeds download size limit ({len(data)} > {MAX_ARCHIVE_DOWNLOAD_BYTES} bytes)")
     expected_sha = meta.get("archive_sha256")
     if expected_sha:
         actual = hashlib.sha256(data).hexdigest()
@@ -234,16 +283,16 @@ def _uri_leaf(uri: str) -> str:
 
 # ── A2CSkillRef 合成 / ref construction ─────────────────────────────────────
 def _build_ref(
-    server_name: str,
+    name: str,
     normalized_server: str,
     frontmatter: dict[str, Any],
     meta: dict[str, Any],
     path: Path,
     uri: str,
 ) -> A2CSkillRef:
-    """从 frontmatter + ``_meta`` 合成 A2CSkillRef（name 经 :func:`synthesize_mcp_name`，可能抛 SkillNameError）。"""
+    """从已合成 ``name`` + frontmatter + ``_meta`` 组装 A2CSkillRef / Assemble A2CSkillRef from precomputed name + frontmatter。"""
     ref: A2CSkillRef = {
-        "name": synthesize_mcp_name(server_name, str(frontmatter["name"])),
+        "name": name,
         "source": f"mcp:{normalized_server}",
         "uri": uri,
         "path": str(path),
@@ -291,6 +340,7 @@ async def stage_mcp_skills(
         by_server[sname].append(res)
 
     registered: list[str] = []
+    seen_this_run: set[str] = set()  # 本 run 已处理的合成 name，用于真冲突检测（§1.5 保留先到者）
     for sname, resources in by_server.items():
         normalized_server = normalize_mcp_server_segment(sname)
         for res in resources:
@@ -319,7 +369,7 @@ async def stage_mcp_skills(
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
 
-            name = _finalize_and_register(sname, normalized_server, meta, staged, root_uri, home, registry)
+            name = _finalize_and_register(sname, normalized_server, meta, staged, root_uri, home, registry, seen_this_run)
             if name is not None:
                 registered.append(name)
     return registered
@@ -333,8 +383,9 @@ def _finalize_and_register(
     root_uri: str,
     home: Path,
     registry: SkillRegistry,
+    seen_this_run: set[str],
 ) -> str | None:
-    """读 frontmatter → 校正包根目录名为 frontmatter.name → 合成 ref → register/update。失败返回 None。"""
+    """读 frontmatter → 真冲突拒绝（落盘前）→ 校正包根目录名 → register/update。失败返回 None。"""
     skill_md = staged / SKILL_MD
     if not skill_md.is_file():
         logger.error("staged SKILL missing %s, skipped: %s", SKILL_MD, root_uri)
@@ -347,6 +398,21 @@ def _finalize_and_register(
         shutil.rmtree(staged, ignore_errors=True)
         return None
 
+    try:
+        name = synthesize_mcp_name(server_name, str(frontmatter["name"]))
+    except SkillNameError as e:
+        logger.error("skill name synthesis failed, skipped: %s (%s)", root_uri, e.reason)
+        shutil.rmtree(staged, ignore_errors=True)
+        return None
+
+    # 真冲突（本 run 内两个不同 SKILL 合成同 name）必须在 rename 落盘前拒绝——否则会覆盖先到者的磁盘文件。
+    # §1.5「拒绝第二注册者、保留先到者」；区别于 register/update 分流：跨 run 既存同一 SKILL 才走 update（刷新/孤儿恢复）。
+    if name in seen_this_run:
+        logger.error("duplicate synthesized SKILL name within staging run (collision), keeping first: %s (%s)", name, root_uri)
+        shutil.rmtree(staged, ignore_errors=True)
+        return None
+    seen_this_run.add(name)
+
     # 包根目录名校正为 frontmatter.name（skill.md §4）
     final = mcp_skill_dir(home, normalized_server, str(frontmatter["name"]))
     if final != staged:
@@ -355,13 +421,7 @@ def _finalize_and_register(
         final.parent.mkdir(parents=True, exist_ok=True)
         staged.rename(final)
 
-    try:
-        ref = _build_ref(server_name, normalized_server, frontmatter, meta, final, root_uri)
-    except SkillNameError as e:
-        logger.error("skill name synthesis failed, skipped: %s (%s)", root_uri, e.reason)
-        shutil.rmtree(final, ignore_errors=True)
-        return None
-
-    name = ref["name"]
+    ref = _build_ref(name, normalized_server, frontmatter, meta, final, root_uri)
+    # 本 run 已 seen 去重；此处 name in registry 必为跨 run 既存的同一 SKILL → update（刷新/孤儿恢复）
     ok = registry.update(ref) if name in registry else registry.register(ref)
     return name if ok else None
