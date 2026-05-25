@@ -10,11 +10,12 @@
 Export utilities
 """
 
-from .path import is_within
+from .path import is_within, resolve_xdg_first
 from .window_uri import WindowURI, is_window_uri
 
 __all__ = [
     "WindowURI",
     "is_within",
     "is_window_uri",
+    "resolve_xdg_first",
 ]
