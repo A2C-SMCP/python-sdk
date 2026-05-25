@@ -52,7 +52,7 @@ from a2c_smcp.computer.blob import (
     BlobResolver,
     BlobThresholds,
     BlobTooLargeError,
-    SkillBlobResolverPending,
+    SkillBlobResolver,
     ToolspoolBlobResolver,
     ToolspoolBlobStore,
     default_thresholds,
@@ -62,13 +62,24 @@ from a2c_smcp.computer.inputs.render import ConfigRender
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
+from a2c_smcp.computer.skills import (
+    SkillRegistry,
+    SkillResourceView,
+    ensure_skill_home,
+    resolve_skill_view,
+    stage_mcp_skills,
+)
 from a2c_smcp.computer.types import ToolCallRecord
-from a2c_smcp.smcp import Desktop, SMCPTool
+from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.logger import get_logger, truncate
 from a2c_smcp.utils.window_uri import is_window_uri
 
 logger = get_logger("computer")
+
+# v0.2.1 SKILL 资源 URI scheme 前缀（与 manager.list_skill_resources 过滤一致）
+# v0.2.1 SKILL resource URI scheme prefix (consistent with manager.list_skill_resources filter)
+_SKILL_URI_PREFIX = "skill://"
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
@@ -88,6 +99,7 @@ class Computer(BaseComputer[PromptSession]):
         blob_cache_root: Path | None = None,
         blob_resolvers: dict[str, BlobResolver] | None = None,
         blob_thresholds: BlobThresholds | None = None,
+        skill_home: Path | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -115,6 +127,10 @@ class Computer(BaseComputer[PromptSession]):
                 wire ``toolspool`` (complete) and ``skill`` (#39 placeholder).
             blob_thresholds (BlobThresholds | None): SKILL / blob 阈值（inline / too_large / chunk_max）；
                 缺省经环境变量覆盖。Threshold bundle; defaults honor env overrides.
+            skill_home (Path | None): v0.2.1 SKILL Home 根覆盖（测试 / 部署注入）。缺省走
+                ``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills`` 解析链。
+                mcp 源 ``skill://`` 物化落盘于 ``<home>/mcp/<server>/<skill>/``。
+                SKILL Home root override (test/deploy injection); defaults to the env resolution chain.
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
@@ -139,16 +155,24 @@ class Computer(BaseComputer[PromptSession]):
         # Windows cache (only URIs that conform to WindowURI to avoid irrelevant refresh triggers)
         self._windows_cache: set[str] = set()
 
+        # v0.2.1 SKILL 子系统 / v0.2.1 SKILL subsystem（设计 §5.1，#66）
+        # 持有 name → A2CSkillRef 物化索引；SKILL Home 于 boot_up 解析落盘；skill:// 缓存仿窗口缓存。
+        # Hold the materialized Registry; SKILL Home resolved at boot_up; skill:// cache mirrors windows cache.
+        self._skill_registry: SkillRegistry = SkillRegistry()
+        self._skill_home_override: Path | None = skill_home
+        self._skill_home: Path | None = None
+        self._skills_cache: set[str] = set()
+
         # v0.2.1 通用二进制传输基础设施 / v0.2.1 generic blob-transfer infrastructure
         # 协议依据 / Protocol: blob-transfer.md；设计 / Design: §4.3 / §4.4
         self._blob_cache_root: Path = (blob_cache_root or Path.home() / ".a2c").expanduser().resolve()
         self._blob_cache_root.mkdir(parents=True, exist_ok=True)
         self._toolspool_store: ToolspoolBlobStore = ToolspoolBlobStore(self._blob_cache_root)
-        # 默认 resolver 装配：toolspool 完整、skill 占位（#39 接管后替换）
-        # Default resolver wiring: toolspool complete, skill placeholder (replaced by #39)
+        # 默认 resolver 装配：toolspool 完整、skill 经 Registry + 沙箱重跑回源（#66 接管占位）
+        # Default resolver wiring: toolspool complete; skill re-runs Registry + sandbox (replaces #39 placeholder)
         default_resolvers: dict[str, BlobResolver] = {
             "toolspool": ToolspoolBlobResolver(self._toolspool_store),
-            "skill": SkillBlobResolverPending(),
+            "skill": SkillBlobResolver(self._skill_registry),
         }
         if blob_resolvers is not None:
             default_resolvers.update(blob_resolvers)
@@ -286,6 +310,28 @@ class Computer(BaseComputer[PromptSession]):
 
         await self.mcp_manager.ainitialize(validated_servers)
 
+        # v0.2.1 SKILL 子系统启动初始化（设计 §5.1，#66）：解析 SKILL Home → 物化 mcp 源 skill:// →
+        # 填充 Registry → 初始化 skill:// 缓存。失败隔离：记 ERROR、**不**阻断 Computer 启动
+        # （skill.md §1.5：SKILL 通道对部分失败健壮）。marketplace/user 源 reconcile 见 #60/#61。
+        # SKILL subsystem boot init: resolve Home → materialize mcp-source skills → seed cache.
+        # Failure-isolated: log ERROR, never block Computer boot. marketplace/user sources land in #60/#61.
+        try:
+            self._skill_home = self._resolve_skill_home()
+            await self._restage_mcp_skills()
+            self._skills_cache = await self._acollect_skill_refs()
+        except Exception as e:  # pragma: no cover — 防御性兜底，正常路径已在内部各自降级
+            logger.error(f"SKILL 子系统启动初始化失败（不阻断 Computer 启动）/ SKILL boot init failed (non-blocking): {e}", exc_info=True)
+
+    def _resolve_skill_home(self) -> Path:
+        """解析并创建 SKILL Home（0o700 防御性写）/ Resolve & create SKILL Home。
+
+        显式注入 ``skill_home`` 时经 ``A2C_SKILL_HOME`` 覆盖；否则走默认 env 解析链
+        （``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills``）。
+        """
+        if self._skill_home_override is not None:
+            return ensure_skill_home({"A2C_SKILL_HOME": str(self._skill_home_override)})
+        return ensure_skill_home()
+
     async def _on_manager_change(
         self,
         message: RequestResponder[types.ServerRequest, types.ClientResult] | types.ServerNotification | Exception,
@@ -308,55 +354,107 @@ class Computer(BaseComputer[PromptSession]):
             except Exception as e:  # pragma: no cover
                 logger.error(f"上报工具变更失败: {e}", exc_info=True)
         elif isinstance(getattr(message, "root", None), ResourceListChangedNotification):
-            # 仅当 window:// 集合发生变化时触发刷新；否则记录日志以便后续策略调整
+            # 资源列表变化：window:// 与 skill:// **并行独立**处理（互不阻断，设计 §5.1）。
+            # Resource list changed: window:// and skill:// handled in parallel & independently.
             client = self.socketio_client
             if client is None:
-                logger.debug("Socket.IO 客户端不存在或已释放，忽略桌面刷新上报")
+                logger.debug("Socket.IO 客户端不存在或已释放，忽略资源列表变化上报")
                 return
-            try:
-                new_windows = await self._acollect_window_uris()
-            except Exception as e:  # pragma: no cover
-                logger.error(f"收集窗口资源失败，跳过刷新: {e}", exc_info=True)
+            await self._on_resource_list_changed_windows(client)
+            await self._on_resource_list_changed_skills(client)
+        elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
+            # 资源内容更新按 scheme 分流：window:// → 桌面刷新；skill:// → 重物化并上报 SKILL 更新。
+            # Resource content updated, dispatched by scheme: window:// → desktop; skill:// → restage skills.
+            client = self.socketio_client
+            if client is None:
+                logger.debug("Socket.IO 客户端不存在或已释放，忽略资源更新上报")
                 return
-
-            if new_windows != self._windows_cache:
-                added = sorted(new_windows - self._windows_cache)
-                removed = sorted(self._windows_cache - new_windows)
-                logger.info(
-                    "WindowURI 列表发生变化，将触发桌面刷新 | Window list changed, refreshing desktop. "
-                    f"added={len(added)}, removed={len(removed)}",
-                )
-                if added:
-                    logger.debug(f"新增窗口: {added}")
-                if removed:
-                    logger.debug(f"移除窗口: {removed}")
-                self._windows_cache = new_windows
+            uri = getattr(getattr(getattr(message, "root", None), "params", None), "uri", None)
+            uri_str = str(uri) if uri is not None else ""
+            if uri is not None and is_window_uri(uri_str):
                 try:
                     await client.emit_refresh_desktop()
                 except Exception as e:  # pragma: no cover
-                    logger.error(f"上报桌面刷新失败: {e}", exc_info=True)
+                    logger.error(f"上报桌面刷新失败: {e}")
+            elif uri_str.startswith(_SKILL_URI_PREFIX):
+                await self._on_skill_resource_updated(client)
             else:
-                # 打印关键信息帮助开发者判断策略是否需要更新
-                logger.info(
-                    "收到 ResourceListChangedNotification 但 WindowURI 未变化，跳过刷新 / "
-                    "Resource list changed but WindowURI set unchanged, skip refresh",
-                )
-        elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
-            # 资源内容更新：若是 window:// 则直接触发刷新（不比较集合，降低延迟）
-            client = self.socketio_client
-            if client is None:
-                logger.debug("Socket.IO 客户端不存在或已释放，忽略桌面刷新上报")
-                return
-            try:
-                uri = getattr(getattr(getattr(message, "root", None), "params", None), "uri", None)
-                if uri is None or not is_window_uri(str(uri)):
-                    logger.debug("收到资源更新但非 WindowURI，放行 / Non-window resource updated, ignore")
-                    return
-                await client.emit_refresh_desktop()
-            except Exception as e:  # pragma: no cover
-                logger.error(f"上报桌面刷新失败: {e}")
+                logger.debug("收到资源更新但非 window/skill scheme，放行 / Non-window/skill resource updated, ignore")
         else:
             logger.warning(f"收到未处理的变化类型: {truncate(message)}，当前版本仅处理工具列表变化")
+
+    async def _on_resource_list_changed_windows(self, client: "SMCPComputerClient") -> None:
+        """window:// 集合变化 → 比对缓存 → 触发桌面刷新（行为同 v0.2 既有逻辑，原样抽取）。
+
+        window:// set changed → compare cache → trigger desktop refresh (behavior-neutral extraction).
+        """
+        try:
+            new_windows = await self._acollect_window_uris()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"收集窗口资源失败，跳过刷新: {e}", exc_info=True)
+            return
+
+        if new_windows != self._windows_cache:
+            added = sorted(new_windows - self._windows_cache)
+            removed = sorted(self._windows_cache - new_windows)
+            logger.info(
+                "WindowURI 列表发生变化，将触发桌面刷新 | Window list changed, refreshing desktop. "
+                f"added={len(added)}, removed={len(removed)}",
+            )
+            if added:
+                logger.debug(f"新增窗口: {added}")
+            if removed:
+                logger.debug(f"移除窗口: {removed}")
+            self._windows_cache = new_windows
+            try:
+                await client.emit_refresh_desktop()
+            except Exception as e:  # pragma: no cover
+                logger.error(f"上报桌面刷新失败: {e}", exc_info=True)
+        else:
+            # 打印关键信息帮助开发者判断策略是否需要更新
+            logger.info(
+                "收到 ResourceListChangedNotification 但 WindowURI 未变化，跳过刷新 / "
+                "Resource list changed but WindowURI set unchanged, skip refresh",
+            )
+
+    async def _on_resource_list_changed_skills(self, client: "SMCPComputerClient") -> None:
+        """skill:// 集合变化 → 重物化 mcp 源 + 孤儿对账 → ``emit_update_skills``（仿窗口缓存对比）。
+
+        集合未变化则仅 DEBUG 跳过（设计 §5.1：``_acollect_skill_refs`` 集合相同跳过）。
+        skill:// set changed → restage mcp source + orphan reconcile → emit; unchanged → DEBUG skip.
+        """
+        try:
+            new_skills = await self._acollect_skill_refs()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"收集 skill:// 资源失败，跳过 SKILL 刷新: {e}", exc_info=True)
+            return
+
+        if new_skills == self._skills_cache:
+            logger.debug("收到 ResourceListChanged 但 skill:// 集合未变化，跳过 SKILL 重物化 / skill:// set unchanged, skip")
+            return
+
+        added = len(new_skills - self._skills_cache)
+        removed = len(self._skills_cache - new_skills)
+        logger.info(f"skill:// 列表发生变化，重物化并上报 SKILL 更新 | skill:// list changed. added={added}, removed={removed}")
+        try:
+            await self._restage_mcp_skills()
+            self._skills_cache = new_skills
+            await client.emit_update_skills()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"SKILL 重物化/上报失败: {e}", exc_info=True)
+
+    async def _on_skill_resource_updated(self, client: "SMCPComputerClient") -> None:
+        """skill:// 资源内容更新 → 重物化 + 上报（不比较集合，降低延迟，仿 window ResourceUpdated）。
+
+        单 SKILL 增量物化的 server 归属无法仅从 URI 推断，故走全量重物化（正确优先；增量为后续优化）。
+        skill:// content updated → restage + emit (no set compare, lower latency). Full restage for
+        simplicity since per-skill server attribution isn't derivable from the URI alone.
+        """
+        try:
+            await self._restage_mcp_skills()
+            await client.emit_update_skills()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"SKILL 内容更新重物化/上报失败: {e}", exc_info=True)
 
     async def _acollect_window_uris(self) -> set[str]:
         """
@@ -371,6 +469,57 @@ class Computer(BaseComputer[PromptSession]):
         pairs = await self.mcp_manager.list_windows()
         # 仅保留符合 WindowURI 协议的资源
         return {str(res.uri) for _srv, res in pairs if is_window_uri(str(res.uri))}
+
+    async def _acollect_skill_refs(self) -> set[str]:
+        """
+        收集当前所有 MCP Server 的 ``skill://`` 资源 URI 集合（去重）/ Collect deduplicated skill:// URI set。
+
+        用于 ``ResourceListChanged`` 缓存对比（集合相同跳过重物化，仿 :meth:`_acollect_window_uris`）。
+        ``manager.list_skill_resources`` 已按 ``skill://`` scheme 过滤并完整消费 cursor 翻页。
+
+        Returns:
+            set[str]: skill:// 资源 URI 集合（含子资源——任何变化都触发重物化，缓存对比更敏感）。
+        """
+        if not self.mcp_manager:
+            return set()
+        pairs = await self.mcp_manager.list_skill_resources()
+        return {str(res.uri) for _srv, res in pairs}
+
+    async def _restage_mcp_skills(self, server_name: str | None = None) -> list[str]:
+        """
+        物化 mcp 源 ``skill://`` → 注册进 :class:`SkillRegistry` / Materialize & register mcp-source skills。
+
+        全量重物化（``server_name is None``）后做孤儿对账：本轮未出现的 mcp 源 SKILL → 标孤儿
+        （从 ``get_skills`` 排除，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无 manager → 空列表。
+        Full restage reconciles orphans: mcp-source skills absent this run are marked orphaned.
+
+        Args:
+            server_name: 若提供仅重物化该 server（单 server 重枚举）；否则全部活跃 server + 孤儿对账。
+
+        Returns:
+            list[str]: 本轮成功注册（或刷新）的 SKILL name 列表。
+        """
+        if not self.mcp_manager or self._skill_home is None:
+            return []
+        registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, server_name=server_name)
+        if server_name is None:
+            self._reconcile_mcp_orphans(set(registered))
+        return registered
+
+    def _reconcile_mcp_orphans(self, present_names: set[str]) -> None:
+        """
+        全量重物化后孤儿对账 / Orphan reconciliation after a full restage。
+
+        当前活跃但本轮未出现的 ``mcp:`` 源 SKILL → :meth:`SkillRegistry.mark_orphan`（消失即从
+        ``get_skills`` 排除；恢复由 staging 的 ``register`` 命中孤儿条目自动完成）。**仅**处理 mcp 源，
+        marketplace/user 源（#60/#61）由各自 reconciler 维护，不在此误标孤儿。
+        Only mcp-source skills are reconciled here; marketplace/user sources are owned by #60/#61.
+        """
+        for ref in self._skill_registry.active_refs():
+            source = ref.get("source", "") or ""
+            name = ref.get("name", "") or ""
+            if name and name not in present_names and source.startswith("mcp:"):
+                self._skill_registry.mark_orphan(name)
 
     async def _arender_and_validate_server(
         self,
@@ -826,6 +975,53 @@ class Computer(BaseComputer[PromptSession]):
         if not self.mcp_manager:
             raise RuntimeError("当前MCP Manager为空 / MCP Manager is not initialized")
         return await self.mcp_manager.list_resources(mcp_server, cursor)
+
+    # ------------------------
+    # SKILL 通道委托 / SKILL channel delegation (v0.2.1, #66)
+    # 协议依据 / Protocol: skill.md §6 / §9；设计 / Design: §5.1
+    # ------------------------
+    @property
+    def skill_registry(self) -> SkillRegistry:
+        """name → A2CSkillRef 物化索引（``client:get_skills`` / ``get_skill`` / ``get_blob`` 经此解析）。
+
+        The materialized name → A2CSkillRef index consumed by the SKILL channel handlers.
+        """
+        return self._skill_registry
+
+    def get_skills(self) -> list[A2CSkillRef]:
+        """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。
+
+        Active installed SKILLs (orphans excluded; unsorted, undeduped) — source for client:get_skills.
+        """
+        return self._skill_registry.active_refs()
+
+    def get_skill_ref(self, name: str) -> A2CSkillRef | None:
+        """O(1) 活跃精确解析 ``name`` → :class:`A2CSkillRef`（孤儿 / 未注册 → ``None``）。
+
+        这是 name→包根的唯一解析入口（§9.2 name 寻址防越权）。handler 据 ``None`` 回 ``4014``。
+        Single name→package-root resolution entry (§9.2); handler maps ``None`` to ``4014``.
+        """
+        return self._skill_registry.resolve(name)
+
+    def read_skill_resource(self, ref: A2CSkillRef, rel_path: str | None) -> SkillResourceView:
+        """沙箱解析 SKILL 包内资源 → 消费字节视图（铸造期带 ``too_large`` 守卫）。
+
+        §9.2：包根**仅**取自 ``ref["path"]``（由 Registry 经 name 解析），:func:`resolve_skill_view`
+        只接受 ``root: Path``，绝不从 name / rel_path 推导 FS 路径。``total_size`` / ``sha256`` 基于
+        消费字节（SKILL.md→frontmatter 剥离后 body；其它→原始字节），与 ``get_blob`` 解析期一致。
+
+        Args:
+            ref: 来自 :meth:`get_skill_ref` 的活跃 A2CSkillRef（``path`` 必为可读绝对包根）。
+            rel_path: 包根内 POSIX 相对路径；``None`` / 空 → 入口 ``SKILL.md``。
+
+        Returns:
+            SkillResourceView: 消费字节视图（mime / total_size / sha256 / is_text / 切片）。
+
+        Raises:
+            SkillSandboxError: 沙箱拒绝（traversal/forbidden/not_found）或 too_large（→ handler 映射 4017）。
+        """
+        root = Path(ref["path"])
+        return resolve_skill_view(root, rel_path, too_large_cap=self._blob_thresholds.too_large_cap)
 
     async def get_desktop(self, size: int | None = None, window_uri: str | None = None) -> list[Desktop]:
         """

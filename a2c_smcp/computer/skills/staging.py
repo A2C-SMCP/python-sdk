@@ -99,6 +99,32 @@ def parse_skill_frontmatter(skill_md_text: str) -> dict[str, Any]:
     return {}
 
 
+def strip_skill_frontmatter(skill_md_text: str) -> str:
+    """
+    剥离 SKILL.md 头部 YAML frontmatter，返回正文 body（Agent 最终消费内容）/ Strip leading YAML
+    frontmatter from SKILL.md, returning the body the Agent ultimately consumes。
+
+    与 :func:`parse_skill_frontmatter` 同源行级定位（首尾 ``---``）：无 frontmatter / 无闭合 ``---``
+    → 原样返回。剥离后正文 = 闭合 ``---`` 行之后的全部内容（保留原行尾，不额外 trim），故
+    ``client:get_skill`` 铸造期与 ``client:get_blob`` 解析期对 SKILL.md 的「消费字节」基准一致
+    （协议 ``blob-transfer.md`` §3 / 设计 §4.4「资源字节三处一致」）。
+    Same line-level fence detection as :func:`parse_skill_frontmatter`; no frontmatter / no closing
+    fence → returned unchanged. Body = everything after the closing ``---`` line (original line
+    endings preserved, no extra trimming), so the get_skill mint and the get_blob resolve agree on
+    the consumed bytes for SKILL.md.
+    """
+    if not skill_md_text.startswith("---"):
+        return skill_md_text
+    lines = skill_md_text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return skill_md_text
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "".join(lines[i + 1 :])
+    # 无闭合 fence → 视为无有效 frontmatter，原样返回（与 parse 一致）
+    return skill_md_text
+
+
 # ── 安全解包 / safe extraction ──────────────────────────────────────────────
 def _resolved_member_target(dest: Path, member_name: str) -> Path:
     """

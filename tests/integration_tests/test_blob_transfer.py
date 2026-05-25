@@ -322,6 +322,84 @@ class TestInProcLazyInvariant:
         )
 
 
+class TestInProcSkillBlobRoundTrip:
+    """SKILL 生产者通道：``on_get_skill`` 铸句柄 → ``drain_blob`` 解析回源 → 字节/sha256 一致（#66）.
+
+    验证设计 §4.4「资源字节三处一致」的端到端契约：``client:get_skill`` 铸造期上报的
+    ``total_size`` / ``sha256``（消费字节基准）**必须**与 ``client:get_blob`` 重跑沙箱后回源、经
+    ``drain_blob`` 重组的字节完全一致。SKILL.md 走 frontmatter 剥离后 body；子资源走原始字节。
+    Verifies the get_skill mint and the get_blob resolve agree on consumed bytes end-to-end.
+    """
+
+    @staticmethod
+    def _register(comp: Computer, pkg) -> None:
+        assert comp.skill_registry.register({"name": "mcp:srv:demo", "source": "mcp:srv", "path": str(pkg)}) is True
+
+    @staticmethod
+    async def _get_skill(cli: SMCPComputerClient, name: str, rel_path: str | None = None) -> Mapping[str, Any]:
+        from a2c_smcp.smcp import GetSkillReq
+
+        req: GetSkillReq = {"agent": "agent-it", "req_id": "r-skill", "computer": cli.computer.name, "name": name}
+        if rel_path is not None:
+            req["rel_path"] = rel_path
+        return await cli.on_get_skill(req)
+
+    @pytest.mark.asyncio
+    async def test_skill_md_over_budget_handle_drain_consistency(
+        self,
+        computer_with_client: tuple[Computer, SMCPComputerClient],
+        tmp_path,
+    ) -> None:
+        comp, cli = computer_with_client
+        pkg = tmp_path / "home" / "mcp" / "srv" / "demo"
+        pkg.mkdir(parents=True)
+        # body > 32 KiB inline 预算 → 铸句柄；frontmatter 剥离后 body == big_body
+        big_body = "# Title\n\n" + ("lorem ipsum dolor sit amet 测试 中文\n" * 3000)
+        (pkg / "SKILL.md").write_text(f"---\nname: demo\nversion: 1.0.0\n---\n{big_body}", encoding="utf-8")
+        self._register(comp, pkg)
+
+        ret = await self._get_skill(cli, "mcp:srv:demo")
+        assert "blob_handle" in ret  # 超内联预算 → 铸句柄（非 body）
+        assert "body" not in ret
+        assert ret["mime_type"] == "text/markdown"
+
+        expected = big_body.encode("utf-8")
+        # get_skill 铸造期 sha256/total_size 基于剥离后 body
+        assert ret["sha256"] == hashlib.sha256(expected).hexdigest()
+        assert ret["total_size"] == len(expected)
+
+        # get_blob 重跑沙箱回源（chunk_size 强制多块）→ 重组字节与 sha256 一致
+        call = _make_in_proc_call(cli)
+        data, mime = await drain_blob(call, comp.name, ret["blob_handle"], chunk_size=4096)
+        assert data == expected
+        assert mime == "text/markdown"
+        assert hashlib.sha256(data).hexdigest() == ret["sha256"]
+
+    @pytest.mark.asyncio
+    async def test_binary_subresource_handle_drain_consistency(
+        self,
+        computer_with_client: tuple[Computer, SMCPComputerClient],
+        tmp_path,
+    ) -> None:
+        comp, cli = computer_with_client
+        pkg = tmp_path / "home" / "mcp" / "srv" / "demo"
+        (pkg / "assets").mkdir(parents=True)
+        (pkg / "SKILL.md").write_text("---\nname: demo\n---\nbody\n", encoding="utf-8")
+        blob = bytes((i * 7 + 3) % 256 for i in range(50 * 1024))  # 50 KiB 二进制
+        (pkg / "assets" / "img.png").write_bytes(blob)
+        self._register(comp, pkg)
+
+        ret = await self._get_skill(cli, "mcp:srv:demo", "assets/img.png")
+        assert ret["mime_type"] == "image/png"
+        assert "blob_handle" in ret  # 二进制 MIME 一律铸句柄
+        assert ret["sha256"] == hashlib.sha256(blob).hexdigest()
+
+        call = _make_in_proc_call(cli)
+        data, mime = await drain_blob(call, comp.name, ret["blob_handle"], chunk_size=4096)
+        assert data == blob  # 子资源 = 原始字节（不剥 frontmatter）
+        assert mime == "image/png"
+
+
 # ======================================================================
 # Part 2 — Real Socket.IO transport (async)
 # ======================================================================

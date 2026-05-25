@@ -16,6 +16,7 @@ Mirrors Claude Code marketplace local SKILL management. Landed modules:
 - :mod:`a2c_smcp.computer.skills.registry` —— `name → A2CSkillRef` O(1) 物化索引 + 孤儿标记/恢复（S3，#57）
 - :mod:`a2c_smcp.computer.skills.staging`  —— 多 source 物化（mcp 源 + manager.list_skill_resources）（S6，#59）
 - :mod:`a2c_smcp.computer.skills.sandbox`  —— 包根内 `safe_join`+`realpath` 沙箱 + `.skillenv` forbidden + name 寻址防越权（S2，#55）
+- :mod:`a2c_smcp.computer.skills.resource` —— 沙箱解析 → 消费字节视图（mint/serve 字节基准一致：sha256/total_size）（S13，#66）
 
 协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §1 / §4 / §6 / §8 / §9.2。
 """
@@ -47,6 +48,12 @@ from a2c_smcp.computer.skills.naming import (
     synthesize_user_name,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.resource import (
+    DEFAULT_SKILL_MIME,
+    SkillResourceView,
+    looks_textual,
+    resolve_skill_view,
+)
 from a2c_smcp.computer.skills.sandbox import (
     DEFAULT_SKILL_FILE,
     FORBIDDEN_SKILL_FILES,
@@ -55,7 +62,12 @@ from a2c_smcp.computer.skills.sandbox import (
     ensure_within_size_cap,
     resolve_skill_resource,
 )
-from a2c_smcp.computer.skills.staging import SkillStagingError, parse_skill_frontmatter, stage_mcp_skills
+from a2c_smcp.computer.skills.staging import (
+    SkillStagingError,
+    parse_skill_frontmatter,
+    stage_mcp_skills,
+    strip_skill_frontmatter,
+)
 
 __all__ = [
     # home
@@ -89,8 +101,14 @@ __all__ = [
     "SkillSandboxReason",
     "ensure_within_size_cap",
     "resolve_skill_resource",
+    # resource（消费字节视图：mint/serve 一致）
+    "DEFAULT_SKILL_MIME",
+    "SkillResourceView",
+    "looks_textual",
+    "resolve_skill_view",
     # staging
     "SkillStagingError",
     "parse_skill_frontmatter",
     "stage_mcp_skills",
+    "strip_skill_frontmatter",
 ]

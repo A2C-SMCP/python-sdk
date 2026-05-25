@@ -5,7 +5,7 @@
 # @Software: PyCharm
 import base64
 import hashlib
-from typing import Any
+from typing import Any, cast
 
 from mcp.types import CallToolResult, Resource
 from pydantic import TypeAdapter
@@ -16,15 +16,20 @@ from a2c_smcp.computer.blob import (
     BlobHandleError,
     BlobHandleInvalidError,
     decode_blob_handle,
+    encode_skill_handle,
 )
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
+from a2c_smcp.computer.mcp_clients.model import GetSkillRet as GetSkillRetModel
+from a2c_smcp.computer.skills import SkillNameError, SkillSandboxError, parse_skill_name
 from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.smcp import (
     GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
@@ -32,6 +37,7 @@ from a2c_smcp.smcp import (
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
     UPDATE_DESKTOP_EVENT,
+    UPDATE_SKILLS_EVENT,
     UPDATE_TOOL_LIST_EVENT,
     A2CResource,
     EnterOfficeReq,
@@ -45,6 +51,10 @@ from a2c_smcp.smcp import (
     GetDeskTopRet,
     GetResourcesReq,
     GetResourcesRet,
+    GetSkillReq,
+    GetSkillRet,
+    GetSkillsReq,
+    GetSkillsRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeReq,
@@ -152,6 +162,9 @@ class SMCPComputerClient(AsyncClient):
         self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
         self.on(GET_RESOURCES_EVENT, self.on_get_resources, namespace=self._namespace)
         self.on(GET_BLOB_EVENT, self.on_get_blob, namespace=self._namespace)
+        # v0.2.1 SKILL 通道发现 / 渐进式披露 / SKILL channel discovery & progressive disclosure (#66)
+        self.on(GET_SKILLS_EVENT, self.on_get_skills, namespace=self._namespace)
+        self.on(GET_SKILL_EVENT, self.on_get_skill, namespace=self._namespace)
         self.office_id: str | None = None
 
     @property
@@ -304,6 +317,19 @@ class SMCPComputerClient(AsyncClient):
         """
         if self.office_id:
             await self.emit(UPDATE_DESKTOP_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
+
+    async def emit_update_skills(self) -> None:
+        """
+        SKILL 集合变更（增/删/物化更新）时触发，向信令服务器推送 server:update_skills；服务端广播
+        notify:update_skills，Agent 据此自动重拉 client:get_skills（与既有 notify:update_* 自动刷新一致）。
+        When the SKILL set changes, emit server:update_skills; server broadcasts notify:update_skills.
+
+        复用 UpdateComputerConfigReq（协议 events.md §server:update_skills 明确复用，不新建结构）；
+        office_id 守卫与 :meth:`emit_update_tool_list` 一致——未入房间不发送。
+        Reuses UpdateComputerConfigReq (protocol reuses it); office_id guard mirrors emit_update_tool_list.
+        """
+        if self.office_id:
+            await self.emit(UPDATE_SKILLS_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def on_tool_call(self, data: ToolCallReq) -> dict:
         """
@@ -579,6 +605,128 @@ class SMCPComputerClient(AsyncClient):
         # Core logic extracted to module-level ``_process_get_blob``, shared with sync wire mock,
         # eliminating dual-maintenance of equivalent sync/async handler bodies (PR #52 fix-review).
         return _process_get_blob(data, self.computer)
+
+    async def on_get_skills(self, data: GetSkillsReq) -> GetSkillsRet:
+        """
+        SKILL 清单发现 / SKILL inventory discovery（``client:get_skills``）.
+
+        协议依据 / Protocol: events.md#client:get_skills；skill.md §6（排除孤儿 / 不排序 / 不去重 / 不读 body）。
+        从 Registry 取**活跃** SKILL 轻量元数据（``A2CSkillRef`` 列表，不含 SKILL.md body——body 由
+        ``client:get_skill`` 拉取）；孤儿（source 消失）由 :meth:`Computer.get_skills` 经 ``active_refs`` 排除。
+        Returns lightweight active SKILL refs (orphans excluded; no body). Body is fetched via get_skill.
+
+        Args:
+            data (GetSkillsReq): 请求数据（computer / req_id）。
+
+        Returns:
+            GetSkillsRet: ``skills`` 列表 + ``req_id``。
+        """
+        # Server 通过 session 保证请求来自同一 office；computer 标识仍需匹配（隔离不变量显式 raise）
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
+        return GetSkillsRet(skills=self.computer.get_skills(), req_id=data["req_id"])
+
+    async def on_get_skill(self, data: GetSkillReq) -> GetSkillRet | ErrorPayload:
+        """
+        SKILL 包内单资源渐进式披露 / Progressive disclosure of one in-package SKILL resource（``client:get_skill``）.
+
+        协议依据 / Protocol: events.md#client:get_skill；skill.md §9（安全模型）；blob-transfer.md §5（生产者通道）。
+
+        错误语义（flat ErrorPayload，经 Socket.IO ack 第一参回传，无嵌套 envelope）/ Errors:
+          - ``4016`` ``SKILL_NAME_INVALID``（``details.name``）：``name`` 违反 SKILL name lexer；
+          - ``4014``（复用 ``MCP_SERVER_NOT_FOUND``，``details.name``）：``name`` 合法但 Registry 未命中 / 孤儿；
+          - ``4017`` ``SKILL_RESOURCE_NOT_ACCESSIBLE``（``details.reason`` / ``rel_path`` / ``total_size``）：
+            ``rel_path`` 沙箱穿越 / ``.skillenv`` forbidden / not_found / too_large（too_large **不铸句柄**）。
+
+        成功路径 / Success path：
+          - 仅 **SKILL.md** 剥 frontmatter（消费字节 = 剥离后 body）；其它资源 = 原始字节；
+          - 文本且 ``total_size`` ≤ 内联预算 → ``body`` 内联；否则铸 ``blob_handle`` 转 ``client:get_blob``；
+          - ``body`` 与 ``blob_handle`` **恰一存在**（经 :class:`GetSkillRetModel` XOR 服务侧自校验）。
+
+        Args:
+            data (GetSkillReq): 请求数据（computer / name / 可选 rel_path / req_id）。
+
+        Returns:
+            GetSkillRet | ErrorPayload: 成功为单资源响应，失败为 flat ErrorPayload。
+        """
+        if self.computer.name != data["computer"]:
+            raise SMCPNamespaceError("计算机标识不匹配")
+        name = data["name"]
+        rel_path = data.get("rel_path")
+
+        # 1) name lexer → 4016（格式硬错）/ malformed name → 4016
+        try:
+            parse_skill_name(name)
+        except SkillNameError as e:
+            logger.warning(f"client:get_skill invalid skill name {name!r}: {e.reason}")
+            return _skill_name_invalid(name)
+
+        # 2) Registry 解析 → 4014（合法但未注册 / 孤儿）/ valid-but-absent → 4014
+        ref = self.computer.get_skill_ref(name)
+        if ref is None:
+            logger.warning(f"client:get_skill name not in registry (unregistered or orphaned): {name!r}")
+            return _skill_not_found(name)
+
+        # 3) 沙箱解析 + 消费字节视图 → 4017（traversal/forbidden/not_found/too_large）
+        try:
+            view = self.computer.read_skill_resource(ref, rel_path)
+        except SkillSandboxError as e:
+            logger.warning(f"client:get_skill resource not accessible: name={name!r} reason={e.reason} rel={e.rel_path!r}")
+            return _skill_resource_error(e)
+
+        # 4) inline body vs blob_handle（文本且 ≤ 内联预算 → body；否则铸句柄）
+        budget = self.computer.blob_thresholds.inline_budget
+        body: str | None = None
+        if view.is_text and view.total_size <= budget:
+            try:
+                body = view.read_all().decode("utf-8")
+            except UnicodeDecodeError:
+                # 声称文本但非 UTF-8 → 回退句柄路径（保守，避免内联破损字符串）
+                logger.debug(f"client:get_skill {name!r} rel={view.rel_path!r} textual mime but not UTF-8; routing to blob_handle")
+                body = None
+        blob_handle: str | None = None
+        if body is None:
+            # too_large 已在 read_skill_resource 铸造期拦截（抛 4017），此处铸句柄安全
+            blob_handle = encode_skill_handle(name, view.rel_path)
+
+        # 5) 服务侧 XOR 自校验 + 规整 wire 形态（exclude_none 丢弃缺席的 body/blob_handle）
+        model = GetSkillRetModel(
+            name=name,
+            rel_path=view.rel_path,
+            mime_type=view.mime,
+            total_size=view.total_size,
+            sha256=view.sha256,
+            req_id=data["req_id"],
+            body=body,
+            blob_handle=blob_handle,
+        )
+        return cast(GetSkillRet, model.model_dump(exclude_none=True))
+
+
+def _skill_name_invalid(name: str) -> ErrorPayload:
+    """``4016 SKILL_NAME_INVALID`` flat ErrorPayload（``details.name``，error-handling.md §4016）。"""
+    return ErrorPayload(code=int(ErrorCode.SKILL_NAME_INVALID), message="Invalid skill name", details={"name": name})
+
+
+def _skill_not_found(name: str) -> ErrorPayload:
+    """``4014`` 复用 flat ErrorPayload：name 合法但 Registry 未命中（未注册 / 卸载 / 孤儿）。
+
+    SKILL 通道复用 ``MCP_SERVER_NOT_FOUND`` 语义（error-handling.md §SKILL）；``name`` 经 ``details`` 下沉
+    （非 mcp_server，故不平铺 ``mcp_server_name``）。
+    """
+    return ErrorPayload(code=int(ErrorCode.MCP_SERVER_NOT_FOUND), message="Skill not found", details={"name": name})
+
+
+def _skill_resource_error(e: SkillSandboxError) -> ErrorPayload:
+    """``4017 SKILL_RESOURCE_NOT_ACCESSIBLE`` flat ErrorPayload（``details.reason`` / ``rel_path`` / ``total_size``）。
+
+    ``reason`` 为开放枚举（traversal/forbidden/not_found/too_large）；``total_size`` 仅 too_large 携带
+    （error-handling.md §4017）。``.skillenv`` 等敏感文件存在/不存在**同 reason** forbidden（不泄漏存在性）。
+    """
+    details: dict[str, Any] = {"reason": e.reason, "rel_path": e.rel_path}
+    if e.total_size is not None:
+        details["total_size"] = e.total_size
+    return ErrorPayload(code=int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE), message="Skill resource not accessible", details=details)
 
 
 def _blob_error(*, reason: str) -> ErrorPayload:
