@@ -45,6 +45,7 @@ from a2c_smcp.computer.skills.naming import (
     synthesize_user_name,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.staging import SkillStagingError, parse_skill_frontmatter, stage_mcp_skills
 
 __all__ = [
     # home
@@ -71,4 +72,8 @@ __all__ = [
     "synthesize_user_name",
     # registry
     "SkillRegistry",
+    # staging
+    "SkillStagingError",
+    "parse_skill_frontmatter",
+    "stage_mcp_skills",
 ]

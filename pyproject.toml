@@ -97,6 +97,8 @@ module = [
     "pexpect.*",
     "msgpack",
     "msgpack.*",
+    "yaml",
+    "yaml.*",
 ]
 ignore_missing_imports = true
 
