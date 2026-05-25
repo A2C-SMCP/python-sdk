@@ -10,12 +10,16 @@
 Export utilities
 """
 
+from .atomic_io import atomic_write_bytes, atomic_write_text, unique_tmp_path
 from .path import is_within, resolve_xdg_first
 from .window_uri import WindowURI, is_window_uri
 
 __all__ = [
     "WindowURI",
+    "atomic_write_bytes",
+    "atomic_write_text",
     "is_within",
     "is_window_uri",
     "resolve_xdg_first",
+    "unique_tmp_path",
 ]
