@@ -23,13 +23,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
-import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from a2c_smcp.computer.blob.handle import BlobHandleGoneError, BlobHandleInvalidError
+from a2c_smcp.utils.atomic_io import atomic_write_bytes, atomic_write_text
 from a2c_smcp.utils.path import is_within
 
 logger = logging.getLogger(__name__)
@@ -107,10 +106,10 @@ class ToolspoolBlobStore:
         if blob_path.exists():
             # 幂等：内容存在则直接复用 / Idempotent: reuse existing content
             # 仍刷新 mime 以兜底首次写盘失败的极端场景 / refresh mime to recover stale state
-            _atomic_write_text(mime_path, mime)
+            atomic_write_text(mime_path, mime)
             return cid
-        _atomic_write_bytes(blob_path, payload)
-        _atomic_write_text(mime_path, mime)
+        atomic_write_bytes(blob_path, payload)
+        atomic_write_text(mime_path, mime)
         return cid
 
     def get(self, cid: str) -> tuple[bytes, str]:
@@ -254,29 +253,3 @@ def _validate_cid(cid: str) -> None:
     """
     if not isinstance(cid, str) or len(cid) != _CID_LEN or not all(ch in _HEX_CHARS for ch in cid):
         raise BlobHandleInvalidError(f"invalid cid form (must be sha256 hex): {cid!r}")
-
-
-def _unique_tmp_path(path: Path) -> Path:
-    """生成进程/线程唯一的临时文件名（``<name>.<pid>.<uuid8>.tmp``）.
-    Build a process+thread-unique tmp filename to avoid cross-process collisions.
-
-    若多个 Computer 进程共享 ``cache_root`` 且并发写同一 cid（同字节内容），固定 ``<cid>.tmp``
-    会让两次写共用一个临时文件——第二次 ``os.replace`` 源已被前者 rename 走 → ``FileNotFoundError``。
-    Cross-process concurrent puts of the same cid (same bytes) would share a fixed ``<cid>.tmp``;
-    the second ``os.replace`` could find its source already renamed → ``FileNotFoundError``.
-    """
-    unique = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
-    return path.with_suffix(f"{path.suffix}.{unique}.tmp")
-
-
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """原子写：先写**唯一**临时文件，再 rename 覆盖目标（POSIX 跨内核保证）/ Atomic write via unique tmp + rename."""
-    tmp = _unique_tmp_path(path)
-    tmp.write_bytes(payload)
-    os.replace(tmp, path)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = _unique_tmp_path(path)
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
