@@ -156,7 +156,7 @@
 ## 8. 风险与依赖
 
 - **marketplace git 源**：网络拉取/缓存/对账失败要降级（记 ERROR、不阻断其余 source、不向 Agent 硬报错）；首拉成本与定时对账策略 SDK 自决。
-- **staging 目录隔离**：MUST NOT 跨用户共享（勿放系统目录）；多用户每用户独立 home。
+- **staging 目录隔离**：对齐 CC——默认每用户私有 home + 创建时 `0o700` 防御性写，隔离交 OS 权限（**不**做 path deny-list）；协议 §9.2 `MUST NOT 跨用户共享` 待校准为 SHOULD/部署指引（详见 skill-computer-management §2.3 决策③）。
 - **底层 mcp 包**：沿用 0.2 锚定（`mcp >= 1.15.0`），`Resource._meta` / `annotations` 须可用（启动自检 fail-fast，沿用 versioning.md §校验建议）。
 - **与 PR #33 无代码冲突**：本工单不碰 `server/middleware.py` / `utils/handshake.py` / `version.py`；如需先合 PR #33 仅为减少 rebase，无强依赖。
 

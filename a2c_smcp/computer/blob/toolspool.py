@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from a2c_smcp.computer.blob.handle import BlobHandleGoneError, BlobHandleInvalidError
+from a2c_smcp.utils.path import is_within
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ class ToolspoolBlobStore:
             mime_real = mime_path.resolve(strict=True)
         except FileNotFoundError as e:
             raise BlobHandleGoneError(f"toolspool entry missing: cid={cid}") from e
-        if not _is_within(blob_real, self.root) or not _is_within(mime_real, self.root):
+        if not is_within(blob_real, self.root) or not is_within(mime_real, self.root):
             # 理论不可达——cid 已经过白名单校验。出现即视为 invalid_handle（不泄漏内部细节）
             # Theoretically unreachable post-cid-validation; treat as invalid_handle (no leak)
             raise BlobHandleInvalidError(f"resolved path escapes blobspool root: cid={cid}")
@@ -167,7 +168,7 @@ class ToolspoolBlobStore:
             mime_real = mime_path.resolve(strict=True)
         except FileNotFoundError as e:
             raise BlobHandleGoneError(f"toolspool entry missing: cid={cid}") from e
-        if not _is_within(blob_real, self.root) or not _is_within(mime_real, self.root):
+        if not is_within(blob_real, self.root) or not is_within(mime_real, self.root):
             raise BlobHandleInvalidError(f"resolved path escapes blobspool root: cid={cid}")
         size = blob_real.stat().st_size  # metadata only — no payload read
         mime = mime_real.read_text(encoding="utf-8").strip()
@@ -203,7 +204,7 @@ class ToolspoolBlobStore:
             blob_real = blob_path.resolve(strict=True)
         except FileNotFoundError as e:
             raise BlobHandleGoneError(f"toolspool entry missing: cid={cid}") from e
-        if not _is_within(blob_real, self.root):
+        if not is_within(blob_real, self.root):
             raise BlobHandleInvalidError(f"resolved path escapes blobspool root: cid={cid}")
         with open(blob_real, "rb") as f:
             f.seek(offset)
@@ -253,15 +254,6 @@ def _validate_cid(cid: str) -> None:
     """
     if not isinstance(cid, str) or len(cid) != _CID_LEN or not all(ch in _HEX_CHARS for ch in cid):
         raise BlobHandleInvalidError(f"invalid cid form (must be sha256 hex): {cid!r}")
-
-
-def _is_within(path: Path, parent: Path) -> bool:
-    """``path`` 是否在 ``parent`` 之下（含相等）/ Whether ``path`` is at or under ``parent``."""
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
 
 
 def _unique_tmp_path(path: Path) -> Path:

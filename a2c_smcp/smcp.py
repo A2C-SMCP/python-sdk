@@ -535,25 +535,28 @@ class A2CSkillRef(TypedDict, total=False):
     SKILL 引用对象，``client:get_skills`` 返回列表元素。
     Skill reference object — element of ``client:get_skills`` return list.
 
-    协议依据 / Protocol: data-structures.md §A2CSkillRef；skill.md §2 命名 / §3 ref 字段。
+    协议依据 / Protocol: data-structures.md §A2CSkillRef；skill.md §1 命名 / §6 数据结构。
 
     关键约束 / Key invariants:
-      - ``name`` 是协议主键（含 source prefix 的合成全局唯一名），Agent **MUST** 当作不透明可比较字符串
-        ``name`` is the protocol primary key (synthesized globally-unique name including source prefix);
-        Agent **MUST** treat as opaque comparable string.
+      - ``name`` 是协议主键（合成全局唯一名，自 0.2.1 起为**裸名**：user 1 段 ``<skill>`` /
+        marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<server>:<skill>``），Agent **MUST**
+        当作不透明可比较字符串（**勿**解析结构，判来源用 ``source``）
+        ``name`` is the protocol primary key (synthesized globally-unique **bare** name since 0.2.1:
+        user 1-seg ``<skill>`` / marketplace 2-seg ``<plugin>:<skill>`` / mcp 3-seg
+        ``mcp:<server>:<skill>``); Agent **MUST** treat it as an opaque comparable string.
       - ``path`` 必选（staging 落盘是所有 source 的统一第一步，故进入 Registry 的 SKILL 必有可读本地目录）
         ``path`` is required (staging is the unified first step for all sources; any SKILL in Registry
         has a readable local directory).
-      - **无 ``mcp_server`` 字段** —— Agent 侧协议表面与 source 无关；来源追溯由 ``source`` 与（仅 MCP）
-        ``uri`` 承担（skill.md §2）
+      - **无 ``mcp_server`` 字段** —— Agent 侧协议表面与 source 无关；来源追溯由 ``source``（完整
+        provenance，**不**进 ``name``）与（仅 MCP）``uri`` 承担（skill.md §1.6）
         **No ``mcp_server`` field** — Agent-facing protocol surface is source-agnostic; provenance is
         carried by ``source`` and (MCP only) ``uri``.
     """
 
     # 主键 / Primary key
-    name: str  # 合成全局唯一名，含 source prefix；如 mcp:tfrobot-tools:code-review
-    # 来源元数据 / Provenance
-    source: str  # source prefix；如 mcp:tfrobot-tools / marketplace:acme-skills / user
+    name: str  # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:tfrobot-tools:code-review`
+    # 来源元数据 / Provenance（完整溯源；**不**进 name）
+    source: str  # 如 mcp:tfrobot-tools / marketplace:acme-skills / user
     uri: str  # 仅 MCP 来源：skill://host/skill-name；Agent 非权威（skill.md §2）
     # 物化输出 / Materialization output
     path: str  # 必选：Computer 本地绝对目录路径，面向 Agent SDK（脚本执行/文件访问），LLM 永不可见
