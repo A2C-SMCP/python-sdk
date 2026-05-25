@@ -163,3 +163,79 @@ def test_unregister() -> None:
     assert reg.resolve("my-helper") is None
     assert len(reg) == 0
     assert reg.unregister("my-helper") is False  # 已不存在
+
+
+# ---------------------------------------------------------------------------
+# 更新（§8.2 ResourceUpdated 刷新活跃条目 ref）
+# ---------------------------------------------------------------------------
+def test_update_active_refreshes_ref() -> None:
+    reg = SkillRegistry()
+    reg.register(_ref("my-helper", path="/abs/v1", description="v1"))
+    refreshed = _ref("my-helper", path="/abs/v2", description="v2")
+    assert reg.update(refreshed) is True
+    assert reg.resolve("my-helper") == refreshed
+    assert len(reg) == 1
+
+
+def test_update_absent_returns_false() -> None:
+    reg = SkillRegistry()
+    assert reg.update(_ref("absent")) is False  # 更新不创建
+    assert "absent" not in reg
+
+
+def test_update_orphan_reactivates() -> None:
+    reg = SkillRegistry()
+    reg.register(_ref("my-helper", path="/abs/old"))
+    reg.mark_orphan("my-helper")
+    new_ref = _ref("my-helper", path="/abs/new")
+    assert reg.update(new_ref) is True  # ResourceUpdated 蕴含该 SKILL 当前存在
+    assert reg.is_orphan("my-helper") is False
+    assert reg.resolve("my-helper") == new_ref
+
+
+def test_update_invalid_does_not_corrupt_existing() -> None:
+    reg = SkillRegistry()
+    good = _ref("my-helper", path="/abs/good")
+    reg.register(good)
+    # 新 ref path 非绝对 → 校验失败 → False，且既有条目不动
+    assert reg.update(_ref("my-helper", path="relative/bad")) is False
+    assert reg.resolve("my-helper") == good
+
+
+# ---------------------------------------------------------------------------
+# 读取深拷贝隔离（调用方就地改写不污染 Registry）
+# ---------------------------------------------------------------------------
+def test_resolve_returns_deepcopy() -> None:
+    reg = SkillRegistry()
+    ref: A2CSkillRef = {
+        "name": "my-helper",
+        "source": "user",
+        "path": "/abs/skills/my-helper",
+        "description": "d",
+        "allowed_tools": ["a", "b"],
+        "skill_metadata": {"k": "v"},
+    }
+    reg.register(ref)
+    got = reg.resolve("my-helper")
+    assert got is not None
+    # 顶层 + 嵌套 list/dict 就地改写
+    got["description"] = "MUTATED"
+    got["allowed_tools"].append("z")
+    got["skill_metadata"]["k"] = "MUTATED"
+    # 再取一份应保持原值（深拷贝隔离）
+    again = reg.resolve("my-helper")
+    assert again is not None
+    assert again["description"] == "d"
+    assert again["allowed_tools"] == ["a", "b"]
+    assert again["skill_metadata"] == {"k": "v"}
+
+
+def test_active_refs_returns_deepcopies() -> None:
+    reg = SkillRegistry()
+    reg.register({"name": "my-helper", "source": "user", "path": "/abs/x", "description": "d", "allowed_tools": ["a"]})
+    out = reg.active_refs()
+    out[0]["description"] = "MUTATED"
+    out[0]["allowed_tools"].append("z")
+    fresh = reg.active_refs()
+    assert fresh[0]["description"] == "d"
+    assert fresh[0]["allowed_tools"] == ["a"]
