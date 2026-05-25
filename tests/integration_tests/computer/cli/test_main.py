@@ -33,7 +33,7 @@ def no_patch_stdout():
 
 
 @pytest.mark.asyncio
-async def test_cli_with_real_stdio(stdio_params: StdioServerParameters) -> None:
+async def test_cli_with_real_stdio(stdio_params: StdioServerParameters, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     集成测试：通过 CLI 交互完成以下流程（使用真实 stdio MCP server 参数）：
     1) 添加 server 配置（disabled=false）
@@ -62,8 +62,8 @@ async def test_cli_with_real_stdio(stdio_params: StdioServerParameters) -> None:
     ]
 
     # Patch interactive IO
-    cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
-    cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
@@ -87,7 +87,7 @@ async def test_cli_socket_connect_guided_inputs_without_real_network(monkeypatch
     集成层面验证 CLI 的交互式引导输入 URL/Auth/Headers 的行为，但不依赖真实网络。
     """
     # Patch client to fake
-    cli_main.SMCPComputerClient = FakeSMCPClient  # type: ignore
+    monkeypatch.setattr(cli_main, "SMCPComputerClient", FakeSMCPClient)
 
     commands = [
         "socket connect",
@@ -98,8 +98,8 @@ async def test_cli_socket_connect_guided_inputs_without_real_network(monkeypatch
     ]
 
     # Patch interactive IO
-    cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
-    cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)

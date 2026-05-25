@@ -41,7 +41,7 @@ def no_patch_stdout():
 
 
 @pytest.mark.asyncio
-async def test_cli_desktop_with_subscribe_resources_server() -> None:
+async def test_cli_desktop_with_subscribe_resources_server(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     中文: 使用 resources_subscribe_stdio_server 启动后，执行 desktop 命令应输出非空列表。
     英文: After starting resources_subscribe_stdio_server, 'desktop' should output a non-empty list.
@@ -69,8 +69,8 @@ async def test_cli_desktop_with_subscribe_resources_server() -> None:
     ]
 
     # Patch interactive IO
-    cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
-    cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
@@ -81,7 +81,7 @@ async def test_cli_desktop_with_subscribe_resources_server() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_help_contains_desktop() -> None:
+async def test_cli_help_contains_desktop(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     中文: help 列表应包含 desktop 命令说明。
     英文: 'help' listing should contain the 'desktop' command description.
@@ -91,8 +91,8 @@ async def test_cli_help_contains_desktop() -> None:
         "exit",
     ]
 
-    cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
-    cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)
