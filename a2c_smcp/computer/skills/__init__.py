@@ -8,14 +8,14 @@
 Computer SKILL 子系统 / Computer SKILL subsystem（v0.2.1）
 
 对标 Claude Code marketplace 的本地 SKILL 管理：SKILL Home / 命名 lexer / Registry / 三源
-staging / 意图层 reconciler / 沙箱。本提交（S1，#54）落地基础两模块：
-Mirrors Claude Code marketplace local SKILL management. This change (S1, #54) lands the two
-foundational modules:
+staging / 意图层 reconciler / 沙箱。已落地模块：
+Mirrors Claude Code marketplace local SKILL management. Landed modules:
 
-- :mod:`a2c_smcp.computer.skills.home`   —— SKILL Home 解析 + `0o700` 防御性写（隔离交 OS，对齐 CC）+ 安装目录布局
-- :mod:`a2c_smcp.computer.skills.naming` —— name 合成 + 段数消歧 lexer + MCP server 段规范化
+- :mod:`a2c_smcp.computer.skills.home`     —— SKILL Home 解析 + `0o700` 防御性写（隔离交 OS，对齐 CC）+ 安装目录布局（S1，#54）
+- :mod:`a2c_smcp.computer.skills.naming`   —— name 合成 + 段数消歧 lexer + MCP server 段规范化（S1，#54）
+- :mod:`a2c_smcp.computer.skills.registry` —— `name → A2CSkillRef` O(1) 物化索引 + 孤儿标记/恢复（S3，#57）
 
-协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §1 / §4 / §9.2。
+协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §1 / §4 / §6 / §8 / §9.2。
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ from a2c_smcp.computer.skills.naming import (
     synthesize_mcp_name,
     synthesize_user_name,
 )
+from a2c_smcp.computer.skills.registry import SkillRegistry
 
 __all__ = [
     # home
@@ -68,4 +69,6 @@ __all__ = [
     "synthesize_marketplace_name",
     "synthesize_mcp_name",
     "synthesize_user_name",
+    # registry
+    "SkillRegistry",
 ]
