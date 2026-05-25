@@ -46,6 +46,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.path import resolve_xdg_first
 
 logger = get_logger(__name__)
 
@@ -80,22 +81,20 @@ def resolve_skill_home(env: Mapping[str, str] | None = None) -> Path:
 
     override = environ.get(SKILL_HOME_ENV, "").strip()
     if override:
-        home = Path(override).expanduser()
-        source = SKILL_HOME_ENV
-    else:
-        xdg = environ.get(XDG_DATA_HOME_ENV, "").strip()
-        xdg_path = Path(xdg) if xdg else None
-        # XDG 规范：XDG_DATA_HOME 必须为绝对路径，相对值按未设置处理。
-        # XDG spec: XDG_DATA_HOME must be absolute; treat relative values as unset.
-        if xdg_path is not None and xdg_path.is_absolute():
-            home = xdg_path.joinpath(*_A2C_DATA_SUBPATH)
-            source = XDG_DATA_HOME_ENV
-        else:
-            home = Path.home().joinpath(*_DOTDIR_SUBPATH)
-            source = "~"
+        # env 覆盖：最高优先级旋钮，绕过 XDG/fallback。/ env override: highest-priority knob.
+        resolved = Path(override).expanduser().resolve()
+        logger.debug("Resolved SKILL Home via %s → %s", SKILL_HOME_ENV, resolved)
+        return resolved
 
-    resolved = home.expanduser().resolve()
-    logger.debug("Resolved SKILL Home via %s → %s", source, resolved)
+    # 无覆盖：XDG-first（``$XDG_DATA_HOME/a2c/skills``）→ 回退 ``~/.a2c/skills``，复用共享解析。
+    # No override: XDG-first via the shared resolver, fallback ``~/.a2c/skills``.
+    resolved = resolve_xdg_first(
+        environ,
+        XDG_DATA_HOME_ENV,
+        *_A2C_DATA_SUBPATH,
+        fallback=Path.home().joinpath(*_DOTDIR_SUBPATH),
+    )
+    logger.debug("Resolved SKILL Home (XDG-first %s) → %s", XDG_DATA_HOME_ENV, resolved)
     return resolved
 
 
