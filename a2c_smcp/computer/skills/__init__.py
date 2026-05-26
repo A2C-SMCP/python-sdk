@@ -14,7 +14,8 @@ Mirrors Claude Code marketplace local SKILL management. Landed modules:
 - :mod:`a2c_smcp.computer.skills.home`     —— SKILL Home 解析 + `0o700` 防御性写（隔离交 OS，对齐 CC）+ 安装目录布局（S1，#54）
 - :mod:`a2c_smcp.computer.skills.naming`   —— name 合成 + 段数消歧 lexer + MCP server 段规范化（S1，#54）
 - :mod:`a2c_smcp.computer.skills.registry` —— `name → A2CSkillRef` O(1) 物化索引 + 孤儿标记/恢复（S3，#57）
-- :mod:`a2c_smcp.computer.skills.staging`  —— 多 source 物化（mcp 源 + manager.list_skill_resources）（S6，#59）
+- :mod:`a2c_smcp.computer.skills.staging`  —— 三源 staging（mcp #59 + user #60 + marketplace git #61）
+- :mod:`a2c_smcp.computer.skills.sources`  —— marketplace plugin source 5 类解析 + github/cnb 简写糖归一化（S8，#61）
 - :mod:`a2c_smcp.computer.skills.sandbox`  —— 包根内 `safe_join`+`realpath` 沙箱 + `.skillenv` forbidden + name 寻址防越权（S2，#55）
 - :mod:`a2c_smcp.computer.skills.resource` —— 沙箱解析 → 消费字节视图（mint/serve 字节基准一致：sha256/total_size）（S13，#66）
 - :mod:`a2c_smcp.computer.skills.debouncer`—— 缓存失效 + 300ms debounce + 单次 emit（事件触发链，S14，#67）
@@ -70,9 +71,20 @@ from a2c_smcp.computer.skills.sandbox import (
     ensure_within_size_cap,
     resolve_skill_resource,
 )
+from a2c_smcp.computer.skills.sources import (
+    DEFAULT_PLUGIN_ROOT,
+    GitCloneSpec,
+    LocalPluginSource,
+    ResolvedPluginSource,
+    SkillSourceError,
+    marketplace_clone_url,
+    normalize_repo_shorthand,
+    resolve_plugin_source,
+)
 from a2c_smcp.computer.skills.staging import (
     SkillStagingError,
     parse_skill_frontmatter,
+    stage_marketplace_skills,
     stage_mcp_skills,
     stage_user_skills,
     strip_skill_frontmatter,
@@ -126,9 +138,19 @@ __all__ = [
     "SkillResourceView",
     "looks_textual",
     "resolve_skill_view",
+    # sources（marketplace plugin source 5 类解析 + 简写糖归一化）
+    "DEFAULT_PLUGIN_ROOT",
+    "GitCloneSpec",
+    "LocalPluginSource",
+    "ResolvedPluginSource",
+    "SkillSourceError",
+    "marketplace_clone_url",
+    "normalize_repo_shorthand",
+    "resolve_plugin_source",
     # staging
     "SkillStagingError",
     "parse_skill_frontmatter",
+    "stage_marketplace_skills",
     "stage_mcp_skills",
     "stage_user_skills",
     "strip_skill_frontmatter",
