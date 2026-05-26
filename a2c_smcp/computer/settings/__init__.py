@@ -7,10 +7,10 @@
 """
 Computer 意图 / 治理层 settings 子系统 / Computer intent & governance settings subsystem（v0.2.1）
 
-承载 settings.json 的结构、五级 scope 合并、policy 子源选取与物化层文件 store——CLI
-marketplace/plugin/skill 管理 UX 的"意图层 + 物化层"。reconciler / MCP 定义层为后续工单（#62 / #64）。
-The intent + materialized layers of the CLI marketplace/plugin/skill management UX. Reconciler /
-MCP-definition layer land in follow-up tickets.
+承载 settings.json 的结构、五级 scope 合并、policy 子源选取、物化层文件 store 与启动对账
+reconciler——CLI marketplace/plugin/skill 管理 UX 的"意图层 + 物化层 + 对账层"。MCP 定义层为后续工单（#64）。
+The intent + materialized + reconcile layers of the CLI marketplace/plugin/skill management UX.
+MCP-definition layer lands in a follow-up ticket.
 
 已落地模块 / Landed modules：
 - :mod:`a2c_smcp.computer.settings.schema` —— settings.json TypedDict + 字段级容错校验
@@ -21,8 +21,10 @@ MCP-definition layer land in follow-up tickets.
   managed-settings[+.d] + HKCU）（S4，#56）
 - :mod:`a2c_smcp.computer.settings.store`  —— 物化文件（known_marketplaces / installed_plugins）原子写 +
   文件锁 + ``.corrupt-<ts>.bak`` 损坏恢复 + 写保护头（带 version）（S5，#58）
+- :mod:`a2c_smcp.computer.settings.reconciler` —— 启动对账（additive-only 四分支）+ 孤儿清理
+  （marketplace prune / plugin gc）（S9，#62）
 
-SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5。
+SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5 / §7。
 """
 
 from __future__ import annotations
@@ -88,6 +90,13 @@ from a2c_smcp.computer.settings.store import (
     update_installed_plugins,
     update_known_marketplaces,
 )
+
+# 注意 / NB：:mod:`...settings.reconciler` **刻意不在此 re-export**——它依赖
+# :mod:`...skills.staging`，而 staging 顶层又 import :mod:`...settings.schema`（触发本 __init__）。
+# 若在此急切导入 reconciler 会与 staging 的半初始化态构成循环（`_EXTERNAL_PLUGINS_NS` 未定义）。
+# 消费方请直接 ``from a2c_smcp.computer.settings.reconciler import reconcile`` 等。
+# reconciler is intentionally NOT re-exported here to avoid a circular import with skills.staging;
+# import it directly from its submodule.
 
 __all__ = [
     # schema
