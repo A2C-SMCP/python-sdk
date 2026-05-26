@@ -13,8 +13,27 @@ SKILL staging: mcp-source materialization + user-source in-place DropIn discover
 SDK 设计 / Design: python-sdk docs/design-0.2.1-skill-computer-management.md §5.2；
                    docs/design-0.2.1-cli-marketplace-ux.md §2.3 / §5.0（user 源 DropIn）。
 
-本模块实现 **mcp 源** 物化（#59）与 **user 源** DropIn 发现（#60）；marketplace git（#61）另见对应模块。
-This module implements **mcp-source** materialization (#59) and **user-source** DropIn discovery (#60).
+本模块实现三源 staging：**mcp 源** 物化（#59）、**user 源** DropIn 发现（#60）、**marketplace git 源**
+clone/refresh + plugin 扫描（#61，依 plugin source 5 类，见 :mod:`~a2c_smcp.computer.skills.sources`）。
+This module implements three-source staging: **mcp-source** materialization (#59), **user-source**
+DropIn discovery (#60), and **marketplace git-source** clone/refresh + plugin scan (#61).
+
+marketplace 流程 / marketplace flow（对账编排 / additive-only diff 归 reconciler #62，本模块只提供「clone 单个
+marketplace + 解析 plugin source + 扫描 skills + 注册」原语）：
+1. 按 ``{type:"git", url}`` ``git clone --depth 1``（SSH→HTTPS 回退、``GIT_TERMINAL_PROMPT=0``、超时默认
+   120s）到 ``<home>/marketplace/<mp>/``；已存在且 ``refresh`` → ``git pull`` 失败则全量重 clone；
+2. 读 ``.tfrobot-plugin/marketplace.json`` 枚举 ``plugins[]``（``metadata.pluginRoot`` 默认 ``./plugins``）；
+3. 每个 plugin：``resolve_plugin_source`` 定位 plugin 根（相对路径在 clone 内 / ``git-subdir`` sparse clone /
+   ``url``·``github``·``cnb`` 独立 clone 到 ``<home>/marketplace/.plugins/<mp>/<plugin>/``）；
+4. 扫 ``<plugin 根>/skills/<skill>/SKILL.md``，``name = <plugin>:<skill>``（``<plugin>`` = entry.name、
+   ``<skill>`` = skill 目录 basename，frontmatter 仅作显示名、不改 ID）→ 注册进 :class:`SkillRegistry`；
+5. 写 ``known_marketplaces.json`` 物化记录（installLocation / commitSha / lastUpdated / autoUpdate）。
+``installed_plugins.json`` 写入、``enabledPlugins`` 过滤、bundled MCP server 注册**不在本模块**（归 #62 /
+plugin install / #53）；``plugin_filter`` 形参供 #62 注入 ``enabledPlugins ∩ installed``。
+
+**不在本模块（显式延后，见 #80）**：marketplace 条目 / plugin.json 的 ``skills`` 组件路径**覆写**
+（protocol-v1 §4.3）与 **strict mode 冲突检测**（§4.4：``strict=false`` + plugin.json 声明组件 → 硬错误）。
+本模块只按约定扫 ``<plugin 根>/skills/<skill>/SKILL.md``（主流场景），strict 语义随组件加载层（#53）跟进。
 
 mcp 流程 / mcp flow：
 1. 经 ``manager.list_skill_resources`` 完整消费 cursor 拿到 server 全量 ``skill://`` 资源；
@@ -44,37 +63,80 @@ user 流程 / user flow（与 mcp 的关键差异）：**就地发现、不复�
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
+import json
+import os
+import re
 import shutil
 import tarfile
 import zipfile
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextResourceContents
 
-from a2c_smcp.computer.skills.home import SOURCE_USER, mcp_skill_dir, user_dropin_root, workdir_skill_root
+from a2c_smcp.computer.settings.schema import is_valid_marketplace_name
+from a2c_smcp.computer.skills.home import (
+    SOURCE_MARKETPLACE,
+    SOURCE_USER,
+    marketplace_skill_dir,
+    mcp_skill_dir,
+    user_dropin_root,
+    workdir_skill_root,
+)
 from a2c_smcp.computer.skills.naming import (
     SkillNameError,
     normalize_mcp_server_segment,
+    synthesize_marketplace_name,
     synthesize_mcp_name,
     synthesize_user_name,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.sources import (
+    DEFAULT_PLUGIN_ROOT,
+    GitCloneSpec,
+    LocalPluginSource,
+    SkillSourceError,
+    marketplace_clone_url,
+    resolve_plugin_source,
+)
 from a2c_smcp.smcp import A2CSkillRef
 from a2c_smcp.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    # settings.store 经 skills.home 反向依赖本包，运行时改用 _record_known_marketplace 内的惰性 import 破环；
+    # 此处仅供类型标注（本模块 from __future__ import annotations，注解全惰性求值，不在运行时触发导入）。
+    from a2c_smcp.computer.settings.store import KnownMarketplacesFile, MarketplaceRecord
 
 logger = get_logger(__name__)
 
 SKILL_MD = "SKILL.md"
 SKILL_URI_PREFIX = "skill://"
 _MCP_SOURCE_MODES = frozenset({"mounted", "archive", "resources"})
+
+# marketplace 布局常量 / marketplace layout constants（协议 marketplace-v1 §2.1 / §3.1 / §6）。
+MARKETPLACE_MANIFEST_DIR = ".tfrobot-plugin"  # marketplace.json / plugin.json 所在目录（嵌套，镜像 CC .claude-plugin）
+MARKETPLACE_MANIFEST = "marketplace.json"  # 仓库级 manifest
+PLUGIN_MANIFEST = "plugin.json"  # plugin 级 manifest
+SKILLS_SUBDIR = "skills"  # plugin 内 SKILL 子树约定目录（SKILL 协议 §2）
+# 独立 clone 的 plugin（url/github/cnb/git-subdir）落点命名空间——置于 marketplace/ 下以 "." 起首的目录，
+# 与 catalog clone（<home>/marketplace/<mp>/）物理隔离、且不与 kebab marketplace 名冲突。
+_EXTERNAL_PLUGINS_NS = ".plugins"
+
+# git clone/pull 默认超时（秒）/ Default git clone/pull timeout (design §2.2: 默认 120s)。
+DEFAULT_GIT_TIMEOUT = 120.0
+
+# scp-like / ssh:// → https 回退的解析（SSH→HTTPS fallback，design §2.2）/ ssh→https rewrite patterns。
+_SSH_SCHEME_RE = re.compile(r"^ssh://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$")
+_SSH_SCP_LIKE_RE = re.compile(r"^[\w.+-]+@([\w.-]+):(.+)$")
 
 # 归档安全上界（防 tar/zip bomb OOM；可信源模型下为安全网，默认宽松，后续可配置化）。
 # Archive safety bounds (bomb guard): generous defaults under the trusted-source model.
@@ -601,4 +663,513 @@ def stage_user_skills(
         # 跨 run 既存（active 或 orphan）→ update（刷新 / 孤儿恢复）；否则 register。
         if registry.register_or_update(ref):
             registered.append(name)
+    return registered
+
+
+# ── marketplace 源 git staging（#61）/ marketplace-source git staging ──────────
+def _git_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """
+    构造非交互 git 环境 / Build a non-interactive git environment（design §2.2）。
+
+    强制 ``GIT_TERMINAL_PROMPT=0`` + ``GIT_ASKPASS=""`` 禁用凭证交互提示；``GIT_SSH_COMMAND`` 注入
+    ``-oBatchMode=yes`` 让 SSH 在缺凭证时**立即失败**（而非挂起等待密码）——失败后由 :func:`_git_clone_with_fallback`
+    走 SSH→HTTPS 回退。基于传入 ``env``（默认 ``os.environ``）派生，不污染调用方环境。
+    """
+    base = dict(os.environ if env is None else env)
+    base["GIT_TERMINAL_PROMPT"] = "0"
+    base["GIT_ASKPASS"] = ""
+    base.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+    return base
+
+
+async def _run_git(args: Sequence[str], *, timeout: float, env: Mapping[str, str] | None) -> str:
+    """
+    执行 ``git <args>`` 并返回 stdout / Run ``git`` capturing stdout（非零退出 / 超时 → :class:`SkillStagingError`）。
+
+    用 ``create_subprocess_exec`` 显式 argv（**不**经 shell，杜绝 url 注入）；超时 ``kill`` 并回收，
+    避免遗留僵尸进程。仿 :func:`a2c_smcp.computer.inputs.cli_io.arun_command` 的超时姿态。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_git_env(env),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:  # pragma: no cover - 进程已退出
+            pass
+        await proc.wait()
+        raise SkillStagingError(f"git {args[0] if args else ''} timed out after {timeout}s") from None
+    if proc.returncode != 0:
+        err = stderr.decode(errors="ignore").strip()
+        raise SkillStagingError(f"git {' '.join(args)} failed (rc={proc.returncode}): {err}")
+    return stdout.decode(errors="ignore")
+
+
+def _ssh_to_https(url: str) -> str | None:
+    """
+    SSH/scp-like URL → ``https://`` 回退候选 / Rewrite an ssh URL to its ``https`` fallback。
+
+    ``ssh://[user@]host[:port]/path`` 与 scp-like ``user@host:path`` → ``https://host/path``；非 ssh 形态
+    （已是 ``https`` / ``file://`` 等）→ ``None``（无回退）。design §2.2 SSH→HTTPS 回退。
+    """
+    u = url.strip()
+    m = _SSH_SCHEME_RE.match(u)
+    if m:
+        return f"https://{m.group(1)}/{m.group(2)}"
+    m = _SSH_SCP_LIKE_RE.match(u)
+    if m:
+        return f"https://{m.group(1)}/{m.group(2)}"
+    return None
+
+
+async def _git_clone_with_fallback(
+    clone_args: Sequence[str],
+    url: str,
+    dest: Path,
+    *,
+    timeout: float,
+    env: Mapping[str, str] | None,
+) -> None:
+    """
+    ``git clone`` 到 ``dest``（clone 与 url 之间插 ``clone_args`` flag），失败 SSH→HTTPS 回退 / Clone with fallback。
+
+    ``dest`` 落盘前先 ``rmtree``（幂等、清半成品）；首次（原 url）失败且为 ssh 形态 → 改写 https 重试一次。
+    """
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        await _run_git(["clone", *clone_args, "--", url, str(dest)], timeout=timeout, env=env)
+        return
+    except SkillStagingError as first:
+        https = _ssh_to_https(url)
+        if https is None or https == url:
+            raise
+        logger.warning("git clone %s failed (%s); retrying via HTTPS %s", url, first, https)
+        shutil.rmtree(dest, ignore_errors=True)
+        await _run_git(["clone", *clone_args, "--", https, str(dest)], timeout=timeout, env=env)
+
+
+async def _git_clone_marketplace(url: str, dest: Path, *, timeout: float, env: Mapping[str, str] | None) -> None:
+    """marketplace catalog ``git clone --depth 1``（无 ref/sha，GitSource 仅 url）/ Shallow-clone the catalog。"""
+    await _git_clone_with_fallback(["--depth", "1"], url, dest, timeout=timeout, env=env)
+
+
+async def _git_refresh_marketplace(dest: Path, url: str, *, timeout: float, env: Mapping[str, str] | None) -> None:
+    """原地 ``git pull --ff-only``；失败 → 全量重 clone / In-place pull, full re-clone on failure（design §2.2）。"""
+    try:
+        await _run_git(["-C", str(dest), "pull", "--ff-only"], timeout=timeout, env=env)
+        return
+    except SkillStagingError as e:
+        logger.warning("git pull in %s failed (%s); full re-clone", dest, e)
+    await _git_clone_marketplace(url, dest, timeout=timeout, env=env)
+
+
+async def _git_clone_plugin(spec: GitCloneSpec, dest: Path, *, timeout: float, env: Mapping[str, str] | None) -> Path:
+    """
+    克隆独立 plugin 源（``url``/``github``/``cnb``/``git-subdir``）→ 返回 plugin 根 / Clone a standalone plugin source。
+
+    - ``sha`` 锁版本：``--filter=blob:none --no-checkout`` 全 refs blobless clone 后 ``checkout <sha>``（浅克隆
+      无法精确命中任意 sha）；
+    - ``git-subdir``（无 sha）：``--filter=tree:0 --sparse --depth 1``（按 design §2.2 / CC pluginLoader 链路）
+      后 ``sparse-checkout set <subdir>``，plugin 根 = ``<clone>/<subdir>``；
+    - 普通（无 sha 无 subdir）：``--depth 1 [--branch <ref>]``。
+    SSH→HTTPS 回退由 :func:`_git_clone_with_fallback` 承担。
+    """
+    if spec.sha:
+        clone_args: list[str] = ["--filter=blob:none", "--no-checkout"]
+    elif spec.subdir:
+        clone_args = ["--filter=tree:0", "--sparse", "--depth", "1"]
+        if spec.ref:
+            clone_args += ["--branch", spec.ref]
+    else:
+        clone_args = ["--depth", "1"]
+        if spec.ref:
+            clone_args += ["--branch", spec.ref]
+
+    await _git_clone_with_fallback(clone_args, spec.url, dest, timeout=timeout, env=env)
+
+    if spec.sha:
+        # blobless/no-checkout：按 sha 落实工作树（subdir 仅作 plugin 根路径，无需 sparse）。
+        await _run_git(["-C", str(dest), "checkout", spec.sha], timeout=timeout, env=env)
+    elif spec.subdir:
+        await _run_git(["-C", str(dest), "sparse-checkout", "set", spec.subdir], timeout=timeout, env=env)
+
+    return (dest / spec.subdir) if spec.subdir else dest
+
+
+async def _git_head_sha(dest: Path, *, timeout: float, env: Mapping[str, str] | None) -> str | None:
+    """``git rev-parse HEAD``（取 commitSha 物化记录用）；失败 → ``None`` / HEAD sha, ``None`` on failure。"""
+    try:
+        return (await _run_git(["-C", str(dest), "rev-parse", "HEAD"], timeout=timeout, env=env)).strip() or None
+    except SkillStagingError as e:
+        logger.warning("git rev-parse HEAD in %s failed (%s)", dest, e)
+        return None
+
+
+# ── marketplace.json / plugin.json 解析 / manifest parsing ───────────────────
+def _read_json_object(path: Path, *, what: str) -> dict[str, Any]:
+    """读 JSON 文件并要求根为对象 / Read a JSON file requiring an object root（失败 → :class:`SkillStagingError`）。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SkillStagingError(f"{what} unreadable/invalid at {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise SkillStagingError(f"{what} root is not an object: {path}")
+    return data
+
+
+def _read_marketplace_manifest(clone_dir: Path) -> dict[str, Any]:
+    """读 ``<clone>/.tfrobot-plugin/marketplace.json``（仓库级 manifest）/ Read the marketplace manifest。"""
+    path = clone_dir / MARKETPLACE_MANIFEST_DIR / MARKETPLACE_MANIFEST
+    if not path.is_file():
+        raise SkillStagingError(f"marketplace manifest not found: {path}")
+    return _read_json_object(path, what="marketplace manifest")
+
+
+def _read_plugin_manifest(plugin_root: Path) -> dict[str, Any]:
+    """读 ``<plugin>/.tfrobot-plugin/plugin.json``（best-effort，缺失 → ``{}``）/ Read plugin.json best-effort。"""
+    path = plugin_root / MARKETPLACE_MANIFEST_DIR / PLUGIN_MANIFEST
+    if not path.is_file():
+        return {}
+    try:
+        return _read_json_object(path, what="plugin manifest")
+    except SkillStagingError as e:
+        # plugin.json 仅供 version / 显示名兜底，损坏不致命（SKILL 由路径推导）。
+        logger.warning("plugin manifest ignored (%s)", e)
+        return {}
+
+
+def _plugin_root_base(manifest: Mapping[str, Any]) -> str:
+    """取 ``metadata.pluginRoot``（缺省 :data:`~a2c_smcp.computer.skills.sources.DEFAULT_PLUGIN_ROOT`）/ Resolve pluginRoot。"""
+    md = manifest.get("metadata")
+    if isinstance(md, Mapping):
+        pr = md.get("pluginRoot")
+        if isinstance(pr, str) and pr.strip():
+            return pr.strip()
+    return DEFAULT_PLUGIN_ROOT
+
+
+def _entry_plugin_name(entry: Mapping[str, Any]) -> str:
+    """plugin 条目 ID = entry.name（marketplace-v1 §4.1 必填；kebab 校验交 name 合成）/ The plugin entry name。"""
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise SkillStagingError(f"plugin entry missing required 'name': {entry!r}")
+    return name.strip()
+
+
+def _within(child: Path, parent: Path) -> bool:
+    """``child`` 是否在 ``parent`` 内（含等于；均 ``resolve`` 后比较）/ Whether ``child`` is within ``parent``。"""
+    child = child.resolve()
+    parent = parent.resolve()
+    return child == parent or parent in child.parents
+
+
+def _external_plugin_dir(home: Path, marketplace: str, plugin: str) -> Path:
+    """独立 clone plugin 的落点 ``<home>/marketplace/.plugins/<mp>/<plugin>/`` / External plugin clone dir。"""
+    return home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS / marketplace / plugin
+
+
+def _build_marketplace_ref(name: str, marketplace: str, frontmatter: dict[str, Any], version: str | None, skill_dir: Path) -> A2CSkillRef:
+    """
+    组装 marketplace 源 A2CSkillRef / Assemble a marketplace-source A2CSkillRef。
+
+    ``source = "marketplace:<repo>"``（完整溯源，**不**进 name）；**无 ``uri``**（marketplace 源不带
+    ``skill://``）；``path`` = SKILL 包根（就地 clone 树内，不复制）；``version`` 取自 entry/plugin.json/commitSha。
+    """
+    ref: A2CSkillRef = {
+        "name": name,
+        "source": f"{SOURCE_MARKETPLACE}:{marketplace}",
+        "path": str(skill_dir.resolve()),
+        "description": str(frontmatter["description"]),
+    }
+    _apply_frontmatter_optional_fields(ref, frontmatter)
+    if version is not None:
+        ref["version"] = str(version)
+    return ref
+
+
+def _scan_and_register_plugin_skills(
+    marketplace: str,
+    plugin_name: str,
+    plugin_root: Path,
+    version: str | None,
+    registry: SkillRegistry,
+    seen: set[str],
+) -> list[str]:
+    """
+    扫 ``<plugin 根>/skills/<skill>/SKILL.md`` 并注册 / Scan a plugin's ``skills/`` and register each SKILL。
+
+    ``name = <plugin>:<skill>``（``<plugin>`` = entry.name、``<skill>`` = skill 目录 basename，frontmatter
+    仅作显示名、不改 ID，marketplace-v1 §2.1 防伪）。缺 frontmatter ``description`` / name 合成失败 / 本 run
+    重名 → 记 ERROR、跳过、不入册（失败降级，不抛）。仅扫 ``skills/`` 下**一级**（``iterdir``），不递归包内。
+
+    .. note::
+       仅扫**约定** ``skills/`` 目录；``entry.skills`` 组件路径覆写与 strict mode 冲突检测显式延后（见 #80）。
+    """
+    skills_dir = plugin_root / SKILLS_SUBDIR
+    if not skills_dir.is_dir():
+        logger.warning(
+            "marketplace %r plugin %r has no %s/ dir at %s; no SKILLs registered",
+            marketplace,
+            plugin_name,
+            SKILLS_SUBDIR,
+            skills_dir,
+        )
+        return []
+
+    registered: list[str] = []
+    for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+        skill_md = skill_dir / SKILL_MD
+        if not skill_md.is_file():
+            continue
+        try:
+            frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
+        except OSError as e:
+            logger.error("marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s", marketplace, plugin_name, skill_dir.name, e)
+            continue
+        if not frontmatter.get("description"):
+            logger.error(
+                "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
+                marketplace,
+                plugin_name,
+                skill_dir.name,
+            )
+            continue
+        try:
+            name = synthesize_marketplace_name(plugin_name, skill_dir.name)
+        except SkillNameError as e:
+            logger.error(
+                "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
+                marketplace,
+                plugin_name,
+                skill_dir.name,
+                e.reason,
+            )
+            continue
+        if name in seen:
+            logger.error("duplicate marketplace SKILL name within staging run, keeping first: %s (%s)", name, skill_dir)
+            continue
+        seen.add(name)
+        ref = _build_marketplace_ref(name, marketplace, frontmatter, version, skill_dir)
+        if registry.register_or_update(ref):
+            registered.append(name)
+    return registered
+
+
+async def _stage_one_plugin(
+    marketplace: str,
+    plugin_name: str,
+    entry: Mapping[str, Any],
+    catalog_dir: Path,
+    plugin_root_base: str,
+    home: Path,
+    registry: SkillRegistry,
+    seen: set[str],
+    catalog_sha: str | None,
+    *,
+    refresh: bool,
+    timeout: float,
+    env: Mapping[str, str] | None,
+) -> list[str]:
+    """解析 plugin source → 定位 plugin 根 → 扫描注册其 SKILL / Resolve source, locate root, scan & register。"""
+    raw_source = entry.get("source")
+    if raw_source is None:
+        raise SkillSourceError(dict(entry), "plugin entry missing required 'source'")
+    resolved = resolve_plugin_source(raw_source, plugin_root=plugin_root_base)
+
+    if isinstance(resolved, LocalPluginSource):
+        # 相对路径：就地在 catalog clone 内（不独立 clone）；越界保护。
+        plugin_root = (catalog_dir / resolved.rel_path).resolve()
+        if not _within(plugin_root, catalog_dir):
+            raise SkillStagingError(f"relative plugin source escapes marketplace clone: {resolved.rel_path!r}")
+        version_fallback = catalog_sha
+    else:  # GitCloneSpec：独立 clone（git-subdir sparse / sha 锁版本等）。
+        ext_dir = _external_plugin_dir(home, marketplace, plugin_name)
+        # sha 锁版本不可变：即便 refresh=True 也复用既有 clone（重 clone 无收益）。
+        if ext_dir.exists() and (not refresh or resolved.sha):
+            plugin_root = (ext_dir / resolved.subdir) if resolved.subdir else ext_dir
+        else:
+            plugin_root = await _git_clone_plugin(resolved, ext_dir, timeout=timeout, env=env)
+        version_fallback = await _git_head_sha(ext_dir, timeout=timeout, env=env)
+
+    if not plugin_root.is_dir():
+        raise SkillStagingError(f"plugin root not found after resolve: {plugin_root}")
+
+    plugin_manifest = _read_plugin_manifest(plugin_root)
+    version = _resolve_plugin_version(entry, plugin_manifest, version_fallback)
+    return _scan_and_register_plugin_skills(marketplace, plugin_name, plugin_root, version, registry, seen)
+
+
+def _resolve_plugin_version(entry: Mapping[str, Any], plugin_manifest: Mapping[str, Any], fallback_sha: str | None) -> str | None:
+    """version 优先级：entry.version > plugin.json.version > git commit SHA（marketplace-v1 §4.2）/ Resolve plugin version。"""
+    for src in (entry, plugin_manifest):
+        v = src.get("version")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return fallback_sha
+
+
+def _record_known_marketplace(
+    name: str,
+    source: Mapping[str, Any],
+    clone_dir: Path,
+    commit_sha: str | None,
+    auto_update: bool,
+    home: Path,
+    env: Mapping[str, str] | None,
+    *,
+    changed: bool,
+) -> None:
+    """
+    写 ``known_marketplaces.json`` 物化记录（持锁原子 RMW）/ Record into known_marketplaces.json（§6.1）。
+
+    记 ``source`` / ``installLocation``（+ 可选 ``commitSha`` / ``autoUpdate``）。``lastUpdated`` 仅在
+    ``changed``（本次实际 clone/pull）或无既有记录时刷为当下；复用既有 clone（``changed=False``）则**保留**原
+    ``lastUpdated``——使该字段语义为「最后更新时间」而非「最后扫描时间」（§6.1）。失败（锁不可得 / I/O）仅记
+    ERROR、**不**中断 staging（物化记录是诊断/对账元数据，丢失靠下次 reconcile 重建）。
+
+    settings.store 经 skills.home 反向依赖本包，故在此**惰性 import** 破除模块级环依赖（store 仅在本函数调用时
+    才被加载，彼时所有模块已初始化完毕）。
+    """
+    from a2c_smcp.computer.settings.store import update_known_marketplaces
+
+    def _mutate(current: KnownMarketplacesFile) -> None:
+        prior = current["marketplaces"].get(name)
+        record: MarketplaceRecord = {
+            "source": dict(source),  # type: ignore[typeddict-item]  # GitSource {type, url}
+            "installLocation": str(clone_dir.resolve()),
+        }
+        # lastUpdated：实际 clone/pull 或首次记录 → 刷新；纯复用 → 保留既有值。
+        prior_last = prior.get("lastUpdated") if prior else None
+        record["lastUpdated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if (changed or not prior_last) else prior_last
+        if commit_sha:
+            record["commitSha"] = commit_sha
+        if auto_update:
+            record["autoUpdate"] = True
+        current["marketplaces"][name] = record
+        return None
+
+    try:
+        update_known_marketplaces(_mutate, home, env)
+    except Exception as e:  # 锁不可得 / I/O 失败 → 不阻断 staging
+        logger.error("failed to record known_marketplaces.json for %r: %s", name, e)
+
+
+async def stage_marketplace_skills(
+    name: str,
+    source: Mapping[str, Any],
+    registry: SkillRegistry,
+    home: Path,
+    *,
+    plugin_filter: set[str] | None = None,
+    auto_update: bool = False,
+    refresh: bool = False,
+    timeout: float = DEFAULT_GIT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """
+    clone/refresh **单个** marketplace 并物化其 plugin SKILL → 注册进 Registry / Stage one marketplace's SKILLs。
+
+    对账编排（declared∖materialized additive-only diff）、``enabledPlugins`` 过滤、孤儿清理归 reconciler（#62）；
+    本函数只「clone 一个 marketplace + 解析 plugin source + 扫描 skills + 注册」。失败降级铁律（design §2.2 /
+    工单 §8）：clone/pull/解析/物化失败 → 记 ERROR、该源 / 该 plugin 不入 Registry、**不**抛、**不**阻断其余。
+
+    :param name: marketplace 名（``known_marketplaces.json`` key + ``<home>/marketplace/<name>/`` clone 目录段）。
+    :param source: marketplace git 源 ``{type:"git", url}``（:class:`~a2c_smcp.computer.settings.schema.GitSource`）。
+    :param registry: 目标 :class:`SkillRegistry`。
+    :param home: SKILL Home 绝对根。
+    :param plugin_filter: 仅物化这些 plugin 名（``None`` = marketplace.json 全部）；#62 注入 ``enabledPlugins ∩ installed``。
+    :param auto_update: 写入物化记录的 ``autoUpdate`` 旗（仅记录，本函数不据此自动刷新）。
+    :param refresh: ``True`` → 已存在 clone 走 ``git pull``（失败重 clone）+ 独立 plugin 重 clone；``False`` →
+        缺失才 clone、已存在则就地复用（重扫）。
+    :param timeout: 单次 git 操作超时（秒）。
+    :param env: git 子进程环境（默认 ``os.environ``；便于测试注入）。
+    :return: 本次成功注册 / 刷新的 SKILL name 列表（供 reconciler / watcher diff 孤儿）。
+    """
+    registered: list[str] = []
+
+    # name 直接作 <home>/marketplace/<name>/ 路径段——本函数已进公开 API（__all__），加防御纵深：
+    # 仅接受严格 kebab marketplace 名（与 settings load 的 is_valid_marketplace_name 同契约），天然拒
+    # ``..`` / ``/`` 等路径穿越向量（上游 settings 已校验，此处兜底未来非 settings 调用方）。
+    if not is_valid_marketplace_name(name):
+        logger.error("marketplace name %r is invalid (must be strict-kebab, 1-64), skipped (not registered)", name)
+        return registered
+
+    try:
+        url = marketplace_clone_url(source)
+    except SkillSourceError as e:
+        logger.error("marketplace %r has invalid source, skipped (not registered): %s", name, e)
+        return registered
+
+    # home 由调用方保证存在（与 stage_mcp_skills / stage_user_skills 一致）；clone 目录父级由
+    # _git_clone_with_fallback 落盘前 mkdir。
+    clone_dir = marketplace_skill_dir(home, name)
+    # changed：本次是否实际发生 clone/pull——决定 known_marketplaces.json 的 lastUpdated 是否刷新
+    # （复用既有 clone 不算更新，避免 lastUpdated 退化为「最后扫描时间」）。
+    changed = False
+    try:
+        if clone_dir.exists():
+            if refresh:
+                await _git_refresh_marketplace(clone_dir, url, timeout=timeout, env=env)
+                changed = True
+        else:
+            await _git_clone_marketplace(url, clone_dir, timeout=timeout, env=env)
+            changed = True
+    except SkillStagingError as e:
+        logger.error("marketplace %r clone/refresh failed, skipped (not registered): %s", name, e)
+        return registered
+
+    commit_sha = await _git_head_sha(clone_dir, timeout=timeout, env=env)
+    _record_known_marketplace(name, source, clone_dir, commit_sha, auto_update, home, env, changed=changed)
+
+    try:
+        manifest = _read_marketplace_manifest(clone_dir)
+    except SkillStagingError as e:
+        logger.error("marketplace %r manifest invalid, skipped (clone kept): %s", name, e)
+        return registered
+
+    plugins = manifest.get("plugins")
+    if not isinstance(plugins, list):
+        logger.error("marketplace %r manifest 'plugins' is not an array, skipped: %s", name, type(plugins).__name__)
+        return registered
+
+    plugin_root_base = _plugin_root_base(manifest)
+    seen: set[str] = set()
+    for entry in plugins:
+        if not isinstance(entry, Mapping):
+            logger.error("marketplace %r has a non-object plugin entry, skipped: %r", name, entry)
+            continue
+        try:
+            plugin_name = _entry_plugin_name(entry)
+        except SkillStagingError as e:
+            logger.error("marketplace %r plugin entry invalid, skipped: %s", name, e)
+            continue
+        if plugin_filter is not None and plugin_name not in plugin_filter:
+            continue
+        try:
+            names = await _stage_one_plugin(
+                name,
+                plugin_name,
+                entry,
+                clone_dir,
+                plugin_root_base,
+                home,
+                registry,
+                seen,
+                commit_sha,
+                refresh=refresh,
+                timeout=timeout,
+                env=env,
+            )
+            registered.extend(names)
+        except (SkillSourceError, SkillStagingError) as e:
+            logger.error("marketplace %r plugin %r staging failed, skipped: %s", name, plugin_name, e)
+        except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
+            logger.error("marketplace %r plugin %r unexpected staging error, skipped: %s", name, plugin_name, e, exc_info=True)
     return registered
