@@ -239,3 +239,38 @@ def test_active_refs_returns_deepcopies() -> None:
     fresh = reg.active_refs()
     assert fresh[0]["description"] == "d"
     assert fresh[0]["allowed_tools"] == ["a"]
+
+
+# ── register_or_update（幂等 upsert，mcp/user 共用入口）────────────────────────
+def test_register_or_update_registers_when_absent() -> None:
+    reg = SkillRegistry()
+    assert reg.register_or_update(_ref("brand-new", description="v1")) is True
+    assert reg.resolve("brand-new") is not None  # type: ignore[union-attr]
+
+
+def test_register_or_update_updates_when_active() -> None:
+    # 已 active 同名 → 走 update（刷新，不触发 register 的「拒绝第二注册者」）
+    reg = SkillRegistry()
+    reg.register(_ref("dup", description="v1"))
+    assert reg.register_or_update(_ref("dup", description="v2")) is True
+    assert reg.resolve("dup")["description"] == "v2"  # type: ignore[index]
+    assert len(reg) == 1
+
+
+def test_register_or_update_recovers_orphan() -> None:
+    # 已孤儿同名 → update 刷新并置活跃（孤儿恢复）
+    reg = SkillRegistry()
+    reg.register(_ref("ghost", description="v1"))
+    reg.mark_orphan("ghost")
+    assert reg.resolve("ghost") is None  # 孤儿不在 active
+    assert reg.register_or_update(_ref("ghost", description="v2")) is True
+    assert reg.resolve("ghost")["description"] == "v2"  # 恢复为活跃 + 刷新  # type: ignore[index]
+
+
+def test_register_or_update_invalid_ref_returns_false(capture_errors: pytest.LogCaptureFixture) -> None:
+    # 缺 path（未注册 → 走 register 分支，由其校验兜底）→ ERROR + False，不入册
+    reg = SkillRegistry()
+    bad: A2CSkillRef = {"name": "no-path", "source": "user", "description": "d"}
+    assert reg.register_or_update(bad) is False
+    assert len(reg) == 0
+    assert any(r.levelno == logging.ERROR for r in capture_errors.records)

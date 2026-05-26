@@ -131,6 +131,17 @@ class SkillRegistry:
         self._entries[name] = _RegistryEntry(ref=ref, orphaned=False)
         return True
 
+    def register_or_update(self, ref: A2CSkillRef) -> bool:
+        """
+        幂等写入：已注册同名 → :meth:`update`（刷新 + 孤儿恢复），否则 :meth:`register` / Idempotent upsert。
+
+        staging 重扫 / 跨 run 复现的统一入口（mcp 与 user 源共用），避免各处重复
+        ``update(ref) if name in registry else register(ref)`` 惯用法。``name`` 缺失 / 未注册走 register
+        分支，由其校验兜底（失败 → ERROR + ``False``）。
+        """
+        name = ref.get("name")
+        return self.update(ref) if name is not None and name in self._entries else self.register(ref)
+
     def mark_orphan(self, name: str) -> bool:
         """把已注册 SKILL 标为孤儿（从活跃集排除，保留以便恢复）/ Mark a registered SKILL orphaned."""
         entry = self._entries.get(name)
