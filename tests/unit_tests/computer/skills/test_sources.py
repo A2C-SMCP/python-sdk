@@ -164,6 +164,17 @@ def test_bad_sha_rejected() -> None:
         resolve_plugin_source({"source": "url", "url": "https://h/r.git", "sha": "abc123"})
 
 
+def test_ref_non_string_rejected() -> None:
+    with pytest.raises(SkillSourceError):
+        resolve_plugin_source({"source": "url", "url": "https://h/r.git", "ref": 123})
+
+
+def test_relative_dot_only_empty_rejected() -> None:
+    # "./." 归一化后无有效路径段（resolves to repo root）→ 拒绝
+    with pytest.raises(SkillSourceError):
+        resolve_plugin_source("./.")
+
+
 # ── normalize_repo_shorthand 直测 / standalone ───────────────────────────────
 def test_normalize_repo_shorthand_github() -> None:
     assert normalize_repo_shorthand("owner/repo", "github.com") == "https://github.com/owner/repo.git"

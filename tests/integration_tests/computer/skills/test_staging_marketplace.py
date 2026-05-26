@@ -307,6 +307,107 @@ def test_ssh_to_https_rewrite(url: str, expected: str | None) -> None:
     assert _ssh_to_https(url) == expected
 
 
+# ── 降级/去重分支 / dedup & degrade branches ─────────────────────────────────
+@requires_git
+async def test_duplicate_synthesized_name_keeps_first(tmp_path: Path) -> None:
+    # 两个同名 plugin 条目（各含 skills/x）→ 合成同 name `dup:x`，单 run 内去重保留先到者
+    files = {
+        ".tfrobot-plugin/marketplace.json": json.dumps(
+            {
+                "name": "dupmp",
+                "owner": {"name": "x"},
+                "metadata": {"pluginRoot": "./plugins"},
+                "plugins": [
+                    {"name": "dup", "source": "alpha"},
+                    {"name": "dup", "source": "beta"},
+                ],
+            },
+        ),
+        "plugins/alpha/skills/x/SKILL.md": _skill_md("x", "from alpha"),
+        "plugins/beta/skills/x/SKILL.md": _skill_md("x", "from beta"),
+    }
+    _, bare = _make_bare(tmp_path, "dupmp", files)
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    names = await stage_marketplace_skills("dupmp", _src(_url(bare)), reg, home, env=_env(home))
+    assert names == ["dup:x"]  # 仅首个注册
+    assert len(reg) == 1
+    ref = reg.resolve("dup:x")
+    assert ref is not None
+    assert ref["description"] == "from alpha"  # 保留先到者
+
+
+@requires_git
+async def test_corrupt_plugin_manifest_degrades(tmp_path: Path) -> None:
+    files = {
+        ".tfrobot-plugin/marketplace.json": json.dumps(
+            {"name": "cpmp", "owner": {"name": "x"}, "metadata": {"pluginRoot": "./plugins"}, "plugins": [{"name": "cp", "source": "cp"}]},
+        ),
+        "plugins/cp/.tfrobot-plugin/plugin.json": "{ this is not valid json",  # 损坏 manifest
+        "plugins/cp/skills/s1/SKILL.md": _skill_md("s1"),
+    }
+    _, bare = _make_bare(tmp_path, "cpmp", files)
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    names = await stage_marketplace_skills("cpmp", _src(_url(bare)), reg, home, env=_env(home))
+    assert names == ["cp:s1"]  # 损坏 plugin.json 降级为空 manifest，不影响 SKILL 注册
+    ref = reg.resolve("cp:s1")
+    assert ref is not None
+    assert ref.get("version")  # 无 plugin.json/entry version → 回退 catalog commit sha
+
+
+# ── sha pin 变更重 pin（A2 修复回归）/ sha re-pin on change ──────────────────
+@requires_git
+async def test_sha_pin_change_repins_on_refresh(tmp_path: Path) -> None:
+    plugin_files = {
+        ".tfrobot-plugin/plugin.json": json.dumps({"name": "pin"}),
+        "skills/s/SKILL.md": _skill_md("s"),
+    }
+    work, plugin_bare = _make_bare(tmp_path, "pinplugin", plugin_files, allow_filter=True)
+    sha_a = _head_sha(work)
+    # 第二个 commit → tip = sha_b（与 sha_a 不同）
+    _write(work, {"skills/s/V2.md": "v2"})
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "v2")
+    _git(work, "push", "-q", "origin", "main")
+    sha_b = _head_sha(work)
+    assert sha_a != sha_b
+
+    def _catalog(sha: str) -> dict[str, str]:
+        return {
+            ".tfrobot-plugin/marketplace.json": json.dumps(
+                {
+                    "name": "pin-mp",
+                    "owner": {"name": "x"},
+                    "plugins": [{"name": "pin", "source": {"source": "url", "url": _url(plugin_bare), "sha": sha}}],
+                },
+            ),
+        }
+
+    cat_work, cat_bare = _make_bare(tmp_path, "pinmp", _catalog(sha_a))
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    await stage_marketplace_skills("pin-mp", _src(_url(cat_bare)), reg, home, env=_env(home))
+
+    ext = home / "marketplace" / ".plugins" / "pin-mp" / "pin"
+    assert _head_sha(ext) == sha_a
+    ref_a = reg.resolve("pin:s")
+    assert ref_a is not None and ref_a["version"] == sha_a
+
+    # catalog 把 pin 从 sha_a 改到 sha_b 并推送；refresh=True → 重 pin（非静默复用旧 sha）
+    _write(cat_work, _catalog(sha_b))
+    _git(cat_work, "add", "-A")
+    _git(cat_work, "commit", "-q", "-m", "repin to sha_b")
+    _git(cat_work, "push", "-q", "origin", "main")
+
+    await stage_marketplace_skills("pin-mp", _src(_url(cat_bare)), reg, home, refresh=True, env=_env(home))
+    assert _head_sha(ext) == sha_b  # 重 pin 到新 sha
+    ref_b = reg.resolve("pin:s")
+    assert ref_b is not None and ref_b["version"] == sha_b
+
+
 # ── 独立 plugin clone：url plain / sha 锁版本（_git_clone_plugin 非 subdir 分支）─
 @requires_git
 async def test_url_source_standalone_clone(tmp_path: Path) -> None:

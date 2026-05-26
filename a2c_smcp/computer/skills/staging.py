@@ -110,6 +110,7 @@ from a2c_smcp.computer.skills.sources import (
 )
 from a2c_smcp.smcp import A2CSkillRef
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.path import is_within
 
 if TYPE_CHECKING:
     # settings.store 经 skills.home 反向依赖本包，运行时改用 _record_known_marketplace 内的惰性 import 破环；
@@ -780,6 +781,12 @@ async def _git_clone_plugin(spec: GitCloneSpec, dest: Path, *, timeout: float, e
       后 ``sparse-checkout set <subdir>``，plugin 根 = ``<clone>/<subdir>``；
     - 普通（无 sha 无 subdir）：``--depth 1 [--branch <ref>]``。
     SSH→HTTPS 回退由 :func:`_git_clone_with_fallback` 承担。
+
+    .. note::
+       ``sha``（``--filter=blob:none``）与 ``git-subdir``（``--filter=tree:0``）路径依赖远端支持 partial clone
+       （``uploadpack.allowFilter``）。不支持的自建 / 部分 CNB 服务器会 clone 失败——由上层
+       :func:`stage_marketplace_skills` 走失败降级（记 ERROR、该 plugin 不入册、不阻断其余）；**暂无**「退回
+       全量 clone」兜底（可按需后续增强）。
     """
     if spec.sha:
         clone_args: list[str] = ["--filter=blob:none", "--no-checkout"]
@@ -861,13 +868,6 @@ def _entry_plugin_name(entry: Mapping[str, Any]) -> str:
     if not isinstance(name, str) or not name.strip():
         raise SkillStagingError(f"plugin entry missing required 'name': {entry!r}")
     return name.strip()
-
-
-def _within(child: Path, parent: Path) -> bool:
-    """``child`` 是否在 ``parent`` 内（含等于；均 ``resolve`` 后比较）/ Whether ``child`` is within ``parent``。"""
-    child = child.resolve()
-    parent = parent.resolve()
-    return child == parent or parent in child.parents
 
 
 def _external_plugin_dir(home: Path, marketplace: str, plugin: str) -> Path:
@@ -984,19 +984,24 @@ async def _stage_one_plugin(
     resolved = resolve_plugin_source(raw_source, plugin_root=plugin_root_base)
 
     if isinstance(resolved, LocalPluginSource):
-        # 相对路径：就地在 catalog clone 内（不独立 clone）；越界保护。
+        # 相对路径：就地在 catalog clone 内（不独立 clone）；越界保护（is_within 词法判定，两侧均已 resolve）。
         plugin_root = (catalog_dir / resolved.rel_path).resolve()
-        if not _within(plugin_root, catalog_dir):
+        if not is_within(plugin_root, catalog_dir.resolve()):
             raise SkillStagingError(f"relative plugin source escapes marketplace clone: {resolved.rel_path!r}")
         version_fallback = catalog_sha
     else:  # GitCloneSpec：独立 clone（git-subdir sparse / sha 锁版本等）。
         ext_dir = _external_plugin_dir(home, marketplace, plugin_name)
-        # sha 锁版本不可变：即便 refresh=True 也复用既有 clone（重 clone 无收益）。
-        if ext_dir.exists() and (not refresh or resolved.sha):
-            plugin_root = (ext_dir / resolved.subdir) if resolved.subdir else ext_dir
-        else:
-            plugin_root = await _git_clone_plugin(resolved, ext_dir, timeout=timeout, env=env)
-        version_fallback = await _git_head_sha(ext_dir, timeout=timeout, env=env)
+        head = await _git_head_sha(ext_dir, timeout=timeout, env=env) if ext_dir.exists() else None
+        # 复用既有 clone 的条件（否则重 clone）：
+        #  - sha 锁版本：既有 HEAD 已等于 pin → 复用（重 clone 无收益）；pin 变更（A→B）→ 重 clone 重 pin（守住
+        #    refresh 契约，杜绝静默忽略新 sha）；
+        #  - 非 sha：仅 refresh=False 复用；refresh=True 重 clone 拉最新。
+        reuse = ext_dir.exists() and (head == resolved.sha if resolved.sha else not refresh)
+        if not reuse:
+            await _git_clone_plugin(resolved, ext_dir, timeout=timeout, env=env)
+            head = await _git_head_sha(ext_dir, timeout=timeout, env=env)
+        plugin_root = (ext_dir / resolved.subdir) if resolved.subdir else ext_dir
+        version_fallback = head
 
     if not plugin_root.is_dir():
         raise SkillStagingError(f"plugin root not found after resolve: {plugin_root}")
@@ -1086,8 +1091,15 @@ async def stage_marketplace_skills(
     :param home: SKILL Home 绝对根。
     :param plugin_filter: 仅物化这些 plugin 名（``None`` = marketplace.json 全部）；#62 注入 ``enabledPlugins ∩ installed``。
     :param auto_update: 写入物化记录的 ``autoUpdate`` 旗（仅记录，本函数不据此自动刷新）。
-    :param refresh: ``True`` → 已存在 clone 走 ``git pull``（失败重 clone）+ 独立 plugin 重 clone；``False`` →
-        缺失才 clone、已存在则就地复用（重扫）。
+    :param refresh: ``True`` → 已存在 catalog clone 走 ``git pull``（失败重 clone）+ 独立 plugin 重 clone
+        （sha 锁版本例外：仅在既有 HEAD ≠ pin 时重 clone，等于 pin 则复用）；``False`` → 缺失才 clone、
+        已存在则就地复用（重扫）。
+
+    .. note::
+       本函数经 :func:`_record_known_marketplace` 写 ``known_marketplaces.json`` 时持**同步阻塞**文件锁
+       （:func:`~a2c_smcp.computer.settings.store.file_lock`，竞争时 ``time.sleep`` 退避）。当前单 marketplace
+       串行调用无碍；若编排方（#62）以 ``asyncio.gather`` 并发 stage 多个 marketplace，须串行化或用
+       ``loop.run_in_executor`` 包裹，避免阻塞事件循环（store.py 同步设计的固有约束）。
     :param timeout: 单次 git 操作超时（秒）。
     :param env: git 子进程环境（默认 ``os.environ``；便于测试注入）。
     :return: 本次成功注册 / 刷新的 SKILL name 列表（供 reconciler / watcher diff 孤儿）。
