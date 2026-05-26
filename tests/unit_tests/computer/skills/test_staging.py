@@ -19,15 +19,18 @@ SKILL staging（mcp 源）单元测试（v0.2.1 #59）
 import base64
 import hashlib
 import io
+import logging
 import tarfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
 from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextResourceContents
 
 import a2c_smcp.computer.skills.staging as staging_mod
 from a2c_smcp.computer.skills.registry import SkillRegistry
-from a2c_smcp.computer.skills.staging import stage_mcp_skills
+from a2c_smcp.computer.skills.staging import stage_mcp_skills, stage_user_skills
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
@@ -300,3 +303,213 @@ async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:
     names = await stage_mcp_skills(FakeManager([("srv", plain)]), reg, tmp_path / "home")
     assert names == []
     assert len(reg) == 0
+
+
+# ── user 源 DropIn（就地发现，不 staging，#60）────────────────────────────────
+@pytest.fixture
+def staging_logs(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """捕获 staging 模块日志（项目 logger 关闭 propagate，直接挂 handler）/ capture staging logs。"""
+    staging_mod.logger.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG)
+    try:
+        yield caplog
+    finally:
+        staging_mod.logger.removeHandler(caplog.handler)
+
+
+def _write_user_skill(root: Path, skill_dir_name: str, *, fm_name: str | None = None, description: str = "do thing") -> Path:
+    """在发现根下写一个 ``<skill_dir_name>/SKILL.md`` / write a DropIn skill dir under a root。"""
+    d = root / skill_dir_name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(_skill_md(name=skill_dir_name if fm_name is None else fm_name, description=description), encoding="utf-8")
+    return d
+
+
+def test_user_global_only_in_place(tmp_path: Path) -> None:
+    # 仅 $A2C_SKILL_HOME/user/ 全局源：就地发现、不复制；name=basename、source=user、无 uri
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "alpha", description="第一")
+    _write_user_skill(home / "user", "beta", description="第二")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert sorted(names) == ["alpha", "beta"]
+    ref = reg.resolve("alpha")
+    assert ref is not None
+    assert ref["source"] == "user"
+    assert "uri" not in ref  # user 源协议表面不带 skill://
+    assert ref["path"] == str((home / "user" / "alpha").resolve())  # 就地包根，未复制
+    assert ref["description"] == "第一"
+    assert ref["license"] == "MIT"
+    assert ref["allowed_tools"] == ["read", "write"]
+
+
+def test_user_global_plus_multi_workdir_union(tmp_path: Path) -> None:
+    # 全局 + 多 workdir 全局并集；能力层不随 active workdir 切换——传入的全部 workdir 一律生效
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "global-skill")
+    wd1 = tmp_path / "ws1"
+    wd2 = tmp_path / "ws2"
+    _write_user_skill(wd1 / ".tfrobot" / "skills", "proj-a")
+    _write_user_skill(wd2 / ".tfrobot" / "skills", "proj-b")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home, [wd1, wd2])
+
+    assert sorted(names) == ["global-skill", "proj-a", "proj-b"]
+    # workdir skill 就地发现于各自 .tfrobot/skills，未复制进 home
+    assert reg.resolve("proj-a")["path"] == str((wd1 / ".tfrobot" / "skills" / "proj-a").resolve())  # type: ignore[index]
+    assert not (home / "user" / "proj-a").exists()
+
+
+def test_workdir_overrides_user_home_with_warning(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # 同名：workspace skill 覆盖 user-home 全局（§2.3「workspace skill 覆盖 user」）+ WARN
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "shared", description="from-home")
+    wd = tmp_path / "ws"
+    _write_user_skill(wd / ".tfrobot" / "skills", "shared", description="from-workdir")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home, [wd])
+
+    assert names == ["shared"]
+    assert reg.resolve("shared")["description"] == "from-workdir"  # workdir 胜  # type: ignore[index]
+    assert any(r.levelno == logging.WARNING and "shadows earlier" in r.getMessage() for r in staging_logs.records)
+
+
+def test_later_workdir_overrides_earlier_in_registration_order(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # 登记目录间同名 → 按登记序后者覆盖前者 + WARN（验收第 1 条）
+    home = tmp_path / "home"
+    wd1 = tmp_path / "ws1"
+    wd2 = tmp_path / "ws2"
+    _write_user_skill(wd1 / ".tfrobot" / "skills", "dup", description="first")
+    _write_user_skill(wd2 / ".tfrobot" / "skills", "dup", description="second")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home, [wd1, wd2])  # 登记序 wd1 → wd2
+
+    assert names == ["dup"]
+    assert reg.resolve("dup")["description"] == "second"  # 后登记者胜  # type: ignore[index]
+    assert any(r.levelno == logging.WARNING for r in staging_logs.records)
+
+
+def test_user_basename_not_kebab_skipped(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # 目录 basename 非严格 kebab → 跳过 + ERROR；合法兄弟仍入册（部分失败健壮）
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "Bad_Name")  # 含大写 + 下划线 → 非 kebab
+    _write_user_skill(home / "user", "good-one")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == ["good-one"]
+    assert len(reg) == 1
+    assert any(r.levelno == logging.ERROR and "name invalid" in r.getMessage() for r in staging_logs.records)
+
+
+def test_user_deeper_skill_md_ignored_with_debug(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # 深于一级的 SKILL.md（<root>/a/b/SKILL.md）→ 忽略 + DEBUG；根下一级的仍发现（验收第 2 条）
+    home = tmp_path / "home"
+    root = home / "user"
+    _write_user_skill(root, "ok-skill")
+    nested = root / "wrapper" / "inner"
+    nested.mkdir(parents=True)
+    (nested / "SKILL.md").write_text(_skill_md(name="inner", description="too deep"), encoding="utf-8")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == ["ok-skill"]  # inner（二级）被忽略
+    assert any(r.levelno == logging.DEBUG and "not at one-level depth" in r.getMessage() for r in staging_logs.records)
+
+
+def test_user_missing_description_skipped(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # frontmatter 缺 description（A2CSkillRef 必填）→ 跳过 + ERROR
+    home = tmp_path / "home"
+    d = home / "user" / "no-desc"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: no-desc\n---\n# body\n", encoding="utf-8")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == []
+    assert len(reg) == 0
+    assert any(r.levelno == logging.ERROR and "missing required 'description'" in r.getMessage() for r in staging_logs.records)
+
+
+def test_user_frontmatter_name_mismatch_basename_wins(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # frontmatter.name 与目录 basename 不一致 → basename 权威（就地不可改名）+ DEBUG
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "real-dir", fm_name="other-name")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == ["real-dir"]  # 目录 basename 胜，非 frontmatter.name
+    assert reg.resolve("other-name") is None
+    assert any(r.levelno == logging.DEBUG and "basename is authoritative" in r.getMessage() for r in staging_logs.records)
+
+
+def test_user_rescan_idempotent_updates(tmp_path: Path) -> None:
+    # 重扫幂等：已注册 → update（不重复、不报错），内容变更被刷新
+    home = tmp_path / "home"
+    skill = _write_user_skill(home / "user", "iter-skill", description="v1")
+    reg = SkillRegistry()
+
+    first = stage_user_skills(reg, home)
+    assert first == ["iter-skill"]
+    assert reg.resolve("iter-skill")["description"] == "v1"  # type: ignore[index]
+
+    (skill / "SKILL.md").write_text(_skill_md(name="iter-skill", description="v2"), encoding="utf-8")
+    second = stage_user_skills(reg, home)
+
+    assert second == ["iter-skill"]
+    assert len(reg) == 1  # 未重复注册
+    assert reg.resolve("iter-skill")["description"] == "v2"  # 刷新生效  # type: ignore[index]
+
+
+def test_user_missing_roots_tolerated(tmp_path: Path) -> None:
+    # 发现根不存在（home/user 与 workdir 都没建）→ 返回空、不抛
+    home = tmp_path / "nonexistent-home"
+    reg = SkillRegistry()
+    names = stage_user_skills(reg, home, [tmp_path / "no-such-ws"])
+    assert names == []
+    assert len(reg) == 0
+
+
+def test_user_skill_md_unreadable_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_logs: pytest.LogCaptureFixture) -> None:
+    # 发现后 SKILL.md 不可读（TOCTOU）→ _build_user_ref 的 OSError 分支 → 跳过 + ERROR、不抛
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "toctou")
+    reg = SkillRegistry()
+
+    orig_read = Path.read_text
+
+    def boom(self: Path, *a: object, **k: object) -> str:
+        if self.name == "SKILL.md":
+            raise OSError("simulated unreadable after discovery (TOCTOU)")
+        return orig_read(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", boom)  # 发现走 is_file()，不读；仅 _build_user_ref 读 → 触发分支
+
+    names = stage_user_skills(reg, home)
+
+    assert names == []
+    assert len(reg) == 0
+    assert any(r.levelno == logging.ERROR and "unreadable" in r.getMessage() for r in staging_logs.records)
+
+
+def test_user_dropin_roots_dedup_no_spurious_warning(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # 同一 workdir 登记两次 → _user_dropin_roots 按解析路径去重 → 只扫一次、不产生「shadows earlier」假 WARN
+    home = tmp_path / "home"
+    wd = tmp_path / "ws"
+    _write_user_skill(wd / ".tfrobot" / "skills", "uniq")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home, [wd, wd])
+
+    assert names == ["uniq"]
+    assert len(reg) == 1
+    assert not any(r.levelno == logging.WARNING for r in staging_logs.records)

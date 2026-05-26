@@ -33,7 +33,9 @@ from a2c_smcp.computer.skills.home import (
     marketplace_skill_dir,
     mcp_skill_dir,
     resolve_skill_home,
+    user_dropin_root,
     user_skill_dir,
+    workdir_skill_root,
 )
 from a2c_smcp.computer.skills.naming import (
     MCP_SEGMENT,
@@ -66,6 +68,7 @@ from a2c_smcp.computer.skills.staging import (
     SkillStagingError,
     parse_skill_frontmatter,
     stage_mcp_skills,
+    stage_user_skills,
     strip_skill_frontmatter,
 )
 
@@ -80,7 +83,9 @@ __all__ = [
     "marketplace_skill_dir",
     "mcp_skill_dir",
     "resolve_skill_home",
+    "user_dropin_root",
     "user_skill_dir",
+    "workdir_skill_root",
     # naming
     "MCP_SEGMENT",
     "ParsedSkillName",
@@ -110,5 +115,6 @@ __all__ = [
     "SkillStagingError",
     "parse_skill_frontmatter",
     "stage_mcp_skills",
+    "stage_user_skills",
     "strip_skill_frontmatter",
 ]
