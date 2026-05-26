@@ -27,7 +27,9 @@ This is the pure logic layer for MCP definitions/gating (no git / MCP manager / 
   state）归 **#65**：本模块产出**带占位符**的定义，``ResolvedMcpServer.ext``（``envFile`` 等 VS Code 扩展）
   + 未渲染占位符是交给 #65 的 handoff。**绝不在此渲染**（§9.1 安全铁律：值不离 Computer）。
 - **批准框 TTY 交互**（``[a]/[y]/[n]``）/ ``--approve-all-mcp`` flag / 非交互 pending→skip+WARN 接线归
-  **#69**：本模块只提供 :class:`McpApprovalStatus` 判定 + 三个写助手原语。
+  **#69**：本模块只提供 :class:`McpApprovalStatus` 判定 + 三个写助手原语。#69 接线另须把
+  :attr:`ResolvedMcpConfig.errors`（含畸形 server/input 被 drop —— 如非 ``envFile`` 的 VS Code 扩展撞
+  ``MCPServerConfig`` 的 ``extra="forbid"``）**纳入启动 WARN 输出**，否则被 drop 的 server 对用户静默不可见。
 - ``allowManagedMcpServersOnly``（§9.2）#56 schema 未引入，v0.2.1 范围外；本模块只用
   ``allowedMcpServers`` / ``deniedMcpServers``。
 - ``managed-mcp.json`` v0.2.1 仅读 layer-3 文件（per-platform managed dir），remote/MDM stub，对齐
@@ -46,6 +48,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
@@ -111,13 +114,14 @@ class ResolvedMcpServer:
     合并解析后的单个 MCP server 定义 / A merged-and-resolved single MCP server definition。
 
     ``config`` 是校验后的 A2C :class:`MCPServerConfig`（**含占位符、未渲染**）；``ext`` 是剥离出的 VS Code
-    扩展字段（如 ``envFile``，交 #65 渲染消费）；``origin`` 为最高定义 scope；``trusted_origin`` 决定是否免
-    批准门控（user/flag/policy 免，project/local 受门控）。
+    扩展字段（如 ``envFile``，交 #65 渲染消费），以 :class:`~types.MappingProxyType` **只读视图**承载——
+    frozen dataclass 只防字段重绑定、不冻 dict 内容，故下沉只读视图杜绝下游原地改污染；``origin`` 为最高定义
+    scope；``trusted_origin`` 决定是否免批准门控（user/flag/policy 免，project/local 受门控）。
     """
 
     name: str
     config: MCPServerConfig
-    ext: dict[str, Any]
+    ext: Mapping[str, Any]
     origin: SettingsScope
     trusted_origin: bool
 
@@ -240,7 +244,9 @@ def _validate_server(
         cfg = _MCP_SERVER_ADAPTER.validate_python(body)
     except ValidationError as exc:
         return None, [_err(scope, fld, f"invalid MCP server config: {exc}", source)]
-    return ResolvedMcpServer(name=name, config=cfg, ext=ext, origin=scope, trusted_origin=scope in _TRUSTED_ORIGINS), []
+    # ext 以只读视图承载（frozen dataclass 不冻 dict 内容；下游 #65 只读消费）/ ext as a read-only view.
+    server = ResolvedMcpServer(name=name, config=cfg, ext=MappingProxyType(ext), origin=scope, trusted_origin=scope in _TRUSTED_ORIGINS)
+    return server, []
 
 
 def _validate_input(idef: Any, scope: SettingsScope, source: str | None) -> tuple[MCPServerInput | None, list[SettingsValidationError]]:

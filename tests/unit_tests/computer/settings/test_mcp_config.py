@@ -29,6 +29,7 @@ import pytest
 
 from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.settings.mcp_config import (
+    MANAGED_MCP_FILENAME,
     McpApprovalStatus,
     McpConfigError,
     ResolvedMcpConfig,
@@ -38,9 +39,11 @@ from a2c_smcp.computer.settings.mcp_config import (
     deny_mcp_server,
     gate_mcp_servers,
     load_mcp_config_file,
+    managed_mcp_config_path,
     mcp_server_status,
     resolve_mcp_config,
 )
+from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
 from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.settings.scope import workdir_local_settings_path
 from a2c_smcp.computer.settings.store import save_installed_plugins
@@ -346,3 +349,23 @@ def test_resolved_mcp_config_dataclass_defaults() -> None:
     """ResolvedMcpConfig inputs/errors 默认空（无 server 场景）。"""
     rc = ResolvedMcpConfig(servers={})
     assert rc.inputs == [] and rc.errors == []
+
+
+# ── managed-mcp.json 平台派生 / 无 id input 覆盖盲区（fix-review #84）────────────
+def test_managed_mcp_config_path_platform_branches() -> None:
+    """平台派生三分支 + 文件名拼接（resolve_* 测试均注入 managed_mcp_path，此处直测兜底派生路径）。"""
+    assert managed_mcp_config_path("darwin") == MACOS_MANAGED_DIR / MANAGED_MCP_FILENAME
+    assert managed_mcp_config_path("win32") == WINDOWS_MANAGED_DIR / MANAGED_MCP_FILENAME
+    assert managed_mcp_config_path("linux") == LINUX_MANAGED_DIR / MANAGED_MCP_FILENAME
+    assert managed_mcp_config_path("freebsd") == LINUX_MANAGED_DIR / MANAGED_MCP_FILENAME  # 非 darwin/win32 → linux 兜底
+
+
+def test_resolve_idless_and_non_object_inputs_dropped(tmp_path: Path) -> None:
+    """无 id 对象 input + 非对象 input：各走 <noid-N> key + inputs.<unknown>，皆 drop、不崩、去重 key 不冲突。"""
+    env = _env(tmp_path)
+    inputs = [{"type": "promptString", "description": "no-id"}, "junk-string"]
+    _write_json(_user_mcp(tmp_path), _mcp_doc(inputs=inputs))
+    out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
+    assert out.inputs == []  # 两者皆 drop、不崩
+    unknown_errs = [e for e in out.errors if e.field == "inputs.<unknown>"]
+    assert len(unknown_errs) == 2  # 各自独立报错 → <noid-N> key 不冲突（非互相覆盖）
