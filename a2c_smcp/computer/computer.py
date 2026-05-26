@@ -27,7 +27,6 @@ All classes and methods use Google style docstrings (bilingual: Chinese and Engl
 
 import asyncio
 import json
-import os
 import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -79,6 +78,7 @@ from a2c_smcp.computer.skills import (
 from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
+from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.logger import get_logger, truncate
 from a2c_smcp.utils.window_uri import is_window_uri
 
@@ -186,12 +186,7 @@ class Computer(BaseComputer[PromptSession]):
         )
         self._skill_watcher: SkillFileWatcher | None = None
         # 原生 Observer 不支持的 FS（网络挂载 / overlayfs）可经此环境变量切 PollingObserver 兜底。
-        self._skill_watch_polling: bool = os.environ.get("A2C_SKILL_WATCH_POLLING", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        self._skill_watch_polling: bool = env_truthy("A2C_SKILL_WATCH_POLLING")
 
         # v0.2.1 通用二进制传输基础设施 / v0.2.1 generic blob-transfer infrastructure
         # 协议依据 / Protocol: blob-transfer.md；设计 / Design: §4.3 / §4.4

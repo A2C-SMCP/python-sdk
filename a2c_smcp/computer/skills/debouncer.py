@@ -61,14 +61,24 @@ class SkillEventDebouncer:
         self._invalidate = invalidate
         self._window_ms = max(0, window_ms)
         self._task: asyncio.Task[None] | None = None
+        self._closed = False
 
     def mark_dirty(self) -> None:
         """
         标脏并重排一次结算 / Mark dirty and (re)schedule a settlement。
 
-        窗口内多次调用 → 取消未到期 task、重排，**末次胜出**（多事件合并为一次 emit）。
-        必须在事件循环线程内调用（跨线程触发先经 ``loop.call_soon_threadsafe``）。
+        窗口内多次调用 → 取消未到期 task、重排，**末次胜出**（多事件合并为一次 emit）。必须在事件循环线程内
+        调用（跨线程触发先经 ``loop.call_soon_threadsafe``）。:meth:`aclose` 后为 **no-op**——中和停机临终
+        投递、滞留循环队列的跨线程 mark_dirty，杜绝停机后复活挂起 emit。
+
+        **权衡：纯尾部去抖、无 max-wait 上限**——若事件持续以 ``< window_ms`` 间隔到来，结算被无限推迟
+        （emit 饿死）。离散 SKILL.md 编辑不会触发，与 CC ``skillChangeDetector`` 同义；仅 PollingObserver
+        兜底下的批量同步（网络盘）值得留意，必要时后续引入 leading+trailing max-wait 上限。
+        Pure trailing debounce, no max-wait cap: continuous sub-window churn starves the emit (won't
+        happen for discrete edits; matches CC). No-op after :meth:`aclose`.
         """
+        if self._closed:
+            return
         if self._task is not None and not self._task.done():
             self._task.cancel()
         self._task = asyncio.create_task(self._settle_after_delay())
@@ -114,8 +124,11 @@ class SkillEventDebouncer:
         """
         关闭去抖器，丢弃未结算的挂起 emit / Close the debouncer, dropping any pending unsettled emit。
 
-        生命周期清理（停机）：取消挂起 task 并等待其结束（幂等）。**不**冲刷——停机时无需再广播。
+        生命周期清理（停机）：先置 ``_closed``（此后 :meth:`mark_dirty` 一律 no-op——中和 watcher 停机临终
+        投递、滞留事件循环队列的跨线程 mark_dirty，杜绝停机后复活挂起 emit / ``Task destroyed pending`` 告警），
+        再取消挂起 task 并等待其结束（幂等）。**不**冲刷——停机时无需再广播。
         """
+        self._closed = True
         task = self._task
         self._task = None
         if task is not None and not task.done():

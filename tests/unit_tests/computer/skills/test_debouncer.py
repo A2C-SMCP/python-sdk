@@ -164,3 +164,15 @@ async def test_aclose_idempotent_without_pending() -> None:
     await deb.aclose()  # 无挂起
     await deb.aclose()  # 重复
     assert rec.emit_calls == 0
+
+
+async def test_mark_dirty_after_aclose_is_noop() -> None:
+    # 关闭后的 mark_dirty（含停机临终滞留的跨线程投递）必须 no-op，不复活挂起 emit。
+    rec = _Recorder()
+    deb = SkillEventDebouncer(rec.emit, invalidate=rec.invalidate, window_ms=10)
+    await deb.aclose()
+    deb.mark_dirty()
+    assert deb._task is None  # 未排程
+    await asyncio.sleep(0.03)  # 给潜在排程一个调度机会
+    assert rec.emit_calls == 0
+    assert rec.invalidate_calls == 0
