@@ -327,6 +327,12 @@ class SMCPComputerClient(AsyncClient):
         复用 UpdateComputerConfigReq（协议 events.md §server:update_skills 明确复用，不新建结构）；
         office_id 守卫与 :meth:`emit_update_tool_list` 一致——未入房间不发送。
         Reuses UpdateComputerConfigReq (protocol reuses it); office_id guard mirrors emit_update_tool_list.
+
+        v0.2.1（S14，#67）：本方法是 :class:`~a2c_smcp.computer.skills.debouncer.SkillEventDebouncer` 的
+        **低层 emit sink**——多源 SKILL 变更（mcp ``ResourceListChanged`` / user 源文件 watcher / CLI 操作）
+        统一经 ``Computer`` 持有的去抖器在 300ms 窗口内合并后调用本方法，事件处理器**不**应裸调它（设计 §8.1）。
+        This is the low-level emit sink for the Computer-owned ``SkillEventDebouncer``; event handlers must
+        route through the debouncer (300ms coalescing) rather than calling this directly.
         """
         if self.office_id:
             await self.emit(UPDATE_SKILLS_EVENT, UpdateComputerConfigReq(computer=self.computer.name))

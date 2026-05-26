@@ -22,6 +22,7 @@ Unit tests for the Computer SKILL subsystem wiring.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,7 @@ from mcp.types import Resource
 
 from a2c_smcp.computer.blob.resolver import SkillBlobResolver
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.skills.debouncer import SkillEventDebouncer
 from a2c_smcp.computer.skills.sandbox import SkillSandboxError
 from a2c_smcp.smcp import A2CSkillRef
 
@@ -226,8 +228,9 @@ async def test_resource_list_changed_skill_set_changed_emits(tmp_path: Path, mon
 
     await comp._on_manager_change(SimpleNamespace(root=ResourceListChangedNotification()))  # type: ignore[arg-type]
     assert restaged["n"] == 1
+    assert comp._skills_cache == {"skill://srv/demo"}  # 缓存在处理器内同步更新
+    await comp._skill_debouncer.aflush()  # 结算去抖窗口 → emit（#67：emit 经去抖器，不再裸调）
     assert client.update_skills_called == 1
-    assert comp._skills_cache == {"skill://srv/demo"}
 
 
 @pytest.mark.asyncio
@@ -279,6 +282,7 @@ async def test_resource_updated_skill_uri_emits(tmp_path: Path, monkeypatch: pyt
     note = ResourceUpdatedNotification(params=ResourceUpdatedNotificationParams(uri="skill://srv/demo"))
     await comp._on_manager_change(SimpleNamespace(root=note))  # type: ignore[arg-type]
     assert restaged["n"] == 1
+    await comp._skill_debouncer.aflush()  # 结算去抖窗口 → emit
     assert client.update_skills_called == 1
     assert client.refresh_called == 0  # 非 window，不刷新桌面
 
@@ -350,3 +354,187 @@ async def test_boot_up_wires_skill_subsystem(tmp_path: Path, monkeypatch: pytest
     assert comp._skills_cache == {"skill://srv/boot"}
 
     await comp.shutdown()
+
+
+# ===========================================================================
+# v0.2.1 user 源 DropIn 接入 + 文件 watcher 生命周期（S14，#67）
+# ===========================================================================
+_USER_SKILL_MD = "---\nname: helper\ndescription: a user skill\n---\n# Helper\n"
+
+
+@pytest.mark.asyncio
+async def test_invalidate_user_skills_registers_then_orphans_on_delete(tmp_path: Path) -> None:
+    """去抖器 invalidate：就地重扫 user 源注册；磁盘删除后重扫 → 标孤儿（从 get_skills 排除，保留以便恢复）。"""
+    import shutil
+
+    skill_home = tmp_path / "sh"
+    user_skill = skill_home / "user" / "helper"
+    user_skill.mkdir(parents=True)
+    (user_skill / "SKILL.md").write_text(_USER_SKILL_MD, encoding="utf-8")
+
+    comp = Computer(name="c", skill_home=skill_home, auto_connect=False, auto_reconnect=False)
+    comp._skill_home = comp._resolve_skill_home()  # 解析并建 home（不走完整 boot_up）
+
+    await comp._invalidate_user_skills()
+    ref = comp.get_skill_ref("helper")
+    assert ref is not None
+    assert ref["source"] == "user"
+    assert Path(ref["path"]) == user_skill.resolve()  # 就地发现：path 指向原目录，未复制
+
+    # 磁盘删除 → 重扫对账 → 标孤儿
+    shutil.rmtree(user_skill)
+    await comp._invalidate_user_skills()
+    assert comp.get_skill_ref("helper") is None  # 孤儿不在 active
+    assert "helper" in comp.skill_registry  # 仍在册以便恢复
+
+
+@pytest.mark.asyncio
+async def test_boot_up_starts_user_watcher_and_shutdown_stops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """user/ 存在 → boot_up 启动文件 watcher；mark_skill_internal_write 透传；shutdown 停止并清空。"""
+    from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
+
+    monkeypatch.setenv("A2C_SKILL_WATCH_POLLING", "1")  # 用 PollingObserver，启停确定性
+    skill_home = tmp_path / "sh"
+    (skill_home / "user").mkdir(parents=True)  # 发现根存在 → watcher 启动
+
+    comp = Computer(name="c", skill_home=skill_home, auto_connect=False, auto_reconnect=False)
+
+    async def _noop_ainit(self: MCPServerManager, servers: object) -> None:
+        return None
+
+    async def fake_restage(server_name: str | None = None) -> list[str]:
+        return []
+
+    async def fake_collect() -> set[str]:
+        return set()
+
+    monkeypatch.setattr(MCPServerManager, "ainitialize", _noop_ainit)
+    monkeypatch.setattr(comp, "_restage_mcp_skills", fake_restage)
+    monkeypatch.setattr(comp, "_acollect_skill_refs", fake_collect)
+
+    await comp.boot_up()
+    assert comp._skill_watcher is not None
+    assert comp._skill_watcher.is_running is True
+    # 内部写打标透传（不报错；watcher 已启动）
+    comp.mark_skill_internal_write(skill_home / "user" / "helper" / "SKILL.md")
+
+    await comp.shutdown()
+    assert comp._skill_watcher is None  # 停机后清空
+
+
+@pytest.mark.asyncio
+async def test_boot_up_no_user_watcher_when_no_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """无任何发现根（user/ 不存在、无登记 workdir）→ watcher 对象建但不启动线程。"""
+    from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
+
+    skill_home = tmp_path / "sh"  # 仅 boot 时建 <sh>，不建 <sh>/user
+
+    comp = Computer(name="c", skill_home=skill_home, auto_connect=False, auto_reconnect=False)
+
+    async def _noop_ainit(self: MCPServerManager, servers: object) -> None:
+        return None
+
+    async def fake_restage(server_name: str | None = None) -> list[str]:
+        return []
+
+    async def fake_collect() -> set[str]:
+        return set()
+
+    monkeypatch.setattr(MCPServerManager, "ainitialize", _noop_ainit)
+    monkeypatch.setattr(comp, "_restage_mcp_skills", fake_restage)
+    monkeypatch.setattr(comp, "_acollect_skill_refs", fake_collect)
+
+    await comp.boot_up()
+    assert comp._skill_watcher is not None
+    assert comp._skill_watcher.is_running is False  # 无可监控根 → 未启动
+    await comp.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_emit_update_skills_now_no_client_is_noop(tmp_path: Path) -> None:
+    """无 Socket.IO 客户端时去抖结算末端 no-op（不抛）/ debouncer sink no-op without client。"""
+    comp = _computer(tmp_path)  # 未设置 socketio_client
+    await comp._emit_update_skills_now()  # 不应抛
+
+
+@pytest.mark.asyncio
+async def test_start_skill_watcher_restart_stops_previous(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """重复 _start_skill_watcher → 先停旧 watcher、装配新对象（覆盖重启分支）。"""
+    monkeypatch.setenv("A2C_SKILL_WATCH_POLLING", "1")
+    skill_home = tmp_path / "sh"
+    (skill_home / "user").mkdir(parents=True)
+
+    comp = Computer(name="c", skill_home=skill_home, auto_connect=False, auto_reconnect=False)
+    comp._skill_home = comp._resolve_skill_home()
+
+    comp._start_skill_watcher()
+    first = comp._skill_watcher
+    assert first is not None
+    assert first.is_running is True
+
+    comp._start_skill_watcher()  # 重启：旧的应被停，新的接管
+    try:
+        assert comp._skill_watcher is not first
+        assert first.is_running is False
+        assert comp._skill_watcher is not None
+        assert comp._skill_watcher.is_running is True
+    finally:
+        if comp._skill_watcher is not None:
+            comp._skill_watcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_real_watch_event_triggers_emit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """端到端接线：Computer 启动后真实文件事件 → _marshal → 去抖器 → invalidate(重扫注册) → emit。
+
+    覆盖生产 marshal 闭包（watchdog 线程 → loop.call_soon_threadsafe → mark_dirty）这一拼接处。
+    用 PollingObserver + 缩短去抖窗口；轮询/去抖均异步到达，故带超时轮询断言。
+    """
+    from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
+
+    monkeypatch.setenv("A2C_SKILL_WATCH_POLLING", "1")
+    skill_home = tmp_path / "sh"
+    (skill_home / "user").mkdir(parents=True)
+
+    comp = Computer(name="c", skill_home=skill_home, auto_connect=False, auto_reconnect=False)
+    client = _DummyClient()
+    comp.socketio_client = client  # type: ignore[assignment]
+    # 缩短去抖窗口加速测试（boot 时 _start_skill_watcher 闭包捕获此 debouncer）
+    comp._skill_debouncer = SkillEventDebouncer(
+        comp._emit_update_skills_now,
+        invalidate=comp._invalidate_user_skills,
+        window_ms=20,
+    )
+
+    async def _noop_ainit(self: MCPServerManager, servers: object) -> None:
+        return None
+
+    async def fake_restage(server_name: str | None = None) -> list[str]:
+        return []
+
+    async def fake_collect() -> set[str]:
+        return set()
+
+    monkeypatch.setattr(MCPServerManager, "ainitialize", _noop_ainit)
+    monkeypatch.setattr(comp, "_restage_mcp_skills", fake_restage)
+    monkeypatch.setattr(comp, "_acollect_skill_refs", fake_collect)
+
+    await comp.boot_up()
+    assert comp._skill_watcher is not None and comp._skill_watcher.is_running is True
+
+    # 启动后落一个 user skill → 触发真实 watchdog 事件链
+    skill_dir = skill_home / "user" / "helper"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(_USER_SKILL_MD, encoding="utf-8")
+
+    # 轮询（~1s）+ 去抖（20ms）均异步：超时内轮询等待 emit 到达
+    for _ in range(60):
+        if client.update_skills_called >= 1:
+            break
+        await asyncio.sleep(0.2)
+
+    try:
+        assert client.update_skills_called >= 1, "真实文件事件未经 _marshal→去抖→emit 链路触发上报"
+        assert comp.get_skill_ref("helper") is not None  # invalidate 重扫已注册该 user skill
+    finally:
+        await comp.shutdown()
