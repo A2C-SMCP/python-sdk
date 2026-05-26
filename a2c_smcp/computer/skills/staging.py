@@ -962,22 +962,35 @@ def _scan_and_register_plugin_skills(
     return registered
 
 
-async def _stage_one_plugin(
+async def locate_plugin_root(
     marketplace: str,
     plugin_name: str,
     entry: Mapping[str, Any],
     catalog_dir: Path,
     plugin_root_base: str,
     home: Path,
-    registry: SkillRegistry,
-    seen: set[str],
     catalog_sha: str | None,
     *,
-    refresh: bool,
-    timeout: float,
-    env: Mapping[str, str] | None,
-) -> list[str]:
-    """解析 plugin source → 定位 plugin 根 → 扫描注册其 SKILL / Resolve source, locate root, scan & register。"""
+    refresh: bool = False,
+    timeout: float = DEFAULT_GIT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
+) -> tuple[Path, str | None]:
+    """
+    解析 plugin source 并 clone/定位其根，返回 ``(plugin_root, version_fallback_sha)`` / Resolve & clone/locate a plugin's root。
+
+    plugin install（:mod:`a2c_smcp.computer.settings.installer`）与 :func:`_stage_one_plugin` 共用本原语，
+    避免 plugin source 5 类解析（相对路径就地 / ``git-subdir`` sparse / ``url``·``github``·``cnb`` 独立 clone）
+    重复实现。**不**扫描 / 注册 SKILL、**不**读 plugin.json——纯定位（install 需先拿 plugin 根再读
+    ``mcp-servers/`` 做冲突预检，故定位须与 skill 扫描解耦）。
+
+    - 相对路径（:class:`LocalPluginSource`）：就地在 catalog clone 内，越界保护（``is_within`` 词法判定）；
+      ``version_fallback = catalog_sha``。
+    - 独立 clone（:class:`GitCloneSpec`）：落 ``<home>/marketplace/.plugins/<mp>/<plugin>/``；复用条件——
+      sha 锁版本既有 HEAD==pin 则复用、pin 变更则重 clone；非 sha 仅 ``refresh=False`` 复用。
+      ``version_fallback = HEAD``。
+
+    clone / source 解析失败 → :class:`SkillStagingError` / :class:`SkillSourceError`（上抛，调用方据失败降级）。
+    """
     raw_source = entry.get("source")
     if raw_source is None:
         raise SkillSourceError(dict(entry), "plugin entry missing required 'source'")
@@ -1005,7 +1018,37 @@ async def _stage_one_plugin(
 
     if not plugin_root.is_dir():
         raise SkillStagingError(f"plugin root not found after resolve: {plugin_root}")
+    return plugin_root, version_fallback
 
+
+async def _stage_one_plugin(
+    marketplace: str,
+    plugin_name: str,
+    entry: Mapping[str, Any],
+    catalog_dir: Path,
+    plugin_root_base: str,
+    home: Path,
+    registry: SkillRegistry,
+    seen: set[str],
+    catalog_sha: str | None,
+    *,
+    refresh: bool,
+    timeout: float,
+    env: Mapping[str, str] | None,
+) -> list[str]:
+    """解析 plugin source → 定位 plugin 根 → 扫描注册其 SKILL / Resolve source, locate root, scan & register。"""
+    plugin_root, version_fallback = await locate_plugin_root(
+        marketplace,
+        plugin_name,
+        entry,
+        catalog_dir,
+        plugin_root_base,
+        home,
+        catalog_sha,
+        refresh=refresh,
+        timeout=timeout,
+        env=env,
+    )
     plugin_manifest = _read_plugin_manifest(plugin_root)
     version = _resolve_plugin_version(entry, plugin_manifest, version_fallback)
     return _scan_and_register_plugin_skills(marketplace, plugin_name, plugin_root, version, registry, seen)
