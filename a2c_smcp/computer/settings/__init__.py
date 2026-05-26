@@ -7,10 +7,11 @@
 """
 Computer 意图 / 治理层 settings 子系统 / Computer intent & governance settings subsystem（v0.2.1）
 
-承载 settings.json 的结构、五级 scope 合并、policy 子源选取、物化层文件 store 与启动对账
-reconciler——CLI marketplace/plugin/skill 管理 UX 的"意图层 + 物化层 + 对账层"。MCP 定义层为后续工单（#64）。
-The intent + materialized + reconcile layers of the CLI marketplace/plugin/skill management UX.
-MCP-definition layer lands in a follow-up ticket.
+承载 settings.json 的结构、五级 scope 合并、policy 子源选取、物化层文件 store、启动对账 reconciler 与
+``.tfrobot/mcp.json`` MCP 定义层/批准门控——CLI marketplace/plugin/skill 管理 UX 的"意图层 + 物化层 + 对账层
++ MCP 定义/门控层"。
+The intent + materialized + reconcile + MCP-definition/gating layers of the CLI marketplace/plugin/skill
+management UX.
 
 已落地模块 / Landed modules：
 - :mod:`a2c_smcp.computer.settings.schema` —— settings.json TypedDict + 字段级容错校验
@@ -94,9 +95,11 @@ from a2c_smcp.computer.settings.store import (
 # 注意 / NB：:mod:`...settings.reconciler` 与 :mod:`...settings.installer` **刻意不在此 re-export**——它们依赖
 # :mod:`...skills.staging`，而 staging 顶层又 import :mod:`...settings.schema`（触发本 __init__）。
 # 若在此急切导入 reconciler/installer 会与 staging 的半初始化态构成循环（`_EXTERNAL_PLUGINS_NS` 未定义）。
-# 消费方请直接 ``from a2c_smcp.computer.settings.reconciler import reconcile`` / ``...installer import install_plugin`` 等。
-# reconciler & installer are intentionally NOT re-exported here to avoid a circular import with skills.staging;
-# import them directly from their submodules.
+# 同理 :mod:`...settings.mcp_config` 亦**不 re-export**——它 import :mod:`...mcp_clients.model`（→ vrl 传递依赖），
+# 在此急切导入会无谓加重 ``import ...settings``（与 installer/manifest 同姿态，不成环但不必拉重）。
+# 消费方请直接 ``from a2c_smcp.computer.settings.reconciler import reconcile`` /
+# ``...installer import install_plugin`` / ``...mcp_config import resolve_mcp_config`` 等。
+# reconciler / installer / mcp_config are intentionally NOT re-exported here; import them directly from submodules.
 
 __all__ = [
     # schema
