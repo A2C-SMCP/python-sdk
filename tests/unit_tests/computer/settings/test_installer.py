@@ -265,6 +265,45 @@ async def test_install_catalog_not_cloned_raises(tmp_path: Path) -> None:
         await install_plugin("audit@acme", SkillRegistry(), home)
 
 
+async def test_install_register_without_existing_names_raises(tmp_path: Path, monkeypatch) -> None:
+    """护栏：给了 register_server 但缺 existing_server_names → 抛（防冲突闸门被静默旁路）。"""
+    home = _home(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=["figma"])
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+    mcp = _FakeMCP()
+
+    with pytest.raises(PluginInstallError, match="existing_server_names is required"):
+        await install_plugin("audit@acme", SkillRegistry(), home, env=_env(tmp_path), register_server=mcp.register)
+
+
+async def test_install_reinstall_failure_preserves_existing(tmp_path: Path, monkeypatch) -> None:
+    """精确回滚：重装中途失败时，不误删此前已有的 skill / 不误摘自有 server（仅撤销本次新增）。"""
+    home = _home(tmp_path)
+    mcp = _FakeMCP()
+    reg = SkillRegistry()
+    await _install(home, tmp_path, monkeypatch, mcp, reg, servers=["figma"])  # 首装 figma + audit:lint
+    assert reg.resolve("audit:lint") is not None and mcp.registered == ["figma"]
+
+    # 重装：plugin 新增一个会注册失败的 server（zeta）；owned={figma}、既有 skill audit:lint 活跃
+    plugin_root = marketplace_skill_dir(home, "acme") / "plugins" / "audit"
+    _write_json(plugin_root / "mcp-servers" / "zeta.json", _stdio("zeta"))
+    mcp.registered.clear()
+    mcp.removed.clear()
+    mcp.fail_on = "zeta"
+
+    with pytest.raises(RuntimeError, match="zeta"):
+        await install_plugin(
+            "audit@acme", reg, home, env=_env(tmp_path),
+            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
+        )
+
+    assert reg.resolve("audit:lint") is not None  # 既有 skill 未被误注销
+    assert mcp.removed == []  # 自有 figma 未被误摘（zeta 注册失败本就没进）
+    assert "figma" in mcp.existing  # figma 仍挂在 manager
+    rec = load_installed_plugins(home=home)["plugins"]["audit@acme"][0]
+    assert rec["bundledMcpServers"] == ["figma"]  # 账本仍为首装记录（本次失败未改写）
+
+
 # ── uninstall ─────────────────────────────────────────────────────────────────
 async def _install(home: Path, tmp_path: Path, monkeypatch, mcp: _FakeMCP, reg: SkillRegistry, *, servers: list[str]) -> Path:
     """安装一个 plugin（happy）作为 uninstall/disable/enable 的前置；返回 installPath。"""
@@ -402,3 +441,11 @@ async def test_enable_foreign_conflict_leaves_settings_untouched(tmp_path: Path,
         )
 
     assert not user_settings_path(env).exists()  # 冲突先于 settings 写 → 原子（未写）
+
+
+async def test_enable_register_without_existing_names_raises(tmp_path: Path) -> None:
+    """护栏：enable 给了 register_server 但缺 existing_server_names → 抛（先于读记录/写 settings）。"""
+    home = _home(tmp_path)
+    mcp = _FakeMCP()
+    with pytest.raises(PluginInstallError, match="existing_server_names is required"):
+        await enable_plugin("audit@acme", SkillRegistry(), home, env=_env(tmp_path), register_server=mcp.register)

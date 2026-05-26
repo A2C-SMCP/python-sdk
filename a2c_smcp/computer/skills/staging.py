@@ -67,7 +67,6 @@ import asyncio
 import base64
 import hashlib
 import io
-import json
 import os
 import re
 import shutil
@@ -92,6 +91,15 @@ from a2c_smcp.computer.skills.home import (
     user_dropin_root,
     workdir_skill_root,
 )
+from a2c_smcp.computer.skills.manifest import (
+    PluginManifestError,
+    read_marketplace_manifest,
+    read_plugin_metadata,
+    resolve_plugin_version,
+)
+from a2c_smcp.computer.skills.manifest import (
+    plugin_root_base as resolve_plugin_root_base,
+)
 from a2c_smcp.computer.skills.naming import (
     SkillNameError,
     normalize_mcp_server_segment,
@@ -101,7 +109,6 @@ from a2c_smcp.computer.skills.naming import (
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import (
-    DEFAULT_PLUGIN_ROOT,
     GitCloneSpec,
     LocalPluginSource,
     SkillSourceError,
@@ -123,10 +130,7 @@ SKILL_MD = "SKILL.md"
 SKILL_URI_PREFIX = "skill://"
 _MCP_SOURCE_MODES = frozenset({"mounted", "archive", "resources"})
 
-# marketplace 布局常量 / marketplace layout constants（协议 marketplace-v1 §2.1 / §3.1 / §6）。
-MARKETPLACE_MANIFEST_DIR = ".tfrobot-plugin"  # marketplace.json / plugin.json 所在目录（嵌套，镜像 CC .claude-plugin）
-MARKETPLACE_MANIFEST = "marketplace.json"  # 仓库级 manifest
-PLUGIN_MANIFEST = "plugin.json"  # plugin 级 manifest
+# marketplace 布局常量 / marketplace layout constants（marketplace.json/plugin.json 解析见 :mod:`skills.manifest`）。
 SKILLS_SUBDIR = "skills"  # plugin 内 SKILL 子树约定目录（SKILL 协议 §2）
 # 独立 clone 的 plugin（url/github/cnb/git-subdir）落点命名空间——置于 marketplace/ 下以 "." 起首的目录，
 # 与 catalog clone（<home>/marketplace/<mp>/）物理隔离、且不与 kebab marketplace 名冲突。
@@ -819,49 +823,7 @@ async def _git_head_sha(dest: Path, *, timeout: float, env: Mapping[str, str] | 
         return None
 
 
-# ── marketplace.json / plugin.json 解析 / manifest parsing ───────────────────
-def _read_json_object(path: Path, *, what: str) -> dict[str, Any]:
-    """读 JSON 文件并要求根为对象 / Read a JSON file requiring an object root（失败 → :class:`SkillStagingError`）。"""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise SkillStagingError(f"{what} unreadable/invalid at {path}: {e}") from e
-    if not isinstance(data, dict):
-        raise SkillStagingError(f"{what} root is not an object: {path}")
-    return data
-
-
-def _read_marketplace_manifest(clone_dir: Path) -> dict[str, Any]:
-    """读 ``<clone>/.tfrobot-plugin/marketplace.json``（仓库级 manifest）/ Read the marketplace manifest。"""
-    path = clone_dir / MARKETPLACE_MANIFEST_DIR / MARKETPLACE_MANIFEST
-    if not path.is_file():
-        raise SkillStagingError(f"marketplace manifest not found: {path}")
-    return _read_json_object(path, what="marketplace manifest")
-
-
-def _read_plugin_manifest(plugin_root: Path) -> dict[str, Any]:
-    """读 ``<plugin>/.tfrobot-plugin/plugin.json``（best-effort，缺失 → ``{}``）/ Read plugin.json best-effort。"""
-    path = plugin_root / MARKETPLACE_MANIFEST_DIR / PLUGIN_MANIFEST
-    if not path.is_file():
-        return {}
-    try:
-        return _read_json_object(path, what="plugin manifest")
-    except SkillStagingError as e:
-        # plugin.json 仅供 version / 显示名兜底，损坏不致命（SKILL 由路径推导）。
-        logger.warning("plugin manifest ignored (%s)", e)
-        return {}
-
-
-def _plugin_root_base(manifest: Mapping[str, Any]) -> str:
-    """取 ``metadata.pluginRoot``（缺省 :data:`~a2c_smcp.computer.skills.sources.DEFAULT_PLUGIN_ROOT`）/ Resolve pluginRoot。"""
-    md = manifest.get("metadata")
-    if isinstance(md, Mapping):
-        pr = md.get("pluginRoot")
-        if isinstance(pr, str) and pr.strip():
-            return pr.strip()
-    return DEFAULT_PLUGIN_ROOT
-
-
+# ── plugin entry 解析 / plugin-entry parsing（marketplace.json/plugin.json/version 解析见 :mod:`skills.manifest`）──
 def _entry_plugin_name(entry: Mapping[str, Any]) -> str:
     """plugin 条目 ID = entry.name（marketplace-v1 §4.1 必填；kebab 校验交 name 合成）/ The plugin entry name。"""
     name = entry.get("name")
@@ -1049,18 +1011,9 @@ async def _stage_one_plugin(
         timeout=timeout,
         env=env,
     )
-    plugin_manifest = _read_plugin_manifest(plugin_root)
-    version = _resolve_plugin_version(entry, plugin_manifest, version_fallback)
+    plugin_manifest = read_plugin_metadata(plugin_root)
+    version = resolve_plugin_version(entry, plugin_manifest, version_fallback)
     return _scan_and_register_plugin_skills(marketplace, plugin_name, plugin_root, version, registry, seen)
-
-
-def _resolve_plugin_version(entry: Mapping[str, Any], plugin_manifest: Mapping[str, Any], fallback_sha: str | None) -> str | None:
-    """version 优先级：entry.version > plugin.json.version > git commit SHA（marketplace-v1 §4.2）/ Resolve plugin version。"""
-    for src in (entry, plugin_manifest):
-        v = src.get("version")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return fallback_sha
 
 
 def _record_known_marketplace(
@@ -1184,8 +1137,8 @@ async def stage_marketplace_skills(
     _record_known_marketplace(name, source, clone_dir, commit_sha, auto_update, home, env, changed=changed)
 
     try:
-        manifest = _read_marketplace_manifest(clone_dir)
-    except SkillStagingError as e:
+        manifest = read_marketplace_manifest(clone_dir)
+    except PluginManifestError as e:
         logger.error("marketplace %r manifest invalid, skipped (clone kept): %s", name, e)
         return registered
 
@@ -1194,7 +1147,7 @@ async def stage_marketplace_skills(
         logger.error("marketplace %r manifest 'plugins' is not an array, skipped: %s", name, type(plugins).__name__)
         return registered
 
-    plugin_root_base = _plugin_root_base(manifest)
+    plugin_root_base = resolve_plugin_root_base(manifest)
     seen: set[str] = set()
     for entry in plugins:
         if not isinstance(entry, Mapping):

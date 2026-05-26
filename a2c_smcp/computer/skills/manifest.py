@@ -12,13 +12,14 @@ Plugin manifest file parsing: marketplace.json + plugin.json + mcp-servers/<n>.j
                       优先级）/ §5（plugin source 5 类）；mcp-servers 协议 §1/§2（文件式、文件名=name）。
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §3.2–3.5 / §3.3（bundled MCP server）。
 
-本模块是 **manifest 纯解析器**（无 git / 无 registry / 无 MCP manager 副作用），供 plugin install/enable
-（:mod:`a2c_smcp.computer.settings.installer`）消费。**刻意保持 leaf**：不 import
-:mod:`~a2c_smcp.computer.skills.staging`（staging 顶层 import ``settings.schema``——见 #62 循环导入教训；
-manifest 若反向耦合 staging 会把解析层卷入 settings/__init__ 的初始化环）。与 staging 私有 manifest 读取器
-（``_read_marketplace_manifest`` 等）存在**轻度重复**：这是为隔离循环导入风险刻意付出的代价（#63 边界决策）。
-This is a pure manifest parser (no git / registry / MCP side effects), consumed by the plugin installer.
-Kept intentionally leaf (no staging import) to avoid the settings/__init__ circular-import trap (#62).
+本模块是 **manifest 纯解析器唯一权威层**（无 git / 无 registry / 无 MCP manager 副作用），供 plugin
+install/enable（:mod:`a2c_smcp.computer.settings.installer`）与 :mod:`~a2c_smcp.computer.skills.staging`
+（marketplace git staging）**共同消费**——单向 ``staging → manifest``，无重复解析器。**刻意保持 leaf**：本模块
+**绝不** import :mod:`~a2c_smcp.computer.skills.staging`（staging 顶层 import ``settings.schema``；且 staging 现
+import 本模块，故反向耦合即构成真环）。
+This is the single authoritative manifest parser (no git / registry / MCP side effects), consumed by both the
+plugin installer and skills.staging (one-way ``staging → manifest``). Kept strictly leaf — it MUST NOT import
+skills.staging (which now imports this module, so a back-edge would be a real cycle).
 
 **显式延后 / Deferred**：
 - **bundled MCP server inputs.json 入池消歧**（§9.3 D2 前缀）归 #65——本模块**枚举 server 时排除**

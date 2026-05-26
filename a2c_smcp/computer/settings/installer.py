@@ -227,6 +227,23 @@ def _conflict_check(servers: list[MCPServerConfig], existing: set[str], owned: s
             )
 
 
+def _require_existing_names_guard(
+    existing_server_names: ExistingServerNames | None,
+    register_server: RegisterServer | None,
+) -> None:
+    """
+    护栏：给了 ``register_server`` 就**必须**给 ``existing_server_names`` / Guard: register implies existing-names。
+
+    否则冲突闸门以 ``existing=∅`` 运行被静默旁路——外来同名 server 会被 MCP manager **静默覆盖**（manager 对
+    同名是覆盖更新、不抛），违 §10.6「外来同名硬抛」铁律。三注入回调应「齐备或全无」，此处强制 register→existing。
+    """
+    if register_server is not None and existing_server_names is None:
+        raise PluginInstallError(
+            "existing_server_names is required when register_server is given "
+            "(else the MCP name-conflict gate is silently bypassed; design §10.6)",
+        )
+
+
 # ---------------------------------------------------------------------------
 # install / uninstall / enable / disable
 # ---------------------------------------------------------------------------
@@ -255,7 +272,8 @@ async def install_plugin(
     4. :func:`load_bundled_servers` 全量解析 ``mcp-servers/<n>.json``（任一畸形→抛，注册前）。
     5. **★冲突闸门**：外来同名→:class:`MCPServerNameConflictError`（零变更）；自有同名→幂等放行。
     6-7. 过闸后变更：注册 bundled servers → :func:`stage_marketplace_skills` 注册 skills（复用既有 clone）。
-       任一失败 → 补偿回滚（注销已注册 skills + 移除已注册 servers）→ 上抛，**不写账本**。
+       任一失败 → **精确补偿回滚**（仅注销本次新增的 skill、仅移除本次新增的 server——重装失败不误删此前已有）
+       → 上抛，**不写账本**。
     8. **★最后**写 ``installed_plugins.json``（仅全成功）：scope / installPath / version / commitSha /
        installedAt / lastUpdated / bundledMcpServers。
 
@@ -263,9 +281,11 @@ async def install_plugin(
     :param version: 记录版本覆盖（``--version``）；缺省按 entry > plugin.json > commitSha 解析。v0.2.1 git-ref
         锁版本由 entry source 的 ref 治理（version 仅作记录）。
     :param existing_server_names / register_server / remove_server: MCP 注入回调（``None`` = ledger-only）。
+        **契约**：给了 ``register_server`` 就必须给 ``existing_server_names``（否则冲突闸门被静默旁路，违 §10.6）。
     :return: 写入的 :class:`InstalledPluginRecord`。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
+    _require_existing_names_guard(existing_server_names, register_server)
     source, commit_sha = _resolve_marketplace_source(marketplace, home, env)
 
     catalog_dir = marketplace_skill_dir(home, marketplace)
@@ -298,6 +318,9 @@ async def install_plugin(
     _conflict_check(servers, existing, owned)
 
     # —— 过闸：开始变更，失败补偿回滚 ——
+    # 回滚前快照本 plugin 已活跃的 skill：使补偿只撤销**本次新增**——重装（plugin 已装、skill 已活跃、owned
+    # server 已挂）中途失败时，不误删此前就存在的 skill / 摘除原本工作的 server（精确回滚，避免 live 态破坏）。
+    skills_before = set(_plugin_skill_names(registry, marketplace, plugin))
     registered: list[str] = []
     try:
         if register_server is not None:
@@ -316,11 +339,15 @@ async def install_plugin(
             env=env,
         )
     except Exception:
-        # 回滚（逆序）：注销本 plugin 已注册的 skills + 移除已注册的 servers，再上抛（账本未写）。
+        # 精确回滚（逆序）：仅注销本次新增的 skill（不在 skills_before）、仅移除本次新增的 server（不在 owned，
+        # 即非自有/非重装前已挂）；再上抛（账本未写）。
         for name in _plugin_skill_names(registry, marketplace, plugin):
-            registry.unregister(name)
+            if name not in skills_before:
+                registry.unregister(name)
         if remove_server is not None:
             for sname in registered:
+                if sname in owned:
+                    continue  # 自有 server（重装前已挂）：保留，不误摘
                 try:
                     await remove_server(sname)
                 except Exception as e:  # 回滚 best-effort，不掩盖原异常
@@ -370,6 +397,13 @@ async def uninstall_plugin(
 
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
+
+    .. note::
+       **相对源 plugin**（``source`` 为相对路径）的 ``installPath`` 位于**共享 catalog clone 内**
+       （``<home>/marketplace/<mp>/plugins/<plugin>``），:func:`_safe_rmtree` 删的是该 marketplace 共享 git
+       工作树的子目录——此行为与兄弟 :func:`gc_plugins` 一致（同一 ``_safe_rmtree`` 语义、非本工单新引入）；
+       后续 ``marketplace refresh`` 遇脏树会 fallback 全量重 clone 干净恢复。「仅删外部 ``.plugins/`` 树、跳过
+       catalog 内子树」的行为收敛是 installer + gc 的**跨切 follow-up**（须两处一致，避免与 #62 的 gc 分叉）。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
     installed = load_installed_plugins(home=home, env=env)
@@ -436,6 +470,12 @@ async def disable_plugin(
     ① 写 ``enabledPlugins[id]=false``；② 停并摘除其 bundled MCP server（读物化记录的 ``bundledMcpServers``）；
     ③ 隐藏 skills（:meth:`SkillRegistry.mark_orphan`，**物化层不动**——clone 树 / installed 记录保留，
     :func:`enable_plugin` 廉价复原）。区别于 :func:`uninstall_plugin`：disable 留 installed 记录、可一键回滚。
+
+    ⚠️ **scope 契约**：``scope`` 须与该 plugin 的**安装 scope 一致**（调用方 / #69 CLI 从上下文传）——否则把
+    ``enabledPlugins[id]=false`` 写到错误层，更高优先级层意图未动 → 六层合并后可能仍 enabled、下次 reconcile 复活，
+    而 live 态已摘 server / orphan skill，造成背离。
+    ⚠️ **非原子**：先写 settings 再摘 server / orphan skill；``remove_server`` 抛错会留半态（settings 已 false 但
+    skill 未隐藏）。与 install/enable 的「预检/写在变更前」不对称——靠 reconcile 收敛兜底（#63 文档化边界）。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
     _write_enabled_plugin(plugin_id, False, scope, project_path, env)
@@ -466,8 +506,12 @@ async def enable_plugin(
     ② 写 ``enabledPlugins[id]=true``；③ 复活 skills——re-stage（:func:`stage_marketplace_skills` 的
     :meth:`register_or_update` 把孤儿同名翻 ``orphaned=False``，``refresh=False`` 复用既有 clone）；④ 重挂 servers。
     未安装 → :class:`PluginInstallError`（须先 install）。
+
+    ⚠️ **scope 契约**：同 :func:`disable_plugin`——``scope`` 须与安装 scope 一致（调用方 / #69 从上下文传），否则
+    ``enabledPlugins[id]=true`` 写错层、与 live 态背离。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
+    _require_existing_names_guard(existing_server_names, register_server)
     installed = load_installed_plugins(home=home, env=env)
     records = installed.get("plugins", {}).get(plugin_id)
     if not records:
