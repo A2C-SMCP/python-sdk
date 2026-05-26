@@ -91,12 +91,12 @@ from a2c_smcp.computer.settings.store import (
     update_known_marketplaces,
 )
 
-# 注意 / NB：:mod:`...settings.reconciler` **刻意不在此 re-export**——它依赖
+# 注意 / NB：:mod:`...settings.reconciler` 与 :mod:`...settings.installer` **刻意不在此 re-export**——它们依赖
 # :mod:`...skills.staging`，而 staging 顶层又 import :mod:`...settings.schema`（触发本 __init__）。
-# 若在此急切导入 reconciler 会与 staging 的半初始化态构成循环（`_EXTERNAL_PLUGINS_NS` 未定义）。
-# 消费方请直接 ``from a2c_smcp.computer.settings.reconciler import reconcile`` 等。
-# reconciler is intentionally NOT re-exported here to avoid a circular import with skills.staging;
-# import it directly from its submodule.
+# 若在此急切导入 reconciler/installer 会与 staging 的半初始化态构成循环（`_EXTERNAL_PLUGINS_NS` 未定义）。
+# 消费方请直接 ``from a2c_smcp.computer.settings.reconciler import reconcile`` / ``...installer import install_plugin`` 等。
+# reconciler & installer are intentionally NOT re-exported here to avoid a circular import with skills.staging;
+# import them directly from their submodules.
 
 __all__ = [
     # schema
