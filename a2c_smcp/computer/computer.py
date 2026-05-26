@@ -29,7 +29,7 @@ import asyncio
 import json
 import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -63,15 +63,22 @@ from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.skills import (
+    SOURCE_USER,
+    SkillEventDebouncer,
+    SkillFileWatcher,
     SkillRegistry,
     SkillResourceView,
     ensure_skill_home,
     resolve_skill_view,
     stage_mcp_skills,
+    stage_user_skills,
+    user_dropin_root,
+    workdir_skill_root,
 )
 from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
+from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.logger import get_logger, truncate
 from a2c_smcp.utils.window_uri import is_window_uri
 
@@ -100,6 +107,7 @@ class Computer(BaseComputer[PromptSession]):
         blob_resolvers: dict[str, BlobResolver] | None = None,
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
+        registered_workdirs: Sequence[Path] | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -131,6 +139,11 @@ class Computer(BaseComputer[PromptSession]):
                 ``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills`` 解析链。
                 mcp 源 ``skill://`` 物化落盘于 ``<home>/mcp/<server>/<skill>/``。
                 SKILL Home root override (test/deploy injection); defaults to the env resolution chain.
+            registered_workdirs (Sequence[Path] | None): v0.2.1 已登记工作目录（能力发现层，#60/#67）。
+                user 源 DropIn 跨 ``<home>/user/`` + 各 ``<workdir>/.tfrobot/skills/`` 全局并集就地发现，
+                并被文件 watcher 递归监控；**登记持久化由 CLI 工单维护，本类仅按注入参数消费**（默认空）。
+                Registered workdirs (capability layer): user-source DropIn discovery + file watcher span
+                these in place; persistence of the registration is owned by the CLI, consumed here as-is.
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
@@ -162,6 +175,18 @@ class Computer(BaseComputer[PromptSession]):
         self._skill_home_override: Path | None = skill_home
         self._skill_home: Path | None = None
         self._skills_cache: set[str] = set()
+
+        # v0.2.1 事件触发链（S14，#67，设计 §8）：多源 SKILL 变更 → 去抖器标脏 → 缓存失效 + 单次 emit。
+        # user 源 DropIn 文件 watcher 递归监控 user/ + 各登记 workdir/.tfrobot/skills/，SKILL.md 变更经去抖器汇聚。
+        # The debouncer coalesces multi-source SKILL changes into a single emit; the file watcher feeds user-source changes.
+        self._registered_workdirs: tuple[Path, ...] = tuple(registered_workdirs or ())
+        self._skill_debouncer: SkillEventDebouncer = SkillEventDebouncer(
+            self._emit_update_skills_now,
+            invalidate=self._invalidate_user_skills,
+        )
+        self._skill_watcher: SkillFileWatcher | None = None
+        # 原生 Observer 不支持的 FS（网络挂载 / overlayfs）可经此环境变量切 PollingObserver 兜底。
+        self._skill_watch_polling: bool = env_truthy("A2C_SKILL_WATCH_POLLING")
 
         # v0.2.1 通用二进制传输基础设施 / v0.2.1 generic blob-transfer infrastructure
         # 协议依据 / Protocol: blob-transfer.md；设计 / Design: §4.3 / §4.4
@@ -322,6 +347,17 @@ class Computer(BaseComputer[PromptSession]):
         except Exception as e:  # pragma: no cover — 防御性兜底，正常路径已在内部各自降级
             logger.error(f"SKILL 子系统启动初始化失败（不阻断 Computer 启动）/ SKILL boot init failed (non-blocking): {e}", exc_info=True)
 
+        # v0.2.1 user 源 DropIn 就地发现 + 文件 watcher（S14，#67，设计 §8.3）：启动时全量扫 user 源 →
+        # 注册；启动递归 watcher 监控 user/ + 各登记 workdir/.tfrobot/skills/，SKILL.md 变更经去抖器触发 emit。
+        # 失败隔离：记 ERROR、**不**阻断 Computer 启动。
+        # User-source in-place discovery + file watcher: initial full scan + start recursive watcher (failure-isolated).
+        try:
+            if self._skill_home is not None:
+                await self._invalidate_user_skills()  # 初次全量发现 user 源 / initial full user-source discovery
+                self._start_skill_watcher()
+        except Exception as e:  # pragma: no cover — 防御性兜底
+            logger.error(f"user 源 DropIn 发现 / watcher 启动失败（不阻断启动）/ user DropIn boot failed: {e}", exc_info=True)
+
     def _resolve_skill_home(self) -> Path:
         """解析并创建 SKILL Home（0o700 防御性写）/ Resolve & create SKILL Home。
 
@@ -361,7 +397,7 @@ class Computer(BaseComputer[PromptSession]):
                 logger.debug("Socket.IO 客户端不存在或已释放，忽略资源列表变化上报")
                 return
             await self._on_resource_list_changed_windows(client)
-            await self._on_resource_list_changed_skills(client)
+            await self._on_resource_list_changed_skills()
         elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
             # 资源内容更新按 scheme 分流：window:// → 桌面刷新；skill:// → 重物化并上报 SKILL 更新。
             # Resource content updated, dispatched by scheme: window:// → desktop; skill:// → restage skills.
@@ -377,7 +413,7 @@ class Computer(BaseComputer[PromptSession]):
                 except Exception as e:  # pragma: no cover
                     logger.error(f"上报桌面刷新失败: {e}")
             elif uri_str.startswith(_SKILL_URI_PREFIX):
-                await self._on_skill_resource_updated(client)
+                await self._on_skill_resource_updated()
             else:
                 logger.debug("收到资源更新但非 window/skill scheme，放行 / Non-window/skill resource updated, ignore")
         else:
@@ -417,11 +453,12 @@ class Computer(BaseComputer[PromptSession]):
                 "Resource list changed but WindowURI set unchanged, skip refresh",
             )
 
-    async def _on_resource_list_changed_skills(self, client: "SMCPComputerClient") -> None:
-        """skill:// 集合变化 → 重物化 mcp 源 + 孤儿对账 → ``emit_update_skills``（仿窗口缓存对比）。
+    async def _on_resource_list_changed_skills(self) -> None:
+        """skill:// 集合变化 → 重物化 mcp 源 + 孤儿对账 → 去抖器标脏（仿窗口缓存对比）。
 
-        集合未变化则仅 DEBUG 跳过（设计 §5.1：``_acollect_skill_refs`` 集合相同跳过）。
-        skill:// set changed → restage mcp source + orphan reconcile → emit; unchanged → DEBUG skip.
+        集合未变化则仅 DEBUG 跳过（设计 §5.1：``_acollect_skill_refs`` 集合相同跳过）。变化时重物化 mcp 源
+        并 :meth:`SkillEventDebouncer.mark_dirty`——emit 经去抖器与其它源在 300ms 窗口内合并为一次（设计 §8.1）。
+        skill:// set changed → restage mcp source + orphan reconcile → debouncer.mark_dirty; unchanged → DEBUG skip.
         """
         try:
             new_skills = await self._acollect_skill_refs()
@@ -435,26 +472,25 @@ class Computer(BaseComputer[PromptSession]):
 
         added = len(new_skills - self._skills_cache)
         removed = len(self._skills_cache - new_skills)
-        logger.info(f"skill:// 列表发生变化，重物化并上报 SKILL 更新 | skill:// list changed. added={added}, removed={removed}")
+        logger.info(f"skill:// 列表发生变化，重物化并标脏 SKILL 更新 | skill:// list changed. added={added}, removed={removed}")
         try:
             await self._restage_mcp_skills()
             self._skills_cache = new_skills
-            await client.emit_update_skills()
+            self._skill_debouncer.mark_dirty()
         except Exception as e:  # pragma: no cover
-            logger.error(f"SKILL 重物化/上报失败: {e}", exc_info=True)
+            logger.error(f"SKILL 重物化/标脏失败: {e}", exc_info=True)
 
-    async def _on_skill_resource_updated(self, client: "SMCPComputerClient") -> None:
-        """skill:// 资源内容更新 → 重物化 + 上报（不比较集合，降低延迟，仿 window ResourceUpdated）。
+    async def _on_skill_resource_updated(self) -> None:
+        """skill:// 资源内容更新 → 重物化 + 去抖器标脏（不比较集合，降低延迟，仿 window ResourceUpdated）。
 
         单 SKILL 增量物化的 server 归属无法仅从 URI 推断，故走全量重物化（正确优先；增量为后续优化）。
-        skill:// content updated → restage + emit (no set compare, lower latency). Full restage for
-        simplicity since per-skill server attribution isn't derivable from the URI alone.
+        skill:// content updated → restage + debouncer.mark_dirty (no set compare, lower latency).
         """
         try:
             await self._restage_mcp_skills()
-            await client.emit_update_skills()
+            self._skill_debouncer.mark_dirty()
         except Exception as e:  # pragma: no cover
-            logger.error(f"SKILL 内容更新重物化/上报失败: {e}", exc_info=True)
+            logger.error(f"SKILL 内容更新重物化/标脏失败: {e}", exc_info=True)
 
     async def _acollect_window_uris(self) -> set[str]:
         """
@@ -503,23 +539,98 @@ class Computer(BaseComputer[PromptSession]):
             return []
         registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, server_name=server_name)
         if server_name is None:
-            self._reconcile_mcp_orphans(set(registered))
+            self._reconcile_orphans(set(registered), lambda s: s.startswith("mcp:"))
         return registered
 
-    def _reconcile_mcp_orphans(self, present_names: set[str]) -> None:
+    def _reconcile_orphans(self, present_names: set[str], source_pred: Callable[[str], bool]) -> None:
         """
-        全量重物化后孤儿对账 / Orphan reconciliation after a full restage。
+        全量重物化 / 重扫后的孤儿对账（按源谓词限定）/ Orphan reconciliation after a full restage/rescan。
 
-        当前活跃但本轮未出现的 ``mcp:`` 源 SKILL → :meth:`SkillRegistry.mark_orphan`（消失即从
-        ``get_skills`` 排除；恢复由 staging 的 ``register`` 命中孤儿条目自动完成）。**仅**处理 mcp 源，
-        marketplace/user 源（#60/#61）由各自 reconciler 维护，不在此误标孤儿。
-        Only mcp-source skills are reconciled here; marketplace/user sources are owned by #60/#61.
+        当前活跃、``source_pred(source)`` 命中、但本轮 ``present_names`` 未出现的 SKILL →
+        :meth:`SkillRegistry.mark_orphan`（消失即从 ``get_skills`` 排除；恢复由 staging 的 ``register_or_update``
+        命中孤儿条目自动完成）。``source_pred`` 把对账**限定在单一源**——mcp（``startswith("mcp:")``）/ user
+        （``== SOURCE_USER``）/ 后续 marketplace（#61）各自传入谓词，互不误标。
+        ``source_pred`` confines reconciliation to a single source so the others are never mis-orphaned.
         """
         for ref in self._skill_registry.active_refs():
             source = ref.get("source", "") or ""
             name = ref.get("name", "") or ""
-            if name and name not in present_names and source.startswith("mcp:"):
+            if name and name not in present_names and source_pred(source):
                 self._skill_registry.mark_orphan(name)
+
+    # ── v0.2.1 事件触发链：去抖结算 + user 源 watcher（S14，#67）────────────────
+    async def _emit_update_skills_now(self) -> None:
+        """
+        去抖器结算末端：向信令服务器推送 ``server:update_skills`` / Debouncer settlement sink。
+
+        无 Socket.IO 客户端 / 未入房间 → no-op（emit 的 office_id 守卫在 client 侧）。该协程是
+        :class:`SkillEventDebouncer` 的 ``on_emit``，**不**应被事件处理器裸调（一律经去抖器 :meth:`mark_dirty`）。
+        """
+        client = self.socketio_client
+        if client is None:
+            logger.debug("Socket.IO 客户端不存在或已释放，跳过 SKILL 更新上报 / no client, skip update_skills")
+            return
+        await client.emit_update_skills()
+
+    async def _invalidate_user_skills(self) -> None:
+        """
+        缓存失效（文件源重扫）：就地重扫 user 源 DropIn 并对账孤儿 / Invalidate by rescanning user-source DropIn。
+
+        设计 §8.1「缓存失效」对**文件源**的落实——watcher/CLI 标脏后、emit 前重扫 ``<home>/user/`` +
+        各登记 ``<workdir>/.tfrobot/skills/``（``stage_user_skills`` 幂等 ``register_or_update``），并把本轮
+        未发现的 user 源 SKILL 标孤儿（磁盘删除即从 ``get_skills`` 排除）。mcp 源由其 ``ResourceListChanged``
+        处理器即时重物化，**不**在此重复。SKILL Home 未就绪 → no-op。
+
+        **同步执行、不卸载线程池**：:class:`SkillRegistry` 按设计为单事件循环线程访问、无锁；``stage_user_skills``
+        会写 Registry，若经 ``asyncio.to_thread`` 在 worker 线程改 ``_entries``，将与循环线程的 ``active_refs``
+        迭代（``client:get_skills``）/ mcp 重物化产生数据竞争（``dict changed size during iteration`` / 撕裂写）。
+        user DropIn 扫描仅遍历少量目录、读少量 ``SKILL.md``（亚毫秒~低毫秒），同步执行不构成有意义阻塞，
+        并守住 Registry 单线程不变量。Run synchronously on the loop thread to preserve the Registry's
+        single-thread (lock-free) invariant; the user-DropIn scan is tiny and does not meaningfully block.
+        """
+        if self._skill_home is None:
+            return
+        try:
+            discovered = stage_user_skills(self._skill_registry, self._skill_home, self._registered_workdirs)
+            self._reconcile_orphans(set(discovered), lambda s: s == SOURCE_USER)
+        except Exception as e:  # pragma: no cover — 防御性兜底（staging 内部已各自降级）
+            logger.error(f"user 源重扫 / 对账失败 / user-source rescan failed: {e}", exc_info=True)
+
+    def _start_skill_watcher(self) -> None:
+        """
+        启动 user 源 DropIn 文件 watcher / Start the user-source DropIn file watcher。
+
+        监控根 = ``<home>/user/`` + 各登记 ``<workdir>/.tfrobot/skills/``（递归、过滤 ``SKILL.md``，**不**监
+        marketplace clone 树）。watchdog 回调在独立线程触发 → 经 ``loop.call_soon_threadsafe`` marshal 回事件
+        循环线程调去抖器 :meth:`mark_dirty`。已有 watcher → 先停。SKILL Home 未就绪 → no-op。
+        """
+        if self._skill_home is None:
+            return
+        if self._skill_watcher is not None:
+            self._skill_watcher.stop()
+        loop = asyncio.get_running_loop()
+        debouncer = self._skill_debouncer
+
+        def _marshal() -> None:
+            try:
+                loop.call_soon_threadsafe(debouncer.mark_dirty)
+            except RuntimeError:  # pragma: no cover — 事件循环已关闭（停机竞态）/ loop closed during shutdown
+                pass
+
+        watcher = SkillFileWatcher(_marshal, use_polling=self._skill_watch_polling)
+        roots = [user_dropin_root(self._skill_home), *(workdir_skill_root(wd) for wd in self._registered_workdirs)]
+        watcher.watch(roots)
+        self._skill_watcher = watcher
+
+    def mark_skill_internal_write(self, path: str | Path) -> None:
+        """
+        给 SKILL 文件 watcher 打内部写标记 / Mark an internal write for the SKILL file watcher。
+
+        供 CLI / SDK 在**写入被监控的 user 源 DropIn 路径**后调用，避免自写触发 watcher 重载循环（对标 CC
+        ``markInternalWrite``）。watcher 未启动 → no-op。
+        """
+        if self._skill_watcher is not None:
+            self._skill_watcher.mark_internal_write(path)
 
     async def _arender_and_validate_server(
         self,
@@ -742,7 +853,14 @@ class Computer(BaseComputer[PromptSession]):
         """
         关闭计算机，关闭 MCP 服务器管理器。
         Shutdown the computer and close the MCP server manager.
+
+        v0.2.1（#67）：先停 user 源文件 watcher（不再产生新事件），再关去抖器（丢弃挂起 emit），最后关
+        MCP 管理器。Stop the file watcher, close the debouncer (drop pending emit), then the MCP manager.
         """
+        if self._skill_watcher is not None:
+            self._skill_watcher.stop()
+            self._skill_watcher = None
+        await self._skill_debouncer.aclose()
         if self.mcp_manager:
             await self.mcp_manager.aclose()
         self.mcp_manager = None

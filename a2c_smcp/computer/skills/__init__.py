@@ -17,12 +17,18 @@ Mirrors Claude Code marketplace local SKILL management. Landed modules:
 - :mod:`a2c_smcp.computer.skills.staging`  —— 多 source 物化（mcp 源 + manager.list_skill_resources）（S6，#59）
 - :mod:`a2c_smcp.computer.skills.sandbox`  —— 包根内 `safe_join`+`realpath` 沙箱 + `.skillenv` forbidden + name 寻址防越权（S2，#55）
 - :mod:`a2c_smcp.computer.skills.resource` —— 沙箱解析 → 消费字节视图（mint/serve 字节基准一致：sha256/total_size）（S13，#66）
+- :mod:`a2c_smcp.computer.skills.debouncer`—— 缓存失效 + 300ms debounce + 单次 emit（事件触发链，S14，#67）
+- :mod:`a2c_smcp.computer.skills.watcher`  —— user 源 DropIn 文件 watcher（watchdog 递归监 SKILL.md + markInternalWrite）（S14，#67）
 
 协议依据 / Protocol: a2c-smcp-protocol docs/specification/skill.md §1 / §4 / §6 / §8 / §9.2。
 """
 
 from __future__ import annotations
 
+from a2c_smcp.computer.skills.debouncer import (
+    DEFAULT_DEBOUNCE_MS,
+    SkillEventDebouncer,
+)
 from a2c_smcp.computer.skills.home import (
     SKILL_HOME_ENV,
     SKILL_HOME_MODE,
@@ -71,8 +77,17 @@ from a2c_smcp.computer.skills.staging import (
     stage_user_skills,
     strip_skill_frontmatter,
 )
+from a2c_smcp.computer.skills.watcher import (
+    DEFAULT_INTERNAL_WRITE_TTL_S,
+    SkillFileWatcher,
+)
 
 __all__ = [
+    # debouncer / watcher（事件触发链：缓存失效 + 300ms debounce + 文件监控）
+    "DEFAULT_DEBOUNCE_MS",
+    "DEFAULT_INTERNAL_WRITE_TTL_S",
+    "SkillEventDebouncer",
+    "SkillFileWatcher",
     # home
     "SKILL_HOME_ENV",
     "SKILL_HOME_MODE",
