@@ -22,6 +22,9 @@ from rich.panel import Panel
 
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.settings.store import load_installed_plugins
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _installed_plugin_count(home: Path | None, env: Mapping[str, str] | None) -> int:
@@ -29,7 +32,8 @@ def _installed_plugin_count(home: Path | None, env: Mapping[str, str] | None) ->
         return 0
     try:
         return len(load_installed_plugins(home, env).get("plugins") or {})
-    except Exception:  # banner 不应因物化读失败而打断启动 / never break boot on store read failure
+    except Exception as e:  # banner 不应因物化读失败而打断启动；记 DEBUG 便于排障（含编程错）/ never break boot
+        logger.debug("banner: installed-plugin count failed (%s), treating as 0", e)
         return 0
 
 

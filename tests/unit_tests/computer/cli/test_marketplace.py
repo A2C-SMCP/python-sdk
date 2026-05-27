@@ -28,10 +28,13 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.cli.commands.marketplace import (
+    _load_trusted,
+    _record_trust,
     default_marketplace_name,
     marketplace_add,
     marketplace_info,
     marketplace_list,
+    marketplace_refresh,
     marketplace_remove,
     marketplace_set,
     normalize_marketplace_url,
@@ -177,13 +180,15 @@ async def test_add_name_conflict_errors(tmp_path: Path) -> None:
 
 @requires_git
 @pytest.mark.asyncio
-async def test_add_already_trusted_skips_prompt(tmp_path: Path) -> None:
-    """首个 add 以 --trust 落 trustedMarketplaces；同 url 再 add（另名）无 confirm 也直通。"""
+async def test_add_name_already_trusted_skips_prompt(tmp_path: Path) -> None:
+    """name 已在 trustedMarketplaces（如经 settings/policy 预信任）→ add 该 name 无 confirm 也直通（按 name 判定）。"""
     bare = _make_bare(tmp_path, "acme", _marketplace_files())
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
-    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=True) == 0
-    # 同 url、不同 name、confirm=None、trust=False → 因 url 已 trusted 而直通
-    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme-two", trust=False, confirm=None) == 0
+    _record_trust("acme", env)  # 预信任 name=acme（非 URL）
+    # name=acme 未在 known_marketplaces，但已 trusted → confirm=None、trust=False 直通
+    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=False, confirm=None) == 0
+    # 信任键空间是 name：另一个未信任的 name 仍需 confirm（缺则退出码 1）
+    assert await marketplace_add(reg, home, env, f"file://{bare}", name="other", trust=False, confirm=None) == 1
 
 
 # ── list / info / set / remove ───────────────────────────────────────────────
@@ -224,3 +229,69 @@ async def test_json_output_shape(tmp_path: Path, capsys: pytest.CaptureFixture[s
     out = capsys.readouterr().out
     data = json.loads(out)
     assert isinstance(data, list) and data[0]["name"] == "acme" and data[0]["trusted"] is True
+
+
+# ── #6 trust 撤销 / revoke trust on remove ────────────────────────────────────
+@requires_git
+@pytest.mark.asyncio
+async def test_remove_revokes_trust(tmp_path: Path) -> None:
+    bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=True)
+    assert "acme" in _load_trusted(env)
+    await marketplace_remove(reg, home, env, "acme", confirm=_yes)
+    assert "acme" not in _load_trusted(env)  # remove 撤销信任，避免只增不减
+
+
+# ── #2 no_clone 仅注册意图 / no_clone registers intent only ───────────────────
+@pytest.mark.asyncio
+async def test_no_clone_registers_intent(tmp_path: Path) -> None:
+    """no_clone=True → 记 known_marketplaces（installLocation 空）但不 clone/stage skill。无需 git。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    code = await marketplace_add(reg, home, env, "https://github.com/team/acme.git", name="acme", trust=True, no_clone=True)
+    assert code == 0
+    mps = load_known_marketplaces(home, env).get("marketplaces") or {}
+    assert "acme" in mps and mps["acme"].get("installLocation") == ""
+    assert reg.active_refs() == []  # 未 clone → 无 skill 注册
+
+
+# ── #2 refresh 三态 / refresh updated|unchanged|missing ───────────────────────
+def _commit_push_skill(work: Path, skill: str) -> None:
+    """向 work 工作仓加一个 skill 并 push 到 origin(bare)（供 refresh 拉取，造 updated 态）。"""
+    _write(work, {f"plugins/audit/skills/{skill}/SKILL.md": _skill_md(skill)})
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", f"add {skill}")
+    _git(work, "push", "-q", "origin", "main")
+
+
+@requires_git
+@pytest.mark.asyncio
+async def test_refresh_states(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # work + bare（work origin=bare，便于 push 造 updated 态）
+    work = tmp_path / "acme-work"
+    work.mkdir(parents=True, exist_ok=True)
+    _git(work, "init", "-q", "-b", "main")
+    _write(work, _marketplace_files())
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init")
+    bare = tmp_path / "acme.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+    _git(work, "remote", "add", "origin", str(bare))
+
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=True)
+    capsys.readouterr()  # 清空 add 的成功行，避免污染后续 json 读取
+
+    # unchanged：add 后立即 refresh，sha 未变
+    await marketplace_refresh(reg, home, env, "all", json_output=True)
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "unchanged"
+
+    # updated：push 新 skill 后 refresh 拉取
+    _commit_push_skill(work, "newskill")
+    await marketplace_refresh(reg, home, env, "all", json_output=True)
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "updated"
+    assert "audit:newskill" in {str(r.get("name")) for r in reg.active_refs()}
+
+    # missing：未知 name
+    await marketplace_refresh(reg, home, env, "ghost", json_output=True)
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "missing"

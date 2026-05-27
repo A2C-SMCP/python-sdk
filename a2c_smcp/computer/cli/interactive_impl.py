@@ -70,7 +70,9 @@ async def interactive_loop(
             "[yellow]检测到控制台可能不支持 ANSI 颜色。若在 PyCharm 中运行，请在 Run/Debug 配置中启用 'Emulate terminal in "
             "output console'；或者使用 --no-color 关闭彩色输出。[/yellow]",
         )
-    # zero-state 引导 banner（§10.1）；未启动时 _skill_home 为 None → 物化计数按 0 处理 / startup banner。
+    # zero-state 引导 banner（§10.1）。刻意读裸 ``_skill_home``（可能为 None）而非公开 ``skill_home`` property：
+    # 后者会 ensure_skill_home() 强制解析并创建目录，而 banner 仅需"未启动=None→物化计数按 0"语义，不应在
+    # 此处产生副作用（尤其未经 boot_up 的单测路径）。/ read raw _skill_home to avoid forcing resolution.
     render_banner(comp, comp._skill_home, os.environ)
 
     while True:

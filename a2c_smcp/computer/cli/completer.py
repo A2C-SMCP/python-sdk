@@ -24,6 +24,9 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
 from a2c_smcp.computer.cli.help import FLAGS, ROOT_WORDS, SUBCOMMANDS
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 # 触发动态名补全的 (namespace, subcommand) / commands whose positional arg is a dynamic name。
 _DYNAMIC_MARKETPLACE = {("marketplace", s) for s in ("info", "remove", "refresh", "set")}
@@ -69,7 +72,8 @@ class A2CCompleter(Completer):
                 return list((load_known_marketplaces(self._comp.skill_home, os.environ).get("marketplaces") or {}).keys())
             if (ns, sub) in _DYNAMIC_SKILL:
                 return [str(r.get("name")) for r in self._comp.get_skills() if r.get("name")]
-        except Exception:  # 动态取名失败不应打断补全 / never break completion on lookup failure
+        except Exception as e:  # 动态取名失败不应打断补全；记 DEBUG 便于排障（含编程错）/ never break completion
+            logger.debug("completer: dynamic-name lookup for (%s %s) failed (%s)", ns, sub, e)
             return []
         return []  # plugin / settings 动态名 → #69
 

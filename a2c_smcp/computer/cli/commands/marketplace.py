@@ -9,8 +9,9 @@
 
 设计依据 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §4.2 / §10.4 / §10.5（S15，#68）。
 
-handler 取**显式资源**（``registry`` / ``home`` / ``env``）+ flags，返回退出码（0 成功 / 1 用户错 / 2 网络错 /
-3 内部错，§4.6），便于隔离单测。包裹既有后端：克隆/对账 :func:`stage_marketplace_skills`、物化读写
+handler 取**显式资源**（``registry`` / ``home`` / ``env``）+ flags，返回退出码（0 成功 / 1 用户错 / 2 网络错；
+§4.6 另定义 3=内部错，本层暂不显式产出——内部异常由 Typer 顶层处理），便于隔离单测。包裹既有后端：克隆/对账
+:func:`stage_marketplace_skills`、物化读写
 :func:`load_known_marketplaces` 等、卸载级联 :func:`uninstall_plugin` + :func:`prune_marketplaces`。
 Trust（§10.5）首见经 ``confirm`` 回调（REPL=session y/N；Typer 非交互无 confirm 且无 ``--trust`` → 退出码 1），
 批准后持久化到 user scope ``trustedMarketplaces``（CC 模型，§16：``known_marketplaces.json`` **不**带 trusted 字段）。
@@ -106,19 +107,31 @@ def default_marketplace_name(url: str) -> str | None:
 
 
 # ── trust 持久化（user scope settings.json）/ trust persistence ────────────────
+# 键空间 = marketplace **name**（设计 §5.3.1 规范表：trustedMarketplaces 元素=name，与 blockedMarketplaces
+# 同键空间、line 458 blocked 优先可比；#80 strict/白名单按 name 读）。**不**用 URL，避免 #80 落地时键型不一致 +
+# 已写入 user settings 的迁移成本。
 def _load_trusted(env: Mapping[str, str] | None) -> set[str]:
     existing, _errors = load_settings_file(user_settings_path(env), SettingsScope.USER)
-    return {u for u in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(u, str)}
+    return {n for n in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(n, str)}
 
 
-def _record_trust(url: str, env: Mapping[str, str] | None) -> None:
-    """把 ``url`` 追加进 user ``settings.json`` 的 ``trustedMarketplaces``（持锁原子 RMW + dedup）/ Record trust。"""
+def _record_trust(name: str, env: Mapping[str, str] | None) -> None:
+    """把 marketplace ``name`` 追加进 user ``settings.json`` 的 ``trustedMarketplaces``（持锁原子 RMW + dedup）。"""
     path = user_settings_path(env)
     with file_lock(path):
         existing, _errors = load_settings_file(path, SettingsScope.USER)
-        current = [u for u in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(u, str)]
-        if url not in current:
-            current.append(url)
+        current = [n for n in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(n, str)]
+        if name not in current:
+            current.append(name)
+        atomic_write_json(path, apply_write(existing, {FIELD_TRUSTED_MARKETPLACES: current}))
+
+
+def _revoke_trust(name: str, env: Mapping[str, str] | None) -> None:
+    """从 user ``settings.json`` 的 ``trustedMarketplaces`` 移除 marketplace ``name``（remove 时调，避免只增不减）。"""
+    path = user_settings_path(env)
+    with file_lock(path):
+        existing, _errors = load_settings_file(path, SettingsScope.USER)
+        current = [n for n in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(n, str) and n != name]
         atomic_write_json(path, apply_write(existing, {FIELD_TRUSTED_MARKETPLACES: current}))
 
 
@@ -147,13 +160,14 @@ async def marketplace_add(
     if mp_name in _marketplaces(home, env):
         return _err(f"marketplace name conflict: {mp_name!r} already exists", json_output=json_output)
 
-    # trust 门：已信任 / --trust → 直通；否则 confirm 回调（缺回调=非交互且无 --trust）→ 报错退出。
-    if not trust and url not in _load_trusted(env):
+    # trust 门：name 已信任 / --trust → 直通；否则 confirm 回调（缺回调=非交互且无 --trust）→ 报错退出。
+    # 门控/落盘按 **name**（§5.3.1），prompt 仍展示 url 供用户判断来源。
+    if not trust and mp_name not in _load_trusted(env):
         if confirm is None:
-            return _err(f"untrusted marketplace {url!r}; pass --trust to confirm non-interactively", json_output=json_output)
+            return _err(f"untrusted marketplace {mp_name!r} ({url}); pass --trust to confirm non-interactively", json_output=json_output)
         if not await confirm(url):
             return _err("aborted by user (untrusted)", json_output=json_output)
-    _record_trust(url, env)
+    _record_trust(mp_name, env)
 
     if no_clone:
         # 仅注册意图（不推荐，§4.2 debug 用）：记 known_marketplaces 但不 clone/stage。
@@ -192,7 +206,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
                 {
                     "name": nm,
                     "url": _source_url(rec),
-                    "trusted": _source_url(rec) in trusted,
+                    "trusted": nm in trusted,  # 信任按 name 判定（§5.3.1）
                     "autoUpdate": bool(rec.get("autoUpdate", False)),
                     "lastUpdated": rec.get("lastUpdated"),
                     "commitSha": rec.get("commitSha"),
@@ -214,7 +228,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         table.add_row(
             nm,
             url,
-            "✓" if url in trusted else "—",
+            "✓" if nm in trusted else "—",
             "on" if rec.get("autoUpdate") else "off",
             str(rec.get("lastUpdated") or "—"),
             sha[:10] if sha else "—",
@@ -238,7 +252,7 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
         "installLocation": rec.get("installLocation"),
         "commitSha": rec.get("commitSha"),
         "autoUpdate": bool(rec.get("autoUpdate", False)),
-        "trusted": url in _load_trusted(env),
+        "trusted": name in _load_trusted(env),  # 信任按 name 判定（§5.3.1）
         "lastUpdated": rec.get("lastUpdated"),
         "installedPlugins": plugins,
     }
@@ -283,6 +297,7 @@ async def marketplace_remove(
                 uninstalled.append(pid)
 
     pruned = prune_marketplaces([name], registry, home, env=env)
+    _revoke_trust(name, env)  # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）
     if json_output:
         console.print_json(data={"removed": name, "pruned": pruned, "uninstalledPlugins": uninstalled, "keptPlugins": keep_plugins})
         return EXIT_OK
@@ -370,12 +385,13 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             console.print("[yellow]usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone][/yellow]")
             return
         name = _flag_value(args, "--name")
-        await marketplace_add(
+        code = await marketplace_add(
             registry, home, env, pos[0],
             name=name, trust="--trust" in args, auto_update="--auto-update" in args,
             no_clone="--no-clone" in args, confirm=_confirm, json_output=json_output,
         )
-        comp.mark_skills_dirty()
+        if code == EXIT_OK:  # 仅成功才标脏，避免失败/拒绝触发无意义 emit
+            comp.mark_skills_dirty()
     elif sub == "list":
         marketplace_list(home, env, json_output=json_output)
     elif sub == "info":
@@ -389,16 +405,18 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             return
         from a2c_smcp.computer.cli.commands import build_mcp_callbacks
 
-        await marketplace_remove(
+        code = await marketplace_remove(
             registry, home, env, pos[0],
             keep_plugins="--keep-plugins" in args, confirm=_confirm,
             mcp_cbs=build_mcp_callbacks(comp), json_output=json_output,
         )
-        comp.mark_skills_dirty()
+        if code == EXIT_OK:
+            comp.mark_skills_dirty()
     elif sub == "refresh":
         target = pos[0] if pos else "all"
-        await marketplace_refresh(registry, home, env, target, json_output=json_output)
-        comp.mark_skills_dirty()
+        code = await marketplace_refresh(registry, home, env, target, json_output=json_output)
+        if code == EXIT_OK:
+            comp.mark_skills_dirty()
     elif sub == "set":
         # marketplace set <name> auto-update=<bool>
         if len(pos) < 2 or "=" not in pos[1]:
