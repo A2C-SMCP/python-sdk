@@ -294,71 +294,28 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             ),
         )
 
-    def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet:
+    def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet | ErrorPayload:
         """
-        同步：获取指定Computer的工具列表（使用 Socket.IO 的 call 等待客户端返回）
-        Sync: get tool list of specified Computer using Socket.IO call
+        同步：获取指定 Computer 的工具列表（``client:get_tools``）/ Sync: get tool list of specified Computer.
+
+        经 :meth:`_relay_client_call` 统一 isolation + flat ErrorPayload 透传（v0.2.2：所有 ``client:*``
+        ack 统一 flat ErrorPayload，旧路由非豁免）。
         """
-        computer_name = data["computer"]
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_sid = self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
-        session = self.get_session(computer_sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持Computer获取工具列表")
-
-        agent_session = self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-        if computer_office_id != agent_office_id:
-            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的工具列表")
-
-        client_response = self.call(
-            GET_TOOLS_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
+        return cast(
+            "GetToolsRet | ErrorPayload",
+            self._relay_client_call(sid, data, GET_TOOLS_EVENT, TypeAdapter(GetToolsRet)),
         )
 
-        return TypeAdapter(GetToolsRet).validate_python(client_response)
-
-    def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet:
+    def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet | ErrorPayload:
         """
-        同步：获取指定Computer的桌面信息（窗口组织后的视图）
-        Sync: get desktop view from specified Computer
+        同步：获取指定 Computer 的桌面视图（``client:get_desktop``）/ Sync: get desktop view from Computer.
 
-        要求：Agent 与 Computer 需在同一 office / Requirement: Agent and Computer must be in the same office
+        要求 Agent 与 Computer 同一 office；经 :meth:`_relay_client_call` 统一 isolation + flat ErrorPayload 透传。
         """
-        computer_name = data["computer"]
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_sid = self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
-        session = self.get_session(computer_sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持Computer获取桌面")
-
-        agent_session = self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-        if computer_office_id != agent_office_id:
-            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的桌面")
-
-        client_response = self.call(
-            GET_DESKTOP_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
+        return cast(
+            "GetDeskTopRet | ErrorPayload",
+            self._relay_client_call(sid, data, GET_DESKTOP_EVENT, TypeAdapter(GetDeskTopRet)),
         )
-
-        return TypeAdapter(GetDeskTopRet).validate_python(client_response)
 
     def _relay_client_call(
         self,
@@ -384,6 +341,10 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             raise SMCPNamespaceError(f"目前仅支持 Computer 响应 {event} / target SID is not a Computer")
 
         agent_session = self.get_session(sid)
+        if agent_session is None:
+            # 发起者（Agent）飞行中断连：会话已不存在。显式 raise 替代 None.get 的 AttributeError
+            # （对齐 #31）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            raise SMCPNamespaceError(f"发起者会话不存在（可能已断连）：{event} / originator session gone")
         if session.get("office_id") != agent_session.get("office_id"):
             raise SMCPNamespaceError(
                 f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
@@ -492,6 +453,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
 
         # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission: ensure Agent is in the requested room
         agent_session = self.get_session(sid)
+        if agent_session is None:
+            # 发起者飞行中断连防御（同 _relay_client_call）：显式 raise 替代 None.get 的 AttributeError。
+            raise SMCPNamespaceError("发起者会话不存在（可能已断连）：server:list_room / originator session gone")
         agent_office_id = agent_session.get("office_id")
 
         if agent_office_id != office_id:

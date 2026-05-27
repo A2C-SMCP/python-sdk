@@ -548,7 +548,8 @@ async def test_get_tools_cross_office_rejected(socketio_server, basic_server_por
     agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-A", "robot-neg-1")
     await _connect_join(computer, basic_server_port, "computer", "office-neg-B", "comp-neg-1")
 
-    with pytest.raises(SMCPNamespaceError, match="自己房间内Computer的工具列表"):
+    # v0.2.2 #46 起，client:get_tools 收编进 _relay_client_call，跨房间错误文案统一为通用 "跨房间" 模板。
+    with pytest.raises(SMCPNamespaceError, match="跨房间"):
         await socketio_server.on_client_get_tools(
             agent_sid,
             {"computer": "comp-neg-1", "agent": "robot-neg-1", "req_id": "neg-r1"},

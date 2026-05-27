@@ -83,7 +83,7 @@ class TestAsyncGetSkills:
     async def test_returns_typed_ret(self, async_client: AsyncSMCPAgentClient) -> None:
         with patch.object(async_client, "call", new=AsyncMock()) as mock_call:
             mock_call.return_value = {
-                "skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}],
+                "skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}],
                 "req_id": "should-be-overridden",
             }
             # 用 monkeypatch + 真实 req_id 比对：覆写 mock 返回 req_id 与生成的一致
@@ -95,7 +95,7 @@ class TestAsyncGetSkills:
 
             mock_call.side_effect = capture
             ret = await async_client.get_skills("comp-1")
-            assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+            assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}]
             _ = real_call
 
     @pytest.mark.asyncio
@@ -243,7 +243,7 @@ class TestSkillsUpdatedAutoRefresh:
     @pytest.mark.asyncio
     async def test_async_dispatches_on_skills_received(self, async_client: AsyncSMCPAgentClient) -> None:
         """成功重拉后回调 on_skills_received，参数透传 / Hook fires with passthrough args (v0.2.1+)."""
-        skills = [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        skills = [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}]
         hook = AsyncMock()
         async_client.event_handler = hook  # type: ignore[assignment]
         with patch.object(async_client, "get_skills", new=AsyncMock(return_value={"skills": skills, "req_id": "r"})):
@@ -436,7 +436,7 @@ class TestSyncMirror:
     def test_sync_dispatches_on_skills_received(self, sync_client: SMCPAgentClient) -> None:
         """sync 镜像：成功重拉后回调 on_skills_received（v0.2.1+）.
         Sync mirror: hook fires with passthrough args (v0.2.1+)."""
-        skills = [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        skills = [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}]
         hook = MagicMock()
         sync_client.event_handler = hook  # type: ignore[assignment]
         with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": skills, "req_id": "r"})):

@@ -123,7 +123,9 @@ class _DummyInteractive:
     last_comp: Any | None = None
 
     @classmethod
-    async def coro(cls, comp: Any, init_client: Any | None = None) -> None:  # noqa: ARG003
+    async def coro(cls, comp: Any, init_client: Any | None = None, **kwargs: Any) -> None:  # noqa: ARG003
+        # **kwargs 吸收 CLI 演进新增的关键字参数（如 #69 的 approve_all_mcp）；本替身仅捕获调用，不断言其值。
+        # **kwargs absorbs CLI-evolving keyword args (e.g. #69's approve_all_mcp); this double only captures the call.
         cls.called = True
         cls.last_comp = comp
 
@@ -140,6 +142,7 @@ class _FakeComputer:
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
+        registered_workdirs: Any | None = None,  # #69/S16：CLI --add-dir → registered_workdirs，替身需接受
     ) -> None:
         self.init_args = {
             "name": name,
@@ -149,6 +152,7 @@ class _FakeComputer:
             "auto_reconnect": auto_reconnect,
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
+            "registered_workdirs": registered_workdirs,
         }
 
     async def __aenter__(self) -> _FakeComputer:
