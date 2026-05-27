@@ -26,15 +26,19 @@ import pytest
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
+    check_strict_conflict,
+    entry_is_strict,
     enumerate_bundled_server_files,
     find_plugin_entry,
     iter_plugin_entries,
     load_bundled_servers,
+    manifest_declared_components,
     parse_bundled_server,
     plugin_root_base,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
+    resolve_skill_override_dirs,
 )
 
 
@@ -194,3 +198,82 @@ def test_load_bundled_servers_any_malformed_raises(tmp_path: Path) -> None:
 
 def test_load_bundled_servers_empty(tmp_path: Path) -> None:
     assert load_bundled_servers(tmp_path) == []
+
+
+# ── strict mode + entry.skills override（§4.3/§4.4，loading-behavior §1/§4/§6；#80）─────────────
+def test_entry_is_strict_default_and_explicit() -> None:
+    assert entry_is_strict({}) is True  # 缺省 → True（默认更宽松、容错）
+    assert entry_is_strict({"strict": False}) is False
+    assert entry_is_strict({"strict": True}) is True
+    assert entry_is_strict({"strict": "false"}) is True  # 非 bool → 容错 True
+
+
+def test_manifest_declared_components() -> None:
+    # 六字段任一真值即声明；falsy（空 dict/list/None/缺）不算
+    assert manifest_declared_components({}) == []
+    assert manifest_declared_components({"skills": [], "commands": None, "version": "1.0"}) == []
+    assert manifest_declared_components({"skills": ["x"], "mcpServers": {"s": {}}, "version": "1.0"}) == ["skills", "mcpServers"]
+    assert manifest_declared_components({"hooks": "h", "agents": "a", "lspServers": {"l": {}}}) == ["agents", "hooks", "lspServers"]
+
+
+def test_check_strict_conflict_false_with_components_raises() -> None:
+    # strict=false + plugin.json 声明组件 → 拒绝加载（红→绿核心）
+    with pytest.raises(PluginManifestError, match="conflicting manifests"):
+        check_strict_conflict({"strict": False}, {"skills": ["mine"]})
+    with pytest.raises(PluginManifestError, match="conflicting manifests"):
+        check_strict_conflict({"strict": False}, {"commands": "cmds"})  # 即便本 SDK 不消费 commands 仍判冲突
+
+
+def test_check_strict_conflict_false_metadata_only_ok() -> None:
+    # strict=false + plugin.json 仅元数据（无组件）→ 不冲突
+    check_strict_conflict({"strict": False}, {"version": "1.0", "description": "d", "author": {"name": "x"}})
+    check_strict_conflict({"strict": False}, {})  # 缺 plugin.json → {} → 不冲突
+
+
+def test_check_strict_conflict_true_never_conflicts() -> None:
+    # strict=true（默认）恒不冲突：plugin.json 权威 + 条目追加合并
+    check_strict_conflict({}, {"skills": ["mine"], "commands": "c"})
+    check_strict_conflict({"strict": True}, {"mcpServers": {"s": {}}})
+
+
+def test_resolve_skill_override_dirs_entry_string_and_array(tmp_path: Path) -> None:
+    (tmp_path / "extra-skills").mkdir()
+    (tmp_path / "more").mkdir()
+    # entry.skills string
+    assert resolve_skill_override_dirs({"skills": "extra-skills"}, {}, tmp_path, strict=True) == [(tmp_path / "extra-skills").resolve()]
+    # entry.skills array（去重保序）
+    out = resolve_skill_override_dirs({"skills": ["extra-skills", "more", "extra-skills"]}, {}, tmp_path, strict=True)
+    assert out == [(tmp_path / "extra-skills").resolve(), (tmp_path / "more").resolve()]
+
+
+def test_resolve_skill_override_dirs_plugin_json_only_when_strict(tmp_path: Path) -> None:
+    (tmp_path / "pj-skills").mkdir()
+    # strict=true → 取 plugin.json.skills
+    assert resolve_skill_override_dirs({}, {"skills": "pj-skills"}, tmp_path, strict=True) == [(tmp_path / "pj-skills").resolve()]
+    # strict=false → 不取 plugin.json.skills（plugin 组件权威已交 entry；冲突另由 check_strict_conflict 拦）
+    assert resolve_skill_override_dirs({}, {"skills": "pj-skills"}, tmp_path, strict=False) == []
+
+
+def test_resolve_skill_override_dirs_entry_always_taken_regardless_of_strict(tmp_path: Path) -> None:
+    # 契约锁定：entry.skills「恒取」（strict 无关）——strict=false 下 entry.skills 仍解析，仅 plugin.json.skills 被忽略
+    (tmp_path / "entry-skills").mkdir()
+    (tmp_path / "pj-skills").mkdir()
+    out = resolve_skill_override_dirs(
+        {"skills": "entry-skills"},
+        {"skills": "pj-skills"},
+        tmp_path,
+        strict=False,
+    )
+    assert out == [(tmp_path / "entry-skills").resolve()]  # entry 恒取；plugin.json 在 strict=false 下忽略
+
+
+def test_resolve_skill_override_dirs_traversal_and_non_dir_skipped(tmp_path: Path) -> None:
+    (tmp_path / "ok").mkdir()
+    (tmp_path / "afile").write_text("x", encoding="utf-8")
+    out = resolve_skill_override_dirs(
+        {"skills": ["../escape", "ok", "afile", "nonexistent"]},
+        {},
+        tmp_path,
+        strict=True,
+    )
+    assert out == [(tmp_path / "ok").resolve()]  # 越界 ../escape 跳过、非目录 afile 跳过、不存在跳过

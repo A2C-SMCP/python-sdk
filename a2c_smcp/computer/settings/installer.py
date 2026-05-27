@@ -63,6 +63,8 @@ from a2c_smcp.computer.settings.store import (
 )
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import (
+    PluginManifestError,
+    check_strict_conflict,
     find_plugin_entry,
     load_bundled_servers,
     plugin_root_base,
@@ -316,6 +318,14 @@ async def install_plugin(
         timeout=timeout,
         env=env,
     )
+    # plugin.json 读一次复用（冲突检测 + version 解析共用，与 staging._stage_one_plugin 姿态对齐，避免重复读盘）。
+    plugin_manifest = read_plugin_metadata(plugin_root)
+    # strict mode 冲突检测（§4.4，#80）：strict=false + plugin.json 声明组件 → 拒绝加载（**硬错误**）。
+    # 早检——在挂载 server / 注册 skill 前拦截，不依赖 staging 降级，保证原子失败（未挂 server、未注册 skill）。
+    try:
+        check_strict_conflict(entry, plugin_manifest)
+    except PluginManifestError as e:
+        raise PluginInstallError(str(e)) from e
     servers = load_bundled_servers(plugin_root)
 
     # 5：★冲突闸门（零变更）。owned = 自有同名白名单（其上次记录的 bundledMcpServers）。
@@ -367,7 +377,7 @@ async def install_plugin(
 
     # 8：★最后写账本（仅全成功）
     bundled_names = [cfg.name for cfg in servers]
-    resolved_version = version if version else resolve_plugin_version(entry, read_plugin_metadata(plugin_root), version_fallback)
+    resolved_version = version if version else resolve_plugin_version(entry, plugin_manifest, version_fallback)
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     record: InstalledPluginRecord = {"scope": scope, "installPath": str(plugin_root)}
     if project_path:
