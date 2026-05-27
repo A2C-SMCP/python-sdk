@@ -126,6 +126,18 @@ async def test_headless_password_hard_errors_without_persist(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_headless_password_hard_errors_when_keyring_available_but_unseeded(tmp_path: Path) -> None:
+    """keyring 可用但该密钥未播种 + 无 TTY → 仍硬错误（#65 fix-review #1，中间态）/ available-but-unseeded headless hard-errors。"""
+    inputs = [MCPServerPromptStringInput(id="sec", description="d", password=True)]
+    vs = _vstore(tmp_path)
+    # available=True 但 seed 为空（步骤 3 keyring miss）+ session=None + 无 env → 应硬错误，不走 prompt
+    r = InputResolver(inputs, env={}, value_store=vs, secret_store=_Secret(available=True))
+    with pytest.raises(SecretResolutionError):
+        await r.aresolve_by_id("sec", session=None)
+    assert vs.get("sec") is None  # 绝不落明文 / never written to plaintext
+
+
+@pytest.mark.asyncio
 async def test_command_not_persisted(tmp_path: Path, monkeypatch) -> None:
     inputs = [MCPServerCommandInput(id="cmd", description="d", command="echo hi")]
     vs = _vstore(tmp_path)

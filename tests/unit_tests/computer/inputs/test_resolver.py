@@ -36,7 +36,8 @@ class _StubSecretStore:
 @pytest.mark.asyncio
 async def test_resolver_prompt_path(monkeypatch):
     inputs = [MCPServerPromptStringInput(id="p1", description="desc", default="d", password=True, type="promptString")]
-    # 注入可用 secret_store：password 在无 TTY 下若 keyring 不可用会硬错误，这里令其可用以走 prompt 路径
+    # 注入可用 secret_store 以承接 prompt 后的 keyring 持久化；password 在无 TTY 下一律硬错误（#65 fix-review #1），
+    # 故模拟交互（_has_tty→True，保持 session=None）走 prompt 路径
     r = InputResolver(inputs, secret_store=_StubSecretStore(available=True))
 
     async def fake_prompt(message: str, *, password: bool = False, default: str | None = None, session: PromptSession | None = None) -> str:
@@ -49,6 +50,7 @@ async def test_resolver_prompt_path(monkeypatch):
     import a2c_smcp.computer.inputs.resolver as resolver_mod
 
     monkeypatch.setattr(resolver_mod, "ainput_prompt", fake_prompt)
+    monkeypatch.setattr(resolver_mod.InputResolver, "_has_tty", staticmethod(lambda session: True))
 
     v = await r.aresolve_by_id("p1")
     assert v == "typed"

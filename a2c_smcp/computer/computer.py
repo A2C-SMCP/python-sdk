@@ -648,8 +648,12 @@ class Computer(BaseComputer[PromptSession]):
         if not env_file or not isinstance(env_file, str):
             return rendered
         params = rendered.get("server_parameters")
-        if not isinstance(params, dict) or "env" not in params and "command" not in params:
-            # 非 stdio（sse/http 无 env/command）→ 不适用 / not applicable to sse/http
+        if not isinstance(params, dict) or ("env" not in params and "command" not in params):
+            # 非 stdio（sse/http 无 env/command）→ envFile 不适用，记 WARN（已填但被忽略）+ 原样返回。
+            # non-stdio (sse/http) → envFile not applicable; WARN that it is ignored, then passthrough.
+            name = rendered.get("name", "unknown")
+            srv_type = rendered.get("type", "unknown")
+            logger.warning(f"envFile 在非 stdio（{srv_type}）server 上不适用，已忽略: {name} / envFile ignored on non-stdio server")
             return rendered
         file_env = load_env_file(Path(env_file))
         if not file_env:

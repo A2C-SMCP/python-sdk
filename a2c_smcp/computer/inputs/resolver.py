@@ -137,9 +137,11 @@ class InputResolver(BaseInputResolver[PromptSession]):
                 self._cache[resolved_id] = stored
                 return stored
 
-        # 解析链步骤 5：交互 prompt——password 在 headless（无 env+无 keyring+无 TTY）下硬错误，绝不落明文
+        # 解析链步骤 5：交互 prompt——password 在 headless（无 env + 无 TTY）下硬错误，绝不落明文。
+        # keyring 已在步骤 3 穷尽并 miss，无 TTY 时无论 keyring 是否可用都拿不到密钥 → 统一硬错误
+        # （而非落到 prompt 在 headless 抛不透明 OSError / 静默返回 ""）。
         has_tty = self._has_tty(sess)
-        if is_password and not has_tty and not self._secret_store.available:
+        if is_password and not has_tty:
             raise SecretResolutionError(
                 f"secret '{resolved_id}' 无法解析；请设置环境变量 {env_var_name(resolved_id)} 或在 TTY 重试 / "
                 f"cannot resolve secret; set {env_var_name(resolved_id)} or retry in a TTY",

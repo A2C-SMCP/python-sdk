@@ -15,12 +15,28 @@ envFile 加载 + 合并单元测试（v0.2.1 #65，§9.1）/ envFile load + merg
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.inputs.render import load_env_file
+
+
+@pytest.fixture
+def attach_logger_to_caplog(caplog):
+    """让项目 logger "a2c_smcp" 的日志被 caplog 捕获（其禁用了 propagate）/ Capture project logger into caplog。"""
+    logger = logging.getLogger("a2c_smcp")
+    prev_level, prev_prop = logger.level, logger.propagate
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(prev_level)
+        logger.propagate = prev_prop
 
 
 def test_load_env_file_parsing(tmp_path: Path) -> None:
@@ -67,10 +83,13 @@ def test_apply_env_file_no_envfile_passthrough(tmp_path: Path) -> None:
     assert comp._apply_env_file(rendered) == rendered
 
 
-def test_apply_env_file_non_stdio_passthrough(tmp_path: Path) -> None:
+def test_apply_env_file_non_stdio_passthrough_and_warns(tmp_path: Path, caplog, attach_logger_to_caplog) -> None:
+    caplog.set_level("WARNING", logger="a2c_smcp")
     comp = _comp(tmp_path)
     rendered = {"name": "s", "type": "sse", "server_parameters": {"url": "http://x"}, "envFile": str(tmp_path / ".env")}
+    # sse/http 填 envFile → 行为仍 passthrough（原样返回）+ 记一条 WARN（#65 fix-review #4）
     assert comp._apply_env_file(rendered) == rendered
+    assert any("非 stdio" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.asyncio
