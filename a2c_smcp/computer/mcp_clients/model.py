@@ -62,9 +62,19 @@ class BaseMCPServerConfig(BaseModel):
         title="VRL脚本",
         description="用于对工具返回值进行动态转换和格式化的VRL脚本。配置后会在初始化时进行语法检查。",
     )
+    # VS Code 对标的 envFile（v0.2.1 #65，§9.1）：spawn 时从 .env 加载 KEY=VALUE 进 stdio server 的 env，
+    # 显式 env 同名项覆盖 envFile（显式胜）。SDK 加性字段（设计 §1092「待协议追认」），仅 Computer 本地
+    # spawn 消费、不在 client:get_config 展开变量；非 stdio（sse/http 无 env）忽略此字段。
+    # VS Code-parity envFile: at spawn, load KEY=VALUE from .env into a stdio server's env (explicit env wins).
+    env_file: str | None = Field(default=None, alias="envFile", title="环境变量文件", description="VS Code 风格 envFile，spawn 时加载")
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", arbitrary_types_allowed=False, frozen=True)
-    """配置字段在初始化完成后不允许修改"""
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=False,
+        frozen=True,
+        populate_by_name=True,
+    )
+    """配置字段在初始化完成后不允许修改；``populate_by_name`` 令 ``envFile``(alias) 与 ``env_file``(名) 均可填充"""
 
     @field_validator("vrl")
     @classmethod

@@ -16,10 +16,28 @@ from a2c_smcp.computer.mcp_clients.model import (
 )
 
 
+class _StubSecretStore:
+    """可用的内存 secret store stub（避免 headless password 硬错误，#65）/ Available in-memory secret store stub。"""
+
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self._store: dict[str, str] = {}
+
+    def get(self, input_id: str) -> str | None:
+        return self._store.get(input_id)
+
+    def set(self, input_id: str, value: str) -> bool:
+        if not self.available:
+            return False
+        self._store[input_id] = value
+        return True
+
+
 @pytest.mark.asyncio
 async def test_resolver_prompt_path(monkeypatch):
     inputs = [MCPServerPromptStringInput(id="p1", description="desc", default="d", password=True, type="promptString")]
-    r = InputResolver(inputs)
+    # 注入可用 secret_store：password 在无 TTY 下若 keyring 不可用会硬错误，这里令其可用以走 prompt 路径
+    r = InputResolver(inputs, secret_store=_StubSecretStore(available=True))
 
     async def fake_prompt(message: str, *, password: bool = False, default: str | None = None, session: PromptSession | None = None) -> str:
         assert "desc" in message
