@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,9 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 from pydantic import TypeAdapter
 
+from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
+from a2c_smcp.computer.cli.commands import skill as skill_cmd
+from a2c_smcp.computer.cli.completer import A2CCompleter
 from a2c_smcp.computer.cli.interactive_impl import interactive_loop as _interactive_loop_impl
 from a2c_smcp.computer.cli.utils import (
     parse_kv_pairs,
@@ -33,6 +37,8 @@ from a2c_smcp.computer.inputs.resolver import InputResolver
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput as MCPServerInputModel,
 )
+from a2c_smcp.computer.skills.home import ensure_skill_home
+from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.computer.utils import console as console_util
 from a2c_smcp.smcp import SMCP_NAMESPACE
@@ -132,6 +138,7 @@ async def _interactive_loop(comp: Computer, init_client: SMCPComputerClient | No
         patch_stdout_ctx=patch_stdout,
         smcp_client_cls=SMCPComputerClient,
         init_client=init_client,
+        completer=A2CCompleter(comp),
     )
 
 
@@ -284,6 +291,106 @@ def run(
         config=config,
         inputs=inputs,
     )
+
+
+# ---------------------------------------------------------------------------
+# 非交互 Typer 子命令（marketplace / skill，S15 #68）/ Non-interactive Typer subcommands
+# ---------------------------------------------------------------------------
+# 非交互形态不 boot Computer、不连 socket：以 env 解析 SKILL Home + 新建 registry，直接读写物化层 / staging。
+# trust 缺 confirm（confirm=None）→ marketplace add 须显式 --trust，否则退出码 1（§4.6 / §11）。
+marketplace_app = typer.Typer(help="SKILL marketplaces (git sources)")
+skill_app = typer.Typer(help="Skills cross-source query (list / info)")
+
+
+@marketplace_app.command("add")
+def _mp_add(
+    git_url: str = typer.Argument(..., help="git URL 或 owner/repo 简写 / git URL or owner/repo shorthand"),
+    name: str | None = typer.Option(None, "--name", help="marketplace 名（默认从 URL 派生）/ name (derived from URL by default)"),
+    trust: bool = typer.Option(False, "--trust", help="跳过 trust 确认（非交互必需）/ skip trust prompt (required non-interactively)"),
+    auto_update: bool = typer.Option(False, "--auto-update", help="启用 per-source 自动更新 / enable per-source auto-update"),
+    no_clone: bool = typer.Option(False, "--no-clone", help="仅注册意图、不 clone（debug）/ register intent only (debug)"),
+    json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
+) -> None:
+    """添加 marketplace（非交互须 --trust）/ Add a marketplace (requires --trust non-interactively)."""
+    code = asyncio.run(
+        mp_cmd.marketplace_add(
+            SkillRegistry(), ensure_skill_home(), os.environ, git_url,
+            name=name, trust=trust, auto_update=auto_update, no_clone=no_clone, confirm=None, json_output=json_output,
+        ),
+    )
+    raise typer.Exit(code)
+
+
+@marketplace_app.command("list")
+def _mp_list(json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output")) -> None:
+    """列出已知 marketplace / List known marketplaces."""
+    raise typer.Exit(mp_cmd.marketplace_list(ensure_skill_home(), os.environ, json_output=json_output))
+
+
+@marketplace_app.command("info")
+def _mp_info(name: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """marketplace 详情 / Marketplace detail."""
+    raise typer.Exit(mp_cmd.marketplace_info(ensure_skill_home(), os.environ, name, json_output=json_output))
+
+
+@marketplace_app.command("remove")
+def _mp_remove(
+    name: str = typer.Argument(...),
+    keep_plugins: bool = typer.Option(False, "--keep-plugins", help="保留 installed plugin（标记孤儿）/ keep installed plugins (orphaned)"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """移除 marketplace（默认级联卸载其下 plugin）/ Remove a marketplace (cascade by default)."""
+    code = asyncio.run(
+        mp_cmd.marketplace_remove(
+            SkillRegistry(), ensure_skill_home(), os.environ, name,
+            keep_plugins=keep_plugins, confirm=None, mcp_cbs=None, json_output=json_output,
+        ),
+    )
+    raise typer.Exit(code)
+
+
+@marketplace_app.command("refresh")
+def _mp_refresh(
+    target: str = typer.Argument("all", help="marketplace 名或 all / a name or 'all'"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """刷新 marketplace（git pull / 重 clone + 对账）/ Refresh marketplaces."""
+    code = asyncio.run(
+        mp_cmd.marketplace_refresh(SkillRegistry(), ensure_skill_home(), os.environ, target, json_output=json_output),
+    )
+    raise typer.Exit(code)
+
+
+@marketplace_app.command("set")
+def _mp_set(
+    name: str = typer.Argument(...),
+    assignment: str = typer.Argument(..., help="auto-update=<bool>"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """设置 per-source 旗（仅 auto-update=<bool>）/ Set a per-source flag (auto-update only)."""
+    key, _, value = assignment.partition("=")
+    raise typer.Exit(mp_cmd.marketplace_set(ensure_skill_home(), os.environ, name, key, value, json_output=json_output))
+
+
+@skill_app.command("list")
+def _skill_list(
+    source: str | None = typer.Option(None, "--source", help="过滤来源 mp|mcp|user / filter by source"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """跨源列出可见 SKILL（非交互重建 registry；mcp 源需 live 服务器 → REPL）/ List skills (registry rebuilt offline)."""
+    reg = asyncio.run(skill_cmd.rebuild_registry(ensure_skill_home(), os.environ))
+    raise typer.Exit(skill_cmd.skill_list(reg, source=source, json_output=json_output))
+
+
+@skill_app.command("info")
+def _skill_info(name: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """SKILL 详情 / Skill detail."""
+    reg = asyncio.run(skill_cmd.rebuild_registry(ensure_skill_home(), os.environ))
+    raise typer.Exit(skill_cmd.skill_info(reg, name, json_output=json_output))
+
+
+app.add_typer(marketplace_app, name="marketplace")
+app.add_typer(skill_app, name="skill")
 
 
 # 为 console_scripts 兼容提供入口

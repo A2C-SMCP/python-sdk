@@ -13,14 +13,19 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Protocol
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer
 from pydantic import TypeAdapter
-from rich.table import Table
 
+from a2c_smcp.computer.cli.banner import render_banner
+from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
+from a2c_smcp.computer.cli.commands import skill as skill_cmd
+from a2c_smcp.computer.cli.help import render_help
 from a2c_smcp.computer.cli.utils import console, parse_kv_pairs, print_mcp_config, print_status, print_tools
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import MCPServerInput as MCPServerInputModel
@@ -48,10 +53,13 @@ async def interactive_loop(
     patch_stdout_ctx: PatchStdoutCtx,
     smcp_client_cls: type[Any],
     init_client: Any | None = None,
+    completer: Completer | None = None,
 ) -> None:
     """
     中文: 交互循环的可注入实现；从 main.py 传入 PromptSession 工厂、patch_stdout 上下文与 SMCP 客户端类。
     English: DI-friendly interactive loop; main.py passes PromptSession factory, patch_stdout ctx and SMCP client class.
+
+    completer: 可选 Tab 补全器（逐次传入 ``prompt_async``，trust y/N 等子提示不带补全）/ optional Tab completer.
     """
     session = session_factory()
     smcp_client = init_client
@@ -62,11 +70,15 @@ async def interactive_loop(
             "[yellow]检测到控制台可能不支持 ANSI 颜色。若在 PyCharm 中运行，请在 Run/Debug 配置中启用 'Emulate terminal in "
             "output console'；或者使用 --no-color 关闭彩色输出。[/yellow]",
         )
+    # zero-state 引导 banner（§10.1）。刻意读裸 ``_skill_home``（可能为 None）而非公开 ``skill_home`` property：
+    # 后者会 ensure_skill_home() 强制解析并创建目录，而 banner 仅需"未启动=None→物化计数按 0"语义，不应在
+    # 此处产生副作用（尤其未经 boot_up 的单测路径）。/ read raw _skill_home to avoid forcing resolution.
+    render_banner(comp, comp._skill_home, os.environ)
 
     while True:
         try:
             with patch_stdout_ctx(raw=True):
-                raw = (await session.prompt_async("a2c> ")).strip()
+                raw = (await session.prompt_async("a2c> ", completer=completer)).strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[cyan]Bye[/cyan]")
             break
@@ -74,52 +86,11 @@ async def interactive_loop(
         if raw == "":
             continue
 
-        if raw.lower() in {"help", "?"}:
-            help_table = Table(
-                title="可用命令 / Commands",
-                header_style="bold magenta",
-                show_lines=False,
-                expand=False,
-            )
-            help_table.add_column("Command", style="bold cyan", no_wrap=True)
-            help_table.add_column("Description", style="white")
-
-            help_table.add_row("status", "查看服务器状态 / show server status")
-            help_table.add_row("tools", "列出可用工具 / list tools")
-            help_table.add_row("mcp", "显示当前 MCP 配置 / show current MCP config")
-            help_table.add_row("server add <json|@file>", "添加或更新 MCP 配置 / add or update config")
-            help_table.add_row("server rm <name>", "移除 MCP 配置 / remove config")
-            help_table.add_row("start <name>|all", "启动客户端 / start client(s)")
-            help_table.add_row("stop <name>|all", "停止客户端 / stop client(s)")
-            help_table.add_row("inputs load <@file>", "从文件加载 inputs 定义 / load inputs")
-            help_table.add_row("inputs list", "查看当前inputs的定义 / show inputs")
-            # 中文: 新增当前 inputs 值的增删改查命令
-            # English: Add CRUD commands for current inputs values
-            help_table.add_row("inputs value list", "列出当前 inputs 的缓存值 / list current cached input values")
-            help_table.add_row("inputs value get <id>", "获取指定 id 的值 / get cached value by id")
-            help_table.add_row(
-                "inputs value set <id> [<json|text>]", "设置指定 id 的值（省略值则用 default）/ set cached value (omit to use default)"
-            )
-            help_table.add_row("inputs value rm <id>", "删除指定 id 的值 / remove cached value by id")
-            help_table.add_row("inputs value clear [<id>]", "清空全部或指定 id 的缓存 / clear all or one cached value")
-            help_table.add_row("tc <json|@file>", "使用与 Socket.IO 一致的 JSON 结构调试工具 / debug tool with Socket.IO-compatible JSON")
-            help_table.add_row(
-                "desktop [size] [window_uri]",
-                "获取当前桌面窗口组合（可选限制条数与指定URI） / get current desktop (optional size and URI)",
-            )
-            help_table.add_row("history [n]", "显示最近的工具调用历史（默认最多10条）/ show recent tool call history (default up to 10)")
-            help_table.add_row(
-                "socket connect [<url>]",
-                "连接 Socket.IO（省略 URL 将进入引导式输入） / connect to Socket.IO (guided if URL omitted)",
-            )
-            help_table.add_row("socket join <office_id> <computer_name>", "加入房间 / join office")
-            help_table.add_row("socket leave", "离开房间 / leave office")
-            help_table.add_row("notify update", "触发配置更新通知 / emit config updated notification")
-            help_table.add_row("render <json|@file>", "测试渲染（占位符解析） / test rendering (placeholders)")
-            help_table.add_row("quit | exit", "退出 / quit")
-
-            console.print(help_table)
-            console.print("[dim]提示: 输入命令后按回车执行；输入 'help' 或 '?' 重新查看命令列表。[/dim]")
+        low = raw.lower()
+        if low in {"help", "?"} or low.startswith("help "):
+            # 分组 help（§10.2）：help 列 namespace，help <ns> 列该组命令 / grouped help, migrated to help.py
+            help_parts = raw.split()
+            render_help(help_parts[1] if len(help_parts) > 1 else None)
             continue
 
         parts = raw.split()
@@ -518,6 +489,14 @@ async def interactive_loop(
                     console.print_json(data=tc_items)
                 except Exception as e:  # pragma: no cover
                     console.print(f"[red]❌ 读取历史失败 / Failed to read history: {e}[/red]")
+
+            elif cmd == "marketplace" and len(parts) >= 2:
+                # v0.2.1 SKILL marketplace 管理（S15，#68）；委托 commands/marketplace.py，变更后触发去抖 emit。
+                await mp_cmd.repl_dispatch(comp, parts, session=session)
+
+            elif cmd == "skill" and len(parts) >= 2:
+                # v0.2.1 跨源 SKILL 只读查询（list / info，§4.4）；直读 Computer 活跃 registry。
+                skill_cmd.repl_dispatch(comp, parts)
 
             else:
                 console.print("[yellow]未知命令 / Unknown command[/yellow]")
