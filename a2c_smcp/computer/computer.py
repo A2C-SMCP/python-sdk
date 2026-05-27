@@ -1106,6 +1106,24 @@ class Computer(BaseComputer[PromptSession]):
         """
         return self._skill_registry
 
+    @property
+    def skill_home(self) -> Path:
+        """SKILL Home 绝对根（``boot_up`` 解析；未启动时按 env 解析链兜底并缓存）/ SKILL Home root。
+
+        CLI marketplace / skill 命令经此取物化根（``known_marketplaces.json`` / ``installed_plugins.json`` /
+        ``marketplace/<name>/`` clone 树所在）。
+        """
+        if self._skill_home is None:
+            self._skill_home = self._resolve_skill_home()
+        return self._skill_home
+
+    def mark_skills_dirty(self) -> None:
+        """标记 SKILL 集合变更 → 去抖器在窗口内合并触发单次 ``emit_update_skills``（CLI marketplace 变更后调）。
+
+        Mark the SKILL set dirty so the debouncer coalesces a single emit (called after CLI marketplace mutations).
+        """
+        self._skill_debouncer.mark_dirty()
+
     def get_skills(self) -> list[A2CSkillRef]:
         """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。
 

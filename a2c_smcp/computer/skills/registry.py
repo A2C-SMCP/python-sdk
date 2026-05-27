@@ -187,6 +187,15 @@ class SkillRegistry:
         """
         return [copy.deepcopy(entry.ref) for entry in self._entries.values() if not entry.orphaned]
 
+    def all_refs(self) -> list[tuple[A2CSkillRef, bool]]:
+        """
+        全部条目的 ``(ref 深拷贝, orphaned)``（含孤儿）/ Deep-copied ``(ref, orphaned)`` for every entry。
+
+        供 CLI ``skill list``（§4.4）跨源扁平视图——需展示 orphan 标志，故 active 集（:meth:`active_refs`）
+        不够。仅读、深拷贝，调用方就地改写不污染 Registry。
+        """
+        return [(copy.deepcopy(entry.ref), entry.orphaned) for entry in self._entries.values()]
+
     def is_orphan(self, name: str) -> bool:
         """name 是否为已注册的孤儿条目 / Whether name is a registered-but-orphaned entry。"""
         entry = self._entries.get(name)

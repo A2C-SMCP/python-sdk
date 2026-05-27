@@ -23,7 +23,8 @@ pexpect = pytest.importorskip("pexpect", reason="e2e tests require pexpect; inst
 # 中文: 帮助标题的匹配，沿用 ANSI 感知的模式以避免误匹配 re.S(或re.DOTALL) 模式下 . 将匹配包括换行模式符在内的任意字符。因此必须强制关闭
 # re.S 否则会拦截正常输出
 # English: Help title regex using ANSI-aware pattern to avoid mismatches
-HELP_TITLE_RE = re.compile(ANSI + r".*可用命令 / Commands.*")
+# v0.2.1 #68：help 改为分组 namespace 视图（§10.2），标题为 "Namespaces (...)" / grouped help title
+HELP_TITLE_RE = re.compile(ANSI + r".*Namespaces.*")
 
 
 @pytest.mark.e2e
@@ -58,12 +59,18 @@ def test_help_shows_table(cli_proc: pexpect.spawn) -> None:
     child.expect(PROMPT_RE, timeout=5)
     output = strip_ansi((child.before or "").strip())
 
-    assert "server add <json|@file>" in output
-    assert "socket connect" in output
+    # v0.2.1 #68：根 help 改为分组 namespace 视图（§10.2），详情移至 help <ns> / grouped namespace list
+    assert "server" in output and "marketplace" in output and "socket" in output
 
     # 再用 ? 验证一次 / verify with ? again
     child.sendline("?")
     child.expect(HELP_TITLE_RE)
     child.expect(PROMPT_RE, timeout=5)
     output2 = strip_ansi((child.before or "").strip())
-    assert "server add <json|@file>" in output2
+    assert "marketplace" in output2 and "skill" in output2
+
+    # help <namespace> 展开该组详细命令 / help <ns> expands the group's commands
+    child.sendline("help server")
+    child.expect(PROMPT_RE, timeout=5)
+    output3 = strip_ansi((child.before or "").strip())
+    assert "server add" in output3
