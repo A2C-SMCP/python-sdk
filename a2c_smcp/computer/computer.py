@@ -625,11 +625,11 @@ class Computer(BaseComputer[PromptSession]):
         """
         预定义渲染变量（对标 VS Code，§9.1）/ Predefined render variables (VS Code parity)。
 
-        ``workspaceFolder`` 取首个已登记 workdir（绑定当前任务的单根代表），无则 ``os.getcwd()``；
+        ``workspaceFolder`` 取 active-workdir 单根（绑定当前任务，见 :attr:`active_workdir`），无则 ``os.getcwd()``；
         ``userHome``=用户主目录；``pathSeparator``=``os.sep``。``${env:VAR}`` 不在此（由 render 直接读
-        进程环境）。``workspaceFolder`` takes the first registered workdir, else cwd.
+        进程环境）。``workspaceFolder`` takes the active workdir (single bound root), else cwd.
         """
-        workspace = str(self._registered_workdirs[0]) if self._registered_workdirs else os.getcwd()
+        workspace = str(self.active_workdir) if self.active_workdir else os.getcwd()
         return {
             "workspaceFolder": workspace,
             "userHome": os.path.expanduser("~"),
@@ -669,6 +669,8 @@ class Computer(BaseComputer[PromptSession]):
         server: MCPServerConfig | dict[str, Any],
         *,
         session: PromptSession | None = None,
+        plugin: str | None = None,
+        marketplace: str | None = None,
     ) -> MCPServerConfig:
         """
         动态渲染并校验单个 MCP 服务器配置，支持原始字典或模型实例。
@@ -706,7 +708,10 @@ class Computer(BaseComputer[PromptSession]):
         # English: Resolve input value by input_id; raise InputNotFoundError if not defined
         async def _resolve_input_by_id(input_id: str) -> Any:
             try:
-                return await self._input_resolver.aresolve_by_id(input_id, session=session)
+                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此回退到
+                # 带前缀池条目 <plugin>@<marketplace>/<id>（§9.3 D2）。非 plugin 来源传 None=现状。
+                # plugin/marketplace context lets a bundled server's bare ${input:id} fall back to the prefixed pool entry.
+                return await self._input_resolver.aresolve_by_id(input_id, session=session, plugin=plugin, marketplace=marketplace)
             except InputNotFoundError:
                 logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
                 # 透传异常到上层，由上层决定是否回退或继续
@@ -731,7 +736,14 @@ class Computer(BaseComputer[PromptSession]):
             logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
             raise e
 
-    async def aadd_or_aupdate_server(self, server: MCPServerConfig | dict[str, Any], *, session: PromptSession | None = None) -> None:
+    async def aadd_or_aupdate_server(
+        self,
+        server: MCPServerConfig | dict[str, Any],
+        *,
+        session: PromptSession | None = None,
+        plugin: str | None = None,
+        marketplace: str | None = None,
+    ) -> None:
         """
         动态添加或更新某个MCP Server配置（支持 inputs 占位符解析）。
         Add or update a MCP Server config dynamically (supports inputs placeholder resolving).
@@ -739,6 +751,9 @@ class Computer(BaseComputer[PromptSession]):
         Args:
             session (PromptSession | None): Computer管理Session
             server (MCPServerConfig | dict[str, Any]): 待添加/更新的配置，可为模型或原始字典。
+            plugin / marketplace (str | None): plugin 实时挂载上下文（#69 Group A）；非 None 时 bundled server 的裸
+                ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None=现状。
+                Plugin mount context; when set, a bundled server's bare ``${input:id}`` resolves to the prefixed pool entry.
         """
         # 确保 manager 已初始化
         if self.mcp_manager is None:
@@ -748,7 +763,7 @@ class Computer(BaseComputer[PromptSession]):
                 message_handler=self._on_manager_change,
             )
 
-        validated = await self._arender_and_validate_server(server, session=session)
+        validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         await self.mcp_manager.aadd_or_aupdate_server(validated)
 
     async def aremove_server(self, server_name: str, *, session: PromptSession | None = None) -> None:
@@ -1151,6 +1166,17 @@ class Computer(BaseComputer[PromptSession]):
         if self._skill_home is None:
             self._skill_home = self._resolve_skill_home()
         return self._skill_home
+
+    @property
+    def active_workdir(self) -> Path | None:
+        """绑定当前任务的 active-workdir 单根（取首个已登记 workdir，空闲=None）/ The single active workdir (None when idle)。
+
+        北极星（#53）两层模型：本属性是 **project/local scope 来源**（``.tfrobot/settings[.local].json`` /
+        ``mcp.json``）与渲染 ``${workspaceFolder}`` 的**单一事实源**；而 :attr:`_registered_workdirs` 作能力发现
+        并集（DropIn 扫描 / watcher）跨全部目录、不随 active 跳变。``resolve_mcp_config`` / ``resolve_settings``
+        的 ``active_workdir`` 与 MCP 批准框写 local 均经此（#69 Group B/C）。
+        """
+        return self._registered_workdirs[0] if self._registered_workdirs else None
 
     def mark_skills_dirty(self) -> None:
         """标记 SKILL 集合变更 → 去抖器在窗口内合并触发单次 ``emit_update_skills``（CLI marketplace 变更后调）。

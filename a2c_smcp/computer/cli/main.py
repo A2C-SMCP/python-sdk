@@ -25,6 +25,8 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from pydantic import TypeAdapter
 
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
+from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.cli.commands import skill as skill_cmd
 from a2c_smcp.computer.cli.completer import A2CCompleter
 from a2c_smcp.computer.cli.interactive_impl import interactive_loop as _interactive_loop_impl
@@ -48,6 +50,12 @@ from a2c_smcp.smcp import MCPServerInput as SMCPServerInputDict
 app = typer.Typer(add_completion=False, help="A2C Computer CLI")
 # 使用全局 Console（引用模块属性，便于后续动态切换）
 console = console_util.console
+
+# ``--add-dir`` 是可重复 list 选项；提取为模块级 OptionInfo 单例规避 ruff B008（list 注解 + call-in-default），
+# 为 ruff 官方推荐做法。``_root`` 与 ``run`` 共用同一选项定义。/ module-level Option singleton to satisfy B008.
+_ADD_DIR_OPTION = typer.Option(
+    None, "--add-dir", help="注册工作目录（可重复；首个作 active-workdir）/ register a workdir (repeatable)",
+)
 
 
 # ------------------------------
@@ -98,6 +106,14 @@ def _root(
         "--no-color",
         help="关闭彩色输出（PyCharm控制台不渲染ANSI时可使用） / Disable ANSI colors",
     ),
+    json_output: bool = typer.Option(False, "--json", help="非交互默认 JSON 输出（子命令亦各带 --json）/ JSON output"),
+    settings_file: str | None = typer.Option(
+        None, "--settings", help="额外 settings.json（flag scope，最低优先级）/ extra settings.json (flag scope)",
+    ),
+    add_dir: list[str] | None = _ADD_DIR_OPTION,
+    approve_all_mcp: bool = typer.Option(
+        False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
+    ),
 ) -> None:
     """
     根级入口：
@@ -124,10 +140,19 @@ def _root(
             computer_factory=computer_factory,
             config=None,
             inputs=None,
+            add_dir=add_dir,
+            approve_all_mcp=approve_all_mcp,
+            settings_file=settings_file,
         )
 
 
-async def _interactive_loop(comp: Computer, init_client: SMCPComputerClient | None = None) -> None:
+async def _interactive_loop(
+    comp: Computer,
+    init_client: SMCPComputerClient | None = None,
+    *,
+    approve_all_mcp: bool = False,
+    mcp_flag_config: Path | None = None,
+) -> None:
     """
     中文: 兼容外部引用的包装器，委托到 interactive_impl，并注入依赖。
     English: Backward-compatible wrapper that delegates to interactive_impl with dependencies injected.
@@ -139,6 +164,8 @@ async def _interactive_loop(comp: Computer, init_client: SMCPComputerClient | No
         smcp_client_cls=SMCPComputerClient,
         init_client=init_client,
         completer=A2CCompleter(comp),
+        approve_all_mcp=approve_all_mcp,
+        mcp_flag_config=mcp_flag_config,
     )
 
 
@@ -153,10 +180,17 @@ def _run_impl(
     computer_factory: str | None,
     config: str | None,
     inputs: str | None,
+    add_dir: list[str] | None = None,
+    approve_all_mcp: bool = False,
+    settings_file: str | None = None,
 ) -> None:
     """
     纯实现函数：不要在此处使用 Typer 的 Option 默认值，避免 OptionInfo 泄露到运行时。
     Both CLI (@app.command) 与回调 (@app.callback) 在需要时调用本函数。
+
+    add_dir / approve_all_mcp / settings_file 来自全局 flag ``--add-dir`` / ``--approve-all-mcp`` / ``--settings``
+    （#69 Group B/D）：``--add-dir`` 注册工作目录（→ ``registered_workdirs`` → ``active_workdir``，project/local
+    scope 与 ``${workspaceFolder}`` 的前置）；后两者透传启动期 MCP 批准框。
     """
 
     async def _amain() -> None:
@@ -175,12 +209,21 @@ def _run_impl(
             console.print("[red]计算机构造目标不可调用，将回退到默认 Computer[/red]")
             comp_factory_obj = Computer
 
+        # --add-dir → registered_workdirs（能力发现并集 + active_workdir=首个）。绝对化去重保序。
+        # 直接调用 run()（绕过 Typer）时 add_dir 可能泄漏 OptionInfo（非 list）→ isinstance 守卫为空（同 computer_factory 容错姿态）。
+        registered_workdirs: list[Path] = []
+        for d in add_dir if isinstance(add_dir, list) else []:
+            rp = Path(d).expanduser().resolve()
+            if rp not in registered_workdirs:
+                registered_workdirs.append(rp)
+
         comp = comp_factory_obj(
             name="friday_hands",
             inputs=set(),
             mcp_servers=set(),
             auto_connect=auto_connect,
             auto_reconnect=auto_reconnect,
+            registered_workdirs=tuple(registered_workdirs) or None,
         )
         async with comp:
             init_client: SMCPComputerClient | None = None
@@ -237,7 +280,13 @@ def _run_impl(
                 except Exception as e:  # pragma: no cover
                     console.print(f"[red]加载 Servers 失败 / Failed to load servers: {e}[/red]")
 
-            await _interactive_loop(comp, init_client=init_client)
+            # settings_file 直接调用 run() 时可能泄漏 OptionInfo → isinstance 守卫（同 add_dir / computer_factory 容错姿态）。
+            await _interactive_loop(
+                comp,
+                init_client=init_client,
+                approve_all_mcp=approve_all_mcp is True,
+                mcp_flag_config=Path(settings_file) if isinstance(settings_file, str) else None,
+            )
 
     asyncio.run(_amain())
 
@@ -275,6 +324,13 @@ def run(
         "-i",
         help="在启动时从文件加载 Inputs 定义（支持 @file 语法或直接文件路径） / Load Inputs from file at startup",
     ),
+    settings_file: str | None = typer.Option(
+        None, "--settings", help="额外 settings.json（flag scope，最低优先级）/ extra settings.json (flag scope)",
+    ),
+    add_dir: list[str] | None = _ADD_DIR_OPTION,
+    approve_all_mcp: bool = typer.Option(
+        False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
+    ),
 ) -> None:
     """
     中文: 启动计算机并进入持续运行模式。后续将支持从配置文件加载 servers 与 inputs。
@@ -290,6 +346,9 @@ def run(
         computer_factory=computer_factory,
         config=config,
         inputs=inputs,
+        add_dir=add_dir,
+        approve_all_mcp=approve_all_mcp,
+        settings_file=settings_file,
     )
 
 
@@ -300,6 +359,10 @@ def run(
 # trust 缺 confirm（confirm=None）→ marketplace add 须显式 --trust，否则退出码 1（§4.6 / §11）。
 marketplace_app = typer.Typer(help="SKILL marketplaces (git sources)")
 skill_app = typer.Typer(help="Skills cross-source query (list / info)")
+# plugin / settings（S16 #69）：非交互无 live Computer → plugin install/enable 走 ledger-only（register=None），
+# MCP server 挂载延到下次 REPL boot 经批准框落地（§4.6）。settings 直读写物化意图层。
+plugin_app = typer.Typer(help="Plugins — skill+mcp bundles (install / enable / list ...)")
+settings_app = typer.Typer(help="settings.json intent layer (show / get / set / edit)")
 
 
 @marketplace_app.command("add")
@@ -389,8 +452,123 @@ def _skill_info(name: str = typer.Argument(...), json_output: bool = typer.Optio
     raise typer.Exit(skill_cmd.skill_info(reg, name, json_output=json_output))
 
 
+# ── plugin 子命令（非交互 ledger-only：无 MCP 回调，挂载延到下次 REPL boot）/ plugin subcommands ──
+@plugin_app.command("install")
+def _plugin_install(
+    plugin_id: str = typer.Argument(..., help="<plugin>@<marketplace>"),
+    scope: str = typer.Option("user", "--scope", help="user|project|local"),
+    version: str | None = typer.Option(None, "--version", help="锁版本（git tag/SHA）/ pin version"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """安装 plugin（非交互 ledger-only；外来 MCP 同名硬抛退出码 1）/ Install a plugin (ledger-only)."""
+    code = asyncio.run(
+        plugin_cmd.plugin_install(
+            SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, scope=scope, version=version, json_output=json_output,
+        ),
+    )
+    raise typer.Exit(code)
+
+
+@plugin_app.command("uninstall")
+def _plugin_uninstall(
+    plugin_id: str = typer.Argument(...),
+    keep_servers: bool = typer.Option(False, "--keep-servers"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """卸载 plugin / Uninstall a plugin."""
+    code = asyncio.run(
+        plugin_cmd.plugin_uninstall(
+            SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, keep_servers=keep_servers, json_output=json_output,
+        ),
+    )
+    raise typer.Exit(code)
+
+
+@plugin_app.command("enable")
+def _plugin_enable(plugin_id: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """启用 plugin（非交互 ledger-only）/ Enable a plugin (ledger-only)."""
+    code = asyncio.run(
+        plugin_cmd.plugin_enable(SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, json_output=json_output),
+    )
+    raise typer.Exit(code)
+
+
+@plugin_app.command("disable")
+def _plugin_disable(plugin_id: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """禁用 plugin = 整 plugin 下线 / Disable a plugin (whole-plugin offline)."""
+    code = asyncio.run(
+        plugin_cmd.plugin_disable(SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, json_output=json_output),
+    )
+    raise typer.Exit(code)
+
+
+@plugin_app.command("list")
+def _plugin_list(
+    available: bool = typer.Option(False, "--available", help="含 disabled / include disabled"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出 installed plugin / List installed plugins."""
+    raise typer.Exit(plugin_cmd.plugin_list(ensure_skill_home(), os.environ, available=available, json_output=json_output))
+
+
+@plugin_app.command("info")
+def _plugin_info(plugin_id: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """plugin 详情 / Plugin detail."""
+    raise typer.Exit(plugin_cmd.plugin_info(ensure_skill_home(), os.environ, plugin_id, json_output=json_output))
+
+
+@plugin_app.command("gc")
+def _plugin_gc(json_output: bool = typer.Option(False, "--json")) -> None:
+    """清理孤儿 plugin（非交互无 confirm → 直接清）/ GC orphan plugins (no confirm non-interactively)."""
+    code = asyncio.run(plugin_cmd.plugin_gc(SkillRegistry(), ensure_skill_home(), os.environ, confirm=None, json_output=json_output))
+    raise typer.Exit(code)
+
+
+# ── settings 子命令 / settings subcommands ────────────────────────────────────
+@settings_app.command("show")
+def _settings_show(
+    scope: str = typer.Option("merged", "--scope", help="user|project|local|flag|policy|merged"),
+    json_output: bool = typer.Option(True, "--json", help="JSON 输出（默认开）/ JSON output (default on)"),
+) -> None:
+    """展示某 scope 的 settings（默认 merged）/ Show settings (default merged)."""
+    raise typer.Exit(settings_cmd.settings_show(ensure_skill_home(), os.environ, scope=scope, json_output=json_output))
+
+
+@settings_app.command("get")
+def _settings_get(
+    key: str = typer.Argument(...),
+    scope: str = typer.Option("merged", "--scope"),
+    json_output: bool = typer.Option(True, "--json"),
+) -> None:
+    """读取单字段 / Read a single field."""
+    raise typer.Exit(settings_cmd.settings_get(ensure_skill_home(), os.environ, key, scope=scope, json_output=json_output))
+
+
+@settings_app.command("set")
+def _settings_set(
+    key: str = typer.Argument(...),
+    value: str = typer.Argument(..., help="JSON 优先，回退字面字符串 / JSON preferred, else literal"),
+    scope: str = typer.Option("user", "--scope", help="user|project|local（flag/policy 只读）"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """写单字段（flag/policy 只读）/ Write a single field (flag/policy read-only)."""
+    raise typer.Exit(settings_cmd.settings_set(ensure_skill_home(), os.environ, key, value, scope=scope, json_output=json_output))
+
+
+@settings_app.command("edit")
+def _settings_edit(
+    scope: str = typer.Option("user", "--scope", help="user|project|local"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """用 $EDITOR 打开该层 settings.json（非交互无 reconcile）/ Open settings.json in $EDITOR."""
+    code, _post = settings_cmd.settings_edit(ensure_skill_home(), os.environ, scope=scope, json_output=json_output)
+    raise typer.Exit(code)
+
+
 app.add_typer(marketplace_app, name="marketplace")
 app.add_typer(skill_app, name="skill")
+app.add_typer(plugin_app, name="plugin")
+app.add_typer(settings_app, name="settings")
 
 
 # 为 console_scripts 兼容提供入口

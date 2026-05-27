@@ -22,7 +22,7 @@ from pathlib import Path
 from prompt_toolkit.document import Document
 
 from a2c_smcp.computer.cli.completer import A2CCompleter
-from a2c_smcp.computer.settings.store import save_known_marketplaces
+from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
 
 
 class _FakeComp:
@@ -72,6 +72,24 @@ def test_dynamic_skill_name(tmp_path: Path) -> None:
     assert "audit:lint" in out and "mcp:blender:render" in out
 
 
-def test_plugin_subcommands_scaffold(tmp_path: Path) -> None:
-    # plugin namespace 子命令词作骨架先行补全（命令体由 #69 落地）
-    assert {"install", "enable", "disable"} <= set(_complete(_comp(tmp_path), "plugin "))
+def test_plugin_subcommands(tmp_path: Path) -> None:
+    assert {"install", "uninstall", "enable", "disable", "list", "info"} <= set(_complete(_comp(tmp_path), "plugin "))
+
+
+def test_settings_subcommands(tmp_path: Path) -> None:
+    assert {"show", "get", "set", "edit"} <= set(_complete(_comp(tmp_path), "settings "))
+
+
+def test_dynamic_plugin_name(tmp_path: Path) -> None:
+    # plugin enable/info 位置参数补 installed plugin id（取 installed_plugins.json，#69）
+    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=tmp_path)
+    comp = A2CCompleter(_FakeComp(tmp_path))
+    assert "audit@acme" in _complete(comp, "plugin enable ")
+    assert "audit@acme" in _complete(comp, "plugin info ")
+
+
+def test_dynamic_settings_keys(tmp_path: Path) -> None:
+    # settings get/set 的 key 补已知 settings.json 字段（#69）
+    out = _complete(_comp(tmp_path), "settings set ")
+    assert {"enabledPlugins", "trustedMarketplaces", "enabledMcpjsonServers"} <= set(out)
+    assert "enabledPlugins" in _complete(_comp(tmp_path), "settings get enabled")

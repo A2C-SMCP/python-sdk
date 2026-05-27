@@ -31,6 +31,16 @@ logger = get_logger(__name__)
 # 触发动态名补全的 (namespace, subcommand) / commands whose positional arg is a dynamic name。
 _DYNAMIC_MARKETPLACE = {("marketplace", s) for s in ("info", "remove", "refresh", "set")}
 _DYNAMIC_SKILL = {("skill", "info")}
+# plugin 位置参数补 installed plugin id（取 installed_plugins.json）；install 补 available 暂不实现（返 []）。
+_DYNAMIC_PLUGIN = {("plugin", s) for s in ("uninstall", "enable", "disable", "info")}
+# settings get/set 的 key 补已知 settings.json 字段名（schema FIELD_* 集，静态）。
+_DYNAMIC_SETTINGS = {("settings", "get"), ("settings", "set")}
+# 已知 settings.json 顶层字段（与 schema.py FIELD_* 对齐；completer 静态名集，无需运行时反射）。
+_SETTINGS_KEYS = (
+    "extraKnownMarketplaces", "enabledPlugins", "strictKnownMarketplaces", "trustedMarketplaces",
+    "blockedMarketplaces", "enableAllProjectMcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers",
+    "allowedMcpServers", "deniedMcpServers", "permissions",
+)
 
 
 class A2CCompleter(Completer):
@@ -72,10 +82,16 @@ class A2CCompleter(Completer):
                 return list((load_known_marketplaces(self._comp.skill_home, os.environ).get("marketplaces") or {}).keys())
             if (ns, sub) in _DYNAMIC_SKILL:
                 return [str(r.get("name")) for r in self._comp.get_skills() if r.get("name")]
+            if (ns, sub) in _DYNAMIC_PLUGIN:
+                from a2c_smcp.computer.settings.store import load_installed_plugins
+
+                return list((load_installed_plugins(self._comp.skill_home, os.environ).get("plugins") or {}).keys())
+            if (ns, sub) in _DYNAMIC_SETTINGS:
+                return list(_SETTINGS_KEYS)
         except Exception as e:  # 动态取名失败不应打断补全；记 DEBUG 便于排障（含编程错）/ never break completion
             logger.debug("completer: dynamic-name lookup for (%s %s) failed (%s)", ns, sub, e)
             return []
-        return []  # plugin / settings 动态名 → #69
+        return []
 
     @staticmethod
     def _match(candidates: Iterable[str], prefix: str) -> Iterator[Completion]:

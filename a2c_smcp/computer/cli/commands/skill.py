@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from a2c_smcp.computer.cli.commands import flag_value
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, SOURCE_MCP, SOURCE_USER
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -127,7 +128,7 @@ def repl_dispatch(comp: Any, parts: list[str]) -> None:
     registry: SkillRegistry = comp.skill_registry
 
     if sub == "list":
-        skill_list(registry, source=_flag_value(args, "--source"), json_output=json_output)
+        skill_list(registry, source=flag_value(args, "--source"), json_output=json_output)
     elif sub == "info":
         if not pos:
             console.print("[yellow]usage: skill info <name>[/yellow]")
@@ -135,11 +136,3 @@ def repl_dispatch(comp: Any, parts: list[str]) -> None:
         skill_info(registry, pos[0], json_output=json_output)
     else:
         console.print(f"[yellow]unknown skill subcommand: {sub}[/yellow]")
-
-
-def _flag_value(args: list[str], flag: str) -> str | None:
-    if flag in args:
-        idx = args.index(flag)
-        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
-            return args[idx + 1]
-    return None
