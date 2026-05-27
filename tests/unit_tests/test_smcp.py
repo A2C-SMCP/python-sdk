@@ -147,17 +147,25 @@ class TestTypedDictsV021:
     """v0.2.1 TypedDict 镜像层可构造性烟雾测试（字段对齐 data-structures.md）。
     Smoke tests confirming v0.2.1 TypedDict mirror layer is constructable per data-structures.md."""
 
-    def test_a2c_skill_ref_minimal_required_fields(self) -> None:
-        """name / source / path 是协议主键 + 必选物化输出；total=False 允许仅设这三个。
-        name / source / path are required core fields; total=False permits a minimal ref."""
+    def test_a2c_skill_ref_required_field_set(self) -> None:
+        """v0.2.2：A2CSkillRef **4 必选** = name/source/path/description（去 total=False → total=True + NotRequired[]）。
+        ``__required_keys__`` 正式编码必选集（PEP 655），类型检查器可在编译期发现漏填（#50）。
+        v0.2.2: 4 required fields encoded in ``__required_keys__`` so the type checker catches omissions."""
+        assert A2CSkillRef.__required_keys__ == frozenset({"name", "source", "path", "description"})
+        assert A2CSkillRef.__optional_keys__ == frozenset(
+            {"uri", "license", "compatibility", "allowed_tools", "version", "skill_metadata"},
+        )
+        # 含全部 4 必选的最小 ref 合法 / minimal ref carrying all 4 required is valid
         ref: A2CSkillRef = {
             "name": "mcp:tfrobot-tools:code-review",
             "source": "mcp:tfrobot-tools",
             "path": "/tmp/skills/mcp/tfrobot-tools/code-review",
+            "description": "Code review skill",
         }
         assert ref["name"] == "mcp:tfrobot-tools:code-review"
         assert ref["source"].startswith("mcp:")
         assert ref["path"].startswith("/")
+        assert ref["description"] == "Code review skill"
 
     def test_a2c_skill_ref_full_with_frontmatter_fields(self) -> None:
         """完整 ref 含 SKILL.md frontmatter 派生字段 / Full ref includes frontmatter-derived fields."""
@@ -182,9 +190,10 @@ class TestTypedDictsV021:
             "name": "mcp:tfrobot-tools:code-review",
             "source": "mcp:tfrobot-tools",
             "path": "/tmp/skills/mcp/tfrobot-tools/code-review",
+            "description": "Code review skill",  # 必选 / required (v0.2.2)
             "uri": "skill://tfrobot-tools/code-review",
         }
-        assert ref["uri"].startswith("skill://")
+        assert ref.get("uri", "").startswith("skill://")
 
     def test_get_skills_req_required_fields(self) -> None:
         """GetSkillsReq total=True：agent / req_id / computer 都是必选。

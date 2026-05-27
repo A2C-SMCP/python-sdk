@@ -391,80 +391,42 @@ class SMCPNamespace(BaseNamespace):
             ),
         )
 
-    async def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet:
+    async def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet | ErrorPayload:
         """
-        获取指定Computer的工具列表
-        Get tool list of specified Computer
+        获取指定 Computer 的工具列表 / Get tool list of specified Computer（``client:get_tools``）.
+
+        经 :meth:`_relay_client_call` 统一 isolation + flat ErrorPayload 透传（v0.2.2：所有 ``client:*``
+        ack 统一 flat ErrorPayload，旧路由非豁免）。
+        Routed via ``_relay_client_call`` (unified isolation + flat ErrorPayload pass-through; v0.2.2
+        makes flat ErrorPayload uniform across all ``client:*`` acks — old routes are not exempt).
 
         Args:
-            sid (str): 发起者的ID，一般是Agent / Initiator ID, usually Agent
-            data (GetToolsReq): 其中包含computer字段，指向Computer的Name / Contains computer field pointing to Computer's Name
+            sid (str): 发起者 SID，一般是 Agent / Initiator SID, usually Agent.
+            data (GetToolsReq): 含 ``computer`` 字段，指向 Computer 的 Name / contains ``computer``.
 
         Returns:
-            GetToolsRet: Computer的工具列表 / Computer's tool list
+            GetToolsRet | ErrorPayload: 工具列表，或 Computer 回传的 flat ErrorPayload。
         """
-        computer_name = data["computer"]
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_sid = await self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
-        session = await self.get_session(computer_sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持Computer获取工具列表")
-
-        # 验证Agent是否有权限获取该Computer的工具列表
-        # Verify if Agent has permission to get this Computer's tool list
-        agent_session = await self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-
-        if computer_office_id != agent_office_id:
-            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的工具列表")
-
-        client_response = await self.call(
-            GET_TOOLS_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
+        return cast(
+            "GetToolsRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_TOOLS_EVENT, TypeAdapter(GetToolsRet)),
         )
 
-        return TypeAdapter(GetToolsRet).validate_python(client_response)
-
-    async def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet:
+    async def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet | ErrorPayload:
         """
-        获取指定Computer的桌面信息（窗口组织后的视图）。
-        Get desktop view from specified Computer.
+        获取指定 Computer 的桌面视图（窗口组织后）/ Get desktop view from specified Computer（``client:get_desktop``）.
 
-        要求：Agent 与 Computer 需在同一 office。
+        要求 Agent 与 Computer 同一 office；经 :meth:`_relay_client_call` 统一 isolation + flat
+        ErrorPayload 透传。
+        Requires same office; routed via ``_relay_client_call`` (unified isolation + flat ErrorPayload).
+
+        Returns:
+            GetDeskTopRet | ErrorPayload: 桌面视图，或 Computer 回传的 flat ErrorPayload。
         """
-        computer_name = data["computer"]
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_sid = await self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
-        session = await self.get_session(computer_sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持获取Computer桌面")
-
-        agent_session = await self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-        if computer_office_id != agent_office_id:
-            raise SMCPNamespaceError("目前仅支持Agent获取自己房间内Computer的桌面")
-
-        client_response = await self.call(
-            GET_DESKTOP_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
+        return cast(
+            "GetDeskTopRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_DESKTOP_EVENT, TypeAdapter(GetDeskTopRet)),
         )
-        return TypeAdapter(GetDeskTopRet).validate_python(client_response)
 
     async def _relay_client_call(
         self,
@@ -507,6 +469,12 @@ class SMCPNamespace(BaseNamespace):
             raise SMCPNamespaceError(f"目前仅支持 Computer 响应 {event} / target SID is not a Computer")
 
         agent_session = await self.get_session(sid)
+        if agent_session is None:
+            # 发起者（Agent）飞行中断连：会话已不存在。显式 raise 替代 None.get 的 AttributeError
+            # （对齐 #31 隔离不变量显式 raise）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            # Originator (Agent) disconnected in-flight: session gone. Explicit raise instead of an
+            # AttributeError on None.get (aligns with #31). Protocol allows Server MAY silently not-ack.
+            raise SMCPNamespaceError(f"发起者会话不存在（可能已断连）：{event} / originator session gone")
         if session.get("office_id") != agent_session.get("office_id"):
             raise SMCPNamespaceError(
                 f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
@@ -638,6 +606,10 @@ class SMCPNamespace(BaseNamespace):
 
         # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission: ensure Agent is in the requested room
         agent_session = await self.get_session(sid)
+        if agent_session is None:
+            # 发起者飞行中断连防御（同 _relay_client_call）：显式 raise 替代 None.get 的 AttributeError。
+            # In-flight disconnect guard (same as _relay_client_call): explicit raise over AttributeError.
+            raise SMCPNamespaceError("发起者会话不存在（可能已断连）：server:list_room / originator session gone")
         agent_office_id = agent_session.get("office_id")
 
         if agent_office_id != office_id:

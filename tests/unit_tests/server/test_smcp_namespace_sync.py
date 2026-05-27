@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     GET_BLOB_EVENT,
     GET_SKILL_EVENT,
     GET_SKILLS_EVENT,
+    GET_TOOLS_EVENT,
     SMCP_NAMESPACE,
     UPDATE_SKILLS_NOTIFICATION,
     EnterOfficeReq,
@@ -167,7 +168,10 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
 
     def test_on_client_get_skills_relays(self, routed_ns):
         ns, agent_sid, comp_name, comp_sid = routed_ns
-        ns.call.return_value = {"skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}], "req_id": "r1"}
+        ns.call.return_value = {
+            "skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}],
+            "req_id": "r1",
+        }
         ret = ns.on_client_get_skills(agent_sid, {"agent": "agent-1", "req_id": "r1", "computer": comp_name})
         ns.call.assert_called_once()
         args, kwargs = ns.call.call_args
@@ -175,7 +179,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         assert kwargs["to"] == comp_sid
         assert kwargs["namespace"] == SMCP_NAMESPACE
         # 语义级断言：内容完整透传 / Semantic-level assertion: contents passed through
-        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}]
         assert ret["req_id"] == "r1"
 
     def test_on_client_get_skill_relays(self, routed_ns):
@@ -309,3 +313,44 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         with pytest.raises(SMCPNamespaceError, match="Computer"):
             smcp_namespace.on_server_update_skills("a-sid", {"computer": "c1"})
         smcp_namespace.emit.assert_not_called()
+
+    # ── v0.2.2 #46（sync 镜像）：旧路由收编 _relay_client_call + 飞行断连防御 ──
+
+    def test_get_tools_relays_via_unified_helper(self, routed_ns):
+        """sync：``client:get_tools`` 收编后经 ``_relay_client_call`` 转发到正确事件 + Computer SID."""
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {"tools": [], "req_id": "r1"}
+        ret = ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        ns.call.assert_called_once()
+        assert ns.call.call_args[0][0] == GET_TOOLS_EVENT
+        assert ns.call.call_args.kwargs["to"] == comp_sid
+        assert ret["tools"] == []
+
+    def test_get_tools_flat_error_passthrough(self, routed_ns):
+        """sync：v0.2.2 旧路由非豁免——``client:get_tools`` 的 flat ErrorPayload 原样透传，不强转 GetToolsRet."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "computer mcp not ready"}
+        ns.call.return_value = err
+        ret = ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    def test_get_desktop_flat_error_passthrough(self, routed_ns):
+        """sync：``client:get_desktop`` 同样透传 flat ErrorPayload."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "no desktop"}
+        ns.call.return_value = err
+        ret = ns.on_client_get_desktop(agent_sid, {"computer": comp_name})
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    def test_relay_agent_session_none_raises_namespace_error(self, smcp_namespace, mock_server):
+        """sync：发起者飞行中断连 ``get_session(sid)`` → None → **显式 raise SMCPNamespaceError**（替代 AttributeError，#46/#31）."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        comp_name = "c1"
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else None)
+        smcp_namespace.call = MagicMock()
+        with pytest.raises(SMCPNamespaceError, match="session gone"):
+            smcp_namespace.on_client_get_tools("gone-agent-sid", {"computer": comp_name})
+        smcp_namespace.call.assert_not_called()

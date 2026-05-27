@@ -23,6 +23,7 @@ from a2c_smcp.smcp import (
     GET_DESKTOP_EVENT,
     GET_SKILL_EVENT,
     GET_SKILLS_EVENT,
+    GET_TOOLS_EVENT,
     SMCP_NAMESPACE,
     UPDATE_DESKTOP_EVENT,
     UPDATE_DESKTOP_NOTIFICATION,
@@ -604,7 +605,10 @@ class TestV021ClientRoutesAndUpdateSkills:
     @pytest.mark.asyncio
     async def test_on_client_get_skills_relays_and_returns_typed_ret(self, routed_ns):
         ns, agent_sid, comp_name, comp_sid = routed_ns
-        ns.call.return_value = {"skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}], "req_id": "r1"}
+        ns.call.return_value = {
+            "skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}],
+            "req_id": "r1",
+        }
         ret = await ns.on_client_get_skills(agent_sid, {"agent": "agent-1", "req_id": "r1", "computer": comp_name})
         # call 携带正确事件名 + Computer 目标 SID / call must dispatch to right event + sid
         ns.call.assert_awaited_once()
@@ -614,7 +618,7 @@ class TestV021ClientRoutesAndUpdateSkills:
         assert kwargs["namespace"] == SMCP_NAMESPACE
         # 语义级断言：内容完整透传（拒绝 "TypeAdapter 把字段吃掉" 或 "被测函数 return data" 的退化）.
         # Semantic-level assertion: contents passed through (catches TypeAdapter swallowing fields).
-        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y"}]
+        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}]
         assert ret["req_id"] == "r1"
 
     @pytest.mark.asyncio
@@ -783,3 +787,53 @@ class TestV021ClientRoutesAndUpdateSkills:
         with pytest.raises(SMCPNamespaceError, match="Computer"):
             await smcp_namespace.on_server_update_skills("a-sid", {"computer": "c1"})
         smcp_namespace.emit.assert_not_awaited()
+
+    # ── v0.2.2 #46：旧路由收编 _relay_client_call + 飞行断连防御 ───────────
+
+    @pytest.mark.asyncio
+    async def test_get_tools_relays_via_unified_helper(self, routed_ns):
+        """``client:get_tools`` 收编后经 ``_relay_client_call`` 转发到正确事件 + Computer SID.
+        get_tools now routes via the unified helper (right event + target sid)."""
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {"tools": [], "req_id": "r1"}
+        ret = await ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        ns.call.assert_awaited_once()
+        assert ns.call.call_args[0][0] == GET_TOOLS_EVENT
+        assert ns.call.call_args.kwargs["to"] == comp_sid
+        assert ret["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_get_tools_flat_error_passthrough(self, routed_ns):
+        """v0.2.2 旧路由非豁免：Computer 对 ``client:get_tools`` 返回 flat ErrorPayload → 原样透传，不强转 GetToolsRet.
+        Old route is not exempt: flat ErrorPayload from Computer is relayed verbatim (no coercion)."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "computer mcp not ready"}
+        ns.call.return_value = err
+        ret = await ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    @pytest.mark.asyncio
+    async def test_get_desktop_flat_error_passthrough(self, routed_ns):
+        """``client:get_desktop`` 同样透传 flat ErrorPayload（收编 _relay_client_call 后）.
+        get_desktop likewise passes flat ErrorPayload through after migration."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "no desktop"}
+        ns.call.return_value = err
+        ret = await ns.on_client_get_desktop(agent_sid, {"computer": comp_name})
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    @pytest.mark.asyncio
+    async def test_relay_agent_session_none_raises_namespace_error(self, smcp_namespace, mock_server):
+        """发起者（Agent）飞行中断连：``get_session(sid)`` → None → **显式 raise SMCPNamespaceError**（替代 AttributeError，#46/#31）.
+        Originator disconnected in-flight → explicit SMCPNamespaceError instead of AttributeError on None.get."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        comp_name = "c1"
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        # Computer 会话存在；发起者（Agent）会话已断连 → None / Computer ok, originator gone
+        smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: sess_comp if sid == comp_sid else None)
+        smcp_namespace.call = AsyncMock()
+        with pytest.raises(SMCPNamespaceError, match="session gone"):
+            await smcp_namespace.on_client_get_tools("gone-agent-sid", {"computer": comp_name})
+        smcp_namespace.call.assert_not_awaited()  # 断连防御先于转发 / guard precedes relay

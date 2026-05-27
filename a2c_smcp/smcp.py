@@ -530,14 +530,20 @@ class ErrorPayload(TypedDict, total=False):
 # =====================================================================
 
 
-class A2CSkillRef(TypedDict, total=False):
+class A2CSkillRef(TypedDict):
     """
     SKILL 引用对象，``client:get_skills`` 返回列表元素。
     Skill reference object — element of ``client:get_skills`` return list.
 
-    协议依据 / Protocol: data-structures.md §A2CSkillRef；skill.md §1 命名 / §6 数据结构。
+    协议依据 / Protocol: data-structures.md §A2CSkillRef（v0.2.2 正式定稿必选集）；skill.md §1 命名 / §6 数据结构。
 
     关键约束 / Key invariants:
+      - **必选 4 字段**：``name`` / ``source`` / ``path`` / ``description``（``total=True`` 默认，PEP 655：
+        裸字段=必选、``NotRequired[]``=可选）。``description`` 跨三源恒存在（SKILL.md frontmatter 强制
+        name+description，marketplace §3.1）。Producer(Computer) **MUST** 发齐 4 必选；Consumer(Agent)
+        **MUST NOT** 假定任一可选字段存在。
+        Required 4: name/source/path/description (total=True + ``NotRequired[]`` optionals). Producer MUST
+        send all 4; Consumer MUST NOT assume any optional field is present.
       - ``name`` 是协议主键（合成全局唯一名，自 0.2.1 起为**裸名**：user 1 段 ``<skill>`` /
         marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<server>:<skill>``），Agent **MUST**
         当作不透明可比较字符串（**勿**解析结构，判来源用 ``source``）
@@ -553,20 +559,20 @@ class A2CSkillRef(TypedDict, total=False):
         carried by ``source`` and (MCP only) ``uri``.
     """
 
-    # 主键 / Primary key
+    # 主键 / Primary key（必选 / required）
     name: str  # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:tfrobot-tools:code-review`
-    # 来源元数据 / Provenance（完整溯源；**不**进 name）
+    # 来源元数据 / Provenance（完整溯源；**不**进 name）（必选 / required）
     source: str  # 如 mcp:tfrobot-tools / marketplace:acme-skills / user
-    uri: str  # 仅 MCP 来源：skill://host/skill-name；Agent 非权威（skill.md §2）
-    # 物化输出 / Materialization output
+    uri: NotRequired[str]  # 仅 MCP 来源：skill://host/skill-name；Agent 非权威（skill.md §2）
+    # 物化输出 / Materialization output（必选 / required）
     path: str  # 必选：Computer 本地绝对目录路径，面向 Agent SDK（脚本执行/文件访问），LLM 永不可见
     # SKILL.md frontmatter 派生 / Derived from SKILL.md frontmatter
-    description: str  # marketplace SKILL v1 §3.1
-    license: str
-    compatibility: str
-    allowed_tools: list[str]  # frontmatter "allowed-tools" 规范化为 list
-    version: str
-    skill_metadata: dict[str, Any]  # frontmatter.metadata 透传；A2C 不解释 / passthrough, A2C does not interpret
+    description: str  # 必选 / required：marketplace SKILL v1 §3.1（跨三源强制）
+    license: NotRequired[str]
+    compatibility: NotRequired[str]
+    allowed_tools: NotRequired[list[str]]  # frontmatter "allowed-tools" 规范化为 list
+    version: NotRequired[str]
+    skill_metadata: NotRequired[dict[str, Any]]  # frontmatter.metadata 透传；A2C 不解释 / passthrough, A2C does not interpret
 
 
 class GetSkillsReq(AgentCallData, total=True):
