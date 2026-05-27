@@ -93,9 +93,12 @@ from a2c_smcp.computer.skills.home import (
 )
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
+    check_strict_conflict,
+    entry_is_strict,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
+    resolve_skill_override_dirs,
 )
 from a2c_smcp.computer.skills.manifest import (
     plugin_root_base as resolve_plugin_root_base,
@@ -859,68 +862,84 @@ def _build_marketplace_ref(name: str, marketplace: str, frontmatter: dict[str, A
 def _scan_and_register_plugin_skills(
     marketplace: str,
     plugin_name: str,
-    plugin_root: Path,
+    skill_dirs: list[Path],
     version: str | None,
     registry: SkillRegistry,
     seen: set[str],
 ) -> list[str]:
     """
-    扫 ``<plugin 根>/skills/<skill>/SKILL.md`` 并注册 / Scan a plugin's ``skills/`` and register each SKILL。
+    扫给定**容器目录**下 ``<skill>/SKILL.md`` 并注册 / Scan SKILL container dirs and register each SKILL。
 
-    ``name = <plugin>:<skill>``（``<plugin>`` = entry.name、``<skill>`` = skill 目录 basename，frontmatter
-    仅作显示名、不改 ID，marketplace-v1 §2.1 防伪）。缺 frontmatter ``description`` / name 合成失败 / 本 run
-    重名 → 记 ERROR、跳过、不入册（失败降级，不抛）。仅扫 ``skills/`` 下**一级**（``iterdir``），不递归包内。
-
-    .. note::
-       仅扫**约定** ``skills/`` 目录；``entry.skills`` 组件路径覆写与 strict mode 冲突检测显式延后（见 #80）。
+    ``skill_dirs`` = 约定 ``<plugin 根>/skills`` + ``entry.skills`` / ``plugin.json.skills`` 覆写容器（§4.3，
+    strict=true 追加合并；见 :func:`~a2c_smcp.computer.skills.manifest.resolve_skill_override_dirs`）。容器按
+    resolve 后路径去重保序（约定径与覆写径同径只扫一次）。``name = <plugin>:<skill>``（``<plugin>`` = entry.name、
+    ``<skill>`` = skill 目录 basename，frontmatter 仅作显示名、不改 ID，marketplace-v1 §2.1 防伪）。缺 frontmatter
+    ``description`` / name 合成失败 / 本 run 重名（**跨容器**）→ 记 ERROR、跳过、不入册（失败降级，不抛）。每个容器
+    仅扫**一级**（``iterdir``），不递归包内。
     """
-    skills_dir = plugin_root / SKILLS_SUBDIR
-    if not skills_dir.is_dir():
+    # 容器去重（resolve 后路径），保序——约定 skills/ 与覆写路径可能同径，仅扫一次。
+    unique_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for d in skill_dirs:
+        rp = d.resolve()
+        if rp in seen_dirs:
+            continue
+        seen_dirs.add(rp)
+        unique_dirs.append(d)
+
+    existing = [d for d in unique_dirs if d.is_dir()]
+    if not existing:
         logger.warning(
-            "marketplace %r plugin %r has no %s/ dir at %s; no SKILLs registered",
+            "marketplace %r plugin %r has no SKILL container dir (convention %s/ + overrides all absent); no SKILLs registered",
             marketplace,
             plugin_name,
             SKILLS_SUBDIR,
-            skills_dir,
         )
         return []
 
     registered: list[str] = []
-    for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
-        skill_md = skill_dir / SKILL_MD
-        if not skill_md.is_file():
-            continue
-        try:
-            frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
-        except OSError as e:
-            logger.error("marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s", marketplace, plugin_name, skill_dir.name, e)
-            continue
-        if not frontmatter.get("description"):
-            logger.error(
-                "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
-                marketplace,
-                plugin_name,
-                skill_dir.name,
-            )
-            continue
-        try:
-            name = synthesize_marketplace_name(plugin_name, skill_dir.name)
-        except SkillNameError as e:
-            logger.error(
-                "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
-                marketplace,
-                plugin_name,
-                skill_dir.name,
-                e.reason,
-            )
-            continue
-        if name in seen:
-            logger.error("duplicate marketplace SKILL name within staging run, keeping first: %s (%s)", name, skill_dir)
-            continue
-        seen.add(name)
-        ref = _build_marketplace_ref(name, marketplace, frontmatter, version, skill_dir)
-        if registry.register_or_update(ref):
-            registered.append(name)
+    for skills_dir in existing:
+        for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+            skill_md = skill_dir / SKILL_MD
+            if not skill_md.is_file():
+                continue
+            try:
+                frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
+            except OSError as e:
+                logger.error(
+                    "marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s",
+                    marketplace,
+                    plugin_name,
+                    skill_dir.name,
+                    e,
+                )
+                continue
+            if not frontmatter.get("description"):
+                logger.error(
+                    "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
+                    marketplace,
+                    plugin_name,
+                    skill_dir.name,
+                )
+                continue
+            try:
+                name = synthesize_marketplace_name(plugin_name, skill_dir.name)
+            except SkillNameError as e:
+                logger.error(
+                    "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
+                    marketplace,
+                    plugin_name,
+                    skill_dir.name,
+                    e.reason,
+                )
+                continue
+            if name in seen:
+                logger.error("duplicate marketplace SKILL name within staging run, keeping first: %s (%s)", name, skill_dir)
+                continue
+            seen.add(name)
+            ref = _build_marketplace_ref(name, marketplace, frontmatter, version, skill_dir)
+            if registry.register_or_update(ref):
+                registered.append(name)
     return registered
 
 
@@ -1012,8 +1031,14 @@ async def _stage_one_plugin(
         env=env,
     )
     plugin_manifest = read_plugin_metadata(plugin_root)
+    # strict mode 冲突检测（§4.4）：strict=false + plugin.json 声明组件 → 抛 PluginManifestError，由外层
+    # per-plugin 循环捕获降级（该 plugin 不入册、不阻断其余，符 #61 失败降级铁律）。
+    check_strict_conflict(entry, plugin_manifest)
     version = resolve_plugin_version(entry, plugin_manifest, version_fallback)
-    return _scan_and_register_plugin_skills(marketplace, plugin_name, plugin_root, version, registry, seen)
+    # 扫描容器 = 约定 skills/ + entry.skills / plugin.json.skills 覆写（§4.3，strict=true 追加合并）。
+    override_dirs = resolve_skill_override_dirs(entry, plugin_manifest, plugin_root, strict=entry_is_strict(entry))
+    skill_dirs = [plugin_root / SKILLS_SUBDIR, *override_dirs]
+    return _scan_and_register_plugin_skills(marketplace, plugin_name, skill_dirs, version, registry, seen)
 
 
 def _record_known_marketplace(
@@ -1176,7 +1201,8 @@ async def stage_marketplace_skills(
                 env=env,
             )
             registered.extend(names)
-        except (SkillSourceError, SkillStagingError) as e:
+        except (SkillSourceError, SkillStagingError, PluginManifestError) as e:
+            # PluginManifestError 含 strict=false 冲突（§4.4）——预期降级，记 ERROR、该 plugin 不入册、不阻断其余。
             logger.error("marketplace %r plugin %r staging failed, skipped: %s", name, plugin_name, e)
         except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
             logger.error("marketplace %r plugin %r unexpected staging error, skipped: %s", name, plugin_name, e, exc_info=True)

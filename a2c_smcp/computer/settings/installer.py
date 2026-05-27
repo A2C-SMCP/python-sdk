@@ -63,6 +63,8 @@ from a2c_smcp.computer.settings.store import (
 )
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import (
+    PluginManifestError,
+    check_strict_conflict,
     find_plugin_entry,
     load_bundled_servers,
     plugin_root_base,
@@ -316,6 +318,12 @@ async def install_plugin(
         timeout=timeout,
         env=env,
     )
+    # strict mode 冲突检测（§4.4，#80）：strict=false + plugin.json 声明组件 → 拒绝加载（**硬错误**）。
+    # 早检——在挂载 server / 注册 skill 前拦截，不依赖 staging 降级，保证原子失败（未挂 server、未注册 skill）。
+    try:
+        check_strict_conflict(entry, read_plugin_metadata(plugin_root))
+    except PluginManifestError as e:
+        raise PluginInstallError(str(e)) from e
     servers = load_bundled_servers(plugin_root)
 
     # 5：★冲突闸门（零变更）。owned = 自有同名白名单（其上次记录的 bundledMcpServers）。

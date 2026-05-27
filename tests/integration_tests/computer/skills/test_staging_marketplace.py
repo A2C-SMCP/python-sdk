@@ -548,3 +548,79 @@ async def test_last_updated_preserved_on_reuse_refreshed_on_pull(tmp_path: Path)
     # refresh=True（实际 pull）→ lastUpdated 刷新
     await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, refresh=True, env=_env(home))
     assert load_known_marketplaces(home, _env(home))["marketplaces"]["acme-skills"]["lastUpdated"] != old
+
+
+# ── strict mode + entry.skills / plugin.json.skills override（§4.3/§4.4；#80）───────────────────
+@requires_git
+async def test_entry_skills_override_appended(tmp_path: Path) -> None:
+    # entry.skills 覆写路径 → 在约定 skills/ 之外**追加扫描**（strict 默认 true 合并语义）
+    manifest = {
+        "name": "acme-skills",
+        "owner": {"name": "Acme"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": "audit", "source": "audit", "version": "1.0.0", "skills": "extra-skills"}],
+    }
+    files = {
+        ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
+        "plugins/audit/skills/conventional/SKILL.md": _skill_md("conventional"),
+        "plugins/audit/extra-skills/overridden/SKILL.md": _skill_md("overridden"),
+    }
+    _, bare = _make_bare(tmp_path, "acme", files)
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    names = await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, env=_env(home))
+    assert set(names) == {"audit:conventional", "audit:overridden"}  # 约定 + 覆写 追加合并
+    assert reg.resolve("audit:overridden") is not None
+
+
+@requires_git
+async def test_plugin_json_skills_override_appended(tmp_path: Path) -> None:
+    # plugin.json.skills 覆写路径（strict 默认 true）→ 追加扫描
+    manifest = {
+        "name": "acme-skills",
+        "owner": {"name": "Acme"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": "audit", "source": "audit"}],
+    }
+    files = {
+        ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
+        "plugins/audit/.tfrobot-plugin/plugin.json": json.dumps({"name": "audit", "skills": "pj-skills", "version": "3.0.0"}),
+        "plugins/audit/skills/conventional/SKILL.md": _skill_md("conventional"),
+        "plugins/audit/pj-skills/from-plugin-json/SKILL.md": _skill_md("from-plugin-json"),
+    }
+    _, bare = _make_bare(tmp_path, "acme", files)
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    names = await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, env=_env(home))
+    assert set(names) == {"audit:conventional", "audit:from-plugin-json"}
+
+
+@requires_git
+async def test_strict_false_with_plugin_components_degrades_without_blocking_others(tmp_path: Path) -> None:
+    # strict=false + plugin.json 声明组件 → 该 plugin **不入册**（失败降级），同 marketplace 其余 plugin 不受影响
+    manifest = {
+        "name": "acme-skills",
+        "owner": {"name": "Acme"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [
+            {"name": "audit", "source": "audit", "strict": False},  # strict=false
+            {"name": "fmt", "source": "./plugins/fmt"},  # 正常 plugin，应仍注册
+        ],
+    }
+    files = {
+        ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
+        # audit 的 plugin.json 声明组件 → 与 strict=false 冲突
+        "plugins/audit/.tfrobot-plugin/plugin.json": json.dumps({"name": "audit", "skills": "x"}),
+        "plugins/audit/skills/should-not-appear/SKILL.md": _skill_md("should-not-appear"),
+        "plugins/fmt/skills/format/SKILL.md": _skill_md("format"),
+    }
+    _, bare = _make_bare(tmp_path, "acme", files)
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    names = await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, env=_env(home))
+    assert names == ["fmt:format"]  # audit 降级不入册；fmt 不受阻断
+    assert reg.resolve("audit:should-not-appear") is None
+    assert reg.resolve("fmt:format") is not None

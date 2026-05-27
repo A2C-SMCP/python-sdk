@@ -24,7 +24,11 @@ skills.staging (which now imports this module, so a back-edge would be a real cy
 **显式延后 / Deferred**：
 - **bundled MCP server inputs.json 入池消歧**（§9.3 D2 前缀）归 #65——本模块**枚举 server 时排除**
   ``inputs.json``，不解析 inputs 池。
-- **strict mode 组件路径覆写 / 冲突检测**（§3.4/§3.5）归 #80——本模块按约定路径解析，不做 strict 校验。
+
+**strict mode 组件路径覆写 / 冲突检测**（§4.3/§4.4，loading-behavior §1/§4/§6；#80）由本模块的纯函数
+:func:`entry_is_strict` / :func:`check_strict_conflict` / :func:`resolve_skill_override_dirs` 承载，供 staging
+（marketplace 注册）与 installer（plugin install 硬失败）共同消费。本 SDK 仅消费 ``skills`` + ``mcp-servers``，
+冲突检测仍按规范判**全六组件字段**（:data:`COMPONENT_FIELDS`），但覆写**路径扫描仅 ``skills``**。
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from pydantic import TypeAdapter, ValidationError
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.path import is_within
 
 logger = get_logger(__name__)
 
@@ -126,6 +131,87 @@ def resolve_plugin_version(entry: Mapping[str, Any], plugin_metadata: Mapping[st
         if isinstance(v, str) and v.strip():
             return v.strip()
     return fallback_sha
+
+
+# ── strict mode + 组件路径覆写（marketplace-v1 §4.3/§4.4 + loading-behavior.md §1/§4/§6；#80）─────
+# strict=false 下 plugin.json 不得再声明的组件字段全集（loading-behavior §6.2）。本 SDK 仅消费 skills +
+# mcp-servers，但冲突检测按规范判**全六字段**（前向兼容 CC 私有组件，防作者「以为生效实际被覆盖」）。
+COMPONENT_FIELDS: tuple[str, ...] = ("commands", "agents", "hooks", "skills", "mcpServers", "lspServers")
+
+
+def entry_is_strict(entry: Mapping[str, Any]) -> bool:
+    """marketplace 条目 ``strict`` 语义（§4.4，默认 ``True``）/ Whether the entry is in strict mode。
+
+    缺省 / 非 bool → ``True``（loading-behavior §4：strict=true 是更宽松、容错的默认模式）。
+    """
+    val = entry.get("strict")
+    return val if isinstance(val, bool) else True
+
+
+def manifest_declared_components(plugin_manifest: Mapping[str, Any]) -> list[str]:
+    """plugin.json 中**真值**组件字段名列表（空 / 缺 / falsy 不算声明）/ Truthy component fields declared in plugin.json。"""
+    return [f for f in COMPONENT_FIELDS if plugin_manifest.get(f)]
+
+
+def check_strict_conflict(entry: Mapping[str, Any], plugin_manifest: Mapping[str, Any]) -> None:
+    """strict=false 且 plugin.json 声明组件 → 抛 conflicting manifests（§4.4 / loading-behavior §6.2）。
+
+    strict=false 语义为「marketplace 条目是组件定义全集」；若 plugin 仓库 ``plugin.json`` 也声明组件，二者权威冲突
+    → **拒绝加载（硬错误）**，而非静默合并。strict=true（默认）恒不冲突（plugin.json 权威 + 条目追加合并）。
+    """
+    if entry_is_strict(entry):
+        return
+    declared = manifest_declared_components(plugin_manifest)
+    if declared:
+        raise PluginManifestError(
+            f"conflicting manifests: strict=false but plugin.json declares components {declared} "
+            "(marketplace-v1 §4.4: the marketplace entry is the authoritative component set)",
+        )
+
+
+def _as_str_path_list(value: Any) -> list[str]:
+    """归一 ``string | array<string>`` → list[str]（非 str 项静默丢，语境化交调用方记日志）/ Normalize string|array<string>。"""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return [v for v in value if isinstance(v, str)]
+    return []
+
+
+def resolve_skill_override_dirs(
+    entry: Mapping[str, Any],
+    plugin_manifest: Mapping[str, Any],
+    plugin_root: Path,
+    *,
+    strict: bool,
+) -> list[Path]:
+    """解析 ``skills`` 组件路径覆写为**容器目录**列表（§4.3，追加进约定 ``skills/`` 之外）/ Resolve skills override container dirs。
+
+    源 = ``entry.skills``（恒取）+ ``plugin_manifest.skills``（仅 strict=true；strict=false 时 plugin 已无组件，
+    取空集亦无害——冲突在 :func:`check_strict_conflict` 已拦）。每项相对 ``plugin_root`` 解析后 ``is_within`` 防穿越
+    （越界记 ERROR 跳过，**不抛**），非目录记 WARNING 跳过；override 间按 resolve 后路径去重保序（与约定 ``skills/``
+    的去重交扫描方）。返回的是**容器**目录（其下 ``<name>/SKILL.md`` 为单个 SKILL，与约定 ``skills/`` 同构）。
+    """
+    raw: list[str] = _as_str_path_list(entry.get("skills"))
+    if strict:
+        raw.extend(_as_str_path_list(plugin_manifest.get("skills")))
+
+    plugin_root_resolved = plugin_root.resolve()
+    out: list[Path] = []
+    seen_paths: set[Path] = set()
+    for rel in raw:
+        cand = (plugin_root / rel).resolve()
+        if not is_within(cand, plugin_root_resolved):
+            logger.error("skills override path %r escapes plugin root %s, skipped", rel, plugin_root)
+            continue
+        if cand in seen_paths:
+            continue
+        if not cand.is_dir():
+            logger.warning("skills override path %r is not a directory at %s, skipped", rel, cand)
+            continue
+        seen_paths.add(cand)
+        out.append(cand)
+    return out
 
 
 # ── mcp-servers/<n>.json（plugin 携带 MCP server，文件式）/ bundled MCP server files ──────────

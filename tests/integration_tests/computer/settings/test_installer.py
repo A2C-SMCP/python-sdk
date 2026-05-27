@@ -25,7 +25,13 @@ from pathlib import Path
 
 import pytest
 
-from a2c_smcp.computer.settings.installer import disable_plugin, enable_plugin, install_plugin, uninstall_plugin
+from a2c_smcp.computer.settings.installer import (
+    PluginInstallError,
+    disable_plugin,
+    enable_plugin,
+    install_plugin,
+    uninstall_plugin,
+)
 from a2c_smcp.computer.settings.store import load_installed_plugins
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -191,3 +197,45 @@ async def test_install_disable_enable_no_reclone(tmp_path: Path) -> None:
     assert captured == ["figma"]  # server 重挂
     settings = json.loads((home / "cfg" / "a2c" / "settings.json").read_text(encoding="utf-8"))
     assert settings["enabledPlugins"]["audit@acme-skills"] is True
+
+
+# ── strict mode 冲突 install 硬失败（§4.4；#80）────────────────────────────────
+def _strict_false_conflict_files() -> dict[str, str]:
+    """audit entry strict=false 但 plugin.json 声明组件（skills）→ conflicting manifests。"""
+    manifest = {
+        "name": "acme-skills",
+        "owner": {"name": "Acme"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": "audit", "source": "audit", "version": "1.2.0", "strict": False}],
+    }
+    server = {"name": "figma", "type": "stdio", "server_parameters": {"command": "echo"}}
+    return {
+        ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
+        "plugins/audit/.tfrobot-plugin/plugin.json": json.dumps({"name": "audit", "skills": "x"}),
+        "plugins/audit/skills/lint/SKILL.md": _skill_md("lint"),
+        "plugins/audit/mcp-servers/figma.json": json.dumps(server),
+    }
+
+
+@requires_git
+async def test_install_strict_false_conflict_hard_fails_atomically(tmp_path: Path) -> None:
+    bare = _make_bare(tmp_path, "acme", _strict_false_conflict_files())
+    home = _home(tmp_path)
+    env = _env(home)
+    await _add_marketplace(home, bare, env)
+    reg = SkillRegistry()
+    captured: list[str] = []
+
+    async def _register(cfg) -> None:
+        captured.append(cfg.name)
+
+    # 早检拦截 → PluginInstallError（硬错误，conflicting manifests）
+    with pytest.raises(PluginInstallError, match="conflicting manifests"):
+        await install_plugin(
+            "audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register,
+        )
+
+    # 原子失败：未挂 server、未注册 skill、未写 installed 记录
+    assert captured == []
+    assert reg.resolve("audit:lint") is None
+    assert "audit@acme-skills" not in load_installed_plugins(home=home)["plugins"]
