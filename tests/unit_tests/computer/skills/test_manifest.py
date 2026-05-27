@@ -254,6 +254,19 @@ def test_resolve_skill_override_dirs_plugin_json_only_when_strict(tmp_path: Path
     assert resolve_skill_override_dirs({}, {"skills": "pj-skills"}, tmp_path, strict=False) == []
 
 
+def test_resolve_skill_override_dirs_entry_always_taken_regardless_of_strict(tmp_path: Path) -> None:
+    # 契约锁定：entry.skills「恒取」（strict 无关）——strict=false 下 entry.skills 仍解析，仅 plugin.json.skills 被忽略
+    (tmp_path / "entry-skills").mkdir()
+    (tmp_path / "pj-skills").mkdir()
+    out = resolve_skill_override_dirs(
+        {"skills": "entry-skills"},
+        {"skills": "pj-skills"},
+        tmp_path,
+        strict=False,
+    )
+    assert out == [(tmp_path / "entry-skills").resolve()]  # entry 恒取；plugin.json 在 strict=false 下忽略
+
+
 def test_resolve_skill_override_dirs_traversal_and_non_dir_skipped(tmp_path: Path) -> None:
     (tmp_path / "ok").mkdir()
     (tmp_path / "afile").write_text("x", encoding="utf-8")

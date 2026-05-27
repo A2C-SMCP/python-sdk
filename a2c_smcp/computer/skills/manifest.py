@@ -170,7 +170,8 @@ def check_strict_conflict(entry: Mapping[str, Any], plugin_manifest: Mapping[str
 
 
 def _as_str_path_list(value: Any) -> list[str]:
-    """归一 ``string | array<string>`` → list[str]（非 str 项静默丢，语境化交调用方记日志）/ Normalize string|array<string>。"""
+    """归一 ``string | array<string>`` → list[str]（非 str 项**静默跳过**，与 :func:`iter_plugin_entries` 对畸形
+    manifest 子项的 silent-skip 姿态一致）/ Normalize string|array<string>; non-str items silently skipped。"""
     if isinstance(value, str):
         return [value]
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
