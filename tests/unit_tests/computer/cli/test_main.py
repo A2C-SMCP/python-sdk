@@ -23,7 +23,7 @@ class DummyInteractive:
     last_init_client: Any | None = None
 
     @classmethod
-    async def coro(cls, comp: Any, init_client: Any | None = None) -> None:  # matches _interactive_loop signature
+    async def coro(cls, comp: Any, init_client: Any | None = None, **_: Any) -> None:  # matches _interactive_loop signature (+ #69 kwargs)
         cls.called = True
         cls.last_comp = comp
         cls.last_init_client = init_client
@@ -41,6 +41,7 @@ class FakeComputer:
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
+        registered_workdirs: Any | None = None,
     ) -> None:
         self.init_args = {
             "inputs": inputs,
@@ -49,6 +50,7 @@ class FakeComputer:
             "auto_reconnect": auto_reconnect,
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
+            "registered_workdirs": registered_workdirs,
         }
 
     async def __aenter__(self) -> FakeComputer:

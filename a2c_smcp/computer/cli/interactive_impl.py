@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Protocol
@@ -24,6 +25,8 @@ from pydantic import TypeAdapter
 
 from a2c_smcp.computer.cli.banner import render_banner
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
+from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.cli.commands import skill as skill_cmd
 from a2c_smcp.computer.cli.help import render_help
 from a2c_smcp.computer.cli.utils import console, parse_kv_pairs, print_mcp_config, print_status, print_tools
@@ -54,12 +57,15 @@ async def interactive_loop(
     smcp_client_cls: type[Any],
     init_client: Any | None = None,
     completer: Completer | None = None,
+    approve_all_mcp: bool = False,
+    mcp_flag_config: Path | None = None,
 ) -> None:
     """
     中文: 交互循环的可注入实现；从 main.py 传入 PromptSession 工厂、patch_stdout 上下文与 SMCP 客户端类。
     English: DI-friendly interactive loop; main.py passes PromptSession factory, patch_stdout ctx and SMCP client class.
 
     completer: 可选 Tab 补全器（逐次传入 ``prompt_async``，trust y/N 等子提示不带补全）/ optional Tab completer.
+    approve_all_mcp / mcp_flag_config: 全局 flag ``--approve-all-mcp`` / ``--settings <file>``，透传给启动期 MCP 批准框（#69 Group B）。
     """
     session = session_factory()
     smcp_client = init_client
@@ -74,6 +80,14 @@ async def interactive_loop(
     # 后者会 ensure_skill_home() 强制解析并创建目录，而 banner 仅需"未启动=None→物化计数按 0"语义，不应在
     # 此处产生副作用（尤其未经 boot_up 的单测路径）。/ read raw _skill_home to avoid forcing resolution.
     render_banner(comp, comp._skill_home, os.environ)
+
+    # 启动期 MCP 批准框（§9.2，#69 Group B）：解析 .tfrobot/mcp.json 定义层 → 门控 → 挂载 ENABLED / 弹 PENDING。
+    # 非 TTY（管道/CI）→ 传 session=None 走 skip+WARN / --approve-all-mcp 分支（避免 prompt_async 在无终端下 EOF）。
+    try:
+        approval_session = session if sys.stdin.isatty() else None
+        await plugin_cmd.run_mcp_approval(comp, approval_session, approve_all=approve_all_mcp, flag_config=mcp_flag_config)
+    except Exception as e:  # pragma: no cover - 批准框失败不阻断进入 REPL
+        console.print(f"[yellow]⚠ MCP 批准门控初始化失败 / MCP approval init failed: {e}[/yellow]")
 
     while True:
         try:
@@ -497,6 +511,14 @@ async def interactive_loop(
             elif cmd == "skill" and len(parts) >= 2:
                 # v0.2.1 跨源 SKILL 只读查询（list / info，§4.4）；直读 Computer 活跃 registry。
                 skill_cmd.repl_dispatch(comp, parts)
+
+            elif cmd == "plugin" and len(parts) >= 2:
+                # v0.2.1 plugin 管理（install/uninstall/enable/disable/list/info/gc，§4.3，S16 #69）；变更后触发去抖 emit。
+                await plugin_cmd.repl_dispatch(comp, parts, session=session)
+
+            elif cmd == "settings" and len(parts) >= 2:
+                # v0.2.1 settings 意图层增删改查（show/get/set/edit，§4.5，S16 #69）。
+                await settings_cmd.repl_dispatch(comp, parts, session=session)
 
             else:
                 console.print("[yellow]未知命令 / Unknown command[/yellow]")

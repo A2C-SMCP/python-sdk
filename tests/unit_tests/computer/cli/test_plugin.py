@@ -1,0 +1,270 @@
+# -*- coding: utf-8 -*-
+# filename: test_plugin.py
+# @Time    : 2026/05/27
+# @Author  : JQQ
+# @Email   : jqq1716@gmail.com
+# @Software: PyCharm
+"""
+``plugin`` 命令 handler 单元测试（v0.2.1 #69）/ Plugin command handler unit tests。
+
+设计依据 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §4.3 / §10.6（S16）。
+
+测试意图 / Test intentions（相对源 plugin → locate_plugin_root 无 git；monkeypatch stage；XDG 重定向隔离）:
+- install：happy（写账本 + 注册 bundled server）/ 外来同名硬抛退出码 1 + JSON error code / 非法 id 退出码 1；
+- enable/disable：**scope 从 ledger 读**（seed project scope → 写 project settings，不写 user）；
+- uninstall / list / info / gc 退出码与输出形态；
+- ``_plugin_inject_inputs_cb``：读 ``mcp-servers/inputs.json`` → 前缀化 → 注入 fake comp 池（#69 Group A）。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+from a2c_smcp.computer.settings.scope import user_settings_path, workdir_project_settings_path
+from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
+from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
+from a2c_smcp.computer.skills.registry import SkillRegistry
+
+_SRC = {"type": "git", "url": "https://example.com/acme.git"}
+_STAGE = "a2c_smcp.computer.settings.installer.stage_marketplace_skills"
+
+
+# ── 辅助（镜像 test_installer.py）/ helpers mirroring test_installer.py ─────────
+def _home(tmp_path: Path) -> Path:
+    h = tmp_path / "skill-home"
+    h.mkdir()
+    return h
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    return {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+
+def _write_json(path: Path, obj: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj), encoding="utf-8")
+
+
+def _stdio(name: str, command: str = "node") -> dict:
+    return {"name": name, "type": "stdio", "server_parameters": {"command": command}}
+
+
+def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], inputs: list[dict] | None = None) -> Path:
+    """造 catalog 树（相对源 plugin）+ marketplace.json + plugin mcp-servers/，seed known_marketplaces。"""
+    catalog = marketplace_skill_dir(home, mp)
+    manifest = {
+        "name": mp,
+        "owner": {"name": "X"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": plugin, "source": plugin, "version": "1.2.0"}],
+    }
+    _write_json(catalog / ".tfrobot-plugin" / "marketplace.json", manifest)
+    plugin_root = catalog / "plugins" / plugin
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    for sname in servers:
+        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", _stdio(sname))
+    if inputs is not None:
+        _write_json(plugin_root / "mcp-servers" / "inputs.json", {"inputs": inputs})
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {mp: {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}}},
+        home=home,
+    )
+    return plugin_root
+
+
+def _fake_stage(register_skill: bool = True):
+    async def _stage(name, source, registry, home, *, plugin_filter=None, auto_update=False, refresh=False, timeout=0.0, env=None):
+        if register_skill:
+            for plugin in plugin_filter or set():
+                registry.register_or_update(
+                    {
+                        "name": f"{plugin}:lint",
+                        "source": f"{SOURCE_MARKETPLACE}:{name}",
+                        "path": str(marketplace_skill_dir(home, name).resolve()),
+                    },
+                )
+        return [f"{p}:lint" for p in plugin_filter or set()]
+
+    return _stage
+
+
+class _FakeMCP:
+    """记录 MCP 注入回调调用 / records injected MCP callback invocations。"""
+
+    def __init__(self, existing: set[str] | None = None) -> None:
+        self.existing: set[str] = set(existing or ())
+        self.registered: list[Any] = []
+        self.removed: list[str] = []
+
+    def existing_names(self) -> set[str]:
+        return set(self.existing)
+
+    async def register(self, cfg: Any) -> None:
+        self.registered.append(cfg)
+
+    async def remove(self, name: str) -> None:
+        self.removed.append(name)
+
+
+# ── install ───────────────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_install_happy_writes_ledger_and_registers_servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    mcp = _FakeMCP()
+
+    code = await plugin_cmd.plugin_install(
+        reg, home, env, "audit@acme",
+        existing_server_names=mcp.existing_names, register_server=mcp.register, json_output=True,
+    )
+    assert code == 0
+    assert "audit@acme" in load_installed_plugins(home=home, env=env)["plugins"]
+    assert [c.name for c in mcp.registered] == ["figma-mcp"]
+
+
+@pytest.mark.asyncio
+async def test_install_foreign_name_conflict_exit1_json_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    # 外来同名（已存在且非自有）→ 硬抛、退出码 1、不写账本（§10.6）
+    mcp = _FakeMCP(existing={"figma-mcp"})
+
+    code = await plugin_cmd.plugin_install(
+        reg, home, env, "audit@acme",
+        existing_server_names=mcp.existing_names, register_server=mcp.register, json_output=True,
+    )
+    assert code == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "mcp_server_name_conflict"
+    assert "audit@acme" not in load_installed_plugins(home=home, env=env)["plugins"]
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_id_exit1(tmp_path: Path) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    assert await plugin_cmd.plugin_install(reg, home, env, "nodelim", json_output=True) == 1
+
+
+# ── enable / disable：scope 从 ledger 读（不默认 user）/ scope read from ledger ──
+@pytest.mark.asyncio
+async def test_enable_reads_scope_from_ledger_writes_project_not_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    plugin_root = _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    wd = tmp_path / "proj"
+    wd.mkdir()
+    # seed installed record at PROJECT scope（projectPath=wd）→ enable 必须写 project settings、不写 user
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "project", "projectPath": str(wd), "installPath": str(plugin_root)}]}},
+        home=home,
+    )
+    mcp = _FakeMCP()
+    code = await plugin_cmd.plugin_enable(
+        reg, home, env, "audit@acme", existing_server_names=mcp.existing_names, register_server=mcp.register,
+    )
+    assert code == 0
+    # enabledPlugins[audit@acme]=true 写 project scope（active workdir），user scope 不动
+    proj = json.loads(workdir_project_settings_path(wd).read_text(encoding="utf-8"))
+    assert proj["enabledPlugins"]["audit@acme"] is True
+    user_ep = json.loads(user_settings_path(env).read_text()).get("enabledPlugins", {}) if user_settings_path(env).exists() else {}
+    assert "audit@acme" not in user_ep  # 未写 user scope
+
+
+@pytest.mark.asyncio
+async def test_enable_not_installed_exit1(tmp_path: Path) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    assert await plugin_cmd.plugin_enable(reg, home, env, "ghost@acme") == 1
+
+
+@pytest.mark.asyncio
+async def test_disable_reads_scope_from_ledger(tmp_path: Path) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    plugin_root = _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(plugin_root), "bundledMcpServers": ["figma-mcp"]}]}},
+        home=home,
+    )
+    mcp = _FakeMCP()
+    code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", remove_server=mcp.remove)
+    assert code == 0
+    assert mcp.removed == ["figma-mcp"]  # 整 plugin 下线：摘 bundled server
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["enabledPlugins"]["audit@acme"] is False
+
+
+# ── uninstall / list / info / gc ───────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_uninstall_not_installed_exit1(tmp_path: Path) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    assert await plugin_cmd.plugin_uninstall(reg, home, env, "ghost@acme") == 1
+
+
+def test_list_and_info(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    home, env = _home(tmp_path), _env(tmp_path)
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x", "bundledMcpServers": ["figma-mcp"]}]}},
+        home=home,
+    )
+    assert plugin_cmd.plugin_list(home, env, json_output=True) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["id"] == "audit@acme" and rows[0]["enabled"] is True
+    assert plugin_cmd.plugin_info(home, env, "audit@acme", json_output=True) == 0
+    assert plugin_cmd.plugin_info(home, env, "ghost@acme", json_output=True) == 1
+
+
+def test_list_hides_disabled_unless_available(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    home, env = _home(tmp_path), _env(tmp_path)
+    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
+    # 显式 disable
+    from a2c_smcp.computer.settings.scope import apply_write
+    from a2c_smcp.computer.settings.scope import user_settings_path as _usp
+    from a2c_smcp.computer.settings.store import atomic_write_json
+
+    atomic_write_json(_usp(env), apply_write({}, {"enabledPlugins": {"audit@acme": False}}))
+    plugin_cmd.plugin_list(home, env, json_output=True)
+    assert json.loads(capsys.readouterr().out) == []  # 默认隐藏 disabled
+    plugin_cmd.plugin_list(home, env, available=True, json_output=True)
+    assert json.loads(capsys.readouterr().out)[0]["enabled"] is False  # --available 含 disabled
+
+
+@pytest.mark.asyncio
+async def test_gc_no_orphans(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    # enabledPlugins 声明 audit@acme（在 user settings）→ 非孤儿；installed 仅 audit@acme → 无孤儿
+    from a2c_smcp.computer.settings.scope import apply_write
+    from a2c_smcp.computer.settings.scope import user_settings_path as _usp
+    from a2c_smcp.computer.settings.store import atomic_write_json
+
+    atomic_write_json(_usp(env), apply_write({}, {"enabledPlugins": {"audit@acme": True}}))
+    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
+    assert await plugin_cmd.plugin_gc(reg, home, env, json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)["removed"] == []
+
+
+# ── _plugin_inject_inputs_cb：D2 入池消歧（#69 Group A）/ inject prefixed inputs ─
+@pytest.mark.asyncio
+async def test_inject_inputs_cb_prefixes_and_injects(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    plugin_root = _setup_catalog(
+        home, "acme", "audit", servers=["figma-mcp"],
+        inputs=[{"id": "figma_token", "type": "promptString", "description": "tok", "password": True}],
+    )
+    injected: list[Any] = []
+
+    class _Comp:
+        def add_or_update_input(self, inp: Any) -> None:
+            injected.append(inp)
+
+    cb = plugin_cmd._plugin_inject_inputs_cb(_Comp(), "audit", "acme")
+    await cb(plugin_root)
+    assert len(injected) == 1
+    assert injected[0].id == "audit@acme/figma_token"  # 前缀化（§9.3 D2）

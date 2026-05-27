@@ -23,11 +23,11 @@ NAMESPACES: dict[str, str] = {
     "server": "MCP server lifecycle (add / rm / start / stop)",
     "inputs": "Input definitions and values",
     "marketplace": "SKILL marketplaces (git sources)",
-    "plugin": "Plugins — skill+mcp bundles (see #69)",
+    "plugin": "Plugins — skill+mcp bundles (install / enable / list ...)",
     "skill": "Skills cross-source query (list / info)",
     "socket": "Socket.IO connection control",
     "notify": "Send notifications to Agent",
-    "settings": "Edit settings.json files (see #69)",
+    "settings": "settings.json intent layer (show / get / set / edit)",
     "utility": "status / tools / mcp / desktop / render / tc / history",
 }
 
@@ -53,7 +53,12 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("marketplace set <name> auto-update=<bool>", "设置 per-source auto-update / set flag"),
     ],
     "plugin": [
-        ("plugin install|uninstall|enable|disable|list|info", "（#69 落地）/ implemented in #69"),
+        ("plugin install <plugin>@<mp> [--version V] [--scope S]", "安装 plugin（外来 MCP 同名硬抛）/ install (name conflict aborts)"),
+        ("plugin uninstall <plugin>@<mp> [--keep-servers]", "卸载 plugin / uninstall"),
+        ("plugin enable|disable <plugin>@<mp>", "启用 / 禁用（整 plugin 上/下线）/ enable / disable (whole plugin)"),
+        ("plugin list [--available] [--json]", "列出 installed plugin / list plugins"),
+        ("plugin info <plugin>@<mp> [--json]", "plugin 详情 / plugin detail"),
+        ("plugin gc", "清理孤儿 plugin / gc orphan plugins"),
     ],
     "skill": [
         ("skill list [--source mp|mcp|user] [--json]", "跨源列出可见 SKILL / list skills"),
@@ -65,7 +70,12 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("socket leave", "离开房间 / leave office"),
     ],
     "notify": [("notify update", "触发配置更新通知 / emit config updated notification")],
-    "settings": [("settings show|edit|get|set", "（#69 落地）/ implemented in #69")],
+    "settings": [
+        ("settings show [--scope user|project|local|flag|policy|merged]", "展示某 scope（默认 merged）/ show a scope (default merged)"),
+        ("settings get <key> [--scope ...]", "读取单字段 / read a field"),
+        ("settings set <key> <value> [--scope user|project|local]", "写单字段（flag/policy 只读）/ set a field (flag/policy read-only)"),
+        ("settings edit [--scope user|project|local]", "$EDITOR 编辑 + 保存后 reconcile / edit then reconcile"),
+    ],
     "utility": [
         ("status", "查看服务器状态 / show server status"),
         ("tools", "列出可用工具 / list tools"),
@@ -107,6 +117,17 @@ FLAGS: dict[tuple[str, str], list[str]] = {
     ("marketplace", "set"): ["--json"],
     ("skill", "list"): ["--source", "--json"],
     ("skill", "info"): ["--json"],
+    ("plugin", "install"): ["--version", "--scope", "--json"],
+    ("plugin", "uninstall"): ["--keep-servers", "--json"],
+    ("plugin", "enable"): ["--json"],
+    ("plugin", "disable"): ["--json"],
+    ("plugin", "list"): ["--available", "--json"],
+    ("plugin", "info"): ["--json"],
+    ("plugin", "gc"): ["--json"],
+    ("settings", "show"): ["--scope", "--json"],
+    ("settings", "get"): ["--scope", "--json"],
+    ("settings", "set"): ["--scope", "--json"],
+    ("settings", "edit"): ["--scope", "--json"],
 }
 
 

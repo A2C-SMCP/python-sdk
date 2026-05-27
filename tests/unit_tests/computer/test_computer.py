@@ -319,7 +319,10 @@ class DummyResolver(InputResolver):
     def clear_cache(self, key: str | None = None) -> None:  # pragma: no cover - only used in update_inputs case
         self.cleared = True
 
-    async def aresolve_by_id(self, input_id: str, *, session: PromptSession | None = None):
+    async def aresolve_by_id(
+        self, input_id: str, *, session: PromptSession | None = None, plugin: str | None = None, marketplace: str | None = None,
+    ):
+        # 接受 #69 Group A 的 plugin/marketplace 上下文 kwargs（默认 None；本 stub 仅按裸 id 查表）。
         return self.mapping[input_id]
 
 

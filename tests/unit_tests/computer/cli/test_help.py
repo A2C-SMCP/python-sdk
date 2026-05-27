@@ -31,3 +31,20 @@ def test_help_namespace_detail(capsys: pytest.CaptureFixture[str]) -> None:
 def test_help_unknown_namespace(capsys: pytest.CaptureFixture[str]) -> None:
     render_help("bogus")
     assert "unknown" in capsys.readouterr().out.lower()
+
+
+def test_help_plugin_detail_real_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    render_help("plugin")
+    out = capsys.readouterr().out
+    # #69 落地：真命令行（非骨架占位），含 install/enable/gc
+    for verb in ("install", "enable", "gc"):
+        assert verb in out
+    assert "#69" not in out  # 骨架占位已替换
+
+
+def test_help_settings_detail_real_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    render_help("settings")
+    out = capsys.readouterr().out
+    for verb in ("show", "get", "set", "edit"):
+        assert verb in out
+    assert "#69" not in out

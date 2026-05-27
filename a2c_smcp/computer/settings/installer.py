@@ -107,6 +107,9 @@ ExistingServerNames = Callable[[], set[str]]
 RegisterServer = Callable[[MCPServerConfig], Awaitable[None]]
 # 停止并移除一个 server（异步；CLI 包 ``Computer.aremove_server``）。
 RemoveServer = Callable[[str], Awaitable[None]]
+# 注入 plugin-scoped inputs 入池（异步；入参 plugin_root；CLI 包 ``load_plugin_inputs`` → ``Computer.add_or_update_input``）。
+# 在 register（→render bundled server 的 ${input:}）之前调，使裸 id 可经 D2 前缀回退解析（#69 Group A，§9.3 D2）。
+InjectInputs = Callable[[Path], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +264,7 @@ async def install_plugin(
     existing_server_names: ExistingServerNames | None = None,
     register_server: RegisterServer | None = None,
     remove_server: RemoveServer | None = None,
+    inject_inputs: InjectInputs | None = None,
 ) -> InstalledPluginRecord:
     """
     显式安装单个 plugin（**原子失败：冲突即抛、不留半装**）/ Install one plugin atomically。
@@ -282,6 +286,8 @@ async def install_plugin(
         锁版本由 entry source 的 ref 治理（version 仅作记录）。
     :param existing_server_names / register_server / remove_server: MCP 注入回调（``None`` = ledger-only）。
         **契约**：给了 ``register_server`` 就必须给 ``existing_server_names``（否则冲突闸门被静默旁路，违 §10.6）。
+    :param inject_inputs: 可选 plugin-scoped inputs 注入 hook（入参 ``plugin_root``）；在冲突闸门后、register 前调一次
+        （#69 Group A，§9.3 D2）。``None`` = 不注入。注入失败走补偿回滚上抛；注入的 inputs 不回滚（无害）。
     :return: 写入的 :class:`InstalledPluginRecord`。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
@@ -323,6 +329,11 @@ async def install_plugin(
     skills_before = set(_plugin_skill_names(registry, marketplace, plugin))
     registered: list[str] = []
     try:
+        # 注入 plugin-scoped inputs 入池（#69 Group A）：须在 register（→render bundled server 的 ``${input:}``）之前，
+        # 使裸 id 经 D2 前缀回退命中带前缀池条目。失败即走下方补偿回滚上抛；inputs 注入本身**不回滚**
+        # （悬空前缀 def 无害——仅在被引用时消费，而该 cfg 已回滚不挂载）。
+        if inject_inputs is not None:
+            await inject_inputs(plugin_root)
         if register_server is not None:
             for cfg in servers:
                 await register_server(cfg)
