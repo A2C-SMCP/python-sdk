@@ -131,6 +131,23 @@ def test_server_config_inheritance():
     assert isinstance(http_config.server_parameters, StreamableHttpParameters)
 
 
+def test_env_file_camelcase_alias_and_default():
+    """v0.2.1 #65：envFile（camelCase alias）与 env_file（字段名）均可填充；默认 None。"""
+    # 默认 None / default None
+    base = StdioServerConfig(name="s", server_parameters=StdioServerParameters(command="node"))
+    assert base.env_file is None
+
+    # camelCase alias（mcp.json 风格）/ camelCase alias as in mcp.json
+    by_alias = StdioServerConfig.model_validate(
+        {"name": "s", "type": "stdio", "server_parameters": {"command": "node"}, "envFile": "${workspaceFolder}/.env"},
+    )
+    assert by_alias.env_file == "${workspaceFolder}/.env"
+
+    # populate_by_name：字段名也可 / field name also accepted
+    by_name = StdioServerConfig(name="s", server_parameters=StdioServerParameters(command="node"), env_file="/x/.env")
+    assert by_name.env_file == "/x/.env"
+
+
 def test_mcp_config_union():
     """测试MCPServerConfig类型别名接受所有子类型"""
     servers: list[MCPServerConfig] = [

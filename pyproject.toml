@@ -29,6 +29,11 @@ cli = [
     "rich >=14.1.0,<15.0.0",
     "prompt-toolkit >=3.0.52,<4.0.0",
 ]
+# v0.2.1 #65：OS keyring（password:true input 的 SecretStorage 后端，对标 VS Code）。可选——
+# 缺失/不可用时 inputs 解析链降级到 env（A2C_INPUT_<ID>），核心功能不依赖它（§9.3 / 决策 #27）。
+keyring = [
+    "keyring >=25,<26",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -100,6 +105,8 @@ module = [
     "msgpack.*",
     "yaml",
     "yaml.*",
+    "keyring",
+    "keyring.*",
 ]
 ignore_missing_imports = true
 

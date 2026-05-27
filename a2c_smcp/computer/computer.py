@@ -27,6 +27,7 @@ All classes and methods use Google style docstrings (bilingual: Chinese and Engl
 
 import asyncio
 import json
+import os
 import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -58,7 +59,7 @@ from a2c_smcp.computer.blob import (
     default_thresholds,
 )
 from a2c_smcp.computer.desktop.organize import organize_desktop
-from a2c_smcp.computer.inputs.render import ConfigRender
+from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
@@ -308,26 +309,14 @@ class Computer(BaseComputer[PromptSession]):
             auto_reconnect=self._auto_reconnect,
             message_handler=self._on_manager_change,
         )
-        # 中文: 对每个 Server 配置执行：model_dump -> 按需渲染(遇到占位符才解析 input) -> 重新校验生成不可变对象
-        # English: For each server config: model_dump -> on-demand render (resolve inputs only when referenced) ->
-        #          model_validate to rebuild immutable object
+        # 中文: 对每个 Server 配置执行：渲染(占位符解析链 + 预定义变量) + envFile 合并 + 校验生成不可变对象。
+        #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
+        # English: Render (resolution chain + predefined vars) + envFile merge + validate, reusing
+        #          _arender_and_validate_server (DRY). On failure, keep the original config and continue.
         validated_servers: list[MCPServerConfig] = []
-
-        async def _resolve_input_by_id(input_id: str) -> Any:
-            try:
-                return await self._input_resolver.aresolve_by_id(input_id, session=session)
-            except InputNotFoundError:
-                # 未找到输入项，按要求保留原始输出并打印警告
-                logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
-                raise
-
-        # 注意: 假设 self._mcp_servers 为 Iterable[MCPServerConfig]
         for server_cfg in self._mcp_servers:
             try:
-                raw = server_cfg.model_dump(mode="json")
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id)
-                validated = type(server_cfg).model_validate(rendered)
-                validated_servers.append(validated)
+                validated_servers.append(await self._arender_and_validate_server(server_cfg, session=session))
             except Exception as e:
                 logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 按稳妥策略: 保留原配置继续
@@ -632,6 +621,49 @@ class Computer(BaseComputer[PromptSession]):
         if self._skill_watcher is not None:
             self._skill_watcher.mark_internal_write(path)
 
+    def _render_variables(self) -> dict[str, str]:
+        """
+        预定义渲染变量（对标 VS Code，§9.1）/ Predefined render variables (VS Code parity)。
+
+        ``workspaceFolder`` 取首个已登记 workdir（绑定当前任务的单根代表），无则 ``os.getcwd()``；
+        ``userHome``=用户主目录；``pathSeparator``=``os.sep``。``${env:VAR}`` 不在此（由 render 直接读
+        进程环境）。``workspaceFolder`` takes the first registered workdir, else cwd.
+        """
+        workspace = str(self._registered_workdirs[0]) if self._registered_workdirs else os.getcwd()
+        return {
+            "workspaceFolder": workspace,
+            "userHome": os.path.expanduser("~"),
+            "pathSeparator": os.sep,
+        }
+
+    def _apply_env_file(self, rendered: dict[str, Any]) -> dict[str, Any]:
+        """
+        合并 ``envFile`` 的 ``KEY=VALUE`` 进 stdio server 的 ``env``（显式 env 胜，§9.1）/ Merge envFile into env。
+
+        仅对 stdio（``server_parameters.env`` 存在）生效；sse/http 无 env 字段，原样返回。envFile **路径**
+        已在 :meth:`ConfigRender.arender` 渲染（``${workspaceFolder}`` 等已展开）。**显式 ``env`` 同名项覆盖
+        envFile**（显式胜）。本方法不改 ``envFile`` 字段本身（spawn 仅消费 ``server_parameters.env``）。
+        """
+        env_file = rendered.get("envFile") or rendered.get("env_file")
+        if not env_file or not isinstance(env_file, str):
+            return rendered
+        params = rendered.get("server_parameters")
+        if not isinstance(params, dict) or ("env" not in params and "command" not in params):
+            # 非 stdio（sse/http 无 env/command）→ envFile 不适用，记 WARN（已填但被忽略）+ 原样返回。
+            # non-stdio (sse/http) → envFile not applicable; WARN that it is ignored, then passthrough.
+            name = rendered.get("name", "unknown")
+            srv_type = rendered.get("type", "unknown")
+            logger.warning(f"envFile 在非 stdio（{srv_type}）server 上不适用，已忽略: {name} / envFile ignored on non-stdio server")
+            return rendered
+        file_env = load_env_file(Path(env_file))
+        if not file_env:
+            return rendered
+        explicit_env = params.get("env") or {}
+        # 显式 env 同名项胜：先铺 envFile，再覆盖以显式值 / explicit env wins over envFile
+        params["env"] = {**file_env, **explicit_env}
+        rendered["server_parameters"] = params
+        return rendered
+
     async def _arender_and_validate_server(
         self,
         server: MCPServerConfig | dict[str, Any],
@@ -680,15 +712,18 @@ class Computer(BaseComputer[PromptSession]):
                 # 透传异常到上层，由上层决定是否回退或继续
                 raise
 
+        variables = self._render_variables()
         try:
             if isinstance(server, dict):
                 raw = server
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id)
+                rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
+                rendered = self._apply_env_file(rendered)
                 # 使用 TypeAdapter 将 union 类型解析为具体模型
                 validated: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(rendered)
             else:
                 raw = server.model_dump(mode="json")
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id)
+                rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
+                rendered = self._apply_env_file(rendered)
                 validated = type(server).model_validate(rendered)
             return validated
         except Exception as e:
