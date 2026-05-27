@@ -114,3 +114,57 @@ def test_edit_readonly_scopes_exit1(tmp_path: Path, scope: str) -> None:
     code, post_save = settings_cmd.settings_edit(home, env, scope=scope, editor="true", json_output=True)
     assert code == 1
     assert post_save is None
+
+
+# ── repl_dispatch（REPL 解析胶水层；fix-review #2/#3）/ REPL parse glue ─────────
+class _FakeComp:
+    """settings repl_dispatch 所需最小 fake（repl 用 os.environ 作 env，故 XDG 经 monkeypatch 隔离）。"""
+
+    def __init__(self, home: Path) -> None:
+        self.skill_home = home
+        self._registered_workdirs: tuple[Path, ...] = ()
+        self.active_workdir: Path | None = None
+        self.dirty = 0
+
+    def mark_skills_dirty(self) -> None:
+        self.dirty += 1
+
+
+@pytest.mark.asyncio
+async def test_repl_set_reconstructs_spaced_json_and_stops_at_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    comp = _FakeComp(tmp_path / "home")
+    # value 含空格（["a", "b"] 被空格切成 2 token）+ 尾随 --scope → 重建含空格 JSON、停在真 flag token（Group C）
+    parts = ["settings", "set", "trustedMarketplaces", '["a",', '"b"]', "--scope", "user"]
+    await settings_cmd.repl_dispatch(comp, parts, session=None)
+    data = json.loads(user_settings_path(os.environ).read_text(encoding="utf-8"))
+    assert data["trustedMarketplaces"] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_repl_set_value_with_doubledash_substring_not_truncated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    comp = _FakeComp(tmp_path / "home")
+    # value 字面含 "--scope" 子串（非独立 flag token）→ 不应被截断（旧 _strip_scope_flag 的 bug，Group C 修复）
+    parts = ["settings", "set", "note", "a--scope-thing", "--scope", "user"]
+    await settings_cmd.repl_dispatch(comp, parts, session=None)
+    data = json.loads(user_settings_path(os.environ).read_text(encoding="utf-8"))
+    assert data["note"] == "a--scope-thing"  # 完整保留，不在 "--scope" 子串处截断
+
+
+@pytest.mark.asyncio
+async def test_repl_set_emit_key_marks_dirty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    comp = _FakeComp(tmp_path / "home")
+    await settings_cmd.repl_dispatch(comp, ["settings", "set", "enabledMcpjsonServers", '["x"]', "--json"], session=None)
+    assert comp.dirty == 1  # 能力/MCP 字段写入 → 触发去抖 emit
+
+
+@pytest.mark.asyncio
+async def test_repl_get_and_unknown_subcommand_no_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    comp = _FakeComp(tmp_path / "home")
+    # 缺失键 get（退出码 1，不抛）+ 未知子命令（no-op，不抛）
+    await settings_cmd.repl_dispatch(comp, ["settings", "get", "neverset"], session=None)
+    await settings_cmd.repl_dispatch(comp, ["settings", "bogus"], session=None)
+    assert comp.dirty == 0

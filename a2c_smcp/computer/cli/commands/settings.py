@@ -28,13 +28,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from a2c_smcp.computer.cli.commands import flag_value, resolved_settings
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.settings.policy import resolve_policy_settings
 from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.settings.scope import (
     apply_write,
     load_settings_file,
-    resolve_settings,
     user_settings_path,
     workdir_local_settings_path,
     workdir_project_settings_path,
@@ -57,14 +57,6 @@ def _err(msg: str, *, json_output: bool) -> int:
     return EXIT_USER_ERROR
 
 
-def _flag_value(args: list[str], flag: str) -> str | None:
-    if flag in args:
-        idx = args.index(flag)
-        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
-            return args[idx + 1]
-    return None
-
-
 def _writable_path(scope: str, active_workdir: Path | None, env: Mapping[str, str] | None) -> tuple[Path, SettingsScope]:
     """解析可写 scope 的 settings.json 路径 + enum；flag/policy/unknown → ``ValueError``。"""
     if scope == "user":
@@ -78,23 +70,6 @@ def _writable_path(scope: str, active_workdir: Path | None, env: Mapping[str, st
     raise ValueError(f"scope {scope!r} is read-only (writable: user|project|local)")
 
 
-def _merged(
-    home: Path,
-    env: Mapping[str, str] | None,
-    registered_workdirs: tuple[Path, ...],
-    active_workdir: Path | None,
-    flag_path: Path | None,
-) -> dict[str, Any]:
-    """六层合并 settings（含 policy first-source-wins）/ Six-layer merged settings incl. policy。"""
-    return resolve_settings(
-        registered_workdirs=registered_workdirs,
-        active_workdir=active_workdir,
-        env=env,
-        flag_settings_path=flag_path,
-        policy_settings=resolve_policy_settings(env=env),
-    ).settings
-
-
 def _read_scope(
     scope: str,
     home: Path,
@@ -106,7 +81,7 @@ def _read_scope(
 ) -> dict[str, Any] | None:
     """读单 scope（或 merged）settings dict；scope 非法或缺 active workdir → ``None``（调用方报错）。"""
     if scope == "merged":
-        return _merged(home, env, registered_workdirs, active_workdir, flag_path)
+        return resolved_settings(registered_workdirs, active_workdir, env, flag_path=flag_path)
     if scope == "user":
         return load_settings_file(user_settings_path(env), SettingsScope.USER)[0]
     if scope in ("project", "local"):
@@ -252,7 +227,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     env = os.environ
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
-    scope = _flag_value(args, "--scope")
+    scope = flag_value(args, "--scope")
     registered = comp._registered_workdirs
     aw = comp.active_workdir
 
@@ -273,13 +248,18 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if len(pos) < 2:
             console.print("[yellow]usage: settings set <key> <value> [--scope user|project|local][/yellow]")
             return
-        # value = key 之后的整段（允许含空格的 JSON）/ value is everything after the key.
-        raw = " ".join(parts[2:])
-        value = raw.split(pos[0], 1)[1].strip() if pos[0] in raw else pos[1]
-        value = _strip_scope_flag(value)
-        code = settings_set(home, env, pos[0], value, scope=scope or "user", active_workdir=aw, json_output=json_output)
+        # value = key（parts[2]）之后、首个 --flag token 前的所有 token（重建含空格 JSON；停在**真 flag token**、
+        # 非子串——修 fix-review #3：旧 _strip_scope_flag 会误截含 "--scope" 子串的 value）。usage 契约：key 在 value 前。
+        key = pos[0]
+        value_tokens: list[str] = []
+        for tok in parts[3:]:
+            if tok.startswith("--"):
+                break
+            value_tokens.append(tok)
+        value = " ".join(value_tokens)
+        code = settings_set(home, env, key, value, scope=scope or "user", active_workdir=aw, json_output=json_output)
         _emit_keys = {"enabledPlugins", "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"}
-        if code == EXIT_OK and pos[0] in _emit_keys:
+        if code == EXIT_OK and key in _emit_keys:
             comp.mark_skills_dirty()
     elif sub == "edit":
         code, post_save = settings_edit(home, env, scope=scope or "user", active_workdir=aw, reconcile_cb=None, json_output=json_output)
@@ -289,12 +269,3 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
                 await post_save()
     else:
         console.print(f"[yellow]unknown settings subcommand: {sub}[/yellow]")
-
-
-def _strip_scope_flag(value: str) -> str:
-    """从 set 的 value 段剥掉尾随的 ``--scope X`` / ``--json``（REPL 简化：flag 可在 value 后）。"""
-    for flag in ("--json",):
-        value = value.replace(flag, "")
-    if "--scope" in value:
-        value = value.split("--scope", 1)[0]
-    return value.strip()

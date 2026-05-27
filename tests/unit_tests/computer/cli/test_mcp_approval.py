@@ -30,8 +30,14 @@ from a2c_smcp.computer.settings.scope import user_settings_path, workdir_local_s
 
 @pytest.fixture(autouse=True)
 def _no_policy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """policy 读取 OS 源不确定 → 测试中固定为空，保证确定性 / pin policy empty for determinism。"""
-    monkeypatch.setattr(plugin_cmd, "resolve_policy_settings", lambda **_: {})
+    """policy 读取 OS 源不确定 → 测试中固定为空，保证确定性 / pin policy empty for determinism。
+
+    fix-review #4 后 ``resolved_settings`` 移入 ``cli.commands.__init__``（函数内 lazy import policy），
+    故 monkeypatch 须打到来源模块 ``settings.policy``（lazy import 会取到打过的属性）。
+    """
+    import a2c_smcp.computer.settings.policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "resolve_policy_settings", lambda **_: {})
 
 
 def _env(tmp_path: Path) -> dict[str, str]:

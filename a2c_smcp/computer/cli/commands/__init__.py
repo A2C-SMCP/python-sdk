@@ -23,8 +23,10 @@ so they unit-test in isolation. Only the cross-command seam lives here: :func:`b
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodge runtime import cycle
     from a2c_smcp.computer.computer import Computer
@@ -63,3 +65,41 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
         await comp.aremove_server(name)
 
     return McpCallbacks(existing_server_names=_existing, register_server=_register, remove_server=_remove)
+
+
+# ── 跨命令解析 / 视图接缝（marketplace / skill / plugin / settings 共用）/ shared parse & view seams ──
+def flag_value(args: list[str], flag: str) -> str | None:
+    """取 ``--flag value`` 形态的值（**不支持** ``--flag=value``，REPL 简化）/ Extract a ``--flag value`` pair。
+
+    四个命令模块（marketplace / skill / plugin / settings）的 REPL dispatcher 共用，避免 4 处分叉。
+    """
+    if flag in args:
+        idx = args.index(flag)
+        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
+            return args[idx + 1]
+    return None
+
+
+def resolved_settings(
+    registered_workdirs: Sequence[Path],
+    active_workdir: Path | None,
+    env: Mapping[str, str] | None,
+    *,
+    flag_path: Path | None = None,
+) -> dict[str, Any]:
+    """六层合并 settings（含 policy first-source-wins）/ Six-layer merged settings incl. policy。
+
+    plugin（``enabledPlugins`` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
+    allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。函数内 lazy import 沿用本仓
+    dodge-cycle 范式（settings.scope / settings.policy 不反向依赖 cli，无环，仅避免 ``import cli.commands`` 拉重）。
+    """
+    from a2c_smcp.computer.settings.policy import resolve_policy_settings
+    from a2c_smcp.computer.settings.scope import resolve_settings
+
+    return resolve_settings(
+        registered_workdirs=registered_workdirs,
+        active_workdir=active_workdir,
+        env=env,
+        flag_settings_path=flag_path,
+        policy_settings=resolve_policy_settings(env=env),
+    ).settings

@@ -268,3 +268,55 @@ async def test_inject_inputs_cb_prefixes_and_injects(tmp_path: Path) -> None:
     await cb(plugin_root)
     assert len(injected) == 1
     assert injected[0].id == "audit@acme/figma_token"  # 前缀化（§9.3 D2）
+
+
+# ── repl_dispatch（REPL 解析胶水层；fix-review #2）/ REPL parse glue ────────────
+class _ReplComp:
+    """plugin repl_dispatch 所需最小 fake（build_mcp_callbacks + register/inject 闭包所需接口）。"""
+
+    def __init__(self, home: Path, registry: SkillRegistry) -> None:
+        self.skill_home = home
+        self.skill_registry = registry
+        self._registered_workdirs: tuple[Path, ...] = ()
+        self.active_workdir: Path | None = None
+        self.dirty = 0
+        self._servers: list[Any] = []
+        self.injected: list[Any] = []
+
+    @property
+    def mcp_servers(self) -> list[Any]:
+        return list(self._servers)
+
+    def mark_skills_dirty(self) -> None:
+        self.dirty += 1
+
+    def add_or_update_input(self, inp: Any) -> None:
+        self.injected.append(inp)
+
+    async def aadd_or_aupdate_server(self, cfg: Any, *, session: Any = None, plugin: Any = None, marketplace: Any = None) -> None:
+        self._servers.append(cfg)
+
+    async def aremove_server(self, name: str) -> None:
+        self._servers = [s for s in self._servers if getattr(s, "name", None) != name]
+
+
+@pytest.mark.asyncio
+async def test_repl_install_marks_dirty_and_fires_register(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    home, reg = _home(tmp_path), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    comp = _ReplComp(home, reg)
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "install", "audit@acme"], session=None)
+    assert comp.dirty == 1  # 成功 → 触发去抖 emit
+    assert "audit@acme" in load_installed_plugins(home=home)["plugins"]
+    assert any(getattr(s, "name", None) == "figma-mcp" for s in comp._servers)  # register cb fired（实时挂载）
+
+
+@pytest.mark.asyncio
+async def test_repl_list_and_unknown_subcommand_no_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    comp = _ReplComp(_home(tmp_path), SkillRegistry())
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "list"], session=None)  # 空 → 无错
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "bogus"], session=None)  # 未知子命令 → no-op
+    assert comp.dirty == 0

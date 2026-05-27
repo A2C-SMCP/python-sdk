@@ -27,7 +27,7 @@ from typing import Any
 
 from rich.table import Table
 
-from a2c_smcp.computer.cli.commands import McpCallbacks
+from a2c_smcp.computer.cli.commands import McpCallbacks, flag_value
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.settings.installer import uninstall_plugin
@@ -384,7 +384,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if not pos:
             console.print("[yellow]usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone][/yellow]")
             return
-        name = _flag_value(args, "--name")
+        name = flag_value(args, "--name")
         code = await marketplace_add(
             registry, home, env, pos[0],
             name=name, trust="--trust" in args, auto_update="--auto-update" in args,
@@ -426,12 +426,3 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         marketplace_set(home, env, pos[0], key, value, json_output=json_output)
     else:
         console.print(f"[yellow]unknown marketplace subcommand: {sub}[/yellow]")
-
-
-def _flag_value(args: list[str], flag: str) -> str | None:
-    """取 ``--flag value`` 形态的值（不支持 ``--flag=value``，REPL 简化）/ Extract a ``--flag value`` pair。"""
-    if flag in args:
-        idx = args.index(flag)
-        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
-            return args[idx + 1]
-    return None

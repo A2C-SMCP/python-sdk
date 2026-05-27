@@ -35,7 +35,7 @@ from typing import Any
 
 from rich.table import Table
 
-from a2c_smcp.computer.cli.commands import build_mcp_callbacks
+from a2c_smcp.computer.cli.commands import build_mcp_callbacks, flag_value, resolved_settings
 from a2c_smcp.computer.cli.progress import clone_spinner
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.inputs.plugin_pool import load_plugin_inputs
@@ -60,9 +60,7 @@ from a2c_smcp.computer.settings.mcp_config import (
     gate_mcp_servers,
     resolve_mcp_config,
 )
-from a2c_smcp.computer.settings.policy import resolve_policy_settings
 from a2c_smcp.computer.settings.reconciler import gc_plugins, list_orphan_plugins
-from a2c_smcp.computer.settings.scope import resolve_settings
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 
@@ -87,15 +85,6 @@ def _ok(msg: str) -> int:
     return EXIT_OK
 
 
-def _flag_value(args: list[str], flag: str) -> str | None:
-    """取 ``--flag value`` 形态的值（不支持 ``--flag=value``，REPL 简化）/ Extract a ``--flag value`` pair。"""
-    if flag in args:
-        idx = args.index(flag)
-        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
-            return args[idx + 1]
-    return None
-
-
 def _installed_records(home: Path, env: Mapping[str, str] | None, plugin_id: str) -> list[dict[str, Any]]:
     """读 ``installed_plugins.json`` 中某 plugin 的全部 scope 记录（plain dict）/ All install records of a plugin。"""
     from a2c_smcp.computer.settings.store import load_installed_plugins
@@ -109,26 +98,6 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str] | None:
     if not plugin or not marketplace:
         return None
     return plugin, marketplace
-
-
-def _resolved_settings(
-    registered_workdirs: tuple[Path, ...],
-    active_workdir: Path | None,
-    env: Mapping[str, str] | None,
-    *,
-    flag_path: Path | None = None,
-) -> Mapping[str, Any]:
-    """六层合并 settings（含 policy first-source-wins）/ Six-layer merged settings incl. policy。
-
-    policy 层承载企业 allowed/deniedMcpServers（POLICY_ONLY 字段）；批准门控须读到，故统一注入。
-    """
-    return resolve_settings(
-        registered_workdirs=registered_workdirs,
-        active_workdir=active_workdir,
-        env=env,
-        flag_settings_path=flag_path,
-        policy_settings=resolve_policy_settings(env=env),
-    ).settings
 
 
 # ── plugin 实时挂载 D2 上下文渲染回调（#69 Group A）/ plugin-mount D2 context callbacks ──
@@ -281,7 +250,7 @@ def _enabled_plugins_view(
     home: Path, env: Mapping[str, str] | None, registered_workdirs: tuple[Path, ...], active_workdir: Path | None,
 ) -> dict[str, Any]:
     """六层合并视图的 ``enabledPlugins`` 映射（``id → bool``，缺省视为启用）/ Merged enabledPlugins map。"""
-    ep = _resolved_settings(registered_workdirs, active_workdir, env).get("enabledPlugins")
+    ep = resolved_settings(registered_workdirs, active_workdir, env).get("enabledPlugins")
     return dict(ep) if isinstance(ep, Mapping) else {}
 
 
@@ -375,7 +344,7 @@ async def plugin_gc(
     json_output: bool = False,
 ) -> int:
     """清理孤儿 plugin（所有 scope 都不再声明 enabledPlugins[id]）/ GC orphan plugins。"""
-    declared = _resolved_settings(registered_workdirs, active_workdir, env)
+    declared = resolved_settings(registered_workdirs, active_workdir, env)
     orphans = list_orphan_plugins(home, declared, env=env)
     if not orphans:
         if json_output:
@@ -415,10 +384,16 @@ async def run_mcp_approval(
     - PENDING（工作区共享未决）→ TTY 弹 y/a/n 写 local scope；非 TTY → skip+WARN，``approve_all`` 全批（仅本次不落盘）。
 
     ``--approve-all-mcp`` 在**非交互**仅本次挂载、**不落盘**；TTY ``[a]`` 才写 enableAllProjectMcpServers（用户显式决定）。
+
+    **flag 层 schema 区分**（fix-review #1）：``flag_config`` 源自 ``--settings <file>``，是 **settings.json** flag 层
+    （喂 :func:`resolved_settings` 的 ``flag_path``——``{enabledPlugins/MCP 门控字段…}``）。它**不是 mcp.json**，故
+    **不**喂 ``resolve_mcp_config(flag_config_path=)``（后者期望 ``{servers,inputs}``、schema 不符）；flag-scope
+    **mcp.json 当前无 CLI 入口**（旧 ``--config`` 仅 ``_run_impl`` server 预加载、从不喂门控解析）。
     """
     aw = comp.active_workdir
     env = os.environ
-    resolved = resolve_mcp_config(active_workdir=aw, env=env, flag_config_path=flag_config)
+    # flag_config 是 settings.json（见 docstring）→ resolve_mcp_config 不收（避免 settings.json 当 mcp.json 误读）。
+    resolved = resolve_mcp_config(active_workdir=aw, env=env, flag_config_path=None)
 
     # 被 drop 的畸形 server/input 必须呈现（§5.6 / mcp_config 容错不静默，#69 Group B 风险 3）。
     for e in resolved.errors:
@@ -427,7 +402,7 @@ async def run_mcp_approval(
     if not resolved.servers:
         return
 
-    settings = _resolved_settings(comp._registered_workdirs, aw, env, flag_path=flag_config)
+    settings = resolved_settings(comp._registered_workdirs, aw, env, flag_path=flag_config)
     bundled = bundled_mcp_server_names(comp.skill_home, env)
     statuses = gate_mcp_servers(resolved, settings, bundled)
 
@@ -501,11 +476,11 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             console.print("[yellow]invalid plugin id (expected '<plugin>@<marketplace>')[/yellow]")
             return
         plugin, marketplace = split
-        scope = _flag_value(args, "--scope") or "user"
+        scope = flag_value(args, "--scope") or "user"
         code = await plugin_install(
             registry, home, env, plugin_id,
             scope=scope, project_path=project_path if scope in ("project", "local") else None,
-            version=_flag_value(args, "--version"),
+            version=flag_value(args, "--version"),
             existing_server_names=cbs.existing_server_names,
             register_server=_plugin_register_cb(comp, plugin, marketplace),
             inject_inputs=_plugin_inject_inputs_cb(comp, plugin, marketplace),
