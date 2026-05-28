@@ -16,53 +16,16 @@ CLI-only（不需要 Server/Computer/Agent 多进程）
 
 ## 测试仓库搭建
 
-测试使用本地裸仓库（`file://` 零网络），结构如下：
-
-```
-work/
-├── .tfrobot-plugin/
-│   └── marketplace.json     # 必须有，且 plugins[].source 必填
-└── plugins/
-    └── hello/
-        └── skills/
-            └── greet/
-                └── SKILL.md
-```
-
-`marketplace.json` 最小格式（**source 字段必填**，否则 plugin staging 跳过）：
-
-```json
-{
-  "version": "1.0.0",
-  "plugins": [
-    {
-      "name": "hello",
-      "source": "./plugins/hello"
-    }
-  ]
-}
-```
+> **复用 seed**: 本场景使用 `seeds/marketplace/valid-single-plugin` seed。
+> marketplace 名: `uat-seed-mp`，plugin: `foo`，skill: `foo:valid-skill-pkg`。
 
 搭建脚本（在 tmux 中通过 Bash 执行）：
 
 ```bash
-WORK_DIR=$(mktemp -d) && WORK="$WORK_DIR/work" && mkdir -p "$WORK" && cd "$WORK"
-git init -q -b main && git config user.name "test" && git config user.email "test@test.com"
-mkdir -p .tfrobot-plugin
-cat > .tfrobot-plugin/marketplace.json << 'EOF'
-{"version":"1.0.0","plugins":[{"name":"hello","source":"./plugins/hello"}]}
-EOF
-mkdir -p plugins/hello/skills/greet
-cat > plugins/hello/skills/greet/SKILL.md << 'EOF'
----
-name: greet
-description: A test greeting skill
----
-# Greet
-Hello test skill.
-EOF
-git add -A . && git commit -q -m "init"
-BARE="$WORK_DIR/test-mp.git" && git clone -q --bare . "$BARE"
+SEEDS_ROOT=<项目根>/.claude/skills/UAT/resources/seeds
+SEED="$SEEDS_ROOT/marketplace/valid-single-plugin"
+TMPDIR=$(mktemp -d) && WORK="$TMPDIR/work" && BARE="$TMPDIR/test-mp.git"
+bash "$SEEDS_ROOT/marketplace/_helpers/init_bare_repo.sh" "$SEED" "$WORK" "$BARE"
 echo "BARE_URL=file://$BARE"
 ```
 
@@ -83,12 +46,15 @@ mkdir -p $A2C_SKILL_HOME
 - **优先级**: P0
 - **步骤**:
   1. 清理环境：`rm -rf /tmp/a2c-uat-skill-home/*`
-  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace add <GIT_URL> --trust --json`
+  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace add <BARE_URL> --trust --json`
   3. 捕获输出
 - **预期结果**:
   - 退出码 0
-  - 输出包含成功添加信息（JSON 模式下返回 marketplace 名称和状态）
-  - `/tmp/a2c-uat-skill-home/marketplace/` 下出现对应目录
+  - JSON 输出包含 `name` 字段，值为 `"uat-seed-mp"`
+  - JSON 输出包含 `trusted` = `true`
+  - JSON 输出包含 `url` = `<BARE_URL>`
+  - `/tmp/a2c-uat-skill-home/marketplace/` 下出现 `uat-seed-mp/` 目录
+  - `uat-seed-mp/` 目录下有 `.git/`（clone 成功）
 
 ### M-02: marketplace list（列出 marketplace）
 
@@ -99,38 +65,52 @@ mkdir -p $A2C_SKILL_HOME
   2. 捕获输出
 - **预期结果**:
   - 退出码 0
-  - JSON 输出包含刚添加的 marketplace
-  - 显示 trusted/cloned 状态
+  - JSON 输出为数组，长度 ≥ 1
+  - 第一个元素包含 `name` = `"uat-seed-mp"`
+  - 包含 `trusted` = `true` 字段
+  - 包含 `autoUpdate` 字段（布尔值）
+  - 包含 `url` = `<BARE_URL>` 字段
 
 ### M-03: marketplace info（查看详情）
 
 - **优先级**: P0
 - **前置**: M-01 成功
 - **步骤**:
-  1. 从 M-01 输出获取 marketplace 名称
-  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace info <NAME> --json`
+  1. 从 M-01 输出获取 marketplace 名称（预期 `uat-seed-mp`）
+  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace info uat-seed-mp --json`
   3. 捕获输出
 - **预期结果**:
   - 退出码 0
-  - 显示 marketplace 详情（skills 列表、strict 模式、auto-update 状态等）
+  - JSON 输出包含以下字段且值非空：
+    - `name` = `"uat-seed-mp"`
+    - `url` = `<BARE_URL>`
+    - `installLocation`（字符串，指向本地 clone 路径）
+    - `commitSha`（40 字符 hex 字符串）
+    - `autoUpdate`（布尔值）
+    - `trusted` = `true`
+    - `lastUpdated`（ISO 8601 时间戳）
+  - `installedPlugins` 为数组（初始可为空 `[]` 或含已安装 plugin）
 
 ### M-04: marketplace refresh（刷新 marketplace）
 
 - **优先级**: P0
 - **前置**: M-01 成功
 - **步骤**:
-  1. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace refresh <NAME> --json`
-  2. 捕获输出
+  1. 记录 M-03 中的 `commitSha`（记为 `SHA_BEFORE`）
+  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace refresh uat-seed-mp --json`
+  3. 捕获输出
+  4. 再次执行 `marketplace info uat-seed-mp --json` 获取 `commitSha`（记为 `SHA_AFTER`）
 - **预期结果**:
-  - 退出码 0
-  - 显示刷新成功信息（git pull 或 re-clone 完成）
+  - refresh 退出码 0
+  - JSON 输出包含刷新结果（`name` = `"uat-seed-mp"`）
+  - `SHA_AFTER` = `SHA_BEFORE`（bare repo 无新提交，SHA 不变；证明 git pull 不报错）
 
 ### M-05: marketplace set auto-update（设置自动更新）
 
 - **优先级**: P1
 - **前置**: M-01 成功
 - **步骤**:
-  1. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace set <NAME> auto-update=true --json`
+  1. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace set uat-seed-mp auto-update=true --json`
   2. 捕获输出
 - **预期结果**:
   - 退出码 0
@@ -140,35 +120,41 @@ mkdir -p $A2C_SKILL_HOME
 
 - **优先级**: P1
 - **步骤**:
-  1. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace add <GIT_URL> --json`
-  2. 捕获输出
+  1. 清理环境：`rm -rf /tmp/a2c-uat-skill-home/*`
+  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace add <BARE_URL> --json`
+  3. 捕获输出（含 stderr）
 - **预期结果**:
   - 退出码 1（非交互模式下必须 --trust）
-  - 输出包含 trust 确认相关错误信息
+  - stderr 或 stdout 包含 `"trust"` 关键词
+  - `/tmp/a2c-uat-skill-home/marketplace/` 下**不**出现新目录（未添加）
 
 ### M-07: marketplace remove（删除 marketplace）
 
 - **优先级**: P0
 - **前置**: M-01 成功
 - **步骤**:
-  1. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace remove <NAME> --json`
-  2. 捕获输出
-  3. 验证：再次 `marketplace list` 确认已移除
+  1. 记录 clone 路径（从 M-03 info 的 `installLocation` 获取）
+  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace remove uat-seed-mp --json`
+  3. 捕获输出
+  4. 验证：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace list --json`
+  5. 捕获输出
+  6. 验证 clone 路径已不存在：`test ! -d <installLocation>`
 - **预期结果**:
-  - 退出码 0
-  - marketplace 从列表消失
-  - clone 目录被清理
+  - remove 退出码 0
+  - `marketplace list` 返回空数组 `[]`
+  - clone 目录已被清理（`<installLocation>` 不存在）
 
 ### M-08: marketplace add 重复添加
 
 - **优先级**: P1
 - **前置**: M-01 成功
 - **步骤**:
-  1. 再次执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace add <GIT_URL> --trust --json`
-  2. 捕获输出
+  1. 再次执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer marketplace add <BARE_URL> --trust --json`
+  2. 捕获输出（含 stderr）
 - **预期结果**:
-  - 退出码 1（已存在）
-  - 输出包含已存在提示
+  - 退出码 1
+  - stderr 或 stdout 包含 `"already exists"` 或 `"already registered"` 或 `"duplicate"` 关键词
+  - 原有 marketplace 数据不受影响（`marketplace list` 仍返回 1 条）
 
 ## 清理
 

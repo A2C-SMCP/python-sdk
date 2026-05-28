@@ -1,0 +1,18 @@
+{
+  "name": "uat-binary-image",
+  "type": "stdio",
+  "disabled": false,
+  "forbidden_tools": [],
+  "tool_meta": {},
+  "default_tool_meta": {
+    "auto_apply": true
+  },
+  "server_parameters": {
+    "command": "uv",
+    "args": ["run", "python", ".claude/skills/UAT/resources/seeds/mcp/binary_image_tool_server.py"],
+    "env": null,
+    "cwd": null,
+    "encoding": "utf-8",
+    "encoding_error_handler": "strict"
+  }
+}

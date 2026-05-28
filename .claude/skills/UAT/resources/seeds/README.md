@@ -24,8 +24,11 @@ seeds/
 
 | name | axis | 形态 | acceptance | 派生引用方 |
 |---|---|---|---|---|
-| valid-skill-pkg | CM-01 | happy | _common/valid-skill-pkg/acceptance.md | mcp/server_resources_ok, mcp/server_resources_no_subs, marketplace/valid-single-plugin, user/home-user-basic |
+| valid-skill-pkg | CM-01 | happy | _common/valid-skill-pkg/acceptance.md | mcp/server_resources_ok, mcp/server_resources_no_subs, marketplace/valid-single-plugin, marketplace/plugin-with-bundled-mcp, user/home-user-basic |
 | invalid-missing-desc | CM-03 | invalid (frontmatter 无 description) | _common/invalid-missing-desc/acceptance.md | user/missing-description |
+| minimal-greet | CM-04 | happy minimal | _common/minimal-greet/acceptance.md | marketplace/strict-true-merge, marketplace/strict-false-clean, marketplace/strict-false-conflict |
+| minimal-review | CM-05 | happy minimal | _common/minimal-review/acceptance.md | marketplace/strict-true-merge, marketplace/strict-false-clean |
+| minimal-scan | CM-06 | happy minimal | _common/minimal-scan/acceptance.md | marketplace/strict-true-merge |
 
 ### `mcp/`
 
@@ -33,12 +36,31 @@ seeds/
 |---|---|---|---|---|
 | server_resources_ok | resources | happy | mcp/server_resources_ok.acceptance.sh | _待 scenario 引用_ |
 | server_resources_no_subs | resources | MC-RES-01 | mcp/server_resources_no_subs.acceptance.sh | _待 scenario 引用_ |
+| server_with_window_resources | resources | MC-RES-WIN | _待补_ | resource-discovery |
+| server_no_resources_capability | tools-only | MC-NO-RES | _待补_ | resource-discovery |
+| binary_image_tool_server | tools (binary image) | MC-BIN happy | mcp/binary_image_tool_server.acceptance.sh | blob-transfer (B-04) |
+| binary_image_tool_server_config | tools (binary image mount config) | MC-BIN mount | _(config JSON, 无独立 acceptance)_ | blob-transfer (B-04 前置) |
 
 ### `marketplace/`
 
 | name | axis | acceptance | 引用 scenarios |
 |---|---|---|---|
-| valid-single-plugin | MK-VAL-01 | marketplace/valid-single-plugin/acceptance.sh | _待 scenario 引用_ |
+| valid-single-plugin | MK-VAL-01 | marketplace/valid-single-plugin/acceptance.sh | marketplace-ops, skill-discovery |
+| plugin-with-bundled-mcp | MK-BMC-01 | marketplace/plugin-with-bundled-mcp/acceptance.sh | plugin-management |
+| strict-true-merge | MK-STR-TRUE | marketplace/strict-true-merge/acceptance.sh | strict-mode |
+| strict-false-clean | MK-STR-FALSE-CLEAN | marketplace/strict-false-clean/acceptance.sh | strict-mode |
+| strict-false-conflict | MK-STR-FALSE-CONFLICT | marketplace/strict-false-conflict/acceptance.sh | strict-mode |
+
+### `_helpers/`
+
+| name | 用途 | acceptance | 引用 scenarios |
+|---|---|---|---|
+| full-protocol | F-01~12 主 Agent 驱动（自动跑 F-01/02/04/05/07/08/09/10/11，跳过 F-03/06/12） | _helpers/full-protocol/README.md | full-protocol |
+| full-protocol-supplement | F-03/F-06/F-12 补测驱动 + 慢速 MCP server | _helpers/full-protocol-supplement/acceptance.sh | full-protocol |
+| blob-resources | Blob 资源相关测试辅助 | _helpers/blob-resources/README.md | blob-transfer |
+| error-codes | 错误码测试辅助 | _helpers/error-codes/README.md | error-codes |
+| resource-discovery | 资源发现测试辅助 | _helpers/resource-discovery/README.md | resource-discovery |
+| skill-discovery | SKILL 发现测试辅助 | _helpers/skill-discovery/README.md | skill-discovery |
 
 ### `user/`
 
@@ -52,7 +74,9 @@ seeds/
 > 由 UAT scenario 写作过程中发现缺口时登记，调用
 > `/uat-seed create <source> <name>` 处理后从本节移除。
 
-_当前无_
+| source | name | axis | 用途 | 关联 scenario |
+|---|---|---|---|---|
+| user | skill-with-skillenv | US-ERR-03 | 包含 `.skillenv` 文件的 SKILL，触发 4017 forbidden | error-codes (E-06) |
 
 ## 审计状态
 
