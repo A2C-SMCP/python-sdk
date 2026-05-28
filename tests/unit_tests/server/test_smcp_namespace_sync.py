@@ -28,6 +28,7 @@ from a2c_smcp.smcp import (
     EnterOfficeReq,
     ErrorCode,
     LeaveOfficeReq,
+    is_protocol_error_payload,
 )
 
 
@@ -263,15 +264,19 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         assert ret["code"] == int(ErrorCode.BLOB_NOT_ACCESSIBLE)
         assert ret["details"]["reason"] == "gone"
 
-    def test_get_blob_computer_not_found_raises_value_error(self, smcp_namespace, mock_server):
+    def test_get_blob_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """``computer`` 名未注册 → flat ErrorPayload(404)，不抛未捕获异常（#92；sync mirror of async case）.
+        Unregistered ``computer`` → flat ErrorPayload(404), no uncaught raise (#92)."""
         smcp_namespace.server = mock_server
         smcp_namespace._name_to_sid_map = {}
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "office_id": "room1"})
-        with pytest.raises(ValueError, match="not found"):
-            smcp_namespace.on_client_get_blob(
-                "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "absent", "blob_handle": "h"},
-            )
+        ret = smcp_namespace.on_client_get_blob(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent", "blob_handle": "h"},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == "absent"
 
     def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
         """跨房间 → 显式 raise SMCPNamespaceError（对齐 #31 `-O` 加固）.

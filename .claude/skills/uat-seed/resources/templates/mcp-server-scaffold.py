@@ -137,7 +137,7 @@ async def run() -> None:
             return build_resources(work_dir)
 
         @server.read_resource()
-        async def read_resource(uri: types.AnyUrl):  # type: ignore[no-redef]
+        async def read_resource(uri: types.AnyUrl) -> str | bytes:  # type: ignore[no-redef]
             # uri = skill://<host>/<leaf>/<rel...>
             rest = str(uri).split("://", 1)[-1]
             _, _, uri_path = rest.partition("/")

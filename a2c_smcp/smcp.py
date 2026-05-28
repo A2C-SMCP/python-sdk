@@ -393,6 +393,11 @@ class ErrorCode(IntEnum):
     "do not retry + diagnose"; new reasons may be added non-breakingly.
     """
 
+    # 通用「资源不存在」/ Generic "resource not found"
+    # 本 SDK 用于 client:* 路由层目标 Computer 名未命中（error-handling.md §20 明确「Computer 不存在」归 404）。
+    # 镜像协议已有定义，非协议新增。Used by the client:* router when the target Computer name is
+    # absent (error-handling.md §20 maps "Computer 不存在" to 404). Mirrors an existing protocol code.
+    NOT_FOUND = 404
     # MCP 上游授权 / MCP upstream authorization
     TOOL_AUTHORIZATION_REQUIRED = 4006
     TOOL_AUTHORIZATION_FAILED = 4007
@@ -725,3 +730,21 @@ def is_protocol_error_payload(data: object) -> bool:
     divergent heuristics. 协议依据 / Protocol: error-handling.md（禁止二次 unwrap）。
     """
     return isinstance(data, dict) and data.get("code") in _ERROR_CODE_VALUES
+
+
+def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
+    """``client:*`` 路由层目标 Computer 名未注册 → flat ErrorPayload(404)。
+    Build the flat ErrorPayload(404) returned when a ``client:*`` route targets an
+    unregistered Computer name.
+
+    sync/async 命名空间共用本 builder，保证两实现返回**逐字节一致**的负载（双实现镜像约束）。
+    Shared by the sync/async namespaces so both implementations return byte-identical payloads.
+
+    协议依据 / Protocol: error-handling.md §20（404 工具或 Computer 不存在）+ §78（所有
+    ``client:*`` ack 通道协议级错误 MUST 为 flat ErrorPayload）。
+    """
+    return {
+        "code": int(ErrorCode.NOT_FOUND),
+        "message": f"Computer with name '{computer_name}' not found",
+        "details": {"computer_name": computer_name},
+    }

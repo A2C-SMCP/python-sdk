@@ -58,6 +58,7 @@ from a2c_smcp.smcp import (
     ToolCallReq,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
+    build_computer_not_found_error,
     is_protocol_error_payload,
 )
 from a2c_smcp.utils.logger import get_logger
@@ -455,14 +456,19 @@ class SMCPNamespace(BaseNamespace):
             成功响应（按 ``ret_adapter`` 校验后的 TypedDict）或 flat ``ErrorPayload``。
             Success TypedDict (validated) or flat ErrorPayload.
 
+        Returns 在 ``computer`` 名未找到对应 SID 时回 flat ``ErrorPayload(404)``（#92）——属路由层
+        「资源不存在」，按 error-handling.md §20（Computer 不存在）+ §78（client:* ack 协议级错误 MUST
+        为 flat ErrorPayload）经 ack 通道返回，**不**抛未捕获异常（避免 Agent ``call`` 静默超时）。
+        Returns a flat ``ErrorPayload(404)`` when the ``computer`` name has no SID (#92).
+
         Raises:
-            ValueError: ``computer`` 名未找到对应 SID（4014 边界由 Computer 端铸造，Server 路由前直接拒绝）.
-            SMCPNamespaceError: ``role != "computer"`` 或跨房间访问（office_id 不一致）.
+            SMCPNamespaceError: ``role != "computer"`` 或跨房间访问（office_id 不一致）——属 sid/session
+                隔离拒绝（安全：跨房间不泄露 Computer 存在性），刻意保留 raise 形态，见 exceptions.py.
         """
         computer_name = data["computer"]
         computer_sid = await self.get_sid_by_name(computer_name)
         if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
+            return build_computer_not_found_error(computer_name)
 
         session = await self.get_session(computer_sid)
         if session["role"] != "computer":

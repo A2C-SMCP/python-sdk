@@ -35,6 +35,7 @@ from a2c_smcp.smcp import (
     GetSkillRet,
     GetSkillsReq,
     GetSkillsRet,
+    build_computer_not_found_error,
     is_protocol_error_payload,
 )
 
@@ -74,6 +75,20 @@ class TestErrorCode:
         """4014 / 4015 MCP Server 路由 / MCP Server routing codes."""
         assert ErrorCode.MCP_SERVER_NOT_FOUND == 4014
         assert ErrorCode.MCP_CAPABILITY_NOT_SUPPORTED == 4015
+
+    def test_not_found_code(self) -> None:
+        """404 通用资源不存在；client:* 路由层用于 Computer 名未命中（error-handling.md §20，#92）.
+        404 generic not-found; used by the client:* router for an absent Computer name."""
+        assert ErrorCode.NOT_FOUND == 404
+
+    def test_build_computer_not_found_error_shape(self) -> None:
+        """builder 产出 flat ErrorPayload(404)，且被 is_protocol_error_payload 识别（Agent 据此抛 SMCPProtocolError 而非超时，#92）.
+        Builder yields a flat ErrorPayload(404) recognized by the predicate (so the Agent raises instead of timing out)."""
+        err = build_computer_not_found_error("ghost-computer")
+        assert err["code"] == int(ErrorCode.NOT_FOUND)
+        assert err["details"]["computer_name"] == "ghost-computer"
+        assert "ghost-computer" in err["message"]
+        assert is_protocol_error_payload(err) is True
 
     def test_int_serialization(self) -> None:
         """IntEnum 可以直接当 int 使用 / IntEnum acts as int for serialization."""

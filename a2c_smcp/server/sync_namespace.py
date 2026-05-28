@@ -57,6 +57,7 @@ from a2c_smcp.smcp import (
     SessionInfo,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
+    build_computer_not_found_error,
     is_protocol_error_payload,
 )
 from a2c_smcp.utils.logger import get_logger
@@ -329,12 +330,17 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         统一收敛 office/role 隔离校验、Computer SID 解析、flat ErrorPayload 透传。
         Unifies office/role isolation, Computer SID lookup, and flat-ErrorPayload pass-through.
 
+        Computer 名未命中 → 回 flat ``ErrorPayload(404)``（#92，error-handling.md §20 + §78），**不**抛
+        未捕获异常（同步 socketio 下抛异常会杀线程、不回 ack，致 Agent ``call`` 静默超时）。office/role
+        隔离失败仍 raise ``SMCPNamespaceError``（安全：跨房间不泄露 Computer 存在性，见 exceptions.py）。
+        Computer name miss → flat ``ErrorPayload(404)`` (no uncaught raise); isolation failures still raise.
+
         协议依据 / Protocol: events.md 各 ``client:*`` 事件 + error-handling.md flat ErrorPayload.
         """
         computer_name = data["computer"]
         computer_sid = self.get_sid_by_name(computer_name)
         if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
+            return build_computer_not_found_error(computer_name)
 
         session = self.get_session(computer_sid)
         if session["role"] != "computer":

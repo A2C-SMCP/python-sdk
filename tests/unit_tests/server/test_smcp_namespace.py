@@ -33,6 +33,7 @@ from a2c_smcp.smcp import (
     GetDeskTopReq,
     GetDeskTopRet,
     LeaveOfficeReq,
+    is_protocol_error_payload,
 )
 
 
@@ -577,7 +578,7 @@ class TestV021ClientRoutesAndUpdateSkills:
     v0.2.1 #41: 3 new ``client:*`` routes + ``server:update_skills`` broadcast.
 
     覆盖统一 ``_relay_client_call`` 助手的关键不变量：
-      - Computer SID 解析（未注册 → ValueError，对齐 4014 边界）
+      - Computer SID 解析（未注册 → flat ErrorPayload(404)，#92；非抛未捕获异常）
       - office/role 隔离 **显式 raise SMCPNamespaceError**（非 assert，对齐 #31 `-O` 加固）
       - flat ErrorPayload 透传（无嵌套 envelope，不二次 unwrap；与 agent 侧 predicate 一致）
     Covers the key invariants of the unified ``_relay_client_call`` helper.
@@ -710,17 +711,38 @@ class TestV021ClientRoutesAndUpdateSkills:
     # ── 隔离 / Isolation ─────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_get_blob_computer_not_found_raises_value_error(self, smcp_namespace, mock_server):
-        """``computer`` 名未注册 → ``ValueError``（Server 路由前直接拒绝，4014 由 Computer 端归一）.
-        Unregistered ``computer`` → ValueError before routing (4014 minted by Computer side)."""
+    async def test_get_blob_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """``computer`` 名未注册 → flat ErrorPayload(404)，**不**抛未捕获异常（#92）.
+
+        协议依据：error-handling.md §20（404 Computer 不存在）+ §78（所有 ``client:*`` ack 协议级错误 MUST
+        为 flat ErrorPayload）。须被 ``is_protocol_error_payload`` 识别，Agent 侧才会抛 SMCPProtocolError 而非超时。
+        Unregistered ``computer`` → flat ErrorPayload(404), no uncaught raise (#92)."""
         smcp_namespace.server = mock_server
         smcp_namespace._name_to_sid_map = {}
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "room1"})
-        with pytest.raises(ValueError, match="not found"):
-            await smcp_namespace.on_client_get_blob(
-                "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "absent", "blob_handle": "h"},
-            )
+        ret = await smcp_namespace.on_client_get_blob(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent", "blob_handle": "h"},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == "absent"
+
+    @pytest.mark.asyncio
+    async def test_get_skills_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """另一路由（``client:get_skills``）未注册 Computer 同样返回 404，证明 not-found 由统一 helper 收口（#92）.
+        A different route (get_skills) returns the same 404, proving not-found is handled by the shared helper."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {}
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "room1"})
+        smcp_namespace.call = AsyncMock()
+        ret = await smcp_namespace.on_client_get_skills(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent"},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        smcp_namespace.call.assert_not_awaited()  # 未找到时不应转发 / no relay on not-found
 
     @pytest.mark.asyncio
     async def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
