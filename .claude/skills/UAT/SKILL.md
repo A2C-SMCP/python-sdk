@@ -29,14 +29,20 @@ description: 执行 A2C-SMCP Python SDK 的用户验收测试（UAT）。通过 
 
 ### 执行协议
 
-1. **加载场景**：根据用户指定的场景，读取对应的 `resources/scenarios/<scenario>.md`
-2. **准备环境**：按场景要求创建 tmux session、启动必要进程
-3. **逐用例执行**：
+1. **加载场景**：读取 `resources/scenarios/<scenario>.md`
+2. **种子前置 audit**：识别场景引用的所有 `resources/seeds/<source>/<name>`；逐条跑
+   acceptance（`/uat-seed audit <source> <name>`）。任一 ❌ → 进入
+   [Seed 升级流程](#seed-升级流程确认是-seed-病) 后再执行 scenario；
+   任一缺失 → 进入 [Seed 缺口流程](#seed-缺口流程scenario-需要的-seed-不存在)
+3. **准备环境**：按场景要求创建 tmux session、启动必要进程
+4. **逐用例执行**：
    - 通过 tmux `execute-command` 发送 CLI 命令
    - 通过 tmux `capture-pane` 获取输出
    - 对比预期结果，标记 PASS / FAIL
-4. **收集日志**：捕获所有 tmux pane 的完整输出
-5. **输出报告**：汇总所有用例的执行结果
+   - 用例 FAIL 时**先**走 [诊断三问](#诊断三问fail-时逐条回答)，判定是 SUT 病还是
+     seed 病，再决定走 `/fix-issue` 或 `/uat-seed` 还是直接报 FAIL
+5. **收集日志**：捕获所有 tmux pane 的完整输出
+6. **输出报告**：汇总所有用例的执行结果 + 「Seed 反馈」节
 
 ### tmux 环境管理
 
@@ -128,6 +134,73 @@ tmux session: a2c-uat
 - **幂等性**：测试不应产生残留状态（marketplace remove 清理、tmp 目录隔离）
 - **独立性**：每个场景可独立执行
 - **容错性**：单个用例失败不阻塞后续用例执行
+- **种子可信**：场景引用的 seed（`resources/seeds/<source>/<name>`）必须当次 audit
+  PASS 才作为前置；不允许带 FAIL/Flaky 的 seed 进入正式测试
+
+### Seed 依赖与触发 `/uat-seed`
+
+> Scenario 中所有 fixture（MCP Server、marketplace 仓库、SKILL 包等）**只能**通过
+> `resources/seeds/<source>/<name>` 路径引用——不在 scenario 文档里 inline 长 fixture。
+> 当 seed 行为与 scenario 期望不符时，本节定义诊断 → 升级流程。
+
+#### 触发条件：从 UAT 看到的三种"seed 病"
+
+| 现象 | 含义 | 默认动作 |
+|---|---|---|
+| **种子 acceptance FAIL（仍可复现）** | seed 自身坏了（被 _common 改动 / SDK 行为变化 / 平台差异） | 暂停 scenario → `/uat-seed audit <source> <name>` 复现 → 走 upgrade |
+| **scenario 期望与 seed 提供的"被测行为"对不上** | seed 的失败维度不准 / 触发的不是 scenario 想测的代码路径 | 暂停 → `/uat-seed audit` 取 seed 实际期望 → 与 scenario 期望比对 → 二选一改 |
+| **scenario 需要的形态在 seeds 不存在** | 缺新 seed（新模式 / 新失败维度 / 新组合） | 进入 [缺口流程](#seed-缺口流程) |
+
+#### 诊断三问（FAIL 时**逐条**回答）
+
+1. **是 SUT bug 还是 seed bug？**
+   - SUT bug：被测系统（a2c-smcp）行为变了但没改对 → 走 `/fix-issue`，不动 seed
+   - Seed bug：seed 自身的资产 / acceptance 与协议条款偏离 → 走 `/uat-seed` upgrade
+   - 判据：`/uat-seed audit <name>` 独立跑能否复现 FAIL？能 → seed 病；不能 → SUT 病
+2. **协议依据是否还在？**
+   - 在 `a2c-smcp-protocol/docs/specification/skill.md` 找 seed 的 axis 对应条款
+   - 找不到 → 该 seed 不应存在，或协议有变更未同步（走 `/add-feature` 协议先行）
+3. **seed 期望与 scenario 期望一致吗？**
+   - seed README 写明的"期望被测行为"是 scenario 真正想验证的目标吗？
+   - 不一致 → 改 scenario 期望（向 seed 看齐）或 改 seed（向 scenario 看齐）；两边
+     都不能动 → 写一条新 seed
+
+#### Seed 升级流程（确认是 seed 病）
+
+```
+1. /uat-seed audit <source> <name>            # 独立复现
+2. 决定 upgrade 维度：
+   - 资产本体（脚本 / 目录 / 归档）问题 → 修资产
+   - acceptance 断言过紧 / 过松 → 修 acceptance（确保仍对齐协议条款）
+   - axis 在 failure-axes.md 不准确 → 先改 failure-axes
+3. /uat-seed audit <source> <name>            # 验收
+4. 若 seed 派生自 _common/<x> → 跑全部派生方 audit（README 内"已派生引用"列）
+5. 回到 scenario，重跑相关 UAT 用例
+6. 在 UAT 报告"Seed 反馈"节登记升级条目（含 axis、修了什么、为什么）
+```
+
+#### Seed 缺口流程（scenario 需要的 seed 不存在）
+
+> 在 UAT 执行**期间**遇到（不是 scenario 编写时——那是 `/uat-scenario` 的责任）：
+> 例如 P1/P2 用例发现需要"archive 模式 happy" 但 seed 库当前只有 resources 模式。
+
+```
+1. 在当前 UAT 报告暂列该用例为 ⏭️ Skipped + 注明"待 seed: ..."
+2. 完成本场景其他用例
+3. 场景结束时统一汇报缺口：
+   - 缺口名（按 failure-axes.md 命名约定）
+   - 在哪条用例需要
+   - 期望被测行为（一句话）
+4. 由用户决策：
+   a. 立刻调 /uat-seed create <source> <name> 补 → 补完回测
+   b. 留到下个开发周期，本场景接受 Skipped 通过
+```
+
+**反模式**（**禁止**）：
+
+- 在 scenario 临时 inline 一份 fixture 凑用例通过
+- 改 seed 让它"勉强"匹配错的 scenario 期望
+- 跳过有 FAIL 的 seed 直接跑场景（"反正大概率能过"）
 
 ### 二次复验机制
 
@@ -152,20 +225,33 @@ tmux session: a2c-uat
 - 跳过：N ⏭️
 
 ### 用例详情
-| # | 用例 | 优先级 | 结果 | 复验 | 备注 |
-|---|------|--------|------|------|------|
-| 1 | ...  | P0     | ✅   | -    |      |
+| # | 用例 | 优先级 | 引用 seed | 结果 | 复验 | 备注 |
+|---|------|--------|-----------|------|------|------|
+| 1 | ...  | P0     | seeds/mcp/server_resources_ok | ✅   | -    |      |
 
 ### 失败用例详情
 #### [用例名称]
 - **步骤**：...
 - **预期**：...
 - **实际**：...
+- **诊断**：SUT bug / Seed bug / Scenario 期望不准（参 [诊断三问](#诊断三问fail-时逐条回答)）
+- **引用 seed**：`seeds/<source>/<name>` —— 当次 `/uat-seed audit` 状态：✅ / ❌
 - **tmux 输出**：
   ```
   [粘贴 capture-pane 内容]
   ```
 - **日志线索**：[从 /tmp/a2c-uat-logs/ 中提取的关键错误信息]
+
+### Seed 反馈（本场景对种子库的变更需求与已执行升级）
+
+| 类型 | seed | axis | 触发用例 | 动作 | 状态 |
+|---|---|---|---|---|---|
+| upgrade | seeds/mcp/server_resources_ok | happy | F-05 | 修 acceptance.sh 断言：补 ref source 字段验证 | ✅ done |
+| 缺口 | seeds/mcp/server_archive_ok | happy | F-08 | `/uat-seed create mcp server_archive_ok` | ⏭️ 待执行 |
+| 缺口 | seeds/marketplace/strict-false-conflict | MK-STR-02 | M-12 | 同上 | ⏭️ 待执行 |
+
+> **规则**：本节为空 = 当次跑没有 seed 病；任一行 ⏭️ 待执行 意味着相关用例仍是
+> Skipped；用户决策补 seed 后回测。
 
 ### 进程日志摘要
 #### Server

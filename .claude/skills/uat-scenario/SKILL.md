@@ -137,23 +137,44 @@ git log --oneline --after="<T>" -- a2c_smcp/ tests/
 4. **环境依赖**：是否需要测试仓库、MCP server 配置、特定 Server 版本？
 5. **配置差异**：是否有 strict/non-strict、inline/blob 等配置组合需要覆盖？
 
-### Step 2: 环境依赖分析
+### Step 2: 环境依赖分析（含 seed 检索）
 
 > **为什么要做这一步？** 测试环境依赖是 UAT 的地基。如果场景需要的测试仓库或
 > MCP 配置不存在，测试无法执行。
+> 同样地，**种子库（`resources/seeds/`）是场景的 fixture 唯一来源**——若所需 fixture
+> 在种子库不存在，scenario 不允许 inline 长 fixture，必须先通过 `/uat-seed` 补齐。
 
-检查 `.claude/skills/UAT/resources/test-env-setup.md` 中已有的环境配置，
-逐项核对新场景所需的环境：
+#### Step 2a: 环境配置层面
 
-- **测试仓库**：是否需要特定 manifest 结构的 marketplace Git 仓库？
-- **MCP Server**：是否需要特定的 MCP server 配置（stdio/http/sse）？
+检查 `.claude/skills/UAT/resources/test-env-setup.md` 中已有的环境配置：
+
 - **Server 版本**：是否需要特定协议版本（版本握手测试）？
 - **SKILL_HOME**：是否需要干净的隔离环境？
+- **A2C_SKILL_HOME workdirs**：是否需要登记多个 workdir？
 
-**判断结果**：
+#### Step 2b: 种子（fixture）层面
 
-- **无缺口** → 跳到 Step 4
-- **有缺口** → 进入 Step 3
+读 `resources/seeds/README.md` 索引，按场景需求逐条核对：
+
+| 场景需要的 fixture | 检索方向 |
+|---|---|
+| MCP Server 暴露 SKILL（mounted/archive/resources/混合） | `seeds/mcp/` |
+| Marketplace 仓库（happy / strict / entry.skills / plugin source 五类 / 失败） | `seeds/marketplace/` |
+| User 源 DropIn（home / workdir / 覆盖 / 失败） | `seeds/user/` |
+| SKILL 包 well-formed 或某种 invalid 形态 | `seeds/_common/` |
+
+| 检索结果 | 动作 |
+|---|---|
+| ✅ 全部命中现有 seed | 直接在场景里路径引用：`seeds/<source>/<name>`；跳到 Step 4 |
+| ❌ 缺 N 条 seed | 进入 [Step 3.5: 触发 /uat-seed 补缺口](#step-35-触发-uat-seed-补缺口) |
+| ⚠️ 命中的 seed 当前 audit FAIL | 暂停场景设计 → 提示用户 `/uat-seed audit` 复现 + 修复 → 修复后回到 Step 2 |
+
+#### Step 2c: 判断后续
+
+- **环境配置 + 种子均无缺口** → 跳到 Step 4
+- **仅环境配置有缺口** → Step 3（生成环境需求报告）
+- **种子有缺口** → Step 3.5（触发 `/uat-seed`）
+- 两者都有 → Step 3 + Step 3.5（顺序无关，但都要做）
 
 ### Step 3: 生成环境需求报告
 
@@ -197,6 +218,47 @@ git log --oneline --after="<T>" -- a2c_smcp/ tests/
 ```
 
 **交接动作**：报告生成后告知用户，并暂停场景编写直到环境就绪。
+
+### Step 3.5: 触发 `/uat-seed` 补缺口
+
+> 触发条件：Step 2b 发现场景需要的 fixture 在 `seeds/<source>/<name>` 不存在。
+
+#### 缺口登记规范
+
+在**待写**的场景文档顶部加一节（写完场景时若仍有未补齐的缺口则保留）：
+
+```markdown
+## 待补种子（blocks 场景终稿）
+
+| 缺口 | source | 期望 axis | 触发用例 | 期望被测行为（一句话） |
+|---|---|---|---|---|
+| server_archive_ok | mcp | MC-ARC happy | F-08 | archive 模式 happy path 注册并校验 sha256 |
+| strict-false-conflict | marketplace | MK-STR-02 | M-12 | strict=false + plugin.json 声明组件 → installer 硬失败 |
+```
+
+#### 调用流程
+
+对每个缺口：
+
+1. **协议依据先核**：在 `a2c-smcp-protocol/docs/specification/skill.md` 找对应条款；
+   若是失败维度还需 `failure-axes.md` 已登记。**找不到 → 不要创建种子**——可能是
+   `/add-feature` 协议先行（feature_release_branch 记忆），或 axis 拼错。
+2. **调用 `/uat-seed create <source> <name>`**：按 `uat-seed/resources/recipes/<source>.md`
+   走完创建流程（含 acceptance）
+3. **跑 `/uat-seed audit <source> <name>`**：必须 PASS 才能算补缺口完成
+4. **回到 scenario**：把"待补种子"行删除 / 在场景用例里改为路径引用 `seeds/<source>/<name>`
+
+#### 不允许的捷径
+
+- ❌ scenario 文档里 inline 一份临时 fixture（哪怕只是几行 JSON）
+- ❌ 复用看起来"差不多"但实际 axis 不同的现有 seed（结果会假阳性）
+- ❌ 跳过 acceptance，直接在 scenario 用例里"先这么写着"
+
+如果用户决定**当前周期不补**该缺口：
+
+1. 保留"待补种子"行
+2. 把依赖该缺口的用例标 `(skip until seed)` 优先级降为 P3
+3. 场景仍可发版（happy path 部分），缺口在下个周期再补
 
 ### Step 4: 选择场景类型 & 加载设计指南
 
@@ -288,6 +350,10 @@ git log --oneline --after="<T>" -- a2c_smcp/ tests/
 - [ ] 环境使用 `A2C_SKILL_HOME` 隔离，不污染真实配置
 - [ ] 日志收集策略已标注（CLI-only 仅 pane 输出；完整链路需三端）
 - [ ] 如有新增环境需求，已生成环境需求报告
+- [ ] **fixture 全部通过 `seeds/<source>/<name>` 路径引用**，无 inline 长 fixture
+- [ ] **被引用的每条 seed 当前 `/uat-seed audit` 状态 = ✅**
+- [ ] **若存在"待补种子"节，所列条目已全部 `/uat-seed create` + audit PASS**，
+      或显式标 `(skip until seed)` 并降优先级
 
 ---
 
@@ -319,6 +385,9 @@ git log --oneline --after="<T>" -- a2c_smcp/ tests/
 | 缺少退出码验证         | 只验证输出不验证退出码      | 补充退出码断言                               |
 | 缺少错误输出描述       | 异常用例只说"应报错"        | 明确具体的错误信息文本                       |
 | 缺少清理步骤           | 测试后未清理临时文件/目录   | 补充清理命令                                 |
+| **inline fixture**     | 场景文档里直接放 manifest / SKILL.md / server 脚本片段 | 抽到 `seeds/<source>/<name>`；走 [Step 3.5](#step-35-触发-uat-seed-补缺口) |
+| **引用不存在的 seed**  | 路径指向 `seeds/...` 但实际无此目录 | 同上：走 Step 3.5 创建；或修正路径 |
+| **依赖 FAIL 的 seed**  | 引用的 seed 当前 audit ❌    | 暂停 update → 提示用户 `/uat-seed audit` 复现 → 修复后再回 |
 
 ### Step 3: 加载设计指南
 

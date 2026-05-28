@@ -36,6 +36,9 @@ MANIFEST
 *.manifest
 *.spec
 
+# UAT seed library uses _seeds.manifest for derivation pointers; track them.
+!.claude/skills/UAT/resources/seeds/**/_seeds.manifest
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
