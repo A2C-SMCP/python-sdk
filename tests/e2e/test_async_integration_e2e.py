@@ -444,9 +444,10 @@ async def test_async_integration_agent_cancel_inflight_tool_call(
         elapsed = time.time() - t0
         assert elapsed < 6.0, f"取消未中断在途调用（耗时 {elapsed:.2f}s）/ cancel did not interrupt (took {elapsed:.2f}s)"
         assert result.get("isError") is True, f"期望取消态 isError，实际 / expected cancelled isError, got: {result}"
-        # Computer 历史末条应记录失败（被中断）/ Computer history last record marks failure (interrupted)
+        # Computer 历史末条应记录失败（被中断）且 error 标为 cancelled / last record: failed + error == cancelled
         assert await _wait_until(lambda: len(computer._tool_call_history) >= 1, timeout=3)
         assert computer._tool_call_history[-1]["success"] is False
+        assert computer._tool_call_history[-1]["error"] == "cancelled"
 
     finally:
         await agent_client.disconnect()

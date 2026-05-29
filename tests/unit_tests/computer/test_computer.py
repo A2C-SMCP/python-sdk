@@ -360,6 +360,10 @@ async def test_aexecute_tool_cancelled_returns_error_result(monkeypatch):
     assert ("取消" in result.content[0].text) or ("cancel" in result.content[0].text.lower())
     assert ran["completed"] is False  # 慢体被中断未跑完 / interrupted before completion
     assert "req-cancel" not in computer._inflight_tool_tasks  # 注册表已清 / registry cleaned
+    # 历史须把「被取消」与其它失败区分（fix-review 🟡1）/ history distinguishes cancelled from other failures
+    assert computer._tool_call_history[-1]["success"] is False
+    assert computer._tool_call_history[-1]["error"] == "cancelled"
+    assert "req-cancel" not in computer._cancelled_req_ids  # 取消标记已清 / cancel marker cleared
 
 
 @pytest.mark.asyncio

@@ -1111,6 +1111,13 @@ class Computer(BaseComputer[PromptSession]):
             )
             success = False
         finally:
+            # 显式取消（acancel_tool 标记本 req_id，由 _acall_tool_cancellable 吞 CancelledError 返回取消态）：
+            # 历史标记为 cancelled，使「被取消」可与其它失败区分；并在此清理标记。
+            # Explicit cancel: mark history as cancelled (distinguishable from other failures) and clear the marker.
+            if req_id in self._cancelled_req_ids:
+                self._cancelled_req_ids.discard(req_id)
+                success = False
+                error_msg = error_msg or "cancelled"
             await self._append_tool_history(
                 {
                     "timestamp": ts,
@@ -1145,10 +1152,16 @@ class Computer(BaseComputer[PromptSession]):
         判别器：``asyncio.current_task().cancelling()``（外层是否被取消）AND ``req_id in _cancelled_req_ids``
         （是否本 req_id 被显式取消）双重确认才吞，杜绝把真实外层取消误判为取消态结果。
 
+        取消语义边界：``inner.cancel()`` 中断的是**本地对 MCP 请求的 await**；是否真正终止**远端 MCP Server**
+        的执行取决于该 MCP 实现 / SDK，**不保证**（本 SDK 不主动发送 MCP ``notifications/cancelled``）。即 Agent
+        能迅速拿到取消态响应，但远端工具可能仍跑完。
+
         English: Wrap ``Manager.acall_tool`` as a cancellable in-flight task so ``notify:tool_call_cancel`` can
         interrupt it (#96). Explicit cancel → swallow & return a cancelled result; outer-coroutine cancel →
         re-raise after teardown; always clean up the registry. The discriminator combines
-        ``current_task().cancelling()`` with the ``_cancelled_req_ids`` marker.
+        ``current_task().cancelling()`` with the ``_cancelled_req_ids`` marker. NOTE: cancellation only abandons
+        the LOCAL await of the MCP request — whether the REMOTE MCP server actually stops is implementation/SDK
+        dependent and NOT guaranteed (this SDK does not emit MCP ``notifications/cancelled``).
         """
         if self.mcp_manager is None:
             raise RuntimeError("当前MCP Manager为空")
@@ -1163,6 +1176,10 @@ class Computer(BaseComputer[PromptSession]):
             outer_cancelled = bool(current is not None and current.cancelling())
             if not outer_cancelled and req_id in self._cancelled_req_ids:
                 # 显式工具取消：吞掉异常并返回取消态结果 / explicit tool cancel: swallow & return cancelled result
+                # 前向兼容：此取消响应形状（isError + 文本）为 SDK 本地约定，协议尚未定义标准取消 ack/响应列
+                # （见 #96「协议待办」）；协议一旦标准化需回此对齐。
+                # Forward-compat: this cancelled-response shape is an SDK-local convention; the protocol has not yet
+                # defined a standard cancel ack/response (#96 deferred). Re-align here once the protocol standardizes it.
                 return CallToolResult(
                     content=[TextContent(text="工具调用已被取消 / Tool call cancelled", type="text")],
                     isError=True,
@@ -1174,8 +1191,11 @@ class Computer(BaseComputer[PromptSession]):
                     await inner
             raise
         finally:
+            # 仅清理在途任务注册表；``_cancelled_req_ids`` 标记留给 :meth:`aexecute_tool` 的 finally 读取后清理，
+            # 以便历史能区分「被取消」与其它失败（见 aexecute_tool）。
+            # Only clear the in-flight registry here; the ``_cancelled_req_ids`` marker is read & cleared by
+            # aexecute_tool's finally so history can distinguish "cancelled" from other failures.
             self._inflight_tool_tasks.pop(req_id, None)
-            self._cancelled_req_ids.discard(req_id)
 
     async def acancel_tool(self, req_id: str) -> bool:
         """中文: 取消一个在途工具调用（响应 ``notify:tool_call_cancel``，#96）。
@@ -1188,6 +1208,11 @@ class Computer(BaseComputer[PromptSession]):
 
         English: Cancel an in-flight tool call (handles ``notify:tool_call_cancel``). Returns ``False`` as an
         idempotent no-op when ``req_id`` is unknown or already finished.
+
+        限制：仅中断本地对 MCP 请求的等待，**不保证**终止远端 MCP Server 的执行（详见
+        :meth:`_acall_tool_cancellable`）。
+        Limitation: only abandons the local await of the MCP request; does NOT guarantee the remote MCP server
+        stops (see :meth:`_acall_tool_cancellable`).
         """
         task = self._inflight_tool_tasks.get(req_id)
         if task is None or task.done():
