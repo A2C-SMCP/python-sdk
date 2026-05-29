@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,43 @@ console = console_util.console
 _ADD_DIR_OPTION = typer.Option(
     None, "--add-dir", help="注册工作目录（可重复；首个作 active-workdir）/ register a workdir (repeatable)",
 )
+
+
+# ------------------------------
+# 根级上下文（#97）：把根回调采集的全局 flag 透传给 settings 子命令
+# Root context (#97): carry callback-gathered global flags to the `settings` subcommands
+# ------------------------------
+@dataclass(frozen=True, slots=True)
+class _RootState:
+    """根回调采集、供 ``settings`` 子命令读取的根级上下文（经 ``ctx.obj`` 在 Click 子上下文间继承）。
+
+    #97：``--settings`` / ``--add-dir`` 此前仅透传给 ``run`` 路径，``settings`` 子命令读不到 → flag scope
+    恒返回 ``{}``、project|local scope 缺 ``active_workdir`` 误报。统一收口到 ``ctx.obj``。
+    Root-level context gathered by the callback and read by `settings` subcommands via inherited ``ctx.obj``.
+    """
+
+    flag_path: Path | None = None
+    registered_workdirs: tuple[Path, ...] = ()
+    active_workdir: Path | None = None
+
+
+def _resolve_workdirs(add_dir: list[str] | None) -> tuple[tuple[Path, ...], Path | None]:
+    """``--add-dir`` → ``(registered_workdirs, active_workdir)``：绝对化、去重保序；``active`` 取首个（镜像
+    :attr:`Computer.active_workdir`）。直接调用 ``run()``（绕过 Typer）时 ``add_dir`` 可能泄漏 OptionInfo（非
+    list）→ isinstance 守卫为空（同 ``computer_factory`` 容错姿态）。/ Resolve ``--add-dir`` to workdirs。
+    """
+    registered: list[Path] = []
+    for d in add_dir if isinstance(add_dir, list) else []:
+        rp = Path(d).expanduser().resolve()
+        if rp not in registered:
+            registered.append(rp)
+    return tuple(registered), (registered[0] if registered else None)
+
+
+def _root_state(ctx: typer.Context) -> _RootState:
+    """从 Typer 上下文取根状态；缺失（未经根回调，如单测直呼）时回退空状态。/ Read root state, empty fallback。"""
+    obj = ctx.obj
+    return obj if isinstance(obj, _RootState) else _RootState()
 
 
 # ------------------------------
@@ -126,6 +164,15 @@ def _root(
         console_util.set_no_color(True)
         # 重新绑定本地引用
         console = console_util.console
+
+    # #97：采集根级上下文（--settings flag scope 文件 + --add-dir 工作目录）存入 ctx.obj，供 settings 子命令读取。
+    # Click 子上下文默认继承父 ctx.obj，故无论是否带子命令都先填充（无子命令时 run 路径仍走显式参数）。
+    registered, active = _resolve_workdirs(add_dir)
+    ctx.obj = _RootState(
+        flag_path=Path(settings_file) if isinstance(settings_file, str) else None,
+        registered_workdirs=registered,
+        active_workdir=active,
+    )
 
     if ctx.invoked_subcommand is None:
         # 注意：不要直接调用被 @app.command 装饰的 run()，否则未传入的参数会保留 OptionInfo 默认值
@@ -209,13 +256,8 @@ def _run_impl(
             console.print("[red]计算机构造目标不可调用，将回退到默认 Computer[/red]")
             comp_factory_obj = Computer
 
-        # --add-dir → registered_workdirs（能力发现并集 + active_workdir=首个）。绝对化去重保序。
-        # 直接调用 run()（绕过 Typer）时 add_dir 可能泄漏 OptionInfo（非 list）→ isinstance 守卫为空（同 computer_factory 容错姿态）。
-        registered_workdirs: list[Path] = []
-        for d in add_dir if isinstance(add_dir, list) else []:
-            rp = Path(d).expanduser().resolve()
-            if rp not in registered_workdirs:
-                registered_workdirs.append(rp)
+        # --add-dir → registered_workdirs（能力发现并集 + active_workdir=首个）。解析复用 _resolve_workdirs（#97 DRY）。
+        registered_workdirs, _active_workdir = _resolve_workdirs(add_dir)
 
         comp = comp_factory_obj(
             name="friday_hands",
@@ -223,7 +265,7 @@ def _run_impl(
             mcp_servers=set(),
             auto_connect=auto_connect,
             auto_reconnect=auto_reconnect,
-            registered_workdirs=tuple(registered_workdirs) or None,
+            registered_workdirs=registered_workdirs or None,
         )
         async with comp:
             init_client: SMCPComputerClient | None = None
@@ -525,43 +567,72 @@ def _plugin_gc(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 # ── settings 子命令 / settings subcommands ────────────────────────────────────
+# 四个 settings 子命令经 ``ctx: typer.Context`` 取根状态（#97）：show/get 需 flag_path + workdirs 才能读 flag
+# scope 与 project|local；set/edit 需 active_workdir 才能写 project|local（flag/policy 本就只读，无 flag_path）。
 @settings_app.command("show")
 def _settings_show(
+    ctx: typer.Context,
     scope: str = typer.Option("merged", "--scope", help="user|project|local|flag|policy|merged"),
     json_output: bool = typer.Option(True, "--json", help="JSON 输出（默认开）/ JSON output (default on)"),
 ) -> None:
     """展示某 scope 的 settings（默认 merged）/ Show settings (default merged)."""
-    raise typer.Exit(settings_cmd.settings_show(ensure_skill_home(), os.environ, scope=scope, json_output=json_output))
+    st = _root_state(ctx)
+    raise typer.Exit(
+        settings_cmd.settings_show(
+            ensure_skill_home(), os.environ, scope=scope,
+            registered_workdirs=st.registered_workdirs, active_workdir=st.active_workdir,
+            flag_path=st.flag_path, json_output=json_output,
+        ),
+    )
 
 
 @settings_app.command("get")
 def _settings_get(
+    ctx: typer.Context,
     key: str = typer.Argument(...),
     scope: str = typer.Option("merged", "--scope"),
     json_output: bool = typer.Option(True, "--json"),
 ) -> None:
     """读取单字段 / Read a single field."""
-    raise typer.Exit(settings_cmd.settings_get(ensure_skill_home(), os.environ, key, scope=scope, json_output=json_output))
+    st = _root_state(ctx)
+    raise typer.Exit(
+        settings_cmd.settings_get(
+            ensure_skill_home(), os.environ, key, scope=scope,
+            registered_workdirs=st.registered_workdirs, active_workdir=st.active_workdir,
+            flag_path=st.flag_path, json_output=json_output,
+        ),
+    )
 
 
 @settings_app.command("set")
 def _settings_set(
+    ctx: typer.Context,
     key: str = typer.Argument(...),
     value: str = typer.Argument(..., help="JSON 优先，回退字面字符串 / JSON preferred, else literal"),
     scope: str = typer.Option("user", "--scope", help="user|project|local（flag/policy 只读）"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """写单字段（flag/policy 只读）/ Write a single field (flag/policy read-only)."""
-    raise typer.Exit(settings_cmd.settings_set(ensure_skill_home(), os.environ, key, value, scope=scope, json_output=json_output))
+    st = _root_state(ctx)
+    raise typer.Exit(
+        settings_cmd.settings_set(
+            ensure_skill_home(), os.environ, key, value, scope=scope,
+            active_workdir=st.active_workdir, json_output=json_output,
+        ),
+    )
 
 
 @settings_app.command("edit")
 def _settings_edit(
+    ctx: typer.Context,
     scope: str = typer.Option("user", "--scope", help="user|project|local"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """用 $EDITOR 打开该层 settings.json（非交互无 reconcile）/ Open settings.json in $EDITOR."""
-    code, _post = settings_cmd.settings_edit(ensure_skill_home(), os.environ, scope=scope, json_output=json_output)
+    st = _root_state(ctx)
+    code, _post = settings_cmd.settings_edit(
+        ensure_skill_home(), os.environ, scope=scope, active_workdir=st.active_workdir, json_output=json_output,
+    )
     raise typer.Exit(code)
 
 

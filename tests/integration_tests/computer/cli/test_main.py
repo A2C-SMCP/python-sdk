@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -214,3 +216,100 @@ def test_cli_run_with_computer_factory_fallback(monkeypatch: pytest.MonkeyPatch)
     assert isinstance(_DummyInteractive.last_comp, _FakeComputer)
     assert _DummyInteractive.last_comp.init_args["auto_connect"] is True
     assert _DummyInteractive.last_comp.init_args["auto_reconnect"] is True
+
+
+# ------------------------------
+# #97：根选项 --settings / --add-dir 透传到 settings 子命令
+# Root options --settings / --add-dir must reach the `settings` subcommands
+# ------------------------------
+# 接线层回归：Typer 包装器 _settings_show/_get/_set 此前调 handler 时未传 flag_path /
+# active_workdir，导致 `settings show --scope flag` 恒返回 {}（merged 视图也丢 flag 字段），
+# 且 `settings set --scope project` 因缺 active_workdir 误报。以下 spy 测试确定性验证「根上
+# 下文是否抵达 handler」，绕开 logging 写 stdout 的输出污染。/ Wiring regression for #97.
+
+
+def _spy_handler(recorded: dict[str, Any]) -> Callable[..., int]:
+    """返回一个记录入参 kwargs 的 handler 替身（返回退出码 0）/ A spy recording call kwargs."""
+
+    def _spy(*_args: Any, **kwargs: Any) -> int:
+        recorded.update(kwargs)
+        return 0
+
+    return _spy
+
+
+def test_root_settings_flag_propagates_to_settings_show(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--settings <f> settings show --scope flag` 应把 flag_path 透传给 settings_show。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    flag_file.write_text(json.dumps({"testFlag": True, "flagKey": "flagValue"}), encoding="utf-8")
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_show", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(cli_main.app, ["--settings", str(flag_file), "settings", "show", "--scope", "flag", "--json"])  # noqa: S603
+
+    assert result.exit_code == 0
+    assert recorded.get("flag_path") == flag_file  # 修前为 None（未透传）→ 红
+
+
+def test_root_settings_flag_propagates_to_settings_get(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--settings <f> settings get <k> --scope flag` 应把 flag_path 透传给 settings_get。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    flag_file.write_text(json.dumps({"flagKey": "flagValue"}), encoding="utf-8")
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_get", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(cli_main.app, ["--settings", str(flag_file), "settings", "get", "flagKey", "--scope", "flag"])  # noqa: S603
+
+    assert result.exit_code == 0
+    assert recorded.get("flag_path") == flag_file
+
+
+def test_root_settings_flag_propagates_to_merged_show(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merged 视图（默认 scope）同样需要 flag_path 才能合入 flag 层字段。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    flag_file.write_text(json.dumps({"testFlag": True}), encoding="utf-8")
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_show", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(cli_main.app, ["--settings", str(flag_file), "settings", "show", "--json"])  # noqa: S603
+
+    assert result.exit_code == 0
+    assert recorded.get("flag_path") == flag_file
+
+
+def test_root_add_dir_propagates_active_workdir_to_settings_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--add-dir <d> settings set <k> <v> --scope project` 应把 active_workdir 透传给 settings_set。"""
+    runner = CliRunner()
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_set", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(  # noqa: S603
+        cli_main.app, ["--add-dir", str(wd), "settings", "set", "k", "v", "--scope", "project"],
+    )
+
+    assert result.exit_code == 0
+    assert recorded.get("active_workdir") == wd.resolve()  # 修前为 None（未透传）→ 红
+
+
+def test_root_settings_flag_scope_real_output(tmp_path: Path) -> None:
+    """端到端复现 G-08：`--settings <f> settings show --scope flag --json` 应输出 flag 文件内容（非 {}）。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    payload = {"testFlag": True, "flagKey": "flagValue"}
+    flag_file.write_text(json.dumps(payload), encoding="utf-8")
+    # 隔离 SKILL Home / XDG，避免触碰真实用户目录 / isolate home to avoid touching real user dirs
+    env = {**os.environ, "A2C_SKILL_HOME": str(tmp_path / "skill"), "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+    result = runner.invoke(  # noqa: S603
+        cli_main.app, ["--settings", str(flag_file), "settings", "show", "--scope", "flag", "--json"], env=env,
+    )
+
+    assert result.exit_code == 0
+    out = result.stdout
+    parsed = json.loads(out[out.index("{"):])  # 跳过可能的日志行（无花括号）→ 取尾部 JSON
+    assert parsed == payload  # 修前为 {} → 红
