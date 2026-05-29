@@ -220,16 +220,17 @@ uv run python .claude/skills/UAT/resources/seeds/_helpers/full-protocol/agent_pr
 - **优先级**: P1
 - **前置**: F-01 成功，Computer 有一个长时间执行的工具
 - **步骤**:
-  1. Agent 发起 `client:call_tool`（选择一个长超时工具）
-  2. 在工具执行中，Agent 发起 `server:tool_call_cancel`，参数：
+  1. Agent 发起 `client:call_tool`（选择一个长超时工具，记其 `req_id`）
+  2. 在工具执行中，Agent 发起 `server:tool_call_cancel`，参数（**`req_id` 必须与步骤 1 的 `req_id` 一致**，否则无法定位在途任务）：
      ```json
      {"computer": "<computer_name>", "req_id": "F-12"}
      ```
   3. 捕获三端 pane 输出
 - **预期结果**:
   - Computer 收到 `notify:tool_call_cancel` 通知
-  - Computer 日志显示工具执行被中断
-  - Agent 原始 tool_call 收到取消响应（非正常结果）
+  - Computer 日志显示工具执行被中断（`slow_tool_server` 输出 `SLOW_ECHO_INTERRUPTED`；Computer 向远端补发 MCP `notifications/cancelled`，#96）
+  - Agent 原始 `client:tool_call` 收到取消响应（`isError` 取消态，非正常结果）
+  - 注：`server:tool_call_cancel` 为 fire-and-forget 广播，**其 ack 为 None 属预期**，不作为判据
 
 ## 清理
 

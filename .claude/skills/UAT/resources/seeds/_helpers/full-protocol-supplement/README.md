@@ -51,4 +51,7 @@ uv run python f06_disconnect_reconnect.py --port-file /tmp/a2c-uat-port --office
 **注意事项**:
 - F-06 需手动在 `KILL_SIGNAL_SENT` 后 kill Computer 进程（`kill -9 <pid>`）
 - F-06 Phase 2 需重启 Computer（`--auto-reconnect`）并在 15 秒等待内完成
-- F-12 当前 cancel 返回 None（SUT bug，已提 GitHub Issue #96）
+- F-12（#96 已修）：cancel 的 `req_id` **必须 == 原 tool_call 的 `req_id`**（同为 `F-12`），否则 Computer 无法定位在途任务。
+  `server:tool_call_cancel` 为 fire-and-forget 广播，**cancel_resp 返回 None 属预期**（非 bug）；判据看**原 tool_call 是否返回取消态**（`isError`）。
+  Computer 会真正中断在途工具（取消承载任务），并向远端 MCP Server 补发 MCP `notifications/cancelled`——
+  `slow_tool_server.py` 被中断时会在 stderr 打印 `SLOW_ECHO_INTERRUPTED`，可在 Computer/MCP 子进程日志中观测「工具执行被中断」。

@@ -11,6 +11,9 @@ url = f"http://127.0.0.1:{port}"
 office = "test-office-001"
 comp = "proto-comp-001"
 agent_name = "f12-agent"
+# 取消的 req_id 必须 == 原 tool_call 的 req_id —— Computer 按 req_id 定位在途任务来取消。
+# 用不同 id（旧 bug：call="F-12-call" / cancel="F-12-cancel"）会导致永不匹配、取消落空。
+req_id = "F-12"
 
 result = {"pass": False, "notes": []}
 
@@ -40,7 +43,7 @@ def do_call():
     r = client.call(
         TOOL_CALL_EVENT,
         {"computer": comp, "tool_name": "slow_echo", "agent": agent_name,
-         "req_id": "F-12-call", "params": {"msg": "hello"}, "timeout": 30000},
+         "req_id": req_id, "params": {"msg": "hello"}, "timeout": 30000},
         namespace=SMCP_NAMESPACE, timeout=35,
     )
     call_result["done"] = True
@@ -54,9 +57,11 @@ t.start()
 time.sleep(1)
 
 print("Sending cancel...", flush=True)
+# req_id 必须与原 tool_call 一致（见上）。注意：server:tool_call_cancel 是 fire-and-forget 广播，
+# 服务端不回执（cancel_resp 为 None 属预期，不作为失败判据）；判据看原 tool_call 是否返回取消态。
 cancel_resp = client.call(
     CANCEL_TOOL_CALL_EVENT,
-    {"computer": comp, "req_id": "F-12-cancel", "agent": agent_name},
+    {"computer": comp, "req_id": req_id, "agent": agent_name},
     namespace=SMCP_NAMESPACE, timeout=10,
 )
 print(f"Cancel response: {cancel_resp}", flush=True)
@@ -80,11 +85,11 @@ if call_result["done"]:
 else:
     result["notes"].append("tool_call timed out (15s) — may indicate cancel did not work")
 
-# Check if cancel response is meaningful
+# cancel 为 fire-and-forget 广播：cancel_resp 为 None 属预期（服务端不回执），不影响 PASS。
 if cancel_resp:
     result["notes"].append(f"cancel_resp: {cancel_resp}")
 else:
-    result["notes"].append("cancel_resp was None/empty")
+    result["notes"].append("cancel_resp was None/empty (expected: fire-and-forget broadcast)")
 
 print(f"\nF-12: {'PASS' if result['pass'] else 'FAIL'}")
 for n in result["notes"]:
