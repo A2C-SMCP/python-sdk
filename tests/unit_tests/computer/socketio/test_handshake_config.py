@@ -19,6 +19,7 @@ import pytest
 
 from a2c_smcp.computer.socketio.client import DEFAULT_AUTH_HEADER_NAME, SMCPComputerClient
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_NOTIFICATION,
     GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
@@ -78,6 +79,7 @@ def test_computer_client_custom_namespace_registers_all_handlers() -> None:
         GET_BLOB_EVENT,
         GET_SKILLS_EVENT,
         GET_SKILL_EVENT,
+        CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器
     }
 
 

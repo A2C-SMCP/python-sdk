@@ -26,6 +26,7 @@ All classes and methods use Google style docstrings (bilingual: Chinese and Engl
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import weakref
@@ -165,6 +166,14 @@ class Computer(BaseComputer[PromptSession]):
         # English: Tool call history (keep last 10). Protected by asyncio.Lock for cross-coroutine safety
         self._tool_call_history: deque = deque(maxlen=10)
         self._tool_call_history_lock = asyncio.Lock()
+        # 中文: 在途工具调用注册表（req_id → 承载 acall_tool 的可取消任务），用于响应 notify:tool_call_cancel（#96）。
+        #   _cancelled_req_ids 标记「经 acancel_tool 显式取消」的 req_id，与外层协程自身被取消（连接断开/teardown）区分。
+        #   Computer 仅单事件循环，容器读写均在 loop 内协程中发生，无需额外锁。
+        # English: In-flight tool-call registry (req_id → cancellable task wrapping acall_tool) for notify:tool_call_cancel (#96).
+        #   _cancelled_req_ids marks req_ids explicitly cancelled via acancel_tool, to distinguish from an outer-coroutine
+        #   cancellation (connection drop/teardown). Single asyncio loop → no extra lock needed.
+        self._inflight_tool_tasks: dict[str, asyncio.Task] = {}
+        self._cancelled_req_ids: set[str] = set()
         # 窗口缓存（仅记录满足 WindowURI 的资源 URI，避免无关资源导致刷新）
         # Windows cache (only URIs that conform to WindowURI to avoid irrelevant refresh triggers)
         self._windows_cache: set[str] = set()
@@ -1056,7 +1065,7 @@ class Computer(BaseComputer[PromptSession]):
             # 中文: 仅当合并结果的 auto_apply 显式为 True 时直接执行；否则进入二次确认流程
             # English: Only execute directly if merged auto_apply is explicitly True; otherwise require confirmation
             if merged_meta is not None and merged_meta.auto_apply is True:
-                result = await self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout)
+                result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
             else:
                 # 除非明确允许 auto_apply 否则均需要调用二次确认回调进行确认
                 # Unless auto_apply is explicitly allowed, require confirm callback
@@ -1077,7 +1086,7 @@ class Computer(BaseComputer[PromptSession]):
                         )
                     else:
                         if apply:
-                            result = await self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout)
+                            result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
                         else:
                             result = CallToolResult(content=[TextContent(text="工具调用二次确认被拒绝，请稍后再试", type="text")])
                 else:
@@ -1116,6 +1125,76 @@ class Computer(BaseComputer[PromptSession]):
             )
 
         return result
+
+    async def _acall_tool_cancellable(
+        self,
+        req_id: str,
+        server_name: str,
+        tool_name: str,
+        parameters: dict,
+        timeout: float | None,
+    ) -> CallToolResult:
+        """中文: 将 ``Manager.acall_tool`` 包装为「可被 :meth:`acancel_tool` 中断」的在途任务（#96）。
+
+        - 在 ``_inflight_tool_tasks[req_id]`` 登记承载任务；
+        - 若经 :meth:`acancel_tool` 显式取消（``req_id`` 入 ``_cancelled_req_ids`` 且**外层协程自身未被取消**）：
+          吞掉 ``CancelledError`` 并返回取消态 ``CallToolResult(isError=True)``（即成为原 ``client:tool_call`` 的 ack）；
+        - 若**外层协程自身**被取消（连接断开 / teardown）：确保承载任务退场后向上重抛，绝不伪装成结果；
+        - 任何路径 ``finally`` 都清理注册表与取消标记。
+
+        判别器：``asyncio.current_task().cancelling()``（外层是否被取消）AND ``req_id in _cancelled_req_ids``
+        （是否本 req_id 被显式取消）双重确认才吞，杜绝把真实外层取消误判为取消态结果。
+
+        English: Wrap ``Manager.acall_tool`` as a cancellable in-flight task so ``notify:tool_call_cancel`` can
+        interrupt it (#96). Explicit cancel → swallow & return a cancelled result; outer-coroutine cancel →
+        re-raise after teardown; always clean up the registry. The discriminator combines
+        ``current_task().cancelling()`` with the ``_cancelled_req_ids`` marker.
+        """
+        if self.mcp_manager is None:
+            raise RuntimeError("当前MCP Manager为空")
+        inner: asyncio.Task[CallToolResult] = asyncio.ensure_future(
+            self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout),
+        )
+        self._inflight_tool_tasks[req_id] = inner
+        try:
+            return await inner
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            outer_cancelled = bool(current is not None and current.cancelling())
+            if not outer_cancelled and req_id in self._cancelled_req_ids:
+                # 显式工具取消：吞掉异常并返回取消态结果 / explicit tool cancel: swallow & return cancelled result
+                return CallToolResult(
+                    content=[TextContent(text="工具调用已被取消 / Tool call cancelled", type="text")],
+                    isError=True,
+                )
+            # 外层协程自身被取消：确保承载任务退场后向上传播 / outer cancellation: ensure teardown then re-raise
+            if not inner.done():
+                inner.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await inner
+            raise
+        finally:
+            self._inflight_tool_tasks.pop(req_id, None)
+            self._cancelled_req_ids.discard(req_id)
+
+    async def acancel_tool(self, req_id: str) -> bool:
+        """中文: 取消一个在途工具调用（响应 ``notify:tool_call_cancel``，#96）。
+
+        Args:
+            req_id (str): 被取消的请求 ID（``AgentCallData.req_id``）。
+
+        Returns:
+            bool: ``True`` 表示已对一个在途任务请求取消；``False`` 表示该 ``req_id`` 未知或已完成（幂等 no-op）。
+
+        English: Cancel an in-flight tool call (handles ``notify:tool_call_cancel``). Returns ``False`` as an
+        idempotent no-op when ``req_id`` is unknown or already finished.
+        """
+        task = self._inflight_tool_tasks.get(req_id)
+        if task is None or task.done():
+            return False
+        self._cancelled_req_ids.add(req_id)
+        task.cancel()
+        return True
 
     async def get_resources(self, mcp_server: str, cursor: str | None = None) -> tuple[list[Resource], str | None]:
         """

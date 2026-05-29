@@ -38,7 +38,10 @@ class MCPServerManager:
 
     所有以下划线开头的私有方法是非协程安全的。如果外部调用，需要使用普通方法。
 
-    # TODO call_tool的时候需要启动子任务对call_tool进行包装，以便进行超时控制与动态取消。实现超时控制与动态取消后，才可以响应服务端取消任务
+    # 动态取消（响应 server 端 notify:tool_call_cancel）已在 Computer.aexecute_tool 层实现（#96）：
+    #   Computer 以 req_id 为键将 acall_tool 包装为可取消的在途任务（见 Computer._acall_tool_cancellable /
+    #   Computer.acancel_tool）。此处 acall_tool 维持原有 asyncio.wait_for 超时语义即可，无需在 Manager 持有
+    #   req_id 级注册表（acall_tool 以 server/tool 为键、被 alias 路径复用，不感知 req_id）。
     """
 
     def __init__(

@@ -119,10 +119,23 @@ async def run() -> None:
                 description="中文: 标记A; 英文: mark A",
                 inputSchema={"type": "object", "properties": {}},
             ),
+            # #96: 慢速工具，用于验证 notify:tool_call_cancel 能中断在途调用。
+            # #96: a slow tool to verify notify:tool_call_cancel interrupts an in-flight call.
+            types.Tool(
+                name="slow_echo",
+                description="中文: 睡眠后回显（用于取消测试）; 英文: sleep then echo (for cancel tests)",
+                inputSchema={"type": "object", "properties": {"delay": {"type": "number"}}},
+            ),
         ]
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict | None):  # noqa: ARG001
+    async def call_tool(name: str, arguments: dict | None):
+        # 中文: slow_echo 睡眠 delay 秒（默认 5s）后才回显——取消应在睡眠期间中断它。
+        # 英文: slow_echo sleeps `delay` seconds (default 5s) before echoing — cancel interrupts during the sleep.
+        if name == "slow_echo":
+            delay = float((arguments or {}).get("delay", 5.0))
+            await anyio.sleep(delay)
+            return [types.TextContent(type="text", text=f"slow_done:{delay}")]
         # 中文: 回显工具名，便于 CLI 端确认调用已发生。
         # 英文: Echo tool name so the CLI can confirm the call happened.
         return [types.TextContent(type="text", text=f"ok:{name}")]

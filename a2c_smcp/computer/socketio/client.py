@@ -24,6 +24,7 @@ from a2c_smcp.computer.mcp_clients.model import GetSkillRet as GetSkillRetModel
 from a2c_smcp.computer.skills import SkillNameError, SkillSandboxError, parse_skill_name
 from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_NOTIFICATION,
     GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
@@ -40,6 +41,7 @@ from a2c_smcp.smcp import (
     UPDATE_SKILLS_EVENT,
     UPDATE_TOOL_LIST_EVENT,
     A2CResource,
+    AgentCallData,
     EnterOfficeReq,
     ErrorCode,
     ErrorPayload,
@@ -165,6 +167,9 @@ class SMCPComputerClient(AsyncClient):
         # v0.2.1 SKILL 通道发现 / 渐进式披露 / SKILL channel discovery & progressive disclosure (#66)
         self.on(GET_SKILLS_EVENT, self.on_get_skills, namespace=self._namespace)
         self.on(GET_SKILL_EVENT, self.on_get_skill, namespace=self._namespace)
+        # v0.2.1 工具调用取消 / tool_call cancellation（#96）：接收 Server 广播的 notify:tool_call_cancel，
+        # 按 req_id 中断本机在途工具调用。notify:* 仅接收、不回执。
+        self.on(CANCEL_TOOL_CALL_NOTIFICATION, self.on_tool_call_cancel, namespace=self._namespace)
         self.office_id: str | None = None
 
     @property
@@ -378,6 +383,29 @@ class SMCPComputerClient(AsyncClient):
         except Exception as e:
             error_result = CallToolResult(isError=True, structuredContent={"error": str(e), "error_type": type(e).__name__}, content=[])
             return error_result.model_dump(mode="json")
+
+    async def on_tool_call_cancel(self, data: AgentCallData) -> None:
+        """信令服务器广播 ``notify:tool_call_cancel``：按 ``req_id`` 中断本机在途工具调用（#96）。
+
+        Server broadcasts ``notify:tool_call_cancel``; interrupt this Computer's in-flight tool call by ``req_id``.
+
+        - 该通知按 office 房间广播，可能投递到房间内并未承载此 ``req_id`` 的其它 Computer——此时为无害 no-op；
+        - ``notify:*`` 通知不回执（返回 ``None``），与协议一致；
+        - ``AgentCallData`` 不含 ``computer`` 字段，故仅以 ``req_id`` 归属判定（在途 ``req_id`` 在本机唯一）。
+
+        - The notification is room-broadcast and may reach Computers not running this ``req_id`` → harmless no-op;
+        - ``notify:*`` returns no ack (``None``); matches the protocol;
+        - ``AgentCallData`` carries no ``computer`` field, so ownership is decided solely by ``req_id``.
+
+        Args:
+            data (AgentCallData): 取消通知数据（``agent`` / ``req_id``）/ cancel notification data.
+        """
+        req_id = data["req_id"]
+        cancelled = await self.computer.acancel_tool(req_id)
+        if cancelled:
+            logger.info(f"工具调用已按 notify:tool_call_cancel 中断 / cancelled in-flight tool call req_id={req_id}")
+        else:
+            logger.debug(f"notify:tool_call_cancel 未命中在途/已完成 req_id={req_id}，忽略 / no in-flight call, ignored")
 
     def _mint_oversize_binary_content(self, raw: dict) -> None:
         """遍历 ``CallToolResult`` content items，超内联预算的二进制 item 铸造 toolspool 句柄.
