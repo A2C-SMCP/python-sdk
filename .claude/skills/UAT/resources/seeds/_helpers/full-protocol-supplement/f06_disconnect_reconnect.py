@@ -4,7 +4,7 @@ import socketio, time, sys, threading
 from a2c_smcp.smcp import SMCP_NAMESPACE, JOIN_OFFICE_EVENT, TOOL_CALL_EVENT
 
 port = open("/tmp/a2c-uat-port").read().strip()
-url = f"http://127.0.0.1:{port}"
+url = f"http://127.0.0.1:{port}?a2c_version=0.2.0"
 office = "test-office-001"
 comp = "proto-comp-001"
 agent_name = "f06-agent"

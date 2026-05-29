@@ -108,7 +108,7 @@ def _check_error(case_id: str, resp, expected_code: int, extra_checks=None) -> N
 
 def run(args: argparse.Namespace) -> int:
     port = open(args.port_file).read().strip()
-    url = f"http://127.0.0.1:{port}"
+    url = f"http://127.0.0.1:{port}?a2c_version=0.2.0"
     agent_name = f"err-agent-{uuid.uuid4().hex[:6]}"
 
     log("=== ERROR CODES UAT AGENT ===")

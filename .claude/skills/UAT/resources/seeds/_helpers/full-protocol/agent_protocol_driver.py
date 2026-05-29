@@ -128,7 +128,8 @@ def _check_error(case_id: str, resp, expected_code: int, extra_checks=None) -> N
 
 def run(args: argparse.Namespace) -> int:
     port = open(args.port_file).read().strip()
-    url = f"http://127.0.0.1:{port}"
+    base_url = f"http://127.0.0.1:{port}"
+    url = f"{base_url}?a2c_version=0.2.0"
     agent_name = f"proto-agent-{uuid.uuid4().hex[:6]}"
 
     log("=== FULL PROTOCOL UAT AGENT ===")
@@ -279,7 +280,7 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         bad_client.connect(
-            f"{url}?a2c_version=99.0.0",
+            f"{base_url}?a2c_version=99.0.0",
             socketio_path="/socket.io",
             namespaces=[SMCP_NAMESPACE],
             transports=["polling"],
