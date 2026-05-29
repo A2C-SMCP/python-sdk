@@ -160,12 +160,17 @@ async def marketplace_add(
     if mp_name in _marketplaces(home, env):
         return _err(f"marketplace name conflict: {mp_name!r} already exists", json_output=json_output)
 
-    # trust 门：name 已信任 / --trust → 直通；否则 confirm 回调（缺回调=非交互且无 --trust）→ 报错退出。
+    # trust 门（§10.5/§11，#95 收紧）/ trust gate:
+    #   - 非交互（confirm is None）：``--trust`` **无条件**强制（契约「非交互须 --trust」）。持久化的
+    #     user-scope trust **不豁免**——能走到「已 trusted 但不在 known_marketplaces」的只有 desync/
+    #     泄漏态（remove 未撤销 / clone 失败 orphan / 跨 A2C_SKILL_HOME；trust 落全局 user settings、
+    #     与 home 解耦），陈旧 trust 不得静默授权一次全新的远端 clone+注册。
+    #   - 交互（confirm 非空，REPL）：已 trusted 的 name 跳过重复 prompt；否则弹 confirm。
     # 门控/落盘按 **name**（§5.3.1），prompt 仍展示 url 供用户判断来源。
-    if not trust and mp_name not in _load_trusted(env):
+    if not trust:
         if confirm is None:
             return _err(f"untrusted marketplace {mp_name!r} ({url}); pass --trust to confirm non-interactively", json_output=json_output)
-        if not await confirm(url):
+        if mp_name not in _load_trusted(env) and not await confirm(url):
             return _err("aborted by user (untrusted)", json_output=json_output)
     _record_trust(mp_name, env)
 

@@ -104,6 +104,24 @@ def test_typer_add_missing_trust_exits_1(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 @requires_git
+def test_typer_add_pretrusted_still_requires_trust_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#95：name 已在全局 trustedMarketplaces（陈旧/跨 home 泄漏）+ 非交互缺 --trust → 仍退出码 1、不落盘。
+
+    全局 trust（~/.config/a2c/settings.json，经 XDG_CONFIG_HOME 隔离）与 A2C_SKILL_HOME 解耦，
+    清空 home 不清 trust；该陈旧 trust 不得让非交互 add 静默放行（契约「非交互须 --trust」）。
+    """
+    from a2c_smcp.computer.cli.commands.marketplace import _record_trust
+
+    _set_env(monkeypatch, tmp_path)
+    url = f"file://{_make_bare(tmp_path)}"
+    # 预置泄漏态：把 acme 写进隔离的全局 user settings（env=None → 用 monkeypatch 后的 os.environ；known_marketplaces 仍空）
+    _record_trust("acme", None)
+    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", url, "--name", "acme"])
+    assert r.exit_code == 1
+    assert "acme" not in (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {})
+
+
+@requires_git
 def test_typer_skill_list_rebuilds_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """新进程 registry 为空 → skill list 离线重扫已物化 marketplace clone 列出 marketplace 源 skill。"""
     _set_env(monkeypatch, tmp_path)

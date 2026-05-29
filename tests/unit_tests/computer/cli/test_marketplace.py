@@ -180,15 +180,42 @@ async def test_add_name_conflict_errors(tmp_path: Path) -> None:
 
 @requires_git
 @pytest.mark.asyncio
-async def test_add_name_already_trusted_skips_prompt(tmp_path: Path) -> None:
-    """name 已在 trustedMarketplaces（如经 settings/policy 预信任）→ add 该 name 无 confirm 也直通（按 name 判定）。"""
+async def test_add_pretrusted_name_noninteractive_still_requires_trust(tmp_path: Path) -> None:
+    """#95：非交互（confirm=None）即便 name 已在 trustedMarketplaces 也须 --trust → 退出码 1、不落盘。
+
+    能走到「已 trusted 但不在 known_marketplaces」的只有 desync/泄漏态（remove 未撤销 / clone 失败
+    orphan / 跨 A2C_SKILL_HOME；trust 落全局 user settings、与 home 解耦）。该陈旧全局 trust 不得
+    静默授权一次全新的非交互远端 clone+注册——契约「非交互须 --trust」无条件成立。
+    """
     bare = _make_bare(tmp_path, "acme", _marketplace_files())
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
-    _record_trust("acme", env)  # 预信任 name=acme（非 URL）
-    # name=acme 未在 known_marketplaces，但已 trusted → confirm=None、trust=False 直通
-    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=False, confirm=None) == 0
-    # 信任键空间是 name：另一个未信任的 name 仍需 confirm（缺则退出码 1）
-    assert await marketplace_add(reg, home, env, f"file://{bare}", name="other", trust=False, confirm=None) == 1
+    _record_trust("acme", env)  # 预置泄漏态：name=acme 已在全局 trustedMarketplaces，但不在 known_marketplaces
+    # 非交互（confirm=None）+ 无 --trust：旧实现直通（bug），新实现必须拒绝
+    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=False, confirm=None) == 1
+    assert "acme" not in (load_known_marketplaces(home, env).get("marketplaces") or {})
+    # 显式 --trust 仍直通（契约提供的非交互旁路）
+    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=True, confirm=None) == 0
+
+
+@requires_git
+@pytest.mark.asyncio
+async def test_add_pretrusted_name_interactive_skips_prompt(tmp_path: Path) -> None:
+    """回归守卫：交互（confirm 非空）下，已 trusted 的 name 仍跳过重复 prompt（#95 收紧不破坏 REPL UX）。"""
+    bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    _record_trust("acme", env)  # 预信任 name=acme
+
+    called = False
+
+    async def _must_not_be_called(_target: str) -> bool:
+        nonlocal called
+        called = True
+        return True
+
+    # confirm 非空（模拟 REPL）但 name 已 trusted → 直接 clone，不触发 confirm prompt
+    assert await marketplace_add(reg, home, env, f"file://{bare}", name="acme", trust=False, confirm=_must_not_be_called) == 0
+    assert called is False
+    assert "acme" in (load_known_marketplaces(home, env).get("marketplaces") or {})
 
 
 # ── list / info / set / remove ───────────────────────────────────────────────

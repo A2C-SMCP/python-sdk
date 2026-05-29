@@ -915,6 +915,13 @@ a2c> marketplace add git@github.com:team/skills.git
 
 `marketplace add ... --trust` 跳过 prompt。
 
+> **非交互恒需 `--trust`（#95 收紧）**：非交互场景（无 TTY / `confirm` 回调缺失）下，`marketplace add`
+> **无条件**要求 `--trust`，缺则退出码 1——即便目标 name 已在 `trustedMarketplaces`。持久化的
+> `trustedMarketplaces` 仅治理**交互 prompt 的跳过**、`list/info` 的 `trusted` 展示、以及 §strict
+> 白名单判定，**不**充当非交互 add 的免检凭证。原因：trust 落**全局 user settings**（`~/.config/a2c`，
+> 经 `XDG_CONFIG_HOME` 解析），与 per-`A2C_SKILL_HOME` 的 `known_marketplaces` 解耦；陈旧/跨 home 的
+> trust 残留（remove 未撤销 / clone 失败 orphan / 换 home）不得静默授权一次全新的远端 clone+注册。
+
 ### 10.6 Plugin MCP server 冲突（硬抛、无逃生口）
 
 name 即身份，外来同名直接抛错——交互与非交互行为一致（无 prompt、无 flag 旁路）：
@@ -943,7 +950,7 @@ a2c> plugin install frontend-design@my-team-skills
 启动时 `a2c-computer --json` 进 REPL：
 - 所有命令默认 JSON 输出（不打 Rich 表格、不上色）。
 - 进度反馈以 line-delimited JSON：`{"event":"clone_progress","name":"my-team","pct":45}`。
-- 交互式 prompt（trust 确认）→ 非交互场景必须用 flag（如 `--trust`），缺则报错退出。MCP server 冲突无 prompt（直接硬抛，§10.6）。
+- 交互式 prompt（trust 确认）→ 非交互场景必须用 flag（如 `--trust`），缺则报错退出。`marketplace add` 的 `--trust` 为**无条件**要求（即便 name 已 trusted，#95，见 §10.5）。MCP server 冲突无 prompt（直接硬抛，§10.6）。
 - 退出码语义同 §4.6。
 
 ```bash
