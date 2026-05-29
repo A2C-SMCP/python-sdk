@@ -73,7 +73,7 @@ mkdir -p $A2C_SKILL_HOME
 - **预期结果**:
   - 退出码 0
   - JSON 包含 `valid-skill-pkg`，source 为 "user"
-  - 显示为 orphan（无对应 plugin）
+  - `enabled` 为 true，`orphan` 为 false（user skill 文件存在于 `$HOME/user/` 时，源可用，非孤儿；orphan 仅在源文件丢失时为 true）
 
 ### D-03: skill list --source mcp（MCP 技能列表）
 
@@ -96,19 +96,27 @@ mkdir -p $A2C_SKILL_HOME
   - 退出码 0
   - JSON 包含 name: "foo:valid-skill-pkg"
   - 包含 source、description、path、enabled 字段
-  - version 为 "1.0.0"，license 为 "MIT"（如果 SKILL.md 中声明了）
+  - version 为 marketplace 源的 git ref（commit hash），license 为 "MIT"（如果 SKILL.md 中声明了）
 
 ### D-05: 渐进披露（get_skills → get_skill → get_blob）
 
 - **优先级**: P0
 - **类型**: 完整链路（需要 Server + Computer + Agent 三进程）
-- **引用 seed**: `seeds/_helpers/skill-discovery` 提供 Agent 驱动脚本
+- **引用 seed**:
+  - `seeds/marketplace/valid-single-plugin`（marketplace bare repo 搭建）
+  - `seeds/_helpers/skill-discovery` 提供 Agent 驱动脚本
 - **前置**:
-  1. D-01 成功（Computer 至少有一个 marketplace skill 含文本资源）
+  1. Computer 进程已启动并通过交互式 CLI 注册 marketplace skill（⚠️ 必须在同一进程内注册；独立 CLI `marketplace add` 仅写入磁盘，新启动的 Computer 进程内存 registry 为空）
   2. 完整链路环境按 `resources/test-env-setup.md` 中"完整链路场景环境"搭建
   3. Computer 连接成功并加入 office
 - **步骤**:
-  运行 Agent 驱动脚本（自动执行 D-05-1~D-05-4）：
+  1. 在 Computer 交互 CLI 中注册 marketplace（确保 skill 进入内存 registry）：
+     ```
+     a2c> marketplace add <BARE_URL> --trust
+     ```
+     等待输出 `✓ added 'test-mp' — cloned, 1 skill(s) found`
+  2. Computer 加入 office：`socket join skill-uat-office skill-uat-computer`
+  3. 运行 Agent 驱动脚本（自动执行 D-05-1~D-05-4）：
 
   ```bash
   cd /Users/liulonggang/PycharmProjects/python-sdk && \

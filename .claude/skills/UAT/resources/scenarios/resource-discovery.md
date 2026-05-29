@@ -29,50 +29,58 @@ Computer 需额外挂载两个 MCP server seed：
 
 ### MCP Server 配置
 
+编写临时配置文件 `/tmp/a2c-uat-mcp-servers.json`（数组格式，供 `run -c` 一次性加载）：
+
 ```bash
 SEEDS_ROOT=<项目根>/.claude/skills/UAT/resources/seeds
+cat > /tmp/a2c-uat-mcp-servers.json << 'CONF'
+[
+  {
+    "name": "window-resource-server",
+    "type": "stdio",
+    "disabled": false,
+    "forbidden_tools": [],
+    "tool_meta": {},
+    "server_parameters": {
+      "command": "python",
+      "args": ["SEEDS_ROOT_PLACEHOLDER/mcp/server_with_window_resources.py"],
+      "env": null,
+      "cwd": "CWD_PLACEHOLDER",
+      "encoding": "utf-8",
+      "encoding_error_handler": "strict"
+    }
+  },
+  {
+    "name": "no-resources-server",
+    "type": "stdio",
+    "disabled": false,
+    "forbidden_tools": [],
+    "tool_meta": {},
+    "server_parameters": {
+      "command": "python",
+      "args": ["SEEDS_ROOT_PLACEHOLDER/mcp/server_no_resources_capability.py"],
+      "env": null,
+      "cwd": "CWD_PLACEHOLDER",
+      "encoding": "utf-8",
+      "encoding_error_handler": "strict"
+    }
+  }
+]
+CONF
+# 替换占位符为实际路径
+sed -i '' "s|SEEDS_ROOT_PLACEHOLDER|$SEEDS_ROOT|g" /tmp/a2c-uat-mcp-servers.json
+sed -i '' "s|CWD_PLACEHOLDER|$(pwd)|g" /tmp/a2c-uat-mcp-servers.json
 ```
 
-在 Computer 的 MCP 配置中注册：
-
-1. **window-resource-server**（有 resources 能力）：
-   ```json
-   {
-     "window-resource-server": {
-       "type": "stdio",
-       "disabled": false,
-       "forbidden_tools": [],
-       "tool_meta": {},
-       "server_parameters": {
-         "command": "python",
-         "args": ["$SEEDS_ROOT/mcp/server_with_window_resources.py"]
-       }
-     }
-   }
-   ```
-
-2. **no-resources-server**（无 resources 能力）：
-   ```json
-   {
-     "no-resources-server": {
-       "type": "stdio",
-       "disabled": false,
-       "forbidden_tools": [],
-       "tool_meta": {},
-       "server_parameters": {
-         "command": "python",
-         "args": ["$SEEDS_ROOT/mcp/server_no_resources_capability.py"]
-       }
-     }
-   }
-   ```
+> **注意**: `server_parameters` 中 `env`/`cwd`/`encoding`/`encoding_error_handler` 为 Pydantic 必填字段，
+> 缺少会导致校验失败、服务器静默跳过。
 
 ### tmux 环境拓扑
 
 ```
 tmux session: a2c-uat
 ├── window: server     →  Server 进程
-├── window: computer   →  a2c-computer run --approve-all-mcp --auto-connect --auto-reconnect
+├── window: computer   →  a2c-computer run -c /tmp/a2c-uat-mcp-servers.json --approve-all-mcp --auto-connect --auto-reconnect
 └── window: agent      →  Agent 驱动脚本（seeds/_helpers/resource-discovery/agent_resource_driver.py）
 ```
 

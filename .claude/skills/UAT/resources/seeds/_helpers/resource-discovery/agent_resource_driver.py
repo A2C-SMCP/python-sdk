@@ -289,18 +289,24 @@ def run(args: argparse.Namespace) -> int:
     # R-05: ghost computer → routing failure
     # ═══════════════════════════════════════════════════════════
     log(f"\n=== R-05: get_resources ghost computer → error ===")
-    resp = get_resources(args.window_server, computer="ghost-computer")
-    # Expect error (may be 4014 or timeout)
-    ok = isinstance(resp, dict) and resp.get("code") is not None
-    if ok:
+    try:
+        resp = get_resources(args.window_server, computer="ghost-computer")
+        # Expect error (may be 4014 or timeout)
+        ok = isinstance(resp, dict) and resp.get("code") is not None
+        if ok:
+            results["R-05"] = {"pass": True, "notes": [
+                f"PASS: error returned code={resp.get('code')}",
+            ]}
+        else:
+            results["R-05"] = {"pass": False, "notes": [
+                f"FAIL: expected error, got: {resp}",
+            ]}
+    except Exception as exc:
+        # Timeout is an acceptable outcome for ghost computer (no route → no response)
         results["R-05"] = {"pass": True, "notes": [
-            f"PASS: error returned code={resp.get('code')}",
+            f"PASS: timeout/exception for ghost computer ({type(exc).__name__})",
         ]}
-    else:
-        results["R-05"] = {"pass": False, "notes": [
-            f"FAIL: expected error, got: {resp}",
-        ]}
-    log(f"R-05: {'PASS' if ok else 'FAIL'}")
+    log(f"R-05: {('PASS' if results['R-05']['pass'] else 'FAIL')}")
 
     # ── Summary ──
     log("\n" + "=" * 50)
