@@ -113,8 +113,10 @@ asyncio.run(main())
 ```python
 from fastapi import FastAPI
 import socketio
-from a2c_smcp.server import SMCPNamespace, DefaultAuthenticationProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.server import A2CProtocolVersionASGIMiddleware, SMCPNamespace, DefaultAuthenticationProvider
 
+SOCKETIO_PATH = "/socket.io"
 app = FastAPI()
 
 # 1. 创建认证提供者
@@ -130,11 +132,15 @@ smcp_ns = SMCPNamespace(auth)
 sio = socketio.AsyncServer(cors_allowed_origins="*")
 sio.register_namespace(smcp_ns)
 
-# 4. 挂载到 FastAPI
-socket_app = socketio.ASGIApp(sio, app)
+# 4. 挂载到 FastAPI，并用 A2C 中间件包裹以启用协议版本握手
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path=SOCKETIO_PATH)
+socket_app = A2CProtocolVersionASGIMiddleware(socket_app, socketio_path=SOCKETIO_PATH, server_version=PROTOCOL_VERSION)
 
 # 运行: uvicorn main:socket_app
 ```
+
+> ⚠️ 不用 `A2CProtocolVersionASGIMiddleware` 包裹，协议版本握手（`a2c_version` → HTTP 400 + `4008`）
+> 不会生效。部署细节见 [Server 协议版本握手部署指南](server-version-handshake.md)。
 
 **下一步**: 阅读 [Server 使用指南](server-guide.md)
 
@@ -196,14 +202,17 @@ asyncio.run(main())
 # server_app.py
 from fastapi import FastAPI
 import socketio
-from a2c_smcp.server import SMCPNamespace, DefaultAuthenticationProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.server import A2CProtocolVersionASGIMiddleware, SMCPNamespace, DefaultAuthenticationProvider
 
 app = FastAPI()
 auth = DefaultAuthenticationProvider(admin_secret="secret")
 smcp_ns = SMCPNamespace(auth)
 sio = socketio.AsyncServer(cors_allowed_origins="*")
 sio.register_namespace(smcp_ns)
-socket_app = socketio.ASGIApp(sio, app)
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="/socket.io")
+# A2C 中间件包裹以启用协议版本握手（详见 server-version-handshake.md）
+socket_app = A2CProtocolVersionASGIMiddleware(socket_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
 
 # uvicorn server_app:socket_app --port 8000
 ```

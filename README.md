@@ -121,7 +121,8 @@ python -m a2c_smcp.computer.cli.main run \
 ```python
 from fastapi import FastAPI
 import socketio
-from a2c_smcp.server import SMCPNamespace, DefaultAuthenticationProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.server import A2CProtocolVersionASGIMiddleware, SMCPNamespace, DefaultAuthenticationProvider
 
 app = FastAPI()
 
@@ -134,8 +135,15 @@ smcp_ns = SMCPNamespace(auth)
 sio = socketio.AsyncServer(cors_allowed_origins="*")
 sio.register_namespace(smcp_ns)
 
-socket_app = socketio.ASGIApp(sio, app)
+# 用 A2C 中间件包裹以启用协议版本握手（不包裹则 a2c_version 校验不生效）
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="/socket.io")
+socket_app = A2CProtocolVersionASGIMiddleware(socket_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
 ```
+
+> **启用握手**：`socketio.ASGIApp` / `WSGIApp` 本身不做版本校验，**必须**再用
+> `A2CProtocolVersionASGIMiddleware` / `A2CProtocolVersionWSGIMiddleware` 包裹一层，
+> 上文「Server MUST 返回 HTTP 400 + 4008」才会真正生效。裸 ASGI/WSGI、FastAPI 集成与验证方法见
+> [`docs/guides/server-version-handshake.md`](docs/guides/server-version-handshake.md)。
 
 同步版本、会话查询与自定义认证示例请参考 `docs/server.md`。
 
