@@ -14,6 +14,7 @@ English: Asynchronous end-to-end tests for Computer-Agent-Server integration.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -390,6 +391,10 @@ async def test_async_integration_agent_cancel_inflight_tool_call(
         "e2e-async-integration-server-cancel",
         "tests/integration_tests/computer/mcp_servers/resources_subscribe_stdio_server.py",
     )
+    # 完成标记：slow_echo 仅在「跑完」时写此文件；若远端被 notifications/cancelled 中断则永不写。
+    # Completion marker: slow_echo writes this only if it runs to completion; never written if the remote is interrupted.
+    marker = tmp_path / "slow_echo_done.marker"
+    mcp_config["server_parameters"]["env"] = {**os.environ, "A2C_TEST_SLOW_ECHO_MARKER": str(marker)}
     stdio_config = StdioServerConfig(**mcp_config)
 
     computer = Computer(name="test", mcp_servers={stdio_config}, auto_connect=True)
@@ -424,9 +429,10 @@ async def test_async_integration_agent_cancel_inflight_tool_call(
         assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
         computer_sid, _tools = event_handler.tools_received_events[0]
 
-        # 显式铸 req（控 req_id），调用 slow_echo（8s）；用底层 call 以便与 cancel 解耦地并发等待。
-        # Explicitly mint req (control req_id) calling slow_echo (8s); use low-level call to await it independently.
-        req = agent_client.create_tool_call_request(computer=computer_sid, tool_name="slow_echo", params={"delay": 8.0}, timeout=15)
+        # 显式铸 req（控 req_id），调用 slow_echo（delay=5s）；用底层 call 以便与 cancel 解耦地并发等待。
+        # Explicitly mint req (control req_id) calling slow_echo (delay=5s); use low-level call to await independently.
+        slow_delay = 5.0
+        req = agent_client.create_tool_call_request(computer=computer_sid, tool_name="slow_echo", params={"delay": slow_delay}, timeout=15)
         t0 = time.time()
         call_task = asyncio.ensure_future(agent_client.call(TOOL_CALL_EVENT, req, namespace=SMCP_NAMESPACE, timeout=15))
 
@@ -439,15 +445,22 @@ async def test_async_integration_agent_cancel_inflight_tool_call(
             namespace=SMCP_NAMESPACE,
         )
 
-        # 原 tool_call 应在远小于 8s 内 resolve 为取消态 / original tool_call resolves cancelled, far below 8s
+        # 原 tool_call 应在远小于 delay 内 resolve 为取消态（本地放弃等待）/ resolves cancelled well before delay
         result = await asyncio.wait_for(call_task, timeout=10)
         elapsed = time.time() - t0
-        assert elapsed < 6.0, f"取消未中断在途调用（耗时 {elapsed:.2f}s）/ cancel did not interrupt (took {elapsed:.2f}s)"
+        assert elapsed < slow_delay - 1.0, f"取消未中断在途调用（耗时 {elapsed:.2f}s）/ cancel did not interrupt (took {elapsed:.2f}s)"
         assert result.get("isError") is True, f"期望取消态 isError，实际 / expected cancelled isError, got: {result}"
         # Computer 历史末条应记录失败（被中断）且 error 标为 cancelled / last record: failed + error == cancelled
         assert await _wait_until(lambda: len(computer._tool_call_history) >= 1, timeout=3)
         assert computer._tool_call_history[-1]["success"] is False
         assert computer._tool_call_history[-1]["error"] == "cancelled"
+
+        # 远端真被中断的证明（#96 最后一公里）：等到超过原始 delay 窗口，若远端未被 notifications/cancelled 中断，
+        # slow_echo 早已写下完成标记；标记缺席即证明远端 MCP Server 的工具执行确被中断。
+        # Proof of real remote interruption: wait past the original delay window; absence of the completion marker
+        # proves the remote MCP server's tool execution was actually interrupted (not merely abandoned locally).
+        await asyncio.sleep(max(0.0, (slow_delay + 1.5) - (time.time() - t0)))
+        assert not marker.exists(), "远端 slow_echo 未被中断：完成标记已写 / remote slow_echo NOT interrupted (marker written)"
 
     finally:
         await agent_client.disconnect()
