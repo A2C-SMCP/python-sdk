@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
     GET_BLOB_EVENT,
+    GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
     GET_SKILL_EVENT,
@@ -40,6 +41,8 @@ from a2c_smcp.smcp import (
     ErrorPayload,
     GetBlobReq,
     GetBlobRet,
+    GetComputerConfigReq,
+    GetComputerConfigRet,
     GetDeskTopReq,
     GetDeskTopRet,
     GetResourcesReq,
@@ -365,6 +368,18 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         if is_protocol_error_payload(client_response):
             return TypeAdapter(ErrorPayload).validate_python(client_response)
         return ret_adapter.validate_python(client_response)
+
+    def on_client_get_config(self, sid: str, data: GetComputerConfigReq) -> GetComputerConfigRet | ErrorPayload:
+        """同步：透明转发 ``client:get_config`` 至目标 Computer，返回其 MCP 配置 / Sync relay of ``client:get_config``.
+
+        返回协议已定义的 ``GetComputerConfigRet``（``servers`` 占位符原样，解析后密钥不外传）；
+        经 :meth:`_relay_client_call` 统一 isolation + flat ErrorPayload 透传。
+        协议依据 / Protocol: events.md §client:get_config；data-structures.md §GetComputerConfigRet.
+        """
+        return cast(
+            "GetComputerConfigRet | ErrorPayload",
+            self._relay_client_call(sid, data, GET_CONFIG_EVENT, TypeAdapter(GetComputerConfigRet)),
+        )
 
     def on_client_get_resources(self, sid: str, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
         """

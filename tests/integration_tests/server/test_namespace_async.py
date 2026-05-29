@@ -23,6 +23,7 @@ from socketio import AsyncClient
 from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
+    GET_CONFIG_EVENT,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
@@ -31,6 +32,7 @@ from a2c_smcp.smcp import (
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
     EnterOfficeReq,
+    GetComputerConfigReq,
     GetToolsReq,
     UpdateMCPConfigNotification,
 )
@@ -614,3 +616,86 @@ async def test_list_room_cross_office_rejected(socketio_server, basic_server_por
         )
 
     await agent.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# 中文：#94 client:get_config 中继回归 / English: #94 client:get_config relay regression
+# ---------------------------------------------------------------------------
+def _stub_stdio_server_config(name: str) -> dict:
+    """最小合法 MCPServerStdioConfig（占位符原样，无解析后密钥）/ Minimal valid stdio config (placeholder form)."""
+    return {
+        "name": name,
+        "type": "stdio",
+        "disabled": False,
+        "forbidden_tools": [],
+        "tool_meta": {},
+        "server_parameters": {
+            "command": "python",
+            "args": [],
+            "env": None,
+            "cwd": None,
+            "encoding": "utf-8",
+            "encoding_error_handler": "strict",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_config_success_same_office(socketio_server, basic_server_port: int):
+    """
+    中文：Agent 与 Computer 同房间，调用 client:get_config，服务端经 _relay_client_call 转发并返回配置（#94）。
+    English: Same office; client:get_config is relayed to the Computer and returns its config (#94).
+
+    修复前 Server 缺 on_client_get_config，call 返回 None；修复后返回含 servers 的配置。
+    """
+    agent = AsyncClient()
+    computer = AsyncClient()
+
+    await agent.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    office_id = "office-async-cfg"
+    await _join_office(agent, role="agent", office_id=office_id, name="robot-CFG")
+
+    await computer.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    await _join_office(computer, role="computer", office_id=office_id, name="comp-CFG")
+
+    config_relayed = asyncio.Event()
+
+    @computer.on(GET_CONFIG_EVENT, namespace=SMCP_NAMESPACE)
+    async def _on_get_config(data: GetComputerConfigReq):
+        config_relayed.set()
+        return {"servers": {"echo": _stub_stdio_server_config("echo")}, "inputs": []}
+
+    res = await agent.call(
+        GET_CONFIG_EVENT,
+        {"computer": "comp-CFG", "agent": "robot-CFG", "req_id": "req-cfg-1"},
+        namespace=SMCP_NAMESPACE,
+        timeout=10,
+    )
+
+    await asyncio.wait_for(config_relayed.wait(), timeout=3)
+
+    assert isinstance(res, dict), f"期望返回 GetComputerConfigRet dict，实际：{type(res)}"
+    assert res.get("servers") and res["servers"]["echo"]["type"] == "stdio"
+    assert res["servers"]["echo"]["server_parameters"]["command"] == "python"
+
+    await agent.disconnect()
+    await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_get_config_cross_office_rejected(socketio_server, basic_server_port: int):
+    """跨房间 client:get_config：Agent(office_A) 取 Computer(office_B) 配置 → SMCPNamespaceError，不路由到 Computer（#94）。"""
+    agent = AsyncClient()
+    computer = AsyncClient()
+    agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-cfgA", "robot-neg-cfg")
+    await _connect_join(computer, basic_server_port, "computer", "office-neg-cfgB", "comp-neg-cfg")
+
+    # 与 get_tools/get_resources 同级：跨房间由 _relay_client_call 统一收敛为通用 "跨房间" 错误。
+    with pytest.raises(SMCPNamespaceError, match="跨房间"):
+        await socketio_server.on_client_get_config(
+            agent_sid,
+            {"computer": "comp-neg-cfg", "agent": "robot-neg-cfg", "req_id": "neg-cfg-1"},
+        )
+
+    await agent.disconnect()
+    await computer.disconnect()
