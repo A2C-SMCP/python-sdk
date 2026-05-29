@@ -568,7 +568,8 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 )
 
         with suppress(Exception):
-            await asyncio.wait_for(asyncio.shield(asyncio.ensure_future(_send())), timeout=2.0)
+            # asyncio.shield 内部已将协程包装为 Task，无需再 ensure_future / shield already wraps the coro in a Task.
+            await asyncio.wait_for(asyncio.shield(_send()), timeout=2.0)
 
     async def _close_task(self) -> None:
         """

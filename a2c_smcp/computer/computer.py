@@ -1152,16 +1152,18 @@ class Computer(BaseComputer[PromptSession]):
         判别器：``asyncio.current_task().cancelling()``（外层是否被取消）AND ``req_id in _cancelled_req_ids``
         （是否本 req_id 被显式取消）双重确认才吞，杜绝把真实外层取消误判为取消态结果。
 
-        取消语义边界：``inner.cancel()`` 中断的是**本地对 MCP 请求的 await**；是否真正终止**远端 MCP Server**
-        的执行取决于该 MCP 实现 / SDK，**不保证**（本 SDK 不主动发送 MCP ``notifications/cancelled``）。即 Agent
-        能迅速拿到取消态响应，但远端工具可能仍跑完。
+        取消语义边界：``inner.cancel()`` 取消承载任务，会经 ``base_client.call_tool`` best-effort 向远端补发 MCP
+        ``notifications/cancelled``（见 :meth:`~a2c_smcp.computer.mcp_clients.base_client.BaseMCPClient._emit_mcp_cancelled`，
+        #96 最后一公里）。但远端是否真正停止执行**仍不保证**——MCP 取消为**协作式**，server 可忽略该通知并跑完。即 Agent
+        能迅速拿到取消态响应，远端通常被中断，但不作硬保证。
 
         English: Wrap ``Manager.acall_tool`` as a cancellable in-flight task so ``notify:tool_call_cancel`` can
         interrupt it (#96). Explicit cancel → swallow & return a cancelled result; outer-coroutine cancel →
         re-raise after teardown; always clean up the registry. The discriminator combines
-        ``current_task().cancelling()`` with the ``_cancelled_req_ids`` marker. NOTE: cancellation only abandons
-        the LOCAL await of the MCP request — whether the REMOTE MCP server actually stops is implementation/SDK
-        dependent and NOT guaranteed (this SDK does not emit MCP ``notifications/cancelled``).
+        ``current_task().cancelling()`` with the ``_cancelled_req_ids`` marker. Cancelling the task makes
+        ``base_client.call_tool`` best-effort emit MCP ``notifications/cancelled`` to the remote
+        (see ``BaseMCPClient._emit_mcp_cancelled``); whether the REMOTE server actually stops is still NOT
+        guaranteed (MCP cancellation is cooperative — the server may ignore it).
         """
         if self.mcp_manager is None:
             raise RuntimeError("当前MCP Manager为空")
@@ -1209,10 +1211,10 @@ class Computer(BaseComputer[PromptSession]):
         English: Cancel an in-flight tool call (handles ``notify:tool_call_cancel``). Returns ``False`` as an
         idempotent no-op when ``req_id`` is unknown or already finished.
 
-        限制：仅中断本地对 MCP 请求的等待，**不保证**终止远端 MCP Server 的执行（详见
-        :meth:`_acall_tool_cancellable`）。
-        Limitation: only abandons the local await of the MCP request; does NOT guarantee the remote MCP server
-        stops (see :meth:`_acall_tool_cancellable`).
+        说明：取消承载任务后会向远端 best-effort 补发 MCP ``notifications/cancelled``，但远端是否真正停止**仍不保证**
+        （MCP 取消为协作式，server 可忽略；详见 :meth:`_acall_tool_cancellable`）。
+        Note: cancelling the task best-effort emits MCP ``notifications/cancelled`` to the remote, but whether the
+        remote actually stops is still NOT guaranteed (cooperative cancellation; see :meth:`_acall_tool_cancellable`).
         """
         task = self._inflight_tool_tasks.get(req_id)
         if task is None or task.done():
