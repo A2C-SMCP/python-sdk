@@ -165,7 +165,11 @@ async def marketplace_add(
     #     user-scope trust **不豁免**——能走到「已 trusted 但不在 known_marketplaces」的只有 desync/
     #     泄漏态（remove 未撤销 / clone 失败 orphan / 跨 A2C_SKILL_HOME；trust 落全局 user settings、
     #     与 home 解耦），陈旧 trust 不得静默授权一次全新的远端 clone+注册。
-    #   - 交互（confirm 非空，REPL）：已 trusted 的 name 跳过重复 prompt；否则弹 confirm。
+    #   - 交互（confirm 非空，REPL）：已 trusted 的 name 跳过重复 prompt；否则弹 confirm。该跳过
+    #     **仅 desync 态可达**——line 160 同名拦截保证走到此处 name 必不在 known_marketplaces，故"已
+    #     trusted"⇒desync；保留是为避免 clone 失败后重试同一 URL 时重复弹窗。残留：trust 按 name 键控，
+    #     <新URL> 套 <旧trusted名> 会跳过 confirm 不再展示 url——交互态由在场真人把关，威胁模型有意接受
+    #     （§10.5；回归守卫 test_add_pretrusted_name_interactive_skips_prompt）。
     # 门控/落盘按 **name**（§5.3.1），prompt 仍展示 url 供用户判断来源。
     if not trust:
         if confirm is None:

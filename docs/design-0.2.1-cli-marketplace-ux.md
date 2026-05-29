@@ -921,6 +921,17 @@ a2c> marketplace add git@github.com:team/skills.git
 > 白名单判定，**不**充当非交互 add 的免检凭证。原因：trust 落**全局 user settings**（`~/.config/a2c`，
 > 经 `XDG_CONFIG_HOME` 解析），与 per-`A2C_SKILL_HOME` 的 `known_marketplaces` 解耦；陈旧/跨 home 的
 > trust 残留（remove 未撤销 / clone 失败 orphan / 换 home）不得静默授权一次全新的远端 clone+注册。
+>
+> **交互态信任跳过 = 有意 UX 取舍（非 bug，#95 / UAT M-06 复盘）**：交互（REPL，`confirm` 非空）下，
+> 已在 `trustedMarketplaces` 的 name 跳过重复 prompt。该短路**仅在 desync 态可达**——`marketplace_add`
+> 入口的同名冲突拦截（`if mp_name in known_marketplaces → name conflict`）保证：能走到 trust 门的 name
+> **必不在** `known_marketplaces`，故"已 trusted"⇒"trusted 但未物化" = desync（clone 失败 orphan /
+> remove 未撤销 / 跨 home）；正常已同步流程里此短路**不可达**。保留它是为避免 clone 失败后重试**同一
+> URL** 时重复弹 prompt。残留面：trust 按 **name** 键控（§6.1、§5.3.1），故 `marketplace add <新URL>
+> --name <旧trusted名>` 会跳过 confirm 直接 clone、不再展示 URL 供来源判断（且因 desync 态 `known_marketplaces`
+> 里无原始记录、trust 又只存 name 不存 URL，无可比对的来源 URL，"加 URL 比对"在 name-keyed 模型下不可行）。
+> **威胁模型有意只收紧非交互路径、放过交互 desync**：交互 add 必由在场真人敲入命令+URL，风险与非交互无人
+> 值守脚本不可同日而语，desync 由人把关。回归守卫见 `test_add_pretrusted_name_interactive_skips_prompt`。
 
 ### 10.6 Plugin MCP server 冲突（硬抛、无逃生口）
 
