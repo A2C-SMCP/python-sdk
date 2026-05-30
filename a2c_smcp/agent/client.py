@@ -17,7 +17,7 @@ from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent import _blob_sideband as _sb
 from a2c_smcp.agent.auth import AgentAuthProvider
 from a2c_smcp.agent.base import BaseAgentClient
-from a2c_smcp.agent.errors import raise_for_error_payload
+from a2c_smcp.agent.errors import SMCPProtocolError, raise_for_error_payload
 from a2c_smcp.agent.types import AsyncAgentEventHandler
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
@@ -251,6 +251,10 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         try:
             ctx.debug("Calling tool")
             res = await self.call(TOOL_CALL_EVENT, req, timeout=timeout, namespace=self._namespace)
+            # 协议级错误（如 #99 目标 Computer 不存在 → flat ErrorPayload(404)）→ 抛 SMCPProtocolError，
+            # 由下方专门分支转成干净 isError 结果（与 6 个 get_* 方法的 raise_for_error_payload 调用点一致）。
+            # Protocol errors (e.g. #99 computer-not-found → flat ErrorPayload(404)) → raise, handled below.
+            raise_for_error_payload(res)
             # v0.2.1：返回前 drain content items 的 _meta.a2c_blob_handle / drain binary sideband pre-return
             res = await self._resolve_tool_call_binary_sideband(res, computer)
             return CallToolResult.model_validate(res, by_name=True)
@@ -262,6 +266,16 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req["req_id"])
             await self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=self._namespace)
             return self.handle_tool_call_timeout(req["req_id"])
+
+        except SMCPProtocolError as e:
+            # 协议级错误（如 #99 的 404 Computer 不存在）→ 干净 isError 结果；不透传 details（防泄露，见 errors.py），
+            # 不打 error 级栈噪声；保持 emit_tool_call「始终返回 CallToolResult、不抛出」契约。
+            # Protocol error (e.g. #99 404 computer-not-found) → clean isError result; no details leak, no stack noise.
+            ctx.warning(f"Tool call protocol error: {e}")
+            return CallToolResult(
+                content=[TextContent(text=f"工具调用失败 / Tool call failed: {e}", type="text")],
+                isError=True,
+            )
 
         except Exception as e:
             ctx.error(f"Tool call failed: {e}", exc_info=True)

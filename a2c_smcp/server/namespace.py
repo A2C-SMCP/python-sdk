@@ -355,7 +355,7 @@ class SMCPNamespace(BaseNamespace):
             skip_sid=sid,
         )
 
-    async def on_client_tool_call(self, sid: str, data: ToolCallReq) -> dict:
+    async def on_client_tool_call(self, sid: str, data: ToolCallReq) -> dict | ErrorPayload:
         """
         响应工具调用。注意因为Namespace的方法名与事件名称有耦合，因此需要保证 TOOL_CALL_EVENT 是 tool_call
         Respond to tool call. Note that due to coupling between Namespace method names and event names,
@@ -365,32 +365,35 @@ class SMCPNamespace(BaseNamespace):
         If the global variable TOOL_CALL_EVENT = "tool_call" is modified in the future,
             the method name here also needs to be modified
 
+        经 :meth:`_relay_client_call` 统一 SID 解析 + office/role 隔离 + flat ErrorPayload(404) 透传（#99：
+        目标 Computer 不存在不再 raise ValueError 致 Agent ``call`` 静默超时，与其余 ``client:*`` 事件对齐）。
+        仅 Agent 可发起工具调用，故委托前保留角色校验。
+        Routed via ``_relay_client_call`` (#99: missing Computer → flat ErrorPayload(404), not an uncaught
+        ValueError that times the Agent out). Only an Agent may invoke a tool, hence the role check before relay.
+
         Args:
             sid (str): 客户端ID，一般是AgentID / Client ID, usually AgentID
             data (ToolCallReq): 工具调用数据 / Tool call data
 
         Returns:
-            dict: 工具调用结果 / Tool call result
+            dict | ErrorPayload: 工具调用结果，或目标 Computer 不存在时的 flat ErrorPayload(404)。
+                Tool call result, or a flat ErrorPayload(404) when the target Computer is absent.
         """
         session = await self.get_session(sid)
         if session["role"] != "agent":
             raise SMCPNamespaceError("目前仅支持Agent调用工具")
 
+        # tool_call 响应是 Computer 回传的 CallToolResult 原样 dict（无固定 A2C TypedDict），ret_adapter 用
+        # TypeAdapter(dict) 原样透传；per-request timeout 透传给底层 self.call。
+        # tool_call's response is the Computer's raw CallToolResult dict, so use TypeAdapter(dict) passthrough.
         tool_call = TypeAdapter(ToolCallReq).validate_python(data)
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_name = tool_call["computer"]
-        computer_sid = await self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
         return cast(
-            dict,
-            await self.call(
-                TOOL_CALL_EVENT,
+            "dict | ErrorPayload",
+            await self._relay_client_call(
+                sid,
                 tool_call,
-                to=computer_sid,
+                TOOL_CALL_EVENT,
+                TypeAdapter(dict),
                 timeout=tool_call["timeout"],
             ),
         )
@@ -438,6 +441,7 @@ class SMCPNamespace(BaseNamespace):
         data: Any,
         event: str,
         ret_adapter: TypeAdapter[Any],
+        timeout: float | None = None,
     ) -> Any:
         """通用 ``client:*`` 事件路由 / Generic ``client:*`` event router.
 
@@ -454,6 +458,8 @@ class SMCPNamespace(BaseNamespace):
             event: 转发的 Socket.IO 事件名（``GET_*_EVENT`` 常量）/ Socket.IO event name to relay.
             ret_adapter: 成功响应的 TypeAdapter（如 ``TypeAdapter(GetResourcesRet)``），用于强校验.
                 Pydantic TypeAdapter for the success-shape return.
+            timeout: 仅 ``tool_call`` 透传 per-request 超时给底层 ``self.call``；其余 ``client:*`` 事件留空
+                （None）→ 走 socketio 默认。Only ``tool_call`` passes a per-request timeout; others None.
 
         Returns:
             成功响应（按 ``ret_adapter`` 校验后的 TypedDict）或 flat ``ErrorPayload``。
@@ -489,12 +495,13 @@ class SMCPNamespace(BaseNamespace):
                 f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
             )
 
-        client_response = await self.call(
-            event,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
-        )
+        # tool_call 透传 per-request timeout；其余 client:* 事件 timeout=None → 用 socketio 默认
+        # （勿对默认事件传 timeout=None，socketio 下会变成永久等待而非默认 60s）。
+        # Pass tool_call's per-request timeout; other client:* events leave it None (socketio default).
+        call_kwargs: dict[str, Any] = {"to": computer_sid, "namespace": SMCP_NAMESPACE}
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
+        client_response = await self.call(event, data, **call_kwargs)
         # flat ErrorPayload 透传（无嵌套 envelope，禁止二次 unwrap；判定与 agent 侧统一）/
         # Pass flat ErrorPayload through (no nested envelope; predicate shared with agent side)
         if is_protocol_error_payload(client_response):

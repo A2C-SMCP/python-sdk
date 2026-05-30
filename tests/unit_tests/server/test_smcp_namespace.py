@@ -286,8 +286,9 @@ class TestSMCPNamespace:
         assert isinstance(ret, dict)
         assert "tools" in ret
 
-        # tool_call：由 agent 发起，映射到 call
-        smcp_namespace.get_session = AsyncMock(return_value=sess_agent)
+        # tool_call：由 agent 发起，经 _relay_client_call 路由到目标 computer（#99）—— 目标 sess 必须解析为 computer
+        # tool_call now routes via _relay_client_call (#99), so the target session must resolve to a computer
+        smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent))
         smcp_namespace.call = AsyncMock(return_value={"ok": True})
         res = await smcp_namespace.on_client_tool_call(
             agent_id,
@@ -742,6 +743,27 @@ class TestV021ClientRoutesAndUpdateSkills:
         )
         assert ret["code"] == int(ErrorCode.NOT_FOUND)
         assert is_protocol_error_payload(ret) is True
+        smcp_namespace.call.assert_not_awaited()  # 未找到时不应转发 / no relay on not-found
+
+    @pytest.mark.asyncio
+    async def test_on_client_tool_call_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """``client:tool_call`` 目标 Computer 名未注册 → flat ErrorPayload(404)，**不**抛未捕获 ValueError（#99）.
+
+        #99：tool_call 原为独立路径手查 SID 后 ``raise ValueError``，致 Agent ``call`` 静默超时。改走统一
+        ``_relay_client_call`` 后与其余 6 个 ``client:*`` 事件一致回 flat ErrorPayload(404)。协议依据同 #92：
+        error-handling.md §20（404 Computer 不存在）+ §78（所有 ``client:*`` ack 协议级错误 MUST 为 flat ErrorPayload）。
+        Unregistered target Computer → flat ErrorPayload(404), no uncaught ValueError (#99)."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {}
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "room1"})
+        smcp_namespace.call = AsyncMock()
+        ret = await smcp_namespace.on_client_tool_call(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent", "tool_name": "t", "params": {}, "timeout": 5},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == "absent"
         smcp_namespace.call.assert_not_awaited()  # 未找到时不应转发 / no relay on not-found
 
     @pytest.mark.asyncio

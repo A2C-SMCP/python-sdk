@@ -269,32 +269,33 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             skip_sid=sid,
         )
 
-    def on_client_tool_call(self, sid: str, data: dict) -> dict:
+    def on_client_tool_call(self, sid: str, data: dict) -> dict | ErrorPayload:
         """
         同步：响应工具调用，使用 call 方法等待 Computer 返回结果
         Sync: respond to tool call, use call method to wait for Computer response
+
+        经 :meth:`_relay_client_call` 统一 SID 解析 + office/role 隔离 + flat ErrorPayload(404) 透传（#99：
+        目标 Computer 不存在不再 raise ValueError 致 Agent ``call`` 静默超时，与其余 ``client:*`` 事件对齐）。
+        仅 Agent 可发起工具调用，故委托前保留角色校验。
+        Routed via ``_relay_client_call`` (#99: missing Computer → flat ErrorPayload(404), not an uncaught
+        ValueError that times the Agent out). Only an Agent may invoke a tool, hence the role check before relay.
         """
         session = self.get_session(sid)
         if session["role"] != "agent":
             raise SMCPNamespaceError("目前仅支持Agent调用工具")
 
+        # tool_call 响应是 Computer 回传的 CallToolResult 原样 dict（无固定 A2C TypedDict），ret_adapter 用
+        # TypeAdapter(dict) 原样透传；per-request timeout 若提供则透传（缺省回落 socketio 默认，保持同步旧行为）。
+        # tool_call's response is the Computer's raw CallToolResult dict; pass through timeout when present.
         tool_call = TypeAdapter(dict).validate_python(data)
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_name = tool_call["computer"]
-        computer_sid = self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
-        # 使用 call 方法调用 Computer，等待返回结果 / Use call method to invoke Computer and wait for result
         return cast(
-            dict,
-            self.call(
-                TOOL_CALL_EVENT,
+            "dict | ErrorPayload",
+            self._relay_client_call(
+                sid,
                 tool_call,
-                to=computer_sid,
-                namespace=SMCP_NAMESPACE,
+                TOOL_CALL_EVENT,
+                TypeAdapter(dict),
+                timeout=tool_call.get("timeout"),
             ),
         )
 
@@ -327,6 +328,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         data: Any,
         event: str,
         ret_adapter: TypeAdapter[Any],
+        timeout: float | None = None,
     ) -> Any:
         """同步版通用 ``client:*`` 事件路由 / Sync mirror of ``_relay_client_call``.
 
@@ -337,6 +339,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         未捕获异常（同步 socketio 下抛异常会杀线程、不回 ack，致 Agent ``call`` 静默超时）。office/role
         隔离失败仍 raise ``SMCPNamespaceError``（安全：跨房间不泄露 Computer 存在性，见 exceptions.py）。
         Computer name miss → flat ``ErrorPayload(404)`` (no uncaught raise); isolation failures still raise.
+
+        ``timeout`` 仅 ``tool_call`` 透传 per-request 超时；其余 ``client:*`` 事件留 None → 走 socketio 默认。
+        ``timeout`` is only passed through for ``tool_call``; other events leave it None (socketio default).
 
         协议依据 / Protocol: events.md 各 ``client:*`` 事件 + error-handling.md flat ErrorPayload.
         """
@@ -359,12 +364,13 @@ class SyncSMCPNamespace(SyncBaseNamespace):
                 f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
             )
 
-        client_response = self.call(
-            event,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
-        )
+        # tool_call 透传 per-request timeout；其余 client:* 事件 timeout=None → 用 socketio 默认
+        # （勿对默认事件传 timeout=None，socketio 下会变成永久等待而非默认 60s）。
+        # Pass tool_call's per-request timeout; other client:* events leave it None (socketio default).
+        call_kwargs: dict[str, Any] = {"to": computer_sid, "namespace": SMCP_NAMESPACE}
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
+        client_response = self.call(event, data, **call_kwargs)
         if is_protocol_error_payload(client_response):
             return TypeAdapter(ErrorPayload).validate_python(client_response)
         return ret_adapter.validate_python(client_response)

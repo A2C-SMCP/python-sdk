@@ -466,3 +466,53 @@ class TestSyncMirror:
         with patch.object(sync_client, "get_skills", new=MagicMock(return_value={"skills": [], "req_id": "r"})):
             sync_client._on_skills_updated({"computer": "comp-1"})  # must not raise
             hook.on_skills_received.assert_called_once()
+
+
+# ── #99 收尾：emit_tool_call flat ErrorPayload 处理 ─────────────────
+
+
+class TestToolCallProtocolErrorPayloadV021:
+    """#99 收尾：tool_call 目标 Computer 不存在 → 服务端回 flat ErrorPayload(404)。
+
+    Agent 侧 ``emit_tool_call`` 须与 6 个 ``get_*`` 一致经 ``raise_for_error_payload`` 识别协议错误，
+    转成**干净**的 ``isError=True`` CallToolResult（文本含 ``[404] ... not found``），而非让
+    ``CallToolResult.model_validate`` 抛 ValidationError 落入通用 except 产出 pydantic 校验噪声。
+    并保持 ``emit_tool_call``「始终返回 CallToolResult、从不抛出」契约。
+    Computer-not-found tool_call → clean isError result, no pydantic noise, method never raises.
+    """
+
+    @staticmethod
+    def _error_payload() -> dict:
+        # 与服务端 build_computer_not_found_error 一致的 flat ErrorPayload(404) / mirrors server builder
+        return {
+            "code": int(ErrorCode.NOT_FOUND),
+            "message": "Computer with name 'ghost' not found",
+            "details": {"computer_name": "ghost"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_emit_tool_call_error_payload_returns_clean_iserror(
+        self,
+        async_client: AsyncSMCPAgentClient,
+    ) -> None:
+        ep = self._error_payload()
+        with patch.object(async_client, "call", new=AsyncMock(return_value=ep)):
+            res = await async_client.emit_tool_call("ghost", "t", {}, timeout=5)
+        assert res.isError is True
+        text = res.content[0].text  # type: ignore[union-attr]
+        assert "404" in text
+        assert "not found" in text
+        # 关键：不得出现 pydantic 校验噪声 / no pydantic validation noise leaks to the user
+        assert "validation error" not in text.lower()
+
+    def test_sync_emit_tool_call_error_payload_returns_clean_iserror(self) -> None:
+        provider = DefaultAgentAuthProvider(agent_id="a", office_id="o")
+        sync_client = SMCPAgentClient(auth_provider=provider)
+        ep = self._error_payload()
+        with patch.object(sync_client, "call", new=MagicMock(return_value=ep)):
+            res = sync_client.emit_tool_call("ghost", "t", {}, timeout=5)
+        assert res.isError is True
+        text = res.content[0].text  # type: ignore[union-attr]
+        assert "404" in text
+        assert "not found" in text
+        assert "validation error" not in text.lower()

@@ -278,6 +278,22 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         assert is_protocol_error_payload(ret) is True
         assert ret["details"]["computer_name"] == "absent"
 
+    def test_on_client_tool_call_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """sync：``client:tool_call`` 目标 Computer 名未注册 → flat ErrorPayload(404)，不抛未捕获 ValueError（#99；sync mirror）.
+        Sync mirror: unregistered target Computer → flat ErrorPayload(404), no uncaught ValueError (#99)."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {}
+        smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "office_id": "room1"})
+        smcp_namespace.call = MagicMock()
+        ret = smcp_namespace.on_client_tool_call(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent", "tool_name": "t", "params": {}, "timeout": 5},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == "absent"
+        smcp_namespace.call.assert_not_called()  # 未找到时不应转发 / no relay on not-found
+
     def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
         """跨房间 → 显式 raise SMCPNamespaceError（对齐 #31 `-O` 加固）.
         Cross-office → explicit raise SMCPNamespaceError (per #31)."""
