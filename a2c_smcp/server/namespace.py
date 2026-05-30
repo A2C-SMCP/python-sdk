@@ -8,6 +8,8 @@
 * 描述: SMCP协议Namespace实现 / SMCP protocol Namespace implementation
 """
 
+import asyncio
+import contextlib
 import copy
 from typing import Any, cast
 
@@ -84,6 +86,46 @@ class SMCPNamespace(BaseNamespace):
             auth_provider (AuthenticationProvider): 认证提供者 / Authentication provider
         """
         super().__init__(namespace=SMCP_NAMESPACE, auth_provider=auth_provider)
+        # 在途 ``client:*`` 调用的「断连信号」登记表，以**目标 Computer SID** 为 key（#100 Phase 1）。
+        # 每个在途 ``_relay_client_call`` 注册一个独立 ``asyncio.Event``；目标 Computer ``on_disconnect`` 时
+        # 触发其名下全部信号，使阻塞中的 ``self.call`` 竞速立刻醒来并回 flat ErrorPayload(404)，
+        # 而非静默等到满 ``timeout``（socketio ``call`` 的等待原语不监听连接掉线）。
+        # Per-target in-flight disconnect signals (#100 Phase 1): target Computer SID -> set of Events.
+        self._inflight_disconnect_signals: dict[SID, set[asyncio.Event]] = {}
+
+    async def on_disconnect(self, sid: SID) -> None:
+        """断连处理：先走 base 的 name/room 清理，再唤醒以 ``sid`` 为目标的全部在途 ``client:*`` 调用（#100 Phase 1）。
+        On disconnect: run base name/room cleanup first, then wake every in-flight call targeting ``sid``.
+
+        **先 super() 再 fire**（关闭 TOCTOU 微窗）：``super().on_disconnect`` 内 ``_unregister_name`` 删除 name 映射后，
+        恰在「解析 SID 与登记信号之间」的并发新调用，其 TOCTOU 复查 ``get_sid_by_name`` 会读到 None 直接短路 404，
+        不会错过 fire 而退化为满 timeout 等待。信号按 sid 登记、``super()`` 不触碰信号 registry，故 fire 置于其后对
+        **已登记**信号的唤醒零损失。幂等（重复 set 是 no-op）。
+        Super-then-fire closes the TOCTOU window: after ``_unregister_name`` drops the name mapping, a concurrent
+        call registering in the window re-checks ``get_sid_by_name`` → None → short-circuits to 404 instead of
+        missing the fire. Already-registered signals still wake (super never touches the signal registry).
+        """
+        await super().on_disconnect(sid)
+        self._fire_inflight_disconnect_signals(sid)
+
+    def _fire_inflight_disconnect_signals(self, sid: SID) -> None:
+        """唤醒以 ``sid`` 为目标的全部在途断连信号（幂等）。Wake all in-flight signals targeting ``sid`` (idempotent)."""
+        for ev in list(self._inflight_disconnect_signals.get(sid, ())):
+            ev.set()
+
+    def _register_inflight_signal(self, computer_sid: SID) -> asyncio.Event:
+        """登记并返回一个针对 ``computer_sid`` 的在途断连信号。Register and return a fresh disconnect signal."""
+        ev = asyncio.Event()
+        self._inflight_disconnect_signals.setdefault(computer_sid, set()).add(ev)
+        return ev
+
+    def _discard_inflight_signal(self, computer_sid: SID, ev: asyncio.Event) -> None:
+        """注销在途信号；set 空时删除 key（防 dict 泄漏）。Unregister a signal; drop the key when the set empties."""
+        bucket = self._inflight_disconnect_signals.get(computer_sid)
+        if bucket is not None:
+            bucket.discard(ev)
+            if not bucket:
+                self._inflight_disconnect_signals.pop(computer_sid, None)
 
     async def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
@@ -501,7 +543,44 @@ class SMCPNamespace(BaseNamespace):
         call_kwargs: dict[str, Any] = {"to": computer_sid, "namespace": SMCP_NAMESPACE}
         if timeout is not None:
             call_kwargs["timeout"] = timeout
-        client_response = await self.call(event, data, **call_kwargs)
+
+        # 在途断连守卫（#100 Phase 1）：把 ``self.call`` 与「目标 Computer 断连信号」竞速。socketio ``call`` 的
+        # 等待原语不监听连接掉线，目标在途断连会静默等到满 timeout；竞速让 ``on_disconnect`` 触发的信号先到时
+        # 立刻放弃等待、回 flat ErrorPayload(404)（语义：Computer 中途消失 == 不存在，与 #92/#99 同一 payload）。
+        # In-flight disconnect guard (#100): race ``self.call`` against the target's disconnect signal.
+        disconnect_ev = self._register_inflight_signal(computer_sid)
+        try:
+            # TOCTOU 复查：解析 SID 与登记信号之间目标可能已断连——此时信号永不会被 fire。用 ``get_sid_by_name``
+            # 复查（``on_disconnect`` → base ``_unregister_name`` 会清掉 name 映射）关闭该窗口。
+            # TOCTOU re-check: target may have died between SID resolve and registration → short-circuit to 404.
+            if disconnect_ev.is_set() or await self.get_sid_by_name(computer_name) is None:
+                return build_computer_not_found_error(computer_name)
+
+            call_task = asyncio.ensure_future(self.call(event, data, **call_kwargs))
+            wait_task = asyncio.ensure_future(disconnect_ev.wait())
+            try:
+                done, _pending = await asyncio.wait({call_task, wait_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not wait_task.done():
+                    wait_task.cancel()
+                    # await 被取消的 waiter，避免罕见 GC 时序下的 "Task was destroyed but it is pending" 噪声告警。
+                    # Await the cancelled waiter to avoid a "Task was destroyed but it is pending" warning.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await wait_task
+            if call_task in done:
+                # 目标在线：取回结果（真超时则原样抛 socketio TimeoutError，**绝不**转 404，守住语义区分）。
+                # Target responded: return its result (a genuine TimeoutError propagates as-is, never 404).
+                client_response = call_task.result()
+            else:
+                # 断连先到：放弃 ``self.call``（ack 回调随 manager.disconnect 清理，目标已断无副作用）。
+                # Disconnect won: abandon the call; only cancel here (not on the timeout path).
+                call_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await call_task
+                return build_computer_not_found_error(computer_name)
+        finally:
+            self._discard_inflight_signal(computer_sid, disconnect_ev)
+
         # flat ErrorPayload 透传（无嵌套 envelope，禁止二次 unwrap；判定与 agent 侧统一）/
         # Pass flat ErrorPayload through (no nested envelope; predicate shared with agent side)
         if is_protocol_error_payload(client_response):

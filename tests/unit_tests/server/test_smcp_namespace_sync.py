@@ -8,9 +8,12 @@
 * 描述: 同步版 SMCP Namespace 测试用例 / Sync SMCP Namespace test cases
 """
 
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
 from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server import (
@@ -18,6 +21,7 @@ from a2c_smcp.server import (
     SyncAuthenticationProvider,
     SyncSMCPNamespace,
 )
+from a2c_smcp.server.sync_base import SyncBaseNamespace
 from a2c_smcp.smcp import (
     GET_BLOB_EVENT,
     GET_SKILL_EVENT,
@@ -375,3 +379,165 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         with pytest.raises(SMCPNamespaceError, match="session gone"):
             smcp_namespace.on_client_get_tools("gone-agent-sid", {"computer": comp_name})
         smcp_namespace.call.assert_not_called()
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    """轮询线程间条件。Poll a cross-thread condition until true or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+class TestInflightTargetDisconnectGuardSync:
+    """#100 Phase 1 sync mirror：目标 Computer 在途断连 → 即时回 flat ErrorPayload(404)，不静默挂死到满超时.
+
+    同步版 ``self.call`` 阻塞当前 worker 线程、其等待原语在 ``call()`` 内部不可达，故守卫把 ``self.call`` 丢到
+    daemon 子线程跑、主线程等「完成 OR 由 ``on_disconnect`` 触发的断连信号」共享事件；断连先到 → 404（子线程
+    成为有界僵尸，至自身 timeout 退出）。三结局严格区分：断连→404 / 真超时→抛 TimeoutError / 正常→透传。
+    Sync mirror of the async guard. Explicit mirror per the sync/async parity convention.
+    """
+
+    @pytest.fixture
+    def guard_ns(self, smcp_namespace, mock_server):
+        smcp_namespace.server = mock_server
+        agent_sid = "a-sid"
+        comp_name = "c1"
+        comp_sid = "c-sid"
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace.call = MagicMock()
+        return smcp_namespace, agent_sid, comp_name, comp_sid
+
+    @staticmethod
+    def _tool_call_req(comp_name: str, timeout: int = 30) -> dict:
+        return {"agent": "agent-1", "req_id": "r", "computer": comp_name, "tool_name": "t", "params": {}, "timeout": timeout}
+
+    def test_target_disconnect_midflight_returns_404(self, guard_ns):
+        """在途 tool_call + 目标断连 → flat ErrorPayload(404)，registry 清理（核心复现，sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        started = threading.Event()
+        gate = threading.Event()  # 测试期间永不 set → 模拟死目标 / never set: simulates dead target
+
+        def blocking_call(*_a, **_k):
+            started.set()
+            gate.wait()
+            return {"late": True}
+
+        ns.call = MagicMock(side_effect=blocking_call)
+        box: dict = {}
+
+        def run():
+            box["ret"] = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name))
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            assert started.wait(timeout=2)  # relay 已下发 self.call（子线程已启动）/ relay dispatched self.call
+            assert _wait_until(lambda: comp_sid in ns._inflight_disconnect_signals)
+            ns._fire_inflight_disconnect_signals(comp_sid)  # 模拟断连 / simulate disconnect
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            assert box["ret"]["code"] == int(ErrorCode.NOT_FOUND)
+            assert is_protocol_error_payload(box["ret"]) is True
+            assert box["ret"]["details"]["computer_name"] == comp_name
+            assert comp_sid not in ns._inflight_disconnect_signals
+        finally:
+            gate.set()  # 释放僵尸子线程 / release the orphaned runner thread
+            worker.join(timeout=2)
+
+    def test_genuine_timeout_propagates_not_404(self, guard_ns):
+        """目标在线但慢（真超时）→ 原样抛 TimeoutError，**绝不**转 404（sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        ns.call = MagicMock(side_effect=SioTimeoutError())
+        with pytest.raises(SioTimeoutError):
+            ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    def test_normal_completion_passes_through(self, guard_ns):
+        """正常返回 → 透传、registry 清空（sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        ns.call = MagicMock(return_value={"ok": True})
+        ret = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert ret == {"ok": True}
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    def test_two_concurrent_calls_both_404_on_disconnect(self, guard_ns):
+        """同 Computer 两并发在途 → 断连后都 404（value 为 set；sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        gate = threading.Event()
+
+        def blocking_call(*_a, **_k):
+            gate.wait()
+            return {"late": True}
+
+        ns.call = MagicMock(side_effect=blocking_call)
+        boxes: list[dict] = [{}, {}]
+
+        def run(i: int):
+            boxes[i]["ret"] = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name))
+
+        workers = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(2)]
+        for w in workers:
+            w.start()
+        try:
+            assert _wait_until(lambda: len(ns._inflight_disconnect_signals.get(comp_sid, ())) == 2)
+            ns._fire_inflight_disconnect_signals(comp_sid)
+            for w in workers:
+                w.join(timeout=2)
+            assert all(not w.is_alive() for w in workers)
+            assert boxes[0]["ret"]["code"] == int(ErrorCode.NOT_FOUND)
+            assert boxes[1]["ret"]["code"] == int(ErrorCode.NOT_FOUND)
+            assert comp_sid not in ns._inflight_disconnect_signals
+        finally:
+            gate.set()
+            for w in workers:
+                w.join(timeout=2)
+
+    def test_cross_office_raises_with_no_dangling_signal(self, smcp_namespace, mock_server):
+        """跨房间仍先 raise SMCPNamespaceError，且未登记任何信号（登记在隔离校验之后；sync）."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": "c1"}
+        sess_agent = {"role": "agent", "office_id": "room2", "name": "agent-1"}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
+        smcp_namespace.call = MagicMock()
+        with pytest.raises(SMCPNamespaceError, match="跨房间"):
+            smcp_namespace.on_client_tool_call(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5},
+            )
+        assert comp_sid not in smcp_namespace._inflight_disconnect_signals
+        smcp_namespace.call.assert_not_called()
+
+    def test_toctou_disconnect_before_registration_returns_404(self, guard_ns):
+        """TOCTOU：解析后、登记前目标已断（``get_sid_by_name`` 复查转 None）→ 短路 404，不触发 ``self.call``（sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        seq = [comp_sid, None]
+        ns.get_sid_by_name = MagicMock(side_effect=lambda _name: seq.pop(0) if seq else None)
+        ns.call = MagicMock(return_value={"ok": True})
+        ret = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert ret["details"]["computer_name"] == comp_name
+        ns.call.assert_not_called()
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    def test_on_disconnect_calls_super_then_fires_signals(self, guard_ns, monkeypatch):
+        """``on_disconnect`` 覆写：**先 ``super()``、再 fire 信号**（关闭 TOCTOU，#100 fix-review 🟡2；sync）.
+        Asserts super runs before fire (the TOCTOU-closing order; sync mirror)."""
+        ns, _agent_sid, _comp_name, comp_sid = guard_ns
+        ev = ns._register_inflight_signal(comp_sid)
+        seen_set_at_super: list[bool] = []
+
+        def _super(_sid):
+            seen_set_at_super.append(ev.is_set())  # super 运行时信号尚未 fire / not yet fired when super runs
+
+        monkeypatch.setattr(SyncBaseNamespace, "on_disconnect", MagicMock(side_effect=_super))
+        ns.on_disconnect(comp_sid)
+        assert seen_set_at_super == [False]  # super 先于 fire / super ran before fire
+        assert ev.is_set()  # fire 在 super 之后 / fire ran after super

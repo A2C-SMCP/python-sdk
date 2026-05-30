@@ -9,6 +9,7 @@
 """
 
 import copy
+import threading
 from typing import Any, cast
 
 from pydantic import TypeAdapter
@@ -67,6 +68,11 @@ from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("server")
 
+# 在途断连守卫的哨兵：与任何合法 Computer 响应（dict / None / flat ErrorPayload）都不相等，
+# 用于把「目标在途断连」与「Computer 正常返回 None」区分开（#100 Phase 1，sync）。
+# Sentinel for the in-flight disconnect guard: distinct from any valid Computer response.
+_DISCONNECTED: object = object()
+
 
 class SyncSMCPNamespace(SyncBaseNamespace):
     """
@@ -80,6 +86,47 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         Initialize SMCP namespace (sync)
         """
         super().__init__(namespace=SMCP_NAMESPACE, auth_provider=auth_provider)
+        # 在途 ``client:*`` 调用的「断连信号」登记表，以**目标 Computer SID** 为 key（#100 Phase 1，async 镜像）。
+        # 同步版 ``self.call`` 阻塞当前 worker 线程，故由独立 daemon 子线程跑 ``call``、主线程等共享事件；
+        # registry 跨线程读写（worker 线程登记/注销 vs ``on_disconnect`` 线程触发），用 ``_inflight_lock`` 守护。
+        # Per-target in-flight disconnect signals (#100 Phase 1, sync mirror): target Computer SID -> set of Events.
+        self._inflight_disconnect_signals: dict[SID, set[threading.Event]] = {}
+        self._inflight_lock = threading.Lock()
+
+    def on_disconnect(self, sid: SID) -> None:
+        """断连处理（同步）：先走 base 的 name/room 清理，再唤醒以 ``sid`` 为目标的全部在途 ``client:*`` 调用（#100 Phase 1）。
+        On disconnect: run base name/room cleanup first, then wake every in-flight call targeting ``sid``.
+
+        **先 super() 再 fire**（与 async 对齐，关闭 TOCTOU 微窗）：``_unregister_name`` 删除 name 映射后，窗内并发新调用的
+        TOCTOU 复查 ``get_sid_by_name`` 读到 None 直接短路 404，不会错过 fire 退化为满 timeout。信号按 sid 登记、``super()``
+        不触碰信号 registry，故 fire 置于其后对已登记信号零损失；``_fire`` 持 ``_inflight_lock`` 而 ``super()`` 不持锁，无死锁。
+        Super-then-fire (mirrors async) closes the TOCTOU window; already-registered signals still wake.
+        """
+        super().on_disconnect(sid)
+        self._fire_inflight_disconnect_signals(sid)
+
+    def _fire_inflight_disconnect_signals(self, sid: SID) -> None:
+        """唤醒以 ``sid`` 为目标的全部在途断连信号（幂等）。Wake all in-flight signals targeting ``sid`` (idempotent)."""
+        with self._inflight_lock:
+            signals = list(self._inflight_disconnect_signals.get(sid, ()))
+        for ev in signals:
+            ev.set()
+
+    def _register_inflight_signal(self, computer_sid: SID) -> threading.Event:
+        """登记并返回一个针对 ``computer_sid`` 的在途断连信号。Register and return a fresh disconnect signal."""
+        ev = threading.Event()
+        with self._inflight_lock:
+            self._inflight_disconnect_signals.setdefault(computer_sid, set()).add(ev)
+        return ev
+
+    def _discard_inflight_signal(self, computer_sid: SID, ev: threading.Event) -> None:
+        """注销在途信号；set 空时删除 key（防 dict 泄漏）。Unregister a signal; drop the key when the set empties."""
+        with self._inflight_lock:
+            bucket = self._inflight_disconnect_signals.get(computer_sid)
+            if bucket is not None:
+                bucket.discard(ev)
+                if not bucket:
+                    self._inflight_disconnect_signals.pop(computer_sid, None)
 
     def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
@@ -370,10 +417,70 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         call_kwargs: dict[str, Any] = {"to": computer_sid, "namespace": SMCP_NAMESPACE}
         if timeout is not None:
             call_kwargs["timeout"] = timeout
-        client_response = self.call(event, data, **call_kwargs)
+
+        client_response = self._call_with_disconnect_guard(event, data, computer_name, computer_sid, call_kwargs)
+        if client_response is _DISCONNECTED:
+            # 目标在途断连：Computer 中途消失 == 不存在，回 flat ErrorPayload(404)（与 #92/#99 同一 payload）。
+            # Target disconnected mid-flight: a vanished Computer == not found → flat ErrorPayload(404).
+            return build_computer_not_found_error(computer_name)
         if is_protocol_error_payload(client_response):
             return TypeAdapter(ErrorPayload).validate_python(client_response)
         return ret_adapter.validate_python(client_response)
+
+    def _call_with_disconnect_guard(
+        self,
+        event: str,
+        data: Any,
+        computer_name: str,
+        computer_sid: SID,
+        call_kwargs: dict[str, Any],
+    ) -> Any:
+        """在途断连守卫（#100 Phase 1，sync）：把阻塞的 ``self.call`` 丢到 daemon 子线程，主线程等「完成 OR 断连信号」.
+
+        同步 socketio ``self.call`` 阻塞当前线程、其等待原语在 ``call()`` 内部不可达，无法外部中断；故子线程跑
+        ``call``、主线程 ``wait`` 一个**既被完成路径又被 ``on_disconnect`` 触发**的共享事件。三结局严格区分：
+          - 子线程正常返回 → 透传结果（``ret_adapter`` 在调用方校验）；
+          - 子线程抛异常（如真超时 ``TimeoutError``）→ 在主线程**原样重抛**（绝不转 404）；
+          - 断连先到（box 仍空）→ 返回 ``_DISCONNECTED`` 哨兵 → 调用方回 404。
+        断连时被遗弃的子线程仍阻塞在 ``call`` 内直到其自身 timeout 退出（有界 daemon 僵尸，仅断连这一罕见事件触发）。
+        **容量评估**：每个在途调用（含 happy path）多占 1 个 daemon 线程（原 worker 阻塞在 ``wait``）；worst-case
+        线程上限随**并发在途调用数**线性增长，断连时再叠加「等各自 ``timeout`` 退出」的僵尸 runner。signaling 负载下可接受，
+        高并发场景如需收敛可另开 issue 引入线程池/信号量（不在本 issue 范围）。
+        Sync in-flight disconnect guard: run blocking ``self.call`` in a daemon thread, wait a shared event set by
+        either completion or ``on_disconnect``; orphaned thread exits at its own timeout (bounded daemon zombie).
+        Capacity note: each in-flight call costs one extra daemon thread; worst-case thread count grows linearly
+        with concurrent in-flight calls (plus zombies awaiting their own timeout on disconnect).
+        """
+        disconnect_ev = self._register_inflight_signal(computer_sid)
+        try:
+            # TOCTOU 复查：解析 SID 与登记之间目标可能已断连（信号永不会被 fire）。用 ``get_sid_by_name`` 复查
+            # （``on_disconnect`` → base ``_unregister_name`` 清掉 name 映射）关闭该窗口。
+            # TOCTOU re-check: target may have died between SID resolve and registration → short-circuit to 404.
+            if disconnect_ev.is_set() or self.get_sid_by_name(computer_name) is None:
+                return _DISCONNECTED
+
+            # ``disconnect_ev`` 一事二用：完成路径由 ``_runner`` 在 finally 触发，断连路径由 ``on_disconnect`` 触发，
+            # 主线程 ``wait`` 二者之一。醒来后查 box 区分（``value`` 优先于断连，确保真 ack 不被误判为断连）。
+            # ``disconnect_ev`` doubles as completion + disconnect signal; the box disambiguates after wakeup.
+            box: dict[str, Any] = {}
+
+            def _runner() -> None:
+                try:
+                    box["value"] = self.call(event, data, **call_kwargs)
+                except BaseException as exc:  # noqa: BLE001 捕获后在调用方线程重抛 / re-raised on caller thread
+                    box["error"] = exc
+                finally:
+                    disconnect_ev.set()
+
+            threading.Thread(target=_runner, name=f"a2c-relay-{event}", daemon=True).start()
+            disconnect_ev.wait()
+            if "value" in box:
+                return box["value"]
+            if "error" in box:
+                raise box["error"]
+            return _DISCONNECTED
+        finally:
+            self._discard_inflight_signal(computer_sid, disconnect_ev)
 
     def on_client_get_config(self, sid: str, data: GetComputerConfigReq) -> GetComputerConfigRet | ErrorPayload:
         """同步：透明转发 ``client:get_config`` 至目标 Computer，返回其 MCP 配置 / Sync relay of ``client:get_config``.

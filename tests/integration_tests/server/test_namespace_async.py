@@ -32,6 +32,7 @@ from a2c_smcp.smcp import (
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
     EnterOfficeReq,
+    ErrorCode,
     GetComputerConfigReq,
     GetToolsReq,
     UpdateMCPConfigNotification,
@@ -181,6 +182,66 @@ async def test_tool_call_roundtrip(socketio_server, basic_server_port: int):
 
     await agent.disconnect()
     await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_target_disconnect_midflight_returns_404(socketio_server, basic_server_port: int):
+    """#100 Phase 1（端到端复现）：Computer 在 tool 执行中途断连 → 服务端即时回 flat ErrorPayload(404)，
+    Agent 不再静默挂死到满 ``timeout``。验证在途断连守卫在真实 socketio 上生效。
+    Target Computer disconnects mid tool_call → server returns flat ErrorPayload(404) fast, no full-timeout hang.
+    """
+    agent = AsyncClient()
+    computer = AsyncClient()
+
+    await agent.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    office_id = "office-async-disc"
+    await _join_office(agent, role="agent", office_id=office_id, name="robot-D")
+
+    await computer.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    await _join_office(computer, role="computer", office_id=office_id, name="comp-D")
+
+    tool_started = asyncio.Event()
+    tool_block = asyncio.Event()  # 测试期间永不 set：模拟慢工具在途 / never set: tool blocks in-flight
+
+    @computer.on(TOOL_CALL_EVENT, namespace=SMCP_NAMESPACE)
+    async def _on_tool_call(data: dict):
+        tool_started.set()
+        await tool_block.wait()
+        return CallToolResult(isError=False, content=[TextContent(type="text", text="late")]).model_dump(mode="json")
+
+    # 发起 tool_call（per-request timeout=30s）作为后台任务 / issue tool_call as a task with a 30s timeout
+    call_task = asyncio.ensure_future(
+        agent.call(
+            TOOL_CALL_EVENT,
+            {"agent": "robot-D", "computer": "comp-D", "tool_name": "slow", "params": {}, "req_id": "req-disc", "timeout": 30},
+            namespace=SMCP_NAMESPACE,
+        ),
+    )
+    try:
+        # 确认工具已在 Computer 端在途（服务端已登记在途信号）/ tool is in-flight on the Computer
+        await asyncio.wait_for(tool_started.wait(), timeout=5)
+        # 在途断连 Computer / disconnect the Computer mid-flight
+        await computer.disconnect()
+        # 关键：远早于 30s timeout 拿到 404（若挂死，wait_for 会先超时报错）/ 404 well before the 30s timeout
+        res = await asyncio.wait_for(call_task, timeout=15)
+    finally:
+        tool_block.set()
+        if not call_task.done():
+            call_task.cancel()
+
+    assert isinstance(res, dict)
+    assert res.get("code") == int(ErrorCode.NOT_FOUND)
+    assert res.get("details", {}).get("computer_name") == "comp-D"
+
+    await agent.disconnect()
 
 
 @pytest.mark.asyncio

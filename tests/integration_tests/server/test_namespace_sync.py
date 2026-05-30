@@ -38,6 +38,7 @@ from a2c_smcp.smcp import (
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
+    ErrorCode,
 )
 from tests.integration_tests.server._local_sync_server import create_local_sync_server
 
@@ -417,6 +418,68 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
         call_completed.set()
         computer_thread.join(timeout=5)
         agent.disconnect()
+
+
+def test_tool_call_target_disconnect_midflight_returns_404_sync(
+    startup_and_shutdown_local_sync_server,
+    sync_server_port: int,
+) -> None:
+    """#100 Phase 1 sync 端到端复现：Computer 在 tool 执行中途断连 → Server 即时回 flat ErrorPayload(404)，
+    Agent 远早于 ``timeout`` 返回。镜像 async 的 ``test_tool_call_target_disconnect_midflight_returns_404``，
+    验证 sync 守卫（daemon 子线程跑 ``self.call`` + 真实 ``on_disconnect`` 触发信号）在真实 werkzeug 多进程 server 上生效。
+    Sync mirror: target Computer disconnects mid tool_call → flat ErrorPayload(404) fast, no full-timeout hang.
+    """
+    agent = Client()
+    computer = Client()
+
+    tool_started = threading.Event()
+    tool_block = threading.Event()  # 测试期间不 set（仅 finally 释放）→ 模拟慢工具在途 / blocks: slow tool in-flight
+    box: dict = {}
+
+    @computer.on(TOOL_CALL_EVENT, namespace=SMCP_NAMESPACE)
+    def _on_tool_call(data: dict):  # noqa: ANN001
+        tool_started.set()
+        tool_block.wait(timeout=20)  # 有界阻塞，保证遗弃的 handler 线程退出 / bounded so the orphaned handler exits
+        return {"ok": True}
+
+    office_id = "office-sync-disc"
+    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    _join_office(computer, role="computer", office_id=office_id, name="comp-SD")
+    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    _join_office(agent, role="agent", office_id=office_id, name="robot-SD")
+
+    def run_agent_call() -> None:
+        try:
+            box["res"] = agent.call(
+                TOOL_CALL_EVENT,
+                {"robot_id": "robot-SD", "computer": "comp-SD", "tool_name": "slow", "params": {}, "req_id": "req-sd", "timeout": 30},
+                namespace=SMCP_NAMESPACE,
+                timeout=40,
+            )
+        except BaseException as e:  # noqa: BLE001 捕获供主线程断言 / captured for main-thread assertion
+            box["error"] = e
+
+    caller = threading.Thread(target=run_agent_call, daemon=True)
+    caller.start()
+    try:
+        assert tool_started.wait(timeout=10), "Computer 未在期望时间内进入 tool_call 处理"
+        # 在途断连 Computer（Client.disconnect 走 eio abort=True，不 join 阻塞中的读循环）/ disconnect mid-flight
+        computer.disconnect()
+        # 关键：远早于 payload timeout=30s 返回（若挂死，join 在 20s 后判定线程仍存活 → 断言失败）/ fail-fast, not full timeout
+        caller.join(timeout=20)
+        assert not caller.is_alive(), "agent.call 应在 Computer 断连后快速返回，而非挂到满 timeout"
+        assert "error" not in box, f"agent.call 不应抛异常（应收到 404 dict）：{box.get('error')!r}"
+        res = box["res"]
+        assert isinstance(res, dict), f"期望 dict，实际 {type(res)}"
+        assert res.get("code") == int(ErrorCode.NOT_FOUND), f"期望 flat ErrorPayload(404)，实际 {res}"
+        assert res.get("details", {}).get("computer_name") == "comp-SD"
+    finally:
+        tool_block.set()  # 释放遗弃的 handler 线程 / release the orphaned handler thread
+        for client in (agent, computer):
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
 
 def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server, sync_server_port: int):

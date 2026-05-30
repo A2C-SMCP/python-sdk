@@ -8,9 +8,11 @@
 * 描述: SMCP Namespace测试用例 / SMCP Namespace test cases
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
 from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server import (
@@ -18,6 +20,7 @@ from a2c_smcp.server import (
     DefaultAuthenticationProvider,
     SMCPNamespace,
 )
+from a2c_smcp.server.base import BaseNamespace
 from a2c_smcp.smcp import (
     GET_BLOB_EVENT,
     GET_DESKTOP_EVENT,
@@ -881,3 +884,169 @@ class TestV021ClientRoutesAndUpdateSkills:
         with pytest.raises(SMCPNamespaceError, match="session gone"):
             await smcp_namespace.on_client_get_tools("gone-agent-sid", {"computer": comp_name})
         smcp_namespace.call.assert_not_awaited()  # 断连防御先于转发 / guard precedes relay
+
+
+async def _await_until(predicate, timeout: float = 2.0) -> bool:
+    """轮询协程内条件（让出事件循环）。Poll an in-loop condition by yielding to the event loop."""
+    loops = int(timeout / 0.005)
+    for _ in range(loops):
+        if predicate():
+            return True
+        await asyncio.sleep(0.005)
+    return predicate()
+
+
+class TestInflightTargetDisconnectGuard:
+    """#100 Phase 1：目标 Computer 在途断连 → Server 即时回 flat ErrorPayload(404)，不再静默挂死到满超时.
+
+    根因：``socketio.AsyncServer.call`` 的等待原语在 ``call()`` 内部、不监听连接掉线，目标断连后会一直等到
+    满 ``timeout``。修复在共享 ``_relay_client_call`` 内把 ``self.call`` 与「由 ``on_disconnect`` 触发的断连信号」
+    竞速；断连先到 → 复用 ``build_computer_not_found_error(404)``（与 #92/#99 同一 payload，协议解读：Computer
+    中途消失 == 不存在，error-handling.md §20，不新增连接状态错误码）。三结局须严格区分：断连→404 / 真超时→
+    原样抛 TimeoutError / 正常→透传。
+    Target Computer disconnecting mid-flight → immediate flat ErrorPayload(404), not a silent full-timeout hang.
+    """
+
+    @pytest.fixture
+    def guard_ns(self, smcp_namespace, mock_server):
+        """同 office 的 agent + computer；``get_sid_by_name`` 走真实 ``_name_to_sid_map``（断连复查依赖它）.
+        Agent + Computer in same office; real ``get_sid_by_name`` (the disconnect re-check relies on it)."""
+        smcp_namespace.server = mock_server
+        agent_sid = "a-sid"
+        comp_name = "c1"
+        comp_sid = "c-sid"
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent))
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace.call = AsyncMock()
+        return smcp_namespace, agent_sid, comp_name, comp_sid
+
+    @staticmethod
+    def _tool_call_req(comp_name: str, timeout: int = 30) -> dict:
+        return {"agent": "agent-1", "req_id": "r", "computer": comp_name, "tool_name": "t", "params": {}, "timeout": timeout}
+
+    @pytest.mark.asyncio
+    async def test_target_disconnect_midflight_returns_404(self, guard_ns):
+        """在途 tool_call + 目标断连 → 返回 flat ErrorPayload(404) 且 registry 清理干净（核心复现）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        started = asyncio.Event()
+
+        async def blocking_call(*_a, **_k):
+            started.set()
+            await asyncio.Event().wait()  # 永不返回，模拟死目标 ack 永不回 / never returns: dead target's ack never arrives
+
+        ns.call = AsyncMock(side_effect=blocking_call)
+        task = asyncio.ensure_future(ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name)))
+        try:
+            assert await _await_until(started.is_set)  # relay 已抵达 self.call / relay reached self.call
+            assert comp_sid in ns._inflight_disconnect_signals  # 在途信号已登记 / signal registered
+            ns._fire_inflight_disconnect_signals(comp_sid)  # 模拟 Computer 断连 / simulate disconnect
+            ret = await asyncio.wait_for(task, timeout=2)
+        finally:
+            if not task.done():
+                task.cancel()
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == comp_name
+        assert comp_sid not in ns._inflight_disconnect_signals  # 正常路径清理 / cleaned up
+
+    @pytest.mark.asyncio
+    async def test_genuine_timeout_propagates_not_404(self, guard_ns):
+        """目标在线但慢（真超时）→ 原样抛 ``SioTimeoutError``，**绝不**转 404（守住语义区分）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        ns.call = AsyncMock(side_effect=SioTimeoutError())
+        with pytest.raises(SioTimeoutError):
+            await ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert comp_sid not in ns._inflight_disconnect_signals  # 异常路径也清理 / cleaned up even on raise
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_passes_through(self, guard_ns):
+        """正常返回 → 结果透传、registry 清空（守卫不改 happy path 语义）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        ns.call = AsyncMock(return_value={"ok": True})
+        ret = await ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert ret == {"ok": True}
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_calls_both_404_on_disconnect(self, guard_ns):
+        """同 Computer 两个并发在途调用 → 断连后**都**收到 404（value 为 set，逐调用独立信号）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        release = asyncio.Event()
+
+        async def blocking_call(*_a, **_k):
+            await release.wait()
+
+        ns.call = AsyncMock(side_effect=blocking_call)
+        t1 = asyncio.ensure_future(ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name)))
+        t2 = asyncio.ensure_future(ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name)))
+        try:
+            assert await _await_until(lambda: len(ns._inflight_disconnect_signals.get(comp_sid, ())) == 2)
+            ns._fire_inflight_disconnect_signals(comp_sid)
+            r1 = await asyncio.wait_for(t1, timeout=2)
+            r2 = await asyncio.wait_for(t2, timeout=2)
+        finally:
+            release.set()
+            for t in (t1, t2):
+                if not t.done():
+                    t.cancel()
+        assert r1["code"] == int(ErrorCode.NOT_FOUND)
+        assert r2["code"] == int(ErrorCode.NOT_FOUND)
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    @pytest.mark.asyncio
+    async def test_cross_office_raises_with_no_dangling_signal(self, smcp_namespace, mock_server):
+        """跨房间仍先 raise SMCPNamespaceError，且**未登记任何信号**（证明登记发生在隔离校验之后）."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        sess_comp_room1 = {"role": "computer", "office_id": "room1", "name": "c1"}
+        sess_agent_room2 = {"role": "agent", "office_id": "room2", "name": "agent-1"}
+        smcp_namespace.get_session = AsyncMock(
+            side_effect=lambda sid: sess_comp_room1 if sid == comp_sid else sess_agent_room2,
+        )
+        smcp_namespace.call = AsyncMock()
+        with pytest.raises(SMCPNamespaceError, match="跨房间"):
+            await smcp_namespace.on_client_tool_call(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5},
+            )
+        assert comp_sid not in smcp_namespace._inflight_disconnect_signals
+        smcp_namespace.call.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_toctou_disconnect_before_registration_returns_404(self, guard_ns):
+        """TOCTOU：解析 SID 后、登记前目标已断（``get_sid_by_name`` 复查转 None）→ 短路 404，不触发 ``self.call``."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        seq = [comp_sid, None]  # 首次解析命中；登记后复查已失联 / first resolve hits, re-check finds it gone
+
+        async def fake_get_sid_by_name(_name):
+            return seq.pop(0) if seq else None
+
+        ns.get_sid_by_name = AsyncMock(side_effect=fake_get_sid_by_name)
+        ns.call = AsyncMock(return_value={"ok": True})
+        ret = await ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert ret["details"]["computer_name"] == comp_name
+        ns.call.assert_not_awaited()
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    @pytest.mark.asyncio
+    async def test_on_disconnect_calls_super_then_fires_signals(self, guard_ns, monkeypatch):
+        """``on_disconnect`` 覆写：**先 ``super()``（name/room 清理）、再 fire 信号**（关闭 TOCTOU，#100 fix-review 🟡2）.
+
+        断言顺序：``super()`` 运行时信号尚未 fire（``ev.is_set()`` 为 False），``on_disconnect`` 返回后才为 True——
+        证明 super 先于 fire，使窗内并发新调用的 TOCTOU 复查能读到已注销的 name 而短路 404。
+        Asserts super runs before fire (the TOCTOU-closing order)."""
+        ns, _agent_sid, _comp_name, comp_sid = guard_ns
+        ev = ns._register_inflight_signal(comp_sid)
+        seen_set_at_super: list[bool] = []
+
+        async def _super(_sid):
+            seen_set_at_super.append(ev.is_set())  # super 运行时信号尚未 fire / not yet fired when super runs
+
+        monkeypatch.setattr(BaseNamespace, "on_disconnect", AsyncMock(side_effect=_super))
+        await ns.on_disconnect(comp_sid)
+        assert seen_set_at_super == [False]  # super 先于 fire / super ran before fire
+        assert ev.is_set()  # fire 在 super 之后 / fire ran after super
