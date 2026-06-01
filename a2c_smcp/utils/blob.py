@@ -126,7 +126,9 @@ async def drain_blob(
         blob_handle: 来自某生产者通道的不透明句柄.
         concurrency: 并发度；``1`` 串行（保守默认），``>1`` 启用并行模式.
         chunk_size: 客户建议单块上限；缺省 :data:`DEFAULT_CHUNK_SIZE`（Computer 会 clamp）.
-        max_retries: 串行重读上限（应对源漂移 / 全量 sha256 不一致）.
+        max_retries: 串行重读上限（应对源漂移 / 全量 sha256 不一致）；入口夹取至 ``max(1, ...)``——
+            显式传 ``0`` 仍至少尝试一次，不会「零次循环直接 max_retries_exceeded」.
+            Clamped to ``max(1, ...)`` at entry: an explicit ``0`` still attempts once.
 
     Returns:
         ``(payload_bytes, mime_type)``: 完整字节内容 + 内容 MIME.
@@ -136,13 +138,17 @@ async def drain_blob(
             或 ``max_retries`` 仍未通过 ``sha256`` 校验.
     """
     effective_chunk = chunk_size or DEFAULT_CHUNK_SIZE
+    # 夹取至 ≥1：显式 max_retries=0 不应「零次循环、一个 call 都不发」即报 max_retries_exceeded（脚枪）。
+    # Clamp to ≥1: an explicit max_retries=0 must still attempt once, never short-circuit to
+    # max_retries_exceeded without a single call.
+    effective_retries = max(1, max_retries)
     if concurrency <= 1:
-        return await _drain_serial_async(call, computer, blob_handle, effective_chunk, max_retries)
+        return await _drain_serial_async(call, computer, blob_handle, effective_chunk, effective_retries)
     try:
-        return await _drain_parallel_async(call, computer, blob_handle, effective_chunk, concurrency, max_retries)
+        return await _drain_parallel_async(call, computer, blob_handle, effective_chunk, concurrency, effective_retries)
     except (_RecoverableDrift, _RecoverableRange) as e:
         logger.info(f"drain_blob: parallel → serial fallback (reason: {type(e).__name__})")
-        return await _drain_serial_async(call, computer, blob_handle, effective_chunk, max_retries)
+        return await _drain_serial_async(call, computer, blob_handle, effective_chunk, effective_retries)
 
 
 def drain_blob_sync(
@@ -161,13 +167,16 @@ def drain_blob_sync(
     Parallel branch uses ``ThreadPoolExecutor``; error coordination matrix mirrors async exactly.
     """
     effective_chunk = chunk_size or DEFAULT_CHUNK_SIZE
+    # 夹取至 ≥1：与 async 入口一致，显式 max_retries=0 仍至少尝试一次（脚枪防御）。
+    # Clamp to ≥1: mirrors the async entry; an explicit max_retries=0 still attempts once.
+    effective_retries = max(1, max_retries)
     if concurrency <= 1:
-        return _drain_serial_sync(call, computer, blob_handle, effective_chunk, max_retries)
+        return _drain_serial_sync(call, computer, blob_handle, effective_chunk, effective_retries)
     try:
-        return _drain_parallel_sync(call, computer, blob_handle, effective_chunk, concurrency, max_retries)
+        return _drain_parallel_sync(call, computer, blob_handle, effective_chunk, concurrency, effective_retries)
     except (_RecoverableDrift, _RecoverableRange) as e:
         logger.info(f"drain_blob_sync: parallel → serial fallback (reason: {type(e).__name__})")
-        return _drain_serial_sync(call, computer, blob_handle, effective_chunk, max_retries)
+        return _drain_serial_sync(call, computer, blob_handle, effective_chunk, effective_retries)
 
 
 # ── 串行实现 / Serial implementations ────────────────────────────────────
@@ -298,66 +307,63 @@ async def _drain_parallel_async(
     offsets = list(range(first_chunk_len, total_size, chunk_size))
     sem = asyncio.Semaphore(concurrency)
 
-    async def fetch(off: int) -> tuple[int, Mapping[str, Any]]:
+    async def fetch(off: int) -> tuple[str, int, Mapping[str, Any] | None]:
         async with sem:
             ret = await call(computer, blob_handle, off, chunk_size)
-        # 单块协议错误就地抛 → TaskGroup 自动取消其他在飞任务
-        # Per-chunk protocol errors raised in-place → TaskGroup auto-cancels others
-        _raise_for_blob_error(ret)
-        # 漂移就地抛 → 与协议错误一并进入 TaskGroup except* 分支
-        # Drift raised in-place → joins protocol errors in the TaskGroup except* dispatch
+        # 可恢复信号（range / 漂移）返回 marker、**不 raise** → 不触发 TaskGroup 取消（镜像 sync：
+        # recoverable 永不早退，收集到结束再分派）。仅 fatal（非 range 的 4018）就地 raise → TaskGroup
+        # fail-fast 取消其余在飞。如此 fatal 永不被「先完成的 range」经 TaskGroup-cancel 掩盖。
+        # Recoverable signals (range / drift) return a marker instead of raising — they do NOT trigger
+        # TaskGroup cancellation (mirrors sync: recoverable never short-circuits). Only fatal raises
+        # in-place → TaskGroup fail-fast cancels the rest, so a fatal can never be masked by a racing
+        # range that finished first (the prior in-place-raise behavior had exactly that leak).
+        try:
+            _raise_for_blob_error(ret)
+        except BlobTransferError as e:
+            if e.reason == "range":
+                return ("range", off, None)
+            raise
         if str(ret["sha256"]) != expected_sha or int(ret["total_size"]) != total_size:
-            raise _RecoverableDrift()
-        return off, ret
+            return ("drift", off, None)
+        return ("ok", off, ret)
 
-    # 步骤 3 / Step 3: TaskGroup 结构化并发；首个失败 → 自动取消所有在飞
-    # TaskGroup gives us structured cancellation: first failure auto-cancels all pending
-    #
-    # 合并为单个 except* BaseException 集中分派 / Unified except* dispatcher:
-    # 双分支 raise（如 ``except* BlobTransferError`` + ``except* _RecoverableDrift`` 各自 raise）
-    # 在 race 下会让 fallback-able (range / drift) 与 fatal (invalid_handle / forbidden / gone)
-    # 并存时被重新包成 ExceptionGroup，外层 ``except (_RecoverableDrift, _RecoverableRange)``
-    # 不接 group 而漏走 serial fallback。集中扁平化处理消除该 race 漏洞。
-    # When two except* branches each raise, a race that produces both fatal and recoverable
-    # exceptions re-wraps them into a group that the outer plain-except cannot match; flattening
-    # the exception group eliminates that leak.
+    # 步骤 3 / Step 3: TaskGroup 结构化并发；**仅 fatal** 触发 fail-fast 取消，recoverable 收集到结束再分派。
+    # 与 _drain_parallel_sync 完全一致：收集全部 outcome 后按 fatal > drift > range 分派，fatal 永不被
+    # race 中先完成的 range 掩盖（旧实现 range 就地抛 → TaskGroup 取消在飞 fatal → group 仅余 range，
+    # 在「快 range + 慢 fatal」竞态下错误降级成 range；marker-collect 消除该漏洞）。
+    # Only fatal triggers fail-fast cancellation; recoverable markers are collected and dispatched
+    # after the group completes — exactly mirroring _drain_parallel_sync (fatal > drift > range).
     try:
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(fetch(off)) for off in offsets]
     except BaseExceptionGroup as eg:
+        # recoverable 不再 raise → group 内只可能是 fatal（或 call 自身抛的未知异常）。
+        # Recoverable no longer raises → the group can only carry a fatal (or an unknown exc from call).
         flat = _flatten_exception_group(eg)
-        # 优先级 / Priority: fatal (invalid_handle / forbidden / gone) > range fallback > drift reread.
-        # 不可恢复的 fatal 必须先于可恢复信号抛出（否则隐藏了 4018 的真实原因）。
-        # Fatal must surface before recoverable signals to avoid hiding the true 4018 cause.
-        fatal: BlobTransferError | None = None
-        has_range = False
-        has_drift = False
-        for sub in flat:
-            if isinstance(sub, BlobTransferError):
-                if sub.reason == "range":
-                    has_range = True
-                else:
-                    # 任一非 range 的 BlobTransferError 即为 fatal
-                    # Any non-range BlobTransferError is fatal
-                    fatal = fatal or sub
-            elif isinstance(sub, _RecoverableDrift):
-                has_drift = True
+        fatal = next((sub for sub in flat if isinstance(sub, BlobTransferError)), None)
         if fatal is not None:
             raise fatal from eg
-        if has_drift:
-            # drift 优先于 range：sha256/total_size 漂移说明源被改写，从 0 重读最稳妥
-            # drift wins over range: source was rewritten, restart from 0 is the safest
-            raise _RecoverableDrift() from eg
-        if has_range:
-            raise _RecoverableRange() from eg
         # 未识别的异常 group → 原样抛 / Unrecognized group → re-raise
         raise
 
-    # 步骤 4 / Step 4: 聚合（每块已在 fetch 内校验协议错误 + 漂移）
-    # Step 4: collect (each chunk already validated inside fetch)
+    # 步骤 4 / Step 4: 无 fatal——收集 marker，按 drift > range 分派（fatal 已在 except 优先抛出）
+    # Step 4: no fatal — collect markers, dispatch drift > range (fatal already surfaced above)
+    has_drift = False
+    has_range = False
     for t in tasks:
-        off, ret = t.result()
-        chunks[off] = base64.b64decode(ret["blob"])
+        kind, off, ret = t.result()
+        if kind == "drift":
+            has_drift = True  # 漂移：源被改写，从 0 串行重读最稳妥 / drift: source rewritten, serial reread
+        elif kind == "range":
+            has_range = True
+        else:  # "ok"
+            assert ret is not None  # marker 不变式：kind=="ok" ⟺ ret 非空 / invariant: ok ⟺ ret present
+            chunks[off] = base64.b64decode(ret["blob"])
+    if has_drift:
+        # drift 优先于 range / drift wins over range
+        raise _RecoverableDrift()
+    if has_range:
+        raise _RecoverableRange()
 
     # 步骤 5 / Step 5: 按 offset 重组 + 全量 sha256 自证
     full = b"".join(chunks[off] for off in sorted(chunks))
@@ -390,13 +396,22 @@ def _drain_parallel_sync(
     first_chunk_len = len(chunks[0])
     offsets = list(range(first_chunk_len, total_size, chunk_size))
 
-    # 步骤 2-3 / Steps 2-3: ThreadPoolExecutor 并发拉取；按 **完成顺序** 收集（``as_completed``）
-    # 而非提交顺序——与 async TaskGroup 「首个失败即可见」语义对齐，兑现协议 §3 并行红利。
-    # Collect by **completion order** via ``as_completed`` (not submit order) — aligns with the
-    # async TaskGroup "first failure visible immediately" semantics and realizes the protocol §3
-    # parallel-fail-fast dividend.
+    # 步骤 2-3 / Steps 2-3: ThreadPoolExecutor 并发拉取；按 **完成顺序**（``as_completed``）收集**全部**
+    # 已完成 outcome 后再按 ``fatal > drift > range`` 分派——**镜像 async** ``_drain_parallel_async``
+    # 的 ``_flatten_exception_group`` 分派，而非「遇首个错误即 break」。
+    #
+    # 为何不 break-on-first-error：并发态下若一个 ``range`` 块先于一个 fatal（``invalid_handle`` /
+    # ``forbidden`` / ``gone``）块完成，先 break → ``_RecoverableRange`` → 串行 fallback → 串行态再遇
+    # ``range`` 即 fatal → **对外报 range，掩盖真实 forbidden/gone**（不可重试错误被降级成貌似瞬态）。
+    # 那会让 ``drain_blob``(async) 报 forbidden、``drain_blob_sync``(sync) 报 range —— 双端对同一服务端
+    # 状况给出不一致诊断。收集全部 outcome 后分派即消除该 race。
+    # Collect ALL completed outcomes, then dispatch by fatal > drift > range — mirroring the async
+    # path. Breaking on the first error would let a racing ``range`` mask a concurrent fatal,
+    # diverging from drain_blob (async). Recoverable signals never break; only fatal stops early.
     results: dict[int, Mapping[str, Any]] = {}
-    first_error: BaseException | None = None
+    fatal: BlobTransferError | None = None
+    has_drift = False
+    has_range = False
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {executor.submit(call, computer, blob_handle, off, chunk_size): off for off in offsets}
         for fut in as_completed(futures):
@@ -405,24 +420,27 @@ def _drain_parallel_sync(
                 ret = fut.result()
                 _raise_for_blob_error(ret)
                 if str(ret["sha256"]) != expected_sha or int(ret["total_size"]) != total_size:
-                    first_error = _RecoverableDrift()
-                    break
+                    has_drift = True  # 漂移：不 break，继续收集（让并存 fatal 必被发现）/ drift: keep collecting
+                    continue
                 results[off] = ret
             except BlobTransferError as e:
-                first_error = e
-                break
-            except _RecoverableDrift as e:  # pragma: no cover — already wrapped above
-                first_error = e
-                break
+                if e.reason == "range":
+                    has_range = True  # range：不 break，继续收集 / range: keep collecting
+                else:
+                    fatal = fatal or e  # 仅 fatal 记录并停止；运行中 future 无法真正取消，等其自然完成
+                    break
         # 取消其余 future（best-effort，ThreadPoolExecutor 无法真正终止已运行任务）
         # Cancel remaining (best-effort; ThreadPoolExecutor cannot terminate in-flight work)
         for fut in futures:
             if not fut.done():
                 fut.cancel()
-    if first_error is not None:
-        if isinstance(first_error, BlobTransferError) and first_error.reason == "range":
-            raise _RecoverableRange() from first_error
-        raise first_error
+    # 分派优先级与 async 完全一致：fatal > drift > range / Same priority as async: fatal > drift > range
+    if fatal is not None:
+        raise fatal
+    if has_drift:
+        raise _RecoverableDrift()
+    if has_range:
+        raise _RecoverableRange()
 
     chunks.update({off: base64.b64decode(r["blob"]) for off, r in results.items()})
     full = b"".join(chunks[off] for off in sorted(chunks))

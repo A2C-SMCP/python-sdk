@@ -18,8 +18,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import threading
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -279,7 +282,11 @@ class TestParallelAsync:
                 if offset == 200:
                     parallel_done["v"] = True  # 触发漂移后即切换到 serial 阶段
                     return _make_ret(
-                        payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=bad_sha,
+                        payload=payload,
+                        chunk_offset=offset,
+                        end=end,
+                        total_size=600,
+                        sha256_hex=bad_sha,
                     )
                 return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
             return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
@@ -379,6 +386,32 @@ class TestParallelAsync:
         # fatal 必须暴露真实原因，而不是被 drift 掩盖 / fatal must surface, not be masked by drift
         assert exc_info.value.reason == "gone"
 
+    @pytest.mark.asyncio
+    async def test_parallel_async_fatal_beats_range(self) -> None:
+        """混合 race（快 range + 慢 fatal）：fatal 必须暴露，不被先完成的 range 经 TaskGroup-cancel 掩盖.
+
+        回归：旧实现 range 就地 raise → TaskGroup 取消在飞 fatal（CancelledError 不进 group）→ group 仅余
+        range → fallback → 串行撞 range 即 fatal → 对外报 range。marker-collect 后 fatal 永不被掩盖。
+        Mirrors Rust ``parallel_async_fatal_beats_recoverable``: a racing fast ``range`` must not mask a
+        slow concurrent fatal.
+        """
+        payload = b"x" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+
+        async def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            end = min(offset + 200, 600)
+            if offset == 0:
+                return _make_ret(payload=payload, chunk_offset=0, end=end, total_size=600, sha256_hex=good_sha)
+            if offset == 200:
+                return _make_blob_error("range")  # 快可恢复，先完成 / fast recoverable, completes first
+            await asyncio.sleep(0.05)  # 慢 fatal，让 range 先完成 / slow fatal so range wins the race
+            return _make_blob_error("forbidden")
+
+        with pytest.raises(BlobTransferError) as exc_info:
+            await drain_blob(call, "c", "h", concurrency=4, chunk_size=200)
+        # fatal 必须暴露，而非被先完成的 range 掩盖 / fatal must surface, not be masked by the racing range
+        assert exc_info.value.reason == "forbidden"
+
 
 # ── Sync 镜像 / Sync mirror ──────────────────────────────────────────────
 
@@ -432,6 +465,124 @@ class TestSyncMirror:
         with pytest.raises(BlobTransferError) as exc_info:
             drain_blob_sync(call, "c", "h")
         assert exc_info.value.reason == "gone"
+
+    def test_parallel_sync_fatal_beats_range(self) -> None:
+        """sync 并行：低 offset ``range`` 块先完成 + 高 offset ``forbidden`` 块后完成 → 必报 fatal(forbidden).
+
+        回归 break-on-first-error：旧实现遇 ``range`` 先 break → 串行 fallback → 串行态先撞低 offset 的
+        ``range`` 即 fatal → 对外报 range，**掩盖** offset=400 的 forbidden（永不抵达）。新实现收集全部
+        outcome 后按 ``fatal > drift > range`` 分派，fatal 永不被掩盖——与 ``drain_blob``(async) 一致。
+        Mirrors Rust ``parallel_sync_fatal_beats_recoverable``: a racing lower-offset ``range`` must
+        not mask a concurrent higher-offset fatal in the sync parallel path.
+        """
+        payload = b"x" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+
+        def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            end = min(offset + 200, 600)
+            if offset == 0:
+                return _make_ret(payload=payload, chunk_offset=0, end=end, total_size=600, sha256_hex=good_sha)
+            if offset == 200:
+                # 可恢复信号，立即返回 → 在并发态先于 fatal 完成（旧实现据此误 break 成 range）
+                # recoverable, returns immediately → completes before the fatal in parallel
+                return _make_blob_error("range")
+            # offset == 400: fatal，故意延迟让 range 先完成 / fatal, delayed so range wins the race
+            time.sleep(0.05)
+            return _make_blob_error("forbidden")
+
+        with pytest.raises(BlobTransferError) as exc_info:
+            drain_blob_sync(call, "c", "h", concurrency=4, chunk_size=200)
+        # fatal 必须暴露，而非被先完成的 range 掩盖 / fatal must surface, not be masked by the racing range
+        assert exc_info.value.reason == "forbidden"
+
+    def test_parallel_sync_range_fallback(self) -> None:
+        """sync 并行纯 ``range`` → 取消 + 串行 fallback 成功还原（覆盖 sync range 分派）.
+        Sync parallel pure ``range`` → serial fallback restores payload (covers sync range dispatch)."""
+        payload = b"x" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+        phase = {"parallel": True}
+
+        def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            end = min(offset + 200, 600)
+            if phase["parallel"] and offset == 200:
+                phase["parallel"] = False  # 触发 fallback 后切到 serial 阶段（全部一致）/ switch to serial phase
+                return _make_blob_error("range")
+            return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
+
+        data, _ = drain_blob_sync(call, "c", "h", concurrency=4, chunk_size=200)
+        assert data == payload
+
+    def test_parallel_sync_drift_fallback(self) -> None:
+        """sync 并行纯 drift（某块 sha256 漂移）→ 串行 fallback 还原（覆盖 sync drift 分派）.
+        Sync parallel pure drift → serial fallback restores payload (covers sync drift dispatch)."""
+        payload = b"a" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+        bad_sha = "0" * 64
+        parallel_done = {"v": False}
+
+        def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            end = min(offset + 200, 600)
+            if not parallel_done["v"] and offset == 200:
+                parallel_done["v"] = True  # 漂移触发 fallback 后切 serial 阶段 / switch to serial after drift
+                return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=bad_sha)
+            return _make_ret(payload=payload, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
+
+        data, _ = drain_blob_sync(call, "c", "h", concurrency=4, chunk_size=200, max_retries=3)
+        assert data == payload
+
+    def test_parallel_sync_full_sha_mismatch_rereads(self) -> None:
+        """sync 并行：各块 per-chunk sha 字段正确但字节损坏 → 重组后全量自证失败 → 串行 fallback 还原.
+
+        覆盖并行重组后的 `_RecoverableDrift` 自证分支（per-chunk 一致但整体 sha 不符）。计数切相：前一轮
+        并行尝试（首块 + 2 并发块 = 3 次调用）返回损坏字节，之后串行 fallback 返回真字节——与完成顺序无关。
+        Covers the post-reassembly whole-blob self-check; first parallel attempt (3 calls) returns
+        corrupt bytes, serial fallback returns real bytes — order-independent via a locked counter."""
+        payload = b"b" * 600
+        good_sha = hashlib.sha256(payload).hexdigest()
+        corrupt = b"Z" * 600  # 同长不同字节，每块 sha 字段仍报 good_sha / same length, different bytes
+        lock = threading.Lock()
+        count = {"n": 0}
+
+        def call(comp: str, handle: str, offset: int, max_chunk: int) -> Mapping[str, Any]:
+            with lock:
+                count["n"] += 1
+                n = count["n"]
+            end = min(offset + 200, 600)
+            # 前 3 次（并行尝试：首块 + 2 并发块）→ 损坏字节 + 正确 sha 字段 → 全量自证必失败
+            # serial fallback（第 4 次起）→ 真字节
+            src = corrupt if n <= 3 else payload
+            return _make_ret(payload=src, chunk_offset=offset, end=end, total_size=600, sha256_hex=good_sha)
+
+        data, _ = drain_blob_sync(call, "c", "h", concurrency=4, chunk_size=200, max_retries=3)
+        assert data == payload
+
+
+# ── max_retries=0 脚枪：夹取至 ≥1 / max_retries=0 footgun: clamp to ≥1 ──────
+
+
+class TestZeroRetriesAttemptsOnce:
+    """``max_retries=0`` 仍至少尝试一次（入口夹取 ``max(1, ...)``）——对标 Rust ``serial_*_zero_retries_still_attempts_once``.
+
+    显式传 ``0`` 不应「零次循环、一个 call 都不发」直接 ``max_retries_exceeded``；夹取后实发一次并成功。
+    An explicit ``max_retries=0`` must still attempt once (not short-circuit to max_retries_exceeded).
+    """
+
+    @pytest.mark.asyncio
+    async def test_async_zero_retries_still_attempts_once(self) -> None:
+        payload = b"hello"
+        sha = hashlib.sha256(payload).hexdigest()
+        call = _AsyncMockCall([_make_ret(payload=payload, chunk_offset=0, end=5, total_size=5, sha256_hex=sha)])
+        data, _ = await drain_blob(call, "c", "h", max_retries=0)
+        assert data == payload
+        assert len(call.calls) == 1  # 夹取至 1 → 实发一次 / clamped to 1 → exactly one real call
+
+    def test_sync_zero_retries_still_attempts_once(self) -> None:
+        payload = b"hello"
+        sha = hashlib.sha256(payload).hexdigest()
+        call = _SyncMockCall([_make_ret(payload=payload, chunk_offset=0, end=5, total_size=5, sha256_hex=sha)])
+        data, _ = drain_blob_sync(call, "c", "h", max_retries=0)
+        assert data == payload
+        assert len(call.calls) == 1
 
 
 # ── docstring 「并行安全」断言（无意中删除即报）/ docstring "parallel-safe" assertion ──
