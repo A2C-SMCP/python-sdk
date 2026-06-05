@@ -96,8 +96,10 @@ from a2c_smcp.server import (
 import asyncio
 from fastapi import FastAPI
 import socketio
-from a2c_smcp.server import SMCPNamespace, DefaultAuthenticationProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.server import A2CProtocolVersionASGIMiddleware, SMCPNamespace, DefaultAuthenticationProvider
 
+SOCKETIO_PATH = "/socket.io"
 app = FastAPI()
 
 # 1. 创建认证提供者
@@ -113,17 +115,26 @@ smcp_namespace = SMCPNamespace(auth_provider)
 sio = socketio.AsyncServer(cors_allowed_origins="*")
 sio.register_namespace(smcp_namespace)
 
-# 4. 挂载到 FastAPI
-socket_app = socketio.ASGIApp(sio, app)
+# 4. 挂载到 FastAPI，并用 A2C 中间件包裹以启用协议版本握手
+#    ⚠️ 不包裹中间件，a2c_version 校验（HTTP 400 + 4008）不会生效。详见 server-version-handshake.md
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path=SOCKETIO_PATH)
+socket_app = A2CProtocolVersionASGIMiddleware(socket_app, socketio_path=SOCKETIO_PATH, server_version=PROTOCOL_VERSION)
 
 # 运行: uvicorn main:socket_app
 ```
+
+> **协议版本握手**：用 `A2CProtocolVersionASGIMiddleware` 包裹后，不兼容的 `a2c_version` 客户端会在
+> 传输层被拒（HTTP 400 + Socket.IO `4008`）。完整部署形态（裸 ASGI/WSGI、FastAPI 集成、验证方法）见
+> [Server 协议版本握手部署指南](server-version-handshake.md)。
 
 ### 同步版本（Flask/WSGI）
 
 ```python
 from socketio import Server, WSGIApp
-from a2c_smcp.server import SyncSMCPNamespace, DefaultSyncAuthenticationProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.server import A2CProtocolVersionWSGIMiddleware, SyncSMCPNamespace, DefaultSyncAuthenticationProvider
+
+SOCKETIO_PATH = "/socket.io"
 
 # 1. 创建同步认证提供者
 auth_provider = DefaultSyncAuthenticationProvider(
@@ -138,8 +149,9 @@ smcp_namespace = SyncSMCPNamespace(auth_provider)
 sio = Server(cors_allowed_origins="*")
 sio.register_namespace(smcp_namespace)
 
-# 4. 在 WSGI 框架中使用
-app = WSGIApp(sio)
+# 4. 在 WSGI 框架中使用，并用 A2C 中间件包裹以启用协议版本握手
+app = WSGIApp(sio, socketio_path=SOCKETIO_PATH)
+app = A2CProtocolVersionWSGIMiddleware(app, socketio_path=SOCKETIO_PATH, server_version=PROTOCOL_VERSION)
 
 # 运行: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker main:app
 ```

@@ -23,6 +23,12 @@ GET_TOOLS_EVENT = "client:get_tools"
 GET_DESKTOP_EVENT = "client:get_desktop"
 # v0.2 新增：资源发现事件 / v0.2 added: resource discovery event
 GET_RESOURCES_EVENT = "client:get_resources"
+# v0.2.1 新增：SKILL 通道发现 / 渐进式披露 + 通用二进制传输
+# 协议依据 / Protocol: events.md §client:get_skill[s] / §client:get_blob
+# v0.2.1 added: SKILL channel discovery / progressive disclosure + generic blob transfer
+GET_SKILLS_EVENT = "client:get_skills"
+GET_SKILL_EVENT = "client:get_skill"
+GET_BLOB_EVENT = "client:get_blob"
 # 服务端事件 由server:开头的事件服务端执行
 JOIN_OFFICE_EVENT = "server:join_office"
 LEAVE_OFFICE_EVENT = "server:leave_office"
@@ -31,6 +37,10 @@ UPDATE_TOOL_LIST_EVENT = "server:update_tool_list"
 # 桌面刷新事件：当资源列表或资源内容变化时，由Computer端通知Server广播。
 # 中文: 当需要让Agent刷新桌面时，由Computer触发此事件。英文: Computer emits this when Agent should refresh desktop.
 UPDATE_DESKTOP_EVENT = "server:update_desktop"
+# v0.2.1 新增：SKILL 集合变化（增/删/物化更新）由 Computer 触发，Server 向房间广播 notify:update_skills
+# 协议依据 / Protocol: events.md §server:update_skills；data-structures.md §UpdateComputerConfigReq（复用，不新建结构）
+# v0.2.1 added: SKILL set change (add/remove/restage) emitted by Computer, broadcast by Server as notify:update_skills
+UPDATE_SKILLS_EVENT = "server:update_skills"
 CANCEL_TOOL_CALL_EVENT = "server:tool_call_cancel"
 # 列出房间内所有会话事件：Agent可以通过此事件查询指定房间内的所有会话信息。
 # List all sessions in room event: Agent can query all session info in a specific room via this event.
@@ -46,6 +56,10 @@ UPDATE_CONFIG_NOTIFICATION = "notify:update_config"  # AgentClient必须实现 �
 UPDATE_TOOL_LIST_NOTIFICATION = "notify:update_tool_list"  # AgentClient必须实现，通过 client:get_tools 实现更新工具配置
 # 桌面刷新通知：Server接收 server:update_desktop 后广播。Agent据此拉取最新桌面。
 UPDATE_DESKTOP_NOTIFICATION = "notify:update_desktop"
+# v0.2.1 新增：SKILL 集合变化广播。Agent 据此自动重拉 client:get_skills（与既有 notify:update_* 自动刷新模式一致）
+# 协议依据 / Protocol: events.md §notify:update_skills
+# v0.2.1 added: SKILL set change broadcast. Agent re-fetches client:get_skills (same pattern as other notify:update_*)
+UPDATE_SKILLS_NOTIFICATION = "notify:update_skills"
 
 
 class AgentCallData(TypedDict):
@@ -90,6 +104,14 @@ class LeaveOfficeReq(TypedDict):
 
 
 class UpdateComputerConfigReq(TypedDict):
+    """
+    复用 / Reused by:
+      - server:update_config / notify:update_config（v0.1+）
+      - server:update_desktop / notify:update_desktop（v0.2）
+      - server:update_skills / notify:update_skills（v0.2.1）
+    协议依据 / Protocol: data-structures.md §UpdateComputerConfigReq（明示三事件族共用同一结构，不新建）。
+    """
+
     computer: str  # 机器人计算机自定义名称
 
 
@@ -352,18 +374,45 @@ class ListRoomRet(TypedDict):
 
 class ErrorCode(IntEnum):
     """
-    A2C-SMCP 协议错误码（v0.2.0）。
-    A2C-SMCP protocol error codes (v0.2.0).
+    A2C-SMCP 协议错误码（v0.2.0 起，v0.2.1 加性追加 4016/4017/4018）。
+    A2C-SMCP protocol error codes (v0.2.0+, v0.2.1 additively adds 4016/4017/4018).
+
+    4014 复用语义 / 4014 reuse (v0.2.1, error-handling.md §SKILL):
+      SKILL ``name`` **格式合法但不存在**（未注册 / 已卸载 / 已孤儿）复用 ``MCP_SERVER_NOT_FOUND`` 语义；
+      ``name`` 格式非法 → 4016；``name`` 有效但 ``rel_path`` 不可达 → 4017。
+      SKILL ``name`` legal-but-absent (unregistered / uninstalled / orphan) reuses ``MCP_SERVER_NOT_FOUND``;
+      malformed name → 4016; name OK but rel_path unreachable → 4017.
+
+    SKILL 通道**不使用** 4015 —— 未声明 ``resources`` capability 的 server 在物化阶段即被排除，不上送 Agent.
+    SKILL channel does **not** use 4015 — servers lacking the ``resources`` capability are filtered out at
+    staging time and never surface to the Agent.
+
+    4017 / 4018 ``details.reason`` 为开放枚举 / open enum: 解析方 **MUST** 容忍未知值并兜底
+    （默认「不重试 + 诊断」），未来可非破坏新增 reason.
+    ``details.reason`` is an open enum: parsers **MUST** tolerate unknown values with a default of
+    "do not retry + diagnose"; new reasons may be added non-breakingly.
     """
 
+    # 通用「资源不存在」/ Generic "resource not found"
+    # 本 SDK 用于 client:* 路由层目标 Computer 名未命中（error-handling.md §20 明确「Computer 不存在」归 404）。
+    # 镜像协议已有定义，非协议新增。Used by the client:* router when the target Computer name is
+    # absent (error-handling.md §20 maps "Computer 不存在" to 404). Mirrors an existing protocol code.
+    NOT_FOUND = 404
     # MCP 上游授权 / MCP upstream authorization
     TOOL_AUTHORIZATION_REQUIRED = 4006
     TOOL_AUTHORIZATION_FAILED = 4007
     # 协议版本握手 / Protocol version handshake
     PROTOCOL_VERSION_MISMATCH = 4008
     # MCP Server 路由 / MCP Server routing
-    MCP_SERVER_NOT_FOUND = 4014
+    MCP_SERVER_NOT_FOUND = 4014  # v0.2.1 复用：SKILL name 合法但 Registry 未命中（含孤儿/卸载）
     MCP_CAPABILITY_NOT_SUPPORTED = 4015
+    # v0.2.1 新增：SKILL 通道 / SKILL channel
+    # 协议依据 / Protocol: error-handling.md §4016 / §4017
+    SKILL_NAME_INVALID = 4016  # client:get_skill 入参 name 违反 SKILL name lexer 规则（格式硬错）
+    SKILL_RESOURCE_NOT_ACCESSIBLE = 4017  # rel_path 穿越 / .skillenv forbidden / not_found / too_large
+    # v0.2.1 新增：通用二进制传输 / Generic binary transfer
+    # 协议依据 / Protocol: error-handling.md §4018
+    BLOB_NOT_ACCESSIBLE = 4018  # client:get_blob 拉取期：invalid_handle / forbidden / gone / range
 
 
 # WebSocket close code（RFC 6455 私有段 4000-4999），用于 WS-only 直连握手按版本不匹配拒绝
@@ -446,6 +495,13 @@ class ErrorPayload(TypedDict, total=False):
       - 4014: mcp_server_name
       - 4015: mcp_server_name / capability
 
+    v0.2.1 起，4016 / 4017 / 4018 的 code-specific 字段下沉到 ``details`` 子对象（无顶层平铺新字段）：
+    From v0.2.1, code-specific fields for 4016 / 4017 / 4018 live under ``details`` (no new top-level fields):
+      - 4016: details.name
+      - 4017: details.reason (traversal/forbidden/not_found/too_large) / details.rel_path / details.total_size
+      - 4018: details.reason (invalid_handle/forbidden/gone/range)
+    协议依据 / Protocol: error-handling.md §各错误码标准字段总表 / §4016 / §4017 / §4018.
+
     details 是诊断容器；Agent MUST NOT 透传给最终用户（防泄露）。
     details is a diagnostic container; Agent MUST NOT propagate to end users.
     """
@@ -466,6 +522,199 @@ class ErrorPayload(TypedDict, total=False):
     details: dict[str, Any]
 
 
+# =====================================================================
+# v0.2.1 协议新增 / v0.2.1 protocol additions
+# 协议来源 / Protocol source: A2C-SMCP/a2c-smcp-protocol v0.2.1
+#   - docs/migrations/v0.2.1-skill-and-blob-transfer.md（先读总纲）
+#   - docs/specification/data-structures.md §SKILL / §BlobHandle / §GetBlob*
+#   - docs/specification/error-handling.md §4016 / §4017 / §4018（4014 复用）
+#   - docs/specification/events.md §client:get_skill[s] / §client:get_blob / §server:update_skills
+#   - docs/specification/skill.md / docs/specification/blob-transfer.md
+# 加性升级 / Additive: PROTOCOL_VERSION 未改动；所有新结构均为 total=False 开放 TypedDict，
+# 允许未来非破坏追加字段。
+# =====================================================================
+
+
+class A2CSkillRef(TypedDict):
+    """
+    SKILL 引用对象，``client:get_skills`` 返回列表元素。
+    Skill reference object — element of ``client:get_skills`` return list.
+
+    协议依据 / Protocol: data-structures.md §A2CSkillRef（v0.2.2 正式定稿必选集）；skill.md §1 命名 / §6 数据结构。
+
+    关键约束 / Key invariants:
+      - **必选 4 字段**：``name`` / ``source`` / ``path`` / ``description``（``total=True`` 默认，PEP 655：
+        裸字段=必选、``NotRequired[]``=可选）。``description`` 跨三源恒存在（SKILL.md frontmatter 强制
+        name+description，marketplace §3.1）。Producer(Computer) **MUST** 发齐 4 必选；Consumer(Agent)
+        **MUST NOT** 假定任一可选字段存在。
+        Required 4: name/source/path/description (total=True + ``NotRequired[]`` optionals). Producer MUST
+        send all 4; Consumer MUST NOT assume any optional field is present.
+      - ``name`` 是协议主键（合成全局唯一名，自 0.2.1 起为**裸名**：user 1 段 ``<skill>`` /
+        marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<server>:<skill>``），Agent **MUST**
+        当作不透明可比较字符串（**勿**解析结构，判来源用 ``source``）
+        ``name`` is the protocol primary key (synthesized globally-unique **bare** name since 0.2.1:
+        user 1-seg ``<skill>`` / marketplace 2-seg ``<plugin>:<skill>`` / mcp 3-seg
+        ``mcp:<server>:<skill>``); Agent **MUST** treat it as an opaque comparable string.
+      - ``path`` 必选（staging 落盘是所有 source 的统一第一步，故进入 Registry 的 SKILL 必有可读本地目录）
+        ``path`` is required (staging is the unified first step for all sources; any SKILL in Registry
+        has a readable local directory).
+      - **无 ``mcp_server`` 字段** —— Agent 侧协议表面与 source 无关；来源追溯由 ``source``（完整
+        provenance，**不**进 ``name``）与（仅 MCP）``uri`` 承担（skill.md §1.6）
+        **No ``mcp_server`` field** — Agent-facing protocol surface is source-agnostic; provenance is
+        carried by ``source`` and (MCP only) ``uri``.
+    """
+
+    # 主键 / Primary key（必选 / required）
+    name: str  # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:tfrobot-tools:code-review`
+    # 来源元数据 / Provenance（完整溯源；**不**进 name）（必选 / required）
+    source: str  # 如 mcp:tfrobot-tools / marketplace:acme-skills / user
+    uri: NotRequired[str]  # 仅 MCP 来源：skill://host/skill-name；Agent 非权威（skill.md §2）
+    # 物化输出 / Materialization output（必选 / required）
+    path: str  # 必选：Computer 本地绝对目录路径，面向 Agent SDK（脚本执行/文件访问），LLM 永不可见
+    # SKILL.md frontmatter 派生 / Derived from SKILL.md frontmatter
+    description: str  # 必选 / required：marketplace SKILL v1 §3.1（跨三源强制）
+    license: NotRequired[str]
+    compatibility: NotRequired[str]
+    allowed_tools: NotRequired[list[str]]  # frontmatter "allowed-tools" 规范化为 list
+    version: NotRequired[str]
+    skill_metadata: NotRequired[dict[str, Any]]  # frontmatter.metadata 透传；A2C 不解释 / passthrough, A2C does not interpret
+
+
+class GetSkillsReq(AgentCallData, total=True):
+    """
+    获取 SKILL 清单请求。协议依据 / Protocol: events.md §client:get_skills；data-structures.md §GetSkillsReq.
+    Get SKILL inventory request.
+    """
+
+    computer: str
+
+
+class GetSkillsRet(TypedDict, total=False):
+    """
+    获取 SKILL 清单响应——轻量元数据，**不含** SKILL.md body（body 由 ``client:get_skill`` 拉取）。
+    Skill inventory response — lightweight metadata, **without** SKILL.md body (body via ``client:get_skill``).
+
+    协议依据 / Protocol: data-structures.md §GetSkillsRet；skill.md §6 排除孤儿 / 不排序 / 不去重.
+    """
+
+    skills: list[A2CSkillRef]  # 当前已安装且可用 SKILL（排除孤儿；不排序、不去重）
+    req_id: str
+
+
+class GetSkillReq(AgentCallData, total=True):
+    """
+    获取 SKILL 包内单个资源请求。SKILL 本质是文件夹：``rel_path`` 缺省取包根 ``SKILL.md``（入口），
+    携带 ``rel_path`` 取包内其它资源（渐进式披露）。
+    Get a single resource inside a SKILL package. SKILL is essentially a folder: ``rel_path`` defaults
+    to package-root ``SKILL.md`` (entry); pass ``rel_path`` to fetch other in-package resources
+    (progressive disclosure).
+
+    协议依据 / Protocol: events.md §client:get_skill；data-structures.md §GetSkillReq；
+    skill.md §9 安全模型（``rel_path`` MUST 相对、无 ``..``、无绝对路径，沙箱在 Computer 解析时强制）.
+    """
+
+    computer: str
+    name: str  # 必选：来自某 A2CSkillRef.name
+    rel_path: NotRequired[str]  # 可选：SKILL 包根 POSIX 相对路径；缺省 = "SKILL.md"
+
+
+class GetSkillRet(TypedDict, total=False):
+    """
+    获取 SKILL 包内单个资源响应。文本且可内联 → ``body`` 直接给出；二进制或过大文本 → ``blob_handle``
+    转 ``client:get_blob`` 拉取——``body`` 与 ``blob_handle`` **恰一存在**（exactly one）。
+    Get-skill response. Inlineable text → ``body``; binary or oversize text → ``blob_handle`` (fetched
+    via ``client:get_blob``). Exactly one of ``body`` / ``blob_handle`` is present.
+
+    协议依据 / Protocol: data-structures.md §GetSkillRet；blob-transfer.md §5 生产者通道接入契约；
+    skill.md §9 安全 / too_large 不铸句柄.
+
+    完整性 / Integrity:
+      - ``total_size`` / ``sha256`` 基于 **Agent 最终消费的资源字节**（SKILL.md → frontmatter 剥离后 body；
+        其它 → 原始字节；占位符 ``$TFROBOT_*`` **不展开**，由 Agent SDK 渲染层处理）
+        ``total_size`` / ``sha256`` are based on the **bytes the Agent will ultimately consume**
+        (SKILL.md → body with frontmatter stripped; others → raw bytes; ``$TFROBOT_*`` placeholders
+        **NOT expanded**, handled by Agent SDK prompt rendering).
+      - Agent **SHOULD** 用 ``sha256`` 校验内联 ``body``；handle 路径于 ``eof`` 后全量校验
+        Agent **SHOULD** verify ``body`` against ``sha256`` inline; for handle path verify after ``eof``.
+    """
+
+    name: str  # 回显请求 name
+    rel_path: str  # 回显请求 rel_path；缺省请求时回显 "SKILL.md"
+    mime_type: str  # 资源 MIME，如 text/markdown / image/png
+    total_size: int  # 资源总字节数（基于最终消费字节）
+    sha256: str  # 全量资源 sha256 十六进制（完整性 + 变更检测）
+    body: str  # 文本且 ≤ 内联预算：直接内容（与 blob_handle 恰一）
+    blob_handle: str  # 否则：转 client:get_blob 的不透明句柄（与 body 恰一）
+    req_id: str
+
+
+# ── 通用二进制传输 / Generic binary transfer ──────────────────────────────
+# 协议依据 / Protocol: blob-transfer.md（句柄契约 / 生产者-消费者模型 / 安全模型）
+
+
+BlobHandle: TypeAlias = str
+"""
+不透明、Computer 铸造、无状态可重解析的 blob 句柄。
+Opaque, Computer-minted, stateless-reparseable blob handle.
+
+Agent 行为约束 / Agent behavior constraints (blob-transfer.md §1):
+  - MUST 视为不透明字符串；MUST NOT 解析 / 拼接 / 伪造 / 跨 Computer 复用
+  - MUST treat as opaque string; MUST NOT parse / concatenate / forge / reuse across Computers
+
+载体随响应结构而异 / Carrier varies by response shape:
+  - ``GetSkillRet.blob_handle``（A2C 可变结构 / A2C mutable）
+  - MCP ``CallToolResult`` content item ``_meta.a2c_blob_handle``（MCP 不可变结构旁路 / MCP immutable sideband）
+"""
+
+
+class GetBlobReq(AgentCallData, total=True):
+    """
+    通用二进制拉取请求。Computer 无服务端状态、幂等可并行（``chunk_offset`` 为资源字节绝对偏移）。
+    Generic binary pull request. Stateless on Computer, idempotent, parallelizable
+    (``chunk_offset`` is absolute byte offset within the resource).
+
+    协议依据 / Protocol: events.md §client:get_blob；data-structures.md §GetBlobReq；
+    blob-transfer.md §2 (handle) / §3 (chunking) / §4 (errors).
+    """
+
+    computer: str
+    blob_handle: str  # 必选：来自某通道响应的不透明句柄
+    chunk_offset: NotRequired[int]  # 可选：资源字节绝对偏移；缺省 0；无状态幂等 → 可续传 / 重试 / 并行
+    max_chunk_bytes: NotRequired[int]  # 可选：客户建议单块上限；Computer clamp（恒保证不超 Server buffer）
+
+
+class GetBlobRet(TypedDict, total=False):
+    """
+    通用二进制拉取响应。
+    Generic binary pull response.
+
+    协议依据 / Protocol: data-structures.md §GetBlobRet；blob-transfer.md §3 完整性 / §4 错误 / §5 演进缝隙.
+
+    完整性与一致性铁律 / Integrity & consistency invariants:
+      - ``eof`` ⟺ ``chunk_offset + len(decode(blob)) == total_size``
+      - ``eof`` 后 Agent **SHOULD** 校验重组 ``sha256`` == 响应 ``sha256``，不符即损坏、重读
+        After ``eof`` Agent **SHOULD** verify reassembled ``sha256`` == response ``sha256``;
+        on mismatch the data is corrupt — reread.
+      - 一次逻辑读取内 ``sha256`` / ``total_size`` **MUST** 稳定；跨块变化 ⇒ 源被改写，
+        Agent **MUST** 从 offset 0 重读
+        Within one logical read ``sha256`` / ``total_size`` **MUST** be stable; on change ⇒ source rewritten,
+        Agent **MUST** restart from offset 0.
+
+    演进缝隙 / Evolution slack (open TypedDict): 未来可非破坏追加 ``content_encoding`` (gzip 等，缺省 identity)
+    / ``etag``；offset / total_size / sha256 基于**解码后**资源字节，加压缩不致歧义。
+    Future fields may be added non-breakingly; offset / total_size / sha256 are on **decoded** bytes.
+    """
+
+    blob_handle: str  # 回显
+    mime_type: str
+    total_size: int  # 首块即知；一次读取内恒定
+    sha256: str  # 全量资源 sha256；跨块恒定
+    chunk_offset: int  # 本块起始字节偏移
+    eof: bool  # ⟺ chunk_offset + 本块字节数 == total_size
+    blob: str  # base64，本块字节
+    req_id: str
+
+
 # 协议错误码取值集合（flat ErrorPayload 顶层 code）/ Protocol error-code value set (flat ErrorPayload top-level code)
 _ERROR_CODE_VALUES: frozenset[int] = frozenset(int(c) for c in ErrorCode)
 
@@ -481,3 +730,21 @@ def is_protocol_error_payload(data: object) -> bool:
     divergent heuristics. 协议依据 / Protocol: error-handling.md（禁止二次 unwrap）。
     """
     return isinstance(data, dict) and data.get("code") in _ERROR_CODE_VALUES
+
+
+def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
+    """``client:*`` 路由层目标 Computer 名未注册 → flat ErrorPayload(404)。
+    Build the flat ErrorPayload(404) returned when a ``client:*`` route targets an
+    unregistered Computer name.
+
+    sync/async 命名空间共用本 builder，保证两实现返回**逐字节一致**的负载（双实现镜像约束）。
+    Shared by the sync/async namespaces so both implementations return byte-identical payloads.
+
+    协议依据 / Protocol: error-handling.md §20（404 工具或 Computer 不存在）+ §78（所有
+    ``client:*`` ack 通道协议级错误 MUST 为 flat ErrorPayload）。
+    """
+    return {
+        "code": int(ErrorCode.NOT_FOUND),
+        "message": f"Computer with name '{computer_name}' not found",
+        "details": {"computer_name": computer_name},
+    }

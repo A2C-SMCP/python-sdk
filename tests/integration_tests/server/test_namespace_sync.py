@@ -29,6 +29,7 @@ from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
+    GET_CONFIG_EVENT,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
@@ -37,6 +38,7 @@ from a2c_smcp.smcp import (
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
+    ErrorCode,
 )
 from tests.integration_tests.server._local_sync_server import create_local_sync_server
 
@@ -418,6 +420,68 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
         agent.disconnect()
 
 
+def test_tool_call_target_disconnect_midflight_returns_404_sync(
+    startup_and_shutdown_local_sync_server,
+    sync_server_port: int,
+) -> None:
+    """#100 Phase 1 sync 端到端复现：Computer 在 tool 执行中途断连 → Server 即时回 flat ErrorPayload(404)，
+    Agent 远早于 ``timeout`` 返回。镜像 async 的 ``test_tool_call_target_disconnect_midflight_returns_404``，
+    验证 sync 守卫（daemon 子线程跑 ``self.call`` + 真实 ``on_disconnect`` 触发信号）在真实 werkzeug 多进程 server 上生效。
+    Sync mirror: target Computer disconnects mid tool_call → flat ErrorPayload(404) fast, no full-timeout hang.
+    """
+    agent = Client()
+    computer = Client()
+
+    tool_started = threading.Event()
+    tool_block = threading.Event()  # 测试期间不 set（仅 finally 释放）→ 模拟慢工具在途 / blocks: slow tool in-flight
+    box: dict = {}
+
+    @computer.on(TOOL_CALL_EVENT, namespace=SMCP_NAMESPACE)
+    def _on_tool_call(data: dict):  # noqa: ANN001
+        tool_started.set()
+        tool_block.wait(timeout=20)  # 有界阻塞，保证遗弃的 handler 线程退出 / bounded so the orphaned handler exits
+        return {"ok": True}
+
+    office_id = "office-sync-disc"
+    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    _join_office(computer, role="computer", office_id=office_id, name="comp-SD")
+    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    _join_office(agent, role="agent", office_id=office_id, name="robot-SD")
+
+    def run_agent_call() -> None:
+        try:
+            box["res"] = agent.call(
+                TOOL_CALL_EVENT,
+                {"robot_id": "robot-SD", "computer": "comp-SD", "tool_name": "slow", "params": {}, "req_id": "req-sd", "timeout": 30},
+                namespace=SMCP_NAMESPACE,
+                timeout=40,
+            )
+        except BaseException as e:  # noqa: BLE001 捕获供主线程断言 / captured for main-thread assertion
+            box["error"] = e
+
+    caller = threading.Thread(target=run_agent_call, daemon=True)
+    caller.start()
+    try:
+        assert tool_started.wait(timeout=10), "Computer 未在期望时间内进入 tool_call 处理"
+        # 在途断连 Computer（Client.disconnect 走 eio abort=True，不 join 阻塞中的读循环）/ disconnect mid-flight
+        computer.disconnect()
+        # 关键：远早于 payload timeout=30s 返回（若挂死，join 在 20s 后判定线程仍存活 → 断言失败）/ fail-fast, not full timeout
+        caller.join(timeout=20)
+        assert not caller.is_alive(), "agent.call 应在 Computer 断连后快速返回，而非挂到满 timeout"
+        assert "error" not in box, f"agent.call 不应抛异常（应收到 404 dict）：{box.get('error')!r}"
+        res = box["res"]
+        assert isinstance(res, dict), f"期望 dict，实际 {type(res)}"
+        assert res.get("code") == int(ErrorCode.NOT_FOUND), f"期望 flat ErrorPayload(404)，实际 {res}"
+        assert res.get("details", {}).get("computer_name") == "comp-SD"
+    finally:
+        tool_block.set()  # 释放遗弃的 handler 线程 / release the orphaned handler thread
+        for client in (agent, computer):
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
+
 def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server, sync_server_port: int):
     """
     中文：测试Computer重名检查：当房间内已存在同名Computer时，第二个Computer加入应失败
@@ -644,3 +708,121 @@ def test_tool_call_wrong_role_rejected_sync(startup_and_shutdown_local_sync_serv
             )
     finally:
         computer.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# 中文：#94 client:get_config 同步中继回归 / English: #94 sync client:get_config relay regression
+# ---------------------------------------------------------------------------
+def _run_computer_config_client_process(port: int, computer_name_queue: multiprocessing.Queue, error_queue: multiprocessing.Queue) -> None:
+    """独立进程运行 Computer 客户端，注册 GET_CONFIG_EVENT handler。"""
+    computer = Client()
+
+    @computer.on(GET_CONFIG_EVENT, namespace=SMCP_NAMESPACE)
+    def _on_get_config(data: dict):  # noqa: ANN001
+        # 占位符原样的最小合法 MCPServerStdioConfig（解析后密钥不外传）
+        return {
+            "servers": {
+                "echo": {
+                    "name": "echo",
+                    "type": "stdio",
+                    "disabled": False,
+                    "forbidden_tools": [],
+                    "tool_meta": {},
+                    "server_parameters": {
+                        "command": "python",
+                        "args": [],
+                        "env": None,
+                        "cwd": None,
+                        "encoding": "utf-8",
+                        "encoding_error_handler": "strict",
+                    },
+                },
+            },
+            "inputs": [],
+        }
+
+    try:
+        computer.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        office_id = "office-sync-cfg"
+        computer_name = "comp-Scfg"
+        _join_office(computer, role="computer", office_id=office_id, name=computer_name)
+        computer_name_queue.put(computer_name)
+        computer.wait()
+    except Exception as e:
+        error_queue.put(f"Computer客户端错误: {str(e)}")
+    finally:
+        computer.disconnect()
+
+
+def _run_agent_config_client_process(
+    port: int,
+    computer_name: str,
+    result_queue: multiprocessing.Queue,
+    error_queue: multiprocessing.Queue,
+) -> None:
+    """独立进程运行 Agent 客户端，发起 GET_CONFIG_EVENT 调用。"""
+    try:
+        agent = Client()
+        agent_id = "robot-Scfg"
+        agent.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        _join_office(agent, role="agent", office_id="office-sync-cfg", name=agent_id)
+        time.sleep(0.2)
+        res = agent.call(
+            GET_CONFIG_EVENT,
+            {"computer": computer_name, "agent": agent_id, "req_id": "req-sync-cfg-1"},
+            namespace=SMCP_NAMESPACE,
+            timeout=15,
+        )
+        result_queue.put(res)
+        agent.disconnect()
+    except Exception as e:
+        error_queue.put(f"Agent客户端错误: {str(e)}")
+
+
+def test_get_config_success_sync(startup_and_shutdown_local_sync_server: Namespace, sync_server_port: int) -> None:
+    """同步环境下 client:get_config 中继成功（#94），多进程避免 GIL 阻塞。修复前返回 None → 失败。"""
+    computer_name_queue: multiprocessing.Queue = multiprocessing.Queue()
+    result_queue: multiprocessing.Queue = multiprocessing.Queue()
+    error_queue: multiprocessing.Queue = multiprocessing.Queue()
+
+    computer_process = multiprocessing.Process(
+        target=_run_computer_config_client_process,
+        args=(sync_server_port, computer_name_queue, error_queue),
+        daemon=True,
+    )
+    computer_process.start()
+
+    try:
+        try:
+            computer_name = computer_name_queue.get(timeout=5)
+        except Exception:
+            if not error_queue.empty():
+                pytest.fail(f"Computer客户端启动失败: {error_queue.get()}")
+            pytest.fail("获取Computer NAME超时")
+
+        agent_process = multiprocessing.Process(
+            target=_run_agent_config_client_process,
+            args=(sync_server_port, computer_name, result_queue, error_queue),
+            daemon=True,
+        )
+        agent_process.start()
+
+        try:
+            try:
+                result = result_queue.get(timeout=20)
+                assert isinstance(result, dict), f"期望返回 GetComputerConfigRet dict，实际：{type(result)}"
+                assert result.get("servers") and result["servers"]["echo"]["type"] == "stdio"
+            except AssertionError:
+                raise
+            except Exception:
+                if not error_queue.empty():
+                    pytest.fail(f"Agent客户端执行失败: {error_queue.get()}")
+                pytest.fail("Agent执行超时")
+        finally:
+            if agent_process.is_alive():
+                agent_process.terminate()
+                agent_process.join(timeout=2)
+    finally:
+        if computer_process.is_alive():
+            computer_process.terminate()
+            computer_process.join(timeout=2)

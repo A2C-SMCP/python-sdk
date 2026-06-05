@@ -14,6 +14,7 @@ English: Asynchronous end-to-end tests for Computer-Agent-Server integration.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,8 +28,11 @@ from a2c_smcp.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_EVENT,
     JOIN_OFFICE_EVENT,
     SMCP_NAMESPACE,
+    TOOL_CALL_EVENT,
+    AgentCallData,
     EnterOfficeNotification,
     LeaveOfficeNotification,
     SMCPTool,
@@ -365,6 +369,105 @@ async def test_async_integration_agent_call_computer_tool(
         print(f"[E2E Test2] Computer shutdown took {time.time() - t3:.2f}s")
 
         print(f"[E2E Test2] Total cleanup took {time.time() - cleanup_start:.2f}s")
+
+
+@pytest.mark.asyncio
+async def test_async_integration_agent_cancel_inflight_tool_call(
+    async_integration_socketio_server,
+    async_integration_server_port: int,
+    tmp_path: Path,
+):
+    """#96：Agent 发 server:tool_call_cancel 取消在途 slow_echo → Computer 中断执行，原 tool_call 返回取消态。
+
+    #96: Agent emits server:tool_call_cancel for an in-flight slow_echo → Computer interrupts execution,
+    the original client:tool_call resolves to a cancelled (isError) result well before the slow tool would finish.
+    """
+    # agent_id == office_id（协议约束）；join 用同名，使 Server 取消校验 session.name == AgentCallData.agent 成立。
+    agent_id = "async-integration-office-cancel"
+    office_id = agent_id
+    server_url = f"http://127.0.0.1:{async_integration_server_port}"
+
+    mcp_config = _create_mcp_config(
+        "e2e-async-integration-server-cancel",
+        "tests/integration_tests/computer/mcp_servers/resources_subscribe_stdio_server.py",
+    )
+    # 完成标记：slow_echo 仅在「跑完」时写此文件；若远端被 notifications/cancelled 中断则永不写。
+    # Completion marker: slow_echo writes this only if it runs to completion; never written if the remote is interrupted.
+    marker = tmp_path / "slow_echo_done.marker"
+    mcp_config["server_parameters"]["env"] = {**os.environ, "A2C_TEST_SLOW_ECHO_MARKER": str(marker)}
+    stdio_config = StdioServerConfig(**mcp_config)
+
+    computer = Computer(name="test", mcp_servers={stdio_config}, auto_connect=True)
+    computer_client = SMCPComputerClient(computer=computer)
+
+    auth_provider = DefaultAgentAuthProvider(agent_id=agent_id, office_id=office_id)
+    event_handler = MockAsyncEventHandler()
+    agent_client = AsyncSMCPAgentClient(auth_provider=auth_provider, event_handler=event_handler)
+
+    try:
+        await agent_client.connect_to_server(server_url)
+        await asyncio.sleep(0.2)
+        # join name == agent_id，与取消校验对齐 / join name equals agent_id to satisfy cancel validation
+        await agent_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "name": agent_id, "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        await asyncio.sleep(0.3)
+
+        await computer.boot_up()
+        await computer_client.connect(
+            server_url,
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+            transports=["polling"],
+        )
+        await computer_client.join_office(office_id)
+        await asyncio.sleep(1.0)
+
+        assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
+        computer_sid, _tools = event_handler.tools_received_events[0]
+
+        # 显式铸 req（控 req_id），调用 slow_echo（delay=5s）；用底层 call 以便与 cancel 解耦地并发等待。
+        # Explicitly mint req (control req_id) calling slow_echo (delay=5s); use low-level call to await independently.
+        slow_delay = 5.0
+        req = agent_client.create_tool_call_request(computer=computer_sid, tool_name="slow_echo", params={"delay": slow_delay}, timeout=15)
+        t0 = time.time()
+        call_task = asyncio.ensure_future(agent_client.call(TOOL_CALL_EVENT, req, namespace=SMCP_NAMESPACE, timeout=15))
+
+        # 1s 后发取消（此时 slow_echo 正在 Computer 上 sleep）/ after ~1s emit cancel while slow_echo is sleeping
+        await asyncio.sleep(1.0)
+        assert not call_task.done(), "slow_echo 不应在取消前完成 / slow_echo must not finish before cancel"
+        await agent_client.emit(
+            CANCEL_TOOL_CALL_EVENT,
+            AgentCallData(agent=agent_id, req_id=req["req_id"]),
+            namespace=SMCP_NAMESPACE,
+        )
+
+        # 原 tool_call 应在远小于 delay 内 resolve 为取消态（本地放弃等待）/ resolves cancelled well before delay
+        result = await asyncio.wait_for(call_task, timeout=10)
+        elapsed = time.time() - t0
+        assert elapsed < slow_delay - 1.0, f"取消未中断在途调用（耗时 {elapsed:.2f}s）/ cancel did not interrupt (took {elapsed:.2f}s)"
+        assert result.get("isError") is True, f"期望取消态 isError，实际 / expected cancelled isError, got: {result}"
+        # Computer 历史末条应记录失败（被中断）且 error 标为 cancelled / last record: failed + error == cancelled
+        assert await _wait_until(lambda: len(computer._tool_call_history) >= 1, timeout=3)
+        assert computer._tool_call_history[-1]["success"] is False
+        assert computer._tool_call_history[-1]["error"] == "cancelled"
+
+        # 远端真被中断的证明（#96 最后一公里）：等到超过原始 delay 窗口，若远端未被 notifications/cancelled 中断，
+        # slow_echo 早已写下完成标记；标记缺席即证明远端 MCP Server 的工具执行确被中断。
+        # Proof of real remote interruption: wait past the original delay window; absence of the completion marker
+        # proves the remote MCP server's tool execution was actually interrupted (not merely abandoned locally).
+        await asyncio.sleep(max(0.0, (slow_delay + 1.5) - (time.time() - t0)))
+        assert not marker.exists(), "远端 slow_echo 未被中断：完成标记已写 / remote slow_echo NOT interrupted (marker written)"
+
+    finally:
+        await agent_client.disconnect()
+        await asyncio.sleep(0.2)
+        if computer_client.connected:
+            await computer_client.leave_office(office_id)
+        await computer.shutdown()
 
 
 @pytest.mark.asyncio

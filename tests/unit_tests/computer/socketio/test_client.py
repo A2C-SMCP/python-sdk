@@ -320,3 +320,33 @@ def test_to_a2c_resource_no_annotations_omits_optional_keys() -> None:
     assert "size" not in mapped
     assert "description" not in mapped
     assert "_meta" not in mapped
+
+
+# -------------------- #96 notify:tool_call_cancel 接收处理器 --------------------
+# #96 Computer-side receiver for notify:tool_call_cancel
+
+
+@pytest.mark.asyncio
+async def test_on_tool_call_cancel_delegates_to_computer():
+    """#96：handler 按 req_id 委托 computer.acancel_tool，notify:* 无 ack 故返回 None。"""
+    computer = MagicMock()
+    computer.acancel_tool = AsyncMock(return_value=True)
+    client = SMCPComputerClient(computer=computer)
+
+    ret = await client.on_tool_call_cancel({"agent": "agt", "req_id": "req-1"})
+
+    assert ret is None  # notify:* 处理器不回执 / no ack for notify:*
+    computer.acancel_tool.assert_awaited_once_with("req-1")
+
+
+@pytest.mark.asyncio
+async def test_on_tool_call_cancel_unknown_req_id_no_raise():
+    """#96：未知/已完成 req_id（acancel_tool 返回 False）→ 无害 no-op，不抛异常。"""
+    computer = MagicMock()
+    computer.acancel_tool = AsyncMock(return_value=False)
+    client = SMCPComputerClient(computer=computer)
+
+    ret = await client.on_tool_call_cancel({"agent": "agt", "req_id": "nope"})
+
+    assert ret is None
+    computer.acancel_tool.assert_awaited_once_with("nope")

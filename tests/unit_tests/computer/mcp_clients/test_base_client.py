@@ -451,3 +451,58 @@ async def test_list_windows_without_subscribe_still_returns_resources(connected_
     assert "/secondary" in uris[1]
     # subscribe=False 时不应调用 subscribe_resource
     mock_session.subscribe_resource.assert_not_called() if hasattr(mock_session, "subscribe_resource") else None
+
+
+# -------------------- #96 取消最后一公里：call_tool 取消时补发 MCP notifications/cancelled --------------------
+# #96 cancel last-mile: call_tool emits MCP notifications/cancelled to the remote on cancellation
+
+
+class _BlockingCancelSession:
+    """伪造 ClientSession：call_tool 阻塞直到被取消；记录 send_notification 调用（含捕获的 request_id）。"""
+
+    def __init__(self, request_id: int) -> None:
+        self._request_id = request_id  # base_client.call_tool 会在调用前同步读取它作为本次请求 id
+        self.send_notification = AsyncMock()
+        self.started = asyncio.Event()
+
+    async def call_tool(self, tool_name: str, params: dict):  # noqa: ANN001, ARG002
+        self.started.set()
+        await asyncio.sleep(30)  # 阻塞直到被取消 / block until cancelled
+        raise AssertionError("call_tool 不应正常返回（应被取消）/ should be cancelled, not return")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_cancel_emits_mcp_cancelled(connected_client):
+    """#96：call_tool 被取消时向远端补发 notifications/cancelled（requestId == 捕获 id），并仍抛 CancelledError。"""
+    client_instance, _ = connected_client
+    fake = _BlockingCancelSession(request_id=42)
+    client_instance._async_session = fake  # 直接注入受控 session（已连接态）
+
+    task = asyncio.ensure_future(client_instance.call_tool("slow", {"x": 1}))
+    await asyncio.wait_for(fake.started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake.send_notification.await_count == 1, "取消时应补发一次 notifications/cancelled"
+    notif = fake.send_notification.await_args.args[0]
+    assert notif.root.method == "notifications/cancelled"
+    assert notif.root.params.requestId == 42  # 即 base_client 捕获的本次 MCP request_id
+    assert notif.root.params.reason == "A2C tool_call cancelled"
+
+
+@pytest.mark.asyncio
+async def test_emit_mcp_cancelled_builds_client_notification(client):
+    """#96：_emit_mcp_cancelled 以 ClientNotification(CancelledNotification(requestId=...)) 调 send_notification，异常全吞。"""
+    client_instance, _ = client
+    session = MagicMock(spec=ClientSession)
+    session.send_notification = AsyncMock()
+
+    await client_instance._emit_mcp_cancelled(session, 99)
+
+    assert session.send_notification.await_count == 1
+    notif = session.send_notification.await_args.args[0]
+    assert notif.root.params.requestId == 99
+    # send_notification 抛错也不应外泄（best-effort）/ failures are swallowed
+    session.send_notification = AsyncMock(side_effect=RuntimeError("boom"))
+    await client_instance._emit_mcp_cancelled(session, 100)  # 不抛异常即通过

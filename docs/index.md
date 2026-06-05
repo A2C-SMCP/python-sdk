@@ -8,6 +8,7 @@
 
 - [快速开始](guides/getting-started.md) - 快速上手
 - [Server 指南](guides/server-guide.md) - 搭建信令服务器
+- [Server 协议版本握手部署指南](guides/server-version-handshake.md) - 启用 `a2c_version` 握手（裸 ASGI/WSGI、FastAPI 集成）
 - [Agent 指南](guides/agent-guide.md) - 开发 Agent 客户端
 - [Computer 指南](guides/computer-guide.md) - 管理 MCP 服务
 - [CLI 指南](guides/cli-guide.md) - 命令行工具使用

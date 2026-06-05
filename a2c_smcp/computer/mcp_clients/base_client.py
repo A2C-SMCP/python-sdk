@@ -7,13 +7,23 @@
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from enum import StrEnum
 from typing import Generic, TypeVar, cast
 
 from mcp import ClientSession, Tool
 from mcp.client.session import MessageHandlerFnT
-from mcp.types import AnyUrl, CallToolResult, InitializeResult, ReadResourceResult, Resource, TextResourceContents
+from mcp.types import (
+    AnyUrl,
+    CallToolResult,
+    CancelledNotification,
+    CancelledNotificationParams,
+    ClientNotification,
+    InitializeResult,
+    ReadResourceResult,
+    Resource,
+    TextResourceContents,
+)
 from pydantic import BaseModel
 from transitions.core import EventData
 from transitions.extensions import AsyncMachine
@@ -512,10 +522,54 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
         Returns:
             CallToolResult: 调用结果 MCP 协议标准制定
+
+        取消传播（#96 最后一公里）：本方法被取消（上层 :meth:`Computer.acancel_tool` → task.cancel，
+        或 Manager 的 ``asyncio.wait_for`` 超时）时，会 best-effort 向远端 MCP Server 补发
+        ``notifications/cancelled``，使远端有机会真正停止该工具执行——MCP 官方 SDK 取消客户端请求时
+        **不**自动发此通知、也不暴露客户端 request_id（见 SDK issue #1410/#1419，至最新版本仍未修），故由我方补发。
+        Cancellation propagation (#96 last mile): on cancellation this best-effort emits MCP
+        ``notifications/cancelled`` to the remote server, since the official SDK neither emits it on
+        client-request cancellation nor exposes the client request_id (SDK issues #1410/#1419).
         """
         if self.state != STATES.connected:
             raise ConnectionError("Not connected to server")
-        return await (await self.async_session).call_tool(tool_name, params)
+        session = await self.async_session
+        # 捕获本次 MCP 请求 id：ClientSession.call_tool → send_request 在首个真正 await 之前同步自增分配
+        # self._request_id；从此处读取到分配点之间无 await 挂起 → 读到的即本次将使用的 id（并发安全）。
+        # Capture this request's MCP id: send_request assigns self._request_id synchronously before its first
+        # real await; no suspension between this read and that assignment → the value read is the id used.
+        request_id = getattr(session, "_request_id", None)
+        try:
+            return await session.call_tool(tool_name, params)
+        except asyncio.CancelledError:
+            # best-effort：通知远端取消该请求；不阻塞取消展开。/ best-effort notify remote; never block teardown.
+            if request_id is not None:
+                await self._emit_mcp_cancelled(session, request_id)
+            raise
+
+    async def _emit_mcp_cancelled(self, session: ClientSession, request_id: int) -> None:
+        """向远端 MCP Server best-effort 发送 ``notifications/cancelled``（#96 取消最后一公里）。
+
+        在调用方被取消的展开期内发送：``asyncio.shield`` 防止发送本身被二次取消打断，``wait_for`` 限时避免拖住
+        teardown，``suppress`` 兜底会话已关闭等异常。MCP 取消为协作式（server 可忽略），故全程 best-effort。
+        Best-effort emit of MCP ``notifications/cancelled``. Shielded against re-cancellation, time-boxed to not
+        stall teardown, and fully suppressed (the session may already be closing). Cooperative per MCP spec.
+        """
+
+        async def _send() -> None:
+            with suppress(Exception):
+                await session.send_notification(
+                    ClientNotification(
+                        CancelledNotification(
+                            params=CancelledNotificationParams(requestId=request_id, reason="A2C tool_call cancelled"),
+                        ),
+                    ),
+                    related_request_id=request_id,
+                )
+
+        with suppress(Exception):
+            # asyncio.shield 内部已将协程包装为 Task，无需再 ensure_future / shield already wraps the coro in a Task.
+            await asyncio.wait_for(asyncio.shield(_send()), timeout=2.0)
 
     async def _close_task(self) -> None:
         """

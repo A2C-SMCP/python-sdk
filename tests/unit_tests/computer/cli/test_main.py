@@ -23,7 +23,7 @@ class DummyInteractive:
     last_init_client: Any | None = None
 
     @classmethod
-    async def coro(cls, comp: Any, init_client: Any | None = None) -> None:  # matches _interactive_loop signature
+    async def coro(cls, comp: Any, init_client: Any | None = None, **_: Any) -> None:  # matches _interactive_loop signature (+ #69 kwargs)
         cls.called = True
         cls.last_comp = comp
         cls.last_init_client = init_client
@@ -41,6 +41,7 @@ class FakeComputer:
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
+        registered_workdirs: Any | None = None,
     ) -> None:
         self.init_args = {
             "inputs": inputs,
@@ -49,6 +50,7 @@ class FakeComputer:
             "auto_reconnect": auto_reconnect,
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
+            "registered_workdirs": registered_workdirs,
         }
 
     async def __aenter__(self) -> FakeComputer:
@@ -899,9 +901,13 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
     """
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
     from a2c_smcp.smcp import (
+        CANCEL_TOOL_CALL_NOTIFICATION,
+        GET_BLOB_EVENT,
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
         GET_RESOURCES_EVENT,
+        GET_SKILL_EVENT,
+        GET_SKILLS_EVENT,
         GET_TOOLS_EVENT,
         SMCP_NAMESPACE,
         TOOL_CALL_EVENT,
@@ -976,4 +982,8 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
         GET_RESOURCES_EVENT,
+        GET_BLOB_EVENT,
+        GET_SKILLS_EVENT,
+        GET_SKILL_EVENT,
+        CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器
     }, f"Unexpected event handlers under {custom_ns!r}: {registered!r}"

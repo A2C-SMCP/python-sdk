@@ -1,5 +1,10 @@
 line-length = 140
 target-version = "py311"
+# 排除 Claude Code 工程目录：.claude/ 下为 harness / SKILL 运行脚本（含 UAT seed 可执行脚本），
+# 非 a2c_smcp 发布包源码，不纳入包级 lint（mypy 也仅作用于 a2c_smcp）。
+# Exclude the Claude Code harness dir: .claude/ holds harness / SKILL runtime scripts
+# (incl. executable UAT seed scripts), not shipped a2c_smcp source — out of package lint scope.
+extend-exclude = [".claude"]
 
 [lint]
 preview = true

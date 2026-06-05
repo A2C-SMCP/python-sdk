@@ -22,6 +22,10 @@ from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
 
+# SKILL 资源枚举翻页安全上界：防御恒非空 cursor（server bug / 恶意）导致的无限循环挂死物化。
+# Pagination safety bound for SKILL enumeration: guard against a never-terminating cursor hanging staging.
+_MAX_SKILL_LIST_PAGES = 1000
+
 
 class ToolNameDuplicatedError(Exception):
     def __init__(self, *args: Any) -> None:
@@ -34,7 +38,10 @@ class MCPServerManager:
 
     所有以下划线开头的私有方法是非协程安全的。如果外部调用，需要使用普通方法。
 
-    # TODO call_tool的时候需要启动子任务对call_tool进行包装，以便进行超时控制与动态取消。实现超时控制与动态取消后，才可以响应服务端取消任务
+    # 动态取消（响应 server 端 notify:tool_call_cancel）已在 Computer.aexecute_tool 层实现（#96）：
+    #   Computer 以 req_id 为键将 acall_tool 包装为可取消的在途任务（见 Computer._acall_tool_cancellable /
+    #   Computer.acancel_tool）。此处 acall_tool 维持原有 asyncio.wait_for 超时语义即可，无需在 Manager 持有
+    #   req_id 级注册表（acall_tool 以 server/tool 为键、被 alias 路径复用，不感知 req_id）。
     """
 
     def __init__(
@@ -542,6 +549,70 @@ class MCPServerManager:
                     continue
                 results.append((server_name, res))
         return results
+
+    async def list_skill_resources(self, server_name: SERVER_NAME | None = None) -> list[tuple[SERVER_NAME, Resource]]:
+        """
+        中文: 枚举活跃 MCP Server 的 ``skill://`` 资源（附 server 归属），**完整消费 cursor 翻页直至末尾**。
+        英文: Enumerate ``skill://`` resources from active MCP servers (with owning server), exhausting cursor pages.
+
+        与 :meth:`list_resources`（单页、Agent 控制翻页）不同：SKILL 物化由 Computer 主导，须拿到**全量**
+        ``skill://`` 集合，故在此完整消费翻页（协议 skill.md §12）。未声明 ``resources`` 能力或枚举出错的
+        server **跳过**（记 ERROR、不中断其余），对齐「SKILL 通道不使用 4015——无 resources 能力的 server
+        在物化阶段即被排除」（error-handling.md / skill.md §1.5）。
+        Unlike :meth:`list_resources` (single-page, Agent-driven): Computer-driven SKILL materialization needs
+        the full ``skill://`` set, so pages are exhausted here. Servers lacking ``resources`` capability or
+        erroring are skipped (logged ERROR, others continue).
+
+        Args:
+            server_name (SERVER_NAME | None): 若提供仅枚举该 server（用于 ResourceListChanged 单 server 重枚举）；
+                否则枚举全部活跃 server / restrict to one server, else enumerate all active servers.
+
+        Returns:
+            list[tuple[SERVER_NAME, Resource]]: [(server_name, skill_resource), ...]
+        """
+        results: list[tuple[SERVER_NAME, Resource]] = []
+        active_snapshot = list(self._active_clients.items())
+        for sname, client in active_snapshot:
+            if server_name is not None and sname != server_name:
+                continue
+            try:
+                cursor: str | None = None
+                pages = 0
+                while True:
+                    page, cursor = await client.list_resources_page(cursor)
+                    results.extend((sname, res) for res in page if str(res.uri).startswith("skill://"))
+                    pages += 1
+                    if not cursor:
+                        break
+                    if pages >= _MAX_SKILL_LIST_PAGES:
+                        logger.error(
+                            f"list_skill_resources: server {sname} exceeded {_MAX_SKILL_LIST_PAGES} pages "
+                            f"(non-terminating cursor?); aborting enumeration for this server",
+                        )
+                        break
+            except Exception as e:
+                # 未声明 resources 能力 / 连接异常 / 翻页失败 → 跳过该 server，不阻断其余
+                logger.error(f"Error listing skill resources for {sname}: {e}", exc_info=True)
+                continue
+        return results
+
+    async def read_resource(self, server_name: SERVER_NAME, uri: str) -> ReadResourceResult:
+        """
+        中文: 读取指定 MCP Server 的单个资源内容（通用 ``resources/read`` 入口，供 SKILL ``resources`` 模式
+              逐子资源物化与子文件渐进式披露复用）。
+        英文: Read a single resource's contents from a server (generic ``resources/read`` entry; reused by
+              SKILL ``resources``-mode per-sub-resource materialization).
+
+        复用既有 ``client.get_window_detail``——其实现为通用 ``read_resource``（命名沿用历史，非仅 window）。
+        Reuses ``client.get_window_detail`` whose impl is a generic ``read_resource`` (name is historical).
+
+        Raises:
+            MCPServerNotFoundError: server_name 未注册 / server_name not registered.
+        """
+        client = self._active_clients.get(server_name)
+        if client is None:
+            raise MCPServerNotFoundError(f"MCP Server '{server_name}' is not registered")
+        return await client.get_window_detail(uri)
 
     async def get_windows_details(self, window_uri: str | None = None) -> list[tuple[SERVER_NAME, Resource, ReadResourceResult]]:
         """

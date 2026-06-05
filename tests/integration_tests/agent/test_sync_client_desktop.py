@@ -57,7 +57,9 @@ def startup_and_shutdown_sync_smcp_server_desktop():
 def _join_office(client: Client, role: str, office_id: str, name: str) -> None:
     payload = {"role": role, "office_id": office_id, "name": name}
     ok, err = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok and err is None
+    # 只检查成功状态，忽略返回消息（server:join_office 成功时第二位可为提示消息或 None，见 test_sync_client.py 约定）
+    # Only assert success; the second tuple element may be an informational message or None.
+    assert ok, f"join_office failed: {err}"
 
 
 def test_sync_agent_get_desktop_and_update_flow(startup_and_shutdown_sync_smcp_server_desktop):

@@ -21,9 +21,12 @@ from a2c_smcp.smcp import (
     LEAVE_OFFICE_EVENT,
     EnterOfficeNotification,
     EnterOfficeReq,
+    GetBlobReq,
     GetDeskTopReq,
     GetDeskTopRet,
     GetResourcesReq,
+    GetSkillReq,
+    GetSkillsReq,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
@@ -145,6 +148,39 @@ class BaseAgentClient(ABC):
             GetDeskTopReq: 获取桌面请求 / Get desktop request
         """
         return _rb.build_get_desktop_request(self.auth_provider.get_agent_config(), computer, size=size, window=window)
+
+    def create_get_skills_request(self, computer: str) -> GetSkillsReq:
+        """创建获取 SKILL 清单请求对象 / Create get-skills request object (v0.2.1).
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md §client:get_skills.
+        """
+        return _rb.build_get_skills_request(self.auth_provider.get_agent_config(), computer)
+
+    def create_get_skill_request(self, computer: str, name: str, rel_path: str | None = None) -> GetSkillReq:
+        """创建获取 SKILL 包内单个资源请求对象 / Create get-skill request object (v0.2.1).
+
+        协议依据 / Protocol: events.md §client:get_skill. ``rel_path`` 缺省取 ``SKILL.md`` 入口.
+        """
+        return _rb.build_get_skill_request(self.auth_provider.get_agent_config(), computer, name, rel_path)
+
+    def create_get_blob_request(
+        self,
+        computer: str,
+        blob_handle: str,
+        chunk_offset: int | None = None,
+        max_chunk_bytes: int | None = None,
+    ) -> GetBlobReq:
+        """创建通用二进制拉取单块请求对象 / Create get-blob chunk request object (v0.2.1).
+
+        协议依据 / Protocol: events.md §client:get_blob；blob-transfer.md.
+        """
+        return _rb.build_get_blob_request(
+            self.auth_provider.get_agent_config(),
+            computer,
+            blob_handle,
+            chunk_offset,
+            max_chunk_bytes,
+        )
 
     def process_desktop_response(self, response: GetDeskTopRet, computer: str) -> None:
         """
@@ -422,6 +458,39 @@ class BaseAgentSyncClient(ABC):
             GetDeskTopReq: 获取桌面请求 / Get desktop request
         """
         return _rb.build_get_desktop_request(self.auth_provider.get_agent_config(), computer, size=size, window=window)
+
+    def create_get_skills_request(self, computer: str) -> GetSkillsReq:
+        """创建获取 SKILL 清单请求对象 / Create get-skills request object (v0.2.1).
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md §client:get_skills.
+        """
+        return _rb.build_get_skills_request(self.auth_provider.get_agent_config(), computer)
+
+    def create_get_skill_request(self, computer: str, name: str, rel_path: str | None = None) -> GetSkillReq:
+        """创建获取 SKILL 包内单个资源请求对象 / Create get-skill request object (v0.2.1).
+
+        协议依据 / Protocol: events.md §client:get_skill. ``rel_path`` 缺省取 ``SKILL.md`` 入口.
+        """
+        return _rb.build_get_skill_request(self.auth_provider.get_agent_config(), computer, name, rel_path)
+
+    def create_get_blob_request(
+        self,
+        computer: str,
+        blob_handle: str,
+        chunk_offset: int | None = None,
+        max_chunk_bytes: int | None = None,
+    ) -> GetBlobReq:
+        """创建通用二进制拉取单块请求对象 / Create get-blob chunk request object (v0.2.1).
+
+        协议依据 / Protocol: events.md §client:get_blob；blob-transfer.md.
+        """
+        return _rb.build_get_blob_request(
+            self.auth_provider.get_agent_config(),
+            computer,
+            blob_handle,
+            chunk_offset,
+            max_chunk_bytes,
+        )
 
     def process_desktop_response(self, response: GetDeskTopRet, computer: str) -> None:
         """

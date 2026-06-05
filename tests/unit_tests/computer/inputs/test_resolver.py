@@ -16,10 +16,29 @@ from a2c_smcp.computer.mcp_clients.model import (
 )
 
 
+class _StubSecretStore:
+    """可用的内存 secret store stub（避免 headless password 硬错误，#65）/ Available in-memory secret store stub。"""
+
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self._store: dict[str, str] = {}
+
+    def get(self, input_id: str) -> str | None:
+        return self._store.get(input_id)
+
+    def set(self, input_id: str, value: str) -> bool:
+        if not self.available:
+            return False
+        self._store[input_id] = value
+        return True
+
+
 @pytest.mark.asyncio
 async def test_resolver_prompt_path(monkeypatch):
     inputs = [MCPServerPromptStringInput(id="p1", description="desc", default="d", password=True, type="promptString")]
-    r = InputResolver(inputs)
+    # 注入可用 secret_store 以承接 prompt 后的 keyring 持久化；password 在无 TTY 下一律硬错误（#65 fix-review #1），
+    # 故模拟交互（_has_tty→True，保持 session=None）走 prompt 路径
+    r = InputResolver(inputs, secret_store=_StubSecretStore(available=True))
 
     async def fake_prompt(message: str, *, password: bool = False, default: str | None = None, session: PromptSession | None = None) -> str:
         assert "desc" in message
@@ -31,6 +50,7 @@ async def test_resolver_prompt_path(monkeypatch):
     import a2c_smcp.computer.inputs.resolver as resolver_mod
 
     monkeypatch.setattr(resolver_mod, "ainput_prompt", fake_prompt)
+    monkeypatch.setattr(resolver_mod.InputResolver, "_has_tty", staticmethod(lambda session: True))
 
     v = await r.aresolve_by_id("p1")
     assert v == "typed"

@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import os
+
 import anyio
 from mcp import types
 from mcp.server.lowlevel.server import Server as LowLevelServer
@@ -119,10 +121,31 @@ async def run() -> None:
                 description="中文: 标记A; 英文: mark A",
                 inputSchema={"type": "object", "properties": {}},
             ),
+            # #96: 慢速工具，用于验证 notify:tool_call_cancel 能中断在途调用。
+            # #96: a slow tool to verify notify:tool_call_cancel interrupts an in-flight call.
+            types.Tool(
+                name="slow_echo",
+                description="中文: 睡眠后回显（用于取消测试）; 英文: sleep then echo (for cancel tests)",
+                inputSchema={"type": "object", "properties": {"delay": {"type": "number"}}},
+            ),
         ]
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict | None):  # noqa: ARG001
+    async def call_tool(name: str, arguments: dict | None):
+        # 中文: slow_echo 睡眠 delay 秒（默认 5s）后才回显，且仅在「跑完」时写完成标记文件（路径取自 env
+        #   A2C_TEST_SLOW_ECHO_MARKER）。若收到 MCP notifications/cancelled，sleep 在 server 端被 cancel scope 中断，
+        #   标记不会写——e2e 据此证明「远端真被中断」（#96 取消最后一公里）。
+        # 英文: slow_echo sleeps then writes a completion-marker file (env A2C_TEST_SLOW_ECHO_MARKER) ONLY if it runs to
+        #   completion. On an incoming MCP notifications/cancelled the server-side cancel scope interrupts the sleep so
+        #   the marker is never written — e2e asserts its absence to prove the remote was actually interrupted (#96).
+        if name == "slow_echo":
+            delay = float((arguments or {}).get("delay", 5.0))
+            await anyio.sleep(delay)
+            marker = os.environ.get("A2C_TEST_SLOW_ECHO_MARKER")
+            if marker:
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(f"slow_done:{delay}")
+            return [types.TextContent(type="text", text=f"slow_done:{delay}")]
         # 中文: 回显工具名，便于 CLI 端确认调用已发生。
         # 英文: Echo tool name so the CLI can confirm the call happened.
         return [types.TextContent(type="text", text=f"ok:{name}")]
