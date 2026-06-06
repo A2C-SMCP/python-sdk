@@ -8,11 +8,14 @@
 * 描述: SMCP协议Namespace实现 / SMCP protocol Namespace implementation
 """
 
+import asyncio
+import contextlib
 import copy
-from typing import cast
+from typing import Any, cast
 
 from pydantic import TypeAdapter
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.base import BaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
@@ -20,19 +23,36 @@ from a2c_smcp.server.utils import aget_all_sessions_in_office
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
+    GET_BLOB_EVENT,
+    GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
+    GET_RESOURCES_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
     UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
     EnterOfficeReq,
+    ErrorPayload,
+    GetBlobReq,
+    GetBlobRet,
+    GetComputerConfigReq,
+    GetComputerConfigRet,
     GetDeskTopReq,
     GetDeskTopRet,
+    GetResourcesReq,
+    GetResourcesRet,
+    GetSkillReq,
+    GetSkillRet,
+    GetSkillsReq,
+    GetSkillsRet,
     GetToolsReq,
     GetToolsRet,
     LeaveOfficeNotification,
@@ -43,6 +63,8 @@ from a2c_smcp.smcp import (
     ToolCallReq,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
+    build_computer_not_found_error,
+    is_protocol_error_payload,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -64,6 +86,46 @@ class SMCPNamespace(BaseNamespace):
             auth_provider (AuthenticationProvider): 认证提供者 / Authentication provider
         """
         super().__init__(namespace=SMCP_NAMESPACE, auth_provider=auth_provider)
+        # 在途 ``client:*`` 调用的「断连信号」登记表，以**目标 Computer SID** 为 key（#100 Phase 1）。
+        # 每个在途 ``_relay_client_call`` 注册一个独立 ``asyncio.Event``；目标 Computer ``on_disconnect`` 时
+        # 触发其名下全部信号，使阻塞中的 ``self.call`` 竞速立刻醒来并回 flat ErrorPayload(404)，
+        # 而非静默等到满 ``timeout``（socketio ``call`` 的等待原语不监听连接掉线）。
+        # Per-target in-flight disconnect signals (#100 Phase 1): target Computer SID -> set of Events.
+        self._inflight_disconnect_signals: dict[SID, set[asyncio.Event]] = {}
+
+    async def on_disconnect(self, sid: SID) -> None:
+        """断连处理：先走 base 的 name/room 清理，再唤醒以 ``sid`` 为目标的全部在途 ``client:*`` 调用（#100 Phase 1）。
+        On disconnect: run base name/room cleanup first, then wake every in-flight call targeting ``sid``.
+
+        **先 super() 再 fire**（关闭 TOCTOU 微窗）：``super().on_disconnect`` 内 ``_unregister_name`` 删除 name 映射后，
+        恰在「解析 SID 与登记信号之间」的并发新调用，其 TOCTOU 复查 ``get_sid_by_name`` 会读到 None 直接短路 404，
+        不会错过 fire 而退化为满 timeout 等待。信号按 sid 登记、``super()`` 不触碰信号 registry，故 fire 置于其后对
+        **已登记**信号的唤醒零损失。幂等（重复 set 是 no-op）。
+        Super-then-fire closes the TOCTOU window: after ``_unregister_name`` drops the name mapping, a concurrent
+        call registering in the window re-checks ``get_sid_by_name`` → None → short-circuits to 404 instead of
+        missing the fire. Already-registered signals still wake (super never touches the signal registry).
+        """
+        await super().on_disconnect(sid)
+        self._fire_inflight_disconnect_signals(sid)
+
+    def _fire_inflight_disconnect_signals(self, sid: SID) -> None:
+        """唤醒以 ``sid`` 为目标的全部在途断连信号（幂等）。Wake all in-flight signals targeting ``sid`` (idempotent)."""
+        for ev in list(self._inflight_disconnect_signals.get(sid, ())):
+            ev.set()
+
+    def _register_inflight_signal(self, computer_sid: SID) -> asyncio.Event:
+        """登记并返回一个针对 ``computer_sid`` 的在途断连信号。Register and return a fresh disconnect signal."""
+        ev = asyncio.Event()
+        self._inflight_disconnect_signals.setdefault(computer_sid, set()).add(ev)
+        return ev
+
+    def _discard_inflight_signal(self, computer_sid: SID, ev: asyncio.Event) -> None:
+        """注销在途信号；set 空时删除 key（防 dict 泄漏）。Unregister a signal; drop the key when the set empties."""
+        bucket = self._inflight_disconnect_signals.get(computer_sid)
+        if bucket is not None:
+            bucket.discard(ev)
+            if not bucket:
+                self._inflight_disconnect_signals.pop(computer_sid, None)
 
     async def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
@@ -275,10 +337,12 @@ class SMCPNamespace(BaseNamespace):
             data (AgentCallData): Agent调用数据 / Agent call data
         """
         session = await self.get_session(sid)
-        assert session["role"] == "agent", "目前仅支持Agent调用取消ToolCall的操作"
+        if session["role"] != "agent":
+            raise SMCPNamespaceError("目前仅支持Agent调用取消ToolCall的操作")
 
         agent_call = TypeAdapter(AgentCallData).validate_python(data)
-        assert session.get("name") == agent_call["agent"], "取消工具调用的广播仅可以由对应Agent发出"
+        if session.get("name") != agent_call["agent"]:
+            raise SMCPNamespaceError("取消工具调用的广播仅可以由对应Agent发出")
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
         office_id = session.get("office_id")
@@ -299,7 +363,8 @@ class SMCPNamespace(BaseNamespace):
             data (UpdateComputerConfigReq): 更新配置请求数据 / Update config request data
         """
         session = await self.get_session(sid)
-        assert session["role"] == "computer", "目前仅支持Computer调用更新MCP配置的操作"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer调用更新MCP配置的操作")
 
         update_config = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
 
@@ -320,7 +385,8 @@ class SMCPNamespace(BaseNamespace):
             data (UpdateComputerConfigReq): 载荷复用 UpdateConfigReq，仅需 computer 标识 / Reuse UpdateConfigReq for payload
         """
         session = await self.get_session(sid)
-        assert session["role"] == "computer", "目前仅支持Computer上报工具列表变更"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer上报工具列表变更")
 
         update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
 
@@ -331,7 +397,7 @@ class SMCPNamespace(BaseNamespace):
             skip_sid=sid,
         )
 
-    async def on_client_tool_call(self, sid: str, data: ToolCallReq) -> dict:
+    async def on_client_tool_call(self, sid: str, data: ToolCallReq) -> dict | ErrorPayload:
         """
         响应工具调用。注意因为Namespace的方法名与事件名称有耦合，因此需要保证 TOOL_CALL_EVENT 是 tool_call
         Respond to tool call. Note that due to coupling between Namespace method names and event names,
@@ -341,105 +407,249 @@ class SMCPNamespace(BaseNamespace):
         If the global variable TOOL_CALL_EVENT = "tool_call" is modified in the future,
             the method name here also needs to be modified
 
+        经 :meth:`_relay_client_call` 统一 SID 解析 + office/role 隔离 + flat ErrorPayload(404) 透传（#99：
+        目标 Computer 不存在不再 raise ValueError 致 Agent ``call`` 静默超时，与其余 ``client:*`` 事件对齐）。
+        仅 Agent 可发起工具调用，故委托前保留角色校验。
+        Routed via ``_relay_client_call`` (#99: missing Computer → flat ErrorPayload(404), not an uncaught
+        ValueError that times the Agent out). Only an Agent may invoke a tool, hence the role check before relay.
+
         Args:
             sid (str): 客户端ID，一般是AgentID / Client ID, usually AgentID
             data (ToolCallReq): 工具调用数据 / Tool call data
 
         Returns:
-            dict: 工具调用结果 / Tool call result
+            dict | ErrorPayload: 工具调用结果，或目标 Computer 不存在时的 flat ErrorPayload(404)。
+                Tool call result, or a flat ErrorPayload(404) when the target Computer is absent.
         """
         session = await self.get_session(sid)
-        assert session["role"] == "agent", "目前仅支持Agent调用工具"
+        if session["role"] != "agent":
+            raise SMCPNamespaceError("目前仅支持Agent调用工具")
 
+        # tool_call 响应是 Computer 回传的 CallToolResult 原样 dict（无固定 A2C TypedDict），ret_adapter 用
+        # TypeAdapter(dict) 原样透传；per-request timeout 透传给底层 self.call。
+        # tool_call's response is the Computer's raw CallToolResult dict, so use TypeAdapter(dict) passthrough.
         tool_call = TypeAdapter(ToolCallReq).validate_python(data)
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_name = tool_call["computer"]
-        computer_sid = await self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
         return cast(
-            dict,
-            await self.call(
-                TOOL_CALL_EVENT,
+            "dict | ErrorPayload",
+            await self._relay_client_call(
+                sid,
                 tool_call,
-                to=computer_sid,
+                TOOL_CALL_EVENT,
+                TypeAdapter(dict),
                 timeout=tool_call["timeout"],
             ),
         )
 
-    async def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet:
+    async def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet | ErrorPayload:
         """
-        获取指定Computer的工具列表
-        Get tool list of specified Computer
+        获取指定 Computer 的工具列表 / Get tool list of specified Computer（``client:get_tools``）.
+
+        经 :meth:`_relay_client_call` 统一 isolation + flat ErrorPayload 透传（v0.2.2：所有 ``client:*``
+        ack 统一 flat ErrorPayload，旧路由非豁免）。
+        Routed via ``_relay_client_call`` (unified isolation + flat ErrorPayload pass-through; v0.2.2
+        makes flat ErrorPayload uniform across all ``client:*`` acks — old routes are not exempt).
 
         Args:
-            sid (str): 发起者的ID，一般是Agent / Initiator ID, usually Agent
-            data (GetToolsReq): 其中包含computer字段，指向Computer的Name / Contains computer field pointing to Computer's Name
+            sid (str): 发起者 SID，一般是 Agent / Initiator SID, usually Agent.
+            data (GetToolsReq): 含 ``computer`` 字段，指向 Computer 的 Name / contains ``computer``.
 
         Returns:
-            GetToolsRet: Computer的工具列表 / Computer's tool list
+            GetToolsRet | ErrorPayload: 工具列表，或 Computer 回传的 flat ErrorPayload。
         """
-        computer_name = data["computer"]
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
-        computer_sid = await self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
-
-        session = await self.get_session(computer_sid)
-        assert session["role"] == "computer", "目前仅支持Computer获取工具列表"
-
-        # 验证Agent是否有权限获取该Computer的工具列表
-        # Verify if Agent has permission to get this Computer's tool list
-        agent_session = await self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-
-        assert computer_office_id == agent_office_id, "目前仅支持Agent获取自己房间内Computer的工具列表"
-
-        client_response = await self.call(
-            GET_TOOLS_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
+        return cast(
+            "GetToolsRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_TOOLS_EVENT, TypeAdapter(GetToolsRet)),
         )
 
-        return TypeAdapter(GetToolsRet).validate_python(client_response)
-
-    async def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet:
+    async def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet | ErrorPayload:
         """
-        获取指定Computer的桌面信息（窗口组织后的视图）。
-        Get desktop view from specified Computer.
+        获取指定 Computer 的桌面视图（窗口组织后）/ Get desktop view from specified Computer（``client:get_desktop``）.
 
-        要求：Agent 与 Computer 需在同一 office。
+        要求 Agent 与 Computer 同一 office；经 :meth:`_relay_client_call` 统一 isolation + flat
+        ErrorPayload 透传。
+        Requires same office; routed via ``_relay_client_call`` (unified isolation + flat ErrorPayload).
+
+        Returns:
+            GetDeskTopRet | ErrorPayload: 桌面视图，或 Computer 回传的 flat ErrorPayload。
+        """
+        return cast(
+            "GetDeskTopRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_DESKTOP_EVENT, TypeAdapter(GetDeskTopRet)),
+        )
+
+    async def _relay_client_call(
+        self,
+        sid: str,
+        data: Any,
+        event: str,
+        ret_adapter: TypeAdapter[Any],
+        timeout: float | None = None,
+    ) -> Any:
+        """通用 ``client:*`` 事件路由 / Generic ``client:*`` event router.
+
+        统一收敛 office/role 隔离校验、Computer SID 解析、flat ErrorPayload 透传，
+        让新事件 handler 缩到一行。
+        Unifies office/role isolation, Computer SID lookup, and flat-ErrorPayload pass-through,
+        so each new event handler is a one-liner.
+
+        协议依据 / Protocol: events.md 各 ``client:*`` 事件 + error-handling.md flat ErrorPayload.
+
+        Args:
+            sid: 发起者 SID（一般是 Agent）/ Initiator SID (usually Agent).
+            data: 请求负载，**MUST** 含 ``computer`` 字段 / payload MUST contain ``computer``.
+            event: 转发的 Socket.IO 事件名（``GET_*_EVENT`` 常量）/ Socket.IO event name to relay.
+            ret_adapter: 成功响应的 TypeAdapter（如 ``TypeAdapter(GetResourcesRet)``），用于强校验.
+                Pydantic TypeAdapter for the success-shape return.
+            timeout: 仅 ``tool_call`` 透传 per-request 超时给底层 ``self.call``；其余 ``client:*`` 事件留空
+                （None）→ 走 socketio 默认。Only ``tool_call`` passes a per-request timeout; others None.
+
+        Returns:
+            成功响应（按 ``ret_adapter`` 校验后的 TypedDict）或 flat ``ErrorPayload``。
+            Success TypedDict (validated) or flat ErrorPayload.
+
+        Returns 在 ``computer`` 名未找到对应 SID 时回 flat ``ErrorPayload(404)``（#92）——属路由层
+        「资源不存在」，按 error-handling.md §20（Computer 不存在）+ §78（client:* ack 协议级错误 MUST
+        为 flat ErrorPayload）经 ack 通道返回，**不**抛未捕获异常（避免 Agent ``call`` 静默超时）。
+        Returns a flat ``ErrorPayload(404)`` when the ``computer`` name has no SID (#92).
+
+        Raises:
+            SMCPNamespaceError: ``role != "computer"`` 或跨房间访问（office_id 不一致）——属 sid/session
+                隔离拒绝（安全：跨房间不泄露 Computer 存在性），刻意保留 raise 形态，见 exceptions.py.
         """
         computer_name = data["computer"]
-
-        # 通过name获取computer的sid
-        # Get computer's sid by name
         computer_sid = await self.get_sid_by_name(computer_name)
         if not computer_sid:
-            raise ValueError(f"Computer with name '{computer_name}' not found")
+            return build_computer_not_found_error(computer_name)
 
         session = await self.get_session(computer_sid)
-        assert session["role"] == "computer", "目前仅支持获取Computer桌面"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError(f"目前仅支持 Computer 响应 {event} / target SID is not a Computer")
 
         agent_session = await self.get_session(sid)
-        computer_office_id = session.get("office_id")
-        agent_office_id = agent_session.get("office_id")
-        assert computer_office_id == agent_office_id, "目前仅支持Agent获取自己房间内Computer的桌面"
+        if agent_session is None:
+            # 发起者（Agent）飞行中断连：会话已不存在。显式 raise 替代 None.get 的 AttributeError
+            # （对齐 #31 隔离不变量显式 raise）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            # Originator (Agent) disconnected in-flight: session gone. Explicit raise instead of an
+            # AttributeError on None.get (aligns with #31). Protocol allows Server MAY silently not-ack.
+            raise SMCPNamespaceError(f"发起者会话不存在（可能已断连）：{event} / originator session gone")
+        if session.get("office_id") != agent_session.get("office_id"):
+            raise SMCPNamespaceError(
+                f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
+            )
 
-        client_response = await self.call(
-            GET_DESKTOP_EVENT,
-            data,
-            to=computer_sid,
-            namespace=SMCP_NAMESPACE,
+        # tool_call 透传 per-request timeout；其余 client:* 事件 timeout=None → 用 socketio 默认
+        # （勿对默认事件传 timeout=None，socketio 下会变成永久等待而非默认 60s）。
+        # Pass tool_call's per-request timeout; other client:* events leave it None (socketio default).
+        call_kwargs: dict[str, Any] = {"to": computer_sid, "namespace": SMCP_NAMESPACE}
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
+
+        # 在途断连守卫（#100 Phase 1）：把 ``self.call`` 与「目标 Computer 断连信号」竞速。socketio ``call`` 的
+        # 等待原语不监听连接掉线，目标在途断连会静默等到满 timeout；竞速让 ``on_disconnect`` 触发的信号先到时
+        # 立刻放弃等待、回 flat ErrorPayload(404)（语义：Computer 中途消失 == 不存在，与 #92/#99 同一 payload）。
+        # In-flight disconnect guard (#100): race ``self.call`` against the target's disconnect signal.
+        disconnect_ev = self._register_inflight_signal(computer_sid)
+        try:
+            # TOCTOU 复查：解析 SID 与登记信号之间目标可能已断连——此时信号永不会被 fire。用 ``get_sid_by_name``
+            # 复查（``on_disconnect`` → base ``_unregister_name`` 会清掉 name 映射）关闭该窗口。
+            # TOCTOU re-check: target may have died between SID resolve and registration → short-circuit to 404.
+            if disconnect_ev.is_set() or await self.get_sid_by_name(computer_name) is None:
+                return build_computer_not_found_error(computer_name)
+
+            call_task = asyncio.ensure_future(self.call(event, data, **call_kwargs))
+            wait_task = asyncio.ensure_future(disconnect_ev.wait())
+            try:
+                done, _pending = await asyncio.wait({call_task, wait_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not wait_task.done():
+                    wait_task.cancel()
+                    # await 被取消的 waiter，避免罕见 GC 时序下的 "Task was destroyed but it is pending" 噪声告警。
+                    # Await the cancelled waiter to avoid a "Task was destroyed but it is pending" warning.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await wait_task
+            if call_task in done:
+                # 目标在线：取回结果（真超时则原样抛 socketio TimeoutError，**绝不**转 404，守住语义区分）。
+                # Target responded: return its result (a genuine TimeoutError propagates as-is, never 404).
+                client_response = call_task.result()
+            else:
+                # 断连先到：放弃 ``self.call``（ack 回调随 manager.disconnect 清理，目标已断无副作用）。
+                # Disconnect won: abandon the call; only cancel here (not on the timeout path).
+                call_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await call_task
+                return build_computer_not_found_error(computer_name)
+        finally:
+            self._discard_inflight_signal(computer_sid, disconnect_ev)
+
+        # flat ErrorPayload 透传（无嵌套 envelope，禁止二次 unwrap；判定与 agent 侧统一）/
+        # Pass flat ErrorPayload through (no nested envelope; predicate shared with agent side)
+        if is_protocol_error_payload(client_response):
+            return TypeAdapter(ErrorPayload).validate_python(client_response)
+        return ret_adapter.validate_python(client_response)
+
+    async def on_client_get_config(self, sid: str, data: GetComputerConfigReq) -> GetComputerConfigRet | ErrorPayload:
+        """透明转发 ``client:get_config`` 至目标 Computer，返回其 MCP 配置（占位符原样 + inputs 定义）。
+        Relay ``client:get_config`` to the target Computer, returning its MCP config.
+
+        返回协议已定义的 ``GetComputerConfigRet``（``servers`` 配置为占位符原样，解析后密钥不外传——
+        见 security.md §零凭证传播）；经 :meth:`_relay_client_call` 统一 isolation + flat ErrorPayload 透传。
+        Returns the protocol-defined ``GetComputerConfigRet`` (server configs in placeholder form;
+        resolved secrets never leave the Computer); routed via ``_relay_client_call``.
+
+        协议依据 / Protocol: events.md §client:get_config；data-structures.md §GetComputerConfigRet.
+        """
+        return cast(
+            "GetComputerConfigRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_CONFIG_EVENT, TypeAdapter(GetComputerConfigRet)),
         )
-        return TypeAdapter(GetDeskTopRet).validate_python(client_response)
+
+    async def on_client_get_resources(self, sid: str, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
+        """
+        透明转发 ``client:get_resources`` 至目标 Computer（含 cursor 翻页）。
+        Relay ``client:get_resources`` to the target Computer (with cursor pagination).
+
+        Computer 返回的 flat ErrorPayload（4014 / 4015）原样回传，不做 GetResourcesRet 强转。
+        Flat ErrorPayload (4014 / 4015) from the Computer is passed through verbatim.
+        """
+        return cast(
+            "GetResourcesRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_RESOURCES_EVENT, TypeAdapter(GetResourcesRet)),
+        )
+
+    async def on_client_get_skills(self, sid: str, data: GetSkillsReq) -> GetSkillsRet | ErrorPayload:
+        """透明转发 ``client:get_skills`` 至目标 Computer / Relay ``client:get_skills``.
+
+        协议依据 / Protocol: events.md §client:get_skills；data-structures.md §GetSkillsRet（轻量元数据）.
+        """
+        return cast(
+            "GetSkillsRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_SKILLS_EVENT, TypeAdapter(GetSkillsRet)),
+        )
+
+    async def on_client_get_skill(self, sid: str, data: GetSkillReq) -> GetSkillRet | ErrorPayload:
+        """透明转发 ``client:get_skill`` 至目标 Computer / Relay ``client:get_skill``.
+
+        协议依据 / Protocol: events.md §client:get_skill；error-handling.md §4016 / §4017（``details.reason`` 透传）.
+        """
+        return cast(
+            "GetSkillRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_SKILL_EVENT, TypeAdapter(GetSkillRet)),
+        )
+
+    async def on_client_get_blob(self, sid: str, data: GetBlobReq) -> GetBlobRet | ErrorPayload:
+        """透明转发 ``client:get_blob`` 至目标 Computer / Relay ``client:get_blob``.
+
+        Server **不**重组 blob，按 ``computer`` 逐 ack 透传；并行红利（协议 §3）由 Agent 侧 drain 例程
+        通过对不同 ``chunk_offset`` 并发调用实现。
+        Server does NOT reassemble; each ``chunk_offset`` is a separate ack. Parallel dividend
+        (protocol §3) is realized by the Agent's drain routine issuing concurrent calls per offset.
+
+        协议依据 / Protocol: events.md §client:get_blob；blob-transfer.md §3 (parallel) / §5.4 (handle untrusted).
+        """
+        return cast(
+            "GetBlobRet | ErrorPayload",
+            await self._relay_client_call(sid, data, GET_BLOB_EVENT, TypeAdapter(GetBlobRet)),
+        )
 
     async def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq) -> None:
         """
@@ -451,11 +661,38 @@ class SMCPNamespace(BaseNamespace):
             data (UpdateComputerConfigReq): 载荷复用 UpdateConfigReq，仅需 computer 标识
         """
         session = await self.get_session(sid)
-        assert session["role"] == "computer", "目前仅支持Computer上报桌面刷新"
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持Computer上报桌面刷新")
 
         update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
         await self.emit(
             UPDATE_DESKTOP_NOTIFICATION,
+            {"computer": update_req["computer"]},
+            room=session.get("office_id"),
+            skip_sid=sid,
+        )
+
+    async def on_server_update_skills(self, sid: str, data: UpdateComputerConfigReq) -> None:
+        """将 ``server:update_skills`` 广播为 ``notify:update_skills`` / Broadcast SKILL set change.
+
+        Computer 在 SKILL 集合变化（增/删/物化更新）时触发；Server 转广播给同 office 内的 Agent，
+        Agent 据此自动重拉 ``client:get_skills``（仿既有 ``notify:update_*`` 自动刷新模式）。
+        Computer emits on SKILL set change; Server broadcasts to office; Agent auto re-fetches
+        ``client:get_skills`` (same pattern as other ``notify:update_*`` events).
+
+        载荷复用 ``UpdateComputerConfigReq``（仅 ``computer`` 字段，data-structures.md §UpdateComputerConfigReq
+        三事件族共用）。
+        Payload reuses ``UpdateComputerConfigReq`` (data-structures.md shared across 3 event families).
+
+        协议依据 / Protocol: events.md §server:update_skills / §notify:update_skills.
+        """
+        session = await self.get_session(sid)
+        if session["role"] != "computer":
+            raise SMCPNamespaceError("目前仅支持 Computer 上报 SKILL 变更 / only Computers may emit update_skills")
+
+        update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
+        await self.emit(
+            UPDATE_SKILLS_NOTIFICATION,
             {"computer": update_req["computer"]},
             room=session.get("office_id"),
             skip_sid=sid,
@@ -480,9 +717,14 @@ class SMCPNamespace(BaseNamespace):
 
         # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission: ensure Agent is in the requested room
         agent_session = await self.get_session(sid)
+        if agent_session is None:
+            # 发起者飞行中断连防御（同 _relay_client_call）：显式 raise 替代 None.get 的 AttributeError。
+            # In-flight disconnect guard (same as _relay_client_call): explicit raise over AttributeError.
+            raise SMCPNamespaceError("发起者会话不存在（可能已断连）：server:list_room / originator session gone")
         agent_office_id = agent_session.get("office_id")
 
-        assert agent_office_id == office_id, f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}"
+        if agent_office_id != office_id:
+            raise SMCPNamespaceError(f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}")
 
         # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
         all_sessions = await aget_all_sessions_in_office(office_id, self.server)
@@ -497,6 +739,9 @@ class SMCPNamespace(BaseNamespace):
                     "role": session["role"],
                     "office_id": session.get("office_id", ""),
                 }
+                # a2c_version 为 NotRequired：仅在握手时记录到则带出 / NotRequired: include only if recorded at handshake
+                if session.get("a2c_version"):
+                    session_info["a2c_version"] = session["a2c_version"]
                 sessions.append(session_info)
 
         return ListRoomRet(sessions=sessions, req_id=req_id)

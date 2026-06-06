@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -33,7 +35,7 @@ def no_patch_stdout():
 
 
 @pytest.mark.asyncio
-async def test_cli_with_real_stdio(stdio_params: StdioServerParameters) -> None:
+async def test_cli_with_real_stdio(stdio_params: StdioServerParameters, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     集成测试：通过 CLI 交互完成以下流程（使用真实 stdio MCP server 参数）：
     1) 添加 server 配置（disabled=false）
@@ -62,8 +64,8 @@ async def test_cli_with_real_stdio(stdio_params: StdioServerParameters) -> None:
     ]
 
     # Patch interactive IO
-    cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
-    cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
@@ -87,7 +89,7 @@ async def test_cli_socket_connect_guided_inputs_without_real_network(monkeypatch
     集成层面验证 CLI 的交互式引导输入 URL/Auth/Headers 的行为，但不依赖真实网络。
     """
     # Patch client to fake
-    cli_main.SMCPComputerClient = FakeSMCPClient  # type: ignore
+    monkeypatch.setattr(cli_main, "SMCPComputerClient", FakeSMCPClient)
 
     commands = [
         "socket connect",
@@ -98,8 +100,8 @@ async def test_cli_socket_connect_guided_inputs_without_real_network(monkeypatch
     ]
 
     # Patch interactive IO
-    cli_main.PromptSession = lambda: FakePromptSession(commands)  # type: ignore
-    cli_main.patch_stdout = lambda raw: no_patch_stdout()  # type: ignore
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     comp = Computer(name="test", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)
@@ -123,7 +125,9 @@ class _DummyInteractive:
     last_comp: Any | None = None
 
     @classmethod
-    async def coro(cls, comp: Any, init_client: Any | None = None) -> None:  # noqa: ARG003
+    async def coro(cls, comp: Any, init_client: Any | None = None, **kwargs: Any) -> None:  # noqa: ARG003
+        # **kwargs 吸收 CLI 演进新增的关键字参数（如 #69 的 approve_all_mcp）；本替身仅捕获调用，不断言其值。
+        # **kwargs absorbs CLI-evolving keyword args (e.g. #69's approve_all_mcp); this double only captures the call.
         cls.called = True
         cls.last_comp = comp
 
@@ -140,6 +144,7 @@ class _FakeComputer:
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
+        registered_workdirs: Any | None = None,  # #69/S16：CLI --add-dir → registered_workdirs，替身需接受
     ) -> None:
         self.init_args = {
             "name": name,
@@ -149,6 +154,7 @@ class _FakeComputer:
             "auto_reconnect": auto_reconnect,
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
+            "registered_workdirs": registered_workdirs,
         }
 
     async def __aenter__(self) -> _FakeComputer:
@@ -210,3 +216,100 @@ def test_cli_run_with_computer_factory_fallback(monkeypatch: pytest.MonkeyPatch)
     assert isinstance(_DummyInteractive.last_comp, _FakeComputer)
     assert _DummyInteractive.last_comp.init_args["auto_connect"] is True
     assert _DummyInteractive.last_comp.init_args["auto_reconnect"] is True
+
+
+# ------------------------------
+# #97：根选项 --settings / --add-dir 透传到 settings 子命令
+# Root options --settings / --add-dir must reach the `settings` subcommands
+# ------------------------------
+# 接线层回归：Typer 包装器 _settings_show/_get/_set 此前调 handler 时未传 flag_path /
+# active_workdir，导致 `settings show --scope flag` 恒返回 {}（merged 视图也丢 flag 字段），
+# 且 `settings set --scope project` 因缺 active_workdir 误报。以下 spy 测试确定性验证「根上
+# 下文是否抵达 handler」，绕开 logging 写 stdout 的输出污染。/ Wiring regression for #97.
+
+
+def _spy_handler(recorded: dict[str, Any]) -> Callable[..., int]:
+    """返回一个记录入参 kwargs 的 handler 替身（返回退出码 0）/ A spy recording call kwargs."""
+
+    def _spy(*_args: Any, **kwargs: Any) -> int:
+        recorded.update(kwargs)
+        return 0
+
+    return _spy
+
+
+def test_root_settings_flag_propagates_to_settings_show(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--settings <f> settings show --scope flag` 应把 flag_path 透传给 settings_show。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    flag_file.write_text(json.dumps({"testFlag": True, "flagKey": "flagValue"}), encoding="utf-8")
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_show", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(cli_main.app, ["--settings", str(flag_file), "settings", "show", "--scope", "flag", "--json"])  # noqa: S603
+
+    assert result.exit_code == 0
+    assert recorded.get("flag_path") == flag_file  # 修前为 None（未透传）→ 红
+
+
+def test_root_settings_flag_propagates_to_settings_get(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--settings <f> settings get <k> --scope flag` 应把 flag_path 透传给 settings_get。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    flag_file.write_text(json.dumps({"flagKey": "flagValue"}), encoding="utf-8")
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_get", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(cli_main.app, ["--settings", str(flag_file), "settings", "get", "flagKey", "--scope", "flag"])  # noqa: S603
+
+    assert result.exit_code == 0
+    assert recorded.get("flag_path") == flag_file
+
+
+def test_root_settings_flag_propagates_to_merged_show(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merged 视图（默认 scope）同样需要 flag_path 才能合入 flag 层字段。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    flag_file.write_text(json.dumps({"testFlag": True}), encoding="utf-8")
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_show", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(cli_main.app, ["--settings", str(flag_file), "settings", "show", "--json"])  # noqa: S603
+
+    assert result.exit_code == 0
+    assert recorded.get("flag_path") == flag_file
+
+
+def test_root_add_dir_propagates_active_workdir_to_settings_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--add-dir <d> settings set <k> <v> --scope project` 应把 active_workdir 透传给 settings_set。"""
+    runner = CliRunner()
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(cli_main.settings_cmd, "settings_set", _spy_handler(recorded), raising=True)
+
+    result = runner.invoke(  # noqa: S603
+        cli_main.app, ["--add-dir", str(wd), "settings", "set", "k", "v", "--scope", "project"],
+    )
+
+    assert result.exit_code == 0
+    assert recorded.get("active_workdir") == wd.resolve()  # 修前为 None（未透传）→ 红
+
+
+def test_root_settings_flag_scope_real_output(tmp_path: Path) -> None:
+    """端到端复现 G-08：`--settings <f> settings show --scope flag --json` 应输出 flag 文件内容（非 {}）。"""
+    runner = CliRunner()
+    flag_file = tmp_path / "flag.json"
+    payload = {"testFlag": True, "flagKey": "flagValue"}
+    flag_file.write_text(json.dumps(payload), encoding="utf-8")
+    # 隔离 SKILL Home / XDG，避免触碰真实用户目录 / isolate home to avoid touching real user dirs
+    env = {**os.environ, "A2C_SKILL_HOME": str(tmp_path / "skill"), "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+    result = runner.invoke(  # noqa: S603
+        cli_main.app, ["--settings", str(flag_file), "settings", "show", "--scope", "flag", "--json"], env=env,
+    )
+
+    assert result.exit_code == 0
+    out = result.stdout
+    parsed = json.loads(out[out.index("{"):])  # 跳过可能的日志行（无花括号）→ 取尾部 JSON
+    assert parsed == payload  # 修前为 {} → 红

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Protocol, TypeAlias
 from mcp.types import CallToolResult
 from typing_extensions import TypedDict
 
-from a2c_smcp.smcp import EnterOfficeNotification, LeaveOfficeNotification, SMCPTool, UpdateMCPConfigNotification
+from a2c_smcp.smcp import A2CSkillRef, EnterOfficeNotification, LeaveOfficeNotification, SMCPTool, UpdateMCPConfigNotification
 
 # 为避免运行时循环依赖，仅在类型检查时导入具体Client类型
 # To avoid runtime circular imports, import concrete Client types only during type checking
@@ -103,6 +103,26 @@ class AgentEventHandler(Protocol):
         """
         ...
 
+    def on_skills_received(self, computer: str, skills: list[A2CSkillRef], client: SMCPAgentClient) -> None:
+        """
+        接收到 SKILL 清单时的处理逻辑（v0.2.1+）
+        Handling logic when SKILL inventory is received (v0.2.1+)
+
+        触发时机 / Trigger:
+            - notify:update_skills 自动重拉 client:get_skills 成功后
+            - After auto-refresh of ``client:get_skills`` triggered by ``notify:update_skills``
+
+        向后兼容 / Backward compatibility:
+            - 旧 EventHandler 未实现此方法时，SDK 通过 hasattr 守卫静默跳过
+            - Legacy handlers missing this method are silently skipped via hasattr guard
+
+        Args:
+            computer: 计算机ID / Computer ID
+            skills: SKILL 引用列表（轻量元数据，无 SKILL.md body） / Skill refs (lightweight, no body)
+            client: 调用发生时的Socket.IO Client / Socket.IO Client where make the call
+        """
+        ...
+
 
 class AsyncAgentEventHandler(Protocol):
     """
@@ -151,6 +171,26 @@ class AsyncAgentEventHandler(Protocol):
         Args:
             computer: 计算机ID / Computer ID
             tools: 工具列表 / Tools list
+            client: 调用发生时的Socket.IO Client / Socket.IO Client where make the call
+        """
+        ...
+
+    async def on_skills_received(self, computer: str, skills: list[A2CSkillRef], client: AsyncSMCPAgentClient) -> None:
+        """
+        接收到 SKILL 清单时的异步处理逻辑（v0.2.1+）
+        Async handling logic when SKILL inventory is received (v0.2.1+)
+
+        触发时机 / Trigger:
+            - notify:update_skills 自动重拉 client:get_skills 成功后
+            - After auto-refresh of ``client:get_skills`` triggered by ``notify:update_skills``
+
+        向后兼容 / Backward compatibility:
+            - 旧 EventHandler 未实现此方法时，SDK 通过 hasattr 守卫静默跳过
+            - Legacy handlers missing this method are silently skipped via hasattr guard
+
+        Args:
+            computer: 计算机ID / Computer ID
+            skills: SKILL 引用列表（轻量元数据，无 SKILL.md body） / Skill refs (lightweight, no body)
             client: 调用发生时的Socket.IO Client / Socket.IO Client where make the call
         """
         ...

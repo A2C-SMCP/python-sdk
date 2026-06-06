@@ -27,7 +27,9 @@ import socketio
 from socketio import Namespace, Server, WSGIApp
 from werkzeug.serving import make_server
 
+from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.server import SyncSMCPNamespace
+from a2c_smcp.server.middleware import A2CProtocolVersionASGIMiddleware, A2CProtocolVersionWSGIMiddleware
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 
 # ============================================================================
@@ -49,8 +51,16 @@ class LocalSyncSMCPNamespace(SyncSMCPNamespace):
         super().__init__(auth_provider=_PassSyncAuth())
 
 
-def create_local_sync_server() -> tuple[Server, Namespace, WSGIApp]:
-    """中文: 创建同步 Socket.IO Server 并注册本地命名空间 / English: Create sync Socket.IO Server with local namespace"""
+def create_local_sync_server() -> tuple[Server, Namespace, A2CProtocolVersionWSGIMiddleware]:
+    """中文: 创建同步 Socket.IO Server 并注册本地命名空间 / English: Create sync Socket.IO Server with local namespace
+
+    中文: 返回的 app 包裹 ``A2CProtocolVersionWSGIMiddleware``，与生产部署等价——在 HTTP 传输层
+        校验 ``a2c_version`` query，不兼容客户端被拒（HTTP 400 + 4008）。否则 UAT F-05（版本不兼容
+        拒绝）会被静默跳过（#93）。SDK 客户端经 build_handshake_url 自动携带兼容版本，故正常连接不受影响。
+    English: The returned app wraps ``A2CProtocolVersionWSGIMiddleware`` (production-equivalent),
+        validating ``a2c_version`` at the HTTP transport layer; incompatible clients get HTTP 400 +
+        4008. Without it the protocol version gate is skipped and UAT F-05 silently passes (#93).
+    """
     sio = Server(
         cors_allowed_origins="*",
         ping_timeout=5,  # 中文: 测试环境使用较短超时 / English: Use shorter timeout for testing
@@ -60,7 +70,8 @@ def create_local_sync_server() -> tuple[Server, Namespace, WSGIApp]:
     )
     ns = LocalSyncSMCPNamespace()
     sio.register_namespace(ns)
-    app = WSGIApp(sio, socketio_path="/socket.io")
+    wsgi_app = WSGIApp(sio, socketio_path="/socket.io")
+    app = A2CProtocolVersionWSGIMiddleware(wsgi_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
     return sio, ns, app
 
 
@@ -206,8 +217,11 @@ def mcp_server_config_path(tmp_path: Path) -> Path:
 
 def create_local_async_server() -> tuple[socketio.AsyncServer, socketio.AsyncNamespace, Any]:
     """
-    中文: 创建本地异步 SMCP 服务器，用于测试。
-    English: Create local async SMCP server for testing.
+    中文: 创建本地异步 SMCP 服务器，用于测试。返回的 app 包裹 ``A2CProtocolVersionASGIMiddleware``，
+        与生产等价——HTTP/WebSocket 传输层校验 ``a2c_version``，不兼容客户端被拒（#93）。
+    English: Create local async SMCP server for testing. The returned app wraps
+        ``A2CProtocolVersionASGIMiddleware`` (production-equivalent), validating ``a2c_version`` at the
+        transport layer so incompatible clients are rejected (#93).
     """
     from a2c_smcp.server import SMCPNamespace
     from a2c_smcp.server.auth import AuthenticationProvider
@@ -236,7 +250,8 @@ def create_local_async_server() -> tuple[socketio.AsyncServer, socketio.AsyncNam
     sio.eio.start_service_task = False
     ns = LocalAsyncSMCPNamespace()
     sio.register_namespace(ns)
-    app = socketio.ASGIApp(sio, socketio_path="/socket.io")
+    asgi_app = socketio.ASGIApp(sio, socketio_path="/socket.io")
+    app = A2CProtocolVersionASGIMiddleware(asgi_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
     return sio, ns, app
 
 

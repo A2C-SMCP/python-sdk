@@ -71,7 +71,10 @@ class _DictResolver:
     def __init__(self, mapping: dict[str, object]):
         self._m = mapping
 
-    async def aresolve_by_id(self, input_id: str, *, session: PromptSession | None = None):  # noqa: D401
+    async def aresolve_by_id(self, input_id: str, *, session: PromptSession | None = None, **kwargs: object):  # noqa: D401
+        # **kwargs 吸收 #69 Group A 新增的 plugin/marketplace 上下文（本替身按裸 id 映射，忽略上下文）。
+        # 缺它 → TypeError → 渲染失败被「保留原配置」策略吞掉 → 未渲染的 ${input:cmd} 当命令起 stdio → mcp 客户端无超时死等。
+        # **kwargs absorbs #69's plugin/marketplace context; without it a swallowed TypeError left ${input:} unrendered → hang.
         return self._m[input_id]
 
     def clear_cache(self, key: str | None = None):  # noqa: D401

@@ -4,6 +4,7 @@
 # @Author  : JQQ
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -308,6 +309,127 @@ async def test_aexecute_tool_no_confirm_callback(monkeypatch):
     assert "没有实现二次确认回调方法" in result.content[0].text
 
 
+# -------------------- #96 工具调用取消（notify:tool_call_cancel）单元测试 --------------------
+# #96 tool_call cancellation unit tests: Computer-side cancellable execution + acancel_tool
+
+
+async def _aexecute_until_inflight(computer: Computer, req_id: str, coro_factory) -> asyncio.Task:
+    """启动一个 aexecute_tool 任务并等其进入在途注册表 / start aexecute_tool & wait until tracked."""
+    task: asyncio.Task = asyncio.ensure_future(coro_factory())
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if req_id in computer._inflight_tool_tasks:
+            break
+    return task
+
+
+def _slow_manager(monkeypatch, ran: dict, *, delay: float = 5.0, result=None):
+    """构造一个 acall_tool 会阻塞 delay 秒的 mock manager（用于验证中断）。"""
+
+    async def slow_call(*_a, **_k):
+        await asyncio.sleep(delay)
+        ran["completed"] = True
+        return result if result is not None else MagicMock(isError=False)
+
+    mock_manager = MagicMock(spec=MCPServerManager)
+    mock_manager.avalidate_tool_call = AsyncMock(return_value=("server", "tool"))
+    mock_manager.get_tool_meta = MagicMock(return_value=ToolMeta(auto_apply=True))
+    mock_manager.acall_tool = AsyncMock(side_effect=slow_call)
+    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
+    return mock_manager
+
+
+@pytest.mark.asyncio
+async def test_aexecute_tool_cancelled_returns_error_result(monkeypatch):
+    """#96：在途工具被 acancel_tool 中断 → 返回取消态 CallToolResult，慢体未跑完，注册表已清。
+
+    #96: an in-flight tool call cancelled via acancel_tool returns a cancelled CallToolResult,
+    the slow body is interrupted (never completes), and the registry is cleaned up.
+    """
+    ran = {"completed": False}
+    _slow_manager(monkeypatch, ran, delay=5.0)
+    computer = Computer(name="test")
+    await computer.boot_up()
+
+    task = await _aexecute_until_inflight(computer, "req-cancel", lambda: computer.aexecute_tool("req-cancel", "tool", {"a": 1}))
+    assert "req-cancel" in computer._inflight_tool_tasks
+
+    assert await computer.acancel_tool("req-cancel") is True
+    result = await task
+    assert result.isError is True
+    assert ("取消" in result.content[0].text) or ("cancel" in result.content[0].text.lower())
+    assert ran["completed"] is False  # 慢体被中断未跑完 / interrupted before completion
+    assert "req-cancel" not in computer._inflight_tool_tasks  # 注册表已清 / registry cleaned
+    # 历史须把「被取消」与其它失败区分（fix-review 🟡1）/ history distinguishes cancelled from other failures
+    assert computer._tool_call_history[-1]["success"] is False
+    assert computer._tool_call_history[-1]["error"] == "cancelled"
+    assert "req-cancel" not in computer._cancelled_req_ids  # 取消标记已清 / cancel marker cleared
+
+
+@pytest.mark.asyncio
+async def test_acancel_tool_unknown_req_id_noop(monkeypatch):
+    """#96：取消未知/已完成 req_id → 幂等 no-op，返回 False，不抛异常。"""
+    mock_manager = MagicMock(spec=MCPServerManager)
+    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
+    computer = Computer(name="test")
+    await computer.boot_up()
+    assert await computer.acancel_tool("does-not-exist") is False
+
+
+@pytest.mark.asyncio
+async def test_aexecute_tool_outer_cancel_reraises(monkeypatch):
+    """#96：外层协程自身被取消（非 acancel_tool）→ 向上传播 CancelledError，inner 不泄漏。
+
+    区别于显式工具取消：连接断开/teardown 取消外层 aexecute_tool 任务时必须传播，
+    不得伪装成取消态结果。
+    """
+    ran = {"completed": False}
+    _slow_manager(monkeypatch, ran, delay=5.0)
+    computer = Computer(name="test")
+    await computer.boot_up()
+
+    task = await _aexecute_until_inflight(computer, "req-outer", lambda: computer.aexecute_tool("req-outer", "tool", {}))
+    inner = computer._inflight_tool_tasks["req-outer"]
+    task.cancel()  # 外层取消，未走 acancel_tool / outer cancel, NOT via acancel_tool
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # inner 已退场（无泄漏）+ 注册表已清
+    await asyncio.sleep(0.01)
+    assert inner.cancelled() or inner.done()
+    assert "req-outer" not in computer._inflight_tool_tasks
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cancel_isolation(monkeypatch):
+    """#96：两在途调用并发，取消其一，另一正常返回，互不影响。"""
+    done_result = MagicMock(isError=False)
+
+    async def call(*_a, **_k):
+        await asyncio.sleep(0.3)
+        return done_result
+
+    mock_manager = MagicMock(spec=MCPServerManager)
+    mock_manager.avalidate_tool_call = AsyncMock(return_value=("server", "tool"))
+    mock_manager.get_tool_meta = MagicMock(return_value=ToolMeta(auto_apply=True))
+    mock_manager.acall_tool = AsyncMock(side_effect=call)
+    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
+    computer = Computer(name="test")
+    await computer.boot_up()
+
+    t1 = asyncio.ensure_future(computer.aexecute_tool("req-1", "tool", {}))
+    t2 = asyncio.ensure_future(computer.aexecute_tool("req-2", "tool", {}))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if {"req-1", "req-2"} <= set(computer._inflight_tool_tasks):
+            break
+
+    assert await computer.acancel_tool("req-1") is True
+    r1 = await t1
+    r2 = await t2
+    assert r1.isError is True  # req-1 被取消 / cancelled
+    assert r2 is done_result  # req-2 正常完成 / completed normally
+
+
 # -------------------- 以下为动态管理相关的单元测试（合并自 test_computer_manage.py） --------------------
 
 
@@ -319,7 +441,10 @@ class DummyResolver(InputResolver):
     def clear_cache(self, key: str | None = None) -> None:  # pragma: no cover - only used in update_inputs case
         self.cleared = True
 
-    async def aresolve_by_id(self, input_id: str, *, session: PromptSession | None = None):
+    async def aresolve_by_id(
+        self, input_id: str, *, session: PromptSession | None = None, plugin: str | None = None, marketplace: str | None = None,
+    ):
+        # 接受 #69 Group A 的 plugin/marketplace 上下文 kwargs（默认 None；本 stub 仅按裸 id 查表）。
         return self.mapping[input_id]
 
 

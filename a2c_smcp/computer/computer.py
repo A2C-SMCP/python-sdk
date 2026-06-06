@@ -26,32 +26,69 @@ All classes and methods use Google style docstrings (bilingual: Chinese and Engl
 """
 
 import asyncio
+import contextlib
 import json
+import os
 import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
 from mcp.shared.session import RequestResponder
-from mcp.types import CallToolResult, ResourceListChangedNotification, ResourceUpdatedNotification, TextContent, ToolListChangedNotification
+from mcp.types import (
+    CallToolResult,
+    Resource,
+    ResourceListChangedNotification,
+    ResourceUpdatedNotification,
+    TextContent,
+    ToolListChangedNotification,
+)
 from prompt_toolkit import PromptSession
 from pydantic import BaseModel, TypeAdapter
 
 from a2c_smcp.computer.base import BaseComputer
+from a2c_smcp.computer.blob import (
+    BlobResolver,
+    BlobThresholds,
+    BlobTooLargeError,
+    SkillBlobResolver,
+    ToolspoolBlobResolver,
+    ToolspoolBlobStore,
+    default_thresholds,
+)
 from a2c_smcp.computer.desktop.organize import organize_desktop
-from a2c_smcp.computer.inputs.render import ConfigRender
+from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
+from a2c_smcp.computer.skills import (
+    SOURCE_USER,
+    SkillEventDebouncer,
+    SkillFileWatcher,
+    SkillRegistry,
+    SkillResourceView,
+    ensure_skill_home,
+    resolve_skill_view,
+    stage_mcp_skills,
+    stage_user_skills,
+    user_dropin_root,
+    workdir_skill_root,
+)
 from a2c_smcp.computer.types import ToolCallRecord
-from a2c_smcp.smcp import Desktop, SMCPTool
+from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
+from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.logger import get_logger, truncate
 from a2c_smcp.utils.window_uri import is_window_uri
 
 logger = get_logger("computer")
+
+# v0.2.1 SKILL 资源 URI scheme 前缀（与 manager.list_skill_resources 过滤一致）
+# v0.2.1 SKILL resource URI scheme prefix (consistent with manager.list_skill_resources filter)
+_SKILL_URI_PREFIX = "skill://"
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
@@ -68,6 +105,11 @@ class Computer(BaseComputer[PromptSession]):
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: InputResolver | None = None,
+        blob_cache_root: Path | None = None,
+        blob_resolvers: dict[str, BlobResolver] | None = None,
+        blob_thresholds: BlobThresholds | None = None,
+        skill_home: Path | None = None,
+        registered_workdirs: Sequence[Path] | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -86,6 +128,24 @@ class Computer(BaseComputer[PromptSession]):
             auto_connect (bool): 是否自动连接。Whether to auto connect.
             auto_reconnect (bool): 是否自动重连。Whether to auto reconnect.
             confirm_callback (Callable[[str, str, str, dict], bool] | None): 工具调用二次确认回调
+            blob_cache_root (Path | None): v0.2.1 通用二进制传输缓存根。默认 ``~/.a2c``；
+                ``.blobspool/`` 子目录将挂在其下。v0.2.1 milestone 内 #39 接管 SKILL Home 后会
+                统一为 SKILL Home 同级。Generic blob-transfer cache root; ``.blobspool/`` lives
+                here. To be replaced by SKILL Home sibling once #39 lands.
+            blob_resolvers (dict[str, BlobResolver] | None): kind → resolver 映射覆盖；缺省装配
+                ``toolspool`` (完整) 与 ``skill`` (#39 占位)。Kind → resolver override; defaults
+                wire ``toolspool`` (complete) and ``skill`` (#39 placeholder).
+            blob_thresholds (BlobThresholds | None): SKILL / blob 阈值（inline / too_large / chunk_max）；
+                缺省经环境变量覆盖。Threshold bundle; defaults honor env overrides.
+            skill_home (Path | None): v0.2.1 SKILL Home 根覆盖（测试 / 部署注入）。缺省走
+                ``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills`` 解析链。
+                mcp 源 ``skill://`` 物化落盘于 ``<home>/mcp/<server>/<skill>/``。
+                SKILL Home root override (test/deploy injection); defaults to the env resolution chain.
+            registered_workdirs (Sequence[Path] | None): v0.2.1 已登记工作目录（能力发现层，#60/#67）。
+                user 源 DropIn 跨 ``<home>/user/`` + 各 ``<workdir>/.tfrobot/skills/`` 全局并集就地发现，
+                并被文件 watcher 递归监控；**登记持久化由 CLI 工单维护，本类仅按注入参数消费**（默认空）。
+                Registered workdirs (capability layer): user-source DropIn discovery + file watcher span
+                these in place; persistence of the registration is owned by the CLI, consumed here as-is.
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
@@ -106,9 +166,53 @@ class Computer(BaseComputer[PromptSession]):
         # English: Tool call history (keep last 10). Protected by asyncio.Lock for cross-coroutine safety
         self._tool_call_history: deque = deque(maxlen=10)
         self._tool_call_history_lock = asyncio.Lock()
+        # 中文: 在途工具调用注册表（req_id → 承载 acall_tool 的可取消任务），用于响应 notify:tool_call_cancel（#96）。
+        #   _cancelled_req_ids 标记「经 acancel_tool 显式取消」的 req_id，与外层协程自身被取消（连接断开/teardown）区分。
+        #   Computer 仅单事件循环，容器读写均在 loop 内协程中发生，无需额外锁。
+        # English: In-flight tool-call registry (req_id → cancellable task wrapping acall_tool) for notify:tool_call_cancel (#96).
+        #   _cancelled_req_ids marks req_ids explicitly cancelled via acancel_tool, to distinguish from an outer-coroutine
+        #   cancellation (connection drop/teardown). Single asyncio loop → no extra lock needed.
+        self._inflight_tool_tasks: dict[str, asyncio.Task] = {}
+        self._cancelled_req_ids: set[str] = set()
         # 窗口缓存（仅记录满足 WindowURI 的资源 URI，避免无关资源导致刷新）
         # Windows cache (only URIs that conform to WindowURI to avoid irrelevant refresh triggers)
         self._windows_cache: set[str] = set()
+
+        # v0.2.1 SKILL 子系统 / v0.2.1 SKILL subsystem（设计 §5.1，#66）
+        # 持有 name → A2CSkillRef 物化索引；SKILL Home 于 boot_up 解析落盘；skill:// 缓存仿窗口缓存。
+        # Hold the materialized Registry; SKILL Home resolved at boot_up; skill:// cache mirrors windows cache.
+        self._skill_registry: SkillRegistry = SkillRegistry()
+        self._skill_home_override: Path | None = skill_home
+        self._skill_home: Path | None = None
+        self._skills_cache: set[str] = set()
+
+        # v0.2.1 事件触发链（S14，#67，设计 §8）：多源 SKILL 变更 → 去抖器标脏 → 缓存失效 + 单次 emit。
+        # user 源 DropIn 文件 watcher 递归监控 user/ + 各登记 workdir/.tfrobot/skills/，SKILL.md 变更经去抖器汇聚。
+        # The debouncer coalesces multi-source SKILL changes into a single emit; the file watcher feeds user-source changes.
+        self._registered_workdirs: tuple[Path, ...] = tuple(registered_workdirs or ())
+        self._skill_debouncer: SkillEventDebouncer = SkillEventDebouncer(
+            self._emit_update_skills_now,
+            invalidate=self._invalidate_user_skills,
+        )
+        self._skill_watcher: SkillFileWatcher | None = None
+        # 原生 Observer 不支持的 FS（网络挂载 / overlayfs）可经此环境变量切 PollingObserver 兜底。
+        self._skill_watch_polling: bool = env_truthy("A2C_SKILL_WATCH_POLLING")
+
+        # v0.2.1 通用二进制传输基础设施 / v0.2.1 generic blob-transfer infrastructure
+        # 协议依据 / Protocol: blob-transfer.md；设计 / Design: §4.3 / §4.4
+        self._blob_cache_root: Path = (blob_cache_root or Path.home() / ".a2c").expanduser().resolve()
+        self._blob_cache_root.mkdir(parents=True, exist_ok=True)
+        self._toolspool_store: ToolspoolBlobStore = ToolspoolBlobStore(self._blob_cache_root)
+        # 默认 resolver 装配：toolspool 完整、skill 经 Registry + 沙箱重跑回源（#66 接管占位）
+        # Default resolver wiring: toolspool complete; skill re-runs Registry + sandbox (replaces #39 placeholder)
+        default_resolvers: dict[str, BlobResolver] = {
+            "toolspool": ToolspoolBlobResolver(self._toolspool_store),
+            "skill": SkillBlobResolver(self._skill_registry),
+        }
+        if blob_resolvers is not None:
+            default_resolvers.update(blob_resolvers)
+        self._blob_resolvers: dict[str, BlobResolver] = default_resolvers
+        self._blob_thresholds: BlobThresholds = blob_thresholds or default_thresholds()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
     # The tool call record type is extracted to ToolCallRecord for reuse across modules
@@ -135,6 +239,70 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._socketio_client_ref = weakref.ref(client) if client is not None else None
 
+    # ------------------------
+    # 通用二进制传输 / Generic blob transfer (v0.2.1)
+    # ------------------------
+    @property
+    def blob_resolvers(self) -> dict[str, BlobResolver]:
+        """``kind → BlobResolver`` 派发表（``client:get_blob`` handler 使用）.
+
+        Kind-to-resolver dispatch table consumed by the ``client:get_blob`` handler.
+        """
+        return self._blob_resolvers
+
+    @property
+    def blob_thresholds(self) -> BlobThresholds:
+        """SKILL / blob 阈值（inline budget / too_large cap / chunk max）.
+
+        Thresholds for inline budget, too-large cap, and chunk max bytes.
+        """
+        return self._blob_thresholds
+
+    @property
+    def toolspool_store(self) -> ToolspoolBlobStore:
+        """``.blobspool`` 内容寻址暂存（``tool_call`` 二进制旁路铸造时写入）.
+
+        Content-addressed ``.blobspool`` store; written when minting tool_call binary sideband.
+        """
+        return self._toolspool_store
+
+    def mint_toolspool_handle(self, payload: bytes, mime: str) -> str:
+        """铸造 ``kind=toolspool`` 不透明句柄并写盘 / Mint an opaque ``kind=toolspool`` handle.
+
+        ``tool_call`` 返回的超内联预算二进制 content item 通过此入口写入 ``.blobspool``，
+        返回的 handle 走 ``_meta.a2c_blob_handle`` 旁路交付 Agent（#40 接入）.
+        Tool_call binary items that exceed the inline budget go through this entry, are written
+        into ``.blobspool``, and the returned handle ships via ``_meta.a2c_blob_handle`` (#40).
+
+        防御纵深 / Defense in depth (协议 ``blob-transfer.md`` §3 + 设计 §4.4):
+            协议要求 too_large 在**铸造期**决断（不铸句柄、零字节传输；DoS 防御）。本入口即铸造期，
+            ``len(payload) > thresholds.too_large_cap`` → 抛 :class:`BlobTooLargeError`，**不写盘**。
+            上游 (#40) 应在其上再做内联预算 / 文本 vs 二进制路由判定；此处是兜底防御层。
+            Protocol mandates too_large decided at minting time (no handle, zero bytes — DoS guard).
+            This entry is that minting point; ``len(payload) > too_large_cap`` raises BlobTooLargeError
+            **without writing to disk**. Upstream (#40) handles inline-budget routing; this is the
+            fallback defense layer.
+
+        Args:
+            payload: 解码后的原始字节内容（**不是** base64）.
+            mime: 内容 MIME（如 ``image/png``）.
+
+        Returns:
+            不透明 ``blob_handle`` 字符串.
+
+        Raises:
+            BlobTooLargeError: ``len(payload) > thresholds.too_large_cap`` —— 拒绝铸造，不写盘。
+        """
+        # 局部导入避免顶层循环：handle 编码 / Local import to avoid top-level cycles
+        from a2c_smcp.computer.blob import encode_toolspool_handle
+
+        size = len(payload)
+        cap = self._blob_thresholds.too_large_cap
+        if size > cap:
+            raise BlobTooLargeError(size=size, cap=cap)
+        cid = self._toolspool_store.put(payload, mime)
+        return encode_toolspool_handle(cid=cid, mime=mime)
+
     async def boot_up(self, *, session: PromptSession | None = None) -> None:
         """
         启动计算机，初始化 MCP 服务器管理器。
@@ -150,32 +318,53 @@ class Computer(BaseComputer[PromptSession]):
             auto_reconnect=self._auto_reconnect,
             message_handler=self._on_manager_change,
         )
-        # 中文: 对每个 Server 配置执行：model_dump -> 按需渲染(遇到占位符才解析 input) -> 重新校验生成不可变对象
-        # English: For each server config: model_dump -> on-demand render (resolve inputs only when referenced) ->
-        #          model_validate to rebuild immutable object
+        # 中文: 对每个 Server 配置执行：渲染(占位符解析链 + 预定义变量) + envFile 合并 + 校验生成不可变对象。
+        #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
+        # English: Render (resolution chain + predefined vars) + envFile merge + validate, reusing
+        #          _arender_and_validate_server (DRY). On failure, keep the original config and continue.
         validated_servers: list[MCPServerConfig] = []
-
-        async def _resolve_input_by_id(input_id: str) -> Any:
-            try:
-                return await self._input_resolver.aresolve_by_id(input_id, session=session)
-            except InputNotFoundError:
-                # 未找到输入项，按要求保留原始输出并打印警告
-                logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
-                raise
-
-        # 注意: 假设 self._mcp_servers 为 Iterable[MCPServerConfig]
         for server_cfg in self._mcp_servers:
             try:
-                raw = server_cfg.model_dump(mode="json")
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id)
-                validated = type(server_cfg).model_validate(rendered)
-                validated_servers.append(validated)
+                validated_servers.append(await self._arender_and_validate_server(server_cfg, session=session))
             except Exception as e:
                 logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 按稳妥策略: 保留原配置继续
                 validated_servers.append(server_cfg)
 
         await self.mcp_manager.ainitialize(validated_servers)
+
+        # v0.2.1 SKILL 子系统启动初始化（设计 §5.1，#66）：解析 SKILL Home → 物化 mcp 源 skill:// →
+        # 填充 Registry → 初始化 skill:// 缓存。失败隔离：记 ERROR、**不**阻断 Computer 启动
+        # （skill.md §1.5：SKILL 通道对部分失败健壮）。marketplace/user 源 reconcile 见 #60/#61。
+        # SKILL subsystem boot init: resolve Home → materialize mcp-source skills → seed cache.
+        # Failure-isolated: log ERROR, never block Computer boot. marketplace/user sources land in #60/#61.
+        try:
+            self._skill_home = self._resolve_skill_home()
+            await self._restage_mcp_skills()
+            self._skills_cache = await self._acollect_skill_refs()
+        except Exception as e:  # pragma: no cover — 防御性兜底，正常路径已在内部各自降级
+            logger.error(f"SKILL 子系统启动初始化失败（不阻断 Computer 启动）/ SKILL boot init failed (non-blocking): {e}", exc_info=True)
+
+        # v0.2.1 user 源 DropIn 就地发现 + 文件 watcher（S14，#67，设计 §8.3）：启动时全量扫 user 源 →
+        # 注册；启动递归 watcher 监控 user/ + 各登记 workdir/.tfrobot/skills/，SKILL.md 变更经去抖器触发 emit。
+        # 失败隔离：记 ERROR、**不**阻断 Computer 启动。
+        # User-source in-place discovery + file watcher: initial full scan + start recursive watcher (failure-isolated).
+        try:
+            if self._skill_home is not None:
+                await self._invalidate_user_skills()  # 初次全量发现 user 源 / initial full user-source discovery
+                self._start_skill_watcher()
+        except Exception as e:  # pragma: no cover — 防御性兜底
+            logger.error(f"user 源 DropIn 发现 / watcher 启动失败（不阻断启动）/ user DropIn boot failed: {e}", exc_info=True)
+
+    def _resolve_skill_home(self) -> Path:
+        """解析并创建 SKILL Home（0o700 防御性写）/ Resolve & create SKILL Home。
+
+        显式注入 ``skill_home`` 时经 ``A2C_SKILL_HOME`` 覆盖；否则走默认 env 解析链
+        （``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills``）。
+        """
+        if self._skill_home_override is not None:
+            return ensure_skill_home({"A2C_SKILL_HOME": str(self._skill_home_override)})
+        return ensure_skill_home()
 
     async def _on_manager_change(
         self,
@@ -199,55 +388,107 @@ class Computer(BaseComputer[PromptSession]):
             except Exception as e:  # pragma: no cover
                 logger.error(f"上报工具变更失败: {e}", exc_info=True)
         elif isinstance(getattr(message, "root", None), ResourceListChangedNotification):
-            # 仅当 window:// 集合发生变化时触发刷新；否则记录日志以便后续策略调整
+            # 资源列表变化：window:// 与 skill:// **并行独立**处理（互不阻断，设计 §5.1）。
+            # Resource list changed: window:// and skill:// handled in parallel & independently.
             client = self.socketio_client
             if client is None:
-                logger.debug("Socket.IO 客户端不存在或已释放，忽略桌面刷新上报")
+                logger.debug("Socket.IO 客户端不存在或已释放，忽略资源列表变化上报")
                 return
-            try:
-                new_windows = await self._acollect_window_uris()
-            except Exception as e:  # pragma: no cover
-                logger.error(f"收集窗口资源失败，跳过刷新: {e}", exc_info=True)
+            await self._on_resource_list_changed_windows(client)
+            await self._on_resource_list_changed_skills()
+        elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
+            # 资源内容更新按 scheme 分流：window:// → 桌面刷新；skill:// → 重物化并上报 SKILL 更新。
+            # Resource content updated, dispatched by scheme: window:// → desktop; skill:// → restage skills.
+            client = self.socketio_client
+            if client is None:
+                logger.debug("Socket.IO 客户端不存在或已释放，忽略资源更新上报")
                 return
-
-            if new_windows != self._windows_cache:
-                added = sorted(new_windows - self._windows_cache)
-                removed = sorted(self._windows_cache - new_windows)
-                logger.info(
-                    "WindowURI 列表发生变化，将触发桌面刷新 | Window list changed, refreshing desktop. "
-                    f"added={len(added)}, removed={len(removed)}",
-                )
-                if added:
-                    logger.debug(f"新增窗口: {added}")
-                if removed:
-                    logger.debug(f"移除窗口: {removed}")
-                self._windows_cache = new_windows
+            uri = getattr(getattr(getattr(message, "root", None), "params", None), "uri", None)
+            uri_str = str(uri) if uri is not None else ""
+            if uri is not None and is_window_uri(uri_str):
                 try:
                     await client.emit_refresh_desktop()
                 except Exception as e:  # pragma: no cover
-                    logger.error(f"上报桌面刷新失败: {e}", exc_info=True)
+                    logger.error(f"上报桌面刷新失败: {e}")
+            elif uri_str.startswith(_SKILL_URI_PREFIX):
+                await self._on_skill_resource_updated()
             else:
-                # 打印关键信息帮助开发者判断策略是否需要更新
-                logger.info(
-                    "收到 ResourceListChangedNotification 但 WindowURI 未变化，跳过刷新 / "
-                    "Resource list changed but WindowURI set unchanged, skip refresh",
-                )
-        elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
-            # 资源内容更新：若是 window:// 则直接触发刷新（不比较集合，降低延迟）
-            client = self.socketio_client
-            if client is None:
-                logger.debug("Socket.IO 客户端不存在或已释放，忽略桌面刷新上报")
-                return
-            try:
-                uri = getattr(getattr(getattr(message, "root", None), "params", None), "uri", None)
-                if uri is None or not is_window_uri(str(uri)):
-                    logger.debug("收到资源更新但非 WindowURI，放行 / Non-window resource updated, ignore")
-                    return
-                await client.emit_refresh_desktop()
-            except Exception as e:  # pragma: no cover
-                logger.error(f"上报桌面刷新失败: {e}")
+                logger.debug("收到资源更新但非 window/skill scheme，放行 / Non-window/skill resource updated, ignore")
         else:
             logger.warning(f"收到未处理的变化类型: {truncate(message)}，当前版本仅处理工具列表变化")
+
+    async def _on_resource_list_changed_windows(self, client: "SMCPComputerClient") -> None:
+        """window:// 集合变化 → 比对缓存 → 触发桌面刷新（行为同 v0.2 既有逻辑，原样抽取）。
+
+        window:// set changed → compare cache → trigger desktop refresh (behavior-neutral extraction).
+        """
+        try:
+            new_windows = await self._acollect_window_uris()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"收集窗口资源失败，跳过刷新: {e}", exc_info=True)
+            return
+
+        if new_windows != self._windows_cache:
+            added = sorted(new_windows - self._windows_cache)
+            removed = sorted(self._windows_cache - new_windows)
+            logger.info(
+                "WindowURI 列表发生变化，将触发桌面刷新 | Window list changed, refreshing desktop. "
+                f"added={len(added)}, removed={len(removed)}",
+            )
+            if added:
+                logger.debug(f"新增窗口: {added}")
+            if removed:
+                logger.debug(f"移除窗口: {removed}")
+            self._windows_cache = new_windows
+            try:
+                await client.emit_refresh_desktop()
+            except Exception as e:  # pragma: no cover
+                logger.error(f"上报桌面刷新失败: {e}", exc_info=True)
+        else:
+            # 打印关键信息帮助开发者判断策略是否需要更新
+            logger.info(
+                "收到 ResourceListChangedNotification 但 WindowURI 未变化，跳过刷新 / "
+                "Resource list changed but WindowURI set unchanged, skip refresh",
+            )
+
+    async def _on_resource_list_changed_skills(self) -> None:
+        """skill:// 集合变化 → 重物化 mcp 源 + 孤儿对账 → 去抖器标脏（仿窗口缓存对比）。
+
+        集合未变化则仅 DEBUG 跳过（设计 §5.1：``_acollect_skill_refs`` 集合相同跳过）。变化时重物化 mcp 源
+        并 :meth:`SkillEventDebouncer.mark_dirty`——emit 经去抖器与其它源在 300ms 窗口内合并为一次（设计 §8.1）。
+        skill:// set changed → restage mcp source + orphan reconcile → debouncer.mark_dirty; unchanged → DEBUG skip.
+        """
+        try:
+            new_skills = await self._acollect_skill_refs()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"收集 skill:// 资源失败，跳过 SKILL 刷新: {e}", exc_info=True)
+            return
+
+        if new_skills == self._skills_cache:
+            logger.debug("收到 ResourceListChanged 但 skill:// 集合未变化，跳过 SKILL 重物化 / skill:// set unchanged, skip")
+            return
+
+        added = len(new_skills - self._skills_cache)
+        removed = len(self._skills_cache - new_skills)
+        logger.info(f"skill:// 列表发生变化，重物化并标脏 SKILL 更新 | skill:// list changed. added={added}, removed={removed}")
+        try:
+            await self._restage_mcp_skills()
+            self._skills_cache = new_skills
+            self._skill_debouncer.mark_dirty()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"SKILL 重物化/标脏失败: {e}", exc_info=True)
+
+    async def _on_skill_resource_updated(self) -> None:
+        """skill:// 资源内容更新 → 重物化 + 去抖器标脏（不比较集合，降低延迟，仿 window ResourceUpdated）。
+
+        单 SKILL 增量物化的 server 归属无法仅从 URI 推断，故走全量重物化（正确优先；增量为后续优化）。
+        skill:// content updated → restage + debouncer.mark_dirty (no set compare, lower latency).
+        """
+        try:
+            await self._restage_mcp_skills()
+            self._skill_debouncer.mark_dirty()
+        except Exception as e:  # pragma: no cover
+            logger.error(f"SKILL 内容更新重物化/标脏失败: {e}", exc_info=True)
 
     async def _acollect_window_uris(self) -> set[str]:
         """
@@ -263,11 +504,182 @@ class Computer(BaseComputer[PromptSession]):
         # 仅保留符合 WindowURI 协议的资源
         return {str(res.uri) for _srv, res in pairs if is_window_uri(str(res.uri))}
 
+    async def _acollect_skill_refs(self) -> set[str]:
+        """
+        收集当前所有 MCP Server 的 ``skill://`` 资源 URI 集合（去重）/ Collect deduplicated skill:// URI set。
+
+        用于 ``ResourceListChanged`` 缓存对比（集合相同跳过重物化，仿 :meth:`_acollect_window_uris`）。
+        ``manager.list_skill_resources`` 已按 ``skill://`` scheme 过滤并完整消费 cursor 翻页。
+
+        Returns:
+            set[str]: skill:// 资源 URI 集合（含子资源——任何变化都触发重物化，缓存对比更敏感）。
+        """
+        if not self.mcp_manager:
+            return set()
+        pairs = await self.mcp_manager.list_skill_resources()
+        return {str(res.uri) for _srv, res in pairs}
+
+    async def _restage_mcp_skills(self, server_name: str | None = None) -> list[str]:
+        """
+        物化 mcp 源 ``skill://`` → 注册进 :class:`SkillRegistry` / Materialize & register mcp-source skills。
+
+        全量重物化（``server_name is None``）后做孤儿对账：本轮未出现的 mcp 源 SKILL → 标孤儿
+        （从 ``get_skills`` 排除，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无 manager → 空列表。
+        Full restage reconciles orphans: mcp-source skills absent this run are marked orphaned.
+
+        Args:
+            server_name: 若提供仅重物化该 server（单 server 重枚举）；否则全部活跃 server + 孤儿对账。
+
+        Returns:
+            list[str]: 本轮成功注册（或刷新）的 SKILL name 列表。
+        """
+        if not self.mcp_manager or self._skill_home is None:
+            return []
+        registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, server_name=server_name)
+        if server_name is None:
+            self._reconcile_orphans(set(registered), lambda s: s.startswith("mcp:"))
+        return registered
+
+    def _reconcile_orphans(self, present_names: set[str], source_pred: Callable[[str], bool]) -> None:
+        """
+        全量重物化 / 重扫后的孤儿对账（按源谓词限定）/ Orphan reconciliation after a full restage/rescan。
+
+        当前活跃、``source_pred(source)`` 命中、但本轮 ``present_names`` 未出现的 SKILL →
+        :meth:`SkillRegistry.mark_orphan`（消失即从 ``get_skills`` 排除；恢复由 staging 的 ``register_or_update``
+        命中孤儿条目自动完成）。``source_pred`` 把对账**限定在单一源**——mcp（``startswith("mcp:")``）/ user
+        （``== SOURCE_USER``）/ 后续 marketplace（#61）各自传入谓词，互不误标。
+        ``source_pred`` confines reconciliation to a single source so the others are never mis-orphaned.
+        """
+        for ref in self._skill_registry.active_refs():
+            source = ref.get("source", "") or ""
+            name = ref.get("name", "") or ""
+            if name and name not in present_names and source_pred(source):
+                self._skill_registry.mark_orphan(name)
+
+    # ── v0.2.1 事件触发链：去抖结算 + user 源 watcher（S14，#67）────────────────
+    async def _emit_update_skills_now(self) -> None:
+        """
+        去抖器结算末端：向信令服务器推送 ``server:update_skills`` / Debouncer settlement sink。
+
+        无 Socket.IO 客户端 / 未入房间 → no-op（emit 的 office_id 守卫在 client 侧）。该协程是
+        :class:`SkillEventDebouncer` 的 ``on_emit``，**不**应被事件处理器裸调（一律经去抖器 :meth:`mark_dirty`）。
+        """
+        client = self.socketio_client
+        if client is None:
+            logger.debug("Socket.IO 客户端不存在或已释放，跳过 SKILL 更新上报 / no client, skip update_skills")
+            return
+        await client.emit_update_skills()
+
+    async def _invalidate_user_skills(self) -> None:
+        """
+        缓存失效（文件源重扫）：就地重扫 user 源 DropIn 并对账孤儿 / Invalidate by rescanning user-source DropIn。
+
+        设计 §8.1「缓存失效」对**文件源**的落实——watcher/CLI 标脏后、emit 前重扫 ``<home>/user/`` +
+        各登记 ``<workdir>/.tfrobot/skills/``（``stage_user_skills`` 幂等 ``register_or_update``），并把本轮
+        未发现的 user 源 SKILL 标孤儿（磁盘删除即从 ``get_skills`` 排除）。mcp 源由其 ``ResourceListChanged``
+        处理器即时重物化，**不**在此重复。SKILL Home 未就绪 → no-op。
+
+        **同步执行、不卸载线程池**：:class:`SkillRegistry` 按设计为单事件循环线程访问、无锁；``stage_user_skills``
+        会写 Registry，若经 ``asyncio.to_thread`` 在 worker 线程改 ``_entries``，将与循环线程的 ``active_refs``
+        迭代（``client:get_skills``）/ mcp 重物化产生数据竞争（``dict changed size during iteration`` / 撕裂写）。
+        user DropIn 扫描仅遍历少量目录、读少量 ``SKILL.md``（亚毫秒~低毫秒），同步执行不构成有意义阻塞，
+        并守住 Registry 单线程不变量。Run synchronously on the loop thread to preserve the Registry's
+        single-thread (lock-free) invariant; the user-DropIn scan is tiny and does not meaningfully block.
+        """
+        if self._skill_home is None:
+            return
+        try:
+            discovered = stage_user_skills(self._skill_registry, self._skill_home, self._registered_workdirs)
+            self._reconcile_orphans(set(discovered), lambda s: s == SOURCE_USER)
+        except Exception as e:  # pragma: no cover — 防御性兜底（staging 内部已各自降级）
+            logger.error(f"user 源重扫 / 对账失败 / user-source rescan failed: {e}", exc_info=True)
+
+    def _start_skill_watcher(self) -> None:
+        """
+        启动 user 源 DropIn 文件 watcher / Start the user-source DropIn file watcher。
+
+        监控根 = ``<home>/user/`` + 各登记 ``<workdir>/.tfrobot/skills/``（递归、过滤 ``SKILL.md``，**不**监
+        marketplace clone 树）。watchdog 回调在独立线程触发 → 经 ``loop.call_soon_threadsafe`` marshal 回事件
+        循环线程调去抖器 :meth:`mark_dirty`。已有 watcher → 先停。SKILL Home 未就绪 → no-op。
+        """
+        if self._skill_home is None:
+            return
+        if self._skill_watcher is not None:
+            self._skill_watcher.stop()
+        loop = asyncio.get_running_loop()
+        debouncer = self._skill_debouncer
+
+        def _marshal() -> None:
+            try:
+                loop.call_soon_threadsafe(debouncer.mark_dirty)
+            except RuntimeError:  # pragma: no cover — 事件循环已关闭（停机竞态）/ loop closed during shutdown
+                pass
+
+        watcher = SkillFileWatcher(_marshal, use_polling=self._skill_watch_polling)
+        roots = [user_dropin_root(self._skill_home), *(workdir_skill_root(wd) for wd in self._registered_workdirs)]
+        watcher.watch(roots)
+        self._skill_watcher = watcher
+
+    def mark_skill_internal_write(self, path: str | Path) -> None:
+        """
+        给 SKILL 文件 watcher 打内部写标记 / Mark an internal write for the SKILL file watcher。
+
+        供 CLI / SDK 在**写入被监控的 user 源 DropIn 路径**后调用，避免自写触发 watcher 重载循环（对标 CC
+        ``markInternalWrite``）。watcher 未启动 → no-op。
+        """
+        if self._skill_watcher is not None:
+            self._skill_watcher.mark_internal_write(path)
+
+    def _render_variables(self) -> dict[str, str]:
+        """
+        预定义渲染变量（对标 VS Code，§9.1）/ Predefined render variables (VS Code parity)。
+
+        ``workspaceFolder`` 取 active-workdir 单根（绑定当前任务，见 :attr:`active_workdir`），无则 ``os.getcwd()``；
+        ``userHome``=用户主目录；``pathSeparator``=``os.sep``。``${env:VAR}`` 不在此（由 render 直接读
+        进程环境）。``workspaceFolder`` takes the active workdir (single bound root), else cwd.
+        """
+        workspace = str(self.active_workdir) if self.active_workdir else os.getcwd()
+        return {
+            "workspaceFolder": workspace,
+            "userHome": os.path.expanduser("~"),
+            "pathSeparator": os.sep,
+        }
+
+    def _apply_env_file(self, rendered: dict[str, Any]) -> dict[str, Any]:
+        """
+        合并 ``envFile`` 的 ``KEY=VALUE`` 进 stdio server 的 ``env``（显式 env 胜，§9.1）/ Merge envFile into env。
+
+        仅对 stdio（``server_parameters.env`` 存在）生效；sse/http 无 env 字段，原样返回。envFile **路径**
+        已在 :meth:`ConfigRender.arender` 渲染（``${workspaceFolder}`` 等已展开）。**显式 ``env`` 同名项覆盖
+        envFile**（显式胜）。本方法不改 ``envFile`` 字段本身（spawn 仅消费 ``server_parameters.env``）。
+        """
+        env_file = rendered.get("envFile") or rendered.get("env_file")
+        if not env_file or not isinstance(env_file, str):
+            return rendered
+        params = rendered.get("server_parameters")
+        if not isinstance(params, dict) or ("env" not in params and "command" not in params):
+            # 非 stdio（sse/http 无 env/command）→ envFile 不适用，记 WARN（已填但被忽略）+ 原样返回。
+            # non-stdio (sse/http) → envFile not applicable; WARN that it is ignored, then passthrough.
+            name = rendered.get("name", "unknown")
+            srv_type = rendered.get("type", "unknown")
+            logger.warning(f"envFile 在非 stdio（{srv_type}）server 上不适用，已忽略: {name} / envFile ignored on non-stdio server")
+            return rendered
+        file_env = load_env_file(Path(env_file))
+        if not file_env:
+            return rendered
+        explicit_env = params.get("env") or {}
+        # 显式 env 同名项胜：先铺 envFile，再覆盖以显式值 / explicit env wins over envFile
+        params["env"] = {**file_env, **explicit_env}
+        rendered["server_parameters"] = params
+        return rendered
+
     async def _arender_and_validate_server(
         self,
         server: MCPServerConfig | dict[str, Any],
         *,
         session: PromptSession | None = None,
+        plugin: str | None = None,
+        marketplace: str | None = None,
     ) -> MCPServerConfig:
         """
         动态渲染并校验单个 MCP 服务器配置，支持原始字典或模型实例。
@@ -305,21 +717,27 @@ class Computer(BaseComputer[PromptSession]):
         # English: Resolve input value by input_id; raise InputNotFoundError if not defined
         async def _resolve_input_by_id(input_id: str) -> Any:
             try:
-                return await self._input_resolver.aresolve_by_id(input_id, session=session)
+                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此回退到
+                # 带前缀池条目 <plugin>@<marketplace>/<id>（§9.3 D2）。非 plugin 来源传 None=现状。
+                # plugin/marketplace context lets a bundled server's bare ${input:id} fall back to the prefixed pool entry.
+                return await self._input_resolver.aresolve_by_id(input_id, session=session, plugin=plugin, marketplace=marketplace)
             except InputNotFoundError:
                 logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
                 # 透传异常到上层，由上层决定是否回退或继续
                 raise
 
+        variables = self._render_variables()
         try:
             if isinstance(server, dict):
                 raw = server
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id)
+                rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
+                rendered = self._apply_env_file(rendered)
                 # 使用 TypeAdapter 将 union 类型解析为具体模型
                 validated: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(rendered)
             else:
                 raw = server.model_dump(mode="json")
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id)
+                rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
+                rendered = self._apply_env_file(rendered)
                 validated = type(server).model_validate(rendered)
             return validated
         except Exception as e:
@@ -327,7 +745,14 @@ class Computer(BaseComputer[PromptSession]):
             logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
             raise e
 
-    async def aadd_or_aupdate_server(self, server: MCPServerConfig | dict[str, Any], *, session: PromptSession | None = None) -> None:
+    async def aadd_or_aupdate_server(
+        self,
+        server: MCPServerConfig | dict[str, Any],
+        *,
+        session: PromptSession | None = None,
+        plugin: str | None = None,
+        marketplace: str | None = None,
+    ) -> None:
         """
         动态添加或更新某个MCP Server配置（支持 inputs 占位符解析）。
         Add or update a MCP Server config dynamically (supports inputs placeholder resolving).
@@ -335,6 +760,9 @@ class Computer(BaseComputer[PromptSession]):
         Args:
             session (PromptSession | None): Computer管理Session
             server (MCPServerConfig | dict[str, Any]): 待添加/更新的配置，可为模型或原始字典。
+            plugin / marketplace (str | None): plugin 实时挂载上下文（#69 Group A）；非 None 时 bundled server 的裸
+                ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None=现状。
+                Plugin mount context; when set, a bundled server's bare ``${input:id}`` resolves to the prefixed pool entry.
         """
         # 确保 manager 已初始化
         if self.mcp_manager is None:
@@ -344,7 +772,7 @@ class Computer(BaseComputer[PromptSession]):
                 message_handler=self._on_manager_change,
             )
 
-        validated = await self._arender_and_validate_server(server, session=session)
+        validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         await self.mcp_manager.aadd_or_aupdate_server(validated)
 
     async def aremove_server(self, server_name: str, *, session: PromptSession | None = None) -> None:
@@ -484,7 +912,14 @@ class Computer(BaseComputer[PromptSession]):
         """
         关闭计算机，关闭 MCP 服务器管理器。
         Shutdown the computer and close the MCP server manager.
+
+        v0.2.1（#67）：先停 user 源文件 watcher（不再产生新事件），再关去抖器（丢弃挂起 emit），最后关
+        MCP 管理器。Stop the file watcher, close the debouncer (drop pending emit), then the MCP manager.
         """
+        if self._skill_watcher is not None:
+            self._skill_watcher.stop()
+            self._skill_watcher = None
+        await self._skill_debouncer.aclose()
         if self.mcp_manager:
             await self.mcp_manager.aclose()
         self.mcp_manager = None
@@ -630,7 +1065,7 @@ class Computer(BaseComputer[PromptSession]):
             # 中文: 仅当合并结果的 auto_apply 显式为 True 时直接执行；否则进入二次确认流程
             # English: Only execute directly if merged auto_apply is explicitly True; otherwise require confirmation
             if merged_meta is not None and merged_meta.auto_apply is True:
-                result = await self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout)
+                result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
             else:
                 # 除非明确允许 auto_apply 否则均需要调用二次确认回调进行确认
                 # Unless auto_apply is explicitly allowed, require confirm callback
@@ -651,7 +1086,7 @@ class Computer(BaseComputer[PromptSession]):
                         )
                     else:
                         if apply:
-                            result = await self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout)
+                            result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
                         else:
                             result = CallToolResult(content=[TextContent(text="工具调用二次确认被拒绝，请稍后再试", type="text")])
                 else:
@@ -676,6 +1111,13 @@ class Computer(BaseComputer[PromptSession]):
             )
             success = False
         finally:
+            # 显式取消（acancel_tool 标记本 req_id，由 _acall_tool_cancellable 吞 CancelledError 返回取消态）：
+            # 历史标记为 cancelled，使「被取消」可与其它失败区分；并在此清理标记。
+            # Explicit cancel: mark history as cancelled (distinguishable from other failures) and clear the marker.
+            if req_id in self._cancelled_req_ids:
+                self._cancelled_req_ids.discard(req_id)
+                success = False
+                error_msg = error_msg or "cancelled"
             await self._append_tool_history(
                 {
                     "timestamp": ts,
@@ -690,6 +1132,199 @@ class Computer(BaseComputer[PromptSession]):
             )
 
         return result
+
+    async def _acall_tool_cancellable(
+        self,
+        req_id: str,
+        server_name: str,
+        tool_name: str,
+        parameters: dict,
+        timeout: float | None,
+    ) -> CallToolResult:
+        """中文: 将 ``Manager.acall_tool`` 包装为「可被 :meth:`acancel_tool` 中断」的在途任务（#96）。
+
+        - 在 ``_inflight_tool_tasks[req_id]`` 登记承载任务；
+        - 若经 :meth:`acancel_tool` 显式取消（``req_id`` 入 ``_cancelled_req_ids`` 且**外层协程自身未被取消**）：
+          吞掉 ``CancelledError`` 并返回取消态 ``CallToolResult(isError=True)``（即成为原 ``client:tool_call`` 的 ack）；
+        - 若**外层协程自身**被取消（连接断开 / teardown）：确保承载任务退场后向上重抛，绝不伪装成结果；
+        - 任何路径 ``finally`` 都清理注册表与取消标记。
+
+        判别器：``asyncio.current_task().cancelling()``（外层是否被取消）AND ``req_id in _cancelled_req_ids``
+        （是否本 req_id 被显式取消）双重确认才吞，杜绝把真实外层取消误判为取消态结果。
+
+        取消语义边界：``inner.cancel()`` 取消承载任务，会经 ``base_client.call_tool`` best-effort 向远端补发 MCP
+        ``notifications/cancelled``（见 :meth:`~a2c_smcp.computer.mcp_clients.base_client.BaseMCPClient._emit_mcp_cancelled`，
+        #96 最后一公里）。但远端是否真正停止执行**仍不保证**——MCP 取消为**协作式**，server 可忽略该通知并跑完。即 Agent
+        能迅速拿到取消态响应，远端通常被中断，但不作硬保证。
+
+        English: Wrap ``Manager.acall_tool`` as a cancellable in-flight task so ``notify:tool_call_cancel`` can
+        interrupt it (#96). Explicit cancel → swallow & return a cancelled result; outer-coroutine cancel →
+        re-raise after teardown; always clean up the registry. The discriminator combines
+        ``current_task().cancelling()`` with the ``_cancelled_req_ids`` marker. Cancelling the task makes
+        ``base_client.call_tool`` best-effort emit MCP ``notifications/cancelled`` to the remote
+        (see ``BaseMCPClient._emit_mcp_cancelled``); whether the REMOTE server actually stops is still NOT
+        guaranteed (MCP cancellation is cooperative — the server may ignore it).
+        """
+        if self.mcp_manager is None:
+            raise RuntimeError("当前MCP Manager为空")
+        inner: asyncio.Task[CallToolResult] = asyncio.ensure_future(
+            self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout),
+        )
+        self._inflight_tool_tasks[req_id] = inner
+        try:
+            return await inner
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            outer_cancelled = bool(current is not None and current.cancelling())
+            if not outer_cancelled and req_id in self._cancelled_req_ids:
+                # 显式工具取消：吞掉异常并返回取消态结果 / explicit tool cancel: swallow & return cancelled result
+                # 前向兼容：此取消响应形状（isError + 文本）为 SDK 本地约定，协议尚未定义标准取消 ack/响应列
+                # （见 #96「协议待办」）；协议一旦标准化需回此对齐。
+                # Forward-compat: this cancelled-response shape is an SDK-local convention; the protocol has not yet
+                # defined a standard cancel ack/response (#96 deferred). Re-align here once the protocol standardizes it.
+                return CallToolResult(
+                    content=[TextContent(text="工具调用已被取消 / Tool call cancelled", type="text")],
+                    isError=True,
+                )
+            # 外层协程自身被取消：确保承载任务退场后向上传播 / outer cancellation: ensure teardown then re-raise
+            if not inner.done():
+                inner.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await inner
+            raise
+        finally:
+            # 仅清理在途任务注册表；``_cancelled_req_ids`` 标记留给 :meth:`aexecute_tool` 的 finally 读取后清理，
+            # 以便历史能区分「被取消」与其它失败（见 aexecute_tool）。
+            # Only clear the in-flight registry here; the ``_cancelled_req_ids`` marker is read & cleared by
+            # aexecute_tool's finally so history can distinguish "cancelled" from other failures.
+            self._inflight_tool_tasks.pop(req_id, None)
+
+    async def acancel_tool(self, req_id: str) -> bool:
+        """中文: 取消一个在途工具调用（响应 ``notify:tool_call_cancel``，#96）。
+
+        Args:
+            req_id (str): 被取消的请求 ID（``AgentCallData.req_id``）。
+
+        Returns:
+            bool: ``True`` 表示已对一个在途任务请求取消；``False`` 表示该 ``req_id`` 未知或已完成（幂等 no-op）。
+
+        English: Cancel an in-flight tool call (handles ``notify:tool_call_cancel``). Returns ``False`` as an
+        idempotent no-op when ``req_id`` is unknown or already finished.
+
+        说明：取消承载任务后会向远端 best-effort 补发 MCP ``notifications/cancelled``，但远端是否真正停止**仍不保证**
+        （MCP 取消为协作式，server 可忽略；详见 :meth:`_acall_tool_cancellable`）。
+        Note: cancelling the task best-effort emits MCP ``notifications/cancelled`` to the remote, but whether the
+        remote actually stops is still NOT guaranteed (cooperative cancellation; see :meth:`_acall_tool_cancellable`).
+        """
+        task = self._inflight_tool_tasks.get(req_id)
+        if task is None or task.done():
+            return False
+        self._cancelled_req_ids.add(req_id)
+        task.cancel()
+        return True
+
+    async def get_resources(self, mcp_server: str, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+        """
+        中文: 单页透传指定 MCP Server 的 `resources/list`，供 v0.2 `client:get_resources` 使用。
+        英文: Single-page transparent forward of a server's `resources/list`, for v0.2 `client:get_resources`.
+
+        Computer 仅作透传层：不做 scheme / 元数据过滤、不做跨 Server 聚合；翻页由调用方通过 cursor 控制。
+        Computer is a transparent layer: no scheme/metadata filtering, no cross-server aggregation;
+        pagination is caller-driven via cursor.
+
+        Args:
+            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name.
+            cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page.
+
+        Returns:
+            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页) /
+                (resources on this page, next cursor — None when last page).
+
+        Raises:
+            RuntimeError: MCP Manager 尚未初始化 / MCP Manager not initialized.
+            MCPServerNotFoundError: mcp_server 未注册（→ 处理器映射 4014）/ not registered (→ handler maps 4014).
+            MCPCapabilityNotSupportedError: 未声明 `resources` 能力（→ 处理器映射 4015）/
+                `resources` capability not declared (→ handler maps 4015).
+        """
+        if not self.mcp_manager:
+            raise RuntimeError("当前MCP Manager为空 / MCP Manager is not initialized")
+        return await self.mcp_manager.list_resources(mcp_server, cursor)
+
+    # ------------------------
+    # SKILL 通道委托 / SKILL channel delegation (v0.2.1, #66)
+    # 协议依据 / Protocol: skill.md §6 / §9；设计 / Design: §5.1
+    # ------------------------
+    @property
+    def skill_registry(self) -> SkillRegistry:
+        """name → A2CSkillRef 物化索引（``client:get_skills`` / ``get_skill`` / ``get_blob`` 经此解析）。
+
+        The materialized name → A2CSkillRef index consumed by the SKILL channel handlers.
+        """
+        return self._skill_registry
+
+    @property
+    def skill_home(self) -> Path:
+        """SKILL Home 绝对根（``boot_up`` 解析；未启动时按 env 解析链兜底并缓存）/ SKILL Home root。
+
+        CLI marketplace / skill 命令经此取物化根（``known_marketplaces.json`` / ``installed_plugins.json`` /
+        ``marketplace/<name>/`` clone 树所在）。
+        """
+        if self._skill_home is None:
+            self._skill_home = self._resolve_skill_home()
+        return self._skill_home
+
+    @property
+    def active_workdir(self) -> Path | None:
+        """绑定当前任务的 active-workdir 单根（取首个已登记 workdir，空闲=None）/ The single active workdir (None when idle)。
+
+        北极星（#53）两层模型：本属性是 **project/local scope 来源**（``.tfrobot/settings[.local].json`` /
+        ``mcp.json``）与渲染 ``${workspaceFolder}`` 的**单一事实源**；而 :attr:`_registered_workdirs` 作能力发现
+        并集（DropIn 扫描 / watcher）跨全部目录、不随 active 跳变。``resolve_mcp_config`` / ``resolve_settings``
+        的 ``active_workdir`` 与 MCP 批准框写 local 均经此（#69 Group B/C）。
+        """
+        return self._registered_workdirs[0] if self._registered_workdirs else None
+
+    def mark_skills_dirty(self) -> None:
+        """标记 SKILL 集合变更 → 去抖器在窗口内合并触发单次 ``emit_update_skills``（CLI marketplace 变更后调）。
+
+        Mark the SKILL set dirty so the debouncer coalesces a single emit (called after CLI marketplace mutations).
+        """
+        self._skill_debouncer.mark_dirty()
+
+    def get_skills(self) -> list[A2CSkillRef]:
+        """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。
+
+        Active installed SKILLs (orphans excluded; unsorted, undeduped) — source for client:get_skills.
+        """
+        return self._skill_registry.active_refs()
+
+    def get_skill_ref(self, name: str) -> A2CSkillRef | None:
+        """O(1) 活跃精确解析 ``name`` → :class:`A2CSkillRef`（孤儿 / 未注册 → ``None``）。
+
+        这是 name→包根的唯一解析入口（§9.2 name 寻址防越权）。handler 据 ``None`` 回 ``4014``。
+        Single name→package-root resolution entry (§9.2); handler maps ``None`` to ``4014``.
+        """
+        return self._skill_registry.resolve(name)
+
+    def read_skill_resource(self, ref: A2CSkillRef, rel_path: str | None) -> SkillResourceView:
+        """沙箱解析 SKILL 包内资源 → 消费字节视图（铸造期带 ``too_large`` 守卫）。
+
+        §9.2：包根**仅**取自 ``ref["path"]``（由 Registry 经 name 解析），:func:`resolve_skill_view`
+        只接受 ``root: Path``，绝不从 name / rel_path 推导 FS 路径。``total_size`` / ``sha256`` 基于
+        消费字节（SKILL.md→frontmatter 剥离后 body；其它→原始字节），与 ``get_blob`` 解析期一致。
+
+        Args:
+            ref: 来自 :meth:`get_skill_ref` 的活跃 A2CSkillRef（``path`` 必为可读绝对包根）。
+            rel_path: 包根内 POSIX 相对路径；``None`` / 空 → 入口 ``SKILL.md``。
+
+        Returns:
+            SkillResourceView: 消费字节视图（mime / total_size / sha256 / is_text / 切片）。
+
+        Raises:
+            SkillSandboxError: 沙箱拒绝（traversal/forbidden/not_found）或 too_large（→ handler 映射 4017）。
+        """
+        root = Path(ref["path"])
+        return resolve_skill_view(root, rel_path, too_large_cap=self._blob_thresholds.too_large_cap)
 
     async def get_desktop(self, size: int | None = None, window_uri: str | None = None) -> list[Desktop]:
         """

@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     SMCP_NAMESPACE,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
 )
 
 EXPECTED_NOTIFY_EVENTS = {
@@ -29,6 +30,7 @@ EXPECTED_NOTIFY_EVENTS = {
     LEAVE_OFFICE_NOTIFICATION,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_NOTIFICATION,
 }
 
 
@@ -84,6 +86,16 @@ def test_async_agent_client_custom_namespace_registers_all_handlers() -> None:
     assert custom_ns in client.handlers
     assert SMCP_NAMESPACE not in client.handlers
     assert set(client.handlers[custom_ns].keys()) == EXPECTED_NOTIFY_EVENTS
+
+
+def test_sync_agent_client_default_namespace() -> None:
+    """Sync Agent 客户端默认 namespace 为 ``/smcp`` / sync agent default namespace is ``/smcp``"""
+    provider = DefaultAgentAuthProvider(agent_id="a", office_id="o")
+    client = SMCPAgentClient(auth_provider=provider)
+
+    assert client.namespace == SMCP_NAMESPACE
+    assert SMCP_NAMESPACE in client.handlers
+    assert set(client.handlers[SMCP_NAMESPACE].keys()) == EXPECTED_NOTIFY_EVENTS
 
 
 def test_sync_agent_client_custom_namespace_registers_all_handlers() -> None:

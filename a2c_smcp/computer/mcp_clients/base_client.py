@@ -7,18 +7,28 @@
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from enum import StrEnum
 from typing import Generic, TypeVar, cast
 
 from mcp import ClientSession, Tool
 from mcp.client.session import MessageHandlerFnT
-from mcp.types import AnyUrl, CallToolResult, InitializeResult, ReadResourceResult, Resource, TextResourceContents
+from mcp.types import (
+    AnyUrl,
+    CallToolResult,
+    CancelledNotification,
+    CancelledNotificationParams,
+    ClientNotification,
+    InitializeResult,
+    ReadResourceResult,
+    Resource,
+    TextResourceContents,
+)
 from pydantic import BaseModel
 from transitions.core import EventData
 from transitions.extensions import AsyncMachine
 
-from a2c_smcp.utils import WindowURI, is_window_uri
+from a2c_smcp.utils import is_window_uri
 from a2c_smcp.utils.async_property import async_property
 from a2c_smcp.utils.logger import get_logger, truncate
 
@@ -27,6 +37,28 @@ logger = get_logger("computer")
 # 泛型参数，用于约束 MCP Server 参数类型
 # Generic parameter for constraining MCP Server parameter types
 ParamsT = TypeVar("ParamsT", bound=BaseModel)
+
+
+class MCPCapabilityNotSupportedError(Exception):
+    """
+    中文: MCP Server 未声明所需 capability（如 `resources`）。
+    英文: MCP Server did not declare a required capability (e.g. `resources`).
+
+    上层（`client:get_resources` 处理器）应映射为 wire-level `4015 MCP_CAPABILITY_NOT_SUPPORTED`。
+    Upper layers (`client:get_resources` handler) should map this to wire-level
+    `4015 MCP_CAPABILITY_NOT_SUPPORTED`.
+    """
+
+
+class MCPServerNotFoundError(Exception):
+    """
+    中文: 引用的 MCP Server 名称在 Manager 中未注册。
+    英文: The referenced MCP Server name is not registered in the Manager.
+
+    上层（`client:get_resources` 处理器）应映射为 wire-level `4014 MCP_SERVER_NOT_FOUND`。
+    Upper layers (`client:get_resources` handler) should map this to wire-level
+    `4014 MCP_SERVER_NOT_FOUND`.
+    """
 
 
 class STATES(StrEnum):
@@ -358,6 +390,35 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 tools.extend(ret.tools)
         return tools
 
+    async def list_resources_page(self, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+        """
+        中文: 单页透传 MCP `resources/list`；不做 scheme 过滤、不订阅、不穷举翻页。
+        英文: Single-page transparent forward of MCP `resources/list`; no scheme filter, no subscription, no pagination exhaustion.
+
+        与 `list_windows()` 严格独立——本方法保持单页语义，调用方自行翻页。供 v0.2 `client:get_resources` 透传使用。
+        Strictly independent from `list_windows()` — this method preserves single-page semantics; callers paginate themselves.
+        Used by the v0.2 `client:get_resources` transparent-forward path.
+
+        Args:
+            cursor (str | None): MCP 翻页游标；首次调用传 None / Pagination cursor; pass None for the first page.
+
+        Returns:
+            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页) /
+                (resources on this page, next cursor — None when last page).
+
+        Raises:
+            MCPCapabilityNotSupportedError: MCP Server 未声明 `resources` 能力（→ 上层映射 4015）/
+                MCP Server did not declare `resources` capability (mapped to 4015 upstream).
+            ConnectionError: 客户端未连接 / Client not connected.
+        """
+        if self.state != STATES.connected:
+            raise ConnectionError("Not connected to server")
+        if not (self.initialize_result and self.initialize_result.capabilities.resources):
+            raise MCPCapabilityNotSupportedError("MCP Server did not declare 'resources' capability")
+        asession = cast(ClientSession, await self.async_session)
+        ret = await asession.list_resources(cursor=cursor) if cursor is not None else await asession.list_resources()
+        return list(ret.resources), ret.nextCursor
+
     async def list_windows(self) -> list[Resource]:
         """
         列出当前MCP服务可用的窗口资源列表。只要 MCP Server 声明了 resources 能力即可发现 window:// 资源。
@@ -386,14 +447,31 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                     resources.extend(ret.resources)
             # 返回满足WindowURI协议要求的Resource
             # Return only resources that conform to WindowURI (window:// scheme)
-            filtered: list[tuple[Resource, int]] = []
+            # v0.2 协议指南 §6.2 / §6.4：priority 来自 Resource.annotations.priority（float [0,1]，缺省 0.0）
+            # v0.2 protocol §6.2/§6.4: priority comes from Resource.annotations.priority (float [0,1], default 0.0)
+            filtered: list[tuple[Resource, float]] = []
             for res in resources:
                 # 类型守卫：快速判定并过滤非 window:// 资源
                 if not is_window_uri(res.uri):
                     continue
-                # 解析优先级（缺省为0）
-                uri = WindowURI(str(res.uri))
-                prio = uri.priority if uri.priority is not None else 0
+                annotations = getattr(res, "annotations", None)
+                prio_raw = getattr(annotations, "priority", None) if annotations is not None else None
+                if prio_raw is None:
+                    prio: float = 0.0
+                else:
+                    try:
+                        prio_f = float(prio_raw)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"annotations.priority 非数值类型，按 0.0 处理 / non-numeric priority, treat as 0.0: {prio_raw!r}",
+                        )
+                        prio_f = 0.0
+                    if not 0.0 <= prio_f <= 1.0:
+                        logger.warning(
+                            f"annotations.priority 越界 [0.0, 1.0]，按 0.0 处理 / out-of-range priority: {prio_f}",
+                        )
+                        prio_f = 0.0
+                    prio = prio_f
                 filtered.append((res, prio))
 
             # 同一 MCP 内按 priority 降序排序（仅在本客户端内比较）
@@ -444,10 +522,54 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
         Returns:
             CallToolResult: 调用结果 MCP 协议标准制定
+
+        取消传播（#96 最后一公里）：本方法被取消（上层 :meth:`Computer.acancel_tool` → task.cancel，
+        或 Manager 的 ``asyncio.wait_for`` 超时）时，会 best-effort 向远端 MCP Server 补发
+        ``notifications/cancelled``，使远端有机会真正停止该工具执行——MCP 官方 SDK 取消客户端请求时
+        **不**自动发此通知、也不暴露客户端 request_id（见 SDK issue #1410/#1419，至最新版本仍未修），故由我方补发。
+        Cancellation propagation (#96 last mile): on cancellation this best-effort emits MCP
+        ``notifications/cancelled`` to the remote server, since the official SDK neither emits it on
+        client-request cancellation nor exposes the client request_id (SDK issues #1410/#1419).
         """
         if self.state != STATES.connected:
             raise ConnectionError("Not connected to server")
-        return await (await self.async_session).call_tool(tool_name, params)
+        session = await self.async_session
+        # 捕获本次 MCP 请求 id：ClientSession.call_tool → send_request 在首个真正 await 之前同步自增分配
+        # self._request_id；从此处读取到分配点之间无 await 挂起 → 读到的即本次将使用的 id（并发安全）。
+        # Capture this request's MCP id: send_request assigns self._request_id synchronously before its first
+        # real await; no suspension between this read and that assignment → the value read is the id used.
+        request_id = getattr(session, "_request_id", None)
+        try:
+            return await session.call_tool(tool_name, params)
+        except asyncio.CancelledError:
+            # best-effort：通知远端取消该请求；不阻塞取消展开。/ best-effort notify remote; never block teardown.
+            if request_id is not None:
+                await self._emit_mcp_cancelled(session, request_id)
+            raise
+
+    async def _emit_mcp_cancelled(self, session: ClientSession, request_id: int) -> None:
+        """向远端 MCP Server best-effort 发送 ``notifications/cancelled``（#96 取消最后一公里）。
+
+        在调用方被取消的展开期内发送：``asyncio.shield`` 防止发送本身被二次取消打断，``wait_for`` 限时避免拖住
+        teardown，``suppress`` 兜底会话已关闭等异常。MCP 取消为协作式（server 可忽略），故全程 best-effort。
+        Best-effort emit of MCP ``notifications/cancelled``. Shielded against re-cancellation, time-boxed to not
+        stall teardown, and fully suppressed (the session may already be closing). Cooperative per MCP spec.
+        """
+
+        async def _send() -> None:
+            with suppress(Exception):
+                await session.send_notification(
+                    ClientNotification(
+                        CancelledNotification(
+                            params=CancelledNotificationParams(requestId=request_id, reason="A2C tool_call cancelled"),
+                        ),
+                    ),
+                    related_request_id=request_id,
+                )
+
+        with suppress(Exception):
+            # asyncio.shield 内部已将协程包装为 Task，无需再 ensure_future / shield already wraps the coro in a Task.
+            await asyncio.wait_for(asyncio.shield(_send()), timeout=2.0)
 
     async def _close_task(self) -> None:
         """

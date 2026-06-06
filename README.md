@@ -40,6 +40,37 @@ poetry add a2c-smcp --allow-prereleases
 ```
 
 
+## 协议兼容性 (SDK ↔ A2C-SMCP Protocol)
+
+本 SDK 实现 [A2C-SMCP 协议](https://github.com/A2C-SMCP/a2c-smcp-protocol)。SDK 内置的协议版本通过常量
+`a2c_smcp.PROTOCOL_VERSION` 暴露，并在 Socket.IO 连接握手阶段以 URL query `a2c_version` 与 Server 协商。
+
+```python
+from a2c_smcp import PROTOCOL_VERSION  # 当前: "0.2.0"
+```
+
+**兼容矩阵 / Compatibility matrix**
+
+| SDK 版本 | `a2c_smcp.PROTOCOL_VERSION` | 兼容的协议 Server 版本 | 说明 |
+|---|---|---|---|
+| `0.2.x` | `0.2.0` | `0.2.x` | v0.2.0 GA：URI 纯标识符化、`client:get_resources`、连接版本握手；DPE 已移出至 [dpe-protocol](https://github.com/A2C-SMCP/dpe-protocol) |
+| `0.1.x`（pre-GA rc） | 无握手常量 | — | 早期 rc，无版本握手协商；请升级到 `0.2.x` |
+
+**兼容性规则（协议 MUST）/ Compatibility rule (protocol MUST)**
+
+- v0.x 阶段 **MUST** 严格匹配 `MAJOR.MINOR`；`PATCH` 任意。即客户端 `X.Y.Z` 仅与
+  Server 支持区间 `[X.Y.0, X.Y.999]` 兼容（见协议 `versioning.md`）。
+- 客户端 **MUST** 在连接 URL query 携带 `a2c_version`；缺失/非法 → Server 返回 HTTP 400。
+- 版本不兼容时 Server **MUST** 返回 HTTP 400 + Socket.IO `4008`；不兼容客户端**连接被拒、绝不建立**
+  （`versioning.md` §4 死循环防御：客户端不得对 4008 无限重连）。
+- 客户端 **MUST** polling-first 握手（显式 `transports=["websocket"]` 会被 SDK 护栏纠正），
+  以确保 `4008` 拒因可被还原归一为 `ProtocolVersionError`。
+- Server **MUST** 将协商到的 `a2c_version` 写入会话信息，经 `server:list_room` 带出（仅展示/诊断，不二次校验）。
+
+不兼容握手会抛出 `a2c_smcp.exceptions.ProtocolVersionError`（或底层连接异常，二者均满足"连接绝不建立"
+的确定性保证）。升级指南参见协议仓库 `docs/migrations/v0.2-uri-metadata-refactor.md`。
+
+
 ## 快速开始
 
 - 选择你的角色：
@@ -90,7 +121,8 @@ python -m a2c_smcp.computer.cli.main run \
 ```python
 from fastapi import FastAPI
 import socketio
-from a2c_smcp.server import SMCPNamespace, DefaultAuthenticationProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.server import A2CProtocolVersionASGIMiddleware, SMCPNamespace, DefaultAuthenticationProvider
 
 app = FastAPI()
 
@@ -103,8 +135,15 @@ smcp_ns = SMCPNamespace(auth)
 sio = socketio.AsyncServer(cors_allowed_origins="*")
 sio.register_namespace(smcp_ns)
 
-socket_app = socketio.ASGIApp(sio, app)
+# 用 A2C 中间件包裹以启用协议版本握手（不包裹则 a2c_version 校验不生效）
+socket_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="/socket.io")
+socket_app = A2CProtocolVersionASGIMiddleware(socket_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
 ```
+
+> **启用握手**：`socketio.ASGIApp` / `WSGIApp` 本身不做版本校验，**必须**再用
+> `A2CProtocolVersionASGIMiddleware` / `A2CProtocolVersionWSGIMiddleware` 包裹一层，
+> 上文「Server MUST 返回 HTTP 400 + 4008」才会真正生效。裸 ASGI/WSGI、FastAPI 集成与验证方法见
+> [`docs/guides/server-version-handshake.md`](docs/guides/server-version-handshake.md)。
 
 同步版本、会话查询与自定义认证示例请参考 `docs/server.md`。
 
@@ -168,8 +207,9 @@ asyncio.run(main())
 
 `Computer` 可将 MCP Servers 暴露的 `window://` 资源整合为 Desktop 视图。设计细节与窗口选择/优先级规则见工作流 `/desktop`：
 
-- 资源 URI 协议：参见 `a2c_smcp/utils/window_uri.py`
-- 与 `MCPServerManager` 的聚合策略：按服务器最近操作历史与 `priority` 组织
+- 资源 URI 协议：参见 `a2c_smcp/utils/window_uri.py`（v0.2 起 `window://` 为**纯标识符**，不再解析 query）
+- 元数据来源（v0.2）：`priority` / `audience` 取自 MCP `Resource.annotations`，`fullscreen` 等 A2C 扩展取自 `_meta`
+- 与 `MCPServerManager` 的聚合策略：仅聚合 `window://`（非 window 资源不进桌面），按最近操作历史与 `priority` 组织
 - `fullscreen` 规则：遇到全屏窗口，当前 Server 只渲染此窗口
 
 集成测试中已包含示例 Stdio MCP 服务器，可参考：

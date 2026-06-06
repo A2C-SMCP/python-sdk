@@ -5,22 +5,27 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-窗口协议 WindowURI 封装
-WindowURI encapsulation for MCP window:// resources
+窗口协议 WindowURI 封装（v0.2 协议）
+WindowURI encapsulation for MCP window:// resources (v0.2 protocol)
 
-协议说明 / Protocol:
-- scheme 固定为 window -> 形如 window://host/path1/path2?.../pathN?priority=..&fullscreen=..
-  Scheme is fixed to 'window' -> e.g., window://host/path1/.../pathN?priority=..&fullscreen=..
-- host 为 MCP 的唯一标识（建议域名），由 MCP 自定义，需避免与其他 MCP 冲突
-  host is MCP unique id (domain-like recommended), defined by MCP, must not collide with others
-- path 可以有 0..N 个段，一个 MCP 可暴露多个 window，是否渲染由桌面系统决定
-  path can have 0..N segments; desktop decides actual rendering
-- 查询参数 / Query params：
-  - priority: 0-100 的整数，仅在同一 MCP 内部窗口间比较时生效，影响布局排序（越大越靠上）
-              integer 0-100, only intra-MCP comparison; affects layout ordering (higher -> higher)
-  - fullscreen: 布尔值；若为 true，Agent 调用该 MCP 工具后，Desktop 将尽量完整渲染该 window。
-                多个 fullscreen 仅第一个生效。
-                boolean; if true, desktop attempts full rendering; only the first fullscreen window takes effect.
+协议说明 / Protocol (v0.2):
+- scheme 固定为 window，URI 形如 window://host/path1/path2/.../pathN —— 纯标识符
+  Scheme is fixed to 'window'; URI is a pure identifier: window://host/path1/.../pathN
+- host 为 MCP 的唯一标识（建议反向域名风格），跨 MCP Server MUST 唯一
+  host is the MCP unique id (reverse-DNS style recommended); MUST be unique across MCP Servers
+- path 可以有 0..N 个段，由 MCP 决定其窗口拓扑
+  path can have 0..N segments; topology decided by the MCP
+- v0.2 起 priority / fullscreen 等元数据不再放在 URI query，而下沉到 MCP Resource
+  的 annotations / _meta（详见协议指南 v0.2-uri-metadata-refactor.md §4.1）
+  Since v0.2, priority / fullscreen metadata are no longer carried in URI query —
+  they live on Resource.annotations / Resource._meta (see protocol guide §4.1)
+
+URI query 处理分层（协议 §F4 Postel's law）：
+URI query handling layers (Postel's law):
+- Computer 解析层（本类）：解析时若含 query → WARN 日志后丢弃，不抛异常
+  Computer parser layer (this class): on query → WARN + drop, no exception
+- Agent SDK 构造层（build_uri）：不接受 priority / fullscreen 参数
+  Agent SDK builder layer (build_uri): does not accept priority / fullscreen params
 
 Pydantic v2 兼容：支持字符串 <-> WindowURI 的校验与序列化
 Pydantic v2 compatibility: supports string <-> WindowURI validation and serialization
@@ -37,26 +42,36 @@ from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema
 from yarl import URL as YURL
 
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("utils.window_uri")
+
 
 class WindowURI:
     """
-    WindowURI 用于解析与构建 window:// 协议的 URI。
-    WindowURI is for parsing and building window:// protocol URIs.
+    WindowURI 用于解析与构建 window:// 协议的 URI（v0.2 纯标识符形态）。
+    WindowURI parses and builds window:// URIs (v0.2 pure-identifier form).
     """
 
     def __init__(self, uri: str) -> None:
         """
         使用 yarl.URL 解析并缓存 URL 组件，避免第三方在 Py3.12 的兼容性问题。
         Parse and cache URL components via yarl.URL to avoid compat issues on Py3.12.
+
+        v0.2 协议层容错：含 query 的 URI 仍可解析成功，但 query 部分会被丢弃并记录 WARN。
+        v0.2 tolerance: URIs with query still parse, but the query is dropped with a WARN log.
         """
         self._url = YURL(uri)
         if self._url.scheme != "window":
             raise ValueError(f"Invalid URI scheme: {self._url.scheme}, uri={uri}")
         if not self._url.host:
             raise IndexError(f"Missing host (MCP id) in URI: {uri}")
-        # 校验查询参数合法性 / validate query params
-        _ = self.priority  # will raise if invalid
-        _ = self.fullscreen  # normalize
+        if self._url.query_string:
+            logger.warning(
+                "WindowURI v0.2 不再支持 query 元数据，已丢弃 query 部分。"
+                "WindowURI v0.2 no longer supports query metadata; query has been dropped. "
+                f"uri={uri}",
+            )
 
     # -------------------------
     # 基础属性 / Basic properties
@@ -91,41 +106,33 @@ class WindowURI:
         return [unquote(seg) for seg in raw.split("/")]
 
     # -------------------------
-    # 查询参数 / Query parameters
+    # 已废弃属性（v0.2 起 query 不再承载元数据）/ Deprecated attrs
     # -------------------------
+    # TODO(#11): 移除 priority / fullscreen 属性，调用方改读 Resource.annotations.priority / _meta.fullscreen
     @cached_property
     def priority(self) -> int | None:
         """
-        获取 priority（0-100），不存在则返回 None；非法值抛出异常
-        Get priority (0-100); None if absent; raise on invalid
+        v0.2 起 priority 不再来自 URI query，统一返回 None。
+        Since v0.2, priority is no longer carried in the URI query; always returns None.
+
+        元数据真实来源：MCP Resource.annotations.priority（float [0,1]）。调用方应改读
+        Resource.annotations，本属性仅为旧调用点向后兼容（由 sub-issue #4 移除）。
+        Real source: MCP Resource.annotations.priority (float [0,1]). Callers should
+        switch to Resource.annotations; this attribute exists only for legacy back-compat
+        (to be removed by sub-issue #4).
         """
-        val = self._url.query.get("priority")
-        if val is None:
-            return None
-        raw = val
-        try:
-            int_val = int(raw)
-        except Exception as e:
-            raise ValueError(f"Invalid priority value: {raw}") from e
-        if not (0 <= int_val <= 100):
-            raise ValueError(f"priority must be in [0, 100], got: {val}")
-        return int_val
+        return None
 
     @cached_property
     def fullscreen(self) -> bool | None:
         """
-        获取 fullscreen 布尔值；不存在则返回 None
-        Get fullscreen boolean; None if absent
+        v0.2 起 fullscreen 不再来自 URI query，统一返回 None。
+        Since v0.2, fullscreen is no longer carried in the URI query; always returns None.
+
+        元数据真实来源：MCP Resource._meta.fullscreen（bool）。
+        Real source: MCP Resource._meta.fullscreen (bool).
         """
-        val = self._url.query.get("fullscreen")
-        if val is None:
-            return None
-        raw = val.strip().lower()
-        if raw in {"1", "true", "yes", "on"}:
-            return True
-        if raw in {"0", "false", "no", "off"}:
-            return False
-        raise ValueError(f"Invalid fullscreen value: {raw}")
+        return None
 
     # -------------------------
     # 构造函数 / Builder
@@ -136,16 +143,20 @@ class WindowURI:
         *,
         host: str,
         windows: Iterable[str] | None = None,
-        priority: int | None = None,
-        fullscreen: bool | None = None,
     ) -> Self:
         """
-        通过 host、windows（0..N 段路径）、可选 priority 与 fullscreen 构建 WindowURI。
-        Build WindowURI from host, windows (0..N path segments), optional priority and fullscreen.
-        所有路径段进行 URL 编码；仅在提供时添加查询参数。
-        All path segments are URL-encoded; query params only included when provided.
+        通过 host 与 windows（0..N 段路径）构建 WindowURI（v0.2 纯标识符）。
+        Build a v0.2 pure-identifier WindowURI from host and windows (0..N path segments).
+
+        所有路径段进行 URL 编码（如 "c/d" -> "c%2Fd"，保持为单段）。
+        All path segments are URL-encoded (e.g., "c/d" -> "c%2Fd", kept as a single segment).
+
+        v0.2 起不再接受 priority / fullscreen 参数 —— 元数据由 MCP Server 在
+        Resource.annotations / _meta 中声明，详见 v0.2 协议指南 §4.1。
+        Since v0.2, priority / fullscreen are not accepted here — metadata is declared by the
+        MCP Server on Resource.annotations / _meta (see protocol guide §4.1).
         """
-        from urllib.parse import quote, urlencode
+        from urllib.parse import quote
 
         if not host:
             raise ValueError("host (MCP id) is required")
@@ -153,20 +164,7 @@ class WindowURI:
         # 对每个段进行编码，确保如 "c/d" -> "c%2Fd" 保持为单段
         segs = [quote(p, safe="") for p in (list(windows) if windows else [])]
         path = "/" + "/".join(segs) if segs else ""
-
-        query_items: dict[str, str] = {}
-        if priority is not None:
-            if not isinstance(priority, int) or not (0 <= priority <= 100):
-                raise ValueError(f"priority must be int in [0, 100], got: {priority}")
-            query_items["priority"] = str(priority)
-        if fullscreen is not None:
-            query_items["fullscreen"] = "true" if fullscreen else "false"
-
-        query_str = urlencode(query_items) if query_items else ""
-        s = f"window://{host}{path}"
-        if query_str:
-            s += f"?{query_str}"
-        return cls(s)
+        return cls(f"window://{host}{path}")
 
     # -------------------------
     # Pydantic v2 支持 / Pydantic v2 support
@@ -216,10 +214,10 @@ def is_window_uri(value: str | AnyUrl | object) -> bool:
     判断给定字符串是否为合法的 WindowURI（window:// 协议）
     Check whether the given string is a valid WindowURI (window:// scheme)
 
-    规则 / Rules:
+    规则 / Rules (v0.2):
     - 必须为 window scheme
     - 必须包含 host（MCP 唯一标识）
-    - 查询参数若存在则需可被解析（如 priority 范围/类型、fullscreen 布尔）
+    - URI 含 query 不会判定为非法（仅在解析时记录 WARN 并丢弃）
     """
     try:
         s = str(value)

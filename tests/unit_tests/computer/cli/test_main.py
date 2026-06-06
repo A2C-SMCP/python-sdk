@@ -23,7 +23,7 @@ class DummyInteractive:
     last_init_client: Any | None = None
 
     @classmethod
-    async def coro(cls, comp: Any, init_client: Any | None = None) -> None:  # matches _interactive_loop signature
+    async def coro(cls, comp: Any, init_client: Any | None = None, **_: Any) -> None:  # matches _interactive_loop signature (+ #69 kwargs)
         cls.called = True
         cls.last_comp = comp
         cls.last_init_client = init_client
@@ -41,6 +41,7 @@ class FakeComputer:
         auto_reconnect: bool = True,
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
+        registered_workdirs: Any | None = None,
     ) -> None:
         self.init_args = {
             "inputs": inputs,
@@ -49,6 +50,7 @@ class FakeComputer:
             "auto_reconnect": auto_reconnect,
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
+            "registered_workdirs": registered_workdirs,
         }
 
     async def __aenter__(self) -> FakeComputer:
@@ -886,7 +888,7 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
     中文：驱动真实 ``SMCPComputerClient``（只打桩 ``connect``），断言 CLI 传入的
     ``--namespace /tf-custom`` 落到客户端构造器，并且所有事件处理器在该命名空间注册。
     修复前：CLI 只把 namespace 传给 ``connect(namespaces=[...])``，构造器绑死在
-    ``/smcp``，因此 ``handlers['/smcp']`` 有 4 项事件、``handlers['/tf-custom']``
+    ``/smcp``，因此 ``handlers['/smcp']`` 有 5 项事件、``handlers['/tf-custom']``
     空缺 —— 该断言会失败。
 
     English: Drive a real ``SMCPComputerClient`` with ``connect`` stubbed, and
@@ -894,13 +896,18 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
     that every event handler is registered under that namespace. Pre-fix, the
     CLI only passed namespace to ``connect(namespaces=[...])`` while the client
     constructor stayed pinned on ``/smcp`` — so ``handlers['/smcp']`` held the
-    four client:* handlers and ``handlers['/tf-custom']`` was absent, making
+    five client:* handlers and ``handlers['/tf-custom']`` was absent, making
     this assertion fail.
     """
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
     from a2c_smcp.smcp import (
+        CANCEL_TOOL_CALL_NOTIFICATION,
+        GET_BLOB_EVENT,
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
+        GET_RESOURCES_EVENT,
+        GET_SKILL_EVENT,
+        GET_SKILLS_EVENT,
         GET_TOOLS_EVENT,
         SMCP_NAMESPACE,
         TOOL_CALL_EVENT,
@@ -974,4 +981,9 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_TOOLS_EVENT,
         GET_CONFIG_EVENT,
         GET_DESKTOP_EVENT,
+        GET_RESOURCES_EVENT,
+        GET_BLOB_EVENT,
+        GET_SKILLS_EVENT,
+        GET_SKILL_EVENT,
+        CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器
     }, f"Unexpected event handlers under {custom_ns!r}: {registered!r}"

@@ -8,16 +8,32 @@
 * 描述: 同步版 SMCP Namespace 测试用例 / Sync SMCP Namespace test cases
 """
 
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server import (
     DefaultSyncAuthenticationProvider,
     SyncAuthenticationProvider,
     SyncSMCPNamespace,
 )
-from a2c_smcp.smcp import SMCP_NAMESPACE, EnterOfficeReq, LeaveOfficeReq
+from a2c_smcp.server.sync_base import SyncBaseNamespace
+from a2c_smcp.smcp import (
+    GET_BLOB_EVENT,
+    GET_SKILL_EVENT,
+    GET_SKILLS_EVENT,
+    GET_TOOLS_EVENT,
+    SMCP_NAMESPACE,
+    UPDATE_SKILLS_NOTIFICATION,
+    EnterOfficeReq,
+    ErrorCode,
+    LeaveOfficeReq,
+    is_protocol_error_payload,
+)
 
 
 class MockSyncAuthProvider(SyncAuthenticationProvider):
@@ -134,3 +150,394 @@ class TestSyncSMCPNamespace:
         assert success is True
         assert error is None
         smcp_namespace.leave_room.assert_called_once_with("test_sid", "office_123")
+
+
+class TestV021ClientRoutesAndUpdateSkillsSync:
+    """v0.2.1 #41 sync mirror：3 ``client:*`` 路由 + ``server:update_skills`` 广播.
+
+    Sync mirror of async ``TestV021ClientRoutesAndUpdateSkills``.
+    """
+
+    @pytest.fixture
+    def routed_ns(self, smcp_namespace, mock_server):
+        smcp_namespace.server = mock_server
+        agent_sid = "a-sid"
+        comp_name = "c1"
+        comp_sid = "c-sid"
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace.call = MagicMock()
+        return smcp_namespace, agent_sid, comp_name, comp_sid
+
+    def test_on_client_get_skills_relays(self, routed_ns):
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {
+            "skills": [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}],
+            "req_id": "r1",
+        }
+        ret = ns.on_client_get_skills(agent_sid, {"agent": "agent-1", "req_id": "r1", "computer": comp_name})
+        ns.call.assert_called_once()
+        args, kwargs = ns.call.call_args
+        assert args[0] == GET_SKILLS_EVENT
+        assert kwargs["to"] == comp_sid
+        assert kwargs["namespace"] == SMCP_NAMESPACE
+        # 语义级断言：内容完整透传 / Semantic-level assertion: contents passed through
+        assert ret["skills"] == [{"name": "user:x:y", "source": "user", "path": "/s/x/y", "description": "demo skill"}]
+        assert ret["req_id"] == "r1"
+
+    def test_on_client_get_skill_relays(self, routed_ns):
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {
+            "name": "user:x:y",
+            "rel_path": "SKILL.md",
+            "mime_type": "text/markdown",
+            "total_size": 5,
+            "sha256": "a" * 64,
+            "body": "# hi",
+            "req_id": "r2",
+        }
+        ret = ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r2", "computer": comp_name, "name": "user:x:y"},
+        )
+        assert ns.call.call_args[0][0] == GET_SKILL_EVENT
+        assert ret["body"] == "# hi"
+
+    def test_on_client_get_blob_relays(self, routed_ns):
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {
+            "blob_handle": "h",
+            "mime_type": "image/png",
+            "total_size": 3,
+            "sha256": "b" * 64,
+            "chunk_offset": 0,
+            "eof": True,
+            "blob": "AAAA",
+            "req_id": "r3",
+        }
+        ret = ns.on_client_get_blob(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r3", "computer": comp_name, "blob_handle": "h"},
+        )
+        assert ns.call.call_args[0][0] == GET_BLOB_EVENT
+        assert ret["eof"] is True
+
+    def test_get_skill_4017_passthrough(self, routed_ns):
+        """``4017 traversal`` flat ErrorPayload 跨 sync 路由透传 / 4017 passes through sync routing.
+
+        显式镜像 async 同名用例，避免依赖 ``_relay_client_call`` 抽象等价性的间接证据。
+        Explicit sync mirror of async case; avoids relying solely on shared-helper equivalence."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {
+            "code": int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE),
+            "message": "Skill resource not accessible",
+            "details": {"reason": "traversal", "rel_path": "../etc"},
+        }
+        ret = ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "name": "user:x:y"},
+        )
+        assert ret["code"] == int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE)
+        assert ret["details"]["reason"] == "traversal"
+        assert ret["details"]["rel_path"] == "../etc"
+
+    def test_get_skill_4014_name_absent_passthrough(self, routed_ns):
+        """SKILL ``name`` 格式合法但 Registry 未命中复用 4014（sync mirror of async case）."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "skill not found"}
+        ret = ns.on_client_get_skill(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "name": "user:no-such:skill"},
+        )
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    def test_get_blob_4018_passthrough(self, routed_ns):
+        """``4018 gone`` flat ErrorPayload 跨 sync 路由透传 / 4018 gone passes through sync routing."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        ns.call.return_value = {
+            "code": int(ErrorCode.BLOB_NOT_ACCESSIBLE),
+            "message": "Blob not accessible",
+            "details": {"reason": "gone"},
+        }
+        ret = ns.on_client_get_blob(
+            agent_sid,
+            {"agent": "agent-1", "req_id": "r-err", "computer": comp_name, "blob_handle": "h"},
+        )
+        assert ret["code"] == int(ErrorCode.BLOB_NOT_ACCESSIBLE)
+        assert ret["details"]["reason"] == "gone"
+
+    def test_get_blob_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """``computer`` 名未注册 → flat ErrorPayload(404)，不抛未捕获异常（#92；sync mirror of async case）.
+        Unregistered ``computer`` → flat ErrorPayload(404), no uncaught raise (#92)."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {}
+        smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "office_id": "room1"})
+        ret = smcp_namespace.on_client_get_blob(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent", "blob_handle": "h"},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == "absent"
+
+    def test_on_client_tool_call_computer_not_found_returns_error_payload(self, smcp_namespace, mock_server):
+        """sync：``client:tool_call`` 目标 Computer 名未注册 → flat ErrorPayload(404)，不抛未捕获 ValueError（#99；sync mirror）.
+        Sync mirror: unregistered target Computer → flat ErrorPayload(404), no uncaught ValueError (#99)."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {}
+        smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "office_id": "room1"})
+        smcp_namespace.call = MagicMock()
+        ret = smcp_namespace.on_client_tool_call(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "absent", "tool_name": "t", "params": {}, "timeout": 5},
+        )
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert is_protocol_error_payload(ret) is True
+        assert ret["details"]["computer_name"] == "absent"
+        smcp_namespace.call.assert_not_called()  # 未找到时不应转发 / no relay on not-found
+
+    def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
+        """跨房间 → 显式 raise SMCPNamespaceError（对齐 #31 `-O` 加固）.
+        Cross-office → explicit raise SMCPNamespaceError (per #31)."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": "c1"}
+        sess_agent = {"role": "agent", "office_id": "room2", "name": "agent-1"}
+        smcp_namespace.get_session = MagicMock(
+            side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent,
+        )
+        with pytest.raises(SMCPNamespaceError, match="跨房间"):
+            smcp_namespace.on_client_get_blob(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "c1", "blob_handle": "h"},
+            )
+
+    def test_on_server_update_skills_broadcasts(self, smcp_namespace, mock_server):
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        comp_name = "c1"
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = MagicMock(return_value=sess_comp)
+        smcp_namespace.emit = MagicMock()
+        smcp_namespace.on_server_update_skills(comp_sid, {"computer": comp_name})
+        smcp_namespace.emit.assert_called_once()
+        args, kwargs = smcp_namespace.emit.call_args
+        assert args[0] == UPDATE_SKILLS_NOTIFICATION
+        assert args[1] == {"computer": comp_name}
+        assert kwargs["room"] == "room1"
+        assert kwargs["skip_sid"] == comp_sid
+
+    def test_on_server_update_skills_rejects_non_computer(self, smcp_namespace, mock_server):
+        smcp_namespace.server = mock_server
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        smcp_namespace.get_session = MagicMock(return_value=sess_agent)
+        smcp_namespace.emit = MagicMock()
+        with pytest.raises(SMCPNamespaceError, match="Computer"):
+            smcp_namespace.on_server_update_skills("a-sid", {"computer": "c1"})
+        smcp_namespace.emit.assert_not_called()
+
+    # ── v0.2.2 #46（sync 镜像）：旧路由收编 _relay_client_call + 飞行断连防御 ──
+
+    def test_get_tools_relays_via_unified_helper(self, routed_ns):
+        """sync：``client:get_tools`` 收编后经 ``_relay_client_call`` 转发到正确事件 + Computer SID."""
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ns.call.return_value = {"tools": [], "req_id": "r1"}
+        ret = ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        ns.call.assert_called_once()
+        assert ns.call.call_args[0][0] == GET_TOOLS_EVENT
+        assert ns.call.call_args.kwargs["to"] == comp_sid
+        assert ret["tools"] == []
+
+    def test_get_tools_flat_error_passthrough(self, routed_ns):
+        """sync：v0.2.2 旧路由非豁免——``client:get_tools`` 的 flat ErrorPayload 原样透传，不强转 GetToolsRet."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "computer mcp not ready"}
+        ns.call.return_value = err
+        ret = ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    def test_get_desktop_flat_error_passthrough(self, routed_ns):
+        """sync：``client:get_desktop`` 同样透传 flat ErrorPayload."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "no desktop"}
+        ns.call.return_value = err
+        ret = ns.on_client_get_desktop(agent_sid, {"computer": comp_name})
+        assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
+
+    def test_relay_agent_session_none_raises_namespace_error(self, smcp_namespace, mock_server):
+        """sync：发起者飞行中断连 ``get_session(sid)`` → None → **显式 raise SMCPNamespaceError**（替代 AttributeError，#46/#31）."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        comp_name = "c1"
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else None)
+        smcp_namespace.call = MagicMock()
+        with pytest.raises(SMCPNamespaceError, match="session gone"):
+            smcp_namespace.on_client_get_tools("gone-agent-sid", {"computer": comp_name})
+        smcp_namespace.call.assert_not_called()
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    """轮询线程间条件。Poll a cross-thread condition until true or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+class TestInflightTargetDisconnectGuardSync:
+    """#100 Phase 1 sync mirror：目标 Computer 在途断连 → 即时回 flat ErrorPayload(404)，不静默挂死到满超时.
+
+    同步版 ``self.call`` 阻塞当前 worker 线程、其等待原语在 ``call()`` 内部不可达，故守卫把 ``self.call`` 丢到
+    daemon 子线程跑、主线程等「完成 OR 由 ``on_disconnect`` 触发的断连信号」共享事件；断连先到 → 404（子线程
+    成为有界僵尸，至自身 timeout 退出）。三结局严格区分：断连→404 / 真超时→抛 TimeoutError / 正常→透传。
+    Sync mirror of the async guard. Explicit mirror per the sync/async parity convention.
+    """
+
+    @pytest.fixture
+    def guard_ns(self, smcp_namespace, mock_server):
+        smcp_namespace.server = mock_server
+        agent_sid = "a-sid"
+        comp_name = "c1"
+        comp_sid = "c-sid"
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
+        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace.call = MagicMock()
+        return smcp_namespace, agent_sid, comp_name, comp_sid
+
+    @staticmethod
+    def _tool_call_req(comp_name: str, timeout: int = 30) -> dict:
+        return {"agent": "agent-1", "req_id": "r", "computer": comp_name, "tool_name": "t", "params": {}, "timeout": timeout}
+
+    def test_target_disconnect_midflight_returns_404(self, guard_ns):
+        """在途 tool_call + 目标断连 → flat ErrorPayload(404)，registry 清理（核心复现，sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        started = threading.Event()
+        gate = threading.Event()  # 测试期间永不 set → 模拟死目标 / never set: simulates dead target
+
+        def blocking_call(*_a, **_k):
+            started.set()
+            gate.wait()
+            return {"late": True}
+
+        ns.call = MagicMock(side_effect=blocking_call)
+        box: dict = {}
+
+        def run():
+            box["ret"] = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name))
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            assert started.wait(timeout=2)  # relay 已下发 self.call（子线程已启动）/ relay dispatched self.call
+            assert _wait_until(lambda: comp_sid in ns._inflight_disconnect_signals)
+            ns._fire_inflight_disconnect_signals(comp_sid)  # 模拟断连 / simulate disconnect
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            assert box["ret"]["code"] == int(ErrorCode.NOT_FOUND)
+            assert is_protocol_error_payload(box["ret"]) is True
+            assert box["ret"]["details"]["computer_name"] == comp_name
+            assert comp_sid not in ns._inflight_disconnect_signals
+        finally:
+            gate.set()  # 释放僵尸子线程 / release the orphaned runner thread
+            worker.join(timeout=2)
+
+    def test_genuine_timeout_propagates_not_404(self, guard_ns):
+        """目标在线但慢（真超时）→ 原样抛 TimeoutError，**绝不**转 404（sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        ns.call = MagicMock(side_effect=SioTimeoutError())
+        with pytest.raises(SioTimeoutError):
+            ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    def test_normal_completion_passes_through(self, guard_ns):
+        """正常返回 → 透传、registry 清空（sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        ns.call = MagicMock(return_value={"ok": True})
+        ret = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert ret == {"ok": True}
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    def test_two_concurrent_calls_both_404_on_disconnect(self, guard_ns):
+        """同 Computer 两并发在途 → 断连后都 404（value 为 set；sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        gate = threading.Event()
+
+        def blocking_call(*_a, **_k):
+            gate.wait()
+            return {"late": True}
+
+        ns.call = MagicMock(side_effect=blocking_call)
+        boxes: list[dict] = [{}, {}]
+
+        def run(i: int):
+            boxes[i]["ret"] = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name))
+
+        workers = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(2)]
+        for w in workers:
+            w.start()
+        try:
+            assert _wait_until(lambda: len(ns._inflight_disconnect_signals.get(comp_sid, ())) == 2)
+            ns._fire_inflight_disconnect_signals(comp_sid)
+            for w in workers:
+                w.join(timeout=2)
+            assert all(not w.is_alive() for w in workers)
+            assert boxes[0]["ret"]["code"] == int(ErrorCode.NOT_FOUND)
+            assert boxes[1]["ret"]["code"] == int(ErrorCode.NOT_FOUND)
+            assert comp_sid not in ns._inflight_disconnect_signals
+        finally:
+            gate.set()
+            for w in workers:
+                w.join(timeout=2)
+
+    def test_cross_office_raises_with_no_dangling_signal(self, smcp_namespace, mock_server):
+        """跨房间仍先 raise SMCPNamespaceError，且未登记任何信号（登记在隔离校验之后；sync）."""
+        smcp_namespace.server = mock_server
+        comp_sid = "c-sid"
+        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        sess_comp = {"role": "computer", "office_id": "room1", "name": "c1"}
+        sess_agent = {"role": "agent", "office_id": "room2", "name": "agent-1"}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
+        smcp_namespace.call = MagicMock()
+        with pytest.raises(SMCPNamespaceError, match="跨房间"):
+            smcp_namespace.on_client_tool_call(
+                "a-sid",
+                {"agent": "agent-1", "req_id": "r", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5},
+            )
+        assert comp_sid not in smcp_namespace._inflight_disconnect_signals
+        smcp_namespace.call.assert_not_called()
+
+    def test_toctou_disconnect_before_registration_returns_404(self, guard_ns):
+        """TOCTOU：解析后、登记前目标已断（``get_sid_by_name`` 复查转 None）→ 短路 404，不触发 ``self.call``（sync）."""
+        ns, agent_sid, comp_name, comp_sid = guard_ns
+        seq = [comp_sid, None]
+        ns.get_sid_by_name = MagicMock(side_effect=lambda _name: seq.pop(0) if seq else None)
+        ns.call = MagicMock(return_value={"ok": True})
+        ret = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
+        assert ret["code"] == int(ErrorCode.NOT_FOUND)
+        assert ret["details"]["computer_name"] == comp_name
+        ns.call.assert_not_called()
+        assert comp_sid not in ns._inflight_disconnect_signals
+
+    def test_on_disconnect_calls_super_then_fires_signals(self, guard_ns, monkeypatch):
+        """``on_disconnect`` 覆写：**先 ``super()``、再 fire 信号**（关闭 TOCTOU，#100 fix-review 🟡2；sync）.
+        Asserts super runs before fire (the TOCTOU-closing order; sync mirror)."""
+        ns, _agent_sid, _comp_name, comp_sid = guard_ns
+        ev = ns._register_inflight_signal(comp_sid)
+        seen_set_at_super: list[bool] = []
+
+        def _super(_sid):
+            seen_set_at_super.append(ev.is_set())  # super 运行时信号尚未 fire / not yet fired when super runs
+
+        monkeypatch.setattr(SyncBaseNamespace, "on_disconnect", MagicMock(side_effect=_super))
+        ns.on_disconnect(comp_sid)
+        assert seen_set_at_super == [False]  # super 先于 fire / super ran before fire
+        assert ev.is_set()  # fire 在 super 之后 / fire ran after super
