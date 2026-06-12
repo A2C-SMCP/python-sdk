@@ -30,43 +30,26 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-skill-computer-management.md �
 from __future__ import annotations
 
 import hashlib
-import mimetypes
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from a2c_smcp.computer.skills.sandbox import DEFAULT_SKILL_FILE, SkillSandboxError, resolve_skill_resource
 from a2c_smcp.computer.skills.staging import strip_skill_frontmatter
+from a2c_smcp.utils.mime import guess_mime, is_text_mime
 
 # SKILL.md 固定 MIME（frontmatter 剥离后仍是 markdown 正文）/ Fixed MIME for the SKILL.md entry doc.
 DEFAULT_SKILL_MIME = "text/markdown"
 # 流式 sha256 / 惰性切片的读块大小 / Read-block size for streaming sha256 & lazy slicing.
 _HASH_BLOCK = 1024 * 1024  # 1 MiB
 
-# 可内联为 ``body`` 的文本类 MIME 允许集（非 text/* 的常见文本格式）/ Textual MIME allowlist.
-_TEXTUAL_NON_TEXT_MIME = frozenset(
-    {
-        "application/json",
-        "application/xml",
-        "application/yaml",
-        "application/x-yaml",
-        "application/toml",
-        "application/javascript",
-    },
-)
-
 # 惰性切片闭包 / Lazy slice closure: (offset, length) -> bytes
 _Slicer = Callable[[int, int], bytes]
 
-
-def looks_textual(mime: str) -> bool:
-    """MIME 是否文本类（可内联为 ``body``）/ Whether a MIME is textual enough to inline as ``body``。
-
-    ``text/*`` 或常见文本格式（json/xml/yaml/...）→ ``True``；其余（含 ``application/octet-stream``
-    与各类二进制）→ ``False``（一律铸句柄）。最终能否内联仍需调用方叠加「≤ inline_budget」+「UTF-8
-    可解码」判定。
-    """
-    return mime.startswith("text/") or mime in _TEXTUAL_NON_TEXT_MIME
+# 向后兼容别名（v0.2.1 公开 API）/ Backward-compat alias。文本性判定已收敛到 utils.mime 单一权威
+# （协议 §6.4 判据：text/* ∨ +json/+xml/+yaml 后缀 ∨ essence 白名单）。新代码请直接用
+# :func:`a2c_smcp.utils.mime.is_text_mime`。
+looks_textual = is_text_mime
 
 
 @dataclass(frozen=True, eq=False)
@@ -79,11 +62,12 @@ class SkillResourceView:
     Attributes:
         rel_path: 回显用相对路径（缺省请求回显 ``"SKILL.md"``）。
         abs_path: 沙箱校验后的真实绝对路径（``realpath``）。
-        mime: 资源 MIME（SKILL.md 固定 ``text/markdown``；其它 ``mimetypes.guess_type``）。
+        mime: 资源 MIME（SKILL.md 固定 ``text/markdown``；其它经 :func:`a2c_smcp.utils.mime.guess_mime`
+            确定性推断，不依赖宿主 OS 注册表）。
         total_size: 消费字节数。
         sha256: 消费字节的 sha256 十六进制（流式计算，不全量驻留）。
         is_entry: 是否服务「frontmatter 剥离后的 SKILL.md 入口」。
-        is_text: MIME 是否文本类（:func:`looks_textual`），供 inline 决策。
+        is_text: MIME 是否文本类（:func:`a2c_smcp.utils.mime.is_text_mime`），供 inline 决策。
         _slicer: 惰性切片闭包；SKILL.md 走内存剥离 body，其它走 disk seek+read。
     """
 
@@ -207,8 +191,8 @@ def resolve_skill_view(
     raw_size = target.stat().st_size
     if too_large_cap is not None and raw_size > too_large_cap:
         raise SkillSandboxError("too_large", rel_path=rel_echo, total_size=raw_size)
-    guessed, _ = mimetypes.guess_type(target.name)
-    mime = guessed or "application/octet-stream"
+    # §6.4(1) 确定性推断：实现内置「扩展名→MIME」映射，绝不依赖宿主 OS 的 mimetypes 注册表。
+    mime = guess_mime(target.name)
     return SkillResourceView(
         rel_path=rel_echo,
         abs_path=target,
@@ -216,6 +200,6 @@ def resolve_skill_view(
         total_size=raw_size,
         sha256=_stream_sha256(target),
         is_entry=False,
-        is_text=looks_textual(mime),
+        is_text=is_text_mime(mime),
         _slicer=_disk_slicer(target),
     )

@@ -21,6 +21,7 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-skill-computer-management.md �
 from __future__ import annotations
 
 import hashlib
+import mimetypes
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,9 @@ def pkg(tmp_path: Path) -> Path:
     (root / "SKILL.md").write_text(_SKILL_MD, encoding="utf-8")
     (root / "references" / "note.txt").write_bytes(_NOTE)
     (root / "data.json").write_text('{"k": 1}\n', encoding="utf-8")
+    (root / "config.yaml").write_text("k: 1\n", encoding="utf-8")
+    (root / "resources").mkdir()
+    (root / "resources" / "doc.md").write_text("# Doc\n\nbody\n", encoding="utf-8")
     (root / ".skillenv").write_text("SECRET=1\n", encoding="utf-8")
     return root
 
@@ -93,6 +97,42 @@ def test_subresource_raw_bytes(pkg: Path) -> None:
 def test_json_subresource_is_textual(pkg: Path) -> None:
     view = resolve_skill_view(pkg, "data.json")
     assert view.is_text is True  # application/json ∈ 文本类允许集
+
+
+# ---------------------------------------------------------------------------
+# #105 回归：文本子资源 MIME 确定性（跨 OS，不依赖宿主 mimetypes 注册表）
+# Protocol: a2c-smcp-protocol skill.md §6.4
+# ---------------------------------------------------------------------------
+def test_yaml_subresource_textual_deterministic(pkg: Path) -> None:
+    """``.yaml`` 子资源跨 OS 确定判为文本（宿主 ``mimetypes`` 对 ``.yaml`` 在多数环境返回 None）。"""
+    view = resolve_skill_view(pkg, "config.yaml")
+    assert view.mime == "application/yaml"
+    assert view.is_text is True
+
+
+def test_md_subresource_textual_cross_os(pkg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#105 根因复现：即便宿主 ``mimetypes`` 对 ``.md`` 返回 None（macOS / Python 3.11 实况），
+    子资源仍 MUST 判为 ``text/markdown`` 文本——证明推断不依赖宿主注册表。"""
+    monkeypatch.setattr(mimetypes, "guess_type", lambda *a, **k: (None, None))
+    view = resolve_skill_view(pkg, "resources/doc.md")
+    assert view.mime == "text/markdown"
+    assert view.is_text is True
+
+
+def test_binary_subresource_wire_mime_accurate(pkg: Path) -> None:
+    """二进制子资源 wire ``mime_type`` 确定且准确（不退化为 octet-stream）。"""
+    (pkg / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    view = resolve_skill_view(pkg, "diagram.png")
+    assert view.mime == "image/png"
+    assert view.is_text is False
+
+
+def test_unknown_ext_subresource_octet_stream(pkg: Path) -> None:
+    """未登记扩展名 → octet-stream + ``is_text`` False（确定回退，不误伤二进制）。"""
+    (pkg / "blob.unknownext").write_bytes(b"\x00\x01\x02")
+    view = resolve_skill_view(pkg, "blob.unknownext")
+    assert view.mime == "application/octet-stream"
+    assert view.is_text is False
 
 
 # ---------------------------------------------------------------------------
