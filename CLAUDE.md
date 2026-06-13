@@ -89,6 +89,11 @@ Socket.IO 事件遵循以下前缀：
 2. 相关命名空间/客户端类中的处理方法
 3. 测试中的 Mock 服务器事件处理器
 
+**工具暴露名语义 (#106)**：`client:get_tools` 暴露给 Agent 的 `SMCPTool.name` 为 **display_name**
+（`tool_meta.alias` 优先，无 alias 时回退 MCP 原始名），由 `manager.available_tools()` 改写。Agent 即以此名
+寻址（`aexecute_tool` 经 `_alias_mapping` 解析回原始名）。故含连字符 / 冲突的原始工具名可借 alias 重命名以适配
+下游命名约束。被 `forbidden_tools` 禁用的工具**不出现在暴露面**（不可见且不可调用），且不参与跨 server 重名冲突检测。
+
 ### v0.2 协议新增 (a2c-smcp-protocol v0.2.0 GA)
 
 - **`client:get_resources`** (`GET_RESOURCES_EVENT`): Agent → Computer，透明转发 MCP

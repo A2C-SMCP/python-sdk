@@ -310,17 +310,23 @@ class MCPServerManager:
 
                     # 确定最终显示的工具名（优先使用别名）
                     display_name: str = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
+
+                    # 检查是否为禁用工具 (根据配置，但此时需要注意如果原始名称在禁用列表中，也应该禁用，因为此处的禁用列表是归属于某个
+                    # ServerConfig的，不存在重复名称的情况，用户有可能配置了alias，但是使用原始名称禁用。)
+                    # 禁用判定必须**先于** tool_sources 收集：被禁用的工具不暴露、不路由、也不应参与跨 server
+                    # 重名冲突检测（#106）——否则「禁用了仍触发 ToolNameDuplicatedError」，用户无法靠 forbid 一方规避重名。
+                    # The forbidden check must precede tool_sources collection: a disabled tool is neither exposed nor
+                    # routed, and must not participate in cross-server duplicate detection (#106).
+                    if display_name in (config.forbidden_tools or []) or original_tool_name in (config.forbidden_tools or []):
+                        self._disabled_tools.add(display_name)
+                        continue
+
                     # 如果使用提别名，则更新别名映射
                     if display_name != original_tool_name:
                         self._alias_mapping[display_name] = (server_name, original_tool_name)
 
                     # 将工具添加到映射
                     tool_sources[display_name].append(server_name)
-
-                    # 检查是否为禁用工具 (根据配置，但此时需要注意如果原始名称在禁用列表中，也应该禁用，因为此处的禁用列表是归属于某个
-                    # ServerConfig的，不存在重复名称的情况，用户有可能配置了alias，但是使用原始名称禁用。)
-                    if display_name in (config.forbidden_tools or []) or original_tool_name in (config.forbidden_tools or []):
-                        self._disabled_tools.add(display_name)
             except Exception as e:
                 logger.error(f"Error listing tools for {server_name}: {e}", exc_info=True)
 
@@ -334,6 +340,12 @@ class MCPServerManager:
                 )
                 raise ToolNameDuplicatedError(f"Tool '{tool}' exists in multiple servers: {sources}\n{suggestion}")
             self._tool_mapping[tool] = sources[0]
+
+        # 跨 server 误伤对账（#106）：_disabled_tools 按全局 display_name 索引，若某名被某 server forbid，
+        # 但同名工具由其它 server 正常提供（已进入 _tool_mapping），应以**存活方为准**，否则 avalidate_tool_call
+        # 会因 _disabled_tools 命中而误拒可用工具。单 server 独有工具被 forbid（无其它提供方）则仍保留禁用语义。
+        # Cross-server reconciliation: a name forbidden on one server but live on another must keep the live one.
+        self._disabled_tools.difference_update(self._tool_mapping.keys())
 
     async def avalidate_tool_call(self, tool_name: TOOL_NAME, parameters: dict) -> tuple[SERVER_NAME, TOOL_NAME]:
         """
@@ -516,12 +528,16 @@ class MCPServerManager:
                 tool = next((t for t in tools if t.name == original_tool_name), None)
                 if tool:
                     a2c_meta = self._merged_tool_meta(config, original_tool_name)
+                    # 对外暴露 display_name（alias 优先，无 alias 时即原始名）作为 Tool.name（#106）：Agent 按此名寻址，
+                    # 含连字符 / 冲突的原始名才能借 alias 适配下游命名约束。tool_name 即 _tool_mapping 的 key（display_name）。
+                    # 产出名字改写后的**副本**，避免原地 mutate 缓存对象（servers_cached_tools 按原始名复用，原地改名会破坏后续查找）。
+                    # Expose display_name as Tool.name (#106); yield a renamed copy to avoid mutating the cached tool object.
+                    update: dict[str, Any] = {"name": tool_name}
                     if a2c_meta:
-                        if tool.meta is None:
-                            tool.meta = {A2C_TOOL_META: a2c_meta}
-                        else:
-                            tool.meta.update({A2C_TOOL_META: a2c_meta})
-                    yield tool
+                        merged_meta = dict(tool.meta) if tool.meta else {}
+                        merged_meta[A2C_TOOL_META] = a2c_meta
+                        update["meta"] = merged_meta
+                    yield tool.model_copy(update=update)
 
     async def list_windows(self, window_uri: str | None = None) -> list[tuple[SERVER_NAME, Resource]]:
         """
