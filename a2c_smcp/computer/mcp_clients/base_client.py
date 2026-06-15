@@ -179,6 +179,16 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         # 私有属性：初始化结果（用于后续能力/元信息使用）；断开连接时需清理
         # Private attribute: InitializeResult cached for later capabilities/meta usage; must be cleared on disconnect
         self._initialize_result: InitializeResult | None = None
+        # 会话级「已订阅 window:// URI」集合，保证 list_windows() 的资源订阅**幂等**：每个资源一会话内至多
+        # subscribe 一次。否则每次 list_windows() 都重订阅，触发支持订阅的 Server 反复回发 resource_updated，
+        # 与 Agent「桌面更新自动回拉 GET_DESKTOP → 又触发 list_windows()」串成自放大反馈环（#110 慢 CI 挂死根因）。
+        # 会话拆除时清空，使重连后会重新订阅。
+        # Per-session set of already-subscribed window:// URIs, making list_windows() subscription idempotent
+        # (subscribe each resource at most once per session). Without it, every list_windows() re-subscribes and
+        # makes a subscribe-capable server re-emit resource_updated, forming a self-amplifying loop with the
+        # Agent's auto GET_DESKTOP refresh (root cause of the #110 slow-CI hang). Cleared on session teardown so
+        # a reconnect re-subscribes.
+        self._subscribed_window_uris: set[str] = set()
 
         # 初始化异步状态机
         self.machine = A2CAsyncMachine(
@@ -284,6 +294,9 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             # 清理初始化结果，确保会话真正关闭时协议初始化态一并清理
             # Cleanup InitializeResult to align with actual session teardown
             self._initialize_result = None
+            # 会话关闭即清空已订阅集合：订阅随会话失效，重连后须重新订阅（幂等性以会话为界）。
+            # Subscriptions die with the session; clear so a reconnect re-subscribes (idempotency is per-session).
+            self._subscribed_window_uris.clear()
             self._async_session_closed_event.set()
 
     # region 状态转换回调函数基类实现
@@ -499,10 +512,20 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
             # 同一 MCP 内按 priority 降序排序（仅在本客户端内比较）
             filtered.sort(key=lambda x: x[1], reverse=True)
-            # subscribe 是可选增强：仅当 Server 声明支持订阅时才订阅 window:// 资源
+            # subscribe 是可选增强：仅当 Server 声明支持订阅时才订阅 window:// 资源。
+            # **幂等订阅**：仅订阅本会话尚未订阅过的 URI。否则重复 list_windows() 会反复 subscribe，
+            # 令支持订阅的 Server 反复回发 resource_updated → 与 Agent 自动 GET_DESKTOP 串成自放大反馈环
+            # （#110：慢 CI 上事件循环被风暴压垮、整套 e2e 偶发挂死）。已订阅集合在会话拆除时清空。
+            # Subscribe is optional. **Idempotent**: only subscribe URIs not yet subscribed in this session;
+            # re-subscribing would make a subscribe-capable server re-emit resource_updated, forming a
+            # self-amplifying loop with the Agent's auto GET_DESKTOP refresh (#110 slow-CI e2e hang).
             if self.initialize_result.capabilities.resources.subscribe:
                 for r, _ in filtered:
+                    uri_str = str(r.uri)
+                    if uri_str in self._subscribed_window_uris:
+                        continue
                     await asession.subscribe_resource(r.uri)
+                    self._subscribed_window_uris.add(uri_str)
             return [r for r, _ in filtered]
         except Exception as e:
             logger.error(f"Error listing resources for connector {truncate(self.params.model_dump(mode='json'))}: {e}", exc_info=True)
