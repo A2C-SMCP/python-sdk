@@ -67,15 +67,19 @@ build = [
 [tool.poe.tasks]
 test = "pytest tests/unit_tests tests/integration_tests"
 test-cov = "pytest tests -m 'not e2e' --cov a2c_smcp --cov-report=term-missing --cov-fail-under=0 --cov-config=.coveragerc"
-# 中文: e2e 为真进程/socketio 套件，历史上存在 CI 偶发死锁会顶满 6h job 上限（见 PR #103）。
-#   --timeout=120 让任何挂起的用例在 120s 内 fail-fast 并打印卡住处栈（signal 法，默认）；
-#   --reruns 3 让 CI 慢双核时序竞态导致的偶发失败自动重试恢复，避免整条流水线因 flake 转红。
+# 中文: e2e 为真进程/socketio 套件，历史上存在 CI 偶发死锁会顶满 job 上限（见 PR #103）。
+#   --timeout-method=thread：**关键**——卡死点在 ThreadedChildWatcher 子线程的 os.waitpid（回收
+#     stdio 子进程），signal 法的 SIGALRM 无法打断它（实测从不触发，见 #105 调查），故必须用
+#     thread 法（faulthandler 打印全部线程栈后 os._exit），命中即快速 RED 并带真实栈，而非挂满守护期。
+#   --timeout=120 给任何挂起用例 120s fail-fast；--reruns 3 让慢双核时序竞态偶发失败自动重试恢复。
 #   仅作用于 e2e（不影响 unit/integration 的 `test` 任务）。属测试基建，不改业务代码。
-# English: the e2e (real-process/socketio) suite has a history of intermittent CI deadlocks that
-#   ran to the 6h job cap (see PR #103). --timeout=120 fails any hung test fast (signal method,
-#   dumping the frozen stack); --reruns 3 auto-recovers flaky races from the slow 2-core CI timing
-#   so a single flake doesn't redden the whole pipeline. e2e-only; test infra, no business-code change.
-test-e2e = "pytest tests -m e2e --timeout=120 --reruns 3 --reruns-delay 5"
+# English: e2e (real-process/socketio) has a history of intermittent CI deadlocks (PR #103). The hang
+#   sits in os.waitpid on a ThreadedChildWatcher thread (reaping a stdio child) which SIGALRM cannot
+#   interrupt — signal-method timeout provably never fired (see #105 investigation). --timeout-method=
+#   thread (faulthandler dumps all thread stacks then os._exit) turns the silent hang into a fast RED
+#   with the real stack. --timeout=120 fail-fast; --reruns 3 auto-recovers slow-2-core timing flakes.
+#   e2e-only; test infra, no business-code change.
+test-e2e = "pytest tests -m e2e --timeout=120 --timeout-method=thread --reruns 3 --reruns-delay 5"
 typecheck = "mypy a2c_smcp"
 format = "ruff format ."
 

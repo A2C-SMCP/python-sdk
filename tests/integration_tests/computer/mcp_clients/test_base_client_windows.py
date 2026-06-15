@@ -11,13 +11,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcp import StdioServerParameters
+from mcp.types import ResourceUpdatedNotification
 
 from a2c_smcp.computer.mcp_clients.stdio_client import StdioMCPClient
+
+
+async def _wait_for(pred: Callable[[], bool], timeout: float = 5.0, interval: float = 0.05) -> None:
+    """中文: 轮询等待断言成立或超时（用于等待异步到达的 MCP 通知）。
+    English: poll until ``pred()`` is true or timeout (await asynchronously-delivered MCP notifications).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if pred():
+            return
+        await asyncio.sleep(interval)
 
 
 @pytest.mark.asyncio
@@ -48,6 +64,122 @@ async def test_list_windows_without_subscribe_returns_resources() -> None:
 
     await client.adisconnect()
     await client._async_session_closed_event.wait()
+
+
+@pytest.mark.asyncio
+async def test_list_windows_subscribe_is_idempotent_no_storm() -> None:
+    """
+    中文: #110 反馈环根因回归 —— ``list_windows()`` 重复调用必须「幂等订阅」：每个 window:// 资源
+          在会话内**至多 subscribe 一次**。否则每次重复 subscribe 都会触发 subscribe-srv 回发一条
+          ``ResourceUpdatedNotification``，与 Agent 侧「桌面更新自动回拉 ``GET_DESKTOP`` → ``GET_DESKTOP``
+          经 ``get_windows_details`` 又调用 ``list_windows()``」串成自放大反馈环，在慢速 CI（2 核）上把
+          事件循环压垮 → 整套 e2e 偶发挂死（~40%，signal-timeout 打不断）。
+
+    英文: Regression for the #110 feedback-loop root cause. Repeated ``list_windows()`` MUST subscribe each
+          window:// resource at most once per session; otherwise every re-subscribe makes subscribe-srv
+          re-emit a ``ResourceUpdatedNotification``, which combined with the Agent's auto ``GET_DESKTOP``
+          refresh (whose ``get_windows_details`` calls ``list_windows()`` again) forms a self-amplifying loop
+          that wedges the event loop on slow CI (~40% e2e hang; signal-timeout cannot interrupt it).
+    """
+    server_py = Path(__file__).resolve().parents[2] / "computer" / "mcp_servers" / "resources_subscribe_stdio_server.py"
+    assert server_py.exists(), f"server script not found: {server_py}"
+
+    # subscribe-srv 每次收到 resources/subscribe 都会回发一次 ResourceUpdatedNotification，
+    # 故收到的通知条数 == 实际 subscribe 次数，可直接据此断言幂等性。
+    # subscribe-srv re-emits one ResourceUpdatedNotification per resources/subscribe, so the count of
+    # received notifications equals the number of subscribe calls — a direct probe for idempotency.
+    updates: list[str] = []
+
+    async def _count_resource_updated(message: Any) -> None:
+        root = getattr(message, "root", None)
+        if isinstance(root, ResourceUpdatedNotification):
+            updates.append(str(root.params.uri))
+
+    params = StdioServerParameters(command=sys.executable, args=[str(server_py)])
+    client = StdioMCPClient(params, message_handler=_count_resource_updated)
+
+    await client.aconnect()
+    await client._create_session_success_event.wait()
+    assert client.initialize_result is not None
+    assert client.initialize_result.capabilities.resources is not None
+    assert client.initialize_result.capabilities.resources.subscribe is True
+
+    try:
+        # 首轮：两个 window:// 资源各订阅一次 → 期望恰好收到 2 条 resource_updated
+        # First round: two window:// resources each subscribed once → expect exactly 2 resource_updated
+        windows = await client.list_windows()
+        n_windows = len(windows)
+        assert n_windows == 2, f"subscribe-srv 暴露两个 window:// 资源，实际 {n_windows}"
+        await _wait_for(lambda: len(updates) >= n_windows, timeout=5.0)
+        first_round = len(updates)
+        assert first_round == n_windows, f"首轮应每个窗口恰一次 resource_updated，实际 {first_round}"
+
+        # 二次 list_windows：幂等订阅下不得重新 subscribe → 不得产生任何新增 resource_updated。
+        # 给「重复订阅风暴」留出充足到达时间（本地 stdio 亚秒级），幂等下计数应保持不变。
+        # Second list_windows: idempotent subscribe must not re-subscribe → no new resource_updated.
+        await client.list_windows()
+        await asyncio.sleep(1.0)
+        assert len(updates) == first_round, (
+            "list_windows() 重复调用重新订阅，触发 resource_updated 风暴（#110 反馈环根因）："
+            f"第二轮新增 {len(updates) - first_round} 条 / repeated list_windows re-subscribed and stormed"
+        )
+    finally:
+        await client.adisconnect()
+        await client._async_session_closed_event.wait()
+
+
+@pytest.mark.asyncio
+async def test_list_windows_subscribe_resets_on_reconnect() -> None:
+    """
+    中文: #110 幂等性以**会话为界** —— 断开重连后 ``list_windows()`` 必须重新订阅。已订阅集合在会话拆除时
+          清空，故重连建立新会话后会对同一 window:// 资源再次 subscribe（每个窗口再产生一条 resource_updated）。
+          反证：若清空缺失，重连后将永久抑制订阅 → 真实内容更新通知丢失（破坏 DoD #3 / v0.2 通知语义）。
+
+    英文: #110 idempotency is **per-session** — after disconnect+reconnect, ``list_windows()`` MUST re-subscribe.
+          The subscribed-URI set is cleared on session teardown, so a reconnected (fresh) session re-subscribes
+          each window:// resource. Without the clear, reconnect would permanently suppress subscriptions.
+    """
+    server_py = Path(__file__).resolve().parents[2] / "computer" / "mcp_servers" / "resources_subscribe_stdio_server.py"
+    assert server_py.exists(), f"server script not found: {server_py}"
+
+    updates: list[str] = []
+
+    async def _count_resource_updated(message: Any) -> None:
+        root = getattr(message, "root", None)
+        if isinstance(root, ResourceUpdatedNotification):
+            updates.append(str(root.params.uri))
+
+    params = StdioServerParameters(command=sys.executable, args=[str(server_py)])
+    client = StdioMCPClient(params, message_handler=_count_resource_updated)
+
+    try:
+        # 首个会话：订阅 N 个窗口 → N 条 resource_updated / first session: subscribe N windows → N updates
+        await client.aconnect()
+        await client._create_session_success_event.wait()
+        windows = await client.list_windows()
+        n_windows = len(windows)
+        assert n_windows == 2, f"subscribe-srv 暴露两个 window:// 资源，实际 {n_windows}"
+        await _wait_for(lambda: len(updates) >= n_windows, timeout=5.0)
+        after_first = len(updates)
+        assert after_first == n_windows
+
+        # 断开 → 重置 → 重连（建立全新会话）/ disconnect → reset → reconnect (fresh session)
+        await client.adisconnect()
+        await client.ainitialize()
+        await client.aconnect()
+        await client._create_session_success_event.wait()
+
+        # 重连后会话级订阅集合已清空 → list_windows 重新订阅 → 再产生 N 条 resource_updated
+        # Post-reconnect the per-session set is cleared → list_windows re-subscribes → N more updates
+        await client.list_windows()
+        await _wait_for(lambda: len(updates) >= after_first + n_windows, timeout=5.0)
+        assert len(updates) == after_first + n_windows, (
+            f"重连后应重新订阅（每窗口再一条 resource_updated），实际新增 {len(updates) - after_first} "
+            f"/ reconnect must re-subscribe"
+        )
+    finally:
+        await client.adisconnect()
+        await client._async_session_closed_event.wait()
 
 
 @pytest.mark.skip(

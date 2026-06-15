@@ -28,11 +28,18 @@ from pydantic import BaseModel
 from transitions.core import EventData
 from transitions.extensions import AsyncMachine
 
+from a2c_smcp.computer.mcp_clients._proc import force_kill_pids
 from a2c_smcp.utils import is_window_uri
 from a2c_smcp.utils.async_property import async_property
 from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
+
+# 优雅关闭整体超时（秒）：mcp 子进程回收（graceful 2s + SIGTERM→SIGKILL 升级）通常秒级完成，
+# 超过此阈值视为异常卡死 → 触发「兑底强杀」。属防御阈值，正常路径远低于此。
+# Overall graceful-teardown budget before the force-kill fallback fires. mcp's own child reaping
+# (2s graceful + SIGTERM→SIGKILL escalation) finishes in seconds; exceeding this means a wedge.
+_TEARDOWN_TIMEOUT = 10.0
 
 # 泛型参数，用于约束 MCP Server 参数类型
 # Generic parameter for constraining MCP Server parameter types
@@ -159,9 +166,29 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         self._create_session_success_event = asyncio.Event()
         self._create_session_failure_event = asyncio.Event()
         self._async_session_closed_event = asyncio.Event()
+        # 优雅关闭信号：替代 task.cancel() 触发 keep-alive 收尾，确保 _aexit_stack.aclose()
+        # （内含 mcp SDK 的 graceful→SIGTERM→SIGKILL 子进程回收）在**非取消**上下文运行；否则
+        # CancelledError 会抢占 mcp 的 anyio.fail_after，跳过强杀 → stdio 子进程残留、其
+        # ThreadedChildWatcher 的 os.waitpid 永久阻塞（慢 CI 偶发整套 e2e 挂死的根因）。
+        # Graceful-close signal replacing task.cancel() so _aexit_stack.aclose() runs cancellation-free
+        # and mcp's child force-kill actually executes (cancel would skip it → wedged stdio child).
+        self._close_event = asyncio.Event()
+        # 本 client 启动的子进程 PID（仅 stdio 传输填充），供「兑底强杀」使用。
+        # PIDs of children spawned by this client (stdio only); used by the force-kill fallback.
+        self._child_pids: set[int] = set()
         # 私有属性：初始化结果（用于后续能力/元信息使用）；断开连接时需清理
         # Private attribute: InitializeResult cached for later capabilities/meta usage; must be cleared on disconnect
         self._initialize_result: InitializeResult | None = None
+        # 会话级「已订阅 window:// URI」集合，保证 list_windows() 的资源订阅**幂等**：每个资源一会话内至多
+        # subscribe 一次。否则每次 list_windows() 都重订阅，触发支持订阅的 Server 反复回发 resource_updated，
+        # 与 Agent「桌面更新自动回拉 GET_DESKTOP → 又触发 list_windows()」串成自放大反馈环（#110 慢 CI 挂死根因）。
+        # 会话拆除时清空，使重连后会重新订阅。
+        # Per-session set of already-subscribed window:// URIs, making list_windows() subscription idempotent
+        # (subscribe each resource at most once per session). Without it, every list_windows() re-subscribes and
+        # makes a subscribe-capable server re-emit resource_updated, forming a self-amplifying loop with the
+        # Agent's auto GET_DESKTOP refresh (root cause of the #110 slow-CI hang). Cleared on session teardown so
+        # a reconnect re-subscribes.
+        self._subscribed_window_uris: set[str] = set()
 
         # 初始化异步状态机
         self.machine = A2CAsyncMachine(
@@ -236,17 +263,23 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         4. 得到关闭信号后，对 self._aexit_stack 里的上下文进行关闭
         """
         logger.debug(f"Session keep-alive task: {asyncio.current_task().get_name()}")
+        # 每个 keep-alive 任务实例使用干净的关闭信号 / fresh close signal per task instance
+        self._close_event.clear()
         try:
             # 创建异步会话，同时完成上下文的压栈
             self._async_session = await self._create_async_session()
             # 通知创建成功
             self._create_session_success_event.set()
-            # 持续等待关闭信息
+            # 持续等待关闭信号
             try:
-                # 等待任务的cancel
-                await asyncio.Event().wait()
+                # 等待 _close_task 通过 _close_event.set() 触发的优雅关闭。
+                # 不再依赖 task.cancel —— cancel 会令 finally 中 _aexit_stack.aclose() 在
+                # CancelledError 抢占下跳过 mcp 的子进程强杀，导致 stdio 子进程残留、os.waitpid 永久阻塞。
+                # Wait for the graceful close signal; do NOT rely on task.cancel (it would let the
+                # finally-block aclose() be pre-empted by CancelledError, skipping mcp's child force-kill).
+                await self._close_event.wait()
             except asyncio.CancelledError:
-                # 任务被取消，完成上下文
+                # 向后兼容：仍容忍历史 cancel 路径 / back-compat: still tolerate the legacy cancel path
                 logger.debug(f"Session keep-alive task cancelled: {asyncio.current_task().get_name()}")
         except Exception as e:
             logger.error(f"Session keep-alive task error: {asyncio.current_task().get_name()}: {e}", exc_info=True)
@@ -261,6 +294,9 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             # 清理初始化结果，确保会话真正关闭时协议初始化态一并清理
             # Cleanup InitializeResult to align with actual session teardown
             self._initialize_result = None
+            # 会话关闭即清空已订阅集合：订阅随会话失效，重连后须重新订阅（幂等性以会话为界）。
+            # Subscriptions die with the session; clear so a reconnect re-subscribes (idempotency is per-session).
+            self._subscribed_window_uris.clear()
             self._async_session_closed_event.set()
 
     # region 状态转换回调函数基类实现
@@ -476,10 +512,20 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
             # 同一 MCP 内按 priority 降序排序（仅在本客户端内比较）
             filtered.sort(key=lambda x: x[1], reverse=True)
-            # subscribe 是可选增强：仅当 Server 声明支持订阅时才订阅 window:// 资源
+            # subscribe 是可选增强：仅当 Server 声明支持订阅时才订阅 window:// 资源。
+            # **幂等订阅**：仅订阅本会话尚未订阅过的 URI。否则重复 list_windows() 会反复 subscribe，
+            # 令支持订阅的 Server 反复回发 resource_updated → 与 Agent 自动 GET_DESKTOP 串成自放大反馈环
+            # （#110：慢 CI 上事件循环被风暴压垮、整套 e2e 偶发挂死）。已订阅集合在会话拆除时清空。
+            # Subscribe is optional. **Idempotent**: only subscribe URIs not yet subscribed in this session;
+            # re-subscribing would make a subscribe-capable server re-emit resource_updated, forming a
+            # self-amplifying loop with the Agent's auto GET_DESKTOP refresh (#110 slow-CI e2e hang).
             if self.initialize_result.capabilities.resources.subscribe:
                 for r, _ in filtered:
+                    uri_str = str(r.uri)
+                    if uri_str in self._subscribed_window_uris:
+                        continue
                     await asession.subscribe_resource(r.uri)
+                    self._subscribed_window_uris.add(uri_str)
             return [r for r, _ in filtered]
         except Exception as e:
             logger.error(f"Error listing resources for connector {truncate(self.params.model_dump(mode='json'))}: {e}", exc_info=True)
@@ -572,17 +618,60 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             await asyncio.wait_for(asyncio.shield(_send()), timeout=2.0)
 
     async def _close_task(self) -> None:
-        """
-        关闭异步任务
-        """
-        # 将所有异步Event全部clear
-        if self._session_keep_alive_task and not self._session_keep_alive_task.done():
-            self._session_keep_alive_task.cancel()
+        """优雅关闭 keep-alive 任务及其持有的 MCP 会话 / stdio 子进程。
 
-            # 等待_session_keep_alive_task结束
-            try:
-                await self._session_keep_alive_task
-            except asyncio.CancelledError:
-                logger.debug("Session keep-alive task was cancelled")
-            except Exception as e:
-                logger.error(f"Session keep-alive task failed: {e}", exc_info=True)
+        中文（三步，确保 ``Computer.shutdown()`` 永不被卡死子进程拖死）：
+          1. ``_close_event.set()`` 触发任务收尾（其 ``finally`` 运行 ``_aexit_stack.aclose()``，
+             在**非取消**上下文中让 mcp 的 graceful→SIGTERM→SIGKILL 子进程回收得以生效）；
+          2. 以 ``asyncio.wait_for`` 限时等待，并 ``asyncio.shield`` 防止外层取消把 CancelledError
+             灌进收尾流程（否则重蹈强杀被跳过的覆辙）；
+          3. 超时则按 PID「兑底强杀」子进程树，再有限等待；仍不结束则放弃任务并补发 closed 事件。
+        English: signal graceful close, bounded shielded wait, then PID-based force-kill fallback so a
+        wedged child can never hang shutdown.
+        """
+        task = self._session_keep_alive_task
+        if task is None or task.done():
+            return
+        # 1. 触发优雅关闭 / signal graceful close
+        self._close_event.set()
+        # 错误路径（aerror→on_enter_error→_close_task 在任务自身上下文内调用）不能 await 自己
+        # The error path may invoke this from within the task itself; never await self.
+        if asyncio.current_task() is task:
+            return
+        # 2. 限时等待收尾（shield 防外层取消污染收尾流程）/ bounded wait, shielded from outer cancel
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=_TEARDOWN_TIMEOUT)
+            return
+        except TimeoutError:
+            logger.error(
+                f"MCP client teardown exceeded {_TEARDOWN_TIMEOUT}s; force-killing child process tree "
+                f"(pids={self._child_pids or 'none'}). server params: {truncate(self.params)}",
+            )
+        except asyncio.CancelledError:
+            logger.debug("Session keep-alive task close-wait was cancelled")
+            return
+        except Exception as e:
+            logger.error(f"Session keep-alive task failed: {e}", exc_info=True)
+            return
+        # 3. 兑底强杀 + 再次有限等待 / force-kill fallback then bounded re-wait
+        await self._aforce_kill()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=_TEARDOWN_TIMEOUT)
+        except asyncio.CancelledError:
+            self._async_session_closed_event.set()
+        except Exception as e:  # noqa: BLE001 - 兜底：放弃任务，绝不让 shutdown 挂死
+            logger.error(f"MCP client teardown still pending after force-kill; abandoning task: {e}")
+            task.cancel()
+            # 子进程已强杀，补发 closed 事件，避免 on_enter_disconnected 的 closed 等待挂死
+            # Child already force-killed; ensure closed-event is set so disconnect doesn't hang.
+            self._async_session_closed_event.set()
+
+    async def _aforce_kill(self) -> None:
+        """兑底强杀本 client 启动的子进程树（仅 stdio 传输有子进程；其它传输为 no-op）。
+
+        best-effort，**绝不抛出**。Force-kill this client's child tree (stdio only; no-op otherwise).
+        """
+        pids = set(self._child_pids)
+        if not pids:
+            return
+        force_kill_pids(pids)

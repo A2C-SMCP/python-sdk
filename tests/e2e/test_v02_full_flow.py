@@ -205,6 +205,93 @@ async def test_v02_full_flow_compatible(compat_server: int) -> None:
         await computer.shutdown()
 
 
+# subscribe-srv 暴露的两个 window:// 资源（见 resources_subscribe_stdio_server.py）：
+#   - /main      ：annotations.priority=0.6，非 fullscreen
+#   - /dashboard ：annotations.priority=0.9，_meta.fullscreen=True
+# subscribe-srv exposes two window:// resources: /main (priority 0.6) and /dashboard (priority 0.9, fullscreen).
+_SUBSCRIBE_MAIN_URI = "window://example.desktop.subscribe.a/main"
+_SUBSCRIBE_DASHBOARD_URI = "window://example.desktop.subscribe.a/dashboard"
+
+
+@pytest.mark.asyncio
+async def test_v02_get_desktop_window_filter(compat_server: int) -> None:
+    """
+    中文：``client:get_desktop`` 的 window 定向过滤全链路 e2e —— Agent 传入指定 WindowURI 时，
+          全链路（Agent → Server → Computer → Manager 精确匹配 → organize）仅返回该窗口内容。
+
+      契约依据 / Contract:
+        - ``GetDeskTopReq.window``（smcp.py）：指定则尝试只获取该 Window。
+        - ``manager.get_windows_details(window_uri)``：对 ``Resource.uri`` 做「完全相等」过滤（非前缀/模糊）。
+        - ``organize_desktop``：过滤已在 Manager 层完成，故 fullscreen 短路规则（§6.2-4）不会再隐藏被定向
+          选中的非全屏窗口。
+
+      三组对照断言 / Three contrasting assertions:
+        1) 不指定 window：fullscreen 的 /dashboard 短路 subscribe-srv，桌面含 /dashboard、不含 /main（基线）。
+        2) 指定 window=/main：桌面仅含 /main，且不含 /dashboard（定向命中 + 绕过 fullscreen 短路）。
+        3) 指定不存在的 window：完全相等过滤 → 空桌面（验证 exact-match、非模糊匹配语义）。
+
+    English: e2e for the window-targeted filter of ``client:get_desktop``. When the Agent passes a specific
+      WindowURI, the full chain returns only that window's content; the baseline (no filter) returns the
+      fullscreen /dashboard (which short-circuits /main), and an unmatched URI yields an empty desktop
+      (exact-match, not prefix/fuzzy).
+    """
+    base = f"http://127.0.0.1:{compat_server}"
+    office_id = "e2e-v02-desktop-filter"
+    # 仅挂载 subscribe-srv（含 /main 与 fullscreen /dashboard 两个 window:// 资源），保持真实进程足迹最小。
+    # Mount only subscribe-srv to keep the real-process footprint minimal.
+    computer = Computer(
+        name="comp-v02-df",
+        mcp_servers={_stdio_cfg("subscribe-srv", _SUBSCRIBE_SRV)},
+    )
+    comp_client = SMCPComputerClient(computer=computer)
+    auth = DefaultAgentAuthProvider(agent_id="robot-v02-df", office_id=office_id)
+    agent = AsyncSMCPAgentClient(auth_provider=auth)
+
+    try:
+        # —— 三端经真实 ASGI 协议中间件建立连接 / establish the three-party connection ——
+        await agent.connect_to_server(base, namespace=SMCP_NAMESPACE, socketio_path=_SIO_PATH)
+        await agent.emit(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "office_id": office_id, "name": "robot-v02-df"},
+            namespace=SMCP_NAMESPACE,
+        )
+        await computer.boot_up()
+        await comp_client.connect(base, socketio_path=_SIO_PATH, namespaces=[SMCP_NAMESPACE])
+        await comp_client.join_office(office_id)
+        assert agent.connected is True
+        assert comp_client.connected is True
+        await asyncio.sleep(0.5)  # 等待 join 在房间内可见 / wait for room visibility
+
+        # (1) 基线：不指定 window —— fullscreen 的 /dashboard 短路 subscribe-srv，/main 被隐藏
+        baseline = (await agent.get_desktop_from_computer("comp-v02-df", timeout=15))["desktops"]
+        baseline_joined = "\n".join(baseline)
+        assert _SUBSCRIBE_DASHBOARD_URI in baseline_joined, f"基线桌面应含 fullscreen /dashboard：{baseline}"
+        assert _SUBSCRIBE_MAIN_URI not in baseline_joined, f"基线下 fullscreen 短路，/main 不应出现：{baseline}"
+
+        # (2) 指定 window=/main —— 全链路定向命中：桌面仅含 /main，且绕过 fullscreen 短路、不含 /dashboard
+        filtered = (await agent.get_desktop_from_computer("comp-v02-df", window=_SUBSCRIBE_MAIN_URI, timeout=15))["desktops"]
+        assert len(filtered) == 1, f"定向过滤后桌面应只有一个窗口：{filtered}"
+        only = filtered[0]
+        assert only.startswith(_SUBSCRIBE_MAIN_URI), f"定向命中的窗口应为 /main：{only!r}"
+        assert _SUBSCRIBE_DASHBOARD_URI not in only, f"定向 /main 时不应混入 /dashboard：{only!r}"
+
+        # (3) 指定不存在的 window —— 完全相等过滤 → 空桌面（非前缀/模糊匹配语义）
+        missing = (
+            await agent.get_desktop_from_computer(
+                "comp-v02-df",
+                window="window://example.desktop.subscribe.a/does-not-exist",
+                timeout=15,
+            )
+        )["desktops"]
+        assert missing == [], f"不匹配的 WindowURI 应返回空桌面（exact-match 语义）：{missing}"
+    finally:
+        await agent.disconnect()
+        await asyncio.sleep(0.2)
+        # 与全链路用例一致：显式 shutdown 清理 MCP 子进程；跳过 comp_client.disconnect()（其 30s 超时拖慢用例）
+        # Same as the full-flow case: explicit shutdown reaps MCP subprocesses; skip comp_client.disconnect().
+        await computer.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_v02_full_flow_incompatible_handshake_rejected(incompat_server: int) -> None:
     """
