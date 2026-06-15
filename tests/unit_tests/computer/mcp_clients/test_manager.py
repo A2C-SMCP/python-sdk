@@ -45,10 +45,10 @@ class MockMCPClient:
 
 
 def create_mock_tool(name: str, meta: dict | None = None) -> Tool:
-    tool = MagicMock(name=name, spec=Tool)
-    tool.name = name
-    tool.meta = meta
-    return tool
+    # 使用真实 Tool（pydantic 模型）而非 MagicMock：available_tools 经 model_copy 改写暴露名（#106），
+    # 而 MagicMock 的 model_copy 不具备 pydantic 语义（返回 mock，.name 非真实字符串）会失真。
+    # Use a real Tool so model_copy (used to rename the exposed tool, #106) behaves faithfully.
+    return Tool(name=name, inputSchema={"type": "object"}, _meta=meta)
 
 
 # 模拟client_factory函数
@@ -224,6 +224,11 @@ async def test_disabled_tool(manager):
     # 尝试执行禁用工具
     with pytest.raises(PermissionError):
         await manager.aexecute_tool("tool2", {})
+
+    # #106 契约：禁用工具不应再出现在对外暴露面（不可见且不可调用），钉死避免被无意改回。
+    # Contract (#106): a disabled tool must not appear in the exposed tool list either.
+    names = [tool.name async for tool in manager.available_tools()]
+    assert "tool2" not in names
 
 
 @pytest.mark.asyncio
@@ -638,7 +643,9 @@ async def test_aadd_or_aupdate_server_with_duplicate_tool(manager, monkeypatch):
     # 验证服务器仍然保持原状
     assert manager._active_clients["server1"].list_tools.return_value[0].name == "tool1"
     tools_list = [tool async for tool in manager.available_tools()]
-    assert any(tool.name == "tool1" and tool.meta["a2c_tool_meta"].alias == "new_alias" for tool in tools_list) and any(
+    # #106：alias 须反映到对外暴露的 Tool.name。server1 的 tool1 别名为 new_alias → 暴露名 new_alias；
+    # server2 的 tool1 无别名 → 暴露名 tool1。二者借 alias 不再同名冲突（正是本修复要达成的效果）。
+    assert any(tool.name == "new_alias" and tool.meta["a2c_tool_meta"].alias == "new_alias" for tool in tools_list) and any(
         tool.name == "tool1" and not tool.meta for tool in tools_list
     )
 
@@ -839,3 +846,93 @@ async def test_acall_tool_vrl_with_nested_parameters(manager, monkeypatch):
     assert transformed["user_info"]["name"] == "Alice"
     assert transformed["options"]["enabled"] is True
     assert transformed["options"]["timeout"] == 30
+
+
+# ── #106 回归：alias 必须反映到对外暴露的工具名 / alias must surface as the exposed tool name ──
+@pytest.mark.asyncio
+async def test_available_tools_exposes_alias_as_name(manager):
+    """#106 复现：配置 alias 后，available_tools 暴露的 Tool.name 应为 display_name（alias），而非原始名。
+
+    Repro for #106: once an alias is configured, available_tools must expose the display_name (alias)
+    as Tool.name, not the original name. Downstream agents address tools by this name, so含连字符 /
+    冲突的原始名才能借 alias 适配下游命名约束。
+    """
+    tool_meta = {"tool5": ToolMeta(alias="aliased_tool")}
+    servers = [create_server_config("alias_server", tool_meta=tool_meta)]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    names = [tool.name async for tool in manager.available_tools()]
+    # 暴露面应为 alias，原始名不得出现 / exposed name must be the alias, never the original
+    assert "aliased_tool" in names
+    assert "tool5" not in names
+
+
+@pytest.mark.asyncio
+async def test_forbidden_tool_excluded_from_duplicate_detection(manager, monkeypatch):
+    """#106 附带缺陷复现：被 forbid 的工具不应再参与跨 server 重名冲突检测。
+
+    Repro for #106 secondary defect: a forbidden tool must not participate in cross-server duplicate
+    detection. 两个 server 都原生暴露同名 ``tool1``，其中一侧 forbid 之后，应能消除 ToolNameDuplicatedError。
+    """
+
+    def both_expose_tool1(config: MCPServerConfig, message_handler=None) -> Any:
+        return MockMCPClient([create_mock_tool("tool1")], message_handler=message_handler)
+
+    monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", both_expose_tool1)
+
+    # server1 forbid tool1，server2 正常暴露 tool1 → 不应再冲突
+    servers = [
+        create_server_config("server1", forbidden_tools=["tool1"]),
+        create_server_config("server2"),
+    ]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    # 冲突被消除：tool1 仅来自 server2 / conflict resolved: tool1 routes to server2 only
+    assert manager._tool_mapping["tool1"] == "server2"
+    # 存活侧（server2）的 tool1 仍可寻址；不被另一 server 的 forbid 误伤
+    # The surviving tool1 (server2) stays addressable; a forbid on another server must not disable it.
+    assert "tool1" not in manager._disabled_tools
+    server_name, original = await manager.avalidate_tool_call("tool1", {})
+    assert (server_name, original) == ("server2", "tool1")
+    # 暴露面只出现一次 tool1（server1 那份被禁用、不暴露）/ tool1 exposed exactly once
+    names = [tool.name async for tool in manager.available_tools()]
+    assert names.count("tool1") == 1
+
+
+@pytest.mark.asyncio
+async def test_forbidden_original_name_suppresses_alias(manager):
+    """#106 边界：对原始名 forbid 时，即便该工具配了 alias，alias 也不应暴露（forbid 优先于 alias）。
+
+    Boundary (#106): forbidding by the original name suppresses an aliased exposure too — forbid wins over alias,
+    so an aliased tool cannot be used to bypass a forbid on its underlying tool.
+    """
+    tool_meta = {"tool5": ToolMeta(alias="aliased_tool")}
+    servers = [create_server_config("alias_server", tool_meta=tool_meta, forbidden_tools=["tool5"])]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    # alias 与原始名都不暴露、不路由 / neither the alias nor the original is exposed/routed
+    names = [tool.name async for tool in manager.available_tools()]
+    assert "aliased_tool" not in names
+    assert "tool5" not in names
+    assert "aliased_tool" not in manager._tool_mapping
+    assert "tool5" not in manager._tool_mapping
+
+
+@pytest.mark.asyncio
+async def test_forbidden_tool_without_provider_stays_disabled(manager):
+    """forbid 单 server 独有工具时，仍应保留 PermissionError 语义（_disabled_tools 命中）。
+
+    When the forbidden tool is not provided by any other server, it stays in _disabled_tools so a call
+    raises PermissionError (regression guard for the existing single-server forbid behavior).
+    """
+    servers = [create_server_config("server1", forbidden_tools=["tool2"])]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    assert "tool2" in manager._disabled_tools
+    assert "tool2" not in manager._tool_mapping
+    with pytest.raises(PermissionError):
+        await manager.aexecute_tool("tool2", {})

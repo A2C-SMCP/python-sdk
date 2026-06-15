@@ -155,6 +155,36 @@ class TestAsyncGetSkill:
             assert "blob_handle" not in ret
 
     @pytest.mark.asyncio
+    async def test_blob_handle_branch_auto_drains_for_application_yaml(self, async_client: AsyncSMCPAgentClient) -> None:
+        """#105 两端对齐：非 text/* 文本（``application/yaml``）的 blob_handle 也自动 drain。
+
+        此前 drain 门 ``mime_type.startswith("text/")`` 对 ``application/yaml`` 不命中 → 超内联预算的
+        yaml 永不回填 body（既存盲区）。改用 §6.4 ``is_text_mime`` 后判文本 → drain。"""
+        payload = b"key: value\n" * 5000  # 超内联预算的大 yaml
+        sha = hashlib.sha256(payload).hexdigest()
+        with (
+            patch.object(async_client, "call", new=AsyncMock()) as mock_call,
+            patch("a2c_smcp.agent.client.drain_blob", new=AsyncMock(return_value=(payload, "application/yaml"))) as mock_drain,
+        ):
+
+            async def fake(event: str, req: dict, **kwargs: Any) -> dict:  # type: ignore[no-untyped-def]
+                return {
+                    "name": "user:x:y",
+                    "rel_path": "config.yaml",
+                    "mime_type": "application/yaml",
+                    "total_size": len(payload),
+                    "sha256": sha,
+                    "blob_handle": "opaque-yaml",
+                    "req_id": req["req_id"],
+                }
+
+            mock_call.side_effect = fake
+            ret = await async_client.get_skill("comp-1", "user:x:y", rel_path="config.yaml")
+            mock_drain.assert_awaited_once()
+            assert ret["body"] == payload.decode("utf-8")
+            assert "blob_handle" not in ret
+
+    @pytest.mark.asyncio
     async def test_blob_handle_branch_keeps_handle_for_binary_mime(self, async_client: AsyncSMCPAgentClient) -> None:
         """二进制 MIME 的 blob_handle 保留供调用方自取字节 / Binary MIME keeps handle for caller-side fetch."""
         with patch.object(async_client, "call", new=AsyncMock()) as mock_call:
@@ -409,6 +439,32 @@ class TestSyncMirror:
             mock_call.side_effect = fake
             ret = sync_client.get_skill("comp-1", "user:x:y")
             assert ret["body"] == "sync"
+
+    def test_sync_get_skill_handle_branch_drains_application_yaml(self, sync_client: SMCPAgentClient) -> None:
+        """#105 两端对齐（sync 镜像）：``application/yaml`` 的 blob_handle 自动 drain 回填 body。"""
+        payload = b"key: value\n" * 5000
+        sha = hashlib.sha256(payload).hexdigest()
+        with (
+            patch.object(sync_client, "call", new=MagicMock()) as mock_call,
+            patch("a2c_smcp.agent.sync_client.drain_blob_sync", new=MagicMock(return_value=(payload, "application/yaml"))) as mock_drain,
+        ):
+
+            def fake(event: str, req: dict, **kwargs: Any) -> dict:  # type: ignore[no-untyped-def]
+                return {
+                    "name": "user:x:y",
+                    "rel_path": "config.yaml",
+                    "mime_type": "application/yaml",
+                    "total_size": len(payload),
+                    "sha256": sha,
+                    "blob_handle": "opaque-yaml",
+                    "req_id": req["req_id"],
+                }
+
+            mock_call.side_effect = fake
+            ret = sync_client.get_skill("comp-1", "user:x:y", rel_path="config.yaml")
+            mock_drain.assert_called_once()
+            assert ret["body"] == payload.decode("utf-8")
+            assert "blob_handle" not in ret
 
     def test_sync_tool_call_binary_sideband_restore(self, sync_client: SMCPAgentClient) -> None:
         payload = b"sync binary payload" * 512

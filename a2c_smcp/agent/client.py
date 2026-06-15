@@ -58,6 +58,7 @@ from a2c_smcp.utils.handshake import (
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import ContextLogger, get_logger
+from a2c_smcp.utils.mime import is_text_mime
 
 logger = get_logger("agent")
 
@@ -511,7 +512,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         # Exactly one of body / blob_handle. blob_handle branch auto-drains for text MIME only.
         ret: GetSkillRet = dict(response)  # type: ignore[assignment]
         mime_type = str(response.get("mime_type", ""))
-        if "blob_handle" in response and "body" not in response and mime_type.startswith("text/"):
+        if "blob_handle" in response and "body" not in response and is_text_mime(mime_type):
             payload, _ = await drain_blob(
                 self._make_blob_call(),
                 computer,
