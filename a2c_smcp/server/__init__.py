@@ -8,7 +8,7 @@
 * 描述: A2C-SMCP Server模块导出 / A2C-SMCP Server module exports
 """
 
-from .auth import DEFAULT_AUTH_HEADER_NAME, AuthenticationProvider, DefaultAuthenticationProvider
+from .auth import DEFAULT_AUTH_FIELD_NAME, AuthenticationProvider, DefaultAuthenticationProvider
 from .base import BaseNamespace
 from .middleware import (
     DEFAULT_SOCKETIO_PATH,
@@ -29,7 +29,7 @@ from .utils import (
 
 __all__ = [
     # 常量 / Constants
-    "DEFAULT_AUTH_HEADER_NAME",
+    "DEFAULT_AUTH_FIELD_NAME",
     # 认证相关 / Authentication related
     "AuthenticationProvider",
     "DefaultAuthenticationProvider",

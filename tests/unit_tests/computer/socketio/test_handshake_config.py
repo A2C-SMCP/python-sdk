@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-中文：Computer 客户端握手配置测试（对齐 Rust ``crates/smcp-computer/tests/handshake_config_test.rs``）。
-English: Handshake config tests for the Computer-side client (mirrors Rust SDK 0.1.15).
+中文：Computer 客户端握手配置测试（对齐 Rust ``crates/smcp-computer/tests/handshake_config_test.rs`` #86 变更）。
+English: Handshake config tests for the Computer-side client.
+
+#112(AS-38)：连接面鉴权改走 Socket.IO ``auth`` dict（字段 ``token``）。Computer 客户端**不持有凭据、
+不构造 auth**——auth dict 由调用方在 ``connect(url, auth=...)`` 提供（CLI 经 ``--auth`` 注入）。
+故本客户端不再有 ``auth_field_name``/header 鉴权配置项，仅保留 ``namespace`` 握手配置。
 
 覆盖场景 / Covered scenarios:
-  1. 默认鉴权 header 名为 ``access_token``
-  2. 自定义鉴权 header 名透传到 getter
-  3. 自定义 namespace 贯穿所有事件处理器注册
-  4. getter 返回构造器传入的真实值
-  5. 向后兼容：未显式指定时默认落在 ``/smcp`` 与 ``access_token``
+  1. 自定义 namespace 贯穿所有事件处理器注册
+  2. namespace getter 返回构造器传入的真实值
+  3. 未显式指定时默认落在 ``/smcp``
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from a2c_smcp.computer.socketio.client import DEFAULT_AUTH_HEADER_NAME, SMCPComputerClient
+from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     GET_BLOB_EVENT,
@@ -32,28 +34,10 @@ from a2c_smcp.smcp import (
 )
 
 
-def test_default_auth_header_name_is_access_token() -> None:
-    """默认鉴权 header 名为 ``access_token`` / Default auth header is ``access_token``"""
-    assert DEFAULT_AUTH_HEADER_NAME == "access_token"
-
-
 def test_computer_client_default_handshake_config() -> None:
-    """未显式指定时，Computer 客户端应落在 ``/smcp`` 与 ``access_token`` / Defaults fall back to ``/smcp`` and ``access_token``"""
+    """未显式指定时，Computer 客户端默认 namespace 为 ``/smcp`` / default namespace is ``/smcp``"""
     client = SMCPComputerClient(computer=MagicMock())
 
-    assert client.namespace == SMCP_NAMESPACE
-    assert client.auth_header_name == "access_token"
-
-
-def test_computer_client_custom_auth_header_name() -> None:
-    """构造器传入的自定义 header 名应能从 getter 读回 / Custom header name is exposed via getter"""
-    client = SMCPComputerClient(
-        computer=MagicMock(),
-        auth_header_name="x-custom-auth",
-    )
-
-    assert client.auth_header_name == "x-custom-auth"
-    # 默认 namespace 不应被误改 / Namespace must stay on default when not overridden
     assert client.namespace == SMCP_NAMESPACE
 
 
@@ -109,14 +93,12 @@ async def test_computer_client_emit_uses_instance_namespace() -> None:
     assert captured["event"] == "server:some_event"
 
 
-def test_computer_client_full_custom_handshake() -> None:
-    """namespace + header 同时自定义时两者独立生效 / Custom namespace and header propagate independently"""
+def test_computer_client_custom_namespace_propagates() -> None:
+    """自定义 namespace 独立生效并贯穿处理器注册 / custom namespace propagates to handler registration"""
     client = SMCPComputerClient(
         computer=MagicMock(),
         namespace="/custom",
-        auth_header_name="x-tf-token",
     )
 
     assert client.namespace == "/custom"
-    assert client.auth_header_name == "x-tf-token"
     assert "/custom" in client.handlers

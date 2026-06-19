@@ -78,15 +78,17 @@ from a2c_smcp.agent import DefaultAgentAuthProvider
 auth = DefaultAgentAuthProvider(
     agent_id="my_agent",           # Agent 唯一标识
     office_id="my_office",         # 房间 ID
-    api_key="your_api_key",        # API 密钥
-    api_key_header="x-api-key",    # API 密钥请求头名称
-    extra_headers={                # 额外请求头
+    api_key="your_api_key",        # 凭据：注入 Socket.IO 连接 auth dict 的 token 字段（#112 / AS-38）
+    auth_field_name="token",       # auth dict 内凭据字段名（默认 token，可覆盖）
+    extra_headers={                # 额外路由请求头（非鉴权；不再承载凭据）
         "User-Agent": "MyAgent/1.0"
     },
-    auth_data={                    # 额外认证数据
-        "token": "auth_token"
+    auth_data={                    # 额外业务认证数据，与 api_key 合并进 auth dict
+        "tenant_id": "t1"
     }
 )
+# 上述配置产生的连接 auth dict：{"tenant_id": "t1", "token": "your_api_key"}
+# 连接面鉴权统一走 auth dict（HTTP header 不再参与鉴权）
 ```
 
 ### 自定义认证提供者

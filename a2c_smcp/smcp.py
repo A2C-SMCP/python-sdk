@@ -93,6 +93,32 @@ class GetToolsRet(TypedDict):
     req_id: str
 
 
+class ConnectAuth(TypedDict):
+    """
+    中文: Socket.IO 连接握手阶段的 ``auth`` 对象（业务层）。协议唯一规范要求是 ``role``；其余字段
+        （如 ``token``）是否存在、如何校验由业务层（Server 实现方）自决。
+        #112(AS-38)：连接面鉴权凭据统一走 ``token`` 字段（SDK / 部署约定，与 rust-sdk / tfrobot-client /
+        TFRS Provider 四处对齐，Epic TFRM-153）；JWT 仅 TFRobotServer 后端验签，SDK 只负责携带。
+    英文: The Socket.IO handshake ``auth`` object (business layer). The only protocol requirement is
+        ``role``; other fields (e.g. ``token``) are business-defined. Since #112(AS-38) the
+        connection-auth credential travels in the ``token`` field (SDK / deployment convention).
+    协议依据 / Protocol: a2c-smcp-protocol data-structures.md#auth-对象业务层connectauth。
+
+    !!! note "role 字段的接线现状（#112/AS-38 范围说明）"
+        本类型忠实镜像协议文档（``role`` 标为 MUST）。但 SDK 默认 provider **不在连接 ``auth`` 注入 role**：
+        ``DefaultAgentAuthProvider.get_connection_auth()`` 仅产出 ``{token: ...}``，Computer 经 CLI ``--auth``
+        注入的也只有 ``token``；服务端 role 仍经 ``EnterOfficeReq`` / ``join_office`` 建立（与 rust-sdk 行为一致）。
+        因此 ``ConnectAuth`` 在 SDK 内是**协议参考类型**，``get_connection_auth()`` 返回裸 ``dict``、不以此为标注。
+        「role-at-connect 全面接线」是既有的协议文档-实现分歧（全生态未实现），非本次范围，留待独立 protocol-first 对齐。
+        The default providers do NOT inject ``role`` at connect (consistent with rust-sdk); role is
+        established via ``EnterOfficeReq`` / ``join_office``. Full role-at-connect wiring is a pre-existing
+        protocol-vs-impl divergence deferred to a separate protocol-first effort.
+    """
+
+    role: Literal["computer", "agent"]  # 协议 MUST：客户端角色 / protocol MUST: client role
+    token: NotRequired[str]  # #112(AS-38) 连接面鉴权凭据字段 / connection-auth credential field
+
+
 class EnterOfficeReq(TypedDict):
     role: Literal["computer", "agent"]
     name: str

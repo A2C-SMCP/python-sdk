@@ -3,17 +3,19 @@
 中文：Agent 客户端握手配置测试（对齐 Rust handshake_config_test 精神）。
 English: Handshake config tests for the Agent-side client.
 
+#112(AS-38)：连接面鉴权改走 Socket.IO ``auth`` dict（字段默认 ``token``）；api_key 注入 auth dict、不再进 header。
+
 覆盖场景 / Covered scenarios:
-  1. ``DEFAULT_AUTH_HEADER_NAME`` 常量对外暴露为 ``access_token``
-  2. ``DefaultAgentAuthProvider`` 默认把 API key 写到 ``access_token`` header
-  3. 自定义 ``api_key_header`` 能覆盖默认名
+  1. ``DEFAULT_AUTH_FIELD_NAME`` 常量对外暴露为 ``token``
+  2. ``DefaultAgentAuthProvider`` 默认把 API key 注入 ``auth`` dict 的 ``token`` 字段（不进 header）
+  3. 自定义 ``auth_field_name`` 能覆盖默认名
   4. Async / Sync Agent 客户端默认 namespace 为 ``/smcp``，自定义 namespace 会贯穿事件注册
   5. getter 返回构造器传入的真实值
 """
 
 from __future__ import annotations
 
-from a2c_smcp.agent import DEFAULT_AUTH_HEADER_NAME, DefaultAgentAuthProvider
+from a2c_smcp.agent import DEFAULT_AUTH_FIELD_NAME, DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import (
@@ -34,36 +36,37 @@ EXPECTED_NOTIFY_EVENTS = {
 }
 
 
-def test_agent_default_auth_header_name_is_access_token() -> None:
-    """Agent 模块导出的默认 header 名为 ``access_token`` / exported default header is ``access_token``"""
-    assert DEFAULT_AUTH_HEADER_NAME == "access_token"
+def test_agent_default_auth_field_name_is_token() -> None:
+    """Agent 模块导出的默认鉴权字段名为 ``token`` / exported default auth field is ``token``"""
+    assert DEFAULT_AUTH_FIELD_NAME == "token"
 
 
-def test_default_agent_auth_provider_uses_access_token_by_default() -> None:
-    """``DefaultAgentAuthProvider`` 默认把 API key 写到 ``access_token`` header"""
+def test_default_agent_auth_provider_injects_token_by_default() -> None:
+    """``DefaultAgentAuthProvider`` 默认把 API key 注入 ``auth`` dict 的 ``token`` 字段（不进 header）"""
     provider = DefaultAgentAuthProvider(
         agent_id="agent-1",
         office_id="office-1",
         api_key="secret",
     )
 
-    headers = provider.get_connection_headers()
-    assert headers["access_token"] == "secret"
-    assert "x-api-key" not in headers
+    assert provider.get_connection_auth() == {"token": "secret"}
+    # api_key 不再进 header；header 仅承载路由
+    assert provider.get_connection_headers() == {}
 
 
-def test_default_agent_auth_provider_custom_header_overrides_default() -> None:
-    """自定义 ``api_key_header`` 能覆盖默认名 / custom api_key_header overrides the default"""
+def test_default_agent_auth_provider_custom_field_overrides_default() -> None:
+    """自定义 ``auth_field_name`` 能覆盖默认名 / custom auth_field_name overrides the default"""
     provider = DefaultAgentAuthProvider(
         agent_id="agent-2",
         office_id="office-2",
         api_key="secret",
-        api_key_header="x-tf-token",
+        auth_field_name="x-tf-token",
     )
 
-    headers = provider.get_connection_headers()
-    assert headers["x-tf-token"] == "secret"
-    assert "access_token" not in headers
+    connection_auth = provider.get_connection_auth()
+    assert connection_auth is not None
+    assert connection_auth == {"x-tf-token": "secret"}
+    assert "token" not in connection_auth
 
 
 def test_async_agent_client_default_namespace() -> None:
