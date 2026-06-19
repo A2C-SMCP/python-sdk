@@ -80,10 +80,6 @@ from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
-# Default auth HTTP header name for the SDK (consumers may override)
-DEFAULT_AUTH_HEADER_NAME = "access_token"
-
 
 def _to_a2c_resource(res: Resource) -> A2CResource:
     """
@@ -136,7 +132,6 @@ class SMCPComputerClient(AsyncClient):
         *args: Any,
         computer: Computer,
         namespace: str = SMCP_NAMESPACE,
-        auth_header_name: str = DEFAULT_AUTH_HEADER_NAME,
         **kwargs: Any,
     ) -> None:  # noqa: E112
         """
@@ -146,16 +141,17 @@ class SMCPComputerClient(AsyncClient):
         Args:
             computer (Computer): 绑定的Computer实例 / Bound Computer instance
             namespace (str): Socket.IO命名空间，默认 ``/smcp`` / Socket.IO namespace, default ``/smcp``
-            auth_header_name (str): 鉴权 HTTP header 名，默认 ``access_token``。
-                连接时若通过 headers 传入该字段，将作为鉴权凭据转发给 Server。/
-                Auth HTTP header name, default ``access_token``. When present in headers at connect time,
-                it is forwarded as credential to the Server.
+
+        Note:
+            #112(AS-38)：连接面鉴权走 Socket.IO ``auth`` dict（字段 ``token``）。Computer 侧的 ``auth`` dict
+            由调用方在 ``connect(url, auth=...)`` 时提供（CLI 经 ``--auth`` 注入），本客户端不持有凭据、
+            不构造 ``auth``。/ The connection ``auth`` dict (field ``token``) is supplied by the caller at
+            ``connect(url, auth=...)`` (CLI injects via ``--auth``); this client holds no credential.
         """
         super().__init__(*args, **kwargs)
         self.computer = computer
         # 实例级握手配置 / Per-instance handshake config
         self._namespace = namespace
-        self._auth_header_name = auth_header_name
         # 将客户端以 weakref 方式绑定回 Computer，避免循环强引用
         self.computer.socketio_client = self
         self.on(TOOL_CALL_EVENT, self.on_tool_call, namespace=self._namespace)
@@ -179,14 +175,6 @@ class SMCPComputerClient(AsyncClient):
         Return the Socket.IO namespace used by this instance
         """
         return self._namespace
-
-    @property
-    def auth_header_name(self) -> str:
-        """
-        返回当前实例使用的鉴权 HTTP header 名
-        Return the auth HTTP header name used by this instance
-        """
-        return self._auth_header_name
 
     async def connect(self, url: str, *args: Any, **kwargs: Any) -> None:
         """

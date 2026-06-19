@@ -441,12 +441,11 @@ class TestDefaultAuthenticationProvider:
 
     @pytest.mark.asyncio
     async def test_admin_authentication(self):
-        """测试管理员认证 / Test admin authentication"""
+        """测试管理员认证 / Test admin authentication（#112(AS-38)：凭据走 auth dict 的 token）"""
         provider = DefaultAuthenticationProvider("admin_secret")
         mock_sio = AsyncMock()
 
-        headers = [(b"access_token", b"admin_secret")]
-        result = await provider.authenticate(mock_sio, "agent_123", None, headers)
+        result = await provider.authenticate(mock_sio, {}, {"token": "admin_secret"}, [])
         assert result is True
 
     @pytest.mark.asyncio
@@ -455,19 +454,19 @@ class TestDefaultAuthenticationProvider:
         provider = DefaultAuthenticationProvider("admin_secret")
         mock_sio = AsyncMock()
 
-        headers = [(b"access_token", b"wrong_secret")]
-        result = await provider.authenticate(mock_sio, "agent_123", None, headers)
+        result = await provider.authenticate(mock_sio, {}, {"token": "wrong_secret"}, [])
         assert result is False
 
     @pytest.mark.asyncio
     async def test_no_api_key(self):
-        """测试无API密钥的情况 / Test no API key scenario"""
+        """测试无API密钥的情况 / Test no API key scenario（#112(AS-38)：auth dict 缺失/无 token）"""
         provider = DefaultAuthenticationProvider("admin_secret")
         mock_sio = AsyncMock()
 
-        headers = []  # 空的headers列表
-        result = await provider.authenticate(mock_sio, "agent_123", None, headers)
-        assert result is False
+        # auth dict 为 None / 无 token 字段 / 旧 header 路径均不应通过
+        assert await provider.authenticate(mock_sio, {}, None, []) is False
+        assert await provider.authenticate(mock_sio, {}, {}, []) is False
+        assert await provider.authenticate(mock_sio, {}, None, [(b"access_token", b"admin_secret")]) is False
 
     @pytest.mark.asyncio
     async def test_enter_room_computer_duplicate_name_raises_error(self, smcp_namespace, mock_server):

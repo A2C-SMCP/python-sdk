@@ -7,6 +7,9 @@
 """
 中文：Agent 认证提供者（AgentAuthProvider）的集成测试。
 English: Integration tests for AgentAuthProvider.
+
+#112(AS-38)：连接面鉴权改走 Socket.IO ``auth`` dict（字段默认 ``token``）；api_key 注入 auth dict、
+不再进 HTTP header；header 仅承载路由。
 """
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
@@ -15,8 +18,8 @@ from a2c_smcp.agent.types import AgentConfig
 
 def test_default_agent_auth_provider_basic():
     """
-    中文：验证默认认证提供者的基本功能。
-    English: Verify basic functionality of DefaultAgentAuthProvider.
+    中文：验证默认认证提供者的基本功能（api_key 进 auth dict token 字段）。
+    English: Verify basic functionality of DefaultAgentAuthProvider (api_key → auth dict token field).
     """
     agent_id = "test-agent-123"
     office_id = "test-office-456"
@@ -31,13 +34,13 @@ def test_default_agent_auth_provider_basic():
     # 验证 agent_id
     assert auth.get_agent_id() == agent_id
 
-    # 验证连接认证信息
+    # #112(AS-38)：api_key 进 auth dict 的 token 字段
     auth_data = auth.get_connection_auth()
-    assert auth_data is None  # 默认无额外认证数据
+    assert auth_data == {"token": api_key}
 
-    # 验证连接请求头
+    # #112(AS-38)：header 仅承载路由，不含凭据
     headers = auth.get_connection_headers()
-    assert headers["access_token"] == api_key
+    assert headers == {}
 
     # 验证 Agent 配置
     config = auth.get_agent_config()
@@ -47,15 +50,15 @@ def test_default_agent_auth_provider_basic():
 
 def test_default_agent_auth_provider_with_custom_headers():
     """
-    中文：验证默认认证提供者支持自定义请求头。
-    English: Verify DefaultAgentAuthProvider supports custom headers.
+    中文：验证默认认证提供者支持自定义（路由）请求头，且凭据走 auth dict 而非 header。
+    English: Verify custom (routing) headers are supported while credential goes to the auth dict.
     """
     agent_id = "test-agent-custom"
     office_id = "test-office-custom"
     api_key = "custom-api-key"
     extra_headers = {
         "X-Custom-Header": "custom-value",
-        "Authorization": "Bearer token123",
+        "X-TF-Route": "route-1",
     }
 
     auth = DefaultAgentAuthProvider(
@@ -65,44 +68,44 @@ def test_default_agent_auth_provider_with_custom_headers():
         extra_headers=extra_headers,
     )
 
+    # #112(AS-38)：凭据在 auth dict
+    assert auth.get_connection_auth() == {"token": api_key}
+
+    # header 仅承载路由头，且不含凭据
     headers = auth.get_connection_headers()
-
-    # 验证 API 密钥头
-    assert headers["access_token"] == api_key
-
-    # 验证自定义头
-    assert headers["X-Custom-Header"] == "custom-value"
-    assert headers["Authorization"] == "Bearer token123"
+    assert headers == extra_headers
+    assert "access_token" not in headers
+    assert api_key not in headers.values()
 
 
-def test_default_agent_auth_provider_with_custom_api_key_header():
+def test_default_agent_auth_provider_with_custom_field_name():
     """
-    中文：验证默认认证提供者支持自定义 API 密钥请求头名称。
-    English: Verify DefaultAgentAuthProvider supports custom API key header name.
+    中文：验证默认认证提供者支持自定义 auth dict 密钥字段名。
+    English: Verify DefaultAgentAuthProvider supports a custom auth-dict field name.
     """
     agent_id = "test-agent-header"
     office_id = "test-office-header"
-    api_key = "header-api-key"
-    custom_header_name = "X-API-TOKEN"
+    api_key = "field-api-key"
+    custom_field_name = "x-api-token"
 
     auth = DefaultAgentAuthProvider(
         agent_id=agent_id,
         office_id=office_id,
         api_key=api_key,
-        api_key_header=custom_header_name,
+        auth_field_name=custom_field_name,
     )
 
-    headers = auth.get_connection_headers()
-
-    # 验证使用自定义头名称
-    assert headers[custom_header_name] == api_key
-    assert "access_token" not in headers
+    connection_auth = auth.get_connection_auth()
+    assert connection_auth is not None
+    assert connection_auth == {custom_field_name: api_key}
+    assert "token" not in connection_auth
+    assert auth.get_connection_headers() == {}
 
 
 def test_default_agent_auth_provider_with_auth_data():
     """
-    中文：验证默认认证提供者支持额外认证数据。
-    English: Verify DefaultAgentAuthProvider supports extra auth data.
+    中文：验证默认认证提供者支持额外认证数据（无 api_key 时原样承载）。
+    English: Verify DefaultAgentAuthProvider supports extra auth data (carried as-is without api_key).
     """
     agent_id = "test-agent-auth"
     office_id = "test-office-auth"
@@ -121,6 +124,7 @@ def test_default_agent_auth_provider_with_auth_data():
     connection_auth = auth.get_connection_auth()
 
     # 验证认证数据
+    assert connection_auth is not None
     assert connection_auth == auth_data
     assert connection_auth["username"] == "testuser"
     assert connection_auth["password"] == "testpass"
@@ -141,9 +145,9 @@ def test_default_agent_auth_provider_no_api_key():
         # 不提供 api_key
     )
 
+    # 无 api_key、无 auth_data → auth dict 为 None，header 为空
+    assert auth.get_connection_auth() is None
     headers = auth.get_connection_headers()
-
-    # 验证没有 API 密钥头
     assert "access_token" not in headers
     assert len(headers) == 0
 

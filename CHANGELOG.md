@@ -11,6 +11,40 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > `0.2.0` is performed separately at release cut. Tracking issue:
 > [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
 
+### Breaking Changes
+- **Connection-plane auth moved from HTTP header to the Socket.IO `auth` dict**
+  (#112 / Jira AS-38; Epic TFRM-153). A2C-SMCP is auth-agnostic — **no protocol
+  change**; `token` is an SDK/deployment convention aligned with rust-sdk /
+  tfrobot-client / TFRS Provider. The credential now travels in the connection
+  `auth` dict's `token` field; **HTTP headers no longer authenticate** (routing
+  headers such as `X-TF-*` are still passed through, unrelated to auth). This
+  **supersedes** the [0.1.5a1] `x-api-key`→`access_token` header default.
+  - Constant `DEFAULT_AUTH_HEADER_NAME` → **`DEFAULT_AUTH_FIELD_NAME`** (default
+    value `access_token` → **`token`**) in `a2c_smcp.agent` and `a2c_smcp.server`;
+    **removed** from `a2c_smcp.computer` (the Computer client holds no credential).
+  - `DefaultAgentAuthProvider`: kwarg `api_key_header=` → **`auth_field_name=`**;
+    `api_key` is now injected into the connection `auth` dict under `auth_field_name`
+    (default `token`) and merged with `auth_data`; `get_connection_headers()` returns
+    routing-only headers (no credential).
+  - `DefaultAuthenticationProvider` / `DefaultSyncAuthenticationProvider`:
+    `authenticate()` reads the credential from the connection `auth` dict
+    (`api_key_name`, default `token`) instead of HTTP headers; auth failure rejects
+    the connection (`ConnectionRefusedError`).
+  - `a2c_smcp.computer.SMCPComputerClient`: **removed** the `auth_header_name=`
+    constructor kwarg and the `auth_header_name` property. The connection `auth`
+    dict is supplied by the caller via `connect(url, auth=...)` (CLI injects via
+    `--auth 'token:...'`).
+  - **Migration**: put the credential in the connection `auth` dict under `token`
+    — Agent: `DefaultAgentAuthProvider(api_key=...)`; Computer CLI: `--auth 'token:...'`.
+    To keep a custom field name, pass `auth_field_name=` (Agent) / `api_key_name=`
+    (Server). JWKS/JWT verification is performed by the Server's custom
+    `AuthenticationProvider` (e.g. TFRS), not by the SDK default provider.
+  - Added `smcp.ConnectAuth` TypedDict (`role` required + `token` `NotRequired`) as a
+    protocol-reference type. Note: default providers do **not** inject `role` at
+    connect (role is established via `EnterOfficeReq`/`join_office`, consistent with
+    rust-sdk); full role-at-connect wiring is a pre-existing protocol-vs-impl
+    divergence deferred to a separate protocol-first effort.
+
 ### Added
 - **Connection protocol-version handshake** (#17 / #18). Clients (Agent + Computer,
   async + sync) auto-append `a2c_version` to the Socket.IO connect URL query;
