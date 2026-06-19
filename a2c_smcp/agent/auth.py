@@ -13,9 +13,13 @@ from typing import Any
 
 from a2c_smcp.agent.types import AgentConfig
 
-# 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
-# Default auth HTTP header name for the SDK (consumers may override)
-DEFAULT_AUTH_HEADER_NAME = "access_token"
+# 默认鉴权字段名（Socket.IO CONNECT ``auth`` dict 内的键）/ Default auth field name within the
+# Socket.IO CONNECT ``auth`` dict.
+#
+# #112(AS-38)：连接面鉴权统一走 Socket.IO ``auth`` dict（不再用 HTTP header）。A2C-SMCP auth-agnostic，
+# 默认 ``token``（对齐 server 默认与 TFRS token-exchange 契约），可由调用方覆盖。
+# #112(AS-38): connection auth lives in the Socket.IO ``auth`` dict (no HTTP header); defaults to ``token``.
+DEFAULT_AUTH_FIELD_NAME = "token"
 
 
 class AgentAuthProvider(ABC):
@@ -80,7 +84,7 @@ class DefaultAgentAuthProvider(AgentAuthProvider):
         agent_id: str,
         office_id: str,
         api_key: str | None = None,
-        api_key_header: str = DEFAULT_AUTH_HEADER_NAME,
+        auth_field_name: str = DEFAULT_AUTH_FIELD_NAME,
         extra_headers: dict[str, str] | None = None,
         auth_data: dict[str, Any] | None = None,
     ) -> None:
@@ -91,15 +95,20 @@ class DefaultAgentAuthProvider(AgentAuthProvider):
         Args:
             agent_id (str): Agent唯一标识 / Agent unique identifier
             office_id (str): 办公室ID / Office ID
-            api_key (str | None): API密钥 / API key
-            api_key_header (str): API密钥请求头名称 / API key header name
-            extra_headers (dict[str, str] | None): 额外请求头 / Extra headers
-            auth_data (dict[str, Any] | None): 额外认证数据 / Extra auth data
+            api_key (str | None): API密钥；#112(AS-38) 注入 Socket.IO ``auth`` dict 的 ``auth_field_name``
+                字段（默认 ``token``）/ API key; injected into the Socket.IO ``auth`` dict under
+                ``auth_field_name`` (default ``token``)
+            auth_field_name (str): auth dict 内密钥字段名，默认 ``token`` / Key field name within the
+                ``auth`` dict, defaults to ``token``
+            extra_headers (dict[str, str] | None): 额外（路由）请求头，#112(AS-38) 起不再承载鉴权凭据 /
+                Extra (routing) headers; no longer carry auth credentials since #112(AS-38)
+            auth_data (dict[str, Any] | None): 额外认证数据，与 api_key 合并进 ``auth`` dict /
+                Extra auth data, merged with api_key into the ``auth`` dict
         """
         self._agent_id = agent_id
         self._office_id = office_id
         self._api_key = api_key
-        self._api_key_header = api_key_header
+        self._auth_field_name = auth_field_name
         self._extra_headers = extra_headers or {}
         self._auth_data = auth_data or {}
 
@@ -112,26 +121,29 @@ class DefaultAgentAuthProvider(AgentAuthProvider):
 
     def get_connection_auth(self) -> dict[str, Any] | None:
         """
-        获取连接认证信息
-        Get connection authentication info
+        获取连接认证信息（Socket.IO ``auth`` dict）
+        Get connection authentication info (Socket.IO ``auth`` dict)
+
+        #112(AS-38)：连接面鉴权走 ``auth`` dict —— 把 ``api_key`` 注入 ``auth_field_name`` 字段
+        （默认 ``token``），并与用户传入的 ``auth_data`` 合并。无任何字段时返回 ``None``。
+        #112(AS-38): connection auth lives in the ``auth`` dict — the api_key is injected under
+        ``auth_field_name`` (default ``token``) and merged with the user-supplied ``auth_data``.
         """
-        if not self._auth_data:
-            return None
-        return self._auth_data.copy()
+        auth: dict[str, Any] = self._auth_data.copy()
+
+        # 把 API 密钥注入 auth dict（默认字段 token）
+        # Inject the API key into the auth dict (default field token)
+        if self._api_key:
+            auth[self._auth_field_name] = self._api_key
+
+        return auth or None
 
     def get_connection_headers(self) -> dict[str, str]:
         """
-        获取连接请求头
-        Get connection headers
+        获取连接请求头（仅路由，#112(AS-38) 起不再承载鉴权凭据）
+        Get connection (routing-only) headers; no auth credentials since #112(AS-38)
         """
-        headers = self._extra_headers.copy()
-
-        # 添加API密钥到请求头
-        # Add API key to headers
-        if self._api_key:
-            headers[self._api_key_header] = self._api_key
-
-        return headers
+        return self._extra_headers.copy()
 
     def get_agent_config(self) -> AgentConfig:
         """

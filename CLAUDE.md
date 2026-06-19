@@ -111,6 +111,22 @@ Socket.IO 事件遵循以下前缀：
 - **DPE 已整体移除**: A2C-SMCP 控制面不再涉及 `client:get_dpe` / `dpe://` 解析；DPE 迁出至独立
   [dpe-protocol](https://github.com/A2C-SMCP/dpe-protocol) 仓库。修改时勿重新引入 DPE 事件/类型。
 
+### 连接面鉴权字段契约 (#112 / AS-38，Epic TFRM-153)
+
+**连接面鉴权统一走 Socket.IO CONNECT `auth` dict，凭据字段名 = `token`**（A2C-SMCP auth-agnostic，
+**无协议规范变更**——`token` 为 SDK/部署约定，与 rust-sdk / tfrobot-client / TFRS Provider 四处对齐）。
+HTTP header **不再参与连接面鉴权**（路由 header 如 `X-TF-*` 仍由传输层透传，与鉴权无关）：
+
+- 客户端：`DefaultAgentAuthProvider(api_key=...)` 把凭据注入 `auth` dict 的 `token` 字段
+  （`auth_field_name` 可覆盖）；`get_connection_headers()` 仅承载路由 header。Computer 经 CLI `--auth 'token:...'` 注入。
+- Server：`DefaultAuthenticationProvider`（含同步版）从 `auth` dict 读 `api_key_name`（默认 `token`）；
+  鉴权失败 `on_connect` 抛 `ConnectionRefusedError` 真正拒连。**JWT 仅 TFRobotServer 后端验签**，SDK 只携带——
+  JWKS 验签由 TFRS 自定义 `AuthenticationProvider` 子类实现（抽象 `authenticate(..., auth, ...)` 已透传 auth dict）。
+- 类型：`smcp.ConnectAuth`（`role` 必需 + `token` NotRequired，为协议参考类型——默认 provider 不在连接注入
+  `role`，`role` 经 `join_office` 建立，与 rust-sdk 一致）；常量 `DEFAULT_AUTH_FIELD_NAME = "token"`
+  （server / agent 两处；computer 客户端不持凭据，不再定义该常量）。
+- 范围外（Phase 2 协议先行）：事件级 `authorize_event` hook + claims 入 session。
+
 ## 测试结构
 
 测试目录结构与 `a2c_smcp/` 源码结构保持一致：

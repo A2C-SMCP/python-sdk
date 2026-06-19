@@ -12,9 +12,14 @@ from abc import ABC, abstractmethod
 
 from socketio import AsyncServer
 
-# 默认鉴权 HTTP header 名（SDK 侧默认，可由调用方覆盖）
-# Default auth HTTP header name for the SDK (consumers may override)
-DEFAULT_AUTH_HEADER_NAME = "access_token"
+# 默认鉴权字段名（Socket.IO CONNECT ``auth`` dict 内的键）/ Default auth field name within the
+# Socket.IO CONNECT ``auth`` dict.
+#
+# #112(AS-38)：连接面鉴权统一走 Socket.IO ``auth`` dict（不再用 HTTP header）。A2C-SMCP 协议
+# auth-agnostic，部署方可显式覆盖 ``api_key_name``；默认 ``token``，对齐 client 侧 auth dict 注入与
+# TuringFocus/TFRS token-exchange 契约（Epic TFRM-153）。
+# #112(AS-38): connection auth lives in the Socket.IO ``auth`` dict (no HTTP header); defaults to ``token``.
+DEFAULT_AUTH_FIELD_NAME = "token"
 
 
 class AuthenticationProvider(ABC):
@@ -47,34 +52,31 @@ class DefaultAuthenticationProvider(AuthenticationProvider):
     Default authentication provider, provides basic authentication logic implementation
     """
 
-    def __init__(self, admin_secret: str | None = None, api_key_name: str = DEFAULT_AUTH_HEADER_NAME) -> None:
+    def __init__(self, admin_secret: str | None = None, api_key_name: str = DEFAULT_AUTH_FIELD_NAME) -> None:
         """
         初始化默认认证提供者
         Initialize default authentication provider
 
         Args:
             admin_secret (str | None): 管理员密钥 / Admin secret
-            api_key_name (str): API密钥字段名 / API key field name
+            api_key_name (str): auth dict 内密钥字段名，默认 ``token`` / Key field name within the
+                Socket.IO CONNECT ``auth`` dict, defaults to ``token``
         """
         self.admin_secret = admin_secret
         self.api_key_name = api_key_name
 
     async def authenticate(self, sio: AsyncServer, environ: dict, auth: dict | None, headers: list) -> bool:
         """
-        默认认证逻辑：从headers中提取API密钥进行认证
-        Default authentication logic: extract API key from headers for authentication
-        """
-        # 从headers中提取API密钥
-        # Extract API key from headers
-        api_key = None
-        for header in headers:
-            if isinstance(header, (list, tuple)) and len(header) >= 2:
-                header_name = header[0].decode("utf-8").lower() if isinstance(header[0], bytes) else str(header[0]).lower()
-                header_value = header[1].decode("utf-8") if isinstance(header[1], bytes) else str(header[1])
+        默认认证逻辑：从 Socket.IO CONNECT ``auth`` dict 提取密钥进行认证。
+        Default authentication logic: extract the API key from the Socket.IO CONNECT ``auth`` dict.
 
-                if header_name == self.api_key_name.lower():
-                    api_key = header_value
-                    break
+        #112(AS-38)：连接面鉴权走 ``auth`` dict（字段 ``api_key_name``，默认 ``token``）；HTTP header 不再
+        参与鉴权（路由 header 仍由传输层透传，与鉴权无关）。
+        #112(AS-38): connection auth reads the ``auth`` dict; HTTP headers no longer authenticate.
+        """
+        # 从 auth dict 提取密钥（字段 api_key_name，默认 token）
+        # Extract the API key from the auth dict (field api_key_name, default token)
+        api_key = auth.get(self.api_key_name) if isinstance(auth, dict) else None
 
         if not api_key:
             return False
