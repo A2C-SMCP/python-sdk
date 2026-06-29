@@ -364,6 +364,12 @@ class SMCPComputerClient(AsyncClient):
                 timeout=data["timeout"],
             )
             # 将 CallToolResult 转换为字典以便 JSON 序列化 / Convert CallToolResult to dict for JSON serialization
+            # 注意：**禁止**传 ``by_alias=True``——协议要求结果级元数据出线 key 为顶层 ``meta``（见 data-structures.md
+            # §「结果级 meta vs 子级 _meta」/ #115）。默认（按字段名）dump 才得 ``meta``；by_alias 会回退到 alias ``_meta``，
+            # 破坏 Agent 对 ``meta.a2c_cancelled`` / ``a2c_timeout`` 的解析。
+            # NOTE: do NOT pass ``by_alias=True`` — the protocol requires result-level metadata to wire out under the
+            # top-level key ``meta`` (data-structures.md / #115). Default (by field name) dump yields ``meta``; by_alias
+            # would fall back to the alias ``_meta`` and break the Agent's reading of ``meta.a2c_cancelled`` / ``a2c_timeout``.
             raw = ret.model_dump(mode="json")
             # v0.2.1 二进制旁路铸造（不动 isError 路径）/ v0.2.1 binary sideband minting (isError untouched)
             self._mint_oversize_binary_content(raw)

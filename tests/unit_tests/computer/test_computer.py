@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp import Tool
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from polyfactory.factories.pydantic_factory import ModelFactory
 from prompt_toolkit import PromptSession
 from pydantic import ValidationError
@@ -358,12 +358,64 @@ async def test_aexecute_tool_cancelled_returns_error_result(monkeypatch):
     result = await task
     assert result.isError is True
     assert ("取消" in result.content[0].text) or ("cancel" in result.content[0].text.lower())
+    # #115：取消态须带协议结果级 meta 标记，使 Agent 能区分「取消 / 超时 / 普通失败」三态
+    # #115: cancelled result MUST carry protocol result-level meta markers so the Agent can tell
+    # cancellation apart from timeout / ordinary failure (protocol 32eea98 / protocol#5)
+    assert result.meta is not None
+    assert result.meta["a2c_cancelled"] is True
+    assert result.meta["a2c_cancel_reason"] == "agent_requested"
     assert ran["completed"] is False  # 慢体被中断未跑完 / interrupted before completion
     assert "req-cancel" not in computer._inflight_tool_tasks  # 注册表已清 / registry cleaned
     # 历史须把「被取消」与其它失败区分（fix-review 🟡1）/ history distinguishes cancelled from other failures
     assert computer._tool_call_history[-1]["success"] is False
     assert computer._tool_call_history[-1]["error"] == "cancelled"
     assert "req-cancel" not in computer._cancelled_req_ids  # 取消标记已清 / cancel marker cleared
+
+
+@pytest.mark.asyncio
+async def test_aexecute_tool_timeout_marks_a2c_timeout(monkeypatch):
+    """#115：Computer 端工具执行超时（Manager 抛 TimeoutError）→ 结果级 meta.a2c_timeout=True。
+
+    专门 except TimeoutError 分支（非通用兜底）使「超时」与「普通失败」可被 Agent 区分；
+    此 ack 会回到 Agent，故此标记是「三态可区分」对 Computer 执行超时一态成立的前提。
+    #115: Computer-side tool execution timeout (Manager raises TimeoutError) → result-level
+    meta.a2c_timeout=True, distinguishable from ordinary failure (protocol 32eea98 / protocol#5).
+    """
+    mock_manager = MagicMock(spec=MCPServerManager)
+    mock_manager.avalidate_tool_call = AsyncMock(return_value=("server", "tool"))
+    mock_manager.get_tool_meta = MagicMock(return_value=ToolMeta(auto_apply=True))
+    mock_manager.acall_tool = AsyncMock(side_effect=TimeoutError("Tool 'tool' execution timed out"))
+    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
+    computer = Computer(name="test")
+    await computer.boot_up()
+
+    result = await computer.aexecute_tool("req-timeout", "tool", {"a": 1}, timeout=0.01)
+    assert result.isError is True
+    assert result.meta is not None
+    assert result.meta["a2c_timeout"] is True
+    # 历史记录此次为失败 / history records this as a failure
+    assert computer._tool_call_history[-1]["success"] is False
+
+
+def test_calltoolresult_meta_serializes_top_level_meta_not_underscore():
+    """#115 回归：结果级 meta 默认 model_dump(mode="json")（不 by_alias）出线 key 必须是顶层 `meta`，非 `_meta`。
+
+    锁死历史易错点：MCP `Result.meta` 字段 alias=`_meta`；若误传 by_alias=True 会回退到 `_meta`，破坏协议
+    data-structures.md §结果级 `meta` 契约（client.py on_tool_call 出线即依赖此默认行为）。
+    #115 regression: default model_dump(mode="json") (no by_alias) MUST emit top-level `meta`, not `_meta`.
+    """
+    # 按生产代码同构方式写真实 meta 字段（属性赋值），而非构造器 meta=（后者会落 extra，字段 alias 为 _meta）。
+    # Populate the real meta field the same way production does (attribute assignment), NOT ctor meta= (which
+    # would land in extra since the field alias is _meta).
+    r = CallToolResult(content=[TextContent(text="x", type="text")], isError=True)
+    r.meta = {"a2c_cancelled": True, "a2c_cancel_reason": "agent_requested"}
+    # 真实字段已被填充（非 extra）/ the real field is populated (not extra)
+    assert r.meta is not None and r.meta["a2c_cancelled"] is True
+    assert r.__pydantic_extra__ == {}
+    dumped = r.model_dump(mode="json")
+    assert "meta" in dumped
+    assert "_meta" not in dumped
+    assert dumped["meta"]["a2c_cancelled"] is True
 
 
 @pytest.mark.asyncio

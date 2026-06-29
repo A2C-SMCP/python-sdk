@@ -1073,6 +1073,12 @@ class Computer(BaseComputer[PromptSession]):
                     try:
                         apply = self._confirm_callback(req_id, server_name, tool_name, parameters)
                     except TimeoutError:
+                        # 二次确认「等待」超时（工具从未执行）：刻意**不**打 ``a2c_timeout`` 标记——协议
+                        # error-handling.md「Computer 端超时」语义界定为工具**执行**超时，此处属确认等待超时，
+                        # 对 Agent 等价于「普通失败」桶，故无标记。区别于下方 ``except TimeoutError`` 的执行超时分支。
+                        # Confirm-callback *wait* timeout (tool never executed): intentionally NOT marked with
+                        # ``a2c_timeout`` — the protocol scopes "Computer-side timeout" to tool *execution* timeout,
+                        # while this is an approval-wait timeout that maps to the ordinary-failure bucket for the Agent.
                         result = CallToolResult(
                             content=[TextContent(text="当前工具需要用户二次确认是否可以调用，当前确认超时。", type="text")],
                             isError=True,
@@ -1101,6 +1107,21 @@ class Computer(BaseComputer[PromptSession]):
                     )
 
             success = not result.isError
+        except TimeoutError as e:
+            # 中文: 工具执行超时（``Manager.acall_tool`` 的 ``asyncio.wait_for`` 抛 TimeoutError，经
+            #   ``_acall_tool_cancellable`` 透传至此）。按协议（32eea98 / protocol#5）写入结果级
+            #   ``meta.a2c_timeout``，使 Agent 能把「超时」与「普通失败 / 取消」区分开（专门分支，避免把任意异常误标超时）。
+            # English: Tool execution timeout (``asyncio.wait_for`` in ``Manager.acall_tool`` raises TimeoutError,
+            #   relayed here via ``_acall_tool_cancellable``). Per protocol (32eea98 / protocol#5) write result-level
+            #   ``meta.a2c_timeout`` so the Agent can tell timeout apart from ordinary failure / cancellation.
+            #   A dedicated branch (not the generic fallback) avoids mislabeling arbitrary errors as timeouts.
+            error_msg = str(e)
+            result = CallToolResult(
+                content=[TextContent(text=f"工具调用超时 / Tool call timeout: {e}", type="text")],
+                isError=True,
+            )
+            result.meta = {"a2c_timeout": True}  # 真实 meta 字段，出线 key=meta / real field, wire key ``meta``
+            success = False
         except Exception as e:  # pragma: no cover
             # 中文: 兜底异常，转换为错误结果并记录
             # English: Fallback for unexpected exception; convert to error result and record
@@ -1178,14 +1199,23 @@ class Computer(BaseComputer[PromptSession]):
             outer_cancelled = bool(current is not None and current.cancelling())
             if not outer_cancelled and req_id in self._cancelled_req_ids:
                 # 显式工具取消：吞掉异常并返回取消态结果 / explicit tool cancel: swallow & return cancelled result
-                # 前向兼容：此取消响应形状（isError + 文本）为 SDK 本地约定，协议尚未定义标准取消 ack/响应列
-                # （见 #96「协议待办」）；协议一旦标准化需回此对齐。
-                # Forward-compat: this cancelled-response shape is an SDK-local convention; the protocol has not yet
-                # defined a standard cancel ack/response (#96 deferred). Re-align here once the protocol standardizes it.
-                return CallToolResult(
+                # 协议已标准化取消 ack（a2c-smcp-protocol 32eea98 / protocol#5）：在结果级 ``meta`` 写入
+                # ``a2c_cancelled``（MUST）+ ``a2c_cancel_reason``（SHOULD，本路径仅经 ``acancel_tool`` ↔
+                # ``notify:tool_call_cancel`` 触达，语义恒为 agent 请求），使 Agent 能区分「取消 / 超时 / 普通失败」。
+                # Protocol-standardized cancel ack (a2c-smcp-protocol 32eea98 / protocol#5): write result-level
+                # ``meta`` markers ``a2c_cancelled`` (MUST) + ``a2c_cancel_reason`` (SHOULD; this path is only
+                # reached via ``acancel_tool`` ↔ ``notify:tool_call_cancel``, so the reason is always agent-requested)
+                # so the Agent can distinguish cancellation from timeout / ordinary failure.
+                # 经 ``.meta`` 属性赋值写入真实 meta 字段（出线默认 dump→key=meta），与 Manager 透传 A2C_TOOL_META 同构。
+                # Set via the ``.meta`` attribute (real field; default dump → wire key ``meta``), mirroring how the
+                # Manager carries ``A2C_TOOL_META``. NB: passing ``meta=`` to the ctor would land in ``extra`` (alias
+                # is ``_meta``) and leave ``result.meta`` None.
+                cancelled_result = CallToolResult(
                     content=[TextContent(text="工具调用已被取消 / Tool call cancelled", type="text")],
                     isError=True,
                 )
+                cancelled_result.meta = {"a2c_cancelled": True, "a2c_cancel_reason": "agent_requested"}
+                return cancelled_result
             # 外层协程自身被取消：确保承载任务退场后向上传播 / outer cancellation: ensure teardown then re-raise
             if not inner.done():
                 inner.cancel()

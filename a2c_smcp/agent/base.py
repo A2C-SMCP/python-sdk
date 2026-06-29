@@ -204,10 +204,17 @@ class BaseAgentClient(ABC):
         Returns:
             CallToolResult: 超时错误结果 / Timeout error result
         """
-        return CallToolResult(
+        result = CallToolResult(
             content=[TextContent(text=f"工具调用超时 / Tool call timeout, req_id={req_id}", type="text")],
             isError=True,
         )
+        # 协议结果级标记（32eea98 / protocol#5）：标识此结果为超时返回，使 Agent 能区分「超时 / 取消 / 普通失败」。
+        # 经 ``.meta`` 写入真实 meta 字段（出线默认 dump→key=meta）；构造器传 ``meta=`` 会落 extra（字段 alias 为 ``_meta``）。
+        # Protocol result-level marker (32eea98 / protocol#5): mark this result as a timeout return so the Agent can
+        # distinguish timeout from cancellation / ordinary failure. Set via ``.meta`` (real field, wire key ``meta``);
+        # passing ``meta=`` to the ctor would land in ``extra`` since the field alias is ``_meta``.
+        result.meta = {"a2c_timeout": True}
+        return result
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
@@ -514,10 +521,17 @@ class BaseAgentSyncClient(ABC):
         Returns:
             CallToolResult: 超时错误结果 / Timeout error result
         """
-        return CallToolResult(
+        result = CallToolResult(
             content=[TextContent(text=f"工具调用超时 / Tool call timeout, req_id={req_id}", type="text")],
             isError=True,
         )
+        # 协议结果级标记（32eea98 / protocol#5）：标识此结果为超时返回，使 Agent 能区分「超时 / 取消 / 普通失败」。
+        # 经 ``.meta`` 写入真实 meta 字段（出线默认 dump→key=meta）；构造器传 ``meta=`` 会落 extra（字段 alias 为 ``_meta``）。
+        # Protocol result-level marker (32eea98 / protocol#5): mark this result as a timeout return so the Agent can
+        # distinguish timeout from cancellation / ordinary failure. Set via ``.meta`` (real field, wire key ``meta``);
+        # passing ``meta=`` to the ctor would land in ``extra`` since the field alias is ``_meta``.
+        result.meta = {"a2c_timeout": True}
+        return result
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
