@@ -42,7 +42,6 @@ from a2c_smcp.computer.skills.home import (
     resolve_skill_home,
     user_dropin_root,
     user_skill_dir,
-    workdir_skill_root,
 )
 from a2c_smcp.computer.skills.naming import (
     MCP_SEGMENT,
@@ -112,7 +111,6 @@ __all__ = [
     "resolve_skill_home",
     "user_dropin_root",
     "user_skill_dir",
-    "workdir_skill_root",
     # naming
     "MCP_SEGMENT",
     "ParsedSkillName",

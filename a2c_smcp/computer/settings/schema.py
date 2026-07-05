@@ -76,9 +76,6 @@ FIELD_ALLOWED_MCP_SERVERS = "allowedMcpServers"
 FIELD_DENIED_MCP_SERVERS = "deniedMcpServers"
 FIELD_PERMISSIONS = "permissions"
 
-# 仅能在能力发现层取并集的字段（§5.0 (A) 层）/ Fields contributed by the capability layer.
-CAPABILITY_FIELDS: frozenset[str] = frozenset({FIELD_ENABLED_PLUGINS, FIELD_EXTRA_KNOWN_MARKETPLACES})
-
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
 POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS})

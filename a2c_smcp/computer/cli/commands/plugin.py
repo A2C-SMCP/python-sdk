@@ -246,11 +246,9 @@ async def plugin_disable(
     return _ok(f"disabled {plugin_id!r} (whole plugin offline; enable to restore)")
 
 
-def _enabled_plugins_view(
-    home: Path, env: Mapping[str, str] | None, registered_workdirs: tuple[Path, ...], active_workdir: Path | None,
-) -> dict[str, Any]:
-    """六层合并视图的 ``enabledPlugins`` 映射（``id → bool``，缺省视为启用）/ Merged enabledPlugins map。"""
-    ep = resolved_settings(registered_workdirs, active_workdir, env).get("enabledPlugins")
+def _enabled_plugins_view(home: Path, env: Mapping[str, str] | None) -> dict[str, Any]:
+    """合并视图的 ``enabledPlugins`` 映射（``id → bool``，缺省视为启用）/ Merged enabledPlugins map。"""
+    ep = resolved_settings(env).get("enabledPlugins")
     return dict(ep) if isinstance(ep, Mapping) else {}
 
 
@@ -258,8 +256,6 @@ def plugin_list(
     home: Path,
     env: Mapping[str, str] | None,
     *,
-    registered_workdirs: tuple[Path, ...] = (),
-    active_workdir: Path | None = None,
     available: bool = False,
     json_output: bool = False,
 ) -> int:
@@ -267,7 +263,7 @@ def plugin_list(
     from a2c_smcp.computer.settings.store import load_installed_plugins
 
     installed = load_installed_plugins(home=home, env=env).get("plugins", {})
-    enabled_map = _enabled_plugins_view(home, env, registered_workdirs, active_workdir)
+    enabled_map = _enabled_plugins_view(home, env)
 
     rows: list[dict[str, Any]] = []
     for pid, records in installed.items():
@@ -304,15 +300,13 @@ def plugin_info(
     env: Mapping[str, str] | None,
     plugin_id: str,
     *,
-    registered_workdirs: tuple[Path, ...] = (),
-    active_workdir: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """plugin 详情：scope / installPath / version / commitSha / enabled / bundledMcpServers / installedAt。"""
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed", json_output=json_output)
-    enabled = _enabled_plugins_view(home, env, registered_workdirs, active_workdir).get(plugin_id) is not False
+    enabled = _enabled_plugins_view(home, env).get(plugin_id) is not False
     info: dict[str, Any] = {"id": plugin_id, "enabled": enabled, "records": records}
     if json_output:
         console.print_json(data=info)
@@ -337,14 +331,12 @@ async def plugin_gc(
     home: Path,
     env: Mapping[str, str] | None,
     *,
-    registered_workdirs: tuple[Path, ...] = (),
-    active_workdir: Path | None = None,
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
     confirm: Callable[[list[str]], Awaitable[bool]] | None = None,
     json_output: bool = False,
 ) -> int:
     """清理孤儿 plugin（所有 scope 都不再声明 enabledPlugins[id]）/ GC orphan plugins。"""
-    declared = resolved_settings(registered_workdirs, active_workdir, env)
+    declared = resolved_settings(env)
     orphans = list_orphan_plugins(home, declared, env=env)
     if not orphans:
         if json_output:
@@ -390,10 +382,10 @@ async def run_mcp_approval(
     **不**喂 ``resolve_mcp_config(flag_config_path=)``（后者期望 ``{servers,inputs}``、schema 不符）；flag-scope
     **mcp.json 当前无 CLI 入口**（旧 ``--config`` 仅 ``_run_impl`` server 预加载、从不喂门控解析）。
     """
-    aw = comp.active_workdir
     env = os.environ
     # flag_config 是 settings.json（见 docstring）→ resolve_mcp_config 不收（避免 settings.json 当 mcp.json 误读）。
-    resolved = resolve_mcp_config(active_workdir=aw, env=env, flag_config_path=None)
+    # #116：project/local 层由 resolve_mcp_config 内部锚定进程 cwd。
+    resolved = resolve_mcp_config(env=env, flag_config_path=None)
 
     # 被 drop 的畸形 server/input 必须呈现（§5.6 / mcp_config 容错不静默，#69 Group B 风险 3）。
     for e in resolved.errors:
@@ -402,7 +394,7 @@ async def run_mcp_approval(
     if not resolved.servers:
         return
 
-    settings = resolved_settings(comp._registered_workdirs, aw, env, flag_path=flag_config)
+    settings = resolved_settings(env, flag_path=flag_config)
     bundled = bundled_mcp_server_names(comp.skill_home, env)
     statuses = gate_mcp_servers(resolved, settings, bundled)
 
@@ -440,14 +432,14 @@ async def run_mcp_approval(
             )
             ans = (await session.prompt_async(prompt)).strip().lower()
             if ans in {"a", "all"}:
-                approve_all_project_mcp(active_workdir=aw)
+                approve_all_project_mcp()
                 approved_all_session = True
                 await _mount(name)
             elif ans in {"y", "yes"}:
-                approve_mcp_server(name, active_workdir=aw)
+                approve_mcp_server(name)
                 await _mount(name)
             else:
-                deny_mcp_server(name, active_workdir=aw)
+                deny_mcp_server(name)
                 console.print(f"[dim]· denied MCP server {name!r} (written to local scope)[/dim]")
 
 
@@ -462,9 +454,8 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     cbs = build_mcp_callbacks(comp)
-    aw = comp.active_workdir
-    # active workdir 作 project/local scope 的 project_path（plugin enable/disable 写 enabledPlugins 落 active 单根）。
-    project_path = str(aw) if aw is not None else None
+    # #116：project/local scope 的 project_path 锚定进程 cwd（plugin enable/disable 写 enabledPlugins 落 cwd 单根）。
+    project_path = os.getcwd()
 
     if sub == "install":
         if not pos:
@@ -524,16 +515,12 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if code == EXIT_OK:
             comp.mark_skills_dirty()
     elif sub == "list":
-        plugin_list(
-            home, env,
-            registered_workdirs=comp._registered_workdirs, active_workdir=aw,
-            available="--available" in args, json_output=json_output,
-        )
+        plugin_list(home, env, available="--available" in args, json_output=json_output)
     elif sub == "info":
         if not pos:
             console.print("[yellow]usage: plugin info <plugin>@<marketplace>[/yellow]")
             return
-        plugin_info(home, env, pos[0], registered_workdirs=comp._registered_workdirs, active_workdir=aw, json_output=json_output)
+        plugin_info(home, env, pos[0], json_output=json_output)
     elif sub == "gc":
 
         async def _confirm(orphans: list[str]) -> bool:
@@ -542,7 +529,6 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
 
         code = await plugin_gc(
             registry, home, env,
-            registered_workdirs=comp._registered_workdirs, active_workdir=aw,
             mcp_teardown=_batch_teardown(cbs.remove_server), confirm=_confirm, json_output=json_output,
         )
         if code == EXIT_OK:

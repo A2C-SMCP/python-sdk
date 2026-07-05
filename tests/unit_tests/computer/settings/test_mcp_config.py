@@ -31,7 +31,6 @@ from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.settings.mcp_config import (
     MANAGED_MCP_FILENAME,
     McpApprovalStatus,
-    McpConfigError,
     ResolvedMcpConfig,
     approve_all_project_mcp,
     approve_mcp_server,
@@ -123,53 +122,44 @@ def test_resolve_user_only_no_active(tmp_path: Path) -> None:
     assert srv.origin == SettingsScope.USER and srv.trusted_origin is True
 
 
-def test_resolve_no_active_ignores_workdir(tmp_path: Path) -> None:
-    """active_workdir=None → project/local 全不读（即使磁盘上有 .tfrobot/mcp.json 也不进）。"""
+def test_resolve_scope_priority_high_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """同名 server：local(高) 整体覆盖 user(低)，origin 记最高 scope（project/local 锚 cwd，#116）。"""
     env = _env(tmp_path)
-    wd = tmp_path / "wd"
-    _write_json(wd / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
-    out = resolve_mcp_config(env=env, active_workdir=None, managed_mcp_path=tmp_path / "absent.json")
-    assert "proj-srv" not in out.servers
-
-
-def test_resolve_scope_priority_high_overrides(tmp_path: Path) -> None:
-    """同名 server：local(高) 整体覆盖 user(低)，origin 记最高 scope。"""
-    env = _env(tmp_path)
-    wd = tmp_path / "wd"
     _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("user-cmd")}))
-    _write_json(wd / ".tfrobot" / "mcp.local.json", _mcp_doc(servers={"figma": _stdio("local-cmd")}))
-    out = resolve_mcp_config(env=env, active_workdir=wd, managed_mcp_path=tmp_path / "absent.json")
+    _write_json(tmp_path / ".tfrobot" / "mcp.local.json", _mcp_doc(servers={"figma": _stdio("local-cmd")}))
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
     srv = out.servers["figma"]
     assert srv.origin == SettingsScope.LOCAL and srv.trusted_origin is False  # workspace-shared、受门控
     assert isinstance(srv.config, StdioServerConfig)
     assert srv.config.server_parameters.command == "local-cmd"  # 整体覆盖（高胜）
 
 
-def test_resolve_origins_partition_trust(tmp_path: Path) -> None:
-    """user/flag/policy → trusted；project/local → 受门控。"""
+def test_resolve_origins_partition_trust(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """user/flag/policy → trusted；project/local（锚 cwd）→ 受门控。"""
     env = _env(tmp_path)
-    wd = tmp_path / "wd"
     flag = tmp_path / "flag-mcp.json"
     managed = tmp_path / "managed-mcp.json"
     _write_json(flag, _mcp_doc(servers={"flag-srv": _stdio()}))
     _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"user-srv": _stdio()}))
-    _write_json(wd / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
+    _write_json(tmp_path / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
     _write_json(managed, _mcp_doc(servers={"policy-srv": _stdio()}))
-    out = resolve_mcp_config(env=env, active_workdir=wd, flag_config_path=flag, managed_mcp_path=managed)
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, flag_config_path=flag, managed_mcp_path=managed)
     trust = {n: s.trusted_origin for n, s in out.servers.items()}
     assert trust == {"flag-srv": True, "user-srv": True, "proj-srv": False, "policy-srv": True}
 
 
-def test_resolve_inputs_dedup_by_id_high_wins(tmp_path: Path) -> None:
+def test_resolve_inputs_dedup_by_id_high_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env = _env(tmp_path)
-    wd = tmp_path / "wd"
     _write_json(_user_mcp(tmp_path), _mcp_doc(inputs=[{"id": "tok", "type": "promptString", "description": "user"}]))
     local_inputs = [
         {"id": "tok", "type": "promptString", "description": "local"},
         {"id": "other", "type": "promptString", "description": "x"},
     ]
-    _write_json(wd / ".tfrobot" / "mcp.local.json", _mcp_doc(inputs=local_inputs))
-    out = resolve_mcp_config(env=env, active_workdir=wd, managed_mcp_path=tmp_path / "absent.json")
+    _write_json(tmp_path / ".tfrobot" / "mcp.local.json", _mcp_doc(inputs=local_inputs))
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
     by_id = {i.id: i for i in out.inputs}
     assert set(by_id) == {"tok", "other"}
     assert by_id["tok"].description == "local"  # 高 scope 胜
@@ -270,12 +260,12 @@ def test_status_policy_allow_whitelist() -> None:
     assert mcp_server_status("x", settings=s2, bundled=set(), trusted_origin=False) == McpApprovalStatus.PENDING
 
 
-def test_gate_mcp_servers_maps_all(tmp_path: Path) -> None:
+def test_gate_mcp_servers_maps_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env = _env(tmp_path)
-    wd = tmp_path / "wd"
     _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"user-srv": _stdio()}))
-    _write_json(wd / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
-    out = resolve_mcp_config(env=env, active_workdir=wd, managed_mcp_path=tmp_path / "absent.json")
+    _write_json(tmp_path / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
     statuses = gate_mcp_servers(out, settings={}, bundled=set())
     assert statuses == {"user-srv": McpApprovalStatus.ENABLED, "proj-srv": McpApprovalStatus.PENDING}
 
@@ -303,46 +293,37 @@ def _read_local_settings(wd: Path) -> dict:
     return json.loads(workdir_local_settings_path(wd).read_text(encoding="utf-8"))
 
 
-def test_approve_writes_enabled_to_local(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    approve_mcp_server("figma", active_workdir=wd)
-    approve_mcp_server("figma", active_workdir=wd)  # dedup
-    settings = _read_local_settings(wd)
+def test_approve_writes_enabled_to_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    approve_mcp_server("figma")
+    approve_mcp_server("figma")  # dedup
+    settings = _read_local_settings(tmp_path)
     assert settings["enabledMcpjsonServers"] == ["figma"]
     assert "version" not in settings  # 人编层无 version
     # 无写保护头：首行即 JSON
-    assert workdir_local_settings_path(wd).read_text(encoding="utf-8").lstrip().startswith("{")
+    assert workdir_local_settings_path(tmp_path).read_text(encoding="utf-8").lstrip().startswith("{")
 
 
-def test_deny_writes_disabled_to_local(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    deny_mcp_server("sketchy", active_workdir=wd)
-    assert _read_local_settings(wd)["disabledMcpjsonServers"] == ["sketchy"]
+def test_deny_writes_disabled_to_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    deny_mcp_server("sketchy")
+    assert _read_local_settings(tmp_path)["disabledMcpjsonServers"] == ["sketchy"]
 
 
-def test_approve_all_sets_bool_local(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    approve_all_project_mcp(active_workdir=wd)
-    assert _read_local_settings(wd)["enableAllProjectMcpServers"] is True
+def test_approve_all_sets_bool_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    approve_all_project_mcp()
+    assert _read_local_settings(tmp_path)["enableAllProjectMcpServers"] is True
 
 
-def test_approve_then_resolve_settings_flips_status(tmp_path: Path) -> None:
+def test_approve_then_resolve_settings_flips_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """approve roundtrip：写 local enabled → 再判定 status 由 pending→enabled（接缝验证）。"""
-    wd = tmp_path / "wd"
+    monkeypatch.chdir(tmp_path)
     assert mcp_server_status("figma", settings={}, bundled=set(), trusted_origin=False) == McpApprovalStatus.PENDING
-    approve_mcp_server("figma", active_workdir=wd)
-    enabled = _read_local_settings(wd)["enabledMcpjsonServers"]
+    approve_mcp_server("figma")
+    enabled = _read_local_settings(tmp_path)["enabledMcpjsonServers"]
     after = mcp_server_status("figma", settings={"enabledMcpjsonServers": enabled}, bundled=set(), trusted_origin=False)
     assert after == McpApprovalStatus.ENABLED
-
-
-def test_approval_write_without_active_workdir_raises() -> None:
-    with pytest.raises(McpConfigError):
-        approve_mcp_server("x", active_workdir=None)
-    with pytest.raises(McpConfigError):
-        deny_mcp_server("x", active_workdir=None)
-    with pytest.raises(McpConfigError):
-        approve_all_project_mcp(active_workdir=None)
 
 
 def test_resolved_mcp_config_dataclass_defaults() -> None:

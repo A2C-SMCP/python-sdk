@@ -31,7 +31,7 @@ import json
 import os
 import weakref
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -75,7 +75,6 @@ from a2c_smcp.computer.skills import (
     stage_mcp_skills,
     stage_user_skills,
     user_dropin_root,
-    workdir_skill_root,
 )
 from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
@@ -109,7 +108,6 @@ class Computer(BaseComputer[PromptSession]):
         blob_resolvers: dict[str, BlobResolver] | None = None,
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
-        registered_workdirs: Sequence[Path] | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -141,11 +139,6 @@ class Computer(BaseComputer[PromptSession]):
                 ``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills`` 解析链。
                 mcp 源 ``skill://`` 物化落盘于 ``<home>/mcp/<server>/<skill>/``。
                 SKILL Home root override (test/deploy injection); defaults to the env resolution chain.
-            registered_workdirs (Sequence[Path] | None): v0.2.1 已登记工作目录（能力发现层，#60/#67）。
-                user 源 DropIn 跨 ``<home>/user/`` + 各 ``<workdir>/.tfrobot/skills/`` 全局并集就地发现，
-                并被文件 watcher 递归监控；**登记持久化由 CLI 工单维护，本类仅按注入参数消费**（默认空）。
-                Registered workdirs (capability layer): user-source DropIn discovery + file watcher span
-                these in place; persistence of the registration is owned by the CLI, consumed here as-is.
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
@@ -187,9 +180,8 @@ class Computer(BaseComputer[PromptSession]):
         self._skills_cache: set[str] = set()
 
         # v0.2.1 事件触发链（S14，#67，设计 §8）：多源 SKILL 变更 → 去抖器标脏 → 缓存失效 + 单次 emit。
-        # user 源 DropIn 文件 watcher 递归监控 user/ + 各登记 workdir/.tfrobot/skills/，SKILL.md 变更经去抖器汇聚。
+        # user 源 DropIn 文件 watcher 递归监控 <home>/user/（#116 起仅 home 单根；workdir 维度已下沉 MCP 服务）。
         # The debouncer coalesces multi-source SKILL changes into a single emit; the file watcher feeds user-source changes.
-        self._registered_workdirs: tuple[Path, ...] = tuple(registered_workdirs or ())
         self._skill_debouncer: SkillEventDebouncer = SkillEventDebouncer(
             self._emit_update_skills_now,
             invalidate=self._invalidate_user_skills,
@@ -574,8 +566,8 @@ class Computer(BaseComputer[PromptSession]):
         """
         缓存失效（文件源重扫）：就地重扫 user 源 DropIn 并对账孤儿 / Invalidate by rescanning user-source DropIn。
 
-        设计 §8.1「缓存失效」对**文件源**的落实——watcher/CLI 标脏后、emit 前重扫 ``<home>/user/`` +
-        各登记 ``<workdir>/.tfrobot/skills/``（``stage_user_skills`` 幂等 ``register_or_update``），并把本轮
+        设计 §8.1「缓存失效」对**文件源**的落实——watcher/CLI 标脏后、emit 前重扫 ``<home>/user/``
+        （``stage_user_skills`` 幂等 ``register_or_update``，#116 起仅 home 单根），并把本轮
         未发现的 user 源 SKILL 标孤儿（磁盘删除即从 ``get_skills`` 排除）。mcp 源由其 ``ResourceListChanged``
         处理器即时重物化，**不**在此重复。SKILL Home 未就绪 → no-op。
 
@@ -589,7 +581,7 @@ class Computer(BaseComputer[PromptSession]):
         if self._skill_home is None:
             return
         try:
-            discovered = stage_user_skills(self._skill_registry, self._skill_home, self._registered_workdirs)
+            discovered = stage_user_skills(self._skill_registry, self._skill_home)
             self._reconcile_orphans(set(discovered), lambda s: s == SOURCE_USER)
         except Exception as e:  # pragma: no cover — 防御性兜底（staging 内部已各自降级）
             logger.error(f"user 源重扫 / 对账失败 / user-source rescan failed: {e}", exc_info=True)
@@ -598,8 +590,8 @@ class Computer(BaseComputer[PromptSession]):
         """
         启动 user 源 DropIn 文件 watcher / Start the user-source DropIn file watcher。
 
-        监控根 = ``<home>/user/`` + 各登记 ``<workdir>/.tfrobot/skills/``（递归、过滤 ``SKILL.md``，**不**监
-        marketplace clone 树）。watchdog 回调在独立线程触发 → 经 ``loop.call_soon_threadsafe`` marshal 回事件
+        监控根 = ``<home>/user/``（递归、过滤 ``SKILL.md``，**不**监 marketplace clone 树；#116 起仅
+        home 单根）。watchdog 回调在独立线程触发 → 经 ``loop.call_soon_threadsafe`` marshal 回事件
         循环线程调去抖器 :meth:`mark_dirty`。已有 watcher → 先停。SKILL Home 未就绪 → no-op。
         """
         if self._skill_home is None:
@@ -616,8 +608,7 @@ class Computer(BaseComputer[PromptSession]):
                 pass
 
         watcher = SkillFileWatcher(_marshal, use_polling=self._skill_watch_polling)
-        roots = [user_dropin_root(self._skill_home), *(workdir_skill_root(wd) for wd in self._registered_workdirs)]
-        watcher.watch(roots)
+        watcher.watch([user_dropin_root(self._skill_home)])
         self._skill_watcher = watcher
 
     def mark_skill_internal_write(self, path: str | Path) -> None:
@@ -634,13 +625,10 @@ class Computer(BaseComputer[PromptSession]):
         """
         预定义渲染变量（对标 VS Code，§9.1）/ Predefined render variables (VS Code parity)。
 
-        ``workspaceFolder`` 取 active-workdir 单根（绑定当前任务，见 :attr:`active_workdir`），无则 ``os.getcwd()``；
         ``userHome``=用户主目录；``pathSeparator``=``os.sep``。``${env:VAR}`` 不在此（由 render 直接读
-        进程环境）。``workspaceFolder`` takes the active workdir (single bound root), else cwd.
+        进程环境）。#116：``${workspaceFolder}`` 已随 workdir 概念瘦身停产（按未知占位符原样保留）。
         """
-        workspace = str(self.active_workdir) if self.active_workdir else os.getcwd()
         return {
-            "workspaceFolder": workspace,
             "userHome": os.path.expanduser("~"),
             "pathSeparator": os.sep,
         }
@@ -650,7 +638,7 @@ class Computer(BaseComputer[PromptSession]):
         合并 ``envFile`` 的 ``KEY=VALUE`` 进 stdio server 的 ``env``（显式 env 胜，§9.1）/ Merge envFile into env。
 
         仅对 stdio（``server_parameters.env`` 存在）生效；sse/http 无 env 字段，原样返回。envFile **路径**
-        已在 :meth:`ConfigRender.arender` 渲染（``${workspaceFolder}`` 等已展开）。**显式 ``env`` 同名项覆盖
+        已在 :meth:`ConfigRender.arender` 渲染（``${input:}`` 等已展开）。**显式 ``env`` 同名项覆盖
         envFile**（显式胜）。本方法不改 ``envFile`` 字段本身（spawn 仅消费 ``server_parameters.env``）。
         """
         env_file = rendered.get("envFile") or rendered.get("env_file")
@@ -1302,17 +1290,6 @@ class Computer(BaseComputer[PromptSession]):
         if self._skill_home is None:
             self._skill_home = self._resolve_skill_home()
         return self._skill_home
-
-    @property
-    def active_workdir(self) -> Path | None:
-        """绑定当前任务的 active-workdir 单根（取首个已登记 workdir，空闲=None）/ The single active workdir (None when idle)。
-
-        北极星（#53）两层模型：本属性是 **project/local scope 来源**（``.tfrobot/settings[.local].json`` /
-        ``mcp.json``）与渲染 ``${workspaceFolder}`` 的**单一事实源**；而 :attr:`_registered_workdirs` 作能力发现
-        并集（DropIn 扫描 / watcher）跨全部目录、不随 active 跳变。``resolve_mcp_config`` / ``resolve_settings``
-        的 ``active_workdir`` 与 MCP 批准框写 local 均经此（#69 Group B/C）。
-        """
-        return self._registered_workdirs[0] if self._registered_workdirs else None
 
     def mark_skills_dirty(self) -> None:
         """标记 SKILL 集合变更 → 去抖器在窗口内合并触发单次 ``emit_update_skills``（CLI marketplace 变更后调）。

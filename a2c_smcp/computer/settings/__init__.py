@@ -40,7 +40,6 @@ from a2c_smcp.computer.settings.policy import (
 )
 from a2c_smcp.computer.settings.schema import (
     BOOL_FIELDS,
-    CAPABILITY_FIELDS,
     POLICY_ONLY_FIELDS,
     STRING_ARRAY_FIELDS,
     ComputerSettings,
@@ -55,7 +54,6 @@ from a2c_smcp.computer.settings.scope import (
     DELETE,
     ResolvedSettings,
     apply_write,
-    filter_capability_fields,
     load_settings_file,
     merge_layers,
     merge_read,
@@ -104,7 +102,6 @@ from a2c_smcp.computer.settings.store import (
 __all__ = [
     # schema
     "BOOL_FIELDS",
-    "CAPABILITY_FIELDS",
     "POLICY_ONLY_FIELDS",
     "STRING_ARRAY_FIELDS",
     "ComputerSettings",
@@ -118,7 +115,6 @@ __all__ = [
     "DELETE",
     "ResolvedSettings",
     "apply_write",
-    "filter_capability_fields",
     "load_settings_file",
     "merge_layers",
     "merge_read",

@@ -5,8 +5,8 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-五级 scope 路径解析 + 读/写两套合并语义 + active-workdir / 能力层解析（v0.2.1）
-Five-level scope path resolution + read/write merge customizers + active-workdir / capability resolution.
+五级 scope 路径解析 + 读/写两套合并语义（v0.2.1；#116 起 project/local 锚定进程 cwd）
+Five-level scope path resolution + read/write merge customizers (project/local anchored at process cwd since #116).
 
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5.0 / §5.1 / §5.4。
 
@@ -23,9 +23,10 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5.0 / 
 - 删字段 → 写 :data:`DELETE`（= 删 key）/ deletion via the :data:`DELETE` sentinel.
 
 scope 分层（low → high）/ Scope layering (§5.1)：
-能力发现层（全部登记目录并集，仅 ``enabledPlugins`` / ``extraKnownMarketplaces``）< user（主）
-< project（active workdir 单根）< local（active workdir 单根）< flag < policy。
-**无 active workdir** 时 project/local 全空，仅 user + 能力层（+ flag/policy）。
+user（主）< project（``<cwd>/.tfrobot/settings.json``）< local（``<cwd>/.tfrobot/settings.local.json``）
+< flag < policy。#116：project/local 无条件锚定进程 ``os.getcwd()``（文件缺失 → 层为空）；
+原「能力发现层」（跨登记目录并集）随 ``registered_workdirs`` 概念一并移除——单 cwd 锚点下其贡献被
+更高优先级的 project/local 层（同文件超集）严格遮蔽，等价冗余。
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.settings.schema import (
-    CAPABILITY_FIELDS,
     SettingsScope,
     SettingsValidationError,
     validate_settings,
@@ -212,11 +212,6 @@ def load_settings_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any]
     return validate_settings(raw, scope, source_path=str(p))
 
 
-def filter_capability_fields(settings: Mapping[str, Any]) -> dict[str, Any]:
-    """只保留能力发现层字段（``enabledPlugins`` / ``extraKnownMarketplaces``）/ Keep only capability fields。"""
-    return {k: v for k, v in settings.items() if k in CAPABILITY_FIELDS}
-
-
 # ---------------------------------------------------------------------------
 # 解析编排 / Resolution orchestration
 # ---------------------------------------------------------------------------
@@ -235,63 +230,24 @@ class ResolvedSettings:
     errors: list[SettingsValidationError] = field(default_factory=list)
 
 
-def _build_capability_layer(
-    registered_workdirs: Sequence[Path],
-) -> tuple[dict[str, Any], list[SettingsValidationError]]:
-    """
-    能力发现层 (A)：跨**全部登记工作目录**取 ``enabledPlugins`` / ``extraKnownMarketplaces`` 并集。
-    Capability layer (A): union of capability fields across all registered workdirs。
-
-    单目录内 local 覆盖 project；跨目录按**登记顺序**后者覆盖前者并 WARN（§5.0「同名优先级」）。
-    Within a workdir local overrides project; across workdirs later registration wins + WARN.
-    """
-    errors: list[SettingsValidationError] = []
-    accumulated: dict[str, Any] = {}
-
-    def _on_conflict(path: str, old: Any, new: Any) -> None:
-        logger.warning(
-            "Capability-layer conflict on %r across registered workdirs: %r overridden by later registration %r",
-            path,
-            old,
-            new,
-        )
-
-    for workdir in registered_workdirs:
-        proj, proj_errors = load_settings_file(workdir_project_settings_path(workdir), SettingsScope.PROJECT)
-        local, local_errors = load_settings_file(workdir_local_settings_path(workdir), SettingsScope.LOCAL)
-        errors.extend(proj_errors)
-        errors.extend(local_errors)
-        # 单目录内：local 覆盖 project（仅能力字段）。
-        per_workdir = merge_read(filter_capability_fields(proj), filter_capability_fields(local))
-        accumulated = merge_read(accumulated, per_workdir, on_conflict=_on_conflict)
-
-    return accumulated, errors
-
-
 def _dedup_errors(errors: Sequence[SettingsValidationError]) -> list[SettingsValidationError]:
-    """按出现顺序去重（active workdir 文件在能力层 + B 层被读两次，错误天然重复）/ Order-preserving error dedup."""
+    """按出现顺序去重（防御性保留：各层独立读文件，正常不重复）/ Order-preserving error dedup."""
     return list(dict.fromkeys(errors))
 
 
 def resolve_settings(
     *,
-    registered_workdirs: Sequence[Path] = (),
-    active_workdir: Path | None = None,
     env: Mapping[str, str] | None = None,
     flag_settings_path: Path | None = None,
     policy_settings: Mapping[str, Any] | None = None,
 ) -> ResolvedSettings:
     """
-    解析六层 settings 视图（能力层 / user / project / local / flag / policy）/ Resolve the six-layer view。
+    解析五层 settings 视图（user / project / local / flag / policy）/ Resolve the five-layer view。
 
-    两层模型（访谈定稿，§5.0 / §5.1）/ Two-layer model:
-    - **(A) 能力发现层**：``enabledPlugins`` / ``extraKnownMarketplaces`` 跨**全部** ``registered_workdirs``
-      取并集、置最低优先级（稳定能力面、不随 active 跳变）。
-    - **(B) active-workdir 单根**：project/local **只取** ``active_workdir`` 的 ``.tfrobot/settings[.local].json``，
-      不跨目录并集；**``active_workdir is None`` 时 project/local 全空**（仅 user + 能力层 + flag/policy）。
+    #116：project/local 无条件锚定进程 ``os.getcwd()`` 的 ``.tfrobot/settings[.local].json``
+    （cwd 恒存在；文件缺失 → 层为空）。原「能力发现层 + active-workdir 单根」两层模型随
+    ``registered_workdirs`` / ``active_workdir`` 概念移除收敛为单 cwd 锚点。
 
-    :param registered_workdirs: workspace 持久登记的全部工作目录（能力层来源）/ all registered workdirs.
-    :param active_workdir: 当前绑定任务的单根（project/local 来源）；``None`` = 空闲 / no active task.
     :param env: 环境映射（解析 user config dir），默认 ``os.environ`` / env mapping for the user config dir.
     :param flag_settings_path: ``--settings <file>`` 指定文件 / the ``--settings`` flag file, if any.
     :param policy_settings: policy scope 原始 dict（来自 :mod:`a2c_smcp.computer.settings.policy`
@@ -299,22 +255,16 @@ def resolve_settings(
     """
     errors: list[SettingsValidationError] = []
 
-    # (A) 能力发现层（最低）/ capability layer (lowest)
-    capability_layer, cap_errors = _build_capability_layer(registered_workdirs)
-    errors.extend(cap_errors)
-
     # user（主）/ user (primary)
     user_layer, user_errors = load_settings_file(user_settings_path(env), SettingsScope.USER)
     errors.extend(user_errors)
 
-    # (B) active-workdir 单根 project/local / active-workdir single-root
-    if active_workdir is not None:
-        project_layer, proj_errors = load_settings_file(workdir_project_settings_path(active_workdir), SettingsScope.PROJECT)
-        local_layer, local_errors = load_settings_file(workdir_local_settings_path(active_workdir), SettingsScope.LOCAL)
-        errors.extend(proj_errors)
-        errors.extend(local_errors)
-    else:
-        project_layer, local_layer = {}, {}
+    # project/local：锚定进程 cwd / anchored at process cwd (#116)
+    cwd = Path(os.getcwd())
+    project_layer, proj_errors = load_settings_file(workdir_project_settings_path(cwd), SettingsScope.PROJECT)
+    local_layer, local_errors = load_settings_file(workdir_local_settings_path(cwd), SettingsScope.LOCAL)
+    errors.extend(proj_errors)
+    errors.extend(local_errors)
 
     # flag / flag (``--settings``)
     if flag_settings_path is not None:
@@ -327,5 +277,5 @@ def resolve_settings(
     policy_layer, policy_errors = validate_settings(dict(policy_settings or {}), SettingsScope.POLICY)
     errors.extend(policy_errors)
 
-    merged = merge_layers([capability_layer, user_layer, project_layer, local_layer, flag_layer, policy_layer])
+    merged = merge_layers([user_layer, project_layer, local_layer, flag_layer, policy_layer])
     return ResolvedSettings(settings=merged, errors=_dedup_errors(errors))

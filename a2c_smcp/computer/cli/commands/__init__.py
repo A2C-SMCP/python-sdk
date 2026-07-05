@@ -81,13 +81,11 @@ def flag_value(args: list[str], flag: str) -> str | None:
 
 
 def resolved_settings(
-    registered_workdirs: Sequence[Path],
-    active_workdir: Path | None,
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
 ) -> dict[str, Any]:
-    """六层合并 settings（含 policy first-source-wins）/ Six-layer merged settings incl. policy。
+    """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
 
     plugin（``enabledPlugins`` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
     allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。函数内 lazy import 沿用本仓
@@ -97,8 +95,6 @@ def resolved_settings(
     from a2c_smcp.computer.settings.scope import resolve_settings
 
     return resolve_settings(
-        registered_workdirs=registered_workdirs,
-        active_workdir=active_workdir,
         env=env,
         flag_settings_path=flag_path,
         policy_settings=resolve_policy_settings(env=env),
