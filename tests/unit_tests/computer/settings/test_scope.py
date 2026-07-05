@@ -223,3 +223,20 @@ def test_resolve_settings_anchors_project_local_at_cwd(tmp_path: Path, monkeypat
     assert resolved.settings["strictKnownMarketplaces"] is False  # local 覆盖 project
     assert resolved.settings["trustedMarketplaces"] == ["m"]
     assert resolved.settings["enabledPlugins"] == {"p@mp": True}  # 能力字段随 project 层进（无需独立能力层）
+
+
+def test_extra_known_marketplaces_deep_merge_at_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: extraKnownMarketplaces（dict）在 cwd project/local 层间深合并（键并集，同名叶子高层胜）。"""
+    _write_json(
+        workdir_project_settings_path(tmp_path),
+        {"extraKnownMarketplaces": {"mp1": {"source": {"type": "git", "url": "git@h:a.git"}}}},
+    )
+    _write_json(
+        workdir_local_settings_path(tmp_path),
+        {"extraKnownMarketplaces": {"mp2": {"source": {"type": "git", "url": "git@h:b.git"}}}},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_settings(env=_empty_user_env(tmp_path))
+    assert set(resolved.settings["extraKnownMarketplaces"]) == {"mp1", "mp2"}  # 深合并键并集
+    assert resolved.settings["extraKnownMarketplaces"]["mp1"]["source"]["url"] == "git@h:a.git"

@@ -14,9 +14,9 @@
 写经 :func:`...scope.apply_write`（**数组整体替换**、``undefined`` 删键，§5.4）+ store 原子写/锁。
 
 - **scope**：``user`` / ``project`` / ``local`` 可写；``flag`` / ``policy`` **只读**（set/edit 拒绝，退出码 1）；
-  ``merged``（默认 show）= 六层合并视图。project/local 需 active workdir。
+  ``merged``（默认 show）= 五层合并视图。project/local 锚定进程 cwd（#116）。
 - settings.json **无 version 字段**（复刻 CC passthrough，§5）；写不注 version/保护头（``header=None``）。
-- ``edit`` 用 ``$EDITOR`` 打开该层文件，保存后经回调 reconcile（能力层对账 + 重跑 MCP 批准门控）。
+- ``edit`` 用 ``$EDITOR`` 打开该层文件，保存后经回调 reconcile（重跑 MCP 批准门控）。
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ def settings_show(
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
     data = _read_scope(scope, home, env, flag_path=flag_path)
-    if data is None:
+    if data is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
     console.print_json(data=data)
     return EXIT_OK
@@ -127,7 +127,7 @@ def settings_get(
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
     data = _read_scope(scope, home, env, flag_path=flag_path)
-    if data is None:
+    if data is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
     if key not in data:
         return _err(f"key {key!r} not set in scope {scope!r}", json_output=json_output)

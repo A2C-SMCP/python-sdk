@@ -231,7 +231,11 @@ class ResolvedSettings:
 
 
 def _dedup_errors(errors: Sequence[SettingsValidationError]) -> list[SettingsValidationError]:
-    """按出现顺序去重（防御性保留：各层独立读文件，正常不重复）/ Order-preserving error dedup."""
+    """按出现顺序去重 / Order-preserving error dedup。
+
+    防御性保留：#116 后各层读**不同文件**，当前无路径产生重复错误（原「能力层 + B 层双读
+    active workdir 文件」场景已随能力层移除消失）。
+    """
     return list(dict.fromkeys(errors))
 
 

@@ -45,14 +45,10 @@ class SettingsScope(StrEnum):
     """
     settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high)。
 
-    ``CAPABILITY`` 是 A2C 特有的**能力发现层**（最低优先级）：跨**全部登记工作目录**取
-    ``enabledPlugins`` / ``extraKnownMarketplaces`` 并集，让 Agent 能力面稳定、不随 active
-    workdir 跳变（§5.0/§5.1）。其余五级 = Claude Code 完整对齐（user/project/local/flag/policy）。
-    ``CAPABILITY`` is the A2C-specific capability-discovery layer (lowest); the other five align
-    with Claude Code.
+    五级与 Claude Code 完整对齐（user/project/local/flag/policy）；project/local 锚定进程 cwd（#116）。
+    Five levels aligned with Claude Code; project/local anchored at process cwd (#116).
     """
 
-    CAPABILITY = "capability"  # 能力发现层（最低）/ capability-discovery (lowest)
     USER = "user"
     PROJECT = "project"
     LOCAL = "local"

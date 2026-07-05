@@ -48,11 +48,10 @@ mcp 流程 / mcp flow：
 4. 合成 ``A2CSkillRef``（name = ``mcp:<normalized-server>:<frontmatter.name>``）→ 注册进 :class:`SkillRegistry`。
 
 user 流程 / user flow（与 mcp 的关键差异）：**就地发现、不复制进 SKILL Home**。扫描发现根
-``$A2C_SKILL_HOME/user/``（全局个人）+ **全部已登记工作目录** ``<workdir>/.tfrobot/skills/``（能力发现层、
-跨目录全局并集、不随 active workdir 切换）；发现单元 ``<root>/<skill>/SKILL.md``（根下**一级**）。
+``$A2C_SKILL_HOME/user/``（全局个人；#116 起仅 home 单根，workdir 维度 SKILL 已下沉 MCP 服务经
+``skill://`` 承载）；发现单元 ``<root>/<skill>/SKILL.md``（根下**一级**）。
 - **name = 目录 basename**（单段裸名，§5.0）——就地目录不可改名，与 sandbox 的 name 寻址（S2）一致；
   ``frontmatter.name`` 仅参考（不一致记 DEBUG）；basename 非严格 kebab → 跳过。
-- **优先级（低→高）**：``user/`` < 各 workdir（按登记序，**后者覆盖前者** + WARN）。
 - 深于一级的 ``SKILL.md``（``<root>/a/b/SKILL.md``）→ 忽略 + DEBUG（user 源单段命名，不嵌套）。
 - 重扫幂等：已注册 → ``update``（含孤儿恢复），否则 ``register``；磁盘删除项的孤儿标记交 reconciler（#62）/
   watcher（#67）按返回的发现 name 列表 diff，本函数不负责。

@@ -16,8 +16,8 @@ management UX.
 已落地模块 / Landed modules：
 - :mod:`a2c_smcp.computer.settings.schema` —— settings.json TypedDict + 字段级容错校验
   （passthrough / 无 version / policy-only 越权过滤）（S4，#56）
-- :mod:`a2c_smcp.computer.settings.scope`  —— 五级 scope 路径解析 + 读/写两套合并 customizer +
-  active-workdir 单根 / 能力层全局并集解析（S4，#56）
+- :mod:`a2c_smcp.computer.settings.scope`  —— 五级 scope 路径解析 + 读/写两套合并 customizer；
+  project/local 锚定进程 cwd（S4，#56；#116 瘦身）
 - :mod:`a2c_smcp.computer.settings.policy` —— policy 四子源 first-source-wins（remote stub + OS-MDM +
   managed-settings[+.d] + HKCU）（S4，#56）
 - :mod:`a2c_smcp.computer.settings.store`  —— 物化文件（known_marketplaces / installed_plugins）原子写 +

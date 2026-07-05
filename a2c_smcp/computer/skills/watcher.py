@@ -11,8 +11,8 @@ SKILL file watcher: watch user-source DropIn roots, SKILL.md change → debounce
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §8.3。
 
 监控范围 / Scope（§8.3）：
-- 监控根（**递归**）= ``$A2C_SKILL_HOME/user/`` + **全部已登记** ``<workdir>/.tfrobot/skills/``（能力发现层、
-  全局并集、不随 active workdir 切换）；过滤器为 ``**/SKILL.md``。**绝不监** marketplace clone 树
+- 监控根（**递归**）= ``$A2C_SKILL_HOME/user/``（#116 起仅 home 单根，workdir 维度已下沉 MCP 服务）；
+  过滤器为 ``**/SKILL.md``。**绝不监** marketplace clone 树
   （``<home>/marketplace/<mp>/...``）——clone 树是物化产物，变更只经 CLI 操作发生（操作自调去抖标脏），
   监控它会引发 ``git pull`` 雪崩并破坏「意图层 / 物化层」单向同步边界（§8.3 三条理由）。
 - **监控范围 ≠ 发现单元**：watcher 监根递归子树并过滤 ``SKILL.md``；SKILL 的「发现单元」是

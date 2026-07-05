@@ -454,7 +454,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     cbs = build_mcp_callbacks(comp)
-    # #116：project/local scope 的 project_path 锚定进程 cwd（plugin enable/disable 写 enabledPlugins 落 cwd 单根）。
+    # #116：project/local scope 的 project_path 锚定进程 cwd（仅 install 分支消费；enable/disable 从 ledger 读 projectPath）。
     project_path = os.getcwd()
 
     if sub == "install":
