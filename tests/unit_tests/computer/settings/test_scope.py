@@ -303,3 +303,18 @@ def test_flag_layer_overrides_user_and_project(tmp_path: Path) -> None:
     assert resolved.settings["strictKnownMarketplaces"] is True  # flag 标量覆盖 project
     # 数组拼接去重（低 project 在前 + 高 flag 在后）。
     assert resolved.settings["trustedMarketplaces"] == ["proj", "flag"]
+
+
+# ---------------------------------------------------------------------------
+# #116 概念瘦身：project/local 锚定进程 cwd / #116: project/local anchored at process cwd
+# ---------------------------------------------------------------------------
+def test_resolve_settings_anchors_project_local_at_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: project/local 层无条件锚定 cwd，`resolve_settings` 不再有 workdir 形参。"""
+    _write_json(workdir_project_settings_path(tmp_path), {"strictKnownMarketplaces": True, "enabledPlugins": {"p@mp": True}})
+    _write_json(workdir_local_settings_path(tmp_path), {"strictKnownMarketplaces": False, "trustedMarketplaces": ["m"]})
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_settings(env=_empty_user_env(tmp_path))
+    assert resolved.settings["strictKnownMarketplaces"] is False  # local 覆盖 project
+    assert resolved.settings["trustedMarketplaces"] == ["m"]
+    assert resolved.settings["enabledPlugins"] == {"p@mp": True}  # 能力字段随 project 层进（无需独立能力层）

@@ -109,3 +109,20 @@ async def test_recursive_dict_and_list() -> None:
 async def test_single_env_placeholder_returns_string() -> None:
     out = await ConfigRender.arender_str("${env:X}", _noop_resolve, env={"X": "val"})
     assert out == "val"
+
+
+# ---------------------------------------------------------------------------
+# #116 概念瘦身：${workspaceFolder} 退出预定义变量 / #116: ${workspaceFolder} no longer predefined
+# ---------------------------------------------------------------------------
+def test_predefined_vars_slimmed_to_two() -> None:
+    """#116: 预定义变量仅剩 userHome / pathSeparator。"""
+    from a2c_smcp.computer.inputs.render import _PREDEFINED_VARS
+
+    assert _PREDEFINED_VARS == ("userHome", "pathSeparator")
+
+
+@pytest.mark.asyncio
+async def test_workspace_folder_left_verbatim_even_if_supplied() -> None:
+    """#116: 即便调用方在 variables 提供 workspaceFolder，也按未知占位符原样保留。"""
+    out = await ConfigRender.arender_str("${workspaceFolder}/x", _noop_resolve, variables={"workspaceFolder": "/work"})
+    assert out == "${workspaceFolder}/x"

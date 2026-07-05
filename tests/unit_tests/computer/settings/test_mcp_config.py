@@ -369,3 +369,31 @@ def test_resolve_idless_and_non_object_inputs_dropped(tmp_path: Path) -> None:
     assert out.inputs == []  # 两者皆 drop、不崩
     unknown_errs = [e for e in out.errors if e.field == "inputs.<unknown>"]
     assert len(unknown_errs) == 2  # 各自独立报错 → <noid-N> key 不冲突（非互相覆盖）
+
+
+# ---------------------------------------------------------------------------
+# #116 概念瘦身：PROJECT/LOCAL 锚定进程 cwd / #116: PROJECT/LOCAL anchored at process cwd
+# ---------------------------------------------------------------------------
+def test_resolve_mcp_config_anchors_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: PROJECT/LOCAL 层无条件锚定 cwd，`resolve_mcp_config` 不再有 active_workdir 形参。"""
+    env = _env(tmp_path)
+    _write_json(tmp_path / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
+    monkeypatch.chdir(tmp_path)
+
+    out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
+    assert "proj-srv" in out.servers
+    assert out.servers["proj-srv"].origin == SettingsScope.PROJECT
+    assert out.servers["proj-srv"].trusted_origin is False  # project 非可信来源，语义不变
+
+
+def test_approval_writes_anchor_cwd_no_failfast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: 批准写盘锚定 cwd（`<cwd>/.tfrobot/settings.local.json`），不再因缺 workdir 而 fail-fast。"""
+    monkeypatch.chdir(tmp_path)
+    approve_mcp_server("figma")
+    deny_mcp_server("sketchy")
+    approve_all_project_mcp()
+
+    settings = _read_local_settings(tmp_path)
+    assert settings["enabledMcpjsonServers"] == ["figma"]
+    assert settings["disabledMcpjsonServers"] == ["sketchy"]
+    assert settings["enableAllProjectMcpServers"] is True
