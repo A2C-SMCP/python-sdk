@@ -48,11 +48,10 @@ mcp 流程 / mcp flow：
 4. 合成 ``A2CSkillRef``（name = ``mcp:<normalized-server>:<frontmatter.name>``）→ 注册进 :class:`SkillRegistry`。
 
 user 流程 / user flow（与 mcp 的关键差异）：**就地发现、不复制进 SKILL Home**。扫描发现根
-``$A2C_SKILL_HOME/user/``（全局个人）+ **全部已登记工作目录** ``<workdir>/.tfrobot/skills/``（能力发现层、
-跨目录全局并集、不随 active workdir 切换）；发现单元 ``<root>/<skill>/SKILL.md``（根下**一级**）。
+``$A2C_SKILL_HOME/user/``（全局个人；#116 起仅 home 单根，workdir 维度 SKILL 已下沉 MCP 服务经
+``skill://`` 承载）；发现单元 ``<root>/<skill>/SKILL.md``（根下**一级**）。
 - **name = 目录 basename**（单段裸名，§5.0）——就地目录不可改名，与 sandbox 的 name 寻址（S2）一致；
   ``frontmatter.name`` 仅参考（不一致记 DEBUG）；basename 非严格 kebab → 跳过。
-- **优先级（低→高）**：``user/`` < 各 workdir（按登记序，**后者覆盖前者** + WARN）。
 - 深于一级的 ``SKILL.md``（``<root>/a/b/SKILL.md``）→ 忽略 + DEBUG（user 源单段命名，不嵌套）。
 - 重扫幂等：已注册 → ``update``（含孤儿恢复），否则 ``register``；磁盘删除项的孤儿标记交 reconciler（#62）/
   watcher（#67）按返回的发现 name 列表 diff，本函数不负责。
@@ -89,7 +88,6 @@ from a2c_smcp.computer.skills.home import (
     marketplace_skill_dir,
     mcp_skill_dir,
     user_dropin_root,
-    workdir_skill_root,
 )
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
@@ -550,24 +548,6 @@ def _finalize_and_register(
 
 
 # ── user 源 DropIn（就地发现，不 staging）/ user-source in-place DropIn ────────
-def _user_dropin_roots(home: Path, workdirs: Sequence[Path]) -> list[Path]:
-    """
-    user 源 DropIn 发现根，按优先级**升序**（低→高，后者覆盖）+ 解析去重 / Ascending-priority deduped roots。
-
-    顺序 = ``[<home>/user]`` + ``[<workdir>/.tfrobot/skills ...]``（登记序）。``resolve()`` 后按路径去重保序，
-    避免同一目录被登记两次造成重复扫描 + 假 WARN（首次出现定其优先级槽位）。
-    """
-    ordered: list[Path] = [user_dropin_root(home).resolve()]
-    ordered.extend(workdir_skill_root(wd).resolve() for wd in workdirs)
-    seen: set[Path] = set()
-    deduped: list[Path] = []
-    for root in ordered:
-        if root not in seen:
-            seen.add(root)
-            deduped.append(root)
-    return deduped
-
-
 def _iter_user_skill_dirs(root: Path) -> Iterator[Path]:
     """
     枚举发现根下的 SKILL 目录 / Yield ``<root>/<skill>/`` whose ``<skill>/SKILL.md`` exists（根下**一级**）。
@@ -630,44 +610,32 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
 def stage_user_skills(
     registry: SkillRegistry,
     home: Path,
-    workdirs: Sequence[Path] = (),
 ) -> list[str]:
     """
     枚举 user 源 DropIn 并注册进 Registry（**就地发现、不复制**）/ Discover user-source DropIn skills in place。
 
-    扫描 ``<home>/user/`` + 各 ``<workdir>/.tfrobot/skills/``（能力发现层全局并集，**不随 active workdir 切换**）；
-    发现单元 ``<root>/<skill>/SKILL.md``（根下一级），name = 目录 basename（单段裸名）。同名按发现根优先级
-    **后者覆盖前者**（``user/`` 最低 < 各 workdir 登记序），覆盖时记 WARN（便于诊断「为何我的 skill 不显示」）。
+    扫描 ``<home>/user/``（#116 起仅 home 单根；workdir 维度 SKILL 已下沉 MCP 服务经 ``skill://`` 承载）；
+    发现单元 ``<root>/<skill>/SKILL.md``（根下一级），name = 目录 basename（单段裸名）。
 
     :param registry: 目标 :class:`SkillRegistry`。
     :param home: SKILL Home 绝对根（见 :mod:`~a2c_smcp.computer.skills.home`）。
-    :param workdirs: workspace **已登记工作目录**（按登记序；调用方提供，本函数不耦合 workspace 登记模块）。
     :return: 本次发现并成功注册/刷新的 SKILL name 列表 / discovered & registered names（供 reconciler/watcher diff 孤儿）。
     """
-    winners: dict[str, tuple[A2CSkillRef, Path]] = {}  # name → (ref, 发现目录)；后者覆盖前者
-    for root in _user_dropin_roots(home, workdirs):
-        for skill_dir in _iter_user_skill_dirs(root):
-            basename = skill_dir.name
-            try:
-                name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
-            except SkillNameError as e:
-                logger.error("user DropIn skill dir name invalid, skipped: %s (%s)", skill_dir, e.reason)
-                continue
-            ref = _build_user_ref(name, skill_dir)
-            if ref is None:
-                continue
-            prev = winners.get(name)
-            if prev is not None:
-                logger.warning(
-                    "user SKILL %r at %s shadows earlier DropIn at %s (later root wins)",
-                    name,
-                    skill_dir,
-                    prev[1],
-                )
-            winners[name] = (ref, skill_dir)
+    winners: dict[str, A2CSkillRef] = {}  # name → ref（单根下 basename 唯一，无跨根遮蔽）
+    for skill_dir in _iter_user_skill_dirs(user_dropin_root(home).resolve()):
+        basename = skill_dir.name
+        try:
+            name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
+        except SkillNameError as e:
+            logger.error("user DropIn skill dir name invalid, skipped: %s (%s)", skill_dir, e.reason)
+            continue
+        ref = _build_user_ref(name, skill_dir)
+        if ref is None:
+            continue
+        winners[name] = ref
 
     registered: list[str] = []
-    for name, (ref, _) in winners.items():
+    for name, ref in winners.items():
         # 跨 run 既存（active 或 orphan）→ update（刷新 / 孤儿恢复）；否则 register。
         if registry.register_or_update(ref):
             registered.append(name)

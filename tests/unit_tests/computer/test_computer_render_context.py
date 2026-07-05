@@ -26,16 +26,21 @@ from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import MCPServerPromptStringInput
 
 
-def test_active_workdir_property(tmp_path: Path) -> None:
-    assert Computer(name="t").active_workdir is None  # 空闲
-    comp = Computer(name="t", registered_workdirs=[tmp_path, tmp_path / "b"])
-    assert comp.active_workdir == tmp_path  # 取首个（绑定任务单根）
+# ---------------------------------------------------------------------------
+# #116 概念瘦身：Computer 无 workdir 概念 / #116: Computer carries no workdir concept
+# ---------------------------------------------------------------------------
+def test_computer_rejects_workdir_concepts(tmp_path: Path) -> None:
+    """#116: `registered_workdirs` 构造参数与 `active_workdir` 属性均已移除。"""
+    with pytest.raises(TypeError):
+        Computer(name="t", registered_workdirs=[tmp_path])
+    assert not hasattr(Computer(name="t"), "active_workdir")
 
 
-def test_render_variables_uses_active_workdir(tmp_path: Path) -> None:
-    comp = Computer(name="t", registered_workdirs=[tmp_path])
-    assert comp._render_variables()["workspaceFolder"] == str(tmp_path)
-    assert Computer(name="t")._render_variables()["workspaceFolder"] == os.getcwd()  # 无 → cwd
+def test_render_variables_no_workspace_folder() -> None:
+    """#116: 渲染变量仅剩 userHome / pathSeparator（${workspaceFolder} 停产）。"""
+    variables = Computer(name="t")._render_variables()
+    assert set(variables) == {"userHome", "pathSeparator"}
+    assert variables["pathSeparator"] == os.sep
 
 
 _CFG = {"name": "s", "type": "stdio", "server_parameters": {"command": "node", "args": ["${input:token}"]}}

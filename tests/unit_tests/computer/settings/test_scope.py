@@ -20,12 +20,10 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5.0 / 
 """
 
 import json
-import logging
 from pathlib import Path
 
 import pytest
 
-import a2c_smcp.computer.settings.scope as scope_mod
 from a2c_smcp.computer.settings.scope import (
     DELETE,
     apply_write,
@@ -157,89 +155,17 @@ def test_workdir_paths(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# active-workdir / 能力层解析 / resolution
+# cwd 锚定解析（#116）/ cwd-anchored resolution
 # ---------------------------------------------------------------------------
 def _empty_user_env(tmp_path: Path) -> dict:
     # 指向无 settings.json 的隔离 config dir，确保 user 层为空。
     return {"XDG_CONFIG_HOME": str(tmp_path / "empty-config")}
 
 
-def test_no_active_workdir_project_local_empty(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    _write_json(workdir_project_settings_path(wd), {"strictKnownMarketplaces": True, "enabledPlugins": {"p@mp": True}})
-
+def test_policy_highest_priority_and_validated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_json(workdir_project_settings_path(tmp_path), {"strictKnownMarketplaces": False})
+    monkeypatch.chdir(tmp_path)
     resolved = resolve_settings(
-        registered_workdirs=[wd],
-        active_workdir=None,  # 无 active
-        env=_empty_user_env(tmp_path),
-    )
-    # 标量 strictKnownMarketplaces 是 project（B 层）键，无 active → 不贡献。
-    assert "strictKnownMarketplaces" not in resolved.settings
-    # enabledPlugins 属能力层（A 层），跨登记目录并集 → 仍在。
-    assert resolved.settings["enabledPlugins"] == {"p@mp": True}
-
-
-def test_non_active_dir_contributes_capability_not_scalars(tmp_path: Path) -> None:
-    wd_active = tmp_path / "active"
-    wd_other = tmp_path / "other"
-    _write_json(workdir_project_settings_path(wd_active), {"enabledPlugins": {"a@mp": True}})
-    _write_json(
-        workdir_project_settings_path(wd_other),
-        {"strictKnownMarketplaces": True, "enabledPlugins": {"b@mp": True}, "trustedMarketplaces": ["x"]},
-    )
-
-    resolved = resolve_settings(
-        registered_workdirs=[wd_active, wd_other],
-        active_workdir=wd_active,
-        env=_empty_user_env(tmp_path),
-    )
-    # 非 active 的 wd_other：标量 strictKnownMarketplaces / 数组 trustedMarketplaces 不贡献。
-    assert "strictKnownMarketplaces" not in resolved.settings
-    assert "trustedMarketplaces" not in resolved.settings
-    # 能力层全局并集：两个目录的 enabledPlugins 都进。
-    assert resolved.settings["enabledPlugins"] == {"a@mp": True, "b@mp": True}
-
-
-def test_active_workdir_full_contribution(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    _write_json(workdir_project_settings_path(wd), {"strictKnownMarketplaces": True})
-    _write_json(workdir_local_settings_path(wd), {"strictKnownMarketplaces": False, "trustedMarketplaces": ["m"]})
-
-    resolved = resolve_settings(
-        registered_workdirs=[wd],
-        active_workdir=wd,
-        env=_empty_user_env(tmp_path),
-    )
-    # local 覆盖 project（高 scope 赢）。
-    assert resolved.settings["strictKnownMarketplaces"] is False
-    assert resolved.settings["trustedMarketplaces"] == ["m"]
-
-
-def test_capability_union_across_extra_marketplaces(tmp_path: Path) -> None:
-    wd1 = tmp_path / "wd1"
-    wd2 = tmp_path / "wd2"
-    _write_json(
-        workdir_project_settings_path(wd1),
-        {"extraKnownMarketplaces": {"mp1": {"source": {"type": "git", "url": "git@h:a.git"}}}},
-    )
-    _write_json(
-        workdir_project_settings_path(wd2),
-        {"extraKnownMarketplaces": {"mp2": {"source": {"type": "git", "url": "git@h:b.git"}}}},
-    )
-    resolved = resolve_settings(
-        registered_workdirs=[wd1, wd2],
-        active_workdir=None,
-        env=_empty_user_env(tmp_path),
-    )
-    assert set(resolved.settings["extraKnownMarketplaces"]) == {"mp1", "mp2"}
-
-
-def test_policy_highest_priority_and_validated(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    _write_json(workdir_project_settings_path(wd), {"strictKnownMarketplaces": False})
-    resolved = resolve_settings(
-        registered_workdirs=[wd],
-        active_workdir=wd,
         env=_empty_user_env(tmp_path),
         policy_settings={"strictKnownMarketplaces": True, "allowedMcpServers": ["srv"]},
     )
@@ -249,57 +175,68 @@ def test_policy_highest_priority_and_validated(tmp_path: Path) -> None:
     assert resolved.settings["allowedMcpServers"] == ["srv"]
 
 
-def test_corrupt_settings_file_yields_error_not_crash(tmp_path: Path) -> None:
-    wd = tmp_path / "wd"
-    p = workdir_project_settings_path(wd)
+def test_corrupt_settings_file_yields_error_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = workdir_project_settings_path(tmp_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{not valid json", encoding="utf-8")
-    resolved = resolve_settings(registered_workdirs=[wd], active_workdir=wd, env=_empty_user_env(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_settings(env=_empty_user_env(tmp_path))
     assert resolved.settings == {}  # 损坏文件回退空、不崩
     assert any(e.field == "<file>" for e in resolved.errors)
 
 
-def test_errors_deduped_when_active_dir_read_twice(tmp_path: Path) -> None:
-    # active workdir 文件在能力层 + B 层各读一次；同一错误应去重。
-    wd = tmp_path / "wd"
-    _write_json(workdir_project_settings_path(wd), {"strictKnownMarketplaces": "bad"})
-    resolved = resolve_settings(registered_workdirs=[wd], active_workdir=wd, env=_empty_user_env(tmp_path))
+def test_invalid_scalar_field_reported_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 单层单文件的字段级错误只报一次（_dedup_errors 防御性保留）。
+    _write_json(workdir_project_settings_path(tmp_path), {"strictKnownMarketplaces": "bad"})
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_settings(env=_empty_user_env(tmp_path))
     scalar_errors = [e for e in resolved.errors if e.field == "strictKnownMarketplaces"]
     assert len(scalar_errors) == 1
 
 
-def test_capability_cross_workdir_conflict_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    # 两登记目录对同一 enabledPlugins["foo@mp"] 给不同 bool → 后者(wd2)覆盖 + WARN（§5.4）。
-    wd1 = tmp_path / "wd1"
-    wd2 = tmp_path / "wd2"
-    _write_json(workdir_project_settings_path(wd1), {"enabledPlugins": {"foo@mp": True}})
-    _write_json(workdir_project_settings_path(wd2), {"enabledPlugins": {"foo@mp": False}})
-
-    # 项目 logger 关闭 propagate，直接挂 caplog handler（同 test_registry.py 范式）。
-    scope_mod.logger.addHandler(caplog.handler)
-    caplog.set_level(logging.WARNING)
-    try:
-        resolved = resolve_settings(registered_workdirs=[wd1, wd2], active_workdir=None, env=_empty_user_env(tmp_path))
-    finally:
-        scope_mod.logger.removeHandler(caplog.handler)
-
-    assert resolved.settings["enabledPlugins"] == {"foo@mp": False}  # 后者胜出
-    assert any("Capability-layer conflict" in r.getMessage() for r in caplog.records)
-
-
-def test_flag_layer_overrides_user_and_project(tmp_path: Path) -> None:
-    # flag 层（--settings <file>）优先级高于 project，仅低于 policy。
-    wd = tmp_path / "wd"
-    _write_json(workdir_project_settings_path(wd), {"strictKnownMarketplaces": False, "trustedMarketplaces": ["proj"]})
+def test_flag_layer_overrides_user_and_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # flag 层（--settings <file>）优先级高于 project，仅低于 policy。project 锚 cwd（#116）。
+    _write_json(workdir_project_settings_path(tmp_path), {"strictKnownMarketplaces": False, "trustedMarketplaces": ["proj"]})
     flag_file = tmp_path / "flag-settings.json"
     flag_file.write_text(json.dumps({"strictKnownMarketplaces": True, "trustedMarketplaces": ["flag"]}), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
 
     resolved = resolve_settings(
-        registered_workdirs=[wd],
-        active_workdir=wd,
         env=_empty_user_env(tmp_path),
         flag_settings_path=flag_file,
     )
     assert resolved.settings["strictKnownMarketplaces"] is True  # flag 标量覆盖 project
     # 数组拼接去重（低 project 在前 + 高 flag 在后）。
     assert resolved.settings["trustedMarketplaces"] == ["proj", "flag"]
+
+
+# ---------------------------------------------------------------------------
+# #116 概念瘦身：project/local 锚定进程 cwd / #116: project/local anchored at process cwd
+# ---------------------------------------------------------------------------
+def test_resolve_settings_anchors_project_local_at_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: project/local 层无条件锚定 cwd，`resolve_settings` 不再有 workdir 形参。"""
+    _write_json(workdir_project_settings_path(tmp_path), {"strictKnownMarketplaces": True, "enabledPlugins": {"p@mp": True}})
+    _write_json(workdir_local_settings_path(tmp_path), {"strictKnownMarketplaces": False, "trustedMarketplaces": ["m"]})
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_settings(env=_empty_user_env(tmp_path))
+    assert resolved.settings["strictKnownMarketplaces"] is False  # local 覆盖 project
+    assert resolved.settings["trustedMarketplaces"] == ["m"]
+    assert resolved.settings["enabledPlugins"] == {"p@mp": True}  # 能力字段随 project 层进（无需独立能力层）
+
+
+def test_extra_known_marketplaces_deep_merge_at_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: extraKnownMarketplaces（dict）在 cwd project/local 层间深合并（键并集，同名叶子高层胜）。"""
+    _write_json(
+        workdir_project_settings_path(tmp_path),
+        {"extraKnownMarketplaces": {"mp1": {"source": {"type": "git", "url": "git@h:a.git"}}}},
+    )
+    _write_json(
+        workdir_local_settings_path(tmp_path),
+        {"extraKnownMarketplaces": {"mp2": {"source": {"type": "git", "url": "git@h:b.git"}}}},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_settings(env=_empty_user_env(tmp_path))
+    assert set(resolved.settings["extraKnownMarketplaces"]) == {"mp1", "mp2"}  # 深合并键并集
+    assert resolved.settings["extraKnownMarketplaces"]["mp1"]["source"]["url"] == "git@h:a.git"

@@ -10,7 +10,8 @@ envFile 加载 + 合并单元测试（v0.2.1 #65，§9.1）/ envFile load + merg
 测试意图 / Test intentions:
 - ``load_env_file``：KEY=VALUE / 注释 / 引号 / export / 缺文件→{} / 无 '=' 行跳过；
 - ``Computer._apply_env_file``：stdio 合并、显式 env 胜、非 stdio（sse）原样、无 envFile 原样；
-- 端到端：envFile 路径含 ``${workspaceFolder}`` 经渲染后再加载（_arender_and_validate_server）。
+- 端到端：envFile 路径含 ``${userHome}`` 等占位符经渲染后再加载（_arender_and_validate_server；
+  #116 起 ``${workspaceFolder}`` 停产）。
 """
 
 from __future__ import annotations
@@ -52,20 +53,19 @@ def test_load_env_file_missing(tmp_path: Path) -> None:
     assert load_env_file(tmp_path / "nope.env") == {}
 
 
-def _comp(tmp_path: Path) -> Computer:
+def _comp() -> Computer:
     return Computer(
         name="t",
         inputs=set(),
         mcp_servers=set(),
         auto_connect=False,
         auto_reconnect=False,
-        registered_workdirs=[tmp_path],
     )
 
 
 def test_apply_env_file_explicit_wins(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("A=fromfile\nB=fromfile\n", encoding="utf-8")
-    comp = _comp(tmp_path)
+    comp = _comp()
     rendered = {
         "name": "s",
         "type": "stdio",
@@ -78,14 +78,14 @@ def test_apply_env_file_explicit_wins(tmp_path: Path) -> None:
 
 
 def test_apply_env_file_no_envfile_passthrough(tmp_path: Path) -> None:
-    comp = _comp(tmp_path)
+    comp = _comp()
     rendered = {"name": "s", "type": "stdio", "server_parameters": {"command": "node", "env": {"A": "1"}}}
     assert comp._apply_env_file(rendered) == rendered
 
 
 def test_apply_env_file_non_stdio_passthrough_and_warns(tmp_path: Path, caplog, attach_logger_to_caplog) -> None:
     caplog.set_level("WARNING", logger="a2c_smcp")
-    comp = _comp(tmp_path)
+    comp = _comp()
     rendered = {"name": "s", "type": "sse", "server_parameters": {"url": "http://x"}, "envFile": str(tmp_path / ".env")}
     # sse/http 填 envFile → 行为仍 passthrough（原样返回）+ 记一条 WARN（#65 fix-review #4）
     assert comp._apply_env_file(rendered) == rendered
@@ -93,14 +93,16 @@ def test_apply_env_file_non_stdio_passthrough_and_warns(tmp_path: Path, caplog, 
 
 
 @pytest.mark.asyncio
-async def test_render_then_envfile_with_workspacefolder(tmp_path: Path) -> None:
+async def test_render_then_envfile_with_env_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """envFile 路径占位符经渲染后再加载（#116：${workspaceFolder} 停产，改用 ${env:}/绝对路径）。"""
     (tmp_path / ".env").write_text("FROM_FILE=yes\n", encoding="utf-8")
-    comp = _comp(tmp_path)  # registered_workdirs=[tmp_path] → ${workspaceFolder}=tmp_path
+    monkeypatch.setenv("WORK_DIR", str(tmp_path))
+    comp = _comp()
     raw = {
         "name": "s",
         "type": "stdio",
         "server_parameters": {"command": "node", "env": {"EXPLICIT": "v"}},
-        "envFile": "${workspaceFolder}/.env",
+        "envFile": "${env:WORK_DIR}/.env",
     }
     validated = await comp._arender_and_validate_server(raw)
     assert validated.server_parameters.env == {"EXPLICIT": "v", "FROM_FILE": "yes"}

@@ -23,6 +23,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from a2c_smcp.computer.settings.mcp_config import (
     McpApprovalStatus,
     approve_mcp_server,
@@ -60,15 +62,16 @@ def _home(tmp_path: Path) -> Path:
 
 
 # ── resolve + gate 全栈 ───────────────────────────────────────────────────────
-def test_resolve_and_gate_full_stack(tmp_path: Path) -> None:
+def test_resolve_and_gate_full_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env = _env(tmp_path)
     wd = tmp_path / "wd"
     managed_mcp = tmp_path / "managed-mcp.json"
 
-    # 跨 scope 铺 server 定义：user(trusted) / project(workspace) / policy(trusted)。
+    # 跨 scope 铺 server 定义：user(trusted) / project(workspace，锚 cwd，#116) / policy(trusted)。
     _write_json(tmp_path / "cfg" / "a2c" / "mcp.json", _mcp({"user-srv": _stdio()}))
     _write_json(wd / ".tfrobot" / "mcp.json", _mcp({"proj-srv": _stdio(), "blender": _stdio()}))
     _write_json(managed_mcp, _mcp({"policy-srv": _stdio()}))
+    monkeypatch.chdir(wd)
 
     # bundled 账本：plugin 携带 "blender" → 即使在 workspace mcp.json 出现，也免批准。
     save_installed_plugins(
@@ -79,10 +82,10 @@ def test_resolve_and_gate_full_stack(tmp_path: Path) -> None:
     # policy denies "policy-srv"（企业拒绝名单，policy scope）。
     policy = {"deniedMcpServers": ["policy-srv"]}
 
-    resolved = resolve_mcp_config(env=env, active_workdir=wd, managed_mcp_path=managed_mcp)
+    resolved = resolve_mcp_config(env=env, managed_mcp_path=managed_mcp)
     assert set(resolved.servers) == {"user-srv", "proj-srv", "blender", "policy-srv"}
 
-    settings = resolve_settings(active_workdir=wd, env=env, policy_settings=policy).settings
+    settings = resolve_settings(env=env, policy_settings=policy).settings
     bundled = bundled_mcp_server_names(env=env)
     statuses = gate_mcp_servers(resolved, settings, bundled)
 
@@ -94,37 +97,39 @@ def test_resolve_and_gate_full_stack(tmp_path: Path) -> None:
     }
 
 
-def test_approve_roundtrip_flips_pending_to_enabled(tmp_path: Path) -> None:
-    """pending workspace server → approve 写 local → resolve_settings 六层读回 → 重门控 enabled。"""
+def test_approve_roundtrip_flips_pending_to_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """pending workspace server → approve 写 local（cwd 锚，#116）→ resolve_settings 读回 → 重门控 enabled。"""
     env = _env(tmp_path)
     wd = tmp_path / "wd"
     managed_mcp = tmp_path / "absent-managed-mcp.json"
     _write_json(wd / ".tfrobot" / "mcp.json", _mcp({"figma": _stdio()}))
+    monkeypatch.chdir(wd)
 
-    resolved = resolve_mcp_config(env=env, active_workdir=wd, managed_mcp_path=managed_mcp)
+    resolved = resolve_mcp_config(env=env, managed_mcp_path=managed_mcp)
     bundled = bundled_mcp_server_names(env=env)
 
-    before = gate_mcp_servers(resolved, resolve_settings(active_workdir=wd, env=env).settings, bundled)
+    before = gate_mcp_servers(resolved, resolve_settings(env=env).settings, bundled)
     assert before == {"figma": McpApprovalStatus.PENDING}
 
-    # 批准框 [y]es：写 active-workdir local settings.local.json。
-    approve_mcp_server("figma", active_workdir=wd)
+    # 批准框 [y]es：写 cwd 的 local settings.local.json。
+    approve_mcp_server("figma")
 
-    after = gate_mcp_servers(resolved, resolve_settings(active_workdir=wd, env=env).settings, bundled)
+    after = gate_mcp_servers(resolved, resolve_settings(env=env).settings, bundled)
     assert after == {"figma": McpApprovalStatus.ENABLED}
 
 
-def test_scope_override_full_stack(tmp_path: Path) -> None:
-    """同名 server user(低) + local(高)：local 整体覆盖、origin=local、workspace 受门控（pending）。"""
+def test_scope_override_full_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """同名 server user(低) + local(高，锚 cwd)：local 整体覆盖、origin=local、workspace 受门控（pending）。"""
     env = _env(tmp_path)
     wd = tmp_path / "wd"
     _write_json(tmp_path / "cfg" / "a2c" / "mcp.json", _mcp({"shared": {"type": "stdio", "server_parameters": {"command": "user-cmd"}}}))
     _write_json(wd / ".tfrobot" / "mcp.local.json", _mcp({"shared": {"type": "stdio", "server_parameters": {"command": "local-cmd"}}}))
+    monkeypatch.chdir(wd)
 
-    resolved = resolve_mcp_config(env=env, active_workdir=wd, managed_mcp_path=tmp_path / "absent.json")
+    resolved = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
     srv = resolved.servers["shared"]
     assert srv.config.server_parameters.command == "local-cmd"  # 高 scope 整体覆盖
     assert srv.trusted_origin is False  # origin=local → workspace 共享、受门控
 
-    statuses = gate_mcp_servers(resolved, resolve_settings(active_workdir=wd, env=env).settings, set())
+    statuses = gate_mcp_servers(resolved, resolve_settings(env=env).settings, set())
     assert statuses == {"shared": McpApprovalStatus.PENDING}

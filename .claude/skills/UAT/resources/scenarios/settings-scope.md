@@ -70,16 +70,17 @@ mkdir -p $A2C_SKILL_HOME
   - set 退出码 0，输出含 scope/key/value 信息
   - show --scope user 输出包含 strictKnownMarketplaces: true
 
-### G-05: settings set --scope project（需要 active workdir）
+### G-05: settings set --scope project（锚定进程 cwd，#116）
 
 - **优先级**: P1
 - **步骤**:
-  1. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run a2c-computer settings set strictKnownMarketplaces true --scope project --json`
-  2. 捕获输出
+  1. 创建临时目录并切入：`mkdir -p /tmp/a2c-uat-proj && cd /tmp/a2c-uat-proj`
+  2. 执行：`A2C_SKILL_HOME=/tmp/a2c-uat-skill-home uv run --project <python-sdk 路径> a2c-computer settings set strictKnownMarketplaces true --scope project --json`
+  3. 捕获输出并检查 `/tmp/a2c-uat-proj/.tfrobot/settings.json`
 - **预期结果**:
-  - 退出码 1
-  - 输出包含 "requires an active workdir" 或类似错误信息
-  - project scope 需要 `--add-dir` 参数指定工作目录
+  - 退出码 0，输出含 scope/key/value 信息
+  - `<cwd>/.tfrobot/settings.json` 生成且包含 `"strictKnownMarketplaces": true`
+  - #116 起 project/local scope 无条件锚定进程 cwd（`--add-dir` 已移除，不再有 "requires an active workdir" 错误）
 
 ### G-06: scope merge 验证（覆盖后合并）
 

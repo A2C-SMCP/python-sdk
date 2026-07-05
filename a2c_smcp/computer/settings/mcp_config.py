@@ -23,7 +23,7 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §9.1（
 This is the pure logic layer for MCP definitions/gating (no git / MCP manager / network).
 
 **显式划界 / Deferred boundaries**：
-- **取值渲染**（``envFile`` 加载 / ``${env:}`` / ``${workspaceFolder}`` / inputs 解析链 / keyring / 明文
+- **取值渲染**（``envFile`` 加载 / ``${env:}`` / inputs 解析链 / keyring / 明文
   state）归 **#65**：本模块产出**带占位符**的定义，``ResolvedMcpServer.ext``（``envFile`` 等 VS Code 扩展）
   + 未渲染占位符是交给 #65 的 handoff。**绝不在此渲染**（§9.1 安全铁律：值不离 Computer）。
 - **批准框 TTY 交互**（``[a]/[y]/[n]``）/ ``--approve-all-mcp`` flag / 非交互 pending→skip+WARN 接线归
@@ -43,6 +43,7 @@ This is the pure logic layer for MCP definitions/gating (no git / MCP manager / 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -94,10 +95,6 @@ _TRUSTED_ORIGINS: frozenset[SettingsScope] = frozenset({SettingsScope.USER, Sett
 # 单点构造校验入口（照 manifest.py 范式）/ Single dict→model adapters.
 _MCP_SERVER_ADAPTER: TypeAdapter[MCPServerConfig] = TypeAdapter(MCPServerConfig)
 _MCP_INPUT_ADAPTER: TypeAdapter[MCPServerInput] = TypeAdapter(MCPServerInput)
-
-
-class McpConfigError(Exception):
-    """MCP 定义/批准写助手的契约违例（如批准写缺 active workdir）/ Contract violation in MCP config helpers."""
 
 
 class McpApprovalStatus(StrEnum):
@@ -265,7 +262,6 @@ def _validate_input(idef: Any, scope: SettingsScope, source: str | None) -> tupl
 # ---------------------------------------------------------------------------
 def resolve_mcp_config(
     *,
-    active_workdir: Path | None = None,
     env: Mapping[str, str] | None = None,
     flag_config_path: Path | None = None,
     managed_mcp_path: Path | None = None,
@@ -274,16 +270,16 @@ def resolve_mcp_config(
     """
     多 scope 加载合并 ``.tfrobot/mcp.json`` + 字段级校验 / Multi-scope load + merge + validate mcp.json。
 
-    合并顺序 low → high = ``[flag, user, active-project, active-local, policy]``（即优先级
+    合并顺序 low → high = ``[flag, user, project, local, policy]``（即优先级
     ``policy > local > project > user > flag``，§9.1/§5.5）；**无能力层并集**（敏感面隔离，区别于
-    settings.json）。``active_workdir is None`` → project/local 全空，仅 user + flag + policy + 默认。
+    settings.json）。#116：project/local 无条件锚定进程 ``os.getcwd()`` 的 ``.tfrobot/mcp[.local].json``
+    （cwd 恒存在；文件缺失 → 层不贡献）。
 
     - **servers**：按 name **整体替换**（高 scope 同名整体覆盖；server config 是原子单元、**非**深合并），
       ``origin`` = 最高定义 scope，``trusted_origin`` = origin ∈ {user, flag, policy}。
     - **inputs**：按 ``id`` 去重、高 scope 胜（缺 ``id`` 的条目各自保留以便逐条报错）。
     - 单 server / input 畸形 → drop + :class:`SettingsValidationError`，**不 abort**（§5.6 人编文件容错）。
 
-    :param active_workdir: 当前绑定任务的单根（project/local 来源）；``None`` = 空闲。
     :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
     :param flag_config_path: ``--config @file`` 老接口文件（最低优先级，§5.5）。
     :param managed_mcp_path: policy scope ``managed-mcp.json`` 覆盖路径（缺省按平台推导；便于测试）。
@@ -291,14 +287,14 @@ def resolve_mcp_config(
     """
     managed_path = managed_mcp_path if managed_mcp_path is not None else managed_mcp_config_path(platform)
 
-    # (scope, path) 层，低优先级在前 / layers, lowest priority first.
+    # (scope, path) 层，低优先级在前；project/local 锚 cwd（#116）/ layers, lowest first; cwd-anchored.
+    cwd = Path(os.getcwd())
     layers: list[tuple[SettingsScope, Path]] = []
     if flag_config_path is not None:
         layers.append((SettingsScope.FLAG, Path(flag_config_path)))
     layers.append((SettingsScope.USER, user_mcp_config_path(env)))
-    if active_workdir is not None:
-        layers.append((SettingsScope.PROJECT, workdir_mcp_config_path(active_workdir)))
-        layers.append((SettingsScope.LOCAL, workdir_mcp_local_config_path(active_workdir)))
+    layers.append((SettingsScope.PROJECT, workdir_mcp_config_path(cwd)))
+    layers.append((SettingsScope.LOCAL, workdir_mcp_local_config_path(cwd)))
     layers.append((SettingsScope.POLICY, managed_path))
 
     errors: list[SettingsValidationError] = []
@@ -411,14 +407,12 @@ def bundled_mcp_server_names(home: Path | None = None, env: Mapping[str, str] | 
 # ---------------------------------------------------------------------------
 # 批准写助手（写 local scope）/ Approval write helpers (write to local scope)（§9.2）
 # ---------------------------------------------------------------------------
-def _require_active_workdir(active_workdir: Path | None) -> Path:
-    """批准写须落 local scope = active workdir；缺则 fail-fast（镜像 installer scope 守卫）/ local-scope guard。"""
-    if not active_workdir:
-        raise McpConfigError("MCP approval write requires an active workdir (local scope); none provided")
-    return Path(active_workdir)
+def _local_settings_write_path() -> Path:
+    """批准写落点：``<cwd>/.tfrobot/settings.local.json``（#116：cwd 恒存在，无 fail-fast）/ local write path。"""
+    return workdir_local_settings_path(Path(os.getcwd()))
 
 
-def _append_local_mcp_array(active_workdir: Path | None, field_name: str, name: str) -> None:
+def _append_local_mcp_array(field_name: str, name: str) -> None:
     """
     把 ``name`` 追加进 local ``settings.local.json`` 的某 MCP 数组字段（持锁原子 RMW + dedup）/ Append to a local array。
 
@@ -426,8 +420,7 @@ def _append_local_mcp_array(active_workdir: Path | None, field_name: str, name: 
     （数组**整体替换**写语义，§5.4）+ :func:`atomic_write_json`（``header=None``——人编意图层无写保护头/version）。
     锁内读-改-写杜绝并发丢更新。
     """
-    wd = _require_active_workdir(active_workdir)
-    path = workdir_local_settings_path(wd)
+    path = _local_settings_write_path()
     with file_lock(path):
         existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
         current = [v for v in existing.get(field_name, []) if isinstance(v, str)]
@@ -437,20 +430,19 @@ def _append_local_mcp_array(active_workdir: Path | None, field_name: str, name: 
         atomic_write_json(path, updated)
 
 
-def approve_mcp_server(name: str, *, active_workdir: Path | None) -> None:
+def approve_mcp_server(name: str) -> None:
     """批准框 ``[y]es``：追加 ``enabledMcpjsonServers`` 到 local scope（§9.2）/ Approve: append to enabled list (local)。"""
-    _append_local_mcp_array(active_workdir, FIELD_ENABLED_MCPJSON_SERVERS, name)
+    _append_local_mcp_array(FIELD_ENABLED_MCPJSON_SERVERS, name)
 
 
-def deny_mcp_server(name: str, *, active_workdir: Path | None) -> None:
+def deny_mcp_server(name: str) -> None:
     """批准框 ``[n]o``：追加 ``disabledMcpjsonServers`` 到 local scope（§9.2）/ Deny: append to disabled list (local)。"""
-    _append_local_mcp_array(active_workdir, FIELD_DISABLED_MCPJSON_SERVERS, name)
+    _append_local_mcp_array(FIELD_DISABLED_MCPJSON_SERVERS, name)
 
 
-def approve_all_project_mcp(*, active_workdir: Path | None) -> None:
+def approve_all_project_mcp() -> None:
     """批准框 ``[a]ll``：``enableAllProjectMcpServers=true`` 写 local scope（§9.2）/ Approve-all: set the bool (local)。"""
-    wd = _require_active_workdir(active_workdir)
-    path = workdir_local_settings_path(wd)
+    path = _local_settings_write_path()
     with file_lock(path):
         existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
         updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})

@@ -280,20 +280,18 @@ def test_root_settings_flag_propagates_to_merged_show(tmp_path: Path, monkeypatc
     assert recorded.get("flag_path") == flag_file
 
 
-def test_root_add_dir_propagates_active_workdir_to_settings_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`--add-dir <d> settings set <k> <v> --scope project` 应把 active_workdir 透传给 settings_set。"""
+# #116 概念瘦身：--add-dir 已移除 / #116 slimming: --add-dir removed
+def test_add_dir_option_removed(tmp_path: Path) -> None:
+    """#116: `--add-dir` 不再是合法选项，传入应报未知选项错误。"""
     runner = CliRunner()
-    wd = tmp_path / "wd"
-    wd.mkdir()
-    recorded: dict[str, Any] = {}
-    monkeypatch.setattr(cli_main.settings_cmd, "settings_set", _spy_handler(recorded), raising=True)
+    env = {**os.environ, "A2C_SKILL_HOME": str(tmp_path / "skill"), "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
 
     result = runner.invoke(  # noqa: S603
-        cli_main.app, ["--add-dir", str(wd), "settings", "set", "k", "v", "--scope", "project"],
+        cli_main.app, ["--add-dir", str(tmp_path), "settings", "show"], env=env,
     )
 
-    assert result.exit_code == 0
-    assert recorded.get("active_workdir") == wd.resolve()  # 修前为 None（未透传）→ 红
+    assert result.exit_code != 0
+    assert "no such option" in result.output.lower()
 
 
 def test_root_settings_flag_scope_real_output(tmp_path: Path) -> None:

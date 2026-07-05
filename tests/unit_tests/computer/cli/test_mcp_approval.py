@@ -70,9 +70,7 @@ class _Session:
 
 
 class _FakeComp:
-    def __init__(self, wd: Path | None, home: Path) -> None:
-        self.active_workdir = wd
-        self._registered_workdirs = (wd,) if wd is not None else ()
+    def __init__(self, home: Path) -> None:
         self.skill_home = home
         self.injected: list[Any] = []
         self.mounted: list[dict[str, Any]] = []
@@ -96,13 +94,14 @@ def _stdio() -> dict[str, Any]:
 
 # ── PENDING + TTY [y] → 写 local + 挂载 + 重启幂等 ──────────────────────────────
 @pytest.mark.asyncio
-async def test_pending_approve_yes_writes_local_and_mounts_then_idempotent(tmp_path: Path) -> None:
+async def test_pending_approve_yes_writes_local_and_mounts_then_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
     wd.mkdir()
     home.mkdir()
     _project_mcp(wd, {"shared": _stdio()})  # project origin → 非 trusted → PENDING
+    monkeypatch.chdir(wd)  # #116：project/local 层锚定进程 cwd
 
-    comp = _FakeComp(wd, home)
+    comp = _FakeComp(home)
     sess = _Session(["y"])
     # run_mcp_approval 读 os.environ 派生 XDG → 用 monkeypatch env 注入
     import unittest.mock as _m
@@ -111,10 +110,10 @@ async def test_pending_approve_yes_writes_local_and_mounts_then_idempotent(tmp_p
         await run_mcp_approval(comp, sess, approve_all=False, flag_config=None)
     assert "shared" in _mounted_names(comp)  # [y] → 挂载
     local = json.loads(workdir_local_settings_path(wd).read_text(encoding="utf-8"))
-    assert local["enabledMcpjsonServers"] == ["shared"]  # 写 local scope
+    assert local["enabledMcpjsonServers"] == ["shared"]  # 写 local scope（cwd 单根）
 
     # 重启幂等：二次启动 gate 读到 local enabled → ENABLED 直挂、不再弹（session 无答案也不报错）
-    comp2 = _FakeComp(wd, home)
+    comp2 = _FakeComp(home)
     sess2 = _Session([])
     with _m.patch.dict(os.environ, env, clear=False):
         await run_mcp_approval(comp2, sess2, approve_all=False, flag_config=None)
@@ -124,12 +123,13 @@ async def test_pending_approve_yes_writes_local_and_mounts_then_idempotent(tmp_p
 
 # ── PENDING + 非 TTY → skip+WARN（不挂不写）；--approve-all-mcp → 挂载不落盘 ──────
 @pytest.mark.asyncio
-async def test_pending_non_tty_skips_and_does_not_write(tmp_path: Path) -> None:
+async def test_pending_non_tty_skips_and_does_not_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
     wd.mkdir()
     home.mkdir()
     _project_mcp(wd, {"shared": _stdio()})
-    comp = _FakeComp(wd, home)
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
@@ -139,12 +139,13 @@ async def test_pending_non_tty_skips_and_does_not_write(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_non_tty_approve_all_mounts_without_persist(tmp_path: Path) -> None:
+async def test_pending_non_tty_approve_all_mounts_without_persist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
     wd.mkdir()
     home.mkdir()
     _project_mcp(wd, {"shared": _stdio()})
-    comp = _FakeComp(wd, home)
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
@@ -160,7 +161,7 @@ async def test_user_origin_mounts_without_box(tmp_path: Path) -> None:
     wd.mkdir()
     home.mkdir()
     _user_mcp(env, {"mine": _stdio()})  # user origin → trusted_origin → ENABLED、免批准
-    comp = _FakeComp(wd, home)
+    comp = _FakeComp(home)
     sess = _Session([])  # 不应被调用
     import unittest.mock as _m
 
@@ -178,7 +179,7 @@ async def test_envfile_ext_merged_into_mount_dict(tmp_path: Path) -> None:
     home.mkdir()
     envfile = str(wd / ".env")
     _user_mcp(env, {"mine": {**_stdio(), "envFile": envfile}})  # user origin → 直挂
-    comp = _FakeComp(wd, home)
+    comp = _FakeComp(home)
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
@@ -189,13 +190,16 @@ async def test_envfile_ext_merged_into_mount_dict(tmp_path: Path) -> None:
 
 # ── resolved.errors 呈现 WARN ──────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_malformed_server_surfaces_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+async def test_malformed_server_surfaces_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
     wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
     wd.mkdir()
     home.mkdir()
     # 畸形 server（缺 type）→ drop + error；valid 同存
     _project_mcp(wd, {"bad": {"server_parameters": {}}, "good": _stdio()})
-    comp = _FakeComp(wd, home)
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):

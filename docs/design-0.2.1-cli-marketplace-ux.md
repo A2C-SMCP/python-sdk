@@ -1,5 +1,10 @@
 # 设计文档：0.2.1 — CLI Marketplace/Plugin/Skill 管理 UX
 
+> ⚠️ **部分内容已被 [#116](https://github.com/A2C-SMCP/python-sdk/issues/116) 取代（v0.2.2 workdir 概念瘦身）**：
+> `--add-dir` / `active_workdir` / `registered_workdirs` / `${workspaceFolder}` / 能力发现层（跨登记目录并集）
+> 已整体移除——workdir 范围 SKILL 下沉 IDE4AI 等 MCP 服务经 `skill://` Resource 承载；settings/mcp 的
+> project·local scope 锚定进程 cwd。本文涉及上述概念的章节（决策 #28、§5.0、§5.1、§9.1 等）仅作历史记录保留。
+
 > **性质**：python-sdk 的 **CLI 表面**设计（如何让用户在 `a2c-computer` 上管理 marketplace/plugin/skill）。**不是协议规范**，也不是内部模型规范（后者归 [`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md)）。
 > **范本**：Claude Code 的 marketplace/plugin/skill 三层模型 + 意图/物化两层 + reconciler；本文档逐项对齐，仅在 A2C 分布式架构（Agent ↔ Server ↔ Computer 三进程）下调整必要的事件机制。
 > **追踪**：GitHub Issue [#39](https://github.com/A2C-SMCP/python-sdk/issues/39) 拓展范围。原 #39 仅落 `computer/skills/` 内部六模块；本设计补 CLI 命令/REPL/settings.json/reconciler 表面 UX。

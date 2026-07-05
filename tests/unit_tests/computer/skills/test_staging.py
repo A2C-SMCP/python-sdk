@@ -345,53 +345,18 @@ def test_user_global_only_in_place(tmp_path: Path) -> None:
     assert ref["allowed_tools"] == ["read", "write"]
 
 
-def test_user_global_plus_multi_workdir_union(tmp_path: Path) -> None:
-    # 全局 + 多 workdir 全局并集；能力层不随 active workdir 切换——传入的全部 workdir 一律生效
+def test_user_home_only_no_workdir_dimension(tmp_path: Path) -> None:
+    # #116：user 源仅扫 <home>/user/ 单根；workdir 维度 SKILL 已下沉 MCP 服务（.tfrobot/skills 不再被发现）
     home = tmp_path / "home"
     _write_user_skill(home / "user", "global-skill")
-    wd1 = tmp_path / "ws1"
-    wd2 = tmp_path / "ws2"
-    _write_user_skill(wd1 / ".tfrobot" / "skills", "proj-a")
-    _write_user_skill(wd2 / ".tfrobot" / "skills", "proj-b")
-    reg = SkillRegistry()
-
-    names = stage_user_skills(reg, home, [wd1, wd2])
-
-    assert sorted(names) == ["global-skill", "proj-a", "proj-b"]
-    # workdir skill 就地发现于各自 .tfrobot/skills，未复制进 home
-    assert reg.resolve("proj-a")["path"] == str((wd1 / ".tfrobot" / "skills" / "proj-a").resolve())  # type: ignore[index]
-    assert not (home / "user" / "proj-a").exists()
-
-
-def test_workdir_overrides_user_home_with_warning(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
-    # 同名：workspace skill 覆盖 user-home 全局（§2.3「workspace skill 覆盖 user」）+ WARN
-    home = tmp_path / "home"
-    _write_user_skill(home / "user", "shared", description="from-home")
     wd = tmp_path / "ws"
-    _write_user_skill(wd / ".tfrobot" / "skills", "shared", description="from-workdir")
+    _write_user_skill(wd / ".tfrobot" / "skills", "proj-a")
     reg = SkillRegistry()
 
-    names = stage_user_skills(reg, home, [wd])
+    names = stage_user_skills(reg, home)
 
-    assert names == ["shared"]
-    assert reg.resolve("shared")["description"] == "from-workdir"  # workdir 胜  # type: ignore[index]
-    assert any(r.levelno == logging.WARNING and "shadows earlier" in r.getMessage() for r in staging_logs.records)
-
-
-def test_later_workdir_overrides_earlier_in_registration_order(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
-    # 登记目录间同名 → 按登记序后者覆盖前者 + WARN（验收第 1 条）
-    home = tmp_path / "home"
-    wd1 = tmp_path / "ws1"
-    wd2 = tmp_path / "ws2"
-    _write_user_skill(wd1 / ".tfrobot" / "skills", "dup", description="first")
-    _write_user_skill(wd2 / ".tfrobot" / "skills", "dup", description="second")
-    reg = SkillRegistry()
-
-    names = stage_user_skills(reg, home, [wd1, wd2])  # 登记序 wd1 → wd2
-
-    assert names == ["dup"]
-    assert reg.resolve("dup")["description"] == "second"  # 后登记者胜  # type: ignore[index]
-    assert any(r.levelno == logging.WARNING for r in staging_logs.records)
+    assert names == ["global-skill"]
+    assert reg.resolve("proj-a") is None  # workdir DropIn 不再进 user 源
 
 
 def test_user_basename_not_kebab_skipped(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
@@ -471,10 +436,10 @@ def test_user_rescan_idempotent_updates(tmp_path: Path) -> None:
 
 
 def test_user_missing_roots_tolerated(tmp_path: Path) -> None:
-    # 发现根不存在（home/user 与 workdir 都没建）→ 返回空、不抛
+    # 发现根不存在（home/user 没建）→ 返回空、不抛
     home = tmp_path / "nonexistent-home"
     reg = SkillRegistry()
-    names = stage_user_skills(reg, home, [tmp_path / "no-such-ws"])
+    names = stage_user_skills(reg, home)
     assert names == []
     assert len(reg) == 0
 
@@ -501,15 +466,15 @@ def test_user_skill_md_unreadable_skipped(tmp_path: Path, monkeypatch: pytest.Mo
     assert any(r.levelno == logging.ERROR and "unreadable" in r.getMessage() for r in staging_logs.records)
 
 
-def test_user_dropin_roots_dedup_no_spurious_warning(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
-    # 同一 workdir 登记两次 → _user_dropin_roots 按解析路径去重 → 只扫一次、不产生「shadows earlier」假 WARN
+def test_user_home_rescan_no_spurious_warning(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    # home 单根重复扫描（幂等 register_or_update）→ 不产生任何 WARN（#116 后无跨根遮蔽语义）
     home = tmp_path / "home"
-    wd = tmp_path / "ws"
-    _write_user_skill(wd / ".tfrobot" / "skills", "uniq")
+    _write_user_skill(home / "user", "uniq")
     reg = SkillRegistry()
 
-    names = stage_user_skills(reg, home, [wd, wd])
+    first = stage_user_skills(reg, home)
+    second = stage_user_skills(reg, home)
 
-    assert names == ["uniq"]
+    assert first == ["uniq"] and second == ["uniq"]
     assert len(reg) == 1
     assert not any(r.levelno == logging.WARNING for r in staging_logs.records)

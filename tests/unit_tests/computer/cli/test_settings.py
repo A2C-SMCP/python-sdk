@@ -66,9 +66,13 @@ def test_set_readonly_scopes_exit1(tmp_path: Path, scope: str) -> None:
     assert settings_cmd.settings_set(home, env, "deniedMcpServers", '["x"]', scope=scope, json_output=True) == 1
 
 
-def test_set_project_without_active_workdir_exit1(tmp_path: Path) -> None:
+def test_set_project_writes_cwd_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#116: project scope 锚定进程 cwd，无 workdir 状态也可写（不再 exit 1）。"""
     home, env = _home(tmp_path), _env(tmp_path)
-    assert settings_cmd.settings_set(home, env, "foo", "1", scope="project", active_workdir=None, json_output=True) == 1
+    monkeypatch.chdir(tmp_path)
+    assert settings_cmd.settings_set(home, env, "strictKnownMarketplaces", "true", scope="project", json_output=True) == 0
+    data = json.loads((tmp_path / ".tfrobot" / "settings.json").read_text(encoding="utf-8"))
+    assert data["strictKnownMarketplaces"] is True
 
 
 # ── get / show ──────────────────────────────────────────────────────────────
