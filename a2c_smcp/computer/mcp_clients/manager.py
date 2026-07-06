@@ -73,6 +73,10 @@ class MCPServerManager:
         """通过名称获取服务配置"""
         return self._servers_config[server_name]
 
+    def server_configs(self) -> tuple[MCPServerConfig, ...]:
+        """全部服务配置的不可变快照（运行期活跃配置集，含动态挂载/重挂项）/ snapshot of all active server configs。"""
+        return tuple(self._servers_config.values())
+
     def get_tool_meta(self, server_name: SERVER_NAME, tool_name: TOOL_NAME) -> ToolMeta | None:
         """
         中文: 获取指定服务器下某工具合并后的元数据（优先具体 tool_meta，缺失字段回落 default_tool_meta）。

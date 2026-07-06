@@ -62,6 +62,7 @@ from a2c_smcp.computer.blob import (
 from a2c_smcp.computer.desktop.organize import organize_desktop
 from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
+from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.recovery import (
@@ -1402,6 +1403,62 @@ class Computer(BaseComputer[PromptSession]):
             existing.add(name)
             report.remounted_servers.append(name)
         return report
+
+    def list_mcp_servers_with_metadata(self) -> list[McpServerWithMetadata]:
+        """列出 MCP 服务器 + 归属 / 生命周期元数据（活跃 inventory，#121 对齐 rust-sdk #97）/ inventory query。
+
+        面向 client（如 ``tfrobot-client``）Skill / MCP tab：一次拿到「当前 Computer 有哪些 MCP server + 每条
+        归谁（user vs plugin，含 marketplace / plugin / pluginId）+ 能否从普通 MCP tab 编辑 / 启停」，**无需**读
+        SDK ledger、**无需**解析 plugin manifest、**无需**持内存 ownership map。协议依据 a2c-smcp-protocol
+        v0.2.3 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起也须可查询）。元数据类型
+        见 :mod:`~a2c_smcp.computer.inventory`，**SDK-facing、不进** Agent-facing ``client:*`` wire。
+
+        合并两个来源（去重按 server 名，运行期条目优先）：
+
+        1. 运行期活跃配置集——manager 已建时取 ``MCPServerManager.server_configs()`` 快照（构造期声明经
+           boot 物化项 + ``aadd_or_aupdate_server`` 动态挂载项 + client 经 ``reconcile_governance(hooks)``
+           重挂的 plugin bundled 项）；manager 未建（pre-boot）回退构造期声明集 ``self._mcp_servers``。
+           名字命中 ledger 派生 bundled 集 → ``managedBy=plugin``，否则 ``managedBy=user``。
+        2. ledger 派生的**已启用但尚未物化**的 plugin bundled server（boot 默认 ``register_server=None`` 后
+           即此态）——补入 inventory 并标 ``managedBy=plugin``，满足 §4.8「进程未拉起也可观测」（client 据此
+           物化或引导 Marketplace）。
+
+        结果按 server 名排序（保证稳定可测输出）。**不**含运行期「进程是否已启动」状态——那由
+        ``MCPServerManager.get_server_status`` 单独提供。
+
+        归属 join key = server 名（限制与非目标，rust #97 同文档化）：同名冲突会退化——用户配置一个与某启用
+        plugin bundled server **同名**的 server 会被标 ``plugin``（只读）；两个 plugin 的同名 bundled server 经
+        首见去重、后者身份不出现。这符合协议「name = 能力身份」语义，且**可靠的冲突拦截是安装期职责**（install
+        hook ``existing_server_names`` 冲突门），非本只读投影的职责。调用方若需强冲突保证，应经带 hooks 的安装
+        路径拦截，而非依赖本查询。
+        """
+        home = self.skill_home
+        # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图）。
+        declared = self._resolve_declared_settings()
+        bundled = {record.config.name: record for record in collect_enabled_bundled_servers(home, declared)}
+
+        def plugin_ownership(record: BundledServerRecord) -> McpPluginOwnership:
+            return McpPluginOwnership(marketplace=record.marketplace, plugin=record.plugin, plugin_id=record.plugin_id)
+
+        out: list[McpServerWithMetadata] = []
+        materialized: set[str] = set()
+
+        # 来源一：运行期活跃配置集。manager 已建 = 权威（含动态挂载/重挂项；`_mcp_servers` 仅构造期声明快照，
+        # 此后不回写）；未建（pre-boot）回退构造集。命中 ledger bundled 集 → plugin，否则 user。
+        active_configs = self.mcp_manager.server_configs() if self.mcp_manager is not None else tuple(self._mcp_servers)
+        for cfg in active_configs:
+            materialized.add(cfg.name)
+            record = bundled.get(cfg.name)
+            managed_by: McpOwnership = plugin_ownership(record) if record is not None else McpUserOwnership()
+            out.append(McpServerWithMetadata.assemble(cfg.name, disabled=cfg.disabled, managed_by=managed_by))
+
+        # 来源二：已启用但尚未物化的 bundled server（不在运行期集 → 补入，标 plugin；§4.8 可观测）。
+        for name, record in bundled.items():
+            if name not in materialized:
+                out.append(McpServerWithMetadata.assemble(name, disabled=record.config.disabled, managed_by=plugin_ownership(record)))
+
+        out.sort(key=lambda entry: entry.name)
+        return out
 
     def get_skills(self) -> list[A2CSkillRef]:
         """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。
