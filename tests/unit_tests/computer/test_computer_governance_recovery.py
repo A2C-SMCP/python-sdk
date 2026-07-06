@@ -154,6 +154,33 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_reconcile_governance_injects_once_per_plugin_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """同一 plugin 根下多个 bundled server → inject_inputs 仅调一次，所有 server 均重挂。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, plugin_root = _seed_home(tmp_path, servers=["blender", "figma"], skills=["lint"])
+
+    mounted: list[str] = []
+    injected: list[Path] = []
+
+    async def register(cfg, record) -> None:
+        mounted.append(cfg.name)
+
+    async def inject(record) -> None:
+        injected.append(record.install_path)
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance(
+            existing_server_names=lambda: set(),
+            register_server=register,
+            inject_inputs=inject,
+            declared={},
+        )
+        assert sorted(mounted) == ["blender", "figma"]
+        assert sorted(report.remounted_servers) == ["blender", "figma"]
+        assert injected == [plugin_root]  # 每 plugin 根仅一次
+
+
+@pytest.mark.asyncio
 async def test_reconcile_governance_register_failure_non_blocking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """register 抛错 → 不阻断（不抛出），失败 server 不入 remounted，skills 恢复不受影响。"""
     _isolate_declared_env(tmp_path, monkeypatch)

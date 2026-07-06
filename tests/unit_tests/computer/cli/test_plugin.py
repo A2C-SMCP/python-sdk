@@ -320,3 +320,119 @@ async def test_repl_list_and_unknown_subcommand_no_raise(tmp_path: Path, monkeyp
     await plugin_cmd.repl_dispatch(comp, ["plugin", "list"], session=None)  # 空 → 无错
     await plugin_cmd.repl_dispatch(comp, ["plugin", "bogus"], session=None)  # 未知子命令 → no-op
     assert comp.dirty == 0
+
+
+# ── run_governance_remount（#117 设计 Y CLI 参考接线）/ boot-time governance remount ──
+def _seed_recovery_home(home: Path, *, servers: list[str], skills: list[str]) -> Path:
+    """预置治理恢复态：catalog 树（acme/audit，含 mcp-servers/ + skills/）+ 双账本。返回 plugin 根。"""
+    catalog = marketplace_skill_dir(home, "acme")
+    _write_json(
+        catalog / ".tfrobot-plugin" / "marketplace.json",
+        {
+            "name": "acme",
+            "owner": {"name": "X"},
+            "metadata": {"pluginRoot": "./plugins"},
+            "plugins": [{"name": "audit", "source": "audit", "version": "1.2.0"}],
+        },
+    )
+    plugin_root = catalog / "plugins" / "audit"
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    for sname in servers:
+        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", _stdio(sname))
+    for sk in skills:
+        p = plugin_root / "skills" / sk / "SKILL.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"---\nname: {sk}\ndescription: d\n---\nbody\n", encoding="utf-8")
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": _SRC, "installLocation": str(catalog.resolve())}}},
+        home=home,
+    )
+    save_installed_plugins(
+        {
+            "version": 1,
+            "plugins": {
+                "audit@acme": [
+                    {"scope": "user", "installPath": str(plugin_root), "version": "1.2.0", "bundledMcpServers": list(servers)},
+                ],
+            },
+        },
+        home=home,
+    )
+    return plugin_root
+
+
+def _isolate_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_wires_ownership_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI 接线断言：register 经 comp.aadd_or_aupdate_server 携正确 plugin/marketplace 归属上下文。"""
+    from a2c_smcp.computer.computer import Computer
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=["figma-mcp"], skills=["lint"])
+
+    async with Computer(name="t", skill_home=home) as comp:
+        recorded: list[tuple[str, str | None, str | None]] = []
+
+        async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
+            recorded.append((server.name, plugin, marketplace))
+
+        monkeypatch.setattr(comp, "aadd_or_aupdate_server", fake_register)
+        await plugin_cmd.run_governance_remount(comp)
+
+        assert recorded == [("figma-mcp", "audit", "acme")]
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_flag_declared_disables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """flag-aware declared 生效于阶段二：``--settings`` 文件里 enabledPlugins=false → 不重挂。"""
+    from a2c_smcp.computer.computer import Computer
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=["figma-mcp"], skills=["lint"])
+    flag_file = tmp_path / "flag-settings.json"
+    flag_file.write_text(json.dumps({"enabledPlugins": {"audit@acme": False}}), encoding="utf-8")
+
+    async with Computer(name="t", skill_home=home) as comp:
+        recorded: list[str] = []
+
+        async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
+            recorded.append(server.name)
+
+        monkeypatch.setattr(comp, "aadd_or_aupdate_server", fake_register)
+        await plugin_cmd.run_governance_remount(comp, flag_config=flag_file)
+
+        assert recorded == []
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_existing_from_comp_servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """existing_server_names 取自 comp.mcp_servers：同名已存在 → skip 不覆盖（用户配置胜）。"""
+    from pydantic import TypeAdapter
+
+    from a2c_smcp.computer.computer import Computer
+    from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=["figma-mcp"], skills=["lint"])
+
+    async with Computer(name="t", skill_home=home) as comp:
+        # 用户已有同名 server（仅入配置集，不挂载进程）/ pre-existing user config, no process spawn
+        user_cfg = TypeAdapter(MCPServerConfig).validate_python(_stdio("figma-mcp"))
+        comp._mcp_servers.add(user_cfg)
+
+        recorded: list[str] = []
+
+        async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
+            recorded.append(server.name)
+
+        monkeypatch.setattr(comp, "aadd_or_aupdate_server", fake_register)
+        await plugin_cmd.run_governance_remount(comp)
+
+        assert recorded == []

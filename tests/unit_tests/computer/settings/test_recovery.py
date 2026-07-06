@@ -197,6 +197,39 @@ async def test_recover_degrades_when_clone_missing_and_unreachable(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_local_only_pid_without_at_is_skipped(tmp_path: Path) -> None:
+    """账本 pid 无 ``@marketplace`` 段（本地-only 形态）→ 恢复与 collect 均静默跳过、不炸、不误纳入。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _seed_installed(home, {"localplugin": [_record(root, servers=["figma"])]})
+    reg = SkillRegistry()
+
+    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+
+    assert report.restored_plugins == [] and report.restored_skills == []
+    assert report.skipped_disabled == [] and report.failed_marketplaces == []
+    assert len(reg) == 0
+    assert collect_enabled_bundled_servers(home, {}, env=_env(tmp_path)) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_revives_orphaned_skill(tmp_path: Path) -> None:
+    """已 orphan 的 bundled SKILL（同会话 disable 内存态）经 recover 重扫复活回活跃集（register_or_update 语义）。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+    assert reg.mark_orphan("audit:lint") is True
+    assert reg.resolve("audit:lint") is None  # 孤儿不可解析
+
+    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+
+    assert "audit:lint" in report.restored_skills
+    assert reg.resolve("audit:lint") is not None  # 复活
+
+
+@pytest.mark.asyncio
 async def test_recover_empty_home_is_noop(tmp_path: Path) -> None:
     """空 home（双账本皆无）→ 空报告 noop。"""
     home = _home(tmp_path)
@@ -228,7 +261,7 @@ def test_collect_returns_enabled_bundled_servers_with_ownership(tmp_path: Path) 
 
 
 def test_collect_dedupes_same_server_name_across_plugins(tmp_path: Path) -> None:
-    """跨 plugin 同名 server → 首见保留去重（与 rust 一致）。"""
+    """跨 plugin 同名 server → 首见保留去重且**归属为首见者**（账本插入序，与 rust "first seen wins" 一致）。"""
     home = _home(tmp_path)
     root_a = _setup_catalog(home, "acme", "audit", servers=["shared"])
     root_b = _setup_catalog(home, "beta", "fmt", servers=["shared"])
@@ -241,6 +274,34 @@ def test_collect_dedupes_same_server_name_across_plugins(tmp_path: Path) -> None
 
     assert len(records) == 1
     assert records[0].config.name == "shared"
+    assert records[0].plugin_id == "audit@acme"  # 首见胜：归属锁定账本序首个
+    assert records[0].install_path == root_a
+
+
+def test_collect_enumerates_multi_scope_records_with_dedup(tmp_path: Path) -> None:
+    """单 pid 多 scope record（user + project 不同 installPath）→ 逐 record 枚举 + 跨 record 同名首见去重。"""
+    home = _home(tmp_path)
+    root_user = _setup_catalog(home, "acme", "audit", servers=["figma"])
+    root_proj = home / "alt-install" / "audit"
+    _write_json(root_proj / "mcp-servers" / "figma.json", _stdio("figma"))
+    _write_json(root_proj / "mcp-servers" / "extra.json", _stdio("extra"))
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                _record(root_user, servers=["figma"]),
+                _record(root_proj, scope="project", servers=["figma", "extra"]),
+            ],
+        },
+    )
+
+    records = collect_enabled_bundled_servers(home, {}, env=_env(tmp_path))
+
+    assert {r.config.name for r in records} == {"figma", "extra"}
+    figma = next(r for r in records if r.config.name == "figma")
+    assert figma.install_path == root_user  # 首见（user record 在前）胜
+    extra = next(r for r in records if r.config.name == "extra")
+    assert extra.install_path == root_proj
 
 
 def test_collect_skips_missing_install_path_and_corrupt_json(tmp_path: Path) -> None:

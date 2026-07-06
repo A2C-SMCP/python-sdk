@@ -110,13 +110,18 @@ def _plugin_register_cb(comp: Any, plugin: str, marketplace: str) -> RegisterSer
     return _register
 
 
+def _inject_plugin_inputs(comp: Any, plugin_root: Path, plugin: str, marketplace: str) -> None:
+    """从 ``<plugin_root>/mcp-servers/inputs.json`` 读 plugin-scoped inputs、前缀化、逐条 add_or_update_input（DRY 单点）。"""
+    inputs_json = plugin_root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
+    for inp in load_plugin_inputs(inputs_json, plugin, marketplace):
+        comp.add_or_update_input(inp)
+
+
 def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> InjectInputs:
-    """注入 plugin-scoped inputs 入池：从 ``<plugin_root>/mcp-servers/inputs.json`` 读、前缀化、逐条 add_or_update_input。"""
+    """注入 plugin-scoped inputs 入池（install/enable 路径回调；闭包携 plugin/marketplace 上下文）。"""
 
     async def _inject(plugin_root: Path) -> None:
-        inputs_json = plugin_root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
-        for inp in load_plugin_inputs(inputs_json, plugin, marketplace):
-            comp.add_or_update_input(inp)
+        _inject_plugin_inputs(comp, plugin_root, plugin, marketplace)
 
     return _inject
 
@@ -129,10 +134,13 @@ async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) 
     参考 client 经**公共 API** ``Computer.reconcile_governance(hooks)`` 显式重挂 enabled bundled MCP
     server（外部 client / 未来 GUI 照抄本函数）。语义要点：
 
-    - declared 传 flag-aware 合并视图（补上 boot 内不可见的 ``--settings`` flag scope）；
+    - declared 传 flag-aware 合并视图——注意其"补上 flag scope"**仅及于阶段二 server 重挂**（boot 从不挂
+      server）；bundled SKILL 已在 boot 期按无 flag 视图恢复且 additive-only 不撤销，flag-scope 的
+      ``enabledPlugins=false`` 对 skill 跨 boot 不生效（可靠 disable 请写 user scope）；
     - inputs 注入先于 register（bundled server 的 ``${input:}`` 经 D2 前缀回退解析，与 install/enable 流一致）；
-    - 与既有 server 同名 → reconcile_governance 内部 skip+WARN（用户配置胜）；bundled **免批准**（§5.10
-      不走 project 信任门），单点失败不阻断。
+    - ``existing_server_names`` **必传**（取自 ``comp.mcp_servers``）：与既有 server 同名 →
+      reconcile_governance 内部 skip+WARN（用户配置胜）；bundled **免批准**（§5.10 不走 project 信任门），
+      单点失败不阻断。
     """
     env = os.environ
     declared = resolved_settings(env, flag_path=flag_config)
@@ -142,9 +150,7 @@ async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) 
         console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
 
     async def _inject(record: Any) -> None:
-        inputs_json = record.install_path / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
-        for inp in load_plugin_inputs(inputs_json, record.plugin, record.marketplace):
-            comp.add_or_update_input(inp)
+        _inject_plugin_inputs(comp, record.install_path, record.plugin, record.marketplace)
 
     report = await comp.reconcile_governance(
         existing_server_names=lambda: {cfg.name for cfg in comp.mcp_servers},

@@ -1361,7 +1361,9 @@ class Computer(BaseComputer[PromptSession]):
         （#93 client owns MCP config），仅经 :func:`collect_enabled_bundled_servers` 可查询；重挂永远是
         client 的显式意志（CLI 为参考 client 实现，外部 GUI/client 调用同一入口）。
 
-        :param existing_server_names: 现存 server 名集合工厂（冲突判定；``None`` = 不判冲突）。
+        :param existing_server_names: 现存 server 名集合工厂（冲突判定）。⚠️ ``None`` = **不判冲突**，
+            同名 bundled server 会经 ``register_server`` 覆盖既有配置——client 重挂时**应当传入**
+            （如 CLI 取 ``comp.mcp_servers`` 名集），仅在明确无冲突面的受控场景省略。
         :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
         :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
         :param declared: ``enabledPlugins`` 合并声明视图覆盖（``None`` = 现算 user/project/local/policy）。
