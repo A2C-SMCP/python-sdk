@@ -104,7 +104,8 @@ async def test_inventory_boot_reports_user_and_plugin_ownership(tmp_path: Path, 
     _isolate_declared_env(tmp_path, monkeypatch)
     home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
 
-    async with Computer(name="t", mcp_servers={_user_stdio_server("user-fs")}, skill_home=home) as comp:
+    # auto_connect=False：与 rust 测试同构（Computer::new(.., false, false)），boot 不主动拉起 disabled server。
+    async with Computer(name="t", mcp_servers={_user_stdio_server("user-fs")}, auto_connect=False, skill_home=home) as comp:
         inv = comp.list_mcp_servers_with_metadata()
 
         # 用户 server：managedBy=user，可从 MCP tab 全权管理（入口 mcp）。
@@ -175,7 +176,7 @@ async def test_inventory_merge_dedupes_by_name_runtime_entry_wins(tmp_path: Path
     home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
 
     # 运行期物化一条同名 server（disabled=True；bundled 侧 disabled=False）。
-    async with Computer(name="t", mcp_servers={_user_stdio_server("audit-mcp")}, skill_home=home) as comp:
+    async with Computer(name="t", mcp_servers={_user_stdio_server("audit-mcp")}, auto_connect=False, skill_home=home) as comp:
         inv = [e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp"]
         assert len(inv) == 1, "同名去重：运行期条目优先，不重复补入"
         assert inv[0].disabled, "disabled 应取运行期配置（运行期条目优先）"
