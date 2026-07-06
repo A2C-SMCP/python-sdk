@@ -1415,15 +1415,16 @@ class Computer(BaseComputer[PromptSession]):
 
         合并两个来源（去重按 server 名，运行期条目优先）：
 
-        1. 运行期已物化集 ``self.mcp_servers``——用户配置 server，或 client 经 ``reconcile_governance(hooks)``
-           物化的 plugin bundled server；名字命中 ledger 派生 bundled 集 → ``managedBy=plugin``，否则
-           ``managedBy=user``。
+        1. 运行期活跃配置集——manager 已建时取 ``MCPServerManager.server_configs()`` 快照（构造期声明经
+           boot 物化项 + ``aadd_or_aupdate_server`` 动态挂载项 + client 经 ``reconcile_governance(hooks)``
+           重挂的 plugin bundled 项）；manager 未建（pre-boot）回退构造期声明集 ``self._mcp_servers``。
+           名字命中 ledger 派生 bundled 集 → ``managedBy=plugin``，否则 ``managedBy=user``。
         2. ledger 派生的**已启用但尚未物化**的 plugin bundled server（boot 默认 ``register_server=None`` 后
            即此态）——补入 inventory 并标 ``managedBy=plugin``，满足 §4.8「进程未拉起也可观测」（client 据此
            物化或引导 Marketplace）。
 
-        结果按 server 名排序（``self._mcp_servers`` 为 set，排序保证稳定可测输出）。**不**含运行期「进程是否
-        已启动」状态——那由 ``MCPServerManager.get_server_status`` 单独提供。
+        结果按 server 名排序（保证稳定可测输出）。**不**含运行期「进程是否已启动」状态——那由
+        ``MCPServerManager.get_server_status`` 单独提供。
 
         归属 join key = server 名（限制与非目标，rust #97 同文档化）：同名冲突会退化——用户配置一个与某启用
         plugin bundled server **同名**的 server 会被标 ``plugin``（只读）；两个 plugin 的同名 bundled server 经
@@ -1442,8 +1443,10 @@ class Computer(BaseComputer[PromptSession]):
         out: list[McpServerWithMetadata] = []
         materialized: set[str] = set()
 
-        # 来源一：运行期已物化 server。命中 ledger bundled 集 → plugin，否则 user。
-        for cfg in self._mcp_servers:
+        # 来源一：运行期活跃配置集。manager 已建 = 权威（含动态挂载/重挂项；`_mcp_servers` 仅构造期声明快照，
+        # 此后不回写）；未建（pre-boot）回退构造集。命中 ledger bundled 集 → plugin，否则 user。
+        active_configs = self.mcp_manager.server_configs() if self.mcp_manager is not None else tuple(self._mcp_servers)
+        for cfg in active_configs:
             materialized.add(cfg.name)
             record = bundled.get(cfg.name)
             managed_by: McpOwnership = plugin_ownership(record) if record is not None else McpUserOwnership()

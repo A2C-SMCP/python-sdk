@@ -30,6 +30,14 @@ from typing import Annotated, ClassVar, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
+__all__ = [
+    "McpLifecycle",
+    "McpOwnership",
+    "McpPluginOwnership",
+    "McpServerWithMetadata",
+    "McpUserOwnership",
+]
+
 
 class _InventoryModel(BaseModel):
     """camelCase 序列化基类：wire 形态 camelCase（对齐 rust serde），Python 侧仍 snake_case 构造/访问。"""
@@ -105,7 +113,8 @@ class McpServerWithMetadata(_InventoryModel):
 
     :meth:`Computer.list_mcp_servers_with_metadata` 的返回元素。合并两个来源（client 无需自己拼）：
 
-    - 运行期已物化的 server（``Computer.mcp_servers``）——用户配置 or client 经 hooks 物化的 plugin bundled；
+    - 运行期活跃配置集（``MCPServerManager.server_configs()``，含动态挂载项）——用户配置 server or client
+      经 hooks 物化的 plugin bundled server；
     - ledger 派生的**已启用但尚未物化**的 plugin bundled server（§4.8：进程未拉起也须可观测）。
 
     ``disabled`` 取自 server 配置本身（:class:`~a2c_smcp.computer.mcp_clients.model.BaseMCPServerConfig`

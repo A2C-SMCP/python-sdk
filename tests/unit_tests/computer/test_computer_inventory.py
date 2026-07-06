@@ -42,7 +42,13 @@ def _write_json(path: Path, obj: object) -> None:
     path.write_text(json.dumps(obj), encoding="utf-8")
 
 
-def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), pid: str = "audit@acme") -> tuple[Path, Path]:
+def _seed_home(
+    tmp_path: Path,
+    *,
+    servers: Sequence[str] = (),
+    disabled_servers: Sequence[str] = (),
+    pid: str = "audit@acme",
+) -> tuple[Path, Path]:
     """预置 skill_home：catalog 树（acme/audit）+ known_marketplaces + installed 账本。返回 (home, plugin_root)。"""
     home = tmp_path / "skill-home"
     home.mkdir()
@@ -58,8 +64,9 @@ def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), pid: str = "audit
     )
     plugin_root = catalog / "plugins" / "audit"
     plugin_root.mkdir(parents=True, exist_ok=True)
-    for sname in servers:
-        server_def = {"name": sname, "type": "stdio", "server_parameters": {"command": "node"}}
+    all_servers = [*servers, *disabled_servers]
+    for sname in all_servers:
+        server_def = {"name": sname, "type": "stdio", "server_parameters": {"command": "node"}, "disabled": sname in disabled_servers}
         _write_json(plugin_root / "mcp-servers" / f"{sname}.json", server_def)
     save_known_marketplaces(
         {"version": 1, "marketplaces": {"acme": {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc123"}}},
@@ -76,7 +83,7 @@ def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), pid: str = "audit
                         "version": "1.2.0",
                         "commitSha": "abc123",
                         "installedAt": "2026-07-06T00:00:00Z",
-                        "bundledMcpServers": list(servers),
+                        "bundledMcpServers": all_servers,
                     },
                 ],
             },
@@ -181,3 +188,55 @@ async def test_inventory_merge_dedupes_by_name_runtime_entry_wins(tmp_path: Path
         assert len(inv) == 1, "同名去重：运行期条目优先，不重复补入"
         assert inv[0].disabled, "disabled 应取运行期配置（运行期条目优先）"
         assert isinstance(inv[0].managed_by, McpPluginOwnership), "name 命中 bundled 集 → 标 plugin（文档化退化）"
+
+
+@pytest.mark.asyncio
+async def test_inventory_includes_dynamically_added_user_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """boot 后经 ``aadd_or_aupdate_server`` 动态挂载的 user server 必须出现（CLI 主路径；防构造期快照漏报）。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
+
+    async with Computer(name="t", auto_connect=False, skill_home=home) as comp:
+        await comp.aadd_or_aupdate_server(_user_stdio_server("dyn-user"))
+        inv = comp.list_mcp_servers_with_metadata()
+
+        dyn = next(e for e in inv if e.name == "dyn-user")
+        assert dyn.managed_by == McpUserOwnership()
+        assert dyn.disabled, "禁用旗应透传（取运行期活跃配置）"
+        # 动态挂载不影响 bundled 观测面。
+        assert any(e.name == "audit-mcp" for e in inv)
+
+
+@pytest.mark.asyncio
+async def test_inventory_marks_remounted_bundled_server_as_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """boot 后经 ``reconcile_governance(hooks)`` 重挂的 bundled server：源一（运行期活跃集）命中仍标 plugin 且仅一条。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
+
+    async with Computer(name="t", auto_connect=False, skill_home=home) as comp:
+
+        async def register(cfg, record) -> None:
+            await comp.aadd_or_aupdate_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
+
+        report = await comp.reconcile_governance(
+            existing_server_names=lambda: {c.name for c in comp.mcp_servers},
+            register_server=register,
+            declared={},
+        )
+        assert report.remounted_servers == ["audit-mcp"]
+
+        entries = [e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp"]
+        assert len(entries) == 1, "重挂后运行期条目与 ledger 条目按 name 去重为一条"
+        assert entries[0].managed_by == McpPluginOwnership(marketplace="acme", plugin="audit", plugin_id="audit@acme")
+
+
+@pytest.mark.asyncio
+async def test_inventory_passes_through_bundled_disabled_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """bundled server 定义自带 ``disabled=true`` → 源二（未物化补入）disabled 旗透传。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, disabled_servers=["audit-mcp"])
+
+    comp = Computer(name="t", skill_home=home)
+    entry = next(e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp")
+    assert entry.disabled, "bundled 配置的 disabled 旗应透传"
+    assert isinstance(entry.managed_by, McpPluginOwnership)
