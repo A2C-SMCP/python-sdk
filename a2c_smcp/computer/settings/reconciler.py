@@ -28,6 +28,10 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1（
   （生产由 #63 写入、本工单测试直接 seed）。
 - bundled MCP server 的起停经 :func:`gc_plugins` 的 ``mcp_teardown`` 回调注入；真正接线（MCP manager）
   由 computer.py 集成承担，不在 #62。
+- **与治理启动恢复的分工（#117）**：本模块是**声明式**对账（declared 驱动，恢复不了"装即活跃"、未写
+  ``enabledPlugins`` 的命令式安装）；boot 恢复走 :mod:`~a2c_smcp.computer.settings.recovery`
+  （**ledger 驱动**：``installed_plugins.json`` 为"已安装"事实源 + ``enabledPlugins`` 仅作禁用门控），
+  两者 additive-only 语义一致、职责不同。
 
 并发 / Concurrency：:func:`reconcile` **串行** stage 各 marketplace（不 ``asyncio.gather``），遵守
 :func:`stage_marketplace_skills` 文档化的同步 ``file_lock`` 阻塞约束（store.py 同步设计的固有约束）。

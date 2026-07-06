@@ -28,11 +28,14 @@ gc/prune，本模块做**显式单 plugin** 增删启停，写 ``installed_plugi
 （§9.3，inputs 池消歧归 #65）。
 
 边界（文档化，非缺陷）/ Documented boundaries：
-- 本模块操作 **live session**（Computer.boot_up 当前不调 reconcile）：跨重启重挂 bundled server +
-  ``installed × enabled`` 交集归 reconcile 接线层（#68/#69）。
-- disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启靠 reconcile 按
-  ``enabledPlugins`` 重建。uninstall 仅注销**活跃** SKILL（与 :func:`_unregister_marketplace_skills` 同限）；
-  先 disable（orphan）再 uninstall 会残留内存孤儿条目，进程重启即清。
+- 本模块操作 **live session**；跨重启恢复（``installed × enabled`` 交集）由治理启动恢复承担（#117）：
+  bundled SKILL 经 ``Computer.boot_up`` 内 :mod:`~a2c_smcp.computer.settings.recovery`（ledger 驱动）
+  自动重建；bundled MCP server 重挂由 client 显式经 ``Computer.reconcile_governance(hooks)`` 触发
+  （#93 client owns MCP config；CLI 启动序列即参考接线）。
+- disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
+  ``enabledPlugins`` 门控重建（显式 false 不复活）。uninstall 仅注销**活跃** SKILL（与
+  :func:`_unregister_marketplace_skills` 同限）；先 disable（orphan）再 uninstall 会残留内存孤儿条目，
+  进程重启即清。
 """
 
 from __future__ import annotations

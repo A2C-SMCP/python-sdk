@@ -110,15 +110,56 @@ def _plugin_register_cb(comp: Any, plugin: str, marketplace: str) -> RegisterSer
     return _register
 
 
+def _inject_plugin_inputs(comp: Any, plugin_root: Path, plugin: str, marketplace: str) -> None:
+    """从 ``<plugin_root>/mcp-servers/inputs.json`` 读 plugin-scoped inputs、前缀化、逐条 add_or_update_input（DRY 单点）。"""
+    inputs_json = plugin_root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
+    for inp in load_plugin_inputs(inputs_json, plugin, marketplace):
+        comp.add_or_update_input(inp)
+
+
 def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> InjectInputs:
-    """注入 plugin-scoped inputs 入池：从 ``<plugin_root>/mcp-servers/inputs.json`` 读、前缀化、逐条 add_or_update_input。"""
+    """注入 plugin-scoped inputs 入池（install/enable 路径回调；闭包携 plugin/marketplace 上下文）。"""
 
     async def _inject(plugin_root: Path) -> None:
-        inputs_json = plugin_root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
-        for inp in load_plugin_inputs(inputs_json, plugin, marketplace):
-            comp.add_or_update_input(inp)
+        _inject_plugin_inputs(comp, plugin_root, plugin, marketplace)
 
     return _inject
+
+
+async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) -> None:
+    """
+    启动期治理重挂（#117 设计 Y 的 client 接线参考实现）/ Boot-time governance remount (reference client wiring)。
+
+    boot_up 已恢复 bundled SKILL（skills-only，§4.8 #93 边界：SDK 不擅自拉 MCP 进程）；此处 CLI 作为
+    参考 client 经**公共 API** ``Computer.reconcile_governance(hooks)`` 显式重挂 enabled bundled MCP
+    server（外部 client / 未来 GUI 照抄本函数）。语义要点：
+
+    - declared 传 flag-aware 合并视图——注意其"补上 flag scope"**仅及于阶段二 server 重挂**（boot 从不挂
+      server）；bundled SKILL 已在 boot 期按无 flag 视图恢复且 additive-only 不撤销，flag-scope 的
+      ``enabledPlugins=false`` 对 skill 跨 boot 不生效（可靠 disable 请写 user scope）；
+    - inputs 注入先于 register（bundled server 的 ``${input:}`` 经 D2 前缀回退解析，与 install/enable 流一致）；
+    - ``existing_server_names`` **必传**（取自 ``comp.mcp_servers``）：与既有 server 同名 →
+      reconcile_governance 内部 skip+WARN（用户配置胜）；bundled **免批准**（§5.10 不走 project 信任门），
+      单点失败不阻断。
+    """
+    env = os.environ
+    declared = resolved_settings(env, flag_path=flag_config)
+
+    async def _register(cfg: Any, record: Any) -> None:
+        await comp.aadd_or_aupdate_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
+        console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
+
+    async def _inject(record: Any) -> None:
+        _inject_plugin_inputs(comp, record.install_path, record.plugin, record.marketplace)
+
+    report = await comp.reconcile_governance(
+        existing_server_names=lambda: {cfg.name for cfg in comp.mcp_servers},
+        register_server=_register,
+        inject_inputs=_inject,
+        declared=declared,
+    )
+    for marketplace in report.failed_marketplaces:
+        console.print(f"[yellow]⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)[/yellow]")
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
