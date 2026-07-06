@@ -89,6 +89,14 @@ async def interactive_loop(
     except Exception as e:  # pragma: no cover - 批准框失败不阻断进入 REPL
         console.print(f"[yellow]⚠ MCP 批准门控初始化失败 / MCP approval init failed: {e}[/yellow]")
 
+    # #117 治理重挂（设计 Y client 接线）：boot 已恢复 bundled SKILL；CLI 作为参考 client 经公共 API
+    # reconcile_governance(hooks) 重挂 enabled bundled MCP server。时序刻意在批准框之后——mcp.json 的
+    # 显式用户配置先挂先占名（同名 bundled 被 skip，用户配置胜）；bundled 免批准（§5.10）。
+    try:
+        await plugin_cmd.run_governance_remount(comp, flag_config=mcp_flag_config)
+    except Exception as e:  # pragma: no cover - 重挂失败不阻断进入 REPL
+        console.print(f"[yellow]⚠ 治理重挂失败 / governance remount failed: {e}[/yellow]")
+
     while True:
         try:
             with patch_stdout_ctx(raw=True):

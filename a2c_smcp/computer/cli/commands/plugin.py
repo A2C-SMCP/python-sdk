@@ -121,6 +121,41 @@ def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> Inject
     return _inject
 
 
+async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) -> None:
+    """
+    启动期治理重挂（#117 设计 Y 的 client 接线参考实现）/ Boot-time governance remount (reference client wiring)。
+
+    boot_up 已恢复 bundled SKILL（skills-only，§4.8 #93 边界：SDK 不擅自拉 MCP 进程）；此处 CLI 作为
+    参考 client 经**公共 API** ``Computer.reconcile_governance(hooks)`` 显式重挂 enabled bundled MCP
+    server（外部 client / 未来 GUI 照抄本函数）。语义要点：
+
+    - declared 传 flag-aware 合并视图（补上 boot 内不可见的 ``--settings`` flag scope）；
+    - inputs 注入先于 register（bundled server 的 ``${input:}`` 经 D2 前缀回退解析，与 install/enable 流一致）；
+    - 与既有 server 同名 → reconcile_governance 内部 skip+WARN（用户配置胜）；bundled **免批准**（§5.10
+      不走 project 信任门），单点失败不阻断。
+    """
+    env = os.environ
+    declared = resolved_settings(env, flag_path=flag_config)
+
+    async def _register(cfg: Any, record: Any) -> None:
+        await comp.aadd_or_aupdate_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
+        console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
+
+    async def _inject(record: Any) -> None:
+        inputs_json = record.install_path / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
+        for inp in load_plugin_inputs(inputs_json, record.plugin, record.marketplace):
+            comp.add_or_update_input(inp)
+
+    report = await comp.reconcile_governance(
+        existing_server_names=lambda: {cfg.name for cfg in comp.mcp_servers},
+        register_server=_register,
+        inject_inputs=_inject,
+        declared=declared,
+    )
+    for marketplace in report.failed_marketplaces:
+        console.print(f"[yellow]⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)[/yellow]")
+
+
 # ── handlers ──────────────────────────────────────────────────────────────────
 async def plugin_install(
     registry: SkillRegistry,

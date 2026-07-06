@@ -56,7 +56,8 @@ def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), skills: Sequence[
     plugin_root = catalog / "plugins" / "audit"
     plugin_root.mkdir(parents=True, exist_ok=True)
     for sname in servers:
-        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", {"name": sname, "type": "stdio", "server_parameters": {"command": "node"}})
+        server_def = {"name": sname, "type": "stdio", "server_parameters": {"command": "node"}}
+        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", server_def)
     for sk in skills:
         p = plugin_root / "skills" / sk / "SKILL.md"
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -129,8 +130,8 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
     async def register(cfg, record: BundledServerRecord) -> None:
         calls.append((cfg.name, record.plugin, record.marketplace))
 
-    async def inject(path: Path) -> None:
-        injected.append(path)
+    async def inject(record: BundledServerRecord) -> None:
+        injected.append(record.install_path)
 
     async with Computer(name="t", skill_home=home) as comp:
         report = await comp.reconcile_governance(

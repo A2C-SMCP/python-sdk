@@ -31,7 +31,7 @@ import json
 import os
 import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -64,6 +64,13 @@ from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
+from a2c_smcp.computer.settings.recovery import (
+    BundledServerRecord,
+    GovernanceRecoveryReport,
+    RegisterBundledServer,
+    collect_enabled_bundled_servers,
+    recover_marketplace_skills,
+)
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
     SkillEventDebouncer,
@@ -325,13 +332,34 @@ class Computer(BaseComputer[PromptSession]):
 
         await self.mcp_manager.ainitialize(validated_servers)
 
-        # v0.2.1 SKILL 子系统启动初始化（设计 §5.1，#66）：解析 SKILL Home → 物化 mcp 源 skill:// →
-        # 填充 Registry → 初始化 skill:// 缓存。失败隔离：记 ERROR、**不**阻断 Computer 启动
-        # （skill.md §1.5：SKILL 通道对部分失败健壮）。marketplace/user 源 reconcile 见 #60/#61。
-        # SKILL subsystem boot init: resolve Home → materialize mcp-source skills → seed cache.
-        # Failure-isolated: log ERROR, never block Computer boot. marketplace/user sources land in #60/#61.
+        # v0.2.1 SKILL 子系统启动初始化（设计 §5.1，#66）：解析 SKILL Home → 治理启动恢复（#117）→
+        # 物化 mcp 源 skill:// → 填充 Registry → 初始化 skill:// 缓存。失败隔离：记 ERROR、**不**阻断
+        # Computer 启动（skill.md §1.5：SKILL 通道对部分失败健壮）。
+        # SKILL subsystem boot init: resolve Home → governance recovery (#117) → materialize mcp-source
+        # skills → seed cache. Failure-isolated: log ERROR, never block Computer boot.
         try:
             self._skill_home = self._resolve_skill_home()
+        except Exception as e:  # pragma: no cover — 防御性兜底
+            logger.error(f"SKILL Home 解析失败（不阻断 Computer 启动）/ SKILL Home resolve failed (non-blocking): {e}", exc_info=True)
+
+        # #117 治理启动恢复（协议 v0.2.3 §4.8.1，rust reconcile_governance 同位）：从双账本恢复
+        # enabled plugin 的 bundled SKILL。**skills-only**——bundled MCP server 不在 boot 拉进程
+        # （#93 client owns MCP config），client 经 reconcile_governance(hooks) 显式重挂（设计 Y）。
+        # Governance boot recovery (skills-only); bundled MCP servers stay client-driven via hooks.
+        if self._skill_home is not None:
+            try:
+                recovery_report = await self.reconcile_governance()
+                if recovery_report.restored_skills or recovery_report.failed_marketplaces:
+                    logger.info(
+                        "governance recovery: %d skills restored, %d plugins, %d marketplaces degraded",
+                        len(recovery_report.restored_skills),
+                        len(recovery_report.restored_plugins),
+                        len(recovery_report.failed_marketplaces),
+                    )
+            except Exception as e:  # pragma: no cover — 防御性兜底（recovery 内部已各自降级）
+                logger.error(f"治理启动恢复失败（不阻断启动）/ governance recovery failed (non-blocking): {e}", exc_info=True)
+
+        try:
             await self._restage_mcp_skills()
             self._skills_cache = await self._acollect_skill_refs()
         except Exception as e:  # pragma: no cover — 防御性兜底，正常路径已在内部各自降级
@@ -1297,6 +1325,81 @@ class Computer(BaseComputer[PromptSession]):
         Mark the SKILL set dirty so the debouncer coalesces a single emit (called after CLI marketplace mutations).
         """
         self._skill_debouncer.mark_dirty()
+
+    def _resolve_declared_settings(self) -> dict[str, Any]:
+        """治理恢复的 declared 合并视图（user/project/local/policy；无 flag——Computer 不持 ``--settings`` 知识）。
+
+        已知限制（与 rust 同构文档化）：flag scope 的 ``enabledPlugins`` 不在此视图；CLI 接线时经
+        ``reconcile_governance(declared=...)`` 显式传 flag-aware 视图。跨重启可靠 disable 请写 user scope。
+        The declared view for governance recovery (no flag scope at boot); pass flag-aware ``declared`` explicitly.
+        """
+        from a2c_smcp.computer.settings.policy import resolve_policy_settings
+        from a2c_smcp.computer.settings.scope import resolve_settings
+
+        return resolve_settings(policy_settings=resolve_policy_settings()).settings
+
+    async def reconcile_governance(
+        self,
+        *,
+        existing_server_names: Callable[[], set[str]] | None = None,
+        register_server: RegisterBundledServer | None = None,
+        inject_inputs: Callable[[BundledServerRecord], Awaitable[None]] | None = None,
+        declared: Mapping[str, Any] | None = None,
+    ) -> GovernanceRecoveryReport:
+        """
+        治理启动恢复公共入口（#117，协议 v0.2.3 §4.8；两 SDK 同构契约"设计 Y"）/ Governance recovery entry。
+
+        阶段一（恒执行）：从双账本恢复 enabled plugin 的 bundled SKILL 进当前 Registry（ledger 驱动、
+        additive-only、幂等、失败降级不抛——见 :mod:`~a2c_smcp.computer.settings.recovery`）。
+        阶段二（仅当给 ``register_server``）：client 显式重挂 bundled MCP server——逐 plugin 根先
+        ``inject_inputs(record)``（携归属上下文做 plugin inputs 前缀化注入，bundled server 的
+        ``${input:}`` D2 渲染前置；每 plugin 根仅一次），再逐 server 经 ``register_server(config, record)``
+        携归属上下文注册；与既有 server 同名 → **skip + WARN 不覆盖**（additive-only，用户配置胜）；
+        单 server 失败 → WARN 不阻断其余。
+
+        boot 默认（``boot_up`` 内无 hooks 调用）= skills-only：bundled MCP server 不在 boot 拉进程
+        （#93 client owns MCP config），仅经 :func:`collect_enabled_bundled_servers` 可查询；重挂永远是
+        client 的显式意志（CLI 为参考 client 实现，外部 GUI/client 调用同一入口）。
+
+        :param existing_server_names: 现存 server 名集合工厂（冲突判定；``None`` = 不判冲突）。
+        :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
+        :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
+        :param declared: ``enabledPlugins`` 合并声明视图覆盖（``None`` = 现算 user/project/local/policy）。
+        :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
+        """
+        home = self.skill_home
+        if declared is None:
+            declared = self._resolve_declared_settings()
+
+        report = await recover_marketplace_skills(self._skill_registry, home, declared)
+        if report.restored_skills:
+            self.mark_skills_dirty()
+
+        if register_server is None:
+            return report
+
+        existing = set(existing_server_names()) if existing_server_names is not None else set()
+        injected_roots: set[Path] = set()
+        for record in collect_enabled_bundled_servers(home, declared):
+            name = record.config.name
+            if name in existing:
+                logger.warning(
+                    "governance recovery: bundled server %r (plugin %s) conflicts with an existing server, skipped (existing wins)",
+                    name,
+                    record.plugin_id,
+                )
+                continue
+            try:
+                if inject_inputs is not None and record.install_path not in injected_roots:
+                    await inject_inputs(record)
+                    injected_roots.add(record.install_path)
+                await register_server(record.config, record)
+            except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
+                logger.warning("governance recovery: failed to remount bundled server %r (plugin %s): %s", name, record.plugin_id, e)
+                continue
+            existing.add(name)
+            report.remounted_servers.append(name)
+        return report
 
     def get_skills(self) -> list[A2CSkillRef]:
         """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。

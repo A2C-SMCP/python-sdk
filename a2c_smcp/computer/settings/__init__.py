@@ -24,6 +24,9 @@ management UX.
   文件锁 + ``.corrupt-<ts>.bak`` 损坏恢复 + 写保护头（带 version）（S5，#58）
 - :mod:`a2c_smcp.computer.settings.reconciler` —— 启动对账（additive-only 四分支）+ 孤儿清理
   （marketplace prune / plugin gc）（S9，#62）
+- :mod:`a2c_smcp.computer.settings.recovery` —— 治理启动恢复（ledger 驱动：boot 恢复 enabled plugin 的
+  bundled SKILL + bundled MCP server 可查询/hooks 重挂）（#117，协议 v0.2.3 §4.8；与 reconciler/installer
+  同因**刻意不在此 re-export**——直接 ``from a2c_smcp.computer.settings.recovery import ...``）
 
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5 / §7。
 """
