@@ -38,7 +38,7 @@ from a2c_smcp.computer.settings.recovery import (
     recover_marketplace_skills,
 )
 from a2c_smcp.computer.settings.schema import SettingsScope, validate_settings
-from a2c_smcp.computer.settings.scope import user_settings_path
+from a2c_smcp.computer.settings.scope import user_settings_path, workdir_local_settings_path, workdir_project_settings_path
 from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -567,6 +567,259 @@ async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monke
         )
 
     assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
+# ── #125 任务 1：重物化 scope 混合线索推回（enable/disable scope 契约的逆运算）──
+@pytest.mark.asyncio
+async def test_recover_rematerialize_infers_project_scope_from_enabled_layer(tmp_path: Path, monkeypatch) -> None:
+    """project 层 ``enabledPlugins[pid]`` 条目 = scope 线索 → 重建记录 scope=project + projectPath=cwd（非归一 user）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: True}})
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [(r["scope"], r.get("projectPath")) for r in records] == [("project", str(Path.cwd()))]
+    assert report.scope_normalized == []  # 有线索 → 不归一
+
+
+@pytest.mark.asyncio
+async def test_recover_rematerialize_multi_layer_clues_rebuild_multi_records(tmp_path: Path, monkeypatch) -> None:
+    """多层线索（user false + local true）→ 重建多条记录（多 scope 不塌缩单条）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: False}})
+    _write_json(workdir_local_settings_path(workdir), {"enabledPlugins": {_PID: True}})
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    by_scope = {r["scope"]: r.get("projectPath") for r in records}
+    assert by_scope == {"user": None, "local": str(Path.cwd())}
+    assert report.scope_normalized == []
+
+
+@pytest.mark.asyncio
+async def test_recover_rematerialize_no_clue_falls_back_user_and_reports(tmp_path: Path, monkeypatch, caplog) -> None:
+    """无任何层线索 → 归一 user + WARN + ``report.scope_normalized`` 显式标注（issue #125 方向 b 兜底）。"""
+    import logging
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    declared = {"installedPlugins": [_PID]}
+
+    with caplog.at_level(logging.WARNING):
+        report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]
+    assert report.scope_normalized == [_PID]
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [(r["scope"], r.get("projectPath")) for r in records] == [("user", None)]
+    assert _PID in caplog.text and "normalized" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_recover_rematerialize_project_installed_declaration_is_clue(tmp_path: Path, monkeypatch) -> None:
+    """project 层 ``installedPlugins`` 声明（声明式复现场景）亦是 scope 线索（installed_disabled 无 enabled 条目时）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _write_json(workdir_project_settings_path(workdir), {"installedPlugins": [_PID]})
+    declared = {"installedPlugins": [_PID]}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [(r["scope"], r.get("projectPath")) for r in records] == [("project", str(Path.cwd()))]
+    assert report.scope_normalized == []
+
+
+@pytest.mark.asyncio
+async def test_recover_rematerialize_replaces_dead_records_of_stale_scopes(tmp_path: Path, monkeypatch) -> None:
+    """重建成功后清扫该 pid 下 installPath 已死的残留记录（防 CLI enable/disable 循环误写死 scope 层）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _seed_installed(home, {_PID: [{"scope": "project", "installPath": str(tmp_path / "gone"), "projectPath": str(workdir)}]})
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [(r["scope"], r.get("projectPath")) for r in records] == [("user", None)]  # 死 project 记录被清扫
+
+
+@pytest.mark.asyncio
+async def test_uninstall_clears_cwd_visible_enabled_entries_without_ledger_projectpath(tmp_path: Path, monkeypatch) -> None:
+    """uninstall 清理集并入 cwd：账本记录无 projectPath（归一后形态）时，cwd 可见 project 层条目也清净（防重装即激活）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    root = _setup_catalog(home, "acme", "audit")
+    _seed_installed(home, {_PID: [_record(root)]})  # user record，无 projectPath
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: True}})
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env)
+
+    assert ok is True
+    proj = json.loads(workdir_project_settings_path(workdir).read_text(encoding="utf-8"))
+    assert _PID not in proj.get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_uninstall_does_not_create_tfrobot_dir_in_cwd(tmp_path: Path, monkeypatch) -> None:
+    """cwd 无 ``.tfrobot/`` 时 uninstall 不得凭空创建（file_lock 会 mkdir——写调用必须先存在性守卫）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "bare"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    root = _setup_catalog(home, "acme", "audit")
+    _seed_installed(home, {_PID: [_record(root)]})
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env)
+
+    assert ok is True
+    assert not (workdir / ".tfrobot").exists()  # 不制造垃圾目录/锁文件
+
+
+# ── #125 任务 2：悬挂意图 prune 执行入口（installer 是 settings 意图唯一写者）──
+def test_prune_plugin_intent_clears_intent_enabled_and_dead_ledger(tmp_path: Path, monkeypatch) -> None:
+    """prune：删 user 意图 + 清 user/cwd 可见层 enabled 条目 + 弹出死账本记录（针对悬挂意图的 uninstall 等价物）。"""
+    from a2c_smcp.computer.settings.installer import prune_plugin_intent
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: False}})
+    _seed_installed(home, {_PID: [{"scope": "user", "installPath": str(tmp_path / "gone")}]})
+
+    prune_plugin_intent(_PID, home, env=env)
+
+    settings = _read_user_settings(env)
+    assert _PID not in settings.get("installedPlugins", [])
+    assert _PID not in settings.get("enabledPlugins", {})
+    proj = json.loads(workdir_project_settings_path(workdir).read_text(encoding="utf-8"))
+    assert _PID not in proj.get("enabledPlugins", {})
+    assert _PID not in load_installed_plugins(home=home)["plugins"]
+
+
+def test_prune_plugin_intent_runs_legacy_migration_first(tmp_path: Path, monkeypatch) -> None:
+    """prune 写 installedPlugins 键前必须先跑一次性迁移（防标记误置永久丢弃 v0.2.x 存量活跃态，同 install/uninstall）。"""
+    from a2c_smcp.computer.settings.installer import prune_plugin_intent
+
+    monkeypatch.chdir(tmp_path)
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "legacy")
+    _seed_installed(home, {"legacy@acme": [_record(root)], _PID: [{"scope": "user", "installPath": str(tmp_path / "gone")}]})
+    # user settings 无 installedPlugins 键 = 迁移尚未发生
+
+    prune_plugin_intent(_PID, home, env=env)
+
+    settings = _read_user_settings(env)
+    assert settings["installedPlugins"] == ["legacy@acme"]  # 迁移先行：存量迁入；目标 pid 已 prune
+    assert settings["enabledPlugins"].get("legacy@acme") is True  # 存量活跃态保住
+    assert _PID not in settings["enabledPlugins"]
+
+
+def test_prune_plugin_intent_warns_on_residual_project_declaration(tmp_path: Path, monkeypatch, caplog) -> None:
+    """pid 仍见于 project 层 ``installedPlugins`` 声明 → WARN 指明文件路径、不静默改写 committable 团队声明。"""
+    import logging
+
+    from a2c_smcp.computer.settings.installer import prune_plugin_intent
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    proj_path = workdir_project_settings_path(workdir)
+    _write_json(proj_path, {"installedPlugins": [_PID]})
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID]})
+
+    with caplog.at_level(logging.WARNING):
+        prune_plugin_intent(_PID, home, env=env)
+
+    proj = json.loads(proj_path.read_text(encoding="utf-8"))
+    assert proj.get("installedPlugins") == [_PID]  # committable 声明不动
+    assert str(proj_path) in caplog.text  # WARN 指路人工处理
+
+
+# ── #125 任务 4：账本失效判据补 bundled JSON 校验（半态防御闭环）──────────────
+@pytest.mark.asyncio
+async def test_recover_rematerializes_on_corrupt_bundled_json(tmp_path: Path) -> None:
+    """账本 installPath 目录在、bundled JSON 损坏 → 判失效走重物化（catalog 完好 → 修复指回 catalog root）。"""
+    home = _home(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    stale = home / "stale-copy"
+    (stale / "mcp-servers").mkdir(parents=True)
+    (stale / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
+    _seed_installed(home, {_PID: [{"scope": "user", "installPath": str(stale)}]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.rematerialized == [_PID]
+    rebuilt = load_installed_plugins(home=home)["plugins"][_PID]
+    assert all(r["installPath"] != str(stale) for r in rebuilt)  # 修复：不再指向损坏副本
+    assert "audit:lint" in report.restored_skills
+    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path))[0].config.name == "figma"  # server 可查询（无半态）
+
+
+@pytest.mark.asyncio
+async def test_recover_corrupt_bundled_json_unrepairable_stays_disabled(tmp_path: Path) -> None:
+    """catalog 自身损坏（重物化也失败）→ 整体保持 installed_disabled：skill 不亮、server 不可查询（半态消除）。"""
+    home = _home(tmp_path)
+    plugin_root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    (plugin_root / "mcp-servers").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
+    _seed_installed(home, {_PID: [_record(plugin_root)]})  # 目录在、JSON 损坏——旧判据误判「已物化」
+    reg = SkillRegistry()
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.rematerialized == []
+    assert report.restored_skills == [] and report.restored_plugins == []
+    assert reg.resolve("audit:lint") is None  # skill 不单独点亮（rust-sdk#102 半态防御）
+    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path)) == []
 
 
 # ── schema：installedPlugins 字段校验 ─────────────────────────────────────────
