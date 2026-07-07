@@ -198,6 +198,30 @@ def _write_enabled_plugin(plugin_id: str, value: bool | None, scope: str, projec
         atomic_write_json(path, updated)
 
 
+def _clear_enabled_entries_visible_layers(plugin_id: str, project_paths: set[str], env: Mapping[str, str] | None) -> None:
+    """
+    清理 ``enabledPlugins[plugin_id]`` 的全部**可见层**条目：user 恒清；project/local 对「账本 projectPath ∪ cwd」
+    逐一清（#125 任务 1：账本重物化归一后丢 projectPath，仅遍历账本会漏掉 cwd 可见层的残留 ``true``——
+    卸载后残留会让重装立即激活，违反 install 不激活）/ Clear enabled entries across visible layers。
+
+    project/local 写调用前**先查 settings 文件存在**：:func:`~a2c_smcp.computer.settings.store.file_lock`
+    会 ``mkdir(parents=True)`` 建父目录 + 建 ``.lock``，而 :func:`_write_enabled_plugin` 的 no-op 短路在锁后——
+    无守卫会在无 ``.tfrobot/`` 的 cwd 制造垃圾目录。managed/policy 只读层不触碰；清失败 WARN 不阻断（best-effort）。
+    """
+    _write_enabled_plugin(plugin_id, None, "user", None, env)
+    targets = {str(Path(p)) for p in project_paths if p}
+    targets.add(str(Path.cwd()))
+    for pp in sorted(targets):
+        for s in ("project", "local"):
+            try:
+                path, _scope = _settings_path_for_scope(s, pp, env)
+                if not path.exists():  # 存在性守卫：不为清理凭空建 .tfrobot/ + .lock
+                    continue
+                _write_enabled_plugin(plugin_id, None, s, pp, env)
+            except PluginInstallError as e:  # best-effort：清条目失败不阻断
+                logger.warning("failed to clear enabledPlugins[%s] in %s scope at %s: %s", plugin_id, s, pp, e)
+
+
 def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str] | None) -> bool:
     """
     user scope ``installedPlugins`` 数组的持锁 RMW（增/删一个条目）；返回**写前**是否已含该条目 / RMW the install intent。
@@ -550,18 +574,12 @@ async def uninstall_plugin(
     update_installed_plugins(_drop, home=home, env=env)
 
     # v0.3.0：账本记录清空（回 available）→ 删全局安装意图 + 清 enabledPlugins 条目（意图是唯一权威，§2.3）。
-    # project/local 落点从被删记录的 projectPath 派生（无需调用方另传）；managed/policy 只读层不触碰。
+    # project/local 落点 = 被删记录的 projectPath ∪ cwd（#125 任务 1：归一记录丢 projectPath 时 cwd 可见层兜底）。
     remaining = load_installed_plugins(home=home, env=env).get("plugins", {}).get(plugin_id)
     if not remaining:
         _write_installed_plugin(plugin_id, False, env)
-        _write_enabled_plugin(plugin_id, None, "user", None, env)
         project_paths = {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p}
-        for pp in sorted(project_paths):
-            for s in ("project", "local"):
-                try:
-                    _write_enabled_plugin(plugin_id, None, s, pp, env)
-                except PluginInstallError as e:  # best-effort：清条目失败不阻断卸载
-                    logger.warning("uninstall: failed to clear enabledPlugins[%s] in %s scope at %s: %s", plugin_id, s, pp, e)
+        _clear_enabled_entries_visible_layers(plugin_id, project_paths, env)
     logger.info(
         "uninstalled plugin %r (scope=%s, servers=%s)",
         plugin_id,
@@ -569,6 +587,59 @@ async def uninstall_plugin(
         "kept" if keep_servers else (bundled or "none"),
     )
     return True
+
+
+def prune_plugin_intent(plugin_id: str, home: Path, *, env: Mapping[str, str] | None = None) -> bool:
+    """
+    prune 单个**悬挂安装意图**（``installedPlugins`` 声明 ∧ 无有效物化 ∧ 静态不可达，#125 任务 2）/ Prune intent。
+
+    :func:`~a2c_smcp.computer.settings.reconciler.list_dangling_plugin_intents` 的执行对应物——针对悬挂意图的
+    uninstall 等价物（无 MCP/SKILL 面：悬挂 pid 从未物化成功，无已挂 server、无已 stage skill）。删的是
+    **权威意图**（§2.3），调用方（CLI ``plugin gc``）须过 confirm 门 / 显式 ``--prune-dangling``
+    （§4.8.4 删除走显式路径）。settings 意图写权归 installer（与 install/uninstall 同边界）。
+
+    顺序 / Order:
+    1. 一次性迁移先行（写 ``installedPlugins`` 键前防迁移标记误置，同 install/uninstall 铁律）；
+    2. 删 user 层安装意图；3. 清可见层 ``enabledPlugins`` 条目（user + 账本 projectPath ∪ cwd）；
+    4. 弹出该 pid 账本残骸记录（若有）；5. pid 仍见于 cwd 可见 project/local 层 ``installedPlugins``
+       声明 → WARN 指明文件路径、**不改写**（committable 团队声明不由本地 gc 静默动，下轮 gc 会再次列出）。
+
+    :return: ``True`` = 意图已彻底移除；``False`` = cwd 可见 project/local 层仍有 committable 声明残留
+        （merged 意图仍含该 pid，下轮 gc 会再次列为悬挂——调用方不得将其计入「已 prune」，隔离审查 🟡#1）。
+    """
+    _split_plugin_id(plugin_id)  # 形态校验（非法 → PluginInstallError，零变更）
+    migrate_legacy_installs(home, env=env)
+    records = load_installed_plugins(home=home, env=env).get("plugins", {}).get(plugin_id, [])
+    project_paths = {p for r in records if isinstance(p := r.get("projectPath"), str) and p}
+    _write_installed_plugin(plugin_id, False, env)
+    _clear_enabled_entries_visible_layers(plugin_id, project_paths, env)
+
+    def _drop(data: InstalledPluginsFile, _pid: str = plugin_id) -> None:
+        data["plugins"].pop(_pid, None)
+
+    update_installed_plugins(_drop, home=home, env=env)
+
+    cwd = Path.cwd()
+    residual_layers = (
+        ("project", workdir_project_settings_path(cwd), SettingsScope.PROJECT),
+        ("local", workdir_local_settings_path(cwd), SettingsScope.LOCAL),
+    )
+    fully_pruned = True
+    for scope_name, path, scope_enum in residual_layers:
+        if not path.exists():
+            continue
+        data, _errors = load_settings_file(path, scope_enum)
+        declared = data.get("installedPlugins")
+        if isinstance(declared, list) and plugin_id in declared:
+            fully_pruned = False
+            logger.warning(
+                "prune: %r still declared in %s scope settings %s; not rewriting committable declaration (remove manually)",
+                plugin_id,
+                scope_name,
+                path,
+            )
+    logger.info("pruned dangling plugin intent %r (fully_pruned=%s)", plugin_id, fully_pruned)
+    return fully_pruned
 
 
 async def disable_plugin(

@@ -513,7 +513,9 @@ def _plugin_disable(plugin_id: str = typer.Argument(...), json_output: bool = ty
 
 @plugin_app.command("list")
 def _plugin_list(
-    available: bool = typer.Option(False, "--available", help="含 disabled / include disabled"),
+    available: bool = typer.Option(
+        False, "--available", help="[deprecated] 已弃用：v0.3.0 起默认列全部已安装 / no-op, listing all is the default",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """列出 installed plugin / List installed plugins."""
@@ -527,9 +529,18 @@ def _plugin_info(plugin_id: str = typer.Argument(...), json_output: bool = typer
 
 
 @plugin_app.command("gc")
-def _plugin_gc(json_output: bool = typer.Option(False, "--json")) -> None:
-    """清理孤儿 plugin（非交互无 confirm → 直接清）/ GC orphan plugins (no confirm non-interactively)."""
-    code = asyncio.run(plugin_cmd.plugin_gc(SkillRegistry(), ensure_skill_home(), os.environ, confirm=None, json_output=json_output))
+def _plugin_gc(
+    prune_dangling: bool = typer.Option(
+        False, "--prune-dangling", help="连带 prune 悬挂安装意图（意图 ∖ 账本 ∧ 不可达）/ also prune dangling intents",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """清理孤儿 plugin + 诊断悬挂意图（非交互删权威意图须显式 --prune-dangling）/ GC orphans + diagnose dangling."""
+    code = asyncio.run(
+        plugin_cmd.plugin_gc(
+            SkillRegistry(), ensure_skill_home(), os.environ, confirm=None, prune_dangling=prune_dangling, json_output=json_output,
+        ),
+    )
     raise typer.Exit(code)
 
 

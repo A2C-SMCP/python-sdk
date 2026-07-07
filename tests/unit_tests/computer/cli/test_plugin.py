@@ -461,3 +461,182 @@ async def test_run_governance_remount_existing_from_comp_servers(tmp_path: Path,
         await plugin_cmd.run_governance_remount(comp)
 
         assert recorded == []
+
+
+# ── #125 任务 1：危害链回归——重物化推回后 disable 跨 boot 有效 ─────────────────
+@pytest.mark.asyncio
+async def test_disable_effective_across_boot_after_rematerialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """project 装+enable → 账本丢失 → recover 推回 project 记录 → disable 写 project 层 false（merged 不再 enabled）。"""
+    from a2c_smcp.computer.settings.recovery import recover_marketplace_skills
+
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    workdir = Path.cwd()
+    # 模拟 project scope 安装+启用后账本丢失：仅 settings 意图在
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"]})
+    _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {"audit@acme": True}})
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=env)
+    assert report.rematerialized == ["audit@acme"]
+
+    mcp = _FakeMCP()
+    code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", remove_server=mcp.remove)
+
+    assert code == 0
+    proj = json.loads(workdir_project_settings_path(workdir).read_text(encoding="utf-8"))
+    assert proj["enabledPlugins"]["audit@acme"] is False  # 写对层（project，而非归一后的 user）
+    assert plugin_cmd._enabled_plugins_view(home, env).get("audit@acme") is not True  # merged 视图不再 enabled
+
+
+# ── #125 任务 2：plugin gc 扩展（悬挂意图诊断/prune + 权威性不对称安全阀）────────
+def _seed_orphan_and_dangling(home: Path, env: dict[str, str]) -> Path:
+    """孤儿（账本 ∖ 意图，live installPath）+ 悬挂（意图 ∖ 账本，marketplace 未添加）。返回孤儿 installPath。"""
+    orphan_path = marketplace_skill_dir(home, "acme") / "plugins" / "orphan"
+    orphan_path.mkdir(parents=True, exist_ok=True)
+    save_installed_plugins(
+        {"version": 1, "plugins": {"orphan@acme": [{"scope": "user", "installPath": str(orphan_path)}]}},
+        home=home,
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["ghost@nowhere"], "enabledPlugins": {"ghost@nowhere": True}})
+    return orphan_path
+
+
+@pytest.mark.asyncio
+async def test_gc_prunes_dangling_json_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """JSON 契约：``removed`` 键不变；增 ``dangling``（诊断+reason）/``prunedIntents``（实际删）/``recoverable``。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    orphan_path = _seed_orphan_and_dangling(home, env)
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True, prune_dangling=True)
+
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["removed"] == ["orphan@acme"]
+    assert out["dangling"] == [{"id": "ghost@nowhere", "reason": "marketplace-not-added"}]
+    assert out["prunedIntents"] == ["ghost@nowhere"]
+    assert out["recoverable"] == []
+    assert not orphan_path.exists()
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert "ghost@nowhere" not in user.get("installedPlugins", [])  # 意图已 prune
+    assert "ghost@nowhere" not in user.get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_gc_confirm_combined_and_abort_keeps_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """confirm 收到孤儿+悬挂组合描述（悬挂条目带 reason 后缀）；拒绝 → 零变更、退出码 1。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    orphan_path = _seed_orphan_and_dangling(home, env)
+    got: list[str] = []
+
+    async def _confirm(items: list[str]) -> bool:
+        got.extend(items)
+        return False
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, confirm=_confirm, prune_dangling=True)
+
+    assert code == 1
+    assert any("orphan@acme" in s for s in got)
+    assert any("ghost@nowhere" in s and "dangling" in s for s in got)  # 悬挂条目带标注
+    assert orphan_path.exists()  # 零变更
+    assert "orphan@acme" in load_installed_plugins(home=home)["plugins"]
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["ghost@nowhere"]
+
+
+@pytest.mark.asyncio
+async def test_gc_prune_dangling_off_by_default_diagnose_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """权威性不对称：非交互（Typer 默认）悬挂意图**只诊断不删**——删权威意图需显式 ``--prune-dangling``。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    _write_json(user_settings_path(env), {"installedPlugins": ["ghost@nowhere"]})
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True)  # prune_dangling 缺省 False
+
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dangling"] == [{"id": "ghost@nowhere", "reason": "marketplace-not-added"}]
+    assert out["prunedIntents"] == []
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["ghost@nowhere"]  # 意图原样保留
+
+
+# ── #125 任务 3：plugin list --available 弃用提示 ──────────────────────────────
+def test_list_available_prints_deprecation_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--available 为兼容 no-op：非 JSON 模式打弃用提示；不带 flag 时不打。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
+
+    plugin_cmd.plugin_list(home, env, available=True)
+    assert "deprecated" in capsys.readouterr().out
+
+    plugin_cmd.plugin_list(home, env)
+    assert "deprecated" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_gc_prune_residual_committable_declaration_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """悬挂意图仅来自 committable project 层声明 → prune 不改写该文件、不计入 prunedIntents（隔离审查 🟡#1：
+    误报会让自动化「prune 到干净」永不收敛），归 residualDeclarations 显式暴露。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    proj_path = workdir_project_settings_path(Path.cwd())
+    _write_json(proj_path, {"installedPlugins": ["ghost@nowhere"]})
+    before = proj_path.read_text(encoding="utf-8")
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True, prune_dangling=True)
+
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dangling"] == [{"id": "ghost@nowhere", "reason": "marketplace-not-added"}]
+    assert out["prunedIntents"] == []  # 未真正移除，不得计入
+    assert out["residualDeclarations"] == ["ghost@nowhere"]
+    assert proj_path.read_text(encoding="utf-8") == before  # committable 声明未被改写
+
+
+@pytest.mark.asyncio
+async def test_gc_confirm_accept_removes_orphans_and_prunes_dangling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """confirm 通过（返回 True）→ 孤儿删除 + 悬挂真 prune 双双生效（隔离审查 🟡#6 正路覆盖）。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    orphan_path = _seed_orphan_and_dangling(home, env)
+
+    async def _confirm(items: list[str]) -> bool:
+        return True
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, confirm=_confirm, prune_dangling=True)
+
+    assert code == 0
+    assert not orphan_path.exists()  # 孤儿已删
+    assert "orphan@acme" not in load_installed_plugins(home=home)["plugins"]
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert "ghost@nowhere" not in user.get("installedPlugins", [])  # 悬挂已 prune
+    assert "ghost@nowhere" not in user.get("enabledPlugins", {})
+
+
+def test_list_available_json_stdout_stays_pure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--available + --json：弃用提示走 logger，stdout 保持纯 JSON 可解析（隔离审查 🟡#5 验收补缺）。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
+
+    plugin_cmd.plugin_list(home, env, available=True, json_output=True)
+
+    out = capsys.readouterr().out
+    rows = json.loads(out)  # stdout 可整体解析 = 纯 JSON
+    assert rows[0]["id"] == "audit@acme"
+    assert "deprecated" not in out

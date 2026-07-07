@@ -86,6 +86,38 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     divergence deferred to a separate protocol-first effort.
 
 ### Added
+- **Plugin lifecycle follow-ups** (#125, closing out the #123 isolated-review items;
+  rust mirror evaluation via rust-sdk#103):
+  - **Re-materialization scope inference** — boot recovery now infers the original
+    install scope of rebuilt ledger records from per-layer `enabledPlugins` entries
+    (and project/local `installedPlugins` declarations) instead of always normalizing
+    to the user scope; multi-layer clues rebuild multiple records, dead stale-scope
+    records are swept, and clue-less rebuilds are normalized to user scope with a
+    WARN plus the new `GovernanceRecoveryReport.scope_normalized` field. This keeps
+    `plugin disable`/`uninstall` writing to the correct settings layer across boots.
+    `uninstall_plugin` additionally clears cwd-visible project/local `enabledPlugins`
+    entries (guarded so it never creates a `.tfrobot/` dir in a bare cwd). Known
+    blind spot (documented): layers of *other* project paths are not visible from
+    the current cwd — precise restoration remains pin-lock territory (§4.9.2).
+  - **Dangling-intent diagnosis & prune** — new `list_dangling_plugin_intents`
+    (reconciler) detects `installedPlugins` entries with no live materialization that
+    are statically unreachable (four reasons: `marketplace-not-added`,
+    `catalog-missing`, `manifest-unreadable`, `entry-missing`; reachable-but-not-yet
+    materialized intents are reported as recoverable and self-heal at next boot).
+    `plugin gc` now reports them (JSON: `removed` unchanged + new `dangling`,
+    `prunedIntents`, `recoverable`) and can prune via the new
+    `installer.prune_plugin_intent` — REPL behind the confirm gate, non-interactive
+    Typer requires the explicit `--prune-dangling` flag (pruning deletes
+    authoritative intent, unlike orphan gc which only drops derived cache).
+    Committable project/local `installedPlugins` declarations are never rewritten
+    (WARN with the file path instead).
+  - **Ledger liveness now validates bundled JSON** — `ledger_entry_materialized`
+    (public in reconciler, migrated from `recovery._ledger_materialized`) treats a
+    record as materialized only if the `installPath` directory exists **and**
+    `load_bundled_servers` parses; a corrupt bundled server JSON now triggers
+    re-materialization (repair) or keeps the plugin wholly `installed_disabled`
+    (no more "skill lit, server WARN-skipped" half-state).
+
 - **Connection protocol-version handshake** (#17 / #18). Clients (Agent + Computer,
   async + sync) auto-append `a2c_version` to the Socket.IO connect URL query;
   `a2c_smcp.PROTOCOL_VERSION` (`"0.2.0"`) is the single source. Server-side
@@ -110,6 +142,11 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - office/role isolation invariants in `on_client_*` now raise
   `a2c_smcp.exceptions.SMCPNamespaceError` instead of `assert` (stripped under
   `python -O`); async + sync namespaces aligned (#31).
+
+### Deprecated
+- `plugin list --available` is a no-op since v0.3.0 (listing all installed plugins is
+  the default) and now emits a deprecation notice (non-JSON mode; JSON mode logs a
+  warning to keep stdout parseable). Planned for removal in a future release (#125).
 
 ### Tests & Docs
 - `tests/e2e/test_v02_full_flow.py` (#20): real-process full chain over a real
