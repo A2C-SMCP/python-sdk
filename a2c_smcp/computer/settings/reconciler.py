@@ -54,6 +54,12 @@ from a2c_smcp.computer.settings.store import (
     update_known_marketplaces,
 )
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
+from a2c_smcp.computer.skills.manifest import (
+    PluginManifestError,
+    find_plugin_entry,
+    load_bundled_servers,
+    read_marketplace_manifest,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
@@ -362,6 +368,88 @@ def list_orphan_plugins(
     declared_ids = declared_installed_plugin_ids(declared)
     installed = load_installed_plugins(home=home, env=env)
     return [pid for pid in installed.get("plugins", {}) if pid not in declared_ids]
+
+
+def ledger_entry_materialized(records: object) -> bool:
+    """
+    某 pid 的账本记录是否仍有效物化：至少一条记录「``installPath`` 目录存在 ∧ bundled JSON 可解析」/ Live check。
+
+    v0.3.0 §5.8（安装路径非权威，boot MUST 重新校验）+ #125 任务 4：仅查目录存在会漏掉「目录在、bundled JSON
+    事后损坏」——stage 后 skill 亮而 :func:`~a2c_smcp.computer.settings.recovery.collect_enabled_bundled_servers`
+    WARN-skip，即 rust-sdk#102 同型半态。判据升级为可解析：:class:`PluginManifestError` → 该记录失效 →
+    触发重物化（catalog 完好则修复指回；不可修复则整体保持 ``installed_disabled``，skill 不单独亮）。
+
+    原 ``recovery._ledger_materialized`` 迁入公开化（#125 任务 2）：boot 恢复的重物化触发与
+    :func:`list_dangling_plugin_intents` 的悬挂判据共用本单点。
+    """
+    if not isinstance(records, list):
+        return False
+    for rec in records:
+        install_path = rec.get("installPath") if isinstance(rec, Mapping) else None
+        if not (isinstance(install_path, str) and install_path and Path(install_path).is_dir()):
+            continue
+        try:
+            load_bundled_servers(Path(install_path))
+        except PluginManifestError as e:
+            logger.warning("ledger record %s has corrupt bundled server JSON, treated as unmaterialized: %s", install_path, e)
+            continue
+        return True
+    return False
+
+
+# 悬挂意图 reason 分档（#125 任务 2；wire 值入 CLI JSON 输出，rust 镜像同字面）/ dangling reason tiers.
+DANGLING_MARKETPLACE_NOT_ADDED = "marketplace-not-added"
+DANGLING_CATALOG_MISSING = "catalog-missing"
+DANGLING_MANIFEST_UNREADABLE = "manifest-unreadable"
+DANGLING_ENTRY_MISSING = "entry-missing"
+
+
+def list_dangling_plugin_intents(
+    home: Path,
+    declared: Mapping[str, object],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """
+    列出悬挂安装意图：``installedPlugins`` 声明 ∧ 账本无有效物化 ∧ **静态不可达**（#125 任务 2）/ Dangling intents。
+
+    与 :func:`list_orphan_plugins` 互为反向：孤儿 = 账本 ∖ 意图（删派生缓存，恒安全）；悬挂 = 意图 ∖ 账本且
+    离线判定无法重物化（prune 删的是**权威意图**，须 confirm / 显式 flag——§4.8.4 删除走显式路径）。
+    「静态可达但未物化」**不**列入——下次 boot 由 recovery 重物化自愈，非 prune 对象。
+
+    纯本地零网络。reason 四档供 CLI 分档提示（``catalog-missing`` 可能只是临时断网后 clone 未建，裁量留给调用方）：
+
+    - :data:`DANGLING_MARKETPLACE_NOT_ADDED`：known_marketplaces 无记录（无自愈路径，最强 prune 信号）；
+    - :data:`DANGLING_CATALOG_MISSING`：known 在、catalog clone 缺失（boot/refresh 会重试 clone）;
+    - :data:`DANGLING_MANIFEST_UNREADABLE`：clone 在、marketplace.json 损坏/缺失（先 ``marketplace refresh``）;
+    - :data:`DANGLING_ENTRY_MISSING`：manifest 合法但无该 plugin entry（上游已移除才 prune）。
+
+    :return: ``[(pid, reason)]``，按 pid 排序稳定输出。
+    """
+    ledger = load_installed_plugins(home=home, env=env).get("plugins", {})
+    known = load_known_marketplaces(home=home, env=env).get("marketplaces", {})
+    out: list[tuple[str, str]] = []
+    for pid in sorted(declared_installed_plugin_ids(declared)):
+        if ledger_entry_materialized(ledger.get(pid)):
+            continue
+        plugin, _, marketplace = pid.partition("@")
+        record = known.get(marketplace)
+        if not isinstance(record, Mapping) or not isinstance(record.get("source"), Mapping):
+            out.append((pid, DANGLING_MARKETPLACE_NOT_ADDED))
+            continue
+        catalog_dir = marketplace_skill_dir(home, marketplace)
+        if not catalog_dir.is_dir():
+            out.append((pid, DANGLING_CATALOG_MISSING))
+            continue
+        try:
+            manifest = read_marketplace_manifest(catalog_dir)
+        except PluginManifestError:
+            out.append((pid, DANGLING_MANIFEST_UNREADABLE))
+            continue
+        if find_plugin_entry(manifest, plugin) is None:
+            out.append((pid, DANGLING_ENTRY_MISSING))
+        # else：静态可达（known ∧ clone ∧ entry）→ recoverable，boot 自愈，不列
+    return out
 
 
 async def gc_plugins(

@@ -42,7 +42,7 @@ from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.installer import materialize_plugin
-from a2c_smcp.computer.settings.reconciler import declared_installed_plugin_ids
+from a2c_smcp.computer.settings.reconciler import declared_installed_plugin_ids, ledger_entry_materialized
 from a2c_smcp.computer.settings.store import load_installed_plugins, load_known_marketplaces
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
@@ -112,17 +112,6 @@ def _split_pid(pid: str) -> tuple[str, str] | None:
     return plugin, marketplace
 
 
-def _ledger_materialized(records: Any) -> bool:
-    """某 pid 的账本记录是否仍有效物化（至少一条记录的 ``installPath`` 目录存在）/ Whether the ledger entry is live。"""
-    if not isinstance(records, list):
-        return False
-    for rec in records:
-        install_path = rec.get("installPath") if isinstance(rec, Mapping) else None
-        if isinstance(install_path, str) and install_path and Path(install_path).is_dir():
-            return True
-    return False
-
-
 async def recover_marketplace_skills(
     registry: SkillRegistry,
     home: Path,
@@ -173,7 +162,7 @@ async def recover_marketplace_skills(
 
     for marketplace, plugins in sorted(by_marketplace.items()):
         active_plugins = {p for p, is_active in plugins.items() if is_active}
-        needs_materialize = sorted(p for p in plugins if not _ledger_materialized(ledger.get(f"{p}@{marketplace}")))
+        needs_materialize = sorted(p for p in plugins if not ledger_entry_materialized(ledger.get(f"{p}@{marketplace}")))
         if not active_plugins and not needs_materialize:
             continue  # 全惰性且账本完好 → 零动作（installed_disabled 静止态）
 
