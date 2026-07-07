@@ -78,6 +78,9 @@ from a2c_smcp.computer.settings.reconciler import (
 )
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 # 退出码语义（§4.6）/ Exit code semantics（与 marketplace.py 对齐）。
 EXIT_OK = 0
@@ -322,9 +325,17 @@ def plugin_list(
 ) -> int:
     """列出全部 installed plugin（enabled 列呈现两态；install-only 的 ``installed_disabled`` 必须可见）/ List。
 
-    v0.3.0（#123）：默认即列全部已安装——``--available`` 保留为兼容 no-op（旧语义"含 disabled"已成默认）。
+    v0.3.0（#123）：默认即列全部已安装——``--available`` 保留为兼容 no-op（旧语义"含 disabled"已成默认），
+    **已弃用、计划移除**（#125 任务 3）：非 JSON 模式打弃用提示；JSON 模式走 logger（stdout 保持纯 JSON）。
     """
     from a2c_smcp.computer.settings.store import load_installed_plugins
+
+    if available:  # 弃用提示（deprecation notice）——行为不变，仅提示
+        msg = "--available is deprecated (listing all installed plugins is the default since v0.3.0) and will be removed"
+        if json_output:
+            logger.warning("plugin list: %s", msg)
+        else:
+            console.print(f"[yellow]⚠ {msg} / --available 已弃用（v0.3.0 起默认列全部已安装），将在后续版本移除[/yellow]")
 
     installed = load_installed_plugins(home=home, env=env).get("plugins", {})
     enabled_map = _enabled_plugins_view(home, env)

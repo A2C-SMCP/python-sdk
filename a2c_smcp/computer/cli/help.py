@@ -56,9 +56,9 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("plugin install <plugin>@<mp> [--version V] [--scope S]", "安装 plugin（外来 MCP 同名硬抛）/ install (name conflict aborts)"),
         ("plugin uninstall <plugin>@<mp> [--keep-servers]", "卸载 plugin / uninstall"),
         ("plugin enable|disable <plugin>@<mp>", "启用 / 禁用（整 plugin 上/下线）/ enable / disable (whole plugin)"),
-        ("plugin list [--available] [--json]", "列出 installed plugin / list plugins"),
+        ("plugin list [--json]", "列出全部 installed plugin（--available 已弃用）/ list plugins (--available deprecated)"),
         ("plugin info <plugin>@<mp> [--json]", "plugin 详情 / plugin detail"),
-        ("plugin gc", "清理孤儿 plugin / gc orphan plugins"),
+        ("plugin gc [--prune-dangling]", "清理孤儿 plugin + 诊断/prune 悬挂意图 / gc orphans + dangling intents"),
     ],
     "skill": [
         ("skill list [--source mp|mcp|user] [--json]", "跨源列出可见 SKILL / list skills"),
@@ -121,9 +121,9 @@ FLAGS: dict[tuple[str, str], list[str]] = {
     ("plugin", "uninstall"): ["--keep-servers", "--json"],
     ("plugin", "enable"): ["--json"],
     ("plugin", "disable"): ["--json"],
-    ("plugin", "list"): ["--available", "--json"],
+    ("plugin", "list"): ["--available", "--json"],  # --available 已弃用（兼容 no-op），保留补全至移除
     ("plugin", "info"): ["--json"],
-    ("plugin", "gc"): ["--json"],
+    ("plugin", "gc"): ["--prune-dangling", "--json"],
     ("settings", "show"): ["--scope", "--json"],
     ("settings", "get"): ["--scope", "--json"],
     ("settings", "set"): ["--scope", "--json"],

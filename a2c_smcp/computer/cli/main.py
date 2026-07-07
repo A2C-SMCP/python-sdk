@@ -513,7 +513,9 @@ def _plugin_disable(plugin_id: str = typer.Argument(...), json_output: bool = ty
 
 @plugin_app.command("list")
 def _plugin_list(
-    available: bool = typer.Option(False, "--available", help="含 disabled / include disabled"),
+    available: bool = typer.Option(
+        False, "--available", help="[deprecated] 已弃用：v0.3.0 起默认列全部已安装 / no-op, listing all is the default",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """列出 installed plugin / List installed plugins."""
