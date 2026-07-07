@@ -10,9 +10,10 @@
 设计依据 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §4.3 / §10.6（S16）。
 
 测试意图 / Test intentions（相对源 plugin → locate_plugin_root 无 git；monkeypatch stage；XDG 重定向隔离）:
-- install：happy（写账本 + 注册 bundled server）/ 外来同名硬抛退出码 1 + JSON error code / 非法 id 退出码 1；
+- install（v0.3.0 #123 不激活）：happy（写 installedPlugins 意图 + 账本；**不**挂 server、不 stage skills）/
+  外来同名硬抛退出码 1 + JSON error code / 非法 id 退出码 1；
 - enable/disable：**scope 从 ledger 读**（seed project scope → 写 project settings，不写 user）；
-- uninstall / list / info / gc 退出码与输出形态；
+- uninstall / list（默认列全部已安装，enabled 两态）/ info / gc（孤儿 = 账本 ∉ installedPlugins）退出码与输出形态；
 - ``_plugin_inject_inputs_cb``：读 ``mcp-servers/inputs.json`` → 前缀化 → 注入 fake comp 池（#69 Group A）。
 """
 
@@ -114,7 +115,10 @@ class _FakeMCP:
 
 # ── install ───────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_install_happy_writes_ledger_and_registers_servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_install_happy_writes_intent_and_ledger_without_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v0.3.0：install 只写 installedPlugins 意图 + 账本 → installed_disabled（无挂载、无 skills）。"""
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
     _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
     monkeypatch.setattr(_STAGE, _fake_stage())
@@ -122,11 +126,15 @@ async def test_install_happy_writes_ledger_and_registers_servers(tmp_path: Path,
 
     code = await plugin_cmd.plugin_install(
         reg, home, env, "audit@acme",
-        existing_server_names=mcp.existing_names, register_server=mcp.register, json_output=True,
+        existing_server_names=mcp.existing_names, json_output=True,
     )
     assert code == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "installed_disabled"
     assert "audit@acme" in load_installed_plugins(home=home, env=env)["plugins"]
-    assert [c.name for c in mcp.registered] == ["figma-mcp"]
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["audit@acme"]
+    assert "enabledPlugins" not in user  # 不激活、不写启用意图
+    assert len(reg) == 0  # skills 不投影
 
 
 @pytest.mark.asyncio
@@ -136,16 +144,19 @@ async def test_install_foreign_name_conflict_exit1_json_error(
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
     _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
     monkeypatch.setattr(_STAGE, _fake_stage())
-    # 外来同名（已存在且非自有）→ 硬抛、退出码 1、不写账本（§10.6）
+    # 外来同名（已存在且非自有）→ 硬抛、退出码 1、不写账本/意图（§10.6 + v0.3.0 原子回滚）
     mcp = _FakeMCP(existing={"figma-mcp"})
 
     code = await plugin_cmd.plugin_install(
         reg, home, env, "audit@acme",
-        existing_server_names=mcp.existing_names, register_server=mcp.register, json_output=True,
+        existing_server_names=mcp.existing_names, json_output=True,
     )
     assert code == 1
     assert json.loads(capsys.readouterr().out)["error"] == "mcp_server_name_conflict"
     assert "audit@acme" not in load_installed_plugins(home=home, env=env)["plugins"]
+    user_file = user_settings_path(env)
+    if user_file.exists():
+        assert "audit@acme" not in json.loads(user_file.read_text(encoding="utf-8")).get("installedPlugins", [])
 
 
 @pytest.mark.asyncio
@@ -214,37 +225,49 @@ def test_list_and_info(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
         {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x", "bundledMcpServers": ["figma-mcp"]}]}},
         home=home,
     )
+    # v0.3.0 缺省翻转：无 enabledPlugins 条目 = installed_disabled——默认列表仍可见，但 enabled=False
     assert plugin_cmd.plugin_list(home, env, json_output=True) == 0
     rows = json.loads(capsys.readouterr().out)
-    assert rows[0]["id"] == "audit@acme" and rows[0]["enabled"] is True
+    assert rows[0]["id"] == "audit@acme" and rows[0]["enabled"] is False
     assert plugin_cmd.plugin_info(home, env, "audit@acme", json_output=True) == 0
     assert plugin_cmd.plugin_info(home, env, "ghost@acme", json_output=True) == 1
 
 
-def test_list_hides_disabled_unless_available(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_list_shows_all_installed_with_enabled_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """v0.3.0：默认 list 列全部已安装（install-only 必须可见）；enabled 列仅显式 true 为 ✓。"""
     home, env = _home(tmp_path), _env(tmp_path)
-    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
-    # 显式 disable
+    save_installed_plugins(
+        {
+            "version": 1,
+            "plugins": {
+                "audit@acme": [{"scope": "user", "installPath": "/x"}],
+                "fmt@acme": [{"scope": "user", "installPath": "/y"}],
+            },
+        },
+        home=home,
+    )
     from a2c_smcp.computer.settings.scope import apply_write
     from a2c_smcp.computer.settings.scope import user_settings_path as _usp
     from a2c_smcp.computer.settings.store import atomic_write_json
 
-    atomic_write_json(_usp(env), apply_write({}, {"enabledPlugins": {"audit@acme": False}}))
+    atomic_write_json(_usp(env), apply_write({}, {"enabledPlugins": {"audit@acme": False, "fmt@acme": True}}))
     plugin_cmd.plugin_list(home, env, json_output=True)
-    assert json.loads(capsys.readouterr().out) == []  # 默认隐藏 disabled
+    rows = {r["id"]: r["enabled"] for r in json.loads(capsys.readouterr().out)}
+    assert rows == {"audit@acme": False, "fmt@acme": True}  # disabled 不再被默认隐藏
     plugin_cmd.plugin_list(home, env, available=True, json_output=True)
-    assert json.loads(capsys.readouterr().out)[0]["enabled"] is False  # --available 含 disabled
+    rows_avail = {r["id"]: r["enabled"] for r in json.loads(capsys.readouterr().out)}
+    assert rows_avail == rows  # --available 兼容 no-op（旧"含 disabled"已成默认）
 
 
 @pytest.mark.asyncio
 async def test_gc_no_orphans(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
-    # enabledPlugins 声明 audit@acme（在 user settings）→ 非孤儿；installed 仅 audit@acme → 无孤儿
+    # v0.3.0：孤儿判据 = 账本 ∉ installedPlugins → user settings 声明安装意图 audit@acme → 非孤儿
     from a2c_smcp.computer.settings.scope import apply_write
     from a2c_smcp.computer.settings.scope import user_settings_path as _usp
     from a2c_smcp.computer.settings.store import atomic_write_json
 
-    atomic_write_json(_usp(env), apply_write({}, {"enabledPlugins": {"audit@acme": True}}))
+    atomic_write_json(_usp(env), apply_write({}, {"installedPlugins": ["audit@acme"]}))
     save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
     assert await plugin_cmd.plugin_gc(reg, home, env, json_output=True) == 0
     assert json.loads(capsys.readouterr().out)["removed"] == []
@@ -301,16 +324,18 @@ class _ReplComp:
 
 
 @pytest.mark.asyncio
-async def test_repl_install_marks_dirty_and_fires_register(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_repl_install_is_lazy_no_mount_no_dirty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """v0.3.0：REPL install 不激活——不挂载 bundled server、skills 无变化不 mark dirty；账本 + 意图照写。"""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     home, reg = _home(tmp_path), SkillRegistry()
     _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
     monkeypatch.setattr(_STAGE, _fake_stage())
     comp = _ReplComp(home, reg)
     await plugin_cmd.repl_dispatch(comp, ["plugin", "install", "audit@acme"], session=None)
-    assert comp.dirty == 1  # 成功 → 触发去抖 emit
+    assert comp.dirty == 0  # skills 无变化 → 不触发去抖 emit
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"]
-    assert any(getattr(s, "name", None) == "figma-mcp" for s in comp._servers)  # register cb fired（实时挂载）
+    assert comp._servers == []  # 不实时挂载（enable 才点亮）
+    assert len(reg) == 0
 
 
 @pytest.mark.asyncio

@@ -12,8 +12,9 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §3.3/§
 
 测试意图 / Test intentions（不依赖 git——用相对路径 plugin（locate_plugin_root 无 git）+ monkeypatch
 ``stage_marketplace_skills`` + 注入回调记录 MCP 调用；settings 写经 ``XDG_CONFIG_HOME`` 重定向隔离）:
-- install：外来同名硬抛+原子（零变更）/ 自有同名幂等 / happy 写账本+注册 / 过闸后失败补偿回滚
-  （register 失败 / stage 失败两路）/ ledger-only（无注入）/ 未添加 mp / catalog 未 clone / 非法 id。
+- install（v0.3.0 #123 不激活）：happy 写 installedPlugins 意图 + 账本（不 stage、不挂 server）/ 外来同名硬抛+
+  原子（零变更）/ 自有同名幂等 / 重装失败不丢既有意图与账本 / 未添加 mp / catalog 未 clone / 非法 id。
+  install-only 目标行为与回滚细节另见 test_install_enable_separation.py。
 - uninstall：级联 stop+remove + 注销 + 删记录 + 删 installPath 树 / --keep-servers / 未安装 no-op。
 - disable：写 enabledPlugins=false + 摘 server + orphan skill（可复原）/ scope 路由 / 非法 scope。
 - enable：写 true + 复活 skill + 重挂 server / 未安装抛 / 外来同名冲突且 settings 未写（原子）。
@@ -136,33 +137,34 @@ class _FakeMCP:
 
 
 # ── install ──────────────────────────────────────────────────────────────────
-async def test_install_happy_writes_ledger_and_registers(tmp_path: Path, monkeypatch) -> None:
+async def test_install_happy_writes_intent_and_ledger(tmp_path: Path, monkeypatch) -> None:
+    """happy：记录字段完整（scope/version/commitSha/installPath/bundled）+ 意图落 user；不激活（v0.3.0）。"""
     home = _home(tmp_path)
+    env = _env(tmp_path)
     _setup_catalog(home, "acme", "audit", servers=["figma"])
     calls: list[dict] = []
     monkeypatch.setattr(_STAGE, _fake_stage(calls))
     mcp = _FakeMCP()
     reg = SkillRegistry()
 
-    record = await install_plugin(
-        "audit@acme", reg, home, env=_env(tmp_path),
-        existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
-    )
+    record = await install_plugin("audit@acme", reg, home, env=env, existing_server_names=mcp.existing_names)
 
     assert record["scope"] == "user"
     assert record["version"] == "1.2.0"  # entry.version 胜
     assert record["commitSha"] == "abc123"
     assert record["bundledMcpServers"] == ["figma"]
     assert record["installPath"].replace("\\", "/").endswith("marketplace/acme/plugins/audit")
-    assert mcp.registered == ["figma"]
-    assert calls[0]["plugin_filter"] == {"audit"} and calls[0]["refresh"] is False
-    assert reg.resolve("audit:lint") is not None
+    assert calls == []  # 不 stage（install ≠ activate）
+    assert reg.resolve("audit:lint") is None
     ipf = load_installed_plugins(home=home)["plugins"]
     assert ipf["audit@acme"][0]["bundledMcpServers"] == ["figma"]
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["audit@acme"]
 
 
 async def test_install_foreign_conflict_is_atomic(tmp_path: Path, monkeypatch) -> None:
     home = _home(tmp_path)
+    env = _env(tmp_path)
     _setup_catalog(home, "acme", "audit", servers=["figma"])
     calls: list[dict] = []
     monkeypatch.setattr(_STAGE, _fake_stage(calls))
@@ -170,15 +172,13 @@ async def test_install_foreign_conflict_is_atomic(tmp_path: Path, monkeypatch) -
     reg = SkillRegistry()
 
     with pytest.raises(MCPServerNameConflictError, match="figma"):
-        await install_plugin(
-            "audit@acme", reg, home, env=_env(tmp_path),
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
-        )
+        await install_plugin("audit@acme", reg, home, env=env, existing_server_names=mcp.existing_names)
 
-    assert mcp.registered == []  # 零注册
-    assert calls == []  # stage 未调用（冲突闸门在变更前）
+    assert calls == []  # stage 未调用
     assert reg.resolve("audit:lint") is None
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]  # 不写账本
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user.get("installedPlugins", []) == []  # 意图原子回滚（零变更）
 
 
 async def test_install_own_same_name_is_idempotent(tmp_path: Path, monkeypatch) -> None:
@@ -189,51 +189,9 @@ async def test_install_own_same_name_is_idempotent(tmp_path: Path, monkeypatch) 
     mcp = _FakeMCP(existing={"figma"})  # figma 存在但归本 plugin 自有 → 不冲突
     reg = SkillRegistry()
 
-    record = await install_plugin(
-        "audit@acme", reg, home, env=_env(tmp_path),
-        existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
-    )
+    record = await install_plugin("audit@acme", reg, home, env=_env(tmp_path), existing_server_names=mcp.existing_names)
 
-    assert mcp.registered == ["figma"]  # 幂等再注册（overwrite 自有）
-    assert record["bundledMcpServers"] == ["figma"]
-
-
-async def test_install_rolls_back_on_server_register_failure(tmp_path: Path, monkeypatch) -> None:
-    home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["alpha", "beta"])
-    calls: list[dict] = []
-    monkeypatch.setattr(_STAGE, _fake_stage(calls))
-    mcp = _FakeMCP()
-    mcp.fail_on = "beta"  # 第二个 server 注册失败
-    reg = SkillRegistry()
-
-    with pytest.raises(RuntimeError, match="beta"):
-        await install_plugin(
-            "audit@acme", reg, home, env=_env(tmp_path),
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
-        )
-
-    assert mcp.removed == ["alpha"]  # 已注册的 alpha 被回滚移除
-    assert calls == []  # stage 在 server 循环之后 → 未到达
-    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]  # 账本未写
-
-
-async def test_install_rolls_back_on_stage_failure(tmp_path: Path, monkeypatch) -> None:
-    home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"])
-    monkeypatch.setattr(_STAGE, _fake_stage([], fail=True))  # stage 先注册 skill 再抛
-    mcp = _FakeMCP()
-    reg = SkillRegistry()
-
-    with pytest.raises(RuntimeError, match="stage boom"):
-        await install_plugin(
-            "audit@acme", reg, home, env=_env(tmp_path),
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
-        )
-
-    assert mcp.registered == ["figma"] and mcp.removed == ["figma"]  # 注册后回滚移除
-    assert reg.resolve("audit:lint") is None  # 已注册 skill 回滚注销
-    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+    assert record["bundledMcpServers"] == ["figma"]  # 幂等重物化（自有同名放行）
 
 
 async def test_install_ledger_only_without_injection(tmp_path: Path, monkeypatch) -> None:
@@ -242,7 +200,7 @@ async def test_install_ledger_only_without_injection(tmp_path: Path, monkeypatch
     monkeypatch.setattr(_STAGE, _fake_stage([]))
     reg = SkillRegistry()
 
-    record = await install_plugin("audit@acme", reg, home, env=_env(tmp_path))  # 无注入
+    record = await install_plugin("audit@acme", reg, home, env=_env(tmp_path))  # 无注入 → 跳过冲突预检
 
     assert record["bundledMcpServers"] == ["figma"]  # 解析+记录（即使未注册 server）
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"]
@@ -265,52 +223,42 @@ async def test_install_catalog_not_cloned_raises(tmp_path: Path) -> None:
         await install_plugin("audit@acme", SkillRegistry(), home)
 
 
-async def test_install_register_without_existing_names_raises(tmp_path: Path, monkeypatch) -> None:
-    """护栏：给了 register_server 但缺 existing_server_names → 抛（防冲突闸门被静默旁路）。"""
-    home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"])
-    monkeypatch.setattr(_STAGE, _fake_stage([]))
-    mcp = _FakeMCP()
-
-    with pytest.raises(PluginInstallError, match="existing_server_names is required"):
-        await install_plugin("audit@acme", SkillRegistry(), home, env=_env(tmp_path), register_server=mcp.register)
-
-
 async def test_install_reinstall_failure_preserves_existing(tmp_path: Path, monkeypatch) -> None:
-    """精确回滚：重装中途失败时，不误删此前已有的 skill / 不误摘自有 server（仅撤销本次新增）。"""
+    """重装失败原子性：物化中途失败时，既有安装意图 / 账本记录 / 活跃 skill 全不丢（仅撤销本次新增）。"""
     home = _home(tmp_path)
+    env = _env(tmp_path)
     mcp = _FakeMCP()
     reg = SkillRegistry()
-    await _install(home, tmp_path, monkeypatch, mcp, reg, servers=["figma"])  # 首装 figma + audit:lint
+    await _install(home, tmp_path, monkeypatch, mcp, reg, servers=["figma"])  # 首装+enable：figma + audit:lint 活跃
     assert reg.resolve("audit:lint") is not None and mcp.registered == ["figma"]
 
-    # 重装：plugin 新增一个会注册失败的 server（zeta）；owned={figma}、既有 skill audit:lint 活跃
+    # 重装：plugin 新增一个畸形 bundled JSON（zeta）→ 物化失败；意图/账本/live 态须保持首装状态
     plugin_root = marketplace_skill_dir(home, "acme") / "plugins" / "audit"
-    _write_json(plugin_root / "mcp-servers" / "zeta.json", _stdio("zeta"))
+    (plugin_root / "mcp-servers" / "zeta.json").write_text("{not json", encoding="utf-8")
     mcp.registered.clear()
     mcp.removed.clear()
-    mcp.fail_on = "zeta"
 
-    with pytest.raises(RuntimeError, match="zeta"):
-        await install_plugin(
-            "audit@acme", reg, home, env=_env(tmp_path),
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
-        )
+    with pytest.raises(Exception, match="zeta"):
+        await install_plugin("audit@acme", reg, home, env=env, existing_server_names=mcp.existing_names)
 
     assert reg.resolve("audit:lint") is not None  # 既有 skill 未被误注销
-    assert mcp.removed == []  # 自有 figma 未被误摘（zeta 注册失败本就没进）
+    assert mcp.removed == []  # 自有 figma 未被误摘
     assert "figma" in mcp.existing  # figma 仍挂在 manager
     rec = load_installed_plugins(home=home)["plugins"]["audit@acme"][0]
     assert rec["bundledMcpServers"] == ["figma"]  # 账本仍为首装记录（本次失败未改写）
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["audit@acme"]  # 重装失败不误删既有意图（was_present → 不回滚）
 
 
 # ── uninstall ─────────────────────────────────────────────────────────────────
 async def _install(home: Path, tmp_path: Path, monkeypatch, mcp: _FakeMCP, reg: SkillRegistry, *, servers: list[str]) -> Path:
-    """安装一个 plugin（happy）作为 uninstall/disable/enable 的前置；返回 installPath。"""
+    """安装 + 启用一个 plugin 作为 uninstall/disable/enable 的活跃前置（v0.3.0 install 不激活，须显式 enable）。"""
     install_path = _setup_catalog(home, "acme", "audit", servers=servers)
     monkeypatch.setattr(_STAGE, _fake_stage([]))
-    await install_plugin(
-        "audit@acme", reg, home, env=_env(tmp_path),
+    env = _env(tmp_path)
+    await install_plugin("audit@acme", reg, home, env=env, existing_server_names=mcp.existing_names)
+    await enable_plugin(
+        "audit@acme", reg, home, env=env,
         existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
     )
     return install_path
@@ -318,29 +266,34 @@ async def _install(home: Path, tmp_path: Path, monkeypatch, mcp: _FakeMCP, reg: 
 
 async def test_uninstall_default_cascades(tmp_path: Path, monkeypatch) -> None:
     home = _home(tmp_path)
+    env = _env(tmp_path)
     mcp = _FakeMCP()
     reg = SkillRegistry()
     install_path = await _install(home, tmp_path, monkeypatch, mcp, reg, servers=["figma"])
     assert install_path.exists()
     mcp.removed.clear()
 
-    ok = await uninstall_plugin("audit@acme", reg, home, remove_server=mcp.remove)
+    ok = await uninstall_plugin("audit@acme", reg, home, env=env, remove_server=mcp.remove)
 
     assert ok is True
     assert mcp.removed == ["figma"]  # 级联 stop+remove
     assert reg.resolve("audit:lint") is None  # skills 注销
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]  # 记录删除
     assert not install_path.exists()  # installPath 树清除
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == []  # v0.3.0：安装意图删除（回 available）
+    assert "audit@acme" not in user.get("enabledPlugins", {})  # enabledPlugins 条目清除
 
 
 async def test_uninstall_keep_servers_skips_teardown(tmp_path: Path, monkeypatch) -> None:
     home = _home(tmp_path)
+    env = _env(tmp_path)
     mcp = _FakeMCP()
     reg = SkillRegistry()
     await _install(home, tmp_path, monkeypatch, mcp, reg, servers=["figma"])
     mcp.removed.clear()
 
-    ok = await uninstall_plugin("audit@acme", reg, home, keep_servers=True, remove_server=mcp.remove)
+    ok = await uninstall_plugin("audit@acme", reg, home, env=env, keep_servers=True, remove_server=mcp.remove)
 
     assert ok is True
     assert mcp.removed == []  # 保留 server

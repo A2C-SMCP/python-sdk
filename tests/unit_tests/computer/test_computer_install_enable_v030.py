@@ -58,7 +58,8 @@ def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), skills: Sequence[
     plugin_root = catalog / "plugins" / "audit"
     plugin_root.mkdir(parents=True, exist_ok=True)
     for sname in servers:
-        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", {"name": sname, "type": "stdio", "server_parameters": {"command": "node"}})
+        server_def = {"name": sname, "type": "stdio", "server_parameters": {"command": "node"}}
+        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", server_def)
     for sk in skills:
         p = plugin_root / "skills" / sk / "SKILL.md"
         p.parent.mkdir(parents=True, exist_ok=True)

@@ -463,7 +463,11 @@ async def install_plugin(
                 logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, e)
         raise
 
-    logger.info("installed plugin %r (servers=%s; installed_disabled, run 'plugin enable' to activate)", plugin_id, record.get("bundledMcpServers") or "none")
+    logger.info(
+        "installed plugin %r (servers=%s; installed_disabled, run 'plugin enable' to activate)",
+        plugin_id,
+        record.get("bundledMcpServers") or "none",
+    )
     return record
 
 

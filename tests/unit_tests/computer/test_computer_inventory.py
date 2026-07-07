@@ -5,7 +5,7 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-Computer 级 MCP server 归属 + 活跃 inventory 查询测试（#121，协议 v0.2.3 §4.8；对齐 rust-sdk #97）。
+Computer 级 MCP server 归属 + 活跃 inventory 查询测试（#121，协议 §4.8；#123 起 enabled 门控 = installed ∧ true；对齐 rust-sdk #97）。
 
 测试意图 / Test intentions（hermetic：预置双账本 + catalog 树，零 git 零网络；fixture 与
 ``test_computer_governance_recovery.py`` 同构）:
@@ -152,12 +152,15 @@ async def test_inventory_excludes_uninstalled_plugin_server(tmp_path: Path, monk
     """卸载（账本移除该 plugin 记录）后以同一 home 重建 Computer → bundled server 不再出现。"""
     _isolate_declared_env(tmp_path, monkeypatch)
     home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
+    # 未 boot（无迁移）→ 显式 seed v0.3.0 双意图（installed ∧ enabled）。
+    _write_json(tmp_path / "cfg" / "a2c" / "settings.json", {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
 
     # 卸载前：inventory 含 plugin bundled server（未 boot 亦可查询——纯函数投影）。
     comp_a = Computer(name="a", skill_home=home)
     assert any(e.name == "audit-mcp" for e in comp_a.list_mcp_servers_with_metadata())
 
-    # 卸载效果 = installed_plugins.json 移除记录（uninstall 的账本落点）。
+    # 卸载的账本落点 = installed_plugins.json 移除记录（v0.3.0 意图条目亦会删；此处仅移账本即须熄灯——
+    # 无记录 = 无 config 可投影）。
     save_installed_plugins({"version": 1, "plugins": {}}, home=home)
 
     comp_b = Computer(name="b", skill_home=home)
@@ -221,7 +224,7 @@ async def test_inventory_marks_remounted_bundled_server_as_plugin(tmp_path: Path
         report = await comp.reconcile_governance(
             existing_server_names=lambda: {c.name for c in comp.mcp_servers},
             register_server=register,
-            declared={},
+            declared={"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}},
         )
         assert report.remounted_servers == ["audit-mcp"]
 
@@ -235,6 +238,8 @@ async def test_inventory_passes_through_bundled_disabled_flag(tmp_path: Path, mo
     """bundled server 定义自带 ``disabled=true`` → 源二（未物化补入）disabled 旗透传。"""
     _isolate_declared_env(tmp_path, monkeypatch)
     home, _ = _seed_home(tmp_path, disabled_servers=["audit-mcp"])
+    # 未 boot（无迁移）→ 显式 seed v0.3.0 双意图。
+    _write_json(tmp_path / "cfg" / "a2c" / "settings.json", {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
 
     comp = Computer(name="t", skill_home=home)
     entry = next(e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp")

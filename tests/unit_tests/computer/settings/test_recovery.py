@@ -5,13 +5,15 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-治理启动恢复单元测试（#117，协议 v0.2.3 §4.8）/ Governance boot-recovery unit tests。
+治理启动恢复单元测试（#117；#123 起对齐协议 v0.3.0 §4.8）/ Governance boot-recovery unit tests。
 
 镜像 rust-sdk recovery.rs 的 hermetic 套件（无 git、无网络：预置 catalog clone 树 + ``refresh=False``
-就地复用）。测试意图 / Test intentions:
-- ``recover_marketplace_skills``：enabled installed plugin 的 bundled SKILL 恢复 + 幂等；
-  ``enabledPlugins=false`` 跳过不复活（disable 负向）；账本无记录不恢复（uninstall 负向）；
+就地复用）。测试意图 / Test intentions（v0.3.0：安装集 = declared ``installedPlugins``；活跃 =
+installed ∧ ``enabledPlugins[pid] is True``，缺省翻转）:
+- ``recover_marketplace_skills``：installed ∧ enabled plugin 的 bundled SKILL 恢复 + 幂等；
+  absent/``false`` 惰性不复活（缺省翻转 + disable 负向）；意图无条目不恢复（uninstall 负向，账本仅派生缓存）；
   known_marketplaces 缺记录 / clone 缺失且源不可达 → ``failed_marketplaces`` 降级不抛；空 home noop。
+  重物化（账本删除重建）见 test_install_enable_separation.py。
 - ``collect_enabled_bundled_servers``：含归属（plugin/marketplace）纯函数输出（§4.8.3）；
   跨 plugin 同名 server 首见去重；installPath 缺失 / JSON 损坏 → WARN 跳过不阻断。
 """
@@ -116,21 +118,22 @@ def _record(plugin_root: Path, *, scope: str = "user", servers: Sequence[str] = 
 # ── recover_marketplace_skills ────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_recover_restages_enabled_installed_plugin_and_idempotent(tmp_path: Path) -> None:
-    """enabled（缺省即启用）installed plugin → bundled SKILL 恢复进 Registry；二次调用幂等。"""
+    """installed ∧ enabled=true plugin → bundled SKILL 恢复进 Registry；二次调用幂等。"""
     home = _home(tmp_path)
     root = _setup_catalog(home, "acme", "audit", skills=["lint"])
     _seed_installed(home, {"audit@acme": [_record(root)]})
     reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
 
-    report = await recover_marketplace_skills(reg, home, {"enabledPlugins": {}}, env=_env(tmp_path))
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
 
     assert "audit@acme" in report.restored_plugins
     assert "audit:lint" in report.restored_skills
     assert reg.resolve("audit:lint") is not None
     assert report.failed_marketplaces == [] and report.skipped_disabled == []
 
-    # 幂等：显式 true 亦启用；registry 不重复注册
-    report2 = await recover_marketplace_skills(reg, home, {"enabledPlugins": {"audit@acme": True}}, env=_env(tmp_path))
+    # 幂等：registry 不重复注册
+    report2 = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
     assert "audit:lint" in report2.restored_skills
     assert len(reg) == 1
 
@@ -142,7 +145,7 @@ async def test_recover_skips_disabled_plugin_and_collect_skips(tmp_path: Path) -
     root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
     _seed_installed(home, {"audit@acme": [_record(root, servers=["figma"])]})
     reg = SkillRegistry()
-    declared = {"enabledPlugins": {"audit@acme": False}}
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": False}}
 
     report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
 
@@ -153,13 +156,14 @@ async def test_recover_skips_disabled_plugin_and_collect_skips(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_recover_without_ledger_record_is_noop(tmp_path: Path) -> None:
-    """账本无记录（uninstall 后）→ 即使 catalog 树仍在也不恢复（uninstall 负向；ledger 驱动）。"""
+async def test_recover_without_intent_is_noop(tmp_path: Path) -> None:
+    """安装意图无条目（uninstall 后）→ 即使 catalog 树 / 账本仍在也不恢复（意图是唯一权威，账本仅派生缓存）。"""
     home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", skills=["lint"])  # 树在、账本空
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])  # 树在
+    _seed_installed(home, {"audit@acme": [_record(root)]})  # 账本残留（未 gc）
     reg = SkillRegistry()
 
-    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+    report = await recover_marketplace_skills(reg, home, {"enabledPlugins": {"audit@acme": True}}, env=_env(tmp_path))
 
     assert report.restored_plugins == [] and report.restored_skills == []
     assert len(reg) == 0
@@ -172,8 +176,9 @@ async def test_recover_degrades_when_marketplace_record_absent(tmp_path: Path) -
     root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
     _seed_installed(home, {"audit@acme": [_record(root)]})
     reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
 
-    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
 
     assert report.failed_marketplaces == ["acme"]
     assert report.restored_skills == []
@@ -189,8 +194,9 @@ async def test_recover_degrades_when_clone_missing_and_unreachable(tmp_path: Pat
     )
     _seed_installed(home, {"audit@acme": [_record(tmp_path / "gone")]})
     reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
 
-    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
 
     assert report.failed_marketplaces == ["acme"]
     assert report.restored_skills == []
@@ -219,11 +225,12 @@ async def test_recover_revives_orphaned_skill(tmp_path: Path) -> None:
     root = _setup_catalog(home, "acme", "audit", skills=["lint"])
     _seed_installed(home, {"audit@acme": [_record(root)]})
     reg = SkillRegistry()
-    await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+    await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
     assert reg.mark_orphan("audit:lint") is True
     assert reg.resolve("audit:lint") is None  # 孤儿不可解析
 
-    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
 
     assert "audit:lint" in report.restored_skills
     assert reg.resolve("audit:lint") is not None  # 复活
@@ -245,13 +252,18 @@ async def test_recover_empty_home_is_noop(tmp_path: Path) -> None:
 
 
 # ── collect_enabled_bundled_servers ──────────────────────────────────────────
+def _declared_enabled(*pids: str) -> dict:
+    """installed ∧ enabled=true 的 declared 视图速造（v0.3.0 门控两键）。"""
+    return {"installedPlugins": list(pids), "enabledPlugins": {pid: True for pid in pids}}
+
+
 def test_collect_returns_enabled_bundled_servers_with_ownership(tmp_path: Path) -> None:
-    """enabled plugin 的 bundled server 可查询，且归属（plugin/marketplace/installPath）为纯函数输出（§4.8.3）。"""
+    """installed ∧ enabled plugin 的 bundled server 可查询，且归属（plugin/marketplace/installPath）为纯函数输出（§4.8.3）。"""
     home = _home(tmp_path)
     root = _setup_catalog(home, "acme", "audit", servers=["figma", "blender"])
     _seed_installed(home, {"audit@acme": [_record(root, servers=["figma", "blender"])]})
 
-    records = collect_enabled_bundled_servers(home, {}, env=_env(tmp_path))
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme"), env=_env(tmp_path))
 
     assert {r.config.name for r in records} == {"figma", "blender"}
     for r in records:
@@ -270,7 +282,7 @@ def test_collect_dedupes_same_server_name_across_plugins(tmp_path: Path) -> None
         {"audit@acme": [_record(root_a, servers=["shared"])], "fmt@beta": [_record(root_b, servers=["shared"])]},
     )
 
-    records = collect_enabled_bundled_servers(home, {}, env=_env(tmp_path))
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme", "fmt@beta"), env=_env(tmp_path))
 
     assert len(records) == 1
     assert records[0].config.name == "shared"
@@ -295,7 +307,7 @@ def test_collect_enumerates_multi_scope_records_with_dedup(tmp_path: Path) -> No
         },
     )
 
-    records = collect_enabled_bundled_servers(home, {}, env=_env(tmp_path))
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme"), env=_env(tmp_path))
 
     assert {r.config.name for r in records} == {"figma", "extra"}
     figma = next(r for r in records if r.config.name == "figma")
@@ -321,6 +333,8 @@ def test_collect_skips_missing_install_path_and_corrupt_json(tmp_path: Path) -> 
         },
     )
 
-    records = collect_enabled_bundled_servers(home, {}, env=_env(tmp_path))
+    records = collect_enabled_bundled_servers(
+        home, _declared_enabled("audit@acme", "fmt@beta", "ghost@acme"), env=_env(tmp_path),
+    )
 
     assert {r.config.name for r in records} == {"figma"}

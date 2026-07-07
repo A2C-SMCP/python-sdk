@@ -13,10 +13,11 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1/§
 测试意图 / Test intentions（不依赖 git——monkeypatch ``stage_marketplace_skills``，只验 reconciler 编排决策）:
 - 四分支：missing→clone(refresh=False) / sourceChanged→wipe+reclone / autoUpdate→pull(refresh=True) /
   orphan(materialized∖declared)→**完全不动**（stage 不被调用、物化记录不变）；附 up_to_date / failed。
-- plugin_filter 由 ``enabledPlugins`` 推导（仅 ``true`` 且属本 marketplace 的 plugin）。
-- 声明视图提取过滤非法 marketplace 名 / 非对象条目 / 非法 plugin key。
+- plugin_filter = installed ∧ ``enabledPlugins[id] is True``（v0.3.0 §4.8.1，#123）且属本 marketplace。
+- 声明视图提取过滤非法 marketplace 名 / 非对象条目 / 非法 pid 条目。
 - 孤儿清理：list/prune marketplace（clone 树 + 外部 plugin 树 + 物化条目 + Registry SKILL）；
-  list/gc plugin（installPath + 物化条目 + Registry SKILL + bundled MCP 回调）；installPath 越界守卫。
+  list/gc plugin（孤儿 = 账本 pid ∉ ``installedPlugins``；installPath + 物化条目 + Registry SKILL +
+  bundled MCP 回调）；installPath 越界守卫。
 """
 
 from collections.abc import Awaitable, Callable, Mapping
@@ -25,8 +26,8 @@ from typing import Any
 
 from a2c_smcp.computer.settings.reconciler import (
     ReconcileReport,
+    declared_installed_plugin_ids,
     declared_marketplace_names,
-    declared_plugin_ids,
     gc_plugins,
     list_orphan_marketplaces,
     list_orphan_plugins,
@@ -117,7 +118,11 @@ async def test_reconcile_missing_clones(tmp_path: Path, monkeypatch) -> None:
     home = _home(tmp_path)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(_RECONCILER, _fake_stage(calls, skills=["audit:lint"]))
-    declared = {"extraKnownMarketplaces": {"acme": {"source": _SRC_A}}, "enabledPlugins": {"audit@acme": True}}
+    declared = {
+        "extraKnownMarketplaces": {"acme": {"source": _SRC_A}},
+        "installedPlugins": ["audit@acme"],
+        "enabledPlugins": {"audit@acme": True},
+    }
 
     report = await reconcile(SkillRegistry(), home, declared)
 
@@ -224,16 +229,19 @@ async def test_reconcile_failed_when_clone_absent_after_stage(tmp_path: Path, mo
     assert report.installed == [] and report.updated == []
 
 
-async def test_reconcile_plugin_filter_only_true_and_same_marketplace(tmp_path: Path, monkeypatch) -> None:
+async def test_reconcile_plugin_filter_installed_true_and_same_marketplace(tmp_path: Path, monkeypatch) -> None:
+    """plugin_filter = installed ∧ true ∧ 本 marketplace（v0.3.0：enabled 但未安装的 ghost 不入）。"""
     home = _home(tmp_path)
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(_RECONCILER, _fake_stage(calls))
     declared = {
         "extraKnownMarketplaces": {"acme": {"source": _SRC_A}},
+        "installedPlugins": ["audit@acme", "fmt@acme", "x@other"],
         "enabledPlugins": {
-            "audit@acme": True,  # 启用、本 mp → 入
-            "fmt@acme": False,  # 禁用 → 不入
-            "x@other": True,  # 启用但别的 mp → 不入
+            "audit@acme": True,  # installed ∧ 启用、本 mp → 入
+            "fmt@acme": False,  # installed 但禁用 → 不入
+            "x@other": True,  # installed ∧ 启用但别的 mp → 不入
+            "ghost@acme": True,  # 启用但**未安装** → 不入（活跃集 = installed ∧ enabled）
             "bad-key-no-at": True,  # 非法 key → 忽略
         },
     }
@@ -255,15 +263,16 @@ def test_declared_marketplace_names_filters_invalid() -> None:
     assert declared_marketplace_names(declared) == {"good-mp"}
 
 
-def test_declared_plugin_ids_filters_invalid() -> None:
-    declared = {"enabledPlugins": {"audit@acme": True, "disabled@acme": False, "no-at-sign": True}}
-    # 含 false（声明禁用，仍是"已声明"）；滤掉非法 key
-    assert declared_plugin_ids(declared) == {"audit@acme", "disabled@acme"}
+def test_declared_installed_plugin_ids_filters_invalid() -> None:
+    declared = {"installedPlugins": ["audit@acme", "disabled@acme", "no-at-sign", 42]}
+    # 安装意图集与 enablement 正交（禁用项仍"已安装"）；滤掉非法形态 / 非字符串条目
+    assert declared_installed_plugin_ids(declared) == {"audit@acme", "disabled@acme"}
 
 
 def test_declared_helpers_handle_missing_keys() -> None:
     assert declared_marketplace_names({}) == set()
-    assert declared_plugin_ids({}) == set()
+    assert declared_installed_plugin_ids({}) == set()
+    assert declared_installed_plugin_ids({"installedPlugins": "not-a-list"}) == set()
 
 
 # ── marketplace prune ───────────────────────────────────────────────────────
@@ -322,7 +331,8 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     reg = SkillRegistry()
     _reg_skill(reg, "audit:lint", "acme", audit_path)
     _reg_skill(reg, "keep:do", "acme", keep_path)
-    declared = {"enabledPlugins": {"keep@acme": True}}  # audit 不再声明 → 孤儿
+    # v0.3.0：孤儿 = 账本 pid ∉ installedPlugins（enablement 正交、不参与判定）→ audit 不在安装意图 → 孤儿
+    declared = {"installedPlugins": ["keep@acme"], "enabledPlugins": {"keep@acme": True}}
 
     assert list_orphan_plugins(home, declared) == ["audit@acme"]
 
