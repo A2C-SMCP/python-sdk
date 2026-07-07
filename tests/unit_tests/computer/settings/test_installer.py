@@ -302,7 +302,9 @@ async def test_uninstall_keep_servers_skips_teardown(tmp_path: Path, monkeypatch
 
 
 async def test_uninstall_not_installed_is_noop(tmp_path: Path) -> None:
-    assert await uninstall_plugin("ghost@acme", SkillRegistry(), _home(tmp_path)) is False
+    env = _env(tmp_path)
+    assert await uninstall_plugin("ghost@acme", SkillRegistry(), _home(tmp_path), env=env) is False
+    assert not user_settings_path(env).exists()  # 真 no-op：零写盘（迁移不被 no-op 路径触发，审查 N1）
 
 
 # ── disable ───────────────────────────────────────────────────────────────────

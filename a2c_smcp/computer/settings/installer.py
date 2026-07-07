@@ -431,13 +431,18 @@ async def install_plugin(
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
 
-    # 1：cheap 预检（不写任何状态；深校验交给 materialize）
+    # 1：cheap 预检（不写任何状态；深校验交给 materialize）——保持 fail-fast 零副作用
     _resolve_marketplace_source(marketplace, home, env)
     catalog_dir = marketplace_skill_dir(home, marketplace)
     if not catalog_dir.is_dir():
         raise PluginInstallError(f"marketplace {marketplace!r} catalog not cloned at {catalog_dir} (run 'marketplace add/refresh' first)")
     if find_plugin_entry(read_marketplace_manifest(catalog_dir), plugin) is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
+
+    # 1.5：预检过后、写意图键之前，先跑一次性迁移（幂等、标记键短路）。install 会写 installedPlugins 键——
+    #      若迁移尚未发生（如升级后未经 boot 的 headless CLI install），先写键会把迁移标记误置为"已迁移"，
+    #      永久丢弃 v0.2.x 存量活跃态（隔离审查 🔴#2 + N1：置于预检后保 fail-fast 无副作用）。
+    migrate_legacy_installs(home, env=env)
 
     # 2：config-first 写全局安装意图（快照写前状态供原子回滚：重装时原已在 → 失败不误删）
     was_present = _write_installed_plugin(plugin_id, True, env)
@@ -510,6 +515,10 @@ async def uninstall_plugin(
     if not targeted:
         logger.info("uninstall: plugin %r has no record in scope %r (no-op)", plugin_id, scope)
         return False
+
+    # no-op 早返回之后、任何变更之前，先跑一次性迁移（幂等）：uninstall 也写 installedPlugins 键
+    # （同 install 的标记误置风险，防迁移被抢跑关闭；置于此处保「未安装 = 真 no-op 零写盘」，审查 N1）。
+    migrate_legacy_installs(home, env=env)
 
     bundled: list[str] = []
     for rec in targeted:

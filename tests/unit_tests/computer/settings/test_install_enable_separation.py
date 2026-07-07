@@ -487,6 +487,88 @@ async def test_migrate_writes_marker_even_with_empty_ledger_and_idempotent(tmp_p
     assert migrate_legacy_installs(home, env=env) == []  # 幂等
 
 
+# ── 隔离审查回归（fix-review：2🔴 + 覆盖空洞）─────────────────────────────────
+@pytest.mark.asyncio
+async def test_recover_rematerialize_failure_keeps_installed_disabled(tmp_path: Path) -> None:
+    """🔴#1：enabled + 账本缺 + 物化失败（bundled JSON 畸形）→ skills **不**进投影（无 rust-sdk#102 半态）、不抛。"""
+    home = _home(tmp_path)
+    plugin_root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    (plugin_root / "mcp-servers").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
+    reg = SkillRegistry()
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.rematerialized == []
+    assert report.restored_skills == [] and report.restored_plugins == []  # 整体保持 installed_disabled
+    assert reg.resolve("audit:lint") is None  # skill 不亮（半态防御）
+    assert _PID not in load_installed_plugins(home=home)["plugins"]  # 账本未重建
+
+
+@pytest.mark.asyncio
+async def test_headless_install_before_first_boot_preserves_legacy_actives(tmp_path: Path, monkeypatch) -> None:
+    """🔴#2：升级后未经 boot 的 headless install 不得抢写迁移标记——install 前置迁移保住 v0.2.x 存量活跃态。"""
+    monkeypatch.chdir(tmp_path)
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"legacy@acme": [_record(root)]})  # v0.2.x 存量（settings 全无）
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    await install_plugin(_PID, SkillRegistry(), home, env=env)
+
+    settings = _read_user_settings(env)
+    assert settings["installedPlugins"] == ["legacy@acme", _PID]  # 迁移先行，存量未丢
+    assert settings["enabledPlugins"] == {"legacy@acme": True}  # 存量保活跃；新装不写 enabled
+
+
+@pytest.mark.asyncio
+async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path, monkeypatch) -> None:
+    """🟡#5：指定 scope 卸载且其余 scope 记录仍在 → installedPlugins 与 enabledPlugins 条目保留（§2.4）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {_PID: [_record(root), {**_record(root), "scope": "project", "projectPath": str(workdir)}]},
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env, scope="project", keep_servers=True)
+
+    assert ok is True
+    remaining = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [r["scope"] for r in remaining] == ["user"]  # 仅删 project 记录
+    settings = _read_user_settings(env)
+    assert settings["installedPlugins"] == [_PID]  # 安装事实未消失 → 意图保留
+    assert settings["enabledPlugins"][_PID] is True  # enabled 条目保留
+
+
+@pytest.mark.asyncio
+async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monkeypatch) -> None:
+    """🟡#6：enable 失败且原值为显式 true（重复 enable / 另一 scope 已启用）→ 恢复 true，不误删。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["alpha", "beta"], skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root, servers=["alpha", "beta"])]})
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+    mcp = _FakeMCP()
+    mcp.fail_on = "beta"
+
+    with pytest.raises(RuntimeError, match="beta"):
+        await enable_plugin(
+            _PID, SkillRegistry(), home, env=env,
+            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
+        )
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
 # ── schema：installedPlugins 字段校验 ─────────────────────────────────────────
 def test_schema_validates_installed_plugins_entries() -> None:
     """installedPlugins：数组元素须 ``<plugin>@<marketplace>`` 形态；非法条目过滤 + 记错（容错风格）。"""

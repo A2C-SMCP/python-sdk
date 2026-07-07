@@ -142,6 +142,10 @@ async def recover_marketplace_skills(
     降级判定与 rust 同构：stage 内部吞错，事后 clone 树仍缺 → 该 marketplace 入 ``failed_marketplaces``；
     known_marketplaces 缺记录 → 同样降级。**绝不抛、不阻断其余**。
 
+    已知限制（文档化，rust 同构）：重物化无法从无 scope 的 ``installedPlugins`` 还原原安装 scope /
+    ``projectPath``——重建记录**归一为 user scope**（多 scope 记录塌缩单条）；此后 enable/disable 从账本
+    读 scope 会落 user 层。scope 精确复原需 committed 记录承载，属可选 pin-lock 扩展（§4.9.2）范畴。
+
     :param registry: 目标 :class:`SkillRegistry`（恢复注册进当前活跃集）。
     :param home: SKILL Home 绝对根。
     :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控）。
@@ -183,33 +187,46 @@ async def recover_marketplace_skills(
             )
             report.failed_marketplaces.append(marketplace)
             continue
-        names = await stage_marketplace_skills(
-            marketplace,
-            source,
-            registry,
-            home,
-            plugin_filter=active_plugins,
-            refresh=False,  # 离线优先：clone 在则零 git / offline-first
-            timeout=timeout,
-            env=env,
-        )
-        # 降级代理判定（rust 同构）：stage 失败降级不抛；事后 clone 树仍缺 = 源不可达且无本地物化。
+
+        # ① 保证 catalog 物化（空 filter = 仅 clone、零 SKILL 注册）——重物化与 skills stage 的共同前置。
+        #    降级代理判定（rust 同构）：stage 失败降级不抛；事后 clone 树仍缺 = 源不可达且无本地物化。
         if not marketplace_skill_dir(home, marketplace).is_dir():
-            logger.warning("governance recovery: marketplace %r clone missing and rebuild failed, degraded", marketplace)
-            report.failed_marketplaces.append(marketplace)
-            continue
-        # 重物化：意图有、账本缺（或 installPath 全失效）→ 由 (marketplace, plugin) 纯函数重建账本
-        # （§4.9 删除无损）。物化 ≠ 激活——installed_disabled 也重建（保 enable 廉价、账本可查询）；
-        # 冲突预检传 None（boot 无 live manager；重挂阶段自有 existing 名跳过护栏）。
+            await stage_marketplace_skills(
+                marketplace, source, registry, home, plugin_filter=set(), refresh=False, timeout=timeout, env=env,
+            )
+            if not marketplace_skill_dir(home, marketplace).is_dir():
+                logger.warning("governance recovery: marketplace %r clone missing and rebuild failed, degraded", marketplace)
+                report.failed_marketplaces.append(marketplace)
+                continue
+
+        # ② 先重物化、后 stage（§2.4 半态防御）：意图有、账本缺（或 installPath 全失效）→ 由
+        #    (marketplace, plugin) 纯函数重建账本（§4.9 删除无损）。物化 ≠ 激活——installed_disabled 也
+        #    重建（保 enable 廉价、账本可查询）；冲突预检传 None（boot 无 live manager；重挂阶段自有
+        #    existing 名跳过护栏）。**物化失败的活跃 plugin 整体保持 installed_disabled**（摘出 stage
+        #    filter，skills 不进投影——否则 skill 已亮、bundled server 不可查询即 rust-sdk#102 半态）。
         for plugin in needs_materialize:
             pid = f"{plugin}@{marketplace}"
             try:
                 await materialize_plugin(pid, home, refresh=False, timeout=timeout, env=env)
                 report.rematerialized.append(pid)
             except Exception as e:  # noqa: BLE001 - 失败降级铁律：WARN 跳过，不阻断 boot
-                logger.warning("governance recovery: re-materialize %r failed, degraded: %s", pid, e)
-        report.restored_skills.extend(names)
-        report.restored_plugins.extend(sorted(f"{plugin}@{marketplace}" for plugin in active_plugins))
+                logger.warning("governance recovery: re-materialize %r failed; kept installed_disabled (skills not staged): %s", pid, e)
+                active_plugins.discard(plugin)
+
+        # ③ stage skills（仅活跃且物化完好的 plugin）
+        if active_plugins:
+            names = await stage_marketplace_skills(
+                marketplace,
+                source,
+                registry,
+                home,
+                plugin_filter=active_plugins,
+                refresh=False,  # 离线优先：clone 在则零 git / offline-first
+                timeout=timeout,
+                env=env,
+            )
+            report.restored_skills.extend(names)
+            report.restored_plugins.extend(sorted(f"{plugin}@{marketplace}" for plugin in active_plugins))
 
     return report
 
