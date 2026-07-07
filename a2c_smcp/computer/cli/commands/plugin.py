@@ -53,6 +53,7 @@ from a2c_smcp.computer.settings.installer import (
     disable_plugin,
     enable_plugin,
     install_plugin,
+    prune_plugin_intent,
     uninstall_plugin,
 )
 from a2c_smcp.computer.settings.mcp_config import (
@@ -64,7 +65,17 @@ from a2c_smcp.computer.settings.mcp_config import (
     gate_mcp_servers,
     resolve_mcp_config,
 )
-from a2c_smcp.computer.settings.reconciler import gc_plugins, list_orphan_plugins
+from a2c_smcp.computer.settings.reconciler import (
+    DANGLING_CATALOG_MISSING,
+    DANGLING_ENTRY_MISSING,
+    DANGLING_MANIFEST_UNREADABLE,
+    DANGLING_MARKETPLACE_NOT_ADDED,
+    declared_installed_plugin_ids,
+    gc_plugins,
+    ledger_entry_materialized,
+    list_dangling_plugin_intents,
+    list_orphan_plugins,
+)
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 
@@ -377,6 +388,33 @@ def plugin_info(
     return EXIT_OK
 
 
+# 悬挂意图 reason → 分档修复提示（catalog-missing 可能只是断网后 clone 未建，裁量留给用户）/ per-reason hints.
+_DANGLING_HINTS: dict[str, str] = {
+    DANGLING_MARKETPLACE_NOT_ADDED: "marketplace unknown — no self-heal path",
+    DANGLING_CATALOG_MISSING: "boot/'marketplace refresh' may re-clone; prune only if the source is gone for good",
+    DANGLING_MANIFEST_UNREADABLE: "try 'marketplace refresh' first; prune only if it stays broken",
+    DANGLING_ENTRY_MISSING: "prune only if upstream removed the plugin",
+}
+
+
+def _recoverable_intents(
+    home: Path,
+    declared: Mapping[str, Any],
+    dangling: list[tuple[str, str]],
+    env: Mapping[str, str] | None,
+) -> list[str]:
+    """「静态可达但未物化」的意图 pid（下次 boot 由 recovery 重物化自愈——只提示、绝不 prune）/ Recoverable。"""
+    from a2c_smcp.computer.settings.store import load_installed_plugins
+
+    ledger = load_installed_plugins(home=home, env=env).get("plugins", {})
+    dangling_ids = {pid for pid, _ in dangling}
+    return sorted(
+        pid
+        for pid in declared_installed_plugin_ids(declared)
+        if pid not in dangling_ids and not ledger_entry_materialized(ledger.get(pid))
+    )
+
+
 async def plugin_gc(
     registry: SkillRegistry,
     home: Path,
@@ -384,24 +422,64 @@ async def plugin_gc(
     *,
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
     confirm: Callable[[list[str]], Awaitable[bool]] | None = None,
+    prune_dangling: bool = False,
     json_output: bool = False,
 ) -> int:
-    """清理孤儿 plugin（账本有记录、``installedPlugins`` 安装意图不再包含，v0.3.0 §2.3）/ GC orphan plugins。"""
+    """
+    清理孤儿 plugin（账本 ∖ 意图）+ 诊断/prune 悬挂意图（意图 ∖ 账本 ∧ 静态不可达，#125 任务 2）/ GC + prune。
+
+    权威性不对称安全阀：孤儿删除的是**派生缓存**（恒安全）→ 无 confirm 也自动执行（Typer 现状不变）；
+    悬挂 prune 删的是**权威意图**（§2.3）→ 须 confirm 门（REPL）或显式 ``--prune-dangling``
+    （Typer 非交互缺省只诊断）。「静态可达未物化」→ ``recoverable``：仅提示（下次 boot 自愈）、绝不删。
+    JSON 契约：``removed``（不变）+ ``dangling``（诊断 ``{id, reason}``）+ ``prunedIntents``（实际删）
+    + ``recoverable``。
+    """
     declared = resolved_settings(env)
     orphans = list_orphan_plugins(home, declared, env=env)
-    if not orphans:
+    dangling = list_dangling_plugin_intents(home, declared, env=env)
+    recoverable = _recoverable_intents(home, declared, dangling, env)
+    prunable = dangling if prune_dangling else []
+
+    if not orphans and not dangling and not recoverable:
         if json_output:
-            console.print_json(data={"removed": []})
+            console.print_json(data={"removed": [], "dangling": [], "prunedIntents": [], "recoverable": []})
         else:
             console.print("[dim]No orphan plugins.[/dim]")
         return EXIT_OK
-    if confirm is not None and not await confirm(orphans):
-        return _err("aborted by user", json_output=json_output)
-    removed = await gc_plugins(orphans, registry, home, env=env, mcp_teardown=mcp_teardown)
+
+    if confirm is not None and (orphans or prunable):
+        items = list(orphans) + [f"{pid} (dangling intent: {reason})" for pid, reason in prunable]
+        if not await confirm(items):
+            return _err("aborted by user", json_output=json_output)
+
+    removed = await gc_plugins(orphans, registry, home, env=env, mcp_teardown=mcp_teardown) if orphans else []
+    pruned: list[str] = []
+    for pid, _reason in prunable:
+        try:
+            prune_plugin_intent(pid, home, env=env)
+            pruned.append(pid)
+        except PluginInstallError as e:  # 单条失败降级，不阻断其余
+            if not json_output:
+                console.print(f"[yellow]⚠ prune {pid!r} failed: {e}[/yellow]")
+
     if json_output:
-        console.print_json(data={"removed": removed})
+        console.print_json(
+            data={
+                "removed": removed,
+                "dangling": [{"id": pid, "reason": reason} for pid, reason in dangling],
+                "prunedIntents": pruned,
+                "recoverable": recoverable,
+            },
+        )
         return EXIT_OK
-    return _ok(f"gc removed {len(removed)} orphan plugin(s): {', '.join(removed) or '—'}")
+    if removed or not (dangling or recoverable):
+        _ok(f"gc removed {len(removed)} orphan plugin(s): {', '.join(removed) or '—'}")
+    for pid, reason in dangling:
+        status = "pruned" if pid in pruned else "diagnosed only (confirm in REPL or pass --prune-dangling)"
+        console.print(f"[yellow]⚠ dangling intent {pid} [{reason}] — {status}; {_DANGLING_HINTS.get(reason, '')}[/yellow]")
+    for pid in recoverable:
+        console.print(f"[dim]recoverable: {pid} (not materialized; next boot will re-materialize)[/dim]")
+    return EXIT_OK
 
 
 # ── MCP 批准框（启动期，§9.2，#69 Group B）/ MCP approval box (boot-time) ─────────
@@ -571,13 +649,14 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         plugin_info(home, env, pos[0], json_output=json_output)
     elif sub == "gc":
 
-        async def _confirm(orphans: list[str]) -> bool:
-            ans = (await session.prompt_async(f"GC {len(orphans)} orphan plugin(s): {', '.join(orphans)}? [y/N]: ")).strip().lower()
+        async def _confirm(items: list[str]) -> bool:
+            ans = (await session.prompt_async(f"GC {len(items)} item(s): {', '.join(items)}? [y/N]: ")).strip().lower()
             return ans in {"y", "yes"}
 
+        # REPL 有 confirm 门 → 悬挂意图 prune 一并纳入确认（#125 任务 2；Typer 非交互须显式 --prune-dangling）
         code = await plugin_gc(
             registry, home, env,
-            mcp_teardown=_batch_teardown(cbs.remove_server), confirm=_confirm, json_output=json_output,
+            mcp_teardown=_batch_teardown(cbs.remove_server), confirm=_confirm, prune_dangling=True, json_output=json_output,
         )
         if code == EXIT_OK:
             comp.mark_skills_dirty()
