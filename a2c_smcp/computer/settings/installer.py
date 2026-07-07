@@ -198,6 +198,30 @@ def _write_enabled_plugin(plugin_id: str, value: bool | None, scope: str, projec
         atomic_write_json(path, updated)
 
 
+def _clear_enabled_entries_visible_layers(plugin_id: str, project_paths: set[str], env: Mapping[str, str] | None) -> None:
+    """
+    清理 ``enabledPlugins[plugin_id]`` 的全部**可见层**条目：user 恒清；project/local 对「账本 projectPath ∪ cwd」
+    逐一清（#125 任务 1：账本重物化归一后丢 projectPath，仅遍历账本会漏掉 cwd 可见层的残留 ``true``——
+    卸载后残留会让重装立即激活，违反 install 不激活）/ Clear enabled entries across visible layers。
+
+    project/local 写调用前**先查 settings 文件存在**：:func:`~a2c_smcp.computer.settings.store.file_lock`
+    会 ``mkdir(parents=True)`` 建父目录 + 建 ``.lock``，而 :func:`_write_enabled_plugin` 的 no-op 短路在锁后——
+    无守卫会在无 ``.tfrobot/`` 的 cwd 制造垃圾目录。managed/policy 只读层不触碰；清失败 WARN 不阻断（best-effort）。
+    """
+    _write_enabled_plugin(plugin_id, None, "user", None, env)
+    targets = {str(Path(p)) for p in project_paths if p}
+    targets.add(str(Path.cwd()))
+    for pp in sorted(targets):
+        for s in ("project", "local"):
+            try:
+                path, _scope = _settings_path_for_scope(s, pp, env)
+                if not path.exists():  # 存在性守卫：不为清理凭空建 .tfrobot/ + .lock
+                    continue
+                _write_enabled_plugin(plugin_id, None, s, pp, env)
+            except PluginInstallError as e:  # best-effort：清条目失败不阻断
+                logger.warning("failed to clear enabledPlugins[%s] in %s scope at %s: %s", plugin_id, s, pp, e)
+
+
 def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str] | None) -> bool:
     """
     user scope ``installedPlugins`` 数组的持锁 RMW（增/删一个条目）；返回**写前**是否已含该条目 / RMW the install intent。
@@ -550,18 +574,12 @@ async def uninstall_plugin(
     update_installed_plugins(_drop, home=home, env=env)
 
     # v0.3.0：账本记录清空（回 available）→ 删全局安装意图 + 清 enabledPlugins 条目（意图是唯一权威，§2.3）。
-    # project/local 落点从被删记录的 projectPath 派生（无需调用方另传）；managed/policy 只读层不触碰。
+    # project/local 落点 = 被删记录的 projectPath ∪ cwd（#125 任务 1：归一记录丢 projectPath 时 cwd 可见层兜底）。
     remaining = load_installed_plugins(home=home, env=env).get("plugins", {}).get(plugin_id)
     if not remaining:
         _write_installed_plugin(plugin_id, False, env)
-        _write_enabled_plugin(plugin_id, None, "user", None, env)
         project_paths = {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p}
-        for pp in sorted(project_paths):
-            for s in ("project", "local"):
-                try:
-                    _write_enabled_plugin(plugin_id, None, s, pp, env)
-                except PluginInstallError as e:  # best-effort：清条目失败不阻断卸载
-                    logger.warning("uninstall: failed to clear enabledPlugins[%s] in %s scope at %s: %s", plugin_id, s, pp, e)
+        _clear_enabled_entries_visible_layers(plugin_id, project_paths, env)
     logger.info(
         "uninstalled plugin %r (scope=%s, servers=%s)",
         plugin_id,

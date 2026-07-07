@@ -615,7 +615,7 @@ async def test_recover_rematerialize_multi_layer_clues_rebuild_multi_records(tmp
 @pytest.mark.asyncio
 async def test_recover_rematerialize_no_clue_falls_back_user_and_reports(tmp_path: Path, monkeypatch, caplog) -> None:
     """无任何层线索 → 归一 user + WARN + ``report.scope_normalized`` 显式标注（issue #125 方向 b 兜底）。"""
-    import logging
+    from a2c_smcp.computer.settings import recovery as recovery_mod
 
     home = _home(tmp_path)
     env = _env(tmp_path)
@@ -625,8 +625,12 @@ async def test_recover_rematerialize_no_clue_falls_back_user_and_reports(tmp_pat
     _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
     declared = {"installedPlugins": [_PID]}
 
-    with caplog.at_level(logging.WARNING):
+    # 项目 logger "a2c_smcp" 关闭 propagate → caplog.handler 直挂源模块 logger（同 test_window_uri 惯例）
+    recovery_mod.logger.addHandler(caplog.handler)
+    try:
         report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+    finally:
+        recovery_mod.logger.removeHandler(caplog.handler)
 
     assert report.rematerialized == [_PID]
     assert report.scope_normalized == [_PID]
@@ -760,8 +764,7 @@ def test_prune_plugin_intent_runs_legacy_migration_first(tmp_path: Path, monkeyp
 
 def test_prune_plugin_intent_warns_on_residual_project_declaration(tmp_path: Path, monkeypatch, caplog) -> None:
     """pid 仍见于 project 层 ``installedPlugins`` 声明 → WARN 指明文件路径、不静默改写 committable 团队声明。"""
-    import logging
-
+    from a2c_smcp.computer.settings import installer as installer_mod
     from a2c_smcp.computer.settings.installer import prune_plugin_intent
 
     home = _home(tmp_path)
@@ -773,8 +776,12 @@ def test_prune_plugin_intent_warns_on_residual_project_declaration(tmp_path: Pat
     _write_json(proj_path, {"installedPlugins": [_PID]})
     _write_json(user_settings_path(env), {"installedPlugins": [_PID]})
 
-    with caplog.at_level(logging.WARNING):
+    # 项目 logger 关闭 propagate → caplog.handler 直挂源模块 logger（同 test_window_uri 惯例）
+    installer_mod.logger.addHandler(caplog.handler)
+    try:
         prune_plugin_intent(_PID, home, env=env)
+    finally:
+        installer_mod.logger.removeHandler(caplog.handler)
 
     proj = json.loads(proj_path.read_text(encoding="utf-8"))
     assert proj.get("installedPlugins") == [_PID]  # committable 声明不动

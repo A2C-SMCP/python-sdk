@@ -43,7 +43,19 @@ from typing import Any
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.installer import materialize_plugin
 from a2c_smcp.computer.settings.reconciler import declared_installed_plugin_ids, ledger_entry_materialized
-from a2c_smcp.computer.settings.store import load_installed_plugins, load_known_marketplaces
+from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.scope import (
+    load_settings_file,
+    user_settings_path,
+    workdir_local_settings_path,
+    workdir_project_settings_path,
+)
+from a2c_smcp.computer.settings.store import (
+    InstalledPluginsFile,
+    load_installed_plugins,
+    load_known_marketplaces,
+    update_installed_plugins,
+)
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -65,6 +77,8 @@ class GovernanceRecoveryReport:
     - ``skipped_disabled``：``installed_disabled``（安装意图在、``enabledPlugins`` absent/false）惰性跳过的 pid
       （v0.3.0 缺省翻转，§2.4）。
     - ``rematerialized``：意图有、账本缺 → 本轮重物化成功重建账本的 pid（§4.9 删除无损）。
+    - ``scope_normalized``：重物化时**无任何层线索**、记录归一 user scope 的 pid（#125 任务 1 显式标注；
+      有线索时经 :func:`_infer_record_scopes` 推回原 scope，不入此列）。
     """
 
     restored_plugins: list[str] = field(default_factory=list)
@@ -73,6 +87,7 @@ class GovernanceRecoveryReport:
     failed_marketplaces: list[str] = field(default_factory=list)
     skipped_disabled: list[str] = field(default_factory=list)
     rematerialized: list[str] = field(default_factory=list)
+    scope_normalized: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +127,66 @@ def _split_pid(pid: str) -> tuple[str, str] | None:
     return plugin, marketplace
 
 
+def _intent_layer_snapshot(env: Mapping[str, str] | None, cwd: Path) -> dict[str, Mapping[str, Any]]:
+    """
+    user / project / local 三层 settings 的**原始分层**快照（merged 视图丢失层归属，scope 推回需逐层看）/ Raw layers。
+
+    project/local 锚定 ``cwd``（#116 单锚点模型）：异地项目的层不可见——该盲区由归一 fallback + WARN 兜底。
+    复用 :func:`~a2c_smcp.computer.settings.scope.load_settings_file`（缺失文件 → ``({}, [])``，纯读零副作用）。
+    """
+    user_data, _ = load_settings_file(user_settings_path(env), SettingsScope.USER)
+    project_data, _ = load_settings_file(workdir_project_settings_path(cwd), SettingsScope.PROJECT)
+    local_data, _ = load_settings_file(workdir_local_settings_path(cwd), SettingsScope.LOCAL)
+    return {"user": user_data, "project": project_data, "local": local_data}
+
+
+def _infer_record_scopes(pid: str, layers: Mapping[str, Mapping[str, Any]], cwd: Path) -> list[tuple[str, str | None]]:
+    """
+    由分层线索推回账本记录 scope——enable/disable「写入层 = 安装 scope」契约（installer）的逆运算（#125 任务 1）。
+
+    线索规则 / Clue rules:
+    - project/local 层：``enabledPlugins`` 含 pid 键（``true``/``false`` 均证明该层与 pid 有 scope 绑定）**或**
+      ``installedPlugins`` 声明含 pid（声明式复现场景）→ ``(scope, str(cwd))``；
+    - user 层：仅 ``enabledPlugins`` 含 pid 键算——user 层 ``installedPlugins`` 是 install 恒写的全局意图，无区分度；
+    - 多层命中 → 多条记录（user→project→local 稳定序，多 scope 不塌缩）；全无线索 → ``[]``
+      （调用方 fallback ``[("user", None)]`` + ``scope_normalized`` 归一标注）。
+    """
+    out: list[tuple[str, str | None]] = []
+    for scope_name in ("user", "project", "local"):
+        data = layers.get(scope_name) or {}
+        enabled = data.get("enabledPlugins")
+        clue = isinstance(enabled, Mapping) and pid in enabled
+        if scope_name != "user" and not clue:
+            installed = data.get("installedPlugins")
+            clue = isinstance(installed, list) and pid in installed
+        if clue:
+            out.append((scope_name, str(cwd) if scope_name != "user" else None))
+    return out
+
+
+def _sweep_dead_records(pid: str, home: Path, env: Mapping[str, str] | None) -> None:
+    """
+    重建成功后清扫该 pid 下 ``installPath`` 已死的残留记录（派生缓存卫生，非资产删除、不违 §4.8.4）。
+
+    动机：``needs_materialize`` 的触发前提是该 pid 全部记录失效；按线索重建后若残留死 scope 记录，
+    CLI enable/disable 会循环逐 scope 误写死层（如已不可推回的异地 project 层）。
+    """
+
+    def _mut(data: InstalledPluginsFile, _pid: str = pid) -> None:
+        records = data["plugins"].get(_pid)
+        if not isinstance(records, list):
+            return
+        alive = [
+            r
+            for r in records
+            if isinstance(r, Mapping) and isinstance(p := r.get("installPath"), str) and p and Path(p).is_dir()
+        ]
+        if alive:
+            data["plugins"][_pid] = alive
+
+    update_installed_plugins(_mut, home=home, env=env)
+
+
 async def recover_marketplace_skills(
     registry: SkillRegistry,
     home: Path,
@@ -131,9 +206,12 @@ async def recover_marketplace_skills(
     降级判定与 rust 同构：stage 内部吞错，事后 clone 树仍缺 → 该 marketplace 入 ``failed_marketplaces``；
     known_marketplaces 缺记录 → 同样降级。**绝不抛、不阻断其余**。
 
-    已知限制（文档化，rust 同构）：重物化无法从无 scope 的 ``installedPlugins`` 还原原安装 scope /
-    ``projectPath``——重建记录**归一为 user scope**（多 scope 记录塌缩单条）；此后 enable/disable 从账本
-    读 scope 会落 user 层。scope 精确复原需 committed 记录承载，属可选 pin-lock 扩展（§4.9.2）范畴。
+    scope 推回（#125 任务 1）：重物化前经 :func:`_infer_record_scopes` 扫描 user / cwd 锚定 project/local
+    三层的 ``enabledPlugins`` 条目（及 project/local 的 ``installedPlugins`` 声明）作 scope 线索——
+    enable/disable「写入层 = 安装 scope」契约的逆运算；多层线索重建多条记录，重建后清扫死残留记录。
+    已知盲区（文档化，rust 同构）：**cwd 不可见的异地 project/local 层线索无法推回**——无线索时归一
+    user scope + WARN + ``report.scope_normalized`` 显式标注；完美复原需 committed 记录承载，属可选
+    pin-lock 扩展（§4.9.2）范畴。
 
     :param registry: 目标 :class:`SkillRegistry`（恢复注册进当前活跃集）。
     :param home: SKILL Home 绝对根。
@@ -147,6 +225,8 @@ async def recover_marketplace_skills(
         return report
     ledger = load_installed_plugins(home=home, env=env).get("plugins", {})
     known = load_known_marketplaces(home=home, env=env).get("marketplaces", {})
+    cwd = Path.cwd()
+    layers = _intent_layer_snapshot(env, cwd)  # scope 推回线索快照（循环外一次，#125 任务 1）
 
     # installed pid 按 marketplace 分组（plugin → 是否活跃）/ group intent pids by marketplace.
     by_marketplace: dict[str, dict[str, bool]] = {}
@@ -193,14 +273,31 @@ async def recover_marketplace_skills(
         #    重建（保 enable 廉价、账本可查询）；冲突预检传 None（boot 无 live manager；重挂阶段自有
         #    existing 名跳过护栏）。**物化失败的活跃 plugin 整体保持 installed_disabled**（摘出 stage
         #    filter，skills 不进投影——否则 skill 已亮、bundled server 不可查询即 rust-sdk#102 半态）。
+        #    scope 经分层线索推回（#125 任务 1）；无线索 → 归一 user + WARN + scope_normalized 标注。
         for plugin in needs_materialize:
             pid = f"{plugin}@{marketplace}"
+            targets = _infer_record_scopes(pid, layers, cwd)
+            normalized = not targets
+            if normalized:
+                targets = [("user", None)]
             try:
-                await materialize_plugin(pid, home, refresh=False, timeout=timeout, env=env)
+                for scope_name, project_path in targets:
+                    await materialize_plugin(
+                        pid, home, scope=scope_name, project_path=project_path, refresh=False, timeout=timeout, env=env,
+                    )
                 report.rematerialized.append(pid)
             except Exception as e:  # noqa: BLE001 - 失败降级铁律：WARN 跳过，不阻断 boot
                 logger.warning("governance recovery: re-materialize %r failed; kept installed_disabled (skills not staged): %s", pid, e)
                 active_plugins.discard(plugin)
+                continue
+            if normalized:
+                report.scope_normalized.append(pid)
+                logger.warning(
+                    "governance recovery: no scope clue for %r; ledger record normalized to user scope "
+                    "(original install scope unrecoverable without committed pin-lock, §4.9.2)",
+                    pid,
+                )
+            _sweep_dead_records(pid, home, env)
 
         # ③ stage skills（仅活跃且物化完好的 plugin）
         if active_plugins:
