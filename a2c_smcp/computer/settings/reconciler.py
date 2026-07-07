@@ -370,31 +370,51 @@ def list_orphan_plugins(
     return [pid for pid in installed.get("plugins", {}) if pid not in declared_ids]
 
 
-def ledger_entry_materialized(records: object) -> bool:
+def ledger_record_materialized(rec: object) -> bool:
     """
-    某 pid 的账本记录是否仍有效物化：至少一条记录「``installPath`` 目录存在 ∧ bundled JSON 可解析」/ Live check。
+    单条账本记录是否仍有效物化：「``installPath`` 目录存在 ∧ bundled JSON 可解析」/ Per-record live check。
 
     v0.3.0 §5.8（安装路径非权威，boot MUST 重新校验）+ #125 任务 4：仅查目录存在会漏掉「目录在、bundled JSON
     事后损坏」——stage 后 skill 亮而 :func:`~a2c_smcp.computer.settings.recovery.collect_enabled_bundled_servers`
     WARN-skip，即 rust-sdk#102 同型半态。判据升级为可解析：:class:`PluginManifestError` → 该记录失效 →
     触发重物化（catalog 完好则修复指回；不可修复则整体保持 ``installed_disabled``，skill 不单独亮）。
+    记录级单点：entry 级 any/all 变体与 recovery 死记录清扫共用（判据对称，隔离审查 🟡#4）。
+    """
+    install_path = rec.get("installPath") if isinstance(rec, Mapping) else None
+    if not (isinstance(install_path, str) and install_path and Path(install_path).is_dir()):
+        return False
+    try:
+        load_bundled_servers(Path(install_path))
+    except PluginManifestError as e:
+        logger.warning("ledger record %s has corrupt bundled server JSON, treated as unmaterialized: %s", install_path, e)
+        return False
+    return True
 
-    原 ``recovery._ledger_materialized`` 迁入公开化（#125 任务 2）：boot 恢复的重物化触发与
-    :func:`list_dangling_plugin_intents` 的悬挂判据共用本单点。
+
+def ledger_entry_materialized(records: object) -> bool:
+    """
+    某 pid 是否**存在**有效物化记录（∃ 语义）/ Whether any record is live。
+
+    原 ``recovery._ledger_materialized`` 迁入公开化（#125 任务 2）：作 :func:`list_dangling_plugin_intents`
+    的悬挂判据——只要还有一条活记录就不是「意图 ∖ 账本」悬挂（prune 对象须是零有效物化）。
+    boot 重物化触发请用 :func:`ledger_entry_fully_materialized`（∀ 语义——混合健康度也要修复）。
     """
     if not isinstance(records, list):
         return False
-    for rec in records:
-        install_path = rec.get("installPath") if isinstance(rec, Mapping) else None
-        if not (isinstance(install_path, str) and install_path and Path(install_path).is_dir()):
-            continue
-        try:
-            load_bundled_servers(Path(install_path))
-        except PluginManifestError as e:
-            logger.warning("ledger record %s has corrupt bundled server JSON, treated as unmaterialized: %s", install_path, e)
-            continue
-        return True
-    return False
+    return any(ledger_record_materialized(rec) for rec in records)
+
+
+def ledger_entry_fully_materialized(records: object) -> bool:
+    """
+    某 pid 的账本记录是否**全部**有效物化（∀ 语义，非空）/ Whether every record is live。
+
+    boot 重物化触发判据（#125 隔离审查 🟡#4）：∃ 语义会让「一条健康 + 一条损坏」的混合健康度 pid 永不进
+    ``needs_materialize``——损坏 scope 记录每次 boot 被 collect WARN-skip、又不被清扫，即窄化半态回归口。
+    ∀ 语义下混合健康度触发重物化：健康 scope 幂等重建、损坏残留由 sweep（同记录级判据）清扫。
+    """
+    if not isinstance(records, list) or not records:
+        return False
+    return all(ledger_record_materialized(rec) for rec in records)
 
 
 # 悬挂意图 reason 分档（#125 任务 2；wire 值入 CLI JSON 输出，rust 镜像同字面）/ dangling reason tiers.

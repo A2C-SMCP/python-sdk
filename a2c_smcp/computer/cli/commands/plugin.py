@@ -465,13 +465,19 @@ async def plugin_gc(
 
     removed = await gc_plugins(orphans, registry, home, env=env, mcp_teardown=mcp_teardown) if orphans else []
     pruned: list[str] = []
+    residual: list[str] = []
     for pid, _reason in prunable:
         try:
-            prune_plugin_intent(pid, home, env=env)
-            pruned.append(pid)
-        except PluginInstallError as e:  # 单条失败降级，不阻断其余
+            # False = cwd 可见 project/local 层仍有 committable 声明残留（merged 意图仍含 pid）——
+            # 不计入 prunedIntents，否则自动化「prune 到干净」永不收敛（隔离审查 🟡#1）。
+            if prune_plugin_intent(pid, home, env=env):
+                pruned.append(pid)
+            else:
+                residual.append(pid)
+        except Exception as e:  # noqa: BLE001 - 单条失败降级不阻断其余（OSError/锁竞争等，隔离审查 🟡#2）
             if not json_output:
                 console.print(f"[yellow]⚠ prune {pid!r} failed: {e}[/yellow]")
+            logger.warning("plugin gc: prune %r failed: %s", pid, e)
 
     if json_output:
         console.print_json(
@@ -479,6 +485,7 @@ async def plugin_gc(
                 "removed": removed,
                 "dangling": [{"id": pid, "reason": reason} for pid, reason in dangling],
                 "prunedIntents": pruned,
+                "residualDeclarations": residual,
                 "recoverable": recoverable,
             },
         )
@@ -486,7 +493,12 @@ async def plugin_gc(
     if removed or not (dangling or recoverable):
         _ok(f"gc removed {len(removed)} orphan plugin(s): {', '.join(removed) or '—'}")
     for pid, reason in dangling:
-        status = "pruned" if pid in pruned else "diagnosed only (confirm in REPL or pass --prune-dangling)"
+        if pid in pruned:
+            status = "pruned"
+        elif pid in residual:
+            status = "intent declaration remains in project/local settings (remove manually)"
+        else:
+            status = "diagnosed only (confirm in REPL or pass --prune-dangling)"
         console.print(f"[yellow]⚠ dangling intent {pid} [{reason}] — {status}; {_DANGLING_HINTS.get(reason, '')}[/yellow]")
     for pid in recoverable:
         console.print(f"[dim]recoverable: {pid} (not materialized; next boot will re-materialize)[/dim]")

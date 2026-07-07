@@ -583,3 +583,60 @@ def test_list_available_prints_deprecation_warning(tmp_path: Path, capsys: pytes
 
     plugin_cmd.plugin_list(home, env)
     assert "deprecated" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_gc_prune_residual_committable_declaration_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """悬挂意图仅来自 committable project 层声明 → prune 不改写该文件、不计入 prunedIntents（隔离审查 🟡#1：
+    误报会让自动化「prune 到干净」永不收敛），归 residualDeclarations 显式暴露。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    proj_path = workdir_project_settings_path(Path.cwd())
+    _write_json(proj_path, {"installedPlugins": ["ghost@nowhere"]})
+    before = proj_path.read_text(encoding="utf-8")
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True, prune_dangling=True)
+
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dangling"] == [{"id": "ghost@nowhere", "reason": "marketplace-not-added"}]
+    assert out["prunedIntents"] == []  # 未真正移除，不得计入
+    assert out["residualDeclarations"] == ["ghost@nowhere"]
+    assert proj_path.read_text(encoding="utf-8") == before  # committable 声明未被改写
+
+
+@pytest.mark.asyncio
+async def test_gc_confirm_accept_removes_orphans_and_prunes_dangling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """confirm 通过（返回 True）→ 孤儿删除 + 悬挂真 prune 双双生效（隔离审查 🟡#6 正路覆盖）。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
+    orphan_path = _seed_orphan_and_dangling(home, env)
+
+    async def _confirm(items: list[str]) -> bool:
+        return True
+
+    code = await plugin_cmd.plugin_gc(reg, home, env, confirm=_confirm, prune_dangling=True)
+
+    assert code == 0
+    assert not orphan_path.exists()  # 孤儿已删
+    assert "orphan@acme" not in load_installed_plugins(home=home)["plugins"]
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert "ghost@nowhere" not in user.get("installedPlugins", [])  # 悬挂已 prune
+    assert "ghost@nowhere" not in user.get("enabledPlugins", {})
+
+
+def test_list_available_json_stdout_stays_pure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--available + --json：弃用提示走 logger，stdout 保持纯 JSON 可解析（隔离审查 🟡#5 验收补缺）。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
+
+    plugin_cmd.plugin_list(home, env, available=True, json_output=True)
+
+    out = capsys.readouterr().out
+    rows = json.loads(out)  # stdout 可整体解析 = 纯 JSON
+    assert rows[0]["id"] == "audit@acme"
+    assert "deprecated" not in out

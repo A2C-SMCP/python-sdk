@@ -589,7 +589,7 @@ async def uninstall_plugin(
     return True
 
 
-def prune_plugin_intent(plugin_id: str, home: Path, *, env: Mapping[str, str] | None = None) -> None:
+def prune_plugin_intent(plugin_id: str, home: Path, *, env: Mapping[str, str] | None = None) -> bool:
     """
     prune 单个**悬挂安装意图**（``installedPlugins`` 声明 ∧ 无有效物化 ∧ 静态不可达，#125 任务 2）/ Prune intent。
 
@@ -603,6 +603,9 @@ def prune_plugin_intent(plugin_id: str, home: Path, *, env: Mapping[str, str] | 
     2. 删 user 层安装意图；3. 清可见层 ``enabledPlugins`` 条目（user + 账本 projectPath ∪ cwd）；
     4. 弹出该 pid 账本残骸记录（若有）；5. pid 仍见于 cwd 可见 project/local 层 ``installedPlugins``
        声明 → WARN 指明文件路径、**不改写**（committable 团队声明不由本地 gc 静默动，下轮 gc 会再次列出）。
+
+    :return: ``True`` = 意图已彻底移除；``False`` = cwd 可见 project/local 层仍有 committable 声明残留
+        （merged 意图仍含该 pid，下轮 gc 会再次列为悬挂——调用方不得将其计入「已 prune」，隔离审查 🟡#1）。
     """
     _split_plugin_id(plugin_id)  # 形态校验（非法 → PluginInstallError，零变更）
     migrate_legacy_installs(home, env=env)
@@ -621,19 +624,22 @@ def prune_plugin_intent(plugin_id: str, home: Path, *, env: Mapping[str, str] | 
         ("project", workdir_project_settings_path(cwd), SettingsScope.PROJECT),
         ("local", workdir_local_settings_path(cwd), SettingsScope.LOCAL),
     )
+    fully_pruned = True
     for scope_name, path, scope_enum in residual_layers:
         if not path.exists():
             continue
         data, _errors = load_settings_file(path, scope_enum)
         declared = data.get("installedPlugins")
         if isinstance(declared, list) and plugin_id in declared:
+            fully_pruned = False
             logger.warning(
                 "prune: %r still declared in %s scope settings %s; not rewriting committable declaration (remove manually)",
                 plugin_id,
                 scope_name,
                 path,
             )
-    logger.info("pruned dangling plugin intent %r", plugin_id)
+    logger.info("pruned dangling plugin intent %r (fully_pruned=%s)", plugin_id, fully_pruned)
+    return fully_pruned
 
 
 async def disable_plugin(

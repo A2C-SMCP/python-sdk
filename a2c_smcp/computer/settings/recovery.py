@@ -42,7 +42,11 @@ from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.installer import materialize_plugin
-from a2c_smcp.computer.settings.reconciler import declared_installed_plugin_ids, ledger_entry_materialized
+from a2c_smcp.computer.settings.reconciler import (
+    declared_installed_plugin_ids,
+    ledger_entry_fully_materialized,
+    ledger_record_materialized,
+)
 from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.settings.scope import (
     load_settings_file,
@@ -145,9 +149,13 @@ def _infer_record_scopes(pid: str, layers: Mapping[str, Mapping[str, Any]], cwd:
     由分层线索推回账本记录 scope——enable/disable「写入层 = 安装 scope」契约（installer）的逆运算（#125 任务 1）。
 
     线索规则 / Clue rules:
-    - project/local 层：``enabledPlugins`` 含 pid 键（``true``/``false`` 均证明该层与 pid 有 scope 绑定）**或**
-      ``installedPlugins`` 声明含 pid（声明式复现场景）→ ``(scope, str(cwd))``；
-    - user 层：仅 ``enabledPlugins`` 含 pid 键算——user 层 ``installedPlugins`` 是 install 恒写的全局意图，无区分度；
+    - project/local 层：``enabledPlugins[pid] is True`` **或** ``installedPlugins`` 声明含 pid（声明式复现）
+      → ``(scope, str(cwd))``。纯 ``false`` **不算**——它可能是团队对 user-scope 安装的独立禁用覆盖（§2.4
+      三态合并），当作 install-scope 线索会凭空捏造记录，此后 CLI enable 逐 scope 写会把团队 ``false``
+      覆写为 ``true``（隔离审查 🟡#3）。误差方向不对称：漏推回 → fallback user、disable 语义靠合并仍成立
+      （安全）；错捏造 → enable 反向覆写治理意图（不安全）。
+    - user 层：``enabledPlugins`` 含 pid 键即算（含 ``false``——与 fallback 同落点，无捏造风险）；
+      user 层 ``installedPlugins`` 是 install 恒写的全局意图，无区分度、不算。
     - 多层命中 → 多条记录（user→project→local 稳定序，多 scope 不塌缩）；全无线索 → ``[]``
       （调用方 fallback ``[("user", None)]`` + ``scope_normalized`` 归一标注）。
     """
@@ -155,10 +163,13 @@ def _infer_record_scopes(pid: str, layers: Mapping[str, Mapping[str, Any]], cwd:
     for scope_name in ("user", "project", "local"):
         data = layers.get(scope_name) or {}
         enabled = data.get("enabledPlugins")
-        clue = isinstance(enabled, Mapping) and pid in enabled
-        if scope_name != "user" and not clue:
-            installed = data.get("installedPlugins")
-            clue = isinstance(installed, list) and pid in installed
+        if scope_name == "user":
+            clue = isinstance(enabled, Mapping) and pid in enabled
+        else:
+            clue = isinstance(enabled, Mapping) and enabled.get(pid) is True
+            if not clue:
+                installed = data.get("installedPlugins")
+                clue = isinstance(installed, list) and pid in installed
         if clue:
             out.append((scope_name, str(cwd) if scope_name != "user" else None))
     return out
@@ -166,21 +177,19 @@ def _infer_record_scopes(pid: str, layers: Mapping[str, Mapping[str, Any]], cwd:
 
 def _sweep_dead_records(pid: str, home: Path, env: Mapping[str, str] | None) -> None:
     """
-    重建成功后清扫该 pid 下 ``installPath`` 已死的残留记录（派生缓存卫生，非资产删除、不违 §4.8.4）。
+    重建成功后清扫该 pid 下失效的残留记录（派生缓存卫生，非资产删除、不违 §4.8.4）。
 
-    动机：``needs_materialize`` 的触发前提是该 pid 全部记录失效；按线索重建后若残留死 scope 记录，
-    CLI enable/disable 会循环逐 scope 误写死层（如已不可推回的异地 project 层）。
+    动机：重物化按线索重建后若残留失效 scope 记录，CLI enable/disable 会循环逐 scope 误写死层
+    （如已不可推回的异地 project 层）。判据与重物化触发同源
+    （:func:`~a2c_smcp.computer.settings.reconciler.ledger_record_materialized`：目录在 ∧ bundled JSON
+    可解析——「目录在但 JSON 损坏」的记录同样清扫，隔离审查 🟡#4 判据对称）。
     """
 
     def _mut(data: InstalledPluginsFile, _pid: str = pid) -> None:
         records = data["plugins"].get(_pid)
         if not isinstance(records, list):
             return
-        alive = [
-            r
-            for r in records
-            if isinstance(r, Mapping) and isinstance(p := r.get("installPath"), str) and p and Path(p).is_dir()
-        ]
+        alive = [r for r in records if ledger_record_materialized(r)]
         if alive:
             data["plugins"][_pid] = alive
 
@@ -242,7 +251,9 @@ async def recover_marketplace_skills(
 
     for marketplace, plugins in sorted(by_marketplace.items()):
         active_plugins = {p for p, is_active in plugins.items() if is_active}
-        needs_materialize = sorted(p for p in plugins if not ledger_entry_materialized(ledger.get(f"{p}@{marketplace}")))
+        # ∀ 语义（fully）：混合健康度（一条健康 + 一条损坏/死路径）也触发重物化——健康 scope 幂等重建、
+        # 损坏残留由 sweep 清扫（隔离审查 🟡#4：∃ 语义会让损坏 scope 记录每次 boot 被 WARN-skip 却永不修复）。
+        needs_materialize = sorted(p for p in plugins if not ledger_entry_fully_materialized(ledger.get(f"{p}@{marketplace}")))
         if not active_plugins and not needs_materialize:
             continue  # 全惰性且账本完好 → 零动作（installed_disabled 静止态）
 

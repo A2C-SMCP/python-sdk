@@ -719,6 +719,54 @@ async def test_uninstall_does_not_create_tfrobot_dir_in_cwd(tmp_path: Path, monk
     assert not (workdir / ".tfrobot").exists()  # 不制造垃圾目录/锁文件
 
 
+@pytest.mark.asyncio
+async def test_recover_rematerialize_ignores_project_false_override(tmp_path: Path, monkeypatch) -> None:
+    """project 层纯 ``false`` 是禁用覆盖、非 install-scope 线索——不得捏造 project 记录（隔离审查 🟡#3：
+    否则 CLI enable 逐 scope 写会把团队 ``false`` 覆写为 ``true``，反向覆写治理意图）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: False}})  # 团队禁用覆盖
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: False}}  # merged：project false 获胜
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [(r["scope"], r.get("projectPath")) for r in records] == [("user", None)]  # 不捏造 project 记录
+    assert report.scope_normalized == []  # user 层有线索，非归一
+
+
+@pytest.mark.asyncio
+async def test_recover_repairs_mixed_health_records(tmp_path: Path, monkeypatch) -> None:
+    """混合健康度（健康 user 记录 + 损坏 project 记录）也触发重物化并清扫损坏残留（隔离审查 🟡#4：
+    ∃ 判据会让损坏 scope 记录每次 boot 被 WARN-skip 却永不修复——窄化半态回归口）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    stale = home / "stale-project-copy"
+    (stale / "mcp-servers").mkdir(parents=True)
+    (stale / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
+    _seed_installed(
+        home,
+        {_PID: [_record(root, servers=["figma"]), {"scope": "project", "installPath": str(stale), "projectPath": "/elsewhere"}]},
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
+    declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=env)
+
+    assert report.rematerialized == [_PID]  # ∀ 判据：混合健康度触发重物化
+    records = load_installed_plugins(home=home)["plugins"][_PID]
+    assert [(r["scope"], r["installPath"]) for r in records] == [("user", str(root))]  # 损坏 project 残留被清扫
+    assert [r.config.name for r in collect_enabled_bundled_servers(home, declared, env=env)] == ["figma"]  # 无半态
+
+
 # ── #125 任务 2：悬挂意图 prune 执行入口（installer 是 settings 意图唯一写者）──
 def test_prune_plugin_intent_clears_intent_enabled_and_dead_ledger(tmp_path: Path, monkeypatch) -> None:
     """prune：删 user 意图 + 清 user/cwd 可见层 enabled 条目 + 弹出死账本记录（针对悬挂意图的 uninstall 等价物）。"""
