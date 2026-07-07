@@ -61,6 +61,7 @@ class SettingsScope(StrEnum):
 # ---------------------------------------------------------------------------
 FIELD_SCHEMA = "$schema"
 FIELD_EXTRA_KNOWN_MARKETPLACES = "extraKnownMarketplaces"
+FIELD_INSTALLED_PLUGINS = "installedPlugins"
 FIELD_ENABLED_PLUGINS = "enabledPlugins"
 FIELD_STRICT_KNOWN_MARKETPLACES = "strictKnownMarketplaces"
 FIELD_TRUSTED_MARKETPLACES = "trustedMarketplaces"
@@ -162,6 +163,7 @@ class ComputerSettings(TypedDict, total=False):
     """
 
     extraKnownMarketplaces: dict[str, MarketplaceEntry]
+    installedPlugins: list[str]
     enabledPlugins: dict[str, bool]
     strictKnownMarketplaces: bool
     trustedMarketplaces: list[str]
@@ -223,6 +225,23 @@ def _validate_string_array(key: str, value: Any, scope: SettingsScope) -> tuple[
             cleaned.append(item)
         else:
             errors.append(_err(scope, f"{key}[{idx}]", f"expected string, got {type(item).__name__}"))
+    return cleaned, errors
+
+
+def _validate_installed_plugins(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
+    """``installedPlugins``（全局安装意图，协议 v0.3.0 §2.4）：字符串数组，元素须 ``<plugin>@<marketplace>`` 形态。"""
+    if not isinstance(value, list):
+        return _DROP, [_err(scope, key, f"expected array, got {type(value).__name__}")]
+    cleaned: list[str] = []
+    errors: list[SettingsValidationError] = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, str):
+            errors.append(_err(scope, f"{key}[{idx}]", f"expected string, got {type(item).__name__}"))
+            continue
+        if not is_valid_enabled_plugin_key(item):
+            errors.append(_err(scope, f"{key}[{idx}]", "entry must be '<plugin>@<marketplace>' (strict kebab)"))
+            continue
+        cleaned.append(item)
     return cleaned, errors
 
 
@@ -306,6 +325,7 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
 # 字段 → 校验器映射（缺席 = 未知字段，passthrough）/ field → validator map (absent = unknown, passthrough).
 _FIELD_VALIDATORS = {
     FIELD_EXTRA_KNOWN_MARKETPLACES: _validate_extra_marketplaces,
+    FIELD_INSTALLED_PLUGINS: _validate_installed_plugins,
     FIELD_ENABLED_PLUGINS: _validate_enabled_plugins,
     FIELD_STRICT_KNOWN_MARKETPLACES: _validate_bool,
     FIELD_TRUSTED_MARKETPLACES: _validate_string_array,

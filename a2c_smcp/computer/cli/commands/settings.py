@@ -240,7 +240,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             value_tokens.append(tok)
         value = " ".join(value_tokens)
         code = settings_set(home, env, key, value, scope=scope or "user", json_output=json_output)
-        _emit_keys = {"enabledPlugins", "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"}
+        _emit_keys = {"installedPlugins", "enabledPlugins", "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"}
         if code == EXIT_OK and key in _emit_keys:
             comp.mark_skills_dirty()
     elif sub == "edit":

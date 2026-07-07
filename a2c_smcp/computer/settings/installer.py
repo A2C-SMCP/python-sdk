@@ -5,11 +5,20 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 """
-Plugin 显式生命周期：install / uninstall / enable / disable（v0.2.1 #63）
-Plugin explicit lifecycle: install / uninstall / enable / disable (v0.2.1 #63).
+Plugin 显式生命周期：install / uninstall / enable / disable（#63；#123 起对齐协议 v0.3.0 §2.4 install ⊥ enable）
+Plugin explicit lifecycle: install / uninstall / enable / disable (aligned to protocol v0.3.0 §2.4 since #123).
 
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §3.3 / §4.3 / §6.2 / §7.2 / §10.6；
-                   父工单 #53 决策 #6（disable=整 plugin 下线）/ #18（MCP 外来同名硬抛、无逃生口）/ #19（uninstall 级联）。
+                   协议 v0.3.0 runtime-contract §2.3（config-first）/ §2.4（三态生命周期）；#123 裁决记录见 #120。
+
+**v0.3.0 语义（破坏性，#123）**：install ≠ activate。两个正交声明式意图——
+``installedPlugins``（**全局**安装事实，固定落 **user scope** settings.json；读取走 merged 并集）×
+``enabledPlugins``（per-scope 启用意图，**仅显式 ``true`` 激活**，absent/false 均不活跃）。
+``install`` 只 config-first 写 ``installedPlugins`` + 物化（:func:`materialize_plugin`：clone/账本/manifest
+校验/冲突预检），**不激活**（不 stage SKILL、不写 ``enabledPlugins``）→ ``installed_disabled``；
+``enable`` 才把 skills 与 bundled server **原子**并入投影（挂载失败回滚 ``installed_disabled``）；
+``uninstall`` 删意图 + 清 ``enabledPlugins`` 条目 + teardown。物化账本 ``installed_plugins.json``
+是可从 ``installedPlugins`` 重建的**纯派生缓存**（boot 重物化见 recovery，§4.9 删除无损）。
 
 本模块是 :mod:`~a2c_smcp.computer.settings.reconciler` 的**兄弟**——reconciler 做 additive-only 对账 + 孤儿
 gc/prune，本模块做**显式单 plugin** 增删启停，写 ``installed_plugins.json``（正是 :func:`gc_plugins` 读取的账本，
@@ -24,18 +33,21 @@ gc/prune，本模块做**显式单 plugin** 增删启停，写 ``installed_plugi
 **MCP 注入**：与 :func:`gc_plugins` 的 ``mcp_teardown`` 同款——bundled MCP server 的存在性查询 / 注册 / 摘除经
 注入回调（:data:`ExistingServerNames` / :data:`RegisterServer` / :data:`RemoveServer`），由 #69 CLI 层用
 ``Computer.aadd_or_aupdate_server`` / ``Computer.aremove_server`` / ``mcp_manager.get_server_status`` 包装；
-回调 ``None`` = ledger-only（单测 / 无 server 场景）。**install/enable 注册经 Computer 路径渲染 ``${input:}``**
-（§9.3，inputs 池消歧归 #65）。
+回调 ``None`` = ledger-only（单测 / 无 server 场景）。**enable 注册经 Computer 路径渲染 ``${input:}``**
+（§9.3，inputs 池消歧归 #65）；v0.3.0 起 install 不再收挂载回调（不激活）。
 
 边界（文档化，非缺陷）/ Documented boundaries：
-- 本模块操作 **live session**；跨重启恢复（``installed × enabled`` 交集）由治理启动恢复承担（#117）：
-  bundled SKILL 经 ``Computer.boot_up`` 内 :mod:`~a2c_smcp.computer.settings.recovery`（ledger 驱动）
+- 本模块操作 **live session**；跨重启恢复（活跃集 = installed ∧ enabled）由治理启动恢复承担（#117/#123）：
+  bundled SKILL 经 ``Computer.boot_up`` 内 :mod:`~a2c_smcp.computer.settings.recovery`（**intent 驱动**）
   自动重建；bundled MCP server 重挂由 client 显式经 ``Computer.reconcile_governance(hooks)`` 触发
   （#93 client owns MCP config；CLI 启动序列即参考接线）。
 - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
-  ``enabledPlugins`` 门控重建（显式 false 不复活）。uninstall 仅注销**活跃** SKILL（与
+  ``enabledPlugins`` 门控重建（仅显式 true 激活）。uninstall 仅注销**活跃** SKILL（与
   :func:`_unregister_marketplace_skills` 同限）；先 disable（orphan）再 uninstall 会残留内存孤儿条目，
   进程重启即清。
+- :func:`enable_plugin` 不校验 ``installedPlugins`` 意图成员资格（以账本记录为"可启用"依据）：手编移除意图
+  而账本未 gc 的窗口里 live enable 仍可点亮，但重启后 boot 门控（installed ∧ enabled）不会恢复，交由
+  reconcile 收敛。
 """
 
 from __future__ import annotations
@@ -49,8 +61,10 @@ from typing import Any
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.schema import SettingsScope, is_valid_enabled_plugin_key
 from a2c_smcp.computer.settings.scope import (
+    DELETE,
     apply_write,
     load_settings_file,
+    resolve_settings,
     user_settings_path,
     workdir_local_settings_path,
     workdir_project_settings_path,
@@ -161,19 +175,49 @@ def _settings_path_for_scope(scope: str, project_path: str | None, env: Mapping[
     raise PluginInstallError(f"cannot write enabledPlugins to scope {scope!r} (writable: user|project|local)")
 
 
-def _write_enabled_plugin(plugin_id: str, value: bool, scope: str, project_path: str | None, env: Mapping[str, str] | None) -> None:
+def _write_enabled_plugin(plugin_id: str, value: bool | None, scope: str, project_path: str | None, env: Mapping[str, str] | None) -> None:
     """
     写 ``enabledPlugins[<plugin_id>] = value`` 到指定 scope 的 settings.json（持锁原子 RMW）/ Write the enabled flag。
 
+    ``value=None`` = 删除该条目（enable 失败回滚恢复 absent / uninstall 清条目，v0.3.0 §2.4）；条目本不存在 → no-op。
+
     复用 store 原语自组织：:func:`file_lock`（旁车 ``.lock``，建父目录）+ :func:`load_settings_file`（容错）+
-    :func:`apply_write`（递归进 ``enabledPlugins`` 仅改该 key、不毁兄弟）+ :func:`atomic_write_json`（``header=None``——
-    settings.json 是人编意图层，无写保护头 / version 字段，区别于物化文件）。
+    :func:`apply_write`（递归进 ``enabledPlugins`` 仅改该 key、不毁兄弟；:data:`DELETE` 删 key）+
+    :func:`atomic_write_json`（``header=None``——settings.json 是人编意图层，无写保护头 / version 字段，区别于物化文件）。
     """
     path, scope_enum = _settings_path_for_scope(scope, project_path, env)
     with file_lock(path):
         existing, _errors = load_settings_file(path, scope_enum)
-        updated = apply_write(existing, {"enabledPlugins": {plugin_id: value}})
+        if value is None:
+            enabled = existing.get("enabledPlugins")
+            if not isinstance(enabled, Mapping) or plugin_id not in enabled:
+                return  # 无条目可删（apply_write 对缺失父键会原样写入哨兵，须在此短路）
+            updated = apply_write(existing, {"enabledPlugins": {plugin_id: DELETE}})
+        else:
+            updated = apply_write(existing, {"enabledPlugins": {plugin_id: value}})
         atomic_write_json(path, updated)
+
+
+def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str] | None) -> bool:
+    """
+    user scope ``installedPlugins`` 数组的持锁 RMW（增/删一个条目）；返回**写前**是否已含该条目 / RMW the install intent。
+
+    安装是全局一次的事实（协议 v0.3.0 §2.1/§2.4「plugin_installation」）→ 意图固定落 **user** settings.json
+    （#123 决策：不随 ``--scope`` 泄漏进可提交的 project 文件）；读取侧由 :func:`resolve_settings` merged
+    并集承担（project/local 声明亦被认可，支持声明式复现）。数组写回整体替换（§5.4 写语义），保序去重。
+    """
+    path = user_settings_path(env)
+    with file_lock(path):
+        existing, _errors = load_settings_file(path, SettingsScope.USER)
+        current = existing.get("installedPlugins")
+        entries: list[str] = list(current) if isinstance(current, list) else []
+        was_present = plugin_id in entries
+        if present and not was_present:
+            entries.append(plugin_id)
+        elif not present and was_present:
+            entries = [e for e in entries if e != plugin_id]
+        atomic_write_json(path, apply_write(existing, {"installedPlugins": entries}))
+        return was_present
 
 
 def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str) -> list[str]:
@@ -255,9 +299,8 @@ def _require_existing_names_guard(
 # ---------------------------------------------------------------------------
 # install / uninstall / enable / disable
 # ---------------------------------------------------------------------------
-async def install_plugin(
+async def materialize_plugin(
     plugin_id: str,
-    registry: SkillRegistry,
     home: Path,
     *,
     scope: str = "user",
@@ -267,37 +310,30 @@ async def install_plugin(
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     existing_server_names: ExistingServerNames | None = None,
-    register_server: RegisterServer | None = None,
-    remove_server: RemoveServer | None = None,
-    inject_inputs: InjectInputs | None = None,
 ) -> InstalledPluginRecord:
     """
-    显式安装单个 plugin（**原子失败：冲突即抛、不留半装**）/ Install one plugin atomically。
+    物化单个 plugin（clone/定位 + manifest 校验 + 冲突预检 + 写账本；**零激活**）/ Materialize one plugin。
+
+    协议 v0.3.0 §2.3「Fetch 资产：意图 → 物化账本 → 克隆缓存 → 活跃集」中**物化账本**一环的执行体：
+    供 :func:`install_plugin`（显式安装）与治理启动恢复（账本删除后由 ``installedPlugins`` 意图重建，
+    §4.9「删除无损」）复用。不 stage SKILL、不挂 server、不写任何 settings 意图。
 
     顺序（§10.6「预检-先于-变更」）/ Order:
     1. 校验 ``plugin_id`` → ``(plugin, mp)``；从 ``known_marketplaces.json`` 取 mp source（未添加→抛）。
     2. 要求 catalog clone 已存在（``marketplace add`` 前置；缺失→抛）；读 marketplace.json 定位 entry。
     3. :func:`locate_plugin_root` 定位 plugin 根（必要时 clone 外部 plugin；失败→抛，零变更）。
-    4. :func:`load_bundled_servers` 全量解析 ``mcp-servers/<n>.json``（任一畸形→抛，注册前）。
-    5. **★冲突闸门**：外来同名→:class:`MCPServerNameConflictError`（零变更）；自有同名→幂等放行。
-    6-7. 过闸后变更：注册 bundled servers → :func:`stage_marketplace_skills` 注册 skills（复用既有 clone）。
-       任一失败 → **精确补偿回滚**（仅注销本次新增的 skill、仅移除本次新增的 server——重装失败不误删此前已有）
-       → 上抛，**不写账本**。
-    8. **★最后**写 ``installed_plugins.json``（仅全成功）：scope / installPath / version / commitSha /
+    4. strict 冲突检测（§4.4，#80）+ :func:`load_bundled_servers` 全量解析（任一畸形→抛，写账本前）。
+    5. **★冲突预检**：外来同名→:class:`MCPServerNameConflictError`（零变更）；自有同名→幂等放行；
+       ``existing_server_names=None``（boot 重物化等无 live manager 场景）→ 跳过预检。
+    6. 写 ``installed_plugins.json``（仅全成功）：scope / installPath / version / commitSha /
        installedAt / lastUpdated / bundledMcpServers。
 
     :param scope: 物化记录 scope（``managed|user|project|local``，默认 ``user``）。
-    :param version: 记录版本覆盖（``--version``）；缺省按 entry > plugin.json > commitSha 解析。v0.2.1 git-ref
-        锁版本由 entry source 的 ref 治理（version 仅作记录）。
-    :param existing_server_names / register_server / remove_server: MCP 注入回调（``None`` = ledger-only）。
-        **契约**：给了 ``register_server`` 就必须给 ``existing_server_names``（否则冲突闸门被静默旁路，违 §10.6）。
-    :param inject_inputs: 可选 plugin-scoped inputs 注入 hook（入参 ``plugin_root``）；在冲突闸门后、register 前调一次
-        （#69 Group A，§9.3 D2）。``None`` = 不注入。注入失败走补偿回滚上抛；注入的 inputs 不回滚（无害）。
+    :param version: 记录版本覆盖（``--version``）；缺省按 entry > plugin.json > commitSha 解析。
     :return: 写入的 :class:`InstalledPluginRecord`。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    _require_existing_names_guard(existing_server_names, register_server)
-    source, commit_sha = _resolve_marketplace_source(marketplace, home, env)
+    _source, commit_sha = _resolve_marketplace_source(marketplace, home, env)
 
     catalog_dir = marketplace_skill_dir(home, marketplace)
     if not catalog_dir.is_dir():
@@ -308,7 +344,7 @@ async def install_plugin(
     if entry is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
 
-    # 1-4：定位 + 解析（注册前，畸形即抛 → 原子前置）
+    # 3-4：定位 + 解析（写账本前，畸形即抛 → 原子前置）
     plugin_root, version_fallback = await locate_plugin_root(
         marketplace,
         plugin,
@@ -321,64 +357,20 @@ async def install_plugin(
         timeout=timeout,
         env=env,
     )
-    # plugin.json 读一次复用（冲突检测 + version 解析共用，与 staging._stage_one_plugin 姿态对齐，避免重复读盘）。
+    # plugin.json 读一次复用（strict 检测 + version 解析共用，与 staging._stage_one_plugin 姿态对齐，避免重复读盘）。
     plugin_manifest = read_plugin_metadata(plugin_root)
-    # strict mode 冲突检测（§4.4，#80）：strict=false + plugin.json 声明组件 → 拒绝加载（**硬错误**）。
-    # 早检——在挂载 server / 注册 skill 前拦截，不依赖 staging 降级，保证原子失败（未挂 server、未注册 skill）。
     try:
         check_strict_conflict(entry, plugin_manifest)
     except PluginManifestError as e:
         raise PluginInstallError(str(e)) from e
     servers = load_bundled_servers(plugin_root)
 
-    # 5：★冲突闸门（零变更）。owned = 自有同名白名单（其上次记录的 bundledMcpServers）。
+    # 5：★冲突预检（零变更）。owned = 自有同名白名单（其上次记录的 bundledMcpServers）。
     owned = _bundled_servers_of(home, plugin_id, env)
     existing = existing_server_names() if existing_server_names is not None else set()
     _conflict_check(servers, existing, owned)
 
-    # —— 过闸：开始变更，失败补偿回滚 ——
-    # 回滚前快照本 plugin 已活跃的 skill：使补偿只撤销**本次新增**——重装（plugin 已装、skill 已活跃、owned
-    # server 已挂）中途失败时，不误删此前就存在的 skill / 摘除原本工作的 server（精确回滚，避免 live 态破坏）。
-    skills_before = set(_plugin_skill_names(registry, marketplace, plugin))
-    registered: list[str] = []
-    try:
-        # 注入 plugin-scoped inputs 入池（#69 Group A）：须在 register（→render bundled server 的 ``${input:}``）之前，
-        # 使裸 id 经 D2 前缀回退命中带前缀池条目。失败即走下方补偿回滚上抛；inputs 注入本身**不回滚**
-        # （悬空前缀 def 无害——仅在被引用时消费，而该 cfg 已回滚不挂载）。
-        if inject_inputs is not None:
-            await inject_inputs(plugin_root)
-        if register_server is not None:
-            for cfg in servers:
-                await register_server(cfg)
-                registered.append(cfg.name)
-        # skills 注册：复用 #61（catalog 已 clone、plugin 已定位 → refresh=False 不重 clone）
-        await stage_marketplace_skills(
-            marketplace,
-            source,
-            registry,
-            home,
-            plugin_filter={plugin},
-            refresh=refresh,
-            timeout=timeout,
-            env=env,
-        )
-    except Exception:
-        # 精确回滚（逆序）：仅注销本次新增的 skill（不在 skills_before）、仅移除本次新增的 server（不在 owned，
-        # 即非自有/非重装前已挂）；再上抛（账本未写）。
-        for name in _plugin_skill_names(registry, marketplace, plugin):
-            if name not in skills_before:
-                registry.unregister(name)
-        if remove_server is not None:
-            for sname in registered:
-                if sname in owned:
-                    continue  # 自有 server（重装前已挂）：保留，不误摘
-                try:
-                    await remove_server(sname)
-                except Exception as e:  # 回滚 best-effort，不掩盖原异常
-                    logger.warning("install rollback: remove_server(%r) failed: %s", sname, e)
-        raise
-
-    # 8：★最后写账本（仅全成功）
+    # 6：写账本（仅全成功）
     bundled_names = [cfg.name for cfg in servers]
     resolved_version = version if version else resolve_plugin_version(entry, plugin_manifest, version_fallback)
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -402,7 +394,76 @@ async def install_plugin(
         plugins[_pid] = kept
 
     update_installed_plugins(_put, home=home, env=env)
-    logger.info("installed plugin %r (servers=%s, skills staged)", plugin_id, bundled_names or "none")
+    return record
+
+
+async def install_plugin(
+    plugin_id: str,
+    registry: SkillRegistry,  # noqa: ARG001 - 签名与 uninstall/enable/disable 对称；v0.3.0 install 不再触碰 Registry
+    home: Path,
+    *,
+    scope: str = "user",
+    project_path: str | None = None,
+    version: str | None = None,
+    refresh: bool = False,
+    timeout: float = DEFAULT_GIT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
+    existing_server_names: ExistingServerNames | None = None,
+) -> InstalledPluginRecord:
+    """
+    显式安装单个 plugin = config-first 写意图 + 物化；**不激活**（v0.3.0 §2.4 install 行）/ Install ≠ activate。
+
+    顺序 / Order:
+    1. cheap 预检（零变更）：``plugin_id`` 形态、marketplace 已添加、catalog 已 clone、manifest entry 存在。
+    2. **config-first**（§2.3）：把 ``plugin_id`` 写入 **user scope** ``installedPlugins``（全局安装意图）。
+    3. :func:`materialize_plugin` 物化（clone/strict/bundled 解析/冲突预检/写账本）。
+    4. 物化失败 → **原子回滚**：撤销第 2 步新写的意图条目（重装场景原已在 → 保留）→ 上抛（#123 决策 #3：
+       「失败 = 零变更」；协议对 install 失败未置可否，本 SDK 取更强不变量，rust-sdk#103 镜像）。
+
+    结果态 ``installed_disabled``：**不** stage SKILL、**不**写 ``enabledPlugins``、**不**挂 bundled server——
+    显式 :func:`enable_plugin` 才原子点亮（skills 与 server 一并）。
+
+    :param registry: 与其余三动词对称保留；install 自 v0.3.0 起不触碰 Registry。
+    :param scope: 物化记录 scope（``managed|user|project|local``，默认 ``user``）——只影响账本记录归档，
+        **不**影响意图落点（安装是全局一次的事实，意图恒写 user scope）。
+    :param existing_server_names: 可选冲突预检输入（``None`` = 跳过预检；enable 时仍有权威预检兜底）。
+    :return: 写入的 :class:`InstalledPluginRecord`。
+    """
+    plugin, marketplace = _split_plugin_id(plugin_id)
+
+    # 1：cheap 预检（不写任何状态；深校验交给 materialize）
+    _resolve_marketplace_source(marketplace, home, env)
+    catalog_dir = marketplace_skill_dir(home, marketplace)
+    if not catalog_dir.is_dir():
+        raise PluginInstallError(f"marketplace {marketplace!r} catalog not cloned at {catalog_dir} (run 'marketplace add/refresh' first)")
+    if find_plugin_entry(read_marketplace_manifest(catalog_dir), plugin) is None:
+        raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
+
+    # 2：config-first 写全局安装意图（快照写前状态供原子回滚：重装时原已在 → 失败不误删）
+    was_present = _write_installed_plugin(plugin_id, True, env)
+
+    # 3-4：物化；失败回滚意图（best-effort，不掩盖原异常）
+    try:
+        record = await materialize_plugin(
+            plugin_id,
+            home,
+            scope=scope,
+            project_path=project_path,
+            version=version,
+            refresh=refresh,
+            timeout=timeout,
+            env=env,
+            existing_server_names=existing_server_names,
+        )
+    except Exception:
+        if not was_present:
+            try:
+                _write_installed_plugin(plugin_id, False, env)
+            except Exception as e:  # noqa: BLE001 - 回滚 best-effort
+                logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, e)
+        raise
+
+    logger.info("installed plugin %r (servers=%s; installed_disabled, run 'plugin enable' to activate)", plugin_id, record.get("bundledMcpServers") or "none")
     return record
 
 
@@ -418,6 +479,11 @@ async def uninstall_plugin(
 ) -> bool:
     """
     卸载单个 plugin（删 installPath 树 + 注销 skills + 级联 stop+remove bundled server + 删账本记录）/ Uninstall。
+
+    **v0.3.0 §2.4 uninstall 行**：当该 pid 的账本记录**全部**移除（回 ``available``）时，同步删除 user scope
+    ``installedPlugins`` 意图条目 + 清 ``enabledPlugins`` 条目（user 必清；给了 ``project_path`` 时 project/local
+    一并 best-effort——managed/policy 只读层不触碰）。指定 ``scope`` 仅删该 scope 记录且其余 scope 仍在 →
+    意图与 enabled 条目保留（安装事实未消失）。
 
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
@@ -469,6 +535,20 @@ async def uninstall_plugin(
             plugins.pop(_pid, None)
 
     update_installed_plugins(_drop, home=home, env=env)
+
+    # v0.3.0：账本记录清空（回 available）→ 删全局安装意图 + 清 enabledPlugins 条目（意图是唯一权威，§2.3）。
+    # project/local 落点从被删记录的 projectPath 派生（无需调用方另传）；managed/policy 只读层不触碰。
+    remaining = load_installed_plugins(home=home, env=env).get("plugins", {}).get(plugin_id)
+    if not remaining:
+        _write_installed_plugin(plugin_id, False, env)
+        _write_enabled_plugin(plugin_id, None, "user", None, env)
+        project_paths = {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p}
+        for pp in sorted(project_paths):
+            for s in ("project", "local"):
+                try:
+                    _write_enabled_plugin(plugin_id, None, s, pp, env)
+                except PluginInstallError as e:  # best-effort：清条目失败不阻断卸载
+                    logger.warning("uninstall: failed to clear enabledPlugins[%s] in %s scope at %s: %s", plugin_id, s, pp, e)
     logger.info(
         "uninstalled plugin %r (scope=%s, servers=%s)",
         plugin_id,
@@ -522,13 +602,17 @@ async def enable_plugin(
     env: Mapping[str, str] | None = None,
     existing_server_names: ExistingServerNames | None = None,
     register_server: RegisterServer | None = None,
+    remove_server: RemoveServer | None = None,
 ) -> None:
     """
-    启用单个 plugin（廉价复原，**无需重 clone/重装**）/ Enable = cheap restore (no re-clone)。
+    启用单个 plugin（**原子激活**：skills 与 bundled server 一并入投影，失败回滚 ``installed_disabled``）/ Enable。
 
-    顺序：① 从物化记录的 ``installPath`` 重解析 bundled servers → **★冲突预检（先于 settings 写 → enable 原子）**；
-    ② 写 ``enabledPlugins[id]=true``；③ 复活 skills——re-stage（:func:`stage_marketplace_skills` 的
-    :meth:`register_or_update` 把孤儿同名翻 ``orphaned=False``，``refresh=False`` 复用既有 clone）；④ 重挂 servers。
+    v0.3.0 §2.4「enable 原子性」：顺序 ① 从物化记录的 ``installPath`` 重解析 bundled servers →
+    **★冲突预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →
+    写 ``enabledPlugins[id]=true``；③ 复活 skills——re-stage（:func:`stage_marketplace_skills` 的
+    :meth:`register_or_update` 把孤儿同名翻 ``orphaned=False``，``refresh=False`` 复用既有 clone）；
+    ④ 重挂 servers。③/④ 任一失败 → **回滚**：注销本次新增 skill、摘除本次新增 server（经 ``remove_server``）、
+    ``enabledPlugins`` 恢复原值（原 absent → 删条目）→ 上抛，净效果回 ``installed_disabled``。
     未安装 → :class:`PluginInstallError`（须先 install）。
 
     ⚠️ **scope 契约**：同 :func:`disable_plugin`——``scope`` 须与安装 scope 一致（调用方 / #69 从上下文传），否则
@@ -551,24 +635,95 @@ async def enable_plugin(
     existing = existing_server_names() if existing_server_names is not None else set()
     _conflict_check(servers, existing, owned)
 
-    # ② 写 enabledPlugins[id]=true（冲突预检通过后）
+    # ② 快照回滚基线（该 scope 文件的原值：True/False/None=absent；本 plugin 已活跃 skill 集）→ 写 true
+    settings_path, scope_enum = _settings_path_for_scope(scope, project_path, env)
+    prior_settings, _errors = load_settings_file(settings_path, scope_enum)
+    prior_enabled = prior_settings.get("enabledPlugins")
+    prev_value: bool | None = prior_enabled.get(plugin_id) if isinstance(prior_enabled, Mapping) else None
+    skills_before = set(_plugin_skill_names(registry, marketplace, plugin))
     _write_enabled_plugin(plugin_id, True, scope, project_path, env)
 
-    # ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）
-    source, _commit_sha = _resolve_marketplace_source(marketplace, home, env)
-    await stage_marketplace_skills(
-        marketplace,
-        source,
-        registry,
-        home,
-        plugin_filter={plugin},
-        refresh=False,
-        timeout=timeout,
-        env=env,
-    )
-
-    # ④ 重挂 servers
-    if register_server is not None:
-        for cfg in servers:
-            await register_server(cfg)
+    registered: list[str] = []
+    try:
+        # ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）
+        source, _commit_sha = _resolve_marketplace_source(marketplace, home, env)
+        await stage_marketplace_skills(
+            marketplace,
+            source,
+            registry,
+            home,
+            plugin_filter={plugin},
+            refresh=False,
+            timeout=timeout,
+            env=env,
+        )
+        # ④ 重挂 servers
+        if register_server is not None:
+            for cfg in servers:
+                await register_server(cfg)
+                registered.append(cfg.name)
+    except Exception:
+        # 回滚（逆序，best-effort 不掩盖原异常）：撤销本次新增 skill / server，enabledPlugins 恢复原值。
+        for name in _plugin_skill_names(registry, marketplace, plugin):
+            if name not in skills_before:
+                registry.unregister(name)
+        if remove_server is not None:
+            for sname in registered:
+                if sname in owned and sname in existing:
+                    continue  # 自有且 enable 前已挂：保留，不误摘
+                try:
+                    await remove_server(sname)
+                except Exception as e:  # noqa: BLE001 - 回滚 best-effort
+                    logger.warning("enable rollback: remove_server(%r) failed: %s", sname, e)
+        try:
+            _write_enabled_plugin(plugin_id, prev_value, scope, project_path, env)
+        except Exception as e:  # noqa: BLE001 - 回滚 best-effort
+            logger.warning("enable rollback: failed to restore enabledPlugins[%s]=%r: %s", plugin_id, prev_value, e)
+        raise
     logger.info("enabled plugin %r (scope=%s, skills recovered, servers remounted)", plugin_id, scope)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.x → v0.3.0 一次性状态迁移 / One-time state migration
+# ---------------------------------------------------------------------------
+def migrate_legacy_installs(home: Path, *, env: Mapping[str, str] | None = None) -> list[str]:
+    """
+    v0.2.x「装即活跃」存量 → v0.3.0 双意图的一次性迁移（迁移指南「保住既有用户现状」）/ One-time legacy migration。
+
+    **标记 = user settings.json 是否含 ``installedPlugins`` 键**（#123 决策 #2）：键在（哪怕空数组）→ 已迁移，
+    严格 no-op——防「v0.3.0 后手动删意图、账本未 gc」被迁回复活（意图是唯一权威，§2.3）。键缺失（pre-v0.3.0
+    世界）→ 把账本全部合法 pid 写入 ``installedPlugins``，并对 merged ``enabledPlugins`` **无条目**的 pid 在
+    user scope 补 ``enabledPlugins=true``（v0.2.x 下 absent=active，翻转后会熄灯，须保住；显式 false 本就
+    禁用 → 不写，保持 ``installed_disabled``）。首跑**必写**标记键（空账本也写 ``[]``）。
+
+    合并视图经 :func:`resolve_settings`（user/project/local；无 flag/policy——boot 语境，与
+    ``Computer._resolve_declared_settings`` 已知限制一致）。由 ``Computer.boot_up`` 在治理恢复前调用（失败
+    隔离）；幂等、只跑一次。
+
+    :param home: SKILL Home 绝对根（账本读取）。
+    :param env: 环境映射（settings 路径解析），默认 ``os.environ``。
+    :return: 本次迁入 ``installedPlugins`` 的 pid 列表（已迁移 no-op → 空）。
+    """
+    path = user_settings_path(env)
+    with file_lock(path):
+        existing, _errors = load_settings_file(path, SettingsScope.USER)
+        if "installedPlugins" in existing:
+            return []  # 已迁移（标记键在）→ 严格 no-op
+
+        ledger_pids = [pid for pid in load_installed_plugins(home=home, env=env).get("plugins", {}) if is_valid_enabled_plugin_key(pid)]
+        merged_enabled = resolve_settings(env=env).settings.get("enabledPlugins")
+        merged_view: Mapping[str, Any] = merged_enabled if isinstance(merged_enabled, Mapping) else {}
+
+        updates: dict[str, Any] = {"installedPlugins": ledger_pids}
+        enabled_updates = {pid: True for pid in ledger_pids if pid not in merged_view}
+        if enabled_updates:
+            updates["enabledPlugins"] = enabled_updates
+        atomic_write_json(path, apply_write(existing, updates))
+        if ledger_pids:
+            logger.info(
+                "migrated %d legacy plugin install(s) to installedPlugins (v0.3.0): %s (enabled=true backfilled for %d)",
+                len(ledger_pids),
+                ledger_pids,
+                len(enabled_updates),
+            )
+        return ledger_pids
