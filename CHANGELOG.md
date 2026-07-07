@@ -12,6 +12,46 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
 
 ### Breaking Changes
+- **Plugin install/enable separation — install no longer activates** (#123, aligned
+  with a2c-smcp-protocol **v0.3.0** `runtime-contract.md` §2.3/§2.4/§4.8; adjudication
+  record in #120 / protocol#11; rust mirror rust-sdk#103).
+  - **`enabledPlugins` default flipped**: an absent entry now means **not enabled**
+    (only an explicit `true` activates; `false` explicitly disables and overrides a
+    lower scope). Under v0.2.x, absent meant enabled.
+  - New declarative intent **`installedPlugins`** (settings.json array of
+    `<plugin>@<marketplace>`): the global install set. `install_plugin` now writes it
+    config-first to the **user scope**, materializes (clone / manifest validation /
+    foreign MCP name-conflict precheck / ledger), and **does not activate** — no SKILL
+    staging, no bundled-server mount, no `enabledPlugins` write → `installed_disabled`.
+    Materialization failure atomically rolls the intent entry back.
+  - `install_plugin` signature: **removed** `register_server=` / `remove_server=` /
+    `inject_inputs=` kwargs (install mounts nothing); `existing_server_names=` kept for
+    the conflict precheck. New `materialize_plugin()` exposes activation-free
+    materialization (reused by boot re-materialization).
+  - **`enable_plugin` is now atomic**: skills and bundled servers light up together;
+    on mount failure it rolls back to `installed_disabled` (unregisters newly staged
+    skills, removes newly mounted servers via the new `remove_server=` kwarg, restores
+    the previous `enabledPlugins` value — absent entries are deleted, not set `false`).
+  - `uninstall_plugin` now also removes the `installedPlugins` entry and clears
+    `enabledPlugins` entries (user always; project/local derived from recorded
+    `projectPath`) once no ledger records remain.
+  - **Boot recovery is intent-driven** (`recovery.py`): the install set comes from the
+    merged `installedPlugins` (the ledger is a rebuildable derived cache — deleting
+    `installed_plugins.json` is lossless: boot re-materializes missing entries, reported
+    via the new `GovernanceRecoveryReport.rematerialized`); the active set is
+    installed ∧ enabled; `installed_disabled` restores lazily (no projection).
+    Orphan detection (`list_orphan_plugins`) now keys off `installedPlugins`
+    (`declared_plugin_ids` **removed** in favor of `declared_installed_plugin_ids`).
+  - **One-time migration** (`migrate_legacy_installs`, run by `Computer.boot_up`):
+    existing ledger installs are written into `installedPlugins`, and plugins without
+    any `enabledPlugins` entry get `enabledPlugins=true` in the user scope so
+    pre-upgrade active plugins stay active (explicit `false` stays disabled). The
+    presence of the `installedPlugins` key in user settings marks migration done
+    (written even when empty), so manual intent removals are never resurrected.
+  - CLI: `plugin install` prints `installed_disabled` state and mounts nothing;
+    `plugin list` shows **all** installed plugins with a two-state enabled column
+    (`--available` kept as a compat no-op); `plugin list`/`info` enabled now means
+    explicit `true`; `plugin enable` wires `remove_server` for rollback.
 - **Connection-plane auth moved from HTTP header to the Socket.IO `auth` dict**
   (#112 / Jira AS-38; Epic TFRM-153). A2C-SMCP is auth-agnostic — **no protocol
   change**; `token` is an SDK/deployment convention aligned with rust-sdk /

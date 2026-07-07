@@ -28,10 +28,10 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1（
   （生产由 #63 写入、本工单测试直接 seed）。
 - bundled MCP server 的起停经 :func:`gc_plugins` 的 ``mcp_teardown`` 回调注入；真正接线（MCP manager）
   由 computer.py 集成承担，不在 #62。
-- **与治理启动恢复的分工（#117）**：本模块是**声明式**对账（declared 驱动，恢复不了"装即活跃"、未写
-  ``enabledPlugins`` 的命令式安装）；boot 恢复走 :mod:`~a2c_smcp.computer.settings.recovery`
-  （**ledger 驱动**：``installed_plugins.json`` 为"已安装"事实源 + ``enabledPlugins`` 仅作禁用门控），
-  两者 additive-only 语义一致、职责不同。
+- **与治理启动恢复的分工（#117/#123）**：本模块是**marketplace 声明式**对账（``extraKnownMarketplaces``
+  驱动的 catalog 物化 + 启用 plugin 的 SKILL 注册）；boot 恢复走 :mod:`~a2c_smcp.computer.settings.recovery`
+  （**intent 驱动**：``installedPlugins`` 为安装事实源、活跃集 = installed ∧ ``enabledPlugins[id] is True``
+  （v0.3.0 缺省翻转）、账本缺失时重物化），两者 additive-only 语义一致、职责不同。
 
 并发 / Concurrency：:func:`reconcile` **串行** stage 各 marketplace（不 ``asyncio.gather``），遵守
 :func:`stage_marketplace_skills` 文档化的同步 ``file_lock`` 阻塞约束（store.py 同步设计的固有约束）。
@@ -116,32 +116,34 @@ def declared_marketplace_names(declared: Mapping[str, object]) -> set[str]:
     return set(_declared_marketplaces(declared))
 
 
-def declared_plugin_ids(declared: Mapping[str, object]) -> set[str]:
+def declared_installed_plugin_ids(declared: Mapping[str, object]) -> set[str]:
     """
-    所有**声明过**的 plugin id（``<plugin>@<mp>``，含 ``false`` 禁用项）/ All declared plugin ids。
+    merged ``installedPlugins``（全局安装意图，协议 v0.3.0 §2.4）中的合法 pid 集合 / Declared install intent。
 
-    用于 :func:`list_orphan_plugins` 的孤儿判定——``false`` = 声明禁用（**非**孤儿），仅 key 完全缺失才算孤儿。
+    用于 :func:`list_orphan_plugins` 的孤儿判定与「活跃集 = installed ∧ enabled」门控（#123）：
+    ``installed_disabled``（已安装未启用）是合法静止态、**非**孤儿；仅账本 pid ∉ 安装意图才算孤儿。
     """
-    raw = declared.get("enabledPlugins")
-    if not isinstance(raw, Mapping):
+    raw = declared.get("installedPlugins")
+    if not isinstance(raw, list):
         return set()
-    return {k for k in raw if is_valid_enabled_plugin_key(k)}
+    return {item for item in raw if isinstance(item, str) and is_valid_enabled_plugin_key(item)}
 
 
 def _enabled_plugin_names_for(marketplace: str, declared: Mapping[str, object]) -> set[str]:
     """
-    某 marketplace 下**启用**（``true``）的 plugin 名集合 / Enabled (``true``) plugin names for a marketplace。
+    某 marketplace 下**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0 §4.8.1）的 plugin 名集合。
 
     ``enabledPlugins`` key 形如 ``<plugin>@<mp>``；返回去掉 ``@<mp>`` 后缀的 ``<plugin>`` 集合，作
-    :func:`stage_marketplace_skills` 的 ``plugin_filter``（缺启用项 → 空集 → 仅 clone catalog、不注册 SKILL）。
+    :func:`stage_marketplace_skills` 的 ``plugin_filter``（缺启用项/未安装 → 空集 → 仅 clone catalog、不注册 SKILL）。
     """
     raw = declared.get("enabledPlugins")
     if not isinstance(raw, Mapping):
         return set()
+    installed = declared_installed_plugin_ids(declared)
     suffix = f"@{marketplace}"
     names: set[str] = set()
     for key, enabled in raw.items():
-        if enabled is True and is_valid_enabled_plugin_key(key) and key.endswith(suffix):
+        if enabled is True and key in installed and key.endswith(suffix):
             names.add(key[: -len(suffix)])
     return names
 
@@ -210,8 +212,9 @@ async def reconcile(
     - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ ``git pull``。
     - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 :func:`prune_marketplaces` 显式清）。
 
-    每个 declared marketplace 物化其 ``enabledPlugins`` 中**启用**的 plugin 的 SKILL（``plugin_filter``）；
-    禁用 / 未声明 plugin 不注册。失败降级：stage 吞错返回空 → 本函数据 clone 树是否存在判 ``failed``。
+    每个 declared marketplace 物化其**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0）plugin 的
+    SKILL（``plugin_filter``）；未安装 / 禁用 / 未声明 plugin 不注册。失败降级：stage 吞错返回空 →
+    本函数据 clone 树是否存在判 ``failed``。
 
     :param registry: 目标 :class:`SkillRegistry`。
     :param home: SKILL Home 绝对根（调用方保证存在）。
@@ -347,14 +350,16 @@ def list_orphan_plugins(
     env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """
-    列出"所有 scope 都不再声明"的孤儿 plugin（installed 有、enabledPlugins 无此 key）/ List orphan plugins。
+    列出孤儿 plugin：账本有记录、``installedPlugins`` 安装意图不再包含（v0.3.0 §2.3 账本=派生缓存）/ Orphans。
 
-    ``false`` = 声明禁用（key 仍在）→ **非**孤儿；仅 key 完全缺失才算孤儿（见 :func:`declared_plugin_ids`）。
+    ``installed_disabled``（意图在、未启用）是合法静止态 → **非**孤儿；``enabledPlugins``（含 ``false``）
+    不参与孤儿判定（enablement 与 installation 正交，§2.4）。
 
-    :param declared: 单一声明视图（取 ``enabledPlugins`` 全部 key——含 ``false``——作"仍声明"集）。
-    :return: ``installed_plugins.json`` 中 plugin id ∉ 声明集 的列表（保持物化顺序）。
+    :param declared: 单一声明视图（取 ``installedPlugins`` 合法条目作"仍安装"集，见
+        :func:`declared_installed_plugin_ids`）。
+    :return: ``installed_plugins.json`` 中 plugin id ∉ 安装意图 的列表（保持物化顺序）。
     """
-    declared_ids = declared_plugin_ids(declared)
+    declared_ids = declared_installed_plugin_ids(declared)
     installed = load_installed_plugins(home=home, env=env)
     return [pid for pid in installed.get("plugins", {}) if pid not in declared_ids]
 

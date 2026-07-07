@@ -27,6 +27,8 @@ from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
+# v0.3.0（#123）：活跃 = installed ∧ enabledPlugins=true（缺省翻转）→ hooks 用例显式给足两键意图。
+_DECLARED_ENABLED = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
 
 
 # ── fixture 辅助（与 test_recovery.py 同构）/ helpers ─────────────────────────
@@ -138,7 +140,7 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
             existing_server_names=lambda: set(),
             register_server=register,
             inject_inputs=inject,
-            declared={},
+            declared=_DECLARED_ENABLED,
         )
         assert report.remounted_servers == ["figma"]
         assert calls == [("figma", "audit", "acme")]
@@ -148,7 +150,7 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
             existing_server_names=lambda: set(),
             register_server=register,
             inject_inputs=inject,
-            declared={},
+            declared=_DECLARED_ENABLED,
         )
         assert report2.remounted_servers == ["figma"]  # 幂等：结果一致
 
@@ -173,7 +175,7 @@ async def test_reconcile_governance_injects_once_per_plugin_root(tmp_path: Path,
             existing_server_names=lambda: set(),
             register_server=register,
             inject_inputs=inject,
-            declared={},
+            declared=_DECLARED_ENABLED,
         )
         assert sorted(mounted) == ["blender", "figma"]
         assert sorted(report.remounted_servers) == ["blender", "figma"]
@@ -193,7 +195,7 @@ async def test_reconcile_governance_register_failure_non_blocking(tmp_path: Path
         report = await comp.reconcile_governance(
             existing_server_names=lambda: set(),
             register_server=register,
-            declared={},
+            declared=_DECLARED_ENABLED,
         )
         assert report.remounted_servers == []
         assert "audit:lint" in report.restored_skills
@@ -214,7 +216,7 @@ async def test_reconcile_governance_conflict_skips_existing_name(tmp_path: Path,
         report = await comp.reconcile_governance(
             existing_server_names=lambda: {"figma"},
             register_server=register,
-            declared={},
+            declared=_DECLARED_ENABLED,
         )
         assert calls == []
         assert report.remounted_servers == []

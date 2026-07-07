@@ -12,9 +12,10 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §4.3 / 
 
 测试意图 / Test intentions（本地 ``git init --bare`` 裸仓作 file:// 源，无网络；plugin 同时含
 ``skills/<s>/SKILL.md`` + ``mcp-servers/<n>.json``；MCP 注入用录制式替身捕获校验后的 MCPServerConfig）:
-- install 端到端：真 clone catalog → 注册 plugin skills + 解析 bundled server + 写 installed_plugins.json。
-- uninstall 端到端：删 installPath 树 + 注销 skills + 级联 remove server + 删账本记录。
-- install→disable→enable：**不重 clone**（哨兵保留）+ skill 复活 + server 重挂。
+- install 端到端（v0.3.0 #123 不激活）：真 clone catalog → 解析 bundled server + 写 installedPlugins 意图 +
+  installed_plugins.json；**不**注册 skills、不挂 server → enable 才原子点亮。
+- uninstall 端到端：删 installPath 树 + 注销 skills + 级联 remove server + 删账本记录 + 清双意图。
+- install→enable→disable→enable：**不重 clone**（哨兵保留）+ skill 复活 + server 重挂。
 """
 
 import json
@@ -113,6 +114,7 @@ async def _add_marketplace(home: Path, bare: Path, env: dict[str, str]) -> None:
 # ── install 端到端 / end-to-end ──────────────────────────────────────────────
 @requires_git
 async def test_install_end_to_end(tmp_path: Path) -> None:
+    """v0.3.0：install 端到端 = 真 clone 物化 + 双账写入，零激活；enable 才点亮 skills + server。"""
     bare = _make_bare(tmp_path, "acme", _plugin_files())
     home = _home(tmp_path)
     env = _env(home)
@@ -123,15 +125,20 @@ async def test_install_end_to_end(tmp_path: Path) -> None:
     async def _register(cfg) -> None:
         captured.append(cfg.name)
 
-    record = await install_plugin(
-        "audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register,
-    )
+    record = await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
 
     assert record["bundledMcpServers"] == ["figma"]
     assert record["version"] == "1.2.0"
-    assert reg.resolve("audit:lint") is not None  # 真 skill 注册
-    assert captured == ["figma"]  # bundled server 解析+注册
+    assert reg.resolve("audit:lint") is None  # install ≠ activate：skill 不注册
     assert "audit@acme-skills" in load_installed_plugins(home=home)["plugins"]
+    settings = json.loads((home / "cfg" / "a2c" / "settings.json").read_text(encoding="utf-8"))
+    assert settings["installedPlugins"] == ["audit@acme-skills"]  # config-first 意图
+    assert "enabledPlugins" not in settings
+
+    # enable：真 staging 注册 skill + 重挂 server（原子点亮）
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    assert reg.resolve("audit:lint") is not None
+    assert captured == ["figma"]
 
 
 @requires_git
@@ -149,7 +156,8 @@ async def test_uninstall_end_to_end(tmp_path: Path) -> None:
     async def _remove(name: str) -> None:
         removed.append(name)
 
-    await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
     install_path = Path(load_installed_plugins(home=home)["plugins"]["audit@acme-skills"][0]["installPath"])
     assert install_path.exists() and reg.resolve("audit:lint") is not None
 
@@ -160,10 +168,13 @@ async def test_uninstall_end_to_end(tmp_path: Path) -> None:
     assert not install_path.exists()  # installPath 树清除
     assert reg.resolve("audit:lint") is None  # skills 注销
     assert "audit@acme-skills" not in load_installed_plugins(home=home)["plugins"]  # 账本记录删除
+    settings = json.loads((home / "cfg" / "a2c" / "settings.json").read_text(encoding="utf-8"))
+    assert settings["installedPlugins"] == []  # 意图删除（回 available）
+    assert "audit@acme-skills" not in settings.get("enabledPlugins", {})  # enabled 条目清除
 
 
 @requires_git
-async def test_install_disable_enable_no_reclone(tmp_path: Path) -> None:
+async def test_install_enable_disable_enable_no_reclone(tmp_path: Path) -> None:
     bare = _make_bare(tmp_path, "acme", _plugin_files())
     home = _home(tmp_path)
     env = _env(home)
@@ -178,8 +189,10 @@ async def test_install_disable_enable_no_reclone(tmp_path: Path) -> None:
     async def _remove(name: str) -> None:
         removed.append(name)
 
-    await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
     assert reg.resolve("audit:lint") is not None
+    captured.clear()
     # 哨兵：植入 catalog clone 内 plugin 根，用于检测 enable 是否误重 clone（重 clone 会 wipe）。
     sentinel = marketplace_skill_dir(home, "acme-skills") / "plugins" / "audit" / "SENTINEL"
     sentinel.write_text("x", encoding="utf-8")
@@ -187,7 +200,6 @@ async def test_install_disable_enable_no_reclone(tmp_path: Path) -> None:
     # disable：摘 server + orphan skill
     await disable_plugin("audit@acme-skills", reg, home, env=env, remove_server=_remove)
     assert reg.is_orphan("audit:lint") and removed == ["figma"]
-    captured.clear()
 
     # enable：复活 skill + 重挂 server，且不重 clone
     await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
@@ -231,11 +243,12 @@ async def test_install_strict_false_conflict_hard_fails_atomically(tmp_path: Pat
 
     # 早检拦截 → PluginInstallError（硬错误，conflicting manifests）
     with pytest.raises(PluginInstallError, match="conflicting manifests"):
-        await install_plugin(
-            "audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register,
-        )
+        await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
 
-    # 原子失败：未挂 server、未注册 skill、未写 installed 记录
+    # 原子失败：未挂 server、未注册 skill、未写 installed 记录、意图回滚
     assert captured == []
     assert reg.resolve("audit:lint") is None
     assert "audit@acme-skills" not in load_installed_plugins(home=home)["plugins"]
+    settings_file = home / "cfg" / "a2c" / "settings.json"
+    if settings_file.exists():
+        assert "audit@acme-skills" not in json.loads(settings_file.read_text(encoding="utf-8")).get("installedPlugins", [])

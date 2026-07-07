@@ -37,7 +37,7 @@ _DYNAMIC_PLUGIN = {("plugin", s) for s in ("uninstall", "enable", "disable", "in
 _DYNAMIC_SETTINGS = {("settings", "get"), ("settings", "set")}
 # 已知 settings.json 顶层字段（与 schema.py FIELD_* 对齐；completer 静态名集，无需运行时反射）。
 _SETTINGS_KEYS = (
-    "extraKnownMarketplaces", "enabledPlugins", "strictKnownMarketplaces", "trustedMarketplaces",
+    "extraKnownMarketplaces", "installedPlugins", "enabledPlugins", "strictKnownMarketplaces", "trustedMarketplaces",
     "blockedMarketplaces", "enableAllProjectMcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers",
     "allowedMcpServers", "deniedMcpServers", "permissions",
 )

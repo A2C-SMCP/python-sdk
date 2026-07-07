@@ -65,6 +65,7 @@ from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
+from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.recovery import (
     BundledServerRecord,
     GovernanceRecoveryReport,
@@ -343,11 +344,18 @@ class Computer(BaseComputer[PromptSession]):
         except Exception as e:  # pragma: no cover — 防御性兜底
             logger.error(f"SKILL Home 解析失败（不阻断 Computer 启动）/ SKILL Home resolve failed (non-blocking): {e}", exc_info=True)
 
-        # #117 治理启动恢复（协议 v0.2.3 §4.8.1，rust reconcile_governance 同位）：从双账本恢复
-        # enabled plugin 的 bundled SKILL。**skills-only**——bundled MCP server 不在 boot 拉进程
-        # （#93 client owns MCP config），client 经 reconcile_governance(hooks) 显式重挂（设计 Y）。
-        # Governance boot recovery (skills-only); bundled MCP servers stay client-driven via hooks.
+        # #117/#123 治理启动恢复（协议 v0.3.0 §4.8.1，rust reconcile_governance 同位）：先跑 v0.2.x → v0.3.0
+        # 一次性迁移（账本存量 → installedPlugins + enabledPlugins=true，保住升级前活跃态；标记键幂等），
+        # 再从安装意图恢复活跃（installed ∧ enabled）plugin 的 bundled SKILL。**skills-only**——bundled MCP
+        # server 不在 boot 拉进程（#93 client owns MCP config），client 经 reconcile_governance(hooks)
+        # 显式重挂（设计 Y）。One-time legacy migration, then intent-driven skills-only recovery.
         if self._skill_home is not None:
+            try:
+                migrated = migrate_legacy_installs(self._skill_home)
+                if migrated:
+                    logger.info("v0.3.0 governance migration: %d legacy install(s) migrated to installedPlugins", len(migrated))
+            except Exception as e:  # pragma: no cover — 失败隔离：迁移失败不阻断启动（下次 boot 重试）
+                logger.warning(f"v0.3.0 治理迁移失败（不阻断启动）/ governance migration failed (non-blocking): {e}")
             try:
                 recovery_report = await self.reconcile_governance()
                 if recovery_report.restored_skills or recovery_report.failed_marketplaces:
@@ -1348,10 +1356,11 @@ class Computer(BaseComputer[PromptSession]):
         declared: Mapping[str, Any] | None = None,
     ) -> GovernanceRecoveryReport:
         """
-        治理启动恢复公共入口（#117，协议 v0.2.3 §4.8；两 SDK 同构契约"设计 Y"）/ Governance recovery entry。
+        治理启动恢复公共入口（#117/#123，协议 v0.3.0 §4.8；两 SDK 同构契约"设计 Y"）/ Governance recovery entry。
 
-        阶段一（恒执行）：从双账本恢复 enabled plugin 的 bundled SKILL 进当前 Registry（ledger 驱动、
-        additive-only、幂等、失败降级不抛——见 :mod:`~a2c_smcp.computer.settings.recovery`）。
+        阶段一（恒执行）：从安装意图恢复**活跃**（installed ∧ ``enabledPlugins[id] is True``，缺省翻转）plugin
+        的 bundled SKILL 进当前 Registry，并重物化账本缺失的 installed pid（intent 驱动、additive-only、幂等、
+        失败降级不抛——见 :mod:`~a2c_smcp.computer.settings.recovery`；``installed_disabled`` 恢复为惰性）。
         阶段二（仅当给 ``register_server``）：client 显式重挂 bundled MCP server——逐 plugin 根先
         ``inject_inputs(record)``（携归属上下文做 plugin inputs 前缀化注入，bundled server 的
         ``${input:}`` D2 渲染前置；每 plugin 根仅一次），再逐 server 经 ``register_server(config, record)``
@@ -1367,7 +1376,8 @@ class Computer(BaseComputer[PromptSession]):
             （如 CLI 取 ``comp.mcp_servers`` 名集），仅在明确无冲突面的受控场景省略。
         :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
         :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
-        :param declared: ``enabledPlugins`` 合并声明视图覆盖（``None`` = 现算 user/project/local/policy）。
+        :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；
+            ``None`` = 现算 user/project/local/policy）。
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
         home = self.skill_home
@@ -1410,8 +1420,9 @@ class Computer(BaseComputer[PromptSession]):
         面向 client（如 ``tfrobot-client``）Skill / MCP tab：一次拿到「当前 Computer 有哪些 MCP server + 每条
         归谁（user vs plugin，含 marketplace / plugin / pluginId）+ 能否从普通 MCP tab 编辑 / 启停」，**无需**读
         SDK ledger、**无需**解析 plugin manifest、**无需**持内存 ownership map。协议依据 a2c-smcp-protocol
-        v0.2.3 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起也须可查询）。元数据类型
-        见 :mod:`~a2c_smcp.computer.inventory`，**SDK-facing、不进** Agent-facing ``client:*`` wire。
+        v0.3.0 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起也须可查询；
+        「已启用」= installed ∧ ``enabledPlugins[id] is True``，``installed_disabled`` 不进本投影，§2.4）。
+        元数据类型见 :mod:`~a2c_smcp.computer.inventory`，**SDK-facing、不进** Agent-facing ``client:*`` wire。
 
         合并两个来源（去重按 server 名，运行期条目优先）：
 

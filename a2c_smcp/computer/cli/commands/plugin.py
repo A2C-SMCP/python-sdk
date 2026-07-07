@@ -13,13 +13,17 @@ Plugin command handlers + boot-time MCP approval box。
 与 marketplace.py 同范式：handler 取**显式资源**（``registry`` / ``home`` / ``env``）+ flags，返回退出码
 （0 成功 / 1 用户错 / 2 网络错），包裹 :mod:`...settings.installer` 四动词 + :mod:`...settings.reconciler`
 gc。MCP 注入回调（``existing_server_names`` / ``register_server`` / ``remove_server`` / ``inject_inputs``）由
-REPL dispatcher 从活跃 ``Computer`` 装配后注入；Typer 非交互无 live Computer → 传 ``None``（ledger-only，
-MCP 挂载延到下次 REPL boot 经批准框落地）。
+REPL dispatcher 从活跃 ``Computer`` 装配后注入；Typer 非交互无 live Computer → 传 ``None``。
+
+**v0.3.0 语义（#123）**：``plugin install`` 只安装**不激活**（不挂 server、不投影 skills → ``installed_disabled``；
+仅传 ``existing_server_names`` 做冲突预检）；``plugin enable`` 才原子点亮 skills + bundled server（挂载失败
+回滚 ``installed_disabled``，故 enable 也注入 ``remove_server``）。``plugin list`` 默认列出**全部已安装**
+（enabled 列呈现两态；install 后必须可见）。
 
 **plugin 实时挂载 D2 上下文渲染（#69 Group A，§9.3 D2）**：plugin 的 ``mcp-servers/inputs.json`` 入池时 id
-前缀化为 ``<plugin>@<marketplace>/<id>``；挂载 bundled server 时，``_plugin_register_cb`` 携 plugin/marketplace
-上下文调 :meth:`Computer.aadd_or_aupdate_server`，使 server config 的裸 ``${input:id}`` 经 resolver D2 前缀回退
-解析。``_plugin_inject_inputs_cb`` 负责在 register 前把 inputs 注入 Computer 池。
+前缀化为 ``<plugin>@<marketplace>/<id>``；enable 挂载 bundled server 时，``_plugin_register_cb`` 携
+plugin/marketplace 上下文调 :meth:`Computer.aadd_or_aupdate_server`，使 server config 的裸 ``${input:id}`` 经
+resolver D2 前缀回退解析。``_plugin_inject_inputs_cb`` 负责在 register 前把 inputs 注入 Computer 池。
 
 **MCP 批准框（#69 Group B，§9.2）**：:func:`run_mcp_approval` 在 REPL 启动期跑——解析 ``.tfrobot/mcp.json``
 定义层、套门控、对 ``PENDING`` server 弹 y/a/n（写 local scope）；非交互无 TTY → skip+WARN（``--approve-all-mcp``
@@ -173,11 +177,12 @@ async def plugin_install(
     project_path: str | None = None,
     version: str | None = None,
     existing_server_names: ExistingServerNames | None = None,
-    register_server: RegisterServer | None = None,
-    inject_inputs: InjectInputs | None = None,
     json_output: bool = False,
 ) -> int:
-    """安装单个 plugin（外来 MCP 同名硬抛、原子失败，§10.6）/ Install a plugin (foreign name conflict hard-throws)。"""
+    """安装单个 plugin（**不激活**：写 installedPlugins + 物化 → ``installed_disabled``，v0.3.0 §2.4）/ Install。
+
+    外来 MCP 同名硬抛、原子失败（§10.6 预检保留）；skills/bundled server 由 ``plugin enable`` 原子点亮。
+    """
     if _split_plugin_id(plugin_id) is None:
         return _err(f"invalid plugin id {plugin_id!r} (expected '<plugin>@<marketplace>')", json_output=json_output)
     try:
@@ -185,7 +190,7 @@ async def plugin_install(
             record = await install_plugin(
                 plugin_id, registry, home,
                 scope=scope, project_path=project_path, version=version, env=env,
-                existing_server_names=existing_server_names, register_server=register_server, inject_inputs=inject_inputs,
+                existing_server_names=existing_server_names,
             )
     except MCPServerNameConflictError as e:
         # §10.6 硬抛、退出码 1 + JSON error（无 rename/force 逃生口）。
@@ -195,10 +200,12 @@ async def plugin_install(
 
     servers = record.get("bundledMcpServers") or []
     if json_output:
-        console.print_json(data={"installed": plugin_id, "scope": record.get("scope"), "bundledMcpServers": servers})
+        console.print_json(
+            data={"installed": plugin_id, "scope": record.get("scope"), "state": "installed_disabled", "bundledMcpServers": servers},
+        )
         return EXIT_OK
-    detail = f" ({len(servers)} MCP server(s) mounted)" if servers else ""
-    return _ok(f"installed {plugin_id!r}{detail}")
+    detail = f" ({len(servers)} MCP server(s) bundled, not mounted)" if servers else ""
+    return _ok(f"installed {plugin_id!r}{detail} (disabled; run 'plugin enable {plugin_id}' to activate)")
 
 
 async def plugin_uninstall(
@@ -229,13 +236,15 @@ async def plugin_enable(
     *,
     existing_server_names: ExistingServerNames | None = None,
     register_server: RegisterServer | None = None,
+    remove_server: RemoveServer | None = None,
     inject_inputs: InjectInputs | None = None,
     json_output: bool = False,
 ) -> int:
-    """启用单个 plugin（廉价复原：重挂 server + 复活 skills）/ Enable a plugin (cheap restore)。
+    """启用单个 plugin（**原子激活**：skills 与 bundled server 一并点亮，失败回滚 installed_disabled）/ Enable。
 
     **scope 契约**（installer §4.3）：从 ledger 逐 scope 读安装 scope 传入，绝不默认 ``user``，否则写错层、与 live
-    态背离。多 scope 记录 → 逐 scope enable。挂载前先经 ``inject_inputs`` 把 plugin-scoped inputs 注入池（#69 Group A）。
+    态背离。多 scope 记录 → 逐 scope enable。挂载前先经 ``inject_inputs`` 把 plugin-scoped inputs 注入池（#69 Group A）；
+    ``remove_server`` 供挂载失败时回滚摘除本次新增 server（v0.3.0 §2.4 enable 原子性）。
     """
     records = _installed_records(home, env, plugin_id)
     if not records:
@@ -248,7 +257,7 @@ async def plugin_enable(
             await enable_plugin(
                 plugin_id, registry, home,
                 scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env,
-                existing_server_names=existing_server_names, register_server=register_server,
+                existing_server_names=existing_server_names, register_server=register_server, remove_server=remove_server,
             )
     except MCPServerNameConflictError as e:
         return _err(str(e), json_output=json_output, error_code="mcp_server_name_conflict")
@@ -288,7 +297,7 @@ async def plugin_disable(
 
 
 def _enabled_plugins_view(home: Path, env: Mapping[str, str] | None) -> dict[str, Any]:
-    """合并视图的 ``enabledPlugins`` 映射（``id → bool``，缺省视为启用）/ Merged enabledPlugins map。"""
+    """合并视图的 ``enabledPlugins`` 映射（``id → bool``；v0.3.0 仅显式 ``true`` 为启用）/ Merged enabledPlugins map。"""
     ep = resolved_settings(env).get("enabledPlugins")
     return dict(ep) if isinstance(ep, Mapping) else {}
 
@@ -300,7 +309,10 @@ def plugin_list(
     available: bool = False,
     json_output: bool = False,
 ) -> int:
-    """列出 installed plugin（默认 enabled；``--available`` 含 disabled）/ List installed plugins。"""
+    """列出全部 installed plugin（enabled 列呈现两态；install-only 的 ``installed_disabled`` 必须可见）/ List。
+
+    v0.3.0（#123）：默认即列全部已安装——``--available`` 保留为兼容 no-op（旧语义"含 disabled"已成默认）。
+    """
     from a2c_smcp.computer.settings.store import load_installed_plugins
 
     installed = load_installed_plugins(home=home, env=env).get("plugins", {})
@@ -308,9 +320,7 @@ def plugin_list(
 
     rows: list[dict[str, Any]] = []
     for pid, records in installed.items():
-        enabled = enabled_map.get(pid) is not False  # 缺省 / true = 启用；显式 false = 禁用
-        if not enabled and not available:
-            continue
+        enabled = enabled_map.get(pid) is True  # 仅显式 true = 启用（缺省翻转，v0.3.0 §2.4）
         scopes = sorted({str(r.get("scope")) for r in records})
         bundled = sorted({s for r in records for s in (r.get("bundledMcpServers") or [])})
         rows.append({"id": pid, "enabled": enabled, "scopes": scopes, "bundledMcpServers": bundled})
@@ -347,7 +357,7 @@ def plugin_info(
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed", json_output=json_output)
-    enabled = _enabled_plugins_view(home, env).get(plugin_id) is not False
+    enabled = _enabled_plugins_view(home, env).get(plugin_id) is True  # 仅显式 true（缺省翻转，v0.3.0）
     info: dict[str, Any] = {"id": plugin_id, "enabled": enabled, "records": records}
     if json_output:
         console.print_json(data=info)
@@ -376,7 +386,7 @@ async def plugin_gc(
     confirm: Callable[[list[str]], Awaitable[bool]] | None = None,
     json_output: bool = False,
 ) -> int:
-    """清理孤儿 plugin（所有 scope 都不再声明 enabledPlugins[id]）/ GC orphan plugins。"""
+    """清理孤儿 plugin（账本有记录、``installedPlugins`` 安装意图不再包含，v0.3.0 §2.3）/ GC orphan plugins。"""
     declared = resolved_settings(env)
     orphans = list_orphan_plugins(home, declared, env=env)
     if not orphans:
@@ -503,23 +513,19 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             console.print("[yellow]usage: plugin install <plugin>@<marketplace> [--version V] [--scope user|project|local][/yellow]")
             return
         plugin_id = pos[0]
-        split = _split_plugin_id(plugin_id)
-        if split is None:
+        if _split_plugin_id(plugin_id) is None:
             console.print("[yellow]invalid plugin id (expected '<plugin>@<marketplace>')[/yellow]")
             return
-        plugin, marketplace = split
         scope = flag_value(args, "--scope") or "user"
-        code = await plugin_install(
+        # v0.3.0（#123）：install 不激活——不注入 register/inject 回调、不 mark_skills_dirty（skills 无变化）；
+        # 仅传 existing_server_names 供冲突预检。激活走 `plugin enable`。
+        await plugin_install(
             registry, home, env, plugin_id,
             scope=scope, project_path=project_path if scope in ("project", "local") else None,
             version=flag_value(args, "--version"),
             existing_server_names=cbs.existing_server_names,
-            register_server=_plugin_register_cb(comp, plugin, marketplace),
-            inject_inputs=_plugin_inject_inputs_cb(comp, plugin, marketplace),
             json_output=json_output,
         )
-        if code == EXIT_OK:
-            comp.mark_skills_dirty()
     elif sub == "uninstall":
         if not pos:
             console.print("[yellow]usage: plugin uninstall <plugin>@<marketplace> [--keep-servers][/yellow]")
@@ -543,6 +549,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             registry, home, env, pos[0],
             existing_server_names=cbs.existing_server_names,
             register_server=_plugin_register_cb(comp, plugin, marketplace),
+            remove_server=cbs.remove_server,  # enable 失败回滚摘除本次新增 server（v0.3.0 原子性）
             inject_inputs=_plugin_inject_inputs_cb(comp, plugin, marketplace),
             json_output=json_output,
         )
