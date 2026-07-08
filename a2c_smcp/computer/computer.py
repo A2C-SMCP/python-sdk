@@ -1004,6 +1004,11 @@ class Computer(BaseComputer[PromptSession]):
         """
         if not self.mcp_manager:
             raise RuntimeError("当前MCP Manger为空")
+        # #127：服务 client:get_tools 前先刷新工具映射。MCP 运行期 tools/list_changed 时，manager 的 boot 期
+        # _tool_mapping 已陈旧——available_tools() 迭代该映射键，**新增**工具不在其中永远漏掉。本方法运行于
+        # socketio on_get_tools 安全上下文（非 MCP 接收循环），可安全 await 刷新（内联刷新会话级死锁见 #127）。
+        # #127: refresh the tool mapping before serving get_tools; runtime tool additions are otherwise missed.
+        await self.mcp_manager.arefresh_tools()
         # 从Manager获取全部工具
         tools = [t async for t in self.mcp_manager.available_tools()]
 

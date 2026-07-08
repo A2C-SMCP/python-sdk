@@ -35,6 +35,7 @@ from a2c_smcp.smcp import (
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
     UPDATE_SKILLS_NOTIFICATION,
+    UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
     GetBlobRet,
@@ -47,6 +48,7 @@ from a2c_smcp.smcp import (
     ListRoomReq,
     SessionInfo,
     UpdateMCPConfigNotification,
+    UpdateToolListNotification,
 )
 from a2c_smcp.utils.blob import drain_blob_sync
 from a2c_smcp.utils.handshake import (
@@ -311,6 +313,8 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=self._namespace)
         # v0.2.1 SKILL 集合更新自动重拉 / v0.2.1 auto-refresh on SKILL set change
         self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
+        # #127 MCP 运行期工具集变化自动重拉 / #127 auto-refresh on runtime tool-set change
+        self.on(UPDATE_TOOL_LIST_NOTIFICATION, self._on_computer_update_tool_list, namespace=self._namespace)
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -358,6 +362,28 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         except Exception as e:
             logger.error(f"Error in _on_computer_update_config: {e}", exc_info=True)
+
+    def _on_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        处理Computer工具列表更新事件的内部方法（#127 sync mirror）
+        Internal handler for a Computer's tool-list-changed event (#127, sync mirror)
+
+        镜像 ``_on_computer_update_config`` 的三段式：预清回调 ``on_computer_update_tool_list`` → 全量回拉
+        ``client:get_tools`` → ``process_tools_response`` 触发 ``on_tools_received`` 重加。
+        """
+        try:
+            # 使用父类的处理方法（预清回调）
+            # Use parent class handling method (pre-clean hook)
+            self.handle_computer_update_tool_list(data)
+
+            # 重新获取工具列表
+            # Re-get tools list
+            computer = data["computer"]
+            tools_response = self.get_tools_from_computer(computer)
+            self.process_tools_response(tools_response, computer)
+
+        except Exception as e:
+            logger.error(f"Error in _on_computer_update_tool_list: {e}", exc_info=True)
 
     def get_desktop_from_computer(
         self,
