@@ -35,6 +35,7 @@ from a2c_smcp.smcp import (
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
     UPDATE_SKILLS_NOTIFICATION,
+    UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
     GetBlobRet,
@@ -47,6 +48,7 @@ from a2c_smcp.smcp import (
     ListRoomReq,
     SessionInfo,
     UpdateMCPConfigNotification,
+    UpdateToolListNotification,
 )
 from a2c_smcp.utils.blob import drain_blob
 from a2c_smcp.utils.handshake import (
@@ -325,6 +327,8 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=self._namespace)
         # v0.2.1 SKILL 集合更新自动重拉（仿 notify:update_*）/ v0.2.1 auto-refresh on SKILL set change
         self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
+        # #127 MCP 运行期工具集变化自动重拉（仿 notify:update_config）/ #127 auto-refresh on runtime tool-set change
+        self.on(UPDATE_TOOL_LIST_NOTIFICATION, self._on_computer_update_tool_list, namespace=self._namespace)
 
     async def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -376,6 +380,32 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         except Exception as e:
             logger.error(f"Error in _on_computer_update_config: {e}", exc_info=True)
+
+    async def _on_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        处理Computer工具列表更新事件的内部方法（#127）
+        Internal handler for a Computer's tool-list-changed event (#127)
+
+        镜像 ``_on_computer_update_config`` 的三段式：先派发预清回调 ``on_computer_update_tool_list``
+        （供消费方清理旧工具，见 base.handle_computer_update_tool_list），再全量回拉 ``client:get_tools``，
+        最后经 ``process_tools_response`` 触发 ``on_tools_received`` 重加。纯 MCP 运行期工具增删
+        （不伴随 config 变更）由此在 Agent 侧可见。
+
+        Mirrors ``_on_computer_update_config``: pre-clean hook → full refetch → ``on_tools_received`` re-add.
+        """
+        try:
+            # 使用父类的异步处理方法（预清回调）
+            # Use parent class async handling method (pre-clean hook)
+            await self.handle_computer_update_tool_list(data)
+
+            # 重新获取工具列表
+            # Re-get tools list
+            computer = data["computer"]
+            tools_response = await self.get_tools_from_computer(computer)
+            await self.process_tools_response(tools_response, computer)
+
+        except Exception as e:
+            logger.error(f"Error in _on_computer_update_tool_list: {e}", exc_info=True)
 
     async def get_desktop_from_computer(
         self,

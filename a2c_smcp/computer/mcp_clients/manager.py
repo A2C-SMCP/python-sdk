@@ -351,6 +351,23 @@ class MCPServerManager:
         # Cross-server reconciliation: a name forbidden on one server but live on another must keep the live one.
         self._disabled_tools.difference_update(self._tool_mapping.keys())
 
+    async def arefresh_tools(self) -> None:
+        """公开的工具映射刷新入口：锁内重建 ``_tool_mapping`` / ``_alias_mapping`` / ``_disabled_tools``（#127）。
+
+        Public tool-mapping refresh entry: rebuild mappings under the lock (#127).
+
+        用途 / Use: MCP Server 运行期 ``tools/list_changed`` 后，boot 期构建的 ``_tool_mapping`` 已陈旧——
+        **新增**工具不在映射中，``available_tools()`` 迭代映射键时永远漏掉它（``client:get_tools`` 看不到新工具）。
+        本方法在 **安全上下文**（如 socketio ``on_get_tools`` 服务路径）被调用以刷新映射。
+
+        约束 / Constraint: **禁止**在 MCP ``ClientSession`` 的 ``message_handler`` 内联 ``await`` 本方法——
+        其内部 ``list_tools()`` 会向同一会话发起请求，而接收循环正阻塞于 message_handler → **会话级重入死锁**
+        （#127 探针实证 ``TimeoutError``）。变化侧仅应触发轻量 socketio emit，刷新交由服务侧安全上下文完成。
+        MUST NOT be awaited inline inside an MCP ``message_handler`` (session-reentrant deadlock, see #127).
+        """
+        async with self._lock:
+            await self._arefresh_tool_mapping()
+
     async def avalidate_tool_call(self, tool_name: TOOL_NAME, parameters: dict) -> tuple[SERVER_NAME, TOOL_NAME]:
         """
         判断工具调用的合法性，如果合法，返回对应的服务名称与原始工具名称

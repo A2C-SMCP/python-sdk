@@ -16,7 +16,14 @@ from typing import TYPE_CHECKING, Protocol, TypeAlias
 from mcp.types import CallToolResult
 from typing_extensions import TypedDict
 
-from a2c_smcp.smcp import A2CSkillRef, EnterOfficeNotification, LeaveOfficeNotification, SMCPTool, UpdateMCPConfigNotification
+from a2c_smcp.smcp import (
+    A2CSkillRef,
+    EnterOfficeNotification,
+    LeaveOfficeNotification,
+    SMCPTool,
+    UpdateMCPConfigNotification,
+    UpdateToolListNotification,
+)
 
 # 为避免运行时循环依赖，仅在类型检查时导入具体Client类型
 # To avoid runtime circular imports, import concrete Client types only during type checking
@@ -91,6 +98,32 @@ class AgentEventHandler(Protocol):
         """
         ...
 
+    def on_computer_update_tool_list(self, data: UpdateToolListNotification, client: SMCPAgentClient) -> None:
+        """
+        Computer工具列表更新（MCP 运行期 tools/list_changed）时的**预清**处理逻辑（#127）
+        Pre-clean hook when a Computer's tool list changed at runtime (MCP tools/list_changed)
+
+        触发时机 / Trigger:
+            - notify:update_tool_list 到达后、SDK 自动回拉 client:get_tools **之前**
+            - On ``notify:update_tool_list``, BEFORE the SDK auto-refetches ``client:get_tools``
+
+        用途 / Purpose:
+            - SDK 自动回拉最终仅回调 ``on_tools_received``（消费方通常只 add、不 remove）。本回调语义
+              对齐 ``on_computer_update_config``：给消费方一个**预清**该 Computer 旧工具的时机，使工具
+              **移除 / 同名换 schema** 不残留旧定义。
+            - The auto-refetch only fires ``on_tools_received`` (consumers usually only add). This hook lets
+              a consumer pre-clean the Computer's stale tools so removal / same-name schema change is clean.
+
+        向后兼容 / Backward compatibility:
+            - 旧 EventHandler 未实现此方法时，SDK 通过 hasattr 守卫静默跳过（仍会回拉，仅退化为只增不删）
+            - Legacy handlers missing this method are silently skipped via hasattr guard (add-only fallback)
+
+        Args:
+            data: 工具列表更新通知数据 / Tool list update notification data
+            client: 调用发生时的Socket.IO Client / Socket.IO Client where make the call
+        """
+        ...
+
     def on_tools_received(self, computer: str, tools: list[SMCPTool], client: SMCPAgentClient) -> None:
         """
         接收到工具列表时的处理逻辑
@@ -159,6 +192,32 @@ class AsyncAgentEventHandler(Protocol):
 
         Args:
             data: 配置更新通知数据 / Configuration update notification data
+            client: 调用发生时的Socket.IO Client / Socket.IO Client where make the call
+        """
+        ...
+
+    async def on_computer_update_tool_list(self, data: UpdateToolListNotification, client: AsyncSMCPAgentClient) -> None:
+        """
+        Computer工具列表更新（MCP 运行期 tools/list_changed）时的**预清**异步处理逻辑（#127）
+        Async pre-clean hook when a Computer's tool list changed at runtime (MCP tools/list_changed)
+
+        触发时机 / Trigger:
+            - notify:update_tool_list 到达后、SDK 自动回拉 client:get_tools **之前**
+            - On ``notify:update_tool_list``, BEFORE the SDK auto-refetches ``client:get_tools``
+
+        用途 / Purpose:
+            - SDK 自动回拉最终仅回调 ``on_tools_received``（消费方通常只 add、不 remove）。本回调语义
+              对齐 ``on_computer_update_config``：给消费方一个**预清**该 Computer 旧工具的时机，使工具
+              **移除 / 同名换 schema** 不残留旧定义。
+            - The auto-refetch only fires ``on_tools_received`` (consumers usually only add). This hook lets
+              a consumer pre-clean the Computer's stale tools so removal / same-name schema change is clean.
+
+        向后兼容 / Backward compatibility:
+            - 旧 EventHandler 未实现此方法时，SDK 通过 hasattr 守卫静默跳过（仍会回拉，仅退化为只增不删）
+            - Legacy handlers missing this method are silently skipped via hasattr guard (add-only fallback)
+
+        Args:
+            data: 工具列表更新通知数据 / Tool list update notification data
             client: 调用发生时的Socket.IO Client / Socket.IO Client where make the call
         """
         ...

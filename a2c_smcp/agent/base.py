@@ -33,6 +33,7 @@ from a2c_smcp.smcp import (
     LeaveOfficeReq,
     ToolCallReq,
     UpdateMCPConfigNotification,
+    UpdateToolListNotification,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -294,6 +295,33 @@ class BaseAgentClient(ABC):
 
         except Exception as e:
             logger.error(f"Error handling computer update config: {e}", exc_info=True)
+
+    async def handle_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        异步处理Computer工具列表更新事件的**预清**回调（#127）
+        Async pre-clean dispatch for a Computer's tool-list-changed event (#127)
+
+        语义对齐 ``handle_computer_update_config``：派发消费方的预清回调 ``on_computer_update_tool_list``，
+        供其清理该 Computer 的旧工具（回拉后经 ``on_tools_received`` 重加）。与 ``on_skills_received`` 一致，
+        对新回调使用 ``hasattr`` 守卫保持向后兼容；本方法自有 try/except 隔离 hook 异常，**不**阻断上层回拉。
+
+        Mirrors ``handle_computer_update_config`` but guards the new callback with ``hasattr`` (backward compat,
+        same convention as ``on_skills_received``). Hook errors are isolated here and never block the caller's refetch.
+
+        Args:
+            data: 工具列表更新通知数据 / Tool list update notification data
+        """
+        try:
+            computer = data["computer"]
+            logger.info(f"Computer {computer} updated tool list")
+
+            # 调用异步事件处理器（强制携带 client 引用）；新回调经 hasattr 守卫兼容旧 handler
+            # Call async event handler (force passing client reference); hasattr guard keeps legacy handlers working
+            if self.event_handler and hasattr(self.event_handler, "on_computer_update_tool_list"):
+                await self.event_handler.on_computer_update_tool_list(data, self)  # type: ignore[arg-type]
+
+        except Exception as e:
+            logger.error(f"Error handling computer update tool list: {e}", exc_info=True)
 
     async def process_tools_response(self, response: GetToolsRet, computer: str) -> None:
         """
@@ -611,6 +639,30 @@ class BaseAgentSyncClient(ABC):
 
         except Exception as e:
             logger.error(f"Error handling computer update config: {e}", exc_info=True)
+
+    def handle_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        处理Computer工具列表更新事件的**预清**回调（#127 sync mirror）
+        Pre-clean dispatch for a Computer's tool-list-changed event (#127, sync mirror)
+
+        语义对齐 ``handle_computer_update_config``：派发消费方的预清回调 ``on_computer_update_tool_list``，
+        供其清理该 Computer 的旧工具（回拉后经 ``on_tools_received`` 重加）。对新回调使用 ``hasattr`` 守卫保持
+        向后兼容；自有 try/except 隔离 hook 异常，**不**阻断上层回拉。
+
+        Args:
+            data: 工具列表更新通知数据 / Tool list update notification data
+        """
+        try:
+            computer = data["computer"]
+            logger.info(f"Computer {computer} updated tool list")
+
+            # 调用事件处理器（强制携带 client 引用）；新回调经 hasattr 守卫兼容旧 handler
+            # Call event handler (force passing client reference); hasattr guard keeps legacy handlers working
+            if self.event_handler and hasattr(self.event_handler, "on_computer_update_tool_list"):
+                self.event_handler.on_computer_update_tool_list(data, self)  # type: ignore[arg-type]
+
+        except Exception as e:
+            logger.error(f"Error handling computer update tool list: {e}", exc_info=True)
 
     def process_tools_response(self, response: GetToolsRet, computer: str) -> None:
         """
