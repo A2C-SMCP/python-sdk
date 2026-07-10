@@ -29,6 +29,7 @@ from a2c_smcp.server.middleware import A2CProtocolVersionASGIMiddleware
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, LIST_ROOM_EVENT, SMCP_NAMESPACE
 from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
+from tests.protocol_versions import COMPATIBLE_PEER, INCOMPATIBLE_PEER, max_supported_of, min_supported_of
 
 _SIO_PATH = "/socket.io"
 
@@ -58,14 +59,15 @@ def _poll_url(port: int, query: str) -> str:
 @pytest.mark.asyncio
 async def test_incompatible_returns_400_4008_with_header(mw_server: int) -> None:
     async with httpx.AsyncClient() as c:
-        r = await c.get(_poll_url(mw_server, "a2c_version=0.3.0"))
+        r = await c.get(_poll_url(mw_server, f"a2c_version={INCOMPATIBLE_PEER}"))
     assert r.status_code == 400
     assert r.headers.get("X-A2C-Error-Code") == "4008"
     body = r.json()
     assert body["code"] == 4008
     assert body["server_version"] == PROTOCOL_VERSION
-    assert body["client_version"] == "0.3.0"
-    assert body["min_supported"] == "0.2.0" and body["max_supported"] == "0.2.999"
+    assert body["client_version"] == INCOMPATIBLE_PEER
+    assert body["min_supported"] == min_supported_of(PROTOCOL_VERSION)
+    assert body["max_supported"] == max_supported_of(PROTOCOL_VERSION)
 
 
 @pytest.mark.asyncio
@@ -88,9 +90,9 @@ async def test_invalid_version_returns_400(mw_server: int) -> None:
 
 @pytest.mark.asyncio
 async def test_compatible_passes_through_to_socketio(mw_server: int) -> None:
-    # PATCH 自由：0.2.999 与 server 0.2.0 兼容；中间件透传，socketio 返回 EIO open（非 400）
+    # PATCH 自由：COMPATIBLE_PEER 与 server(=PROTOCOL_VERSION) 兼容；中间件透传，socketio 返回 EIO open（非 400）
     async with httpx.AsyncClient() as c:
-        r = await c.get(_poll_url(mw_server, "a2c_version=0.2.999"))
+        r = await c.get(_poll_url(mw_server, f"a2c_version={COMPATIBLE_PEER}"))
     assert r.status_code == 200
     assert "X-A2C-Error-Code" not in r.headers
 
@@ -137,13 +139,13 @@ async def test_list_room_session_info_contains_a2c_version(mw_server: int) -> No
 
 @pytest.fixture
 async def incompatible_mw_server(basic_server_port: int) -> AsyncGenerator[int, None]:
-    """Server 协议版本 0.3.0，与 SDK 0.2.0 不兼容（用于 WS-only 拒绝端到端）。"""
+    """Server 协议版本 = INCOMPATIBLE_PEER（与 SDK PROTOCOL_VERSION MINOR 不匹配，用于 WS-only 拒绝端到端）。"""
     sio = create_computer_test_socketio()
     sio.eio.start_service_task = False
     app = A2CProtocolVersionASGIMiddleware(
         ASGIApp(sio, socketio_path=_SIO_PATH),
         socketio_path=_SIO_PATH,
-        server_version="0.3.0",
+        server_version=INCOMPATIBLE_PEER,
     )
     server = UvicornTestServer(app, port=basic_server_port)
     await server.up()

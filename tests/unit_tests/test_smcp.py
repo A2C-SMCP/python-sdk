@@ -38,18 +38,21 @@ from a2c_smcp.smcp import (
     build_computer_not_found_error,
     is_protocol_error_payload,
 )
+from a2c_smcp.version import ProtocolVersion
 
 
 class TestProtocolVersion:
     """协议版本常量导出 / Protocol version constant export."""
 
     def test_protocol_version_importable_from_package(self) -> None:
-        """from a2c_smcp import PROTOCOL_VERSION 可用 / importable."""
-        assert PROTOCOL_VERSION == "0.2.0"
+        """from a2c_smcp import PROTOCOL_VERSION 可用且为合法 semver（不耦合具体值）/ importable & valid semver."""
+        assert isinstance(PROTOCOL_VERSION, str) and PROTOCOL_VERSION
+        # 合法 semver → parse 不抛；不断言具体值（协议版本会经常升级）
+        ProtocolVersion.parse(PROTOCOL_VERSION)
 
     def test_protocol_version_attribute_on_module(self) -> None:
-        """模块级属性可访问 / accessible as module attribute."""
-        assert a2c_smcp.PROTOCOL_VERSION == "0.2.0"
+        """模块级属性可访问且与包导出同值 / accessible as module attribute, consistent with package export."""
+        assert a2c_smcp.PROTOCOL_VERSION == PROTOCOL_VERSION
 
     def test_protocol_version_independent_from_package_version(self) -> None:
         """协议版本与包版本独立 / protocol version is independent from package version."""

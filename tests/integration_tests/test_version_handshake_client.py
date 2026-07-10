@@ -39,9 +39,11 @@ from a2c_smcp.smcp import SMCP_NAMESPACE
 from a2c_smcp.utils.handshake import HANDSHAKE_CONNECT_ERRORS
 from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
+from tests.protocol_versions import INCOMPATIBLE_PEER, max_supported_of, min_supported_of
 
 _SIO_PATH = "/socket.io"
-_INCOMPATIBLE_SERVER = "0.3.0"  # 与 SDK PROTOCOL_VERSION(0.2.0) MINOR 不匹配
+# 从 PROTOCOL_VERSION 派生的不兼容 server 版本（MINOR 不匹配）——不耦合具体协议版本值
+_INCOMPATIBLE_SERVER = INCOMPATIBLE_PEER
 # 确定性拒绝形态集合：归一成功 → ProtocolVersionError；body 竞态丢失 → 原始连接异常
 # （二者都满足"连接被拒"的确定性保证；精确类型契约见单测）
 _REJECTION_TYPES: tuple[type[BaseException], ...] = (ProtocolVersionError, *HANDSHAKE_CONNECT_ERRORS)
@@ -70,8 +72,8 @@ def _assert_mismatch_if_pve(exc: BaseException) -> None:
     if isinstance(exc, ProtocolVersionError):
         assert exc.client_version == PROTOCOL_VERSION
         assert exc.server_version == _INCOMPATIBLE_SERVER
-        assert exc.min_supported == "0.3.0"
-        assert exc.max_supported == "0.3.999"
+        assert exc.min_supported == min_supported_of(_INCOMPATIBLE_SERVER)
+        assert exc.max_supported == max_supported_of(_INCOMPATIBLE_SERVER)
         assert PROTOCOL_VERSION in str(exc) and _INCOMPATIBLE_SERVER in str(exc)
 
 

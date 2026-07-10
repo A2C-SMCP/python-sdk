@@ -56,12 +56,13 @@ from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
 from a2c_smcp.utils.handshake import HANDSHAKE_CONNECT_ERRORS
 from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
+from tests.protocol_versions import INCOMPATIBLE_PEER
 
 pytestmark = pytest.mark.e2e
 
 _SIO_PATH = "/socket.io"
-# 与 SDK PROTOCOL_VERSION(0.2.x) MINOR 不匹配 → 不兼容 / MINOR mismatch → incompatible
-_INCOMPATIBLE_SERVER = "0.3.0"
+# 从 PROTOCOL_VERSION 派生的不兼容 server 版本（MINOR 不匹配）——不耦合具体协议版本值
+_INCOMPATIBLE_SERVER = INCOMPATIBLE_PEER
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _MCP_SERVERS_DIR = _PROJECT_ROOT / "tests" / "integration_tests" / "computer" / "mcp_servers"
 # subscribe-srv：暴露 window:// 资源（annotations priority / _meta fullscreen）+ 工具 mark_a
