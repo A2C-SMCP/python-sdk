@@ -120,7 +120,7 @@ def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_p
         "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
-        "tool_name": "mark_b",  # 由 B server 提供
+        "tool_name": "e2e-desktop-B__mark_b",  # 由 B server 提供（exposed_tool_name = {bundle_id}__mark_b）
         "params": {},
         "timeout": 5,
     }
@@ -154,7 +154,7 @@ def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_p
         "agent": "r-e2e",
         "req_id": "req-e2e-2",
         "computer": "client",
-        "tool_name": "mark_a",  # 由 A server 提供
+        "tool_name": "e2e-desktop-A__mark_a",  # 由 A server 提供
         "params": {},
         "timeout": 5,
     }
@@ -179,7 +179,7 @@ def test_desktop_order_respects_recent_tool_calls(cli_proc: pexpect.spawn, tmp_p
         "agent": "r-e2e",
         "req_id": "req-e2e-3",
         "computer": "client",
-        "tool_name": "mark_b",
+        "tool_name": "e2e-desktop-B__mark_b",
         "params": {},
         "timeout": 5,
     }

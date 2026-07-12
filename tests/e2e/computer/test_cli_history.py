@@ -66,7 +66,7 @@ def test_history_after_tc(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
     # 3) tools 确认一下 hello 可用
     child.sendline("tools")
     tools_out = expect_prompt_stable(child, quiet=0.6, max_wait=12.0)
-    assert "hello" in strip_ansi(tools_out)
+    assert "e2e-hist__hello" in strip_ansi(tools_out)
 
     # 4) 通过 tc 触发一次调用（固定 req_id 以便断言）
     req_id = "req-e2e-history-1"
@@ -74,7 +74,7 @@ def test_history_after_tc(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
         "agent": "bot-e2e",
         "req_id": req_id,
         "computer": "ignored",
-        "tool_name": "hello",
+        "tool_name": "e2e-hist__hello",
         "params": {"name": "Hist"},
         "timeout": 10,
     }

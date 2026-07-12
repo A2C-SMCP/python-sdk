@@ -82,7 +82,7 @@ def test_tc_with_vrl_transformation_basic(cli_proc: pexpect.spawn, tmp_path: Pat
     # Verify tool is visible
     child.sendline("tools")
     tools_out = expect_prompt_stable(child, quiet=0.6, max_wait=12.0)
-    assert "hello" in strip_ansi(tools_out)
+    assert "e2e-tc-vrl-basic__hello" in strip_ansi(tools_out)
 
     # 5) 构造 tc 负载并调用
     # Construct tc payload and call
@@ -90,7 +90,7 @@ def test_tc_with_vrl_transformation_basic(cli_proc: pexpect.spawn, tmp_path: Pat
         "agent": "bot-e2e-vrl",
         "req_id": "req-e2e-vrl-hello",
         "computer": "ignored",
-        "tool_name": "hello",
+        "tool_name": "e2e-tc-vrl-basic__hello",
         "params": {"name": "VRL-Test"},
         "timeout": 10,
     }
@@ -165,7 +165,7 @@ def test_tc_with_vrl_field_mapping(cli_proc: pexpect.spawn, tmp_path: Path) -> N
     # Verify tool is visible
     child.sendline("tools")
     tools_out = expect_prompt_stable(child, quiet=0.6, max_wait=12.0)
-    assert "mark_a" in strip_ansi(tools_out)
+    assert "e2e-tc-vrl-mapping__mark_a" in strip_ansi(tools_out)
 
     # 5) 构造 tc 负载并调用
     # Construct tc payload and call
@@ -173,7 +173,7 @@ def test_tc_with_vrl_field_mapping(cli_proc: pexpect.spawn, tmp_path: Path) -> N
         "agent": "bot-e2e-vrl-map",
         "req_id": "req-e2e-vrl-map",
         "computer": "ignored",
-        "tool_name": "mark_a",
+        "tool_name": "e2e-tc-vrl-mapping__mark_a",
         "params": {},
         "timeout": 10,
     }
@@ -294,7 +294,7 @@ def test_tc_vrl_transformation_preserves_original_content(cli_proc: pexpect.spaw
         "agent": "bot-e2e-vrl-preserve",
         "req_id": "req-e2e-vrl-preserve",
         "computer": "ignored",
-        "tool_name": "hello",
+        "tool_name": "e2e-tc-vrl-preserve__hello",
         "params": {"name": "Preserve-Test"},
         "timeout": 10,
     }

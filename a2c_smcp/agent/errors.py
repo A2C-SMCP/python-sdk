@@ -25,7 +25,7 @@ class SMCPProtocolError(Exception):
 
     当 Agent SDK 在 Socket.IO ack 中识别到 flat ErrorPayload（顶层含 ``code``）时抛出，
     覆盖范围 / Covers:
-      - ``client:get_resources``：``4014`` / ``4015``（顶层平铺 ``mcp_server_name`` / ``capability``）
+      - ``client:get_resources``：``4014`` / ``4015``（顶层平铺 ``mcp_server``(bundle_id) / ``capability``）
       - ``client:get_skill[s]``：``4014`` 复用（SKILL ``name`` 合法但未命中）/ ``4016`` Invalid Name /
         ``4017`` Skill Resource Not Accessible（v0.2.1 ``details.reason``）
       - ``client:get_blob``：``4018 Blob Not Accessible``（v0.2.1 ``details.reason``）
@@ -38,8 +38,8 @@ class SMCPProtocolError(Exception):
         self.payload: ErrorPayload = payload
         self.code: int = int(payload.get("code", -1))
         self.error_message: str = str(payload.get("message", ""))
-        # 4014 / 4015 顶层 code-specific 字段 / Top-level code-specific fields (4014 / 4015)
-        self.mcp_server_name: str | None = payload.get("mcp_server_name")
+        # 4014 / 4015 顶层 code-specific 字段（``mcp_server`` = bundle_id，协议 #18）/ Top-level fields (4014 / 4015)
+        self.mcp_server: str | None = payload.get("mcp_server")
         self.capability: str | None = payload.get("capability")
         # 4016 / 4017 / 4018 details 容器（v0.2.1 起 code-specific 字段下沉到 details）
         # details container for 4016 / 4017 / 4018 (since v0.2.1 code-specific fields live under details)

@@ -13,7 +13,7 @@ from mcp import StdioServerParameters, Tool
 from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
 from mcp.types import CallToolResult
 
-from a2c_smcp.computer.mcp_clients.manager import MCPServerManager, ToolNameDuplicatedError
+from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import (
     MCPClientProtocol,
     MCPServerConfig,
@@ -141,10 +141,10 @@ async def test_initialize_with_servers(manager):
     assert "sse_server" in manager._active_clients
     assert "server2" not in manager._active_clients
 
-    # 验证工具映射
-    assert manager._tool_mapping["tool1"] == "server1"
-    assert manager._tool_mapping["tool2"] == "server1"
-    assert "tool3" not in manager._tool_mapping  # 禁用的服务器
+    # 验证 ExposedToolMapping（exposed = {bundle_id}__{原始名}；此处 bundle_id == name）
+    assert manager._exposed_tools["server1__tool1"] == ("server1", "tool1")
+    assert manager._exposed_tools["server1__tool2"] == ("server1", "tool2")
+    assert "server2__tool3" not in manager._exposed_tools  # 禁用的服务器
 
     # 验证状态检查
     statuses = manager.get_server_status()
@@ -163,14 +163,14 @@ async def test_tool_execution(manager):
 
     # 执行工具
     params = {"key": "value"}
-    await manager.aexecute_tool("tool1", params)
+    await manager.aexecute_tool("server1__tool1", params)
 
-    # 验证调用
+    # 验证调用（透传原始名 tool1）
     client = manager._active_clients["server1"]
     client.call_tool.assert_awaited_once_with("tool1", params)
 
     with pytest.raises(Exception):
-        await manager.aexecute_tool("tool5", params)
+        await manager.aexecute_tool("server1__tool5", params)
 
 
 @pytest.mark.asyncio
@@ -183,7 +183,7 @@ async def test_tool_execution_with_ret_meta(manager):
 
     # 执行工具
     params = {"key": "value"}
-    ret = await manager.aexecute_tool("tool3", params)
+    ret = await manager.aexecute_tool("server2__tool3", params)
     assert ret.meta["test"] == "ret_meta"
 
     # 验证调用
@@ -199,13 +199,12 @@ async def test_tool_with_alias(manager):
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    # 验证别名映射
-    assert manager._alias_mapping["aliased_tool"] == ("alias_server", "tool5")
-    assert "tool5" not in manager._tool_mapping
-    assert manager._tool_mapping["aliased_tool"] == "alias_server"
+    # 验证 ExposedToolMapping：alias 仅替换工具名部分，仍带 {bundle_id}__ 前缀
+    assert manager._exposed_tools["alias_server__aliased_tool"] == ("alias_server", "tool5")
+    assert "alias_server__tool5" not in manager._exposed_tools
 
-    # 执行别名工具
-    await manager.aexecute_tool("aliased_tool", {})
+    # 执行别名工具（以 exposed 名寻址，解析回原始名 tool5）
+    await manager.aexecute_tool("alias_server__aliased_tool", {})
     client = manager._active_clients["alias_server"]
     print("Call args list:", client.call_tool.call_args_list)
     client.call_tool.assert_awaited_once_with("tool5", {})
@@ -218,35 +217,34 @@ async def test_disabled_tool(manager):
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    # 验证禁用状态
-    assert "tool2" in manager._disabled_tools
+    # forbidden 工具不进 ExposedToolMapping（不可见不可调用）
+    assert "server1__tool2" not in manager._exposed_tools
 
-    # 尝试执行禁用工具
-    with pytest.raises(PermissionError):
-        await manager.aexecute_tool("tool2", {})
+    # 尝试执行禁用工具 → 未命中 ExposedToolMapping → ValueError（上层映射 4001）
+    with pytest.raises(ValueError):
+        await manager.aexecute_tool("server1__tool2", {})
 
-    # #106 契约：禁用工具不应再出现在对外暴露面（不可见且不可调用），钉死避免被无意改回。
-    # Contract (#106): a disabled tool must not appear in the exposed tool list either.
+    # #106 契约：禁用工具不应再出现在对外暴露面（不可见且不可调用）
     names = [tool.name async for tool in manager.available_tools()]
-    assert "tool2" not in names
+    assert "server1__tool2" not in names
+    assert "server1__tool1" in names
 
 
 @pytest.mark.asyncio
-async def test_tool_name_conflict(manager):
-    """测试工具名冲突处理"""
+async def test_cross_server_same_name_coexist_via_bundle_prefix(manager):
+    """BundleID：跨 server 同名工具经 ``{bundle_id}__`` 前缀天然共存，不再抛 ToolNameDuplicatedError。"""
     servers = [
         create_server_config("server1"),
+        # duplicate_server 的 duplicate_tool 别名为 tool1；与 server1 的 tool1 因 bundle 前缀不同而共存
         create_server_config("duplicate_server", tool_meta={"duplicate_tool": ToolMeta(alias="tool1")}),
     ]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
 
-    # 验证初始化时检测到冲突
-    with pytest.raises(ToolNameDuplicatedError):
-        await manager.ainitialize(servers)
-        await manager.astart_all()
-
-    # 工具重名导致的异常是在逐个启动Client的时候抛出的，因此只会回滚检测到异常的Client，
-    # 而不会回滚所有Client
-    assert len(manager._active_clients) == 1
+    assert len(manager._active_clients) == 2
+    # 两个 "tool1" 借 bundle 前缀共存于暴露面，互不冲突
+    assert manager._exposed_tools["server1__tool1"] == ("server1", "tool1")
+    assert manager._exposed_tools["duplicate_server__tool1"] == ("duplicate_server", "duplicate_tool")
 
 
 @pytest.mark.asyncio
@@ -276,8 +274,8 @@ async def test_dynamic_server_management(manager):
 
     old_client.adisconnect.assert_awaited()
 
-    # 验证更新应用
-    assert "tool1" in manager._disabled_tools
+    # 验证更新应用：forbid tool1 后不再暴露 server1__tool1
+    assert "server1__tool1" not in manager._exposed_tools
 
     # 移除服务器
     await manager.aremove_server("http_server")
@@ -315,7 +313,7 @@ async def test_get_available_tools(manager):
         tools.append(tool)
 
     assert len(tools) == 2
-    tool1 = next(t for t in tools if t.name == "tool1")
+    tool1 = next(t for t in tools if t.name == "server1__tool1")
     assert tool1.meta["a2c_tool_meta"].auto_apply
 
 
@@ -332,11 +330,11 @@ async def test_default_tool_meta_applies_when_missing_per_tool(manager):
     tools = []
     async for tool in manager.available_tools():
         tools.append(tool)
-    t1 = next(t for t in tools if t.name == "tool1")
+    t1 = next(t for t in tools if t.name == "server1__tool1")
     assert t1.meta["a2c_tool_meta"].auto_apply is True
 
     # 检查 aexecute_tool 返回元数据注入
-    ret = await manager.aexecute_tool("tool1", {})
+    ret = await manager.aexecute_tool("server1__tool1", {})
     assert ret.meta["a2c_tool_meta"].auto_apply is True
 
 
@@ -355,7 +353,7 @@ async def test_per_tool_overrides_default(manager):
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    ret = await manager.aexecute_tool("tool1", {})
+    ret = await manager.aexecute_tool("server1__tool1", {})
     assert ret.meta["a2c_tool_meta"].auto_apply is False
 
 
@@ -382,7 +380,7 @@ async def test_error_handling(manager):
     client.call_tool.side_effect = TimeoutError("Execution timed out")
 
     with pytest.raises(TimeoutError):
-        await manager.aexecute_tool("tool1", {}, timeout=0.1)
+        await manager.aexecute_tool("server1__tool1", {}, timeout=0.1)
 
 
 @pytest.mark.asyncio
@@ -394,7 +392,7 @@ async def test_meta_data_injection(manager):
     await manager.astart_all()
 
     # 执行工具
-    result = await manager.aexecute_tool("tool1", {})
+    result = await manager.aexecute_tool("server1__tool1", {})
 
     # 验证元数据注入
     assert "a2c_tool_meta" in result.meta
@@ -479,19 +477,15 @@ async def test_aexecute_tool_invalid_cases(manager):
     测试：执行被禁用工具/未注册工具/服务器未激活时报错。
     Test: Raise PermissionError/ValueError/RuntimeError for disabled tool, missing tool, or inactive server.
     """
-    # 工具被禁用
-    manager._disabled_tools.add("toolX")
-    with pytest.raises(PermissionError):
-        await manager.aexecute_tool("toolX", {})
-    # 工具未注册
+    # 未命中 ExposedToolMapping（含被 forbidden / 未注册工具）→ ValueError（上层映射 4001）
     with pytest.raises(ValueError):
-        await manager.aexecute_tool("no_tool", {})
-    # 工具所在服务器未激活
-    manager._tool_mapping["toolY"] = "serverY"
+        await manager.aexecute_tool("srv__no_tool", {})
+    # 映射命中但服务器未激活 → RuntimeError
+    manager._exposed_tools["serverY__toolY"] = ("serverY", "toolY")
     manager._active_clients.clear()
     manager._servers_config["serverY"] = create_server_config("serverY")
     with pytest.raises(RuntimeError):
-        await manager.aexecute_tool("toolY", {})
+        await manager.aexecute_tool("serverY__toolY", {})
 
 
 # 覆盖 aexecute_tool 的 TimeoutError/Exception 分支
@@ -503,53 +497,47 @@ async def test_aexecute_tool_timeout_and_exception(manager, monkeypatch):
     Test: Raise TimeoutError/RuntimeError when tool execution times out or raises.
     """
     config = create_server_config("server3")
-    manager._servers_config[config.name] = config
-    manager._active_clients[config.name] = cast(MCPClientProtocol, MagicMock(spec=MCPClientProtocol))
-    manager._tool_mapping["toolZ"] = config.name
-    mock_client = manager._active_clients[config.name]
+    manager._servers_config["server3"] = config
+    manager._active_clients["server3"] = cast(MCPClientProtocol, MagicMock(spec=MCPClientProtocol))
+    manager._exposed_tools["server3__toolZ"] = ("server3", "toolZ")
+    mock_client = manager._active_clients["server3"]
     # 超时
     mock_client.call_tool = AsyncMock(side_effect=asyncio.TimeoutError)
     with pytest.raises(TimeoutError):
-        await manager.aexecute_tool("toolZ", {}, timeout=0.01)
+        await manager.aexecute_tool("server3__toolZ", {}, timeout=0.01)
     # 其它异常
     mock_client.call_tool = AsyncMock(side_effect=Exception("fail"))
     with pytest.raises(RuntimeError):
-        await manager.aexecute_tool("toolZ", {})
+        await manager.aexecute_tool("server3__toolZ", {})
 
 
 # 覆盖 _arefresh_tool_mapping 的 ToolNameDuplicatedError 分支
 # Test _arefresh_tool_mapping ToolNameDuplicatedError branch
 @pytest.mark.asyncio
-async def test_arefresh_tool_mapping_duplicate(manager, monkeypatch):
-    """
-    测试：多个服务器存在同名工具时抛出 ToolNameDuplicatedError。
-    Test: Raise ToolNameDuplicatedError when duplicate tool name exists across servers.
-    """
-    # 两个 server 都返回同名工具 duplicate_tool
+async def test_arefresh_builds_exposed_mapping_coexist_same_tool(manager, monkeypatch):
+    """BundleID：两 server 同名 duplicate_tool 经 ``{bundle_id}__`` 前缀共存于 ExposedToolMapping，不再抛异常。"""
     config1 = create_server_config("duplicate_server1")
     config2 = create_server_config("duplicate_server2")
-    # 强制都只返回同名工具 duplicate_tool
 
     def always_duplicate_tool(_, message_handler=None):
         return MockMCPClient([create_mock_tool("duplicate_tool")], message_handler=message_handler)
 
     monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", always_duplicate_tool)
-    manager._servers_config = {config1.name: config1, config2.name: config2}
-    manager._active_clients = {config1.name: always_duplicate_tool(config1), config2.name: always_duplicate_tool(config2)}
-    with pytest.raises(ToolNameDuplicatedError):
-        await manager._arefresh_tool_mapping()
+    manager._servers_config = {"duplicate_server1": config1, "duplicate_server2": config2}
+    manager._active_clients = {
+        "duplicate_server1": always_duplicate_tool(config1),
+        "duplicate_server2": always_duplicate_tool(config2),
+    }
+    await manager._arefresh_tool_mapping()
+    assert manager._exposed_tools["duplicate_server1__duplicate_tool"] == ("duplicate_server1", "duplicate_tool")
+    assert manager._exposed_tools["duplicate_server2__duplicate_tool"] == ("duplicate_server2", "duplicate_tool")
 
 
 @pytest.mark.asyncio
-async def test_astart_client(manager, monkeypatch):
-    """
-    测试：多个服务器存在同名工具时抛出 ToolNameDuplicatedError。
-    Test: Raise ToolNameDuplicatedError when duplicate tool name exists across servers.
-    """
-    # 两个 server 都返回同名工具 duplicate_tool
+async def test_astart_client_same_tool_coexist(manager, monkeypatch):
+    """BundleID：两 server 同名工具可同时启动共存（bundle 前缀隔离），不再抛 ToolNameDuplicatedError。"""
     config1 = create_server_config("duplicate_server1")
     config2 = create_server_config("duplicate_server2")
-    # 强制都只返回同名工具 duplicate_tool
 
     def always_duplicate_tool(_, message_handler=None):
         return MockMCPClient([create_mock_tool("duplicate_tool")], message_handler=message_handler)
@@ -558,16 +546,12 @@ async def test_astart_client(manager, monkeypatch):
     await manager.aadd_or_aupdate_server(config1)
     await manager.aadd_or_aupdate_server(config2)
     assert not manager._active_clients
-    await manager.astart_client(config1.name)
-    assert manager._active_clients
+    await manager.astart_client("duplicate_server1")
     assert len(manager._active_clients) == 1
-    with pytest.raises(ToolNameDuplicatedError):
-        await manager.astart_client(config2.name)
-    await manager.astop_client(config1.name)
-    assert not manager._active_clients
-    await manager.astart_client(config2.name)
-    assert manager._active_clients
-    assert len(manager._active_clients) == 1
+    await manager.astart_client("duplicate_server2")  # 不再冲突，共存
+    assert len(manager._active_clients) == 2
+    assert "duplicate_server1__duplicate_tool" in manager._exposed_tools
+    assert "duplicate_server2__duplicate_tool" in manager._exposed_tools
 
 
 # 覆盖 aremove_server 的删除不存在服务器分支
@@ -583,71 +567,52 @@ async def test_aremove_server_not_exist(manager):
 
 
 @pytest.mark.asyncio
-async def test_astart_all_tool_name_duplicate(manager, monkeypatch):
-    """
-    覆盖 astart_all 的工具名重复异常分支。
-    Cover the duplicate tool name exception branch in astart_all.
-    """
-    # 确保 manager 状态干净
+async def test_astart_all_same_tool_coexist(manager, monkeypatch):
+    """BundleID：astart_all 启动两个同名工具 server，经 bundle 前缀共存，不再抛异常。"""
     await manager.aclose()
     config1 = create_server_config("dup_server1")
     config2 = create_server_config("dup_server2")
 
-    # 两个 server 都返回同名工具 duplicate_tool
     def always_duplicate_tool(_, message_handler=None):
         return MockMCPClient([create_mock_tool("duplicate_tool")], message_handler=message_handler)
 
     monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", always_duplicate_tool)
-    servers = [config1, config2]
-    # 因为首次初始化时配置未连接，也就不会检查工具名冲突，因此可以正常初始化
-    await manager.ainitialize(servers)
-    with pytest.raises(ToolNameDuplicatedError):
-        await manager.astart_all()
+    await manager.ainitialize([config1, config2])
+    await manager.astart_all()
+    assert len(manager._active_clients) == 2
+    assert "dup_server1__duplicate_tool" in manager._exposed_tools
+    assert "dup_server2__duplicate_tool" in manager._exposed_tools
 
 
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_with_duplicate_tool(manager, monkeypatch):
-    """
-    测试：在添加/更新服务器时遇到工具名重复会抛出ToolNameDuplicatedError
-    Test: Raise ToolNameDuplicatedError when adding/updating server with duplicate tool name
-    """
-    # 初始配置
+async def test_aadd_or_aupdate_server_same_tool_coexist(manager, monkeypatch):
+    """BundleID：add/update 遇同名工具不再抛 ToolNameDuplicatedError / 回滚——经 ``{bundle_id}__`` 前缀共存。"""
     await manager.enable_auto_connect()
     config1 = create_server_config("server1")
     await manager.ainitialize([config1])
     await manager.astart_all()
 
-    # 模拟工具名重复的情况
     def duplicate_tool_factory(config: MCPServerConfig, message_handler=None) -> Any:
-        if config.name == "server1":
-            return MockMCPClient([create_mock_tool("tool1")], message_handler=message_handler)
-        else:
-            return MockMCPClient([create_mock_tool("tool1")], message_handler=message_handler)  # 故意返回同名工具
+        return MockMCPClient([create_mock_tool("tool1")], message_handler=message_handler)  # 两 server 都返回 tool1
 
     monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", duplicate_tool_factory)
 
-    # 添加新服务器（会触发工具名冲突）
+    # 添加新服务器：不再冲突/回滚，直接共存
     config2 = create_server_config("server2")
-    with pytest.raises(ToolNameDuplicatedError):
-        await manager.aadd_or_aupdate_server(config2)
-
-    # 验证状态回滚
-    assert "server2" not in manager._active_clients
-    assert "server2" not in manager._servers_config  # 因为异常导致回滚
-
-    # 更新现有服务器（会触发工具名冲突）
-    config1_updated = create_server_config("server1", tool_meta={"tool1": ToolMeta(alias="new_alias")})
-    await manager.aadd_or_aupdate_server(config1_updated)
     await manager.aadd_or_aupdate_server(config2)
+    assert "server2" in manager._servers_config
+    assert "server2" in manager._active_clients
 
-    # 验证服务器仍然保持原状
-    assert manager._active_clients["server1"].list_tools.return_value[0].name == "tool1"
-    tools_list = [tool async for tool in manager.available_tools()]
-    # #106：alias 须反映到对外暴露的 Tool.name。server1 的 tool1 别名为 new_alias → 暴露名 new_alias；
-    # server2 的 tool1 无别名 → 暴露名 tool1。二者借 alias 不再同名冲突（正是本修复要达成的效果）。
-    assert any(tool.name == "new_alias" and tool.meta["a2c_tool_meta"].alias == "new_alias" for tool in tools_list) and any(
-        tool.name == "tool1" and not tool.meta for tool in tools_list
-    )
+    # server1 原客户端由 mock_client_factory 建（tool1/tool2），server2 由 duplicate_tool_factory 建（tool1）
+    names = {t.name async for t in manager.available_tools()}
+    assert {"server1__tool1", "server1__tool2", "server2__tool1"} <= names
+
+    # 借 alias 把 server2 的 tool1 改名（仍带 bundle 前缀）
+    config2_aliased = create_server_config("server2", tool_meta={"tool1": ToolMeta(alias="renamed")})
+    await manager.aadd_or_aupdate_server(config2_aliased)
+    names2 = {t.name async for t in manager.available_tools()}
+    assert "server2__renamed" in names2
+    assert "server2__tool1" not in names2
 
 
 @pytest.mark.asyncio
@@ -863,9 +828,9 @@ async def test_available_tools_exposes_alias_as_name(manager):
     await manager.astart_all()
 
     names = [tool.name async for tool in manager.available_tools()]
-    # 暴露面应为 alias，原始名不得出现 / exposed name must be the alias, never the original
-    assert "aliased_tool" in names
-    assert "tool5" not in names
+    # 暴露面应为 {bundle_id}__{alias}，原始名不得出现 / exposed name = {bundle_id}__{alias}, never the original
+    assert "alias_server__aliased_tool" in names
+    assert "alias_server__tool5" not in names
 
 
 @pytest.mark.asyncio
@@ -889,16 +854,15 @@ async def test_forbidden_tool_excluded_from_duplicate_detection(manager, monkeyp
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    # 冲突被消除：tool1 仅来自 server2 / conflict resolved: tool1 routes to server2 only
-    assert manager._tool_mapping["tool1"] == "server2"
-    # 存活侧（server2）的 tool1 仍可寻址；不被另一 server 的 forbid 误伤
-    # The surviving tool1 (server2) stays addressable; a forbid on another server must not disable it.
-    assert "tool1" not in manager._disabled_tools
-    server_name, original = await manager.avalidate_tool_call("tool1", {})
-    assert (server_name, original) == ("server2", "tool1")
-    # 暴露面只出现一次 tool1（server1 那份被禁用、不暴露）/ tool1 exposed exactly once
+    # server1 forbid tool1（不进表），server2 正常暴露 → 仅 server2__tool1
+    assert "server1__tool1" not in manager._exposed_tools
+    assert manager._exposed_tools["server2__tool1"] == ("server2", "tool1")
+    bundle_id, original = await manager.avalidate_tool_call("server2__tool1", {})
+    assert (bundle_id, original) == ("server2", "tool1")
+    # 暴露面只出现一次 server2__tool1（server1 那份被 forbid、不暴露）
     names = [tool.name async for tool in manager.available_tools()]
-    assert names.count("tool1") == 1
+    assert names.count("server2__tool1") == 1
+    assert "server1__tool1" not in names
 
 
 @pytest.mark.asyncio
@@ -915,24 +879,19 @@ async def test_forbidden_original_name_suppresses_alias(manager):
 
     # alias 与原始名都不暴露、不路由 / neither the alias nor the original is exposed/routed
     names = [tool.name async for tool in manager.available_tools()]
-    assert "aliased_tool" not in names
-    assert "tool5" not in names
-    assert "aliased_tool" not in manager._tool_mapping
-    assert "tool5" not in manager._tool_mapping
+    assert "alias_server__aliased_tool" not in names
+    assert "alias_server__tool5" not in names
+    assert "alias_server__aliased_tool" not in manager._exposed_tools
+    assert "alias_server__tool5" not in manager._exposed_tools
 
 
 @pytest.mark.asyncio
-async def test_forbidden_tool_without_provider_stays_disabled(manager):
-    """forbid 单 server 独有工具时，仍应保留 PermissionError 语义（_disabled_tools 命中）。
-
-    When the forbidden tool is not provided by any other server, it stays in _disabled_tools so a call
-    raises PermissionError (regression guard for the existing single-server forbid behavior).
-    """
+async def test_forbidden_tool_not_exposed_and_uncallable(manager):
+    """forbid 工具后：不进 ExposedToolMapping、不可调用（未命中 → ValueError，上层映射 4001）。"""
     servers = [create_server_config("server1", forbidden_tools=["tool2"])]
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    assert "tool2" in manager._disabled_tools
-    assert "tool2" not in manager._tool_mapping
-    with pytest.raises(PermissionError):
-        await manager.aexecute_tool("tool2", {})
+    assert "server1__tool2" not in manager._exposed_tools
+    with pytest.raises(ValueError):
+        await manager.aexecute_tool("server1__tool2", {})

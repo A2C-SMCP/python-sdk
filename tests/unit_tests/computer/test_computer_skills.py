@@ -66,8 +66,12 @@ class _FakeManager:
     def set_pairs(self, pairs: list[tuple[str, Resource]]) -> None:
         self._pairs = pairs
 
-    async def list_skill_resources(self, server_name: str | None = None) -> list[tuple[str, Resource]]:
-        return [(s, r) for s, r in self._pairs if server_name is None or s == server_name]
+    async def list_skill_resources(self, bundle_id: str | None = None) -> list[tuple[str, Resource]]:
+        return [(s, r) for s, r in self._pairs if bundle_id is None or s == bundle_id]
+
+    def get_server_config(self, bundle_id: str) -> SimpleNamespace:
+        # SKILL ``<server>`` 段取 server name（协议 #18 正交、不变）；stub 中 name == bundle_id。
+        return SimpleNamespace(name=bundle_id)
 
 
 def _mounted_skill_resource(uri: str, src_dir: Path) -> Resource:

@@ -462,7 +462,10 @@ async def stage_mcp_skills(
     registered: list[str] = []
     seen_this_run: set[str] = set()  # 本 run 已处理的合成 name，用于真冲突检测（§1.5 保留先到者）
     for sname, resources in by_server.items():
-        normalized_server = normalize_mcp_server_segment(sname)
+        # sname = bundle_id（manager 身份键）。SKILL ``<server>`` 段与磁盘路径仍取 server **name**（协议 #18：
+        # SKILL ``<server>`` 段与 BundleID 正交、不变）；``read_resource`` 仍按 bundle_id 路由。
+        server_display_name = manager.get_server_config(sname).name
+        normalized_server = normalize_mcp_server_segment(server_display_name)
         for res in resources:
             meta = dict(getattr(res, "meta", None) or {})
             mode = meta.get("source")
@@ -489,7 +492,10 @@ async def stage_mcp_skills(
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
 
-            name = _finalize_and_register(sname, normalized_server, meta, staged, root_uri, home, registry, seen_this_run)
+            # SKILL name 的 `<server>` 段取 server **name**（非 bundle_id）——协议 #18 SKILL `<server>` 段不变。
+            name = _finalize_and_register(
+                server_display_name, normalized_server, meta, staged, root_uri, home, registry, seen_this_run,
+            )
             if name is not None:
                 registered.append(name)
     return registered

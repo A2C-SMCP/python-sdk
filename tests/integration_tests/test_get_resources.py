@@ -176,7 +176,7 @@ async def test_get_resources_unregistered_server_raises_4014(socketio_server: No
         with pytest.raises(SMCPProtocolError) as ei:
             await agent.get_resources(computer="comp-res-2", mcp_server="does-not-exist")
         assert ei.value.code == 4014
-        assert ei.value.mcp_server_name == "does-not-exist"
+        assert ei.value.mcp_server == "does-not-exist"
     finally:
         await agent.disconnect()
         await comp_client.disconnect()
@@ -210,7 +210,7 @@ async def test_get_resources_capability_missing_raises_4015(socketio_server: Non
         with pytest.raises(SMCPProtocolError) as ei:
             await agent.get_resources(computer="comp-res-3", mcp_server="tools-srv")
         assert ei.value.code == 4015
-        assert ei.value.mcp_server_name == "tools-srv"
+        assert ei.value.mcp_server == "tools-srv"
         assert ei.value.capability == "resources"
     finally:
         await agent.disconnect()
@@ -286,13 +286,13 @@ def _run_mock_computer_process(port: int, ready_q: multiprocessing.Queue, err_q:
             return {
                 "code": 4014,
                 "message": "MCP Server not found",
-                "mcp_server_name": "does-not-exist",
+                "mcp_server": "does-not-exist",
             }
         if mcp_server == "no-res":
             return {
                 "code": 4015,
                 "message": "MCP Server does not support 'resources' capability",
-                "mcp_server_name": "no-res",
+                "mcp_server": "no-res",
                 "capability": "resources",
             }
         if data.get("cursor") == "page2":
@@ -345,7 +345,7 @@ def _run_sync_agent_process(port: int, result_q: multiprocessing.Queue, err_q: m
             agent.get_resources(computer=_SYNC_COMPUTER, mcp_server="does-not-exist")
         except SMCPProtocolError as e:
             err4014_code = e.code
-            err4014_server = e.mcp_server_name
+            err4014_server = e.mcp_server
 
         result_q.put(
             {
@@ -398,7 +398,7 @@ def test_get_resources_sync_pagination_and_error_passthrough(sync_smcp_server: i
             # flat ErrorPayload（4015）经 SyncSMCPNamespace 原样透传 → SMCPProtocolError
             assert res["err_code"] == 4015
             assert res["capability"] == "resources"
-            # flat ErrorPayload（4014 未注册 server）同样透传 → SMCPProtocolError，含 mcp_server_name
+            # flat ErrorPayload（4014 未注册 server）同样透传 → SMCPProtocolError，含 mcp_server
             assert res["err4014_code"] == 4014
             assert res["err4014_server"] == "does-not-exist"
         finally:

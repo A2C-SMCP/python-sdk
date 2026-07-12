@@ -68,6 +68,7 @@ from a2c_smcp.smcp import (
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
 )
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
     HANDSHAKE_CONNECT_ERRORS,
@@ -538,10 +539,17 @@ class SMCPComputerClient(AsyncClient):
         # 从 Computer 中获取初始化时传入的配置集合（不可变元组）
         # From Computer, get the immutable tuple of initial MCP server configs
         for cfg in self.computer.mcp_servers:
+            # 身份键 = bundle_id（协议 #18）；从 raw config derive（与注册边界 seam 一致，raw #17）。
+            # no-double-open：同 bundle_id 保留首个（与 manager boot first-wins 一致）。
+            bundle_id = resolve_bundle_id(cfg)
+            if bundle_id in servers:
+                continue
             # 使用强校验转换为协议定义（中英文）/ Validate strictly to protocol definition (bilingual)
             # 若类型不匹配，抛出异常，属于硬性 Bug / If mismatched, raise to surface a hard bug.
             validated_server: dict = TypeAdapter(SMCPServerConfigDict).validate_python(cfg.model_dump(mode="json"), from_attributes=True)
-            servers[cfg.name] = validated_server
+            # 物化解析后 bundle_id（entry 携 bundle_id + name(display)，供 Agent tool→server 归属桥）
+            validated_server["bundle_id"] = bundle_id
+            servers[bundle_id] = validated_server
 
         inputs: list[MCPServerInput] = []
         for i in self.computer.inputs:
@@ -585,14 +593,14 @@ class SMCPComputerClient(AsyncClient):
             return ErrorPayload(
                 code=int(ErrorCode.MCP_SERVER_NOT_FOUND),
                 message="MCP Server not registered",
-                mcp_server_name=mcp_server,
+                mcp_server=mcp_server,
             )
         except MCPCapabilityNotSupportedError as e:
             logger.warning(f"client:get_resources MCP Server '{mcp_server}' 未声明 resources 能力 / capability missing: {e}")
             return ErrorPayload(
                 code=int(ErrorCode.MCP_CAPABILITY_NOT_SUPPORTED),
                 message="MCP Server does not support 'resources' capability",
-                mcp_server_name=mcp_server,
+                mcp_server=mcp_server,
                 capability="resources",
             )
         ret: GetResourcesRet = {
@@ -740,7 +748,7 @@ def _skill_not_found(name: str) -> ErrorPayload:
     """``4014`` 复用 flat ErrorPayload：name 合法但 Registry 未命中（未注册 / 卸载 / 孤儿）。
 
     SKILL 通道复用 ``MCP_SERVER_NOT_FOUND`` 语义（error-handling.md §SKILL）；``name`` 经 ``details`` 下沉
-    （非 mcp_server，故不平铺 ``mcp_server_name``）。
+    （SKILL 按 name 寻址、非 mcp_server(bundle_id)，故不平铺 ``mcp_server``）。
     """
     return ErrorPayload(code=int(ErrorCode.MCP_SERVER_NOT_FOUND), message="Skill not found", details={"name": name})
 
