@@ -88,6 +88,7 @@ from a2c_smcp.computer.skills import (
 from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.logger import get_logger, truncate
 from a2c_smcp.utils.window_uri import is_window_uri
@@ -755,16 +756,25 @@ class Computer(BaseComputer[PromptSession]):
         try:
             if isinstance(server, dict):
                 raw = server
+                # BundleID 取 raw（protocol#17）：注入前配置即身份来源。构 raw model 求 bundle_id
+                # （占位 ${input:*} 按字面参与摘要）。注：raw 若在**非字符串**字段（如 timeout）含占位会在此
+                # 提前校验失败——属边角（§9.4 占位面向字符串字段），正常配置不触及。
+                raw_model: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(raw)
                 rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
                 rendered = self._apply_env_file(rendered)
                 # 使用 TypeAdapter 将 union 类型解析为具体模型
                 validated: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(rendered)
             else:
                 raw = server.model_dump(mode="json")
+                raw_model = server  # 模型入参即未渲染 raw（self._mcp_servers / 调用方原样）
                 rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
                 rendered = self._apply_env_file(rendered)
                 validated = type(server).model_validate(rendered)
-            return validated
+            # 物化 bundle_id：在 RAW 配置上 derive-on-load（protocol#15/#17），注入渲染后 config——
+            # 使 config.bundle_id 解析后恒有值、作 no-double-open 去重键跨渲染阶段稳定。model_copy 不重跑
+            # validator（resolved 已合法）。生成不在 Pydantic（config frozen）。
+            resolved_bundle_id = resolve_bundle_id(raw_model)
+            return validated.model_copy(update={"bundle_id": resolved_bundle_id})
         except Exception as e:
             name = (server.get("name") if isinstance(server, dict) else getattr(server, "name", "unknown")) or "unknown"
             logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
@@ -800,19 +810,19 @@ class Computer(BaseComputer[PromptSession]):
         validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         await self.mcp_manager.aadd_or_aupdate_server(validated)
 
-    async def aremove_server(self, server_name: str, *, session: PromptSession | None = None) -> None:
+    async def aremove_server(self, bundle_id: str, *, session: PromptSession | None = None) -> None:
         """
-        动态移除某个MCP Server配置。
-        Remove a MCP Server config dynamically.
+        动态移除某个MCP Server配置（按 bundle_id）。
+        Remove a MCP Server config dynamically (by bundle_id).
 
         Args:
-            server_name (str): 配置名称。
+            bundle_id (str): MCP Server 唯一身份 bundle_id（协议 #18）。
         """
         if not self.mcp_manager:
             # 未初始化则无操作
             logger.warning("MCP 管理器尚未初始化，忽略移除操作 / MCP manager not initialized, skip remove")
             return
-        await self.mcp_manager.aremove_server(server_name)
+        await self.mcp_manager.aremove_server(bundle_id)
 
     def update_inputs(self, inputs: set[MCPServerInput], *, session: PromptSession | None = None) -> None:
         """

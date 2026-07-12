@@ -150,8 +150,8 @@ class ToolMeta(TypedDict, total=False):
     # 不同MCP工具返回值并不统一，虽然其满足MCP标准的返回格式，但具体的原始内容命名仍然无法避免出现不一致的情况。通过object_mapper可以方便
     # 前端对其进行转换，以使用标准组件渲染解析。
     ret_object_mapper: NotRequired[dict | None]
-    # 工具别名，与 model.ToolMeta.alias 对齐，用于解决不同 Server 下工具重名冲突
-    # Tool alias, align with model.ToolMeta.alias, used to resolve name conflicts across servers
+    # 工具别名（BundleID 模型，协议 0.3.0）。仅替换 exposed_tool_name 的**工具名部分**，仍带 {bundle_id}__ 前缀。
+    # Tool alias (BundleID model): replaces only the tool-name part of exposed_tool_name, keeps the {bundle_id}__ prefix.
     alias: NotRequired[str | None]
     # 工具标签，用于对工具进行分类
     # Tool tags, used to categorize tools
@@ -162,6 +162,9 @@ class BaseMCPServerConfig(TypedDict):
     """MCP服务器配置基类"""
 
     name: SERVER_NAME  # MCP Server的名称
+    # MCP Server 唯一身份（BundleID 模型，协议 0.3.0）。省略/未解析为 None；注册边界 derive 后恒有值。
+    # MCP Server unique identity (BundleID model). None when omitted/unresolved; always set after derive.
+    bundle_id: NotRequired[str | None]
     disabled: bool
     forbidden_tools: list[str]  # 禁用的工具列表，因为一个mcp可能有非常多工具，有些工具用户需要禁用。
     tool_meta: dict[TOOL_NAME, ToolMeta]
@@ -492,7 +495,7 @@ class GetResourcesReq(AgentCallData, total=True):
     """
 
     computer: str
-    mcp_server: str  # 必填：MCP Server 名称 / Required: MCP Server name
+    mcp_server: str  # 必填：目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Required: target server bundle_id
     cursor: NotRequired[str]
 
 
@@ -518,8 +521,8 @@ class ErrorPayload(TypedDict, total=False):
 
     分流字段顶层平铺 / Code-specific dispatch fields are top-level:
       - 4008: server_version / client_version / min_supported / max_supported
-      - 4014: mcp_server_name
-      - 4015: mcp_server_name / capability
+      - 4014: mcp_server（bundle_id）
+      - 4015: mcp_server（bundle_id）/ capability
 
     v0.2.1 起，4016 / 4017 / 4018 的 code-specific 字段下沉到 ``details`` 子对象（无顶层平铺新字段）：
     From v0.2.1, code-specific fields for 4016 / 4017 / 4018 live under ``details`` (no new top-level fields):
@@ -540,8 +543,8 @@ class ErrorPayload(TypedDict, total=False):
     client_version: str
     min_supported: str
     max_supported: str
-    # 4014 / MCP Server not found；4015 / MCP Capability not supported
-    mcp_server_name: str
+    # 4014 / MCP Server not found；4015 / MCP Capability not supported。值 = 目标 server 的 **bundle_id**（协议 #18）
+    mcp_server: str
     # 4015 / 缺失的 capability 名（如 "resources"）/ Missing capability name (e.g. "resources")
     capability: str
     # 诊断容器 / Diagnostic container

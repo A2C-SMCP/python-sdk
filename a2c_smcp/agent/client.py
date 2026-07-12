@@ -445,7 +445,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         Args:
             computer (str): 目标 Computer 名称 / Target Computer name
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
             timeout (int): 超时时间（秒）/ Timeout in seconds
 

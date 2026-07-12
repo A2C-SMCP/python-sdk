@@ -161,25 +161,25 @@ async def test_update_tool_list_live_refetch_add_change_remove(tmp_path) -> None
         )
         try:
             # —— 基线：enter_office 自动回拉 → 仅控制工具 set_phase ——
-            await _wait_until(lambda: "set_phase" in handler.names("comp-tl"))
-            assert "dynamic_tool" not in handler.names("comp-tl")
+            await _wait_until(lambda: "mutable-srv__set_phase" in handler.names("comp-tl"))
+            assert "mutable-srv__dynamic_tool" not in handler.names("comp-tl")
 
             # —— 新增（不伴随 config 变更）：set_phase(1) → dynamic_tool(schemaA: alpha) ——
-            await agent.emit_tool_call("comp-tl", "set_phase", {"phase": 1}, timeout=10)
-            await _wait_until(lambda: "dynamic_tool" in handler.names("comp-tl"))
-            assert handler.schema_props("comp-tl", "dynamic_tool") == {"alpha"}
+            await agent.emit_tool_call("comp-tl", "mutable-srv__set_phase", {"phase": 1}, timeout=10)
+            await _wait_until(lambda: "mutable-srv__dynamic_tool" in handler.names("comp-tl"))
+            assert handler.schema_props("comp-tl", "mutable-srv__dynamic_tool") == {"alpha"}
 
             # —— 同名换 schema：set_phase(2) → dynamic_tool(schemaB: beta，旧 alpha 须清） ——
-            await agent.emit_tool_call("comp-tl", "set_phase", {"phase": 2}, timeout=10)
-            await _wait_until(lambda: handler.schema_props("comp-tl", "dynamic_tool") == {"beta"})
-            assert "alpha" not in handler.schema_props("comp-tl", "dynamic_tool")
+            await agent.emit_tool_call("comp-tl", "mutable-srv__set_phase", {"phase": 2}, timeout=10)
+            await _wait_until(lambda: handler.schema_props("comp-tl", "mutable-srv__dynamic_tool") == {"beta"})
+            assert "alpha" not in handler.schema_props("comp-tl", "mutable-srv__dynamic_tool")
 
             # —— 移除：set_phase(0) → dynamic_tool 消失（唯预清回调生效才成立，加法式否则残留） ——
             # 注意等**正向终态** names=={set_phase}：预清会先清空注册表，若只等「dynamic_tool 不在」会命中
             # 「清空后、on_tools_received 重加 set_phase 前」的空窗而误判。
-            await agent.emit_tool_call("comp-tl", "set_phase", {"phase": 0}, timeout=10)
-            await _wait_until(lambda: handler.names("comp-tl") == {"set_phase"})
-            assert "dynamic_tool" not in handler.names("comp-tl")
+            await agent.emit_tool_call("comp-tl", "mutable-srv__set_phase", {"phase": 0}, timeout=10)
+            await _wait_until(lambda: handler.names("comp-tl") == {"mutable-srv__set_phase"})
+            assert "mutable-srv__dynamic_tool" not in handler.names("comp-tl")
 
             # 预清回调确实被触发过（新增/换 schema/移除 至少三次）/ pre-clean hook actually fired
             assert handler.preclean_calls >= 3
@@ -211,20 +211,20 @@ async def test_legacy_consumer_backward_compat_and_preclean_necessity(tmp_path) 
         )
         try:
             # 基线：enter_office 自动回拉 → 仅 set_phase / baseline
-            await _wait_until(lambda: "set_phase" in legacy.names("comp-tl-legacy"))
+            await _wait_until(lambda: "mutable-srv__set_phase" in legacy.names("comp-tl-legacy"))
 
             # 新增：旧消费方**仍**因 notify:update_tool_list 自动回拉看到 dynamic_tool（hasattr 守卫不破链路）
-            await agent.emit_tool_call("comp-tl-legacy", "set_phase", {"phase": 1}, timeout=10)
-            await _wait_until(lambda: legacy.schema_props("comp-tl-legacy", "dynamic_tool") == {"alpha"})
+            await agent.emit_tool_call("comp-tl-legacy", "mutable-srv__set_phase", {"phase": 1}, timeout=10)
+            await _wait_until(lambda: legacy.schema_props("comp-tl-legacy", "mutable-srv__dynamic_tool") == {"alpha"})
 
             # 同名换 schema：alpha→beta 正向可观测——证明 notify→回拉链对旧消费方**持续**生效（非一次性）
-            await agent.emit_tool_call("comp-tl-legacy", "set_phase", {"phase": 2}, timeout=10)
-            await _wait_until(lambda: legacy.schema_props("comp-tl-legacy", "dynamic_tool") == {"beta"})
+            await agent.emit_tool_call("comp-tl-legacy", "mutable-srv__set_phase", {"phase": 2}, timeout=10)
+            await _wait_until(lambda: legacy.schema_props("comp-tl-legacy", "mutable-srv__dynamic_tool") == {"beta"})
 
             # 移除：set_phase(0) → 同一链路已被证明生效，但旧消费方缺预清 → dynamic_tool 残留（仍带 beta schema）
-            await agent.emit_tool_call("comp-tl-legacy", "set_phase", {"phase": 0}, timeout=10)
+            await agent.emit_tool_call("comp-tl-legacy", "mutable-srv__set_phase", {"phase": 0}, timeout=10)
             await asyncio.sleep(3.0)  # 让 notify→回拉→on_tools_received 链完成（无 ack，确定性宽等）
-            assert legacy.schema_props("comp-tl-legacy", "dynamic_tool") == {"beta"}, (
+            assert legacy.schema_props("comp-tl-legacy", "mutable-srv__dynamic_tool") == {"beta"}, (
                 "旧消费方缺预清 → 移除的工具应残留（正是 on_computer_update_tool_list 预清回调要解决的问题）"
             )
         finally:

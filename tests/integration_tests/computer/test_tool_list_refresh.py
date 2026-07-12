@@ -54,27 +54,27 @@ async def test_get_tools_reflects_runtime_add_schema_change_remove() -> None:
     try:
         # 基线：仅控制工具 / baseline: only the control tool
         base = await computer.aget_available_tools()
-        assert _names(base) == {"set_phase"}
+        assert _names(base) == {"mutable-srv__set_phase"}
 
         # —— 新增：phase 1 → dynamic_tool(schemaA: alpha) ——
-        await computer.mcp_manager.aexecute_tool("set_phase", {"phase": 1})
+        await computer.mcp_manager.aexecute_tool("mutable-srv__set_phase", {"phase": 1})
         added = await computer.aget_available_tools()
-        assert "dynamic_tool" in _names(added), "运行期新增工具须出现在 get_tools / runtime-added tool must surface"
-        dyn_a = next(t for t in added if t["name"] == "dynamic_tool")
+        assert "mutable-srv__dynamic_tool" in _names(added), "运行期新增工具须出现在 get_tools / runtime-added tool must surface"
+        dyn_a = next(t for t in added if t["name"] == "mutable-srv__dynamic_tool")
         assert "alpha" in dyn_a["params_schema"].get("properties", {})
 
         # —— 同名换 schema：phase 2 → dynamic_tool(schemaB: beta，无 alpha) ——
-        await computer.mcp_manager.aexecute_tool("set_phase", {"phase": 2})
+        await computer.mcp_manager.aexecute_tool("mutable-srv__set_phase", {"phase": 2})
         changed = await computer.aget_available_tools()
-        dyn_b = next(t for t in changed if t["name"] == "dynamic_tool")
+        dyn_b = next(t for t in changed if t["name"] == "mutable-srv__dynamic_tool")
         props = dyn_b["params_schema"].get("properties", {})
         assert "beta" in props and "alpha" not in props, "同名工具须换到新 schema、无旧残留 / new schema, no stale"
 
         # —— 移除：phase 0 → dynamic_tool 消失 ——
-        await computer.mcp_manager.aexecute_tool("set_phase", {"phase": 0})
+        await computer.mcp_manager.aexecute_tool("mutable-srv__set_phase", {"phase": 0})
         removed = await computer.aget_available_tools()
-        assert "dynamic_tool" not in _names(removed), "移除的工具须从 get_tools 消失 / removed tool must disappear"
-        assert _names(removed) == {"set_phase"}
+        assert "mutable-srv__dynamic_tool" not in _names(removed), "移除的工具须从 get_tools 消失 / removed tool must disappear"
+        assert _names(removed) == {"mutable-srv__set_phase"}
     finally:
         await computer.shutdown()
 
@@ -87,16 +87,16 @@ async def test_manager_arefresh_tools_surfaces_added_tool() -> None:
     await manager.astart_all()
     try:
         base = {t.name async for t in manager.available_tools()}
-        assert base == {"set_phase"}
+        assert base == {"mutable-srv__set_phase"}
 
         # 运行期新增工具但**不**刷新映射 → available_tools 仍漏掉（复现 Bug B）
-        await manager.aexecute_tool("set_phase", {"phase": 1})
+        await manager.aexecute_tool("mutable-srv__set_phase", {"phase": 1})
         stale = {t.name async for t in manager.available_tools()}
-        assert "dynamic_tool" not in stale, "未刷新时 _tool_mapping 陈旧、新增工具被漏（Bug B 现象）"
+        assert "mutable-srv__dynamic_tool" not in stale, "未刷新时 _tool_mapping 陈旧、新增工具被漏（Bug B 现象）"
 
         # 显式刷新（Computer 服务 get_tools 时所做）→ 新增工具浮现
         await manager.arefresh_tools()
         fresh = {t.name async for t in manager.available_tools()}
-        assert "dynamic_tool" in fresh, "arefresh_tools() 后新增工具须可见（#127 修复）"
+        assert "mutable-srv__dynamic_tool" in fresh, "arefresh_tools() 后新增工具须可见（#127 修复）"
     finally:
         await manager.aclose()

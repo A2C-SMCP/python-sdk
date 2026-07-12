@@ -178,8 +178,8 @@ async def test_smcp_tool_data_with_per_tool_meta(stdio_params) -> None:
 
     assert tools, "工具列表不应为空"
 
-    # 找到 hello 工具验证合并结果
-    hello_tool = next((t for t in tools if t["name"] == "hello"), None)
+    # 找到 hello 工具验证合并结果（exposed_tool_name = {bundle_id}__hello；bundle_id == name）
+    hello_tool = next((t for t in tools if t["name"] == "merged_meta_server__hello"), None)
     assert hello_tool is not None, "应存在 hello 工具"
 
     meta = hello_tool.get("meta", {})

@@ -218,7 +218,7 @@ async def test_async_integration_agent_receives_vrl_transformed_result(
         # Agent calls tool
         result = await agent_client.emit_tool_call(
             computer=computer_name,
-            tool_name="mark_a",
+            tool_name="e2e-vrl-integration-server-1__mark_a",
             params={},
             timeout=15,
         )
@@ -390,7 +390,7 @@ async def test_async_integration_vrl_field_mapping_and_extraction(
         # Agent calls tool
         result = await agent_client.emit_tool_call(
             computer=computer_name,
-            tool_name="mark_a",
+            tool_name="e2e-vrl-integration-server-2__mark_a",
             params={},
             timeout=15,
         )
@@ -529,7 +529,7 @@ async def test_async_integration_vrl_preserves_original_result(
         # Agent calls tool
         result = await agent_client.emit_tool_call(
             computer=computer_name,
-            tool_name="mark_a",
+            tool_name="e2e-vrl-integration-server-3__mark_a",
             params={},
             timeout=15,
         )

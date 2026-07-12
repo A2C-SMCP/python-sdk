@@ -75,7 +75,7 @@ def test_tc_call_hello(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
     # 3) 确认工具已可见（tools 列表应包含 hello）
     child.sendline("tools")
     tools_out = expect_prompt_stable(child, quiet=0.6, max_wait=12.0)
-    assert "hello" in strip_ansi(tools_out)
+    assert "e2e-tc__hello" in strip_ansi(tools_out)
 
     # 4) 构造 tc 负载，工具名使用原始 MCP 工具名（不加前缀）。
     #    中文: Manager 会在所有已启动 server 中解析该工具名；我们前一步已确认 tools 中包含 hello。
@@ -84,7 +84,7 @@ def test_tc_call_hello(cli_proc: pexpect.spawn, tmp_path: Path) -> None:
         "agent": "bot-e2e",
         "req_id": "req-e2e-hello",
         "computer": "ignored",
-        "tool_name": "hello",
+        "tool_name": "e2e-tc__hello",
         "params": {"name": "E2E"},
         "timeout": 10,
     }
@@ -138,7 +138,7 @@ def test_tc_default_and_tool_both_false_then_error(cli_proc: pexpect.spawn, tmp_
         "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
-        "tool_name": "mark_b",
+        "tool_name": "e2e-tc-b-both-false__mark_b",
         "params": {},
         "timeout": 5,
     }
@@ -190,7 +190,7 @@ def test_tc_tool_true_overrides_default(cli_proc: pexpect.spawn, tmp_path: Path)
         "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
-        "tool_name": "mark_b",
+        "tool_name": "e2e-tc-b-tool-true__mark_b",
         "params": {},
         "timeout": 5,
     }
@@ -240,7 +240,7 @@ def test_tc_tool_unset_uses_default(cli_proc: pexpect.spawn, tmp_path: Path) -> 
         "agent": "r-e2e",
         "req_id": "req-e2e",
         "computer": "client",
-        "tool_name": "mark_b",
+        "tool_name": "e2e-tc-b-default-true__mark_b",
         "params": {},
         "timeout": 5,
     }

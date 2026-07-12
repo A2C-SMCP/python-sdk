@@ -194,7 +194,7 @@ async def test_v02_full_flow_compatible(compat_server: int) -> None:
         assert any(u.startswith("window://example.desktop.paged/p2") for u in uris)
 
         # —— 工具调用链路：Agent → Server → Computer 真实 MCP Server → 结果回传 ——
-        result = await agent.emit_tool_call(computer="comp-v02", tool_name="mark_a", params={}, timeout=15)
+        result = await agent.emit_tool_call(computer="comp-v02", tool_name="subscribe-srv__mark_a", params={}, timeout=15)
         assert result.isError is False, f"工具调用失败 / tool call failed: {result}"
         assert len(result.content) >= 1
         assert "ok:mark_a" in result.content[0].text

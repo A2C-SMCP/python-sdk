@@ -4,9 +4,7 @@
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
 import asyncio
-import copy
 import json
-from collections import defaultdict
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any
 
@@ -17,7 +15,8 @@ from vrl_python import VRLRuntime
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
 from a2c_smcp.computer.mcp_clients.utils import client_factory
-from a2c_smcp.types import SERVER_NAME, TOOL_NAME
+from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, TOOL_NAME
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
@@ -50,16 +49,15 @@ class MCPServerManager:
         auto_reconnect: bool = True,
         message_handler: MessageHandlerFnT | None = None,
     ) -> None:
-        # 存储所有服务器配置
-        self._servers_config: dict[SERVER_NAME, MCPServerConfig] = {}
-        # 存储活动客户端 {server_name: client}
-        self._active_clients: dict[SERVER_NAME, MCPClientProtocol] = {}
-        # 工具到服务器的映射 {tool_name: server_name}
-        self._tool_mapping: dict[TOOL_NAME, SERVER_NAME] = {}
-        # 工具的alias到server+original_name的映射 {alias: (server_name, original_name)}
-        self._alias_mapping: dict[str, tuple[SERVER_NAME, TOOL_NAME]] = {}
-        # 禁用工具集合
-        self._disabled_tools: set[TOOL_NAME] = set()
+        # 存储所有服务器配置，以 bundle_id 为唯一身份键（协议 #15/#18：身份=bundle_id，name 降纯 display 不做键）
+        # Server configs keyed by bundle_id (unique identity; name is pure display, never a key — protocol #15/#18).
+        self._servers_config: dict[BUNDLE_ID, MCPServerConfig] = {}
+        # 活动客户端 {bundle_id: client}
+        self._active_clients: dict[BUNDLE_ID, MCPClientProtocol] = {}
+        # ExposedToolMapping：exposed_tool_name -> (bundle_id, 原始工具名)。list_tools 与 tool_call **共用同一份**表
+        # （协议 §ExposedToolMapping）。exposed = {bundle_id}__{alias ?? 原始名}，bundle_id 无 `__` 保证单射→查表不 split。
+        # 被 forbidden 的工具**不进本表**（不可见不可调用）；跨 bundle_id 天然唯一，无需跨 server 对账。
+        self._exposed_tools: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
         # 自动重连标志
         self._auto_reconnect: bool = auto_reconnect
         # 自动连接标志
@@ -69,27 +67,27 @@ class MCPServerManager:
         # 内部锁防止并发修改
         self._lock = asyncio.Lock()
 
-    def get_server_config(self, server_name: SERVER_NAME) -> MCPServerConfig:
-        """通过名称获取服务配置"""
-        return self._servers_config[server_name]
+    def get_server_config(self, bundle_id: BUNDLE_ID) -> MCPServerConfig:
+        """通过 bundle_id 获取服务配置 / Get server config by bundle_id。"""
+        return self._servers_config[bundle_id]
 
     def server_configs(self) -> tuple[MCPServerConfig, ...]:
         """全部服务配置的不可变快照（运行期活跃配置集，含动态挂载/重挂项）/ snapshot of all active server configs。"""
         return tuple(self._servers_config.values())
 
-    def get_tool_meta(self, server_name: SERVER_NAME, tool_name: TOOL_NAME) -> ToolMeta | None:
+    def get_tool_meta(self, bundle_id: BUNDLE_ID, tool_name: TOOL_NAME) -> ToolMeta | None:
         """
-        中文: 获取指定服务器下某工具合并后的元数据（优先具体 tool_meta，缺失字段回落 default_tool_meta）。
-        English: Get merged ToolMeta for a tool under the given server (specific overrides; fallback to default).
+        中文: 获取指定服务器（bundle_id）下某工具合并后的元数据（优先具体 tool_meta，缺失字段回落 default_tool_meta）。
+        English: Get merged ToolMeta for a tool under the given server (bundle_id).
 
         Args:
-            server_name (SERVER_NAME): 服务器名称 / server name
-            tool_name (TOOL_NAME): 工具原始名称或别名解析后的名称 / tool name
+            bundle_id (BUNDLE_ID): 服务器唯一身份 / server bundle_id
+            tool_name (TOOL_NAME): 工具**原始名称**（非 exposed）/ original tool name
 
         Returns:
             ToolMeta | None: 合并后的工具元数据；若两侧均为空返回 None / merged ToolMeta or None if both absent.
         """
-        config = self.get_server_config(server_name)
+        config = self.get_server_config(bundle_id)
         return self._merged_tool_meta(config, tool_name)
 
     async def enable_auto_connect(self) -> None:
@@ -125,18 +123,21 @@ class MCPServerManager:
             await self._astop_all()
             # 2. 清空所有状态存储
             self._clear_all()
-            # 3. 添加新配置
+            # 3. 添加新配置（no-double-open，加载期 first-wins）：按配置顺序 per-bundle_id 保留**首个**，
+            #    其余作 Computer 本地诊断（WARN，非协议错误码）。同 bundle_id = 同软件，任一时刻只一个。
+            #    (protocol §no-double-open, boot=first-wins). Runtime add/update is update-in-place (see _add_or_update).
+            seen_bundle_ids: set[BUNDLE_ID] = set()
             for server in servers:
+                bundle_id = resolve_bundle_id(server)
+                if bundle_id in seen_bundle_ids:
+                    logger.warning(
+                        f"no-double-open: 重复 bundle_id '{bundle_id}'（name={server.name!r}）——保留配置顺序首个、"
+                        f"跳过此项（Computer 本地诊断，非协议错误码）；如需多实例请显式指定不同 bundle_id。",
+                    )
+                    continue
+                seen_bundle_ids.add(bundle_id)
                 await self._add_or_update_server_config(server)
-            try:
-                await self._arefresh_tool_mapping()
-            except ToolNameDuplicatedError as e:  # pragma: no cover
-                # 极端分支：仅在外部错误用法下触发，主流程不会走到这里
-                # 中文：此处为防御性分支，正常流程不会触发
-                # English: Defensive branch, not triggered in normal flow
-                await self._astop_all()  # pragma: no cover
-                self._clear_all()  # pragma: no cover
-                raise e  # pragma: no cover
+            await self._arefresh_tool_mapping()
 
     async def _add_or_update_server_config(self, config: MCPServerConfig) -> None:
         """
@@ -148,119 +149,100 @@ class MCPServerManager:
         Args:
             config (MCPServerConfig): MCP服务器配置
         """
-        if config.name in self._servers_config:
-            # 配置更新时检查是否激活
-            if config.name in self._active_clients:
+        bundle_id = resolve_bundle_id(config)
+        if bundle_id in self._servers_config:
+            # 运行期同 bundle_id = **原地更新**（intentional replace；name 可变、bundle_id 稳定），不算 no-double-open 冲突
+            # Runtime same bundle_id = update-in-place (protocol §no-double-open runtime branch).
+            if bundle_id in self._active_clients:
                 if self._auto_reconnect:
-                    self._servers_config[config.name] = config
-                    await self._arestart_server(config.name)
+                    self._servers_config[bundle_id] = config
+                    await self._arestart_server(bundle_id)
                 else:
-                    raise RuntimeError(f"Server {config.name} is active. Stop it before updating config")
+                    raise RuntimeError(
+                        f"Server bundle_id={bundle_id!r} (name={config.name!r}) is active. Stop it before updating config",
+                    )
             else:
                 # 配置存在但客户端未激活，更新配置并根据 auto_connect 决定是否启动
                 # Config exists but client is not active, update config and start if auto_connect is enabled
-                self._servers_config[config.name] = config
+                self._servers_config[bundle_id] = config
                 if self._auto_connect:
-                    await self._astart_client(config.name)
+                    await self._astart_client(bundle_id)
         else:
-            self._servers_config[config.name] = config
+            self._servers_config[bundle_id] = config
             if self._auto_connect:
-                await self._astart_client(config.name)
+                await self._astart_client(bundle_id)
 
     async def aadd_or_aupdate_server(self, config: MCPServerConfig) -> None:
-        """
-        添加或更新服务器配置
-
-        Args:
-            config (MCPServerConfig): MCP服务器配置
-        """
+        """添加或更新服务器配置。运行期同 ``bundle_id`` = **原地更新**（不算 no-double-open 冲突）。"""
         async with self._lock:
-            backup_config = copy.deepcopy(self._servers_config)
-            try:
-                await self._add_or_update_server_config(config)
-                await self._arefresh_tool_mapping()
-            except ToolNameDuplicatedError as e:
-                self._servers_config = backup_config
-                raise e
-
-    async def aremove_server(self, server_name: str) -> None:
-        """移除服务器配置"""
-        async with self._lock:
-            if server_name in self._active_clients:
-                await self._astop_client(server_name)
-            del self._servers_config[server_name]
+            await self._add_or_update_server_config(config)
             await self._arefresh_tool_mapping()
 
-    async def _arestart_server(self, server_name: str) -> None:
-        """
-        重启服务器客户端
+    async def aremove_server(self, bundle_id: BUNDLE_ID) -> None:
+        """按 bundle_id 移除服务器配置 / Remove a server config by bundle_id。"""
+        async with self._lock:
+            if bundle_id in self._active_clients:
+                await self._astop_client(bundle_id)
+            del self._servers_config[bundle_id]
+            await self._arefresh_tool_mapping()
 
-        Args:
-            server_name (str): 服务器名称
-        """
+    async def _arestart_server(self, bundle_id: BUNDLE_ID) -> None:
+        """重启服务器客户端（按 bundle_id）。"""
         # 明确使用当前管理器中的最新配置
-        config = self._servers_config.get(server_name)
+        config = self._servers_config.get(bundle_id)
         if not config:
-            # 极端分支：仅在外部错误用法下触发，主流程不会走到这里
-            # 中文：此处为防御性分支，正常流程不会触发
-            # English: Defensive branch, not triggered in normal flow
-            raise ValueError(f"Server {server_name} not found in config")  # pragma: no cover
+            # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
+            raise ValueError(f"Server bundle_id={bundle_id!r} not found in config")  # pragma: no cover
 
         # 确保使用最新配置重启
-        if server_name in self._active_clients:
-            await self._astop_client(server_name)
+        if bundle_id in self._active_clients:
+            await self._astop_client(bundle_id)
 
         # 只有启用的配置才能重启
         if not config.disabled:
-            await self._astart_client(server_name)
+            await self._astart_client(bundle_id)
 
     async def astart_all(self) -> None:
         """启动所有启用的服务器"""
         async with self._lock:
             logger.debug(f"Manager Start all async task: {asyncio.current_task()}")
-            for server_name in self._servers_config:
-                if not self._servers_config[server_name].disabled:
-                    await self._astart_client(server_name)
+            for bundle_id in self._servers_config:
+                if not self._servers_config[bundle_id].disabled:
+                    await self._astart_client(bundle_id)
 
-    async def astart_client(self, server_name: str) -> None:
-        """启动单个服务器客户端"""
+    async def astart_client(self, bundle_id: BUNDLE_ID) -> None:
+        """启动单个服务器客户端（按 bundle_id）。"""
         async with self._lock:
-            await self._astart_client(server_name)
+            await self._astart_client(bundle_id)
 
-    async def _astart_client(self, server_name: str) -> None:
-        """启动单个服务器客户端"""
-        config = self._servers_config.get(server_name)
+    async def _astart_client(self, bundle_id: BUNDLE_ID) -> None:
+        """启动单个服务器客户端（按 bundle_id）。"""
+        config = self._servers_config.get(bundle_id)
         if not config:
-            # 极端分支：仅在外部错误用法下触发，主流程不会走到这里
-            # 中文：此处为防御性分支，正常流程不会触发
-            # English: Defensive branch, not triggered in normal flow
-            raise ValueError(f"Unknown server: {server_name}")  # pragma: no cover
+            # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
+            raise ValueError(f"Unknown server bundle_id={bundle_id!r}")  # pragma: no cover
 
         if config.disabled:
-            raise RuntimeError(f"Cannot start disabled server: {server_name}")
+            raise RuntimeError(f"Cannot start disabled server bundle_id={bundle_id!r} (name={config.name!r})")
 
-        if server_name in self._active_clients:
+        if bundle_id in self._active_clients:
             return  # 已经启动
 
         # 根据配置类型创建客户端
         client = client_factory(config, message_handler=self._message_handler)
         await client.aconnect()
-        self._active_clients[server_name] = client
-        try:
-            await self._arefresh_tool_mapping()
-        except ToolNameDuplicatedError as e:
-            await client.adisconnect()
-            del self._active_clients[server_name]
-            raise e
+        self._active_clients[bundle_id] = client
+        # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚
+        await self._arefresh_tool_mapping()
 
-    async def astop_client(self, server_name: str) -> None:
-        """停止单个服务器客户端"""
+    async def astop_client(self, bundle_id: BUNDLE_ID) -> None:
+        """停止单个服务器客户端（按 bundle_id）。"""
         async with self._lock:
-            await self._astop_client(server_name)
+            await self._astop_client(bundle_id)
 
-    async def _astop_client(self, server_name: str) -> None:
-        """停止单个服务器客户端"""
-        client = self._active_clients.pop(server_name, None)
+    async def _astop_client(self, bundle_id: BUNDLE_ID) -> None:
+        """停止单个服务器客户端（按 bundle_id）。"""
+        client = self._active_clients.pop(bundle_id, None)
         if client:
             await client.adisconnect()
             await self._arefresh_tool_mapping()
@@ -277,12 +259,10 @@ class MCPServerManager:
             await self._astop_all()
 
     def _clear_all(self) -> None:
-        """清空所有连接（别名）"""
+        """清空所有连接与映射 / Clear all state。"""
         self._servers_config.clear()
         self._active_clients.clear()
-        self._tool_mapping.clear()
-        self._alias_mapping.clear()
-        self._disabled_tools.clear()
+        self._exposed_tools.clear()
 
     async def aclose(self) -> None:
         """关闭所有连接（别名）"""
@@ -292,71 +272,48 @@ class MCPServerManager:
         self._clear_all()
 
     async def _arefresh_tool_mapping(self) -> None:
-        """刷新工具映射和禁用状态"""
-        # 清空现有映射
-        self._tool_mapping.clear()
-        self._disabled_tools.clear()
-        self._alias_mapping.clear()
+        """重建 ExposedToolMapping：``_exposed_tools[exposed_tool_name] = (bundle_id, 原始工具名)``。
 
-        # 临时存储工具源服务器
-        tool_sources: dict[TOOL_NAME, list[str]] = defaultdict(list)
+        Rebuild the shared ExposedToolMapping used by both ``available_tools`` and ``tool_call`` routing.
 
-        # 收集所有活动服务器的工具
-        for server_name, client in self._active_clients.items():
-            config = self._servers_config[server_name]
+        ``exposed_tool_name = {bundle_id}__{alias ?? 原始名}``（协议 §exposed_tool_name）。跨 bundle_id 因前缀
+        天然唯一——**无需**跨 server 重名对账（旧 ``ToolNameDuplicatedError`` 场景消失）。forbidden 工具**不进表**
+        （不可见不可调用）。同一 bundle_id 内两工具经 ``alias`` 撞出相同 exposed → 保留首个 + Computer 本地诊断
+        （WARN，非协议错误码）。
+        """
+        self._exposed_tools.clear()
+        for bundle_id, client in self._active_clients.items():
+            config = self._servers_config[bundle_id]
             try:
                 tools = await client.list_tools()
-                for t in tools:
-                    original_tool_name = t.name
-                    # 获取合并后的工具元数据（浅合并，具体配置优先，其次使用默认配置）
-                    # Get merged tool meta (shallow merge: specific overrides default)
-                    tool_meta = self._merged_tool_meta(config, original_tool_name)
-
-                    # 确定最终显示的工具名（优先使用别名）
-                    display_name: str = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
-
-                    # 检查是否为禁用工具 (根据配置，但此时需要注意如果原始名称在禁用列表中，也应该禁用，因为此处的禁用列表是归属于某个
-                    # ServerConfig的，不存在重复名称的情况，用户有可能配置了alias，但是使用原始名称禁用。)
-                    # 禁用判定必须**先于** tool_sources 收集：被禁用的工具不暴露、不路由、也不应参与跨 server
-                    # 重名冲突检测（#106）——否则「禁用了仍触发 ToolNameDuplicatedError」，用户无法靠 forbid 一方规避重名。
-                    # The forbidden check must precede tool_sources collection: a disabled tool is neither exposed nor
-                    # routed, and must not participate in cross-server duplicate detection (#106).
-                    if display_name in (config.forbidden_tools or []) or original_tool_name in (config.forbidden_tools or []):
-                        self._disabled_tools.add(display_name)
-                        continue
-
-                    # 如果使用提别名，则更新别名映射
-                    if display_name != original_tool_name:
-                        self._alias_mapping[display_name] = (server_name, original_tool_name)
-
-                    # 将工具添加到映射
-                    tool_sources[display_name].append(server_name)
             except Exception as e:
-                logger.error(f"Error listing tools for {server_name}: {e}", exc_info=True)
-
-        # 构建最终映射（处理工具名冲突）
-        for tool, sources in tool_sources.items():
-            if len(sources) > 1:
-                logger.warning(f"Warning: Tool '{tool}' exists in multiple servers: {sources}")
-                suggestion = (
-                    "Please use the 'alias' feature in ToolMeta to resolve conflicts. "
-                    "Each tool should have a unique name or alias across all servers."
-                )
-                raise ToolNameDuplicatedError(f"Tool '{tool}' exists in multiple servers: {sources}\n{suggestion}")
-            self._tool_mapping[tool] = sources[0]
-
-        # 跨 server 误伤对账（#106）：_disabled_tools 按全局 display_name 索引，若某名被某 server forbid，
-        # 但同名工具由其它 server 正常提供（已进入 _tool_mapping），应以**存活方为准**，否则 avalidate_tool_call
-        # 会因 _disabled_tools 命中而误拒可用工具。单 server 独有工具被 forbid（无其它提供方）则仍保留禁用语义。
-        # Cross-server reconciliation: a name forbidden on one server but live on another must keep the live one.
-        self._disabled_tools.difference_update(self._tool_mapping.keys())
+                logger.error(f"Error listing tools for bundle_id={bundle_id!r} (name={config.name!r}): {e}", exc_info=True)
+                continue
+            for t in tools or []:
+                original_tool_name = t.name
+                # 合并后的工具元数据（具体 tool_meta 优先，回落 default_tool_meta）
+                tool_meta = self._merged_tool_meta(config, original_tool_name)
+                # alias 仅替换 exposed 的**工具名部分**（协议新语义，仍带 {bundle_id}__ 前缀）；无 alias 回退原始名
+                tool_part = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
+                # forbidden：按**原始名**或 **alias 后工具名**匹配（用户可用任一禁用）；命中即不暴露、不路由
+                if original_tool_name in (config.forbidden_tools or []) or tool_part in (config.forbidden_tools or []):
+                    continue
+                exposed = f"{bundle_id}__{tool_part}"
+                if exposed in self._exposed_tools:
+                    # 同一 bundle_id 内 alias 撞名（跨 bundle_id 不可能撞）→ 保留首个 + 诊断，指导修正 alias
+                    logger.warning(
+                        f"exposed_tool_name 冲突（同 bundle_id={bundle_id!r} 内 alias 撞名）：'{exposed}'——保留首个、"
+                        f"跳过原始工具 '{original_tool_name}'；请修正 tool_meta.alias（Computer 本地诊断，非协议错误码）。",
+                    )
+                    continue
+                self._exposed_tools[exposed] = (bundle_id, original_tool_name)
 
     async def arefresh_tools(self) -> None:
-        """公开的工具映射刷新入口：锁内重建 ``_tool_mapping`` / ``_alias_mapping`` / ``_disabled_tools``（#127）。
+        """公开的工具映射刷新入口：锁内重建 ExposedToolMapping（``_exposed_tools``）（#127）。
 
-        Public tool-mapping refresh entry: rebuild mappings under the lock (#127).
+        Public tool-mapping refresh entry: rebuild the ExposedToolMapping under the lock (#127).
 
-        用途 / Use: MCP Server 运行期 ``tools/list_changed`` 后，boot 期构建的 ``_tool_mapping`` 已陈旧——
+        用途 / Use: MCP Server 运行期 ``tools/list_changed`` 后，boot 期构建的 ``_exposed_tools`` 已陈旧——
         **新增**工具不在映射中，``available_tools()`` 迭代映射键时永远漏掉它（``client:get_tools`` 看不到新工具）。
         本方法在 **安全上下文**（如 socketio ``on_get_tools`` 服务路径）被调用以刷新映射。
 
@@ -368,46 +325,42 @@ class MCPServerManager:
         async with self._lock:
             await self._arefresh_tool_mapping()
 
-    async def avalidate_tool_call(self, tool_name: TOOL_NAME, parameters: dict) -> tuple[SERVER_NAME, TOOL_NAME]:
-        """
-        判断工具调用的合法性，如果合法，返回对应的服务名称与原始工具名称
+    async def avalidate_tool_call(self, tool_name: EXPOSED_TOOL_NAME, parameters: dict) -> tuple[BUNDLE_ID, TOOL_NAME]:
+        """校验 ``exposed_tool_name`` 并经 ExposedToolMapping 解析到 ``(bundle_id, 原始工具名)``。
+
+        Validate an ``exposed_tool_name`` and route it via ExposedToolMapping to ``(bundle_id, original_tool_name)``.
 
         Args:
-            tool_name (str): 被调用的工具名称，可能是alias
-            parameters (dict): 工具调用的参数
+            tool_name (EXPOSED_TOOL_NAME): Agent 传入的 exposed_tool_name（``{bundle_id}__{alias??原始名}``）。
+            parameters (dict): 工具调用参数（当前版本不做 Schema 校验）。
 
         Returns:
-            tuple[SERVER_NAME, TOOL_NAME]: 经过校验后的合法服务名与工具名
+            tuple[BUNDLE_ID, TOOL_NAME]: 归属 bundle_id 与**原始**工具名。
+
+        Raises:
+            ValueError: exposed_tool_name 未命中 ExposedToolMapping（上层映射协议 ``4001``）。
         """
-        # 标记当前parameters尚未被使用
+        # 标记当前parameters尚未被使用 / parameters not schema-checked in this version
         logger.debug(f"{truncate(parameters)}未被检查。当前版本不支持Schema校验。")
-        # 检查工具是否可用
-        if tool_name in self._disabled_tools:
-            raise PermissionError(f"Tool '{tool_name}' is disabled by configuration")
-
-        server_name = self._tool_mapping.get(tool_name)
-        if not server_name:
-            raise ValueError(f"Tool '{tool_name}' not found in any active server")
-
-        # 如果tool_name是一个别名，则使用别名映射到原始名称
-        if tool_name in self._alias_mapping:
-            original_server_name, tool_name = self._alias_mapping[tool_name]
-            assert original_server_name == server_name, "Alias mapping should map to the same server"
-        return server_name, tool_name
+        # 整键查表（禁 split 反解身份；bundle_id 无 `__` 保证单射，原始名内含 `__` 无害）
+        route = self._exposed_tools.get(tool_name)
+        if route is None:
+            raise ValueError(f"Tool '{tool_name}' not found in ExposedToolMapping")
+        return route
 
     async def acall_tool(
         self,
-        server_name: SERVER_NAME,
+        bundle_id: BUNDLE_ID,
         tool_name: TOOL_NAME,
         parameters: dict,
         timeout: float | None = None,
     ) -> CallToolResult:
         """
-        触发MCP工具的调用。注意此方法tool_name必须是工具原始名称，如果是alias别名调用，需要使用 aexecute_tool
+        触发MCP工具的调用。注意此方法 tool_name 必须是工具**原始名称**，若以 exposed_tool_name 调用请用 aexecute_tool。
 
         Args:
-            server_name (str): 服务名称
-            tool_name (str): 工具名称
+            bundle_id (BUNDLE_ID): 目标 MCP Server 唯一身份 / target server bundle_id
+            tool_name (str): 工具**原始名称** / original tool name
             parameters (dict): 工具调用参数
             timeout (float | None): 超时时间
 
@@ -415,12 +368,12 @@ class MCPServerManager:
             CallToolResult: MCP 标准返回格式
         """
         # 获取MCP服务客户端连接
-        client = self._active_clients.get(server_name)
+        client = self._active_clients.get(bundle_id)
         if not client:
-            raise RuntimeError(f"Server '{server_name}' for tool '{tool_name}' is not active")
+            raise RuntimeError(f"Server bundle_id={bundle_id!r} for tool '{tool_name}' is not active")
 
         # 获取合并后的工具元数据
-        config = self._servers_config[server_name]
+        config = self._servers_config[bundle_id]
         tool_meta = self._merged_tool_meta(config, tool_name)
 
         # 执行工具调用
@@ -487,195 +440,187 @@ class MCPServerManager:
         except Exception as e:
             raise RuntimeError(f"Tool execution failed: {e}") from e
 
-    async def aexecute_tool(self, tool_name: TOOL_NAME, parameters: dict, timeout: float | None = None) -> CallToolResult:
-        """执行指定工具 与 acall_tool 的区别在于此方法支持使用alias别名进行调用。"""
-        server_name, tool_name = await self.avalidate_tool_call(tool_name, parameters)
-        return await self.acall_tool(server_name, tool_name, parameters, timeout)
+    async def aexecute_tool(self, tool_name: EXPOSED_TOOL_NAME, parameters: dict, timeout: float | None = None) -> CallToolResult:
+        """执行指定工具。入参 ``tool_name`` 为 **exposed_tool_name**，经 ExposedToolMapping 解析后调用原始工具。"""
+        bundle_id, original_tool_name = await self.avalidate_tool_call(tool_name, parameters)
+        return await self.acall_tool(bundle_id, original_tool_name, parameters, timeout)
 
-    async def list_resources(self, server_name: SERVER_NAME, cursor: str | None = None) -> tuple[list[Resource], str | None]:
+    async def list_resources(self, bundle_id: BUNDLE_ID, cursor: str | None = None) -> tuple[list[Resource], str | None]:
         """
-        中文: 单页透传指定 MCP Server 的 `resources/list`，供 v0.2 `client:get_resources` 使用。
+        中文: 单页透传指定 MCP Server（bundle_id）的 `resources/list`，供 v0.2 `client:get_resources` 使用。
         英文: Single-page transparent forward of a server's `resources/list`, for v0.2 `client:get_resources`.
 
         不做 scheme / 元数据过滤、不做跨 Server 聚合；翻页由调用方通过 cursor 控制。
         No scheme/metadata filtering, no cross-server aggregation; pagination is caller-driven via cursor.
 
         Args:
-            server_name (SERVER_NAME): 目标 MCP Server 名称 / Target MCP Server name.
+            bundle_id (BUNDLE_ID): 目标 MCP Server 的 bundle_id（wire `mcp_server`，协议 #18）/ Target server bundle_id.
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page.
 
         Returns:
-            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页) /
-                (resources on this page, next cursor — None when last page).
+            tuple[list[Resource], str | None]: (本页资源, 下一页游标——None 表示末页)。
 
         Raises:
-            MCPServerNotFoundError: server_name 未注册（→ 上层映射 4014）/
-                server_name not registered (mapped to 4014 upstream).
-            MCPCapabilityNotSupportedError: 目标 Server 未声明 `resources` 能力（→ 上层映射 4015）/
-                target server did not declare `resources` capability (mapped to 4015 upstream).
+            MCPServerNotFoundError: bundle_id 未注册（→ 上层映射 4014，payload ``mcp_server``=bundle_id）。
+            MCPCapabilityNotSupportedError: 目标 Server 未声明 `resources` 能力（→ 上层映射 4015）。
         """
-        client = self._active_clients.get(server_name)
+        client = self._active_clients.get(bundle_id)
         if client is None:
-            raise MCPServerNotFoundError(f"MCP Server '{server_name}' is not registered")
+            raise MCPServerNotFoundError(f"MCP Server bundle_id={bundle_id!r} is not registered")
         return await client.list_resources_page(cursor)
 
-    def get_server_status(self) -> list[tuple[str, bool, str]]:
-        """获取服务器状态列表"""
+    def get_server_status(self) -> list[tuple[BUNDLE_ID, bool, str]]:
+        """获取服务器状态列表 [(bundle_id, 是否活跃, 状态), ...]（身份=bundle_id）。"""
         return [
             (
-                server_name,
-                server_name in self._active_clients,
-                "pending" if server_name not in self._active_clients else self._active_clients[server_name].state,
+                bundle_id,
+                bundle_id in self._active_clients,
+                "pending" if bundle_id not in self._active_clients else self._active_clients[bundle_id].state,
             )
-            for server_name in self._servers_config
+            for bundle_id in self._servers_config
         ]
 
     async def available_tools(self) -> AsyncGenerator[Tool, Any]:
-        """获取可用工具及其元数据"""
+        """获取暴露给 Agent 的工具及其元数据；``Tool.name`` = **exposed_tool_name**（``{bundle_id}__{alias??原始名}``）。
+
+        Yield tools exposed to the Agent; each ``Tool.name`` is the exposed_tool_name (协议 §exposed_tool_name / #106)。
+        Agent 即以 exposed_tool_name 寻址，``aexecute_tool`` 经 ExposedToolMapping 解析回原始名调用上游。
+        """
         async with self._lock:
-            servers_cached_tools = defaultdict(list)
-            for tool_name, server in self._tool_mapping.items():
-                if server not in servers_cached_tools and server in self._active_clients:
-                    client = self._active_clients[server]
-                    tools = await client.list_tools()
-                    servers_cached_tools[server] = tools
-
-                config = self._servers_config[server]
-                assert not config.disabled, "Server should not be disabled"
-
-                original_server, original_tool_name = self._alias_mapping.get(tool_name) or (server, tool_name)
-                assert original_server == server, "Alias mapping error"
+            servers_cached_tools: dict[BUNDLE_ID, list[Tool]] = {}
+            for exposed_name, (bundle_id, original_tool_name) in self._exposed_tools.items():
+                if bundle_id not in self._active_clients:
+                    continue
+                if bundle_id not in servers_cached_tools:
+                    servers_cached_tools[bundle_id] = await self._active_clients[bundle_id].list_tools()
+                tools = servers_cached_tools[bundle_id]
+                config = self._servers_config[bundle_id]
 
                 tool = next((t for t in tools if t.name == original_tool_name), None)
                 if tool:
                     a2c_meta = self._merged_tool_meta(config, original_tool_name)
-                    # 对外暴露 display_name（alias 优先，无 alias 时即原始名）作为 Tool.name（#106）：Agent 按此名寻址，
-                    # 含连字符 / 冲突的原始名才能借 alias 适配下游命名约束。tool_name 即 _tool_mapping 的 key（display_name）。
-                    # 产出名字改写后的**副本**，避免原地 mutate 缓存对象（servers_cached_tools 按原始名复用，原地改名会破坏后续查找）。
-                    # Expose display_name as Tool.name (#106); yield a renamed copy to avoid mutating the cached tool object.
-                    update: dict[str, Any] = {"name": tool_name}
+                    # 产出名字改写后的**副本**（改 name 为 exposed_name），避免原地 mutate 缓存对象。
+                    # Yield a renamed copy (name=exposed_name) to avoid mutating the cached tool object.
+                    update: dict[str, Any] = {"name": exposed_name}
                     if a2c_meta:
                         merged_meta = dict(tool.meta) if tool.meta else {}
                         merged_meta[A2C_TOOL_META] = a2c_meta
                         update["meta"] = merged_meta
                     yield tool.model_copy(update=update)
 
-    async def list_windows(self, window_uri: str | None = None) -> list[tuple[SERVER_NAME, Resource]]:
+    async def list_windows(self, window_uri: str | None = None) -> list[tuple[BUNDLE_ID, Resource]]:
         """
-        列出所有活动MCP服务器的窗口资源，并附带其归属的server名称。
-        List window resources from all active MCP servers with owning server name.
+        列出所有活动MCP服务器的窗口资源，并附带其归属 server 的 **bundle_id**（desktop 按 bundle_id 分组，协议 #18）。
+        List window resources from all active MCP servers with owning server **bundle_id**.
 
         Args:
             window_uri (str | None): 若提供，则仅返回URI完全匹配的窗口；否则返回所有窗口。
 
         Returns:
-            list[tuple[SERVER_NAME, Resource]]: [(server_name, resource), ...]
+            list[tuple[BUNDLE_ID, Resource]]: [(bundle_id, resource), ...]（``window://host`` 的 host 不受影响）。
         """
-        results: list[tuple[SERVER_NAME, Resource]] = []
+        results: list[tuple[BUNDLE_ID, Resource]] = []
         # 不加锁读取活跃客户端快照，避免长时间持锁阻塞 I/O
         active_snapshot = list(self._active_clients.items())
-        for server_name, client in active_snapshot:
+        for bundle_id, client in active_snapshot:
             try:
                 resources = await client.list_windows()
             except Exception as e:
-                logger.error(f"Error listing windows for {server_name}: {e}", exc_info=True)
+                logger.error(f"Error listing windows for bundle_id={bundle_id!r}: {e}", exc_info=True)
                 continue
 
             for res in resources:
                 if window_uri is not None and str(res.uri) != window_uri:
                     continue
-                results.append((server_name, res))
+                results.append((bundle_id, res))
         return results
 
-    async def list_skill_resources(self, server_name: SERVER_NAME | None = None) -> list[tuple[SERVER_NAME, Resource]]:
+    async def list_skill_resources(self, bundle_id: BUNDLE_ID | None = None) -> list[tuple[BUNDLE_ID, Resource]]:
         """
-        中文: 枚举活跃 MCP Server 的 ``skill://`` 资源（附 server 归属），**完整消费 cursor 翻页直至末尾**。
-        英文: Enumerate ``skill://`` resources from active MCP servers (with owning server), exhausting cursor pages.
+        中文: 枚举活跃 MCP Server 的 ``skill://`` 资源（附归属 **bundle_id**），**完整消费 cursor 翻页直至末尾**。
+        英文: Enumerate ``skill://`` resources from active MCP servers (with owning **bundle_id**), exhausting pages.
 
         与 :meth:`list_resources`（单页、Agent 控制翻页）不同：SKILL 物化由 Computer 主导，须拿到**全量**
         ``skill://`` 集合，故在此完整消费翻页（协议 skill.md §12）。未声明 ``resources`` 能力或枚举出错的
-        server **跳过**（记 ERROR、不中断其余），对齐「SKILL 通道不使用 4015——无 resources 能力的 server
-        在物化阶段即被排除」（error-handling.md / skill.md §1.5）。
-        Unlike :meth:`list_resources` (single-page, Agent-driven): Computer-driven SKILL materialization needs
-        the full ``skill://`` set, so pages are exhausted here. Servers lacking ``resources`` capability or
-        erroring are skipped (logged ERROR, others continue).
+        server **跳过**（记 ERROR、不中断其余），对齐「SKILL 通道不使用 4015」（error-handling.md / skill.md §1.5）。
+        Servers lacking ``resources`` capability or erroring are skipped (logged ERROR, others continue).
+
+        注意 / Note: 归属键为 **bundle_id**（路由用）。SKILL name 的 ``<server>`` 段仍取 server **name**（协议 #18：
+        SKILL ``<server>`` 段与 BundleID 正交、不变）——由 staging 经 ``get_server_config(bundle_id).name`` 派生。
 
         Args:
-            server_name (SERVER_NAME | None): 若提供仅枚举该 server（用于 ResourceListChanged 单 server 重枚举）；
-                否则枚举全部活跃 server / restrict to one server, else enumerate all active servers.
+            bundle_id (BUNDLE_ID | None): 若提供仅枚举该 server（ResourceListChanged 单 server 重枚举）；否则全部活跃 server。
 
         Returns:
-            list[tuple[SERVER_NAME, Resource]]: [(server_name, skill_resource), ...]
+            list[tuple[BUNDLE_ID, Resource]]: [(bundle_id, skill_resource), ...]
         """
-        results: list[tuple[SERVER_NAME, Resource]] = []
+        results: list[tuple[BUNDLE_ID, Resource]] = []
         active_snapshot = list(self._active_clients.items())
-        for sname, client in active_snapshot:
-            if server_name is not None and sname != server_name:
+        for bid, client in active_snapshot:
+            if bundle_id is not None and bid != bundle_id:
                 continue
             try:
                 cursor: str | None = None
                 pages = 0
                 while True:
                     page, cursor = await client.list_resources_page(cursor)
-                    results.extend((sname, res) for res in page if str(res.uri).startswith("skill://"))
+                    results.extend((bid, res) for res in page if str(res.uri).startswith("skill://"))
                     pages += 1
                     if not cursor:
                         break
                     if pages >= _MAX_SKILL_LIST_PAGES:
                         logger.error(
-                            f"list_skill_resources: server {sname} exceeded {_MAX_SKILL_LIST_PAGES} pages "
+                            f"list_skill_resources: bundle_id={bid!r} exceeded {_MAX_SKILL_LIST_PAGES} pages "
                             f"(non-terminating cursor?); aborting enumeration for this server",
                         )
                         break
             except Exception as e:
                 # 未声明 resources 能力 / 连接异常 / 翻页失败 → 跳过该 server，不阻断其余
-                logger.error(f"Error listing skill resources for {sname}: {e}", exc_info=True)
+                logger.error(f"Error listing skill resources for bundle_id={bid!r}: {e}", exc_info=True)
                 continue
         return results
 
-    async def read_resource(self, server_name: SERVER_NAME, uri: str) -> ReadResourceResult:
+    async def read_resource(self, bundle_id: BUNDLE_ID, uri: str) -> ReadResourceResult:
         """
-        中文: 读取指定 MCP Server 的单个资源内容（通用 ``resources/read`` 入口，供 SKILL ``resources`` 模式
-              逐子资源物化与子文件渐进式披露复用）。
-        英文: Read a single resource's contents from a server (generic ``resources/read`` entry; reused by
-              SKILL ``resources``-mode per-sub-resource materialization).
+        中文: 读取指定 MCP Server（bundle_id）的单个资源内容（通用 ``resources/read`` 入口，供 SKILL ``resources``
+              模式逐子资源物化与子文件渐进式披露、及 ``client:get_resources`` 复用）。
+        英文: Read a single resource's contents from a server by bundle_id (generic ``resources/read`` entry).
 
         复用既有 ``client.get_window_detail``——其实现为通用 ``read_resource``（命名沿用历史，非仅 window）。
-        Reuses ``client.get_window_detail`` whose impl is a generic ``read_resource`` (name is historical).
 
         Raises:
-            MCPServerNotFoundError: server_name 未注册 / server_name not registered.
+            MCPServerNotFoundError: bundle_id 未注册（→ 上层映射 4014）/ bundle_id not registered.
         """
-        client = self._active_clients.get(server_name)
+        client = self._active_clients.get(bundle_id)
         if client is None:
-            raise MCPServerNotFoundError(f"MCP Server '{server_name}' is not registered")
+            raise MCPServerNotFoundError(f"MCP Server bundle_id={bundle_id!r} is not registered")
         return await client.get_window_detail(uri)
 
-    async def get_windows_details(self, window_uri: str | None = None) -> list[tuple[SERVER_NAME, Resource, ReadResourceResult]]:
+    async def get_windows_details(self, window_uri: str | None = None) -> list[tuple[BUNDLE_ID, Resource, ReadResourceResult]]:
         """
-        中文: 读取所有活动 MCP 服务器的窗口资源详情。由于 MCP 协议中的 Resource 仅为标识，需要通过 read_resource 获取内容。
-        英文: Read detailed contents for window resources from all active MCP servers. Resource is an identifier; use read_resource.
+        中文: 读取所有活动 MCP 服务器的窗口资源详情（附归属 bundle_id）。Resource 仅为标识，需 read_resource 取内容。
+        英文: Read detailed contents for window resources from all active MCP servers (with owning bundle_id).
 
         Args:
             window_uri (str | None): 若提供，则仅读取该 URI 完全匹配的窗口；否则读取所有窗口。
 
         Returns:
-            list[tuple[SERVER_NAME, Resource, list[object]]]: 列表项为 (server_name, resource, contents)。
+            list[tuple[BUNDLE_ID, Resource, ReadResourceResult]]: 列表项为 (bundle_id, resource, contents)。
         """
-        details: list[tuple[SERVER_NAME, Resource, ReadResourceResult]] = []
+        details: list[tuple[BUNDLE_ID, Resource, ReadResourceResult]] = []
         active_snapshot = list(self._active_clients.items())
-        for server_name, client in active_snapshot:
+        for bundle_id, client in active_snapshot:
             try:
                 resources = await client.list_windows()
             except Exception as e:
-                logger.error(f"Error listing windows for {server_name}: {e}", exc_info=True)
+                logger.error(f"Error listing windows for bundle_id={bundle_id!r}: {e}", exc_info=True)
                 continue
 
             for res in resources:
                 if window_uri is not None and str(res.uri) != window_uri:
                     continue
                 content = await client.get_window_detail(res)
-                details.append((server_name, res, content))
+                details.append((bundle_id, res, content))
         return details
 
     @staticmethod

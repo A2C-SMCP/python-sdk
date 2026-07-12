@@ -87,7 +87,7 @@ if .tool_name == "browser_navigate" || .tool_name == "browser_navigate_back" {
         # English: Call browser_navigate tool to open Baidu homepage
         baidu_url = "https://www.baidu.com"
         result = await manager.acall_tool(
-            server_name="playwright",
+            bundle_id="playwright",
             tool_name="browser_navigate",
             parameters={"url": baidu_url},
             timeout=30.0,  # 中文: 浏览器操作可能需要较长时间 / English: Browser operations may take longer

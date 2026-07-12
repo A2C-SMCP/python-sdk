@@ -24,6 +24,7 @@ import tarfile
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextResourceContents
@@ -36,14 +37,19 @@ from a2c_smcp.computer.skills.staging import stage_mcp_skills, stage_user_skills
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
 class FakeManager:
     def __init__(self, pairs: list[tuple[str, Resource]], reads: dict[str, ReadResourceResult] | None = None) -> None:
+        # pairs 的第一元现按 bundle_id 语义（协议 #18）；本 stub 里 bundle_id 与 display name 取同值。
         self._pairs = pairs
         self._reads = reads or {}
 
-    async def list_skill_resources(self, server_name: str | None = None) -> list[tuple[str, Resource]]:
-        return [(s, r) for s, r in self._pairs if server_name is None or s == server_name]
+    async def list_skill_resources(self, bundle_id: str | None = None) -> list[tuple[str, Resource]]:
+        return [(s, r) for s, r in self._pairs if bundle_id is None or s == bundle_id]
 
     async def read_resource(self, server: str, uri: str) -> ReadResourceResult:
         return self._reads[str(uri)]
+
+    def get_server_config(self, bundle_id: str) -> SimpleNamespace:
+        # SKILL ``<server>`` 段取 server name（协议 #18 正交、不变）；stub 中 name == bundle_id。
+        return SimpleNamespace(name=bundle_id)
 
 
 def _skill_md(name: str = "my-skill", description: str = "聚合 CSV") -> str:

@@ -13,7 +13,7 @@ Integration test: MCPServerManager manages multiple protocol clients
 import pytest
 from mcp import Tool
 
-from a2c_smcp.computer.mcp_clients.manager import MCPServerManager, ToolNameDuplicatedError
+from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig, ToolMeta
 
 
@@ -103,17 +103,19 @@ async def test_manager_remove_server(stdio_params, sse_params, sse_server):
 
 
 @pytest.mark.anyio
-async def test_manager_duplicate_tool_name(sse_params, http_params, sse_server, basic_server):
-    """
-    测试重复工具名异常
-    Test duplicate tool name error
-    """
+async def test_manager_same_tool_name_coexist_via_bundle_prefix(sse_params, http_params, sse_server, basic_server):
+    """BundleID：两 server 同名工具经 ``{bundle_id}__`` 前缀天然共存，不再抛 ToolNameDuplicatedError。"""
     manager = MCPServerManager(auto_connect=False)
     sse_cfg = SseServerConfig(name="sse_server", server_parameters=sse_params)
     http_cfg = StreamableHttpServerConfig(name="http_server", server_parameters=http_params)
-    with pytest.raises(ToolNameDuplicatedError):
-        await manager.ainitialize([sse_cfg, http_cfg])
-        await manager.astart_all()
+    await manager.ainitialize([sse_cfg, http_cfg])
+    await manager.astart_all()
+    assert len(manager._active_clients) == 2
+    names = [tool.name async for tool in manager.available_tools()]
+    # 所有暴露名都带 bundle 前缀，sse/http 各自成组、互不冲突
+    assert names and all(n.startswith("sse_server__") or n.startswith("http_server__") for n in names)
+    assert any(n.startswith("sse_server__") for n in names)
+    assert any(n.startswith("http_server__") for n in names)
 
 
 @pytest.mark.anyio
@@ -132,21 +134,23 @@ async def test_manager_invalid_server(stdio_params, sse_params, sse_server):
 
 
 @pytest.mark.anyio
-async def test_manager_disabled_tool(stdio_params, sse_params, sse_server):
-    """
-    测试禁用工具异常
-    Test disabled tool error
-    """
+async def test_manager_forbidden_tool_not_exposed(stdio_params, sse_server):
+    """forbid 工具后：不进 ExposedToolMapping、不可调用（未命中 → ValueError）。"""
     manager = MCPServerManager(auto_connect=False)
     stdio_cfg = StdioServerConfig(name="stdio_server", server_parameters=stdio_params)
-    sse_cfg = SseServerConfig(name="sse_server", server_parameters=sse_params)
-    await manager.ainitialize([stdio_cfg, sse_cfg])
+    await manager.ainitialize([stdio_cfg])
     await manager.astart_all()
-    tools = [tool async for tool in manager.available_tools()]
-    if tools:
-        manager._disabled_tools.add(tools[0].name)
-        with pytest.raises(PermissionError):
-            await manager.aexecute_tool(tools[0].name, {})
+    names = [tool.name async for tool in manager.available_tools()]
+    if names:
+        exposed = names[0]
+        _, original = await manager.avalidate_tool_call(exposed, {})
+        # forbid 该原始名并原地更新（auto_reconnect 默认 True → 重启刷新映射）
+        await manager.aadd_or_aupdate_server(
+            StdioServerConfig(name="stdio_server", forbidden_tools=[original], server_parameters=stdio_params),
+        )
+        assert exposed not in manager._exposed_tools
+        with pytest.raises(ValueError):
+            await manager.aexecute_tool(exposed, {})
 
 
 @pytest.mark.anyio

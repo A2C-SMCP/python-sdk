@@ -33,7 +33,7 @@ async def test_computer_aexecute_tool_success(stdio_params, sse_params, sse_serv
     # 获取可用工具/Get available tools
     tools = await computer.aget_available_tools()
     assert tools, "No tools available"
-    tool_name = "hello"
+    tool_name = "stdio_server__hello"  # exposed_tool_name = {bundle_id}__hello（bundle_id == name）
     # 调用工具/Call tool
     result = await computer.aexecute_tool("reqid", tool_name, {"name": "China"})
     assert hasattr(result, "content")
@@ -55,7 +55,7 @@ async def test_computer_aexecute_tool_confirm_callback_called(stdio_params):
     computer = Computer(name="test", mcp_servers={stdio_cfg}, confirm_callback=confirm_mock)
     await computer.boot_up()
     await computer.aget_available_tools()
-    tool_name = "hello"
+    tool_name = "stdio_server__hello"  # exposed_tool_name = {bundle_id}__hello（bundle_id == name）
     result = await computer.aexecute_tool("reqid", tool_name, {"name": "China"})
     assert hasattr(result, "content")
     assert confirm_mock.called, "confirm_callback should be called"
@@ -126,9 +126,9 @@ async def test_dynamic_add_with_inputs_and_tool_call(stdio_params) -> None:
 
     # 获取工具并调用
     tools = await computer.aget_available_tools()
-    assert any(t["name"] == "hello" for t in tools)
+    assert any(t["name"] == "dyn_stdio__hello" for t in tools)
 
-    ret = await computer.aexecute_tool("reqid", "hello", {"name": "China"})
+    ret = await computer.aexecute_tool("reqid", "dyn_stdio__hello", {"name": "China"})
     assert ret.content and ret.content[0].text == "Hello, China!"
 
 
@@ -143,16 +143,16 @@ async def test_dynamic_update_forbid_tool_then_call_fails(stdio_params) -> None:
     await computer.aadd_or_aupdate_server(cfg)
 
     # 确认可调用
-    ret1 = await computer.aexecute_tool("reqid", "hello", {"name": "China"})
+    ret1 = await computer.aexecute_tool("reqid", "dyn_stdio2__hello", {"name": "China"})
     assert ret1.content and ret1.content[0].text == "Hello, China!"
 
-    # 更新：禁用工具
+    # 更新：禁用工具（按原始名 forbidden）
     cfg2 = StdioServerConfig(name="dyn_stdio2", server_parameters=stdio_params, forbidden_tools=["hello"])
     await computer.aadd_or_aupdate_server(cfg2)
 
-    # 调用应被 Manager 拒绝
-    with pytest.raises(PermissionError):
-        await computer.aexecute_tool("reqid", "hello", {"name": "China"})
+    # 调用应被拒绝：forbidden 后不进 ExposedToolMapping → 未命中 → ValueError（上层映射 4001）
+    with pytest.raises(ValueError):
+        await computer.aexecute_tool("reqid", "dyn_stdio2__hello", {"name": "China"})
 
 
 @pytest.mark.anyio
@@ -165,15 +165,15 @@ async def test_dynamic_remove_then_tool_not_found(stdio_params) -> None:
     await computer.aadd_or_aupdate_server(cfg)
 
     # 调用成功一次
-    ret1 = await computer.aexecute_tool("reqid", "hello", {"name": "China"})
+    ret1 = await computer.aexecute_tool("reqid", "dyn_stdio3__hello", {"name": "China"})
     assert ret1.content and ret1.content[0].text == "Hello, China!"
 
-    # 移除
+    # 移除（按 bundle_id）
     await computer.aremove_server("dyn_stdio3")
 
     # 再次调用应报错：工具不存在
     with pytest.raises(ValueError):
-        await computer.aexecute_tool("reqid", "hello", {"name": "China"})
+        await computer.aexecute_tool("reqid", "dyn_stdio3__hello", {"name": "China"})
 
 
 # -------------------- 新增：工具调用历史集成用例 --------------------
@@ -190,8 +190,8 @@ async def test_tool_call_history_records_success_and_order(stdio_params) -> None
     await computer.boot_up()
 
     # 进行两次调用/Two calls
-    r1 = await computer.aexecute_tool("req-1", "hello", {"name": "A"})
-    r2 = await computer.aexecute_tool("req-2", "hello", {"name": "B"})
+    r1 = await computer.aexecute_tool("req-1", "hist_stdio__hello", {"name": "A"})
+    r2 = await computer.aexecute_tool("req-2", "hist_stdio__hello", {"name": "B"})
     assert r1.content and r2.content
 
     hist = await computer.aget_tool_call_history()
@@ -221,7 +221,7 @@ async def test_tool_call_history_maxlen(stdio_params) -> None:
     # 执行12次，maxlen=10后应只保留后10次/Execute 12 times, keep last 10
     for i in range(12):
         rid = f"req-{i + 1}"
-        await computer.aexecute_tool(rid, "hello", {"name": str(i + 1)})
+        await computer.aexecute_tool(rid, "hist_maxlen__hello", {"name": str(i + 1)})
 
     hist = await computer.aget_tool_call_history()
     assert len(hist) == 10
@@ -244,7 +244,7 @@ async def test_tool_call_history_confirm_callback_exception(stdio_params) -> Non
     computer = Computer(name="test", mcp_servers={cfg}, confirm_callback=bad_confirm)
     await computer.boot_up()
 
-    result = await computer.aexecute_tool("req-X", "hello", {"name": "Err"})
+    result = await computer.aexecute_tool("req-X", "hist_confirm_err__hello", {"name": "Err"})
     assert result.isError is True
 
     hist = await computer.aget_tool_call_history()
