@@ -316,10 +316,12 @@ class _ReplComp:
     def add_or_update_input(self, inp: Any) -> None:
         self.injected.append(inp)
 
-    async def aadd_or_aupdate_server(self, cfg: Any, *, session: Any = None, plugin: Any = None, marketplace: Any = None) -> None:
+    async def amount_server(self, cfg: Any, *, session: Any = None, plugin: Any = None, marketplace: Any = None) -> None:
+        # #137 ③：plugin enable/install remount 经 build_mcp_callbacks → transient amount_server（治理投影）。
         self._servers.append(cfg)
 
-    async def aremove_server(self, name: str) -> None:
+    async def aunmount_server(self, name: str) -> None:
+        # #137 ③：plugin disable/uninstall teardown 经 build_mcp_callbacks → transient aunmount_server（停不删）。
         self._servers = [s for s in self._servers if getattr(s, "name", None) != name]
 
 
@@ -393,7 +395,7 @@ def _isolate_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_run_governance_remount_wires_ownership_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """CLI 接线断言：register 经 comp.aadd_or_aupdate_server 携正确 plugin/marketplace 归属上下文。"""
+    """CLI 接线断言：register 经 transient comp.amount_server 携正确 plugin/marketplace 归属上下文（#137 ③）。"""
     from a2c_smcp.computer.computer import Computer
 
     _isolate_env(tmp_path, monkeypatch)
@@ -406,7 +408,7 @@ async def test_run_governance_remount_wires_ownership_context(tmp_path: Path, mo
         async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
             recorded.append((server.name, plugin, marketplace))
 
-        monkeypatch.setattr(comp, "aadd_or_aupdate_server", fake_register)
+        monkeypatch.setattr(comp, "amount_server", fake_register)  # #137 ③：治理重挂经 transient amount_server
         await plugin_cmd.run_governance_remount(comp)
 
         assert recorded == [("figma-mcp", "audit", "acme")]
@@ -429,7 +431,7 @@ async def test_run_governance_remount_flag_declared_disables(tmp_path: Path, mon
         async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
             recorded.append(server.name)
 
-        monkeypatch.setattr(comp, "aadd_or_aupdate_server", fake_register)
+        monkeypatch.setattr(comp, "amount_server", fake_register)  # #137 ③：治理重挂经 transient amount_server
         await plugin_cmd.run_governance_remount(comp, flag_config=flag_file)
 
         assert recorded == []
@@ -457,7 +459,7 @@ async def test_run_governance_remount_existing_from_comp_servers(tmp_path: Path,
         async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
             recorded.append(server.name)
 
-        monkeypatch.setattr(comp, "aadd_or_aupdate_server", fake_register)
+        monkeypatch.setattr(comp, "amount_server", fake_register)  # #137 ③：治理重挂经 transient amount_server
         await plugin_cmd.run_governance_remount(comp)
 
         assert recorded == []

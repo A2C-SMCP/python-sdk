@@ -48,21 +48,26 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
     从 ``Computer`` 装配 installer / uninstall 级联所需的 MCP 注入回调 / Wire MCP callbacks from a live Computer。
 
     - ``existing_server_names``：当前已注册 MCP server 名集合（冲突预检用）；
-    - ``register_server``：注册 / 更新一个 ``MCPServerConfig``（enable / install remount 用）；
-    - ``remove_server``：按 name 停并摘除 server（disable / uninstall teardown 用）。
+    - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / install remount 用）；
+    - ``remove_server``：按 name **运行期停摘** server（disable / uninstall teardown 用）。
 
     设计 §12.2：marketplace remove 的级联卸载（→ :func:`installer.uninstall_plugin`）与 #69 的 plugin
     enable/disable/install/uninstall 共用此接缝，避免各处重复装配。
+
+    **#137 ③ transient 分流**：本接缝**唯一**消费方是 plugin enable/disable/install/uninstall 与 marketplace
+    级联卸载——皆**治理投影**（bundled 真相在 ledger，非用户此刻声明），故走 transient
+    :meth:`Computer.amount_server` / :meth:`Computer.aunmount_server`，**不回写** mcp.json（否则 disable 后
+    复活 + scope 漂移，见 #138）。用户显式 ``server add``/``rm`` 是另一条（REPL）durable 路径，与此无关。
     """
 
     def _existing() -> set[str]:
         return {cfg.name for cfg in comp.mcp_servers}
 
     async def _register(cfg: MCPServerConfig) -> None:
-        await comp.aadd_or_aupdate_server(cfg)
+        await comp.amount_server(cfg)
 
     async def _remove(name: str) -> None:
-        await comp.aremove_server(name)
+        await comp.aunmount_server(name)
 
     return McpCallbacks(existing_server_names=_existing, register_server=_register, remove_server=_remove)
 

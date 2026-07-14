@@ -219,7 +219,8 @@ async def test_inventory_marks_remounted_bundled_server_as_plugin(tmp_path: Path
     async with Computer(name="t", auto_connect=False, skill_home=home) as comp:
 
         async def register(cfg, record) -> None:
-            await comp.aadd_or_aupdate_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
+            # #137 ③：治理重挂 = 投影，经 transient amount_server（bundled 名走 durable 会触 McpWriteTargetError）。
+            await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
 
         report = await comp.reconcile_governance(
             existing_server_names=lambda: {c.name for c in comp.mcp_servers},

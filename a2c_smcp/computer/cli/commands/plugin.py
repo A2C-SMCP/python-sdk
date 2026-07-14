@@ -22,8 +22,9 @@ REPL dispatcher 从活跃 ``Computer`` 装配后注入；Typer 非交互无 live
 
 **plugin 实时挂载 D2 上下文渲染（#69 Group A，§9.3 D2）**：plugin 的 ``mcp-servers/inputs.json`` 入池时 id
 前缀化为 ``<plugin>@<marketplace>/<id>``；enable 挂载 bundled server 时，``_plugin_register_cb`` 携
-plugin/marketplace 上下文调 :meth:`Computer.aadd_or_aupdate_server`，使 server config 的裸 ``${input:id}`` 经
-resolver D2 前缀回退解析。``_plugin_inject_inputs_cb`` 负责在 register 前把 inputs 注入 Computer 池。
+plugin/marketplace 上下文调 transient :meth:`Computer.amount_server`（#137 ③：治理投影不回写 mcp.json），使
+server config 的裸 ``${input:id}`` 经 resolver D2 前缀回退解析。``_plugin_inject_inputs_cb`` 负责在 register 前把
+inputs 注入 Computer 池。
 
 **MCP 批准框（#69 Group B，§9.2）**：:func:`run_mcp_approval` 在 REPL 启动期跑——解析 ``.tfrobot/mcp.json``
 定义层、套门控、对 ``PENDING`` server 弹 y/a/n（写 local scope）；非交互无 TTY → skip+WARN（``--approve-all-mcp``
@@ -120,10 +121,13 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str] | None:
 
 # ── plugin 实时挂载 D2 上下文渲染回调（#69 Group A）/ plugin-mount D2 context callbacks ──
 def _plugin_register_cb(comp: Any, plugin: str, marketplace: str) -> RegisterServer:
-    """携 plugin/marketplace 上下文的 register 回调：bundled server 的裸 ``${input:id}`` 经此解析到带前缀池条目。"""
+    """携 plugin/marketplace 上下文的 register 回调：bundled server 的裸 ``${input:id}`` 经此解析到带前缀池条目。
+
+    #137 ③：bundled 挂载 = 治理投影（ledger 是真相），走 transient :meth:`Computer.amount_server`，**不回写** mcp.json。
+    """
 
     async def _register(cfg: Any) -> None:
-        await comp.aadd_or_aupdate_server(cfg, plugin=plugin, marketplace=marketplace)
+        await comp.amount_server(cfg, plugin=plugin, marketplace=marketplace)
 
     return _register
 
@@ -164,7 +168,8 @@ async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) 
     declared = resolved_settings(env, flag_path=flag_config)
 
     async def _register(cfg: Any, record: Any) -> None:
-        await comp.aadd_or_aupdate_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
+        # #137 ③：治理重挂 = 投影（ledger 是真相），走 transient amount_server，不回写 mcp.json。
+        await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
         console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
 
     async def _inject(record: Any) -> None:
@@ -558,7 +563,9 @@ async def run_mcp_approval(
 
     async def _mount(name: str) -> None:
         try:
-            await comp.aadd_or_aupdate_server(_mount_dict(resolved.servers[name]), session=session)
+            # #137 ③：boot 读**已声明** mcp.json 挂载 = 投影（盘上已是真相），走 transient amount_server，不回写
+            # （否则每 boot 重复回写用户声明层 / scope 漂移，见 #138）。
+            await comp.amount_server(_mount_dict(resolved.servers[name]), session=session)
             console.print(f"[green]✓ mounted MCP server {name!r}[/green]")
         except Exception as exc:  # 单个 server 挂载失败不阻断其余 / one failure must not block the rest
             console.print(f"[red]✗ failed to mount MCP server {name!r}: {exc}[/red]")

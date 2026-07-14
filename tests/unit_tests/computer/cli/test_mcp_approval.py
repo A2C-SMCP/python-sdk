@@ -78,9 +78,10 @@ class _FakeComp:
     def add_or_update_input(self, inp: Any) -> None:
         self.injected.append(inp)
 
-    async def aadd_or_aupdate_server(
+    async def amount_server(
         self, cfg: dict[str, Any], *, session: Any = None, plugin: Any = None, marketplace: Any = None,
     ) -> None:
+        # #137 ③：run_mcp_approval 走 transient amount_server（boot 读已声明 mcp.json = 投影，不回写）。
         self.mounted.append(cfg)
 
 
@@ -156,10 +157,11 @@ async def test_pending_non_tty_approve_all_mounts_without_persist(tmp_path: Path
 
 # ── ENABLED（user origin trusted）直挂 ─────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_user_origin_mounts_without_box(tmp_path: Path) -> None:
+async def test_user_origin_mounts_without_box(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
     wd.mkdir()
     home.mkdir()
+    monkeypatch.chdir(wd)  # #116：project/local 锚 cwd——chdir 到空 wd，隔离真实仓库 .tfrobot/（与 PENDING 用例一致）
     _user_mcp(env, {"mine": _stdio()})  # user origin → trusted_origin → ENABLED、免批准
     comp = _FakeComp(home)
     sess = _Session([])  # 不应被调用
@@ -173,10 +175,11 @@ async def test_user_origin_mounts_without_box(tmp_path: Path) -> None:
 
 # ── ext（envFile）合回挂载 dict（#69 Group B 风险 2）─────────────────────────────
 @pytest.mark.asyncio
-async def test_envfile_ext_merged_into_mount_dict(tmp_path: Path) -> None:
+async def test_envfile_ext_merged_into_mount_dict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
     wd.mkdir()
     home.mkdir()
+    monkeypatch.chdir(wd)  # #116：project/local 锚 cwd——chdir 到空 wd，隔离真实仓库 .tfrobot/（与 PENDING 用例一致）
     envfile = str(wd / ".env")
     _user_mcp(env, {"mine": {**_stdio(), "envFile": envfile}})  # user origin → 直挂
     comp = _FakeComp(home)

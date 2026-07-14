@@ -358,6 +358,9 @@ def test_run_impl_inputs_and_servers_single_object(tmp_path: Path, monkeypatch: 
 @pytest.mark.asyncio
 async def test_cover_remaining_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """覆盖 interactive_impl.py 中剩余未命中的分支。"""
+    # #137 ②：REPL `server add` 现为 durable 落盘——隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
     # 为 inputs update @file 准备文件（列表）
     upd_file = tmp_path / "upd.json"
     upd_file.write_text(
@@ -427,6 +430,9 @@ async def test_interactive_misc_and_file_paths(tmp_path: Path, monkeypatch: pyte
     - 未知子命令（server/socket/notify）与 render 内联 JSON
     - start/stop 单个名称（manager 初始化后触发路径）
     """
+    # #137 ②：REPL `server add` 现为 durable 落盘——隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
 
     # 预备文件：server 与 inputs
     server_file = tmp_path / "server.json"
@@ -712,7 +718,10 @@ def test_run_with_cli_url_auth_headers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_add_and_status_without_auto_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_server_add_and_status_without_auto_connect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #137 ②：REPL `server add` 现为 durable 落盘——隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
     # Minimal stdio server config (disabled=true to avoid start operations later)
     stdio_cfg = {
         "name": "test-stdio",

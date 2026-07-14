@@ -122,9 +122,10 @@ class MCPServerNameConflictError(Exception):
 # ---------------------------------------------------------------------------
 # 当前已注册 server 名集合（同步；CLI 包 ``{r[0] for r in mcp_manager.get_server_status()}``）。
 ExistingServerNames = Callable[[], set[str]]
-# 注册 / 更新一个 server（异步；CLI 包 ``Computer.aadd_or_aupdate_server``，含 ``${input:}`` 渲染）。
+# 运行期挂载一个 bundled server（异步；#137 ③ 起 CLI 包 transient ``Computer.amount_server``，含 ``${input:}`` 渲染；
+# 治理投影不回写 mcp.json——bundled 真相在 ledger）。
 RegisterServer = Callable[[MCPServerConfig], Awaitable[None]]
-# 停止并移除一个 server（异步；CLI 包 ``Computer.aremove_server``）。
+# 运行期停摘一个 bundled server（异步；#137 ③ 起 CLI 包 transient ``Computer.aunmount_server``，停进程不删声明）。
 RemoveServer = Callable[[str], Awaitable[None]]
 # 注入 plugin-scoped inputs 入池（异步；入参 plugin_root；CLI 包 ``load_plugin_inputs`` → ``Computer.add_or_update_input``）。
 # 在 register（→render bundled server 的 ${input:}）之前调，使裸 id 可经 D2 前缀回退解析（#69 Group A，§9.3 D2）。

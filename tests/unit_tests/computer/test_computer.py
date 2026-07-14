@@ -500,8 +500,11 @@ class DummyResolver(InputResolver):
         return self.mapping[input_id]
 
 
+# NOTE(#137 ②/③): 以下三例原测 ``aadd_or_aupdate_server`` 的「render + validate + manager 委派」——该语义已 flip
+# 为 durable（落盘）后**原状迁至 transient** ``amount_server``。此处改测 ``amount_server`` 以在**不触碰磁盘**下保持
+# 对渲染/校验/委派的等价覆盖；durable 落盘专属行为另见 ``test_computer_dual_path_crud.py``。
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(monkeypatch):
+async def test_amount_server_with_raw_dict_uses_inputs_and_validates(monkeypatch):
     # Arrange manager mock
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aadd_or_aupdate_server = AsyncMock()
@@ -529,7 +532,7 @@ async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(mo
     }
 
     # Act
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)
 
     # Assert: forwarded to manager with validated model instance and placeholders resolved
     mock_manager.aadd_or_aupdate_server.assert_called_once()
@@ -542,7 +545,7 @@ async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(mo
 
 
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
+async def test_amount_server_with_model_instance(monkeypatch):
     # Arrange manager mock
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aadd_or_aupdate_server = AsyncMock()
@@ -559,7 +562,7 @@ async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
     )
 
     # Act
-    await computer.aadd_or_aupdate_server(cfg)
+    await computer.amount_server(cfg)
 
     # Assert: same model (after dump/render/validate) is sent
     mock_manager.aadd_or_aupdate_server.assert_called_once()
@@ -571,7 +574,7 @@ async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatch):
+async def test_amount_server_missing_input_keeps_placeholder(monkeypatch):
     # Arrange manager mock (should be called with placeholder preserved)
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aadd_or_aupdate_server = AsyncMock()
@@ -599,7 +602,7 @@ async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatc
     }
 
     # Act: should not raise; placeholder remains
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)
     mock_manager.aadd_or_aupdate_server.assert_called_once()
     (validated_cfg,), _ = mock_manager.aadd_or_aupdate_server.call_args
     # Assert placeholder preserved after rendering+validation
@@ -607,13 +610,19 @@ async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_aremove_server_delegates(monkeypatch):
+async def test_aunmount_server_by_id_delegates(monkeypatch):
+    # #137 ②：旧 ``aremove_server`` 的纯运行期停摘语义现为 transient ``aunmount_server_by_id``。
+    cfg = StdioServerConfig(
+        name="echo",
+        server_parameters=StdioServerParameters(command="/bin/echo", args=[], env=None, cwd=None),
+    )
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aremove_server = AsyncMock()
+    mock_manager.server_configs = MagicMock(return_value=(cfg,))  # bundle_id("echo") == "echo"
     computer = Computer(name="test")
     computer.mcp_manager = mock_manager
 
-    await computer.aremove_server("echo")
+    await computer.aunmount_server_by_id("echo")
 
     mock_manager.aremove_server.assert_called_once_with("echo")
 
