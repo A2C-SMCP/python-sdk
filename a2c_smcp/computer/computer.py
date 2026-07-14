@@ -66,6 +66,14 @@ from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpSer
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
+from a2c_smcp.computer.settings.mcp_config import (
+    McpWriteScope,
+    McpWriteTargetError,
+    bundled_mcp_server_names,
+    remove_mcp_server,
+    resolve_mcp_config,
+    upsert_mcp_server,
+)
 from a2c_smcp.computer.settings.recovery import (
     BundledServerRecord,
     GovernanceRecoveryReport,
@@ -780,6 +788,106 @@ class Computer(BaseComputer[PromptSession]):
             logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
             raise e
 
+    # ════════════════════════════════════════════════════════════════════════════
+    # 双路径 MCP-server CRUD（#137 ②，父 #135：对齐 rust-sdk ``crates/smcp-computer/src/computer.rs``）
+    # Dual-path MCP-server CRUD (aligns rust-sdk).
+    #
+    # 一句话分流规则（与 rust 完全同构）：**「用户此刻在声明一个 server」→ durable（落盘+重启存活）；
+    # 「把别处已是真相的东西投影进 runtime」→ transient（纯运行期、不落盘）。**
+    #   - durable  ：:meth:`aadd_or_aupdate_server` / :meth:`aadd_or_aupdate_server_in_scope` / :meth:`aremove_server`
+    #                （REPL ``server add``/``rm``、外部 API 用户显式增删）。对齐 rust ``add_or_update_server*`` / ``remove_server``。
+    #   - transient：:meth:`amount_server` / :meth:`aunmount_server` / :meth:`aunmount_server_by_id`
+    #                （boot 读已声明 mcp.json 挂载、``--config @file`` 加载、plugin/治理 D2 挂载/重挂）。对齐 rust
+    #                ``mount_server`` / ``unmount_server`` / ``unmount_server_by_id``。
+    #
+    # §12 R2 revision 分账（对齐 rust）：durable 落盘属 **config** 轴变化、transient 属纯 **capability** 轴。python 侧
+    #   **capability** 上报由 manager 物化经 ``_on_manager_change`` → ``emit_update_tool_list`` **自动**触发（两路径皆有）；
+    #   **config** 上报（``emit_update_config``/``notify:update_config``）由 **调用方（CLI/外部宿主）** 驱动——现状即
+    #   REPL durable 路径 emit、boot/plugin transient 路径不 emit，恰好满足分账，故 SDK 层**不在** CRUD 方法内 emit
+    #   config（保持既有「client owns Socket.IO 上报」分层，#93；rust 内部 bump 属实现细节，概念对齐即可，#135）。
+    # ════════════════════════════════════════════════════════════════════════════
+
+    async def _amount_rendered(self, validated: MCPServerConfig) -> None:
+        """物化**已渲染校验**的 config 进 manager（内存投影 + capability 上报）/ Mount an already-rendered config。
+
+        对齐 rust ``mount_rendered``：durable 与 transient 两路径的**共享核**——durable 落盘后复用同一次 render 结果
+        经此物化，**避免重复触发** input/secret resolver 副作用（不二次渲染）。manager 惰性初始化于此单点。
+        """
+        if self.mcp_manager is None:
+            self.mcp_manager = MCPServerManager(
+                auto_connect=self._auto_connect,
+                auto_reconnect=self._auto_reconnect,
+                message_handler=self._on_manager_change,
+            )
+        await self.mcp_manager.aadd_or_aupdate_server(validated)
+
+    @staticmethod
+    def _raw_body_for_disk(server: MCPServerConfig | dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """从入参取**未渲染 raw** server 定义体（map key = ``name``，body 不含 name）/ Extract the un-rendered raw body。
+
+        **D1 铁律**：durable 落盘取此 raw（占位 ``${input:}`` / ``${env:}`` 字面保留），**绝不写渲染后 secret**
+        （值不离 Computer，§9.1）。dict 入参原样、model 入参 ``model_dump(mode="json")``；剥离 ``name``（身份由
+        ``servers.<name>`` map key 承载，与 :func:`resolve_mcp_config` 读取契约一致，杜绝 name/key 冗余漂移）。
+        """
+        raw = dict(server) if isinstance(server, dict) else server.model_dump(mode="json")
+        name = raw.get("name")
+        if not name or not isinstance(name, str):
+            raise ValueError("server config must carry a non-empty 'name' for durable persistence")
+        body = {k: v for k, v in raw.items() if k != "name"}
+        return name, body
+
+    # ── transient 路径（纯运行期，不落盘）/ transient path (runtime-only, no disk write) ──────────────
+
+    async def amount_server(
+        self,
+        server: MCPServerConfig | dict[str, Any],
+        *,
+        session: PromptSession | None = None,
+        plugin: str | None = None,
+        marketplace: str | None = None,
+    ) -> None:
+        """**运行期挂载**一个 MCP server（渲染校验 → 物化，**不落盘**）/ Transient mount (no disk write)。
+
+        对齐 rust ``mount_server``。语义 = 本 SDK 历史 ``aadd_or_aupdate_server`` 的**原状**（现已 flip 为 durable，
+        故抽此新名承接纯运行期投影）。用于「把别处已是真相的东西投影进 runtime」：boot 读已声明 mcp.json 挂载、
+        ``--config @file`` 加载、plugin/治理 bundled 重挂——这些**不应回写** mcp.json（否则双源 / 每 boot 重写 /
+        scope 漂移，见 #138）。只 bump **capability**（manager 物化自动上报），不碰持久 config。
+
+        Args:
+            server: 待挂载配置，可为模型或原始字典。
+            session: Computer 管理 Session（交互式 input 解析用）。
+            plugin / marketplace: plugin 实时挂载 D2 上下文（#69 Group A）；非 None 时 bundled server 的裸
+                ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None。
+        """
+        validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
+        await self._amount_rendered(validated)
+
+    async def aunmount_server(self, name: str) -> None:
+        """按 **name** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by name。
+
+        对齐 rust ``unmount_server``。manager 以 bundle_id 为键，故按 name 在运行期活跃集里解析出对应 bundle_id 再停摘
+        （同名多条则全摘，正常运行集内 name 唯一）。用于 plugin disable / uninstall / marketplace 级联的 bundled 停摘
+        （bundled 真相在 ledger，停进程而**不删** mcp.json 声明）。manager 未建 / 无匹配 → no-op。
+        """
+        if self.mcp_manager is None:
+            return
+        targets = {resolve_bundle_id(cfg) for cfg in self.mcp_manager.server_configs() if cfg.name == name}
+        for bundle_id in targets:
+            await self.mcp_manager.aremove_server(bundle_id)
+
+    async def aunmount_server_by_id(self, bundle_id: str) -> None:
+        """按 **bundle_id** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by bundle_id。
+
+        对齐 rust ``unmount_server_by_id``。manager 未建 / 无匹配 → no-op（避免 ``manager.aremove_server`` 的
+        ``KeyError``）。durable :meth:`aremove_server` 停摘段复用本方法。
+        """
+        if self.mcp_manager is None:
+            return
+        if any(resolve_bundle_id(cfg) == bundle_id for cfg in self.mcp_manager.server_configs()):
+            await self.mcp_manager.aremove_server(bundle_id)
+
+    # ── durable 路径（落盘 raw + 重启存活）/ durable path (persist raw + survive restart) ─────────────
+
     async def aadd_or_aupdate_server(
         self,
         server: MCPServerConfig | dict[str, Any],
@@ -788,41 +896,84 @@ class Computer(BaseComputer[PromptSession]):
         plugin: str | None = None,
         marketplace: str | None = None,
     ) -> None:
-        """
-        动态添加或更新某个MCP Server配置（支持 inputs 占位符解析）。
-        Add or update a MCP Server config dynamically (supports inputs placeholder resolving).
+        """**持久声明**一个 MCP server（默认落 **Local**）并物化 / Durably declare a server (defaults to Local)。
 
-        Args:
-            session (PromptSession | None): Computer管理Session
-            server (MCPServerConfig | dict[str, Any]): 待添加/更新的配置，可为模型或原始字典。
-            plugin / marketplace (str | None): plugin 实时挂载上下文（#69 Group A）；非 None 时 bundled server 的裸
-                ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None=现状。
-                Plugin mount context; when set, a bundled server's bare ``${input:id}`` resolves to the prefixed pool entry.
-        """
-        # 确保 manager 已初始化
-        if self.mcp_manager is None:
-            self.mcp_manager = MCPServerManager(
-                auto_connect=self._auto_connect,
-                auto_reconnect=self._auto_reconnect,
-                message_handler=self._on_manager_change,
-            )
+        对齐 rust ``add_or_update_server``（:1978 ``add_or_update_server_in_scope(server, Local)``）。**破坏性变更**
+        （#135/#137）：历史此方法为纯运行期，现 flip 为持久——落盘 ``mcp.local.json``（不入 git、boot 读取、重启
+        存活）+ 运行期物化。用于「用户此刻在声明一个 server」（REPL ``server add``、外部 API 用户新增）。纯运行期
+        投影请改用 :meth:`amount_server`。
 
+        Args 同 :meth:`amount_server`（保留 ``plugin`` / ``marketplace`` D2 上下文 kwargs）。
+        """
+        await self.aadd_or_aupdate_server_in_scope(
+            server, McpWriteScope.LOCAL, session=session, plugin=plugin, marketplace=marketplace,
+        )
+
+    async def aadd_or_aupdate_server_in_scope(
+        self,
+        server: MCPServerConfig | dict[str, Any],
+        scope: McpWriteScope,
+        *,
+        session: PromptSession | None = None,
+        plugin: str | None = None,
+        marketplace: str | None = None,
+    ) -> None:
+        """**持久声明**一个 MCP server 到**显式 scope** 并物化 / Durably declare a server into an explicit scope。
+
+        对齐 rust ``add_or_update_server_in_scope``（:1992）。``scope`` ∈ ``Local``（``mcp.local.json`` 不入 git）/
+        ``Project``（``mcp.json`` 入 git、团队共享）/ ``User``（``$XDG_CONFIG_HOME/a2c`` 全局）。**改已有 server 恒落其
+        origin scope**（① :func:`upsert_mcp_server` 已保证，``scope`` 仅对新声明生效，杜绝跨 scope 漂移）。
+
+        流程（对齐 rust）：**先 render 校验**（早失败、不落盘）→ 取**未渲染 raw**（D1）→ 经 ① 落盘 raw → **复用**同一
+        次 render 结果 :meth:`_amount_rendered` 物化（不二次渲染）。落盘属 config 轴、物化属 capability 轴（分账见类内
+        双路径块注释）。
+
+        :raises McpWriteTargetError: ``name`` 为 plugin-bundled server 名（其真相在 ledger，不可经 mcp.json 写）。
+        :raises McpConfigCorruptError: 目标 ``mcp.json`` 结构损坏（① 拒绝覆盖以免销毁既有内容）。
+        """
+        # 1. 先渲染校验（早失败：损坏配置在落盘前抛出，绝不留下盘上声明而运行期未挂的半态）。
         validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
-        await self.mcp_manager.aadd_or_aupdate_server(validated)
+        # 2. 取未渲染 raw 落盘（D1：占位字面保留、绝不写 secret）。
+        name, raw_body = self._raw_body_for_disk(server)
+        upsert_mcp_server(name, raw_body, scope=scope, env=os.environ, home=self.skill_home)
+        # 3. 复用 render 结果物化（capability 自动上报；config 上报由调用方驱动，见分账注释）。
+        await self._amount_rendered(validated)
 
     async def aremove_server(self, bundle_id: str, *, session: PromptSession | None = None) -> None:
-        """
-        动态移除某个MCP Server配置（按 bundle_id）。
-        Remove a MCP Server config dynamically (by bundle_id).
+        """**持久删除**一个 MCP server 声明（bundle_id → 声明名 → 删所有可写 scope）+ 运行期停摘 / Durably remove。
+
+        对齐 rust ``remove_server``（:2038）。**破坏性变更**（#135/#137）：历史仅运行期停摘（→ 复活 footgun：人写在
+        ``mcp.json`` 的 server 重启复活），现 flip 为持久删除。流程：
+
+        1. **bundled 身份拒删**：目标 bundle_id 命中**运行期已挂载**的 bundled server（其真相在 ledger）→ 抛
+           :class:`McpWriteTargetError`（应经 ``plugin uninstall`` 而非 ``server rm``）。**边界**：拒删按运行期挂载态
+           判定；未挂载的 bundled 名不在任何 ``mcp.json``（bundled 从不入声明面）→ 本方法对其为无害 no-op（无声明可删、
+           无投影可停），无需拒绝——真正的 bundled 治理入口是 ``plugin`` 命令，不经此 MCP-CRUD 面。
+        2. 以本实例上下文 :func:`resolve_mcp_config` 取**快照** → 对每条声明算 :func:`resolve_bundle_id` 匹配
+           ``bundle_id`` → 收集声明名（去重）→ 经 ① :func:`remove_mcp_server` 删**所有可写 scope**。
+        3. :meth:`aunmount_server_by_id` 运行期停摘。**无声明匹配** → 落盘 no-op、**仍停摘**（运行期投影清理）。
 
         Args:
-            bundle_id (str): MCP Server 唯一身份 bundle_id（协议 #18）。
+            bundle_id (str): MCP Server 唯一身份 bundle_id（协议 #18）。REPL ``server rm <name>`` 在缺省身份下
+                （bundle_id = normalize(name)）以 name 寻址即可。
         """
-        if not self.mcp_manager:
-            # 未初始化则无操作
-            logger.warning("MCP 管理器尚未初始化，忽略移除操作 / MCP manager not initialized, skip remove")
-            return
-        await self.mcp_manager.aremove_server(bundle_id)
+        env = os.environ
+        # 1. bundled 身份拒删：运行期活跃集里该 bundle_id 的 name 命中 ledger 派生 bundled 集 → 拒。
+        bundled = bundled_mcp_server_names(home=self.skill_home, env=env)
+        if self.mcp_manager is not None and bundled:
+            for cfg in self.mcp_manager.server_configs():
+                if resolve_bundle_id(cfg) == bundle_id and cfg.name in bundled:
+                    raise McpWriteTargetError(
+                        f"bundle_id={bundle_id!r} (name={cfg.name!r}) is a plugin-bundled MCP server "
+                        "(its truth is the installed_plugins.json ledger); use 'plugin uninstall' instead of removing it via mcp.json",
+                    )
+        # 2. 快照解析声明名（未渲染 config，derive-on-raw 与注册边界同源）→ 删所有可写 scope。
+        snapshot = resolve_mcp_config(env=env)
+        matched = {name for name, srv in snapshot.servers.items() if resolve_bundle_id(srv.config) == bundle_id}
+        for name in matched:
+            remove_mcp_server(name, env=env)
+        # 3. 运行期停摘（无声明匹配也停：清理纯运行期投影）。
+        await self.aunmount_server_by_id(bundle_id)
 
     def update_inputs(self, inputs: set[MCPServerInput], *, session: PromptSession | None = None) -> None:
         """

@@ -122,7 +122,7 @@ async def test_dynamic_add_with_inputs_and_tool_call(stdio_params) -> None:
     computer = Computer(name="test", auto_connect=True, input_resolver=resolver)
 
     # 动态添加
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)
 
     # 获取工具并调用
     tools = await computer.aget_available_tools()
@@ -140,7 +140,7 @@ async def test_dynamic_update_forbid_tool_then_call_fails(stdio_params) -> None:
     computer = Computer(name="test", auto_connect=True, confirm_callback=lambda *_: True)
     # 先添加（直接用模型，不涉及 inputs）
     cfg = StdioServerConfig(name="dyn_stdio2", server_parameters=stdio_params)
-    await computer.aadd_or_aupdate_server(cfg)
+    await computer.amount_server(cfg)
 
     # 确认可调用
     ret1 = await computer.aexecute_tool("reqid", "dyn_stdio2__hello", {"name": "China"})
@@ -148,7 +148,7 @@ async def test_dynamic_update_forbid_tool_then_call_fails(stdio_params) -> None:
 
     # 更新：禁用工具（按原始名 forbidden）
     cfg2 = StdioServerConfig(name="dyn_stdio2", server_parameters=stdio_params, forbidden_tools=["hello"])
-    await computer.aadd_or_aupdate_server(cfg2)
+    await computer.amount_server(cfg2)
 
     # 调用应被拒绝：forbidden 后不进 ExposedToolMapping → 未命中 → ValueError（上层映射 4001）
     with pytest.raises(ValueError):
@@ -162,14 +162,14 @@ async def test_dynamic_remove_then_tool_not_found(stdio_params) -> None:
     """
     computer = Computer(name="test", auto_connect=True, confirm_callback=lambda *_: True)
     cfg = StdioServerConfig(name="dyn_stdio3", server_parameters=stdio_params)
-    await computer.aadd_or_aupdate_server(cfg)
+    await computer.amount_server(cfg)
 
     # 调用成功一次
     ret1 = await computer.aexecute_tool("reqid", "dyn_stdio3__hello", {"name": "China"})
     assert ret1.content and ret1.content[0].text == "Hello, China!"
 
     # 移除（按 bundle_id）
-    await computer.aremove_server("dyn_stdio3")
+    await computer.aunmount_server_by_id("dyn_stdio3")
 
     # 再次调用应报错：工具不存在
     with pytest.raises(ValueError):

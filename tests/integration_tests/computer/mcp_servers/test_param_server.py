@@ -54,7 +54,7 @@ async def test_param_server_dynamic_update() -> None:
             encoding_error_handler="strict",
         )
         new_cfg = StdioServerConfig(name="param_server", server_parameters=new_params)
-        await comp.aadd_or_aupdate_server(new_cfg)
+        await comp.amount_server(new_cfg)  # #137：运行期更新用 transient（不落盘）
 
         # 再次调用，验证已生效
         result2 = await comp.mcp_manager.acall_tool("param_server", "config_value", {})

@@ -35,7 +35,9 @@ def no_patch_stdout():
 
 
 @pytest.mark.asyncio
-async def test_cli_with_real_stdio(stdio_params: StdioServerParameters, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cli_with_real_stdio(
+    stdio_params: StdioServerParameters, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     集成测试：通过 CLI 交互完成以下流程（使用真实 stdio MCP server 参数）：
     1) 添加 server 配置（disabled=false）
@@ -45,6 +47,9 @@ async def test_cli_with_real_stdio(stdio_params: StdioServerParameters, monkeypa
     5) 退出
     期望：流程执行无异常。
     """
+    # #137 ②：REPL `server add` 现为 durable 落盘——隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
     server_cfg = {
         "name": "it-stdio",
         "type": "stdio",

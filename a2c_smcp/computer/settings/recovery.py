@@ -100,7 +100,7 @@ class BundledServerRecord:
 
     ``config`` 从账本 ``installPath`` 经 :func:`load_bundled_servers` **每次 boot 重新解析**（不信任
     存储态，§5.8 精神）；``plugin``/``marketplace`` 供 client 挂载时携带 D2 渲染上下文
-    （``Computer.aadd_or_aupdate_server(cfg, plugin=, marketplace=)``）。
+    （#137 ③ 起走 transient ``Computer.amount_server(cfg, plugin=, marketplace=)``——治理投影不回写 mcp.json）。
     """
 
     plugin_id: str

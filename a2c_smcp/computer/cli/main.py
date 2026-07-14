@@ -280,7 +280,9 @@ def _run_impl(
 
                     async def _add_server(cfg_obj: dict[str, Any]) -> None:
                         validated: dict[str, Any] = TypeAdapter(SMCPServerConfigDict).validate_python(cfg_obj)
-                        await comp.aadd_or_aupdate_server(validated)
+                        # #137 ③：`--config @file` 加载既有声明 = 投影（加载 ≠ 用户此刻新声明），走 transient
+                        # amount_server，不回写 mcp.json（对齐 rust boot approval 用 mount_server，见 #138）。
+                        await comp.amount_server(validated)
 
                     if isinstance(data, list):
                         for cfg in data:

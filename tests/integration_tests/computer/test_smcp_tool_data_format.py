@@ -46,7 +46,7 @@ async def test_smcp_tool_data_without_default_tool_meta(stdio_params) -> None:
     }
 
     computer = Computer(name="test_no_meta", auto_connect=True)
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)  # #137：测试挂载用 transient（不落盘、不依赖 skill_home）
 
     tools = await computer.aget_available_tools()
 
@@ -107,7 +107,7 @@ async def test_smcp_tool_data_with_default_tool_meta_tags(stdio_params) -> None:
     }
 
     computer = Computer(name="test_with_tags", auto_connect=True)
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)  # #137：测试挂载用 transient（不落盘、不依赖 skill_home）
 
     tools = await computer.aget_available_tools()
 

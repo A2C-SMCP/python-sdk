@@ -80,6 +80,9 @@ async def test_tools_and_inputs_update_single_and_list(tmp_path: Path, monkeypat
     - inputs get 不存在与存在
     - inputs value set: JSON 与 纯文本 两类
     """
+    # #137 ②：REPL `server add` 现为 durable 落盘——隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli_main, "SMCPComputerClient", _Client)
 
     # 通过文件提供 inputs 数组

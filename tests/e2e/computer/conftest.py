@@ -80,6 +80,24 @@ def _spawn_cli(*extra_args: str, cwd: str | None = None) -> Iterator[pexpect.spa
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     spawn_cwd = cwd or project_root
 
+    # #137 ②：REPL `server add`/`rm` 现为 durable，落盘于 spawn_cwd/.tfrobot/{mcp.local.json,mcp.json}
+    # （project/local 锚 cwd，#116）。e2e 默认 cwd=项目根、config 文件走相对路径（不便改 tmp cwd），故对两个 durable
+    # 落点做**字节级快照**，测试结束**精确还原**至运行前状态——防污染仓库 + 防跨 spawn 残留被下个进程 boot 审批读到
+    # （PENDING 提示导致 e2e 挂起，#110 同类死循环）。快照-还原对「仓库根已有真实 .tfrobot」亦安全（还原其原内容，
+    # 绝不删/改用户既有文件）。
+    tfrobot_dir = os.path.join(spawn_cwd, ".tfrobot")
+    tfrobot_preexisted = os.path.isdir(tfrobot_dir)
+    durable_targets = (os.path.join(tfrobot_dir, "mcp.local.json"), os.path.join(tfrobot_dir, "mcp.json"))
+
+    def _snapshot(path: str) -> bytes | None:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    durable_snapshot = {p: _snapshot(p) for p in durable_targets}
+
     print("a2c-computer starting...")
     # 保证每次发送前有一个时延保持稳定
     child = pexpect.spawn(args[0], args[1:], env=env, encoding="utf-8", timeout=60, cwd=spawn_cwd)
@@ -104,6 +122,17 @@ def _spawn_cli(*extra_args: str, cwd: str | None = None) -> Iterator[pexpect.spa
                 child.kill(signal.SIGKILL)
             except Exception:
                 pass
+        # #137 ②：精确还原 durable 落点至运行前状态——本次新建则删、原有则写回原字节（对既有真实 .tfrobot 亦安全）。
+        for path, original in durable_snapshot.items():
+            if original is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                with open(path, "wb") as fh:
+                    fh.write(original)
+        # 本次新建的空 .tfrobot 目录一并清走（原有目录保留）。
+        if not tfrobot_preexisted and os.path.isdir(tfrobot_dir):
+            shutil.rmtree(tfrobot_dir, ignore_errors=True)
 
 
 @pytest.fixture()
