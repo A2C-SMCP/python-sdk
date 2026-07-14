@@ -31,6 +31,10 @@ from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.settings.mcp_config import (
     MANAGED_MCP_FILENAME,
     McpApprovalStatus,
+    McpConfigCorruptError,
+    McpUpsertResult,
+    McpWriteScope,
+    McpWriteTargetError,
     ResolvedMcpConfig,
     approve_all_project_mcp,
     approve_mcp_server,
@@ -40,7 +44,10 @@ from a2c_smcp.computer.settings.mcp_config import (
     load_mcp_config_file,
     managed_mcp_config_path,
     mcp_server_status,
+    mcp_write_path,
+    remove_mcp_server,
     resolve_mcp_config,
+    upsert_mcp_server,
 )
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
 from a2c_smcp.computer.settings.schema import SettingsScope
@@ -365,6 +372,210 @@ def test_resolve_mcp_config_anchors_cwd(tmp_path: Path, monkeypatch: pytest.Monk
     assert "proj-srv" in out.servers
     assert out.servers["proj-srv"].origin == SettingsScope.PROJECT
     assert out.servers["proj-srv"].trusted_origin is False  # project 非可信来源，语义不变
+
+
+# ---------------------------------------------------------------------------
+# scope-aware 持久写层：upsert / remove 单个 server 定义（#136，对齐 rust write_target.rs / crud.rs）
+# scope-aware durable write layer: upsert / remove one server definition (#136)
+# ---------------------------------------------------------------------------
+def _read_mcp(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _proj_mcp(wd: Path) -> Path:
+    return wd / ".tfrobot" / "mcp.json"
+
+
+def _local_mcp(wd: Path) -> Path:
+    return wd / ".tfrobot" / "mcp.local.json"
+
+
+def test_mcp_write_path_maps_three_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """三 scope → 落点：user=$XDG/a2c/mcp.json、project=<cwd>/.tfrobot/mcp.json、local=mcp.local.json。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert mcp_write_path(McpWriteScope.USER, env=env) == _user_mcp(tmp_path)
+    assert mcp_write_path(McpWriteScope.PROJECT, env=env) == _proj_mcp(tmp_path)
+    assert mcp_write_path(McpWriteScope.LOCAL, env=env) == _local_mcp(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("scope", "path_of"),
+    [
+        (McpWriteScope.USER, _user_mcp),
+        (McpWriteScope.PROJECT, _proj_mcp),
+        (McpWriteScope.LOCAL, _local_mcp),
+    ],
+)
+def test_upsert_new_lands_requested_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: McpWriteScope,
+    path_of: object,
+) -> None:
+    """新声明落**请求 scope**；raw body 原样落盘；``{servers, inputs}`` 规整形状；changed=True。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    body = _stdio("node")
+    res = upsert_mcp_server("figma", body, scope=scope, env=env, home=tmp_path)
+    assert res == McpUpsertResult(scope=scope, changed=True)
+    doc = _read_mcp(path_of(tmp_path))  # type: ignore[operator]
+    assert doc == {"servers": {"figma": body}, "inputs": []}
+
+
+def test_upsert_writes_raw_unrendered_body(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D1 铁律：占位符 ``${input:}`` / ``${env:}`` 逐字保留、绝不渲染（值不离 Computer）。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    body = {
+        "type": "stdio",
+        "server_parameters": {"command": "node", "env": {"TOK": "${input:tok}", "HM": "${env:HOME}"}},
+    }
+    upsert_mcp_server("srv", body, scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    stored = _read_mcp(_local_mcp(tmp_path))["servers"]["srv"]
+    assert stored["server_parameters"]["env"] == {"TOK": "${input:tok}", "HM": "${env:HOME}"}  # 未渲染
+
+
+def test_upsert_existing_lands_origin_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """改已有 server 恒落其 **origin** scope；请求 scope 仅新声明生效 → 请求的 project scope 不被创建。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("old")}))  # origin=user
+    res = upsert_mcp_server("figma", _stdio("new"), scope=McpWriteScope.PROJECT, env=env, home=tmp_path)
+    assert res.scope == McpWriteScope.USER and res.changed is True  # 落 origin(user)，非请求(project)
+    assert _read_mcp(_user_mcp(tmp_path))["servers"]["figma"]["server_parameters"]["command"] == "new"
+    assert not _proj_mcp(tmp_path).exists()  # 请求的 project scope 未被创建（无 scope 漂移）
+
+
+def test_upsert_unchanged_content_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """内容未变 → changed=False 且不落盘（对齐 rust 仅真变才 bump revision）。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    body = _stdio("node")
+    assert upsert_mcp_server("figma", body, scope=McpWriteScope.LOCAL, env=env, home=tmp_path).changed is True
+    path = _local_mcp(tmp_path)
+    mtime = path.stat().st_mtime_ns
+    second = upsert_mcp_server("figma", dict(body), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    assert second == McpUpsertResult(scope=McpWriteScope.LOCAL, changed=False)
+    assert path.stat().st_mtime_ns == mtime  # 未重写、无 churn
+
+
+def test_upsert_bundled_name_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """bundled server 名（plugin ledger 派生）→ 拒写 McpWriteTargetError，且不落盘。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    save_installed_plugins(
+        {"plugins": {"a@mp": [{"scope": "user", "installPath": "/x", "bundledMcpServers": ["figma"]}]}},
+        home=tmp_path,
+    )
+    with pytest.raises(McpWriteTargetError):
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    assert not _local_mcp(tmp_path).exists()  # 拒写发生在落盘前
+
+
+def test_remove_clears_all_writable_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """remove 跨 user/project/local 全清同名声明（真删干净）；同 scope 其他 server 保留；返回 True。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("u"), "keep": _stdio()}))
+    _write_json(_proj_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("p")}))
+    _write_json(_local_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("l")}))
+    assert remove_mcp_server("figma", env=env) is True
+    assert "figma" not in _read_mcp(_user_mcp(tmp_path))["servers"]
+    assert "keep" in _read_mcp(_user_mcp(tmp_path))["servers"]  # 同 scope 邻居保留
+    assert _read_mcp(_proj_mcp(tmp_path))["servers"] == {}
+    assert _read_mcp(_local_mcp(tmp_path))["servers"] == {}
+
+
+def test_remove_absent_is_noop_no_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """全无匹配 → no-op 返回 False；不创建目录/锁/文件。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert remove_mcp_server("ghost", env=env) is False
+    assert not (tmp_path / ".tfrobot").exists()  # 未创建 .tfrobot 目录/锁
+    assert not _user_mcp(tmp_path).exists()
+
+
+def test_remove_skips_scope_without_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """未声明该 name 的 scope 不被触碰（不 normalize）→ 其未知顶层 key 原样保留。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    up = _user_mcp(tmp_path)
+    _write_json(up, {"servers": {"other": _stdio()}, "inputs": [], "$schema": "x"})  # 无 figma
+    _write_json(_local_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio()}))
+    assert remove_mcp_server("figma", env=env) is True
+    assert _read_mcp(up).get("$schema") == "x"  # user 文件未被重写/规整
+    assert _read_mcp(_local_mcp(tmp_path))["servers"] == {}
+
+
+def test_upsert_over_corrupt_target_refuses_no_clobber(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🔴 回归：目标 mcp.json 损坏 → 抛 McpConfigCorruptError，绝不覆盖（既有内容/字节完好保留）。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    corrupt = "{ this is not valid json"
+    lp = _local_mcp(tmp_path)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(corrupt, encoding="utf-8")
+    with pytest.raises(McpConfigCorruptError):
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    assert lp.read_text(encoding="utf-8") == corrupt  # 逐字节未动（无覆盖、无备份丢失）
+
+
+def test_upsert_over_malformed_field_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """结构性字段错（servers 非对象）→ 拒写（否则整体覆盖会销毁那批无法安全合并的 server）。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    lp = _local_mcp(tmp_path)
+    _write_json(lp, {"servers": ["oops-not-a-map"], "inputs": []})
+    with pytest.raises(McpConfigCorruptError):
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    assert _read_mcp(lp)["servers"] == ["oops-not-a-map"]  # 原样保留
+
+
+def test_upsert_existing_policy_origin_falls_back_to_requested(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """只读 policy origin：非可写 → 回落写请求 scope（rust parity：policy 等同新声明；写会被 policy 读遮蔽）。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    managed = tmp_path / "managed-mcp.json"
+    _write_json(managed, _mcp_doc(servers={"figma": _stdio("policy-cmd")}))
+    # origin 快照要看到 policy 定义：resolve_mcp_config 默认按平台推导 managed 路径，故重定向到我们的临时文件。
+    monkeypatch.setattr(
+        "a2c_smcp.computer.settings.mcp_config.managed_mcp_config_path",
+        lambda platform=None: managed,
+    )
+    res = upsert_mcp_server("figma", _stdio("user-cmd"), scope=McpWriteScope.USER, env=env, home=tmp_path)
+    assert res.scope == McpWriteScope.USER and res.changed is True  # 回落请求 scope（user）
+    assert _read_mcp(_user_mcp(tmp_path))["servers"]["figma"]["server_parameters"]["command"] == "user-cmd"
+    # shadow 语义：user 定义落盘了，但 policy 读优先级最高 → 有效配置仍是 policy-cmd（changed=True 却被遮蔽）。
+    shadowed = resolve_mcp_config(env=env).servers["figma"]
+    assert isinstance(shadowed.config, StdioServerConfig)
+    assert shadowed.origin == SettingsScope.POLICY and shadowed.config.server_parameters.command == "policy-cmd"
+
+
+def test_upsert_existing_same_scope_in_place_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """已有 server 在同一 origin scope 内改内容 → 原地改写、changed=True（非跨 scope、非 noop）。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _write_json(_local_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("old"), "keep": _stdio()}))
+    res = upsert_mcp_server("figma", _stdio("new"), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    assert res == McpUpsertResult(scope=McpWriteScope.LOCAL, changed=True)
+    doc = _read_mcp(_local_mcp(tmp_path))
+    assert doc["servers"]["figma"]["server_parameters"]["command"] == "new"
+    assert "keep" in doc["servers"]  # 同 scope 邻居保留（整体替换只动目标条目）
+
+
+def test_remove_skips_corrupt_scope_but_clears_clean_ones(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """remove 跨 scope best-effort：损坏 scope 跳过（原字节保留），干净 scope 照删，返回 True。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    corrupt = "{not json"
+    up = _user_mcp(tmp_path)
+    up.parent.mkdir(parents=True, exist_ok=True)
+    up.write_text(corrupt, encoding="utf-8")  # user scope 损坏
+    _write_json(_local_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio()}))  # local scope 干净、含 figma
+    assert remove_mcp_server("figma", env=env) is True  # 从干净 local 删掉 → True
+    assert up.read_text(encoding="utf-8") == corrupt  # 损坏 user scope 逐字节未动
+    assert _read_mcp(_local_mcp(tmp_path))["servers"] == {}
 
 
 def test_approval_writes_anchor_cwd_no_failfast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
