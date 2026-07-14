@@ -447,3 +447,210 @@ def approve_all_project_mcp() -> None:
         existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
         updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})
         atomic_write_json(path, updated)
+
+
+# ---------------------------------------------------------------------------
+# scope-aware 持久写层（单个 server 定义的 upsert / remove）/ Scope-aware durable write layer（#136）
+# ---------------------------------------------------------------------------
+# 对齐 rust-sdk ``settings/config/write_target.rs``（``WriteScope`` + 写目标解析）与 ``config/crud.rs``
+# （``ConfigEdit`` / ``update_config``）。**纯逻辑写层**：只按 name 写/删 raw 未渲染定义，不接 Computer /
+# MCP manager / 网络（bundle_id→name 解析、运行期物化归 ②）。落盘复用批准写助手同款原语（``file_lock`` +
+# ``load_mcp_config_file`` + ``atomic_write_json``）。#135 双路径地基。
+# Aligns rust ``write_target.rs`` / ``config/crud.rs``. Pure logic write layer: writes/removes a
+# single raw (un-rendered) server definition by name; no Computer / MCP manager / network wiring.
+
+
+class McpWriteScope(StrEnum):
+    """
+    可写 scope 子集（逐字对齐 rust ``WriteScope``）/ The writable scope subset (mirrors rust ``WriteScope``)。
+
+    映射到 :class:`SettingsScope` 的三个**可写**层与落点：``LOCAL`` → ``<cwd>/.tfrobot/mcp.local.json``
+    （不入 git）、``PROJECT`` → ``<cwd>/.tfrobot/mcp.json``（入 git、团队共享）、``USER`` →
+    ``$XDG_CONFIG_HOME/a2c/mcp.json``（全局）。``policy`` / ``flag`` 是**只读**来源，不在此列。
+    """
+
+    LOCAL = "local"
+    PROJECT = "project"
+    USER = "user"
+
+
+class McpWriteTargetError(RuntimeError):
+    """
+    写目标非法（对应 rust ``WriteTargetError::Synthesized``）/ Illegal write target。
+
+    目前唯一触发：``name`` 是 plugin ledger 派生的 **bundled** server 名——用户不应经 ``mcp.json`` 写/删
+    plugin 携带的 server（其真相在 ``installed_plugins.json`` 账本，见 :func:`bundled_mcp_server_names`）。
+    """
+
+
+class McpConfigCorruptError(RuntimeError):
+    """
+    写目标 ``mcp.json`` **结构损坏**、拒绝覆盖以免销毁既有内容 / Refuse to clobber a structurally-corrupt target。
+
+    :func:`load_mcp_config_file` 对损坏文件（不可解析 JSON / 根非对象 / ``servers`` 非对象 / ``inputs`` 非数组）
+    按契约返回**空规整视图 + 错误**且**保留原文件不清盘**。写层若无视这些错误直接以 ``{servers, inputs}`` 整体
+    覆盖，会**永久销毁**用户在该文件里的其余 server 定义 / inputs（且无备份）。故 :func:`upsert_mcp_server` 遇
+    结构性错误**抛此异常、绝不写**（读层容错、写层 fail-fast——二者不冲突：容错是"读时不因一处坏而全废"，
+    fail-fast 是"写时不盲目覆盖不可解析的目标"）。由 ② / REPL 捕获并提示用户修复。
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class McpUpsertResult:
+    """
+    :func:`upsert_mcp_server` 的结果 / The result of :func:`upsert_mcp_server`。
+
+    ``scope`` 为**实际落盘** scope（新声明 = 请求 scope；改已有 = 其 origin scope，见函数文档）；``changed``
+    表示内容是否**真的**变化（旧定义 == 新 body → ``False`` 且不落盘、不 churn），供 ② 决定是否 bump config
+    revision（对齐 rust「仅内容真变才 bump」）。
+    """
+
+    scope: McpWriteScope
+    changed: bool
+
+
+# McpWriteScope ↔ SettingsScope 双向映射（值等价，纯语义收窄）/ Bidirectional map (values are equal).
+_WRITE_SCOPE_TO_SETTINGS: dict[McpWriteScope, SettingsScope] = {
+    McpWriteScope.USER: SettingsScope.USER,
+    McpWriteScope.PROJECT: SettingsScope.PROJECT,
+    McpWriteScope.LOCAL: SettingsScope.LOCAL,
+}
+_SETTINGS_TO_WRITE_SCOPE: dict[SettingsScope, McpWriteScope] = {v: k for k, v in _WRITE_SCOPE_TO_SETTINGS.items()}
+
+# remove 扫描的可写 scope（policy 只读、不删；顺序仅影响遍历，不影响结果）/ Writable scopes scanned by remove.
+_WRITABLE_SCOPES: tuple[McpWriteScope, ...] = (McpWriteScope.USER, McpWriteScope.PROJECT, McpWriteScope.LOCAL)
+
+
+def mcp_write_path(scope: McpWriteScope, *, env: Mapping[str, str] | None = None) -> Path:
+    """
+    某写 scope 的 ``mcp.json`` 落点路径 / The ``mcp.json`` write path for a given scope。
+
+    project/local 锚定进程 ``os.getcwd()``（#116，cwd 恒存在）；user 走 ``$XDG_CONFIG_HOME/a2c``（``env``
+    覆盖，便于测试隔离）。复用既有路径原语 :func:`user_mcp_config_path` / :func:`workdir_mcp_config_path` /
+    :func:`workdir_mcp_local_config_path`。
+    """
+    if scope is McpWriteScope.USER:
+        return user_mcp_config_path(env)
+    cwd = Path(os.getcwd())
+    if scope is McpWriteScope.PROJECT:
+        return workdir_mcp_config_path(cwd)
+    return workdir_mcp_local_config_path(cwd)  # LOCAL
+
+
+def _write_servers_map(path: Path, servers: dict[str, Any], inputs: list[Any]) -> None:
+    """
+    原子重写单个 ``mcp.json`` 的规整视图 ``{servers, inputs}`` / Atomically rewrite one mcp.json's normalized view。
+
+    经 :func:`load_mcp_config_file` 规整（未知顶层 key 如 ``$schema`` 不保留——``mcp.json`` 的 SDK 权威形状
+    即 ``{servers, inputs}``）；``atomic_write_json`` 无 ``header``（``mcp.json`` 是人编意图层，无写保护头/version，
+    照批准写助手姿态）。**调用方须已持 :func:`file_lock`**。
+    """
+    atomic_write_json(path, {"servers": servers, "inputs": inputs})
+
+
+def upsert_mcp_server(
+    name: str,
+    body: Mapping[str, Any],
+    *,
+    scope: McpWriteScope,
+    env: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> McpUpsertResult:
+    """
+    持锁原子 upsert **单个** MCP server 定义到指定 / origin scope / Locked atomic upsert of one server def。
+
+    对齐 rust ``add_or_update_server_in_scope``：
+
+    - **写 raw 未渲染 ``body``**（保留 ``${input:}`` / ``${env:}``，**D1 铁律：绝不写渲染后 secret**，§9.1 值不
+      离 Computer）；``servers.<name>`` **整体替换**（配置是原子单元，**非**深合并——刻意绕开 :func:`apply_write`
+      的嵌套 dict 递归合并）。
+    - **改已有 server 恒落其 origin scope**：先经 :func:`resolve_mcp_config` **快照**查 ``name`` 的 origin，若其
+      origin ∈ 可写 scope（user/project/local）则写回**该 scope**（忽略 ``scope`` 入参）；``scope`` 入参**仅对
+      新声明**生效，杜绝跨 scope 漂移。origin 判定基于**锁外快照**（轻微 TOCTOU：并发进程可在快照与取锁间改动
+      声明；实际写在锁内原子）。**注意**：若 origin 为只读 **policy**（``managed-mcp.json``，读优先级最高）则回落
+      写请求 scope——但该写会被 policy 定义在 :func:`resolve_mcp_config` 中**遮蔽**（``changed`` 为 ``True`` 而有效
+      配置不变，属 rust parity 行为：policy 非可写目标、等同新声明）；``flag`` origin 优先级最低、user-写胜出、
+      不被遮蔽。
+    - **bundled 名拒写**：``name`` 命中 plugin ledger 派生的 bundled 集 → 抛 :class:`McpWriteTargetError`。
+    - **损坏目标拒写**：目标 ``mcp.json`` 结构损坏（不可解析 / 根非对象 / ``servers``|``inputs`` 类型错）→ 抛
+      :class:`McpConfigCorruptError`，**绝不覆盖**（否则销毁既有内容，见该异常文档）。
+    - **内容未变 = no-op**：目标 scope 现存定义与 ``body`` 逐字相等 → 不落盘、``changed=False``（对齐 rust 仅
+      真变才 bump revision）。
+    - **规整副作用**：落盘经 :func:`load_mcp_config_file` 规整为 ``{servers, inputs}``——目标文件的**未知顶层
+      key**（如 IDE 补全用的 ``$schema``）在改写时**不保留**（``mcp.json`` 的 SDK 权威形状即 ``{servers, inputs}``）。
+
+    :param name: server 身份（``mcp.json`` map key）/ the server identity (mcp.json map key).
+    :param body: **未渲染** server 定义体（不含 map key；``name`` 由 key 承载）/ the un-rendered server body.
+    :param scope: 请求写 scope（仅新声明生效）/ requested write scope (honored only for a new declaration).
+    :param env: 环境映射（解析 user config dir + origin 快照），默认 ``os.environ``。
+    :param home: SKILL Home（解析 bundled 账本），默认 ``$A2C_SKILL_HOME``。
+    :raises McpWriteTargetError: ``name`` 为 bundled server 名（不可经 config 写）。
+    :raises McpConfigCorruptError: 目标 ``mcp.json`` 结构损坏（拒绝覆盖以免销毁既有内容）。
+    :returns: :class:`McpUpsertResult`（实际落盘 scope + 是否真写）。
+    """
+    if name in bundled_mcp_server_names(home=home, env=env):
+        raise McpWriteTargetError(
+            f"{name!r} is a plugin-bundled MCP server (its truth is the installed_plugins.json ledger); "
+            "refuse to write it via mcp.json",
+        )
+
+    # 改已有恒落 origin scope；新声明（或 origin 只读 policy/flag）落请求 scope / existing → origin, else → requested.
+    target = scope
+    existing = resolve_mcp_config(env=env).servers.get(name)
+    if existing is not None:
+        origin_write = _SETTINGS_TO_WRITE_SCOPE.get(existing.origin)
+        if origin_write is not None:
+            target = origin_write
+
+    raw_body = dict(body)  # 脱离调用方映射；raw、未渲染 / detach caller's mapping; raw, un-rendered.
+    path = mcp_write_path(target, env=env)
+    settings_scope = _WRITE_SCOPE_TO_SETTINGS[target]
+    with file_lock(path):
+        data, errors = load_mcp_config_file(path, settings_scope)  # 容错读 {servers, inputs}
+        if errors:
+            # 结构损坏：读层已"空视图 + 保留原文件"；写层绝不整体覆盖（否则销毁既有 server/inputs、无备份）。
+            reasons = "; ".join(e.reason for e in errors)
+            raise McpConfigCorruptError(f"refuse to upsert {name!r}: target {path} is structurally corrupt: {reasons}")
+        servers = dict(data["servers"])
+        if servers.get(name) == raw_body:
+            return McpUpsertResult(scope=target, changed=False)  # 内容未变 → 不写、不 churn
+        servers[name] = raw_body  # 整体替换（非深合并）；其余 server（含读层未校验的原样条目）逐字保留。
+        _write_servers_map(path, servers, data["inputs"])
+    return McpUpsertResult(scope=target, changed=True)
+
+
+def remove_mcp_server(name: str, *, env: Mapping[str, str] | None = None) -> bool:
+    """
+    从**所有可写 scope** 删除同名 server 声明 / Remove a server declaration from all writable scopes。
+
+    对齐 rust ``remove_server`` 的 name 删声明段（bundle_id→name 解析 + bundled 身份拒删归 ②，那里有 Computer
+    上下文）。逐 scope（user/project/local，**不含 policy**）持锁原子删 ``servers.<name>``（``mcp.json`` name-keyed，
+    真删干净）；无匹配 scope → 跳过（不创建目录/锁、不 normalize）；全无匹配 → no-op。
+
+    **损坏 scope 跳过而非覆盖**：某 scope 的 ``mcp.json`` 结构损坏时 :func:`load_mcp_config_file` 返回空视图 +
+    错误且保留原文件；此处**跳过该 scope + WARN**（best-effort，不重写以免销毁其余内容/丢弃畸形 inputs），继续
+    其他 scope（区别于 :func:`upsert_mcp_server` 的单目标 fail-fast——remove 是跨 scope 尽力清理）。损坏 scope 里
+    若仍声明着该 server，删除对它是"不彻底"的，但保住用户文件优先——用户修好文件后重跑 remove 即可清净。
+
+    :param name: 待删 server 名 / the server name to remove.
+    :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+    :returns: 是否从至少一个 scope 删除了声明 / whether it removed a declaration from ≥1 scope。
+    """
+    removed = False
+    for wscope in _WRITABLE_SCOPES:
+        path = mcp_write_path(wscope, env=env)
+        if not path.exists():
+            continue  # 该 scope 无 mcp.json → 无可删，不创建 .lock/目录、不触碰 / skip untouched.
+        settings_scope = _WRITE_SCOPE_TO_SETTINGS[wscope]
+        with file_lock(path):
+            data, errors = load_mcp_config_file(path, settings_scope)
+            if errors:
+                # 结构损坏 → 跳过、不重写（保住既有内容）；best-effort 跨 scope 清理容忍局部不彻底。
+                logger.warning("MCP config %s corrupt, skipped during remove of %r (kept on disk)", path, name)
+                continue
+            if name not in data["servers"]:
+                continue  # 该 scope 未声明 → no-op（不重写、不 normalize）/ not declared here → no-op.
+            servers = {k: v for k, v in data["servers"].items() if k != name}
+            _write_servers_map(path, servers, data["inputs"])
+            removed = True
+    return removed
