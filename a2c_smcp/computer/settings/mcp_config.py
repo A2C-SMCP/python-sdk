@@ -72,7 +72,7 @@ from a2c_smcp.computer.settings.scope import (
     workdir_local_settings_path,
     workdir_settings_dir,
 )
-from a2c_smcp.computer.settings.store import atomic_write_json, file_lock, load_installed_plugins
+from a2c_smcp.computer.settings.store import atomic_write_json, file_lock
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -342,22 +342,28 @@ def _str_list(settings: Mapping[str, Any], key: str) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
-def mcp_server_status(name: str, *, settings: Mapping[str, Any], bundled: set[str], trusted_origin: bool) -> McpApprovalStatus:
+def mcp_server_status(name: str, *, settings: Mapping[str, Any], trusted_origin: bool) -> McpApprovalStatus:
     """
-    判定单个 MCP server 的批准状态（§9.2，**顺序即优先级**）/ Decide one server's approval status。
+    判定单个 MCP server 的批准状态（**顺序即优先级**）/ Decide one server's approval status。
 
     优先级（先到先决）/ Priority (first match wins):
     1. ``deniedMcpServers``（企业拒绝名单，policy）→ ``DISABLED``。
     2. ``allowedMcpServers`` 非空（企业白名单，policy）且不在其中 → ``DISABLED``。
     3. ``disabledMcpjsonServers`` → ``DISABLED``（**disabled 优先** over enabled）。
-    4. plugin-bundled（``bundled`` 并集，#63 显式 install = trusted）→ ``ENABLED``（免批准）。
-    5. ``trusted_origin``（user/flag/policy scope 自定义 server）→ ``ENABLED``（用户自己加的，不弹框）。
-    6. ``enabledMcpjsonServers`` → ``ENABLED``。
-    7. ``enableAllProjectMcpServers is True`` → ``ENABLED``。
-    8. 否则（工作区共享且未决）→ ``PENDING``。
+    4. ``trusted_origin``（user/flag/policy scope 自定义 server）→ ``ENABLED``（用户自己加的，不弹框）。
+    5. ``enabledMcpjsonServers`` → ``ENABLED``。
+    6. ``enableAllProjectMcpServers is True`` → ``ENABLED``。
+    7. 否则（工作区共享且未决）→ ``PENDING``。
+
+    **#148（P0 安全）**：历史「plugin-bundled 名集免批准」档位（`if name in bundled → ENABLED`）**已删除**。
+    真正的 plugin bundled server **从不进入** :func:`resolve_mcp_config`（走 transient ``amount_server`` 挂载、
+    不落 mcp.json），故该档**唯一可达路径** = project/local 声明的 server 借用了某已装 plugin 的 server 名 =
+    100% 借名跳过审批门。审批门 **MUST NOT 依赖物化账本的名集**，plugin 声明 **MUST NOT 进入迭代**（其可信性由
+    install ∧ enable 门保证，不走 settings 信任面）——见协议 ``runtime-contract.md §5 item 10`` 与
+    ``guides/mcp-approval-gate-alignment.md``。本函数只判 :func:`resolve_mcp_config` 产出的 mcp.json origin，
+    当前架构下这些 origin 恒非 plugin，无需在此额外过滤。
 
     :param settings: 六层合并后的 resolved settings（含 #56 落地的 MCP 门控字段）。
-    :param bundled: 已安装 plugin 携带的 bundled MCP server name 并集（见 :func:`bundled_mcp_server_names`）。
     :param trusted_origin: 该 server 是否来自预信任 scope（见 :attr:`ResolvedMcpServer.trusted_origin`）。
     """
     if name in _str_list(settings, FIELD_DENIED_MCP_SERVERS):
@@ -367,8 +373,6 @@ def mcp_server_status(name: str, *, settings: Mapping[str, Any], bundled: set[st
         return McpApprovalStatus.DISABLED
     if name in _str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS):
         return McpApprovalStatus.DISABLED
-    if name in bundled:
-        return McpApprovalStatus.ENABLED
     if trusted_origin:
         return McpApprovalStatus.ENABLED
     if name in _str_list(settings, FIELD_ENABLED_MCPJSON_SERVERS):
@@ -381,27 +385,12 @@ def mcp_server_status(name: str, *, settings: Mapping[str, Any], bundled: set[st
 def gate_mcp_servers(
     resolved: ResolvedMcpConfig,
     settings: Mapping[str, Any],
-    bundled: set[str],
 ) -> dict[str, McpApprovalStatus]:
     """对全部已解析 server 套 :func:`mcp_server_status` / Apply the gate to all resolved servers。"""
     return {
-        name: mcp_server_status(name, settings=settings, bundled=bundled, trusted_origin=srv.trusted_origin)
+        name: mcp_server_status(name, settings=settings, trusted_origin=srv.trusted_origin)
         for name, srv in resolved.servers.items()
     }
-
-
-def bundled_mcp_server_names(home: Path | None = None, env: Mapping[str, str] | None = None) -> set[str]:
-    """
-    已安装 plugin 携带的 bundled MCP server name 并集（#64↔#63 账本接缝）/ Union of installed plugins' bundled servers。
-
-    读 ``installed_plugins.json``（#63 物化账本）全记录的 ``bundledMcpServers`` 字段——这些 server 因用户**显式
-    install plugin**而 trusted、门控免批准（§9.2 ``mcp_server_status`` 第 4 档）。
-    """
-    out: set[str] = set()
-    for records in load_installed_plugins(home=home, env=env)["plugins"].values():
-        for record in records:
-            out.update(record.get("bundledMcpServers", []) or [])
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -478,8 +467,10 @@ class McpWriteTargetError(RuntimeError):
     """
     写目标非法（对应 rust ``WriteTargetError::Synthesized``）/ Illegal write target。
 
-    目前唯一触发：``name`` 是 plugin ledger 派生的 **bundled** server 名——用户不应经 ``mcp.json`` 写/删
-    plugin 携带的 server（其真相在 ``installed_plugins.json`` 账本，见 :func:`bundled_mcp_server_names`）。
+    唯一触发点（#148 / 指南 §5）：:meth:`Computer.aremove_server` 试图 **durable 删除**一个「运行期活跃却
+    无任何用户侧 mcp.json 声明」的 server —— 它是 plugin / 治理**投影**（其真相在 ``installed_plugins.json``
+    账本，应经 ``plugin uninstall`` 整体停用，而非经 mcp.json CRUD 单独打掉，否则产生半态）。**写层不再**因
+    「同 bundle_id 已由 plugin 提供」拒写 upsert（用户覆盖权，见 :func:`upsert_mcp_server`）。
     """
 
 
@@ -554,7 +545,6 @@ def upsert_mcp_server(
     *,
     scope: McpWriteScope,
     env: Mapping[str, str] | None = None,
-    home: Path | None = None,
 ) -> McpUpsertResult:
     """
     持锁原子 upsert **单个** MCP server 定义到指定 / origin scope / Locked atomic upsert of one server def。
@@ -571,7 +561,9 @@ def upsert_mcp_server(
       写请求 scope——但该写会被 policy 定义在 :func:`resolve_mcp_config` 中**遮蔽**（``changed`` 为 ``True`` 而有效
       配置不变，属 rust parity 行为：policy 非可写目标、等同新声明）；``flag`` origin 优先级最低、user-写胜出、
       不被遮蔽。
-    - **bundled 名拒写**：``name`` 命中 plugin ledger 派生的 bundled 集 → 抛 :class:`McpWriteTargetError`。
+    - **不因「同 bundle_id 已由 plugin 提供」而拒写**（#148 / 指南 §5）：用户在 mcp.json 声明同 bundle_id 的 server
+      正是优先序赋予的**覆盖权**（用户侧 scope > plugin 声明基线），历史「bundled 名拒写」短路**已删除**。SDK MAY
+      在别处提示「该 bundle_id 已由 plugin 提供、你的声明将覆盖它」，但**写层不阻止**。
     - **损坏目标拒写**：目标 ``mcp.json`` 结构损坏（不可解析 / 根非对象 / ``servers``|``inputs`` 类型错）→ 抛
       :class:`McpConfigCorruptError`，**绝不覆盖**（否则销毁既有内容，见该异常文档）。
     - **内容未变 = no-op**：目标 scope 现存定义与 ``body`` 逐字相等 → 不落盘、``changed=False``（对齐 rust 仅
@@ -583,17 +575,9 @@ def upsert_mcp_server(
     :param body: **未渲染** server 定义体（不含 map key；``name`` 由 key 承载）/ the un-rendered server body.
     :param scope: 请求写 scope（仅新声明生效）/ requested write scope (honored only for a new declaration).
     :param env: 环境映射（解析 user config dir + origin 快照），默认 ``os.environ``。
-    :param home: SKILL Home（解析 bundled 账本），默认 ``$A2C_SKILL_HOME``。
-    :raises McpWriteTargetError: ``name`` 为 bundled server 名（不可经 config 写）。
     :raises McpConfigCorruptError: 目标 ``mcp.json`` 结构损坏（拒绝覆盖以免销毁既有内容）。
     :returns: :class:`McpUpsertResult`（实际落盘 scope + 是否真写）。
     """
-    if name in bundled_mcp_server_names(home=home, env=env):
-        raise McpWriteTargetError(
-            f"{name!r} is a plugin-bundled MCP server (its truth is the installed_plugins.json ledger); "
-            "refuse to write it via mcp.json",
-        )
-
     # 改已有恒落 origin scope；新声明（或 origin 只读 policy/flag）落请求 scope / existing → origin, else → requested.
     target = scope
     existing = resolve_mcp_config(env=env).servers.get(name)

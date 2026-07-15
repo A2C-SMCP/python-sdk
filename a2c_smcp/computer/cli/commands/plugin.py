@@ -61,7 +61,6 @@ from a2c_smcp.computer.settings.mcp_config import (
     McpApprovalStatus,
     approve_all_project_mcp,
     approve_mcp_server,
-    bundled_mcp_server_names,
     deny_mcp_server,
     gate_mcp_servers,
     resolve_mcp_config,
@@ -528,7 +527,7 @@ async def run_mcp_approval(
 ) -> None:
     """启动期解析 ``.tfrobot/mcp.json`` 定义层 + 批准门控 + 挂载 ENABLED server（§9.2）/ Boot-time MCP approval + mount。
 
-    - bundled / user-flag-policy origin server → 门控判 ENABLED → 直挂（免批准框）；
+    - user/flag/policy origin server（trusted）→ 门控判 ENABLED → 直挂（免批准框）；
     - DISABLED（企业拒绝/不在白名单/显式 disabled）→ 跳过；
     - PENDING（工作区共享未决）→ TTY 弹 y/a/n 写 local scope；非 TTY → skip+WARN，``approve_all`` 全批（仅本次不落盘）。
 
@@ -552,8 +551,9 @@ async def run_mcp_approval(
         return
 
     settings = resolved_settings(env, flag_path=flag_config)
-    bundled = bundled_mcp_server_names(comp.skill_home, env)
-    statuses = gate_mcp_servers(resolved, settings, bundled)
+    # #148/F8：审批门 MUST NOT 依赖账本 bundled 名集；plugin 声明本就不入 resolve_mcp_config（走 transient
+    # amount_server 挂载、不落 mcp.json），迭代永不遇 plugin origin，无需显式过滤（详见 mcp_server_status）。
+    statuses = gate_mcp_servers(resolved, settings)
 
     # mcp.json 定义的 input 入池（无前缀），供 server config 的裸 ${input:} 解析（#69 Group B 风险 3）。
     for inp in resolved.inputs:

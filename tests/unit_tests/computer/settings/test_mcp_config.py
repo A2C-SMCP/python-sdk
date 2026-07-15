@@ -15,10 +15,9 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §9.1 / 
 - merge：scope 优先级 policy>local>project>user>flag；同名 server 高 scope 整体覆盖 + origin；无 active →
   仅 user+flag+policy；inputs 按 id 去重高胜。
 - ext 剥离：envFile 入 ext + 配置校验通过；含真未知 key 的 server → drop + err（字段容错、不 abort）。
-- gate：未知→pending；enabled/disabled（disabled 优先）；enableAll；plugin-bundled 免批准；user-origin 自动
-  enabled；policy deny→disabled；policy allow 白名单。
+- gate：未知→pending；enabled/disabled（disabled 优先）；enableAll；user-origin 自动 enabled；policy deny→disabled；
+  policy allow 白名单。**#148**：档④「bundled 名集免批准」已删除——审批门不再感知账本，借名不再绕过（签名无 bundled）。
 - 写助手：approve/deny/approveAll 写 active-workdir local（dedup、无 version/header）；缺 active → 抛。
-- bundled 接缝：bundled_mcp_server_names 跨多记录并集。
 """
 
 import json
@@ -34,11 +33,9 @@ from a2c_smcp.computer.settings.mcp_config import (
     McpConfigCorruptError,
     McpUpsertResult,
     McpWriteScope,
-    McpWriteTargetError,
     ResolvedMcpConfig,
     approve_all_project_mcp,
     approve_mcp_server,
-    bundled_mcp_server_names,
     deny_mcp_server,
     gate_mcp_servers,
     load_mcp_config_file,
@@ -52,7 +49,6 @@ from a2c_smcp.computer.settings.mcp_config import (
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
 from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.settings.scope import workdir_local_settings_path
-from a2c_smcp.computer.settings.store import save_installed_plugins
 
 
 # ── 辅助 / helpers ───────────────────────────────────────────────────────────
@@ -223,48 +219,61 @@ def test_resolve_malformed_input_dropped(tmp_path: Path) -> None:
 
 # ── gate：mcp_server_status / gate_mcp_servers ────────────────────────────────
 def test_status_pending_when_unknown_workspace(tmp_path: Path) -> None:
-    assert mcp_server_status("x", settings={}, bundled=set(), trusted_origin=False) == McpApprovalStatus.PENDING
+    assert mcp_server_status("x", settings={}, trusted_origin=False) == McpApprovalStatus.PENDING
 
 
 def test_status_enabled_via_enabled_list() -> None:
     s = {"enabledMcpjsonServers": ["x"]}
-    assert mcp_server_status("x", settings=s, bundled=set(), trusted_origin=False) == McpApprovalStatus.ENABLED
+    assert mcp_server_status("x", settings=s, trusted_origin=False) == McpApprovalStatus.ENABLED
 
 
 def test_status_disabled_takes_priority_over_enabled() -> None:
     s = {"enabledMcpjsonServers": ["x"], "disabledMcpjsonServers": ["x"]}
-    assert mcp_server_status("x", settings=s, bundled=set(), trusted_origin=False) == McpApprovalStatus.DISABLED
+    assert mcp_server_status("x", settings=s, trusted_origin=False) == McpApprovalStatus.DISABLED
 
 
 def test_status_enable_all() -> None:
     s = {"enableAllProjectMcpServers": True}
-    assert mcp_server_status("x", settings=s, bundled=set(), trusted_origin=False) == McpApprovalStatus.ENABLED
+    assert mcp_server_status("x", settings=s, trusted_origin=False) == McpApprovalStatus.ENABLED
 
 
-def test_status_bundled_auto_enabled_even_if_not_listed() -> None:
-    assert mcp_server_status("x", settings={}, bundled={"x"}, trusted_origin=False) == McpApprovalStatus.ENABLED
+def test_status_no_bundled_param_borrowed_name_not_auto_enabled() -> None:
+    """#148（P0 安全）：档④「bundled 名集免批准」已删除。审批门**不再感知**账本 bundled 名——一个 untrusted
+    workspace（project/local）origin 且不在 enabled 名单的 server，无论是否与某已装 plugin 的 bundled server 同名，
+    一律走普通门控 → PENDING（弹框），杜绝借名绕过。签名收敛回归见 :func:`test_mcp_server_status_signature_has_no_bundled`。"""
+    # 即便调用方"以为"名叫 "audit-mcp" 的 server 被某 plugin bundle 过：纯函数无 bundled 入参、无从据此放行。
+    assert mcp_server_status("audit-mcp", settings={}, trusted_origin=False) == McpApprovalStatus.PENDING
 
 
-def test_status_disabled_overrides_bundled() -> None:
-    """disabled（显式拒绝）优先于 bundled 免批准。"""
-    s = {"disabledMcpjsonServers": ["x"]}
-    assert mcp_server_status("x", settings=s, bundled={"x"}, trusted_origin=False) == McpApprovalStatus.DISABLED
+def test_mcp_server_status_signature_has_no_bundled() -> None:
+    """F8 可验收信号：门函数签名 **MUST NOT** 含 ``bundled`` 入参（防档④以等价形状复活）。"""
+    import inspect
+
+    assert "bundled" not in inspect.signature(mcp_server_status).parameters
+    assert "bundled" not in inspect.signature(gate_mcp_servers).parameters
+
+
+def test_bundled_mcp_server_names_removed() -> None:
+    """F8 可验收信号：``bundled_mcp_server_names()`` **不存在**（"函数不存在"比"文档说别用"强）。"""
+    import a2c_smcp.computer.settings.mcp_config as mcp_config_mod
+
+    assert not hasattr(mcp_config_mod, "bundled_mcp_server_names")
 
 
 def test_status_trusted_origin_auto_enabled() -> None:
-    assert mcp_server_status("x", settings={}, bundled=set(), trusted_origin=True) == McpApprovalStatus.ENABLED
+    assert mcp_server_status("x", settings={}, trusted_origin=True) == McpApprovalStatus.ENABLED
 
 
 def test_status_policy_deny() -> None:
     s = {"deniedMcpServers": ["x"], "enabledMcpjsonServers": ["x"]}
-    assert mcp_server_status("x", settings=s, bundled={"x"}, trusted_origin=True) == McpApprovalStatus.DISABLED
+    assert mcp_server_status("x", settings=s, trusted_origin=True) == McpApprovalStatus.DISABLED
 
 
 def test_status_policy_allow_whitelist() -> None:
     s = {"allowedMcpServers": ["other"]}  # 非空白名单且 x 不在内 → disabled
-    assert mcp_server_status("x", settings=s, bundled=set(), trusted_origin=True) == McpApprovalStatus.DISABLED
+    assert mcp_server_status("x", settings=s, trusted_origin=True) == McpApprovalStatus.DISABLED
     s2 = {"allowedMcpServers": ["x"]}
-    assert mcp_server_status("x", settings=s2, bundled=set(), trusted_origin=False) == McpApprovalStatus.PENDING
+    assert mcp_server_status("x", settings=s2, trusted_origin=False) == McpApprovalStatus.PENDING
 
 
 def test_gate_mcp_servers_maps_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,26 +282,8 @@ def test_gate_mcp_servers_maps_all(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _write_json(tmp_path / ".tfrobot" / "mcp.json", _mcp_doc(servers={"proj-srv": _stdio()}))
     monkeypatch.chdir(tmp_path)
     out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
-    statuses = gate_mcp_servers(out, settings={}, bundled=set())
+    statuses = gate_mcp_servers(out, settings={})
     assert statuses == {"user-srv": McpApprovalStatus.ENABLED, "proj-srv": McpApprovalStatus.PENDING}
-
-
-# ── bundled 接缝 ──────────────────────────────────────────────────────────────
-def test_bundled_mcp_server_names_union(tmp_path: Path) -> None:
-    save_installed_plugins(
-        {
-            "plugins": {
-                "a@mp": [{"scope": "user", "installPath": "/x", "bundledMcpServers": ["figma", "blender"]}],
-                "b@mp": [{"scope": "user", "installPath": "/y", "bundledMcpServers": ["blender", "godot"]}],
-            }
-        },
-        home=tmp_path,
-    )
-    assert bundled_mcp_server_names(home=tmp_path) == {"figma", "blender", "godot"}
-
-
-def test_bundled_mcp_server_names_empty(tmp_path: Path) -> None:
-    assert bundled_mcp_server_names(home=tmp_path) == set()
 
 
 # ── 批准写助手（local scope）─────────────────────────────────────────────────
@@ -326,10 +317,10 @@ def test_approve_all_sets_bool_local(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def test_approve_then_resolve_settings_flips_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """approve roundtrip：写 local enabled → 再判定 status 由 pending→enabled（接缝验证）。"""
     monkeypatch.chdir(tmp_path)
-    assert mcp_server_status("figma", settings={}, bundled=set(), trusted_origin=False) == McpApprovalStatus.PENDING
+    assert mcp_server_status("figma", settings={}, trusted_origin=False) == McpApprovalStatus.PENDING
     approve_mcp_server("figma")
     enabled = _read_local_settings(tmp_path)["enabledMcpjsonServers"]
-    after = mcp_server_status("figma", settings={"enabledMcpjsonServers": enabled}, bundled=set(), trusted_origin=False)
+    after = mcp_server_status("figma", settings={"enabledMcpjsonServers": enabled}, trusted_origin=False)
     assert after == McpApprovalStatus.ENABLED
 
 
@@ -417,7 +408,7 @@ def test_upsert_new_lands_requested_scope(
     env = _env(tmp_path)
     monkeypatch.chdir(tmp_path)
     body = _stdio("node")
-    res = upsert_mcp_server("figma", body, scope=scope, env=env, home=tmp_path)
+    res = upsert_mcp_server("figma", body, scope=scope, env=env)
     assert res == McpUpsertResult(scope=scope, changed=True)
     doc = _read_mcp(path_of(tmp_path))  # type: ignore[operator]
     assert doc == {"servers": {"figma": body}, "inputs": []}
@@ -431,7 +422,7 @@ def test_upsert_writes_raw_unrendered_body(tmp_path: Path, monkeypatch: pytest.M
         "type": "stdio",
         "server_parameters": {"command": "node", "env": {"TOK": "${input:tok}", "HM": "${env:HOME}"}},
     }
-    upsert_mcp_server("srv", body, scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    upsert_mcp_server("srv", body, scope=McpWriteScope.LOCAL, env=env)
     stored = _read_mcp(_local_mcp(tmp_path))["servers"]["srv"]
     assert stored["server_parameters"]["env"] == {"TOK": "${input:tok}", "HM": "${env:HOME}"}  # 未渲染
 
@@ -441,7 +432,7 @@ def test_upsert_existing_lands_origin_scope(tmp_path: Path, monkeypatch: pytest.
     env = _env(tmp_path)
     monkeypatch.chdir(tmp_path)
     _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("old")}))  # origin=user
-    res = upsert_mcp_server("figma", _stdio("new"), scope=McpWriteScope.PROJECT, env=env, home=tmp_path)
+    res = upsert_mcp_server("figma", _stdio("new"), scope=McpWriteScope.PROJECT, env=env)
     assert res.scope == McpWriteScope.USER and res.changed is True  # 落 origin(user)，非请求(project)
     assert _read_mcp(_user_mcp(tmp_path))["servers"]["figma"]["server_parameters"]["command"] == "new"
     assert not _proj_mcp(tmp_path).exists()  # 请求的 project scope 未被创建（无 scope 漂移）
@@ -452,25 +443,12 @@ def test_upsert_unchanged_content_is_noop(tmp_path: Path, monkeypatch: pytest.Mo
     env = _env(tmp_path)
     monkeypatch.chdir(tmp_path)
     body = _stdio("node")
-    assert upsert_mcp_server("figma", body, scope=McpWriteScope.LOCAL, env=env, home=tmp_path).changed is True
+    assert upsert_mcp_server("figma", body, scope=McpWriteScope.LOCAL, env=env).changed is True
     path = _local_mcp(tmp_path)
     mtime = path.stat().st_mtime_ns
-    second = upsert_mcp_server("figma", dict(body), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    second = upsert_mcp_server("figma", dict(body), scope=McpWriteScope.LOCAL, env=env)
     assert second == McpUpsertResult(scope=McpWriteScope.LOCAL, changed=False)
     assert path.stat().st_mtime_ns == mtime  # 未重写、无 churn
-
-
-def test_upsert_bundled_name_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """bundled server 名（plugin ledger 派生）→ 拒写 McpWriteTargetError，且不落盘。"""
-    env = _env(tmp_path)
-    monkeypatch.chdir(tmp_path)
-    save_installed_plugins(
-        {"plugins": {"a@mp": [{"scope": "user", "installPath": "/x", "bundledMcpServers": ["figma"]}]}},
-        home=tmp_path,
-    )
-    with pytest.raises(McpWriteTargetError):
-        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
-    assert not _local_mcp(tmp_path).exists()  # 拒写发生在落盘前
 
 
 def test_remove_clears_all_writable_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -517,7 +495,7 @@ def test_upsert_over_corrupt_target_refuses_no_clobber(tmp_path: Path, monkeypat
     lp.parent.mkdir(parents=True, exist_ok=True)
     lp.write_text(corrupt, encoding="utf-8")
     with pytest.raises(McpConfigCorruptError):
-        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env)
     assert lp.read_text(encoding="utf-8") == corrupt  # 逐字节未动（无覆盖、无备份丢失）
 
 
@@ -528,7 +506,7 @@ def test_upsert_over_malformed_field_refuses(tmp_path: Path, monkeypatch: pytest
     lp = _local_mcp(tmp_path)
     _write_json(lp, {"servers": ["oops-not-a-map"], "inputs": []})
     with pytest.raises(McpConfigCorruptError):
-        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.LOCAL, env=env)
     assert _read_mcp(lp)["servers"] == ["oops-not-a-map"]  # 原样保留
 
 
@@ -543,7 +521,7 @@ def test_upsert_existing_policy_origin_falls_back_to_requested(tmp_path: Path, m
         "a2c_smcp.computer.settings.mcp_config.managed_mcp_config_path",
         lambda platform=None: managed,
     )
-    res = upsert_mcp_server("figma", _stdio("user-cmd"), scope=McpWriteScope.USER, env=env, home=tmp_path)
+    res = upsert_mcp_server("figma", _stdio("user-cmd"), scope=McpWriteScope.USER, env=env)
     assert res.scope == McpWriteScope.USER and res.changed is True  # 回落请求 scope（user）
     assert _read_mcp(_user_mcp(tmp_path))["servers"]["figma"]["server_parameters"]["command"] == "user-cmd"
     # shadow 语义：user 定义落盘了，但 policy 读优先级最高 → 有效配置仍是 policy-cmd（changed=True 却被遮蔽）。
@@ -557,7 +535,7 @@ def test_upsert_existing_same_scope_in_place_change(tmp_path: Path, monkeypatch:
     env = _env(tmp_path)
     monkeypatch.chdir(tmp_path)
     _write_json(_local_mcp(tmp_path), _mcp_doc(servers={"figma": _stdio("old"), "keep": _stdio()}))
-    res = upsert_mcp_server("figma", _stdio("new"), scope=McpWriteScope.LOCAL, env=env, home=tmp_path)
+    res = upsert_mcp_server("figma", _stdio("new"), scope=McpWriteScope.LOCAL, env=env)
     assert res == McpUpsertResult(scope=McpWriteScope.LOCAL, changed=True)
     doc = _read_mcp(_local_mcp(tmp_path))
     assert doc["servers"]["figma"]["server_parameters"]["command"] == "new"

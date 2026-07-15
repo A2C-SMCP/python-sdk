@@ -16,8 +16,8 @@ transient 不落盘 / 投影不回写——逐条与 rust 对应用例**同结�
   1. durable add 落盘对拍：``aadd_or_aupdate_server`` → ``mcp.local.json`` raw 未渲染；``_in_scope(PROJECT)`` → git 层；
      改已有落 origin。（rust ``add_or_update_server`` / ``add_or_update_server_in_scope``）
   2. 重启存活：durable 声明经模拟 boot（``run_mcp_approval``）后仍在运行期投影。（rust 重启存活断言）
-  3. remove 复活守护：人写 mcp.json 声明 → ``aremove_server`` 删所有可写 scope → 再 boot **不复活**；bundled 拒删。
-     （rust ``8f4229a`` 复活守护测试自足 + ``Synthesized`` 拒删）
+  3. remove 复活守护：人写 mcp.json 声明 → ``aremove_server`` 删所有可写 scope → 再 boot **不复活**；无声明的运行期
+     投影拒删（#148 origin 判据）。（rust ``8f4229a`` 复活守护测试自足 + ``Synthesized`` 拒删）
   4. transient 不落盘：``amount_server`` / ``aunmount_server`` 前后 mcp 文件字节不变、只运行期投影变。（rust ``mount_server``）
   5. 投影调用方不回写：boot 挂载已声明 server 后用户 mcp.json 层 diff 干净。（#138 ③ 守护）
 
@@ -41,6 +41,7 @@ from a2c_smcp.computer.settings.mcp_config import (
     McpWriteScope,
     McpWriteTargetError,
     mcp_write_path,
+    resolve_mcp_config,
 )
 
 
@@ -236,12 +237,13 @@ async def test_alignment_remove_deletes_all_scopes_and_no_resurrection(
 
 
 @pytest.mark.asyncio
-async def test_alignment_remove_rejects_bundled_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """bundled 身份 ``aremove_server`` → 拒删（对应 rust ``WriteTargetError::Synthesized``）。"""
+async def test_alignment_remove_rejects_undeclared_runtime_projection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """无用户侧声明却运行期活跃的投影（plugin/治理）``aremove_server`` → 拒删（**origin 判据**，不按账本名集；
+    对应 rust ``WriteTargetError::Synthesized``，#148/F3 取代历史 name-keyed bundled 拒删）。"""
     _isolate(tmp_path, monkeypatch)
-    monkeypatch.setattr("a2c_smcp.computer.computer.bundled_mcp_server_names", lambda **_: {"figma"})
     comp = _comp(tmp_path)
-    await comp.amount_server(_stdio_dict("figma", "/bin/figma"))  # 运行期投影一条 bundled（bundle_id=="figma"）
+    await comp.amount_server(_stdio_dict("figma", "/bin/figma"))  # 无盘声明的运行期投影（bundle_id=="figma"）
+    assert "figma" not in resolve_mcp_config(env=os.environ).servers, "前置：盘上无任何 figma 声明"
 
     with pytest.raises(McpWriteTargetError):
         await comp.aremove_server("figma")

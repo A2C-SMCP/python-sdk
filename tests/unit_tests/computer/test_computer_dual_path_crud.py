@@ -12,7 +12,8 @@
 - ``aadd_or_aupdate_server``：默认落 **Local**（``mcp.local.json``）、重投影可读、重启存活、**raw 未渲染**（D1）。
 - ``aadd_or_aupdate_server_in_scope(Project)``：落 git 共享层（``mcp.json``）。
 - ``amount_server``：**不落盘**（纯运行期投影）。
-- ``aremove_server``：删**所有可写 scope** 声明 + 运行期停摘；**bundled 身份拒删**；**改已有恒落 origin**。
+- ``aremove_server``：**声明优先 origin 判据**（#148）——有用户侧声明 ⇒ 删所有可写 scope + 停摘；无声明但运行期
+  活跃（plugin/治理投影）⇒ 拒删导向 ``plugin uninstall``；无声明且未活跃 ⇒ no-op。**改已有恒落 origin**。
 
 隔离：``monkeypatch.chdir(tmp)`` 锚 project/local（#116）、``XDG_CONFIG_HOME`` → tmp 锚 user；``auto_connect=False``
 免拉起真实进程（``_amount_rendered`` 仅入册配置、不 spawn）。
@@ -195,23 +196,50 @@ async def test_aremove_server_absent_is_noop(tmp_path: Path, monkeypatch: pytest
         assert not mcp_write_path(scope, env=os.environ).exists()
 
 
-# ── durable: aremove_server bundled 身份拒删 ────────────────────────────────────────────────────────
+# ── durable: aremove_server 无声明 + 运行期活跃 → 拒删（origin 判据，非账本名集）─────────────────────
 @pytest.mark.asyncio
-async def test_aremove_server_rejects_bundled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _isolate(tmp_path, monkeypatch)
-    # 令 "figma" 命中 ledger 派生 bundled 集（隔离 Computer 的拒删分支，不需真装 plugin）。
-    monkeypatch.setattr("a2c_smcp.computer.computer.bundled_mcp_server_names", lambda **_: {"figma"})
+async def test_aremove_server_rejects_undeclared_runtime_projection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#148/F3：durable rm 一个「运行期活跃却无用户侧 mcp.json 声明」的运行期投影 → 拒删、导向显式停用
+    （``origin == plugin`` 的可观测等价，**不**按账本名集判定）；拒删后投影仍在（未误停摘）。
 
+    **架构限制显式化**：manager 不存 provenance，本 scope（#148 不依赖 #153/#154）无法区分 plugin 投影 vs 纯 transient
+    （``--config @file`` 预加载 / 裸 ``amount_server``）。此处裸 ``amount_server`` 挂载即「非 plugin 的纯 transient」，
+    **同样被拒**——这是保守拒删的**已知过宽**（宁可拒删导向显式停用，也不越权停摘一个非用户声明的投影），非缺陷。"""
+    _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
-    # 运行期投影一条 bundled server（transient；bundle_id("figma") == "figma"）。
+    # transient 投影一条**无盘声明**的 server（裸 amount_server = 非 plugin 纯 transient；bundle_id("figma") == "figma"）。
     await comp.amount_server(_stdio_dict("figma", "/bin/figma"))
+    assert "figma" not in resolve_mcp_config(env=os.environ).servers, "前置：盘上无任何 figma 声明"
 
     with pytest.raises(McpWriteTargetError):
         await comp.aremove_server("figma")
 
-    # 拒删后运行期投影仍在（未被误停摘）。
+    # 拒删后运行期投影仍在（未被误停摘）；且未产生任何落盘写。
     assert comp.mcp_manager is not None
     assert any(c.name == "figma" for c in comp.mcp_manager.server_configs())
+    for scope in (McpWriteScope.LOCAL, McpWriteScope.PROJECT, McpWriteScope.USER):
+        assert not mcp_write_path(scope, env=os.environ).exists()
+
+
+# ── durable: aremove_server 用户侧有声明 → 放行（误伤修复：即便名撞某 bundled）─────────────────────────
+@pytest.mark.asyncio
+async def test_aremove_server_allows_user_declared_even_if_name_shadows_bundled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#148/F3 误伤修复：用户侧有声明 ⇒ **放行**（删的是用户自己那条声明 + 停摘），即便该 server 名与某 plugin
+    的 bundled server 同名——用户覆盖权优先（runtime-contract §2.5）。历史 name-keyed 守卫会误伤此路径（同名即拒）。"""
+    _isolate(tmp_path, monkeypatch)
+    comp = _comp(tmp_path)
+    # durable add：写 local mcp.json 声明 + 运行期挂载（用户自己加的 server）。
+    await comp.aadd_or_aupdate_server(_stdio_dict("figma", "/bin/figma"))
+    assert "figma" in resolve_mcp_config(env=os.environ).servers, "用户侧有声明"
+    assert comp.mcp_manager is not None
+    assert any(c.name == "figma" for c in comp.mcp_manager.server_configs())
+
+    # 放行：删所有可写 scope 声明 + 停摘（不抛）。
+    await comp.aremove_server("figma")
+    assert "figma" not in resolve_mcp_config(env=os.environ).servers, "用户声明已删净"
+    assert not any(c.name == "figma" for c in comp.mcp_manager.server_configs()), "运行期投影已停摘"
 
 
 # ── durable: 改已有 server 恒落其 origin scope（新 scope 只作用于新声明）─────────────────────────────
@@ -263,11 +291,14 @@ async def test_aunmount_server_manager_none_is_noop(tmp_path: Path, monkeypatch:
     assert comp.mcp_manager is None
 
 
-# ── durable: aremove_server 无盘上声明但仍停摘运行期投影 ─────────────────────────────────────────────
+# ── durable: aremove_server 对无声明的运行期投影不再静默停摘（#148 取代 #137 旧契约）──────────────────
 @pytest.mark.asyncio
-async def test_aremove_server_unmounts_runtime_projection_without_disk_declaration(
+async def test_aremove_server_no_longer_silently_unmounts_undeclared_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """**契约变更（#148 取代 #137）**：durable ``aremove_server`` 对「运行期活跃却无盘声明」的投影**不再静默停摘**
+    （旧行为），改为**拒删**并导向 ``plugin uninstall``——纯运行期停摘是 :meth:`aunmount_server_by_id` 的职责，
+    durable rm 只操作声明面。这样才拦得住「借 durable rm 单独打掉某 bundled server 产生半态」（runtime-contract §2.4）。"""
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
     # transient 投影一条（不落盘、无声明）；bundle_id("proj-only") == "proj-only"（连字符合法、不折叠）。
@@ -275,8 +306,9 @@ async def test_aremove_server_unmounts_runtime_projection_without_disk_declarati
     assert comp.mcp_manager is not None
     assert any(c.name == "proj-only" for c in comp.mcp_manager.server_configs())
 
-    # durable remove：盘上无匹配声明 → 落盘 no-op，但仍停摘运行期投影（文档承诺的关键分支）。
-    await comp.aremove_server("proj-only")
-    assert not any(c.name == "proj-only" for c in comp.mcp_manager.server_configs()), "无盘声明也须清运行期投影"
-    for scope in (McpWriteScope.LOCAL, McpWriteScope.PROJECT, McpWriteScope.USER):
-        assert not mcp_write_path(scope, env=os.environ).exists(), "无声明匹配 → 不产生任何落盘写"
+    with pytest.raises(McpWriteTargetError):
+        await comp.aremove_server("proj-only")
+    # 投影仍在（durable rm 未越权停摘）；纯运行期停摘须显式走 aunmount_server_by_id。
+    assert any(c.name == "proj-only" for c in comp.mcp_manager.server_configs())
+    await comp.aunmount_server_by_id("proj-only")
+    assert not any(c.name == "proj-only" for c in comp.mcp_manager.server_configs())
