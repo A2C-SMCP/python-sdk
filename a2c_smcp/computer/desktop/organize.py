@@ -22,7 +22,7 @@ from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextRe
 
 from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import Desktop
-from a2c_smcp.types import SERVER_NAME
+from a2c_smcp.types import BUNDLE_ID
 from a2c_smcp.utils import is_window_uri
 
 __all__ = ["organize_desktop"]
@@ -108,7 +108,7 @@ def _check_audience(res: Resource) -> None:
 
 async def organize_desktop(
     *,
-    windows: list[tuple[SERVER_NAME, Resource, ReadResourceResult]],
+    windows: list[tuple[BUNDLE_ID, Resource, ReadResourceResult]],
     size: int | None,
     history: tuple[ToolCallRecord, ...],
 ) -> list[Desktop]:
@@ -131,7 +131,8 @@ async def organize_desktop(
       5) 全局按 size 截断（None 表示不限；size<=0 则返回空）。
 
     Args:
-        windows (list[tuple[SERVER_NAME, Resource, ReadResourceResult]]): (server_name, resource, detail) 列表。
+        windows (list[tuple[BUNDLE_ID, Resource, ReadResourceResult]]): (bundle_id, resource, detail) 列表
+            ——分组键为 server 唯一身份 **bundle_id**（非可碰撞的 display name），避免同名 server 窗口误并（协议 #18）。
         size (int | None): 期望返回的最大数量；None 表示全部。
         history (tuple[ToolCallRecord, ...]): 最近的工具调用历史（用于服务器顺序）。
 
@@ -146,7 +147,7 @@ async def organize_desktop(
     #    保留原始序号以确定"第一个 fullscreen"。同时过滤无内容的资源（contents 为空时跳过）。
     # Build server->windows mapping; read priority/fullscreen from Resource.annotations/_meta and
     # keep original index to pick the first fullscreen.
-    grouped: dict[SERVER_NAME, list[tuple[Resource, float, bool, int, ReadResourceResult]]] = {}
+    grouped: dict[BUNDLE_ID, list[tuple[Resource, float, bool, int, ReadResourceResult]]] = {}
     for idx, (server, res, detail) in enumerate(windows):
         try:
             contents = detail.contents
@@ -166,8 +167,8 @@ async def organize_desktop(
         grouped.setdefault(server, []).append((res, prio, fullscreen, idx, detail))
 
     # 2) 服务器优先级：根据最近工具调用历史，倒序去重
-    recent_servers: list[SERVER_NAME] = []
-    seen: set[SERVER_NAME] = set()
+    recent_servers: list[BUNDLE_ID] = []
+    seen: set[BUNDLE_ID] = set()
     for rec in reversed(history):  # 最近在前
         srv = rec.get("server")
         if srv in grouped and srv not in seen:
@@ -176,7 +177,7 @@ async def organize_desktop(
 
     # 其余服务器（未在历史中出现）按名称稳定排序追加
     remaining = sorted([s for s in grouped.keys() if s not in seen])
-    server_order: list[SERVER_NAME] = recent_servers + remaining
+    server_order: list[BUNDLE_ID] = recent_servers + remaining
 
     # 3) 每个服务器内按 priority 降序排序
     for srv in server_order:

@@ -579,24 +579,31 @@ class A2CSkillRef(TypedDict):
         Required 4: name/source/path/description (total=True + ``NotRequired[]`` optionals). Producer MUST
         send all 4; Consumer MUST NOT assume any optional field is present.
       - ``name`` 是协议主键（合成全局唯一名，自 0.2.1 起为**裸名**：user 1 段 ``<skill>`` /
-        marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<server>:<skill>``），Agent **MUST**
+        marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<bundle_id>:<skill>``），Agent **MUST**
         当作不透明可比较字符串（**勿**解析结构，判来源用 ``source``）
         ``name`` is the protocol primary key (synthesized globally-unique **bare** name since 0.2.1:
         user 1-seg ``<skill>`` / marketplace 2-seg ``<plugin>:<skill>`` / mcp 3-seg
-        ``mcp:<server>:<skill>``); Agent **MUST** treat it as an opaque comparable string.
+        ``mcp:<bundle_id>:<skill>``); Agent **MUST** treat it as an opaque comparable string.
+      - mcp 形态的 server 段取 **``bundle_id``**（server 唯一身份，= ``get_config.servers`` 字典 key），
+        **非** display ``name``——后者允许碰撞。故 mcp 形态 name 构造上不碰撞，且 Agent 可据 ``source``
+        把一条 SKILL 关联回对应 A2C server（skill.md §1.3，协议 #142 supersede #18 的正交结论）
+        The mcp server segment is the ``bundle_id`` (unique identity), never the collision-allowed display name.
       - ``path`` 必选（staging 落盘是所有 source 的统一第一步，故进入 Registry 的 SKILL 必有可读本地目录）
         ``path`` is required (staging is the unified first step for all sources; any SKILL in Registry
         has a readable local directory).
-      - **无 ``mcp_server`` 字段** —— Agent 侧协议表面与 source 无关；来源追溯由 ``source``（完整
-        provenance，**不**进 ``name``）与（仅 MCP）``uri`` 承担（skill.md §1.6）
-        **No ``mcp_server`` field** — Agent-facing protocol surface is source-agnostic; provenance is
-        carried by ``source`` and (MCP only) ``uri``.
+      - **无 raw display server 名字段** —— Agent 侧协议表面与 source 无关；server 身份由 ``source`` 里的
+        ``bundle_id`` 承载，来源追溯由 ``source``（完整 provenance，**不**进 ``name``）与（仅 MCP）
+        ``uri`` 承担（skill.md §1.6）
+        **No raw display server-name field** — provenance is carried by ``source`` (which embeds the
+        ``bundle_id``) and (MCP only) ``uri``.
     """
 
     # 主键 / Primary key（必选 / required）
-    name: str  # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:tfrobot-tools:code-review`
+    # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:<bundle_id>:<skill>`
+    # （mcp 例：`mcp:tfrobot-tools:code-review`；hash-fallback 例：`mcp:bundle_a1b2c3d4e5f60718:summarize`）
+    name: str
     # 来源元数据 / Provenance（完整溯源；**不**进 name）（必选 / required）
-    source: str  # 如 mcp:tfrobot-tools / marketplace:acme-skills / user
+    source: str  # 如 mcp:<bundle_id>（例 mcp:tfrobot-tools）/ marketplace:acme-skills / user
     uri: NotRequired[str]  # 仅 MCP 来源：skill://host/skill-name；Agent 非权威（skill.md §2）
     # 物化输出 / Materialization output（必选 / required）
     path: str  # 必选：Computer 本地绝对目录路径，面向 Agent SDK（脚本执行/文件访问），LLM 永不可见

@@ -35,11 +35,28 @@ from a2c_smcp.computer.skills.staging import stage_mcp_skills, stage_user_skills
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
+@pytest.fixture
+def staging_logs(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """捕获 staging 模块日志（项目 logger 关闭 propagate，直接挂 handler）/ capture staging logs。"""
+    staging_mod.logger.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG)
+    try:
+        yield caplog
+    finally:
+        staging_mod.logger.removeHandler(caplog.handler)
+
+
 class FakeManager:
-    def __init__(self, pairs: list[tuple[str, Resource]], reads: dict[str, ReadResourceResult] | None = None) -> None:
-        # pairs 的第一元现按 bundle_id 语义（协议 #18）；本 stub 里 bundle_id 与 display name 取同值。
+    def __init__(
+        self,
+        pairs: list[tuple[str, Resource]],
+        reads: dict[str, ReadResourceResult] | None = None,
+        display_names: dict[str, str] | None = None,
+    ) -> None:
+        # pairs 的第一元 = bundle_id（manager 身份键）。
         self._pairs = pairs
         self._reads = reads or {}
+        self._display_names = display_names or {}
 
     async def list_skill_resources(self, bundle_id: str | None = None) -> list[tuple[str, Resource]]:
         return [(s, r) for s, r in self._pairs if bundle_id is None or s == bundle_id]
@@ -48,8 +65,14 @@ class FakeManager:
         return self._reads[str(uri)]
 
     def get_server_config(self, bundle_id: str) -> SimpleNamespace:
-        # SKILL ``<server>`` 段取 server name（协议 #18 正交、不变）；stub 中 name == bundle_id。
-        return SimpleNamespace(name=bundle_id)
+        """display ``name`` **刻意与 bundle_id 分叉**（#142）。
+
+        SKILL ``<server>`` 段 = ``bundle_id`` 原样（skill.md §1.3）。display 名是纯展示、允许碰撞、
+        永不做键——本 stub 默认返回一个既 **不等于** bundle_id、规范化后又 **必然不同**的名字（含空格 /
+        括号），使本文件全部 mcp 用例成为「display 名泄漏进 name / source / 磁盘路径」的回归守卫：
+        任何一处误取 display 名都会立刻在断言上炸开，而非悄悄同值蒙混过关。
+        """
+        return SimpleNamespace(name=self._display_names.get(bundle_id, f"{bundle_id} (display)"))
 
 
 def _skill_md(name: str = "my-skill", description: str = "聚合 CSV") -> str:
@@ -302,6 +325,104 @@ async def test_in_run_name_collision_keeps_first(tmp_path: Path) -> None:
     assert not (final / "b.txt").exists()
 
 
+# ── #142：<server> 段 = bundle_id（协议 skill.md §1.3；supersede #18 正交结论）──────
+async def _mount_skill(tmp_path: Path, dirname: str, skill_name: str, description: str = "d") -> Resource:
+    """建一个 mounted SKILL 包并返回其根 Resource / Build a mounted SKILL package, return its root Resource."""
+    mount = tmp_path / "mount" / dirname
+    mount.mkdir(parents=True)
+    (mount / "SKILL.md").write_text(_skill_md(name=skill_name, description=description), encoding="utf-8")
+    return _root(f"skill://h/{skill_name}", {"source": "mounted", "mount_dir": str(mount)})
+
+
+async def test_mcp_segment_takes_bundle_id_not_display_name(tmp_path: Path) -> None:
+    """``<server>`` 段 / ``source`` / 磁盘路径三处均取 bundle_id 原样，display 名不得泄漏（skill.md §1.3）。
+
+    display 名 ``My Editor`` 若泄漏，旧行为会规范化成 ``My_Editor`` 而非 ``acme-editor``。
+    """
+    res = await _mount_skill(tmp_path, "e", "format")
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    mgr = FakeManager([("acme-editor", res)], display_names={"acme-editor": "My Editor"})
+    names = await stage_mcp_skills(mgr, reg, home)
+
+    assert names == ["mcp:acme-editor:format"]
+    ref = reg.resolve("mcp:acme-editor:format")
+    assert ref is not None
+    assert ref["source"] == "mcp:acme-editor"
+    assert ref["path"] == str(home / "mcp" / "acme-editor" / "format")
+    # display 名不得出现在磁盘布局里 / display name MUST NOT appear on disk
+    assert not (home / "mcp" / "My_Editor").exists()
+
+
+async def test_same_display_name_different_bundle_id_both_visible(tmp_path: Path) -> None:
+    """验收 #2：两个 display 名相同、bundle_id 不同的合法共存 Server，各自 SKILL 均可见、互不拒绝。
+
+    这是本 issue 的核心失效模式：旧实现下二者撞出同一 ``mcp:<display>:<skill>``，§1.5 被迫拒绝
+    第二注册者 → 一个**合法** SKILL 对 Agent 永久隐身。
+    """
+    res_a = await _mount_skill(tmp_path, "a", "review", description="from A")
+    res_b = await _mount_skill(tmp_path, "b", "review", description="from B")
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    mgr = FakeManager(
+        [("editor-a", res_a), ("editor-b", res_b)],
+        # 同一个 display 名——协议允许（name 纯 display、允许碰撞）
+        display_names={"editor-a": "Editor", "editor-b": "Editor"},
+    )
+    names = await stage_mcp_skills(mgr, reg, home)
+
+    assert sorted(names) == ["mcp:editor-a:review", "mcp:editor-b:review"]
+    assert len(reg) == 2  # 无一被「拒绝第二注册者」误杀
+    assert reg.resolve("mcp:editor-a:review")["description"] == "from A"  # type: ignore[index]
+    assert reg.resolve("mcp:editor-b:review")["description"] == "from B"  # type: ignore[index]
+    # 磁盘亦不碰撞（旧实现下两者同为 <home>/mcp/Editor/review）
+    assert (home / "mcp" / "editor-a" / "review" / "SKILL.md").is_file()
+    assert (home / "mcp" / "editor-b" / "review" / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize(
+    ("bundle_id", "desc"),
+    [
+        ("acme-editor", "显式 bundle_id / explicit"),
+        ("bundle_a1b2c3d4e5f60718", "hash-fallback（CJK / 全符号 name 派生）/ hash fallback"),
+        ("My_Server", "auto-derive 保留大小写 / auto-derive, case preserved"),
+        ("a" * 80, "超 64 字符：协议 §1.4 已删该上限，MUST 仍可见 / no length cap"),
+    ],
+)
+async def test_bundle_id_shapes_enter_segment_verbatim(tmp_path: Path, bundle_id: str, desc: str) -> None:
+    """验收 #3：显式 / hash-fallback / auto-derive / 超长 四种 bundle_id 形态均原样进段。"""
+    res = await _mount_skill(tmp_path, "s", "summarize")
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(FakeManager([(bundle_id, res)]), reg, home)
+
+    assert names == [f"mcp:{bundle_id}:summarize"], desc
+    assert reg.resolve(f"mcp:{bundle_id}:summarize")["source"] == f"mcp:{bundle_id}"  # type: ignore[index]
+
+
+async def test_mcp_name_synthesis_failure_skips_only_offender(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """mcp frontmatter ``name`` 非严格 kebab → 该 SKILL 判废（不入册 + 记 ERROR），**合法兄弟仍入册**。
+
+    skill.md §1.5：装配 Registry 时合成失败的 SKILL 不入册、记 ERROR，**不**向 Agent 硬报错——
+    batch 接口须对部分失败健壮，一颗坏苹果不得拖垮同 server 的其余 SKILL。
+    """
+    bad = await _mount_skill(tmp_path, "bad", "Bad-Leaf")  # 大写 → 非严格 kebab
+    good = await _mount_skill(tmp_path, "good", "fine-skill")
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(FakeManager([("srv", bad), ("srv", good)]), reg, home)
+
+    assert names == ["mcp:srv:fine-skill"]  # 合法兄弟不受牵连
+    assert len(reg) == 1
+    assert any("skill name synthesis failed" in r.getMessage() for r in staging_logs.records)
+    # 判废者的 staging 目录已清理，不留半成品 / offender's staging dir cleaned up
+    assert not (home / "mcp" / "srv" / "Bad-Leaf").exists()
+
+
 async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:
     # 无 _meta.source 的 skill:// 资源（子资源 / 未声明）→ 非 SKILL 根 → 跳过
     plain = Resource(uri="skill://h/not-a-root", name="not-a-root")
@@ -312,17 +433,6 @@ async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:
 
 
 # ── user 源 DropIn（就地发现，不 staging，#60）────────────────────────────────
-@pytest.fixture
-def staging_logs(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
-    """捕获 staging 模块日志（项目 logger 关闭 propagate，直接挂 handler）/ capture staging logs。"""
-    staging_mod.logger.addHandler(caplog.handler)
-    caplog.set_level(logging.DEBUG)
-    try:
-        yield caplog
-    finally:
-        staging_mod.logger.removeHandler(caplog.handler)
-
-
 def _write_user_skill(root: Path, skill_dir_name: str, *, fm_name: str | None = None, description: str = "do thing") -> Path:
     """在发现根下写一个 ``<skill_dir_name>/SKILL.md`` / write a DropIn skill dir under a root。"""
     d = root / skill_dir_name

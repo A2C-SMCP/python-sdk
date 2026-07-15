@@ -132,7 +132,15 @@ class BaseMCPServerConfig(BaseModel):
         return validate_explicit_bundle_id(v)
 
     def __hash__(self) -> int:
-        """对于MCP Server配置，以name作为唯一标识凭证，如果name相同则表示完全相同"""
+        """以 ``name`` 作**哈希桶**键——**不**是身份判定 / Hash bucket only, NOT an identity claim.
+
+        身份是 ``bundle_id``（BundleID 模型，协议 #18）：``name`` 已降级为纯 display、**允许碰撞**，
+        故同名 ≠ 同一 Server。这里仍按 ``name`` 取哈希是**合法且安全**的——相等性由 Pydantic 的
+        全字段 ``__eq__`` 判定，同名不同 config 只是落进同一哈希桶（碰撞），在 ``set`` 中**仍各自共存**，
+        不会被误去重。真正的 Server 去重（no-double-open）由 Manager 按 ``bundle_id`` 负责，不在此处。
+        Equal objects always share a name ⇒ the hash contract holds; same-name-different-config
+        entries merely collide in a bucket and still coexist in a ``set``.
+        """
         return hash(self.name)
 
 

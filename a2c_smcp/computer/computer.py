@@ -131,7 +131,9 @@ class Computer(BaseComputer[PromptSession]):
         初始化 Computer 实例
         Initialize Computer instance
 
-        MCP Server使用set来管理配置项，注意配置项基类里有定义，如果配置name相同表示完全相同（重写了__hash__方法）
+        MCP Server 使用 set 管理配置项。注意基类重写了 __hash__ 并以 name 取哈希，但那**仅是哈希桶**、非身份判定：
+        相等性走 Pydantic 全字段 __eq__，同名不同 config 只是碰撞、在 set 中各自共存。Server 唯一身份是
+        bundle_id（协议 #18），去重（no-double-open）由 Manager 按 bundle_id 负责。
 
         The MCP Server configuration is in the form of a dictionary to help users reduce the possibility of duplicate
         configuration, and it is recommended to use the name of the MCP Server as the key to avoid duplicate
@@ -557,24 +559,24 @@ class Computer(BaseComputer[PromptSession]):
         pairs = await self.mcp_manager.list_skill_resources()
         return {str(res.uri) for _srv, res in pairs}
 
-    async def _restage_mcp_skills(self, server_name: str | None = None) -> list[str]:
+    async def _restage_mcp_skills(self, bundle_id: str | None = None) -> list[str]:
         """
         物化 mcp 源 ``skill://`` → 注册进 :class:`SkillRegistry` / Materialize & register mcp-source skills。
 
-        全量重物化（``server_name is None``）后做孤儿对账：本轮未出现的 mcp 源 SKILL → 标孤儿
+        全量重物化（``bundle_id is None``）后做孤儿对账：本轮未出现的 mcp 源 SKILL → 标孤儿
         （从 ``get_skills`` 排除，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无 manager → 空列表。
         Full restage reconciles orphans: mcp-source skills absent this run are marked orphaned.
 
         Args:
-            server_name: 若提供仅重物化该 server（单 server 重枚举）；否则全部活跃 server + 孤儿对账。
+            bundle_id: 若提供仅重物化该 server（单 server 重枚举）；否则全部活跃 server + 孤儿对账。
 
         Returns:
             list[str]: 本轮成功注册（或刷新）的 SKILL name 列表。
         """
         if not self.mcp_manager or self._skill_home is None:
             return []
-        registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, server_name=server_name)
-        if server_name is None:
+        registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, bundle_id=bundle_id)
+        if bundle_id is None:
             self._reconcile_orphans(set(registered), lambda s: s.startswith("mcp:"))
         return registered
 
@@ -1242,7 +1244,7 @@ class Computer(BaseComputer[PromptSession]):
             raise RuntimeError("当前MCP Manager为空")
         # 中文: 统一记录输出，保证任何返回路径都能记录历史
         # English: Unify return to ensure we always record call history
-        server_name, tool_name = await self.mcp_manager.avalidate_tool_call(tool_name, parameters)
+        bundle_id, tool_name = await self.mcp_manager.avalidate_tool_call(tool_name, parameters)
 
         ts = datetime.now(UTC).isoformat()
         success: bool = False
@@ -1251,18 +1253,18 @@ class Computer(BaseComputer[PromptSession]):
         try:
             # 中文: 通过 Manager 获取合并后的 ToolMeta（specific 优先，缺失字段回落 default_tool_meta）
             # English: Use Manager to get merged ToolMeta (specific overrides; fallback to default_tool_meta)
-            merged_meta = self.mcp_manager.get_tool_meta(server_name, tool_name)
+            merged_meta = self.mcp_manager.get_tool_meta(bundle_id, tool_name)
 
             # 中文: 仅当合并结果的 auto_apply 显式为 True 时直接执行；否则进入二次确认流程
             # English: Only execute directly if merged auto_apply is explicitly True; otherwise require confirmation
             if merged_meta is not None and merged_meta.auto_apply is True:
-                result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
+                result = await self._acall_tool_cancellable(req_id, bundle_id, tool_name, parameters, timeout)
             else:
                 # 除非明确允许 auto_apply 否则均需要调用二次确认回调进行确认
                 # Unless auto_apply is explicitly allowed, require confirm callback
                 if self._confirm_callback:
                     try:
-                        apply = self._confirm_callback(req_id, server_name, tool_name, parameters)
+                        apply = self._confirm_callback(req_id, bundle_id, tool_name, parameters)
                     except TimeoutError:
                         # 二次确认「等待」超时（工具从未执行）：刻意**不**打 ``a2c_timeout`` 标记——协议
                         # error-handling.md「Computer 端超时」语义界定为工具**执行**超时，此处属确认等待超时，
@@ -1283,7 +1285,7 @@ class Computer(BaseComputer[PromptSession]):
                         )
                     else:
                         if apply:
-                            result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
+                            result = await self._acall_tool_cancellable(req_id, bundle_id, tool_name, parameters, timeout)
                         else:
                             result = CallToolResult(content=[TextContent(text="工具调用二次确认被拒绝，请稍后再试", type="text")])
                 else:
@@ -1334,7 +1336,7 @@ class Computer(BaseComputer[PromptSession]):
                 {
                     "timestamp": ts,
                     "req_id": req_id,
-                    "server": server_name,
+                    "server": bundle_id,
                     "tool": tool_name,
                     "parameters": parameters,
                     "timeout": timeout,
@@ -1348,7 +1350,7 @@ class Computer(BaseComputer[PromptSession]):
     async def _acall_tool_cancellable(
         self,
         req_id: str,
-        server_name: str,
+        bundle_id: str,
         tool_name: str,
         parameters: dict,
         timeout: float | None,
@@ -1380,7 +1382,7 @@ class Computer(BaseComputer[PromptSession]):
         if self.mcp_manager is None:
             raise RuntimeError("当前MCP Manager为空")
         inner: asyncio.Task[CallToolResult] = asyncio.ensure_future(
-            self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout),
+            self.mcp_manager.acall_tool(bundle_id, tool_name, parameters, timeout),
         )
         self._inflight_tool_tasks[req_id] = inner
         try:
@@ -1454,7 +1456,7 @@ class Computer(BaseComputer[PromptSession]):
         pagination is caller-driven via cursor.
 
         Args:
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name.
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id.
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page.
 
         Returns:
@@ -1690,8 +1692,8 @@ class Computer(BaseComputer[PromptSession]):
             logger.warning("MCP 管理器尚未初始化，返回空桌面 / MCP manager not initialized, return empty desktop")
             return []
 
-        # 1) 从 Manager 拉取窗口资源“及其详情”（含归属 server 元数据）
-        #    Fetch window resources WITH their details (and owning server name)
+        # 1) 从 Manager 拉取窗口资源“及其详情”（含归属 server 的 bundle_id——desktop 按 bundle_id 分组，协议 #18）
+        #    Fetch window resources WITH their details (and the owning server's bundle_id)
         windows = await self.mcp_manager.get_windows_details(window_uri)
 
         # 2) 读取近期工具调用历史，供组织策略使用
