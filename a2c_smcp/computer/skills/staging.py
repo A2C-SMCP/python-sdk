@@ -463,8 +463,10 @@ async def stage_mcp_skills(
 
     registered: list[str] = []
     seen_this_run: set[str] = set()  # 本 run 已处理的合成 name，用于真冲突检测（§1.5 保留先到者）
-    for bundle_id, resources in by_server.items():
-        # bundle_id = manager 身份键，同时即 SKILL ``<server>`` 段与磁盘路径分组键（skill.md §1.3）。
+    # 循环变量刻意用 `bid` 而非 `bundle_id`：后者是本函数形参（单 server 过滤器），同名重绑定会让
+    # 循环后任何对形参的读取静默拿到「最后一个 server 的 id」。
+    for bid, resources in by_server.items():
+        # bid = manager 身份键，同时即 SKILL ``<server>`` 段与磁盘路径分组键（skill.md §1.3）。
         # display ``name`` 纯展示、允许碰撞、永不做键——不参与此处任何构造。
         for res in resources:
             meta = dict(getattr(res, "meta", None) or {})
@@ -478,7 +480,7 @@ async def stage_mcp_skills(
                 logger.error("skill root URI has no path segment, skipped: %s", root_uri)
                 continue
 
-            staged = mcp_skill_dir(home, bundle_id, leaf)
+            staged = mcp_skill_dir(home, bid, leaf)
             try:
                 if mode == "mounted":
                     _materialize_mounted(meta, staged)
@@ -486,13 +488,13 @@ async def stage_mcp_skills(
                     await _materialize_archive(meta, staged, fetch)
                 else:  # resources
                     subs = [r for r in resources if str(r.uri).startswith(root_uri + "/")]
-                    await _materialize_resources(partial(manager.read_resource, bundle_id), root_uri, subs, staged)
+                    await _materialize_resources(partial(manager.read_resource, bid), root_uri, subs, staged)
             except Exception as e:
                 logger.error("materialize failed for %s (mode=%s): %s", root_uri, mode, e, exc_info=True)
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
 
-            name = _finalize_and_register(bundle_id, meta, staged, root_uri, home, registry, seen_this_run)
+            name = _finalize_and_register(bid, meta, staged, root_uri, home, registry, seen_this_run)
             if name is not None:
                 registered.append(name)
     return registered

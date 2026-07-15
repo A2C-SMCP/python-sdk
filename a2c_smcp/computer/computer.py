@@ -1244,7 +1244,7 @@ class Computer(BaseComputer[PromptSession]):
             raise RuntimeError("当前MCP Manager为空")
         # 中文: 统一记录输出，保证任何返回路径都能记录历史
         # English: Unify return to ensure we always record call history
-        server_name, tool_name = await self.mcp_manager.avalidate_tool_call(tool_name, parameters)
+        bundle_id, tool_name = await self.mcp_manager.avalidate_tool_call(tool_name, parameters)
 
         ts = datetime.now(UTC).isoformat()
         success: bool = False
@@ -1253,18 +1253,18 @@ class Computer(BaseComputer[PromptSession]):
         try:
             # 中文: 通过 Manager 获取合并后的 ToolMeta（specific 优先，缺失字段回落 default_tool_meta）
             # English: Use Manager to get merged ToolMeta (specific overrides; fallback to default_tool_meta)
-            merged_meta = self.mcp_manager.get_tool_meta(server_name, tool_name)
+            merged_meta = self.mcp_manager.get_tool_meta(bundle_id, tool_name)
 
             # 中文: 仅当合并结果的 auto_apply 显式为 True 时直接执行；否则进入二次确认流程
             # English: Only execute directly if merged auto_apply is explicitly True; otherwise require confirmation
             if merged_meta is not None and merged_meta.auto_apply is True:
-                result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
+                result = await self._acall_tool_cancellable(req_id, bundle_id, tool_name, parameters, timeout)
             else:
                 # 除非明确允许 auto_apply 否则均需要调用二次确认回调进行确认
                 # Unless auto_apply is explicitly allowed, require confirm callback
                 if self._confirm_callback:
                     try:
-                        apply = self._confirm_callback(req_id, server_name, tool_name, parameters)
+                        apply = self._confirm_callback(req_id, bundle_id, tool_name, parameters)
                     except TimeoutError:
                         # 二次确认「等待」超时（工具从未执行）：刻意**不**打 ``a2c_timeout`` 标记——协议
                         # error-handling.md「Computer 端超时」语义界定为工具**执行**超时，此处属确认等待超时，
@@ -1285,7 +1285,7 @@ class Computer(BaseComputer[PromptSession]):
                         )
                     else:
                         if apply:
-                            result = await self._acall_tool_cancellable(req_id, server_name, tool_name, parameters, timeout)
+                            result = await self._acall_tool_cancellable(req_id, bundle_id, tool_name, parameters, timeout)
                         else:
                             result = CallToolResult(content=[TextContent(text="工具调用二次确认被拒绝，请稍后再试", type="text")])
                 else:
@@ -1336,7 +1336,7 @@ class Computer(BaseComputer[PromptSession]):
                 {
                     "timestamp": ts,
                     "req_id": req_id,
-                    "server": server_name,
+                    "server": bundle_id,
                     "tool": tool_name,
                     "parameters": parameters,
                     "timeout": timeout,
@@ -1350,7 +1350,7 @@ class Computer(BaseComputer[PromptSession]):
     async def _acall_tool_cancellable(
         self,
         req_id: str,
-        server_name: str,
+        bundle_id: str,
         tool_name: str,
         parameters: dict,
         timeout: float | None,
@@ -1382,7 +1382,7 @@ class Computer(BaseComputer[PromptSession]):
         if self.mcp_manager is None:
             raise RuntimeError("当前MCP Manager为空")
         inner: asyncio.Task[CallToolResult] = asyncio.ensure_future(
-            self.mcp_manager.acall_tool(server_name, tool_name, parameters, timeout),
+            self.mcp_manager.acall_tool(bundle_id, tool_name, parameters, timeout),
         )
         self._inflight_tool_tasks[req_id] = inner
         try:
@@ -1692,8 +1692,8 @@ class Computer(BaseComputer[PromptSession]):
             logger.warning("MCP 管理器尚未初始化，返回空桌面 / MCP manager not initialized, return empty desktop")
             return []
 
-        # 1) 从 Manager 拉取窗口资源“及其详情”（含归属 server 元数据）
-        #    Fetch window resources WITH their details (and owning server name)
+        # 1) 从 Manager 拉取窗口资源“及其详情”（含归属 server 的 bundle_id——desktop 按 bundle_id 分组，协议 #18）
+        #    Fetch window resources WITH their details (and the owning server's bundle_id)
         windows = await self.mcp_manager.get_windows_details(window_uri)
 
         # 2) 读取近期工具调用历史，供组织策略使用

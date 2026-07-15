@@ -46,6 +46,8 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from a2c_smcp.utils.bundle_id import is_valid_bundle_id
+
 # 段最大长度（skill.md §1.4：各段 1–64）/ Max per-segment length (skill.md §1.4: 1–64).
 MAX_SEGMENT_LEN = 64
 
@@ -59,8 +61,8 @@ MCP_SEGMENT = "mcp"
 # Strict kebab (leaf / plugin segments): lowercase alnum, single-hyphen separated.
 _STRICT_KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-# mcp <server> 段（= bundle_id）字符集（大小写保留）/ mcp <server> (= bundle_id) charset (case preserved).
-_MCP_SERVER_SEG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# 注意 / Note：mcp <server> 段的字符集**不在此处定义**——它就是 bundle_id，判据单一权威在
+# a2c_smcp.utils.bundle_id.is_valid_bundle_id（见 _is_valid_mcp_server_segment）。
 
 SkillNameKind = Literal["user", "marketplace", "mcp"]
 
@@ -72,8 +74,9 @@ class SkillNameError(ValueError):
     映射协议 ``4016 Invalid Skill Name``（error-handling.md §4016，``details.name`` 透传非法 name）。
     Maps to protocol ``4016 Invalid Skill Name`` (``details.name`` carries the offending name).
 
-    本异常**不**自带协议码常量（保持 naming 模块对 ``a2c_smcp.smcp`` 零依赖）；由调用方
-    （``client:get_skill`` 处理器 / Registry 装配）按需映射 / 吞掉。
+    本异常**不**自带协议码常量（保持 naming 模块对 ``a2c_smcp.smcp`` 零依赖——注：对
+    ``a2c_smcp.utils.bundle_id`` 的依赖不在此约束内，那是 ``<server>`` 段判据的单一权威）；
+    由调用方（``client:get_skill`` 处理器 / Registry 装配）按需映射 / 吞掉。
     This exception does not embed the protocol-code constant (keeps naming dependency-free of
     ``a2c_smcp.smcp``); callers map / swallow it as appropriate.
     """
@@ -111,15 +114,20 @@ def _is_strict_kebab(segment: str) -> bool:
 def _is_valid_mcp_server_segment(segment: str) -> bool:
     """mcp ``<server>`` 段（= bundle_id）是否合规 / Whether the mcp ``<server>`` (= bundle_id) segment is valid.
 
-    判据即 BundleID 字符集（skill.md §1.3 / data-structures.md §BundleID）：非空 + ``[A-Za-z0-9_-]``
-    + 无连续 ``__``（``__`` 是 BundleID 与工具名的保留分隔符）。
+    **判据完全委托** :func:`a2c_smcp.utils.bundle_id.is_valid_bundle_id` —— ``<server>`` 段**就是** bundle_id
+    （skill.md §1.3），故其合法性判据只能有一个来源。此处**不得**另写一份等价谓词：两处一旦漂移
+    （如协议调整 BundleID 字符集），mcp 段就会拒绝合法 bundle_id → SKILL 对 Agent 隐身，即本模块
+    要消灭的失效模式（#142）原地复活。
+    Fully delegated: the segment IS the bundle_id, so its validity has exactly one source of truth.
 
     **无长度上限**：§1.4 的「1–64」随「``<server>`` = bundle_id」删除，§1.5 亦删掉「长度 > 64 → 判废」
     一行——BundleID 规范不设长度上限，§1.3 断言 bundle_id「是 lexer 字符集的严格子集，**直接合法**」。
-    卡 64 会让 name 超长的 server 其 SKILL 对 Agent 隐身，即本模块要消灭的失效模式（#142）。
-    No length cap: the bound was dropped from §1.4/§1.5 when ``<server>`` became ``bundle_id``.
+    唯一残留边界在文件系统而非协议：bundle_id 超 ``NAME_MAX``（多数 OS 255 字节）时 staging 建目录
+    会失败 → 该 server 的 SKILL 记 ERROR 跳过（与 #129 Phase7「SDK 保 wire-faithful、长度适配属
+    Agent 侧」一致）。
+    No length cap in the protocol; the only residual bound is the filesystem's NAME_MAX at staging time.
     """
-    return bool(segment) and "__" not in segment and _MCP_SERVER_SEG_RE.match(segment) is not None
+    return is_valid_bundle_id(segment)
 
 
 def parse_skill_name(name: str) -> ParsedSkillName:

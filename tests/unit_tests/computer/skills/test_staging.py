@@ -35,6 +35,17 @@ from a2c_smcp.computer.skills.staging import stage_mcp_skills, stage_user_skills
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
+@pytest.fixture
+def staging_logs(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """捕获 staging 模块日志（项目 logger 关闭 propagate，直接挂 handler）/ capture staging logs。"""
+    staging_mod.logger.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG)
+    try:
+        yield caplog
+    finally:
+        staging_mod.logger.removeHandler(caplog.handler)
+
+
 class FakeManager:
     def __init__(
         self,
@@ -392,6 +403,26 @@ async def test_bundle_id_shapes_enter_segment_verbatim(tmp_path: Path, bundle_id
     assert reg.resolve(f"mcp:{bundle_id}:summarize")["source"] == f"mcp:{bundle_id}"  # type: ignore[index]
 
 
+async def test_mcp_name_synthesis_failure_skips_only_offender(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """mcp frontmatter ``name`` 非严格 kebab → 该 SKILL 判废（不入册 + 记 ERROR），**合法兄弟仍入册**。
+
+    skill.md §1.5：装配 Registry 时合成失败的 SKILL 不入册、记 ERROR，**不**向 Agent 硬报错——
+    batch 接口须对部分失败健壮，一颗坏苹果不得拖垮同 server 的其余 SKILL。
+    """
+    bad = await _mount_skill(tmp_path, "bad", "Bad-Leaf")  # 大写 → 非严格 kebab
+    good = await _mount_skill(tmp_path, "good", "fine-skill")
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(FakeManager([("srv", bad), ("srv", good)]), reg, home)
+
+    assert names == ["mcp:srv:fine-skill"]  # 合法兄弟不受牵连
+    assert len(reg) == 1
+    assert any("skill name synthesis failed" in r.getMessage() for r in staging_logs.records)
+    # 判废者的 staging 目录已清理，不留半成品 / offender's staging dir cleaned up
+    assert not (home / "mcp" / "srv" / "Bad-Leaf").exists()
+
+
 async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:
     # 无 _meta.source 的 skill:// 资源（子资源 / 未声明）→ 非 SKILL 根 → 跳过
     plain = Resource(uri="skill://h/not-a-root", name="not-a-root")
@@ -402,17 +433,6 @@ async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:
 
 
 # ── user 源 DropIn（就地发现，不 staging，#60）────────────────────────────────
-@pytest.fixture
-def staging_logs(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
-    """捕获 staging 模块日志（项目 logger 关闭 propagate，直接挂 handler）/ capture staging logs。"""
-    staging_mod.logger.addHandler(caplog.handler)
-    caplog.set_level(logging.DEBUG)
-    try:
-        yield caplog
-    finally:
-        staging_mod.logger.removeHandler(caplog.handler)
-
-
 def _write_user_skill(root: Path, skill_dir_name: str, *, fm_name: str | None = None, description: str = "do thing") -> Path:
     """在发现根下写一个 ``<skill_dir_name>/SKILL.md`` / write a DropIn skill dir under a root。"""
     d = root / skill_dir_name

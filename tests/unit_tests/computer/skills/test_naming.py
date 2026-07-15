@@ -30,6 +30,7 @@ from a2c_smcp.computer.skills.naming import (
     synthesize_mcp_name,
     synthesize_user_name,
 )
+from a2c_smcp.utils.bundle_id import is_valid_bundle_id
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,32 @@ def test_segment_length_boundary() -> None:
     assert parse_skill_name(ok).skill == ok
     with pytest.raises(SkillNameError):
         parse_skill_name(too_long)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "tfrobot-tools",
+        "My_Server",
+        "bundle_a1b2c3d4e5f60718",
+        "a" * (MAX_SEGMENT_LEN + 16),
+        "",
+        "a__b",
+        "my.api",
+        "my api",
+        "_leading",
+        "-x-",
+    ],
+)
+def test_mcp_server_segment_predicate_is_bundle_id_predicate(candidate: str) -> None:
+    """``<server>`` 段判据 **≡** :func:`is_valid_bundle_id` —— 钉死单一权威，防两处漂移。
+
+    ``<server>`` 段**就是** bundle_id（skill.md §1.3），故合法性判据只能有一个来源。若 naming 侧
+    另存一份等价谓词，协议调整 BundleID 字符集时两处会静默分叉 → mcp 段拒绝合法 bundle_id →
+    SKILL 对 Agent 隐身，即 #142 要消灭的失效模式复活。本用例即该耦合的守卫。
+    """
+    name = f"mcp:{candidate}:x"
+    assert is_valid_skill_name(name) is is_valid_bundle_id(candidate)
 
 
 def test_mcp_server_segment_has_no_length_cap() -> None:
