@@ -11,9 +11,9 @@
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §9.1 / §9.2 / §5.1 / §5.5。
 
 测试意图 / Test intentions（无 git；真实跨 user(XDG) + active project/local(.tfrobot) + managed 目录铺 mcp.json，
-真实 installed_plugins.json 供 bundled 接缝；批准 roundtrip 经真实 ``resolve_settings`` 六层合并读回）:
-- resolve + gate 全栈：user→enabled(trusted) / project→pending(workspace) / bundled→enabled(免批准) /
-  policy deny→disabled。
+真实 installed_plugins.json 账本仍在但 **#148 起审批门不再感知它**；批准 roundtrip 经真实 ``resolve_settings`` 六层合并读回）:
+- resolve + gate 全栈：user→enabled(trusted) / project→pending(workspace) / **借用 bundled 名的 project server→pending
+  （#148 借名不再免批准）** / policy deny→disabled。
 - approve roundtrip：pending project server → ``approve_mcp_server`` 写 local → ``resolve_settings`` 读回 →
   重门控 → enabled（接缝验证、不重复造判定）。
 - scope 覆盖全栈：同名 server user+local 双定义，local 胜（origin=local、workspace 受门控）。
@@ -28,7 +28,6 @@ import pytest
 from a2c_smcp.computer.settings.mcp_config import (
     McpApprovalStatus,
     approve_mcp_server,
-    bundled_mcp_server_names,
     gate_mcp_servers,
     resolve_mcp_config,
 )
@@ -86,13 +85,14 @@ def test_resolve_and_gate_full_stack(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert set(resolved.servers) == {"user-srv", "proj-srv", "blender", "policy-srv"}
 
     settings = resolve_settings(env=env, policy_settings=policy).settings
-    bundled = bundled_mcp_server_names(env=env)
-    statuses = gate_mcp_servers(resolved, settings, bundled)
+    statuses = gate_mcp_servers(resolved, settings)
 
     assert statuses == {
         "user-srv": McpApprovalStatus.ENABLED,  # trusted origin（用户自己加）
         "proj-srv": McpApprovalStatus.PENDING,  # workspace 共享、未决 → 弹框（#69）
-        "blender": McpApprovalStatus.ENABLED,  # plugin-bundled 免批准（即便 workspace 声明）
+        # #148（P0 安全回归）：project scope 声明的 "blender" 借用了已装 plugin 的 bundled 名（账本已记，见上）。
+        # 档④删除后审批门**不再感知账本**，它当普通 untrusted workspace server 处理 → PENDING（弹框），杜绝借名绕过。
+        "blender": McpApprovalStatus.PENDING,
         "policy-srv": McpApprovalStatus.DISABLED,  # 企业拒绝名单
     }
 
@@ -106,15 +106,14 @@ def test_approve_roundtrip_flips_pending_to_enabled(tmp_path: Path, monkeypatch:
     monkeypatch.chdir(wd)
 
     resolved = resolve_mcp_config(env=env, managed_mcp_path=managed_mcp)
-    bundled = bundled_mcp_server_names(env=env)
 
-    before = gate_mcp_servers(resolved, resolve_settings(env=env).settings, bundled)
+    before = gate_mcp_servers(resolved, resolve_settings(env=env).settings)
     assert before == {"figma": McpApprovalStatus.PENDING}
 
     # 批准框 [y]es：写 cwd 的 local settings.local.json。
     approve_mcp_server("figma")
 
-    after = gate_mcp_servers(resolved, resolve_settings(env=env).settings, bundled)
+    after = gate_mcp_servers(resolved, resolve_settings(env=env).settings)
     assert after == {"figma": McpApprovalStatus.ENABLED}
 
 
@@ -131,5 +130,5 @@ def test_scope_override_full_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert srv.config.server_parameters.command == "local-cmd"  # 高 scope 整体覆盖
     assert srv.trusted_origin is False  # origin=local → workspace 共享、受门控
 
-    statuses = gate_mcp_servers(resolved, resolve_settings(env=env).settings, set())
+    statuses = gate_mcp_servers(resolved, resolve_settings(env=env).settings)
     assert statuses == {"shared": McpApprovalStatus.PENDING}
