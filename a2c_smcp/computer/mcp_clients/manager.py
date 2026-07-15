@@ -545,8 +545,10 @@ class MCPServerManager:
         server **跳过**（记 ERROR、不中断其余），对齐「SKILL 通道不使用 4015」（error-handling.md / skill.md §1.5）。
         Servers lacking ``resources`` capability or erroring are skipped (logged ERROR, others continue).
 
-        注意 / Note: 归属键为 **bundle_id**（路由用）。SKILL name 的 ``<server>`` 段仍取 server **name**（协议 #18：
-        SKILL ``<server>`` 段与 BundleID 正交、不变）——由 staging 经 ``get_server_config(bundle_id).name`` 派生。
+        注意 / Note: 归属键为 **bundle_id**——既用于 ``read_resource`` 路由，也**直接**充当 SKILL name 的
+        ``<server>`` 段与磁盘分组键（skill.md §1.3，协议 #142 supersede 了 #18 的「``<server>`` 段与 BundleID
+        正交」结论）。staging 不再回查 display ``name``。
+        The bundle_id is both the routing key and the SKILL ``<server>`` segment verbatim.
 
         Args:
             bundle_id (BUNDLE_ID | None): 若提供仅枚举该 server（ResourceListChanged 单 server 重枚举）；否则全部活跃 server。

@@ -131,7 +131,9 @@ class Computer(BaseComputer[PromptSession]):
         初始化 Computer 实例
         Initialize Computer instance
 
-        MCP Server使用set来管理配置项，注意配置项基类里有定义，如果配置name相同表示完全相同（重写了__hash__方法）
+        MCP Server 使用 set 管理配置项。注意基类重写了 __hash__ 并以 name 取哈希，但那**仅是哈希桶**、非身份判定：
+        相等性走 Pydantic 全字段 __eq__，同名不同 config 只是碰撞、在 set 中各自共存。Server 唯一身份是
+        bundle_id（协议 #18），去重（no-double-open）由 Manager 按 bundle_id 负责。
 
         The MCP Server configuration is in the form of a dictionary to help users reduce the possibility of duplicate
         configuration, and it is recommended to use the name of the MCP Server as the key to avoid duplicate
@@ -557,24 +559,24 @@ class Computer(BaseComputer[PromptSession]):
         pairs = await self.mcp_manager.list_skill_resources()
         return {str(res.uri) for _srv, res in pairs}
 
-    async def _restage_mcp_skills(self, server_name: str | None = None) -> list[str]:
+    async def _restage_mcp_skills(self, bundle_id: str | None = None) -> list[str]:
         """
         物化 mcp 源 ``skill://`` → 注册进 :class:`SkillRegistry` / Materialize & register mcp-source skills。
 
-        全量重物化（``server_name is None``）后做孤儿对账：本轮未出现的 mcp 源 SKILL → 标孤儿
+        全量重物化（``bundle_id is None``）后做孤儿对账：本轮未出现的 mcp 源 SKILL → 标孤儿
         （从 ``get_skills`` 排除，保留以便 source 回归时恢复）。SKILL Home 未就绪 / 无 manager → 空列表。
         Full restage reconciles orphans: mcp-source skills absent this run are marked orphaned.
 
         Args:
-            server_name: 若提供仅重物化该 server（单 server 重枚举）；否则全部活跃 server + 孤儿对账。
+            bundle_id: 若提供仅重物化该 server（单 server 重枚举）；否则全部活跃 server + 孤儿对账。
 
         Returns:
             list[str]: 本轮成功注册（或刷新）的 SKILL name 列表。
         """
         if not self.mcp_manager or self._skill_home is None:
             return []
-        registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, server_name=server_name)
-        if server_name is None:
+        registered = await stage_mcp_skills(self.mcp_manager, self._skill_registry, self._skill_home, bundle_id=bundle_id)
+        if bundle_id is None:
             self._reconcile_orphans(set(registered), lambda s: s.startswith("mcp:"))
         return registered
 
@@ -1454,7 +1456,7 @@ class Computer(BaseComputer[PromptSession]):
         pagination is caller-driven via cursor.
 
         Args:
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name.
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id.
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page.
 
         Returns:

@@ -38,14 +38,15 @@ plugin install / #53）；``plugin_filter`` 形参供 #62 注入 ``enabledPlugin
 mcp 流程 / mcp flow：
 1. 经 ``manager.list_skill_resources`` 完整消费 cursor 拿到 server 全量 ``skill://`` 资源；
 2. 其中带 ``_meta.source∈{mounted,archive,resources}`` 者为 **SKILL 根**，按模式物化到
-   ``<home>/mcp/<normalized-server>/<skill>/``（marketplace SKILL v1 §2 包结构）：
+   ``<home>/mcp/<bundle_id>/<skill>/``（marketplace SKILL v1 §2 包结构）：
    - **mounted**：``_meta.mount_dir`` 本地目录 → 复制进 staging（自包含，避免符号链接绕过沙箱）；
    - **archive**：HTTP 拉 ``_meta.archive_uri`` → 校验 ``archive_sha256``（若有）+ 大小/解压/成员数上限（防 tar·zip bomb）
      → 安全解包（防穿越/拒符号链接）；
    - **resources**：枚举 ``skill://<root>/**`` 子资源，逐个 ``resources/read``，按相对路径安全写入 staging。
 3. 读 staged ``SKILL.md`` 的 YAML frontmatter 作为元数据权威源（§3：不镜像进 ``_meta``）；
    包根目录名校正为 ``frontmatter.name``（§4）；
-4. 合成 ``A2CSkillRef``（name = ``mcp:<normalized-server>:<frontmatter.name>``）→ 注册进 :class:`SkillRegistry`。
+4. 合成 ``A2CSkillRef``（name = ``mcp:<bundle_id>:<frontmatter.name>``，``<server>`` 段 = server 的
+   **bundle_id 原样**——skill.md §1.3；display ``name`` 允许碰撞、永不做键）→ 注册进 :class:`SkillRegistry`。
 
 user 流程 / user flow（与 mcp 的关键差异）：**就地发现、不复制进 SKILL Home**。扫描发现根
 ``$A2C_SKILL_HOME/user/``（全局个人；#116 起仅 home 单根，workdir 维度 SKILL 已下沉 MCP 服务经
@@ -103,7 +104,6 @@ from a2c_smcp.computer.skills.manifest import (
 )
 from a2c_smcp.computer.skills.naming import (
     SkillNameError,
-    normalize_mcp_server_segment,
     synthesize_marketplace_name,
     synthesize_mcp_name,
     synthesize_user_name,
@@ -412,7 +412,7 @@ def _apply_frontmatter_optional_fields(ref: A2CSkillRef, frontmatter: dict[str, 
 
 def _build_ref(
     name: str,
-    normalized_server: str,
+    bundle_id: str,
     frontmatter: dict[str, Any],
     meta: dict[str, Any],
     path: Path,
@@ -421,7 +421,9 @@ def _build_ref(
     """从已合成 ``name`` + frontmatter + ``_meta`` 组装 A2CSkillRef / Assemble A2CSkillRef from precomputed name + frontmatter。"""
     ref: A2CSkillRef = {
         "name": name,
-        "source": f"mcp:{normalized_server}",
+        # source 与 name 同头，server 部分统一取 bundle_id（skill.md §1.2）——Agent 据此把一条 SKILL
+        # 关联回 get_config.servers / get_resources.mcp_server 里的同一 A2C server。
+        "source": f"mcp:{bundle_id}",
         "uri": uri,
         "path": str(path),
         "description": str(frontmatter["description"]),
@@ -439,33 +441,31 @@ async def stage_mcp_skills(
     registry: SkillRegistry,
     home: Path,
     *,
-    server_name: str | None = None,
+    bundle_id: str | None = None,
     archive_fetch: ArchiveFetcher | None = None,
 ) -> list[str]:
     """
     枚举并物化 mcp 源 SKILL，注册进 Registry / Enumerate, materialize and register mcp-source SKILLs。
 
-    :param manager: 提供 ``list_skill_resources(server_name)`` 与 ``read_resource(server, uri)`` 的 MCP 管理器。
+    :param manager: 提供 ``list_skill_resources(bundle_id)`` 与 ``read_resource(bundle_id, uri)`` 的 MCP 管理器。
     :param registry: 目标 :class:`SkillRegistry`。
     :param home: SKILL Home 绝对根（见 :mod:`~a2c_smcp.computer.skills.home`）。
-    :param server_name: 若提供仅物化该 server（ResourceListChanged 单 server 重物化）；否则全部活跃 server。
+    :param bundle_id: 若提供仅物化该 server（ResourceListChanged 单 server 重物化）；否则全部活跃 server。
     :param archive_fetch: 归档拉取替身（默认 aiohttp）；便于测试注入。
     :return: 成功注册（或刷新）的 SKILL name 列表 / names successfully registered (or refreshed).
     """
     fetch = archive_fetch or _default_archive_fetch
-    pairs: list[tuple[str, Resource]] = await manager.list_skill_resources(server_name)
+    pairs: list[tuple[str, Resource]] = await manager.list_skill_resources(bundle_id)
 
     by_server: dict[str, list[Resource]] = defaultdict(list)
-    for sname, res in pairs:
-        by_server[sname].append(res)
+    for bid, res in pairs:
+        by_server[bid].append(res)
 
     registered: list[str] = []
     seen_this_run: set[str] = set()  # 本 run 已处理的合成 name，用于真冲突检测（§1.5 保留先到者）
-    for sname, resources in by_server.items():
-        # sname = bundle_id（manager 身份键）。SKILL ``<server>`` 段与磁盘路径仍取 server **name**（协议 #18：
-        # SKILL ``<server>`` 段与 BundleID 正交、不变）；``read_resource`` 仍按 bundle_id 路由。
-        server_display_name = manager.get_server_config(sname).name
-        normalized_server = normalize_mcp_server_segment(server_display_name)
+    for bundle_id, resources in by_server.items():
+        # bundle_id = manager 身份键，同时即 SKILL ``<server>`` 段与磁盘路径分组键（skill.md §1.3）。
+        # display ``name`` 纯展示、允许碰撞、永不做键——不参与此处任何构造。
         for res in resources:
             meta = dict(getattr(res, "meta", None) or {})
             mode = meta.get("source")
@@ -478,7 +478,7 @@ async def stage_mcp_skills(
                 logger.error("skill root URI has no path segment, skipped: %s", root_uri)
                 continue
 
-            staged = mcp_skill_dir(home, normalized_server, leaf)
+            staged = mcp_skill_dir(home, bundle_id, leaf)
             try:
                 if mode == "mounted":
                     _materialize_mounted(meta, staged)
@@ -486,24 +486,20 @@ async def stage_mcp_skills(
                     await _materialize_archive(meta, staged, fetch)
                 else:  # resources
                     subs = [r for r in resources if str(r.uri).startswith(root_uri + "/")]
-                    await _materialize_resources(partial(manager.read_resource, sname), root_uri, subs, staged)
+                    await _materialize_resources(partial(manager.read_resource, bundle_id), root_uri, subs, staged)
             except Exception as e:
                 logger.error("materialize failed for %s (mode=%s): %s", root_uri, mode, e, exc_info=True)
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
 
-            # SKILL name 的 `<server>` 段取 server **name**（非 bundle_id）——协议 #18 SKILL `<server>` 段不变。
-            name = _finalize_and_register(
-                server_display_name, normalized_server, meta, staged, root_uri, home, registry, seen_this_run,
-            )
+            name = _finalize_and_register(bundle_id, meta, staged, root_uri, home, registry, seen_this_run)
             if name is not None:
                 registered.append(name)
     return registered
 
 
 def _finalize_and_register(
-    server_name: str,
-    normalized_server: str,
+    bundle_id: str,
     meta: dict[str, Any],
     staged: Path,
     root_uri: str,
@@ -525,7 +521,7 @@ def _finalize_and_register(
         return None
 
     try:
-        name = synthesize_mcp_name(server_name, str(frontmatter["name"]))
+        name = synthesize_mcp_name(bundle_id, str(frontmatter["name"]))
     except SkillNameError as e:
         logger.error("skill name synthesis failed, skipped: %s (%s)", root_uri, e.reason)
         shutil.rmtree(staged, ignore_errors=True)
@@ -540,14 +536,14 @@ def _finalize_and_register(
     seen_this_run.add(name)
 
     # 包根目录名校正为 frontmatter.name（skill.md §4）
-    final = mcp_skill_dir(home, normalized_server, str(frontmatter["name"]))
+    final = mcp_skill_dir(home, bundle_id, str(frontmatter["name"]))
     if final != staged:
         if final.exists():
             shutil.rmtree(final, ignore_errors=True)
         final.parent.mkdir(parents=True, exist_ok=True)
         staged.rename(final)
 
-    ref = _build_ref(name, normalized_server, frontmatter, meta, final, root_uri)
+    ref = _build_ref(name, bundle_id, frontmatter, meta, final, root_uri)
     # 本 run 已 seen 去重；此处 name in registry 必为跨 run 既存的同一 SKILL → update（刷新/孤儿恢复）
     ok = registry.register_or_update(ref)
     return name if ok else None

@@ -30,8 +30,9 @@ mcp            ``mcp:<server>:<skill>``     3
 - 字符集 / charsets（skill.md §1.4）：
     - ``<skill>`` / ``<plugin>`` 段为**严格 kebab**（``[a-z0-9-]``，不以 ``-`` 始末、无连续 ``--``、长 1–64）。
       strict kebab leaf segments.
-    - mcp ``<server>`` 段为规范化字符集 ``[A-Za-z0-9_-]``（大小写保留，长 1–64）；见 §1.3。
-      normalized mcp server charset (case preserved).
+    - mcp ``<server>`` 段 **= server 的 ``bundle_id`` 原样**（``[A-Za-z0-9_-]``、无 ``.``、无连续 ``__``、
+      大小写保留、**无长度上限**）；见 §1.3 与 :mod:`a2c_smcp.utils.bundle_id`。
+      The mcp ``<server>`` segment is the server's ``bundle_id`` verbatim (no length cap).
 - 非法 name → :class:`SkillNameError`，由 ``client:get_skill`` 处理器映射为协议 ``4016``；
   装配 Registry 时合成失败的 SKILL 不入册（记 ERROR，不向 Agent 硬报错，skill.md §1.5）。
   Illegal name raises :class:`SkillNameError`, mapped to protocol ``4016`` by the
@@ -58,11 +59,8 @@ MCP_SEGMENT = "mcp"
 # Strict kebab (leaf / plugin segments): lowercase alnum, single-hyphen separated.
 _STRICT_KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-# mcp <server> 段规范化字符集（大小写保留）/ Normalized mcp <server> charset (case preserved).
+# mcp <server> 段（= bundle_id）字符集（大小写保留）/ mcp <server> (= bundle_id) charset (case preserved).
 _MCP_SERVER_SEG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
-# 规范化替换：非 [A-Za-z0-9_-] → "_" / Normalization: non-[A-Za-z0-9_-] → "_".
-_MCP_NORMALIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 SkillNameKind = Literal["user", "marketplace", "mcp"]
 
@@ -92,8 +90,8 @@ class ParsedSkillName:
     lexer 解析结果 / Result of the name lexer.
 
     ``kind`` 标明 source 形态；按形态填充对应段（``skill`` 恒有；``plugin`` 仅 marketplace；
-    ``server`` 仅 mcp）。Agent 仍 **MUST** 把 name 当不透明字符串——本结构仅供 Computer 内部
-    （Registry / staging）使用。
+    ``server`` 仅 mcp，其值 = 该 server 的 ``bundle_id``）。Agent 仍 **MUST** 把 name 当不透明字符串
+    ——本结构仅供 Computer 内部（Registry / staging）使用。
     ``kind`` identifies the source shape; segments are populated accordingly (``skill`` always
     present; ``plugin`` marketplace-only; ``server`` mcp-only). For Computer-internal use only.
     """
@@ -111,26 +109,17 @@ def _is_strict_kebab(segment: str) -> bool:
 
 
 def _is_valid_mcp_server_segment(segment: str) -> bool:
-    """mcp <server> 段是否合规 / Whether the mcp <server> segment is valid."""
-    return 1 <= len(segment) <= MAX_SEGMENT_LEN and _MCP_SERVER_SEG_RE.match(segment) is not None
+    """mcp ``<server>`` 段（= bundle_id）是否合规 / Whether the mcp ``<server>`` (= bundle_id) segment is valid.
 
+    判据即 BundleID 字符集（skill.md §1.3 / data-structures.md §BundleID）：非空 + ``[A-Za-z0-9_-]``
+    + 无连续 ``__``（``__`` 是 BundleID 与工具名的保留分隔符）。
 
-def normalize_mcp_server_segment(name: str) -> str:
+    **无长度上限**：§1.4 的「1–64」随「``<server>`` = bundle_id」删除，§1.5 亦删掉「长度 > 64 → 判废」
+    一行——BundleID 规范不设长度上限，§1.3 断言 bundle_id「是 lexer 字符集的严格子集，**直接合法**」。
+    卡 64 会让 name 超长的 server 其 SKILL 对 Agent 隐身，即本模块要消灭的失效模式（#142）。
+    No length cap: the bound was dropped from §1.4/§1.5 when ``<server>`` became ``bundle_id``.
     """
-    MCP <server> 段规范化 / Normalize the MCP <server> segment.
-
-    与 Claude Code ``normalizeNameForMCP()`` 通用规则等价：非 ``[A-Za-z0-9_-]`` → ``_``，
-    大小写保留、不截断。**不**实现 Claude Code 的 ``"claude.ai "`` 前缀折叠 + trim 特例
-    （Anthropic 平台特化，违反 A2C 协议中立性）。协议依据 skill.md §1.3。
-    Equivalent to Claude Code ``normalizeNameForMCP()`` general rule (non-[A-Za-z0-9_-] → ``_``,
-    case preserved, no truncation); does NOT implement the ``"claude.ai "`` prefix special case.
-
-    注意 / Note：本函数仅做字符替换，**不**校验结果长度。空串 / 超长由 :func:`synthesize_mcp_name`
-    在合成时按 skill.md §1.5 判废。
-    Pure character substitution; emptiness / over-length are rejected by
-    :func:`synthesize_mcp_name` at synthesis time per skill.md §1.5.
-    """
-    return _MCP_NORMALIZE_RE.sub("_", name)
+    return bool(segment) and "__" not in segment and _MCP_SERVER_SEG_RE.match(segment) is not None
 
 
 def parse_skill_name(name: str) -> ParsedSkillName:
@@ -143,7 +132,8 @@ def parse_skill_name(name: str) -> ParsedSkillName:
     - 段数 ∉ {1, 2, 3} → 非法 / segment count ∉ {1, 2, 3} → invalid
     - 1 段 → user（缺 ``:`` 的裸名**合法**，不得因缺 ``:`` 报错）/ 1 seg → user (bare name accepted)
     - 2 段 → marketplace ``<plugin>:<skill>``
-    - 3 段 → mcp，首段 **MUST** 字面 ``mcp`` / 3 seg → mcp, first segment MUST be literal ``mcp``
+    - 3 段 → mcp，首段 **MUST** 字面 ``mcp``；``<server>`` 段 = bundle_id 字符集（§1.3，无长度上限）
+      / 3 seg → mcp, first segment MUST be literal ``mcp``; ``<server>`` follows the bundle_id charset
     - 任一段不符字符集 → 非法 / any segment failing its charset → invalid
 
     :raises SkillNameError: name 格式非法（映射协议 4016）/ malformed name (maps to protocol 4016).
@@ -168,7 +158,7 @@ def parse_skill_name(name: str) -> ParsedSkillName:
         if head != MCP_SEGMENT:
             raise SkillNameError(name, "3-segment names are reserved for the mcp source (first segment must be 'mcp')")
         if not _is_valid_mcp_server_segment(server):
-            raise SkillNameError(name, "mcp <server> segment must match [A-Za-z0-9_-]{1,64}")
+            raise SkillNameError(name, "mcp <server> segment must be a valid bundle_id: [A-Za-z0-9_-], no '__'")
         if not _is_strict_kebab(skill):
             raise SkillNameError(name, "mcp <skill> leaf must be strict kebab")
         return ParsedSkillName(raw=name, kind="mcp", skill=skill, server=server)
@@ -213,25 +203,30 @@ def synthesize_marketplace_name(plugin: str, skill: str) -> str:
     return f"{plugin}{SEPARATOR}{skill}"
 
 
-def synthesize_mcp_name(server: str, skill: str) -> str:
+def synthesize_mcp_name(bundle_id: str, skill: str) -> str:
     """
-    合成 mcp 源 name / Synthesize an mcp-source name：``mcp:<normalized-server>:<skill>``（3 段）。
+    合成 mcp 源 name / Synthesize an mcp-source name：``mcp:<bundle_id>:<skill>``（3 段）。
 
-    ``server`` 先经 :func:`normalize_mcp_server_segment` 规范化；规范化后长度 = 0 或 > 64 →
-    判废（skill.md §1.5：拒绝该 server 全部 SKILL 注册，记 ERROR）。
-    ``server`` is normalized first; a normalized length of 0 or > 64 is rejected (skill.md §1.5).
+    ``bundle_id`` **原样**进段、不做任何规范化（skill.md §1.3）——它已是 A2C server 的唯一身份，
+    由 :func:`a2c_smcp.utils.bundle_id.resolve_bundle_id` 在 Computer 注册边界解析后恒有值、恒合法。
+    取 bundle_id（而非可碰撞的 display ``name``）令 mcp 形态 name **构造上不碰撞**：no-double-open
+    保证同一 Computer 内 bundle_id 唯一，故不再有「两个合法 Server 撞名 → 拒绝其一 → SKILL 隐身」。
+    ``bundle_id`` goes in verbatim (no normalization); its uniqueness makes mcp names collision-free
+    by construction.
 
-    :raises SkillNameError: 规范化 server 越界或 ``skill`` 非严格 kebab（→ 不入册）。
+    此处校验是**防御性**的（正常链路传入的 bundle_id 恒合法）：非法即调用方 bug——
+    按 skill.md §1.5 判废（不入册、记 ERROR），而非静默产出畸形 name。
+
+    :raises SkillNameError: ``bundle_id`` 不符 BundleID 字符集，或 ``skill`` 非严格 kebab（→ 不入册）。
     """
-    normalized = normalize_mcp_server_segment(server)
-    if not _is_valid_mcp_server_segment(normalized):
+    if not _is_valid_mcp_server_segment(bundle_id):
         raise SkillNameError(
-            f"{MCP_SEGMENT}{SEPARATOR}{normalized}{SEPARATOR}{skill}",
-            "normalized mcp <server> must match [A-Za-z0-9_-]{1,64} (empty or >64 rejected)",
+            f"{MCP_SEGMENT}{SEPARATOR}{bundle_id}{SEPARATOR}{skill}",
+            "mcp <server> must be a valid bundle_id: non-empty, [A-Za-z0-9_-], no consecutive '__'",
         )
     if not _is_strict_kebab(skill):
         raise SkillNameError(
-            f"{MCP_SEGMENT}{SEPARATOR}{normalized}{SEPARATOR}{skill}",
+            f"{MCP_SEGMENT}{SEPARATOR}{bundle_id}{SEPARATOR}{skill}",
             "mcp <skill> leaf must be strict kebab",
         )
-    return f"{MCP_SEGMENT}{SEPARATOR}{normalized}{SEPARATOR}{skill}"
+    return f"{MCP_SEGMENT}{SEPARATOR}{bundle_id}{SEPARATOR}{skill}"

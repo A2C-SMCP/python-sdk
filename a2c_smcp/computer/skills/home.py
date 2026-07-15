@@ -116,9 +116,14 @@ def ensure_skill_home(env: Mapping[str, str] | None = None) -> Path:
     return home
 
 
-def mcp_skill_dir(home: Path, server: str, skill: str) -> Path:
-    """mcp 源安装目录 / mcp-source install dir：``<home>/mcp/<server>/<skill>/``。"""
-    return home / SOURCE_MCP / server / skill
+def mcp_skill_dir(home: Path, bundle_id: str, skill: str) -> Path:
+    """mcp 源安装目录 / mcp-source install dir：``<home>/mcp/<bundle_id>/<skill>/``。
+
+    按 **bundle_id**（server 唯一身份）分组，非 display ``name``——后者允许碰撞，用作路径段会让两个
+    合法共存的同名 server 撞进同一目录（skill.md §1.3）。
+    Grouped by ``bundle_id`` (the server's unique identity), never the collision-allowed display name.
+    """
+    return home / SOURCE_MCP / bundle_id / skill
 
 
 def marketplace_skill_dir(home: Path, repo: str, *inner: str) -> Path:

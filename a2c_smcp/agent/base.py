@@ -127,7 +127,7 @@ class BaseAgentClient(ABC):
 
         Args:
             computer (str): 目标计算机ID / Target computer ID
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
 
         Returns:
@@ -471,7 +471,7 @@ class BaseAgentSyncClient(ABC):
 
         Args:
             computer (str): 目标计算机ID / Target computer ID
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
 
         Returns:
