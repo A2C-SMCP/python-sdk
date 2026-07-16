@@ -45,7 +45,7 @@ async def test_manager_available_tools(stdio_params, sse_params, sse_server):
     sse_cfg = SseServerConfig(name="sse_server", server_parameters=sse_params)
     await manager.ainitialize([stdio_cfg, sse_cfg])
     await manager.astart_all()
-    tools = [tool async for tool in manager.available_tools()]
+    tools = [tool async for _bid, tool in manager.available_tools()]
     assert isinstance(tools, list)
     assert any(isinstance(t, Tool) for t in tools)
 
@@ -60,7 +60,7 @@ async def test_manager_default_tool_meta_injection(stdio_params, sse_params, sse
     stdio_cfg = StdioServerConfig(name="stdio_server", server_parameters=stdio_params, default_tool_meta=ToolMeta(auto_apply=True))
     await manager.ainitialize([stdio_cfg])
     await manager.astart_all()
-    tools = [tool async for tool in manager.available_tools()]
+    tools = [tool async for _bid, tool in manager.available_tools()]
     assert tools, "Should list at least one tool"
     # 所有工具应该包含注入的 a2c_tool_meta.auto_apply == True 因为目前这些工具没有自定义元数据
     assert all(getattr(t.meta.get("a2c_tool_meta"), "auto_apply", False) is True for t in tools)
@@ -77,7 +77,7 @@ async def test_manager_execute_tool(stdio_params, sse_params, sse_server):
     sse_cfg = SseServerConfig(name="sse_server", server_parameters=sse_params)
     await manager.ainitialize([stdio_cfg, sse_cfg])
     await manager.astart_all()
-    tools = [tool async for tool in manager.available_tools()]
+    tools = [tool async for _bid, tool in manager.available_tools()]
     for tool in tools:
         try:
             result = await manager.aexecute_tool(tool.name, {})
@@ -111,7 +111,7 @@ async def test_manager_same_tool_name_coexist_via_bundle_prefix(sse_params, http
     await manager.ainitialize([sse_cfg, http_cfg])
     await manager.astart_all()
     assert len(manager._active_clients) == 2
-    names = [tool.name async for tool in manager.available_tools()]
+    names = [tool.name async for _bid, tool in manager.available_tools()]
     # 所有暴露名都带 bundle 前缀，sse/http 各自成组、互不冲突
     assert names and all(n.startswith("sse_server__") or n.startswith("http_server__") for n in names)
     assert any(n.startswith("sse_server__") for n in names)
@@ -140,7 +140,7 @@ async def test_manager_forbidden_tool_not_exposed(stdio_params, sse_server):
     stdio_cfg = StdioServerConfig(name="stdio_server", server_parameters=stdio_params)
     await manager.ainitialize([stdio_cfg])
     await manager.astart_all()
-    names = [tool.name async for tool in manager.available_tools()]
+    names = [tool.name async for _bid, tool in manager.available_tools()]
     if names:
         exposed = names[0]
         _, original = await manager.avalidate_tool_call(exposed, {})

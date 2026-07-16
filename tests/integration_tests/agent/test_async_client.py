@@ -86,6 +86,7 @@ async def test_agent_receives_enter_and_tools(socketio_server, basic_server_port
         tools: list[SMCPTool] = [
             {
                 "name": "echo",
+                "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                 "description": "echo text",
                 "params_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
                 "return_schema": None,
@@ -202,7 +203,21 @@ async def test_agent_receives_update_config(socketio_server, basic_server_port: 
         nonlocal tools_req_count
         tools_req_count += 1
         tools_event.set()
-        return {"tools": [{"name": f"tool-{tools_req_count}"}], "req_id": data["req_id"]}
+        # #152 D1：返回 wire-valid SMCPTool（含 required bundle_id + description/params_schema/return_schema），
+        # 否则经 Server relay 的 TypeAdapter(GetToolsRet) 强校验会拒、tools_received 静默死亡（此前该 mock
+        # 仅有 name 即已 wire-invalid，靠末尾 `or` 弱断言短路掩盖）。bundle_id 取 name≠bundle_id 分叉。
+        return {
+            "tools": [
+                {
+                    "name": f"tool-{tools_req_count}",
+                    "bundle_id": "tool-srv",
+                    "description": "dynamic tool",
+                    "params_schema": {"type": "object"},
+                    "return_schema": None,
+                },
+            ],
+            "req_id": data["req_id"],
+        }
 
     handler = _EH()
     office_id = "office-3"

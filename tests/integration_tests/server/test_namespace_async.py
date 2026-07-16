@@ -277,6 +277,7 @@ async def test_get_tools_success_same_office(socketio_server, basic_server_port:
             "tools": [
                 {
                     "name": "echo",
+                    "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "echo text",
                     "params_schema": {"type": "object", "properties": {"text": {"type": "string"}}},
                     "return_schema": None,

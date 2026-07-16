@@ -123,6 +123,7 @@ async def test_async_server_end_to_end_flow(async_agent_client, async_computer_c
             "tools": [
                 {
                     "name": "echo",
+                    "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "echo input",
                     "params_schema": {"type": "object"},
                     "return_schema": {"type": "object"},

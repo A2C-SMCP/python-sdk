@@ -86,17 +86,17 @@ async def test_manager_arefresh_tools_surfaces_added_tool() -> None:
     await manager.ainitialize([_mutable_cfg()])
     await manager.astart_all()
     try:
-        base = {t.name async for t in manager.available_tools()}
+        base = {t.name async for _bid, t in manager.available_tools()}
         assert base == {"mutable-srv__set_phase"}
 
         # 运行期新增工具但**不**刷新映射 → available_tools 仍漏掉（复现 Bug B）
         await manager.aexecute_tool("mutable-srv__set_phase", {"phase": 1})
-        stale = {t.name async for t in manager.available_tools()}
+        stale = {t.name async for _bid, t in manager.available_tools()}
         assert "mutable-srv__dynamic_tool" not in stale, "未刷新时 _tool_mapping 陈旧、新增工具被漏（Bug B 现象）"
 
         # 显式刷新（Computer 服务 get_tools 时所做）→ 新增工具浮现
         await manager.arefresh_tools()
-        fresh = {t.name async for t in manager.available_tools()}
+        fresh = {t.name async for _bid, t in manager.available_tools()}
         assert "mutable-srv__dynamic_tool" in fresh, "arefresh_tools() 后新增工具须可见（#127 修复）"
     finally:
         await manager.aclose()

@@ -427,12 +427,14 @@ def test_process_tools_response():
     tools = [
         SMCPTool(
             name="tool1",
+            bundle_id="srv1",  # #152 D1：name ≠ bundle_id 分叉
             description="Test tool 1",
             params_schema={"type": "object"},
             return_schema=None,
         ),
         SMCPTool(
             name="tool2",
+            bundle_id="srv1",  # #152 D1：name ≠ bundle_id 分叉（与 tool1 同 server）
             description="Test tool 2",
             params_schema={"type": "string"},
             return_schema=None,
@@ -547,6 +549,7 @@ def test_sio_param_passed_to_handlers():
     tools = [
         SMCPTool(
             name="tool1",
+            bundle_id="srv1",  # #152 D1：name ≠ bundle_id 分叉
             description="Test tool 1",
             params_schema={"type": "object"},
             return_schema=None,

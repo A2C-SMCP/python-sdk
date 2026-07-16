@@ -1254,8 +1254,8 @@ class Computer(BaseComputer[PromptSession]):
         # socketio on_get_tools 安全上下文（非 MCP 接收循环），可安全 await 刷新（内联刷新会话级死锁见 #127）。
         # #127: refresh the tool mapping before serving get_tools; runtime tool additions are otherwise missed.
         await self.mcp_manager.arefresh_tools()
-        # 从Manager获取全部工具
-        tools = [t async for t in self.mcp_manager.available_tools()]
+        # 从 Manager 获取全部工具，携带各自归属 bundle_id（#152 D1）。
+        tools = [(bundle_id, t) async for bundle_id, t in self.mcp_manager.available_tools()]
 
         def is_attr(v: Any) -> bool:
             """
@@ -1275,12 +1275,13 @@ class Computer(BaseComputer[PromptSession]):
                 logger.debug(f"非简单属性:{truncate(v)}", exc_info=e)
                 return False
 
-        def convert_tool(t: Tool) -> SMCPTool:
+        def convert_tool(bundle_id: str, t: Tool) -> SMCPTool:
             """
             将 MCP 工具定义转换为 SMCP 工具定义。
             Convert MCP tool definition to SMCP tool definition.
 
             Args:
+                bundle_id (str): 该工具所属 MCP Server 的**解析后** bundle_id（#152 D1，工具归属）。
                 t (Tool): MCP 工具。MCP tool.
 
             Returns:
@@ -1302,10 +1303,15 @@ class Computer(BaseComputer[PromptSession]):
             if t.annotations:
                 meta["MCP_TOOL_ANNOTATION"] = json.dumps(t.annotations.model_dump(mode="json"))
             return SMCPTool(
-                name=t.name, description=t.description or "None", params_schema=t.inputSchema, return_schema=t.outputSchema, meta=meta
+                name=t.name,
+                bundle_id=bundle_id,  # #152 D1：显式归属（解析后值，来自 available_tools 产出，非 config.bundle_id）
+                description=t.description or "None",
+                params_schema=t.inputSchema,
+                return_schema=t.outputSchema,
+                meta=meta,
             )
 
-        mcp_tools = [convert_tool(t) for t in tools]
+        mcp_tools = [convert_tool(bundle_id, t) for bundle_id, t in tools]
         return mcp_tools
 
     async def aexecute_tool(self, req_id: str, tool_name: str, parameters: dict, timeout: float | None = None) -> CallToolResult:
