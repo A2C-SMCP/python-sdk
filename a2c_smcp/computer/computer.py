@@ -163,6 +163,11 @@ class Computer(BaseComputer[PromptSession]):
         self.mcp_manager: MCPServerManager | None = None
         self._inputs: set[MCPServerInput] = set(inputs or set())
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
+        # #149：运行期活跃集的**声明面 raw 投影**缓存（bundle_id → raw-with-bundle 未渲染 config）。get_config wire
+        # 从此取 body（占位符字面保留、绝不外泄已解析 secret）；SET 仍以 manager 运行期权威为准（见 active_server_configs）。
+        # #149: raw (un-rendered) projection of the runtime-active set, keyed by bundle_id — the body source for the
+        # client:get_config wire (placeholders kept literal, resolved secrets never leave the Computer). SET = manager authority.
+        self._active_raw: dict[str, MCPServerConfig] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
         self._confirm_callback = confirm_callback
@@ -333,14 +338,19 @@ class Computer(BaseComputer[PromptSession]):
         #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
         # English: Render (resolution chain + predefined vars) + envFile merge + validate, reusing
         #          _arender_and_validate_server (DRY). On failure, keep the original config and continue.
+        # #149：boot 重建运行期活跃集 → 先重置 raw 投影缓存，逐条登记（setdefault=first-wins，与 ainitialize
+        # no-double-open 同序：同 bundle_id 保配置顺序首个）。
+        self._active_raw.clear()
         validated_servers: list[MCPServerConfig] = []
         for server_cfg in self._mcp_servers:
             try:
-                validated_servers.append(await self._arender_and_validate_server(server_cfg, session=session))
+                raw_cfg, validated = await self._arender_and_validate_server(server_cfg, session=session)
             except Exception as e:
                 logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
-                # 按稳妥策略: 保留原配置继续
-                validated_servers.append(server_cfg)
+                # 按稳妥策略: 保留原配置继续（raw == rendered == 原始未渲染 config）
+                raw_cfg = validated = server_cfg
+            validated_servers.append(validated)
+            self._active_raw.setdefault(resolve_bundle_id(validated), raw_cfg)
 
         await self.mcp_manager.ainitialize(validated_servers)
 
@@ -715,7 +725,7 @@ class Computer(BaseComputer[PromptSession]):
         session: PromptSession | None = None,
         plugin: str | None = None,
         marketplace: str | None = None,
-    ) -> MCPServerConfig:
+    ) -> tuple[MCPServerConfig, MCPServerConfig]:
         """
         动态渲染并校验单个 MCP 服务器配置，支持原始字典或模型实例。
         Render and validate a single MCP server config dynamically, supporting raw dict or model instance.
@@ -731,9 +741,13 @@ class Computer(BaseComputer[PromptSession]):
                 Prompt session used for interactive resolving during rendering; can be None for silent resolving.
 
         Returns:
-          - MCPServerConfig:
-            中文: 通过渲染与校验后的不可变配置对象。
-            English: The immutable config object after rendering and validation.
+          - tuple[MCPServerConfig, MCPServerConfig]:
+            中文: ``(raw_with_bundle, rendered_with_bundle)`` 二元组（#149）。两者 ``bundle_id`` 均物化为同一 derive-on-raw
+                值；``raw`` = **未渲染** config（占位符字面保留，供 get_config wire 保真、绝不外泄已解析 secret），
+                ``rendered`` = 渲染校验后的不可变 config（供 manager 物化 / spawn）。
+            English: ``(raw_with_bundle, rendered_with_bundle)`` (#149). Both carry the same materialized ``bundle_id``;
+                ``raw`` is the un-rendered config (placeholders kept, feeds the get_config wire — resolved secrets never
+                leave the Computer), ``rendered`` is the validated immutable config (feeds manager materialization / spawn).
 
         Raises:
           - InputNotFoundError:
@@ -783,7 +797,13 @@ class Computer(BaseComputer[PromptSession]):
             # 使 config.bundle_id 解析后恒有值、作 no-double-open 去重键跨渲染阶段稳定。model_copy 不重跑
             # validator（resolved 已合法）。生成不在 Pydantic（config frozen）。
             resolved_bundle_id = resolve_bundle_id(raw_model)
-            return validated.model_copy(update={"bundle_id": resolved_bundle_id})
+            # #149：并列返回 (raw-with-bundle, rendered-with-bundle)。raw 供 get_config wire 保真（占位符字面保留），
+            # rendered 供 manager 物化 / spawn。二者 bundle_id 均物化为同一 derive-on-raw 值（no-double-open 跨渲染稳定）。
+            # DRY：复用同一次 raw_model / validated，不二次校验。
+            return (
+                raw_model.model_copy(update={"bundle_id": resolved_bundle_id}),
+                validated.model_copy(update={"bundle_id": resolved_bundle_id}),
+            )
         except Exception as e:
             name = (server.get("name") if isinstance(server, dict) else getattr(server, "name", "unknown")) or "unknown"
             logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
@@ -808,11 +828,15 @@ class Computer(BaseComputer[PromptSession]):
     #   config（保持既有「client owns Socket.IO 上报」分层，#93；rust 内部 bump 属实现细节，概念对齐即可，#135）。
     # ════════════════════════════════════════════════════════════════════════════
 
-    async def _amount_rendered(self, validated: MCPServerConfig) -> None:
+    async def _amount_rendered(self, raw_cfg: MCPServerConfig, validated: MCPServerConfig) -> None:
         """物化**已渲染校验**的 config 进 manager（内存投影 + capability 上报）/ Mount an already-rendered config。
 
         对齐 rust ``mount_rendered``：durable 与 transient 两路径的**共享核**——durable 落盘后复用同一次 render 结果
         经此物化，**避免重复触发** input/secret resolver 副作用（不二次渲染）。manager 惰性初始化于此单点。
+
+        #149：``raw_cfg`` = 同一 server 的**未渲染 raw**（bundle_id 已物化），随物化登记进 ``_active_raw`` 供 get_config
+        wire 取 body（占位符字面保留）。运行期同 bundle_id = 覆盖（与 manager ``_add_or_update`` 原地更新语义一致）。
+        #149: ``raw_cfg`` is the un-rendered raw of the same server; register it into ``_active_raw`` for the wire body.
         """
         if self.mcp_manager is None:
             self.mcp_manager = MCPServerManager(
@@ -820,7 +844,11 @@ class Computer(BaseComputer[PromptSession]):
                 auto_reconnect=self._auto_reconnect,
                 message_handler=self._on_manager_change,
             )
+        # 先物化进 manager，**成功后**再登记 raw（事务性一致：manager add 失败——如 server 活跃 ∧ 非 auto_reconnect
+        # 抛 RuntimeError——则不留 attempted≠running 的 map 漂移；raw 恒未渲染故无安全影响，此为展示一致性加固）。
+        # Register raw only after a successful manager add, so a failed update leaves no attempted≠running drift.
         await self.mcp_manager.aadd_or_aupdate_server(validated)
+        self._active_raw[resolve_bundle_id(validated)] = raw_cfg
 
     @staticmethod
     def _raw_body_for_disk(server: MCPServerConfig | dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -860,8 +888,8 @@ class Computer(BaseComputer[PromptSession]):
             plugin / marketplace: plugin 实时挂载 D2 上下文（#69 Group A）；非 None 时 bundled server 的裸
                 ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None。
         """
-        validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
-        await self._amount_rendered(validated)
+        raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
+        await self._amount_rendered(raw_cfg, validated)
 
     async def aunmount_server(self, name: str) -> None:
         """按 **name** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by name。
@@ -875,6 +903,7 @@ class Computer(BaseComputer[PromptSession]):
         targets = {resolve_bundle_id(cfg) for cfg in self.mcp_manager.server_configs() if cfg.name == name}
         for bundle_id in targets:
             await self.mcp_manager.aremove_server(bundle_id)
+            self._active_raw.pop(bundle_id, None)  # #149 hygiene：raw 投影随停摘回收（读时以 manager 集为准，非正确性关键）
 
     async def aunmount_server_by_id(self, bundle_id: str) -> None:
         """按 **bundle_id** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by bundle_id。
@@ -886,6 +915,7 @@ class Computer(BaseComputer[PromptSession]):
             return
         if any(resolve_bundle_id(cfg) == bundle_id for cfg in self.mcp_manager.server_configs()):
             await self.mcp_manager.aremove_server(bundle_id)
+            self._active_raw.pop(bundle_id, None)  # #149 hygiene（读时以 manager 集为准，非正确性关键）
 
     # ── durable 路径（落盘 raw + 重启存活）/ durable path (persist raw + survive restart) ─────────────
 
@@ -932,12 +962,12 @@ class Computer(BaseComputer[PromptSession]):
         :raises McpConfigCorruptError: 目标 ``mcp.json`` 结构损坏（① 拒绝覆盖以免销毁既有内容）。
         """
         # 1. 先渲染校验（早失败：损坏配置在落盘前抛出，绝不留下盘上声明而运行期未挂的半态）。
-        validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
+        raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         # 2. 取未渲染 raw 落盘（D1：占位字面保留、绝不写 secret）。
         name, raw_body = self._raw_body_for_disk(server)
         upsert_mcp_server(name, raw_body, scope=scope, env=os.environ)
         # 3. 复用 render 结果物化（capability 自动上报；config 上报由调用方驱动，见分账注释）。
-        await self._amount_rendered(validated)
+        await self._amount_rendered(raw_cfg, validated)
 
     async def aremove_server(self, bundle_id: str, *, session: PromptSession | None = None) -> None:
         """**持久删除**一个 MCP server 声明（bundle_id → 声明名 → 删所有可写 scope）+ 运行期停摘 / Durably remove。
@@ -1124,6 +1154,7 @@ class Computer(BaseComputer[PromptSession]):
         if self.mcp_manager:
             await self.mcp_manager.aclose()
         self.mcp_manager = None
+        self._active_raw.clear()  # #149：运行期活跃集销毁 → 清空 raw 投影缓存
 
     async def __aenter__(self) -> "Computer":
         """
@@ -1158,6 +1189,44 @@ class Computer(BaseComputer[PromptSession]):
             tuple[MCPServerConfig, ...]: 配置字典。Config dict.
         """
         return tuple(self._mcp_servers)
+
+    def active_server_configs(self) -> tuple[MCPServerConfig, ...]:
+        """运行期活跃 MCP server 配置集的**声明面 raw 投影**（``client:get_config`` wire 权威，#149 / F2 / PROTO-2）。
+
+        Runtime-active MCP server configs projected to their **raw (un-rendered) declared form** — the authority for
+        the ``client:get_config`` wire projection (#149 / F2 / PROTO-2).
+
+        - **SET** 取 :meth:`MCPServerManager.server_configs`（运行期权威——含 boot 物化 / :meth:`amount_server` 动态挂载 /
+          plugin 治理重挂项；**非**构造期死快照 :attr:`mcp_servers`——后者 CLI 空集构造下恒空，正是 #149 P0 病根）。
+        - 每条 **body** 取 :attr:`_active_raw` 里的**未渲染 raw**（``${input:}`` / ``${env:}`` 字面保留、**绝不外泄已解析
+          secret**，§9.1 值不离 Computer）。manager 存的是渲染后 config（供 spawn），故此处按 bundle_id join 回 raw。
+        - manager 未建（pre-boot）→ 空元组（无运行期活跃集）。
+
+        不变式：每个运行期活跃 bundle_id 必有 raw 记录（boot 与 :meth:`_amount_rendered` 两挂载漏斗均登记）。若缺失
+        （某挂载路径漏登记的 Bug）→ **fail-closed**：从 wire **省略**该 server（大声 WARN 可诊断），**绝不**回退渲染后
+        config——那会把已解析 secret 送上「MUST 为 raw」的 wire（§9.1）。宁可 Agent 少看到一个 server，也不泄漏一把
+        secret。正常路径两漏斗均登记 raw，不触发。
+
+        区别于 :attr:`mcp_servers`（构造期快照）与 :meth:`list_mcp_servers_with_metadata`（含 pre-boot 声明回退的诊断
+        视图）：本方法是**纯运行期活跃集 + raw body** 的 wire 投影，无构造期回退。
+        """
+        if self.mcp_manager is None:
+            return ()
+        out: list[MCPServerConfig] = []
+        for cfg in self.mcp_manager.server_configs():
+            bundle_id = resolve_bundle_id(cfg)
+            raw = self._active_raw.get(bundle_id)
+            if raw is None:
+                # fail-closed（安全纵深）：缺 raw 记录 = 某挂载漏斗漏登记的 Bug。**省略**该 server、绝不回退 ``cfg``
+                # （渲染后 config，含已解析 secret）——避免在「MUST 为 raw」的 wire 上泄漏 secret。大声 WARN 供诊断。
+                # Fail-closed: omit the server rather than leak the rendered config's resolved secrets onto a raw-only wire.
+                logger.warning(
+                    f"active_server_configs: 运行期活跃 bundle_id={bundle_id!r} 无 raw 记录，**从 get_config 省略**该 server"
+                    f"（某挂载路径未登记 raw，属 Bug；绝不回退渲染值以免 secret 外泄）/ omitting server (no raw record)",
+                )
+                continue
+            out.append(raw)
+        return tuple(out)
 
     @property
     def inputs(self) -> tuple[MCPServerInput, ...]:

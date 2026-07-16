@@ -23,6 +23,7 @@ from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
     GET_BLOB_EVENT,
+    GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
     GET_SKILL_EVENT,
@@ -39,6 +40,7 @@ from a2c_smcp.smcp import (
     AgentCallData,
     EnterOfficeNotification,
     GetBlobRet,
+    GetComputerConfigRet,
     GetDeskTopRet,
     GetResourcesRet,
     GetSkillRet,
@@ -315,6 +317,30 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         except Exception as e:
             logger.error(f"Failed to get tools from computer {computer}: {e}", exc_info=True)
             raise
+
+    async def get_config_from_computer(self, computer: str, timeout: int = 20) -> GetComputerConfigRet:
+        """
+        异步从指定计算机获取 MCP 配置（servers 键 = bundle_id，协议 #18）（#149）
+        Async get MCP config from the specified computer (servers keyed by bundle_id) (#149)
+
+        Args:
+            computer (str): 计算机名称 / Computer Name
+            timeout (int): 超时时间 / Timeout duration
+
+        Returns:
+            GetComputerConfigRet: 配置响应（``servers[bundle_id]`` + 可选 ``inputs``）/ Config response.
+
+        备注 / Notes:
+            ``GetComputerConfigRet`` 无 ``req_id`` 字段、``on_get_config`` 也不 echo req_id，故**不做** req_id 校验
+            （与 get_tools / get_resources 不同）；``on_get_config`` 无 flat ErrorPayload 路径，故**不需** raise_for_error_payload。
+        """
+        req = self.create_get_config_request(computer)
+        logger.debug(f"Getting config from computer {computer}")
+        response = await self.call(GET_CONFIG_EVENT, req, namespace=self._namespace, timeout=timeout)
+        ret: GetComputerConfigRet = {"servers": response.get("servers", {})}
+        if response.get("inputs") is not None:
+            ret["inputs"] = response["inputs"]
+        return ret
 
     def register_event_handlers(self) -> None:
         """

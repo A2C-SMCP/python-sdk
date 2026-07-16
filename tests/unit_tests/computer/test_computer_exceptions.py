@@ -28,7 +28,8 @@ async def test_arender_and_validate_server_missing_input_keeps_original() -> Non
     )
     cfg = StdioServerConfig(name="bad", server_parameters=params)
 
-    validated = await comp._arender_and_validate_server(cfg)  # type: ignore[attr-defined]
+    # #149：返回 (raw, rendered)；本用例断言渲染后结果，取第二元。
+    _raw, validated = await comp._arender_and_validate_server(cfg)  # type: ignore[attr-defined]
     assert validated.server_parameters.env is not None
     assert validated.server_parameters.env.get("FOO") == "${input:NOT_DEFINED}"
 

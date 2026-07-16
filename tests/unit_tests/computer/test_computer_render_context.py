@@ -54,8 +54,11 @@ async def test_render_context_resolves_prefixed_input(monkeypatch: pytest.Monkey
     comp = Computer(name="t")
     comp.add_or_update_input(MCPServerPromptStringInput(id="audit@acme/token", description="d", password=True, type="promptString"))
 
-    validated = await comp._arender_and_validate_server(dict(_CFG), plugin="audit", marketplace="acme")
+    _raw, validated = await comp._arender_and_validate_server(dict(_CFG), plugin="audit", marketplace="acme")  # #149：取渲染后
     assert "secret-val" in json.dumps(validated.model_dump(mode="json"))  # 渲染命中
+    # #149：同源 raw 元须保留占位符字面（未渲染），证明 raw≠rendered、raw 绝不含已解析 secret。
+    raw_dumped = json.dumps(_raw.model_dump(mode="json"))
+    assert "${input:token}" in raw_dumped and "secret-val" not in raw_dumped
 
 
 @pytest.mark.asyncio
@@ -64,6 +67,6 @@ async def test_render_without_context_leaves_placeholder(monkeypatch: pytest.Mon
     comp = Computer(name="t")
     comp.add_or_update_input(MCPServerPromptStringInput(id="audit@acme/token", description="d", password=True, type="promptString"))
     # 无 plugin/marketplace 上下文 → 裸 token 不在池、无前缀回退 → render 容错保留占位符（不解析、不泄漏 env 值）
-    validated = await comp._arender_and_validate_server(dict(_CFG))
+    _raw, validated = await comp._arender_and_validate_server(dict(_CFG))  # #149：取渲染后
     dumped = json.dumps(validated.model_dump(mode="json"))
     assert "${input:token}" in dumped and "secret-val" not in dumped

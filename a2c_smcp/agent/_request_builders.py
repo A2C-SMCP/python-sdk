@@ -26,6 +26,7 @@ import uuid
 from a2c_smcp.agent.types import AgentConfig
 from a2c_smcp.smcp import (
     GetBlobReq,
+    GetComputerConfigReq,
     GetDeskTopReq,
     GetResourcesReq,
     GetSkillReq,
@@ -80,6 +81,25 @@ def build_get_tools_request(agent_config: AgentConfig, computer: str) -> GetTool
         GetToolsReq: 获取工具请求 / Get tools request
     """
     return GetToolsReq(
+        computer=computer,
+        agent=agent_config["agent"],
+        req_id=uuid.uuid4().hex,
+    )
+
+
+def build_get_config_request(agent_config: AgentConfig, computer: str) -> GetComputerConfigReq:
+    """
+    创建获取 Computer MCP 配置请求对象（#149）
+    Create get-config request object (#149)
+
+    Args:
+        agent_config (AgentConfig): Agent 配置 / Agent configuration
+        computer (str): 目标计算机ID / Target computer ID
+
+    Returns:
+        GetComputerConfigReq: 获取配置请求 / Get config request
+    """
+    return GetComputerConfigReq(
         computer=computer,
         agent=agent_config["agent"],
         req_id=uuid.uuid4().hex,

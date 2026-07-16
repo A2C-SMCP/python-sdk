@@ -50,6 +50,17 @@ def test_build_get_tools_request_structure() -> None:
     assert isinstance(req["req_id"], str) and req["req_id"]
 
 
+def test_build_get_config_request_structure() -> None:
+    # #149 B 半：get_config 请求构造器（镜像 build_get_tools_request，构造式、无可选键）。
+    # 局部 import：实现落地前该函数不存在，此测试红（ImportError），不牵连其他 builder 测试的 collection。
+    from a2c_smcp.agent._request_builders import build_get_config_request
+
+    req = build_get_config_request(_CFG, "comp-1")
+    assert req["computer"] == "comp-1"
+    assert req["agent"] == "agent-1"
+    assert isinstance(req["req_id"], str) and req["req_id"]
+
+
 def test_build_get_resources_request_omits_cursor_by_default() -> None:
     # 中文：首次请求不带 cursor 键；English: first page must not carry the cursor key.
     req = build_get_resources_request(_CFG, "comp-1", "mcp-srv")

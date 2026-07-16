@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     EnterOfficeNotification,
     EnterOfficeReq,
     GetBlobReq,
+    GetComputerConfigReq,
     GetDeskTopReq,
     GetDeskTopRet,
     GetResourcesReq,
@@ -119,6 +120,19 @@ class BaseAgentClient(ABC):
             GetToolsReq: 获取工具请求 / Get tools request
         """
         return _rb.build_get_tools_request(self.auth_provider.get_agent_config(), computer)
+
+    def create_get_config_request(self, computer: str) -> GetComputerConfigReq:
+        """
+        创建获取 Computer MCP 配置请求对象（#149）
+        Create get-config request object (#149)
+
+        Args:
+            computer (str): 目标计算机ID / Target computer ID
+
+        Returns:
+            GetComputerConfigReq: 获取配置请求 / Get config request
+        """
+        return _rb.build_get_config_request(self.auth_provider.get_agent_config(), computer)
 
     def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
         """
@@ -463,6 +477,19 @@ class BaseAgentSyncClient(ABC):
             GetToolsReq: 获取工具请求 / Get tools request
         """
         return _rb.build_get_tools_request(self.auth_provider.get_agent_config(), computer)
+
+    def create_get_config_request(self, computer: str) -> GetComputerConfigReq:
+        """
+        创建获取 Computer MCP 配置请求对象（#149）
+        Create get-config request object (#149)
+
+        Args:
+            computer (str): 目标计算机ID / Target computer ID
+
+        Returns:
+            GetComputerConfigReq: 获取配置请求 / Get config request
+        """
+        return _rb.build_get_config_request(self.auth_provider.get_agent_config(), computer)
 
     def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
         """

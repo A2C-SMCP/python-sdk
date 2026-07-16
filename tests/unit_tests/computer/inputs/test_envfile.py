@@ -104,6 +104,6 @@ async def test_render_then_envfile_with_env_placeholder(tmp_path: Path, monkeypa
         "server_parameters": {"command": "node", "env": {"EXPLICIT": "v"}},
         "envFile": "${env:WORK_DIR}/.env",
     }
-    validated = await comp._arender_and_validate_server(raw)
+    _raw, validated = await comp._arender_and_validate_server(raw)  # #149：返回 (raw, rendered)，取渲染后断言
     assert validated.server_parameters.env == {"EXPLICIT": "v", "FROM_FILE": "yes"}
     assert validated.env_file == str(tmp_path / ".env")  # 字段保留、路径已渲染

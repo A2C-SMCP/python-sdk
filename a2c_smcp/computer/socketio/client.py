@@ -536,9 +536,11 @@ class SMCPComputerClient(AsyncClient):
             raise SMCPNamespaceError("计算机标识不匹配")
 
         servers: dict[str, dict] = {}
-        # 从 Computer 中获取初始化时传入的配置集合（不可变元组）
-        # From Computer, get the immutable tuple of initial MCP server configs
-        for cfg in self.computer.mcp_servers:
+        # #149：数据源 = **运行期活跃集的 raw 投影**（F2/PROTO-2：wire 投影 MUST 读运行期权威、MUST NOT 读构造期死快照）。
+        # active_server_configs() 的 SET 取 manager 运行期权威、body 取未渲染 raw（占位符字面保留、绝不外泄已解析 secret）。
+        # #149: source = raw projection of the runtime-active set (F2/PROTO-2: wire MUST read runtime authority, never the
+        # construction-time dead snapshot). SET from manager authority; body kept raw (placeholders literal, no secret leak).
+        for cfg in self.computer.active_server_configs():
             # 身份键 = bundle_id（协议 #18）；从 raw config derive（与注册边界 seam 一致，raw #17）。
             # no-double-open：同 bundle_id 保留首个（与 manager boot first-wins 一致）。
             bundle_id = resolve_bundle_id(cfg)

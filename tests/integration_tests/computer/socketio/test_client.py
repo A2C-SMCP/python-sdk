@@ -298,6 +298,10 @@ async def test_computer_handles_get_config(computer_server: MockComputerServerNa
         def name(self) -> str:
             return computer_name
 
+        def active_server_configs(self):
+            # #149：on_get_config 现从运行期活跃集的 raw 投影取数；本 fake 直接回等价配置集。
+            return (stdio_cfg, sse_cfg, http_cfg)
+
         # 兼容其他测试中会用到的方法（此测试用例中不会调用）/ compatibility no-op
         aget_available_tools = AsyncMock(return_value=[])
         mcp_manager = MagicMock()
