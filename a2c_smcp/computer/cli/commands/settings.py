@@ -99,8 +99,11 @@ def _read_scope_with_errors(
             return {}, []
         return load_settings_file(flag_path, SettingsScope.FLAG)
     if scope == "policy":
-        # policy 层由 resolve_policy_settings 做 first-source-wins；其校验错误在 merged 路径
-        # （resolve_settings 内按 POLICY scope 校验）呈现——此处单 scope 读为原始 dict，无独立校验通道。
+        # policy 层 = resolve_policy_settings 的 first-source-wins 结果，此处**未经 validate_settings**、
+        # 按原始 dict 返回（与 rust ``read_scope_with_errors`` 的 policy 分支同形，双端一致）。
+        # 已知缺口（#157 fix-review 🟡）：故 ``settings show --scope policy`` 看到的字段可能在 merged 路径
+        # 被判废（如 allowedMcpServers 类型错）却在此零警告。**不是「没有校验通道」**——validate_settings
+        # 就在同模块、``scope.py`` 的 resolve_settings 正是这么用的；只是行为变更须双端同步，另立 issue。
         return resolve_policy_settings(env=env), []
     return None
 
