@@ -20,6 +20,11 @@ transient 不落盘 / 投影不回写——逐条与 rust 对应用例**同结�
      投影拒删（#148 origin 判据）。（rust ``8f4229a`` 复活守护测试自足 + ``Synthesized`` 拒删）
   4. transient 不落盘：``amount_server`` / ``aunmount_server`` 前后 mcp 文件字节不变、只运行期投影变。（rust ``mount_server``）
   5. 投影调用方不回写：boot 挂载已声明 server 后用户 mcp.json 层 diff 干净。（#138 ③ 守护）
+  6. 寻址对拍（#150 R5②）：同 display 名 + 显式异 bundle_id 共存 → 运行期按 bundle_id 键各自保留（测寻址、非生成算法）。
+
+#150 site3 改造：全套夹具 display name 与 bundle_id **取值分叉**（``"svc.disp"`` → bundle_id ``svc_disp``）；运行期存在性/
+寻址断言经 :func:`_runtime_bundle_ids` 落在 **bundle_id** 维度，盘上 ``mcp.json`` 断言保 **name** 键（两识别空间分账，
+后者为 wontfix 正交声明面）——缺省 name≡bundle_id 曾双重致盲，分叉后全套既有用例自动升级为身份泄漏守卫。
 
 隔离：``monkeypatch.chdir(tmp)`` 锚 project/local（#116）、``XDG_CONFIG_HOME`` → tmp 锚 user；``_no_policy`` 固定
 policy 为空保确定性；``auto_connect=False`` 免拉起真实进程（``run_mcp_approval`` 经 transient ``amount_server`` 入册
@@ -43,6 +48,7 @@ from a2c_smcp.computer.settings.mcp_config import (
     mcp_write_path,
     resolve_mcp_config,
 )
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 
 class _MapResolver(InputResolver):
@@ -74,8 +80,8 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
 
 
-def _stdio_dict(name: str, command: str, *, disabled: bool = False) -> dict[str, Any]:
-    return {
+def _stdio_dict(name: str, command: str, *, disabled: bool = False, bundle_id: str | None = None) -> dict[str, Any]:
+    d: dict[str, Any] = {
         "type": "stdio",
         "name": name,
         "disabled": disabled,
@@ -90,6 +96,9 @@ def _stdio_dict(name: str, command: str, *, disabled: bool = False) -> dict[str,
         "forbidden_tools": [],
         "tool_meta": {},
     }
+    if bundle_id is not None:
+        d["bundle_id"] = bundle_id  # #150 R5②：注入**显式** bundle_id，令 display name 与身份可控地分叉。
+    return d
 
 
 def _comp(tmp_path: Path, *, resolver: InputResolver | None = None) -> Computer:
@@ -133,8 +142,13 @@ def _snapshot_mcp_files() -> dict[str, bytes | None]:
     return snap
 
 
-def _runtime_names(comp: Computer) -> set[str]:
-    return {c.name for c in comp.mcp_manager.server_configs()} if comp.mcp_manager is not None else set()
+def _runtime_bundle_ids(comp: Computer) -> set[str]:
+    """运行期投影的**身份键集** = bundle_id（#150 site3/#4：断言维度改 bundle_id，不再只取 display name 丢弃身份维度）。
+
+    Runtime projection's identity key set = bundle_id. server_configs() 内部按 bundle_id 键；``.name`` 仅 display，
+    存在性/寻址断言 MUST 落在 bundle_id 维度，否则 name≡bundle_id 缺省路径会把身份错乱盖住（本文件夹具已全数分叉）。
+    """
+    return {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()} if comp.mcp_manager is not None else set()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -150,15 +164,16 @@ async def test_alignment_durable_add_persists_raw_to_local(tmp_path: Path, monke
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path, resolver=_MapResolver({"cmd": "/bin/echo"}))
     # command 带占位符：resolver 使 raw≠rendered，证明盘上写的是 raw 未渲染（D1：绝不写渲染后 secret）。
-    await comp.aadd_or_aupdate_server(_stdio_dict("svc", "${input:cmd}"))
+    # #150 R5①：display name "svc.disp" → bundle_id "svc_disp"（分叉）；盘上 map key = name（wontfix 正交项）。
+    await comp.aadd_or_aupdate_server(_stdio_dict("svc.disp", "${input:cmd}"))
 
     local = _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ))
-    assert "svc" in local, "durable 默认落 Local（mcp.local.json）"
-    assert local["svc"]["server_parameters"]["command"] == "${input:cmd}", "盘上为 raw 未渲染（占位字面保留、非 /bin/echo）"
-    assert "svc" not in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "不碰 git 共享 project 层"
+    assert "svc.disp" in local, "durable 默认落 Local（mcp.local.json）；盘上按 name 键"
+    assert local["svc.disp"]["server_parameters"]["command"] == "${input:cmd}", "盘上为 raw 未渲染（占位字面保留、非 /bin/echo）"
+    assert "svc.disp" not in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "不碰 git 共享 project 层"
     # 内存投影为**渲染后**值——与盘上 raw 形成对照，坐实「盘上确为未渲染 raw」而非二者恰好相等的假阳性。
     runtime = {c.name: c for c in comp.mcp_manager.server_configs()}
-    assert runtime["svc"].server_parameters.command == "/bin/echo", "内存投影用渲染后结果（raw≠rendered，D1 断言可证伪）"
+    assert runtime["svc.disp"].server_parameters.command == "/bin/echo", "内存投影用渲染后结果（raw≠rendered，D1 断言可证伪）"
 
 
 @pytest.mark.asyncio
@@ -168,10 +183,10 @@ async def test_alignment_durable_in_scope_project_persists_git_layer(
     """durable ``_in_scope(PROJECT)`` → ``.tfrobot/mcp.json``（入 git、团队共享层）。"""
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
-    await comp.aadd_or_aupdate_server_in_scope(_stdio_dict("shared", "/bin/true"), McpWriteScope.PROJECT)
+    await comp.aadd_or_aupdate_server_in_scope(_stdio_dict("shared.disp", "/bin/true"), McpWriteScope.PROJECT)
 
-    assert "shared" in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "显式 Project → git 层"
-    assert "shared" not in _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ))
+    assert "shared.disp" in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "显式 Project → git 层（盘上 name 键）"
+    assert "shared.disp" not in _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ))
 
 
 @pytest.mark.asyncio
@@ -181,12 +196,12 @@ async def test_alignment_durable_update_existing_lands_origin_scope(
     """改已有 server 恒落其 origin scope（默认 Local 入参对已有声明无效，不迁移）。"""
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
-    await comp.aadd_or_aupdate_server_in_scope(_stdio_dict("svc", "/bin/v1"), McpWriteScope.PROJECT)
-    await comp.aadd_or_aupdate_server(_stdio_dict("svc", "/bin/v2"))  # 默认 Local，但恒落 origin=Project
+    await comp.aadd_or_aupdate_server_in_scope(_stdio_dict("svc.disp", "/bin/v1"), McpWriteScope.PROJECT)
+    await comp.aadd_or_aupdate_server(_stdio_dict("svc.disp", "/bin/v2"))  # 默认 Local，但恒落 origin=Project
 
     project = _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ))
-    assert "svc" in project and project["svc"]["server_parameters"]["command"] == "/bin/v2", "落 origin 且内容更新"
-    assert "svc" not in _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ)), "不漂移到 Local"
+    assert "svc.disp" in project and project["svc.disp"]["server_parameters"]["command"] == "/bin/v2", "落 origin 且内容更新"
+    assert "svc.disp" not in _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ)), "不漂移到 Local"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -197,14 +212,14 @@ async def test_alignment_durable_add_survives_restart(tmp_path: Path, monkeypatc
     """durable add → **全新 Computer**（模拟重启）经 ``run_mcp_approval`` 读盘挂载 → 该 server 仍在运行期投影。"""
     _isolate(tmp_path, monkeypatch)
     comp_a = _comp(tmp_path)
-    await comp_a.aadd_or_aupdate_server(_stdio_dict("survivor", "/bin/echo"))
-    assert "survivor" in _runtime_names(comp_a)
+    await comp_a.aadd_or_aupdate_server(_stdio_dict("survivor.disp", "/bin/echo"))  # name "survivor.disp" → bundle_id "survivor_disp"
+    assert "survivor_disp" in _runtime_bundle_ids(comp_a)
 
     # 「重启」= 丢弃 comp_a、全新实例读同一 cwd/XDG。
     comp_b = _comp(tmp_path)
-    assert "survivor" not in _runtime_names(comp_b), "新实例构造期无运行期投影（未 boot）"
+    assert "survivor_disp" not in _runtime_bundle_ids(comp_b), "新实例构造期无运行期投影（未 boot）"
     await _boot_mount(comp_b)
-    assert "survivor" in _runtime_names(comp_b), "durable 声明重启后仍挂载（对齐 rust 重启存活）"
+    assert "survivor_disp" in _runtime_bundle_ids(comp_b), "durable 声明重启后仍挂载（对齐 rust 重启存活）"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -216,24 +231,24 @@ async def test_alignment_remove_deletes_all_scopes_and_no_resurrection(
 ) -> None:
     """人写 mcp.json 声明 → boot 挂载 → ``aremove_server`` 删所有可写 scope → **再 boot 不复活**（footgun 守护）。"""
     _isolate(tmp_path, monkeypatch)
-    # 人在 project + local 两层都写了同名声明（复活 footgun 最险场景：删不干净就重启复活）。
-    _write_mcp_file(mcp_write_path(McpWriteScope.PROJECT, env=os.environ), {"ghost": _stdio_dict("ghost", "/bin/p")})
-    _write_mcp_file(mcp_write_path(McpWriteScope.LOCAL, env=os.environ), {"ghost": _stdio_dict("ghost", "/bin/l")})
+    # 人在 project + local 两层都写了同名声明（复活 footgun 最险场景：删不干净就重启复活）。盘上 map key = name。
+    _write_mcp_file(mcp_write_path(McpWriteScope.PROJECT, env=os.environ), {"ghost.disp": _stdio_dict("ghost.disp", "/bin/p")})
+    _write_mcp_file(mcp_write_path(McpWriteScope.LOCAL, env=os.environ), {"ghost.disp": _stdio_dict("ghost.disp", "/bin/l")})
 
     comp_a = _comp(tmp_path)
     await _boot_mount(comp_a)
-    assert "ghost" in _runtime_names(comp_a), "boot 读盘挂载人写声明"
+    assert "ghost_disp" in _runtime_bundle_ids(comp_a), "boot 读盘挂载人写声明（运行期身份键 = bundle_id）"
 
-    # durable remove（bundle_id("ghost") == "ghost"）→ 删所有可写 scope + 运行期停摘。
-    await comp_a.aremove_server("ghost")
-    assert "ghost" not in _runtime_names(comp_a), "运行期投影已停摘"
-    assert "ghost" not in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "project 声明删净"
-    assert "ghost" not in _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ)), "local 声明删净"
+    # durable remove 以 **bundle_id** 寻址（name "ghost.disp" → bundle_id "ghost_disp"）→ 删所有可写 scope + 运行期停摘。
+    await comp_a.aremove_server("ghost_disp")
+    assert "ghost_disp" not in _runtime_bundle_ids(comp_a), "运行期投影已停摘"
+    assert "ghost.disp" not in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "project 声明删净（盘上 name 键）"
+    assert "ghost.disp" not in _read_servers(mcp_write_path(McpWriteScope.LOCAL, env=os.environ)), "local 声明删净"
 
     # 关键：全新实例重启 → 盘上已无声明 → **不复活**。
     comp_b = _comp(tmp_path)
     await _boot_mount(comp_b)
-    assert "ghost" not in _runtime_names(comp_b), "复活 footgun 守护：删后重启不复活"
+    assert "ghost_disp" not in _runtime_bundle_ids(comp_b), "复活 footgun 守护：删后重启不复活"
 
 
 @pytest.mark.asyncio
@@ -242,12 +257,12 @@ async def test_alignment_remove_rejects_undeclared_runtime_projection(tmp_path: 
     对应 rust ``WriteTargetError::Synthesized``，#148/F3 取代历史 name-keyed bundled 拒删）。"""
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
-    await comp.amount_server(_stdio_dict("figma", "/bin/figma"))  # 无盘声明的运行期投影（bundle_id=="figma"）
-    assert "figma" not in resolve_mcp_config(env=os.environ).servers, "前置：盘上无任何 figma 声明"
+    await comp.amount_server(_stdio_dict("figma.disp", "/bin/figma"))  # 无盘声明的运行期投影（name "figma.disp" → bundle_id "figma_disp"）
+    assert "figma.disp" not in resolve_mcp_config(env=os.environ).servers, "前置：盘上无任何 figma 声明（config 按 name 键）"
 
     with pytest.raises(McpWriteTargetError):
-        await comp.aremove_server("figma")
-    assert "figma" in _runtime_names(comp), "拒删后运行期投影仍在（未误停摘）"
+        await comp.aremove_server("figma_disp")  # 以 bundle_id 寻址
+    assert "figma_disp" in _runtime_bundle_ids(comp), "拒删后运行期投影仍在（未误停摘）"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -257,15 +272,15 @@ async def test_alignment_remove_rejects_undeclared_runtime_projection(tmp_path: 
 async def test_alignment_transient_mount_does_not_persist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``amount_server`` 前后所有 mcp 文件字节不变（config 源稳定），但运行期投影新增（capability 面变）。"""
     _isolate(tmp_path, monkeypatch)
-    # 先播一个人写声明，证明 transient 连既有文件也不动。
-    _write_mcp_file(mcp_write_path(McpWriteScope.PROJECT, env=os.environ), {"declared": _stdio_dict("declared", "/bin/d")})
+    # 先播一个人写声明，证明 transient 连既有文件也不动。盘上 map key = name。
+    _write_mcp_file(mcp_write_path(McpWriteScope.PROJECT, env=os.environ), {"declared.disp": _stdio_dict("declared.disp", "/bin/d")})
     comp = _comp(tmp_path)
     before = _snapshot_mcp_files()
 
-    await comp.amount_server(_stdio_dict("ephemeral", "/bin/e"))
+    await comp.amount_server(_stdio_dict("ephemeral.disp", "/bin/e"))
 
     assert _snapshot_mcp_files() == before, "transient 挂载不改任一 mcp 文件（config 源不变）"
-    assert "ephemeral" in _runtime_names(comp), "但运行期投影已含新 server（capability 面变）"
+    assert "ephemeral_disp" in _runtime_bundle_ids(comp), "但运行期投影已含新 server（capability 面变；身份键 = bundle_id）"
 
 
 @pytest.mark.asyncio
@@ -273,13 +288,13 @@ async def test_alignment_transient_unmount_does_not_persist(tmp_path: Path, monk
     """``aunmount_server(name)`` 只摘运行期投影，不动任一 mcp 文件。"""
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
-    await comp.amount_server(_stdio_dict("tmp-srv", "/bin/t"))
+    await comp.amount_server(_stdio_dict("tmp.srv.disp", "/bin/t"))  # name "tmp.srv.disp" → bundle_id "tmp_srv_disp"
     before = _snapshot_mcp_files()  # 均不存在（transient 未落盘）
 
-    await comp.aunmount_server("tmp-srv")
+    await comp.aunmount_server("tmp.srv.disp")  # aunmount_server 以 **name**（display）寻址
 
     assert _snapshot_mcp_files() == before, "transient 停摘不产生任何落盘"
-    assert "tmp-srv" not in _runtime_names(comp), "运行期投影已摘除"
+    assert "tmp_srv_disp" not in _runtime_bundle_ids(comp), "运行期投影已摘除（身份键 = bundle_id）"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -289,11 +304,38 @@ async def test_alignment_transient_unmount_does_not_persist(tmp_path: Path, monk
 async def test_alignment_boot_mount_does_not_write_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``run_mcp_approval`` 挂载**已声明** server（投影语义）→ 用户 mcp.json 层 **byte-diff 干净**（不回写）。"""
     _isolate(tmp_path, monkeypatch)
-    _write_mcp_file(mcp_write_path(McpWriteScope.LOCAL, env=os.environ), {"declared": _stdio_dict("declared", "/bin/d")})
+    _write_mcp_file(mcp_write_path(McpWriteScope.LOCAL, env=os.environ), {"declared.disp": _stdio_dict("declared.disp", "/bin/d")})
     before = _snapshot_mcp_files()
 
     comp = _comp(tmp_path)
     await _boot_mount(comp)
 
     assert _snapshot_mcp_files() == before, "boot 挂载已声明 server 不回写任一 mcp 文件（无双源/scope 漂移）"
-    assert "declared" in _runtime_names(comp), "但确实挂载进运行期投影"
+    assert "declared_disp" in _runtime_bundle_ids(comp), "但确实挂载进运行期投影（身份键 = bundle_id）"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 组 6 — 寻址对拍（#150 R5②：同 display 名 + 显式异 bundle_id 共存，测「寻址行为」非「生成算法」）
+# ═══════════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_alignment_same_name_distinct_bundle_id_coexist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**同 display 名 + 显式异 bundle_id** 两 server 经 transient 挂载 → 运行期投影**同时含**两 bundle_id（各自共存）。
+
+    English: two servers sharing a display name but carrying explicitly distinct bundle_id coexist in the runtime
+    projection, each keyed by its own bundle_id.
+
+    #150 R5② 针对根因：现有对拍只测**生成算法**（逐字节向量），缺陷全在**寻址行为**——本向量正是补上这一半。
+    manager 以 bundle_id 为键：display 名碰撞不塌缩、异 bundle_id 不触发 no-double-open ⇒ 二者并存。
+    用 transient ``amount_server`` 避开盘上 name-keyed mcp.json 的同名覆盖（那是正交的 wontfix 声明面形态）。
+    对应 rust：``mount_server`` 两次异 bundle_id 后 ``server_configs()`` 含两条——SDK 方法名不强制对拍，wire/寻址语义一致即可。
+    """
+    _isolate(tmp_path, monkeypatch)
+    comp = _comp(tmp_path)
+    await comp.amount_server(_stdio_dict("dup.disp", "/bin/a", bundle_id="dup-a"))
+    await comp.amount_server(_stdio_dict("dup.disp", "/bin/b", bundle_id="dup-b"))
+
+    # 运行期身份键 = bundle_id：两条各按自身 bundle_id 共存（若寻址误按 name 则塌缩为 1，此断言即红）。
+    assert {"dup-a", "dup-b"} <= _runtime_bundle_ids(comp)
+    # 佐证：两条 display name 逐字相同——证明区分靠 bundle_id 而非 name。
+    names = [c.name for c in comp.mcp_manager.server_configs()]
+    assert names.count("dup.disp") == 2

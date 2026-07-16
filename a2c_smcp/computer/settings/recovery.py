@@ -64,6 +64,7 @@ from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -340,9 +341,13 @@ def collect_enabled_bundled_servers(
     协议 §4.8 blockquote 的"SDK MUST 使 enabled bundled server 可查询"落点：client 据此物化进自己的
     MCP 配置模型，或经 :meth:`Computer.reconcile_governance` 传 hooks 显式重挂。门控 = **installed ∧
     enabled**（v0.3.0 §4.8.1：pid ∈ merged ``installedPlugins`` 且 ``enabledPlugins[pid] is True``；
-    ``installed_disabled`` 不可见——不进活跃投影，§2.4）。跨 plugin/scope 同名
-    server **首见保留去重**（账本插入序，与 rust 一致）；``installPath`` 缺失 / bundled JSON 损坏 →
-    WARN 跳过该记录，不阻断其余、不抛。
+    ``installed_disabled`` 不可见——不进活跃投影，§2.4）。跨 plugin/scope 按 **bundle_id**
+    （身份，非 display name）**首见保留去重**（账本插入序）：同 display 名但显式异 bundle_id 是两个不同身份的
+    server，各自保留（协议 data-structures.md no-double-open 同键，#150 site4）。``installPath`` 缺失 /
+    bundled JSON 损坏 → WARN 跳过该记录，不阻断其余、不抛。
+
+    与 rust ``settings/recovery.rs`` 同构（modulo rust-sdk 待跟修：rust 侧去重键 name→bundle_id 镜像本改动，
+    追踪于 Epic A2C-SMCP/python-sdk#147）——在缺省路径（name≡bundle_id）下二者等价，仅「同名异 bundle_id」裂缝上分叉。
 
     :param home: SKILL Home 绝对根。
     :param declared: 合并声明视图（``installedPlugins`` + ``enabledPlugins`` 两键）。
@@ -371,10 +376,14 @@ def collect_enabled_bundled_servers(
                 logger.warning("governance recovery: plugin %r bundled servers unparsable at %s, skipped: %s", pid, root, e)
                 continue
             for config in configs:
-                if config.name in seen:
-                    logger.debug("governance recovery: bundled server %r duplicated across plugins/scopes, first seen wins", config.name)
+                # 去重键 = bundle_id（身份），**非** display name——协议 data-structures.md §BundleID no-double-open
+                # 同键：同 display 名但显式异 bundle_id 是两个不同身份的 server，MUST 各自保留（#150 site4 根治）。
+                # 跨 SDK：rust settings/recovery.rs 同款 name→bundle_id 去重键待跟修（镜像 follow-up 追踪于 Epic #147）。
+                bid = resolve_bundle_id(config)
+                if bid in seen:
+                    logger.debug("governance recovery: bundled server bundle_id %r duplicated across plugins/scopes, first seen wins", bid)
                     continue
-                seen.add(config.name)
+                seen.add(bid)
                 out.append(
                     BundledServerRecord(plugin_id=pid, plugin=plugin, marketplace=marketplace, install_path=root, config=config),
                 )

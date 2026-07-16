@@ -34,6 +34,7 @@ from a2c_smcp.computer.settings.recovery import (
 from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
 
@@ -288,6 +289,34 @@ def test_collect_dedupes_same_server_name_across_plugins(tmp_path: Path) -> None
     assert records[0].config.name == "shared"
     assert records[0].plugin_id == "audit@acme"  # 首见胜：归属锁定账本序首个
     assert records[0].install_path == root_a
+
+
+def test_collect_keeps_same_name_distinct_bundle_id(tmp_path: Path) -> None:
+    """跨 plugin **同 display 名 + 显式异 bundle_id** → 两条都保留（去重键 = bundle_id，非 name）。
+
+    English: same display name but explicitly distinct bundle_id ⇒ both kept (dedup key is bundle_id, not name).
+
+    #150 R5②/site4：display 名允许碰撞、``bundle_id`` 才是身份（协议 no-double-open 同键）。现码按
+    ``config.name`` 去重会把两个**不同身份**的 server 误并成一条（server-name-as-identity Bug，本用例即其红灯守卫）；
+    去重键改 ``resolve_bundle_id(config)`` 后二者共存。
+    """
+    home = _home(tmp_path)
+    root_a = _setup_catalog(home, "acme", "audit", servers=[])
+    root_b = _setup_catalog(home, "beta", "fmt", servers=[])
+    # 同 display 名 "shared"，两 plugin 根不同 → 文件名不碰撞；显式异 bundle_id → 两个不同身份的 server。
+    _write_json(root_a / "mcp-servers" / "shared.json", {**_stdio("shared"), "bundle_id": "shared-a"})
+    _write_json(root_b / "mcp-servers" / "shared.json", {**_stdio("shared"), "bundle_id": "shared-b"})
+    _seed_installed(
+        home,
+        {"audit@acme": [_record(root_a, servers=["shared"])], "fmt@beta": [_record(root_b, servers=["shared"])]},
+    )
+
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme", "fmt@beta"), env=_env(tmp_path))
+
+    # 现码红（按 name 并成 1）→ 去重键改 bundle_id 后绿（两条都保留）。
+    assert len(records) == 2
+    assert {resolve_bundle_id(r.config) for r in records} == {"shared-a", "shared-b"}
+    assert all(r.config.name == "shared" for r in records)  # display 名碰撞合法、非身份
 
 
 def test_collect_enumerates_multi_scope_records_with_dedup(tmp_path: Path) -> None:

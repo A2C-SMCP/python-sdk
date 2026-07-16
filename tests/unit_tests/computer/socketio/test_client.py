@@ -93,21 +93,24 @@ async def test_on_get_config_serialization_three_types():
     中文：验证 on_get_config 对 stdio/sse/streamable_http 三种配置的序列化与强校验
     English: Verify on_get_config serialization and strict validation for stdio/sse/streamable_http types
     """
-    # 构造三种类型配置 / Build three types of server configs
+    # 构造三种类型配置 / Build three types of server configs。
+    # #150 R5①：display name **取值分叉**——含空格/括号，normalize_name 后 bundle_id 与 name 逐字不同
+    # （"stdio srv (display)" → "stdio_srv_display"）⇒ 键断言从此能鉴别「按 name 取」还是「按 bundle_id 取」，
+    # 令本序列化用例升级为真正的泄漏守卫（原名 "stdio-srv" 规范化后逐字等于自身，零鉴别力）。
     stdio_cfg = StdioServerConfig(
-        name="stdio-srv",
+        name="stdio srv (display)",
         server_parameters=StdioServerParameters(command="bash", args=["-lc", "echo hi"], env={}),
         forbidden_tools=["ban1"],
         tool_meta={"toolA": ToolMeta(auto_apply=True)},
     )
     sse_cfg = SseServerConfig(
-        name="sse-srv",
+        name="sse srv (display)",
         server_parameters=SseServerParameters(url="http://localhost:18080/sse"),
         forbidden_tools=[],
         tool_meta={},
     )
     http_cfg = StreamableHttpServerConfig(
-        name="http-srv",
+        name="http srv (display)",
         server_parameters=StreamableHttpParameters(url="http://localhost:18081"),
         forbidden_tools=[],
         tool_meta={},
@@ -140,21 +143,27 @@ async def test_on_get_config_serialization_three_types():
     # 结构校验 / Structure checks
     assert "servers" in ret
     servers = ret["servers"]
-    assert set(servers.keys()) == {"stdio-srv", "sse-srv", "http-srv"}
+    # #150：键 = **bundle_id**（与 display name 分叉）；若实现误按 name 取键此断言即红（泄漏守卫）。
+    assert set(servers.keys()) == {"stdio_srv_display", "sse_srv_display", "http_srv_display"}
+    # entry 同时携原始 display name 与解析后 bundle_id（name≠key，证明二者是不同维度）。
+    assert servers["stdio_srv_display"]["name"] == "stdio srv (display)"
+    assert servers["stdio_srv_display"]["bundle_id"] == "stdio_srv_display"
+    assert servers["sse_srv_display"]["name"] == "sse srv (display)"
+    assert servers["http_srv_display"]["name"] == "http srv (display)"
 
-    assert servers["stdio-srv"]["type"] == "stdio"
-    assert servers["sse-srv"]["type"] == "sse"
-    assert servers["http-srv"]["type"] == "streamable"
+    assert servers["stdio_srv_display"]["type"] == "stdio"
+    assert servers["sse_srv_display"]["type"] == "sse"
+    assert servers["http_srv_display"]["type"] == "streamable"
 
     # 基础字段校验 / Base fields
-    assert servers["stdio-srv"]["disabled"] is False
-    assert servers["stdio-srv"]["forbidden_tools"] == ["ban1"]
-    assert "toolA" in servers["stdio-srv"]["tool_meta"]
+    assert servers["stdio_srv_display"]["disabled"] is False
+    assert servers["stdio_srv_display"]["forbidden_tools"] == ["ban1"]
+    assert "toolA" in servers["stdio_srv_display"]["tool_meta"]
 
     # server_parameters 应为可序列化结构 / server_parameters should be JSON-like
-    assert isinstance(servers["stdio-srv"]["server_parameters"], dict)
-    assert isinstance(servers["sse-srv"]["server_parameters"], dict)
-    assert isinstance(servers["http-srv"]["server_parameters"], dict)
+    assert isinstance(servers["stdio_srv_display"]["server_parameters"], dict)
+    assert isinstance(servers["sse_srv_display"]["server_parameters"], dict)
+    assert isinstance(servers["http_srv_display"]["server_parameters"], dict)
 
 
 @pytest.mark.asyncio
