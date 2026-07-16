@@ -122,6 +122,47 @@ def test_show_merged_surfaces_scope_overreach_on_stderr(
     assert "settings.local.json" in captured.err  # 且给出可操作去向
 
 
+def test_show_single_scope_surfaces_overreach_not_only_merged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#157（fix-review 🔴1）：**单 scope 读**同样须呈现越权错误，不能只有 merged 接线。
+
+    ``settings show --scope project`` 正是用户排查「我的 settings 莫名不生效」时最先跑的命令——若此处吞
+    错误，字段静默蒸发、诊断回路断裂。对拍 rust ``read_scope_with_errors``（对所有 scope 返回 errors）。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    wd = tmp_path / "proj"
+    (wd / ".tfrobot").mkdir(parents=True)
+    (wd / ".tfrobot" / "settings.json").write_text(json.dumps({"enableAllProjectMcpServers": True}), encoding="utf-8")
+    monkeypatch.chdir(wd)
+    capsys.readouterr()
+
+    assert settings_cmd.settings_show(home, env, scope="project", json_output=True) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {}  # 越权字段已过滤（stdout 仍纯 JSON）
+    assert "enableAllProjectMcpServers" in captured.err  # ★ 单 scope 也有解释
+
+
+def test_get_overreach_field_explains_instead_of_bare_not_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#157（fix-review 🔴1）：越权字段被过滤后，``settings get`` 的「not set in scope」是**主动误导**
+    （文件里明明写了）——须同时在 stderr 给出真正原因。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    wd = tmp_path / "proj"
+    (wd / ".tfrobot").mkdir(parents=True)
+    (wd / ".tfrobot" / "settings.json").write_text(json.dumps({"enableAllProjectMcpServers": True}), encoding="utf-8")
+    monkeypatch.chdir(wd)
+    capsys.readouterr()
+
+    code = settings_cmd.settings_get(home, env, "enableAllProjectMcpServers", scope="project", json_output=True)
+    captured = capsys.readouterr()
+    assert code == 1  # 确实读不到（已被过滤）
+    assert "enableAllProjectMcpServers" in captured.err  # 但用户被告知**为什么**
+    assert "settings.local.json" in captured.err
+
+
 # ── edit ──────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_edit_opens_editor_and_returns_reconcile_cb(tmp_path: Path) -> None:
