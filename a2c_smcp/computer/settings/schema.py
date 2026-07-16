@@ -24,9 +24,14 @@ definitions / inputs (those live in ``.tfrobot/mcp.json``).
   其余保留、错误收进 :class:`SettingsValidationError` 列表（照 CC：错误不阻断启动、不整文件作废）。
   Field-level tolerance: a single bad known key / map entry / array element is filtered out
   per-item, the rest is kept, and the error is collected — never invalidating the whole file.
-- **scope 越权**：``allowedMcpServers`` / ``deniedMcpServers`` 是 **policy-only**；出现在非 policy
-  scope → 过滤不用 + 记 ValidationError（杜绝用户态自我提权）。
-  Scope overreach: policy-only fields appearing in a non-policy scope are filtered + recorded.
+- **scope 越权**（两个平行类目，共用「过滤 + 记 ValidationError」管线）/ Scope overreach (two parallel categories):
+
+  1. :data:`POLICY_ONLY_FIELDS`：``allowedMcpServers`` / ``deniedMcpServers`` 是 **policy-only**；出现在
+     非 policy scope → 过滤不用 + 记错（杜绝用户态自我提权）。
+     Policy-only fields appearing outside the policy scope are filtered + recorded.
+  2. :data:`TRUSTED_SCOPE_ONLY_FIELDS`：审批门 **enable 方向**判据；出现在 **project** scope → 过滤 + 记错
+     （杜绝**不受信 scope 自我批准**，#157 / 协议 ``guides/mcp-approval-gate-alignment.md`` §2.1）。
+     Approval-gate ENABLE-direction inputs supplied by the project scope are filtered + recorded.
 """
 
 from __future__ import annotations
@@ -76,6 +81,29 @@ FIELD_PERMISSIONS = "permissions"
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
 POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS})
+
+# 审批门 **enable 方向**判据：出现在 **project** scope → 过滤 + 记错（#157）。
+# Approval-gate ENABLE-direction inputs: filtered + recorded if supplied by the **project** scope.
+#
+# 协议依据：``guides/mcp-approval-gate-alignment.md`` §2.1 通则（MUST）——
+#   「审批门的输入 MUST 来自比被判定 server 更高信任的来源；任何 scope 都不得为『自身是否受信』提供判据。」
+#
+# ``.tfrobot/settings.json``（project scope）与 ``mcp.json`` 一样**入 git、随仓库分发**。若门接受它供给
+# 档⑤/⑥，被 clone 的仓库携一份 ``{"enableAllProjectMcpServers": true}`` 即可让其 ``mcp.json`` 里的任意
+# server 启动期免批准框直挂 —— 与 #148 删掉的档④ **同构且更易达成**（无需装任何插件、无需猜任何名字）。
+#
+# 为何**只拒 PROJECT**（而非复用 :mod:`a2c_smcp.computer.settings.mcp_config` 的 ``_TRUSTED_ORIGINS``）：
+#   受信供给方 = ``user`` / ``local`` / ``flag`` / ``policy``（§2.1 表）——**含 LOCAL**。这与 mcp.json
+#   **声明面**的 ``_TRUSTED_ORIGINS``（``{USER, FLAG, POLICY}``，**不含 LOCAL**）**有意不同**，勿混用：
+#   三个批准写助手（``approve_mcp_server`` / ``deny_mcp_server`` / ``approve_all_project_mcp``）**只写 local
+#   scope**（个人决定不污染共享层）。若把 LOCAL 也判为不受信，**每次批准都会在读回时被自己过滤掉、批准
+#   永远不生效**。读面与写面 MUST 对称。
+#
+# 为何**不含** ``disabledMcpjsonServers``：
+#   那是 **DENY** 方向（§2.1 表第 3 行）：**任意 scope（含 project）可供给** —— fail-safe，仓库禁自己的
+#   server 无安全影响，更严格永远安全。把它收进本类目属**过度矫正**，由单测
+#   ``test_disabled_mcpjson_allowed_from_any_scope`` 守护。
+TRUSTED_SCOPE_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP})
 
 # 字符串数组字段（读合并：拼接去重；写回：整体替换，§5.4）/ String-array fields.
 STRING_ARRAY_FIELDS: frozenset[str] = frozenset(
@@ -353,6 +381,8 @@ def validate_settings(
     - 非 dict 根 → 返回 ``({}, [error])``（整层判废，回退空）。Non-dict root → empty + error.
     - ``$schema``：原样保留、CLI 不消费 / preserved verbatim, not consumed.
     - **policy-only 字段在非 policy scope** → 过滤 + 记错 / filtered + recorded.
+    - **审批门 enable 方向判据在 project scope** → 过滤 + 记错（#157，§2.1）/ approval-gate ENABLE
+      inputs in the project scope are filtered + recorded.
     - 已知字段：经对应校验器**逐条过滤**非法 map 项 / 数组元素；整字段类型错 → 回退默认（剔除）。
       Known fields: per-item filtered; whole-field type error → dropped (falls back to default).
     - 未知字段：**静默保留**（passthrough）/ unknown fields: silently preserved.
@@ -377,6 +407,19 @@ def validate_settings(
             continue
         if key in POLICY_ONLY_FIELDS and scope is not SettingsScope.POLICY:
             errors.append(_err(scope, key, "policy-only field not allowed outside the policy scope (filtered)"))
+            continue
+        # #157：审批门 enable 方向判据 MUST NOT 由 project scope（入 git、随仓库分发）供给——否则被 clone 的
+        # 仓库可自我批准（与档④ 同构）。协议指南 §2.1。DENY 方向不在本类目（fail-safe），见常量注释。
+        if key in TRUSTED_SCOPE_ONLY_FIELDS and scope is SettingsScope.PROJECT:
+            errors.append(
+                _err(
+                    scope,
+                    key,
+                    "approval-gate field not allowed in the project scope (filtered): it is a personal decision "
+                    "and project settings.json is git-tracked — move it to settings.local.json (not git-tracked) "
+                    "or the user scope",
+                ),
+            )
             continue
         validator = _FIELD_VALIDATORS.get(key)
         if validator is None:

@@ -40,7 +40,13 @@ from typing import Any
 
 from rich.table import Table
 
-from a2c_smcp.computer.cli.commands import build_mcp_callbacks, flag_value, resolved_settings
+from a2c_smcp.computer.cli.commands import (
+    build_mcp_callbacks,
+    flag_value,
+    format_settings_errors,
+    resolved_settings,
+    resolved_settings_with_errors,
+)
 from a2c_smcp.computer.cli.progress import clone_spinner
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.inputs.plugin_pool import load_plugin_inputs
@@ -550,7 +556,12 @@ async def run_mcp_approval(
     if not resolved.servers:
         return
 
-    settings = resolved_settings(env, flag_path=flag_config)
+    # #157：scope 越权被过滤的字段必须有解释——否则用户只看到莫名的批准框（协议 §2.1「响亮失败」）。
+    # 典型：仓库的 project settings.json 携 enableAllProjectMcpServers → 被过滤 → 此处告知该挪去 local/user。
+    resolved_st = resolved_settings_with_errors(env, flag_path=flag_config)
+    for line in format_settings_errors(resolved_st.errors):
+        console.print(f"[yellow]{line}[/yellow]")
+    settings = resolved_st.settings
     # #148/F8：审批门 MUST NOT 依赖账本 bundled 名集；plugin 声明本就不入 resolve_mcp_config（走 transient
     # amount_server 挂载、不落 mcp.json），迭代永不遇 plugin origin，无需显式过滤（详见 mcp_server_status）。
     statuses = gate_mcp_servers(resolved, settings)

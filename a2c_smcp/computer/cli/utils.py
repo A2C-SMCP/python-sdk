@@ -25,6 +25,9 @@ from a2c_smcp.smcp import SMCPTool
 # 使用全局 Console（引用模块属性，便于后续动态切换）
 # Use a global Console (module attribute reference for dynamic switching)
 console = console_util.console
+# stderr 侧（#157）：供 stdout 恒为 JSON 的命令打诊断，避免污染机读输出。
+# stderr side: diagnostics for commands whose stdout is machine-readable JSON.
+console_err = console_util.console_err
 
 
 def resolve_import_target(target: str) -> Any:

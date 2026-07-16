@@ -94,6 +94,34 @@ def test_show_merged_default(tmp_path: Path, capsys: pytest.CaptureFixture[str])
     assert json.loads(capsys.readouterr().out).get("strictKnownMarketplaces") is True
 
 
+def test_show_merged_surfaces_scope_overreach_on_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#157：merged 视图里被 scope 越权过滤的字段须有解释——打 **stderr**，stdout 保持机读 JSON。
+
+    ★ 「stderr 而非 stdout」是硬约束：``settings show`` 的 stdout 恒为 JSON（``| jq`` 消费），若把警示打进
+    stdout，``json.loads`` 立刻碎（见同文件 ``test_show_merged_default``）。本测正向钉死该分流。
+    Diagnostics go to stderr; stdout stays machine-readable JSON.
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    wd = tmp_path / "proj"
+    (wd / ".tfrobot").mkdir(parents=True)
+    (wd / ".tfrobot" / "settings.json").write_text(
+        json.dumps({"enableAllProjectMcpServers": True, "strictKnownMarketplaces": True}), encoding="utf-8",
+    )
+    monkeypatch.chdir(wd)
+    capsys.readouterr()
+
+    assert settings_cmd.settings_show(home, env, scope="merged", json_output=True) == 0
+    captured = capsys.readouterr()
+
+    data = json.loads(captured.out)  # stdout 仍是纯 JSON（未被警示污染）
+    assert "enableAllProjectMcpServers" not in data  # 越权字段已过滤出 merged 视图
+    assert data.get("strictKnownMarketplaces") is True  # 同文件的合法字段照常保留
+    assert "enableAllProjectMcpServers" in captured.err  # 解释在 stderr
+    assert "settings.local.json" in captured.err  # 且给出可操作去向
+
+
 # ── edit ──────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_edit_opens_editor_and_returns_reconcile_cb(tmp_path: Path) -> None:

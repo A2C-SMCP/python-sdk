@@ -28,8 +28,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from a2c_smcp.computer.cli.commands import flag_value, resolved_settings
-from a2c_smcp.computer.cli.utils import console
+from a2c_smcp.computer.cli.commands import flag_value, format_settings_errors, resolved_settings_with_errors
+from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.policy import resolve_policy_settings
 from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.settings.scope import (
@@ -76,9 +76,17 @@ def _read_scope(
     *,
     flag_path: Path | None,
 ) -> dict[str, Any] | None:
-    """读单 scope（或 merged）settings dict；scope 非法 → ``None``（调用方报错）。project/local 锚 cwd（#116）。"""
+    """读单 scope（或 merged）settings dict；scope 非法 → ``None``（调用方报错）。project/local 锚 cwd（#116）。
+
+    #157：merged 视图的 scope 越权过滤（policy-only / 审批门 enable 方向判据）在此有解释——打 **stderr**，
+    不污染 stdout 的机读 JSON（``settings show | jq`` 须仍可用）。
+    Overreach-filtered fields are explained on stderr, keeping stdout pure JSON.
+    """
     if scope == "merged":
-        return resolved_settings(env, flag_path=flag_path)
+        resolved_st = resolved_settings_with_errors(env, flag_path=flag_path)
+        for line in format_settings_errors(resolved_st.errors):
+            console_err.print(f"[yellow]{line}[/yellow]")
+        return resolved_st.settings
     if scope == "user":
         return load_settings_file(user_settings_path(env), SettingsScope.USER)[0]
     if scope in ("project", "local"):
