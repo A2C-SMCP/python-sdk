@@ -284,6 +284,16 @@ class MCPServerManager:
         self._exposed_tools.clear()
         for bundle_id, client in self._active_clients.items():
             config = self._servers_config[bundle_id]
+            # #151 R1'：default_tool_meta.alias 天生病态（alias 是 per-tool 改名）→ 已忽略（见 _merged_tool_meta），
+            # 每次刷新各 server 各打一次响亮配置诊断（方案 d，与 no-double-open「不静默丢 + 配置诊断」同姿态；非协议错误码）。
+            # 跨 SDK：rust 侧同款 R1' 待以**同方案 d**跟修（否则 python 各以原始名暴露 / rust 塌名 = 双端分叉，向量测不出；
+            # #142 教训）——镜像 follow-up 追踪于 Epic #147。
+            if config.default_tool_meta is not None and config.default_tool_meta.alias:
+                logger.warning(
+                    f"default_tool_meta.alias={config.default_tool_meta.alias!r}（bundle_id={bundle_id!r}）已忽略："
+                    f"alias 是 per-tool 改名，放 default 位会令该 server 所有工具塌成同名。"
+                    f"如需改名请在具体 tool_meta.<工具名> 内单独配 alias（Computer 本地诊断，非协议错误码）。",
+                )
             try:
                 tools = await client.list_tools()
             except Exception as e:
@@ -630,13 +640,23 @@ class MCPServerManager:
         """
         浅层合并工具元数据：优先使用具体 tool_meta，若字段缺失则回落到 default_tool_meta。
         Shallow merge ToolMeta: prefer per-tool meta; fallback to default for missing root-level fields.
+
+        **例外（#151 R1'）**：``alias`` **绝不**从 ``default_tool_meta`` 继承——``alias`` 语义天生 per-tool（把某个工具
+        改名），放 default 位会落到该 server 每一个未单独配 alias 的工具、令其 exposed 名全塌成同一个（first-wins 静默
+        丢工具）。故 alias **仅**取自具体 ``tool_meta[tool_name]``；default 位的 alias 被忽略（诊断由
+        :meth:`_arefresh_tool_mapping` 每次刷新各 server 打一次）。其余根级字段（tags/auto_apply/ret_object_mapper）照常回落。
+
+        Exception (#151 R1'): ``alias`` is NEVER inherited from ``default_tool_meta`` — it is inherently per-tool; a
+        default alias would collapse every un-aliased tool of the server onto one exposed name (first-wins tool loss).
+        ``alias`` comes solely from the per-tool entry; other root fields still fall back to the default.
         """
         specific = (config.tool_meta or {}).get(tool_name)
         default = config.default_tool_meta
         if specific is None and default is None:
             return None
         if specific is None:
-            return default
+            # 无 per-tool meta：继承 default 的非 alias 字段，alias 强制置空（#151 R1'）。
+            return default.model_copy(update={"alias": None}) if default is not None else None
         if default is None:
             return specific
         # 仅根级字段浅合并；specific优先
@@ -644,4 +664,6 @@ class MCPServerManager:
         # Pydantic v2: model_dump 可排除 None，以避免用 None 覆盖
         merged.update(default.model_dump(exclude_none=True))
         merged.update(specific.model_dump(exclude_none=True))
+        # #151 R1'：alias 只认 per-tool（specific），绝不采纳 default 带入的 alias。
+        merged["alias"] = specific.alias
         return ToolMeta(**merged)

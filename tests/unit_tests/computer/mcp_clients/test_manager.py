@@ -358,6 +358,63 @@ async def test_per_tool_overrides_default(manager):
 
 
 @pytest.mark.asyncio
+async def test_default_tool_meta_alias_ignored_no_collapse(manager, monkeypatch):
+    """#151 R1'：``default_tool_meta.alias`` 天生病态（alias 是 per-tool 改名）→ 被忽略，工具各以原始名暴露、一个不丢。
+
+    English: an ``alias`` in ``default_tool_meta`` is inherently ill-formed (alias renames a single tool); it MUST be
+    ignored so every tool of the server stays exposed under its own name — never collapsed.
+
+    现码红（塌名 Bug）：default alias 回落到 server1 的 tool1/tool2 → 全塌成 ``server1__custom`` → first-wins →
+    tool2 对 Agent 静默不可见/不可调用。修后绿：alias 不从 default 继承 → ``server1__tool1`` 与 ``server1__tool2`` 都暴露；
+    且打一次响亮配置诊断（方案 d，与 no-double-open「不静默丢 + 配置诊断」同姿态）。
+    """
+    import a2c_smcp.computer.mcp_clients.manager as mgr_mod
+
+    # 项目自定义 logger 不向 caplog 传播 → 直接 spy 模块 logger.warning 断言诊断（须在 astart_all 触发刷新前设置）。
+    warns: list[str] = []
+    monkeypatch.setattr(mgr_mod.logger, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+
+    servers = [create_server_config("server1", default_tool_meta=ToolMeta(alias="custom"))]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    names = {tool.name async for tool in manager.available_tools()}
+    # 塌名 Bug：现码只剩一个 'server1__custom'；修后两工具各以原始名暴露、无丢失。
+    assert names == {"server1__tool1", "server1__tool2"}, f"default alias 不应塌名/丢工具，实际: {names}"
+    # a2c_tool_meta.alias 亦为 None（default 位 alias 被忽略，输出与命名一致、不误导 Agent）。
+    tools = {t.name: t async for t in manager.available_tools()}
+    assert tools["server1__tool1"].meta["a2c_tool_meta"].alias is None
+    # 响亮配置诊断：命中被忽略的 default alias 时 WARN 一次（方案 d）。
+    assert any("default_tool_meta.alias" in w and "custom" in w for w in warns), (
+        f"被忽略的 default_tool_meta.alias 必须打配置诊断 WARN，实际 WARN: {warns}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_per_tool_alias_wins_over_default_alias_no_collapse(manager):
+    """#151 R1' 分支 D：server 配 ``default_tool_meta.alias`` 且 tool1 另配 per-tool alias → per-tool alias 生效、
+    default alias 被弃、无塌名。锁死 ``_merged_tool_meta`` 合并分支的 ``merged["alias"] = specific.alias`` 语义。
+
+    English: per-tool alias wins; default alias is discarded; no collapse (locks the both-present merge branch).
+    """
+    servers = [
+        create_server_config(
+            "server1",
+            tool_meta={"tool1": ToolMeta(alias="renamed1")},
+            default_tool_meta=ToolMeta(alias="custom"),
+        ),
+    ]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    names = {tool.name async for tool in manager.available_tools()}
+    # tool1 用 per-tool alias 'renamed1'；tool2 无 per-tool → default alias 被弃 → 原始名 'tool2'。无塌名、无丢失。
+    assert names == {"server1__renamed1", "server1__tool2"}, f"实际: {names}"
+    # 路由回原始名可解析（per-tool alias 生效但路由目标仍是 tool1）。
+    assert manager._exposed_tools["server1__renamed1"] == ("server1", "tool1")
+
+
+@pytest.mark.asyncio
 async def test_error_handling(manager):
     """测试错误处理"""
     # 模拟客户端连接错误
