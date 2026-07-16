@@ -14,6 +14,9 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5.3 / 
 - 未知顶层字段 passthrough（静默保留）；``$schema`` 保留
 - policy-only 字段（allowedMcpServers/deniedMcpServers）在非 policy scope → 过滤 + 记 ValidationError；
   policy scope → 保留
+- **#157**：审批门 enable 方向判据（enabledMcpjsonServers/enableAllProjectMcpServers）在 project scope →
+  过滤 + 记错（自我批准闭环）；受信 scope（user/**local**/flag/policy）→ 保留；DENY 方向
+  （disabledMcpjsonServers）任意 scope 照常生效（防过度矫正）。协议 §2.1，对拍 rust-sdk#143
 - 已知字段逐条过滤：enabledPlugins / extraKnownMarketplaces 单项非法剔除、其余保留
 - 标量 / 数组类型错 → 回退默认 + 记错
 - 形态校验器：git url / <plugin>@<mp> key / marketplace 名
@@ -23,6 +26,11 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5.3 / 
 import pytest
 
 from a2c_smcp.computer.settings.schema import (
+    BOOL_FIELDS,
+    FIELD_DISABLED_MCPJSON_SERVERS,
+    POLICY_ONLY_FIELDS,
+    STRING_ARRAY_FIELDS,
+    TRUSTED_SCOPE_ONLY_FIELDS,
     SettingsScope,
     is_valid_enabled_plugin_key,
     is_valid_git_url,
@@ -121,6 +129,69 @@ def test_policy_only_fields_kept_in_policy_scope() -> None:
     cleaned, errors = validate_settings(raw, SettingsScope.POLICY)
     assert cleaned == raw
     assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# #157：审批门 enable 方向判据的 scope 越权 / approval-gate ENABLE-direction overreach
+# 协议 guides/mcp-approval-gate-alignment.md §2.1（MUST）。对拍 rust-sdk#143 schema.rs test mod。
+# ---------------------------------------------------------------------------
+def test_trusted_scope_only_fields_filtered_in_project_scope() -> None:
+    """project scope（入 git、随仓库分发）供给档⑤/⑥ → 过滤 + 记错（杜绝自我批准，档④ 同构面）。"""
+    raw = {"enabledMcpjsonServers": ["s"], "enableAllProjectMcpServers": True, "trustedMarketplaces": ["mp"]}
+    cleaned, errors = validate_settings(raw, SettingsScope.PROJECT)
+    assert "enabledMcpjsonServers" not in cleaned
+    assert "enableAllProjectMcpServers" not in cleaned
+    assert cleaned["trustedMarketplaces"] == ["mp"]  # 非本类目字段保留
+    assert {e.field for e in errors} == {"enabledMcpjsonServers", "enableAllProjectMcpServers"}
+    assert all("settings.local.json" in e.reason for e in errors)  # 文案给出可操作去向
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [SettingsScope.USER, SettingsScope.LOCAL, SettingsScope.FLAG, SettingsScope.POLICY],
+)
+def test_trusted_scope_only_fields_kept_in_trusted_scopes(scope: SettingsScope) -> None:
+    """★ 陷阱 1 守护：受信供给方 = user/local/flag/policy（**含 LOCAL**，§2.1 表）——MUST 原样保留。
+
+    LOCAL 尤为关键：三个批准写助手（approve/deny/approve-all）**只写 local scope**，若把 local 判为不受信，
+    每次批准都会在读回时被自己过滤掉、**批准永远不生效**。读面与写面 MUST 对称。
+    NB: this deliberately differs from mcp_config._TRUSTED_ORIGINS ({USER, FLAG, POLICY}) — the mcp.json
+    declaration face — which excludes LOCAL. Do not conflate the two.
+    """
+    raw = {"enabledMcpjsonServers": ["s"], "enableAllProjectMcpServers": True}
+    cleaned, errors = validate_settings(raw, scope)
+    assert cleaned["enabledMcpjsonServers"] == ["s"], f"{scope} 是受信供给方，MUST 保留"
+    assert cleaned["enableAllProjectMcpServers"] is True, f"{scope} 是受信供给方，MUST 保留"
+    assert errors == [], f"{scope} 不应记错，实得 {errors}"
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [SettingsScope.USER, SettingsScope.PROJECT, SettingsScope.LOCAL, SettingsScope.FLAG, SettingsScope.POLICY],
+)
+def test_disabled_mcpjson_allowed_from_any_scope(scope: SettingsScope) -> None:
+    """★ **防过度矫正**：``disabledMcpjsonServers`` 是 **DENY** 方向，§2.1 表第 3 行明定**任意 scope 可供给**。
+
+    fail-safe——仓库禁自己的 server 无安全影响，更严格永远安全。当前「碰巧正确」（无约束≠有意放行），本测把
+    该**意图**钉死：后人若顺手把它一起收进 TRUSTED_SCOPE_ONLY_FIELDS「保持一致」，此测立刻红。
+    Guards the DENY direction against over-tightening.
+    """
+    assert FIELD_DISABLED_MCPJSON_SERVERS not in TRUSTED_SCOPE_ONLY_FIELDS, (
+        "DENY 方向 MUST NOT 进 enable-方向类目（§2.1 表第 3 行 fail-safe）"
+    )
+    raw = {"disabledMcpjsonServers": ["srv"]}
+    cleaned, errors = validate_settings(raw, scope)
+    assert cleaned["disabledMcpjsonServers"] == ["srv"], f"{scope}：DENY 方向任意 scope 可供给（更严格永远安全）"
+    assert errors == [], f"{scope} 不应记错"
+
+
+def test_field_sets_exact() -> None:
+    """字段集合内容精确（对拍 rust ``test_field_sets_exact``）——防「顺手增删」漂移。"""
+    assert POLICY_ONLY_FIELDS == frozenset({"allowedMcpServers", "deniedMcpServers"})
+    # #157：enable 方向判据（拒 project）。**不含** disabledMcpjsonServers —— DENY 方向 fail-safe。
+    assert TRUSTED_SCOPE_ONLY_FIELDS == frozenset({"enabledMcpjsonServers", "enableAllProjectMcpServers"})
+    assert BOOL_FIELDS == frozenset({"strictKnownMarketplaces", "enableAllProjectMcpServers"})
+    assert len(STRING_ARRAY_FIELDS) == 6
 
 
 # ---------------------------------------------------------------------------

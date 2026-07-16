@@ -31,6 +31,7 @@ from a2c_smcp.computer.settings.mcp_config import (
     gate_mcp_servers,
     resolve_mcp_config,
 )
+from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.settings.scope import resolve_settings
 from a2c_smcp.computer.settings.store import save_installed_plugins
 
@@ -132,3 +133,65 @@ def test_scope_override_full_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     statuses = gate_mcp_servers(resolved, resolve_settings(env=env).settings)
     assert statuses == {"shared": McpApprovalStatus.PENDING}
+
+
+# ── #157（P0 安全）：project scope 自我批准 ─────────────────────────────────────
+# 攻击链：被 clone 的仓库同时携带两个**入 git** 的文件 —— `.tfrobot/mcp.json`（恶意 server）+
+# `.tfrobot/settings.json`（自我批准）。project scope 若能为「自身是否受信」供给判据，则审批门形同虚设。
+# 协议 `guides/mcp-approval-gate-alignment.md` §2.1 通则（MUST）：审批门的输入 MUST 来自比被判定 server
+# 更高信任的来源；**enable 方向**判据（档⑤ enabledMcpjsonServers / 档⑥ enableAllProjectMcpServers）
+# 由 project 供给时 MUST 被过滤 + 记错。与 #148 删掉的档④ 同构，且更易达成（无需装任何插件、无需任何名字）。
+# Attack chain: a cloned repo ships both git-tracked files; project scope MUST NOT supply its own trust.
+@pytest.mark.parametrize(
+    "self_approval",
+    [
+        pytest.param({"enableAllProjectMcpServers": True}, id="gate6-enable-all"),
+        pytest.param({"enabledMcpjsonServers": ["evil"]}, id="gate5-enabled-list"),
+    ],
+)
+def test_project_settings_cannot_self_approve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    self_approval: dict,
+) -> None:
+    """被 clone 仓库的 project settings.json 自我批准 → MUST PENDING（非 ENABLED）+ 响亮失败（记错）。"""
+    env = _env(tmp_path)
+    wd = tmp_path / "wd"  # 模拟被 clone 的仓库目录
+    _write_json(wd / ".tfrobot" / "mcp.json", _mcp({"evil": _stdio()}))
+    _write_json(wd / ".tfrobot" / "settings.json", self_approval)  # ← 入 git，随仓库分发
+    monkeypatch.chdir(wd)
+
+    resolved = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
+    assert resolved.servers["evil"].trusted_origin is False  # origin=project → 本就该受门控
+
+    resolved_st = resolve_settings(env=env)
+    statuses = gate_mcp_servers(resolved, resolved_st.settings)
+
+    # ① 安全：自我批准判据被过滤 → 恶意 server 仍需用户当面批准。
+    assert statuses == {"evil": McpApprovalStatus.PENDING}
+
+    # ② 响亮失败：越权字段进 settings 校验错误通道（不静默忽略，§2.1 / §3 同姿态）。
+    offending = [e for e in resolved_st.errors if e.field in self_approval and e.scope is SettingsScope.PROJECT]
+    assert len(offending) == 1, f"越权字段 MUST 记一条错误，实得 {resolved_st.errors}"
+    assert "settings.local.json" in offending[0].reason  # 文案须给出可操作去向
+
+
+def test_local_scope_approval_still_works_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ #157 陷阱 1 守护（全栈）：受信供给方**含 local** —— 三个批准写助手只写 local scope，
+    若把 local 一并判为不受信，每次批准都会在读回时被自己过滤掉、**批准永远不生效**。读面与写面 MUST 对称。
+    Guards that LOCAL stays a trusted supplier: the approval write helpers only ever write local scope.
+    """
+    env = _env(tmp_path)
+    wd = tmp_path / "wd"
+    # project 层同时携带自我批准（应被过滤）——确保 local 的批准不是被 project 层「顺带」放行的。
+    _write_json(wd / ".tfrobot" / "mcp.json", _mcp({"figma": _stdio()}))
+    _write_json(wd / ".tfrobot" / "settings.json", {"enableAllProjectMcpServers": True})
+    monkeypatch.chdir(wd)
+
+    resolved = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
+    assert gate_mcp_servers(resolved, resolve_settings(env=env).settings) == {"figma": McpApprovalStatus.PENDING}
+
+    approve_mcp_server("figma")  # 批准框 [y]es → 写 local settings.local.json
+
+    after = gate_mcp_servers(resolved, resolve_settings(env=env).settings)
+    assert after == {"figma": McpApprovalStatus.ENABLED}, "local 供给的批准 MUST 读得回（写面/读面对称）"

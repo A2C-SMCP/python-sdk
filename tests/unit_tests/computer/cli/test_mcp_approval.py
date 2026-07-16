@@ -209,3 +209,33 @@ async def test_malformed_server_surfaces_warning(
         await run_mcp_approval(comp, None, approve_all=True, flag_config=None)
     out = capsys.readouterr().out
     assert "mcp.json" in out  # resolved.errors 呈现（被 drop 的 bad 不静默）
+
+
+# ── #157：project scope 自我批准 —— 拦下 + 响亮失败 ─────────────────────────────
+@pytest.mark.asyncio
+async def test_project_self_approval_filtered_and_surfaced_at_boot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """被 clone 仓库携 project settings.json 自我批准 → **不挂载**（非 TTY 无 approve_all）+ **打印解释**。
+
+    这是 #157 的用户侧终局断言：过滤生效（安全）**且**用户看得懂为何自己的 settings 没生效（协议 §2.1
+    「响亮失败」）。只断言过滤、不断言呈现 = 文案写进黑洞的假绿。
+    End-to-end: the self-approval is filtered AND the user is told why.
+    """
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil": _stdio()})
+    _write_json(wd / ".tfrobot" / "settings.json", {"enableAllProjectMcpServers": True})  # ← 入 git
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    import unittest.mock as _m
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        # session=None（非 TTY）且未 --approve-all-mcp → 若自我批准生效会直挂；被过滤后应 skip+WARN。
+        await run_mcp_approval(comp, None, approve_all=False, flag_config=None)
+
+    assert _mounted_names(comp) == set(), "project 自我批准 MUST NOT 让恶意 server 直挂"
+    out = capsys.readouterr().out
+    assert "enableAllProjectMcpServers" in out  # 越权字段被点名
+    assert "settings.local.json" in out  # 且给出可操作去向

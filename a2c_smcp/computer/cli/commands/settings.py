@@ -28,10 +28,10 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from a2c_smcp.computer.cli.commands import flag_value, resolved_settings
-from a2c_smcp.computer.cli.utils import console
+from a2c_smcp.computer.cli.commands import flag_value, format_settings_errors, resolved_settings_with_errors
+from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.policy import resolve_policy_settings
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError
 from a2c_smcp.computer.settings.scope import (
     apply_write,
     load_settings_file,
@@ -69,30 +69,52 @@ def _writable_path(scope: str, env: Mapping[str, str] | None) -> tuple[Path, Set
     raise ValueError(f"scope {scope!r} is read-only (writable: user|project|local)")
 
 
-def _read_scope(
+def _read_scope_with_errors(
     scope: str,
     home: Path,
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None,
-) -> dict[str, Any] | None:
-    """读单 scope（或 merged）settings dict；scope 非法 → ``None``（调用方报错）。project/local 锚 cwd（#116）。"""
+) -> tuple[dict[str, Any], list[SettingsValidationError]] | None:
+    """读单 scope（或 merged）settings dict **连同校验错误**；scope 非法 → ``None``。project/local 锚 cwd（#116）。
+
+    #157：**每个 scope 都带出 errors**（非仅 merged）——``settings show --scope project`` 正是用户排查
+    「我的 settings 莫名不生效」时最先跑的命令，若此处吞掉越权错误则诊断回路断裂（字段静默蒸发、
+    ``settings get`` 还会答「not set in scope」主动误导）。协议 §3「响亮失败」；对拍 rust
+    ``settings.rs::read_scope_with_errors``。呈现由调用方统一走 stderr（见 :func:`_emit_errors`）。
+    Every scope carries its errors out; the callers surface them on stderr.
+    """
     if scope == "merged":
-        return resolved_settings(env, flag_path=flag_path)
+        resolved_st = resolved_settings_with_errors(env, flag_path=flag_path)
+        return resolved_st.settings, list(resolved_st.errors)
     if scope == "user":
-        return load_settings_file(user_settings_path(env), SettingsScope.USER)[0]
+        return load_settings_file(user_settings_path(env), SettingsScope.USER)
     if scope in ("project", "local"):
         cwd = Path(os.getcwd())
         path = workdir_project_settings_path(cwd) if scope == "project" else workdir_local_settings_path(cwd)
         enum = SettingsScope.PROJECT if scope == "project" else SettingsScope.LOCAL
-        return load_settings_file(path, enum)[0]
+        return load_settings_file(path, enum)
     if scope == "flag":
         if flag_path is None:
-            return {}
-        return load_settings_file(flag_path, SettingsScope.FLAG)[0]
+            return {}, []
+        return load_settings_file(flag_path, SettingsScope.FLAG)
     if scope == "policy":
-        return resolve_policy_settings(env=env)
+        # policy 层 = resolve_policy_settings 的 first-source-wins 结果，此处**未经 validate_settings**、
+        # 按原始 dict 返回（与 rust ``read_scope_with_errors`` 的 policy 分支同形，双端一致）。
+        # 已知缺口（#157 fix-review 🟡）：故 ``settings show --scope policy`` 看到的字段可能在 merged 路径
+        # 被判废（如 allowedMcpServers 类型错）却在此零警告。**不是「没有校验通道」**——validate_settings
+        # 就在同模块、``scope.py`` 的 resolve_settings 正是这么用的；只是行为变更须双端同步，另立 issue。
+        return resolve_policy_settings(env=env), []
     return None
+
+
+def _emit_errors(errors: list[SettingsValidationError]) -> None:
+    """把 settings 校验错误打 **stderr**（#157）——stdout 恒为机读 JSON，``settings show | jq`` 须仍可用。
+
+    Diagnostics on stderr; stdout stays pure JSON.
+    """
+    for line in format_settings_errors(errors):
+        console_err.print(f"[yellow]{line}[/yellow]")
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
@@ -107,9 +129,11 @@ def settings_show(
     """展示某 scope 的 settings（默认 merged 合并视图）/ Show settings of a scope (default merged)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    data = _read_scope(scope, home, env, flag_path=flag_path)
-    if data is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
+    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path)
+    if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
+    data, errors = read
+    _emit_errors(errors)  # #157：被 scope 越权过滤的字段在此有解释（stderr，不污染 stdout JSON）
     console.print_json(data=data)
     return EXIT_OK
 
@@ -126,9 +150,12 @@ def settings_get(
     """读取单字段（默认 merged 视图）/ Read a single field (default merged view)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    data = _read_scope(scope, home, env, flag_path=flag_path)
-    if data is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
+    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path)
+    if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
+    data, errors = read
+    # #157：越权字段会被过滤出 data —— 若不呈现，下面的 "not set in scope" 会**主动误导**（文件里明明写了）。
+    _emit_errors(errors)
     if key not in data:
         return _err(f"key {key!r} not set in scope {scope!r}", json_output=json_output)
     console.print_json(data={key: data[key]})

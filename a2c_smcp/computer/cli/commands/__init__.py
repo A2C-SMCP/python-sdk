@@ -32,6 +32,8 @@ if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodg
     from a2c_smcp.computer.computer import Computer
     from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
     from a2c_smcp.computer.settings.installer import ExistingServerNames, RegisterServer, RemoveServer
+    from a2c_smcp.computer.settings.schema import SettingsValidationError
+    from a2c_smcp.computer.settings.scope import ResolvedSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,16 +87,19 @@ def flag_value(args: list[str], flag: str) -> str | None:
     return None
 
 
-def resolved_settings(
+def resolved_settings_with_errors(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
-) -> dict[str, Any]:
-    """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
+) -> ResolvedSettings:
+    """五层合并 settings **连同校验错误**（含 policy first-source-wins；#116 锚 cwd）/ Merged settings **with errors**。
 
-    plugin（``enabledPlugins`` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
-    allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。函数内 lazy import 沿用本仓
-    dodge-cycle 范式（settings.scope / settings.policy 不反向依赖 cli，无环，仅避免 ``import cli.commands`` 拉重）。
+    :func:`resolved_settings` 是本函数的薄包装（只取 ``.settings``）。需要向用户**呈现**越权/畸形字段的
+    调用方（boot 批准流程、``settings show``）用本函数拿完整 :class:`ResolvedSettings`。
+    Callers that must surface filtered/malformed fields use this; :func:`resolved_settings` wraps it.
+
+    函数内 lazy import 沿用本仓 dodge-cycle 范式（settings.scope / settings.policy 不反向依赖 cli，无环，
+    仅避免 ``import cli.commands`` 拉重）。
     """
     from a2c_smcp.computer.settings.policy import resolve_policy_settings
     from a2c_smcp.computer.settings.scope import resolve_settings
@@ -103,4 +108,34 @@ def resolved_settings(
         env=env,
         flag_settings_path=flag_path,
         policy_settings=resolve_policy_settings(env=env),
-    ).settings
+    )
+
+
+def resolved_settings(
+    env: Mapping[str, str] | None,
+    *,
+    flag_path: Path | None = None,
+) -> dict[str, Any]:
+    """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
+
+    plugin（``enabledPlugins`` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
+    allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。
+
+    **丢弃校验错误**——只在「不向用户呈现诊断」的声明视图用；要呈现的走
+    :func:`resolved_settings_with_errors` + :func:`format_settings_errors`（#157）。
+    Drops validation errors; use the ``_with_errors`` variant where diagnostics must surface.
+    """
+    return resolved_settings_with_errors(env, flag_path=flag_path).settings
+
+
+def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[str]:
+    """把 settings 校验错误格式化为人读警示行（**纯函数**，供 boot 批准流程与 ``settings show`` 共用）/ format。
+
+    #157：scope 越权过滤（policy-only / 审批门 enable 方向判据）**静默丢弃字段**——若连错误也不呈现，用户
+    只会看到「我的 settings 莫名不生效」（协议 §2.1 要求**响亮失败**，``SettingsValidationError`` 的契约亦
+    自称「经 ``settings show`` / 诊断命令呈现」）。抽为纯函数以便**单测文案与 scope/field 拼装**，杜绝未来
+    重构把「呈现」半程静默回退成吞错误——呈现行为在 ``run_mcp_approval`` 这类 ``Session``-泛型异步副作用
+    函数里无法直接断言。对拍 rust ``cli/commands/mod.rs::format_settings_errors``。
+    Pure function so the wording/assembly is unit-testable; the call sites are thin by design.
+    """
+    return [f"⚠ settings.json[{e.scope.value}]: {e.field} — {e.reason}" for e in errors]
