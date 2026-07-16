@@ -12,6 +12,40 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
 
 ### Breaking Changes
+- **plugin ↔ MCP Server is a dependency relation, not an ownership one** (#153, aligned
+  with a2c-smcp-protocol `runtime-contract.md` §2.5 / §4.9.1 / §5.6; adjudication record
+  in protocol Discussion #23 D3/F1; rust mirror rust-sdk#139 — **both SDKs share the same
+  on-disk ledger format, a divergence is data corruption**).
+  - **Ledger field renamed and re-typed**: `bundledMcpServers` (array of display **name**)
+    → **`mcpServers` (array of `bundle_id`)**, written unconditionally (`[]` when empty).
+    It records the MCP servers a plugin **declares a dependency on**. The ledger MUST NOT
+    store display names (they go stale when an explicit `bundleId` server is renamed) nor
+    point-in-time facts such as provenance/introduced (they rot as *other* plugins are
+    uninstalled — the transitive-leak source). **Legacy records are dropped wholesale and
+    rebuilt from the `installedPlugins` intent** (§4.9.1-4); no name→bundle_id migration
+    mapping is written.
+  - **Uninstall/disable/gc no longer reclaim unconditionally.** New criterion (§4.9.1-2,
+    a pure function in `reconciler.py`): **reclaim X ⟺ no other plugin declares a
+    dependency on X ∧ X is not user-declared**. Consequences: a user's own server is
+    **never** collaterally removed, and a dependency shared by several plugins survives
+    until its last dependent is uninstalled (no leak).
+  - **`MCPServerNameConflictError` removed**, along with `_conflict_check` and the whole
+    `owned` notion. Installing a plugin whose declared `bundle_id` already exists is
+    **dependency satisfied** → report and install normally (exit 0); it MUST NOT be
+    rejected. `plugin enable` **reuses** an already-satisfied dependency instead of
+    remounting over it. Same display name with a different `bundle_id` is legal
+    coexistence (§5.6). The CLI JSON error code `mcp_server_name_conflict` is gone.
+  - **Injected-callback seam is now bundle_id-keyed**: `ExistingServerNames` →
+    **`ExistingBundleIds`** (`install_plugin` / `enable_plugin` / `materialize_plugin`
+    kwarg `existing_server_names=` → **`existing_bundle_ids=`**); `RemoveServer` and
+    `gc_plugins(mcp_teardown=)` now take a **bundle_id**; `Computer.reconcile_governance`
+    kwarg `existing_server_names=` → **`existing_bundle_ids=`**.
+  - **Dependency prechecks and governance remount now read the runtime-authoritative
+    config set** (`manager.server_configs()`), never the construction-time snapshot
+    `Computer.mcp_servers` (§2.5-4) — under the CLI that snapshot is permanently empty,
+    so every "dependency satisfied" was misjudged as "unsatisfied".
+  - CLI output: `plugin install/list/info` field `bundledMcpServers` → **`mcpServers`**
+    (values are now bundle_ids).
 - **Plugin install/enable separation — install no longer activates** (#123, aligned
   with a2c-smcp-protocol **v0.3.0** `runtime-contract.md` §2.3/§2.4/§4.8; adjudication
   record in #120 / protocol#11; rust mirror rust-sdk#103).
@@ -21,12 +55,13 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - New declarative intent **`installedPlugins`** (settings.json array of
     `<plugin>@<marketplace>`): the global install set. `install_plugin` now writes it
     config-first to the **user scope**, materializes (clone / manifest validation /
-    foreign MCP name-conflict precheck / ledger), and **does not activate** — no SKILL
+    MCP dependency precheck / ledger), and **does not activate** — no SKILL
     staging, no bundled-server mount, no `enabledPlugins` write → `installed_disabled`.
     Materialization failure atomically rolls the intent entry back.
   - `install_plugin` signature: **removed** `register_server=` / `remove_server=` /
-    `inject_inputs=` kwargs (install mounts nothing); `existing_server_names=` kept for
-    the conflict precheck. New `materialize_plugin()` exposes activation-free
+    `inject_inputs=` kwargs (install mounts nothing); the precheck kwarg is kept but was
+    since renamed to `existing_bundle_ids=` and demoted to report-only (see #153 above —
+    it no longer rejects). New `materialize_plugin()` exposes activation-free
     materialization (reused by boot re-materialization).
   - **`enable_plugin` is now atomic**: skills and bundled servers light up together;
     on mount failure it rolls back to `installed_disabled` (unregisters newly staged
