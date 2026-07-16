@@ -70,6 +70,10 @@ MATERIALIZED_VERSION = 1
 KNOWN_MARKETPLACES_FILENAME = "known_marketplaces.json"
 INSTALLED_PLUGINS_FILENAME = "installed_plugins.json"
 
+# v0.2.x 账本的 bundled-server 字段（display **name** 数组）；v0.3.0 起为 ``mcpServers``（**bundle_id** 数组）。
+# 仅用于**识别并丢弃**旧记录（协议 §4.9.1-4）——MUST NOT 用于读取其值做迁移映射 / legacy key, detect-and-drop only.
+_LEGACY_MCP_DEPS_KEY = "bundledMcpServers"
+
 # 文件锁退避默认参数（指数退避，封顶）/ Default lock backoff knobs (exponential, capped).
 DEFAULT_LOCK_RETRIES = 10
 DEFAULT_LOCK_BACKOFF_BASE = 0.05  # 秒 / seconds
@@ -105,7 +109,15 @@ class InstalledPluginRecord(TypedDict):
     ``installed_plugins.json`` 单条安装记录（§6.2，对齐 CC V2 schema）/ a single plugin install record。
 
     数组化按 scope 维度（``scope`` + ``projectPath`` 精确匹配），为「user + workspace 同时装、不同版本」
-    预留；``bundledMcpServers`` 为 A2C 扩展字段（CC 无），供 uninstall 级联精准清理 bundled MCP server。
+    预留；``mcpServers`` 为 A2C 扩展字段（CC 无）。
+
+    **``mcpServers`` = 该 plugin 声明依赖的 MCP Server bundle_id 纯数组**（协议 runtime-contract §4.9.1-1，
+    #153/D3+F1）。三条硬约束，改动前务必读协议原文：
+      1. **只记 bundle_id**，MUST NOT 记 display ``name``（显式 ``bundleId`` 的 server 改名后账本名即过期）。
+      2. MUST NOT 记「安装时本地是否已有」一类**时点快照事实**（provenance/introduced）——它随其他 plugin 卸载
+         而失真，是传递性泄漏之源；回收/门控/归属判定 MUST NOT 依赖此类字段。
+      3. 语义是**依赖**而非**所有**（§2.5）：卸载本 plugin 不等于回收这些 server，须过
+         :func:`~a2c_smcp.computer.settings.reconciler.reclaimable_mcp_deps` 判据。
     """
 
     scope: str  # managed | user | project | local
@@ -115,7 +127,7 @@ class InstalledPluginRecord(TypedDict):
     commitSha: NotRequired[str]
     installedAt: NotRequired[str]
     lastUpdated: NotRequired[str]
-    bundledMcpServers: NotRequired[list[str]]  # A2C 扩展 / A2C extension
+    mcpServers: NotRequired[list[str]]  # A2C 扩展：声明依赖的 bundle_id 数组 / declared MCP deps (bundle_ids)
 
 
 class InstalledPluginsFile(TypedDict):
@@ -356,14 +368,48 @@ def _coerce_known_marketplaces(data: Mapping[str, Any], path: Path) -> KnownMark
     return {"version": MATERIALIZED_VERSION, "marketplaces": marketplaces}
 
 
-def _coerce_installed_plugins(data: Mapping[str, Any], path: Path) -> InstalledPluginsFile:
-    """把读到的 dict 规整为 :class:`InstalledPluginsFile`（容错 + 手编 WARN）/ Coerce to the typed shape。"""
+def _drop_legacy_mcp_dep_records(plugins: dict[str, Any], path: Path) -> dict[str, Any]:
+    """
+    丢弃旧格式（``bundledMcpServers`` = display name 数组）的账本记录（协议 §4.9.1-4，#153）/ Drop legacy records。
+
+    v0.2.x 账本以 display **name** 数组记 bundled server；v0.3.0 起改记 ``mcpServers``（**bundle_id** 数组，
+    语义为「声明依赖」而非「所有」）。协议 §4.9.1-4 定：检测到旧格式 **MUST 整条丢弃**、经 reconcile 从
+    ``installedPlugins`` 意图重建（§4.9「账本可弃、删除它无损」），**MUST NOT 编写 name→bundle_id 映射迁移
+    逻辑**——那正是本 Epic（#147）在拆的 name-join。
+
+    判据取「**含** ``bundledMcpServers`` 键」而非「**缺** ``mcpServers`` 键」：前者精确只打真旧记录；旧格式里
+    「无 bundled server」的记录本就不写该键，其依赖确实为空，保留无害。丢空的 pid 整条移除 → 使
+    :func:`~a2c_smcp.computer.settings.reconciler.ledger_entry_fully_materialized` 返 ``False`` → 触发重物化。
+    """
+    out: dict[str, Any] = {}
+    for pid, records in plugins.items():
+        if not isinstance(records, list):
+            out[pid] = records  # 非法结构原样透传（与本模块既有容错姿态一致，不在此处收敛）
+            continue
+        kept = [r for r in records if not (isinstance(r, Mapping) and _LEGACY_MCP_DEPS_KEY in r)]
+        if len(kept) != len(records):
+            logger.warning(
+                "Ledger record(s) for %r in %s use the legacy %r (display-name) format; discarded and will be "
+                "rebuilt from the installedPlugins intent (protocol runtime-contract §4.9.1-4)",
+                pid,
+                path,
+                _LEGACY_MCP_DEPS_KEY,
+            )
+        if kept:
+            out[pid] = kept
+    return out
+
+
+def _coerce_installed_plugins(data: Mapping[str, Any], path: Path, *, drop_legacy: bool = True) -> InstalledPluginsFile:
+    """把读到的 dict 规整为 :class:`InstalledPluginsFile`（容错 + 手编 WARN + 旧格式丢弃）/ Coerce to the typed shape。"""
     _warn_hand_edit(path, data.get("version"), {"version", "plugins"}, data)
     plugins = data.get("plugins")
     if not isinstance(plugins, dict):
         if plugins is not None:
             logger.warning("Materialized file %s field 'plugins' is not an object; treating as empty", path)
         plugins = {}
+    if drop_legacy:
+        plugins = _drop_legacy_mcp_dep_records(plugins, path)
     return {"version": MATERIALIZED_VERSION, "plugins": plugins}
 
 
@@ -393,13 +439,29 @@ def load_known_marketplaces(home: Path | None = None, env: Mapping[str, str] | N
     return _coerce_known_marketplaces(data, path)
 
 
-def load_installed_plugins(home: Path | None = None, env: Mapping[str, str] | None = None) -> InstalledPluginsFile:
-    """加载 ``installed_plugins.json``（缺失 / 损坏 → 空配置）/ Load installed_plugins.json (missing/corrupt → empty)。"""
+def load_installed_plugins(
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    drop_legacy: bool = True,
+) -> InstalledPluginsFile:
+    """
+    加载 ``installed_plugins.json``（缺失 / 损坏 → 空配置）/ Load installed_plugins.json (missing/corrupt → empty)。
+
+    :param drop_legacy: 是否丢弃旧格式记录（协议 §4.9.1-4，见 :func:`_drop_legacy_mcp_dep_records`）。默认 ``True``
+        ——**几乎所有调用方都应该用默认值**，旧格式记录的依赖信息（display name 数组）不可用于任何判定。
+
+        ⚠️ **唯一的例外是 v0.2.x→v0.3.0 意图迁移**（:func:`~a2c_smcp.computer.settings.installer
+        .migrate_legacy_installs`）：它从账本 **pid（key）** 回填 ``installedPlugins`` 意图，而账本格式迁移
+        （丢弃 → 从意图重建）**恰恰依赖该意图已存在**。两者顺序颠倒则 v0.2.x 存量用户的带 MCP server 的
+        plugin 会连 pid 一起消失、意图无从回填 ⇒ 升级后 plugin 静默全丢。故迁移路径 MUST 传 ``False``
+        （它只读 key，不碰旧格式的字段值）。
+    """
     path = installed_plugins_path(home, env)
     data = read_jsonc_with_recovery(path)
     if data is None:
         return empty_installed_plugins()
-    return _coerce_installed_plugins(data, path)
+    return _coerce_installed_plugins(data, path, drop_legacy=drop_legacy)
 
 
 def save_known_marketplaces(

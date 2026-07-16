@@ -79,7 +79,7 @@ def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), skills: Sequence[
                         "version": "1.2.0",
                         "commitSha": "abc123",
                         "installedAt": "2026-07-06T00:00:00Z",
-                        "bundledMcpServers": list(servers),
+                        "mcpServers": list(servers),
                     },
                 ],
             },

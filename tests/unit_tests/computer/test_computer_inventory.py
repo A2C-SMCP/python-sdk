@@ -83,7 +83,7 @@ def _seed_home(
                         "version": "1.2.0",
                         "commitSha": "abc123",
                         "installedAt": "2026-07-06T00:00:00Z",
-                        "bundledMcpServers": all_servers,
+                        "mcpServers": all_servers,
                     },
                 ],
             },
@@ -223,7 +223,7 @@ async def test_inventory_marks_remounted_bundled_server_as_plugin(tmp_path: Path
             await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
 
         report = await comp.reconcile_governance(
-            existing_server_names=lambda: {c.name for c in comp.mcp_servers},
+            existing_bundle_ids=lambda: {c.name for c in comp.mcp_servers},
             register_server=register,
             declared={"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}},
         )

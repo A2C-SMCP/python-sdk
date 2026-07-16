@@ -324,7 +324,7 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     _seed_installed(
         home,
         {
-            "audit@acme": [{"scope": "user", "installPath": str(audit_path), "bundledMcpServers": ["figma", "blender"]}],
+            "audit@acme": [{"scope": "user", "installPath": str(audit_path), "mcpServers": ["figma", "blender"]}],
             "keep@acme": [{"scope": "user", "installPath": str(keep_path)}],
         },
     )
@@ -350,7 +350,7 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     assert "audit@acme" not in ipf and "keep@acme" in ipf
     assert reg.resolve("audit:lint") is None  # 孤儿 plugin 的 SKILL 注销
     assert reg.resolve("keep:do") is not None  # 保留 plugin 的 SKILL 不动
-    assert teardown == [["figma", "blender"]]  # bundled MCP 经回调下线
+    assert teardown == [["blender", "figma"]]  # 可回收的 MCP 依赖经回调下线（#153：判据过滤后 sorted，确定序）
 
 
 async def test_gc_guards_installpath_outside_home(tmp_path: Path) -> None:
@@ -372,7 +372,7 @@ async def test_gc_without_teardown_callback(tmp_path: Path) -> None:
     home = _home(tmp_path)
     p = marketplace_skill_dir(home, "acme") / "audit"
     p.mkdir(parents=True)
-    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(p), "bundledMcpServers": ["x"]}]})
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(p), "mcpServers": ["x"]}]})
 
     removed = await gc_plugins(["audit@acme"], SkillRegistry(), home, mcp_teardown=None)
 

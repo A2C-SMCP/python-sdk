@@ -297,7 +297,7 @@ def test_installed_plugins_roundtrip(tmp_path: Path) -> None:
                     "commitSha": "abc1234",
                     "installedAt": "2026-05-10T00:00:00Z",
                     "lastUpdated": "2026-05-10T00:00:00Z",
-                    "bundledMcpServers": ["figma-mcp"],
+                    "mcpServers": ["figma-mcp"],
                 }
             ]
         },

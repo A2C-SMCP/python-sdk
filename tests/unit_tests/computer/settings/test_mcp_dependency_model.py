@@ -143,7 +143,7 @@ class _FakeMCP:
 
 async def _install(home: Path, env: dict, pid: str, mcp: _FakeMCP) -> dict:
     plugin, mp = pid.split("@")
-    return await install_plugin(pid, SkillRegistry(), home, env=env, existing_server_names=mcp.existing_bundle_ids)
+    return await install_plugin(pid, SkillRegistry(), home, env=env, existing_bundle_ids=mcp.existing_bundle_ids)
 
 
 # ── F1：账本 schema —— 存 bundle_id 而非 display name ─────────────────────────
@@ -154,7 +154,7 @@ async def test_ledger_stores_bundle_id_not_display_name(tmp_path: Path, monkeypa
     _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage())
 
-    record = await install_plugin("audit@acme", SkillRegistry(), home, env=env, existing_server_names=lambda: set())
+    record = await install_plugin("audit@acme", SkillRegistry(), home, env=env, existing_bundle_ids=lambda: set())
 
     assert record["mcpServers"] == [FIGMA_BID]  # bundle_id，非 "figma.mcp"
     assert "bundledMcpServers" not in record  # 旧字段不存在
@@ -288,7 +288,7 @@ async def test_install_same_bundle_id_is_dependency_satisfied_not_conflict(tmp_p
     monkeypatch.setattr(_STAGE, _fake_stage())
     mcp = _FakeMCP(existing={FIGMA_BID})  # 本地已有（用户自有或他 plugin 带入）
 
-    record = await install_plugin("audit@acme", SkillRegistry(), home, env=env, existing_server_names=mcp.existing_bundle_ids)
+    record = await install_plugin("audit@acme", SkillRegistry(), home, env=env, existing_bundle_ids=mcp.existing_bundle_ids)
 
     assert record["mcpServers"] == [FIGMA_BID]  # 不抛、正常写账本
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"]
@@ -305,7 +305,7 @@ async def test_install_same_display_name_different_bundle_id_coexists(tmp_path: 
     # 已有 server 的 display 名相同，但显式 bundle_id 不同 → 两个身份
     mcp = _FakeMCP(existing={"other_identity"})
 
-    record = await install_plugin("audit@acme", SkillRegistry(), home, env=env, existing_server_names=mcp.existing_bundle_ids)
+    record = await install_plugin("audit@acme", SkillRegistry(), home, env=env, existing_bundle_ids=mcp.existing_bundle_ids)
 
     assert record["mcpServers"] == [FIGMA_BID]
 
@@ -322,7 +322,7 @@ async def test_enable_reuses_existing_instance_instead_of_remounting(tmp_path: P
 
     await enable_plugin(
         "audit@acme", SkillRegistry(), home, env=env,
-        existing_server_names=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
+        existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
     )
 
     assert mcp.registered == [SHARED_BID]  # figma_mcp 依赖已满足 → 复用，不重挂
@@ -340,6 +340,25 @@ def test_legacy_ledger_record_is_discarded_on_load(tmp_path: Path) -> None:
     loaded = load_installed_plugins(home=home)
 
     assert "audit@acme" not in loaded["plugins"]  # 整条丢弃，MUST NOT 做 name→bundle_id 映射迁移
+
+
+def test_legacy_ledger_pids_survive_for_intent_migration(tmp_path: Path) -> None:
+    """
+    ⚠️ **顺序依赖守卫**：v0.2.x→v0.3.0 意图迁移 MUST 能读到旧格式记录的 pid（``drop_legacy=False``）。
+
+    两个迁移方向相反、互为前提：①「意图迁移」从**账本 pid** 回填 ``installedPlugins``；②「账本格式迁移」丢弃
+    旧记录并**从该意图重建**。若 ② 的丢弃对 ① 也生效，v0.2.x 存量用户**带 MCP server 的 plugin 会连 pid 一起
+    消失**（无 bundled server 的记录无该键、不受影响）⇒ 意图无从回填 ⇒ 升级后 plugin 静默全丢。
+    本例实测曾红（`test_boot_migrates_legacy_ledger_installs_and_stays_active` 同时红）。
+    """
+    home = _home(tmp_path)
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x", "bundledMcpServers": [FIGMA_NAME]}]}},
+        home=home,
+    )
+
+    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]  # 默认读法：丢弃
+    assert "audit@acme" in load_installed_plugins(home=home, drop_legacy=False)["plugins"]  # 迁移读法：pid 仍在
 
 
 def test_legacy_and_new_records_mixed_only_legacy_dropped(tmp_path: Path) -> None:

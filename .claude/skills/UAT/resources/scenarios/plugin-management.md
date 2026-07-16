@@ -58,7 +58,7 @@ mkdir -p $A2C_SKILL_HOME
 - **预期结果**:
   - 退出码 0
   - 输出包含安装成功信息
-  - 含 scope、bundledMcpServers（figma-mcp）
+  - 含 scope、mcpServers（声明依赖的 bundle_id：figma-mcp）
 
 ### P-02: plugin list（列出已安装 plugin）
 
@@ -82,7 +82,7 @@ mkdir -p $A2C_SKILL_HOME
 - **预期结果**:
   - 退出码 0
   - JSON 包含 id: "foo@$MP_NAME"
-  - 包含 enabled、records（含 scope、installPath、version、bundledMcpServers）
+  - 包含 enabled、records（含 scope、installPath、version、mcpServers）
 
 ### P-04: plugin disable（禁用 plugin）
 

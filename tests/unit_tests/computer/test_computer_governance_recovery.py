@@ -79,7 +79,7 @@ def _seed_home(tmp_path: Path, *, servers: Sequence[str] = (), skills: Sequence[
                         "version": "1.2.0",
                         "commitSha": "abc123",
                         "installedAt": "2026-07-06T00:00:00Z",
-                        "bundledMcpServers": list(servers),
+                        "mcpServers": list(servers),
                     },
                 ],
             },
@@ -137,7 +137,7 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
 
     async with Computer(name="t", skill_home=home) as comp:
         report = await comp.reconcile_governance(
-            existing_server_names=lambda: set(),
+            existing_bundle_ids=lambda: set(),
             register_server=register,
             inject_inputs=inject,
             declared=_DECLARED_ENABLED,
@@ -147,7 +147,7 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
         assert injected == [plugin_root]
 
         report2 = await comp.reconcile_governance(
-            existing_server_names=lambda: set(),
+            existing_bundle_ids=lambda: set(),
             register_server=register,
             inject_inputs=inject,
             declared=_DECLARED_ENABLED,
@@ -172,7 +172,7 @@ async def test_reconcile_governance_injects_once_per_plugin_root(tmp_path: Path,
 
     async with Computer(name="t", skill_home=home) as comp:
         report = await comp.reconcile_governance(
-            existing_server_names=lambda: set(),
+            existing_bundle_ids=lambda: set(),
             register_server=register,
             inject_inputs=inject,
             declared=_DECLARED_ENABLED,
@@ -193,7 +193,7 @@ async def test_reconcile_governance_register_failure_non_blocking(tmp_path: Path
 
     async with Computer(name="t", skill_home=home) as comp:
         report = await comp.reconcile_governance(
-            existing_server_names=lambda: set(),
+            existing_bundle_ids=lambda: set(),
             register_server=register,
             declared=_DECLARED_ENABLED,
         )
@@ -214,7 +214,7 @@ async def test_reconcile_governance_conflict_skips_existing_name(tmp_path: Path,
 
     async with Computer(name="t", skill_home=home) as comp:
         report = await comp.reconcile_governance(
-            existing_server_names=lambda: {"figma"},
+            existing_bundle_ids=lambda: {"figma"},
             register_server=register,
             declared=_DECLARED_ENABLED,
         )

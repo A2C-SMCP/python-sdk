@@ -15,8 +15,8 @@ CLI 命令核心（REPL 与 Typer 非交互共用）/ CLI command core shared by
 Typer 子命令则构造轻量上下文（不 boot Computer、不连 socket）。
 
 本模块只放 **跨命令共享的接缝**：:func:`build_mcp_callbacks`——从 ``Computer`` 装配 installer / 卸载级联所需的
-MCP 注入回调（``existing_server_names`` / ``register_server`` / ``remove_server``）。plugin / settings 命令（#69）
-将复用本接缝。
+MCP 注入回调（``existing_bundle_ids`` / ``register_server`` / ``remove_server``，身份一律 **bundle_id**，
+数据源为**运行期权威配置集**，#153）。plugin / settings 命令（#69）将复用本接缝。
 This package holds the command business logic as pure-ish handlers (explicit resources, not the whole Computer)
 so they unit-test in isolation. Only the cross-command seam lives here: :func:`build_mcp_callbacks`.
 """
@@ -28,10 +28,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
+
 if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodge runtime import cycle
     from a2c_smcp.computer.computer import Computer
     from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-    from a2c_smcp.computer.settings.installer import ExistingServerNames, RegisterServer, RemoveServer
+    from a2c_smcp.computer.settings.installer import ExistingBundleIds, RegisterServer, RemoveServer
     from a2c_smcp.computer.settings.schema import SettingsValidationError
     from a2c_smcp.computer.settings.scope import ResolvedSettings
 
@@ -40,7 +42,7 @@ if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodg
 class McpCallbacks:
     """installer / 卸载级联所需的三个 MCP 注入回调 / The three MCP injection callbacks installer/cascade needs。"""
 
-    existing_server_names: ExistingServerNames
+    existing_bundle_ids: ExistingBundleIds
     register_server: RegisterServer
     remove_server: RemoveServer
 
@@ -49,29 +51,37 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
     """
     从 ``Computer`` 装配 installer / uninstall 级联所需的 MCP 注入回调 / Wire MCP callbacks from a live Computer。
 
-    - ``existing_server_names``：当前已注册 MCP server 名集合（冲突预检用）；
-    - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / install remount 用）；
-    - ``remove_server``：按 name **运行期停摘** server（disable / uninstall teardown 用）。
+    - ``existing_bundle_ids``：当前**运行期活跃** server 的 bundle_id 集（依赖预检用）；
+    - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / 治理重挂用）；
+    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 回收用）。
 
     设计 §12.2：marketplace remove 的级联卸载（→ :func:`installer.uninstall_plugin`）与 #69 的 plugin
     enable/disable/install/uninstall 共用此接缝，避免各处重复装配。
 
+    **#153 数据源 = 运行期权威配置集**：``existing`` 取 ``comp.mcp_manager.server_configs()``
+    （:meth:`MCPServerManager.server_configs`），**不是** ``comp.mcp_servers``——后者是**构造期快照**，
+    仅 ``Computer.__init__`` 赋值一次，而 CLI 恒传 ``mcp_servers=set()``、所有 server 走 ``amount_server`` /
+    ``aadd_or_aupdate_server`` 挂载 ⇒ 快照恒空 ⇒ 依赖预检把「已满足」全判成「未满足」（协议 §2.5-4 明禁）。
+    亦**不用** :meth:`Computer.active_server_configs`：它 fail-closed 省略缺 raw 记录的 server，用于预检会漏判。
+
     **#137 ③ transient 分流**：本接缝**唯一**消费方是 plugin enable/disable/install/uninstall 与 marketplace
-    级联卸载——皆**治理投影**（bundled 真相在 ledger，非用户此刻声明），故走 transient
-    :meth:`Computer.amount_server` / :meth:`Computer.aunmount_server`，**不回写** mcp.json（否则 disable 后
-    复活 + scope 漂移，见 #138）。用户显式 ``server add``/``rm`` 是另一条（REPL）durable 路径，与此无关。
+    级联卸载——皆**治理投影**（依赖声明的真相在 ledger，非用户此刻声明），故走 transient
+    :meth:`Computer.amount_server` / :meth:`Computer.aunmount_server_by_id`，**不回写** mcp.json（否则 disable
+    后复活 + scope 漂移，见 #138）。用户显式 ``server add``/``rm`` 是另一条（REPL）durable 路径，与此无关。
     """
 
     def _existing() -> set[str]:
-        return {cfg.name for cfg in comp.mcp_servers}
+        if comp.mcp_manager is None:  # pre-boot：无活跃集 → 空（预检只提示，不影响正确性）
+            return set()
+        return {resolve_bundle_id(cfg) for cfg in comp.mcp_manager.server_configs()}
 
     async def _register(cfg: MCPServerConfig) -> None:
         await comp.amount_server(cfg)
 
-    async def _remove(name: str) -> None:
-        await comp.aunmount_server(name)
+    async def _remove(bundle_id: str) -> None:
+        await comp.aunmount_server_by_id(bundle_id)
 
-    return McpCallbacks(existing_server_names=_existing, register_server=_register, remove_server=_remove)
+    return McpCallbacks(existing_bundle_ids=_existing, register_server=_register, remove_server=_remove)
 
 
 # ── 跨命令解析 / 视图接缝（marketplace / skill / plugin / settings 共用）/ shared parse & view seams ──

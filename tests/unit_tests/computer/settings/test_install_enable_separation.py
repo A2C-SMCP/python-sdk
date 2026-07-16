@@ -28,7 +28,6 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.settings.installer import (
-    MCPServerNameConflictError,
     enable_plugin,
     install_plugin,
     uninstall_plugin,
@@ -42,10 +41,14 @@ from a2c_smcp.computer.settings.scope import user_settings_path, workdir_local_s
 from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
 _STAGE = "a2c_smcp.computer.settings.installer.stage_marketplace_skills"
 _PID = "audit@acme"
+
+# 夹具身份对（#153 + 协议 conformance §2.0）：display name 含 `.` → bundle_id 折 `_`，两者**必须分叉**。
+FIGMA_NAME, FIGMA_BID = "figma.mcp", "figma_mcp"
 
 
 # ── 辅助（与 test_installer.py / test_recovery.py 同构）/ helpers ─────────────
@@ -120,8 +123,8 @@ def _record(plugin_root: Path, *, scope: str = "user", servers: Sequence[str] = 
         "commitSha": "abc123",
         "installedAt": "2026-07-06T00:00:00Z",
     }
-    if servers:
-        rec["bundledMcpServers"] = list(servers)
+    # 无条件写（生产 installer 亦然）：`mcpServers` 是新格式的正向标志，条件写会与旧格式记录难辨。
+    rec["mcpServers"] = list(servers)
     return rec
 
 
@@ -151,26 +154,26 @@ def _fake_stage(calls: list[dict], *, fail: bool = False, register_skill: bool =
 
 
 class _FakeMCP:
-    """记录 MCP 注入回调调用 / Records injected MCP callback invocations。"""
+    """记录 MCP 注入回调调用；**身份一律 bundle_id**（#153）/ Records callbacks; identity is bundle_id。"""
 
     def __init__(self, existing: set[str] | None = None) -> None:
-        self.existing: set[str] = set(existing or ())
-        self.registered: list[str] = []
-        self.removed: list[str] = []
-        self.fail_on: str | None = None
+        self.existing: set[str] = set(existing or ())  # bundle_id 集
+        self.registered: list[str] = []  # bundle_id
+        self.removed: list[str] = []  # bundle_id
+        self.fail_on: str | None = None  # 该 display name 的 server 注册时抛错
 
-    def existing_names(self) -> set[str]:
+    def existing_bundle_ids(self) -> set[str]:
         return set(self.existing)
 
     async def register(self, cfg) -> None:
         if self.fail_on is not None and cfg.name == self.fail_on:
             raise RuntimeError(f"register {cfg.name} boom")
-        self.registered.append(cfg.name)
-        self.existing.add(cfg.name)
+        self.registered.append(resolve_bundle_id(cfg))
+        self.existing.add(resolve_bundle_id(cfg))
 
-    async def remove(self, name: str) -> None:
-        self.removed.append(name)
-        self.existing.discard(name)
+    async def remove(self, bundle_id: str) -> None:
+        self.removed.append(bundle_id)
+        self.existing.discard(bundle_id)
 
 
 # ── install：不激活 + config-first 意图（§2.4 操作表 install 行）─────────────
@@ -179,7 +182,7 @@ async def test_install_only_writes_intent_and_ledger_without_activation(tmp_path
     """install-only：写 user ``installedPlugins`` + 账本；不 stage SKILL、不写 enabledPlugins → installed_disabled。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     calls: list[dict] = []
     monkeypatch.setattr(_STAGE, _fake_stage(calls))
     reg = SkillRegistry()
@@ -187,7 +190,7 @@ async def test_install_only_writes_intent_and_ledger_without_activation(tmp_path
     record = await install_plugin(_PID, reg, home, env=env)
 
     # 物化照旧：账本 + bundled server 解析记录
-    assert record["bundledMcpServers"] == ["figma"]
+    assert record["mcpServers"] == [FIGMA_BID]
     assert _PID in load_installed_plugins(home=home)["plugins"]
     # config-first：安装意图落 user scope settings.json
     settings = _read_user_settings(env)
@@ -233,19 +236,23 @@ async def test_install_materialize_failure_rolls_back_intent(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_install_foreign_conflict_precheck_survives_separation(tmp_path: Path, monkeypatch) -> None:
-    """外来同名冲突预检保留（§2.4 install 行「预检 foreign MCP name 冲突」）：硬抛 + 意图/账本零变更。"""
+async def test_install_dependency_precheck_survives_separation(tmp_path: Path, monkeypatch) -> None:
+    """
+    依赖预检在 install⊥enable 分离后仍在，但**只提示不拒绝**（协议 §2.5-1，#153/D3）。
+
+    原名 ``test_install_foreign_conflict_precheck_survives_separation``：断言「外来同名硬抛 + 意图/账本零变更」。
+    D3 推翻该语义后，本例改为守护相反的不变量——**依赖已满足不得阻断安装**（意图与账本都要写成）。
+    """
     home = _home(tmp_path)
     env = _env(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage([]))
-    mcp = _FakeMCP(existing={"figma"})
+    mcp = _FakeMCP(existing={FIGMA_BID})
 
-    with pytest.raises(MCPServerNameConflictError, match="figma"):
-        await install_plugin(_PID, SkillRegistry(), home, env=env, existing_server_names=mcp.existing_names)
+    await install_plugin(_PID, SkillRegistry(), home, env=env, existing_bundle_ids=mcp.existing_bundle_ids)
 
-    assert _PID not in _read_user_settings(env).get("installedPlugins", [])
-    assert _PID not in load_installed_plugins(home=home)["plugins"]
+    assert _PID in _read_user_settings(env).get("installedPlugins", [])
+    assert _PID in load_installed_plugins(home=home)["plugins"]
 
 
 # ── enable：原子激活失败回滚（§2.4「enable 原子性」blockquote）────────────────
@@ -266,7 +273,7 @@ async def test_enable_mount_failure_rolls_back_to_installed_disabled(tmp_path: P
     with pytest.raises(RuntimeError, match="beta"):
         await enable_plugin(
             _PID, reg, home, env=env,
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
+            existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
     settings = _read_user_settings(env)
@@ -281,17 +288,17 @@ async def test_enable_mount_failure_restores_previous_false(tmp_path: Path, monk
     """enable 失败且原值为显式 false → 恢复 false（不残留 true、不误删原禁用意图）。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
-    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
-    _seed_installed(home, {_PID: [_record(root, servers=["figma"])]})
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_NAME])]})
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: False}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
     mcp = _FakeMCP()
-    mcp.fail_on = "figma"
+    mcp.fail_on = FIGMA_NAME
 
     with pytest.raises(RuntimeError, match="figma"):
         await enable_plugin(
             _PID, SkillRegistry(), home, env=env,
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
+            existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
     assert _read_user_settings(env)["enabledPlugins"][_PID] is False
@@ -303,8 +310,8 @@ async def test_uninstall_clears_intent_and_enabled_entries(tmp_path: Path, monke
     """uninstall → installedPlugins 删 pid + enabledPlugins 清条目 + 账本删除（回 available）。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
-    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
-    _seed_installed(home, {_PID: [_record(root, servers=["figma"])]})
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_NAME])]})
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
     mcp = _FakeMCP()
@@ -370,7 +377,7 @@ async def test_recover_installed_and_enabled_restores(tmp_path: Path) -> None:
 async def test_recover_rematerializes_missing_ledger_from_intent(tmp_path: Path) -> None:
     """账本删除 → boot 从 installedPlugins 重物化重建（§4.9「删除无损」；conformance §5 账本删除条目）。"""
     home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])  # 账本刻意不 seed
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])  # 账本刻意不 seed
     reg = SkillRegistry()
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
 
@@ -379,16 +386,16 @@ async def test_recover_rematerializes_missing_ledger_from_intent(tmp_path: Path)
     assert report.rematerialized == [_PID]
     rebuilt = load_installed_plugins(home=home)["plugins"][_PID][0]
     assert rebuilt["installPath"].replace("\\", "/").endswith("marketplace/acme/plugins/audit")
-    assert rebuilt["bundledMcpServers"] == ["figma"]
+    assert rebuilt["mcpServers"] == [FIGMA_BID]
     assert "audit:lint" in report.restored_skills  # enabled → 重物化后照常激活
-    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path))[0].config.name == "figma"
+    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path))[0].config.name == FIGMA_NAME
 
 
 @pytest.mark.asyncio
 async def test_recover_rematerializes_disabled_installs_without_activation(tmp_path: Path) -> None:
     """installed_disabled 的重物化也执行（installed = materialized 不变量；enable 无需重 clone），但不激活。"""
     home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     reg = SkillRegistry()
     declared = {"installedPlugins": [_PID]}
 
@@ -403,14 +410,14 @@ async def test_recover_rematerializes_disabled_installs_without_activation(tmp_p
 def test_collect_gates_on_installed_and_enabled(tmp_path: Path) -> None:
     """collect：intent 有但未启用 → 空；installed ∧ true → 可查询（§4.8 blockquote 的 enabled 门槛翻转）。"""
     home = _home(tmp_path)
-    root = _setup_catalog(home, "acme", "audit", servers=["figma"])
-    _seed_installed(home, {_PID: [_record(root, servers=["figma"])]})
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_NAME])]})
 
     assert collect_enabled_bundled_servers(home, {"installedPlugins": [_PID]}, env=_env(tmp_path)) == []
     records = collect_enabled_bundled_servers(
         home, {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}, env=_env(tmp_path),
     )
-    assert [r.config.name for r in records] == ["figma"]
+    assert [r.config.name for r in records] == [FIGMA_NAME]
 
 
 # ── migrate_legacy_installs：一次性迁移（迁移指南「保住既有用户现状」）─────────
@@ -563,7 +570,7 @@ async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monke
     with pytest.raises(RuntimeError, match="beta"):
         await enable_plugin(
             _PID, SkillRegistry(), home, env=env,
-            existing_server_names=mcp.existing_names, register_server=mcp.register, remove_server=mcp.remove,
+            existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
     assert _read_user_settings(env)["enabledPlugins"][_PID] is True
@@ -578,7 +585,7 @@ async def test_recover_rematerialize_infers_project_scope_from_enabled_layer(tmp
     workdir = tmp_path / "proj"
     workdir.mkdir()
     monkeypatch.chdir(workdir)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: True}})
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
 
@@ -598,7 +605,7 @@ async def test_recover_rematerialize_multi_layer_clues_rebuild_multi_records(tmp
     workdir = tmp_path / "proj"
     workdir.mkdir()
     monkeypatch.chdir(workdir)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: False}})
     _write_json(workdir_local_settings_path(workdir), {"enabledPlugins": {_PID: True}})
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
@@ -622,7 +629,7 @@ async def test_recover_rematerialize_no_clue_falls_back_user_and_reports(tmp_pat
     workdir = tmp_path / "proj"
     workdir.mkdir()
     monkeypatch.chdir(workdir)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     declared = {"installedPlugins": [_PID]}
 
     # 项目 logger "a2c_smcp" 关闭 propagate → caplog.handler 直挂源模块 logger（同 test_window_uri 惯例）
@@ -647,7 +654,7 @@ async def test_recover_rematerialize_project_installed_declaration_is_clue(tmp_p
     workdir = tmp_path / "proj"
     workdir.mkdir()
     monkeypatch.chdir(workdir)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     _write_json(workdir_project_settings_path(workdir), {"installedPlugins": [_PID]})
     declared = {"installedPlugins": [_PID]}
 
@@ -667,7 +674,7 @@ async def test_recover_rematerialize_replaces_dead_records_of_stale_scopes(tmp_p
     workdir = tmp_path / "proj"
     workdir.mkdir()
     monkeypatch.chdir(workdir)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     _seed_installed(home, {_PID: [{"scope": "project", "installPath": str(tmp_path / "gone"), "projectPath": str(workdir)}]})
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
@@ -728,7 +735,7 @@ async def test_recover_rematerialize_ignores_project_false_override(tmp_path: Pa
     workdir = tmp_path / "proj"
     workdir.mkdir()
     monkeypatch.chdir(workdir)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: False}})  # 团队禁用覆盖
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: False}}  # merged：project false 获胜
@@ -748,13 +755,13 @@ async def test_recover_repairs_mixed_health_records(tmp_path: Path, monkeypatch)
     home = _home(tmp_path)
     env = _env(tmp_path)
     monkeypatch.chdir(tmp_path)
-    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     stale = home / "stale-project-copy"
     (stale / "mcp-servers").mkdir(parents=True)
     (stale / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
     _seed_installed(
         home,
-        {_PID: [_record(root, servers=["figma"]), {"scope": "project", "installPath": str(stale), "projectPath": "/elsewhere"}]},
+        {_PID: [_record(root, servers=[FIGMA_NAME]), {"scope": "project", "installPath": str(stale), "projectPath": "/elsewhere"}]},
     )
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
@@ -764,7 +771,7 @@ async def test_recover_repairs_mixed_health_records(tmp_path: Path, monkeypatch)
     assert report.rematerialized == [_PID]  # ∀ 判据：混合健康度触发重物化
     records = load_installed_plugins(home=home)["plugins"][_PID]
     assert [(r["scope"], r["installPath"]) for r in records] == [("user", str(root))]  # 损坏 project 残留被清扫
-    assert [r.config.name for r in collect_enabled_bundled_servers(home, declared, env=env)] == ["figma"]  # 无半态
+    assert [r.config.name for r in collect_enabled_bundled_servers(home, declared, env=env)] == [FIGMA_NAME]  # 无半态
 
 
 # ── #125 任务 2：悬挂意图 prune 执行入口（installer 是 settings 意图唯一写者）──
@@ -841,7 +848,7 @@ def test_prune_plugin_intent_warns_on_residual_project_declaration(tmp_path: Pat
 async def test_recover_rematerializes_on_corrupt_bundled_json(tmp_path: Path) -> None:
     """账本 installPath 目录在、bundled JSON 损坏 → 判失效走重物化（catalog 完好 → 修复指回 catalog root）。"""
     home = _home(tmp_path)
-    _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
     stale = home / "stale-copy"
     (stale / "mcp-servers").mkdir(parents=True)
     (stale / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
@@ -855,7 +862,7 @@ async def test_recover_rematerializes_on_corrupt_bundled_json(tmp_path: Path) ->
     rebuilt = load_installed_plugins(home=home)["plugins"][_PID]
     assert all(r["installPath"] != str(stale) for r in rebuilt)  # 修复：不再指向损坏副本
     assert "audit:lint" in report.restored_skills
-    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path))[0].config.name == "figma"  # server 可查询（无半态）
+    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path))[0].config.name == FIGMA_NAME  # server 可查询（无半态）
 
 
 @pytest.mark.asyncio

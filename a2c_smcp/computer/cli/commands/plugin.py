@@ -12,11 +12,11 @@ Plugin command handlers + boot-time MCP approval box。
 
 与 marketplace.py 同范式：handler 取**显式资源**（``registry`` / ``home`` / ``env``）+ flags，返回退出码
 （0 成功 / 1 用户错 / 2 网络错），包裹 :mod:`...settings.installer` 四动词 + :mod:`...settings.reconciler`
-gc。MCP 注入回调（``existing_server_names`` / ``register_server`` / ``remove_server`` / ``inject_inputs``）由
+gc。MCP 注入回调（``existing_bundle_ids`` / ``register_server`` / ``remove_server`` / ``inject_inputs``）由
 REPL dispatcher 从活跃 ``Computer`` 装配后注入；Typer 非交互无 live Computer → 传 ``None``。
 
 **v0.3.0 语义（#123）**：``plugin install`` 只安装**不激活**（不挂 server、不投影 skills → ``installed_disabled``；
-仅传 ``existing_server_names`` 做冲突预检）；``plugin enable`` 才原子点亮 skills + bundled server（挂载失败
+仅传 ``existing_bundle_ids`` 做依赖预检）；``plugin enable`` 才原子点亮 skills + bundled server（挂载失败
 回滚 ``installed_disabled``，故 enable 也注入 ``remove_server``）。``plugin list`` 默认列出**全部已安装**
 （enabled 列呈现两态；install 后必须可见）。
 
@@ -51,9 +51,8 @@ from a2c_smcp.computer.cli.progress import clone_spinner
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.inputs.plugin_pool import load_plugin_inputs
 from a2c_smcp.computer.settings.installer import (
-    ExistingServerNames,
+    ExistingBundleIds,
     InjectInputs,
-    MCPServerNameConflictError,
     PluginInstallError,
     RegisterServer,
     RemoveServer,
@@ -165,9 +164,10 @@ async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) 
       server）；bundled SKILL 已在 boot 期按无 flag 视图恢复且 additive-only 不撤销，flag-scope 的
       ``enabledPlugins=false`` 对 skill 跨 boot 不生效（可靠 disable 请写 user scope）；
     - inputs 注入先于 register（bundled server 的 ``${input:}`` 经 D2 前缀回退解析，与 install/enable 流一致）；
-    - ``existing_server_names`` **必传**（取自 ``comp.mcp_servers``）：与既有 server 同名 →
-      reconcile_governance 内部 skip+WARN（用户配置胜）；bundled **免批准**（§5.10 不走 project 信任门），
-      单点失败不阻断。
+    - ``existing_bundle_ids`` **必传**（#153：取 :func:`build_mcp_callbacks` 装配的**运行期权威**集，
+      **不是** ``comp.mcp_servers`` 构造期快照——后者 CLI 下恒空，会把已挂的用户 server 判成不存在、
+      令 bundled server 覆盖它）：同 bundle_id 已有 = 依赖已满足 → reconcile_governance 内部 skip（用户配置胜）；
+      bundled **免批准**（§5.10 不走 project 信任门），单点失败不阻断。
     """
     env = os.environ
     declared = resolved_settings(env, flag_path=flag_config)
@@ -181,13 +181,36 @@ async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) 
         _inject_plugin_inputs(comp, record.install_path, record.plugin, record.marketplace)
 
     report = await comp.reconcile_governance(
-        existing_server_names=lambda: {cfg.name for cfg in comp.mcp_servers},
+        existing_bundle_ids=build_mcp_callbacks(comp).existing_bundle_ids,
         register_server=_register,
         inject_inputs=_inject,
         declared=declared,
     )
     for marketplace in report.failed_marketplaces:
         console.print(f"[yellow]⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)[/yellow]")
+
+
+def _satisfied_deps(deps: list[str], existing_bundle_ids: ExistingBundleIds | None) -> list[str]:
+    """本次声明的依赖里**已满足**（同 bundle_id 本地已有）的部分（协议 §2.5-1）/ Already-satisfied deps。"""
+    if existing_bundle_ids is None:
+        return []
+    existing = existing_bundle_ids()
+    return [d for d in deps if d in existing]
+
+
+def _print_satisfied_deps(satisfied: list[str]) -> None:
+    """
+    提示「依赖已满足」（协议 §2.5-1 SHOULD 提示）/ Report dependency-satisfied to the user。
+
+    D3 前此处是**硬失败**（``MCPServerNameConflictError``，退出码 1，「name 即身份、无逃生口」）——该裁决已被
+    协议推翻：plugin 与 MCP Server 是依赖关系，同 bundle_id 已有 = 依赖已满足，MUST NOT 拒绝。
+    """
+    for bundle_id in satisfied:
+        console.print(
+            f"[cyan]ℹ dependency satisfied: MCP server {bundle_id!r} already exists locally; this plugin reuses it "
+            f"rather than creating a new one. Configs reconcile by scope precedence. Uninstalling this plugin will "
+            f"not remove it.[/cyan]",
+        )
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
@@ -200,7 +223,7 @@ async def plugin_install(
     scope: str = "user",
     project_path: str | None = None,
     version: str | None = None,
-    existing_server_names: ExistingServerNames | None = None,
+    existing_bundle_ids: ExistingBundleIds | None = None,
     json_output: bool = False,
 ) -> int:
     """安装单个 plugin（**不激活**：写 installedPlugins + 物化 → ``installed_disabled``，v0.3.0 §2.4）/ Install。
@@ -214,21 +237,20 @@ async def plugin_install(
             record = await install_plugin(
                 plugin_id, registry, home,
                 scope=scope, project_path=project_path, version=version, env=env,
-                existing_server_names=existing_server_names,
+                existing_bundle_ids=existing_bundle_ids,
             )
-    except MCPServerNameConflictError as e:
-        # §10.6 硬抛、退出码 1 + JSON error（无 rename/force 逃生口）。
-        return _err(str(e), json_output=json_output, error_code="mcp_server_name_conflict")
     except PluginInstallError as e:
         return _err(str(e), json_output=json_output)
 
-    servers = record.get("bundledMcpServers") or []
+    deps = record.get("mcpServers") or []
     if json_output:
         console.print_json(
-            data={"installed": plugin_id, "scope": record.get("scope"), "state": "installed_disabled", "bundledMcpServers": servers},
+            data={"installed": plugin_id, "scope": record.get("scope"), "state": "installed_disabled", "mcpServers": deps},
         )
         return EXIT_OK
-    detail = f" ({len(servers)} MCP server(s) bundled, not mounted)" if servers else ""
+    # 依赖已满足提示（协议 §2.5-1）：install 不挂载 ⇒ 活跃集不变 ⇒ 事后算与事前算等价。
+    _print_satisfied_deps(_satisfied_deps(deps, existing_bundle_ids))
+    detail = f" ({len(deps)} MCP server(s) declared as dependencies, not mounted)" if deps else ""
     return _ok(f"installed {plugin_id!r}{detail} (disabled; run 'plugin enable {plugin_id}' to activate)")
 
 
@@ -258,7 +280,7 @@ async def plugin_enable(
     env: Mapping[str, str] | None,
     plugin_id: str,
     *,
-    existing_server_names: ExistingServerNames | None = None,
+    existing_bundle_ids: ExistingBundleIds | None = None,
     register_server: RegisterServer | None = None,
     remove_server: RemoveServer | None = None,
     inject_inputs: InjectInputs | None = None,
@@ -269,10 +291,14 @@ async def plugin_enable(
     **scope 契约**（installer §4.3）：从 ledger 逐 scope 读安装 scope 传入，绝不默认 ``user``，否则写错层、与 live
     态背离。多 scope 记录 → 逐 scope enable。挂载前先经 ``inject_inputs`` 把 plugin-scoped inputs 注入池（#69 Group A）；
     ``remove_server`` 供挂载失败时回滚摘除本次新增 server（v0.3.0 §2.4 enable 原子性）。
+
+    「依赖已满足」提示 **MUST 在 enable 之前算**（协议 §2.5-1）：enable 会挂载未满足的依赖、改变活跃集，
+    事后再算就分不清「本来就有」与「刚被自己挂上」——这与 install 路径（不挂载、事后算等价）不同。
     """
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed (install it first)", json_output=json_output)
+    satisfied = _satisfied_deps(sorted({s for r in records for s in (r.get("mcpServers") or [])}), existing_bundle_ids)
     try:
         for rec in records:
             install_path = rec.get("installPath")
@@ -281,15 +307,14 @@ async def plugin_enable(
             await enable_plugin(
                 plugin_id, registry, home,
                 scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env,
-                existing_server_names=existing_server_names, register_server=register_server, remove_server=remove_server,
+                existing_bundle_ids=existing_bundle_ids, register_server=register_server, remove_server=remove_server,
             )
-    except MCPServerNameConflictError as e:
-        return _err(str(e), json_output=json_output, error_code="mcp_server_name_conflict")
     except PluginInstallError as e:
         return _err(str(e), json_output=json_output)
     if json_output:
         console.print_json(data={"enabled": plugin_id, "scopes": [r.get("scope") for r in records]})
         return EXIT_OK
+    _print_satisfied_deps(satisfied)  # 用 enable 前的快照：此刻活跃集已含本次挂上的，事后算会失真
     return _ok(f"enabled {plugin_id!r}")
 
 
@@ -354,8 +379,8 @@ def plugin_list(
     for pid, records in installed.items():
         enabled = enabled_map.get(pid) is True  # 仅显式 true = 启用（缺省翻转，v0.3.0 §2.4）
         scopes = sorted({str(r.get("scope")) for r in records})
-        bundled = sorted({s for r in records for s in (r.get("bundledMcpServers") or [])})
-        rows.append({"id": pid, "enabled": enabled, "scopes": scopes, "bundledMcpServers": bundled})
+        deps = sorted({s for r in records for s in (r.get("mcpServers") or [])})
+        rows.append({"id": pid, "enabled": enabled, "scopes": scopes, "mcpServers": deps})
     rows.sort(key=lambda r: str(r["id"]))
 
     if json_output:
@@ -365,14 +390,14 @@ def plugin_list(
         console.print("[dim]No plugins installed. Install one: plugin install <plugin>@<marketplace>[/dim]")
         return EXIT_OK
     table = Table(title="Plugins", header_style="bold magenta")
-    for col in ("Plugin", "Enabled", "Scopes", "MCP servers"):
+    for col in ("Plugin", "Enabled", "Scopes", "MCP deps (bundle_id)"):
         table.add_column(col)
     for r in rows:
         table.add_row(
             str(r["id"]),
             "✓" if r["enabled"] else "—",
             ", ".join(r["scopes"]) or "—",
-            ", ".join(r["bundledMcpServers"]) or "—",
+            ", ".join(r["mcpServers"]) or "—",
         )
     console.print(table)
     return EXIT_OK
@@ -385,7 +410,7 @@ def plugin_info(
     *,
     json_output: bool = False,
 ) -> int:
-    """plugin 详情：scope / installPath / version / commitSha / enabled / bundledMcpServers / installedAt。"""
+    """plugin 详情：scope / installPath / version / commitSha / enabled / mcpServers / installedAt。"""
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed", json_output=json_output)
@@ -400,7 +425,7 @@ def plugin_info(
     table.add_row("enabled", "✓" if enabled else "—")
     for idx, rec in enumerate(records):
         prefix = f"[{rec.get('scope')}] " if len(records) > 1 else ""
-        for k in ("scope", "installPath", "version", "commitSha", "installedAt", "bundledMcpServers"):
+        for k in ("scope", "installPath", "version", "commitSha", "installedAt", "mcpServers"):
             if k in rec:
                 table.add_row(f"{prefix}{k}", str(rec[k]))
         if idx < len(records) - 1:
@@ -637,12 +662,12 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             return
         scope = flag_value(args, "--scope") or "user"
         # v0.3.0（#123）：install 不激活——不注入 register/inject 回调、不 mark_skills_dirty（skills 无变化）；
-        # 仅传 existing_server_names 供冲突预检。激活走 `plugin enable`。
+        # 仅传 existing_bundle_ids 供依赖预检（只提示不拒绝）。激活走 `plugin enable`。
         await plugin_install(
             registry, home, env, plugin_id,
             scope=scope, project_path=project_path if scope in ("project", "local") else None,
             version=flag_value(args, "--version"),
-            existing_server_names=cbs.existing_server_names,
+            existing_bundle_ids=cbs.existing_bundle_ids,
             json_output=json_output,
         )
     elif sub == "uninstall":
@@ -666,7 +691,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         plugin, marketplace = split
         code = await plugin_enable(
             registry, home, env, pos[0],
-            existing_server_names=cbs.existing_server_names,
+            existing_bundle_ids=cbs.existing_bundle_ids,
             register_server=_plugin_register_cb(comp, plugin, marketplace),
             remove_server=cbs.remove_server,  # enable 失败回滚摘除本次新增 server（v0.3.0 原子性）
             inject_inputs=_plugin_inject_inputs_cb(comp, plugin, marketplace),
@@ -706,10 +731,11 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
 
 
 def _batch_teardown(remove_server: RemoveServer) -> Callable[[list[str]], Awaitable[None]]:
-    """把单个 ``remove_server`` 包成批量 teardown 回调（gc_plugins 的 ``mcp_teardown`` 入参为 name 列表）。"""
+    """把单个 ``remove_server`` 包成批量 teardown 回调（gc_plugins 的 ``mcp_teardown`` 入参为 **bundle_id** 列表，
+    且已在 gc 内过完 §4.9.1-2 回收判据）/ Adapt single-remove into gc's batch teardown。"""
 
-    async def _teardown(names: list[str]) -> None:
-        for name in names:
-            await remove_server(name)
+    async def _teardown(bundle_ids: list[str]) -> None:
+        for bundle_id in bundle_ids:
+            await remove_server(bundle_id)
 
     return _teardown

@@ -73,6 +73,7 @@ from a2c_smcp.computer.settings.scope import (
     workdir_settings_dir,
 )
 from a2c_smcp.computer.settings.store import atomic_write_json, file_lock
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -331,6 +332,23 @@ def resolve_mcp_config(
             inputs.append(resolved_input)
 
     return ResolvedMcpConfig(servers=servers, inputs=inputs, errors=errors)
+
+
+def user_declared_bundle_ids(*, env: Mapping[str, str] | None = None) -> set[str]:
+    """
+    当前**用户声明面**（各 scope mcp.json）全部 server 的 bundle_id 集 / bundle_ids declared by the user。
+
+    协议 runtime-contract §4.9.1-2 回收判据第二项「X **非用户声明**」的数据源（#153/F1）：plugin
+    disable/uninstall 时，用户自己在 mcp.json 里声明过的同 bundle_id server **永不连坐**。
+
+    **为何不按 ``origin != plugin`` 过滤**（协议原文如此表述，此处刻意省略）：本 SDK 中
+    :func:`resolve_mcp_config` 产出的 ``origin`` 恒为 ``user/project/local/flag/policy``——plugin 声明依赖的
+    server 走 transient ``Computer.amount_server`` 挂载、**从不回写 mcp.json**，故不可能出现在本视图里。
+    即「出现在 mcp.json」⇔「用户声明」，额外过滤是恒真条件。同款推理见 :func:`mcp_server_status` 的 #148 注释。
+    ⚠️ 若将来 bundled server 改为回写 mcp.json（origin 可为 plugin），此函数 **MUST** 同步加 origin 过滤。
+    """
+    snapshot = resolve_mcp_config(env=env)
+    return {resolve_bundle_id(srv.config) for srv in snapshot.servers.values()}
 
 
 # ---------------------------------------------------------------------------

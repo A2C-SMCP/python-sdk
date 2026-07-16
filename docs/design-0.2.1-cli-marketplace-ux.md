@@ -289,7 +289,7 @@ MCP server 走 **`<plugin>/mcp-servers/<name>.json`** 文件式（mcp-servers �
 
 | 命令 | 行为 |
 |---|---|
-| `plugin install <plugin>@<marketplace> [--version <v>]` | 安装单个 plugin。检查 MCP server 名冲突：bundled server name 已存在**且不归属本 plugin**（不在其 `bundledMcpServers` 记录里）→ **硬抛、原子失败、不留半装状态**（无 rename/force 逃生口）。`--version` 锁版本（暂用 git tag/SHA，v0.2.1 默认 latest）。 |
+| `plugin install <plugin>@<marketplace> [--version <v>]` | 安装单个 plugin。**MCP 依赖预检**（#153/D3）：声明依赖的 `bundle_id` 已存在于运行期权威配置集 → **依赖已满足 → 提示 + 正常安装**（MUST NOT 拒绝，§2.5-1；原「外来同名硬抛」已作废）。`--version` 锁版本（暂用 git tag/SHA，v0.2.1 默认 latest）。 |
 | `plugin uninstall <plugin>@<marketplace> [--keep-servers]` | 卸载。默认 stop+remove plugin 携带的 MCP server；`--keep-servers` 保留 MCP server config。 |
 | `plugin enable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = true`；emit_update_skills。 |
 | `plugin disable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = false`；**停掉并从生效 MCP 定义层摘除该 plugin 携带的 MCP server**（与 §7.1 步骤 5「禁用 plugin 不合并其 mcp_servers」对齐——禁用 = 整 plugin 贡献下线）；**物化层保留**（clone 树 + installed_plugins.json 记录不动），`enable` 可廉价复原（重新挂载 server + 暴露 skill），无需重 clone/重装；emit_update_skills（server 停所引发的 tools 变更经 `server:update_tool_list` 同步广播）。区别于 `uninstall`：disable 留 installed 记录、可一键回滚；uninstall 删 installed 记录、移除 server config。 |
@@ -558,16 +558,27 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
         "commitSha": "abc1234",
         "installedAt": "2026-05-10T...",
         "lastUpdated": "2026-05-10T...",
-        "bundledMcpServers": ["figma-mcp"]
+        "mcpServers": ["figma-mcp"]
       }
     ]
   }
 }
 ```
 
-- `bundledMcpServers`：**A2C 扩展字段**（CC 的 installed_plugins.json **没有**此字段——CC 把 bundled MCP 存在 plugin 目录的 `.mcp.json` 里，uninstall 随 `deletePluginDataDir` 清）。A2C 为做 uninstall 级联（§4.3 决策 #19）显式记录该 plugin install 时注册的 MCP server name，用于精准清理。
+- `mcpServers`：**A2C 扩展字段**（CC 的 installed_plugins.json **没有**此字段）。语义 = 该 plugin **声明依赖**的
+  MCP Server **`bundle_id` 纯数组**（协议 runtime-contract §4.9.1-1，#153/D3+F1）。三条硬约束：
+  - **只记 `bundle_id`**，MUST NOT 记 display `name`（显式 `bundleId` 的 server 改名后账本名即过期）；
+  - MUST NOT 记「安装时本地是否已有」一类**时点快照事实**（provenance/introduced）——它随其他 plugin 卸载而
+    失真，是**传递性泄漏**之源（A 引入 X → B 装时已在 → 卸 A 后「X 由 A 引入」的事实随记录一起消失 → 卸 B 时
+    无人认领 ⇒ X 永久泄漏）。任何回收/门控/归属判定 MUST NOT 依赖此类字段；
+  - 语义是**依赖**而非**所有**：卸载 plugin **不等于**回收这些 server。
+- **回收判据**（§4.9.1-2，纯函数、零落盘状态）：disable/uninstall/gc 时对每个 `bundle_id` X ——
+  **回收 X ⟺ 无其他 plugin 声明依赖 X ∧ X 非用户声明**（`resolve_mcp_config()` 里无该 `bundle_id`）。
+  由此「用户自有 server 永不连坐」与「多 plugin 共享依赖不被提前摘、最后一个依赖者卸载时回收（无泄漏）」同时成立。
+  > 原字段名 `bundledMcpServers`（display **name** 数组，「uninstall 无条件级联清理」语义）已作废。旧格式账本
+  > **整条丢弃 + 从 `installedPlugins` 意图重建**（§4.9.1-4），**MUST NOT** 写 name→bundle_id 映射迁移逻辑。
 - 数组化：scope 维度（`scope`+`projectPath` 精确匹配），为「user + workspace 工作目录同时装、不同版本」预留（对齐 CC V2 schema，实际已支持多 scope 并存；v0.2.1 常见为单元素）。
-- 字段集对齐 CC：`scope`(managed|user|project|local) / `projectPath`(project/local 必填) / `installPath`(版本化路径) / `version` / `installedAt` / `lastUpdated` / `commitSha` + A2C 扩展 `bundledMcpServers`。
+- 字段集对齐 CC：`scope`(managed|user|project|local) / `projectPath`(project/local 必填) / `installPath`(版本化路径) / `version` / `installedAt` / `lastUpdated` / `commitSha` + A2C 扩展 `mcpServers`。
 
 ### 6.3 文件级写保护、原子写与损坏恢复
 
@@ -608,10 +619,13 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 ### 7.2 失败降级
 
 - git clone/pull 失败：记 ERROR、不阻断其余 marketplace、该 marketplace 标记为 `lastError`、对 Agent 不可见（Registry 不入册）。
-- **MCP server name 冲突（非对称处理）**：
-  - **冲突判定**：bundled server name 已存在 **且** 该 server 不在「待装 plugin 的 `bundledMcpServers` 记录」里（即不是它自己上次装的）。重装/重启时 plugin 自有的 server 命中自己 → **不算冲突**（幂等再物化）。
-  - **交互/CLI `plugin install`**：外来同名 → **硬抛**（`MCPServerNameConflictError`），原子失败、不留半装状态。用户自行解决（删/改自己的同名 server，或在自有 marketplace 仓库里改 plugin manifest 的 server name）。**不**提供 `--rename`/`--force-override`（类比「软件双开」：name 即身份，不给官方旁路；force-override 会静默毁用户配置，rename 会让 `mcp:<server>:*` 命名映射与 manifest 声明对不上）。
-  - **reconciler 启动自动加载**：外来同名 → **跳过该 plugin 加载 + WARN + 留意图层 `enabled` 不动**（不能让一个冲突 plugin 拖垮整个启动；冲突消解后重启即恢复）。
+- **MCP 依赖已满足（不是冲突）**——**已按 D3 重写，#153**：
+  - **判定**：plugin 声明依赖的 `bundle_id` 已存在于**运行期权威配置集** → **依赖已满足**。数据源 MUST 是
+    `manager.server_configs()`，**MUST NOT** 是构造期快照 `Computer.mcp_servers`（协议 §2.5-4）。
+  - **交互/CLI `plugin install`**：提示「依赖已满足、复用既有实例、卸载不移除它」→ **正常安装**（退出码 0）。
+    原「外来同名硬抛、原子失败、无 rename/force 逃生口」已作废（详见 §10.6）。
+  - **reconciler 启动自动加载 / 治理重挂**：同 `bundle_id` 已有 → **skip register**（复用既有实例，用户配置胜），
+    不覆盖、不阻断其余。
 - known_marketplaces.json 文件损坏：备份 `.corrupt-<ts>.bak` + 降级空配置 + 下次 reconcile 按 settings 声明重装（§6.3）。
 
 ### 7.3 显式 sync 与孤儿清理
@@ -938,26 +952,31 @@ a2c> marketplace add git@github.com:team/skills.git
 > **威胁模型有意只收紧非交互路径、放过交互 desync**：交互 add 必由在场真人敲入命令+URL，风险与非交互无人
 > 值守脚本不可同日而语，desync 由人把关。回归守卫见 `test_add_pretrusted_name_interactive_skips_prompt`。
 
-### 10.6 Plugin MCP server 冲突（硬抛、无逃生口）
+### 10.6 Plugin MCP 依赖已满足（提示、不拒绝）
 
-name 即身份，外来同名直接抛错——交互与非交互行为一致（无 prompt、无 flag 旁路）：
+> **⚠️ 本节已按协议 D3 重写（#153）**。原文为「name 即身份，外来同名硬抛、原子失败、无 rename/force 逃生口」
+> ——该裁决已被 [protocol Discussion #23](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/23) 终审
+> **正面推翻**：plugin 与 MCP Server 是 **依赖关系而非所有关系**（runtime-contract §2.5）。
+> `MCPServerNameConflictError` 已退役。
+
+plugin 以 `bundle_id` **声明依赖**；同 `bundle_id` 本地已有 = **依赖已满足** → 提示 + 正常安装：
 
 ```
 a2c> plugin install frontend-design@my-team-skills
 
-  ✗ MCP server name conflict: 'figma-mcp'
-    Existing: figma-mcp (added manually 2026-05-19, owner=user)
-    Plugin brings: figma-mcp (transport=stdio, command=node)
-
-  Install aborted. No changes made.
-  Resolve by one of:
-    • rename/remove your existing server:  server rm figma-mcp
-    • or rename the server in the plugin's own manifest (if you own the repo)
+  ℹ dependency satisfied: MCP server 'figma-mcp' already exists locally; this plugin
+    reuses it rather than creating a new one. Configs reconcile by scope precedence.
+    Uninstalling this plugin will not remove it.
+  ✓ installed 'frontend-design@my-team-skills' (1 MCP server(s) declared as dependencies,
+    not mounted) (disabled; run 'plugin enable ...' to activate)
 ```
 
-- **原子失败**：抛 `MCPServerNameConflictError`，plugin 与其 skills 一个都不装、不写 `installed_plugins.json`。
-- **判定排除自有**：若 `figma-mcp` 本就是该 plugin 上次装的（命中 `bundledMcpServers`）→ 不算冲突，正常幂等再物化。
-- 非交互 / `--json`：同样硬抛，退出码 1 + JSON error（`{"error":"mcp_server_name_conflict","name":"figma-mcp","owner":"user"}`）。
+- **MUST NOT 拒绝**（协议 §2.5-1）；退出码 0，交互与非交互一致。
+- **复用既有实例**：`plugin enable` 对已满足的依赖 **skip register**，不覆盖既有 server 配置。
+- **display name 相同、`bundle_id` 不同 = 合法共存**（§5.6），MUST NOT 视为冲突。
+- **唯一硬错误**：同一声明文件内多 key 归一到同一 `bundle_id`（fail-fast，§2.5-2）——那是**声明面**写法错误，
+  与本处**依赖面**是两回事。
+- **卸载不连坐**：见 §6.2 回收判据。
 
 ---
 
@@ -1063,7 +1082,7 @@ a2c_smcp/computer/
 ### 13.2 集成
 
 - `marketplace add` 全链路：trust prompt → 写 settings.json `trustedMarketplaces` → git clone → known_marketplaces.json（**无 trusted 字段**）落盘 → emit_update_skills。
-- `plugin install` 外来同名 MCP server → 硬抛 + 原子失败（不留半装）；自有同名 → 幂等放行；`plugin uninstall` 清理 bundledMcpServers。
+- `plugin install` 同 bundle_id 已有 → **依赖已满足：提示 + 正常安装**（#153/D3）；`plugin uninstall` 按 §4.9.1-2 回收判据处理 `mcpServers` 声明的依赖（无人再依赖 ∧ 非用户声明才回收）。
 - **MCP 批准门控**：workspace `.tfrobot/mcp.json` 未知 server → pending → 批准框 → 写 **local** `enabledMcpjsonServers`；plugin-bundled server 免批准直连。
 - **inputs 解析链**：env `A2C_INPUT_<ID>` 命中 → 不落盘；password prompt → keyring 存 → 重启不再问；非密钥 → 明文 state；keyring 不可用 + 无 env + 无 TTY → 硬错误。
 - File watcher：user/project 目录 SKILL.md 增删改 → debounce → emit；CLI 写回 settings 经 `markInternalWrite` 不触发重载循环。
@@ -1081,7 +1100,7 @@ a2c_smcp/computer/
 
 - Sandbox 穿越 / `.skillenv` forbidden / `too_large` 不铸句柄 / staging 隔离 / name 寻址防越权。
 - Trust 拒绝：`strictKnownMarketplaces=true` + 不在 `trustedMarketplaces` + 非交互 `--json` → 退出码 1 + JSON error。
-- MCP server 外来同名冲突（交互/非交互一致）→ 硬抛 `MCPServerNameConflictError`、退出码 1、不留半装状态；自有同名 → 不触发。
+- MCP 依赖已满足（交互/非交互一致）→ 提示 + 退出码 0 正常安装；`enable` 复用既有实例不覆盖（#153/D3，原 `MCPServerNameConflictError` 已退役）。
 - **密钥不落明文**：`password:true` 值绝不出现在 `.tfrobot/mcp.json`/`input-values.json`/日志；keyring 不可用且无 env → 硬错误而非明文落盘。
 - **占位符不外泄**：`get_config`/`get_skills` payload 中 `${input:}`/`${env:}` 不展开，密钥不离开 Computer。
 
@@ -1137,7 +1156,7 @@ A ⫫ B（并行）；C 依赖 A+B；D 依赖 A；E 依赖 A/B/C/D；F 依赖 A/
 - [ ] **inputs/secret（VS Code 对标）**：解析链 env→keyring→明文 state→prompt→default；password 走 keyring 重启不再问；keyring 不可用降级 env，**绝不写明文**。
 - [ ] Trust：CC 风格 settings.json policy 字段计算（`strictKnownMarketplaces`/`trustedMarketplaces`/`blockedMarketplaces`）；known_marketplaces.json **无** trusted 字段。
 - [ ] `marketplace add/list/info/remove/refresh/set` 六命令完整；trust prompt 流程红→绿。
-- [ ] `plugin install/uninstall/enable/disable/list/info` + `plugin gc` 完整；MCP server 外来同名硬抛 + 原子失败、自有同名幂等放行；bundledMcpServers 联动卸载。
+- [ ] `plugin install/uninstall/enable/disable/list/info` + `plugin gc` 完整；MCP 依赖已满足 → 提示不拒绝、enable 复用不覆盖；`mcpServers` 依赖按回收判据卸载（用户自有永不连坐）。
 - [ ] **Reconciler additive-only**：物化多于声明不自动清理；孤儿靠 `plugin gc`/`marketplace prune`。
 - [ ] 物化文件**原子写 + 锁 + .corrupt 备份**（优于 CC writeFileSync）。
 - [ ] `skill list/info` 跨三源扁平视图。
