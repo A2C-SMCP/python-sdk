@@ -182,6 +182,7 @@ def _run_computer_client_process(port: int, computer_name_queue: multiprocessing
             "tools": [
                 {
                     "name": "echo",
+                    "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "echo text",
                     "params_schema": {"type": "object"},
                     "return_schema": None,

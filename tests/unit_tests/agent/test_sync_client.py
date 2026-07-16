@@ -162,6 +162,7 @@ class TestSMCPAgentClient:
             "tools": [
                 {
                     "name": "test_tool",
+                    "bundle_id": "srv_x",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "Test tool",
                     "params_schema": {},
                     "return_schema": None,
@@ -313,6 +314,7 @@ class TestSMCPAgentClient:
         tools = [
             SMCPTool(
                 name="test_tool",
+                bundle_id="srv_x",  # #152 D1：夹具 name ≠ bundle_id 分叉
                 description="Test tool",
                 params_schema={},
                 return_schema=None,

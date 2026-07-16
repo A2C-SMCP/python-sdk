@@ -490,11 +490,14 @@ class MCPServerManager:
             for bundle_id in self._servers_config
         ]
 
-    async def available_tools(self) -> AsyncGenerator[Tool, Any]:
-        """获取暴露给 Agent 的工具及其元数据；``Tool.name`` = **exposed_tool_name**（``{bundle_id}__{alias??原始名}``）。
+    async def available_tools(self) -> AsyncGenerator[tuple[BUNDLE_ID, Tool], Any]:
+        """获取暴露给 Agent 的工具及其归属；产出 ``(bundle_id, Tool)``，``Tool.name`` = **exposed_tool_name**。
 
-        Yield tools exposed to the Agent; each ``Tool.name`` is the exposed_tool_name (协议 §exposed_tool_name / #106)。
-        Agent 即以 exposed_tool_name 寻址，``aexecute_tool`` 经 ExposedToolMapping 解析回原始名调用上游。
+        Yield ``(bundle_id, Tool)`` exposed to the Agent; each ``Tool.name`` is the exposed_tool_name
+        (协议 §exposed_tool_name / #106)。``bundle_id`` = 该工具所属 server 的**解析后**身份（#152 D1，供
+        ``SMCPTool.bundle_id`` 填充，显式归属、禁前缀反推）。Agent 即以 exposed_tool_name 寻址，
+        ``aexecute_tool`` 经 ExposedToolMapping 解析回原始名调用上游。与 ``list_windows`` / ``list_resources``
+        返回 ``(bundle_id, X)`` 的既定约定一致。
         """
         async with self._lock:
             servers_cached_tools: dict[BUNDLE_ID, list[Tool]] = {}
@@ -516,7 +519,8 @@ class MCPServerManager:
                         merged_meta = dict(tool.meta) if tool.meta else {}
                         merged_meta[A2C_TOOL_META] = a2c_meta
                         update["meta"] = merged_meta
-                    yield tool.model_copy(update=update)
+                    # 携归属 bundle_id 产出（#152 D1）；bundle_id 即 _exposed_tools 键的解析后身份。
+                    yield bundle_id, tool.model_copy(update=update)
 
     async def list_windows(self, window_uri: str | None = None) -> list[tuple[BUNDLE_ID, Resource]]:
         """

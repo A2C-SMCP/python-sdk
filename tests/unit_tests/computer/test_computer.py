@@ -54,7 +54,8 @@ async def test_aget_available_tools(monkeypatch):
     tool = ToolFactory.build(description="mock_desc")
     # 构造mock manager/Build mock manager
     mock_manager = MagicMock(spec=MCPServerManager)
-    mock_manager.available_tools.return_value = DummyAsyncIterator([tool])
+    # #152 D1：available_tools 现产出 (bundle_id, Tool) 元组；夹具 bundle_id ≠ tool.name 分叉
+    mock_manager.available_tools.return_value = DummyAsyncIterator([("srv_mock", tool)])
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     # 实例化Computer/Instantiate Computer
     computer = Computer(name="test")
@@ -68,6 +69,7 @@ async def test_aget_available_tools(monkeypatch):
     # 检查SMCPTool结构/Check SMCPTool structure
     assert isinstance(t, dict)
     assert t["name"] == tool.name
+    assert t["bundle_id"] == "srv_mock"  # #152 D1：归属填的是 available_tools 产出的 bundle_id
     assert t["description"] == tool.description
     assert t["params_schema"] == tool.inputSchema
     assert t["return_schema"] == tool.outputSchema
@@ -95,7 +97,8 @@ async def test_aget_available_tools_meta_branches(monkeypatch):
     tool5.annotations = dummy_annotations
     # 构造mock manager
     mock_manager = MagicMock(spec=MCPServerManager)
-    mock_manager.available_tools.return_value = DummyAsyncIterator([tool1, tool2, tool3, tool4, tool5])
+    # #152 D1：available_tools 现产出 (bundle_id, Tool) 元组
+    mock_manager.available_tools.return_value = DummyAsyncIterator([("srv_mock", t) for t in (tool1, tool2, tool3, tool4, tool5)])
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     computer = Computer(name="test")
     await computer.boot_up()

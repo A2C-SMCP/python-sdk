@@ -79,9 +79,18 @@ class GetToolsReq(AgentCallData):
 
 
 class SMCPTool(TypedDict):
-    """在Computer端侧管理多个MCP时，无法保证ToolName不重复。因此alias字段被添加以帮助用户进行区分不同工具。如果alias被设置，创建工具时将会使用alias。"""
+    """在Computer端侧管理多个MCP时，无法保证ToolName不重复。因此alias字段被添加以帮助用户进行区分不同工具。如果alias被设置，创建工具时将会使用alias。
+
+    #152 D1：``bundle_id`` 显式承载工具归属。``name`` 为聚合后 exposed_tool_name（恒 ``{bundle_id}__``
+    开头），Agent 据 ``bundle_id`` 把工具关联回具体 server（分组展示、关联 config/resources），
+    **MUST NOT** 切分 ``name`` 的 ``__`` 前缀反推归属（``name`` 对 Agent 不透明）。wire 字段名 = snake_case
+    ``bundle_id``（与 rust 逐字一致，协议 data-structures.md）。
+    """
 
     name: str
+    # 所属 MCP Server 的**解析后** bundle_id（resolve_bundle_id 产物，恒非空；非配置中的显式声明值）。
+    # 与 GetComputerConfigRet.servers 的 key、错误码 meta.mcp_server 属**同一身份空间**。
+    bundle_id: str
     description: str
     params_schema: dict
     return_schema: dict | None
@@ -297,7 +306,13 @@ MCPServerConfig = MCPServerStdioConfig | MCPServerStreamableHttpConfig | MCPSSEC
 
 
 class GetComputerConfigRet(TypedDict):
-    """完整的Computer配置文件类型"""
+    """完整的Computer配置文件类型。
+
+    #152 D1 不变量：``servers`` 的 **key = 解析后 bundle_id**，且每个 entry 的 ``bundle_id`` 字段 = 同值
+    （运行期注入，见 #149 on_get_config）——与 SMCPTool.bundle_id 属**同一身份空间**，Agent 据此把工具
+    归属回 server。注意 ``MCPServerConfig.bundle_id`` 类型为 ``str | None`` 承载的是**显式声明值**，
+    wire 投影 MUST 物化为解析后值（绝不直接序列化模型字段，缺省会得 null）。
+    """
 
     inputs: NotRequired[list[MCPServerInput] | None]
     servers: dict[str, MCPServerConfig]

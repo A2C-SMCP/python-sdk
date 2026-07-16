@@ -63,6 +63,11 @@ async def test_smcp_tool_data_without_default_tool_meta(stdio_params) -> None:
         assert "description" in tool
         assert "params_schema" in tool
         assert "return_schema" in tool
+        # #152 D1：SMCPTool 必含 bundle_id，且 == 路由该工具的 bundle_id（exposed name 前缀）
+        assert "bundle_id" in tool, "SMCPTool 必含 bundle_id 字段（协议 D1 required）"
+        assert tool["name"].startswith(tool["bundle_id"] + "__"), (
+            f"exposed name 必以 {{bundle_id}}__ 开头：bundle_id={tool['bundle_id']!r} name={tool['name']!r}"
+        )
         # default_tool_meta=null 时，meta 中不应有 a2c_tool_meta
         meta = tool.get("meta", {})
         assert "a2c_tool_meta" not in meta, (
@@ -124,6 +129,11 @@ async def test_smcp_tool_data_with_default_tool_meta_tags(stdio_params) -> None:
         assert "description" in tool
         assert "params_schema" in tool
         assert "return_schema" in tool
+        # #152 D1：SMCPTool 必含 bundle_id，且 == 路由该工具的 bundle_id（exposed name 前缀）
+        assert "bundle_id" in tool, "SMCPTool 必含 bundle_id 字段（协议 D1 required）"
+        assert tool["name"].startswith(tool["bundle_id"] + "__"), (
+            f"exposed name 必以 {{bundle_id}}__ 开头：bundle_id={tool['bundle_id']!r} name={tool['name']!r}"
+        )
 
         meta = tool.get("meta", {})
         assert "a2c_tool_meta" in meta, (
@@ -178,9 +188,14 @@ async def test_smcp_tool_data_with_per_tool_meta(stdio_params) -> None:
 
     assert tools, "工具列表不应为空"
 
-    # 找到 hello 工具验证合并结果（exposed_tool_name = {bundle_id}__hello；bundle_id == name）
+    # 找到 hello 工具验证合并结果（exposed_tool_name = {bundle_id}__hello；此夹具合法 name → bundle_id == name）
     hello_tool = next((t for t in tools if t["name"] == "merged_meta_server__hello"), None)
     assert hello_tool is not None, "应存在 hello 工具"
+
+    # #152 D1：bundle_id 显式化归属（此夹具 name 合法字符 → bundle_id == name == "merged_meta_server"）
+    assert hello_tool["bundle_id"] == "merged_meta_server", (
+        f"hello 工具 bundle_id 应为 'merged_meta_server'，实际={hello_tool['bundle_id']!r}"
+    )
 
     meta = hello_tool.get("meta", {})
     assert "a2c_tool_meta" in meta
@@ -190,5 +205,45 @@ async def test_smcp_tool_data_with_per_tool_meta(stdio_params) -> None:
     assert parsed.get("auto_apply") is True, f"per-tool auto_apply 应覆盖为 True，实际={parsed}"
     # tags 应从 default 回落得到 ["default_tag"]
     assert parsed.get("tags") == ["default_tag"], f"tags 应从 default 回落为 ['default_tag']，实际={parsed}"
+
+    await computer.shutdown()
+
+
+@pytest.mark.anyio
+async def test_smcp_tool_bundle_id_distinct_from_name(stdio_params) -> None:
+    """
+    #152 D1 核心验收：在 **name ≠ bundle_id** 前提下，验证 SMCPTool.bundle_id 填的是
+    该工具实际路由的**解析后 bundle_id**，而非 display name（消除 stub 同值假绿）。
+
+    D1 acceptance under name ≠ bundle_id: SMCPTool.bundle_id MUST carry the resolved bundle_id
+    that routes the tool, not the display name. Guards against the stub-collision false-green
+    where fixtures let name == bundle_id.
+
+    夹具显式声明 bundle_id='custombid'，name='Display Name Srv'（含空格，normalize 后 ≠ bundle_id）。
+    显式值经 resolve_bundle_id 优先 → 运行期身份 = 'custombid'，exposed = 'custombid__<tool>'。
+    """
+    cfg = StdioServerConfig(
+        name="Display Name Srv",  # display 名，含空格；与 bundle_id 刻意分叉
+        bundle_id="custombid",  # 显式声明 → 解析后身份，≠ name
+        server_parameters=stdio_params,
+    )
+    assert cfg.name != cfg.bundle_id, "夹具前提：name 必须 ≠ bundle_id"
+
+    computer = Computer(name="test_bundle_id_distinct", auto_connect=True)
+    await computer.amount_server(cfg)  # #137：transient 挂载（不落盘）
+
+    tools = await computer.aget_available_tools()
+
+    assert tools, "工具列表不应为空"
+    for tool in tools:
+        # bundle_id == 显式解析后身份，而非 display name
+        assert tool["bundle_id"] == "custombid", (
+            f"SMCPTool.bundle_id 应为解析后 'custombid'，实际={tool['bundle_id']!r}（若填成 name 即回归）"
+        )
+        assert tool["bundle_id"] != cfg.name, "bundle_id 绝不应等于 display name"
+        # exposed name 以 {bundle_id}__ 开头，佐证 bundle_id 即路由身份
+        assert tool["name"].startswith("custombid__"), (
+            f"exposed name 应以 'custombid__' 开头，实际={tool['name']!r}"
+        )
 
     await computer.shutdown()

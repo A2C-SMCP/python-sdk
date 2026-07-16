@@ -225,7 +225,7 @@ async def test_disabled_tool(manager):
         await manager.aexecute_tool("server1__tool2", {})
 
     # #106 契约：禁用工具不应再出现在对外暴露面（不可见且不可调用）
-    names = [tool.name async for tool in manager.available_tools()]
+    names = [tool.name async for _bid, tool in manager.available_tools()]
     assert "server1__tool2" not in names
     assert "server1__tool1" in names
 
@@ -309,7 +309,7 @@ async def test_get_available_tools(manager):
 
     # 获取工具
     tools = []
-    async for tool in manager.available_tools():
+    async for _bid, tool in manager.available_tools():
         tools.append(tool)
 
     assert len(tools) == 2
@@ -328,7 +328,7 @@ async def test_default_tool_meta_applies_when_missing_per_tool(manager):
 
     # 检查 available_tools 注入
     tools = []
-    async for tool in manager.available_tools():
+    async for _bid, tool in manager.available_tools():
         tools.append(tool)
     t1 = next(t for t in tools if t.name == "server1__tool1")
     assert t1.meta["a2c_tool_meta"].auto_apply is True
@@ -378,11 +378,11 @@ async def test_default_tool_meta_alias_ignored_no_collapse(manager, monkeypatch)
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    names = {tool.name async for tool in manager.available_tools()}
+    names = {tool.name async for _bid, tool in manager.available_tools()}
     # 塌名 Bug：现码只剩一个 'server1__custom'；修后两工具各以原始名暴露、无丢失。
     assert names == {"server1__tool1", "server1__tool2"}, f"default alias 不应塌名/丢工具，实际: {names}"
     # a2c_tool_meta.alias 亦为 None（default 位 alias 被忽略，输出与命名一致、不误导 Agent）。
-    tools = {t.name: t async for t in manager.available_tools()}
+    tools = {t.name: t async for _bid, t in manager.available_tools()}
     assert tools["server1__tool1"].meta["a2c_tool_meta"].alias is None
     # 响亮配置诊断：命中被忽略的 default alias 时 WARN 一次（方案 d）。
     assert any("default_tool_meta.alias" in w and "custom" in w for w in warns), (
@@ -407,7 +407,7 @@ async def test_per_tool_alias_wins_over_default_alias_no_collapse(manager):
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    names = {tool.name async for tool in manager.available_tools()}
+    names = {tool.name async for _bid, tool in manager.available_tools()}
     # tool1 用 per-tool alias 'renamed1'；tool2 无 per-tool → default alias 被弃 → 原始名 'tool2'。无塌名、无丢失。
     assert names == {"server1__renamed1", "server1__tool2"}, f"实际: {names}"
     # 路由回原始名可解析（per-tool alias 生效但路由目标仍是 tool1）。
@@ -661,13 +661,13 @@ async def test_aadd_or_aupdate_server_same_tool_coexist(manager, monkeypatch):
     assert "server2" in manager._active_clients
 
     # server1 原客户端由 mock_client_factory 建（tool1/tool2），server2 由 duplicate_tool_factory 建（tool1）
-    names = {t.name async for t in manager.available_tools()}
+    names = {t.name async for _bid, t in manager.available_tools()}
     assert {"server1__tool1", "server1__tool2", "server2__tool1"} <= names
 
     # 借 alias 把 server2 的 tool1 改名（仍带 bundle 前缀）
     config2_aliased = create_server_config("server2", tool_meta={"tool1": ToolMeta(alias="renamed")})
     await manager.aadd_or_aupdate_server(config2_aliased)
-    names2 = {t.name async for t in manager.available_tools()}
+    names2 = {t.name async for _bid, t in manager.available_tools()}
     assert "server2__renamed" in names2
     assert "server2__tool1" not in names2
 
@@ -884,7 +884,7 @@ async def test_available_tools_exposes_alias_as_name(manager):
     await manager.ainitialize(servers)
     await manager.astart_all()
 
-    names = [tool.name async for tool in manager.available_tools()]
+    names = [tool.name async for _bid, tool in manager.available_tools()]
     # 暴露面应为 {bundle_id}__{alias}，原始名不得出现 / exposed name = {bundle_id}__{alias}, never the original
     assert "alias_server__aliased_tool" in names
     assert "alias_server__tool5" not in names
@@ -917,7 +917,7 @@ async def test_forbidden_tool_excluded_from_duplicate_detection(manager, monkeyp
     bundle_id, original = await manager.avalidate_tool_call("server2__tool1", {})
     assert (bundle_id, original) == ("server2", "tool1")
     # 暴露面只出现一次 server2__tool1（server1 那份被 forbid、不暴露）
-    names = [tool.name async for tool in manager.available_tools()]
+    names = [tool.name async for _bid, tool in manager.available_tools()]
     assert names.count("server2__tool1") == 1
     assert "server1__tool1" not in names
 
@@ -935,7 +935,7 @@ async def test_forbidden_original_name_suppresses_alias(manager):
     await manager.astart_all()
 
     # alias 与原始名都不暴露、不路由 / neither the alias nor the original is exposed/routed
-    names = [tool.name async for tool in manager.available_tools()]
+    names = [tool.name async for _bid, tool in manager.available_tools()]
     assert "alias_server__aliased_tool" not in names
     assert "alias_server__tool5" not in names
     assert "alias_server__aliased_tool" not in manager._exposed_tools
