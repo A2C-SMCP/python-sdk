@@ -150,7 +150,8 @@ class _FakeComputer:
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
         registered_workdirs: Any | None = None,  # #69/S16：CLI --add-dir → registered_workdirs，替身需接受
-    ) -> None:
+
+        mcp_flag_config: Any | None = None) -> None:
         self.init_args = {
             "name": name,
             "inputs": inputs,

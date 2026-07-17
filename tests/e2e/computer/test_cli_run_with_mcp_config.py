@@ -1,12 +1,19 @@
 """
-文件名: test_cli_run_with_config.py
+文件名: test_cli_run_with_mcp_config.py
 作者: JQQ
 创建日期: 2025/9/22
 版权: 2023 JQQ. All rights reserved.
 依赖: pytest, pexpect
 描述:
-  中文: 启动 CLI 时通过 --config/-c 传入配置文件，验证服务加载与工具可见。
-  English: Pass --config at startup to load servers config and verify tools.
+  中文: 启动 CLI 时通过 --mcp-config/-c 传入 flag 层 mcp.json，验证服务加载与工具可见。
+  English: Pass --mcp-config (the flag-layer mcp.json) at startup and verify servers load and tools are visible.
+
+  #154：旧 `--config`（收「裸 server 对象/数组」、绕开 scope 合并与审批门直挂）已更名为 `--mcp-config`
+  且形状硬切为 mcp.json 的 `{servers, inputs}` —— 它现在是 flag scope 的 mcp.json（优先级次高、仅低于
+  policy），与 `--settings`（flag 层 settings.json）构成 flag scope 的**文件对**（协议 §2.5-3）。
+
+  注：REPL 面的 `server add @<file>` 仍吃**裸 server** 形状（另一条通路、另一套夹具），见
+  `test_cli_mcp_config_start.py` / `test_cli_inputs_resolve.py` —— 本次不动它们。
 """
 
 from __future__ import annotations
@@ -109,14 +116,25 @@ def _assert_status(child: pexpect.spawn, server: str, retries: int = 8, delay: f
 
 
 @pytest.mark.e2e
-def test_run_with_config_param_loads_server() -> None:
+def test_run_with_mcp_config_param_loads_server() -> None:
     """
-    启动参数包含 --config @tests/e2e/computer/configs/server_direct_execution.json，应能加载并启动服务：
-    - 进入 a2c> 后检查 status 含 e2e-test
+    启动参数含 --mcp-config @tests/e2e/computer/configs/mcp_flag_direct_execution.json，应能加载并启动服务：
+    - 进入 a2c> 后检查 status 含 e2e.direct
     - tools 中包含 hello
     若自动启动存在延迟，调用一次 start all 作为补偿
+
+    夹具键 `e2e.direct`（**非** `e2e-direct`）：`normalize_name` 折叠 `.`→`_` 但**不折叠 `-`** ⇒ `e2e-direct`
+    的 bundle_id 恰等于自身、两概念不分叉（conformance §2.0 违规）。`e2e.direct` → bundle_id `e2e_direct`。
+
+    保留 `--mcp-config=@...` 的**等号形**：这是全仓唯一钉住等号形解析的地方。
+
+    ⚠️ **status 断言的是 bundle_id `e2e_direct`，不是 display name** —— `MCPServerManager.get_server_status()`
+    刻意以 **bundle_id 为身份**返回（#129/#130/#131 BundleID 模型），而 `cli/utils.py` 把它渲染在标着 "Name"
+    的列下。**旧夹具 `e2e-test` 看不见这个分叉**（`-` 不折叠 ⇒ name ≡ bundle_id ⇒ 同值致盲，正是 Epic #147
+    「stub 同值陷阱」那一族）；换成分叉夹具后才暴露出来。「人机面该显示 display name」属 REPL 寻址/展示轴
+    （#143 / #144），**不在本 Issue 范围**——此处如实断言**今日行为**，勿改成 `e2e.direct` 掩盖它。
     """
-    cfg_arg = "--config=@tests/e2e/computer/configs/server_direct_execution.json"
+    cfg_arg = "--mcp-config=@tests/e2e/computer/configs/mcp_flag_direct_execution.json"
     with _spawn_cli_with_args(cfg_arg) as child:
         # 等横幅/提示符
         try:
@@ -137,5 +155,6 @@ def test_run_with_config_param_loads_server() -> None:
         child.sendline("start all")
         _wait_prompt(child)
 
-        _assert_status(child, "e2e-test", retries=10, delay=0.8)
+        # 身份 = bundle_id（见 docstring：status 渲染 get_server_status() 的 bundle_id，非 display name）
+        _assert_status(child, "e2e_direct", retries=10, delay=0.8)
         _assert_tools(child, "hello", retries=12, delay=1.0)
