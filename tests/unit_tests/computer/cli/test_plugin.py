@@ -27,6 +27,8 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.mcp_clients.model import MCPServerPromptStringInput
 from a2c_smcp.computer.settings.scope import user_settings_path, workdir_project_settings_path
 from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
@@ -350,6 +352,40 @@ async def test_inject_inputs_cb_skips_collisions_without_partial_injection(tmp_p
     await cb(plugin_root)  # 不得抛
 
     assert {i.id for i in injected} == {"audit@acme/safe"}, f"肇事对未全跳过 / 无辜项被连坐：{[i.id for i in injected]}"
+
+
+def test_inject_inputs_skips_candidate_colliding_with_existing_pool(capsys: pytest.CaptureFixture[str]) -> None:
+    """#155 **跨批次**坍缩：候选与**池内既有** id 撞名 → 只跳候选、既有不动、无辜项照常、**不抛**。
+
+    守卫 ``_inject_inputs_collision_safe`` 的 ``existing`` 项——**承重墙且此前无人看守**：把它丢掉
+    （只做批次内前检）后本仓相关用例全绿，而本用例转红并复现原始 🔴（EnvNameCollisionError 逸出 +
+    部分注入）。判据参照 rubric 5.2：实现替换为空，测试必须能红。
+
+    生产可达（两条真实路径）：
+      ① ``run_mcp_approval``（mcp.json 裸 id）先注入、``run_governance_remount``（plugin 前缀 id）后注入：
+         用户 mcp.json 写 ``audit_acme_token`` + plugin ``audit@acme`` 声明 ``token`` → 同映射；
+      ② 两个 plugin ``a-b@mp`` / ``a_b@mp`` 各自声明同名 input → 先后 enable。
+
+    **必须用真实 Computer**：两处 stub 的 ``list_inputs()`` 都从**空池**起步 ⇒ ``existing`` 分支对它们
+    物理上不可达（这也是补 stub 的 ``list_inputs()`` 并**没有**让该分支变可测的原因）。
+    """
+    # 既有池：mcp.json 声明的裸 id；候选：plugin 前缀 id —— 二者同映射 A2C_SMCP_audit_acme_token
+    comp = Computer(name="t", inputs={MCPServerPromptStringInput(id="audit_acme_token", description="d")})
+    incoming = [
+        MCPServerPromptStringInput(id="audit@acme/token", description="d"),  # 与既有撞名
+        MCPServerPromptStringInput(id="audit@acme/safe", description="d"),  # 无辜项
+    ]
+
+    plugin_cmd._inject_inputs_collision_safe(comp, incoming, source="plugin audit@acme")  # 不得抛
+
+    pool = {i.id for i in comp.list_inputs()}
+    assert "audit@acme/token" not in pool, "撞名候选未被拦下"
+    assert "audit_acme_token" in pool, "池内既有项被误伤（无法追溯撤回，MUST 不动）"
+    assert "audit@acme/safe" in pool, f"无辜项被连坐丢弃：{pool}"
+
+    # 消息据实分述：不得把「池内既有、其实好好的」那条说成已跳过——否则用户去改错对象
+    out = capsys.readouterr().out
+    assert "本次跳过" in out and "池内既有" in out, f"跨批次消息未分述归属：{out}"
 
 
 # ── repl_dispatch（REPL 解析胶水层；fix-review #2）/ REPL parse glue ────────────

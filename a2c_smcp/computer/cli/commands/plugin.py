@@ -151,17 +151,30 @@ def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, so
     为何须**批量前检**而非依赖逐条注入时抛：``add_or_update_input`` 自 #155 起会抛，裸循环撞名即
     中途 abort ⇒ 前面的已注入、后面的被静默丢弃（部分注入）。前检使注入要么全成、要么只少肇事项。
 
-    肇事组内**每一个** id 都跳过（无一方有优先权，符合「两者均已跳过」的呈现语义）；已在池内的既有
-    id 不动（无法追溯撤回，且既有池自身恒无坍缩）。
+    本批次内肇事的**每一个** id 都跳过（无一方有优先权——若留一方胜出，谁赢取决于 set 迭代序，正是
+    #155 要消灭的「静默串味」换个马甲）；已在**池内的既有** id 不动（无法追溯撤回，且既有池自身恒无
+    坍缩）。故跨批次时「被跳过的」只有候选方——消息**必须**据实分述，否则用户会去改那个其实好好的
+    既有 id，而真正没生效的是本批次这条。
+
+    ``existing`` 项是承重墙：去掉它（只做批次内前检）⇒ 候选与池内既有撞名时 ``add_or_update_input``
+    仍会抛 ⇒ 原始 🔴（异常逸出 + 部分注入）复活。生产可达路径见
+    ``test_inject_inputs_skips_candidate_colliding_with_existing_pool``。
     """
     existing = {i.id for i in comp.list_inputs()}
-    collisions = detect_env_name_collisions(existing | {i.id for i in inputs})
-    skipped = {i for ids in collisions.values() for i in ids}
+    candidates = {i.id for i in inputs}
+    collisions = detect_env_name_collisions(existing | candidates)
+    # 只跳候选：既有项已在池里、无法追溯撤回（池的「无坍缩」不变量仍成立——凡与任何人撞名的候选都被拦下）。
+    skipped = {i for ids in collisions.values() for i in ids} & candidates
     for name, ids in sorted(collisions.items()):
-        joined = ", ".join(repr(i) for i in ids)
+        # 据实分述，且不写死「两者」——坍缩组可 >2 个成员（如 a-b / a.b / a@b / a_b 四者同名）。
+        now = sorted(i for i in ids if i in candidates)
+        kept = sorted(i for i in ids if i not in candidates)
+        detail = f"{', '.join(repr(i) for i in now)}（本次跳过 / skipped）"
+        if kept:
+            detail += f"；{', '.join(repr(i) for i in kept)}（池内既有，未受影响 / already in pool, untouched）"
         console.print(
-            f"[red]❌ {source}: input id {joined} 均映射到同一环境变量名 {name!r}，两者已跳过，请改 id 消歧 / "
-            f"input ids collide on one env var name, all skipped; rename to disambiguate[/red]",
+            f"[red]❌ {source}: 以下 input id 均映射到同一环境变量名 {name!r} —— {detail}。请改 id 消歧 / "
+            f"input ids collide on one env var name; rename to disambiguate[/red]",
         )
     for inp in inputs:
         if inp.id in skipped:
