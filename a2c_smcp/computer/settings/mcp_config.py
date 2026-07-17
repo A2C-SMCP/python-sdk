@@ -334,18 +334,22 @@ def resolve_mcp_config(
     return ResolvedMcpConfig(servers=servers, inputs=inputs, errors=errors)
 
 
-def user_declared_bundle_ids(*, env: Mapping[str, str] | None = None) -> set[str]:
+def mcp_json_declared_bundle_ids(*, env: Mapping[str, str] | None = None) -> set[str]:
     """
-    当前**用户声明面**（各 scope mcp.json）全部 server 的 bundle_id 集 / bundle_ids declared by the user。
+    **mcp.json 声明面**（各 scope）全部 server 的 bundle_id 集 / bundle_ids declared in mcp.json。
 
-    协议 runtime-contract §4.9.1-2 回收判据第二项「X **非用户声明**」的数据源（#153/F1）：plugin
-    disable/uninstall 时，用户自己在 mcp.json 里声明过的同 bundle_id server **永不连坐**。
+    这是回收判据「X 非用户声明」的**其中一个**来源，**不是全部**——完整判定集见
+    :func:`~a2c_smcp.computer.settings.reconciler.user_owned_bundle_ids`（协议 §4.9.1-2 的数据源是
+    **运行期权威配置集** + ``origin != plugin``，而 mcp.json 只覆盖其中「落了声明」的那部分）。
 
-    **为何不按 ``origin != plugin`` 过滤**（协议原文如此表述，此处刻意省略）：本 SDK 中
-    :func:`resolve_mcp_config` 产出的 ``origin`` 恒为 ``user/project/local/flag/policy``——plugin 声明依赖的
-    server 走 transient ``Computer.amount_server`` 挂载、**从不回写 mcp.json**，故不可能出现在本视图里。
-    即「出现在 mcp.json」⇔「用户声明」，额外过滤是恒真条件。同款推理见 :func:`mcp_server_status` 的 #148 注释。
-    ⚠️ 若将来 bundled server 改为回写 mcp.json（origin 可为 plugin），此函数 **MUST** 同步加 origin 过滤。
+    **⚠️ 勿单独用它当「用户声明」判据**（#153 隔离审查 🔴）：「出现在 mcp.json ⇒ 用户声明」成立，但
+    **反向不成立**——用户经 ``a2c-computer run --config @file`` 预加载、或 SDK 内嵌
+    ``Computer(mcp_servers={...})`` 构造的 server 均走 transient ``amount_server`` 挂载，**进运行期活跃集
+    但不进 mcp.json**（``cli/main.py`` `_add_server` / ``computer.py`` boot_up）。只读本视图会把它们误判为
+    「非用户声明」而在 plugin 卸载时**连坐停摘**，正是 §4.9.1-2 与 Epic #147 北极星要根治的 P0。
+
+    ``origin`` 无需过滤：本视图的 origin 恒为 ``user/project/local/flag/policy``（plugin 声明依赖的 server
+    从不回写 mcp.json），故 ``origin != plugin`` 在此恒真。同款推理见 :func:`mcp_server_status` 的 #148 注释。
     """
     snapshot = resolve_mcp_config(env=env)
     return {resolve_bundle_id(srv.config) for srv in snapshot.servers.values()}

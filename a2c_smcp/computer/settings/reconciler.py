@@ -44,7 +44,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from a2c_smcp.computer.settings.mcp_config import user_declared_bundle_ids
+from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
 from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_valid_marketplace_name
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
@@ -486,7 +486,13 @@ def reclaimable_mcp_deps(
 
     :param deps: 本次 disable/uninstall 的 plugin 所声明的依赖（``ledger_mcp_deps_of`` 产出）。
     :param other_deps: :func:`other_plugin_mcp_deps` 产出。
-    :param user_declared: :func:`~a2c_smcp.computer.settings.mcp_config.user_declared_bundle_ids` 产出。
+    :param user_declared: :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids` 产出。
+        ⚠️ **已知未覆盖面**（#153 隔离审查 🔴，方案待三仓 Discussion 定案）：协议把本项的数据源写作「**运行期
+        权威配置集**中 ``origin != plugin`` 的条目」，而本 SDK 的 manager **不存 origin**——用户经
+        ``--config @file`` / SDK 内嵌 ``Computer(mcp_servers={...})`` 挂载的 server 走 transient
+        ``amount_server``、**不落 mcp.json**，与「plugin 自己挂的 server」在可观测信息上**完全同形**。
+        故若该 server 同时被某 plugin 声明依赖，卸载该 plugin 时仍会回收它。详见
+        :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids`。
     :return: 可回收的 bundle_id（保 ``deps`` 迭代序）。
     """
     return [d for d in deps if d not in other_deps and d not in user_declared]
@@ -581,7 +587,7 @@ async def gc_plugins(
         reclaim = reclaimable_mcp_deps(
             sorted(deps),
             other_deps=other_plugin_mcp_deps(plugins, exclude_pid=pid),
-            user_declared=user_declared_bundle_ids(env=env),
+            user_declared=mcp_json_declared_bundle_ids(env=env),
         )
         for rec in records:
             install_path = rec.get("installPath")

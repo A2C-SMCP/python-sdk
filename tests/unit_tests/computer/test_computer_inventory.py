@@ -32,6 +32,7 @@ from a2c_smcp.computer.inventory import McpPluginOwnership, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
 
@@ -223,7 +224,11 @@ async def test_inventory_marks_remounted_bundled_server_as_plugin(tmp_path: Path
             await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
 
         report = await comp.reconcile_governance(
-            existing_bundle_ids=lambda: {c.name for c in comp.mcp_servers},
+            # #153：身份 = bundle_id + 数据源 = 运行期权威集（`comp.mcp_servers` 是构造期快照，CLI 下恒空，
+            # 协议 §2.5-4 明禁）——与生产 build_mcp_callbacks 同构。
+            existing_bundle_ids=lambda: (
+                {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()} if comp.mcp_manager else set()
+            ),
             register_server=register,
             declared={"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}},
         )

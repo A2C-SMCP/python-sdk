@@ -24,6 +24,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from a2c_smcp.computer.settings.reconciler import (
     ReconcileReport,
     declared_installed_plugin_ids,
@@ -313,6 +315,20 @@ def test_prune_skips_invalid_marketplace_name(tmp_path: Path) -> None:
 # ── plugin gc ────────────────────────────────────────────────────────────────
 def _seed_installed(home: Path, plugins: dict[str, list[dict]]) -> None:
     save_installed_plugins({"version": 1, "plugins": plugins}, home=home)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cwd_and_user_config(tmp_path: Path, monkeypatch) -> None:
+    """
+    隔离 cwd + user config / Isolate cwd and user config。
+
+    #153 起 :func:`gc_plugins` 经回收判据（``mcp_json_declared_bundle_ids`` → ``resolve_mcp_config``）读
+    **cwd 锚定**的 ``.tfrobot/mcp[.local].json``（project/local scope，#116）与 user scope mcp.json。
+    不隔离则读进真实仓库 / 开发者 home——本地一旦存在这些文件，断言即随环境漂移（#137 同款教训；本文件的
+    泄漏由 #153 隔离审查 🟡 实测发现）。
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
 
 
 async def test_list_and_gc_plugins(tmp_path: Path) -> None:

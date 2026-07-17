@@ -26,6 +26,12 @@ from a2c_smcp.computer.settings.recovery import BundledServerRecord
 from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 
+# 夹具身份对（#153 隔离审查 🔴2 + 协议 conformance §2.0）：原 "figma"/"blender" 的 bundle_id 恰等于自身
+# ⇒ `resolve_bundle_id(record.config)` 换成 `record.config.name` 也测不出来（变异存活）。含 `.` 令两者分叉。
+FIGMA_NAME, FIGMA_BID = "figma.mcp", "figma_mcp"
+BLENDER_NAME, BLENDER_BID = "blender.3d", "blender_3d"
+
+
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
 # v0.3.0（#123）：活跃 = installed ∧ enabledPlugins=true（缺省翻转）→ hooks 用例显式给足两键意图。
 _DECLARED_ENABLED = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
@@ -124,7 +130,7 @@ async def test_boot_up_does_not_restore_disabled_plugin(tmp_path: Path, monkeypa
 async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """hooks 重挂：register 收到 (config, 归属记录)；inject_inputs 先于 register；二次调用幂等。"""
     _isolate_declared_env(tmp_path, monkeypatch)
-    home, plugin_root = _seed_home(tmp_path, servers=["figma"], skills=["lint"])
+    home, plugin_root = _seed_home(tmp_path, servers=[FIGMA_NAME], skills=["lint"])
 
     calls: list[tuple[str, str, str]] = []
     injected: list[Path] = []
@@ -142,8 +148,8 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
             inject_inputs=inject,
             declared=_DECLARED_ENABLED,
         )
-        assert report.remounted_servers == ["figma"]
-        assert calls == [("figma", "audit", "acme")]
+        assert report.remounted_servers == [FIGMA_BID]  # 值域 = bundle_id（#153）
+        assert calls == [(FIGMA_NAME, "audit", "acme")]  # register 回调收 config（display 名）
         assert injected == [plugin_root]
 
         report2 = await comp.reconcile_governance(
@@ -152,14 +158,14 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
             inject_inputs=inject,
             declared=_DECLARED_ENABLED,
         )
-        assert report2.remounted_servers == ["figma"]  # 幂等：结果一致
+        assert report2.remounted_servers == [FIGMA_BID]  # 幂等：结果一致
 
 
 @pytest.mark.asyncio
 async def test_reconcile_governance_injects_once_per_plugin_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """同一 plugin 根下多个 bundled server → inject_inputs 仅调一次，所有 server 均重挂。"""
     _isolate_declared_env(tmp_path, monkeypatch)
-    home, plugin_root = _seed_home(tmp_path, servers=["blender", "figma"], skills=["lint"])
+    home, plugin_root = _seed_home(tmp_path, servers=[BLENDER_NAME, FIGMA_NAME], skills=["lint"])
 
     mounted: list[str] = []
     injected: list[Path] = []
@@ -177,8 +183,8 @@ async def test_reconcile_governance_injects_once_per_plugin_root(tmp_path: Path,
             inject_inputs=inject,
             declared=_DECLARED_ENABLED,
         )
-        assert sorted(mounted) == ["blender", "figma"]
-        assert sorted(report.remounted_servers) == ["blender", "figma"]
+        assert sorted(mounted) == [BLENDER_NAME, FIGMA_NAME]
+        assert sorted(report.remounted_servers) == [BLENDER_BID, FIGMA_BID]
         assert injected == [plugin_root]  # 每 plugin 根仅一次
 
 
@@ -186,7 +192,7 @@ async def test_reconcile_governance_injects_once_per_plugin_root(tmp_path: Path,
 async def test_reconcile_governance_register_failure_non_blocking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """register 抛错 → 不阻断（不抛出），失败 server 不入 remounted，skills 恢复不受影响。"""
     _isolate_declared_env(tmp_path, monkeypatch)
-    home, _ = _seed_home(tmp_path, servers=["figma"], skills=["lint"])
+    home, _ = _seed_home(tmp_path, servers=[FIGMA_NAME], skills=["lint"])
 
     async def register(cfg, record) -> None:
         raise RuntimeError("mount boom")
@@ -205,7 +211,7 @@ async def test_reconcile_governance_register_failure_non_blocking(tmp_path: Path
 async def test_reconcile_governance_conflict_skips_existing_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """existing 已有同名 server → skip 不覆盖（additive-only，用户配置胜），register 不被调用。"""
     _isolate_declared_env(tmp_path, monkeypatch)
-    home, _ = _seed_home(tmp_path, servers=["figma"], skills=["lint"])
+    home, _ = _seed_home(tmp_path, servers=[FIGMA_NAME], skills=["lint"])
 
     calls: list[str] = []
 
@@ -214,7 +220,7 @@ async def test_reconcile_governance_conflict_skips_existing_name(tmp_path: Path,
 
     async with Computer(name="t", skill_home=home) as comp:
         report = await comp.reconcile_governance(
-            existing_bundle_ids=lambda: {"figma"},
+            existing_bundle_ids=lambda: {FIGMA_BID},
             register_server=register,
             declared=_DECLARED_ENABLED,
         )

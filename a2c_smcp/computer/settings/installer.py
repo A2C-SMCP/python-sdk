@@ -66,7 +66,7 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-from a2c_smcp.computer.settings.mcp_config import user_declared_bundle_ids
+from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
 from a2c_smcp.computer.settings.reconciler import (
     ledger_mcp_deps_of,
     other_plugin_mcp_deps,
@@ -275,12 +275,6 @@ def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str) 
     return names
 
 
-def _declared_mcp_deps_of(home: Path, plugin_id: str, env: Mapping[str, str] | None) -> set[str]:
-    """该 plugin 账本记录声明依赖的 MCP Server **bundle_id** 集（跨 scope 并集）/ Declared MCP deps of a plugin。"""
-    installed = load_installed_plugins(home=home, env=env)
-    return ledger_mcp_deps_of(installed.get("plugins", {}).get(plugin_id, []))
-
-
 def _resolve_marketplace_source(marketplace: str, home: Path, env: Mapping[str, str] | None) -> tuple[Mapping[str, Any], str | None]:
     """从 ``known_marketplaces.json`` 取 marketplace 的 git source + commitSha；未添加 → :class:`PluginInstallError`。"""
     known = load_known_marketplaces(home=home, env=env)
@@ -294,7 +288,7 @@ def _resolve_marketplace_source(marketplace: str, home: Path, env: Mapping[str, 
     return source, commit_sha if isinstance(commit_sha, str) else None
 
 
-def _log_satisfied_deps(servers: list[MCPServerConfig], existing: set[str]) -> list[str]:
+def _log_satisfied_deps(servers: list[MCPServerConfig], existing: set[str]) -> None:
     """
     依赖预检（协议 §2.5-1，**只提示不拒绝**）/ Dependency precheck: report, never reject。
 
@@ -304,16 +298,17 @@ def _log_satisfied_deps(servers: list[MCPServerConfig], existing: set[str]) -> l
     连同 ``owned``（所有权白名单）概念一并退役：依赖声明没有所有权，故无需区分「自有」与「外来」。
     display name 相同、``bundle_id`` 不同是**合法共存**（§5.6），MUST NOT 视为冲突。
 
-    :return: 依赖已满足的 bundle_id 列表（保序，供调用方提示用户）。
+    **只记日志、无返回值**：面向用户的提示由 CLI 层的 ``_satisfied_deps`` / ``_print_satisfied_deps`` 承担
+    （enable 路径 MUST 在挂载**之前**算——挂载会改变活跃集，事后算分不清「本来就有」与「刚被自己挂上」）。
     """
-    satisfied = [bid for cfg in servers if (bid := resolve_bundle_id(cfg)) in existing]
-    for bid in satisfied:
-        logger.info(
-            "dependency satisfied: MCP server %r already exists locally; reusing it rather than creating a new one "
-            "(configs reconcile by scope precedence; uninstalling this plugin will not remove it)",
-            bid,
-        )
-    return satisfied
+    for cfg in servers:
+        bid = resolve_bundle_id(cfg)
+        if bid in existing:
+            logger.info(
+                "dependency satisfied: MCP server %r already exists locally; reusing it rather than creating a new one "
+                "(configs reconcile by scope precedence; uninstalling this plugin will not remove it)",
+                bid,
+            )
 
 
 def _require_existing_ids_guard(
@@ -533,6 +528,7 @@ async def uninstall_plugin(
     **回收 X ⟺ 无其他 plugin 声明依赖 X ∧ X 非用户声明**。由此「用户自有 server 永不连坐」与「多 plugin 共享
     依赖不被提前摘除、最后一个依赖者卸载时回收（无泄漏）」两条同时成立。``--keep-servers`` 跳过整个回收环节。
 
+
     **v0.3.0 §2.4 uninstall 行**：当该 pid 的账本记录**全部**移除（回 ``available``）时，同步删除 user scope
     ``installedPlugins`` 意图条目 + 清 ``enabledPlugins`` 条目（user 必清；给了 ``project_path`` 时 project/local
     一并 best-effort——managed/policy 只读层不触碰）。指定 ``scope`` 仅删该 scope 记录且其余 scope 仍在 →
@@ -569,10 +565,11 @@ async def uninstall_plugin(
     #    ``retained``：scoped uninstall 时本 pid 其余 scope 的记录仍声明依赖 ⇒ 仍算依赖者，不可回收。
     deps = sorted(ledger_mcp_deps_of(targeted))
     retained = [r for r in records if r not in targeted]
+    ledger_plugins = installed.get("plugins", {})
     reclaim = reclaimable_mcp_deps(
         deps,
-        other_deps=other_plugin_mcp_deps(installed.get("plugins", {}), exclude_pid=plugin_id, retained_records=retained),
-        user_declared=user_declared_bundle_ids(env=env),
+        other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id, retained_records=retained),
+        user_declared=mcp_json_declared_bundle_ids(env=env),
     )
 
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
@@ -693,6 +690,13 @@ async def disable_plugin(
        disable **不删账本记录**，故判据的「其他 plugin」须排除本 pid **全部**记录（``exclude_pid``，无 retained）
        ——否则自己的记录会把自己的依赖判成「他人仍依赖」而永不回收。
 
+       **已知驻留行为**（协议字面推论，与 rust-sdk#139 同口径）：「其他 plugin」= 账本 **installed** 记录
+       （**含 disabled**，§4.9.1-2 字面为「无其他 plugin **声明依赖**」= 账本有记录）。故 A、B 均声明 X 时，
+       **二者都 disable 后 X 仍驻留**（各自的账本记录互相替对方挡住回收），须等 uninstall 才回收。这是保守侧
+       ——X 多活一会儿，但不泄漏（最后一个依赖者 uninstall 时回收）。守卫见
+       ``test_disable_both_dependents_keeps_dep_resident``。
+
+
     ⚠️ **scope 契约**：``scope`` 须与该 plugin 的**安装 scope 一致**（调用方 / #69 CLI 从上下文传）——否则把
     ``enabledPlugins[id]=false`` 写到错误层，更高优先级层意图未动 → 六层合并后可能仍 enabled、下次 reconcile 复活，
     而 live 态已摘 server / orphan skill，造成背离。
@@ -703,11 +707,12 @@ async def disable_plugin(
     _write_enabled_plugin(plugin_id, False, scope, project_path, env)
     reclaim: list[str] = []
     if remove_server is not None:
-        installed = load_installed_plugins(home=home, env=env)
+        # 账本单次读：自己的声明与「其他 plugin 的声明」取自**同一快照**，消 TOCTOU（与 uninstall/gc 对称）。
+        ledger_plugins = load_installed_plugins(home=home, env=env).get("plugins", {})
         reclaim = reclaimable_mcp_deps(
-            sorted(_declared_mcp_deps_of(home, plugin_id, env)),
-            other_deps=other_plugin_mcp_deps(installed.get("plugins", {}), exclude_pid=plugin_id),
-            user_declared=user_declared_bundle_ids(env=env),
+            sorted(ledger_mcp_deps_of(ledger_plugins.get(plugin_id, []))),
+            other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id),
+            user_declared=mcp_json_declared_bundle_ids(env=env),
         )
         for bundle_id in reclaim:
             await remove_server(bundle_id)

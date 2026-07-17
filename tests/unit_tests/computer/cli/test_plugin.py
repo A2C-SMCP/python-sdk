@@ -36,6 +36,23 @@ from a2c_smcp.utils.bundle_id import resolve_bundle_id
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
 _STAGE = "a2c_smcp.computer.settings.installer.stage_marketplace_skills"
 
+# 夹具身份对（#153 隔离审查 🔴2 + 协议 conformance §2.0）：原夹具 "figma-mcp" 的 bundle_id **恰等于自身**
+# （normalize_name 字符集含 `-` 且不折 `-`）⇒ 「误用 name 当身份」的实现无法被鉴别（Epic #147 陷阱 (b)
+# 第五例）。改用含 `.` 的 display 名令两者分叉。/ Forked so name-as-identity bugs cannot pass.
+FIGMA_NAME, FIGMA_BID = "figma.mcp", "figma_mcp"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    隔离 cwd / Isolate the process cwd。
+
+    #153 起 disable / gc 经回收判据读 **cwd 锚定**的 ``.tfrobot/mcp[.local].json``（project/local scope，
+    #116）。不 chdir 则读进真实仓库的工作区配置 → 断言随开发者本地环境漂移（#137 同款；本文件的泄漏由
+    #153 隔离审查 🟡 实测发现）。
+    """
+    monkeypatch.chdir(tmp_path)
+
 
 # ── 辅助（镜像 test_installer.py）/ helpers mirroring test_installer.py ─────────
 def _home(tmp_path: Path) -> Path:
@@ -121,7 +138,7 @@ async def test_install_happy_writes_intent_and_ledger_without_activation(
 ) -> None:
     """v0.3.0：install 只写 installedPlugins 意图 + 账本 → installed_disabled（无挂载、无 skills）。"""
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
-    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage())
     mcp = _FakeMCP()
 
@@ -150,16 +167,16 @@ async def test_install_dependency_satisfied_exit0_and_installs(
     plugin 与 MCP Server 是依赖关系，本地已有即依赖满足，复用而非拒绝。
     """
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
-    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage())
-    mcp = _FakeMCP(existing={"figma-mcp"})  # 本地已有同 bundle_id
+    mcp = _FakeMCP(existing={FIGMA_BID})  # 本地已有同 bundle_id（身份 = bundle_id，非 display 名）
 
     code = await plugin_cmd.plugin_install(
         reg, home, env, "audit@acme",
         existing_bundle_ids=mcp.existing_bundle_ids, json_output=True,
     )
     assert code == 0
-    assert json.loads(capsys.readouterr().out)["mcpServers"] == ["figma-mcp"]
+    assert json.loads(capsys.readouterr().out)["mcpServers"] == [FIGMA_BID]  # wire 值 = bundle_id
     assert "audit@acme" in load_installed_plugins(home=home, env=env)["plugins"]
     assert "audit@acme" in json.loads(user_settings_path(env).read_text(encoding="utf-8"))["installedPlugins"]
 
@@ -174,7 +191,7 @@ async def test_install_invalid_id_exit1(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_enable_reads_scope_from_ledger_writes_project_not_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
-    plugin_root = _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    plugin_root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage())
     wd = tmp_path / "proj"
     wd.mkdir()
@@ -204,15 +221,15 @@ async def test_enable_not_installed_exit1(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_disable_reads_scope_from_ledger(tmp_path: Path) -> None:
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
-    plugin_root = _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    plugin_root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     save_installed_plugins(
-        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(plugin_root), "mcpServers": ["figma-mcp"]}]}},
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(plugin_root), "mcpServers": [FIGMA_NAME]}]}},
         home=home,
     )
     mcp = _FakeMCP()
     code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", remove_server=mcp.remove)
     assert code == 0
-    assert mcp.removed == ["figma-mcp"]  # 整 plugin 下线：摘 bundled server
+    assert mcp.removed == [FIGMA_NAME]  # 整 plugin 下线：摘 bundled server
     user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert user["enabledPlugins"]["audit@acme"] is False
 
@@ -227,7 +244,7 @@ async def test_uninstall_not_installed_exit1(tmp_path: Path) -> None:
 def test_list_and_info(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     home, env = _home(tmp_path), _env(tmp_path)
     save_installed_plugins(
-        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x", "mcpServers": ["figma-mcp"]}]}},
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x", "mcpServers": [FIGMA_NAME]}]}},
         home=home,
     )
     # v0.3.0 缺省翻转：无 enabledPlugins 条目 = installed_disabled——默认列表仍可见，但 enabled=False
@@ -283,7 +300,7 @@ async def test_gc_no_orphans(tmp_path: Path, capsys: pytest.CaptureFixture[str])
 async def test_inject_inputs_cb_prefixes_and_injects(tmp_path: Path) -> None:
     home = _home(tmp_path)
     plugin_root = _setup_catalog(
-        home, "acme", "audit", servers=["figma-mcp"],
+        home, "acme", "audit", servers=[FIGMA_NAME],
         inputs=[{"id": "figma_token", "type": "promptString", "description": "tok", "password": True}],
     )
     injected: list[Any] = []
@@ -352,7 +369,7 @@ async def test_repl_install_is_lazy_no_mount_no_dirty(tmp_path: Path, monkeypatc
     """v0.3.0：REPL install 不激活——不挂载 bundled server、skills 无变化不 mark dirty；账本 + 意图照写。"""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     home, reg = _home(tmp_path), SkillRegistry()
-    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage())
     comp = _ReplComp(home, reg)
     await plugin_cmd.repl_dispatch(comp, ["plugin", "install", "audit@acme"], session=None)
@@ -422,7 +439,7 @@ async def test_run_governance_remount_wires_ownership_context(tmp_path: Path, mo
 
     _isolate_env(tmp_path, monkeypatch)
     home = _home(tmp_path)
-    _seed_recovery_home(home, servers=["figma-mcp"], skills=["lint"])
+    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
 
     async with Computer(name="t", skill_home=home) as comp:
         recorded: list[tuple[str, str | None, str | None]] = []
@@ -433,7 +450,7 @@ async def test_run_governance_remount_wires_ownership_context(tmp_path: Path, mo
         monkeypatch.setattr(comp, "amount_server", fake_register)  # #137 ③：治理重挂经 transient amount_server
         await plugin_cmd.run_governance_remount(comp)
 
-        assert recorded == [("figma-mcp", "audit", "acme")]
+        assert recorded == [(FIGMA_NAME, "audit", "acme")]
 
 
 @pytest.mark.asyncio
@@ -443,7 +460,7 @@ async def test_run_governance_remount_flag_declared_disables(tmp_path: Path, mon
 
     _isolate_env(tmp_path, monkeypatch)
     home = _home(tmp_path)
-    _seed_recovery_home(home, servers=["figma-mcp"], skills=["lint"])
+    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
     flag_file = tmp_path / "flag-settings.json"
     flag_file.write_text(json.dumps({"enabledPlugins": {"audit@acme": False}}), encoding="utf-8")
 
@@ -478,11 +495,11 @@ async def test_run_governance_remount_skips_dependency_satisfied_from_runtime_se
 
     _isolate_env(tmp_path, monkeypatch)
     home = _home(tmp_path)
-    _seed_recovery_home(home, servers=["figma-mcp"], skills=["lint"])
+    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
 
     # auto_connect=False：config-only 挂载（不起子进程），与 #150 的 F7 范式一致（test_client.py:169-216）。
     async with Computer(name="t", mcp_servers=set(), auto_connect=False, skill_home=home) as comp:
-        user_cfg = TypeAdapter(MCPServerConfig).validate_python(_stdio("figma-mcp"))
+        user_cfg = TypeAdapter(MCPServerConfig).validate_python(_stdio(FIGMA_NAME))
         recorded: list[str] = []
 
         async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
@@ -508,7 +525,7 @@ async def test_disable_effective_across_boot_after_rematerialization(
 
     _isolate_env(tmp_path, monkeypatch)
     home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
-    _setup_catalog(home, "acme", "audit", servers=["figma-mcp"])
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     workdir = Path.cwd()
     # 模拟 project scope 安装+启用后账本丢失：仅 settings 意图在
     _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"]})

@@ -30,6 +30,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from a2c_smcp.computer.settings.installer import (
     disable_plugin,
     enable_plugin,
@@ -237,6 +239,66 @@ async def test_scenario5_user_declares_after_install_blocks_reclaim(tmp_path: Pa
     await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
 
     assert mcp.removed == []
+
+
+@pytest.mark.xfail(
+    reason="已知未覆盖面（#153 隔离审查 🔴）：协议 §4.9.1-2 的数据源是**运行期权威配置集** + origin != plugin，"
+    "而本 SDK 的 manager 不存 origin —— 用户经 `--config @file` / SDK 内嵌 Computer(mcp_servers=) 挂载的 "
+    "server 与 plugin 自己挂的在可观测信息上完全同形，无法区分。根治需运行期 origin（#134 轴）或 --config "
+    "归一进 mcp.json flag 层（#154），方案待三仓 Discussion 定案。本用例钉住缺口：修好后会 XPASS 提醒。",
+    strict=False,
+)
+async def test_runtime_only_user_server_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
+    """
+    ⚠️ **已知缺口守卫**（xfail）：用户经 ``--config @file`` 挂的 server 在运行期活跃集、**不在 mcp.json**。
+
+    协议 §4.9.1-2 把「X 非用户声明」的数据源定为**运行期权威配置集**（``origin != plugin``），**不是** mcp.json。
+    ``a2c-computer run --config @servers.json``（``cli/main.py`` `_add_server`）与 SDK 内嵌
+    ``Computer(mcp_servers={...})`` 都走 transient ``amount_server``、**从不回写 mcp.json** ⇒ 本 SDK 只读
+    mcp.json 声明面就会把它们判成「非用户声明」⇒ 若该 server 同时被某 plugin 声明依赖，卸载该 plugin 时**连坐停摘**。
+
+    **为何不在 #153 内根治**：「用户 --config 挂的 X」与「plugin enable 挂的 X」在 manager 层信息完全相同
+    （无 origin / 无归属），不新增运行期归属就无法同时满足场景①（A 引入 X 无人依赖 → 回收）与本例。
+    补运行期归属 = #134「ownership 归属混源」轴（Epic #147 明载「共识未覆盖该轴」）；
+    ``--config`` 归一进 mcp.json flag 层 = #154。二者择一，交三仓 Discussion 定案。
+
+    **注**：本 PR 相对 develop 仍是净改善——develop 是「卸载**无条件**摘」（连 mcp.json 声明的用户 server 都摘），
+    本 PR 已保护住 mcp.json 各 scope 声明面，仅剩本例这条路径。
+    """
+    monkeypatch.chdir(tmp_path)
+    home, env = _home(tmp_path), _env(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    # 用户自己挂的 figma.mcp：进运行期活跃集，但**没有** _user_mcp_json（不落 mcp.json 声明）
+    mcp = _FakeMCP(existing={FIGMA_BID})
+    await _install(home, env, "audit@acme", mcp)
+
+    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+
+    assert mcp.removed == [], "用户经 --config @file / 内嵌构造挂载的 server 被连坐停摘（协议 §4.9.1-2）"
+
+
+async def test_disable_both_dependents_keeps_dep_resident(tmp_path: Path, monkeypatch) -> None:
+    """
+    驻留行为守卫（协议字面推论，rust-sdk#139 须同口径）：A、B 均声明 X，**二者都 disable 后 X 仍驻留**。
+
+    §4.9.1-2 的「其他 plugin」= 账本 **installed** 记录（**含 disabled**，字面为「无其他 plugin **声明依赖**」）。
+    故 disable A 时 B 的记录替 X 挡住回收，disable B 时 A 的记录同样挡住 ⇒ X 驻留至 uninstall。
+    这是**保守侧**：X 多活一会儿，但不泄漏（最后一个依赖者 uninstall 时回收，见场景③④）。
+    """
+    monkeypatch.chdir(tmp_path)
+    home, env = _home(tmp_path), _env(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _setup_catalog(home, "beta", "review", servers=[FIGMA_NAME])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    mcp = _FakeMCP()
+    await _install(home, env, "audit@acme", mcp)
+    await _install(home, env, "review@beta", mcp)
+
+    await disable_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await disable_plugin("review@beta", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+
+    assert mcp.removed == []  # 两者账本记录仍在 → 互相替对方挡住回收（驻留，非泄漏）
 
 
 async def test_scoped_uninstall_keeps_dep_for_remaining_scope(tmp_path: Path, monkeypatch) -> None:

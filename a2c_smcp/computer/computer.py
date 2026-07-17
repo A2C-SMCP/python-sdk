@@ -1655,12 +1655,12 @@ class Computer(BaseComputer[PromptSession]):
         for record in collect_enabled_bundled_servers(home, declared):
             # 身份 = bundle_id：按 display name 判会误伤「同名异 id」——协议 §5.6 明定其为**合法共存**，
             # MUST NOT 视为冲突；同 bundle_id 才是「依赖已满足」（§2.5-1），此时复用既有实例、不覆盖。
-            name = resolve_bundle_id(record.config)
-            if name in existing:
+            bundle_id = resolve_bundle_id(record.config)
+            if bundle_id in existing:
                 logger.info(
                     "governance recovery: dependency satisfied for bundle_id %r (plugin %s); reusing the existing "
                     "server instead of remounting (existing wins)",
-                    name,
+                    bundle_id,
                     record.plugin_id,
                 )
                 continue
@@ -1670,10 +1670,15 @@ class Computer(BaseComputer[PromptSession]):
                     injected_roots.add(record.install_path)
                 await register_server(record.config, record)
             except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
-                logger.warning("governance recovery: failed to remount bundled server %r (plugin %s): %s", name, record.plugin_id, e)
+                logger.warning(
+                    "governance recovery: failed to remount bundled server %r (plugin %s): %s",
+                    bundle_id,
+                    record.plugin_id,
+                    e,
+                )
                 continue
-            existing.add(name)
-            report.remounted_servers.append(name)
+            existing.add(bundle_id)
+            report.remounted_servers.append(bundle_id)
         return report
 
     def list_mcp_servers_with_metadata(self) -> list[McpServerWithMetadata]:
