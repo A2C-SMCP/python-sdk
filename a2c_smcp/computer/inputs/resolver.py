@@ -8,9 +8,11 @@
 描述:
   中文: inputs 解析器定义与实现。按需根据 id 解析三类输入：promptString、pickString、command。
         v0.2.1 #65（§9.3，对标 VS Code SecretStorage）：在交互 prompt 前前插解析链
-        env(`A2C_INPUT_<ID>`) → keyring（仅 password）→ 明文 value store（仅非密钥），并在**交互 prompt
-        得值后**按类持久化（password→keyring、非密钥→明文 state；env 命中/command/headless 不落盘）。
-        密钥在 headless（无 env+无 keyring+无 TTY）下**硬错误**，绝不落明文。
+        env(`A2C_SMCP_<ENV_SEGMENT(id)>`) → keyring（仅 password）→ 明文 value store（仅非密钥），并在
+        **交互 prompt 得值后**按类持久化（password→keyring、非密钥→明文 state；env 命中/command/headless
+        不落盘）。密钥在 headless（无 env+无 keyring+无 TTY）下**硬错误**，绝不落明文。
+        env 名派生的单一权威在 `a2c_smcp/utils/env_segment.py`（#155 / PROTO-5，0.3.0 起 `A2C_INPUT_`
+        前缀硬切废止）。
   English: Input resolvers. v0.2.1 #65 prepends an env→keyring→plaintext resolution chain and persists
            interactively-prompted values by type (secrets to OS keyring, non-secrets to plaintext state);
            headless secrets hard-error rather than ever writing plaintext.
@@ -19,7 +21,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -37,6 +38,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
 )
+from a2c_smcp.utils.env_segment import env_var_name
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("computer")
@@ -48,21 +50,11 @@ class InputNotFoundError(KeyError):
 
 class SecretResolutionError(RuntimeError):
     """
-    中文: ``password:true`` input 在 headless（无 ``A2C_INPUT_<ID>`` env、无 keyring、无 TTY）下无法解析。
+    中文: ``password:true`` input 在 headless（无 ``A2C_SMCP_<ENV_SEGMENT(id)>`` env、无 keyring、无 TTY）下无法解析。
     English: A ``password:true`` input cannot be resolved headless (no env, no keyring, no TTY).
 
     设计要求**硬错误**而非降级落明文（§9.3，杜绝把密钥明文落盘的反模式）。
     """
-
-
-def env_var_name(input_id: str) -> str:
-    """
-    把 input id 映射为环境变量名 ``A2C_INPUT_<ID_UPPER>``（非字母数字 → ``_``）/ Map id to env var name。
-
-    含前缀 plugin id（``<plugin>@<mp>/<id>``）一并归一，如 ``frontend@team/figma_token`` →
-    ``A2C_INPUT_FRONTEND_TEAM_FIGMA_TOKEN``。
-    """
-    return "A2C_INPUT_" + re.sub(r"[^A-Z0-9]", "_", input_id.upper())
 
 
 class InputResolver(BaseInputResolver[PromptSession]):
@@ -117,7 +109,8 @@ class InputResolver(BaseInputResolver[PromptSession]):
         is_password = isinstance(cfg, MCPServerPromptStringInput) and bool(cfg.password)
         is_plain_persistable = isinstance(cfg, (MCPServerPromptStringInput, MCPServerPickStringInput)) and not is_password
 
-        # 解析链步骤 2：环境变量 A2C_INPUT_<ID>（编排层注入，命中不落盘）
+        # 解析链步骤 2：环境变量 A2C_SMCP_<ENV_SEGMENT(id)>（编排层注入，命中不落盘）。
+        # 只传裸 id：live 路径不带 server/tool 段，与 rust 逐字节一致（#155 决策 1）。
         env_val = self._env.get(env_var_name(resolved_id))
         if env_val is not None:
             self._cache[resolved_id] = env_val

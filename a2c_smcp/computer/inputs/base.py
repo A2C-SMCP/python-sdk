@@ -31,6 +31,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
 )
+from a2c_smcp.utils.env_segment import raise_on_env_name_collisions
 
 S = TypeVar("S")
 
@@ -45,6 +46,10 @@ class BaseInputResolver(Generic[S], ABC):
         # 中文: inputs 定义快照与解析缓存
         # English: inputs definition snapshot and resolve cache
         self._inputs: dict[str, MCPServerInput] = {i.id: i for i in inputs}
+        # 注册期坍缩 fail-fast（#155 / PROTO-5 F4）：ENV_SEGMENT 非单射（`-` 与 `_` 同映射），两个 id 撞到
+        # 同一完整 env 名会静默串味（后写的赢，含 password 密钥）⇒ 硬错误。本类是唯一收口：Computer 的
+        # update_inputs / add_or_update_input / remove_input 每次变更都重建 resolver，无路径绕过。
+        raise_on_env_name_collisions(self._inputs)
         self._cache: dict[str, Any] = {}
         # 中文: 可选会话实例，子类在解析时可优先使用
         # English: Optional session instance; subclasses may prefer using it during resolution

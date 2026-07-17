@@ -12,6 +12,28 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
 
 ### Breaking Changes
+- **Input env var naming: `A2C_INPUT_<ID_UPPER>` → `A2C_SMCP_<ENV_SEGMENT(id)>`, hard cut, no dual-read**
+  (#155, aligned with a2c-smcp-protocol `computer-mcp-config-guide.md` §"环境变量命名规则（双端统一规范）"
+  and Discussion #23 F4 / F5; rust mirror rust-sdk#140).
+  - **Prefix `A2C_INPUT_` is abolished**; the id segment is **no longer upper-cased**. `A2C_INPUT_FIGMA_TOKEN`
+    becomes `A2C_SMCP_figma_token`. Per F5 there is **no dual-read and no transition window** — orchestration
+    layers (CI, containers) MUST update injected env var names. The headless secret error message derives the
+    new name on the spot, so it is self-teaching.
+  - **One `ENV_SEGMENT` normalizer for every segment** (`a2c_smcp/utils/env_segment.py`, single source of
+    truth, byte-identical with rust): per-code-point, `[^A-Za-z0-9_]` → `_`, **case preserved**. Case
+    preservation is what keeps `MyServer` / `myserver` — two legal, simultaneously mountable bundle_ids —
+    from collapsing onto one variable name. Note `ENV_SEGMENT` **neither folds consecutive `_` nor trims
+    edges**, unlike `bundle_id.normalize_name`; the two are distinct functions and MUST NOT be conflated.
+  - **Env name collisions now fail fast at registration** (`EnvNameCollisionError`, raised from
+    `BaseInputResolver.__init__`). `ENV_SEGMENT` is not injective (`-` and `_` both map to `_`), so
+    `figma-token` and `figma_token` resolve to one variable name. Previously this silently cross-fed values
+    between inputs — last writer wins, secrets included. Detection is on the **full** variable name; segments
+    that collapse while full names differ are harmless and are **not** rejected. Rejected mutations leave
+    `Computer` state untouched.
+  - Cache / keyring / value-store keys are unchanged (`resolved_id`): the live resolution path passes a bare
+    id on both SDKs, so no server context enters the key. Multi-source disambiguation continues to ride on
+    prefixed plugin ids (`<plugin>@<marketplace>/<id>`), whose `@` and `/` `ENV_SEGMENT` now normalizes into a
+    legal POSIX env name.
 - **The two scope-layering orders are unified; `--config` → `--mcp-config`; `--inputs` removed**
   (#154 + #164, aligned with a2c-smcp-protocol `runtime-contract.md` §2.5-3 / §2.5-5 and
   Discussion #23 F6 / Discussion #32; rust mirror rust-sdk#137 / #147).

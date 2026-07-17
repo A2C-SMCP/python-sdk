@@ -1089,12 +1089,18 @@ class Computer(BaseComputer[PromptSession]):
 
         注意：更新 inputs 只会影响后续的渲染，不会自动对已激活的配置进行重新渲染/重启。
         如需应用到已存在的服务，可结合 aadd_or_aupdate_server 重新提交配置达到热更新效果。
+
+        :raises EnvNameCollisionError: 新池内两个 id 撞同一 env 名（#155 F4）；此时**本实例状态完全不变**。
         """
-        self._inputs = inputs or set()
+        candidate = inputs or set()
         # 复用传入或已有的会话，以便后续解析共享同一 Session
         # Reuse provided or existing session so subsequent resolving shares the same session
         sess = session or getattr(self._input_resolver, "session", None)
-        self._input_resolver = InputResolver(self._inputs, session=sess)
+        # 先构造（坍缩在此抛，#155）、成功后再一并赋值——否则异常会留下「池已换 + resolver 是旧的」的裂开状态。
+        # Construct first (collision raises here), assign only on success: keeps state intact on rejection.
+        resolver = InputResolver(candidate, session=sess)
+        self._inputs = candidate
+        self._input_resolver = resolver
         # 清理缓存，确保后续渲染使用最新 inputs
         self._input_resolver.clear_cache()
 
@@ -1106,18 +1112,25 @@ class Computer(BaseComputer[PromptSession]):
         规则 Rules:
           - 以 input.id 为唯一键，存在则替换，不存在则追加
           - 重新构建 InputResolver 并清空对应缓存，确保后续渲染拿到最新值
+
+        :raises EnvNameCollisionError: 新 id 与池内既有 id 撞同一 env 名（#155 F4）；此时**本实例状态完全不变**。
         """
         if not input_cfg or not getattr(input_cfg, "id", None):
             logger.warning("无效的 input 配置，忽略 / Invalid input config, skip")
             return
 
-        # 由于 __hash__ 与 __eq__ 基于 id，先丢弃再添加可实现“更新”
-        self._inputs.discard(input_cfg)
-        self._inputs.add(input_cfg)
+        # 在**副本**上算新池：由于 __hash__ 与 __eq__ 基于 id，先丢弃再添加可实现“更新”。
+        # 用副本是为了坍缩被拒时不污染 self._inputs（#155）。
+        candidate = set(self._inputs)
+        candidate.discard(input_cfg)
+        candidate.add(input_cfg)
 
         # 重新初始化解析器以应用最新定义，并清理该 id 的缓存
         sess = session or getattr(self._input_resolver, "session", None)
-        self._input_resolver = InputResolver(self._inputs, session=sess)
+        # 先构造（坍缩在此抛）、成功后再一并赋值，保证拒绝路径上状态不变。
+        resolver = InputResolver(candidate, session=sess)
+        self._inputs = candidate
+        self._input_resolver = resolver
         self._input_resolver.clear_cache(input_cfg.id)
 
     def remove_input(self, input_id: str, *, session: PromptSession | None = None) -> bool:

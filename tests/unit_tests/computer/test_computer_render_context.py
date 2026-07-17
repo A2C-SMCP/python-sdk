@@ -49,8 +49,8 @@ _CFG = {"name": "s", "type": "stdio", "server_parameters": {"command": "node", "
 @pytest.mark.asyncio
 async def test_render_context_resolves_prefixed_input(monkeypatch: pytest.MonkeyPatch) -> None:
     # 前缀化 id 入池 + bare ${input:token} 经 plugin/marketplace 上下文回退到 audit@acme/token（§9.3 D2）。
-    # env 命中（A2C_INPUT_AUDIT_ACME_TOKEN）→ headless 安全（password 在 env 命中先于无 TTY 守卫）。
-    monkeypatch.setenv("A2C_INPUT_AUDIT_ACME_TOKEN", "secret-val")
+    # env 命中（A2C_SMCP_audit_acme_token）→ headless 安全（password 在 env 命中先于无 TTY 守卫）。
+    monkeypatch.setenv("A2C_SMCP_audit_acme_token", "secret-val")
     comp = Computer(name="t")
     comp.add_or_update_input(MCPServerPromptStringInput(id="audit@acme/token", description="d", password=True, type="promptString"))
 
@@ -63,7 +63,7 @@ async def test_render_context_resolves_prefixed_input(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_render_without_context_leaves_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("A2C_INPUT_AUDIT_ACME_TOKEN", "secret-val")
+    monkeypatch.setenv("A2C_SMCP_audit_acme_token", "secret-val")
     comp = Computer(name="t")
     comp.add_or_update_input(MCPServerPromptStringInput(id="audit@acme/token", description="d", password=True, type="promptString"))
     # 无 plugin/marketplace 上下文 → 裸 token 不在池、无前缀回退 → render 容错保留占位符（不解析、不泄漏 env 值）

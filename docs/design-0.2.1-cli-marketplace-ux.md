@@ -45,7 +45,7 @@
 | 24 | 非交互形态 | Typer 子命令 + REPL 同名同义 | `a2c-computer marketplace add ...` 与 REPL `marketplace add ...` 走同一逻辑 |
 | 25 | MCP server 定义文件 | A2C **原生 schema**（`{servers,inputs}`）→ workspace/project `.tfrobot/mcp.json` + user `$XDG_CONFIG_HOME/a2c/mcp.json` | `server_parameters` 嵌套 + 治理字段与标准 `.mcp.json` 不兼容，**不同名混用**（§9.1） |
 | 26 | MCP 批准门控 | **全套 CC**：首见未知 server 弹批准框；`enableAllProjectMcpServers`/`enabledMcpjsonServers`/`disabledMcpjsonServers`；批准状态写 **local scope** | MCP 执行任意命令，每用户先批准（§9.2） |
-| 27 | inputs/env/secret | **完整对标 VS Code**：`${env:VAR}` + `${input:id}` + 预定义变量；`password:true` 走 **OS keyring**（`keyring` 库）；env 注入 `A2C_INPUT_<ID>`；`envFile`；**密钥永不落明文** | §9.3，含 headless 降级 |
+| 27 | inputs/env/secret | **完整对标 VS Code**：`${env:VAR}` + `${input:id}` + 预定义变量；`password:true` 走 **OS keyring**（`keyring` 库）；env 注入 `A2C_SMCP_<ENV_SEGMENT(ID)>`；`envFile`；**密钥永不落明文** | §9.3，含 headless 降级 |
 | 28 | scope 聚合 | **user 为主** + workspace **active workdir 单根**作 project/local（根随任务切换）+ **能力层**（`enabledPlugins`/`extraKnownMarketplaces`/skills）跨全部登记目录全局并集 | 访谈定稿；映射 CC `--add-dir`（详见 §5.0/§5.1） |
 
 ---
@@ -792,7 +792,7 @@ A2C input 定义本就照搬 VS Code（promptString/pickString + `password`，A2
 **取值解析链**（`${input:id}` 按序解析，命中即止）：
 ```
 1. 进程内 cache (_cache)                          ← 本会话已解析
-2. 环境变量 A2C_INPUT_<ID_UPPER>                  ← 编排层/CI 注入（12-factor，密钥不落 A2C 盘）
+2. 环境变量 A2C_SMCP_<ENV_SEGMENT(ID)>            ← 编排层/CI 注入（12-factor，密钥不落 A2C 盘）
 3. OS keyring（仅 password:true）                 ← VS Code SecretStorage 等价（keyring 库）
 4. 非密钥持久化值（仅非 password）                ← $XDG_STATE_HOME/a2c/input-values.json
 5. 交互 prompt（仅 TTY；promptString/pickString/command 按现有 resolver）
@@ -811,8 +811,8 @@ A2C input 定义本就照搬 VS Code（promptString/pickString + `password`，A2
 **OS keyring 后端（对标 VS Code SecretStorage）**：`keyring` 库自动选 macOS Keychain / Windows Credential Manager / Linux Secret Service（libsecret）。
 
 **headless / keyring 不可用降级**（容器/CI/无 Secret Service）：
-- `password:true` 仍可经**步骤 2 env**（`A2C_INPUT_<ID>`）解析——这条永远在；
-- 若无 env 且无 keyring 且无 TTY → **硬错误**「secret `<id>` 无法解析；请用 `A2C_INPUT_<ID>` 环境变量或在 TTY 重试」，**绝不写明文**（杜绝 AWS Q 把密钥明文落盘的反模式）。
+- `password:true` 仍可经**步骤 2 env**（`A2C_SMCP_<ENV_SEGMENT(ID)>`）解析——这条永远在；
+- 若无 env 且无 keyring 且无 TTY → **硬错误**「secret `<id>` 无法解析；请用 `A2C_SMCP_<ENV_SEGMENT(ID)>` 环境变量或在 TTY 重试」，**绝不写明文**（杜绝 AWS Q 把密钥明文落盘的反模式）。
 
 **与 `.skillenv` 的边界（D1，与 tfrobot SKILL 协议 §5 交叉核对）**：本节的 `${input:}`/keyring/env 机制**只**服务 **MCP server 配置**的占位符解析；与 SKILL 的 `.skillenv` 是**不同层、不同机制、不重叠**：
 
@@ -1062,7 +1062,7 @@ a2c_smcp/computer/
 | 文件 | 改动 |
 |---|---|
 | `computer.py` | 持有 `SettingsStore`、`Reconciler`、`SkillEventDebouncer`；启动调 reconcile（additive-only）；扩展 `_on_manager_change` 调 debouncer（与 [`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md) §5.1 同步） |
-| `inputs/resolver.py` | 解析链前插 env(`A2C_INPUT_<ID>`)→keyring→明文 state；prompt 后按类持久化（§9.3） |
+| `inputs/resolver.py` | 解析链前插 env(`A2C_SMCP_<ENV_SEGMENT(ID)>`)→keyring→明文 state；prompt 后按类持久化（§9.3） |
 | `inputs/render.py` | `${env:VAR}`/`${input:id}`/`${workspaceFolder}` 等变量替换 + `envFile` 加载（§9.1） |
 | `socketio/client.py` | `emit_update_skills` 改为通过 debouncer 触发（不裸调） |
 | `cli/main.py` | 新增 `--json` / `--settings <file>` / `--add-dir <dir>` / `--approve-all-mcp` 全局 flag；新增 typer 子命令（marketplace/plugin/skill/settings/migrate-settings） |
@@ -1096,7 +1096,7 @@ a2c_smcp/computer/
 - `marketplace add` 全链路：trust prompt → 写 settings.json `trustedMarketplaces` → git clone → known_marketplaces.json（**无 trusted 字段**）落盘 → emit_update_skills。
 - `plugin install` 同 bundle_id 已有 → **依赖已满足：提示 + 正常安装**（#153/D3）；`plugin uninstall` 按 §4.9.1-2 回收判据处理 `mcpServers` 声明的依赖（无人再依赖 ∧ 非用户声明才回收）。
 - **MCP 批准门控**：workspace `.tfrobot/mcp.json` 未知 server → pending → 批准框 → 写 **local** `enabledMcpjsonServers`；plugin-bundled server 免批准直连。
-- **inputs 解析链**：env `A2C_INPUT_<ID>` 命中 → 不落盘；password prompt → keyring 存 → 重启不再问；非密钥 → 明文 state；keyring 不可用 + 无 env + 无 TTY → 硬错误。
+- **inputs 解析链**：env `A2C_SMCP_<ENV_SEGMENT(ID)>` 命中 → 不落盘；password prompt → keyring 存 → 重启不再问；非密钥 → 明文 state；keyring 不可用 + 无 env + 无 TTY → 硬错误。
 - File watcher：user/project 目录 SKILL.md 增删改 → debounce → emit；CLI 写回 settings 经 `markInternalWrite` 不触发重载循环。
 - Reconciler additive-only：物化多于声明的条目重启后**仍在**；`plugin gc` 才清。
 - `--mcp-config @file` + `.tfrobot/mcp.json` 同时存在 → 按 `SCOPE_ORDER` 合并，**flag 胜出**（#154）。

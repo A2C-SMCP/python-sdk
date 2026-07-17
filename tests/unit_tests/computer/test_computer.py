@@ -26,6 +26,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     StdioServerParameters,
     ToolMeta,
 )
+from a2c_smcp.utils.env_segment import EnvNameCollisionError
 
 
 class ToolFactory(ModelFactory[Tool]):
@@ -648,6 +649,41 @@ def test_update_inputs_replaces_resolver_and_clears_cache():
     assert not isinstance(computer._input_resolver, DummyResolver)
     # The new resolver should be able to clear cache without error
     computer._input_resolver.clear_cache()
+
+
+def test_add_or_update_input_env_collision_leaves_state_unchanged():
+    """#155：坍缩被拒时 Computer 状态 MUST 完全不变（池未污染 + resolver 仍可用）。
+
+    fail-fast 在 ``BaseInputResolver.__init__``；若 CRUD 仍是「先改池再重建 resolver」，
+    异常会留下「池已含肇事 id + resolver 是旧的」的裂开状态——本用例正是钉住这点。
+    """
+    computer = Computer(name="test", inputs={MCPServerPromptStringInput(id="figma-token", description="d")})
+    resolver_before = computer._input_resolver
+
+    with pytest.raises(EnvNameCollisionError):
+        computer.add_or_update_input(MCPServerPromptStringInput(id="figma_token", description="d"))
+
+    # 池未被污染：肇事 id 不得留在定义池里
+    assert {i.id for i in computer.list_inputs()} == {"figma-token"}
+    # resolver 未被换掉：仍是拒绝前那个可用实例
+    assert computer._input_resolver is resolver_before
+
+
+def test_update_inputs_env_collision_leaves_state_unchanged():
+    """#155：整体替换路径同款——拒绝后旧池/旧 resolver 原样保留。"""
+    computer = Computer(name="test", inputs={MCPServerPromptStringInput(id="kept", description="d")})
+    resolver_before = computer._input_resolver
+
+    with pytest.raises(EnvNameCollisionError):
+        computer.update_inputs(
+            {
+                MCPServerPromptStringInput(id="a-b", description="d"),
+                MCPServerPromptStringInput(id="a_b", description="d"),
+            },
+        )
+
+    assert {i.id for i in computer.list_inputs()} == {"kept"}
+    assert computer._input_resolver is resolver_before
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@
 """
 解析链单元测试（v0.2.1 #65，§9.3）/ Resolution-chain unit tests。
 
-链序：cache → env(`A2C_INPUT_<ID>`) → keyring(password) → 明文 value store(非密钥) → prompt → default。
+链序：cache → env(`A2C_SMCP_<ENV_SEGMENT(id)>`) → keyring(password) → 明文 value store(非密钥) → prompt → default。
 持久化：仅**交互 prompt 得值**（有 TTY/session）按类落盘；env 命中/headless/command 不落盘。
 密钥 headless（无 env+无 keyring+无 TTY）→ ``SecretResolutionError``，绝不落明文。
 """
@@ -21,13 +21,14 @@ import pytest
 
 import a2c_smcp.computer.inputs.resolver as resolver_mod
 from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
-from a2c_smcp.computer.inputs.resolver import InputResolver, SecretResolutionError, env_var_name
+from a2c_smcp.computer.inputs.resolver import InputResolver, SecretResolutionError
 from a2c_smcp.computer.inputs.value_store import ValueStore
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerCommandInput,
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
 )
+from a2c_smcp.utils.env_segment import EnvNameCollisionError, env_var_name
 
 _SESSION: Any = object()  # 非 None → _has_tty 视为可交互 / non-None → treated as interactive (TTY)
 
@@ -52,15 +53,45 @@ def _vstore(tmp_path: Path) -> ValueStore:
 
 
 def test_env_var_name_normalization() -> None:
-    assert env_var_name("figma_token") == "A2C_INPUT_FIGMA_TOKEN"
-    assert env_var_name("frontend@my-team/api.key") == "A2C_INPUT_FRONTEND_MY_TEAM_API_KEY"
+    """#155 F4 硬切：前缀 A2C_SMCP_、id 段不再 upper()、'@' '/' '.' 均走 ENV_SEGMENT。"""
+    assert env_var_name("figma_token") == "A2C_SMCP_figma_token"
+    assert env_var_name("frontend@my-team/api.key") == "A2C_SMCP_frontend_my_team_api_key"
+
+
+def test_resolver_rejects_env_name_collision() -> None:
+    """#155 F4 坍缩 fail-fast：两个 id 映射到同一完整 env 名 → 注册期硬错误（此前是静默串味、后写的赢）。"""
+    inputs = [
+        MCPServerPromptStringInput(id="figma-token", description="d"),
+        MCPServerPromptStringInput(id="figma_token", description="d"),
+    ]
+    with pytest.raises(EnvNameCollisionError) as ei:
+        InputResolver(inputs)
+    msg = str(ei.value)
+    # 提示 MUST 自解释：撞上的完整 env 名 + 两个肇事 id 都要出现，否则用户无从下手
+    assert "A2C_SMCP_figma_token" in msg
+    assert "figma-token" in msg and "figma_token" in msg
+
+
+def test_resolver_allows_same_segment_different_full_name() -> None:
+    """#155 F4 检测面 = **完整 env 名**：段相同但完整名不同 MUST NOT 报错（按段判会误拒）。
+
+    正对照：`a-b` / `a_b` 若作为**不同 input 的前缀段**出现（此处经带前缀池条目体现），
+    只要完整名不同就必须放行——防 fail-fast 收得过紧。
+    """
+    inputs = [
+        MCPServerPromptStringInput(id=prefix_input_id("plugin-a", "mp", "token"), description="d"),
+        MCPServerPromptStringInput(id=prefix_input_id("plugin_a", "mp", "secret"), description="d"),
+    ]
+    # plugin-a→plugin_a 段坍缩，但 token/secret 让完整名分叉 ⇒ 放行
+    r = InputResolver(inputs)
+    assert r is not None
 
 
 @pytest.mark.asyncio
 async def test_env_hit_not_persisted(tmp_path: Path) -> None:
     inputs = [MCPServerPromptStringInput(id="tok", description="d")]
     vs = _vstore(tmp_path)
-    r = InputResolver(inputs, env={"A2C_INPUT_TOK": "from-env"}, value_store=vs, secret_store=_Secret())
+    r = InputResolver(inputs, env={"A2C_SMCP_tok": "from-env"}, value_store=vs, secret_store=_Secret())
     assert await r.aresolve_by_id("tok", session=_SESSION) == "from-env"
     # env 命中不落盘（编排层拥有）/ env hit is never persisted
     assert vs.get("tok") is None
