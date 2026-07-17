@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -62,6 +62,7 @@ from a2c_smcp.computer.settings.schema import (
     FIELD_DISABLED_MCPJSON_SERVERS,
     FIELD_ENABLE_ALL_PROJECT_MCP,
     FIELD_ENABLED_MCPJSON_SERVERS,
+    SCOPE_ORDER,
     SettingsScope,
     SettingsValidationError,
 )
@@ -89,9 +90,20 @@ MANAGED_MCP_FILENAME = "managed-mcp.json"  # policy scope（企业下发）
 # 剥离、原样保留交 #65 渲染消费 / VS Code-style extension keys, stripped before validation, kept for #65.
 _VSCODE_EXT_KEYS: frozenset[str] = frozenset({"envFile"})
 
-# 预信任 origin scope（用户/老 flag/企业自己加的 server，不弹批准框，§9.2）；project/local = 工作区共享、
-# 受门控 / Pre-trusted origin scopes (no approval prompt); project/local = workspace-shared, gated.
-_TRUSTED_ORIGINS: frozenset[SettingsScope] = frozenset({SettingsScope.USER, SettingsScope.FLAG, SettingsScope.POLICY})
+# 预信任 origin scope（用户 / CLI 显式传入 / 宿主构造 / 企业自己加的 server，不弹批准框，§9.2 + 审批门档④）；
+# project/local = 工作区共享（入 git、随仓库分发）⇒ 受门控。
+# Pre-trusted origin scopes (no approval prompt); project/local = workspace-shared (git-tracked) ⇒ gated.
+#
+# ``EMBED`` 受信依据（Discussion #32 裁决 / §2.5-3）：宿主构造入参 ``Computer(mcp_servers=...)`` 是**代码级
+# 显式意图**，与 ``flag`` 同属「调用方显式受信层」。注意受信**不等于**豁免——embed 条目仍**进门迭代**，故
+# 档①②③（policy 拒绝名单 / 白名单 / 通用禁用开关）对其适用（用户/管理员保留最终关停权）；只有 project 信任门
+# （``enabledMcpjsonServers`` / ``enableAllProjectMcpServers``，档⑤⑥）因档④已放行而不可达。
+_TRUSTED_ORIGINS: frozenset[SettingsScope] = frozenset(
+    {SettingsScope.USER, SettingsScope.EMBED, SettingsScope.FLAG, SettingsScope.POLICY},
+)
+
+# embed 层的 ``source`` 标签：非文件来源，故不是路径 / Source label for the embed layer (not a file path).
+_EMBED_SOURCE = "<embed:Computer(mcp_servers=...)>"
 
 # 单点构造校验入口（照 manifest.py 范式）/ Single dict→model adapters.
 _MCP_SERVER_ADAPTER: TypeAdapter[MCPServerConfig] = TypeAdapter(MCPServerConfig)
@@ -261,42 +273,67 @@ def _validate_input(idef: Any, scope: SettingsScope, source: str | None) -> tupl
 # ---------------------------------------------------------------------------
 # 多 scope 解析 / Multi-scope resolution
 # ---------------------------------------------------------------------------
+def _embed_layer(embed_servers: Iterable[MCPServerConfig]) -> dict[str, Any]:
+    """
+    宿主构造入参 → mcp.json 形状的 embed 层 / Embedded-constructor args → an mcp.json-shaped embed layer。
+
+    ``Computer(mcp_servers={...})`` 收的是**已校验的模型**，而合并管线吃 raw dict（各层同构、复用
+    :func:`_validate_server`）⇒ 此处 ``model_dump(mode="json")`` 回落 raw。往返无损：``model_config``
+    的 ``populate_by_name`` 令 by-alias 输出（如 ``envFile``）可被重新吸收。
+
+    identity 由 map key 承载（与文件层一致）：key = ``cfg.name``。embed 层**无 inputs**——构造入参
+    ``Computer(inputs=...)`` 是另一条通路（直接入 ``_inputs`` 池），不经本层。
+    """
+    return {"servers": {cfg.name: cfg.model_dump(mode="json") for cfg in embed_servers}, "inputs": []}
+
+
 def resolve_mcp_config(
     *,
     env: Mapping[str, str] | None = None,
     flag_config_path: Path | None = None,
+    embed_servers: Iterable[MCPServerConfig] | None = None,
     managed_mcp_path: Path | None = None,
     platform: str | None = None,
 ) -> ResolvedMcpConfig:
     """
     多 scope 加载合并 ``.tfrobot/mcp.json`` + 字段级校验 / Multi-scope load + merge + validate mcp.json。
 
-    合并顺序 low → high = ``[flag, user, project, local, policy]``（即优先级
-    ``policy > local > project > user > flag``，§9.1/§5.5）；**无能力层并集**（敏感面隔离，区别于
-    settings.json）。#116：project/local 无条件锚定进程 ``os.getcwd()`` 的 ``.tfrobot/mcp[.local].json``
-    （cwd 恒存在；文件缺失 → 层不贡献）。
+    合并顺序**派生自** :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`（协议 §2.5-3 唯一权威，
+    低 → 高 ``user < project < local < embed < flag < policy``），与 settings.json 的
+    :func:`~a2c_smcp.computer.settings.scope.resolve_settings` **同序**——协议明令两套来源 MUST 一致。
+    **无能力层并集**（敏感面隔离，区别于 settings.json）。#116：project/local 无条件锚定进程
+    ``os.getcwd()`` 的 ``.tfrobot/mcp[.local].json``（cwd 恒存在；文件缺失 → 层不贡献）。
+
+    **本函数的 origin 恒 ∈ 非-plugin**（无 plugin 入参、``SettingsScope`` 无 ``PLUGIN`` 成员，见
+    :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER` 的「为何无 PLUGIN 成员」）。这是**结构性**保证，
+    不是约定——故本函数产出即协议 §2.5-5 的「带 origin 的运行期权威配置集」中的非-plugin 部分，
+    :func:`non_plugin_declared_bundle_ids` 据此无需过滤。
 
     - **servers**：按 name **整体替换**（高 scope 同名整体覆盖；server config 是原子单元、**非**深合并），
-      ``origin`` = 最高定义 scope，``trusted_origin`` = origin ∈ {user, flag, policy}。
+      ``origin`` = 最高定义 scope，``trusted_origin`` = origin ∈ :data:`_TRUSTED_ORIGINS`。
     - **inputs**：按 ``id`` 去重、高 scope 胜（缺 ``id`` 的条目各自保留以便逐条报错）。
     - 单 server / input 畸形 → drop + :class:`SettingsValidationError`，**不 abort**（§5.6 人编文件容错）。
 
     :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
-    :param flag_config_path: ``--config @file`` 老接口文件（最低优先级，§5.5）。
+    :param flag_config_path: ``--mcp-config <file>``（flag 层 mcp.json，含 ``servers``/``inputs``；
+        **次高优先级、仅低于 policy**，§2.5-3）。历史 ``--config`` 老接口曾把本层排**最低**，协议已废止该形态。
+    :param embed_servers: 宿主构造入参 ``Computer(mcp_servers=...)``（embed 层，§2.5-3）。
     :param managed_mcp_path: policy scope ``managed-mcp.json`` 覆盖路径（缺省按平台推导；便于测试）。
     :param platform: 平台标识（缺省 ``sys.platform``）；仅在 ``managed_mcp_path`` 未给时用于推导 managed 目录。
     """
     managed_path = managed_mcp_path if managed_mcp_path is not None else managed_mcp_config_path(platform)
 
-    # (scope, path) 层，低优先级在前；project/local 锚 cwd（#116）/ layers, lowest first; cwd-anchored.
+    # 各 scope 的数据源（未排序；顺序由 SCOPE_ORDER 唯一决定）；project/local 锚 cwd（#116）。
+    # Per-scope sources (unordered here — SCOPE_ORDER alone decides precedence); cwd-anchored.
     cwd = Path(os.getcwd())
-    layers: list[tuple[SettingsScope, Path]] = []
+    file_sources: dict[SettingsScope, Path] = {
+        SettingsScope.USER: user_mcp_config_path(env),
+        SettingsScope.PROJECT: workdir_mcp_config_path(cwd),
+        SettingsScope.LOCAL: workdir_mcp_local_config_path(cwd),
+        SettingsScope.POLICY: managed_path,
+    }
     if flag_config_path is not None:
-        layers.append((SettingsScope.FLAG, Path(flag_config_path)))
-    layers.append((SettingsScope.USER, user_mcp_config_path(env)))
-    layers.append((SettingsScope.PROJECT, workdir_mcp_config_path(cwd)))
-    layers.append((SettingsScope.LOCAL, workdir_mcp_local_config_path(cwd)))
-    layers.append((SettingsScope.POLICY, managed_path))
+        file_sources[SettingsScope.FLAG] = Path(flag_config_path)
 
     errors: list[SettingsValidationError] = []
     # 累积原始定义（低→高，后者覆盖前者）；server 整体替换 + 记 origin / source / Raw accumulation.
@@ -304,10 +341,18 @@ def resolve_mcp_config(
     raw_inputs: dict[str, tuple[Any, SettingsScope, str]] = {}
     noid = 0
 
-    for scope, path in layers:
-        data, errs = load_mcp_config_file(path, scope)
-        errors.extend(errs)
-        src = str(path)
+    for scope in SCOPE_ORDER:
+        if scope is SettingsScope.EMBED:
+            if not embed_servers:
+                continue
+            data, src = _embed_layer(embed_servers), _EMBED_SOURCE
+        else:
+            path = file_sources.get(scope)
+            if path is None:
+                continue
+            data, errs = load_mcp_config_file(path, scope)
+            errors.extend(errs)
+            src = str(path)
         for srv_name, sdef in data["servers"].items():
             raw_servers[srv_name] = (sdef, scope, src)  # 高 scope 整体覆盖 → origin = 最高 / high wins.
         for idef in data["inputs"]:
@@ -334,27 +379,37 @@ def resolve_mcp_config(
     return ResolvedMcpConfig(servers=servers, inputs=inputs, errors=errors)
 
 
-def mcp_json_declared_bundle_ids(*, env: Mapping[str, str] | None = None) -> set[str]:
+def non_plugin_declared_bundle_ids(
+    *,
+    env: Mapping[str, str] | None = None,
+    flag_config_path: Path | None = None,
+    embed_servers: Iterable[MCPServerConfig] | None = None,
+) -> set[str]:
     """
-    **mcp.json 声明面**（各 scope）全部 server 的 bundle_id 集 / bundle_ids declared in mcp.json。
+    §4.9.1-2 回收判据「X 非用户声明」项的**完整**数据源 / The complete source for the criterion's 2nd term。
 
-    这是回收判据「X 非用户声明」的**其中一个**来源，**不是全部**——完整判定集见
-    :func:`~a2c_smcp.computer.settings.reconciler.user_owned_bundle_ids`（协议 §4.9.1-2 的数据源是
-    **运行期权威配置集** + ``origin != plugin``，而 mcp.json 只覆盖其中「落了声明」的那部分）。
+    = 运行期权威配置集中 ``origin != plugin`` 的 bundle_id 集（协议 §2.5-5 + Discussion #32 裁决）。
+    即 :func:`resolve_mcp_config` 的全部产出——**每条非-plugin 挂载路径都在其中留下携带正确 origin 的条目**：
+    durable scopes（user/project/local/policy）、flag（``--mcp-config``）、embed（``Computer(mcp_servers=...)``）。
 
-    **⚠️ 勿单独用它当「用户声明」判据**（#153 隔离审查 🔴）：「出现在 mcp.json ⇒ 用户声明」成立，但
-    **反向不成立**——用户经 ``a2c-computer run --config @file`` 预加载、或 SDK 内嵌
-    ``Computer(mcp_servers={...})`` 构造的 server 均走 transient ``amount_server`` 挂载，**进运行期活跃集
-    但不进 mcp.json**（``cli/main.py`` `_add_server` / ``computer.py`` boot_up）。只读本视图会把它们误判为
-    「非用户声明」而在 plugin 卸载时**连坐停摘**，正是 §4.9.1-2 与 Epic #147 北极星要根治的 P0。
-    根治需运行期 origin（#134 轴）或 ``--config`` 归一进 mcp.json flag 层（#154）——**方案求裁于
-    protocol Discussion #32**（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）；在此之前本函数是回收判据「非用户声明」项的**唯一**数据源，
-    该缺口由 ``test_runtime_only_user_server_is_never_collateral``（xfail）钉住。
+    **``origin != plugin`` 无需过滤——由构造保证**：本函数与 :func:`resolve_mcp_config` 均**无 plugin 入参**，
+    且 ``SettingsScope`` **无 ``PLUGIN`` 成员**（见 :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`），
+    故 plugin origin 在此**物理上不可能出现**。plugin 声明基线层不经本 resolve（经 transient ``amount_server``
+    从 manifest 挂载）。
 
-    ``origin`` 无需过滤：本视图的 origin 恒为 ``user/project/local/flag/policy``（plugin 声明依赖的 server
-    从不回写 mcp.json），故 ``origin != plugin`` 在此恒真。同款推理见 :func:`mcp_server_status` 的 #148 注释。
+    ⚠️ **两条被协议钉死为 MUST NOT 的歧路**（§4.9.1-2，本仓实测证伪，勿再尝试）：
+
+    1. **MUST NOT 用裸 manager 活跃集**（无 origin ⇒ flag / embed / plugin 三条挂载路径在其中**可观测同形**
+       ⇒ 连坐停摘用户 / 宿主自有 server）；
+    2. **MUST NOT 用「活跃集 ∖ 全 plugin 声明集」差集**（回收候选**必然**落在 plugin 声明集内，该差集对其
+       **恒空**，判定退化为死代码——#153 期间已实现并实测：守卫仍红）。
+
+    :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+    :param flag_config_path: ``--mcp-config <file>``（flag 层 mcp.json）。**MUST 传**——漏传会让经 flag
+        挂载的用户 server 退回「非用户声明」而被连坐（正是 #153 遗留缺口的形状）。
+    :param embed_servers: 宿主构造入参 ``Computer(mcp_servers=...)``（embed 层）。同上，**MUST 传**。
     """
-    snapshot = resolve_mcp_config(env=env)
+    snapshot = resolve_mcp_config(env=env, flag_config_path=flag_config_path, embed_servers=embed_servers)
     return {resolve_bundle_id(srv.config) for srv in snapshot.servers.values()}
 
 
@@ -375,20 +430,29 @@ def mcp_server_status(name: str, *, settings: Mapping[str, Any], trusted_origin:
     1. ``deniedMcpServers``（企业拒绝名单，policy）→ ``DISABLED``。
     2. ``allowedMcpServers`` 非空（企业白名单，policy）且不在其中 → ``DISABLED``。
     3. ``disabledMcpjsonServers`` → ``DISABLED``（**disabled 优先** over enabled）。
-    4. ``trusted_origin``（user/flag/policy scope 自定义 server）→ ``ENABLED``（用户自己加的，不弹框）。
+    4. ``trusted_origin``（user/embed/flag/policy origin）→ ``ENABLED``（用户/宿主/CLI/企业自己加的，不弹框）。
     5. ``enabledMcpjsonServers`` → ``ENABLED``。
     6. ``enableAllProjectMcpServers is True`` → ``ENABLED``。
     7. 否则（工作区共享且未决）→ ``PENDING``。
 
-    **#148（P0 安全）**：历史「plugin-bundled 名集免批准」档位（`if name in bundled → ENABLED`）**已删除**。
-    真正的 plugin bundled server **从不进入** :func:`resolve_mcp_config`（走 transient ``amount_server`` 挂载、
-    不落 mcp.json），故该档**唯一可达路径** = project/local 声明的 server 借用了某已装 plugin 的 server 名 =
-    100% 借名跳过审批门。审批门 **MUST NOT 依赖物化账本的名集**，plugin 声明 **MUST NOT 进入迭代**（其可信性由
-    install ∧ enable 门保证，不走 settings 信任面）——见协议 ``runtime-contract.md §5 item 10`` 与
-    ``guides/mcp-approval-gate-alignment.md``。本函数只判 :func:`resolve_mcp_config` 产出的 mcp.json origin，
-    当前架构下这些 origin 恒非 plugin，无需在此额外过滤。
+    **档④ 与 embed**（Discussion #32 裁决）：``embed`` 已入 :data:`_TRUSTED_ORIGINS` ⇒ 命中档④。注意它**进门
+    迭代**、只是在档④ 被放行——故档①②③（policy 拒绝名单 / 白名单 / 通用禁用开关）**对 embed 适用**
+    （用户/管理员保留最终关停权；embed 无 plugin 那样的整体 enable/disable 兜底，不可豁免）；档⑤⑥ 的 project
+    信任门对 embed 不可达。
 
-    :param settings: 六层合并后的 resolved settings（含 #56 落地的 MCP 门控字段）。
+    **#148（P0 安全）**：历史「plugin-bundled 名集免批准」档位（`if name in bundled → ENABLED`）**已删除**。
+    其唯一可达路径 = project/local 声明的 server 借用某已装 plugin 的 server 名 = 100% 借名跳过审批门。
+    审批门 **MUST NOT 依赖物化账本的名集**，plugin 声明 **MUST NOT 进入迭代**（其可信性由 install ∧ enable 门
+    保证，不走 settings 信任面）——见协议 ``runtime-contract.md §5 item 10`` 与
+    ``guides/mcp-approval-gate-alignment.md``。
+
+    **F8 由结构保证、无需过滤器**（#154 裁决）：本函数只判 :func:`resolve_mcp_config` 的产出，而该 resolve
+    **无 plugin 入参**、``SettingsScope`` **无 ``PLUGIN`` 成员**（见
+    :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`）⇒ plugin origin **物理上不可能进入迭代**。
+    在此写 ``if origin is PLUGIN: continue`` 会是**永假守卫**（死代码），且新增一个无生产者的 ``PLUGIN``
+    成员正是档④ 那个「进门后豁免」形状复活的诱因。**验收信号取缺席**（「成员不存在」比「文档说别用」可靠）。
+
+    :param settings: 多层合并后的 resolved settings（含 #56 落地的 MCP 门控字段）。
     :param trusted_origin: 该 server 是否来自预信任 scope（见 :attr:`ResolvedMcpServer.trusted_origin`）。
     """
     if name in _str_list(settings, FIELD_DENIED_MCP_SERVERS):
@@ -537,6 +601,21 @@ _SETTINGS_TO_WRITE_SCOPE: dict[SettingsScope, McpWriteScope] = {v: k for k, v in
 _WRITABLE_SCOPES: tuple[McpWriteScope, ...] = (McpWriteScope.USER, McpWriteScope.PROJECT, McpWriteScope.LOCAL)
 
 
+def is_writable_origin(scope: SettingsScope) -> bool:
+    """
+    该 origin scope 的声明是否**可被 SDK 删改** / Whether declarations of this origin scope are writable by the SDK。
+
+    可写 = ``user`` / ``project`` / ``local``（有 ``mcp.json`` 落点）；只读 = ``policy``（企业托管）、``flag``
+    （``--mcp-config`` 命令行文件）、``embed``（宿主构造入参——根本不在盘上）。
+
+    **纯委托** :data:`_SETTINGS_TO_WRITE_SCOPE`（可写性的单一权威），**勿写 DRY 副本**：判据分叉会让写层与
+    「能不能删」的判定不一致（#142 ``is_valid_bundle_id`` 同款教训）。
+
+    **注意「只读」≠「优先级低」**：``flag``/``embed`` 优先级**次高**（§2.5-3）却不可写——二者正交。
+    """
+    return scope in _SETTINGS_TO_WRITE_SCOPE
+
+
 def mcp_write_path(scope: McpWriteScope, *, env: Mapping[str, str] | None = None) -> Path:
     """
     某写 scope 的 ``mcp.json`` 落点路径 / The ``mcp.json`` write path for a given scope。
@@ -584,8 +663,14 @@ def upsert_mcp_server(
       新声明**生效，杜绝跨 scope 漂移。origin 判定基于**锁外快照**（轻微 TOCTOU：并发进程可在快照与取锁间改动
       声明；实际写在锁内原子）。**注意**：若 origin 为只读 **policy**（``managed-mcp.json``，读优先级最高）则回落
       写请求 scope——但该写会被 policy 定义在 :func:`resolve_mcp_config` 中**遮蔽**（``changed`` 为 ``True`` 而有效
-      配置不变，属 rust parity 行为：policy 非可写目标、等同新声明）；``flag`` origin 优先级最低、user-写胜出、
-      不被遮蔽。
+      配置不变，属 rust parity 行为：policy 非可写目标、等同新声明）。
+
+      ⚠️ **本处的 origin 快照 MUST NOT 串入 ``flag_config_path`` / ``embed_servers``**（#154）：``:608`` 刻意只
+      解析 durable 层（user/project/local/policy）。理由——flag/embed 均**非可写目标**
+      （``_SETTINGS_TO_WRITE_SCOPE`` 无其条目），把它们喂进来只会让 ``target`` 回落到请求 scope 并**额外**造出
+      一条被 flag/embed 遮蔽的重复声明（写成功、有效配置不变），比现状更坏。**已知代价**（follow-up）：REPL
+      ``server add`` 因此看不见 flag 层，写 user scope 报成功、却被 flag 层静默遮蔽——与 policy 同形，但 policy
+      至少已在上文写明「遮蔽」。
     - **不因「同 bundle_id 已由 plugin 提供」而拒写**（#148 / 指南 §5）：用户在 mcp.json 声明同 bundle_id 的 server
       正是优先序赋予的**覆盖权**（用户侧 scope > plugin 声明基线），历史「bundled 名拒写」短路**已删除**。SDK MAY
       在别处提示「该 bundle_id 已由 plugin 提供、你的声明将覆盖它」，但**写层不阻止**。

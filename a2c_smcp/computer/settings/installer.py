@@ -66,8 +66,8 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
 from a2c_smcp.computer.settings.reconciler import (
+    NonPluginBundleIds,
     ledger_mcp_deps_of,
     other_plugin_mcp_deps,
     reclaimable_mcp_deps,
@@ -138,6 +138,9 @@ RegisterServer = Callable[[MCPServerConfig], Awaitable[None]]
 # 运行期停摘一个 server（异步，入参 **bundle_id**；CLI 包 transient ``Computer.aunmount_server_by_id``，
 # 停进程不删声明）。仅对经 §4.9.1-2 回收判据判定**可回收**者调用。
 RemoveServer = Callable[[str], Awaitable[None]]
+# ``NonPluginBundleIds``（§4.9.1-2 回收判据「X 非用户声明」项的数据源，#164）定义在 :mod:`.reconciler`
+# ——判据本体 ``reclaimable_mcp_deps`` 的所在地，且本模块**导入** reconciler（反向导入会成环）。此处仅转导出，
+# 使四个回调别名在 installer 的公开面齐整 / re-exported here so the callback aliases read together.
 # 注入 plugin-scoped inputs 入池（异步；入参 plugin_root；CLI 包 ``load_plugin_inputs`` → ``Computer.add_or_update_input``）。
 # 在 register（→render bundled server 的 ${input:}）之前调，使裸 id 可经 D2 前缀回退解析（#69 Group A，§9.3 D2）。
 InjectInputs = Callable[[Path], Awaitable[None]]
@@ -515,6 +518,7 @@ async def uninstall_plugin(
     registry: SkillRegistry,
     home: Path,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     scope: str | None = None,
     keep_servers: bool = False,
     env: Mapping[str, str] | None = None,
@@ -569,7 +573,7 @@ async def uninstall_plugin(
     reclaim = reclaimable_mcp_deps(
         deps,
         other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id, retained_records=retained),
-        user_declared=mcp_json_declared_bundle_ids(env=env),
+        user_declared=non_plugin_bundle_ids(),
     )
 
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
@@ -673,6 +677,7 @@ async def disable_plugin(
     registry: SkillRegistry,
     home: Path,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     scope: str = "user",
     project_path: str | None = None,
     env: Mapping[str, str] | None = None,
@@ -712,7 +717,7 @@ async def disable_plugin(
         reclaim = reclaimable_mcp_deps(
             sorted(ledger_mcp_deps_of(ledger_plugins.get(plugin_id, []))),
             other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id),
-            user_declared=mcp_json_declared_bundle_ids(env=env),
+            user_declared=non_plugin_bundle_ids(),
         )
         for bundle_id in reclaim:
             await remove_server(bundle_id)

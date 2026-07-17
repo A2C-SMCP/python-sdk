@@ -33,18 +33,19 @@ from a2c_smcp.utils.bundle_id import resolve_bundle_id
 if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodge runtime import cycle
     from a2c_smcp.computer.computer import Computer
     from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-    from a2c_smcp.computer.settings.installer import ExistingBundleIds, RegisterServer, RemoveServer
+    from a2c_smcp.computer.settings.installer import ExistingBundleIds, NonPluginBundleIds, RegisterServer, RemoveServer
     from a2c_smcp.computer.settings.schema import SettingsValidationError
     from a2c_smcp.computer.settings.scope import ResolvedSettings
 
 
 @dataclass(frozen=True, slots=True)
 class McpCallbacks:
-    """installer / 卸载级联所需的三个 MCP 注入回调 / The three MCP injection callbacks installer/cascade needs。"""
+    """installer / 卸载级联所需的 MCP 注入回调 / The MCP injection callbacks installer/cascade needs。"""
 
     existing_bundle_ids: ExistingBundleIds
     register_server: RegisterServer
     remove_server: RemoveServer
+    non_plugin_bundle_ids: NonPluginBundleIds
 
 
 def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
@@ -53,7 +54,11 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
 
     - ``existing_bundle_ids``：当前**运行期活跃** server 的 bundle_id 集（依赖预检用）；
     - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / 治理重挂用）；
-    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 回收用）。
+    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 回收用）；
+    - ``non_plugin_bundle_ids``：**声明面**中 ``origin != plugin`` 的 bundle_id 集（§4.9.1-2 回收判据的
+      「X 非用户声明」项，#164）——与 ``existing_bundle_ids`` **判然不同**，勿混用：前者是「谁被声明了（且非 plugin
+      带入）」，后者是「谁挂起来了」。协议**明禁**用裸活跃集判回收（无 origin ⇒ flag/embed/plugin 三条挂载路径
+      可观测同形 ⇒ 连坐停摘用户 / 宿主自有 server）。
 
     设计 §12.2：marketplace remove 的级联卸载（→ :func:`installer.uninstall_plugin`）与 #69 的 plugin
     enable/disable/install/uninstall 共用此接缝，避免各处重复装配。
@@ -81,7 +86,30 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
     async def _remove(bundle_id: str) -> None:
         await comp.aunmount_server_by_id(bundle_id)
 
-    return McpCallbacks(existing_bundle_ids=_existing, register_server=_register, remove_server=_remove)
+    def _non_plugin() -> set[str]:
+        # 声明面（含 flag/embed 层，携 origin）；每次重算、零持久态（§2.5-5 禁落盘为快照）。
+        return {resolve_bundle_id(srv.config) for srv in comp.resolve_mcp_declarations().servers.values()}
+
+    return McpCallbacks(
+        existing_bundle_ids=_existing,
+        register_server=_register,
+        remove_server=_remove,
+        non_plugin_bundle_ids=_non_plugin,
+    )
+
+
+def files_only_non_plugin_bundle_ids(env: Mapping[str, str] | None = None) -> NonPluginBundleIds:
+    """
+    **无 Computer** 的非交互进程的非-plugin 声明面 / The non-plugin declaration surface for Computer-less processes。
+
+    非交互 ``plugin uninstall|disable|gc`` / ``marketplace remove`` 是 **ledger-only**（无 MCP 回调、不挂载、
+    ``remove_server=None`` ⇒ 回收判据结果实际未被消费，见 :func:`~a2c_smcp.computer.settings.installer.uninstall_plugin`）。
+    该进程**既无宿主构造入参（embed）、也无 ``--mcp-config``（flag 仅存在于 ``run``）** ⇒ 声明面 = durable scopes，
+    这不是「漏传两层」而是「那两层在此进程确实不存在」。REPL / boot 路径请用 :func:`build_mcp_callbacks`。
+    """
+    from a2c_smcp.computer.settings.mcp_config import non_plugin_declared_bundle_ids
+
+    return lambda: non_plugin_declared_bundle_ids(env=env)
 
 
 # ── 跨命令解析 / 视图接缝（marketplace / skill / plugin / settings 共用）/ shared parse & view seams ──

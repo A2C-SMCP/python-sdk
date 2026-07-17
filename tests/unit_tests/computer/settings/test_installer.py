@@ -301,7 +301,7 @@ async def test_uninstall_default_cascades(tmp_path: Path, monkeypatch) -> None:
     assert install_path.exists()
     mcp.removed.clear()
 
-    ok = await uninstall_plugin("audit@acme", reg, home, env=env, remove_server=mcp.remove)
+    ok = await uninstall_plugin("audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=mcp.remove)
 
     assert ok is True
     assert mcp.removed == [FIGMA_BID]  # 级联 stop+remove
@@ -321,7 +321,9 @@ async def test_uninstall_keep_servers_skips_teardown(tmp_path: Path, monkeypatch
     await _install(home, tmp_path, monkeypatch, mcp, reg, servers=[FIGMA_NAME])
     mcp.removed.clear()
 
-    ok = await uninstall_plugin("audit@acme", reg, home, env=env, keep_servers=True, remove_server=mcp.remove)
+    ok = await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, keep_servers=True, remove_server=mcp.remove,
+    )
 
     assert ok is True
     assert mcp.removed == []  # 保留 server
@@ -331,7 +333,7 @@ async def test_uninstall_keep_servers_skips_teardown(tmp_path: Path, monkeypatch
 
 async def test_uninstall_not_installed_is_noop(tmp_path: Path) -> None:
     env = _env(tmp_path)
-    assert await uninstall_plugin("ghost@acme", SkillRegistry(), _home(tmp_path), env=env) is False
+    assert await uninstall_plugin("ghost@acme", SkillRegistry(), _home(tmp_path), non_plugin_bundle_ids=lambda: set(), env=env) is False
     assert not user_settings_path(env).exists()  # 真 no-op：零写盘（迁移不被 no-op 路径触发，审查 N1）
 
 
@@ -344,7 +346,7 @@ async def test_disable_writes_flag_detaches_servers_orphans_skills(tmp_path: Pat
     await _install(home, tmp_path, monkeypatch, mcp, reg, servers=[FIGMA_NAME])
     mcp.removed.clear()
 
-    await disable_plugin("audit@acme", reg, home, env=env, remove_server=mcp.remove)
+    await disable_plugin("audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=mcp.remove)
 
     settings = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert settings["enabledPlugins"]["audit@acme"] is False
@@ -364,7 +366,9 @@ async def test_disable_project_scope_writes_workdir_settings(tmp_path: Path, mon
     _seed_installed(home, {"audit@acme": [{"scope": "project", "installPath": audit_path}]})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
 
-    await disable_plugin("audit@acme", SkillRegistry(), home, scope="project", project_path=str(workdir), env=env)
+    await disable_plugin(
+        "audit@acme", SkillRegistry(), home, scope="project", project_path=str(workdir), non_plugin_bundle_ids=lambda: set(), env=env,
+    )
 
     settings = json.loads(workdir_project_settings_path(workdir).read_text(encoding="utf-8"))
     assert settings["enabledPlugins"]["audit@acme"] is False
@@ -372,12 +376,16 @@ async def test_disable_project_scope_writes_workdir_settings(tmp_path: Path, mon
 
 async def test_disable_project_scope_requires_project_path(tmp_path: Path) -> None:
     with pytest.raises(PluginInstallError, match="project_path"):
-        await disable_plugin("audit@acme", SkillRegistry(), _home(tmp_path), scope="project", env=_env(tmp_path))
+        await disable_plugin(
+            "audit@acme", SkillRegistry(), _home(tmp_path), non_plugin_bundle_ids=lambda: set(), scope="project", env=_env(tmp_path),
+        )
 
 
 async def test_disable_managed_scope_rejected(tmp_path: Path) -> None:
     with pytest.raises(PluginInstallError, match="writable"):
-        await disable_plugin("audit@acme", SkillRegistry(), _home(tmp_path), scope="managed", env=_env(tmp_path))
+        await disable_plugin(
+            "audit@acme", SkillRegistry(), _home(tmp_path), non_plugin_bundle_ids=lambda: set(), scope="managed", env=_env(tmp_path),
+        )
 
 
 # ── enable ────────────────────────────────────────────────────────────────────
@@ -387,7 +395,7 @@ async def test_enable_recovers_skills_and_remounts_servers(tmp_path: Path, monke
     mcp = _FakeMCP()
     reg = SkillRegistry()
     await _install(home, tmp_path, monkeypatch, mcp, reg, servers=[FIGMA_NAME])
-    await disable_plugin("audit@acme", reg, home, env=env, remove_server=mcp.remove)
+    await disable_plugin("audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=mcp.remove)
     assert reg.is_orphan("audit:lint")
     mcp.registered.clear()
 

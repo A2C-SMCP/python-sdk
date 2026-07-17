@@ -118,7 +118,7 @@ async def _boot_mount(comp: Computer) -> None:
     ``session=None``（非 TTY）+ ``approve_all=True`` → PENDING（工作区 local/project origin）**仅本次挂载、不落盘**，
     忠实复现「新进程启动读盘挂载已声明 server」。
     """
-    await run_mcp_approval(comp, None, approve_all=True, flag_config=None)
+    await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
 
 
 def _write_mcp_file(path: Path, servers: dict[str, Any]) -> None:

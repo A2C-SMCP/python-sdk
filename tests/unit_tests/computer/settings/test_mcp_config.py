@@ -168,6 +168,126 @@ def test_resolve_inputs_dedup_by_id_high_wins(tmp_path: Path, monkeypatch: pytes
     assert by_id["tok"].description == "local"  # 高 scope 胜
 
 
+# ── 协议 §2.5-3 统一优先序（#154/#164）/ The unified source-priority order ─────
+# 夹具键一律用 ``figma.mcp``（**非** ``figma-mcp``）：``normalize_name`` 折叠 ``.``→``_`` 但**不折叠 ``-``**，
+# 故 ``figma-mcp`` 的 bundle_id 恰等于自身、令 name/bundle_id 两概念不分叉（conformance §2.0 违规，本仓已因此
+# 出过四次假绿）。``figma.mcp`` → bundle_id ``figma_mcp``，两者分叉。
+def test_scope_order_matches_protocol_and_has_no_plugin_member() -> None:
+    """
+    ``SCOPE_ORDER`` 是协议 §2.5-3 优先序的**唯一**权威（两套 resolve 都迭代它，不各写字面量）。
+
+    协议序（低→高）：``plugin 声明 < user < project < local < embed < flag < policy``。
+
+    **无 ``PLUGIN`` 成员是刻意的结构性缺席**（#154 裁决）：plugin 声明基线层**不经任一 resolve**——
+    它经 transient ``amount_server`` 从 plugin manifest 挂载，plugin-lowest 由 boot 序保证
+    （``run_mcp_approval`` 先于 ``run_governance_remount``，后者跳过 ``bundle_id in existing`` 者）。
+    加一个无生产者的 ``PLUGIN`` 成员会让「迭代层过滤」沦为永假守卫（死代码），并正是 #148 那个 P0
+    「进门后豁免」档位复活的诱因。F8 的可验收信号 = **缺席**（「成员不存在」比「文档说别用」可靠）。
+    """
+    from a2c_smcp.computer.settings.schema import SCOPE_ORDER
+
+    assert SCOPE_ORDER == (
+        SettingsScope.USER,
+        SettingsScope.PROJECT,
+        SettingsScope.LOCAL,
+        SettingsScope.EMBED,
+        SettingsScope.FLAG,
+        SettingsScope.POLICY,
+    )
+    assert "plugin" not in {s.value for s in SettingsScope}
+    assert not hasattr(SettingsScope, "PLUGIN")
+
+
+def test_resolve_flag_beats_user_and_local_same_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    **flag 次高**（协议 §2.5-3）：同名 server 上 flag 覆盖 user/project/local，仅低于 policy。
+
+    历史实现把 mcp.json 的 flag 层排**最低**（``--config`` 老接口遗留），协议明写该形态**废止**——
+    CLI 显式传入的配置被用户默认配置覆盖违反直觉，且与 ``_TRUSTED_ORIGINS`` 已把 flag 当受信来源自相矛盾。
+
+    本用例是本次改动的**红灯守卫**：改前 `test_resolve_origins_partition_trust` 用四个**不同** server 名、
+    永不发生遮蔽 ⇒ 无一条现存测试钉住 flag 层位 ⇒ 把 flag 挪到次高会**全绿通过**。
+    """
+    env = _env(tmp_path)
+    flag = tmp_path / "flag-mcp.json"
+    _write_json(flag, _mcp_doc(servers={"figma.mcp": _stdio("flag-cmd")}))
+    _write_json(_user_mcp(tmp_path), _mcp_doc(servers={"figma.mcp": _stdio("user-cmd")}))
+    _write_json(tmp_path / ".tfrobot" / "mcp.json", _mcp_doc(servers={"figma.mcp": _stdio("proj-cmd")}))
+    _write_json(tmp_path / ".tfrobot" / "mcp.local.json", _mcp_doc(servers={"figma.mcp": _stdio("local-cmd")}))
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, flag_config_path=flag, managed_mcp_path=tmp_path / "absent.json")
+    srv = out.servers["figma.mcp"]
+    assert srv.origin == SettingsScope.FLAG
+    assert isinstance(srv.config, StdioServerConfig)
+    assert srv.config.server_parameters.command == "flag-cmd"  # 整体覆盖（flag 次高）
+    assert srv.trusted_origin is True
+
+
+def test_resolve_policy_still_beats_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    天花板栅栏：policy 仍高于 flag（§2.5-3 「flag 仅低于 policy」）。
+
+    **注**：本例改前即绿（flag 曾最低、policy 曾最高，policy 本就胜出），是**回归栅栏**而非红灯守卫——
+    它钉住的是 `test_resolve_flag_beats_user_and_local_same_name` 够不到的那个边界（防「flag 一路提到顶」）。
+    """
+    env = _env(tmp_path)
+    flag = tmp_path / "flag-mcp.json"
+    managed = tmp_path / "managed-mcp.json"
+    _write_json(flag, _mcp_doc(servers={"figma.mcp": _stdio("flag-cmd")}))
+    _write_json(managed, _mcp_doc(servers={"figma.mcp": _stdio("policy-cmd")}))
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, flag_config_path=flag, managed_mcp_path=managed)
+    srv = out.servers["figma.mcp"]
+    assert srv.origin == SettingsScope.POLICY
+    assert isinstance(srv.config, StdioServerConfig)
+    assert srv.config.server_parameters.command == "policy-cmd"
+
+
+def test_resolve_inputs_flag_beats_local_by_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """inputs 同 ``id`` 亦按统一序去重：flag 胜 local（改前 flag 最低 ⇒ local 胜）。"""
+    env = _env(tmp_path)
+    flag = tmp_path / "flag-mcp.json"
+    _write_json(flag, _mcp_doc(inputs=[{"id": "tok", "type": "promptString", "description": "flag"}]))
+    _write_json(tmp_path / ".tfrobot" / "mcp.local.json", _mcp_doc(inputs=[{"id": "tok", "type": "promptString", "description": "local"}]))
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, flag_config_path=flag, managed_mcp_path=tmp_path / "absent.json")
+    by_id = {i.id: i for i in out.inputs}
+    assert by_id["tok"].description == "flag"
+
+
+def test_resolve_embed_layer_origin_and_trust(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``embed`` = 宿主构造挂载层（``Computer(mcp_servers=...)`` 构造入参，§2.5-3）：代码级显式受信意图。
+
+    与 flag 同属「调用方显式受信层」⇒ ``trusted_origin`` 为真（审批门档④，§2.5 裁决 Discussion #32）。
+    """
+    env = _env(tmp_path)
+    embed = StdioServerConfig(name="figma.mcp", server_parameters={"command": "embed-cmd"})
+    monkeypatch.chdir(tmp_path)
+    out = resolve_mcp_config(env=env, embed_servers=[embed], managed_mcp_path=tmp_path / "absent.json")
+    srv = out.servers["figma.mcp"]
+    assert srv.origin == SettingsScope.EMBED
+    assert srv.trusted_origin is True
+    assert isinstance(srv.config, StdioServerConfig)
+    assert srv.config.server_parameters.command == "embed-cmd"
+
+
+def test_resolve_embed_beats_local_but_loses_to_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """层位 ``local < embed < flag``（§2.5-3）：宿主构造入参覆盖工作区声明，但宿主自身 flag 仍可覆盖代码默认。"""
+    env = _env(tmp_path)
+    embed = StdioServerConfig(name="figma.mcp", server_parameters={"command": "embed-cmd"})
+    _write_json(tmp_path / ".tfrobot" / "mcp.local.json", _mcp_doc(servers={"figma.mcp": _stdio("local-cmd")}))
+    monkeypatch.chdir(tmp_path)
+
+    out = resolve_mcp_config(env=env, embed_servers=[embed], managed_mcp_path=tmp_path / "absent.json")
+    assert out.servers["figma.mcp"].origin == SettingsScope.EMBED  # embed > local
+
+    flag = tmp_path / "flag-mcp.json"
+    _write_json(flag, _mcp_doc(servers={"figma.mcp": _stdio("flag-cmd")}))
+    out = resolve_mcp_config(env=env, embed_servers=[embed], flag_config_path=flag, managed_mcp_path=tmp_path / "absent.json")
+    assert out.servers["figma.mcp"].origin == SettingsScope.FLAG  # flag > embed
+
+
 # ── ext 剥离 + 字段级容错 ──────────────────────────────────────────────────────
 def test_resolve_envfile_stripped_to_ext(tmp_path: Path) -> None:
     """envFile 是 VS Code 扩展（非 MCPServerConfig 字段）→ 剥离入 ext，配置仍校验通过。"""

@@ -48,17 +48,51 @@ logger = get_logger(__name__)
 
 class SettingsScope(StrEnum):
     """
-    settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high)。
+    配置来源 scope（低 → 高，high 覆盖 low）/ Config source scope (low → high)。
 
-    五级与 Claude Code 完整对齐（user/project/local/flag/policy）；project/local 锚定进程 cwd（#116）。
-    Five levels aligned with Claude Code; project/local anchored at process cwd (#116).
+    与 Claude Code 对齐（user/project/local/flag/policy）；project/local 锚定进程 cwd（#116）。
+    ``embed`` 为 A2C 特有的**宿主构造挂载层**，仅存在于 mcp.json 轴（settings.json 无此来源，见 :data:`SCOPE_ORDER`）。
+    Aligned with Claude Code, plus A2C's ``embed`` (mcp.json axis only).
+
+    **顺序权威在 :data:`SCOPE_ORDER`，不在本枚举的成员声明序**——成员序只是巧合一致，勿依赖。
     """
 
     USER = "user"
     PROJECT = "project"
     LOCAL = "local"
+    EMBED = "embed"  # 宿主构造入参 Computer(mcp_servers=...)；仅 mcp.json 轴 / embedded-constructor, mcp.json axis only
     FLAG = "flag"
     POLICY = "policy"  # 最高 / highest
+
+
+# 协议 ``runtime-contract.md`` §2.5-3 来源优先序（低 → 高）的**唯一**权威 / The single authority for §2.5-3。
+#
+#     plugin 声明 < user < project < local < embed < flag < policy
+#
+# **settings.json 与 mcp.json 两套 resolve MUST 由本元组派生顺序，MUST NOT 各写列表字面量**——两份字面量
+# 漂移（mcp.json 曾把 flag 排最低、settings.json 排次高，差四格）正是 #154 的根因。改序只需改本元组，
+# 两边同时翻转；任何一边改回字面量都会被 ``test_scope_order_matches_protocol_and_has_no_plugin_member``
+# 与两套 resolve 的层位守卫抓住。
+#
+# **为何无 ``PLUGIN`` 成员**（#154 裁决，刻意的结构性缺席）：plugin 声明基线层**不经任一 resolve**——它经
+# transient ``amount_server`` 从 plugin manifest 挂载；plugin-lowest 由 boot 序保证（``run_mcp_approval``
+# 先于 ``run_governance_remount``，后者跳过 ``bundle_id`` 已活跃者，见 ``installer.py`` 的「existing wins」）。
+# 无任一消费者需要 plugin 层：审批门 MUST 滤掉它（F8）、回收判据要 ``origin != plugin``、``upsert_mcp_server``
+# 只认可写 scope ⇒「合并进来再处处滤掉」与「从不合并」**可证等价**。加一个无生产者的 ``PLUGIN`` 成员会让
+# 「迭代层过滤」沦为永假守卫（死代码），且正是 #148 那个 P0「进门后豁免」档位复活的诱因。F8 的可验收信号
+# 取**缺席**（「成员不存在」比「文档说别用」可靠）。
+#
+# ⚠️ 与 rust-sdk#137（显式 ``ProvenanceScope::Plugin`` 变体 + 迭代层过滤）**代码形态分叉、行为等价**：
+# rust 无本 SDK 这套 approval→remount boot 序，其 ``collect_enabled_bundled_servers`` 是 plugin 集内
+# first-wins、不与用户声明比对。协议 §2.5-5 明许「scope 纯推导与挂载时标记**行为等价即合规**」。
+SCOPE_ORDER: tuple[SettingsScope, ...] = (
+    SettingsScope.USER,
+    SettingsScope.PROJECT,
+    SettingsScope.LOCAL,
+    SettingsScope.EMBED,
+    SettingsScope.FLAG,
+    SettingsScope.POLICY,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.settings.schema import (
+    SCOPE_ORDER,
     SettingsScope,
     SettingsValidationError,
     validate_settings,
@@ -158,7 +159,9 @@ def merge_layers(layers: Sequence[Mapping[str, Any]], *, on_conflict: ConflictHo
     """
     按 low → high 顺序折叠多层 settings（读合并）/ Fold multiple layers low → high (read merge)。
 
-    :param layers: 已校验的各 scope dict，**低优先级在前**（如 ``[capability, user, project, local, flag, policy]``）。
+    :param layers: 已校验的各 scope dict，**低优先级在前**。调用方 MUST 按
+        :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER` 派生顺序（协议 §2.5-3 的唯一权威），
+        MUST NOT 手写列表字面量——两处字面量漂移正是 #154 的根因。
     """
     result: dict[str, Any] = {}
     for layer in layers:
@@ -220,7 +223,7 @@ class ResolvedSettings:
     """
     解析结果 / The resolved settings result。
 
-    ``settings`` 为六层合并后的最终视图；``errors`` 汇总各层字段级校验错误（不阻断启动，供
+    ``settings`` 为多层合并后的最终视图；``errors`` 汇总各层字段级校验错误（不阻断启动，供
     ``settings show`` / 诊断命令呈现，§5.6），已按出现顺序去重。
     ``settings`` is the merged view; ``errors`` aggregates field-level validation errors
     (non-fatal, deduped, surfaced via diagnostics).
@@ -246,7 +249,13 @@ def resolve_settings(
     policy_settings: Mapping[str, Any] | None = None,
 ) -> ResolvedSettings:
     """
-    解析五层 settings 视图（user / project / local / flag / policy）/ Resolve the five-layer view。
+    解析 settings 视图（user / project / local / flag / policy）/ Resolve the settings view。
+
+    合并序由 :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER` 派生（协议 §2.5-3，与 ``mcp.json``
+    的 :func:`~a2c_smcp.computer.settings.mcp_config.resolve_mcp_config` **同序**——两套来源 MUST 一致）。
+    ``embed`` 在本轴**无数据源**（宿主经 ``Computer(mcp_servers=...)`` 只供 server 配置，无 settings 入参；
+    plugin 亦然——manifest 只带 server 与 skill，不带 settings），故 ``SCOPE_ORDER`` 里的 ``EMBED`` 在此
+    被 ``if s in by_scope`` 过滤掉。这是**轴不对称**、非缺陷。
 
     #116：project/local 无条件锚定进程 ``os.getcwd()`` 的 ``.tfrobot/settings[.local].json``
     （cwd 恒存在；文件缺失 → 层为空）。原「能力发现层 + active-workdir 单根」两层模型随
@@ -281,5 +290,13 @@ def resolve_settings(
     policy_layer, policy_errors = validate_settings(dict(policy_settings or {}), SettingsScope.POLICY)
     errors.extend(policy_errors)
 
-    merged = merge_layers([user_layer, project_layer, local_layer, flag_layer, policy_layer])
+    # 顺序**派生**自 SCOPE_ORDER（协议 §2.5-3 唯一权威），不手写字面量 / order derived, never hand-written.
+    by_scope: dict[SettingsScope, Mapping[str, Any]] = {
+        SettingsScope.USER: user_layer,
+        SettingsScope.PROJECT: project_layer,
+        SettingsScope.LOCAL: local_layer,
+        SettingsScope.FLAG: flag_layer,
+        SettingsScope.POLICY: policy_layer,
+    }
+    merged = merge_layers([by_scope[s] for s in SCOPE_ORDER if s in by_scope])
     return ResolvedSettings(settings=merged, errors=_dedup_errors(errors))

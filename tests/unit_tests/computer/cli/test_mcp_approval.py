@@ -25,6 +25,7 @@ import pytest
 
 import a2c_smcp.computer.cli.commands.plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands.plugin import run_mcp_approval
+from a2c_smcp.computer.settings.mcp_config import resolve_mcp_config
 from a2c_smcp.computer.settings.scope import user_settings_path, workdir_local_settings_path
 
 
@@ -70,10 +71,31 @@ class _Session:
 
 
 class _FakeComp:
-    def __init__(self, home: Path) -> None:
+    """Computer 桩：**声明面解析逐字复用生产实现**，只桩掉挂载副作用 / Stub that reuses the real declaration resolve。
+
+    ``resolve_mcp_declarations`` **刻意不自己实现**，而是照 :meth:`Computer.resolve_mcp_declarations` 同款委托
+    :func:`resolve_mcp_config`（同样透传 flag/embed 两条 boot 声明式输入）——否则桩会把「flag/embed 层不存在」
+    这个前提固化进测试，令 #154/#164 的层序与 origin 条款**在此文件内永远测不到**（Epic #147 记载的 ``_FakeComputer``
+    假绿正是此形状）。真实构造路径的契约测试见 ``tests/integration_tests/computer/cli/test_mcp_flag_config.py``（F7）。
+    """
+
+    def __init__(
+        self,
+        home: Path,
+        *,
+        mcp_flag_config: Path | None = None,
+        mcp_servers: list[Any] | None = None,
+    ) -> None:
         self.skill_home = home
         self.injected: list[Any] = []
         self.mounted: list[dict[str, Any]] = []
+        self.unmounted: list[str] = []
+        self.mcp_manager: Any = None  # pre-boot：无活跃集（与 CLI 首次 boot 同形）
+        self._mcp_flag_config = mcp_flag_config
+        self._mcp_servers = list(mcp_servers or [])
+
+    def resolve_mcp_declarations(self, *, env: Any = None) -> Any:
+        return resolve_mcp_config(env=env, flag_config_path=self._mcp_flag_config, embed_servers=self._mcp_servers)
 
     def add_or_update_input(self, inp: Any) -> None:
         self.injected.append(inp)
@@ -83,6 +105,9 @@ class _FakeComp:
     ) -> None:
         # #137 ③：run_mcp_approval 走 transient amount_server（boot 读已声明 mcp.json = 投影，不回写）。
         self.mounted.append(cfg)
+
+    async def aunmount_server_by_id(self, bundle_id: str) -> None:
+        self.unmounted.append(bundle_id)
 
 
 def _mounted_names(comp: _FakeComp) -> set[str]:
@@ -108,7 +133,7 @@ async def test_pending_approve_yes_writes_local_and_mounts_then_idempotent(tmp_p
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp, sess, approve_all=False, flag_config=None)
+        await run_mcp_approval(comp, sess, approve_all=False, settings_flag_path=None)
     assert "shared" in _mounted_names(comp)  # [y] → 挂载
     local = json.loads(workdir_local_settings_path(wd).read_text(encoding="utf-8"))
     assert local["enabledMcpjsonServers"] == ["shared"]  # 写 local scope（cwd 单根）
@@ -117,7 +142,7 @@ async def test_pending_approve_yes_writes_local_and_mounts_then_idempotent(tmp_p
     comp2 = _FakeComp(home)
     sess2 = _Session([])
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp2, sess2, approve_all=False, flag_config=None)
+        await run_mcp_approval(comp2, sess2, approve_all=False, settings_flag_path=None)
     assert "shared" in _mounted_names(comp2)
     assert sess2.prompts == []  # 不再弹批准框
 
@@ -134,7 +159,7 @@ async def test_pending_non_tty_skips_and_does_not_write(tmp_path: Path, monkeypa
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp, None, approve_all=False, flag_config=None)  # session=None = 非 TTY
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)  # session=None = 非 TTY
     assert _mounted_names(comp) == set()  # 未挂
     assert not workdir_local_settings_path(wd).exists()  # 未写
 
@@ -150,7 +175,7 @@ async def test_pending_non_tty_approve_all_mounts_without_persist(tmp_path: Path
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp, None, approve_all=True, flag_config=None)
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
     assert "shared" in _mounted_names(comp)  # --approve-all-mcp → 挂载
     assert not workdir_local_settings_path(wd).exists()  # 仅本次、不落盘
 
@@ -168,7 +193,7 @@ async def test_user_origin_mounts_without_box(tmp_path: Path, monkeypatch: pytes
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp, sess, approve_all=False, flag_config=None)
+        await run_mcp_approval(comp, sess, approve_all=False, settings_flag_path=None)
     assert "mine" in _mounted_names(comp)
     assert sess.prompts == []
 
@@ -186,7 +211,7 @@ async def test_envfile_ext_merged_into_mount_dict(tmp_path: Path, monkeypatch: p
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp, _Session([]), approve_all=False, flag_config=None)
+        await run_mcp_approval(comp, _Session([]), approve_all=False, settings_flag_path=None)
     mine = next(m for m in comp.mounted if m.get("name") == "mine")
     assert mine.get("envFile") == envfile  # ext 合回，否则 spawn 丢 envFile
 
@@ -206,7 +231,7 @@ async def test_malformed_server_surfaces_warning(
     import unittest.mock as _m
 
     with _m.patch.dict(os.environ, env, clear=False):
-        await run_mcp_approval(comp, None, approve_all=True, flag_config=None)
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
     out = capsys.readouterr().out
     assert "mcp.json" in out  # resolved.errors 呈现（被 drop 的 bad 不静默）
 
@@ -233,7 +258,7 @@ async def test_project_self_approval_filtered_and_surfaced_at_boot(
 
     with _m.patch.dict(os.environ, env, clear=False):
         # session=None（非 TTY）且未 --approve-all-mcp → 若自我批准生效会直挂；被过滤后应 skip+WARN。
-        await run_mcp_approval(comp, None, approve_all=False, flag_config=None)
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)
 
     assert _mounted_names(comp) == set(), "project 自我批准 MUST NOT 让恶意 server 直挂"
     out = capsys.readouterr().out

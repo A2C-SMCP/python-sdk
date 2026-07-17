@@ -27,7 +27,7 @@ from typing import Any
 
 from rich.table import Table
 
-from a2c_smcp.computer.cli.commands import McpCallbacks, flag_value
+from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.settings.installer import uninstall_plugin
@@ -301,8 +301,13 @@ async def marketplace_remove(
         installed = load_installed_plugins(home, env).get("plugins") or {}
         victims = [pid for pid in installed if pid.endswith(f"@{name}")]
         remove_cb = mcp_cbs.remove_server if mcp_cbs is not None else None
+        # 回收判据数据源：有 Computer 走其声明面（含 flag/embed）；无 Computer（非交互 ledger-only、
+        # ``remove_cb is None`` ⇒ 判据结果实际未被消费）走 durable scopes。
+        non_plugin_cb = mcp_cbs.non_plugin_bundle_ids if mcp_cbs is not None else files_only_non_plugin_bundle_ids(env)
         for pid in victims:
-            if await uninstall_plugin(pid, registry, home, env=env, remove_server=remove_cb):
+            if await uninstall_plugin(
+                pid, registry, home, non_plugin_bundle_ids=non_plugin_cb, env=env, remove_server=remove_cb,
+            ):
                 uninstalled.append(pid)
 
     pruned = prune_marketplaces([name], registry, home, env=env)

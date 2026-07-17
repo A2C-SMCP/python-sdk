@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 
 import a2c_smcp.computer.cli.main as cli_main
 from a2c_smcp.computer.cli.main import _interactive_loop
@@ -42,6 +43,7 @@ class FakeComputer:
         confirm_callback: Callable[[str, str, str, dict], bool] | None = None,
         input_resolver: Any | None = None,
         registered_workdirs: Any | None = None,
+        mcp_flag_config: Any | None = None,
     ) -> None:
         self.init_args = {
             "inputs": inputs,
@@ -51,6 +53,7 @@ class FakeComputer:
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
             "registered_workdirs": registered_workdirs,
+            "mcp_flag_config": mcp_flag_config,
         }
 
     async def __aenter__(self) -> FakeComputer:
@@ -74,8 +77,7 @@ def test_run_impl_uses_default_computer_when_no_factory(monkeypatch: pytest.Monk
         auth=None,
         headers=None,
         computer_factory=None,
-        config=None,
-        inputs=None,
+        mcp_config=None,
     )
 
     assert DummyInteractive.called is True
@@ -104,8 +106,7 @@ def test_run_impl_uses_resolved_factory(monkeypatch: pytest.MonkeyPatch) -> None
         auth=None,
         headers=None,
         computer_factory="some.module:factory",
-        config=None,
-        inputs=None,
+        mcp_config=None,
     )
 
     assert calls["count"] == 1
@@ -129,8 +130,7 @@ def test_run_impl_factory_not_callable_fallback(monkeypatch: pytest.MonkeyPatch)
         auth=None,
         headers=None,
         computer_factory="x.y:bad",
-        config=None,
-        inputs=None,
+        mcp_config=None,
     )
 
     assert isinstance(DummyInteractive.last_comp, FakeComputer)
@@ -152,8 +152,7 @@ def test_run_impl_resolve_error_fallback(monkeypatch: pytest.MonkeyPatch) -> Non
         auth=None,
         headers=None,
         computer_factory="x.y:z",
-        config=None,
-        inputs=None,
+        mcp_config=None,
     )
 
     assert isinstance(DummyInteractive.last_comp, FakeComputer)
@@ -308,40 +307,12 @@ async def test_inputs_value_print_json_fallback(monkeypatch: pytest.MonkeyPatch)
     await _interactive_loop(comp)
 
 
-def test_run_impl_inputs_and_servers_single_object(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """覆盖 _run_impl 的 inputs/config 单对象路径。"""
-    # 立即退出的交互
-    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["exit"]))
-    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
-
-    inputs_file = tmp_path / "i.json"
-    inputs_file.write_text(
-        json.dumps({"id": "SO", "type": "promptString", "description": "d", "default": "a"}),
-        encoding="utf-8",
-    )
-
-    server_file = tmp_path / "s.json"
-    server_file.write_text(
-        json.dumps(
-            {
-                "name": "solo",
-                "type": "stdio",
-                "disabled": True,
-                "forbidden_tools": [],
-                "tool_meta": {},
-                "server_parameters": {
-                    "command": "echo",
-                    "args": [],
-                    "env": None,
-                    "cwd": None,
-                    "encoding": "utf-8",
-                    "encoding_error_handler": "strict",
-                },
-            },
-        ),
-        encoding="utf-8",
-    )
-
+# ── `--mcp-config` 形状硬切 + fail-fast（#154）/ shape hard-cut + fail-fast ──────
+#
+# 历史 `test_run_impl_inputs_and_servers_single_object` / `..._loads_inputs_and_servers_from_files` **已删除**：
+# 它们钉的正是本次要切掉的契约（`--config` 收「裸 server 对象 / 数组」+ 独立 `--inputs`）。替代守卫 = 下列
+# fail-fast 用例 + `tests/integration_tests/computer/cli/test_mcp_flag_config.py`（真实构造路径消费 inputs 段，F7）。
+def _run_with_mcp_config(raw: str) -> None:
     cli_main._run_impl(
         auto_connect=False,
         auto_reconnect=False,
@@ -350,9 +321,133 @@ def test_run_impl_inputs_and_servers_single_object(tmp_path: Path, monkeypatch: 
         auth=None,
         headers=None,
         computer_factory=None,
-        config=str(server_file),  # 单对象
-        inputs=str(inputs_file),  # 单对象
+        mcp_config=raw,
     )
+
+
+def test_run_impl_rejects_legacy_bare_server_mcp_config(tmp_path: Path) -> None:
+    """旧「裸 server 对象」格式 → fail-fast(2)，且提示含新形状与「去掉 name 字段」指引。"""
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({"name": "solo", "type": "stdio", "server_parameters": {"command": "echo"}}), encoding="utf-8")
+    with pytest.raises(typer.Exit) as ei:
+        _run_with_mcp_config(str(p))
+    assert ei.value.exit_code == 2
+
+
+def test_run_impl_rejects_legacy_server_array_mcp_config(tmp_path: Path) -> None:
+    """旧「server 数组」格式 → fail-fast(2)。"""
+    p = tmp_path / "old-arr.json"
+    p.write_text(json.dumps([{"name": "a", "type": "stdio", "server_parameters": {"command": "echo"}}]), encoding="utf-8")
+    with pytest.raises(typer.Exit) as ei:
+        _run_with_mcp_config(str(p))
+    assert ei.value.exit_code == 2
+
+
+def test_run_impl_rejects_unreadable_mcp_config(tmp_path: Path) -> None:
+    """路径不存在 / JSON 损坏 → fail-fast(2)（旧 `--config` 在此静默降级启动）。"""
+    with pytest.raises(typer.Exit) as ei:
+        _run_with_mcp_config(str(tmp_path / "nope.json"))
+    assert ei.value.exit_code == 2
+
+
+def test_run_impl_mcp_config_invalid_fails_before_connect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    **置于 connect 之前**的守卫：坏 flag 文件 MUST NOT 留下已连接 socket / 已 boot 的 Computer。
+
+    历史 `--config` 解析在 `await init_client.connect(...)` **之后**且吞异常 ⇒ 坏文件会连上再静默降级。
+    变异验证：把 `_mcp_flag_path(...)` 移回 `_amain` 的 connect 之后 → 本例转红（唯一钉住「校验位置」的守卫）。
+    """
+    connected: list[str] = []
+
+    class _Client:
+        def __init__(self, **_: Any) -> None: ...
+        async def connect(self, *a: Any, **kw: Any) -> None:
+            connected.append("yes")
+
+    constructed: list[str] = []
+
+    class _Comp(FakeComputer):
+        def __init__(self, **kw: Any) -> None:
+            constructed.append("yes")
+            super().__init__(**kw)
+
+    monkeypatch.setattr(cli_main, "SMCPComputerClient", _Client, raising=True)
+    monkeypatch.setattr(cli_main, "Computer", _Comp, raising=True)
+    monkeypatch.setattr(cli_main, "_interactive_loop", DummyInteractive.coro, raising=True)
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(typer.Exit) as ei:
+        cli_main._run_impl(
+            auto_connect=False,
+            auto_reconnect=False,
+            url="http://example.invalid",  # 有 url ⇒ 若校验在 connect 之后，必已连接
+            namespace=cli_main.SMCP_NAMESPACE,
+            auth=None,
+            headers=None,
+            computer_factory=None,
+            mcp_config=str(bad),
+        )
+    assert ei.value.exit_code == 2
+    assert connected == [], "坏 --mcp-config 不得留下已连接的 socket（校验须先于 connect）"
+    assert constructed == [], "坏 --mcp-config 不得留下已 boot 的 Computer"
+
+
+def test_run_impl_hands_mcp_flag_path_to_computer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `--mcp-config` 经 `Computer(mcp_flag_config=)` 注入（boot 声明式输入），且 `_run_impl` **不**自行急切挂载。
+
+    `@file` 前缀被剥离。搭档守卫 = 集成测试 C1（真正验证 flag 层被 resolve 消费）——本例只钉「交接」。
+    """
+    monkeypatch.setattr(cli_main, "Computer", FakeComputer, raising=True)
+    monkeypatch.setattr(cli_main, "_interactive_loop", DummyInteractive.coro, raising=True)
+
+    good = tmp_path / "flag-mcp.json"
+    good.write_text(
+        json.dumps({"servers": {"figma.mcp": {"type": "stdio", "server_parameters": {"command": "node"}}}, "inputs": []}), encoding="utf-8",
+    )
+
+    _run_with_mcp_config("@" + str(good))  # `@file` 语法
+    comp = DummyInteractive.last_comp
+    assert comp.init_args["mcp_flag_config"] == good  # `@` 已剥离
+    assert comp.init_args["mcp_servers"] == set()  # CLI 非嵌入式宿主 ⇒ embed 层恒空
+
+
+def test_run_cli_options_renamed_and_inputs_removed() -> None:
+    """
+    参数面契约：`--mcp-config`/`-c` 在，`--config` / `--inputs` / `-i` **不在**——root 与 run **双查**。
+
+    **程序化查参**而非查渲染 help：rich/typer 按终端宽度换行，help 文本断行会让子串断言 flaky。
+    """
+    import typer.main as typer_main
+
+    cmd = typer_main.get_command(cli_main.app)
+    run_cmd = cmd.commands["run"]  # type: ignore[attr-defined]
+    for name, target in (("run", run_cmd), ("root", cmd)):
+        opts = {o for p in target.params for o in p.opts}
+        assert "--mcp-config" in opts, f"{name}: --mcp-config 缺失"
+        assert "-c" in opts, f"{name}: -c 短参缺失"
+        assert "--config" not in opts, f"{name}: 旧 --config 未删"
+        assert "--inputs" not in opts, f"{name}: --inputs 未删"
+        assert "-i" not in opts, f"{name}: -i 未删"
+
+
+def test_settings_help_no_longer_claims_lowest_priority() -> None:
+    """
+    `--settings` 帮助文案订正：flag 是**次高**、不是「最低优先级」（该文案一直是错的，实现从来是次高）。
+
+    root 与 run **两份都查**——只查一份会让另一份烂掉（本仓 `--settings` 确有两份声明）。
+    """
+    import typer.main as typer_main
+
+    cmd = typer_main.get_command(cli_main.app)
+    run_cmd = cmd.commands["run"]  # type: ignore[attr-defined]
+    for name, target in (("run", run_cmd), ("root", cmd)):
+        helps = {p.name: (p.help or "") for p in target.params}
+        for flag in ("settings_file", "mcp_config"):
+            assert "最低优先级" not in helps.get(flag, ""), f"{name}.{flag}: 仍写「最低优先级」"
+        assert "次高" in helps.get("settings_file", ""), f"{name}: --settings 未写明次高"
+        assert "次高" in helps.get("mcp_config", ""), f"{name}: --mcp-config 未写明次高"
 
 
 @pytest.mark.asyncio
@@ -542,48 +637,50 @@ def test_root_no_color_triggers_console_switch(monkeypatch: pytest.MonkeyPatch) 
     assert called["ok"] is True
 
 
-def test_run_impl_loads_inputs_and_servers_from_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """覆盖 _run_impl 的 inputs/config 文件加载成功路径。"""
-    # 提供立即退出的交互
+def test_run_impl_accepts_valid_mcp_flag_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `--mcp-config` 合法 mcp.json 形状 → 正常 boot 进 REPL（本例只走通路径；层序/消费见 Group A + 集成 C1）。
+
+    取代已删除的 `test_run_impl_loads_inputs_and_servers_from_files`（它钉的是被切掉的「server 数组 + 独立
+    --inputs」契约）。`inputs` 段现由 flag 层 mcp.json 承载、经 `run_mcp_approval` 与其余 scope 同路消费。
+    """
+    # #137 ②：REPL 路径可能 durable 落盘 → 隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["exit"]))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    inputs_file = tmp_path / "inputs.json"
-    inputs_file.write_text(
+    flag_file = tmp_path / "flag-mcp.json"
+    flag_file.write_text(
         json.dumps(
-            [
-                {"id": "VA", "type": "promptString", "description": "d", "default": "1"},
-                {"id": "VB", "type": "pickString", "description": "d", "options": ["x", "y"], "default": "x"},
-            ],
-        ),
-        encoding="utf-8",
-    )
-
-    server_file = tmp_path / "servers.json"
-    server_file.write_text(
-        json.dumps(
-            [
-                {
-                    "name": "s1",
-                    "type": "stdio",
-                    "disabled": True,
-                    "forbidden_tools": [],
-                    "tool_meta": {},
-                    "server_parameters": {
-                        "command": "echo",
-                        "args": [],
-                        "env": None,
-                        "cwd": None,
-                        "encoding": "utf-8",
-                        "encoding_error_handler": "strict",
+            {
+                "servers": {
+                    # 键含 `.` ⇒ bundle_id `s1_srv` ≠ name（conformance §2.0 分叉；`-` 不会被折叠，故不用 `-`）
+                    "s1.srv": {
+                        "type": "stdio",
+                        "disabled": True,
+                        "forbidden_tools": [],
+                        "tool_meta": {},
+                        "server_parameters": {
+                            "command": "echo",
+                            "args": [],
+                            "env": None,
+                            "cwd": None,
+                            "encoding": "utf-8",
+                            "encoding_error_handler": "strict",
+                        },
                     },
                 },
-            ],
+                "inputs": [
+                    {"id": "VA", "type": "promptString", "description": "d", "default": "1"},
+                    {"id": "VB", "type": "pickString", "description": "d", "options": ["x", "y"], "default": "x"},
+                ],
+            },
         ),
         encoding="utf-8",
     )
 
-    # 运行：不提供 url，避免网络；仅加载文件
+    # 不提供 url，避免网络
     cli_main._run_impl(
         auto_connect=False,
         auto_reconnect=False,
@@ -592,8 +689,7 @@ def test_run_impl_loads_inputs_and_servers_from_files(tmp_path: Path, monkeypatc
         auth=None,
         headers=None,
         computer_factory=None,
-        config=str(server_file),
-        inputs=str(inputs_file),
+        mcp_config=str(flag_file),
     )
 
 
@@ -614,8 +710,7 @@ def test_run_impl_cli_params_parse_error(monkeypatch: pytest.MonkeyPatch) -> Non
         auth="invalid",  # 无效
         headers="also_invalid",  # 无效
         computer_factory=None,
-        config=None,
-        inputs=None,
+        mcp_config=None,
     )
 
 
