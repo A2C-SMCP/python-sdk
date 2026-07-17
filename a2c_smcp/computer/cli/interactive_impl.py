@@ -29,6 +29,12 @@ from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.cli.commands import skill as skill_cmd
 from a2c_smcp.computer.cli.help import render_help
+from a2c_smcp.computer.cli.resolve import (
+    AmbiguousTargetError,
+    TargetNotFoundError,
+    collect_candidates,
+    resolve_target,
+)
 from a2c_smcp.computer.cli.utils import console, parse_kv_pairs, print_mcp_config, print_status, print_tools
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import MCPServerInput as MCPServerInputModel
@@ -47,6 +53,30 @@ class PatchStdoutCtx(Protocol):
 
 class _Session(Protocol):
     async def prompt_async(self, *_: str, **__: Any) -> str: ...
+
+
+def _resolve_or_report(comp: Computer, token: str, *, settings_flag_path: Path | None) -> str | None:
+    """人机面寻址：token → **bundle_id**，未命中 / 多命中打印诊断并返回 ``None``（#143 / R4）。
+
+    库层公开 API 一律收 bundle_id、无 name 启发式（协议 ``sdk-api-guidance.md §5.1``），故 REPL 收到的
+    ``<name|bundle_id>`` **必须**在此解析后再下传。返回 ``None`` = 调用方不得继续执行该动词——**绝不**静默成功。
+
+    Resolve a REPL token to a bundle_id; on miss/ambiguity print diagnostics and return None (never fake success).
+    """
+    try:
+        return resolve_target(token, collect_candidates(comp, settings_flag_path=settings_flag_path))
+    except AmbiguousTargetError as e:
+        # §5.1-3：列出每个候选的 bundle_id + display name + 归属（只列 bundle_id 用户分不清哪个是自己的）。
+        console.print(
+            f"[yellow]⚠ 有 {len(e.candidates)} 个 server 叫 '{token}' / {len(e.candidates)} servers named '{token}':[/yellow]",
+        )
+        width = max(len(c.bundle_id) for c in e.candidates)
+        for cand in sorted(e.candidates, key=lambda c: c.bundle_id):
+            console.print(f"[yellow]   {cand.bundle_id:<{width}}  {cand.name}  ({cand.attribution})[/yellow]")
+        console.print("[yellow]请用 bundle_id 重试 / Retry with a bundle_id[/yellow]")
+    except TargetNotFoundError:
+        console.print(f"[red]❌ 未找到服务器 '{token}' / Server '{token}' not found[/red]")
+    return None
 
 
 async def interactive_loop(
@@ -177,12 +207,16 @@ async def interactive_loop(
                         console.print(f"[red]❌ 添加/更新服务器失败 / Failed to add/update server: {e}[/red]")
                 elif sub in {"rm", "remove"}:
                     if len(parts) < 3:
-                        console.print("[yellow]用法: server rm <name>[/yellow]")
+                        console.print("[yellow]用法: server rm <name|bundle_id>[/yellow]")
                     else:
-                        await comp.aremove_server(parts[2])
-                        console.print("[green]已移除配置 / Removed[/green]")
-                        if smcp_client:
-                            await smcp_client.emit_update_config()
+                        # #143：先解析再下传——历史直接把 token 当 bundle_id 交 aremove_server，name≠bundle_id
+                        # 时落档⑤ no-op 却照打「已移除配置」= 静默假成功。
+                        bundle_id = _resolve_or_report(comp, parts[2], settings_flag_path=settings_flag_path)
+                        if bundle_id is not None:
+                            await comp.aremove_server(bundle_id)
+                            console.print("[green]已移除配置 / Removed[/green]")
+                            if smcp_client:
+                                await smcp_client.emit_update_config()
                 else:
                     console.print("[yellow]未知的 server 子命令 / Unknown subcommand[/yellow]")
 
@@ -193,11 +227,14 @@ async def interactive_loop(
                 else:
                     try:
                         if target == "all":
+                            # `all` 是关键字而非 server 标识 → 先短路，不进解析。
                             await comp.mcp_manager.astart_all()
                             console.print("[green]✅ 所有服务器启动完成 / All servers started[/green]")
                         else:
-                            await comp.mcp_manager.astart_client(target)
-                            console.print(f"[green]✅ 服务器 '{target}' 启动完成 / Server '{target}' started[/green]")
+                            bundle_id = _resolve_or_report(comp, target, settings_flag_path=settings_flag_path)
+                            if bundle_id is not None:
+                                await comp.mcp_manager.astart_client(bundle_id)
+                                console.print(f"[green]✅ 服务器 '{target}' 启动完成 / Server '{target}' started[/green]")
                     except Exception as e:
                         console.print(f"[red]❌ 启动服务器失败 / Failed to start server: {e}[/red]")
 
@@ -208,11 +245,16 @@ async def interactive_loop(
                 else:
                     try:
                         if target == "all":
+                            # `all` 是关键字而非 server 标识 → 先短路，不进解析。
                             await comp.mcp_manager.astop_all()
                             console.print("[green]✅ 所有服务器停止完成 / All servers stopped[/green]")
                         else:
-                            await comp.mcp_manager.astop_client(target)
-                            console.print(f"[green]✅ 服务器 '{target}' 停止完成 / Server '{target}' stopped[/green]")
+                            # #143：``_astop_client`` 用 ``pop(bundle_id, None)`` 静默吞 miss（与 rust 逐行同构，
+                            # 刻意不动，见 R4）——假成功必须在此拦住：未命中不下传、不打印成功。
+                            bundle_id = _resolve_or_report(comp, target, settings_flag_path=settings_flag_path)
+                            if bundle_id is not None:
+                                await comp.mcp_manager.astop_client(bundle_id)
+                                console.print(f"[green]✅ 服务器 '{target}' 停止完成 / Server '{target}' stopped[/green]")
                     except Exception as e:
                         console.print(f"[red]❌ 停止服务器失败 / Failed to stop server: {e}[/red]")
 

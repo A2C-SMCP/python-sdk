@@ -322,24 +322,31 @@ async def test_aadd_or_aupdate_server_existing_lands_origin_scope(
     assert project_servers["origin-svc"]["server_parameters"]["command"] == "/bin/v2", "内容已更新（整体替换）"
 
 
-# ── transient: aunmount_server(name) 只摘目标 + 守护 no-op ───────────────────────────────────────────
+# ── transient: aunmount_server_by_id(bundle_id) 只摘目标 + 守护 no-op ───────────────────────────────
 @pytest.mark.asyncio
-async def test_aunmount_server_by_name_unmounts_only_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_aunmount_server_by_id_unmounts_only_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#143 / R4：库层停摘**一律收 bundle_id**（历史 ``aunmount_server(name)`` 便捷入口已删）。
+
+    夹具 name/bundle_id **刻意分叉**（``keep.me`` → ``keep_me``）：若实现回退成按 name 寻址，本例转红。
+    """
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
-    await comp.amount_server(_stdio_dict("keep", "/bin/keep"))
-    await comp.amount_server(_stdio_dict("drop", "/bin/drop"))
+    await comp.amount_server(_stdio_dict("keep.me", "/bin/keep"))
+    await comp.amount_server(_stdio_dict("drop.me", "/bin/drop"))
     assert comp.mcp_manager is not None
-    assert {c.name for c in comp.mcp_manager.server_configs()} == {"keep", "drop"}
+    assert {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()} == {"keep_me", "drop_me"}
 
-    await comp.aunmount_server("drop")
-    assert {c.name for c in comp.mcp_manager.server_configs()} == {"keep"}, "按 name 只摘目标，不误伤同侪"
+    await comp.aunmount_server_by_id("drop_me")
+    assert {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()} == {"keep_me"}, "按 bundle_id 只摘目标，不误伤同侪"
     # 纯运行期：不落任一 scope。
     for scope in (McpWriteScope.LOCAL, McpWriteScope.PROJECT, McpWriteScope.USER):
         assert not mcp_write_path(scope, env=os.environ).exists()
-    # 不存在的 name → no-op（不抛、不误摘）。
-    await comp.aunmount_server("ghost")
-    assert {c.name for c in comp.mcp_manager.server_configs()} == {"keep"}
+    # display name 不是身份：拿 name 来摘**摘不掉**（R4 无 name 启发式；解析是人机面的事）。
+    await comp.aunmount_server_by_id("drop.me")
+    assert {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()} == {"keep_me"}
+    # 不存在的 bundle_id → no-op（不抛、不误摘）。
+    await comp.aunmount_server_by_id("ghost")
+    assert {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()} == {"keep_me"}
 
 
 @pytest.mark.asyncio
@@ -347,7 +354,6 @@ async def test_aunmount_server_manager_none_is_noop(tmp_path: Path, monkeypatch:
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
     # manager 未建（无任何挂载）→ no-op，不抛、不建 manager。
-    await comp.aunmount_server("anything")
     await comp.aunmount_server_by_id("anything")
     assert comp.mcp_manager is None
 

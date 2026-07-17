@@ -285,13 +285,16 @@ async def test_alignment_transient_mount_does_not_persist(tmp_path: Path, monkey
 
 @pytest.mark.asyncio
 async def test_alignment_transient_unmount_does_not_persist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``aunmount_server(name)`` 只摘运行期投影，不动任一 mcp 文件。"""
+    """``aunmount_server_by_id(bundle_id)`` 只摘运行期投影，不动任一 mcp 文件。
+
+    #143 / R4：库层停摘一律收 **bundle_id**（历史 name 便捷入口已删，rust 侧 ``unmount_server`` 收 id 后同构）。
+    """
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path)
     await comp.amount_server(_stdio_dict("tmp.srv.disp", "/bin/t"))  # name "tmp.srv.disp" → bundle_id "tmp_srv_disp"
     before = _snapshot_mcp_files()  # 均不存在（transient 未落盘）
 
-    await comp.aunmount_server("tmp.srv.disp")  # aunmount_server 以 **name**（display）寻址
+    await comp.aunmount_server_by_id("tmp_srv_disp")  # 以 **bundle_id**（身份）寻址，非 display name
 
     assert _snapshot_mcp_files() == before, "transient 停摘不产生任何落盘"
     assert "tmp_srv_disp" not in _runtime_bundle_ids(comp), "运行期投影已摘除（身份键 = bundle_id）"

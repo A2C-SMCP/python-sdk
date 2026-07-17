@@ -843,9 +843,15 @@ class Computer(BaseComputer[PromptSession]):
     # 「把别处已是真相的东西投影进 runtime」→ transient（纯运行期、不落盘）。**
     #   - durable  ：:meth:`aadd_or_aupdate_server` / :meth:`aadd_or_aupdate_server_in_scope` / :meth:`aremove_server`
     #                （REPL ``server add``/``rm``、外部 API 用户显式增删）。对齐 rust ``add_or_update_server*`` / ``remove_server``。
-    #   - transient：:meth:`amount_server` / :meth:`aunmount_server` / :meth:`aunmount_server_by_id`
+    #   - transient：:meth:`amount_server` / :meth:`aunmount_server_by_id`
     #                （boot 读已声明 mcp.json 挂载、``--config @file`` 加载、plugin/治理 D2 挂载/重挂）。对齐 rust
-    #                ``mount_server`` / ``unmount_server`` / ``unmount_server_by_id``。
+    #                ``mount_server`` / ``unmount_server_by_id``。
+    #
+    # 寻址（#143 / R4，协议 sdk-api-guidance §5.1）：本类**公开 API 一律收 bundle_id，无 name 启发式**。历史的
+    #   ``aunmount_server(name)`` 便捷入口已**删除**（它是库层最后一个 name 入口；零生产调用方——plugin
+    #   disable/uninstall/marketplace 级联走 ``aunmount_server_by_id``）。name→bundle_id 解析只存在于人机面
+    #   :mod:`a2c_smcp.computer.cli.resolve`，那里未命中/多命中可交互报错；库层做启发式回退会让每个外部集成方
+    #   各继承一次不可靠推断（name 空间与 id 空间在缺省派生下大面积重叠）。
     #
     # §12 R2 revision 分账（对齐 rust）：durable 落盘属 **config** 轴变化、transient 属纯 **capability** 轴。python 侧
     #   **capability** 上报由 manager 物化经 ``_on_manager_change`` → ``emit_update_tool_list`` **自动**触发（两路径皆有）；
@@ -916,20 +922,6 @@ class Computer(BaseComputer[PromptSession]):
         """
         raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         await self._amount_rendered(raw_cfg, validated)
-
-    async def aunmount_server(self, name: str) -> None:
-        """按 **name** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by name。
-
-        对齐 rust ``unmount_server``。manager 以 bundle_id 为键，故按 name 在运行期活跃集里解析出对应 bundle_id 再停摘
-        （同名多条则全摘，正常运行集内 name 唯一）。用于 plugin disable / uninstall / marketplace 级联的 bundled 停摘
-        （bundled 真相在 ledger，停进程而**不删** mcp.json 声明）。manager 未建 / 无匹配 → no-op。
-        """
-        if self.mcp_manager is None:
-            return
-        targets = {resolve_bundle_id(cfg) for cfg in self.mcp_manager.server_configs() if cfg.name == name}
-        for bundle_id in targets:
-            await self.mcp_manager.aremove_server(bundle_id)
-            self._active_raw.pop(bundle_id, None)  # #149 hygiene：raw 投影随停摘回收（读时以 manager 集为准，非正确性关键）
 
     async def aunmount_server_by_id(self, bundle_id: str) -> None:
         """按 **bundle_id** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by bundle_id。
@@ -1048,8 +1040,10 @@ class Computer(BaseComputer[PromptSession]):
         5. **无声明 ∧ 未活跃 ⇒ no-op**（无声明可删、无投影可停；``aunmount_server_by_id`` 幂等 no-op）。
 
         Args:
-            bundle_id (str): MCP Server 唯一身份 bundle_id（协议 #18）。REPL ``server rm <name>`` 在缺省身份下
-                （bundle_id = normalize(name)）以 name 寻址即可。
+            bundle_id (str): MCP Server 唯一身份 bundle_id（协议 #18）。**入参即身份，无 name 启发式**（R4）——
+                历史此处曾注「REPL ``server rm <name>`` 在缺省身份下（bundle_id = normalize(name)）以 name 寻址
+                即可」，该前提**只在 name 本身已属 ``[A-Za-z0-9_-]`` 时成立**，正是 #143 静默假成功的病根，已作废。
+                人机面的 ``<name|bundle_id>`` 解析见 :mod:`a2c_smcp.computer.cli.resolve`。
 
         Raises:
             McpWriteTargetError: 档 3（声明只存在于只读 scope）或档 4（纯运行期投影）。
