@@ -97,9 +97,12 @@ def collect_candidates(comp: Computer, *, settings_flag_path: Path | None = None
        ``amount_server``），归属 ``runtime``。
 
     .. note::
-       **DRY 接缝声明**：:meth:`Computer.ainventory` 做同类 join，但其 join key 是 **display name**（已知缺陷，
-       同名会退化误标 plugin，迁 bundle_id 挂 **#144**）。本函数从一开始就 **bundle_id join**，不复制该缺陷；
-       两处收敛属 #144 范围，不在 #143 内。
+       **DRY 接缝声明**：:meth:`~a2c_smcp.computer.computer.Computer.list_mcp_servers_with_metadata` 做同类
+       join，但其 join key 是 **display name**（已知缺陷，同名会退化误标 plugin，见该方法 docstring 的 ⚠️ 注；
+       迁 bundle_id 挂 **#144**）。本函数从一开始就 **bundle_id join**，不复制该缺陷；两处收敛属 #144 范围。
+       另：该方法取 ``_resolve_declared_settings()``（**无 flag 层**），本函数取 flag-aware 的
+       :func:`~a2c_smcp.computer.cli.commands.resolved_settings` ⇒ 「谁是 enabled plugin」两处答案在 flag scope
+       上可分叉，一并挂 #144 收敛。
 
     :param settings_flag_path: 全局 ``--settings <file>`` flag 层路径（flag-aware 账本视图）。
     """
@@ -111,21 +114,34 @@ def collect_candidates(comp: Computer, *, settings_flag_path: Path | None = None
     declarations = comp.resolve_mcp_declarations(env=os.environ)
     for name, srv in declarations.servers.items():
         bundle_id = resolve_bundle_id(srv.config)
+        if bundle_id in by_id:
+            # 声明面是 name-keyed，两个不同 name 可折叠到同一 bundle_id（``my.server`` 与 ``my server`` 都 →
+            # ``my_server``；或两条显式同 id）。此处后写胜出 ⇒ 先者从候选里消失、其 name 将报「未找到」。
+            # 声明面不受注册期 no-double-open 门约束，该态可达 ⇒ 至少留痕，别让它成为查无实据的怪事。
+            logger.warning(
+                "resolve: 声明 %r 与 %r 折叠到同一 bundle_id=%r，候选表只保留后者 / declarations collapse",
+                by_id[bundle_id].name, name, bundle_id,
+            )
         by_id[bundle_id] = ServerCandidate(bundle_id=bundle_id, name=name, attribution=srv.origin.value)
 
     # 2. ledger 派生的 enabled plugin bundled server（补声明面的 origin==plugin 结构性缺席；已按 bundle_id 去重）。
-    try:
-        declared = resolved_settings(os.environ, flag_path=settings_flag_path)
-        for record in collect_enabled_bundled_servers(comp.skill_home, declared):
-            bundle_id = resolve_bundle_id(record.config)
-            if bundle_id not in by_id:  # 用户自己的声明胜出（§2.5 用户主权）——显示它能操作的那条真相。
-                by_id[bundle_id] = ServerCandidate(
-                    bundle_id=bundle_id, name=record.config.name, attribution=f"plugin:{record.plugin}",
-                )
-    except Exception as e:  # noqa: BLE001 - 读层容错去连坐（#155）：账本不可读只丢 plugin 归属标注，不该让
-        # 寻址整体瘫痪（用户的 user-scope server 与 plugin 账本无关，不连坐）。降级**必须留痕**——静默降级
-        # 会让「归属显示 runtime 而非 plugin:x」变成查无实据的怪事。
-        logger.warning("resolve: plugin 归属推导降级（账本不可读）/ ownership derivation degraded: %s", e)
+    #    读裸 ``_skill_home``（可能 None）而非公开 ``skill_home`` property：后者会 ``ensure_skill_home()`` 建目录，
+    #    本函数当前只在 REPL boot 后调（已解析）故无害，但读裸属性 + None 短路可防将来 pre-boot 复用踩副作用
+    #    （同 ``interactive_impl`` banner 的既有约定）。home 为 None ⇒ 跳过 ledger 源，仅丢 plugin 归属标注。
+    home = comp._skill_home
+    if home is not None:
+        try:
+            declared = resolved_settings(os.environ, flag_path=settings_flag_path)
+            for record in collect_enabled_bundled_servers(home, declared):
+                bundle_id = resolve_bundle_id(record.config)
+                if bundle_id not in by_id:  # 用户自己的声明胜出（§2.5 用户主权）——显示它能操作的那条真相。
+                    by_id[bundle_id] = ServerCandidate(
+                        bundle_id=bundle_id, name=record.config.name, attribution=f"plugin:{record.plugin}",
+                    )
+        except Exception as e:  # noqa: BLE001 - 读层容错去连坐（#155）：账本不可读只丢 plugin 归属标注，不该让
+            # 寻址整体瘫痪（用户的 user-scope server 与 plugin 账本无关，不连坐）。降级**必须留痕**——静默降级
+            # 会让「归属显示 runtime 而非 plugin:x」变成查无实据的怪事。
+            logger.warning("resolve: plugin 归属推导降级（账本不可读）/ ownership derivation degraded: %s", e)
 
     # 3. 运行期活跃集兜底：补纯 transient 投影（无声明、非 bundled）。
     if comp.mcp_manager is not None:
@@ -156,7 +172,7 @@ def resolve_target(token: str, candidates: tuple[ServerCandidate, ...]) -> BUNDL
        故多命中时够不到步骤 2。⇒ ``A(name='foo', 缺省派生 id='foo')`` 与 ``B(name='foo', 显式 id='bundle_x')``
        合法共存（§5.6）时，A 的 bundle_id 恰等于那个冲突的名字，用户照「请用 bundle_id 重试」再敲 ``foo``
        仍是 name 多命中 ⇒ **A 永远不可寻址**。修它属改协议明文，且该语义 MUST 双端逐字一致 ⇒ 不单端发明。
-       缺口由 ``tests/unit_tests/computer/cli/test_resolve.py`` 的 xfail 用例钉住。
+       缺口由 ``tests/unit_tests/computer/cli/test_resolve.py`` 的 xfail 用例钉住，求裁于 **#170**。
 
     :raises AmbiguousTargetError: token 作为 display name 命中多条。
     :raises TargetNotFoundError: token 既非已知 name 也非已注册的合法 bundle_id。

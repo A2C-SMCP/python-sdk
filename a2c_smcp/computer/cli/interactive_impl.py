@@ -41,6 +41,7 @@ from a2c_smcp.computer.mcp_clients.model import MCPServerInput as MCPServerInput
 from a2c_smcp.smcp import MCPServerConfig as SMCPServerConfigDict
 from a2c_smcp.smcp import MCPServerInput as SMCPServerInputDict
 from a2c_smcp.smcp import ToolCallReq as SMCPToolCallReq
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 # 定义上下文管理器类型
 ContextManager = AbstractContextManager[None]
@@ -76,6 +77,39 @@ def _resolve_or_report(comp: Computer, token: str, *, settings_flag_path: Path |
         console.print("[yellow]请用 bundle_id 重试 / Retry with a bundle_id[/yellow]")
     except TargetNotFoundError:
         console.print(f"[red]❌ 未找到服务器 '{token}' / Server '{token}' not found[/red]")
+    return None
+
+
+def _resolve_lifecycle_target(comp: Computer, token: str, *, verb: str, settings_flag_path: Path | None) -> str | None:
+    """为 ``start`` / ``stop`` 解析 token，且**额外要求命中的 bundle_id 当前真的挂载着**（#143 决策 1 补丁）。
+
+    决策 1 的查找空间是「运行期 ∪ 声明面」（为让 ``server rm`` 的档 1-4 可达）。副作用：仅**声明**而尚未挂载
+    的 server（如本次启动未过审批门的 project 声明）也会解析成功。但 ``start``/``stop`` 操作的是**运行期进程**，
+    对未挂载目标：``astop_client`` 会静默 no-op → 打印「✅ 停止完成」（本 Issue 要根治的假回执）；``astart_client``
+    会抛内部 ``Unknown server bundle_id=...``（把内部 id 概念漏给用户）。故解析后再判「是否已挂载」，未挂载则
+    诚实陈述而非假成功/漏内部错。
+
+    .. note::
+       这两条路径是决策 1 引入的、协议 §5.1-1「在**活跃配置集**反查」未覆盖的态（协议此处 MUST 双端逐字一致）。
+       已开 **#171** 求协议把查找空间改为「活跃集 ∪ 声明面」并明确本态行为，裁决后双端同步。
+
+    :returns: 已挂载 → 其 bundle_id；未命中 / 多命中 / 已声明未挂载 → ``None``（打印诊断，调用方不得执行）。
+    """
+    bundle_id = _resolve_or_report(comp, token, settings_flag_path=settings_flag_path)
+    if bundle_id is None:
+        return None
+    mounted = comp.mcp_manager is not None and any(
+        resolve_bundle_id(cfg) == bundle_id for cfg in comp.mcp_manager.server_configs()
+    )
+    if mounted:
+        return bundle_id
+    if verb == "stop":
+        console.print(f"[yellow]⚠ 服务器 '{token}' 尚未挂载，无需停止 / Server '{token}' not mounted; nothing to stop[/yellow]")
+    else:
+        console.print(
+            f"[yellow]⚠ 服务器 '{token}' 已声明但未挂载 / Server '{token}' declared but not mounted[/yellow]",
+        )
+        console.print("[yellow]  提示：它可能在 mcp.json 里但本次启动未过批准门 / it may be pending the approval gate[/yellow]")
     return None
 
 
@@ -231,7 +265,7 @@ async def interactive_loop(
                             await comp.mcp_manager.astart_all()
                             console.print("[green]✅ 所有服务器启动完成 / All servers started[/green]")
                         else:
-                            bundle_id = _resolve_or_report(comp, target, settings_flag_path=settings_flag_path)
+                            bundle_id = _resolve_lifecycle_target(comp, target, verb="start", settings_flag_path=settings_flag_path)
                             if bundle_id is not None:
                                 await comp.mcp_manager.astart_client(bundle_id)
                                 console.print(f"[green]✅ 服务器 '{target}' 启动完成 / Server '{target}' started[/green]")
@@ -250,8 +284,8 @@ async def interactive_loop(
                             console.print("[green]✅ 所有服务器停止完成 / All servers stopped[/green]")
                         else:
                             # #143：``_astop_client`` 用 ``pop(bundle_id, None)`` 静默吞 miss（与 rust 逐行同构，
-                            # 刻意不动，见 R4）——假成功必须在此拦住：未命中不下传、不打印成功。
-                            bundle_id = _resolve_or_report(comp, target, settings_flag_path=settings_flag_path)
+                            # 刻意不动，见 R4）——假成功必须在此拦住：未命中/已声明未挂载不下传、不打印成功。
+                            bundle_id = _resolve_lifecycle_target(comp, target, verb="stop", settings_flag_path=settings_flag_path)
                             if bundle_id is not None:
                                 await comp.mcp_manager.astop_client(bundle_id)
                                 console.print(f"[green]✅ 服务器 '{target}' 停止完成 / Server '{target}' stopped[/green]")

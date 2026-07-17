@@ -69,10 +69,11 @@ def test_name_collision_raises_ambiguous_with_full_candidates() -> None:
     with pytest.raises(AmbiguousTargetError) as exc:
         resolve_target("filesystem", (user_fs, plugin_fs))
 
+    # 候选原样带出三元组，供 CLI 渲染 bundle_id + name + 归属。
+    # （勿加 ``assert c.bundle_id and c.name and c.attribution`` 之流：resolve_target 对候选是纯透传，
+    #   那只是在断言本测试自己构造的字面量非空 = 永真，与被测实现无关。归属**是否真被打印**的守卫在
+    #   test_repl_addressing.py 的多命中用例——那里才是渲染发生的地方。）
     assert set(exc.value.candidates) == {user_fs, plugin_fs}
-    # 三个维度都必须能被 CLI 渲染出来，缺一不可。
-    for cand in exc.value.candidates:
-        assert cand.bundle_id and cand.name and cand.attribution
 
 
 def test_ambiguous_never_silently_picks_lexicographically_smallest() -> None:
@@ -105,7 +106,7 @@ def test_name_hit_takes_precedence_over_bundle_id_hit() -> None:
         "报错、步骤 4 禁任意规则选一。⇒ A(name='foo', 缺省派生 id='foo') 与 B(name='foo', 显式 "
         "id='bundle_x') 合法共存（§5.6）时，A 的 bundle_id 恰等于那个冲突的名字，用户照「请用 bundle_id "
         "重试」再敲 'foo' 仍是 name 多命中 ⇒ **A 永远不可寻址**。修它属改协议明文，且该语义 MUST 双端逐字"
-        "一致 ⇒ 不单端发明。本轮严格实现协议并以本例钉住缺口（不靠文档降级）。"
+        "一致 ⇒ 不单端发明。本轮严格实现协议并以本例钉住缺口（不靠文档降级）。求裁于 #170。"
     ),
     strict=True,
 )
