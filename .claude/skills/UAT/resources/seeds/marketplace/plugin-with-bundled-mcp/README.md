@@ -13,5 +13,5 @@
 
 **期望被测行为**:
 - `plugin install foo@mp-bundled-mcp` 成功
-- `plugin info` 显示 `bundledMcpServers` 含 `figma-mcp`
+- `plugin info` 显示 `mcpServers`（声明依赖的 bundle_id 数组）含 `figma-mcp`
 - `plugin uninstall foo@mp-bundled-mcp` 级联移除捆绑 MCP server

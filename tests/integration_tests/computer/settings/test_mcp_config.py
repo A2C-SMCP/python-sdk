@@ -75,7 +75,7 @@ def test_resolve_and_gate_full_stack(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     # bundled 账本：plugin 携带 "blender" → 即使在 workspace mcp.json 出现，也免批准。
     save_installed_plugins(
-        {"plugins": {"3d@mp": [{"scope": "user", "installPath": "/x", "bundledMcpServers": ["blender"]}]}},
+        {"plugins": {"3d@mp": [{"scope": "user", "installPath": "/x", "mcpServers": ["blender"]}]}},
         home=_home(tmp_path),
     )
 

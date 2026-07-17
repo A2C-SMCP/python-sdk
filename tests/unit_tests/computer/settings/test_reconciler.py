@@ -24,6 +24,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from a2c_smcp.computer.settings.reconciler import (
     ReconcileReport,
     declared_installed_plugin_ids,
@@ -315,6 +317,20 @@ def _seed_installed(home: Path, plugins: dict[str, list[dict]]) -> None:
     save_installed_plugins({"version": 1, "plugins": plugins}, home=home)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cwd_and_user_config(tmp_path: Path, monkeypatch) -> None:
+    """
+    隔离 cwd + user config / Isolate cwd and user config。
+
+    #153 起 :func:`gc_plugins` 经回收判据（``mcp_json_declared_bundle_ids`` → ``resolve_mcp_config``）读
+    **cwd 锚定**的 ``.tfrobot/mcp[.local].json``（project/local scope，#116）与 user scope mcp.json。
+    不隔离则读进真实仓库 / 开发者 home——本地一旦存在这些文件，断言即随环境漂移（#137 同款教训；本文件的
+    泄漏由 #153 隔离审查 🟡 实测发现）。
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+
 async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     home = _home(tmp_path)
     audit_path = marketplace_skill_dir(home, "acme") / "audit"
@@ -324,7 +340,7 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     _seed_installed(
         home,
         {
-            "audit@acme": [{"scope": "user", "installPath": str(audit_path), "bundledMcpServers": ["figma", "blender"]}],
+            "audit@acme": [{"scope": "user", "installPath": str(audit_path), "mcpServers": ["figma", "blender"]}],
             "keep@acme": [{"scope": "user", "installPath": str(keep_path)}],
         },
     )
@@ -350,7 +366,7 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     assert "audit@acme" not in ipf and "keep@acme" in ipf
     assert reg.resolve("audit:lint") is None  # 孤儿 plugin 的 SKILL 注销
     assert reg.resolve("keep:do") is not None  # 保留 plugin 的 SKILL 不动
-    assert teardown == [["figma", "blender"]]  # bundled MCP 经回调下线
+    assert teardown == [["blender", "figma"]]  # 可回收的 MCP 依赖经回调下线（#153：判据过滤后 sorted，确定序）
 
 
 async def test_gc_guards_installpath_outside_home(tmp_path: Path) -> None:
@@ -372,7 +388,7 @@ async def test_gc_without_teardown_callback(tmp_path: Path) -> None:
     home = _home(tmp_path)
     p = marketplace_skill_dir(home, "acme") / "audit"
     p.mkdir(parents=True)
-    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(p), "bundledMcpServers": ["x"]}]})
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(p), "mcpServers": ["x"]}]})
 
     removed = await gc_plugins(["audit@acme"], SkillRegistry(), home, mcp_teardown=None)
 

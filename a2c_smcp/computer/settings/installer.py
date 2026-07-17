@@ -30,11 +30,18 @@ gc/prune，本模块做**显式单 plugin** 增删启停，写 ``installed_plugi
 ``settings/__init__`` re-export（与 reconciler 同——见 #62 教训）；消费方直接
 ``from a2c_smcp.computer.settings.installer import install_plugin`` 等。
 
-**MCP 注入**：与 :func:`gc_plugins` 的 ``mcp_teardown`` 同款——bundled MCP server 的存在性查询 / 注册 / 摘除经
-注入回调（:data:`ExistingServerNames` / :data:`RegisterServer` / :data:`RemoveServer`），由 #69 CLI 层用
-``Computer.aadd_or_aupdate_server`` / ``Computer.aremove_server`` / ``mcp_manager.get_server_status`` 包装；
-回调 ``None`` = ledger-only（单测 / 无 server 场景）。**enable 注册经 Computer 路径渲染 ``${input:}``**
-（§9.3，inputs 池消歧归 #65）；v0.3.0 起 install 不再收挂载回调（不激活）。
+**MCP 注入**：与 :func:`gc_plugins` 的 ``mcp_teardown`` 同款——MCP server 的存在性查询 / 注册 / 摘除经注入
+回调（:data:`ExistingBundleIds` / :data:`RegisterServer` / :data:`RemoveServer`），由 #69 CLI 层的
+:func:`~a2c_smcp.computer.cli.commands.build_mcp_callbacks` 用 ``Computer.amount_server`` /
+``Computer.aunmount_server_by_id`` / ``mcp_manager.server_configs`` 包装；回调 ``None`` = ledger-only
+（单测 / 无 server 场景）。**enable 注册经 Computer 路径渲染 ``${input:}``**（§9.3，inputs 池消歧归 #65）；
+v0.3.0 起 install 不再收挂载回调（不激活）。
+
+**plugin ↔ MCP Server = 依赖关系，非所有关系**（协议 runtime-contract §2.5 / §4.9.1，#153/D3+F1）：plugin 以
+``bundle_id`` **声明依赖**，账本 ``mcpServers`` 记的是依赖声明。由此三条贯穿本模块：
+  1. **install/enable 不因「同 bundle_id 已有」拒绝**——那是「依赖已满足」，提示并复用既有实例（§2.5-1）；
+  2. **uninstall/disable 不无条件收回**——过 §4.9.1-2 判据「无其他 plugin 依赖 ∧ 非用户声明」才回收；
+  3. **身份一律 bundle_id**——display name 只给用户看。
 
 边界（文档化，非缺陷）/ Documented boundaries：
 - 本模块操作 **live session**；跨重启恢复（活跃集 = installed ∧ enabled）由治理启动恢复承担（#117/#123）：
@@ -59,6 +66,12 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
+from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
+from a2c_smcp.computer.settings.reconciler import (
+    ledger_mcp_deps_of,
+    other_plugin_mcp_deps,
+    reclaimable_mcp_deps,
+)
 from a2c_smcp.computer.settings.schema import SettingsScope, is_valid_enabled_plugin_key
 from a2c_smcp.computer.settings.scope import (
     DELETE,
@@ -95,6 +108,7 @@ from a2c_smcp.computer.skills.staging import (
     locate_plugin_root,
     stage_marketplace_skills,
 )
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -108,24 +122,21 @@ class PluginInstallError(Exception):
     """plugin install/enable 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope）。"""
 
 
-class MCPServerNameConflictError(Exception):
-    """
-    bundled MCP server 与**外来**同名 server 冲突（§7.2/§10.6）/ Foreign MCP server name conflict。
-
-    **硬抛、原子失败、无 rename/force 逃生口**（name 即身份）。判定排除 plugin 自有
-    （命中其 ``bundledMcpServers`` 记录）→ 幂等再物化不算冲突。
-    """
-
-
 # ---------------------------------------------------------------------------
 # MCP 注入接口 / Injected MCP interface（沿用 gc_plugins 的回调注入风格）
+#
+# **身份一律 bundle_id**（#153/D3）：账本记 bundle_id（§4.9.1-1）⇒ 依赖预检与停摘链全部收 bundle_id。
+# 历史上本接缝收 display name，与「name 给用户看、bundle_id 给代码」判据相悖，且令「同名异 id」误判。
 # ---------------------------------------------------------------------------
-# 当前已注册 server 名集合（同步；CLI 包 ``{r[0] for r in mcp_manager.get_server_status()}``）。
-ExistingServerNames = Callable[[], set[str]]
-# 运行期挂载一个 bundled server（异步；#137 ③ 起 CLI 包 transient ``Computer.amount_server``，含 ``${input:}`` 渲染；
-# 治理投影不回写 mcp.json——bundled 真相在 ledger）。
+# 当前运行期已注册 server 的 **bundle_id** 集（同步）。数据源 MUST 是**运行期权威配置集**
+# （CLI 包 ``{resolve_bundle_id(cfg) for cfg in comp.mcp_manager.server_configs()}``），
+# MUST NOT 读构造期快照（协议 §2.5-4：快照对运行期挂载不可见，会把「依赖已满足」误判为「未满足」）。
+ExistingBundleIds = Callable[[], set[str]]
+# 运行期挂载一个 plugin 声明依赖的 server（异步；#137 ③ 起 CLI 包 transient ``Computer.amount_server``，含
+# ``${input:}`` 渲染；治理投影不回写 mcp.json——依赖声明的真相在 ledger）。
 RegisterServer = Callable[[MCPServerConfig], Awaitable[None]]
-# 运行期停摘一个 bundled server（异步；#137 ③ 起 CLI 包 transient ``Computer.aunmount_server``，停进程不删声明）。
+# 运行期停摘一个 server（异步，入参 **bundle_id**；CLI 包 transient ``Computer.aunmount_server_by_id``，
+# 停进程不删声明）。仅对经 §4.9.1-2 回收判据判定**可回收**者调用。
 RemoveServer = Callable[[str], Awaitable[None]]
 # 注入 plugin-scoped inputs 入池（异步；入参 plugin_root；CLI 包 ``load_plugin_inputs`` → ``Computer.add_or_update_input``）。
 # 在 register（→render bundled server 的 ${input:}）之前调，使裸 id 可经 D2 前缀回退解析（#69 Group A，§9.3 D2）。
@@ -264,17 +275,6 @@ def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str) 
     return names
 
 
-def _bundled_servers_of(home: Path, plugin_id: str, env: Mapping[str, str] | None) -> set[str]:
-    """该 plugin 物化记录里全部 ``bundledMcpServers`` 名（跨 scope 记录并集）/ All recorded bundled server names。"""
-    installed = load_installed_plugins(home=home, env=env)
-    out: set[str] = set()
-    for rec in installed.get("plugins", {}).get(plugin_id, []):
-        servers = rec.get("bundledMcpServers")
-        if isinstance(servers, list):
-            out.update(s for s in servers if isinstance(s, str))
-    return out
-
-
 def _resolve_marketplace_source(marketplace: str, home: Path, env: Mapping[str, str] | None) -> tuple[Mapping[str, Any], str | None]:
     """从 ``known_marketplaces.json`` 取 marketplace 的 git source + commitSha；未添加 → :class:`PluginInstallError`。"""
     known = load_known_marketplaces(home=home, env=env)
@@ -288,36 +288,44 @@ def _resolve_marketplace_source(marketplace: str, home: Path, env: Mapping[str, 
     return source, commit_sha if isinstance(commit_sha, str) else None
 
 
-def _conflict_check(servers: list[MCPServerConfig], existing: set[str], owned: set[str]) -> None:
+def _log_satisfied_deps(servers: list[MCPServerConfig], existing: set[str]) -> None:
     """
-    bundled server 同名冲突预检（§7.2/§10.6）/ Bundled-server name-conflict precheck。
+    依赖预检（协议 §2.5-1，**只提示不拒绝**）/ Dependency precheck: report, never reject。
 
-    外来同名（``cfg.name in existing`` 且 ``not in owned``）→ :class:`MCPServerNameConflictError`（硬抛、零变更）；
-    plugin 自有（命中 ``owned`` = 其 ``bundledMcpServers`` 记录）→ 幂等放行（overwrite 自有 server）。
+    同 ``bundle_id`` 本地已有 = **依赖已满足** → 复用既有实例、按来源优先序 reconcile、卸载本 plugin 不移除它。
+    **MUST NOT 拒绝安装**——plugin 与 MCP Server 是**依赖关系而非所有关系**（§2.5），历史的
+    ``MCPServerNameConflictError``「外来同名硬抛、name 即身份」已被协议正面推翻（Discussion #23 / D3），
+    连同 ``owned``（所有权白名单）概念一并退役：依赖声明没有所有权，故无需区分「自有」与「外来」。
+    display name 相同、``bundle_id`` 不同是**合法共存**（§5.6），MUST NOT 视为冲突。
+
+    **只记日志、无返回值**：面向用户的提示由 CLI 层的 ``_satisfied_deps`` / ``_print_satisfied_deps`` 承担
+    （enable 路径 MUST 在挂载**之前**算——挂载会改变活跃集，事后算分不清「本来就有」与「刚被自己挂上」）。
     """
     for cfg in servers:
-        if cfg.name in existing and cfg.name not in owned:
-            raise MCPServerNameConflictError(
-                f"MCP server name conflict: {cfg.name!r} already exists and is not owned by this plugin. "
-                "Resolve by 'server rm' the existing server, or rename it in the plugin's own manifest "
-                "(no --rename / --force-override escape hatch: name is identity).",
+        bid = resolve_bundle_id(cfg)
+        if bid in existing:
+            logger.info(
+                "dependency satisfied: MCP server %r already exists locally; reusing it rather than creating a new one "
+                "(configs reconcile by scope precedence; uninstalling this plugin will not remove it)",
+                bid,
             )
 
 
-def _require_existing_names_guard(
-    existing_server_names: ExistingServerNames | None,
+def _require_existing_ids_guard(
+    existing_bundle_ids: ExistingBundleIds | None,
     register_server: RegisterServer | None,
 ) -> None:
     """
-    护栏：给了 ``register_server`` 就**必须**给 ``existing_server_names`` / Guard: register implies existing-names。
+    护栏：给了 ``register_server`` 就**必须**给 ``existing_bundle_ids`` / Guard: register implies existing-ids。
 
-    否则冲突闸门以 ``existing=∅`` 运行被静默旁路——外来同名 server 会被 MCP manager **静默覆盖**（manager 对
-    同名是覆盖更新、不抛），违 §10.6「外来同名硬抛」铁律。三注入回调应「齐备或全无」，此处强制 register→existing。
+    D3 后 ``existing`` 不再是「拒绝闸门」而是 **skip-or-register 的判据**（§2.5-1「依赖已满足 → 复用既有实例」）：
+    缺它则以 ``existing=∅`` 运行 ⇒ 全量 register ⇒ 把用户既有的同 bundle_id server **静默覆盖**（manager 对同
+    bundle_id 是覆盖更新、不抛）。三注入回调应「齐备或全无」，此处强制 register→existing。
     """
-    if register_server is not None and existing_server_names is None:
+    if register_server is not None and existing_bundle_ids is None:
         raise PluginInstallError(
-            "existing_server_names is required when register_server is given "
-            "(else the MCP name-conflict gate is silently bypassed; design §10.6)",
+            "existing_bundle_ids is required when register_server is given "
+            "(else a dependency-satisfied server would be silently overwritten instead of reused; protocol §2.5-1)",
         )
 
 
@@ -334,10 +342,10 @@ async def materialize_plugin(
     refresh: bool = False,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
-    existing_server_names: ExistingServerNames | None = None,
+    existing_bundle_ids: ExistingBundleIds | None = None,
 ) -> InstalledPluginRecord:
     """
-    物化单个 plugin（clone/定位 + manifest 校验 + 冲突预检 + 写账本；**零激活**）/ Materialize one plugin。
+    物化单个 plugin（clone/定位 + manifest 校验 + 依赖预检 + 写账本；**零激活**）/ Materialize one plugin。
 
     协议 v0.3.0 §2.3「Fetch 资产：意图 → 物化账本 → 克隆缓存 → 活跃集」中**物化账本**一环的执行体：
     供 :func:`install_plugin`（显式安装）与治理启动恢复（账本删除后由 ``installedPlugins`` 意图重建，
@@ -348,10 +356,11 @@ async def materialize_plugin(
     2. 要求 catalog clone 已存在（``marketplace add`` 前置；缺失→抛）；读 marketplace.json 定位 entry。
     3. :func:`locate_plugin_root` 定位 plugin 根（必要时 clone 外部 plugin；失败→抛，零变更）。
     4. strict 冲突检测（§4.4，#80）+ :func:`load_bundled_servers` 全量解析（任一畸形→抛，写账本前）。
-    5. **★冲突预检**：外来同名→:class:`MCPServerNameConflictError`（零变更）；自有同名→幂等放行；
-       ``existing_server_names=None``（boot 重物化等无 live manager 场景）→ 跳过预检。
+    5. **依赖预检**（协议 §2.5-1）：同 ``bundle_id`` 已存在 = 依赖已满足 → **提示、不拒绝**（历史的外来同名
+       硬抛已被 D3 推翻，见 :func:`_log_satisfied_deps`）；``existing_bundle_ids=None``（boot 重物化等无 live
+       manager 场景）→ 跳过预检。**本步骤零副作用**——install ⊥ activate，挂载归 :func:`enable_plugin`。
     6. 写 ``installed_plugins.json``（仅全成功）：scope / installPath / version / commitSha /
-       installedAt / lastUpdated / bundledMcpServers。
+       installedAt / lastUpdated / **mcpServers（bundle_id 数组，§4.9.1-1）**。
 
     :param scope: 物化记录 scope（``managed|user|project|local``，默认 ``user``）。
     :param version: 记录版本覆盖（``--version``）；缺省按 entry > plugin.json > commitSha 解析。
@@ -390,13 +399,12 @@ async def materialize_plugin(
         raise PluginInstallError(str(e)) from e
     servers = load_bundled_servers(plugin_root)
 
-    # 5：★冲突预检（零变更）。owned = 自有同名白名单（其上次记录的 bundledMcpServers）。
-    owned = _bundled_servers_of(home, plugin_id, env)
-    existing = existing_server_names() if existing_server_names is not None else set()
-    _conflict_check(servers, existing, owned)
+    # 5：依赖预检（§2.5-1，只提示不拒绝；零变更）
+    existing = existing_bundle_ids() if existing_bundle_ids is not None else set()
+    _log_satisfied_deps(servers, existing)
 
     # 6：写账本（仅全成功）
-    bundled_names = [cfg.name for cfg in servers]
+    mcp_deps = [resolve_bundle_id(cfg) for cfg in servers]
     resolved_version = version if version else resolve_plugin_version(entry, plugin_manifest, version_fallback)
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     record: InstalledPluginRecord = {"scope": scope, "installPath": str(plugin_root)}
@@ -408,8 +416,8 @@ async def materialize_plugin(
         record["commitSha"] = version_fallback
     record["installedAt"] = now
     record["lastUpdated"] = now
-    if bundled_names:
-        record["bundledMcpServers"] = bundled_names
+    # 无条件写（空则 ``[]`）：格式明确、与 rust-sdk#139 磁盘形态逐字节一致，且「有该键」= 新格式正向标志。
+    record["mcpServers"] = mcp_deps
 
     def _put(data: InstalledPluginsFile, _rec: InstalledPluginRecord = record, _pid: str = plugin_id) -> None:
         plugins = data["plugins"]
@@ -433,7 +441,7 @@ async def install_plugin(
     refresh: bool = False,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
-    existing_server_names: ExistingServerNames | None = None,
+    existing_bundle_ids: ExistingBundleIds | None = None,
 ) -> InstalledPluginRecord:
     """
     显式安装单个 plugin = config-first 写意图 + 物化；**不激活**（v0.3.0 §2.4 install 行）/ Install ≠ activate。
@@ -441,7 +449,7 @@ async def install_plugin(
     顺序 / Order:
     1. cheap 预检（零变更）：``plugin_id`` 形态、marketplace 已添加、catalog 已 clone、manifest entry 存在。
     2. **config-first**（§2.3）：把 ``plugin_id`` 写入 **user scope** ``installedPlugins``（全局安装意图）。
-    3. :func:`materialize_plugin` 物化（clone/strict/bundled 解析/冲突预检/写账本）。
+    3. :func:`materialize_plugin` 物化（clone/strict/bundled 解析/依赖预检/写账本）。
     4. 物化失败 → **原子回滚**：撤销第 2 步新写的意图条目（重装场景原已在 → 保留）→ 上抛（#123 决策 #3：
        「失败 = 零变更」；协议对 install 失败未置可否，本 SDK 取更强不变量，rust-sdk#103 镜像）。
 
@@ -451,7 +459,8 @@ async def install_plugin(
     :param registry: 与其余三动词对称保留；install 自 v0.3.0 起不触碰 Registry。
     :param scope: 物化记录 scope（``managed|user|project|local``，默认 ``user``）——只影响账本记录归档，
         **不**影响意图落点（安装是全局一次的事实，意图恒写 user scope）。
-    :param existing_server_names: 可选冲突预检输入（``None`` = 跳过预检；enable 时仍有权威预检兜底）。
+    :param existing_bundle_ids: 可选依赖预检输入（``None`` = 跳过预检）。预检**只提示不拒绝**（§2.5-1），
+        故此处缺省不影响正确性；真正消费 ``existing`` 做 skip-or-register 决策的是 :func:`enable_plugin`。
     :return: 写入的 :class:`InstalledPluginRecord`。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
@@ -483,7 +492,7 @@ async def install_plugin(
             refresh=refresh,
             timeout=timeout,
             env=env,
-            existing_server_names=existing_server_names,
+            existing_bundle_ids=existing_bundle_ids,
         )
     except Exception:
         if not was_present:
@@ -494,9 +503,9 @@ async def install_plugin(
         raise
 
     logger.info(
-        "installed plugin %r (servers=%s; installed_disabled, run 'plugin enable' to activate)",
+        "installed plugin %r (MCP deps=%s; installed_disabled, run 'plugin enable' to activate)",
         plugin_id,
-        record.get("bundledMcpServers") or "none",
+        record.get("mcpServers") or "none",
     )
     return record
 
@@ -512,7 +521,13 @@ async def uninstall_plugin(
     remove_server: RemoveServer | None = None,
 ) -> bool:
     """
-    卸载单个 plugin（删 installPath 树 + 注销 skills + 级联 stop+remove bundled server + 删账本记录）/ Uninstall。
+    卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据回收** MCP 依赖 + 删账本记录）/ Uninstall。
+
+    **MCP 依赖回收**（协议 §4.9.1-2，#153/D3+F1）：plugin 声明依赖的 server **不是**它的所有物，故卸载
+    **不无条件收回**——逐个过 :func:`~a2c_smcp.computer.settings.reconciler.reclaimable_mcp_deps`：
+    **回收 X ⟺ 无其他 plugin 声明依赖 X ∧ X 非用户声明**。由此「用户自有 server 永不连坐」与「多 plugin 共享
+    依赖不被提前摘除、最后一个依赖者卸载时回收（无泄漏）」两条同时成立。``--keep-servers`` 跳过整个回收环节。
+
 
     **v0.3.0 §2.4 uninstall 行**：当该 pid 的账本记录**全部**移除（回 ``available``）时，同步删除 user scope
     ``installedPlugins`` 意图条目 + 清 ``enabledPlugins`` 条目（user 必清；给了 ``project_path`` 时 project/local
@@ -545,21 +560,30 @@ async def uninstall_plugin(
     # （同 install 的标记误置风险，防迁移被抢跑关闭；置于此处保「未安装 = 真 no-op 零写盘」，审查 N1）。
     migrate_legacy_installs(home, env=env)
 
-    bundled: list[str] = []
+    # ① 停摘候选 + 回收判定，**先于任何删除**取得（§4.9.1-3：名单 MUST 在账本记录移除之前取得，且 MUST 仅依赖
+    #    账本自身字段——``installPath`` 指向的树在下面就被删了，「从 install_path 重解析」在本路径恒不成立）。
+    #    ``retained``：scoped uninstall 时本 pid 其余 scope 的记录仍声明依赖 ⇒ 仍算依赖者，不可回收。
+    deps = sorted(ledger_mcp_deps_of(targeted))
+    retained = [r for r in records if r not in targeted]
+    ledger_plugins = installed.get("plugins", {})
+    reclaim = reclaimable_mcp_deps(
+        deps,
+        other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id, retained_records=retained),
+        user_declared=mcp_json_declared_bundle_ids(env=env),
+    )
+
+    # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
     for rec in targeted:
         install_path = rec.get("installPath")
         if isinstance(install_path, str) and install_path:
             _safe_rmtree(Path(install_path), home)
-        servers = rec.get("bundledMcpServers")
-        if isinstance(servers, list):
-            bundled.extend(s for s in servers if isinstance(s, str))
 
     for name in _plugin_skill_names(registry, marketplace, plugin):
         registry.unregister(name)
 
     if not keep_servers and remove_server is not None:
-        for sname in bundled:
-            await remove_server(sname)
+        for bundle_id in reclaim:
+            await remove_server(bundle_id)
 
     def _drop(data: InstalledPluginsFile, _pid: str = plugin_id, _scope: str | None = scope) -> None:
         plugins = data["plugins"]
@@ -582,10 +606,11 @@ async def uninstall_plugin(
         project_paths = {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p}
         _clear_enabled_entries_visible_layers(plugin_id, project_paths, env)
     logger.info(
-        "uninstalled plugin %r (scope=%s, servers=%s)",
+        "uninstalled plugin %r (scope=%s, MCP deps declared=%s, reclaimed=%s)",
         plugin_id,
         scope or "all",
-        "kept" if keep_servers else (bundled or "none"),
+        deps or "none",
+        "kept" if keep_servers else (reclaim or "none"),
     )
     return True
 
@@ -656,9 +681,21 @@ async def disable_plugin(
     """
     禁用单个 plugin = 整 plugin 下线（§4.3 决策 #6）/ Disable = take the whole plugin offline。
 
-    ① 写 ``enabledPlugins[id]=false``；② 停并摘除其 bundled MCP server（读物化记录的 ``bundledMcpServers``）；
-    ③ 隐藏 skills（:meth:`SkillRegistry.mark_orphan`，**物化层不动**——clone 树 / installed 记录保留，
-    :func:`enable_plugin` 廉价复原）。区别于 :func:`uninstall_plugin`：disable 留 installed 记录、可一键回滚。
+    ① 写 ``enabledPlugins[id]=false``；② **按 §4.9.1-2 判据回收**其声明依赖的 MCP server（判据与 uninstall 同源
+    ——协议明列 disable / uninstall 二者共用；用户自有 / 他 plugin 仍依赖者 MUST NOT 被摘）；③ 隐藏 skills
+    （:meth:`SkillRegistry.mark_orphan`，**物化层不动**——clone 树 / installed 记录保留，:func:`enable_plugin`
+    廉价复原）。区别于 :func:`uninstall_plugin`：disable 留 installed 记录、可一键回滚。
+
+    .. note::
+       disable **不删账本记录**，故判据的「其他 plugin」须排除本 pid **全部**记录（``exclude_pid``，无 retained）
+       ——否则自己的记录会把自己的依赖判成「他人仍依赖」而永不回收。
+
+       **已知驻留行为**（协议字面推论，与 rust-sdk#139 同口径）：「其他 plugin」= 账本 **installed** 记录
+       （**含 disabled**，§4.9.1-2 字面为「无其他 plugin **声明依赖**」= 账本有记录）。故 A、B 均声明 X 时，
+       **二者都 disable 后 X 仍驻留**（各自的账本记录互相替对方挡住回收），须等 uninstall 才回收。这是保守侧
+       ——X 多活一会儿，但不泄漏（最后一个依赖者 uninstall 时回收）。守卫见
+       ``test_disable_both_dependents_keeps_dep_resident``。
+
 
     ⚠️ **scope 契约**：``scope`` 须与该 plugin 的**安装 scope 一致**（调用方 / #69 CLI 从上下文传）——否则把
     ``enabledPlugins[id]=false`` 写到错误层，更高优先级层意图未动 → 六层合并后可能仍 enabled、下次 reconcile 复活，
@@ -668,12 +705,20 @@ async def disable_plugin(
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
     _write_enabled_plugin(plugin_id, False, scope, project_path, env)
+    reclaim: list[str] = []
     if remove_server is not None:
-        for sname in sorted(_bundled_servers_of(home, plugin_id, env)):
-            await remove_server(sname)
+        # 账本单次读：自己的声明与「其他 plugin 的声明」取自**同一快照**，消 TOCTOU（与 uninstall/gc 对称）。
+        ledger_plugins = load_installed_plugins(home=home, env=env).get("plugins", {})
+        reclaim = reclaimable_mcp_deps(
+            sorted(ledger_mcp_deps_of(ledger_plugins.get(plugin_id, []))),
+            other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id),
+            user_declared=mcp_json_declared_bundle_ids(env=env),
+        )
+        for bundle_id in reclaim:
+            await remove_server(bundle_id)
     for name in _plugin_skill_names(registry, marketplace, plugin):
         registry.mark_orphan(name)
-    logger.info("disabled plugin %r (scope=%s, servers detached, skills orphaned)", plugin_id, scope)
+    logger.info("disabled plugin %r (scope=%s, MCP deps reclaimed=%s, skills orphaned)", plugin_id, scope, reclaim or "none")
 
 
 async def enable_plugin(
@@ -685,15 +730,21 @@ async def enable_plugin(
     project_path: str | None = None,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
-    existing_server_names: ExistingServerNames | None = None,
+    existing_bundle_ids: ExistingBundleIds | None = None,
     register_server: RegisterServer | None = None,
     remove_server: RemoveServer | None = None,
 ) -> None:
     """
     启用单个 plugin（**原子激活**：skills 与 bundled server 一并入投影，失败回滚 ``installed_disabled``）/ Enable。
 
+    **依赖已满足 ⇒ 复用既有实例**（协议 §2.5-1，#153/D3）：声明的 ``bundle_id`` 若已在运行期活跃集里，
+    **跳过 register**——既有实例（用户 mcp.json 声明的，或他 plugin 带入的）胜出，本 plugin 复用它而非覆盖。
+    与 :meth:`Computer.reconcile_governance` 的「existing wins → skip」同姿态。
+    完整来源优先序（``plugin < user < project < local < flag < policy``）属 #154 范围；此处「existing wins」
+    是其**可观测等价**（``origin=plugin`` 恒最低 ⇒ 任何既有声明都胜过 plugin 带入的）。
+
     v0.3.0 §2.4「enable 原子性」：顺序 ① 从物化记录的 ``installPath`` 重解析 bundled servers →
-    **★冲突预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →
+    **依赖预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →
     写 ``enabledPlugins[id]=true``；③ 复活 skills——re-stage（:func:`stage_marketplace_skills` 的
     :meth:`register_or_update` 把孤儿同名翻 ``orphaned=False``，``refresh=False`` 复用既有 clone）；
     ④ 重挂 servers。③/④ 任一失败 → **回滚**：注销本次新增 skill、摘除本次新增 server（经 ``remove_server``）、
@@ -704,21 +755,20 @@ async def enable_plugin(
     ``enabledPlugins[id]=true`` 写错层、与 live 态背离。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    _require_existing_names_guard(existing_server_names, register_server)
+    _require_existing_ids_guard(existing_bundle_ids, register_server)
     installed = load_installed_plugins(home=home, env=env)
     records = installed.get("plugins", {}).get(plugin_id)
     if not records:
         raise PluginInstallError(f"plugin {plugin_id!r} not installed; cannot enable (run 'plugin install' first)")
 
-    # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 冲突预检（零持久化变更前）
+    # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 依赖预检（零持久化变更前）
     servers: list[MCPServerConfig] = []
     for rec in records:
         install_path = rec.get("installPath")
         if isinstance(install_path, str) and install_path:
             servers.extend(load_bundled_servers(Path(install_path)))
-    owned = _bundled_servers_of(home, plugin_id, env)
-    existing = existing_server_names() if existing_server_names is not None else set()
-    _conflict_check(servers, existing, owned)
+    existing = existing_bundle_ids() if existing_bundle_ids is not None else set()
+    _log_satisfied_deps(servers, existing)
 
     # ② 快照回滚基线（该 scope 文件的原值：True/False/None=absent；本 plugin 已活跃 skill 集）→ 写 true
     settings_path, scope_enum = _settings_path_for_scope(scope, project_path, env)
@@ -742,24 +792,26 @@ async def enable_plugin(
             timeout=timeout,
             env=env,
         )
-        # ④ 重挂 servers
+        # ④ 挂载依赖：仅挂**尚未满足**者；已满足 → 复用既有实例，不覆盖（§2.5-1）
         if register_server is not None:
             for cfg in servers:
+                bundle_id = resolve_bundle_id(cfg)
+                if bundle_id in existing:
+                    continue
                 await register_server(cfg)
-                registered.append(cfg.name)
+                registered.append(bundle_id)  # 身份 = bundle_id：按 name 记会在「同名异 id」时回滚摘错对象
     except Exception:
         # 回滚（逆序，best-effort 不掩盖原异常）：撤销本次新增 skill / server，enabledPlugins 恢复原值。
+        # ``registered`` 只含本次真正挂上的（依赖已满足者已在 ④ skip），故此处无需再判「是否本来就在」。
         for name in _plugin_skill_names(registry, marketplace, plugin):
             if name not in skills_before:
                 registry.unregister(name)
         if remove_server is not None:
-            for sname in registered:
-                if sname in owned and sname in existing:
-                    continue  # 自有且 enable 前已挂：保留，不误摘
+            for bundle_id in registered:
                 try:
-                    await remove_server(sname)
+                    await remove_server(bundle_id)
                 except Exception as e:  # noqa: BLE001 - 回滚 best-effort
-                    logger.warning("enable rollback: remove_server(%r) failed: %s", sname, e)
+                    logger.warning("enable rollback: remove_server(%r) failed: %s", bundle_id, e)
         try:
             _write_enabled_plugin(plugin_id, prev_value, scope, project_path, env)
         except Exception as e:  # noqa: BLE001 - 回滚 best-effort
@@ -795,7 +847,12 @@ def migrate_legacy_installs(home: Path, *, env: Mapping[str, str] | None = None)
         if "installedPlugins" in existing:
             return []  # 已迁移（标记键在）→ 严格 no-op
 
-        ledger_pids = [pid for pid in load_installed_plugins(home=home, env=env).get("plugins", {}) if is_valid_enabled_plugin_key(pid)]
+        # ``drop_legacy=False`` 是**必须**的（#153）：v0.2.x 账本记录一律是旧格式（``bundledMcpServers``），
+        # 默认读法会把它们整条丢弃 ⇒ 带 MCP server 的 plugin 连 pid 一起消失 ⇒ 意图无从回填 ⇒ 升级后
+        # plugin 静默全丢。此处**只读 key**（pid），不碰旧格式的字段值，故安全；账本记录本身随后由
+        # recovery 从这里回填出的意图重建（协议 §4.9.1-4「丢弃 + 从 installedPlugins 意图重建」的前提）。
+        raw_ledger = load_installed_plugins(home=home, env=env, drop_legacy=False)
+        ledger_pids = [pid for pid in raw_ledger.get("plugins", {}) if is_valid_enabled_plugin_key(pid)]
         merged_enabled = resolve_settings(env=env).settings.get("enabledPlugins")
         merged_view: Mapping[str, Any] = merged_enabled if isinstance(merged_enabled, Mapping) else {}
 

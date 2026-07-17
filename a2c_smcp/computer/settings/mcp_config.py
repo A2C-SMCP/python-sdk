@@ -73,6 +73,7 @@ from a2c_smcp.computer.settings.scope import (
     workdir_settings_dir,
 )
 from a2c_smcp.computer.settings.store import atomic_write_json, file_lock
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -331,6 +332,30 @@ def resolve_mcp_config(
             inputs.append(resolved_input)
 
     return ResolvedMcpConfig(servers=servers, inputs=inputs, errors=errors)
+
+
+def mcp_json_declared_bundle_ids(*, env: Mapping[str, str] | None = None) -> set[str]:
+    """
+    **mcp.json 声明面**（各 scope）全部 server 的 bundle_id 集 / bundle_ids declared in mcp.json。
+
+    这是回收判据「X 非用户声明」的**其中一个**来源，**不是全部**——完整判定集见
+    :func:`~a2c_smcp.computer.settings.reconciler.user_owned_bundle_ids`（协议 §4.9.1-2 的数据源是
+    **运行期权威配置集** + ``origin != plugin``，而 mcp.json 只覆盖其中「落了声明」的那部分）。
+
+    **⚠️ 勿单独用它当「用户声明」判据**（#153 隔离审查 🔴）：「出现在 mcp.json ⇒ 用户声明」成立，但
+    **反向不成立**——用户经 ``a2c-computer run --config @file`` 预加载、或 SDK 内嵌
+    ``Computer(mcp_servers={...})`` 构造的 server 均走 transient ``amount_server`` 挂载，**进运行期活跃集
+    但不进 mcp.json**（``cli/main.py`` `_add_server` / ``computer.py`` boot_up）。只读本视图会把它们误判为
+    「非用户声明」而在 plugin 卸载时**连坐停摘**，正是 §4.9.1-2 与 Epic #147 北极星要根治的 P0。
+    根治需运行期 origin（#134 轴）或 ``--config`` 归一进 mcp.json flag 层（#154）——**方案求裁于
+    protocol Discussion #32**（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）；在此之前本函数是回收判据「非用户声明」项的**唯一**数据源，
+    该缺口由 ``test_runtime_only_user_server_is_never_collateral``（xfail）钉住。
+
+    ``origin`` 无需过滤：本视图的 origin 恒为 ``user/project/local/flag/policy``（plugin 声明依赖的 server
+    从不回写 mcp.json），故 ``origin != plugin`` 在此恒真。同款推理见 :func:`mcp_server_status` 的 #148 注释。
+    """
+    snapshot = resolve_mcp_config(env=env)
+    return {resolve_bundle_id(srv.config) for srv in snapshot.servers.values()}
 
 
 # ---------------------------------------------------------------------------

@@ -1606,7 +1606,7 @@ class Computer(BaseComputer[PromptSession]):
     async def reconcile_governance(
         self,
         *,
-        existing_server_names: Callable[[], set[str]] | None = None,
+        existing_bundle_ids: Callable[[], set[str]] | None = None,
         register_server: RegisterBundledServer | None = None,
         inject_inputs: Callable[[BundledServerRecord], Awaitable[None]] | None = None,
         declared: Mapping[str, Any] | None = None,
@@ -1620,16 +1620,19 @@ class Computer(BaseComputer[PromptSession]):
         阶段二（仅当给 ``register_server``）：client 显式重挂 bundled MCP server——逐 plugin 根先
         ``inject_inputs(record)``（携归属上下文做 plugin inputs 前缀化注入，bundled server 的
         ``${input:}`` D2 渲染前置；每 plugin 根仅一次），再逐 server 经 ``register_server(config, record)``
-        携归属上下文注册；与既有 server 同名 → **skip + WARN 不覆盖**（additive-only，用户配置胜）；
-        单 server 失败 → WARN 不阻断其余。
+        携归属上下文注册；**同 ``bundle_id`` 已存在 = 依赖已满足 → skip 不覆盖**（协议 §2.5-1「复用既有实例」，
+        additive-only，用户配置胜）；单 server 失败 → WARN 不阻断其余。
 
         boot 默认（``boot_up`` 内无 hooks 调用）= skills-only：bundled MCP server 不在 boot 拉进程
         （#93 client owns MCP config），仅经 :func:`collect_enabled_bundled_servers` 可查询；重挂永远是
         client 的显式意志（CLI 为参考 client 实现，外部 GUI/client 调用同一入口）。
 
-        :param existing_server_names: 现存 server 名集合工厂（冲突判定）。⚠️ ``None`` = **不判冲突**，
-            同名 bundled server 会经 ``register_server`` 覆盖既有配置——client 重挂时**应当传入**
-            （如 CLI 取 ``comp.mcp_servers`` 名集），仅在明确无冲突面的受控场景省略。
+        :param existing_bundle_ids: 现存 server 的 **bundle_id** 集工厂（依赖已满足判定）。数据源 MUST 是
+            **运行期权威配置集**（``{resolve_bundle_id(cfg) for cfg in comp.mcp_manager.server_configs()}``，
+            如 :func:`~a2c_smcp.computer.cli.commands.build_mcp_callbacks`），**MUST NOT** 读构造期快照
+            ``Computer.mcp_servers``——它在 CLI 下恒空（协议 §2.5-4），会把「依赖已满足」误判为「未满足」。
+            ⚠️ ``None`` = **不判**，同 bundle_id 的 server 会经 ``register_server`` 覆盖既有配置——client
+            重挂时**应当传入**，仅在明确无既有面的受控场景省略。
         :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
         :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
         :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；
@@ -1647,14 +1650,17 @@ class Computer(BaseComputer[PromptSession]):
         if register_server is None:
             return report
 
-        existing = set(existing_server_names()) if existing_server_names is not None else set()
+        existing = set(existing_bundle_ids()) if existing_bundle_ids is not None else set()
         injected_roots: set[Path] = set()
         for record in collect_enabled_bundled_servers(home, declared):
-            name = record.config.name
-            if name in existing:
-                logger.warning(
-                    "governance recovery: bundled server %r (plugin %s) conflicts with an existing server, skipped (existing wins)",
-                    name,
+            # 身份 = bundle_id：按 display name 判会误伤「同名异 id」——协议 §5.6 明定其为**合法共存**，
+            # MUST NOT 视为冲突；同 bundle_id 才是「依赖已满足」（§2.5-1），此时复用既有实例、不覆盖。
+            bundle_id = resolve_bundle_id(record.config)
+            if bundle_id in existing:
+                logger.info(
+                    "governance recovery: dependency satisfied for bundle_id %r (plugin %s); reusing the existing "
+                    "server instead of remounting (existing wins)",
+                    bundle_id,
                     record.plugin_id,
                 )
                 continue
@@ -1664,10 +1670,15 @@ class Computer(BaseComputer[PromptSession]):
                     injected_roots.add(record.install_path)
                 await register_server(record.config, record)
             except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
-                logger.warning("governance recovery: failed to remount bundled server %r (plugin %s): %s", name, record.plugin_id, e)
+                logger.warning(
+                    "governance recovery: failed to remount bundled server %r (plugin %s): %s",
+                    bundle_id,
+                    record.plugin_id,
+                    e,
+                )
                 continue
-            existing.add(name)
-            report.remounted_servers.append(name)
+            existing.add(bundle_id)
+            report.remounted_servers.append(bundle_id)
         return report
 
     def list_mcp_servers_with_metadata(self) -> list[McpServerWithMetadata]:
@@ -1693,11 +1704,15 @@ class Computer(BaseComputer[PromptSession]):
         结果按 server 名排序（保证稳定可测输出）。**不**含运行期「进程是否已启动」状态——那由
         ``MCPServerManager.get_server_status`` 单独提供。
 
-        归属 join key = server 名（限制与非目标，rust #97 同文档化）：同名冲突会退化——用户配置一个与某启用
-        plugin bundled server **同名**的 server 会被标 ``plugin``（只读）；两个 plugin 的同名 bundled server 经
-        首见去重、后者身份不出现。这符合协议「name = 能力身份」语义，且**可靠的冲突拦截是安装期职责**（install
-        hook ``existing_server_names`` 冲突门），非本只读投影的职责。调用方若需强冲突保证，应经带 hooks 的安装
-        路径拦截，而非依赖本查询。
+        ⚠️ **归属 join key 仍是 server 名**（已知缺陷，迁 ``bundle_id`` 挂 #144；rust #97 同）：同名会退化——
+        用户配置一个与某启用 plugin 声明依赖的 server **同名但异 bundle_id** 的 server 会被误标 ``plugin``
+        （只读），而协议 §5.6 明定二者是**合法共存的不同身份**。
+
+        .. note::
+           此处原注称「name = 能力身份」且「可靠的冲突拦截是安装期职责（install hook 冲突门）」——**两句均已
+           作废**（#153/D3）：协议裁定身份是 ``bundle_id``、plugin 与 server 是**依赖关系**，安装期不再拦截
+           冲突（同 bundle_id 已有 = 依赖已满足 → 提示并复用）。故本投影的同名退化**不再有安装期兜底**，
+           修复须落在 join key 本身（#144）。
         """
         home = self.skill_home
         # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图）。

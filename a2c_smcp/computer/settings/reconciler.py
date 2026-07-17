@@ -40,10 +40,11 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1（
 from __future__ import annotations
 
 import shutil
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
 from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_valid_marketplace_name
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
@@ -417,6 +418,87 @@ def ledger_entry_fully_materialized(records: object) -> bool:
     return all(ledger_record_materialized(rec) for rec in records)
 
 
+# ---------------------------------------------------------------------------
+# 账本 MCP 依赖 + 回收判据（协议 runtime-contract §4.9.1，#153/D3+F1）/ Ledger MCP deps & reclaim criterion
+# ---------------------------------------------------------------------------
+def ledger_mcp_deps_of(records: object) -> set[str]:
+    """
+    某 pid 全部账本记录声明依赖的 MCP Server bundle_id 并集（§4.9.1-1）/ Declared MCP deps (bundle_ids) of a pid。
+
+    值域是 **bundle_id**（身份），非 display name——账本 MUST NOT 记 name（§4.9.1-1）。跨 scope 记录取并集。
+    """
+    out: set[str] = set()
+    if not isinstance(records, list):
+        return out
+    for rec in records:
+        if not isinstance(rec, Mapping):
+            continue
+        deps = rec.get("mcpServers")
+        if isinstance(deps, list):
+            out.update(d for d in deps if isinstance(d, str))
+    return out
+
+
+def other_plugin_mcp_deps(
+    plugins: Mapping[str, object],
+    *,
+    exclude_pid: str,
+    retained_records: Sequence[object] = (),
+) -> set[str]:
+    """
+    **本次操作后**仍有 plugin 声明依赖的 bundle_id 并集（回收判据第一项的数据源，#153）/ Deps still declared by others。
+
+    :param plugins: 账本 ``plugins`` 映射（**移除本次记录之前**的视图——§4.9.1-3 要求停摘名单在账本移除前取得）。
+    :param exclude_pid: 正在 disable/uninstall/gc 的 plugin id（其记录不算「其他 plugin」）。
+    :param retained_records: ``exclude_pid`` 本次**未被移除**的记录（scoped uninstall 时的其余 scope）——它们
+        仍声明依赖，故仍算依赖者。整 pid 移除（disable / 全 scope uninstall / gc）时传空。
+
+    「其他 plugin」= 账本中的 **installed** 记录（**含 disabled**），不按 enabled 过滤：协议 §4.9.1-2 字面为
+    「无其他 plugin **声明依赖** X」（声明 = 账本有记录），``conformance-tests.md`` §285「**最后一个依赖者卸载**
+    时回收」亦印证判据看记录存在性而非启用态。后果是 installed-but-disabled 的依赖者会令 X 保留（保守），但其
+    卸载时仍回收 ⇒ **不泄漏**。与 rust-sdk#139 同字面。
+    """
+    out: set[str] = set()
+    for pid, records in plugins.items():
+        if pid == exclude_pid:
+            continue
+        out |= ledger_mcp_deps_of(records)
+    out |= ledger_mcp_deps_of(list(retained_records))
+    return out
+
+
+def reclaimable_mcp_deps(
+    deps: Iterable[str],
+    *,
+    other_deps: set[str],
+    user_declared: set[str],
+) -> list[str]:
+    """
+    §4.9.1-2 **回收判据**（纯函数、零落盘状态、零 IO）/ The reclaim criterion。
+
+    **回收 X ⟺ 无其他 plugin 声明依赖 X ∧ X 非用户声明**。disable / uninstall / gc **三个消费者全部委托本函数**，
+    MUST NOT 各写副本（判据分叉 = 用户 server 被连坐或 server 泄漏；#142 `is_valid_bundle_id` 同款教训）。
+
+    D5 措辞已由「只收回**自己带入**的」正式重写为「只收回**无人再依赖 ∧ 非用户声明**的」：前者把**时点快照**
+    （安装时谁带入）写进了**长期判据**，正是传递性泄漏之源——A 引入 X、B 装时已在、卸 A 后 A 的记录连同
+    「X 由 A 引入」这一事实一并消失 ⇒ 卸 B 时无人认领 X ⇒ **永久泄漏**。故账本 MUST NOT 存 provenance
+    （§4.9.1-1），判据只用**现时**事实。
+
+    :param deps: 本次 disable/uninstall 的 plugin 所声明的依赖（``ledger_mcp_deps_of`` 产出）。
+    :param other_deps: :func:`other_plugin_mcp_deps` 产出。
+    :param user_declared: :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids` 产出。
+        ⚠️ **已知未覆盖面**（#153 隔离审查 🔴，方案待三仓 Discussion 定案）：协议把本项的数据源写作「**运行期
+        权威配置集**中 ``origin != plugin`` 的条目」，而本 SDK 的 manager **不存 origin**——用户经
+        ``--config @file`` / SDK 内嵌 ``Computer(mcp_servers={...})`` 挂载的 server 走 transient
+        ``amount_server``、**不落 mcp.json**，与「plugin 自己挂的 server」在可观测信息上**完全同形**。
+        故若该 server 同时被某 plugin 声明依赖，卸载该 plugin 时仍会回收它。详见
+        :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids`；
+        方案求裁于 protocol Discussion #32（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。
+    :return: 可回收的 bundle_id（保 ``deps`` 迭代序）。
+    """
+    return [d for d in deps if d not in other_deps and d not in user_declared]
+
+
 # 悬挂意图 reason 分档（#125 任务 2；wire 值入 CLI JSON 输出，rust 镜像同字面）/ dangling reason tiers.
 DANGLING_MARKETPLACE_NOT_ADDED = "marketplace-not-added"
 DANGLING_CATALOG_MISSING = "catalog-missing"
@@ -481,13 +563,17 @@ async def gc_plugins(
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> list[str]:
     """
-    清理孤儿 plugin（installPath 树 + installed_plugins.json 条目 + Registry SKILL + bundled MCP）/ GC plugins。
+    清理孤儿 plugin（installPath 树 + installed_plugins.json 条目 + Registry SKILL + MCP 依赖回收）/ GC plugins。
 
     y/N 确认交 CLI 层（#68）；``plugin_ids`` 应为 :func:`list_orphan_plugins` 的子集（用户确认后传入）。
-    每条记录的 ``installPath`` 仅在词法位于 SKILL Home 内才删（:func:`_safe_rmtree`）；``bundledMcpServers``
-    汇总后经 ``mcp_teardown`` 回调停/摘（真正接线由 computer.py 集成承担，#62 只触发回调）。
+    每条记录的 ``installPath`` 仅在词法位于 SKILL Home 内才删（:func:`_safe_rmtree`）；其声明依赖的 MCP Server
+    经 **§4.9.1-2 回收判据**（:func:`reclaimable_mcp_deps`）过滤后才交 ``mcp_teardown`` 停/摘——gc 是 uninstall
+    的批量形态，同样 **MUST NOT 连坐用户自有 server**（#153）。
 
-    :param mcp_teardown: 可选异步回调，入参为本次清理涉及的全部 bundled MCP server name；``None`` = 不处理。
+    逐 pid 处理且账本随之逐个删除 ⇒ 同批两 plugin 共享同一依赖时，先处理者因后者仍在账本而保留、后处理者
+    （前者已删）回收 —— 自动满足「最后一个依赖者回收」。
+
+    :param mcp_teardown: 可选异步回调，入参为本次**判定可回收**的 MCP Server **bundle_id** 列表；``None`` = 不处理。
     :return: 实际清理的 plugin id 列表。
     """
     installed = load_installed_plugins(home=home, env=env)
@@ -497,26 +583,32 @@ async def gc_plugins(
         records = plugins.get(pid)
         if records is None:
             continue
-        bundled: list[str] = []
+        # 停摘候选（账本字段自足，§4.9.1-3）须在删树/删账本前取得。
+        deps = ledger_mcp_deps_of(records)
+        reclaim = reclaimable_mcp_deps(
+            sorted(deps),
+            other_deps=other_plugin_mcp_deps(plugins, exclude_pid=pid),
+            user_declared=mcp_json_declared_bundle_ids(env=env),
+        )
         for rec in records:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
                 _safe_rmtree(Path(install_path), home)
-            servers = rec.get("bundledMcpServers")
-            if isinstance(servers, list):
-                bundled.extend(s for s in servers if isinstance(s, str))
 
         plugin, _, marketplace = pid.partition("@")
         if marketplace:
             _unregister_marketplace_skills(registry, marketplace, plugin=plugin)
 
-        if mcp_teardown is not None and bundled:
-            await mcp_teardown(bundled)
+        if mcp_teardown is not None and reclaim:
+            await mcp_teardown(reclaim)
 
         def _drop(data: InstalledPluginsFile, _p: str = pid) -> None:
             data.get("plugins", {}).pop(_p, None)
 
         update_installed_plugins(_drop, home=home, env=env)
+        # 内存视图与磁盘同步：否则后续 pid 的 other_plugin_mcp_deps 会把**已 gc 的 pid** 误算作依赖者，
+        # 令同批共享的依赖永不回收（泄漏）。
+        plugins.pop(pid, None)
         removed.append(pid)
-        logger.info("gc: removed orphan plugin %r (bundled MCP: %s)", pid, bundled or "none")
+        logger.info("gc: removed orphan plugin %r (MCP deps reclaimed: %s)", pid, reclaim or "none")
     return removed

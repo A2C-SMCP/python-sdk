@@ -125,9 +125,9 @@ async def test_install_end_to_end(tmp_path: Path) -> None:
     async def _register(cfg) -> None:
         captured.append(cfg.name)
 
-    record = await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
+    record = await install_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set())
 
-    assert record["bundledMcpServers"] == ["figma"]
+    assert record["mcpServers"] == ["figma"]
     assert record["version"] == "1.2.0"
     assert reg.resolve("audit:lint") is None  # install ≠ activate：skill 不注册
     assert "audit@acme-skills" in load_installed_plugins(home=home)["plugins"]
@@ -136,7 +136,7 @@ async def test_install_end_to_end(tmp_path: Path) -> None:
     assert "enabledPlugins" not in settings
 
     # enable：真 staging 注册 skill + 重挂 server（原子点亮）
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
     assert reg.resolve("audit:lint") is not None
     assert captured == ["figma"]
 
@@ -156,8 +156,8 @@ async def test_uninstall_end_to_end(tmp_path: Path) -> None:
     async def _remove(name: str) -> None:
         removed.append(name)
 
-    await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    await install_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set())
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
     install_path = Path(load_installed_plugins(home=home)["plugins"]["audit@acme-skills"][0]["installPath"])
     assert install_path.exists() and reg.resolve("audit:lint") is not None
 
@@ -189,8 +189,8 @@ async def test_install_enable_disable_enable_no_reclone(tmp_path: Path) -> None:
     async def _remove(name: str) -> None:
         removed.append(name)
 
-    await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    await install_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set())
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
     assert reg.resolve("audit:lint") is not None
     captured.clear()
     # 哨兵：植入 catalog clone 内 plugin 根，用于检测 enable 是否误重 clone（重 clone 会 wipe）。
@@ -202,7 +202,7 @@ async def test_install_enable_disable_enable_no_reclone(tmp_path: Path) -> None:
     assert reg.is_orphan("audit:lint") and removed == ["figma"]
 
     # enable：复活 skill + 重挂 server，且不重 clone
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set(), register_server=_register)
+    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
 
     assert sentinel.exists()  # 未重 clone（哨兵保留 → 复用既有 clone 树）
     assert reg.resolve("audit:lint") is not None  # 孤儿复活
@@ -243,7 +243,7 @@ async def test_install_strict_false_conflict_hard_fails_atomically(tmp_path: Pat
 
     # 早检拦截 → PluginInstallError（硬错误，conflicting manifests）
     with pytest.raises(PluginInstallError, match="conflicting manifests"):
-        await install_plugin("audit@acme-skills", reg, home, env=env, existing_server_names=lambda: set())
+        await install_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set())
 
     # 原子失败：未挂 server、未注册 skill、未写 installed 记录、意图回滚
     assert captured == []
