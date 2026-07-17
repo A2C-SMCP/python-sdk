@@ -898,9 +898,9 @@ class Computer(BaseComputer[PromptSession]):
         """**运行期挂载**一个 MCP server（渲染校验 → 物化，**不落盘**）/ Transient mount (no disk write)。
 
         对齐 rust ``mount_server``。语义 = 本 SDK 历史 ``aadd_or_aupdate_server`` 的**原状**（现已 flip 为 durable，
-        故抽此新名承接纯运行期投影）。用于「把别处已是真相的东西投影进 runtime」：boot 读已声明 mcp.json 挂载、
-        ``--config @file`` 加载、plugin/治理 bundled 重挂——这些**不应回写** mcp.json（否则双源 / 每 boot 重写 /
-        scope 漂移，见 #138）。只 bump **capability**（manager 物化自动上报），不碰持久 config。
+        故抽此新名承接纯运行期投影）。用于「把别处已是真相的东西投影进 runtime」：boot 读已声明 mcp.json 各 scope
+        （含 ``--mcp-config`` flag 层）挂载、plugin/治理 bundled 重挂——这些**不应回写** mcp.json（否则双源 /
+        每 boot 重写 / scope 漂移，见 #138）。只 bump **capability**（manager 物化自动上报），不碰持久 config。
 
         Args:
             server: 待挂载配置，可为模型或原始字典。

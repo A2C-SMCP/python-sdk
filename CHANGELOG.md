@@ -44,9 +44,15 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - **New `embed` scope** — the embedding host's `Computer(mcp_servers=...)` constructor
     argument, a code-level explicit intent ranked between `local` and `flag`, and a trusted
     origin (no approval prompt). It still enters the gate iteration, so `policy` deny-lists and
-    the generic disable switch apply to it. **Known gap** (tracked separately): a pure embedded
-    host (`Computer(...)` + `boot_up`, no REPL) has no approval gate at all, so `policy`
-    deny-lists do not reach it.
+    the generic disable switch apply to it. **Known gaps** (tracked separately, both stem from
+    §5 item 10 putting plugin declarations outside the gate):
+    - a pure embedded host (`Computer(...)` + `boot_up`, no REPL) has no approval gate at all,
+      so `policy` deny-lists do not reach it;
+    - unmounting a policy-denied `embed` server frees its `bundle_id`, after which the governance
+      remount may mount a *plugin*-declared server with the same `bundle_id` — the deny-list is
+      still circumvented, just by a different config. (Before this change the denied embed server
+      simply kept running, so neither state is good; the gate cannot reach plugin declarations by
+      protocol design.)
   - **Reclaim criterion re-anchored** (closes a #153 gap): "X is not user-declared" is now
     evaluated on the **origin-carrying** declaration set, which covers *every* non-plugin mount
     path (durable scopes + `flag` + `embed`). Servers mounted via `--mcp-config` or via the host

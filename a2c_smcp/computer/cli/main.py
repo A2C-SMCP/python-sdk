@@ -77,9 +77,15 @@ class _RootState:
     恒返回 ``{}``。统一收口到 ``ctx.obj``。#116：project/local scope 锚定进程 cwd，
     不再有 ``--add-dir`` / workdir 状态。
     Root-level context gathered by the callback and read by `settings` subcommands via inherited ``ctx.obj``.
+
+    **#154（隔离审查 🔴2）**：flag scope 的**文件对**（``--settings`` + ``--mcp-config``）在根回调与 ``run``
+    上各声明一份，但根那份此前**只在无子命令时**被消费 ⇒ ``a2c-computer --mcp-config x.json run``（flag 置于
+    子命令之前）会把文件**静默丢弃**（连 fail-fast 都碰不到，用户落进空 REPL）。二者现统一收口到本状态，
+    由 ``run`` 兜底回读（``run`` 自身的显式值优先）。
     """
 
-    flag_path: Path | None = None
+    flag_path: Path | None = None  # --settings <file>（flag 层 settings.json）
+    mcp_config: str | None = None  # --mcp-config <file>（flag 层 mcp.json；未剥 `@`、未校验）
 
 
 def _root_state(ctx: typer.Context) -> _RootState:
@@ -202,6 +208,7 @@ def _root(
     # Click 子上下文默认继承父 ctx.obj，故无论是否带子命令都先填充（无子命令时 run 路径仍走显式参数）。
     ctx.obj = _RootState(
         flag_path=Path(settings_file) if isinstance(settings_file, str) else None,
+        mcp_config=mcp_config if isinstance(mcp_config, str) else None,
     )
 
     if ctx.invoked_subcommand is None:
@@ -337,6 +344,7 @@ def _run_impl(
 
 @app.command()
 def run(
+    ctx: typer.Context,
     auto_connect: bool = typer.Option(True, help="是否自动连接 / Auto connect"),
     auto_reconnect: bool = typer.Option(True, help="是否自动重连 / Auto reconnect"),
     url: str | None = typer.Option(None, help="Socket.IO 服务器URL，例如 https://host:port"),
@@ -366,6 +374,11 @@ def run(
     中文: 启动计算机并进入持续运行模式。servers 与 inputs 经 mcp.json 各 scope（含 ``--mcp-config`` flag 层）声明。
     English: Boot the computer and enter the persistent loop. Servers/inputs come from mcp.json scopes.
     """
+    # flag 文件对兜底回读根级（隔离审查 🔴2）：``a2c-computer --mcp-config x.json run`` 里 flag 被 Click 归给
+    # 根回调，``run`` 自身收到 None ⇒ 不回读就**静默丢弃**（连 fail-fast 都碰不到）。``run`` 自身显式值优先。
+    st = _root_state(ctx)
+    mcp_config = mcp_config if isinstance(mcp_config, str) else st.mcp_config
+    settings_file = settings_file if isinstance(settings_file, str) else (str(st.flag_path) if st.flag_path else None)
     _run_impl(
         auto_connect=auto_connect,
         auto_reconnect=auto_reconnect,

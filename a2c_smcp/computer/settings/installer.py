@@ -745,8 +745,14 @@ async def enable_plugin(
     **依赖已满足 ⇒ 复用既有实例**（协议 §2.5-1，#153/D3）：声明的 ``bundle_id`` 若已在运行期活跃集里，
     **跳过 register**——既有实例（用户 mcp.json 声明的，或他 plugin 带入的）胜出，本 plugin 复用它而非覆盖。
     与 :meth:`Computer.reconcile_governance` 的「existing wins → skip」同姿态。
-    完整来源优先序（``plugin < user < project < local < flag < policy``）属 #154 范围；此处「existing wins」
-    是其**可观测等价**（``origin=plugin`` 恒最低 ⇒ 任何既有声明都胜过 plugin 带入的）。
+    完整来源优先序见 :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`（**唯一权威**，勿在此复述字面量
+    ——两处手写序漂移正是 #154 的根因）。此处「existing wins」是「``origin=plugin`` 恒最低」的**可观测等价**：
+    plugin 声明**不进任一 resolve**（结构性缺席，见 ``SCOPE_ORDER`` 的说明），其「输给用户侧」由本处 +
+    :meth:`Computer.reconcile_governance` 的 skip 保证。
+    ⚠️ **等价的边界**：保证的是「plugin 输给任何**已挂载**的 server」，而非「输给任何**声明**」——若某用户声明
+    被审批门拦下（DISABLED / PENDING 未批）而未挂，其 bundle_id 空出，plugin 那份仍会挂上。这与 rust
+    ``collect_enabled_bundled_servers``（plugin 集内 first-wins、不与用户声明比对）**同姿态**，parity 保持；
+    且协议 §5 item 10 明定 plugin 声明 MUST NOT 进审批门，故门控结果本就不该反向决定 plugin 基线。
 
     v0.3.0 §2.4「enable 原子性」：顺序 ① 从物化记录的 ``installPath`` 重解析 bundled servers →
     **依赖预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →

@@ -81,6 +81,7 @@ from a2c_smcp.computer.settings.reconciler import (
     list_dangling_plugin_intents,
     list_orphan_plugins,
 )
+from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -636,10 +637,21 @@ async def run_mcp_approval(
     async def _ensure_mounted(name: str) -> None:
         try:
             srv = resolved.servers[name]
-            # embed 层在 boot_up 已挂 ⇒ 重复 amount_server 会 restart 客户端（auto_reconnect=False 时抛
-            # RuntimeError）。文件来源此刻恒未活跃，故此分支对其不改变行为。
-            if resolve_bundle_id(srv.config) in _active_bundle_ids():
-                console.print(f"[dim]· MCP server {name!r} already active (embed/构造入参), left as is[/dim]")
+            # **只在「已挂的那份就是胜出者」时跳过**（隔离审查 🔴1）。``boot_up`` **只**预挂 embed 层
+            # （``_mcp_servers``），故该条件精确等价于「胜出者的 origin 是 embed」：
+            #   - 胜出者 = embed ∧ 已活跃 ⇒ boot_up 挂的正是它 ⇒ 无事可做（重挂只会 restart 客户端，
+            #     ``auto_reconnect=False`` 时更抛 RuntimeError）；
+            #   - 胜出者 = flag/policy/local/user ⇒ **必须挂**，否则 resolved 里那份更高层的胜出配置永不
+            #     生效 ⇒ 运行期层序相对 resolve 层被反转（``local < embed < flag < policy`` 名存实亡）。
+            # 文件来源此刻恒未活跃 ⇒ 走 mount 分支，行为不变。
+            #
+            # ⚠️ **勿改成比较 config**（两种都试过、都错）：``mcp_manager.server_configs()`` 存**渲染后**配置、
+            # 而声明面恒为 **raw**（D1）⇒ 任何带 ``${input:}`` 的 config 恒不相等 ⇒ 每 boot 重挂（restart /
+            # RuntimeError）；改用 raw-对-raw 又受 embed 层 ``model_dump`` 往返规整影响，同样脆。
+            # origin 判据直接表达意图，不受二者影响。守卫见
+            # ``test_higher_layer_beats_embed_at_mount_time`` + ``test_embed_with_placeholder_is_not_remounted...``。
+            if srv.origin is SettingsScope.EMBED and resolve_bundle_id(srv.config) in _active_bundle_ids():
+                console.print(f"[dim]· MCP server {name!r} already mounted from the embed layer (winner), left as is[/dim]")
                 return
             # #137 ③：boot 读**已声明** mcp.json 挂载 = 投影（盘上已是真相），走 transient amount_server，不回写
             # （否则每 boot 重复回写用户声明层 / scope 漂移，见 #138）。

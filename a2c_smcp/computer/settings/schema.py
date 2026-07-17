@@ -78,9 +78,21 @@ class SettingsScope(StrEnum):
 # transient ``amount_server`` 从 plugin manifest 挂载；plugin-lowest 由 boot 序保证（``run_mcp_approval``
 # 先于 ``run_governance_remount``，后者跳过 ``bundle_id`` 已活跃者，见 ``installer.py`` 的「existing wins」）。
 # 无任一消费者需要 plugin 层：审批门 MUST 滤掉它（F8）、回收判据要 ``origin != plugin``、``upsert_mcp_server``
-# 只认可写 scope ⇒「合并进来再处处滤掉」与「从不合并」**可证等价**。加一个无生产者的 ``PLUGIN`` 成员会让
-# 「迭代层过滤」沦为永假守卫（死代码），且正是 #148 那个 P0「进门后豁免」档位复活的诱因。F8 的可验收信号
-# 取**缺席**（「成员不存在」比「文档说别用」可靠）。
+# 只认可写 scope ⇒ 对上述三个消费者而言，「合并进来再处处滤掉」与「从不合并」**输出同集**。加一个无生产者的
+# ``PLUGIN`` 成员会让「迭代层过滤」沦为永假守卫（死代码），且正是 #148 那个 P0「进门后豁免」档位复活的诱因。
+# F8 的可验收信号取**缺席**（「成员不存在」比「文档说别用」可靠）。
+#
+# ⚠️ **等价的边界**（隔离审查订正，勿把「等价」读成无限定）：现设计保证「plugin 输给任何**已挂载**的 server」，
+# **非**「输给任何**声明**」——若某用户声明被审批门拦下（DISABLED / PENDING 未批 / 挂载抛异常）而未挂，其
+# bundle_id 空出，governance remount 会挂上 plugin 那份；真有 PLUGIN 层时用户声明会在 merge 层遮蔽它、
+# 什么都不挂。二者行为不同。但协议 §5 item 10 明定 plugin 声明 MUST NOT 进审批门（门控结果本就不该反向决定
+# plugin 基线），且 rust ``collect_enabled_bundled_servers`` 同为「plugin 集内 first-wins、不与用户声明比对」
+# ⇒ **parity 保持**，结论仍成立。
+#
+# ⚠️ 与 rust-sdk#137（显式 ``ProvenanceScope::Plugin`` 变体 + 迭代层过滤）**代码形态分叉、行为等价**：
+# rust 无本 SDK 这套 approval→remount boot 序。协议 §2.5-5 明许「scope 纯推导与挂载时标记**行为等价即合规**」。
+# **须盯的唯一差异**：rust 的权威集**能观测到** ``origin==plugin`` 条目、python 的不能——若将来 conformance
+# 出现「权威集须含 origin==plugin 条目」这类向量，python 会失败（双端跟踪 Issue 已记）。
 #
 # ⚠️ 与 rust-sdk#137（显式 ``ProvenanceScope::Plugin`` 变体 + 迭代层过滤）**代码形态分叉、行为等价**：
 # rust 无本 SDK 这套 approval→remount boot 序，其 ``collect_enabled_bundled_servers`` 是 plugin 集内

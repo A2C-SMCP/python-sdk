@@ -37,9 +37,10 @@ from typing import Any
 import pytest
 from pydantic import TypeAdapter
 
+from a2c_smcp.computer.cli.commands import build_mcp_callbacks
 from a2c_smcp.computer.cli.commands.plugin import run_mcp_approval
 from a2c_smcp.computer.computer import Computer
-from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
+from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.mcp_config import MANAGED_MCP_FILENAME
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
@@ -58,10 +59,21 @@ def _no_policy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
-    monkeypatch.chdir(tmp_path)  # #137：durable 落 cwd/.tfrobot/ ⇒ 不 chdir 即写进真实仓库
-    env = {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+    """
+    隔离**三条**落盘面 / Isolate all three on-disk surfaces。
+
+    - ``chdir``：#137 flip 后 durable 落 ``cwd/.tfrobot/`` ⇒ 不 chdir 即写进真实仓库；
+    - ``XDG_CONFIG_HOME``：user scope 的 ``mcp.json`` / ``settings.json``；
+    - ``XDG_STATE_HOME``：**明文 input value store**（``<state>/a2c/input-values.json``，
+      :func:`~a2c_smcp.computer.inputs.value_store.resolve_value_store_path`）——**极易漏**：它走
+      ``XDG_STATE_HOME``（非 CONFIG_HOME），不隔离则 ``${input:}`` 解析会读到**开发机真实存量值**、并把本次
+      解析结果**写进开发机**。实测本仓真实 state 里已积下 ``VAR1: "exit"`` / ``CHOICE: "x"`` 等历史测试残留
+      ⇒ 带 ``${input:}`` 的用例结果取决于**跑过什么**，非确定性。追踪 Issue 见 #168。
+    """
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    return env
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    return {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "state")}
 
 
 def _server_body(command_placeholder: str) -> dict[str, Any]:
@@ -251,6 +263,130 @@ async def test_flag_beats_local_on_real_construction_path(tmp_path: Path, monkey
         assert comp.mcp_manager is not None
         active = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
         assert active[SRV_BID].server_parameters.args == ["flag.py"], "flag 未覆盖 local（改前 local 胜）"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["flag", "policy"], ids=["flag_beats_embed", "policy_beats_embed"])
+async def test_higher_layer_beats_embed_at_mount_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winner: str,
+) -> None:
+    """
+    **层序在挂载层也 MUST 成立**：同 bundle_id 上 flag / policy 的胜出配置必须真的**跑起来**，不能被
+    「embed 已挂 ⇒ 跳过」静默丢弃（§2.5-3 `local < embed < flag < policy`）。
+
+    隔离审查 🔴1：``_ensure_mounted`` 若只比 bundle_id 是否活跃就 skip，则 ``resolved.servers[name]`` 里那份
+    更高层的胜出配置**永不生效** ⇒ 运行期层序相对 resolve 层被反转。
+
+    **为何 skip 过宽**：``manager._add_or_update_server_config`` 对**未激活**客户端是安全的原地更新
+    （``manager.py:164-169``）；即便客户端已激活，用更高层配置 restart **正是**「优先级」的定义。
+
+    **为何此前没被抓到**：`test_flag_beats_local_on_real_construction_path` 挑的是 ``local``（永不预挂），
+    而唯一会被 ``boot_up`` 预挂的 ``embed`` 恰恰没有对应用例；纯函数用例
+    `test_resolve_embed_beats_local_but_loses_to_flag` 给出了「端到端也成立」的错觉。
+
+    **可达性**：CLI 下 ``mcp_servers=set()`` 不可达；纯嵌入式宿主不调 ``run_mcp_approval`` 不可达；
+    **混合宿主**（嵌入式宿主调 ``run_mcp_approval``，或 ``--computer-factory`` 自注入 ``mcp_servers``）可达
+    —— 而那正是 ``_ensure_mounted``/``_ensure_unmounted`` 两分支存在的唯一理由。
+    """
+    _isolate(tmp_path, monkeypatch)
+    embed_cfg = TypeAdapter(MCPServerConfig).validate_python({"name": SRV_NAME, **_server_body("embed.py")})
+
+    kw: dict[str, Any] = {}
+    if winner == "flag":
+        kw["mcp_flag_config"] = _write_flag_file(tmp_path, servers={SRV_NAME: _server_body("flag.py")}, inputs=[])
+    else:
+        managed = tmp_path / "managed-mcp.json"
+        managed.write_text(json.dumps({"servers": {SRV_NAME: _server_body("policy.py")}, "inputs": []}), encoding="utf-8")
+        monkeypatch.setattr(
+            "a2c_smcp.computer.settings.mcp_config.managed_mcp_config_path", lambda *_a, **_k: managed,
+        )
+
+    comp = _real_computer(tmp_path, **kw)
+    comp._mcp_servers = {embed_cfg}
+    async with comp:
+        assert comp.mcp_manager is not None
+        pre = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
+        assert pre[SRV_BID].server_parameters.args == ["embed.py"], "前置：boot_up 已无门挂起 embed 那份"
+
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)
+
+        active = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
+        assert active[SRV_BID].server_parameters.args == [f"{winner}.py"], (
+            f"{winner} 的胜出配置未生效——被「embed 已挂 ⇒ 跳过」丢弃 ⇒ 运行期层序相对 resolve 层反转"
+        )
+
+
+@pytest.mark.asyncio
+async def test_embed_with_placeholder_is_not_remounted_when_config_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    **`_ensure_mounted` 的比较必须 raw-对-raw**：含 ``${input:}`` 的 embed server 在配置未变时**不得**被重挂。
+
+    陷阱：``mcp_manager.server_configs()`` 存的是**渲染后**配置（供 spawn），而 ``resolved.servers[*].config``
+    是**未渲染 raw**（D1：盘上/声明面恒 raw）。若直接拿两者比较，**任何带占位符的 config 都恒不相等** ⇒ 每次
+    ``run_mcp_approval`` 都重挂 ⇒ 客户端 restart，``auto_reconnect=False`` 时更直接抛 ``RuntimeError``。
+    正确基准 = :meth:`Computer.active_server_configs`（#149 的 **raw 投影**，按 bundle_id join 回 ``_active_raw``）。
+
+    无占位符的 config 恰好 rendered == raw ⇒ **同值致盲**：不带占位符的夹具测不出此 bug（本仓「同值陷阱」同族）。
+    故本例夹具**必须**带占位符。
+    """
+    _isolate(tmp_path, monkeypatch)
+    embed_cfg = TypeAdapter(MCPServerConfig).validate_python({"name": SRV_NAME, **_server_body("${input:SCRIPT}")})
+
+    comp = _real_computer(tmp_path)
+    comp._mcp_servers = {embed_cfg}
+    comp.add_or_update_input(
+        TypeAdapter(MCPServerInput).validate_python(
+            {"id": "SCRIPT", "type": "promptString", "description": "d", "default": "real.py"},
+        ),
+    )
+    async with comp:
+        assert comp.mcp_manager is not None
+        # 前置：boot_up 已挂**渲染后**那份（占位符已解析）——正是 rendered≠raw 的来源
+        pre = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
+        assert pre[SRV_BID].server_parameters.args == ["real.py"], "前置：boot_up 挂的是渲染后配置"
+
+        mounts: list[Any] = []
+        orig = comp.amount_server
+
+        async def _spy(cfg: Any, **kw: Any) -> None:
+            mounts.append(cfg)
+            await orig(cfg, **kw)
+
+        monkeypatch.setattr(comp, "amount_server", _spy)
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)
+
+        assert mounts == [], "配置未变却重挂了 embed server（rendered 与 raw 直接比较 ⇒ 带占位符者恒不等）"
+
+
+@pytest.mark.asyncio
+async def test_build_mcp_callbacks_non_plugin_bundle_ids_covers_flag_and_embed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    **生产接线守卫**（隔离审查 🟡3）：``build_mcp_callbacks(comp).non_plugin_bundle_ids()`` 必须真的含
+    flag + embed 两个 bundle_id。
+
+    四景（``test_mcp_dependency_model.py``）走的是 ``_declared`` 直呼 ``non_plugin_declared_bundle_ids``，
+    **绕过**了 ``build_mcp_callbacks`` → ``Computer.resolve_mcp_declarations`` 这条生产接线 ⇒ 若 ``_non_plugin``
+    退化成 ``lambda: set()``、或被误接成 ``existing_bundle_ids``（同签名 ``() -> set[str]``、语义判然不同，
+    故极易混），**四景仍全绿**。本例即那条接线的守卫。
+    """
+    _isolate(tmp_path, monkeypatch)
+    flag_name, flag_bid = "flag.srv", "flag_srv"
+    embed_name, embed_bid = "embed.srv", "embed_srv"
+    flag = _write_flag_file(tmp_path, servers={flag_name: _server_body("f.py")}, inputs=[])
+    embed_cfg = TypeAdapter(MCPServerConfig).validate_python({"name": embed_name, **_server_body("e.py")})
+
+    comp = _real_computer(tmp_path, mcp_flag_config=flag)
+    comp._mcp_servers = {embed_cfg}
+    async with comp:
+        cbs = build_mcp_callbacks(comp)
+        assert cbs.non_plugin_bundle_ids() >= {flag_bid, embed_bid}, "生产接线漏了 flag/embed 层"
+        # 与 existing_bundle_ids 语义判然不同：后者是「谁挂起来了」，前者是「谁被声明了（且非 plugin）」。
+        # flag 声明的 server 此刻**未挂**（未过门），故两集合必然不等 —— 这钉住「误把两者接反」。
+        assert cbs.non_plugin_bundle_ids() != cbs.existing_bundle_ids(), "non_plugin 与 existing 被接反/混用"
 
 
 def test_managed_mcp_filename_is_stable() -> None:

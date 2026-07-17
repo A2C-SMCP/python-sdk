@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
 import a2c_smcp.computer.cli.main as cli_main
 from a2c_smcp.computer.cli.main import _interactive_loop
@@ -432,6 +433,44 @@ def test_run_cli_options_renamed_and_inputs_removed() -> None:
         assert "-i" not in opts, f"{name}: -i 未删"
 
 
+def test_root_level_mcp_config_reaches_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``a2c-computer --mcp-config <file> run``（flag 置于**子命令之前**）MUST 被消费 —— 不得静默丢弃。
+
+    隔离审查 🔴2：``--mcp-config`` 在根回调与 ``run`` 上各声明一份，但根回调**只在无子命令时**消费它；
+    显式带 ``run`` 时根的值既不入 ``_RootState``、``run`` 也不回读 ⇒ **静默丢弃**（连 fail-fast 都碰不到）。
+    实测 develop 上 ``a2c-computer --config bad.json run`` 会响亮报 "No such option"（exit 2），本 PR
+    若不修则退化为 exit 1 + 一个与 ``--mcp-config`` 毫无关系的 OSError ⇒ **本 PR 自引入的失败模式回归**。
+
+    ``--settings`` 同形（既有缺陷，一并修）：它同样 root+run 双声明，root 那份对 ``run`` 从来无效。
+    """
+    seen: dict[str, Any] = {}
+
+    def _capture(**kw: Any) -> None:
+        seen.update(kw)
+
+    monkeypatch.setattr(cli_main, "_run_impl", _capture, raising=True)
+
+    good = tmp_path / "flag-mcp.json"
+    good.write_text(json.dumps({"servers": {}, "inputs": []}), encoding="utf-8")
+    st = tmp_path / "flag-settings.json"
+    st.write_text(json.dumps({}), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main.app, ["--mcp-config", str(good), "--settings", str(st), "run"])
+    assert result.exit_code == 0, result.output
+    assert seen.get("mcp_config") == str(good), "根级 --mcp-config 未透传到 run（静默丢弃）"
+    assert seen.get("settings_file") == str(st), "根级 --settings 未透传到 run（静默丢弃）"
+
+
+def test_root_level_mcp_config_still_fails_fast_on_bad_file(tmp_path: Path) -> None:
+    """根级 ``--mcp-config`` 的坏文件同样 fail-fast(2)——静默丢弃会让 fail-fast 形同虚设（🔴2 的后果面）。"""
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    result = CliRunner().invoke(cli_main.app, ["--mcp-config", str(bad), "run"])
+    assert result.exit_code == 2, f"根级坏 --mcp-config 未 fail-fast；output={result.output!r}"
+
+
 def test_settings_help_no_longer_claims_lowest_priority() -> None:
     """
     `--settings` 帮助文案订正：flag 是**次高**、不是「最低优先级」（该文案一直是错的，实现从来是次高）。
@@ -792,14 +831,18 @@ def test_run_with_cli_url_auth_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    # 调用同步的 run()，其内部使用 asyncio.run() 执行
-    cli_main.run(
+    # 走 `_run_impl`（纯实现函数）而非被 @app.command 装饰的 `run`：后者的形参由 Typer 解析（#154 起还需
+    # `ctx` 兜底回读根级 flag），直呼会让未传的形参保留 OptionInfo —— 这正是 `_run_impl` 存在的理由，
+    # 本文件其余用例亦皆走它。
+    cli_main._run_impl(
         auto_connect=False,
         auto_reconnect=False,
         url="http://service:1234",
         namespace=cli_main.SMCP_NAMESPACE,
         auth="token:abc",
         headers="h1:v1,h2:v2",
+        computer_factory=None,
+        mcp_config=None,
     )
 
     last: FakeSMCPClient = FakeSMCPClient.last  # type: ignore[assignment]
@@ -1050,13 +1093,16 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["exit"]))
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
-    cli_main.run(
+    # 同上：走纯实现函数 `_run_impl`，不直呼被 @app.command 装饰的 `run`（其形参由 Typer 解析）。
+    cli_main._run_impl(
         auto_connect=False,
         auto_reconnect=False,
         url="http://localhost:1",
         namespace=custom_ns,
         auth=None,
         headers=None,
+        computer_factory=None,
+        mcp_config=None,
     )
 
     # 至少应创建过一个客户端 / at least one client must have been created
