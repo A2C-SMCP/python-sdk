@@ -347,6 +347,9 @@ def mcp_json_declared_bundle_ids(*, env: Mapping[str, str] | None = None) -> set
     ``Computer(mcp_servers={...})`` 构造的 server 均走 transient ``amount_server`` 挂载，**进运行期活跃集
     但不进 mcp.json**（``cli/main.py`` `_add_server` / ``computer.py`` boot_up）。只读本视图会把它们误判为
     「非用户声明」而在 plugin 卸载时**连坐停摘**，正是 §4.9.1-2 与 Epic #147 北极星要根治的 P0。
+    根治需运行期 origin（#134 轴）或 ``--config`` 归一进 mcp.json flag 层（#154）——**方案求裁于
+    protocol Discussion #32**（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）；在此之前本函数是回收判据「非用户声明」项的**唯一**数据源，
+    该缺口由 ``test_runtime_only_user_server_is_never_collateral``（xfail）钉住。
 
     ``origin`` 无需过滤：本视图的 origin 恒为 ``user/project/local/flag/policy``（plugin 声明依赖的 server
     从不回写 mcp.json），故 ``origin != plugin`` 在此恒真。同款推理见 :func:`mcp_server_status` 的 #148 注释。

@@ -245,7 +245,7 @@ async def test_scenario5_user_declares_after_install_blocks_reclaim(tmp_path: Pa
     reason="已知未覆盖面（#153 隔离审查 🔴）：协议 §4.9.1-2 的数据源是**运行期权威配置集** + origin != plugin，"
     "而本 SDK 的 manager 不存 origin —— 用户经 `--config @file` / SDK 内嵌 Computer(mcp_servers=) 挂载的 "
     "server 与 plugin 自己挂的在可观测信息上完全同形，无法区分。根治需运行期 origin（#134 轴）或 --config "
-    "归一进 mcp.json flag 层（#154），方案待三仓 Discussion 定案。本用例钉住缺口：修好后会 XPASS 提醒。",
+    "归一进 mcp.json flag 层（#154）。**方案求裁中：protocol Discussion #32**（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。本用例钉住缺口：修好后 XPASS 提醒。",
     strict=False,
 )
 async def test_runtime_only_user_server_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
@@ -260,7 +260,8 @@ async def test_runtime_only_user_server_is_never_collateral(tmp_path: Path, monk
     **为何不在 #153 内根治**：「用户 --config 挂的 X」与「plugin enable 挂的 X」在 manager 层信息完全相同
     （无 origin / 无归属），不新增运行期归属就无法同时满足场景①（A 引入 X 无人依赖 → 回收）与本例。
     补运行期归属 = #134「ownership 归属混源」轴（Epic #147 明载「共识未覆盖该轴」）；
-    ``--config`` 归一进 mcp.json flag 层 = #154。二者择一，交三仓 Discussion 定案。
+    ``--config`` 归一进 mcp.json flag 层 = #154。二者择一，求裁于 protocol Discussion #32：
+    https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32
 
     **注**：本 PR 相对 develop 仍是净改善——develop 是「卸载**无条件**摘」（连 mcp.json 声明的用户 server 都摘），
     本 PR 已保护住 mcp.json 各 scope 声明面，仅剩本例这条路径。

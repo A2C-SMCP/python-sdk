@@ -492,7 +492,8 @@ def reclaimable_mcp_deps(
         ``--config @file`` / SDK 内嵌 ``Computer(mcp_servers={...})`` 挂载的 server 走 transient
         ``amount_server``、**不落 mcp.json**，与「plugin 自己挂的 server」在可观测信息上**完全同形**。
         故若该 server 同时被某 plugin 声明依赖，卸载该 plugin 时仍会回收它。详见
-        :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids`。
+        :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids`；
+        方案求裁于 protocol Discussion #32（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。
     :return: 可回收的 bundle_id（保 ``deps`` 迭代序）。
     """
     return [d for d in deps if d not in other_deps and d not in user_declared]
