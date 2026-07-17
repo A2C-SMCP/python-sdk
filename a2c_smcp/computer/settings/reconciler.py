@@ -44,7 +44,6 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
 from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_valid_marketplace_name
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
@@ -467,6 +466,19 @@ def other_plugin_mcp_deps(
     return out
 
 
+# §4.9.1-2 回收判据「X 非用户声明」项的数据源接缝（同步）/ The criterion's "not user-declared" data-source seam。
+# = **声明面**中 ``origin != plugin`` 的 bundle_id 集；CLI 包 ``Computer.resolve_mcp_declarations()``
+# （durable scopes + flag ``--mcp-config`` + embed 构造入参，每次重算、零持久态，§2.5-5 禁落盘为快照）。
+#
+# 定义在此（而非 :mod:`.installer` 那组回调别名旁）有二：① 判据本体 :func:`reclaimable_mcp_deps` 在本模块，
+# 数据源与判据同源易改不易漂；② installer **导入**本模块，反向导入会成环。installer 转导出本名。
+#
+# ⚠️ **与 :data:`~a2c_smcp.computer.settings.installer.ExistingBundleIds` 判然不同，勿混用**：本接缝是
+# 「谁被声明了（且非 plugin 带入）」，那个是「谁挂起来了」。协议 §4.9.1-2 **明禁**以裸活跃集判回收——无 origin
+# ⇒ flag / embed / plugin 三条挂载路径可观测同形 ⇒ 连坐停摘用户 / 宿主自有 server。
+NonPluginBundleIds = Callable[[], set[str]]
+
+
 def reclaimable_mcp_deps(
     deps: Iterable[str],
     *,
@@ -486,14 +498,12 @@ def reclaimable_mcp_deps(
 
     :param deps: 本次 disable/uninstall 的 plugin 所声明的依赖（``ledger_mcp_deps_of`` 产出）。
     :param other_deps: :func:`other_plugin_mcp_deps` 产出。
-    :param user_declared: :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids` 产出。
-        ⚠️ **已知未覆盖面**（#153 隔离审查 🔴，方案待三仓 Discussion 定案）：协议把本项的数据源写作「**运行期
-        权威配置集**中 ``origin != plugin`` 的条目」，而本 SDK 的 manager **不存 origin**——用户经
-        ``--config @file`` / SDK 内嵌 ``Computer(mcp_servers={...})`` 挂载的 server 走 transient
-        ``amount_server``、**不落 mcp.json**，与「plugin 自己挂的 server」在可观测信息上**完全同形**。
-        故若该 server 同时被某 plugin 声明依赖，卸载该 plugin 时仍会回收它。详见
-        :func:`~a2c_smcp.computer.settings.mcp_config.mcp_json_declared_bundle_ids`；
-        方案求裁于 protocol Discussion #32（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。
+    :param user_declared: :func:`~a2c_smcp.computer.settings.mcp_config.non_plugin_declared_bundle_ids` 产出
+        ——**带 origin 的运行期权威配置集中 ``origin != plugin`` 的 bundle_id 集**（协议 §2.5-5 + §4.9.1-2，
+        Discussion #32 裁决落地于 #164）。它覆盖**全部**非-plugin 挂载路径：durable scopes、flag
+        （``--mcp-config``）、embed（``Computer(mcp_servers=...)``）⇒ 用户 / 宿主自有 server **永不连坐**。
+        MUST NOT 退回只读 mcp.json 声明面（那正是 #153 遗留缺口的形状：经 flag/embed 挂载者会被误判为
+        「非用户声明」而连坐停摘）。
     :return: 可回收的 bundle_id（保 ``deps`` 迭代序）。
     """
     return [d for d in deps if d not in other_deps and d not in user_declared]
@@ -559,6 +569,7 @@ async def gc_plugins(
     registry: SkillRegistry,
     home: Path,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     env: Mapping[str, str] | None = None,
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> list[str]:
@@ -588,7 +599,7 @@ async def gc_plugins(
         reclaim = reclaimable_mcp_deps(
             sorted(deps),
             other_deps=other_plugin_mcp_deps(plugins, exclude_pid=pid),
-            user_declared=mcp_json_declared_bundle_ids(env=env),
+            user_declared=non_plugin_bundle_ids(),
         )
         for rec in records:
             install_path = rec.get("installPath")

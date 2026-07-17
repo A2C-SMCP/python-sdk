@@ -77,11 +77,15 @@ blob 传输场景需要完整的 Agent ↔ Server ↔ Computer 链路，且 Comp
 ```
 tmux session: a2c-uat
 ├── window: server     →  Server
-├── window: computer   →  a2c-computer run --url <URL> --config <blob-test-mcp.json>
+├── window: computer   →  a2c-computer run --url <URL> --mcp-config <blob-test-mcp.json>
 └── window: agent      →  Agent 测试脚本
 ```
 
 `blob-test-mcp.json` 需要配置一个能返回多种大小资源的 MCP server。
+
+> **#154 起格式为 flag 层 mcp.json**（旧 `--config` 的裸 server 形状已废止，旧文件会 fail-fast）：
+> `{"servers": {"<server-name>": {"type": "stdio", "server_parameters": {…}}}, "inputs": []}`
+> —— server 身份由 map key 承载，**body 里不要写 `name` 字段**（`name` ≠ key 会被丢弃）。
 
 ## 验证清单补充项
 

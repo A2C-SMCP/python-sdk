@@ -29,15 +29,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import TypeAdapter
 
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.inputs.resolver import InputResolver
+from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.mcp_config import (
     McpWriteScope,
     McpWriteTargetError,
     mcp_write_path,
     resolve_mcp_config,
 )
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 
 class _MapResolver(InputResolver):
@@ -91,13 +94,21 @@ def _read_servers(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8")).get("servers", {})
 
 
-def _comp(tmp_path: Path, resolver: InputResolver | None = None) -> Computer:
+def _comp(
+    tmp_path: Path,
+    resolver: InputResolver | None = None,
+    *,
+    mcp_flag_config: Path | None = None,
+    mcp_servers: set[Any] | None = None,
+) -> Computer:
     return Computer(
         name="dual-path-test",
         auto_connect=False,
         auto_reconnect=False,
         skill_home=tmp_path / "home",
         input_resolver=resolver,
+        mcp_flag_config=mcp_flag_config,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -217,6 +228,56 @@ async def test_aremove_server_rejects_undeclared_runtime_projection(tmp_path: Pa
     # 拒删后运行期投影仍在（未被误停摘）；且未产生任何落盘写。
     assert comp.mcp_manager is not None
     assert any(c.name == "figma" for c in comp.mcp_manager.server_configs())
+    for scope in (McpWriteScope.LOCAL, McpWriteScope.PROJECT, McpWriteScope.USER):
+        assert not mcp_write_path(scope, env=os.environ).exists()
+
+
+# ── durable: aremove_server 声明只存在于**只读 scope** → 拒删（不静默假成功，#154）───────────────────
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["flag", "embed", "policy"])
+async def test_aremove_server_rejects_readonly_scope_declaration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str,
+) -> None:
+    """
+    胜出声明落**只读 scope**（flag / embed / policy）⇒ 抛 :class:`McpWriteTargetError`，**不**静默假成功。
+
+    若走档②「有声明 ⇒ 放行」：``remove_mcp_server`` 只扫 user/project/local ⇒ **一条也删不掉**，却 unmount +
+    返回成功，下次 boot 该声明原样复活 = 假成功（#143 正在根治的同类）。
+
+    - ``policy``：**本次之前即已存在**的缺陷（policy 从来不在 ``_WRITABLE_SCOPES``），随本判据一并根治；
+    - ``flag`` / ``embed``：#154/#164 让它们进 resolve 后**本会新引入**该缺陷 —— 本守卫即其修法。
+
+    夹具 name(``figma.mcp``) ≠ bundle_id(``figma_mcp``)：`-` 不被 normalize_name 折叠，故用 `.`（conformance §2.0）。
+    """
+    _isolate(tmp_path, monkeypatch)
+    name, bid = "figma.mcp", "figma_mcp"
+
+    flag_path: Path | None = None
+    embed: set[Any] | None = None
+    if origin == "flag":
+        flag_path = tmp_path / "flag-mcp.json"
+        _write_mcp_file(flag_path, {name: _stdio_dict(name, "/bin/figma")})
+    elif origin == "embed":
+        embed = {TypeAdapter(MCPServerConfig).validate_python(_stdio_dict(name, "/bin/figma"))}
+    else:  # policy：managed-mcp.json 只读、读优先级最高
+        managed = tmp_path / "managed-mcp.json"
+        _write_mcp_file(managed, {name: _stdio_dict(name, "/bin/figma")})
+        monkeypatch.setattr(
+            "a2c_smcp.computer.settings.mcp_config.managed_mcp_config_path", lambda *_a, **_k: managed,
+        )
+
+    comp = _comp(tmp_path, mcp_flag_config=flag_path, mcp_servers=embed)
+    assert bid in {
+        resolve_bundle_id(s.config) for s in comp.resolve_mcp_declarations(env=os.environ).servers.values()
+    }, "前置：该 bundle_id 确已被只读 scope 声明"
+
+    with pytest.raises(McpWriteTargetError, match=origin):
+        await comp.aremove_server(bid)
+
+    # 拒删后声明仍在（未被静默"删"掉）；且未在任一可写 scope 留下写痕。
+    assert bid in {
+        resolve_bundle_id(s.config) for s in comp.resolve_mcp_declarations(env=os.environ).servers.values()
+    }
     for scope in (McpWriteScope.LOCAL, McpWriteScope.PROJECT, McpWriteScope.USER):
         assert not mcp_write_path(scope, env=os.environ).exists()
 

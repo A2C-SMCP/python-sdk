@@ -12,6 +12,56 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
 
 ### Breaking Changes
+- **The two scope-layering orders are unified; `--config` → `--mcp-config`; `--inputs` removed**
+  (#154 + #164, aligned with a2c-smcp-protocol `runtime-contract.md` §2.5-3 / §2.5-5 and
+  Discussion #23 F6 / Discussion #32; rust mirror rust-sdk#137 / #147).
+  - **One source-priority order, low → high — `settings.json` and `mcp.json` MUST agree**:
+    `plugin declaration < user < project < local < embed < flag < policy`.
+    Previously `settings.json` ranked `flag` **second-highest** while `mcp.json` ranked it
+    **lowest** (a `--config` legacy artifact) — four positions apart. The protocol abolishes
+    the latter. The order now has a single authority, `SCOPE_ORDER` in `settings/schema.py`,
+    which both resolvers iterate; the two hand-written list literals that drifted are gone.
+  - **`--config` → `--mcp-config`** (short `-c` kept). It is now the **flag-layer `mcp.json`**,
+    forming the flag-scope *file pair* with `--settings` (the flag-layer `settings.json`),
+    symmetric with every other scope.
+    - **File shape hard-cut**: a bare server object / an array of server objects →
+      the `mcp.json` shape `{"servers": {...}, "inputs": [...]}`. Server identity is the
+      **map key**; drop the `name` field from the body (a body `name` ≠ key is rejected).
+      Old-format files **fail fast with exit code 2** and a rewrite hint — deliberately
+      reversing the old silently-degrading behaviour, where a typo'd `--config` path booted
+      you into an empty REPL. Validation now also runs **before** any connection is opened.
+    - **Precedence flips**: previously overridden by `user`/`project`/`local`; now overrides them.
+    - **Now passes the approval gate** (it used to bypass scope merge, origin tracking and the
+      gate entirely, mounting directly). `flag` is a trusted origin ⇒ still no prompt, so the
+      common case is unchanged — but a `policy` deny-list / allow-list / `disabledMcpjsonServers`
+      can now block a `--mcp-config` server. This is protocol-correct (`policy > flag`).
+  - **`--inputs` (and `-i`) removed.** The `inputs` segment of the `--mcp-config` file carries
+    that role; it is consumed on the same path as every other scope's `inputs`. The legacy
+    `--config` schema had **no** `inputs` field, which is why a separate flag existed at all.
+    The REPL `inputs` command is a different surface and is unaffected.
+  - **`--settings` help text corrected**: it claimed "最低优先级" (lowest priority) while the
+    implementation has always ranked it second-highest.
+  - **New `embed` scope** — the embedding host's `Computer(mcp_servers=...)` constructor
+    argument, a code-level explicit intent ranked between `local` and `flag`, and a trusted
+    origin (no approval prompt). It still enters the gate iteration, so `policy` deny-lists and
+    the generic disable switch apply to it. **Known gaps** (tracked separately, both stem from
+    §5 item 10 putting plugin declarations outside the gate):
+    - a pure embedded host (`Computer(...)` + `boot_up`, no REPL) has no approval gate at all,
+      so `policy` deny-lists do not reach it;
+    - unmounting a policy-denied `embed` server frees its `bundle_id`, after which the governance
+      remount may mount a *plugin*-declared server with the same `bundle_id` — the deny-list is
+      still circumvented, just by a different config. (Before this change the denied embed server
+      simply kept running, so neither state is good; the gate cannot reach plugin declarations by
+      protocol design.)
+  - **Reclaim criterion re-anchored** (closes a #153 gap): "X is not user-declared" is now
+    evaluated on the **origin-carrying** declaration set, which covers *every* non-plugin mount
+    path (durable scopes + `flag` + `embed`). Servers mounted via `--mcp-config` or via the host
+    constructor are consequently **never** collaterally torn down when a plugin is uninstalled.
+    `mcp_json_declared_bundle_ids` → **`non_plugin_declared_bundle_ids`**.
+  - **`Computer.aremove_server` now raises `McpWriteTargetError`** when the winning declaration
+    lives in a **read-only scope** (`policy` / `flag` / `embed`) instead of reporting success
+    while deleting nothing and resurrecting the server on the next boot. Note this **also fixes
+    a pre-existing defect** for `policy`-origin servers.
 - **plugin ↔ MCP Server is a dependency relation, not an ownership one** (#153, aligned
   with a2c-smcp-protocol `runtime-contract.md` §2.5 / §4.9.1 / §5.6; adjudication record
   in protocol Discussion #23 D3/F1; rust mirror rust-sdk#139 — **both SDKs share the same

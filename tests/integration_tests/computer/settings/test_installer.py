@@ -161,7 +161,7 @@ async def test_uninstall_end_to_end(tmp_path: Path) -> None:
     install_path = Path(load_installed_plugins(home=home)["plugins"]["audit@acme-skills"][0]["installPath"])
     assert install_path.exists() and reg.resolve("audit:lint") is not None
 
-    ok = await uninstall_plugin("audit@acme-skills", reg, home, env=env, remove_server=_remove)
+    ok = await uninstall_plugin("audit@acme-skills", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=_remove)
 
     assert ok is True
     assert removed == ["figma"]  # 级联 stop+remove
@@ -198,7 +198,7 @@ async def test_install_enable_disable_enable_no_reclone(tmp_path: Path) -> None:
     sentinel.write_text("x", encoding="utf-8")
 
     # disable：摘 server + orphan skill
-    await disable_plugin("audit@acme-skills", reg, home, env=env, remove_server=_remove)
+    await disable_plugin("audit@acme-skills", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=_remove)
     assert reg.is_orphan("audit:lint") and removed == ["figma"]
 
     # enable：复活 skill + 重挂 server，且不重 clone

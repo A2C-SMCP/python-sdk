@@ -316,7 +316,7 @@ async def test_uninstall_clears_intent_and_enabled_entries(tmp_path: Path, monke
     monkeypatch.setattr(_STAGE, _fake_stage([]))
     mcp = _FakeMCP()
 
-    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    ok = await uninstall_plugin(_PID, SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=mcp.remove)
 
     assert ok is True
     settings = _read_user_settings(env)
@@ -545,7 +545,9 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
 
-    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env, scope="project", keep_servers=True)
+    ok = await uninstall_plugin(
+        _PID, SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+    )
 
     assert ok is True
     remaining = load_installed_plugins(home=home)["plugins"][_PID]
@@ -700,7 +702,7 @@ async def test_uninstall_clears_cwd_visible_enabled_entries_without_ledger_proje
     _write_json(workdir_project_settings_path(workdir), {"enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
 
-    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env)
+    ok = await uninstall_plugin(_PID, SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env)
 
     assert ok is True
     proj = json.loads(workdir_project_settings_path(workdir).read_text(encoding="utf-8"))
@@ -720,7 +722,7 @@ async def test_uninstall_does_not_create_tfrobot_dir_in_cwd(tmp_path: Path, monk
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
 
-    ok = await uninstall_plugin(_PID, SkillRegistry(), home, env=env)
+    ok = await uninstall_plugin(_PID, SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env)
 
     assert ok is True
     assert not (workdir / ".tfrobot").exists()  # 不制造垃圾目录/锁文件

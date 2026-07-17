@@ -227,7 +227,7 @@ async def test_disable_reads_scope_from_ledger(tmp_path: Path) -> None:
         home=home,
     )
     mcp = _FakeMCP()
-    code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", remove_server=mcp.remove)
+    code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", non_plugin_bundle_ids=lambda: set(), remove_server=mcp.remove)
     assert code == 0
     assert mcp.removed == [FIGMA_NAME]  # 整 plugin 下线：摘 bundled server
     user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
@@ -238,7 +238,7 @@ async def test_disable_reads_scope_from_ledger(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_uninstall_not_installed_exit1(tmp_path: Path) -> None:
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
-    assert await plugin_cmd.plugin_uninstall(reg, home, env, "ghost@acme") == 1
+    assert await plugin_cmd.plugin_uninstall(reg, home, env, "ghost@acme", non_plugin_bundle_ids=lambda: set()) == 1
 
 
 def test_list_and_info(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -291,7 +291,7 @@ async def test_gc_no_orphans(tmp_path: Path, capsys: pytest.CaptureFixture[str])
 
     atomic_write_json(_usp(env), apply_write({}, {"installedPlugins": ["audit@acme"]}))
     save_installed_plugins({"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": "/x"}]}}, home=home)
-    assert await plugin_cmd.plugin_gc(reg, home, env, json_output=True) == 0
+    assert await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), json_output=True) == 0
     assert json.loads(capsys.readouterr().out)["removed"] == []
 
 
@@ -471,7 +471,7 @@ async def test_run_governance_remount_flag_declared_disables(tmp_path: Path, mon
             recorded.append(server.name)
 
         monkeypatch.setattr(comp, "amount_server", fake_register)  # #137 ③：治理重挂经 transient amount_server
-        await plugin_cmd.run_governance_remount(comp, flag_config=flag_file)
+        await plugin_cmd.run_governance_remount(comp, settings_flag_path=flag_file)
 
         assert recorded == []
 
@@ -536,7 +536,7 @@ async def test_disable_effective_across_boot_after_rematerialization(
     assert report.rematerialized == ["audit@acme"]
 
     mcp = _FakeMCP()
-    code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", remove_server=mcp.remove)
+    code = await plugin_cmd.plugin_disable(reg, home, env, "audit@acme", non_plugin_bundle_ids=lambda: set(), remove_server=mcp.remove)
 
     assert code == 0
     proj = json.loads(workdir_project_settings_path(workdir).read_text(encoding="utf-8"))
@@ -566,7 +566,7 @@ async def test_gc_prunes_dangling_json_contract(
     home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
     orphan_path = _seed_orphan_and_dangling(home, env)
 
-    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True, prune_dangling=True)
+    code = await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), json_output=True, prune_dangling=True)
 
     assert code == 0
     out = json.loads(capsys.readouterr().out)
@@ -594,7 +594,7 @@ async def test_gc_confirm_combined_and_abort_keeps_everything(
         got.extend(items)
         return False
 
-    code = await plugin_cmd.plugin_gc(reg, home, env, confirm=_confirm, prune_dangling=True)
+    code = await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), confirm=_confirm, prune_dangling=True)
 
     assert code == 1
     assert any("orphan@acme" in s for s in got)
@@ -614,7 +614,7 @@ async def test_gc_prune_dangling_off_by_default_diagnose_only(
     home, env, reg = _home(tmp_path), dict(os.environ), SkillRegistry()
     _write_json(user_settings_path(env), {"installedPlugins": ["ghost@nowhere"]})
 
-    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True)  # prune_dangling 缺省 False
+    code = await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), json_output=True)  # prune_dangling 缺省 False
 
     assert code == 0
     out = json.loads(capsys.readouterr().out)
@@ -649,7 +649,7 @@ async def test_gc_prune_residual_committable_declaration_not_counted(
     _write_json(proj_path, {"installedPlugins": ["ghost@nowhere"]})
     before = proj_path.read_text(encoding="utf-8")
 
-    code = await plugin_cmd.plugin_gc(reg, home, env, json_output=True, prune_dangling=True)
+    code = await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), json_output=True, prune_dangling=True)
 
     assert code == 0
     out = json.loads(capsys.readouterr().out)
@@ -671,7 +671,7 @@ async def test_gc_confirm_accept_removes_orphans_and_prunes_dangling(
     async def _confirm(items: list[str]) -> bool:
         return True
 
-    code = await plugin_cmd.plugin_gc(reg, home, env, confirm=_confirm, prune_dangling=True)
+    code = await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), confirm=_confirm, prune_dangling=True)
 
     assert code == 0
     assert not orphan_path.exists()  # 孤儿已删

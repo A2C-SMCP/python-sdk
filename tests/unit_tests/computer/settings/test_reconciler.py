@@ -357,7 +357,7 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     async def _cb(servers: list[str]) -> None:
         teardown.append(servers)
 
-    removed = await gc_plugins(["audit@acme"], reg, home, mcp_teardown=_cb)
+    removed = await gc_plugins(["audit@acme"], reg, home, non_plugin_bundle_ids=lambda: set(), mcp_teardown=_cb)
 
     assert removed == ["audit@acme"]
     assert not audit_path.exists()  # installPath 树清除
@@ -376,7 +376,7 @@ async def test_gc_guards_installpath_outside_home(tmp_path: Path) -> None:
     (outside / "keepme").write_text("x", encoding="utf-8")
     _seed_installed(home, {"evil@acme": [{"scope": "user", "installPath": str(outside)}]})
 
-    removed = await gc_plugins(["evil@acme"], SkillRegistry(), home)
+    removed = await gc_plugins(["evil@acme"], SkillRegistry(), home, non_plugin_bundle_ids=lambda: set())
 
     assert removed == ["evil@acme"]
     assert outside.exists() and (outside / "keepme").exists()  # 越界守卫：拒删盘外目录
@@ -390,7 +390,7 @@ async def test_gc_without_teardown_callback(tmp_path: Path) -> None:
     p.mkdir(parents=True)
     _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(p), "mcpServers": ["x"]}]})
 
-    removed = await gc_plugins(["audit@acme"], SkillRegistry(), home, mcp_teardown=None)
+    removed = await gc_plugins(["audit@acme"], SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), mcp_teardown=None)
 
     assert removed == ["audit@acme"]
     assert not p.exists()
@@ -422,7 +422,7 @@ async def test_gc_skips_unknown_plugin_id(tmp_path: Path) -> None:
     home = _home(tmp_path)
     _seed_installed(home, {"real@acme": [{"scope": "user", "installPath": str(marketplace_skill_dir(home, "acme"))}]})
 
-    removed = await gc_plugins(["ghost@acme"], SkillRegistry(), home)
+    removed = await gc_plugins(["ghost@acme"], SkillRegistry(), home, non_plugin_bundle_ids=lambda: set())
 
     assert removed == []
     assert "real@acme" in load_installed_plugins(home=home)["plugins"]  # 已存在项不受影响
@@ -435,7 +435,7 @@ async def test_gc_plugin_id_without_at_sign(tmp_path: Path) -> None:
     p.mkdir(parents=True)
     _seed_installed(home, {"noatsign": [{"scope": "user", "installPath": str(p)}]})
 
-    removed = await gc_plugins(["noatsign"], SkillRegistry(), home)
+    removed = await gc_plugins(["noatsign"], SkillRegistry(), home, non_plugin_bundle_ids=lambda: set())
 
     assert removed == ["noatsign"]
     assert not p.exists()

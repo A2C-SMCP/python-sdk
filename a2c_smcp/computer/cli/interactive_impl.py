@@ -58,14 +58,16 @@ async def interactive_loop(
     init_client: Any | None = None,
     completer: Completer | None = None,
     approve_all_mcp: bool = False,
-    mcp_flag_config: Path | None = None,
+    settings_flag_path: Path | None = None,
 ) -> None:
     """
     中文: 交互循环的可注入实现；从 main.py 传入 PromptSession 工厂、patch_stdout 上下文与 SMCP 客户端类。
     English: DI-friendly interactive loop; main.py passes PromptSession factory, patch_stdout ctx and SMCP client class.
 
     completer: 可选 Tab 补全器（逐次传入 ``prompt_async``，trust y/N 等子提示不带补全）/ optional Tab completer.
-    approve_all_mcp / mcp_flag_config: 全局 flag ``--approve-all-mcp`` / ``--settings <file>``，透传给启动期 MCP 批准框（#69 Group B）。
+    approve_all_mcp / settings_flag_path: 全局 flag ``--approve-all-mcp`` / ``--settings <file>``，透传给启动期
+    MCP 批准框（#69 Group B）。``settings_flag_path`` 旧名 ``mcp_flag_config`` 已更名——它是 **settings.json**，
+    旧名主动误导（#154）；flag 层 **mcp.json**（``--mcp-config``）不走本参数，而是注入 :class:`Computer`。
     """
     session = session_factory()
     smcp_client = init_client
@@ -85,7 +87,7 @@ async def interactive_loop(
     # 非 TTY（管道/CI）→ 传 session=None 走 skip+WARN / --approve-all-mcp 分支（避免 prompt_async 在无终端下 EOF）。
     try:
         approval_session = session if sys.stdin.isatty() else None
-        await plugin_cmd.run_mcp_approval(comp, approval_session, approve_all=approve_all_mcp, flag_config=mcp_flag_config)
+        await plugin_cmd.run_mcp_approval(comp, approval_session, approve_all=approve_all_mcp, settings_flag_path=settings_flag_path)
     except Exception as e:  # pragma: no cover - 批准框失败不阻断进入 REPL
         console.print(f"[yellow]⚠ MCP 批准门控初始化失败 / MCP approval init failed: {e}[/yellow]")
 
@@ -93,7 +95,7 @@ async def interactive_loop(
     # reconcile_governance(hooks) 重挂 enabled bundled MCP server。时序刻意在批准框之后——mcp.json 的
     # 显式用户配置先挂先占名（同名 bundled 被 skip，用户配置胜）；bundled 免批准（§5.10）。
     try:
-        await plugin_cmd.run_governance_remount(comp, flag_config=mcp_flag_config)
+        await plugin_cmd.run_governance_remount(comp, settings_flag_path=settings_flag_path)
     except Exception as e:  # pragma: no cover - 重挂失败不阻断进入 REPL
         console.print(f"[yellow]⚠ 治理重挂失败 / governance remount failed: {e}[/yellow]")
 

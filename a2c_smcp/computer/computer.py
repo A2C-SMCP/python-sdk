@@ -69,6 +69,8 @@ from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
     McpWriteScope,
     McpWriteTargetError,
+    ResolvedMcpConfig,
+    is_writable_origin,
     remove_mcp_server,
     resolve_mcp_config,
     upsert_mcp_server,
@@ -125,6 +127,7 @@ class Computer(BaseComputer[PromptSession]):
         blob_resolvers: dict[str, BlobResolver] | None = None,
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
+        mcp_flag_config: Path | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -158,11 +161,28 @@ class Computer(BaseComputer[PromptSession]):
                 ``A2C_SKILL_HOME`` → ``$XDG_DATA_HOME/a2c/skills`` → ``~/.a2c/skills`` 解析链。
                 mcp 源 ``skill://`` 物化落盘于 ``<home>/mcp/<server>/<skill>/``。
                 SKILL Home root override (test/deploy injection); defaults to the env resolution chain.
+            mcp_flag_config (Path | None): flag 层 ``mcp.json`` 路径（CLI ``--mcp-config <file>``，含
+                ``servers``/``inputs``；优先级**次高、仅低于 policy**，§2.5-3）。与 ``mcp_servers``（embed 层）
+                同属**当次 boot 的声明式输入** —— §2.5-5 要求 origin 集「可从当次 boot 的声明式输入重建」，
+                Computer 即该 boot 对象，故二者同住于此，经 :meth:`resolve_mcp_declarations` 一并投影。
+                The flag-layer mcp.json path (CLI ``--mcp-config``); a boot-declarative input alongside
+                ``mcp_servers`` (the embed layer). See :meth:`resolve_mcp_declarations`.
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
         self._inputs: set[MCPServerInput] = set(inputs or set())
+        # **embed scope 的声明面**（协议 §2.5-3 / §2.5-5，Discussion #32 裁决）：宿主构造入参 = 代码级显式意图。
+        # The **embed-scope declaration surface**: the embedded host's constructor args = explicit code-level intent.
+        #
+        # ⚠️ 勿被历史注释误导：本字段**仅在此处赋值一次、全仓无第二处写入**，CLI 下恒空（`cli/main.py` 传
+        # `mcp_servers=set()`，所有 server 走运行期挂载）。#149/#153 据此定性它为「构造期死快照」——那**依然成立**，
+        # 指的是「MUST NOT 把它当**运行期活跃集**读」（它对运行期挂载不可见，读它会把「依赖已满足」误判为「未满足」；
+        # 运行期权威见 `active_server_configs()` / `mcp_manager.server_configs()`，§2.5-4）。
+        # 但 §2.5-5 **新增**要求：把它当 **embed 声明层**参与 resolve（见 `resolve_mcp_declarations`）。二者不矛盾——
+        # 它在 CLI 下恒空不是缺陷，而是「CLI 不是嵌入式宿主」的正确表现。
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
+        # flag 层 mcp.json 路径（`--mcp-config`）：与 `_mcp_servers` 同为当次 boot 的声明式输入（§2.5-5）。
+        self._mcp_flag_config: Path | None = mcp_flag_config
         # #149：运行期活跃集的**声明面 raw 投影**缓存（bundle_id → raw-with-bundle 未渲染 config）。get_config wire
         # 从此取 body（占位符字面保留、绝不外泄已解析 secret）；SET 仍以 manager 运行期权威为准（见 active_server_configs）。
         # #149: raw (un-rendered) projection of the runtime-active set, keyed by bundle_id — the body source for the
@@ -878,9 +898,9 @@ class Computer(BaseComputer[PromptSession]):
         """**运行期挂载**一个 MCP server（渲染校验 → 物化，**不落盘**）/ Transient mount (no disk write)。
 
         对齐 rust ``mount_server``。语义 = 本 SDK 历史 ``aadd_or_aupdate_server`` 的**原状**（现已 flip 为 durable，
-        故抽此新名承接纯运行期投影）。用于「把别处已是真相的东西投影进 runtime」：boot 读已声明 mcp.json 挂载、
-        ``--config @file`` 加载、plugin/治理 bundled 重挂——这些**不应回写** mcp.json（否则双源 / 每 boot 重写 /
-        scope 漂移，见 #138）。只 bump **capability**（manager 物化自动上报），不碰持久 config。
+        故抽此新名承接纯运行期投影）。用于「把别处已是真相的东西投影进 runtime」：boot 读已声明 mcp.json 各 scope
+        （含 ``--mcp-config`` flag 层）挂载、plugin/治理 bundled 重挂——这些**不应回写** mcp.json（否则双源 /
+        每 boot 重写 / scope 漂移，见 #138）。只 bump **capability**（manager 物化自动上报），不碰持久 config。
 
         Args:
             server: 待挂载配置，可为模型或原始字典。
@@ -969,6 +989,27 @@ class Computer(BaseComputer[PromptSession]):
         # 3. 复用 render 结果物化（capability 自动上报；config 上报由调用方驱动，见分账注释）。
         await self._amount_rendered(raw_cfg, validated)
 
+    def resolve_mcp_declarations(self, *, env: Mapping[str, str] | None = None) -> ResolvedMcpConfig:
+        """当次 boot 的**非-plugin 声明面**（协议 §2.5-5 权威集的非-plugin 部分）/ This boot's non-plugin declaration surface。
+
+        = :func:`resolve_mcp_config` 全量层 + 本 Computer 的两条 **boot 声明式输入**：
+        ``--mcp-config``（flag 层，:attr:`_mcp_flag_config`）与宿主构造入参（embed 层，:attr:`_mcp_servers`）。
+        产出条目**均携带正确 origin**，origin 恒 ∈ ``{user, project, local, embed, flag, policy}``（结构性非-plugin，
+        见 :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`）。
+
+        §2.5-5 要求该集合「MUST 可从当次 boot 的声明式输入重建、MUST NOT 落盘为快照」——本方法即**每次重算**、
+        零持久态，天然满足。
+
+        **与 `active_server_configs()` 的分工**（勿混）：本方法是**声明面**（谁被声明了、以何 origin）；
+        ``active_server_configs()`` / ``mcp_manager.server_configs()`` 是**运行期活跃集**（谁真的挂起来了）。
+        依赖预检与 wire 投影读后者（§2.5-4）；回收判据的「X 非用户声明」读前者（§4.9.1-2）。
+        """
+        return resolve_mcp_config(
+            env=env,
+            flag_config_path=self._mcp_flag_config,
+            embed_servers=self._mcp_servers,
+        )
+
     async def aremove_server(self, bundle_id: str, *, session: PromptSession | None = None) -> None:
         """**持久删除**一个 MCP server 声明（bundle_id → 声明名 → 删所有可写 scope）+ 运行期停摘 / Durably remove。
 
@@ -978,42 +1019,63 @@ class Computer(BaseComputer[PromptSession]):
         **守卫按 origin 判定，不按账本名集**（#148 / 指南 §5，取代历史 name-keyed bundled 拒删——那会误伤与某已装
         plugin bundled server 同名的用户 server）：
 
-        1. **声明优先**：经 :func:`resolve_mcp_config` 取**快照**，收集 ``bundle_id`` 匹配的**用户侧声明名**
-           （:func:`resolve_bundle_id` 逐条比对）。
-        2. **有用户侧声明 ⇒ 放行**：经 ① :func:`remove_mcp_server` 删**所有可写 scope** + :meth:`aunmount_server_by_id`
-           停摘。删的是用户自己那条声明——即便它与某 plugin bundled server 同 bundle_id，用户覆盖权优先（runtime-contract
-           §2.5「用户主权」），plugin 基线保留。
-        3. **无用户侧声明 ∧ 运行期仍有该 bundle_id 活跃投影 ⇒ 拒删**（抛 :class:`McpWriteTargetError`）：它是**纯运行期
-           投影**——「挂载却不落声明」的生产路径有 plugin/治理重挂（#137③）与 ``--config @file`` 预加载（``cli/main.py``），
-           均经 transient :meth:`amount_server` 挂载、不入 :func:`resolve_mcp_config`（层仅 FLAG/USER/PROJECT/LOCAL/POLICY，
-           **无 plugin origin**——boot 挂 mcp.json 声明的投影有盘上声明、落档 2）。durable rm 只操作声明面，对无声明的投影
-           拒删——若属 plugin 应经 ``plugin uninstall`` **整体**停用（单独打掉某 bundled server 产生 §2.4 禁止的半态），若
-           属纯 transient 应经 :meth:`aunmount_server_by_id` 停摘。**架构限制**：manager 不存 provenance，本 scope（#148 不依赖
-           #153/#154）下无法精确区分 ``origin == plugin``，故保守拒删——这即指南 §5「``origin == plugin`` ∧ 无用户侧声明」
-           在当前架构下的**可观测等价**（宁可拒删导向显式停用，也不越权停摘一个非用户声明的投影）。
-        4. **无用户侧声明 ∧ 未活跃 ⇒ no-op**（无声明可删、无投影可停；``aunmount_server_by_id`` 幂等 no-op）。
+        1. **声明优先**：经 :meth:`resolve_mcp_declarations` 取**快照**（含 flag/embed 层），收集 ``bundle_id``
+           匹配的声明名（:func:`resolve_bundle_id` 逐条比对）。
+        2. **有声明 ∧ origin 可写（user/project/local）⇒ 放行**：经 :func:`remove_mcp_server` 删**所有可写 scope**
+           + :meth:`aunmount_server_by_id` 停摘。删的是用户自己那条声明——即便它与某 plugin bundled server 同
+           bundle_id，用户覆盖权优先（runtime-contract §2.5「用户主权」），plugin 基线保留。
+
+           *为何 origin 可写 ⇒ 删干净*：只读 scope（embed/flag/policy）在 §2.5-3 序中**全部高于**三个可写 scope
+           ⇒ origin 若是可写 scope，该名在只读层**必然无声明**（否则 origin 就会是那个更高的只读 scope）⇒ 删尽可写
+           scope 即删尽该名的全部声明。
+        3. **有声明 ∧ origin 只读（embed/flag/policy）⇒ 拒删**（抛 :class:`McpWriteTargetError`）：胜出的那条声明
+           SDK **删不掉**（policy 企业托管 / flag 命令行文件 / embed 宿主构造入参根本不在盘上）。若仍走档 2 会
+           **静默假成功**——``remove_mcp_server`` 无声可删、``aunmount`` 停摘、返回成功，而下次 boot 该声明原样复活
+           （#143 正在根治的同类假成功）。故显式报错并指出真正的关停途径。
+        4. **无声明 ∧ 运行期仍有该 bundle_id 活跃投影 ⇒ 拒删**（抛 :class:`McpWriteTargetError`）：它是**纯运行期
+           投影**——「挂载却不落声明」的生产路径为 plugin/治理重挂（#137③）与临时 :meth:`amount_server`，均不入
+           :func:`resolve_mcp_config`。durable rm 只操作声明面，对无声明的投影拒删——若属 plugin 应经
+           ``plugin uninstall`` **整体**停用（单独打掉某 bundled server 产生 §2.4 禁止的半态），若属纯 transient
+           应经 :meth:`aunmount_server_by_id` 停摘。**架构限制**：``origin == plugin`` 不进 resolve（结构性缺席，见
+           :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`）故仍不可精确区分，保守拒删 = 指南 §5
+           「``origin == plugin`` ∧ 无用户侧声明」的**可观测等价**（宁可拒删导向显式停用，也不越权停摘）。
+        5. **无声明 ∧ 未活跃 ⇒ no-op**（无声明可删、无投影可停；``aunmount_server_by_id`` 幂等 no-op）。
 
         Args:
             bundle_id (str): MCP Server 唯一身份 bundle_id（协议 #18）。REPL ``server rm <name>`` 在缺省身份下
                 （bundle_id = normalize(name)）以 name 寻址即可。
+
+        Raises:
+            McpWriteTargetError: 档 3（声明只存在于只读 scope）或档 4（纯运行期投影）。
         """
         env = os.environ
-        # 1. 声明优先：快照解析用户侧声明名（未渲染 config，derive-on-raw 与注册边界同源）。
-        snapshot = resolve_mcp_config(env=env)
-        matched = {name for name, srv in snapshot.servers.items() if resolve_bundle_id(srv.config) == bundle_id}
+        # 1. 声明优先：快照解析声明名（未渲染 config，derive-on-raw 与注册边界同源）。含 flag/embed 层（§2.5-5）。
+        snapshot = self.resolve_mcp_declarations(env=env)
+        matched = {name: srv.origin for name, srv in snapshot.servers.items() if resolve_bundle_id(srv.config) == bundle_id}
         if matched:
-            # 2. 有用户侧声明 ⇒ 放行：删所有可写 scope + 停摘（用户覆盖权，即便与某 bundled 同 bundle_id 亦可删）。
+            # 3. 胜出声明落只读 scope ⇒ 删不掉，拒删而非静默假成功（见 docstring 档 3）。
+            readonly = {name: origin for name, origin in matched.items() if not is_writable_origin(origin)}
+            if readonly:
+                detail = ", ".join(f"{name!r} (origin={origin.value})" for name, origin in sorted(readonly.items()))
+                raise McpWriteTargetError(
+                    f"bundle_id={bundle_id!r} is declared in a read-only scope and cannot be durably removed: {detail}. "
+                    "A 'policy' declaration is enterprise-managed (edit managed-mcp.json); a 'flag' declaration comes "
+                    "from this run's '--mcp-config <file>' (drop it from that file or from the command line); an "
+                    "'embed' declaration comes from the embedding host's Computer(mcp_servers=...) constructor "
+                    "argument. To only stop it for this run, unmount the projection instead.",
+                )
+            # 2. origin 可写 ⇒ 放行：删所有可写 scope + 停摘（用户覆盖权，即便与某 bundled 同 bundle_id 亦可删）。
             for name in matched:
                 remove_mcp_server(name, env=env)
             await self.aunmount_server_by_id(bundle_id)
             return
-        # 3. 无用户侧声明 ∧ 运行期仍活跃 ⇒ plugin/治理投影，拒删、导向 plugin uninstall（origin==plugin 的可观测等价）。
+        # 4. 无声明 ∧ 运行期仍活跃 ⇒ plugin/治理投影，拒删、导向 plugin uninstall（origin==plugin 的可观测等价）。
         if self.mcp_manager is not None and any(
             resolve_bundle_id(cfg) == bundle_id for cfg in self.mcp_manager.server_configs()
         ):
             raise McpWriteTargetError(
-                f"bundle_id={bundle_id!r} has no user-side mcp.json declaration but is active at runtime; "
-                "it is a runtime-only projection (a plugin/governance mount, or a '--config @file' preload), "
+                f"bundle_id={bundle_id!r} has no mcp.json declaration but is active at runtime; "
+                "it is a runtime-only projection (a plugin/governance mount, or an ad-hoc amount_server), "
                 "not a durably-declared server—if it is plugin-provided use 'plugin uninstall' to disable the "
                 "whole plugin; otherwise unmount the transient projection directly instead of removing it via mcp.json",
             )

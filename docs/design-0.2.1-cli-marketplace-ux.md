@@ -40,7 +40,7 @@
 | 19 | Uninstall 级联 | 默认 stop+remove plugin 携带的 MCP server；`--keep-servers` 跳过 | |
 | 20 | settings.json 职责 | **只**放 `enabledPlugins` + `extraKnownMarketplaces` + MCP 门控字段 + trust policy 字段；**不放** MCP server 定义/inputs | 校正：MCP defs 移出 settings.json（见 #25） |
 | 21 | Reconciler | **additive-only 只增不删**（true-CC）；孤儿靠显式 `plugin uninstall` / `plugin gc` 清 | 校正：CC 不自动清理「声明没、物化有」 |
-| 22 | 老 flag 迁移 | settings.json 与 `--config/--inputs` **并存**；启动合并，settings 优先 | 不破坏老脚本 |
+| 22 | ~~老 flag 迁移~~ | **#154 已 supersede**：`--config`→`--mcp-config`（flag 层 mcp.json，次高）；`--inputs` 删除（inputs 段并入该文件）。无存量用户，不做兼容 | 见 §5.5 |
 | 23 | JSON 输出 | 启动时**全局** `--json` flag | REPL 内也默认 JSON |
 | 24 | 非交互形态 | Typer 子命令 + REPL 同名同义 | `a2c-computer marketplace add ...` 与 REPL `marketplace add ...` 走同一逻辑 |
 | 25 | MCP server 定义文件 | A2C **原生 schema**（`{servers,inputs}`）→ workspace/project `.tfrobot/mcp.json` + user `$XDG_CONFIG_HOME/a2c/mcp.json` | `server_parameters` 嵌套 + 治理字段与标准 `.mcp.json` 不兼容，**不同名混用**（§9.1） |
@@ -56,7 +56,7 @@
 
 1. **CLI 命令表面**：marketplace / plugin / skill 三组命名空间命令（add/install/list/info/enable/disable/refresh/remove）+ 现有命令保持。
 2. **REPL UX**：tab 补全、help 重组、Rich 进度反馈、Banner、zero-state 引导。
-3. **意图层文件**：`settings.json` 格式 + 五级 scope 合并；与现有 `--config/--inputs` 共存。
+3. **意图层文件**：`settings.json` 格式 + 多级 scope 合并（#154：与 `mcp.json` **同序**，flag 次高）；flag scope 的文件对 = `--settings` + `--mcp-config`。
 4. **Reconciler**：启动时声明 vs 物化对账；自动 clone 缺失、自动清理废弃。
 5. **事件触发链**：CLI 动作 → 缓存失效 → debounce 300ms → emit_update_skills；与文件 watcher 同节奏。
 6. **Trust 流程**：首次 add 弹 y/N；持久化进 `known_marketplaces.json`。
@@ -486,18 +486,30 @@ $XDG_CONFIG_HOME/a2c/                     # → ~/.config/a2c
 - **删字段**：写 `undefined`（= 删 key）。
 - 写后 `markInternalWrite(<path>)` 给 file-watcher 打标，**避免把自己的写回当用户手编触发重载循环**（CC `settings.ts:~500` 同款机制）。
 
-### 5.5 与现有 `--config @file` / `--inputs @file` 共存
+### 5.5 flag scope 的**文件对**：`--mcp-config @file` + `--settings @file`
 
-老 flag 现在喂的是 **MCP 定义层**（§9.1），不是 settings.json：
+> **#154 起（breaking）**：旧 `--config`（收「裸 server 对象/数组」、排最低优先级、绕开审批门直挂）→ 更名
+> **`--mcp-config`**（保留 `-c`）、形状硬切为 mcp.json 的 `{servers, inputs}`、**排次高**、与其余 scope 同路
+> 过审批门；旧 `--inputs` **已删除**（其职责由 `--mcp-config` 文件的 `inputs` 段承载）。旧格式文件 **fail-fast**
+> （exit 2）并提示改写。无存量用户，按通用口径不做兼容设计。
+
+`--mcp-config`（flag 层 mcp.json）与 `--settings`（flag 层 settings.json）构成 flag scope 的**文件对**，
+与其余 scope 的双文件形态对称（协议 runtime-contract §2.5-3）。它喂的是 **MCP 定义层**（§9.1），不是 settings.json：
 
 ```
 MCP 定义合并顺序（高 → 低，§9.1 scope；同 §5.1 active-workdir 单根模型）：
   1. policy（managed-mcp.json）            ← 最高
-  2. active workdir local (.tfrobot/mcp.local.json)
-  3. active workdir project (.tfrobot/mcp.json)
-  4. user ($XDG_CONFIG_HOME/a2c/mcp.json)
-  5. --config / --inputs flag             ← 老接口，最低优先级
-  6. 默认值
+  2. --mcp-config <file> flag             ← 次高，仅低于 policy（#154）
+  3. embed（Computer(mcp_servers=...) 构造入参）  ← 宿主代码级显式意图（#164）
+  4. active workdir local (.tfrobot/mcp.local.json)
+  5. active workdir project (.tfrobot/mcp.json)
+  6. user ($XDG_CONFIG_HOME/a2c/mcp.json)
+  7. plugin 声明（基线，**不经 resolve**——由 boot 序「existing wins」保证，见 §12）
+  8. 默认值
+
+  ⚠️ **本序自 #154/#164 起翻转**：历史把 `--config` flag 排**最低**（老接口遗留），协议
+  runtime-contract §2.5-3 已**废止**该形态——settings 与 mcp.json MUST 同序、flag 统一次高。
+  **顺序的唯一权威 = `settings/schema.py` 的 `SCOPE_ORDER`**，两个 resolve 均由它派生，勿再手写字面量。
 
   注：MCP 定义层同构 settings 的 (B) 层——**只取 active workdir** 的 mcp.json/mcp.local.json，
   **不**跨登记目录并集（无 active 时仅 user + flag + 默认）；批准门控随之一致。
@@ -506,8 +518,8 @@ MCP 定义合并顺序（高 → 低，§9.1 scope；同 §5.1 active-workdir �
 settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 ```
 
-- `--config @servers.json` / `--inputs @inputs.json` 等价于在 MCP 定义层最低优先级注入；
-- 老脚本零迁移即可继续工作；新场景推荐 `.tfrobot/mcp.json` + settings.json + GitOps。
+- `--mcp-config @flag-mcp.json` 等价于在 MCP 定义层**次高**优先级注入（仅低于 policy）；其 `inputs` 段与 servers 同路消费；
+- **旧 `--config`/`--inputs` 脚本需迁移**（形状硬切 + 更名，旧文件 fail-fast 并给出改写提示）；新场景推荐 `.tfrobot/mcp.json` + settings.json + GitOps。
 
 ### 5.6 校验与前向兼容（复刻 CC：passthrough + 全可选，无版本字段）
 
@@ -723,7 +735,7 @@ class SkillEventDebouncer:
 | project | **active workdir** `<workdir>/.tfrobot/mcp.json` | 入 git、团队共享；**单根、不跨目录并集**；无 active 时空 |
 | local | **active workdir** `<workdir>/.tfrobot/mcp.local.json` | 不入 git；同上 |
 | policy | managed 路径下 `managed-mcp.json` | 企业下发 |
-| flag | `--config @file`（老接口，最低优先级） | 兼容 |
+| flag | `--mcp-config @file`（flag 层 mcp.json，**次高**、仅低于 policy；#154 由 `--config` 更名 + 形状硬切） | 与 `--settings` 构成 flag scope 文件对 |
 
 查找优先级 policy > active-local > active-project > user > flag（对齐 CC enterprise > local > project > user，A2C 主根随任务动态切换）。**无 active workdir** 时只取 user + flag + 默认；MCP server 定义**不**像能力层那样跨登记目录并集（敏感面隔离，与 §5.1 (B) 一致）。
 
@@ -1087,7 +1099,7 @@ a2c_smcp/computer/
 - **inputs 解析链**：env `A2C_INPUT_<ID>` 命中 → 不落盘；password prompt → keyring 存 → 重启不再问；非密钥 → 明文 state；keyring 不可用 + 无 env + 无 TTY → 硬错误。
 - File watcher：user/project 目录 SKILL.md 增删改 → debounce → emit；CLI 写回 settings 经 `markInternalWrite` 不触发重载循环。
 - Reconciler additive-only：物化多于声明的条目重启后**仍在**；`plugin gc` 才清。
-- `--config @file` + `.tfrobot/mcp.json` 同时存在 → settings/mcp 定义层优先合并。
+- `--mcp-config @file` + `.tfrobot/mcp.json` 同时存在 → 按 `SCOPE_ORDER` 合并，**flag 胜出**（#154）。
 
 ### 13.3 E2E（pexpect）
 
@@ -1162,7 +1174,7 @@ A ⫫ B（并行）；C 依赖 A+B；D 依赖 A；E 依赖 A/B/C/D；F 依赖 A/
 - [ ] `skill list/info` 跨三源扁平视图。
 - [ ] `settings show/edit/get/set` 四命令；非编辑器场景纯 CLI 可改；写回经 `markInternalWrite` 不触发 watcher 重载循环。
 - [ ] `--json` 全局 flag：所有命令机器可读输出；JSON line-delimited 进度。
-- [ ] `--config/--inputs` 老 flag 与 `.tfrobot/mcp.json` 共存，启动合并。
+- [x] `--mcp-config` 与 `.tfrobot/mcp.json` 各 scope 按统一序合并（flag 次高）；旧 `--config`/`--inputs` 已移除（#154）。
 - [ ] Tab 补全：动词/子命令/flag/动态名称/文件路径全覆盖。
 - [ ] Help 分组：默认列 namespace、`help <ns>` 详情。
 - [ ] Banner 仅 `plugins=0 AND servers=0` 触发。

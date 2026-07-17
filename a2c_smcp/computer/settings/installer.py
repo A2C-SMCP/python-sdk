@@ -66,8 +66,8 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-from a2c_smcp.computer.settings.mcp_config import mcp_json_declared_bundle_ids
 from a2c_smcp.computer.settings.reconciler import (
+    NonPluginBundleIds,
     ledger_mcp_deps_of,
     other_plugin_mcp_deps,
     reclaimable_mcp_deps,
@@ -138,6 +138,9 @@ RegisterServer = Callable[[MCPServerConfig], Awaitable[None]]
 # 运行期停摘一个 server（异步，入参 **bundle_id**；CLI 包 transient ``Computer.aunmount_server_by_id``，
 # 停进程不删声明）。仅对经 §4.9.1-2 回收判据判定**可回收**者调用。
 RemoveServer = Callable[[str], Awaitable[None]]
+# ``NonPluginBundleIds``（§4.9.1-2 回收判据「X 非用户声明」项的数据源，#164）定义在 :mod:`.reconciler`
+# ——判据本体 ``reclaimable_mcp_deps`` 的所在地，且本模块**导入** reconciler（反向导入会成环）。此处仅转导出，
+# 使四个回调别名在 installer 的公开面齐整 / re-exported here so the callback aliases read together.
 # 注入 plugin-scoped inputs 入池（异步；入参 plugin_root；CLI 包 ``load_plugin_inputs`` → ``Computer.add_or_update_input``）。
 # 在 register（→render bundled server 的 ${input:}）之前调，使裸 id 可经 D2 前缀回退解析（#69 Group A，§9.3 D2）。
 InjectInputs = Callable[[Path], Awaitable[None]]
@@ -515,6 +518,7 @@ async def uninstall_plugin(
     registry: SkillRegistry,
     home: Path,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     scope: str | None = None,
     keep_servers: bool = False,
     env: Mapping[str, str] | None = None,
@@ -569,7 +573,7 @@ async def uninstall_plugin(
     reclaim = reclaimable_mcp_deps(
         deps,
         other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id, retained_records=retained),
-        user_declared=mcp_json_declared_bundle_ids(env=env),
+        user_declared=non_plugin_bundle_ids(),
     )
 
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
@@ -673,6 +677,7 @@ async def disable_plugin(
     registry: SkillRegistry,
     home: Path,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     scope: str = "user",
     project_path: str | None = None,
     env: Mapping[str, str] | None = None,
@@ -712,7 +717,7 @@ async def disable_plugin(
         reclaim = reclaimable_mcp_deps(
             sorted(ledger_mcp_deps_of(ledger_plugins.get(plugin_id, []))),
             other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id),
-            user_declared=mcp_json_declared_bundle_ids(env=env),
+            user_declared=non_plugin_bundle_ids(),
         )
         for bundle_id in reclaim:
             await remove_server(bundle_id)
@@ -740,8 +745,14 @@ async def enable_plugin(
     **依赖已满足 ⇒ 复用既有实例**（协议 §2.5-1，#153/D3）：声明的 ``bundle_id`` 若已在运行期活跃集里，
     **跳过 register**——既有实例（用户 mcp.json 声明的，或他 plugin 带入的）胜出，本 plugin 复用它而非覆盖。
     与 :meth:`Computer.reconcile_governance` 的「existing wins → skip」同姿态。
-    完整来源优先序（``plugin < user < project < local < flag < policy``）属 #154 范围；此处「existing wins」
-    是其**可观测等价**（``origin=plugin`` 恒最低 ⇒ 任何既有声明都胜过 plugin 带入的）。
+    完整来源优先序见 :data:`~a2c_smcp.computer.settings.schema.SCOPE_ORDER`（**唯一权威**，勿在此复述字面量
+    ——两处手写序漂移正是 #154 的根因）。此处「existing wins」是「``origin=plugin`` 恒最低」的**可观测等价**：
+    plugin 声明**不进任一 resolve**（结构性缺席，见 ``SCOPE_ORDER`` 的说明），其「输给用户侧」由本处 +
+    :meth:`Computer.reconcile_governance` 的 skip 保证。
+    ⚠️ **等价的边界**：保证的是「plugin 输给任何**已挂载**的 server」，而非「输给任何**声明**」——若某用户声明
+    被审批门拦下（DISABLED / PENDING 未批）而未挂，其 bundle_id 空出，plugin 那份仍会挂上。这与 rust
+    ``collect_enabled_bundled_servers``（plugin 集内 first-wins、不与用户声明比对）**同姿态**，parity 保持；
+    且协议 §5 item 10 明定 plugin 声明 MUST NOT 进审批门，故门控结果本就不该反向决定 plugin 基线。
 
     v0.3.0 §2.4「enable 原子性」：顺序 ① 从物化记录的 ``installPath`` 重解析 bundled servers →
     **依赖预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →

@@ -53,6 +53,7 @@ from a2c_smcp.computer.inputs.plugin_pool import load_plugin_inputs
 from a2c_smcp.computer.settings.installer import (
     ExistingBundleIds,
     InjectInputs,
+    NonPluginBundleIds,
     PluginInstallError,
     RegisterServer,
     RemoveServer,
@@ -68,7 +69,6 @@ from a2c_smcp.computer.settings.mcp_config import (
     approve_mcp_server,
     deny_mcp_server,
     gate_mcp_servers,
-    resolve_mcp_config,
 )
 from a2c_smcp.computer.settings.reconciler import (
     DANGLING_CATALOG_MISSING,
@@ -81,8 +81,10 @@ from a2c_smcp.computer.settings.reconciler import (
     list_dangling_plugin_intents,
     list_orphan_plugins,
 )
+from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -152,7 +154,7 @@ def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> Inject
     return _inject
 
 
-async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) -> None:
+async def run_governance_remount(comp: Any, *, settings_flag_path: Path | None = None) -> None:
     """
     启动期治理重挂（#117 设计 Y 的 client 接线参考实现）/ Boot-time governance remount (reference client wiring)。
 
@@ -170,7 +172,7 @@ async def run_governance_remount(comp: Any, *, flag_config: Path | None = None) 
       bundled **免批准**（§5.10 不走 project 信任门），单点失败不阻断。
     """
     env = os.environ
-    declared = resolved_settings(env, flag_path=flag_config)
+    declared = resolved_settings(env, flag_path=settings_flag_path)
 
     async def _register(cfg: Any, record: Any) -> None:
         # #137 ③：治理重挂 = 投影（ledger 是真相），走 transient amount_server，不回写 mcp.json。
@@ -260,12 +262,21 @@ async def plugin_uninstall(
     env: Mapping[str, str] | None,
     plugin_id: str,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     keep_servers: bool = False,
     remove_server: RemoveServer | None = None,
     json_output: bool = False,
 ) -> int:
-    """卸载单个 plugin（删 installPath 树 + 注销 skills + 级联停摘 bundled server + 删账本）/ Uninstall a plugin。"""
-    ok = await uninstall_plugin(plugin_id, registry, home, env=env, keep_servers=keep_servers, remove_server=remove_server)
+    """卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据**回收 bundled server + 删账本）/ Uninstall a plugin。"""
+    ok = await uninstall_plugin(
+        plugin_id,
+        registry,
+        home,
+        non_plugin_bundle_ids=non_plugin_bundle_ids,
+        env=env,
+        keep_servers=keep_servers,
+        remove_server=remove_server,
+    )
     if not ok:
         return _err(f"plugin {plugin_id!r} not installed (no-op)", json_output=json_output)
     if json_output:
@@ -324,6 +335,7 @@ async def plugin_disable(
     env: Mapping[str, str] | None,
     plugin_id: str,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     remove_server: RemoveServer | None = None,
     json_output: bool = False,
 ) -> int:
@@ -337,6 +349,7 @@ async def plugin_disable(
     for rec in records:
         await disable_plugin(
             plugin_id, registry, home,
+            non_plugin_bundle_ids=non_plugin_bundle_ids,
             scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env, remove_server=remove_server,
         )
     if json_output:
@@ -466,6 +479,7 @@ async def plugin_gc(
     home: Path,
     env: Mapping[str, str] | None,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
     confirm: Callable[[list[str]], Awaitable[bool]] | None = None,
     prune_dangling: bool = False,
@@ -498,7 +512,13 @@ async def plugin_gc(
         if not await confirm(items):
             return _err("aborted by user", json_output=json_output)
 
-    removed = await gc_plugins(orphans, registry, home, env=env, mcp_teardown=mcp_teardown) if orphans else []
+    removed = (
+        await gc_plugins(
+            orphans, registry, home, non_plugin_bundle_ids=non_plugin_bundle_ids, env=env, mcp_teardown=mcp_teardown,
+        )
+        if orphans
+        else []
+    )
     pruned: list[str] = []
     residual: list[str] = []
     for pid, _reason in prunable:
@@ -554,25 +574,35 @@ async def run_mcp_approval(
     session: Any | None,
     *,
     approve_all: bool = False,
-    flag_config: Path | None = None,
+    settings_flag_path: Path | None = None,
 ) -> None:
-    """启动期解析 ``.tfrobot/mcp.json`` 定义层 + 批准门控 + 挂载 ENABLED server（§9.2）/ Boot-time MCP approval + mount。
+    """启动期解析 mcp.json 声明面 + 批准门控 + 收敛挂载态（§9.2）/ Boot-time MCP approval + mount reconciliation。
 
-    - user/flag/policy origin server（trusted）→ 门控判 ENABLED → 直挂（免批准框）；
-    - DISABLED（企业拒绝/不在白名单/显式 disabled）→ 跳过；
+    - user/embed/flag/policy origin server（trusted）→ 门控判 ENABLED → 直挂（免批准框）；
+    - DISABLED（企业拒绝/不在白名单/显式 disabled）→ **确保停摘**；
     - PENDING（工作区共享未决）→ TTY 弹 y/a/n 写 local scope；非 TTY → skip+WARN，``approve_all`` 全批（仅本次不落盘）。
 
     ``--approve-all-mcp`` 在**非交互**仅本次挂载、**不落盘**；TTY ``[a]`` 才写 enableAllProjectMcpServers（用户显式决定）。
 
-    **flag 层 schema 区分**（fix-review #1）：``flag_config`` 源自 ``--settings <file>``，是 **settings.json** flag 层
-    （喂 :func:`resolved_settings` 的 ``flag_path``——``{enabledPlugins/MCP 门控字段…}``）。它**不是 mcp.json**，故
-    **不**喂 ``resolve_mcp_config(flag_config_path=)``（后者期望 ``{servers,inputs}``、schema 不符）；flag-scope
-    **mcp.json 当前无 CLI 入口**（旧 ``--config`` 仅 ``_run_impl`` server 预加载、从不喂门控解析）。
+    **循环契约 = `ENABLED ⇒ 确保已挂 / DISABLED ⇒ 确保停摘 / PENDING ⇒ 问`**（#164）。「确保」而非「挂载」是
+    因为 embed 层（``Computer(mcp_servers=...)``）在 ``boot_up`` 已被**无门**挂起：
+    - ENABLED 时若 bundle_id 已活跃则跳过——重复 ``amount_server`` 会 restart 客户端，``auto_reconnect=False``
+      时更直接抛 ``RuntimeError``（见 ``manager._add_or_update_server_config``）。文件来源的 server 此刻恒未活跃，
+      故行为不变。
+    - DISABLED 时**必须真的摘掉**，否则 policy 拒绝名单对 embed 只是装饰品、协议「用户/管理员保留最终关停权」
+      落空。对从未挂过的文件来源 server，``aunmount_server_by_id`` 是幂等 no-op，行为不变。
+
+    **两个 flag 文件分工**（协议 §2.5-3 的 flag scope **文件对**）：``settings_flag_path`` = ``--settings <file>``，
+    是 **settings.json** flag 层（喂 :func:`resolved_settings` 的 ``flag_path``——``{enabledPlugins/MCP 门控字段…}``）；
+    flag 层 **mcp.json** = ``--mcp-config <file>``，经 :class:`Computer` 注入、由 ``comp.resolve_mcp_declarations()``
+    解析（含其 ``inputs`` 段）。二者 schema 不同、**不可互喂**。旧参数名 ``flag_config`` 已更名——它从来是
+    settings.json，旧名主动误导（#154）。
     """
     env = os.environ
-    # flag_config 是 settings.json（见 docstring）→ resolve_mcp_config 不收（避免 settings.json 当 mcp.json 误读）。
+    # 声明面 = durable scopes + flag（`--mcp-config`）+ embed（构造入参），均携 origin（§2.5-5）。两个 flag 文件
+    # 分工见 docstring：settings_flag_path 是 settings.json，**不**喂 resolve_mcp_config。
     # #116：project/local 层由 resolve_mcp_config 内部锚定进程 cwd。
-    resolved = resolve_mcp_config(env=env, flag_config_path=None)
+    resolved = comp.resolve_mcp_declarations(env=env)
 
     # 被 drop 的畸形 server/input 必须呈现（§5.6 / mcp_config 容错不静默，#69 Group B 风险 3）。
     for e in resolved.errors:
@@ -583,12 +613,13 @@ async def run_mcp_approval(
 
     # #157：scope 越权被过滤的字段必须有解释——否则用户只看到莫名的批准框（协议 §2.1「响亮失败」）。
     # 典型：仓库的 project settings.json 携 enableAllProjectMcpServers → 被过滤 → 此处告知该挪去 local/user。
-    resolved_st = resolved_settings_with_errors(env, flag_path=flag_config)
+    resolved_st = resolved_settings_with_errors(env, flag_path=settings_flag_path)
     for line in format_settings_errors(resolved_st.errors):
         console.print(f"[yellow]{line}[/yellow]")
     settings = resolved_st.settings
-    # #148/F8：审批门 MUST NOT 依赖账本 bundled 名集；plugin 声明本就不入 resolve_mcp_config（走 transient
-    # amount_server 挂载、不落 mcp.json），迭代永不遇 plugin origin，无需显式过滤（详见 mcp_server_status）。
+    # #148/F8：审批门 MUST NOT 依赖账本 bundled 名集；plugin 声明**结构性**不入 resolve（无 plugin 入参 +
+    # SettingsScope 无 PLUGIN 成员，见 schema.SCOPE_ORDER）⇒ 迭代物理上遇不到 plugin origin，无需过滤器
+    # ——写一个就是永假守卫（死代码），且是档④「进门后豁免」形状复活的诱因（详见 mcp_server_status）。
     statuses = gate_mcp_servers(resolved, settings)
 
     # mcp.json 定义的 input 入池（无前缀），供 server config 的裸 ${input:} 解析（#69 Group B 风险 3）。
@@ -597,23 +628,58 @@ async def run_mcp_approval(
 
     approved_all_session = approve_all  # 非交互 --approve-all-mcp，或 TTY 选过一次 [a]
 
-    async def _mount(name: str) -> None:
+    def _active_bundle_ids() -> set[str]:
+        """运行期活跃集的 bundle_id（embed 层已被 ``boot_up`` 无门挂起 ⇒ 挂载前须查）/ Active bundle_ids。"""
+        if getattr(comp, "mcp_manager", None) is None:
+            return set()
+        return {resolve_bundle_id(cfg) for cfg in comp.mcp_manager.server_configs()}
+
+    async def _ensure_mounted(name: str) -> None:
         try:
+            srv = resolved.servers[name]
+            # **只在「已挂的那份就是胜出者」时跳过**（隔离审查 🔴1）。``boot_up`` **只**预挂 embed 层
+            # （``_mcp_servers``），故该条件精确等价于「胜出者的 origin 是 embed」：
+            #   - 胜出者 = embed ∧ 已活跃 ⇒ boot_up 挂的正是它 ⇒ 无事可做（重挂只会 restart 客户端，
+            #     ``auto_reconnect=False`` 时更抛 RuntimeError）；
+            #   - 胜出者 = flag/policy/local/user ⇒ **必须挂**，否则 resolved 里那份更高层的胜出配置永不
+            #     生效 ⇒ 运行期层序相对 resolve 层被反转（``local < embed < flag < policy`` 名存实亡）。
+            # 文件来源此刻恒未活跃 ⇒ 走 mount 分支，行为不变。
+            #
+            # ⚠️ **勿改成比较 config**（两种都试过、都错）：``mcp_manager.server_configs()`` 存**渲染后**配置、
+            # 而声明面恒为 **raw**（D1）⇒ 任何带 ``${input:}`` 的 config 恒不相等 ⇒ 每 boot 重挂（restart /
+            # RuntimeError）；改用 raw-对-raw 又受 embed 层 ``model_dump`` 往返规整影响，同样脆。
+            # origin 判据直接表达意图，不受二者影响。守卫见
+            # ``test_higher_layer_beats_embed_at_mount_time`` + ``test_embed_with_placeholder_is_not_remounted...``。
+            if srv.origin is SettingsScope.EMBED and resolve_bundle_id(srv.config) in _active_bundle_ids():
+                console.print(f"[dim]· MCP server {name!r} already mounted from the embed layer (winner), left as is[/dim]")
+                return
             # #137 ③：boot 读**已声明** mcp.json 挂载 = 投影（盘上已是真相），走 transient amount_server，不回写
             # （否则每 boot 重复回写用户声明层 / scope 漂移，见 #138）。
-            await comp.amount_server(_mount_dict(resolved.servers[name]), session=session)
+            await comp.amount_server(_mount_dict(srv), session=session)
             console.print(f"[green]✓ mounted MCP server {name!r}[/green]")
         except Exception as exc:  # 单个 server 挂载失败不阻断其余 / one failure must not block the rest
             console.print(f"[red]✗ failed to mount MCP server {name!r}: {exc}[/red]")
 
+    async def _ensure_unmounted(name: str) -> None:
+        """DISABLED ⇒ 真的摘掉：embed 已被 boot_up 无门挂起，只打印不摘会让 policy 拒绝名单沦为装饰品。"""
+        try:
+            bid = resolve_bundle_id(resolved.servers[name].config)
+            if bid not in _active_bundle_ids():
+                return  # 从未挂过（文件来源恒走此分支）→ 幂等 no-op，行为不变
+            await comp.aunmount_server_by_id(bid)
+            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied) → unmounted[/dim]")
+        except Exception as exc:
+            console.print(f"[red]✗ failed to unmount disabled MCP server {name!r}: {exc}[/red]")
+
     for name, status in statuses.items():
         if status == McpApprovalStatus.ENABLED:
-            await _mount(name)
+            await _ensure_mounted(name)
         elif status == McpApprovalStatus.DISABLED:
             console.print(f"[dim]· MCP server {name!r} disabled (policy/denied), skipped[/dim]")
+            await _ensure_unmounted(name)
         else:  # PENDING
             if approved_all_session:
-                await _mount(name)
+                await _ensure_mounted(name)
                 continue
             if session is None:  # 非 TTY 且未 --approve-all-mcp → skip + WARN
                 console.print(
@@ -629,10 +695,10 @@ async def run_mcp_approval(
             if ans in {"a", "all"}:
                 approve_all_project_mcp()
                 approved_all_session = True
-                await _mount(name)
+                await _ensure_mounted(name)
             elif ans in {"y", "yes"}:
                 approve_mcp_server(name)
-                await _mount(name)
+                await _ensure_mounted(name)
             else:
                 deny_mcp_server(name)
                 console.print(f"[dim]· denied MCP server {name!r} (written to local scope)[/dim]")
@@ -676,6 +742,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             return
         code = await plugin_uninstall(
             registry, home, env, pos[0],
+            non_plugin_bundle_ids=cbs.non_plugin_bundle_ids,
             keep_servers="--keep-servers" in args, remove_server=cbs.remove_server, json_output=json_output,
         )
         if code == EXIT_OK:
@@ -703,7 +770,10 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if not pos:
             console.print("[yellow]usage: plugin disable <plugin>@<marketplace>[/yellow]")
             return
-        code = await plugin_disable(registry, home, env, pos[0], remove_server=cbs.remove_server, json_output=json_output)
+        code = await plugin_disable(
+            registry, home, env, pos[0],
+            non_plugin_bundle_ids=cbs.non_plugin_bundle_ids, remove_server=cbs.remove_server, json_output=json_output,
+        )
         if code == EXIT_OK:
             comp.mark_skills_dirty()
     elif sub == "list":
@@ -722,6 +792,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         # REPL 有 confirm 门 → 悬挂意图 prune 一并纳入确认（#125 任务 2；Typer 非交互须显式 --prune-dangling）
         code = await plugin_gc(
             registry, home, env,
+            non_plugin_bundle_ids=cbs.non_plugin_bundle_ids,
             mcp_teardown=_batch_teardown(cbs.remove_server), confirm=_confirm, prune_dangling=True, json_output=json_output,
         )
         if code == EXIT_OK:

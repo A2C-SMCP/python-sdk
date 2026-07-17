@@ -31,14 +31,17 @@ import os
 from pathlib import Path
 
 import pytest
+from pydantic import TypeAdapter
 
+from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.installer import (
     disable_plugin,
     enable_plugin,
     install_plugin,
     uninstall_plugin,
 )
-from a2c_smcp.computer.settings.reconciler import gc_plugins
+from a2c_smcp.computer.settings.mcp_config import non_plugin_declared_bundle_ids
+from a2c_smcp.computer.settings.reconciler import NonPluginBundleIds, gc_plugins
 from a2c_smcp.computer.settings.store import (
     load_installed_plugins,
     load_known_marketplaces,
@@ -75,6 +78,25 @@ def _write_json(path: Path, obj: object) -> None:
 
 def _stdio(name: str, command: str = "node") -> dict:
     return {"name": name, "type": "stdio", "server_parameters": {"command": command}}
+
+
+def _declared(
+    env: dict[str, str],
+    *,
+    flag: Path | None = None,
+    embed: list[MCPServerConfig] | None = None,
+) -> NonPluginBundleIds:
+    """
+    回收判据「X 非用户声明」项的数据源，**与生产同构** / The criterion's data source, mirroring production。
+
+    生产侧 = :func:`~a2c_smcp.computer.cli.commands.build_mcp_callbacks` 的 ``non_plugin_bundle_ids``
+    （包 ``Computer.resolve_mcp_declarations()``）。此处直呼同一底层函数，故测试与生产读**同一判据面**——
+    传桩（如 ``lambda: set()``）会让「用户/宿主自有 server 永不连坐」这条守卫**永真**，正是本仓踩过四次的假绿。
+
+    :param flag: ``--mcp-config`` flag 层 mcp.json（四景 ①④）。
+    :param embed: 宿主构造入参 ``Computer(mcp_servers=...)``（四景 ②）。
+    """
+    return lambda: non_plugin_declared_bundle_ids(env=env, flag_config_path=flag, embed_servers=embed)
 
 
 def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], commit: str = "abc123") -> Path:
@@ -185,7 +207,7 @@ async def test_scenario1_sole_dependent_uninstall_reclaims(tmp_path: Path, monke
     mcp = _FakeMCP()
     await _install(home, env, "audit@acme", mcp)
 
-    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
 
     assert mcp.removed == [FIGMA_BID]  # 停摘身份 = bundle_id
 
@@ -200,7 +222,7 @@ async def test_scenario2_user_declared_server_is_never_collateral(tmp_path: Path
     mcp = _FakeMCP(existing={FIGMA_BID})
     await _install(home, env, "audit@acme", mcp)
 
-    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
 
     assert mcp.removed == []  # 用户声明 → 非本 plugin 可回收之物
 
@@ -217,11 +239,11 @@ async def test_scenario3_and_4_shared_dependency_no_leak(tmp_path: Path, monkeyp
     await _install(home, env, "review@beta", mcp)
 
     # ③ 卸 A —— B 仍声明依赖 X → 保留
-    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
     assert mcp.removed == []
 
     # ④ 续卸 B —— 最后一个依赖者 → 回收，X 不泄漏
-    await uninstall_plugin("review@beta", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await uninstall_plugin("review@beta", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
     assert mcp.removed == [FIGMA_BID]
 
 
@@ -236,48 +258,117 @@ async def test_scenario5_user_declares_after_install_blocks_reclaim(tmp_path: Pa
 
     _user_mcp_json(tmp_path, {FIGMA_NAME: _stdio(FIGMA_NAME)})  # 事后声明
 
-    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
 
     assert mcp.removed == []
 
 
-@pytest.mark.xfail(
-    reason="已知未覆盖面（#153 隔离审查 🔴）：协议 §4.9.1-2 的数据源是**运行期权威配置集** + origin != plugin，"
-    "而本 SDK 的 manager 不存 origin —— 用户经 `--config @file` / SDK 内嵌 Computer(mcp_servers=) 挂载的 "
-    "server 与 plugin 自己挂的在可观测信息上完全同形，无法区分。根治需运行期 origin（#134 轴）或 --config "
-    "归一进 mcp.json flag 层（#154）。**方案求裁中：protocol Discussion #32** "
-    "（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。本用例钉住缺口：修好后 XPASS 提醒。",
-    strict=False,
-)
-async def test_runtime_only_user_server_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
+# ── conformance §5：回收判据 origin 四景对拍（#164 / Discussion #32 裁决）─────────
+#
+# **#153 遗留缺口的转正**：原 `test_runtime_only_user_server_is_never_collateral`（xfail）钉的是
+# 「用户经 `--config @file` / 内嵌构造挂的 server 不落 mcp.json ⇒ 被判『非用户声明』⇒ plugin 卸载连坐停摘」。
+# 该 xfail 现**转正为下列四景**：`--config` 已归一为 `--mcp-config`（flag 层 mcp.json）、构造入参已成 embed 层，
+# 二者均在 resolve 输出中携带正确 origin ⇒ 判据可分辨。
+#
+# ⚠️ **注意四景**不再**用 `_FakeMCP(existing=...)` 模拟「用户挂了 X」**——那是**裸运行期活跃集**，正是协议
+# §4.9.1-2 钉死的歧路①（无 origin ⇒ flag/embed/plugin 三条挂载路径可观测同形）。用它做夹具会让守卫测的是
+# 一个协议禁止的判据面。四景改注入**真实的 flag 文件 / embed 构造入参**。
+def _flag_mcp(tmp_path: Path, servers: dict) -> Path:
+    """写一份 flag 层 mcp.json（模拟 ``a2c-computer run --mcp-config <file>``）。"""
+    p = tmp_path / "flag-mcp.json"
+    _write_json(p, {"servers": servers, "inputs": []})
+    return p
+
+
+async def test_vector1_flag_mounted_server_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
     """
-    ⚠️ **已知缺口守卫**（xfail）：用户经 ``--config @file`` 挂的 server 在运行期活跃集、**不在 mcp.json**。
+    **四景①**：X 经 flag（``--mcp-config``）挂载 → 卸载声明依赖 X 的 plugin **不回收** X。
 
-    协议 §4.9.1-2 把「X 非用户声明」的数据源定为**运行期权威配置集**（``origin != plugin``），**不是** mcp.json。
-    ``a2c-computer run --config @servers.json``（``cli/main.py`` `_add_server`）与 SDK 内嵌
-    ``Computer(mcp_servers={...})`` 都走 transient ``amount_server``、**从不回写 mcp.json** ⇒ 本 SDK 只读
-    mcp.json 声明面就会把它们判成「非用户声明」⇒ 若该 server 同时被某 plugin 声明依赖，卸载该 plugin 时**连坐停摘**。
-
-    **为何不在 #153 内根治**：「用户 --config 挂的 X」与「plugin enable 挂的 X」在 manager 层信息完全相同
-    （无 origin / 无归属），不新增运行期归属就无法同时满足场景①（A 引入 X 无人依赖 → 回收）与本例。
-    补运行期归属 = #134「ownership 归属混源」轴（Epic #147 明载「共识未覆盖该轴」）；
-    ``--config`` 归一进 mcp.json flag 层 = #154。二者择一，求裁于 protocol Discussion #32：
-    https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32
-
-    **注**：本 PR 相对 develop 仍是净改善——develop 是「卸载**无条件**摘」（连 mcp.json 声明的用户 server 都摘），
-    本 PR 已保护住 mcp.json 各 scope 声明面，仅剩本例这条路径。
+    origin=flag ⇒ 落 `non_plugin_declared_bundle_ids` ⇒ 「X 非用户声明」为假 ⇒ 不回收。
+    **变异验证**：把判据数据源退回「只读 mcp.json 声明面」（即 `_declared(env)` 去掉 `flag=`）→ 本例必红。
     """
     monkeypatch.chdir(tmp_path)
     home, env = _home(tmp_path), _env(tmp_path)
     _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
     monkeypatch.setattr(_STAGE, _fake_stage())
-    # 用户自己挂的 figma.mcp：进运行期活跃集，但**没有** _user_mcp_json（不落 mcp.json 声明）
-    mcp = _FakeMCP(existing={FIGMA_BID})
+    flag = _flag_mcp(tmp_path, {FIGMA_NAME: _stdio(FIGMA_NAME)})  # 用户经命令行点名声明 figma.mcp
+    mcp = _FakeMCP()
     await _install(home, env, "audit@acme", mcp)
 
-    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home,
+        non_plugin_bundle_ids=_declared(env, flag=flag), env=env, remove_server=mcp.remove,
+    )
 
-    assert mcp.removed == [], "用户经 --config @file / 内嵌构造挂载的 server 被连坐停摘（协议 §4.9.1-2）"
+    assert mcp.removed == [], "经 --mcp-config 挂载的用户 server 被连坐停摘（协议 §4.9.1-2 四景①）"
+
+
+async def test_vector2_embed_mounted_server_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
+    """
+    **四景②**：X 经宿主构造入参挂载（``Computer(mcp_servers=...)``，origin=embed）→ **不回收**。
+
+    宿主自有 server 不因 plugin 卸载连坐（§2.5-3：embed 是非-plugin origin）。
+    **变异验证**：`_declared(env, embed=...)` 去掉 `embed=` → 本例必红。
+    """
+    monkeypatch.chdir(tmp_path)
+    home, env = _home(tmp_path), _env(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    embed = [TypeAdapter(MCPServerConfig).validate_python(_stdio(FIGMA_NAME))]  # 宿主构造挂载
+    mcp = _FakeMCP()
+    await _install(home, env, "audit@acme", mcp)
+
+    await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home,
+        non_plugin_bundle_ids=_declared(env, embed=embed), env=env, remove_server=mcp.remove,
+    )
+
+    assert mcp.removed == [], "宿主构造入参挂载的 server 被连坐停摘（协议 §4.9.1-2 四景②）"
+
+
+async def test_vector3_plugin_only_server_is_reclaimed(tmp_path: Path, monkeypatch) -> None:
+    """
+    **四景③**：X 仅由 plugin 声明（无其他 plugin 依赖、无任何非-plugin 声明）→ **回收**。
+
+    这一景是四景里唯一「该回收」的——它守住判据**不会因为①②的修法而全面失灵**（否则 server 永久泄漏）。
+    plugin 声明**不进 resolve**（结构性缺席，见 schema.SCOPE_ORDER）⇒ X ∉ 非-plugin 集 ⇒ 回收。
+    """
+    monkeypatch.chdir(tmp_path)
+    home, env = _home(tmp_path), _env(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    mcp = _FakeMCP()
+    await _install(home, env, "audit@acme", mcp)
+
+    await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home,
+        non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove,
+    )
+
+    assert mcp.removed == [FIGMA_BID], "无人依赖 ∧ 无非-plugin 声明的 server 未被回收 ⇒ 泄漏（四景③）"
+
+
+async def test_vector4_mixed_origin_same_bundle_id_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
+    """
+    **四景④**：同 ``bundle_id`` 混源碰撞（plugin 声明依赖 X ∧ 用户经 flag 也声明 X，flag > plugin）→ **不回收**。
+
+    用户覆盖权（§2.5-3「用户主权」）：即便某 plugin 也声明依赖同一 bundle_id，用户那条声明令 X 永不连坐。
+    与①的区别：①的 X 只有 flag 一个来源；④ 的 X **两个来源并存**，考的是「plugin 也声明」不会盖过「非 plugin 声明」。
+    """
+    monkeypatch.chdir(tmp_path)
+    home, env = _home(tmp_path), _env(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])  # plugin 声明依赖 figma.mcp
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    flag = _flag_mcp(tmp_path, {FIGMA_NAME: _stdio(FIGMA_NAME, command="user-cmd")})  # 用户也声明同 bundle_id
+    mcp = _FakeMCP()
+    await _install(home, env, "audit@acme", mcp)
+
+    await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home,
+        non_plugin_bundle_ids=_declared(env, flag=flag), env=env, remove_server=mcp.remove,
+    )
+
+    assert mcp.removed == [], "混源（plugin + flag）同 bundle_id 被连坐停摘（协议 §4.9.1-2 四景④）"
 
 
 async def test_disable_both_dependents_keeps_dep_resident(tmp_path: Path, monkeypatch) -> None:
@@ -297,8 +388,8 @@ async def test_disable_both_dependents_keeps_dep_resident(tmp_path: Path, monkey
     await _install(home, env, "audit@acme", mcp)
     await _install(home, env, "review@beta", mcp)
 
-    await disable_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
-    await disable_plugin("review@beta", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await disable_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
+    await disable_plugin("review@beta", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
 
     assert mcp.removed == []  # 两者账本记录仍在 → 互相替对方挡住回收（驻留，非泄漏）
 
@@ -323,7 +414,9 @@ async def test_scoped_uninstall_keeps_dep_for_remaining_scope(tmp_path: Path, mo
     monkeypatch.setattr(_STAGE, _fake_stage())
     mcp = _FakeMCP()
 
-    await uninstall_plugin("audit@acme", SkillRegistry(), home, env=env, scope="user", remove_server=mcp.remove)
+    await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, scope="user", remove_server=mcp.remove,
+    )
 
     assert mcp.removed == []  # project scope 记录仍依赖 X
 
@@ -338,7 +431,7 @@ async def test_disable_applies_reclaim_criterion(tmp_path: Path, monkeypatch) ->
     mcp = _FakeMCP(existing={FIGMA_BID})
     await _install(home, env, "audit@acme", mcp)
 
-    await disable_plugin("audit@acme", SkillRegistry(), home, env=env, remove_server=mcp.remove)
+    await disable_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, remove_server=mcp.remove)
 
     assert mcp.removed == []
 
@@ -461,7 +554,7 @@ async def test_gc_does_not_reclaim_user_declared_server(tmp_path: Path, monkeypa
     async def _teardown(ids: list[str]) -> None:
         torn.append(ids)
 
-    await gc_plugins(["audit@acme"], SkillRegistry(), home, env=env, mcp_teardown=_teardown)
+    await gc_plugins(["audit@acme"], SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, mcp_teardown=_teardown)
 
     assert torn == []  # 用户声明 → 不回收
 
@@ -480,6 +573,6 @@ async def test_gc_reclaims_unreferenced_server(tmp_path: Path, monkeypatch) -> N
     async def _teardown(ids: list[str]) -> None:
         torn.append(ids)
 
-    await gc_plugins(["audit@acme"], SkillRegistry(), home, env=env, mcp_teardown=_teardown)
+    await gc_plugins(["audit@acme"], SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, mcp_teardown=_teardown)
 
     assert torn == [[FIGMA_BID]]
