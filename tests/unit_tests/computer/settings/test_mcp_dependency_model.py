@@ -245,7 +245,8 @@ async def test_scenario5_user_declares_after_install_blocks_reclaim(tmp_path: Pa
     reason="已知未覆盖面（#153 隔离审查 🔴）：协议 §4.9.1-2 的数据源是**运行期权威配置集** + origin != plugin，"
     "而本 SDK 的 manager 不存 origin —— 用户经 `--config @file` / SDK 内嵌 Computer(mcp_servers=) 挂载的 "
     "server 与 plugin 自己挂的在可观测信息上完全同形，无法区分。根治需运行期 origin（#134 轴）或 --config "
-    "归一进 mcp.json flag 层（#154）。**方案求裁中：protocol Discussion #32**（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。本用例钉住缺口：修好后 XPASS 提醒。",
+    "归一进 mcp.json flag 层（#154）。**方案求裁中：protocol Discussion #32** "
+    "（https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/32）。本用例钉住缺口：修好后 XPASS 提醒。",
     strict=False,
 )
 async def test_runtime_only_user_server_is_never_collateral(tmp_path: Path, monkeypatch) -> None:
