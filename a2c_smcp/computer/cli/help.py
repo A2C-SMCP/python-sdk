@@ -35,9 +35,11 @@ NAMESPACES: dict[str, str] = {
 NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
     "server": [
         ("server add <json|@file>", "添加或更新 MCP 配置 / add or update config"),
-        ("server rm <name>", "移除 MCP 配置 / remove config"),
-        ("start <name>|all", "启动客户端 / start client(s)"),
-        ("stop <name>|all", "停止客户端 / stop client(s)"),
+        # #143：三个动词收 <name|bundle_id>——CLI 经 resolve.py 解析（name 唯一命中 → 其 bundle_id；同名多条
+        # 则列候选要求改用 bundle_id）。bundle_id 可经 `status` 查看。
+        ("server rm <name|bundle_id>", "移除 MCP 配置 / remove config"),
+        ("start <name|bundle_id>|all", "启动客户端 / start client(s)"),
+        ("stop <name|bundle_id>|all", "停止客户端 / stop client(s)"),
     ],
     "inputs": [
         ("inputs load <@file>", "从文件加载 inputs 定义 / load inputs"),

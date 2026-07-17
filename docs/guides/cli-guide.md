@@ -43,9 +43,29 @@ a2c-computer run --auto-connect true --auto-reconnect true
 | 命令 | 说明 |
 |------|------|
 | `server add <json\|@file>` | 添加/更新 MCP Server 配置 |
-| `server rm <name>` | 移除 MCP Server 配置 |
-| `start <name>\|all` | 启动 MCP Server |
-| `stop <name>\|all` | 停止 MCP Server |
+| `server rm <name\|bundle_id>` | 移除 MCP Server 配置 |
+| `start <name\|bundle_id>\|all` | 启动 MCP Server |
+| `stop <name\|bundle_id>\|all` | 停止 MCP Server |
+
+#### 寻址：`<name>` 还是 `<bundle_id>`？
+
+`name` 是**给人看的显示名**（允许重名），`bundle_id` 是 **server 的唯一身份**。上述三个命令两者都收：
+
+1. 按 `name` 唯一命中 → 直接执行；
+2. 没有 server 叫这个名，但它是个已注册的 `bundle_id` → 按 `bundle_id` 执行；
+3. **有多个 server 同名**（合法共存）→ 列出候选并要求改用 `bundle_id` 重试，**不会**替你猜一个：
+
+```
+a2c> stop filesystem
+⚠ 有 2 个 server 叫 'filesystem' / 2 servers named 'filesystem':
+   bundle_a3f9c2e1  filesystem  (plugin:fs-tools)
+   filesystem       filesystem  (user)
+请用 bundle_id 重试 / Retry with a bundle_id
+```
+
+4. 都不匹配 → 报「未找到」。**绝不会**出现「打印已停止/已移除，实际什么都没做」的假回执。
+
+各 server 的 `bundle_id` 用 `status` 命令查看。
 
 ### Inputs 管理
 

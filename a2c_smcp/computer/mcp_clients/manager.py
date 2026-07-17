@@ -241,6 +241,11 @@ class MCPServerManager:
             await self._astop_client(bundle_id)
 
     async def _astop_client(self, bundle_id: BUNDLE_ID) -> None:
+        # ⚠️ 未命中 = **静默 no-op**，与同类三兄弟刻意不同（``aremove_server`` 抛 KeyError、``_astart_client``
+        #    抛 ValueError）：停止是幂等语义，且与 rust ``stop_client`` 逐行同构（#143 决策 2 保留现状）。
+        #    代价：**报错义务落在人机面** :mod:`a2c_smcp.computer.cli.resolve` —— REPL 先 ``resolve_target``
+        #    解析并校验「已注册」，未命中不下传。**绕过 CLI 直调本方法的调用方拿不到任何未命中信号**
+        #    （历史 P0「stop <未知 token> 却打印 ✅ 停止完成」即由此而来，见 #143）。新增调用方请自行判存。
         """停止单个服务器客户端（按 bundle_id）。"""
         client = self._active_clients.pop(bundle_id, None)
         if client:
