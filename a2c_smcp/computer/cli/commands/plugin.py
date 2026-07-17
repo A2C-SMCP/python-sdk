@@ -50,6 +50,7 @@ from a2c_smcp.computer.cli.commands import (
 from a2c_smcp.computer.cli.progress import clone_spinner
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.inputs.plugin_pool import load_plugin_inputs
+from a2c_smcp.computer.mcp_clients.model import MCPServerInput
 from a2c_smcp.computer.settings.installer import (
     ExistingBundleIds,
     InjectInputs,
@@ -85,6 +86,7 @@ from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.env_segment import detect_env_name_collisions
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -138,11 +140,39 @@ def _plugin_register_cb(comp: Any, plugin: str, marketplace: str) -> RegisterSer
     return _register
 
 
-def _inject_plugin_inputs(comp: Any, plugin_root: Path, plugin: str, marketplace: str) -> None:
-    """从 ``<plugin_root>/mcp-servers/inputs.json`` 读 plugin-scoped inputs、前缀化、逐条 add_or_update_input（DRY 单点）。"""
-    inputs_json = plugin_root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
-    for inp in load_plugin_inputs(inputs_json, plugin, marketplace):
+def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, source: str) -> None:
+    """把一批 input 注入池，**跳过**会造成 env 名坍缩的条目并红字呈现（DRY 单点，#155）。
+
+    分层依据（本仓既有边界，#136）：**写层 fail-fast、读层容错**。库层
+    :meth:`BaseInputResolver.__init__` 对坍缩是硬错误（协议 §「环境变量命名规则」MUST）；CLI 是**读层**，
+    对声明面容错——肇事条目跳过 + 呈现，不连坐掉整条挂载管线（与 ``load_plugin_inputs`` 对畸形条目
+    「WARN 跳过、不抛」同款）。
+
+    为何须**批量前检**而非依赖逐条注入时抛：``add_or_update_input`` 自 #155 起会抛，裸循环撞名即
+    中途 abort ⇒ 前面的已注入、后面的被静默丢弃（部分注入）。前检使注入要么全成、要么只少肇事项。
+
+    肇事组内**每一个** id 都跳过（无一方有优先权，符合「两者均已跳过」的呈现语义）；已在池内的既有
+    id 不动（无法追溯撤回，且既有池自身恒无坍缩）。
+    """
+    existing = {i.id for i in comp.list_inputs()}
+    collisions = detect_env_name_collisions(existing | {i.id for i in inputs})
+    skipped = {i for ids in collisions.values() for i in ids}
+    for name, ids in sorted(collisions.items()):
+        joined = ", ".join(repr(i) for i in ids)
+        console.print(
+            f"[red]❌ {source}: input id {joined} 均映射到同一环境变量名 {name!r}，两者已跳过，请改 id 消歧 / "
+            f"input ids collide on one env var name, all skipped; rename to disambiguate[/red]",
+        )
+    for inp in inputs:
+        if inp.id in skipped:
+            continue
         comp.add_or_update_input(inp)
+
+
+def _inject_plugin_inputs(comp: Any, plugin_root: Path, plugin: str, marketplace: str) -> None:
+    """从 ``<plugin_root>/mcp-servers/inputs.json`` 读 plugin-scoped inputs、前缀化、注入池（DRY 单点）。"""
+    inputs_json = plugin_root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
+    _inject_inputs_collision_safe(comp, load_plugin_inputs(inputs_json, plugin, marketplace), source=f"plugin {plugin}@{marketplace}")
 
 
 def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> InjectInputs:
@@ -623,8 +653,8 @@ async def run_mcp_approval(
     statuses = gate_mcp_servers(resolved, settings)
 
     # mcp.json 定义的 input 入池（无前缀），供 server config 的裸 ${input:} 解析（#69 Group B 风险 3）。
-    for inp in resolved.inputs:
-        comp.add_or_update_input(inp)
+    # #155：坍缩条目跳过 + 红字呈现，合法 input / server 照常——一个 id 笔误不该让整面 server 消失。
+    _inject_inputs_collision_safe(comp, list(resolved.inputs), source="mcp.json")
 
     approved_all_session = approve_all  # 非交互 --approve-all-mcp，或 TTY 选过一次 [a]
 

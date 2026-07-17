@@ -99,6 +99,7 @@ from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.env import env_truthy
+from a2c_smcp.utils.env_segment import raise_on_env_name_collisions
 from a2c_smcp.utils.logger import get_logger, truncate
 from a2c_smcp.utils.window_uri import is_window_uri
 
@@ -171,6 +172,11 @@ class Computer(BaseComputer[PromptSession]):
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
         self._inputs: set[MCPServerInput] = set(inputs or set())
+        # #155：构造期即拒坍缩池。**无条件**检（与是否注入 input_resolver 无关）——注入 resolver 时
+        # 下面的 `input_resolver or InputResolver(...)` 会短路掉 resolver 自检，池将带着坍缩存活到
+        # 后续任一 CRUD 才炸，且届时报的是与调用无关的既有 id。input_resolver 是**公开构造参数**，
+        # 嵌入式宿主是一等消费者，不能只靠「测试才用」兜底。
+        raise_on_env_name_collisions({i.id for i in self._inputs})
         # **embed scope 的声明面**（协议 §2.5-3 / §2.5-5，Discussion #32 裁决）：宿主构造入参 = 代码级显式意图。
         # The **embed-scope declaration surface**: the embedded host's constructor args = explicit code-level intent.
         #
@@ -1092,7 +1098,9 @@ class Computer(BaseComputer[PromptSession]):
 
         :raises EnvNameCollisionError: 新池内两个 id 撞同一 env 名（#155 F4）；此时**本实例状态完全不变**。
         """
-        candidate = inputs or set()
+        # 拷贝而非持有入参引用：池已带「无坍缩」不变量（#155），别名会让调用方事后 `s.add(...)` 把坍缩
+        # 塞进池且完全绕过校验。与 `__init__` / `add_or_update_input` 的拷贝语义对齐。
+        candidate = set(inputs or set())
         # 复用传入或已有的会话，以便后续解析共享同一 Session
         # Reuse provided or existing session so subsequent resolving shares the same session
         sess = session or getattr(self._input_resolver, "session", None)
@@ -1141,6 +1149,8 @@ class Computer(BaseComputer[PromptSession]):
         if not input_id:
             return False
 
+        # 注：此处**刻意**不做 add/update 那套「先构造再赋值」——纯删除只会减少 env 名，不可能新增坍缩
+        # （#155）。这是推理结论而非疏漏，勿「顺手对齐」写出无意义代码。
         removed = False
         target = None
         for existed in self._inputs:

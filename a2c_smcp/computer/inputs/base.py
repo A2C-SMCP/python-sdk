@@ -47,9 +47,12 @@ class BaseInputResolver(Generic[S], ABC):
         # English: inputs definition snapshot and resolve cache
         self._inputs: dict[str, MCPServerInput] = {i.id: i for i in inputs}
         # 注册期坍缩 fail-fast（#155 / PROTO-5 F4）：ENV_SEGMENT 非单射（`-` 与 `_` 同映射），两个 id 撞到
-        # 同一完整 env 名会静默串味（后写的赢，含 password 密钥）⇒ 硬错误。本类是唯一收口：Computer 的
-        # update_inputs / add_or_update_input / remove_input 每次变更都重建 resolver，无路径绕过。
-        raise_on_env_name_collisions(self._inputs)
+        # 同一完整 env 名会静默串味（后写的赢，含 password 密钥）⇒ 硬错误。
+        # 覆盖面：Computer 的 update_inputs / add_or_update_input / remove_input 每次变更都重建 resolver，
+        # 故经这三条路径的池恒过检。但 `Computer.__init__` 允许**注入** input_resolver 并借此短路本构造
+        # （`input_resolver or InputResolver(...)`）⇒ 那条路由 `Computer.__init__` 自己无条件补检，
+        # 二者合起来才是完整收口。
+        raise_on_env_name_collisions(self._inputs.keys())
         self._cache: dict[str, Any] = {}
         # 中文: 可选会话实例，子类在解析时可优先使用
         # English: Optional session instance; subclasses may prefer using it during resolution

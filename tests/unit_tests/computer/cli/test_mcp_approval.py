@@ -100,6 +100,12 @@ class _FakeComp:
     def add_or_update_input(self, inp: Any) -> None:
         self.injected.append(inp)
 
+    def list_inputs(self) -> tuple[Any, ...]:
+        # 累积池：#155 的坍缩前检读它。注意本桩的 add_or_update_input **永不抛**（真 Computer 会），
+        # 故「注入失败」类契约在本文件**测不到**——其真实构造路径守卫见
+        # tests/integration_tests/computer/cli/test_mcp_flag_config.py（F7）。
+        return tuple(self.injected)
+
     async def amount_server(
         self, cfg: dict[str, Any], *, session: Any = None, plugin: Any = None, marketplace: Any = None,
     ) -> None:

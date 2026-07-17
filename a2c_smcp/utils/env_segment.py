@@ -87,6 +87,11 @@ def detect_env_name_collisions(input_ids: Iterable[str]) -> dict[str, list[str]]
 
     检测面 = **完整 env 名**（F4）：某段 ENV_SEGMENT 相同但完整名不同的情形**无害**，MUST NOT 报错
     ——按段判会误拒（如 `plugin-a@mp/token` 与 `plugin_a@mp/secret` 前缀段坍缩但完整名分叉）。
+
+    🔴 **接线 server/tool 段时本函数 MUST 同步扩形**：当前只吃裸 id，因 live 路径只有 id 段 ⇒ 裸 id 集
+    即「全部活跃 env 名」，协议 MUST 已满足。一旦 bundle_id 段接入 live（见模块头「决策 1」），活跃
+    env 名成 (id × bundle_id) 的积，本函数不会自动跟进，会静默退化成只查 id 空间——而协议给的坍缩
+    例子（`a-b` / `a_b` → 提示显式指定 `bundleId`）恰恰就是 bundle_id 段。
     """
     by_name: dict[str, list[str]] = {}
     for input_id in input_ids:

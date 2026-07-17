@@ -309,10 +309,47 @@ async def test_inject_inputs_cb_prefixes_and_injects(tmp_path: Path) -> None:
         def add_or_update_input(self, inp: Any) -> None:
             injected.append(inp)
 
+        def list_inputs(self) -> tuple[Any, ...]:
+            # 返回**累积池**而非恒空——#155 的坍缩前检要读它；恒空会让「与既有池撞名」这一支永远测不到。
+            return tuple(injected)
+
     cb = plugin_cmd._plugin_inject_inputs_cb(_Comp(), "audit", "acme")
     await cb(plugin_root)
     assert len(injected) == 1
     assert injected[0].id == "audit@acme/figma_token"  # 前缀化（§9.3 D2）
+
+
+@pytest.mark.asyncio
+async def test_inject_inputs_cb_skips_collisions_without_partial_injection(tmp_path: Path) -> None:
+    """#155：plugin inputs 撞 env 名 → 肇事对全跳过、无辜项照常注入，**不中途 abort**。
+
+    ``_inject_plugin_inputs`` 是 install / enable / 治理重挂三条路径的 DRY 单点；裸循环在此撞名会
+    partial-inject 并把异常抛给上游 catch-all（enable 路径只 catch PluginInstallError ⇒ 会穿透，
+    留下「inputs 注入一半 + plugin 未启用」）。
+    """
+    home = _home(tmp_path)
+    plugin_root = _setup_catalog(
+        home, "acme", "audit", servers=[FIGMA_NAME],
+        # 前缀化后 `audit@acme/tok-a` 与 `audit@acme/tok_a` 同映射到 A2C_SMCP_audit_acme_tok_a
+        inputs=[
+            {"id": "tok-a", "type": "promptString", "description": "d"},
+            {"id": "tok_a", "type": "promptString", "description": "d"},
+            {"id": "safe", "type": "promptString", "description": "d"},
+        ],
+    )
+    injected: list[Any] = []
+
+    class _Comp:
+        def add_or_update_input(self, inp: Any) -> None:
+            injected.append(inp)
+
+        def list_inputs(self) -> tuple[Any, ...]:
+            return tuple(injected)
+
+    cb = plugin_cmd._plugin_inject_inputs_cb(_Comp(), "audit", "acme")
+    await cb(plugin_root)  # 不得抛
+
+    assert {i.id for i in injected} == {"audit@acme/safe"}, f"肇事对未全跳过 / 无辜项被连坐：{[i.id for i in injected]}"
 
 
 # ── repl_dispatch（REPL 解析胶水层；fix-review #2）/ REPL parse glue ────────────
@@ -354,6 +391,9 @@ class _ReplComp:
 
     def add_or_update_input(self, inp: Any) -> None:
         self.injected.append(inp)
+
+    def list_inputs(self) -> tuple[Any, ...]:
+        return tuple(self.injected)  # 累积池：#155 坍缩前检的数据源
 
     async def amount_server(self, cfg: Any, *, session: Any = None, plugin: Any = None, marketplace: Any = None) -> None:
         # #137 ③：plugin enable/install remount 经 build_mcp_callbacks → transient amount_server（治理投影）。

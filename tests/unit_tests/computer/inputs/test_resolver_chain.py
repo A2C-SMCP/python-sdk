@@ -28,7 +28,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
 )
-from a2c_smcp.utils.env_segment import EnvNameCollisionError, env_var_name
+from a2c_smcp.utils.env_segment import EnvNameCollisionError, detect_env_name_collisions, env_var_name
 
 _SESSION: Any = object()  # 非 None → _has_tty 视为可交互 / non-None → treated as interactive (TTY)
 
@@ -72,19 +72,18 @@ def test_resolver_rejects_env_name_collision() -> None:
     assert "figma-token" in msg and "figma_token" in msg
 
 
-def test_resolver_allows_same_segment_different_full_name() -> None:
-    """#155 F4 检测面 = **完整 env 名**：段相同但完整名不同 MUST NOT 报错（按段判会误拒）。
+def test_resolver_allows_ids_whose_full_names_differ() -> None:
+    """#155 F4 检测面 = **完整 env 名**：完整名不同即 MUST NOT 报错——防 fail-fast 收得过紧。
 
-    正对照：`a-b` / `a_b` 若作为**不同 input 的前缀段**出现（此处经带前缀池条目体现），
-    只要完整名不同就必须放行——防 fail-fast 收得过紧。
+    正对照：`plugin-a@mp/token` 与 `plugin_a@mp/secret` 的 `plugin-a`/`plugin_a` 部分同映射为
+    `plugin_a`，但 token/secret 让**完整名**分叉 ⇒ 必须放行。
     """
-    inputs = [
-        MCPServerPromptStringInput(id=prefix_input_id("plugin-a", "mp", "token"), description="d"),
-        MCPServerPromptStringInput(id=prefix_input_id("plugin_a", "mp", "secret"), description="d"),
-    ]
-    # plugin-a→plugin_a 段坍缩，但 token/secret 让完整名分叉 ⇒ 放行
-    r = InputResolver(inputs)
-    assert r is not None
+    a = prefix_input_id("plugin-a", "mp", "token")
+    b = prefix_input_id("plugin_a", "mp", "secret")
+    # 判据直断：检测器对这两个 id 返回空冲突集（而非靠「构造不抛」这种装饰性断言）
+    assert detect_env_name_collisions([a, b]) == {}
+    assert env_var_name(a) != env_var_name(b)
+    InputResolver([MCPServerPromptStringInput(id=a, description="d"), MCPServerPromptStringInput(id=b, description="d")])
 
 
 @pytest.mark.asyncio

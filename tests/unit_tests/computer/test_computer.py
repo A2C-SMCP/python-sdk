@@ -686,6 +686,34 @@ def test_update_inputs_env_collision_leaves_state_unchanged():
     assert computer._input_resolver is resolver_before
 
 
+def test_init_rejects_collision_even_with_injected_resolver():
+    """#155：注入 input_resolver 时 **`or` 短路**会跳过 resolver 自检 ⇒ __init__ 必须无条件补检。
+
+    input_resolver 是公开构造参数（嵌入式宿主是一等消费者），不能只靠「只有测试才传」兜底：
+    漏检的池会带着坍缩存活到后续任一 CRUD 才炸，届时报的还是与本次调用无关的既有 id。
+    """
+    with pytest.raises(EnvNameCollisionError):
+        Computer(
+            name="t",
+            inputs={
+                MCPServerPromptStringInput(id="a-b", description="d"),
+                MCPServerPromptStringInput(id="a_b", description="d"),
+            },
+            input_resolver=DummyResolver({}),  # 短路掉 InputResolver 自检的那条路
+        )
+
+
+def test_update_inputs_copies_and_does_not_alias_caller_set():
+    """#155：池带「无坍缩」不变量后，持有入参引用即成静默漏洞——调用方事后 add 可绕过全部校验。"""
+    caller_set = {MCPServerPromptStringInput(id="kept", description="d")}
+    computer = Computer(name="t")
+    computer.update_inputs(caller_set)
+
+    caller_set.add(MCPServerPromptStringInput(id="sneaked", description="d"))
+
+    assert {i.id for i in computer.list_inputs()} == {"kept"}, "Computer 池被调用方的后续 mutate 污染（别名）"
+
+
 @pytest.mark.asyncio
 async def test_boot_up_renders_all_initial_servers(monkeypatch):
     # Arrange an initial server with placeholders

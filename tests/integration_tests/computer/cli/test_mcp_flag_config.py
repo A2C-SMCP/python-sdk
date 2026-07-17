@@ -392,3 +392,50 @@ async def test_build_mcp_callbacks_non_plugin_bundle_ids_covers_flag_and_embed(
 def test_managed_mcp_filename_is_stable() -> None:
     """``MANAGED_MCP_FILENAME`` 被本模块的 policy 用例间接依赖；此处仅做导入面存在性守卫。"""
     assert MANAGED_MCP_FILENAME.endswith(".json")
+
+
+@pytest.mark.asyncio
+async def test_colliding_input_ids_skip_only_offenders_and_keep_mounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    **#155 🔴 回归钉**：声明面 input id 撞 env 名 → 只拒肇事对，无辜 input 与合法 server 照常（读层容错）。
+
+    背景：#155 让 ``add_or_update_input`` 从「永不抛」变成「会抛」。若 ``run_mcp_approval`` 仍用裸循环
+    ``for inp in resolved.inputs: comp.add_or_update_input(inp)`` 逐条投喂，撞名即**中途 abort**：
+    前面的已注入、后面的被静默丢弃（部分注入），且异常穿透到 ``interactive_impl`` 的 catch-all
+    ⇒ 整条门控/挂载管线消失，用户只看到一行黄字「MCP 批准门控初始化失败」——**一个 id 笔误让所有
+    server 蒸发**。修法 = 循环前整体前检 + 跳过肇事项（``_inject_inputs_collision_safe``）。
+
+    **必须走真实 Computer**（F7）：``_FakeComp`` 的 ``add_or_update_input`` 只 append、**永不抛**，会把
+    「注入不会失败」这个恰恰被本次改动推翻的前提固化为真 ⇒ 本 bug 对桩**物理上不可见**（Epic #147 陷阱①/④）。
+
+    **变异验证**：把 ``plugin.py`` 的 ``_inject_inputs_collision_safe(...)`` 换回裸循环 → 本例转红
+    （``SAFE`` 丢失 + server 不挂）。
+    """
+    _isolate(tmp_path, monkeypatch)
+    script = "tests/integration_tests/computer/mcp_servers/direct_execution.py"
+    # `tok-a` 与 `tok_a` 同映射到 A2C_SMCP_tok_a（ENV_SEGMENT 非单射：'-' 与 '_' 同归一）。
+    # SAFE 排在肇事对**之后**入池顺序上无关（set 无序），但它是「无辜项是否被连坐丢弃」的探针。
+    flag = _write_flag_file(
+        tmp_path,
+        servers={SRV_NAME: _server_body("${input:SAFE}")},
+        inputs=[
+            {"id": "tok-a", "type": "promptString", "description": "d", "default": "x"},
+            {"id": "tok_a", "type": "promptString", "description": "d", "default": "y"},
+            {"id": "SAFE", "type": "promptString", "description": "server script", "default": script},
+        ],
+    )
+
+    comp = _real_computer(tmp_path, mcp_flag_config=flag)
+    async with comp:
+        # 不得抛：读层对声明面容错，异常若逸出会被上游 catch-all 吞成黄字 + 全面停摆
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)
+
+        pool = {i.id for i in comp.inputs}
+        # ① 肇事对**两个都**跳过（无一方有优先权）——否则谁赢取决于 set 迭代序，即「静默串味」换个马甲
+        assert "tok-a" not in pool and "tok_a" not in pool, f"肇事 input 未被拒：{pool}"
+        # ② 无辜项未被连坐（裸循环的部分注入正是在此漏）
+        assert "SAFE" in pool, f"无辜 input 被连坐丢弃：{pool}"
+        # ③ 合法 server 照常挂载（爆炸半径不外溢；旧行为此处为空集）
+        assert SRV_BID in {resolve_bundle_id(c) for c in comp.mcp_manager.server_configs()}, "合法 server 未挂载"

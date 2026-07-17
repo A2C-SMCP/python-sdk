@@ -7,12 +7,16 @@
 """
 input env 命名（ENV_SEGMENT）**跨 SDK 一致性对拍**（P0 硬门槛）/ Cross-SDK conformance for input env var naming.
 
-夹具来源 / Fixture source（唯一权威）：
-    a2c-smcp-protocol ``docs/specification/fixtures/env_segment_conformance_vectors.json``
-    —— 规范正文见 ``docs/guides/computer-mcp-config-guide.md`` §「环境变量命名规则（双端统一规范）」
+规范正文 / Spec（唯一权威）：
+    a2c-smcp-protocol ``docs/guides/computer-mcp-config-guide.md`` §「环境变量命名规则（双端统一规范）」
     @ develop ``9cde57c``（PROTO-5 / Discussion #23 F4-F5）。
-    本文件旁的 ``fixtures/env_segment_conformance_vectors.json`` 为该规范文件的**逐字节 vendored 副本**——
-    协议仓更新向量时须重新同步（``git show origin/develop:docs/specification/fixtures/... > fixtures/...``）。
+
+⚠️ **夹具落地状态：PENDING（#155）** —— 旁边的 ``fixtures/env_segment_conformance_vectors.json``
+    是 **python-sdk 首版**，**尚未**落到协议仓（协议仓当前只有 ``bundle_id_conformance_vectors.json``）。
+    故本轮验收 ①「与 rust 共享测试向量」**尚未成立**：向量已按规范正文写就并锁形态，但跨仓共享待协议仓收口。
+    协议仓落地后，此处应改为其**逐字节 vendored 副本**并按 bundle_id 同款方式同步
+    （``git show origin/develop:docs/specification/fixtures/... > fixtures/...``）——**在那之前勿跑该命令**，
+    会把本地首版清空。
 
 含义 / Meaning：任一 SDK 的 ``env_var_name(input_id, bundle_id, tool_name)`` **MUST** 对每条向量产出
 ``expected_env_var_name`` 方为合规。python 与 rust 逐字节一致是 F4 的硬门槛（rust 镜像 rust-sdk#140）。
@@ -84,8 +88,8 @@ def test_known_collision_pair_maps_to_same_name() -> None:
 def test_env_segment_is_not_bundle_id_normalize_name() -> None:
     """ENV_SEGMENT **不**折叠连续 '_'、**不**裁首尾——与 bundle_id.normalize_name 的行为差异钉死。
 
-    normalize_name('a--b') == 'a-b'（不折 '-'）、normalize_name('_lead_') == 'lead'（裁首尾）；
-    误把 normalize_name 当 ENV_SEGMENT 复用会让 a_b/a__b 坍缩且首尾信息丢失 ⇒ 此处先红。
+    误把 normalize_name 当 ENV_SEGMENT 复用会让 a_b/a__b 坍缩（它折叠 '_+'）且首尾信息丢失
+    （它裁 [_-]）⇒ 此处先红。下方对 normalize_name 的正对照断言即两者产出的分叉证据。
     """
     from a2c_smcp.utils.bundle_id import normalize_name
 
