@@ -1761,64 +1761,85 @@ class Computer(BaseComputer[PromptSession]):
         return report
 
     def list_mcp_servers_with_metadata(self) -> list[McpServerWithMetadata]:
-        """列出 MCP 服务器 + 归属 / 生命周期元数据（活跃 inventory，#121 对齐 rust-sdk #97）/ inventory query。
+        """列出 MCP 服务器 + 归属 / 生命周期元数据（活跃 inventory，#121；#144 迁 bundle_id 主键，对齐 rust-sdk #97）。
 
-        面向 client（如 ``tfrobot-client``）Skill / MCP tab：一次拿到「当前 Computer 有哪些 MCP server + 每条
-        归谁（user vs plugin，含 marketplace / plugin / pluginId）+ 能否从普通 MCP tab 编辑 / 启停」，**无需**读
-        SDK ledger、**无需**解析 plugin manifest、**无需**持内存 ownership map。协议依据 a2c-smcp-protocol
-        v0.3.0 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起也须可查询；
-        「已启用」= installed ∧ ``enabledPlugins[id] is True``，``installed_disabled`` 不进本投影，§2.4）。
-        元数据类型见 :mod:`~a2c_smcp.computer.inventory`，**SDK-facing、不进** Agent-facing ``client:*`` wire。
+        面向 client（如 ``tfrobot-client``）Skill / MCP tab：一次拿到「当前 Computer 有哪些 MCP server（**身份 =
+        ``bundle_id``**，client 据此关联回 ``client:get_config.servers``（bundle_id 为 key）与工具
+        ``{bundle_id}__{tool}``）+ 每条归谁（user vs plugin，含 marketplace / plugin / pluginId）+ 能否从普通
+        MCP tab 编辑 / 启停」，**无需**读 SDK ledger、**无需**解析 plugin manifest、**无需**持内存 ownership map。
+        协议依据 a2c-smcp-protocol v0.3.0 §4.8（归属 = boot 纯函数、每次可复现；enabled bundled server 进程未拉起
+        也须可查询；「已启用」= installed ∧ ``enabledPlugins[id] is True``，``installed_disabled`` 不进本投影，§2.4）
+        + Discussion #23 F1/F2。元数据类型见 :mod:`~a2c_smcp.computer.inventory`，**SDK-facing、不进** Agent-facing
+        ``client:*`` wire。
 
-        合并两个来源（去重按 server 名，运行期条目优先）：
+        合并两个来源（**按 bundle_id 去重**，运行期条目优先）：
 
-        1. 运行期活跃配置集——manager 已建时取 ``MCPServerManager.server_configs()`` 快照（构造期声明经
-           boot 物化项 + ``aadd_or_aupdate_server`` 动态挂载项 + client 经 ``reconcile_governance(hooks)``
-           重挂的 plugin bundled 项）；manager 未建（pre-boot）回退构造期声明集 ``self._mcp_servers``。
-           名字命中 ledger 派生 bundled 集 → ``managedBy=plugin``，否则 ``managedBy=user``。
-        2. ledger 派生的**已启用但尚未物化**的 plugin bundled server（boot 默认 ``register_server=None`` 后
-           即此态）——补入 inventory 并标 ``managedBy=plugin``，满足 §4.8「进程未拉起也可观测」（client 据此
-           物化或引导 Marketplace）。
+        1. 运行期活跃配置集——manager 已建时取 ``MCPServerManager.server_configs()`` 快照（构造期声明经 boot 物化项
+           + ``aadd_or_aupdate_server`` 动态挂载项 + client 经 ``reconcile_governance(hooks)`` 重挂的 plugin bundled
+           项，§2.5-4 运行期权威）；manager 未建（pre-boot）回退构造期 embed 声明集 ``self._mcp_servers``。
+        2. ledger 派生的**已启用但尚未物化**的 plugin bundled server（boot 默认 ``register_server=None`` 后即此态）——
+           补入 inventory，满足 §4.8「进程未拉起也可观测」（client 据此物化或引导 Marketplace）。
 
-        结果按 server 名排序（保证稳定可测输出）。**不**含运行期「进程是否已启动」状态——那由
-        ``MCPServerManager.get_server_status`` 单独提供。
+        **归属 F1 纯推导**（``managed_by``，Discussion #23 F1）：``bundle_id ∈ 非-plugin 声明面 ⇒ user，否则若被 plugin
+        声明 ⇒ plugin``。「非-plugin 声明面」= :meth:`resolve_mcp_declarations`（携 ``origin``，结构性 ∈
+        ``{user/project/local/embed/flag/policy}``）的 bundle_id 集。故用户自己声明的 server **永远 user 主权**（可编辑），
+        **即便它与某 plugin 依赖同 ``bundle_id``**（§2.5 用户主权）——这正是 #144 纠正的旧「同名误标 plugin 只读」缺陷；
+        纯运行期 transient 投影（无声明、非 bundled）落 user（无 plugin 元数据可构造 ``McpPluginOwnership``，与人机面
+        :func:`~a2c_smcp.computer.cli.resolve.collect_candidates` 的 ``runtime`` 归属可观测等价）。
 
-        ⚠️ **归属 join key 仍是 server 名**（已知缺陷，迁 ``bundle_id`` 挂 #144；rust #97 同）：同名会退化——
-        用户配置一个与某启用 plugin 声明依赖的 server **同名但异 bundle_id** 的 server 会被误标 ``plugin``
-        （只读），而协议 §5.6 明定二者是**合法共存的不同身份**。
+        结果按 ``bundle_id`` 排序（唯一全序、稳定可测；``name`` 可碰撞非全序）。**不**含运行期「进程是否已启动」状态——
+        那由 ``MCPServerManager.get_server_status`` 单独提供。异 ``bundle_id`` 的同名 server 合法共存（§5.6），各自独立成条。
 
         .. note::
-           此处原注称「name = 能力身份」且「可靠的冲突拦截是安装期职责（install hook 冲突门）」——**两句均已
-           作废**（#153/D3）：协议裁定身份是 ``bundle_id``、plugin 与 server 是**依赖关系**，安装期不再拦截
-           冲突（同 bundle_id 已有 = 依赖已满足 → 提示并复用）。故本投影的同名退化**不再有安装期兜底**，
-           修复须落在 join key 本身（#144）。
+           **flag-scope 结构性差异（非 #144 缺陷）**：本方法读核心层 flag-less :meth:`_resolve_declared_settings`
+           判「谁是 enabled plugin」（Computer 结构上不持 ``--settings`` flag 知识，与 rust 同构文档化），故经
+           ``--settings`` flag 启用的 plugin 不在本视图；人机面 :func:`~a2c_smcp.computer.cli.resolve.collect_candidates`
+           读 flag-aware 视图。此差异是核心 / CLI 边界的既有限制。
         """
         home = self.skill_home
-        # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图）。
+        # F1「∃ origin != plugin 的声明」判据的 bundle_id 集 = 非-plugin 声明面（携 origin，结构性 ∈ 非-plugin：
+        # durable + flag --mcp-config + embed）。与 `aremove_server` / `cli.resolve.collect_candidates` 同接缝。
+        non_plugin_bundle_ids = {
+            resolve_bundle_id(srv.config) for srv in self.resolve_mcp_declarations(env=os.environ).servers.values()
+        }
+        # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图），**按 bundle_id 为键**（#144）。
         declared = self._resolve_declared_settings()
-        bundled = {record.config.name: record for record in collect_enabled_bundled_servers(home, declared)}
+        bundled: dict[str, BundledServerRecord] = {
+            resolve_bundle_id(record.config): record for record in collect_enabled_bundled_servers(home, declared)
+        }
 
-        def plugin_ownership(record: BundledServerRecord) -> McpPluginOwnership:
-            return McpPluginOwnership(marketplace=record.marketplace, plugin=record.plugin, plugin_id=record.plugin_id)
+        def ownership_for(bundle_id: str) -> McpOwnership:
+            # F1 纯推导：有非-plugin 声明 ⇒ user（用户主权，即便与某 plugin 依赖同 bundle_id，§2.5）；否则若被 plugin
+            # 声明 ⇒ plugin；纯运行期 transient 孤儿（无 plugin 元数据可构造 McpPluginOwnership）⇒ user（同 collect_candidates
+            # 的 runtime 归属可观测等价）。
+            record = bundled.get(bundle_id)
+            if record is not None and bundle_id not in non_plugin_bundle_ids:
+                return McpPluginOwnership(marketplace=record.marketplace, plugin=record.plugin, plugin_id=record.plugin_id)
+            return McpUserOwnership()
 
         out: list[McpServerWithMetadata] = []
         materialized: set[str] = set()
 
         # 来源一：运行期活跃配置集。manager 已建 = 权威（含动态挂载/重挂项；`_mcp_servers` 仅构造期声明快照，
-        # 此后不回写）；未建（pre-boot）回退构造集。命中 ledger bundled 集 → plugin，否则 user。
+        # 此后不回写）；未建（pre-boot）回退构造集。**按 bundle_id 去重**（no-double-open ⇒ 运行期集本就唯一）。
         active_configs = self.mcp_manager.server_configs() if self.mcp_manager is not None else tuple(self._mcp_servers)
         for cfg in active_configs:
-            materialized.add(cfg.name)
-            record = bundled.get(cfg.name)
-            managed_by: McpOwnership = plugin_ownership(record) if record is not None else McpUserOwnership()
-            out.append(McpServerWithMetadata.assemble(cfg.name, disabled=cfg.disabled, managed_by=managed_by))
+            bundle_id = resolve_bundle_id(cfg)
+            materialized.add(bundle_id)
+            out.append(
+                McpServerWithMetadata.assemble(cfg.name, bundle_id=bundle_id, disabled=cfg.disabled, managed_by=ownership_for(bundle_id))
+            )
 
-        # 来源二：已启用但尚未物化的 bundled server（不在运行期集 → 补入，标 plugin；§4.8 可观测）。
-        for name, record in bundled.items():
-            if name not in materialized:
-                out.append(McpServerWithMetadata.assemble(name, disabled=record.config.disabled, managed_by=plugin_ownership(record)))
+        # 来源二：已启用但尚未物化的 bundled server（bundle_id 不在运行期集 → 补入；§4.8 可观测）。
+        for bundle_id, record in bundled.items():
+            if bundle_id not in materialized:
+                out.append(
+                    McpServerWithMetadata.assemble(
+                        record.config.name, bundle_id=bundle_id, disabled=record.config.disabled, managed_by=ownership_for(bundle_id)
+                    )
+                )
 
-        out.sort(key=lambda entry: entry.name)
+        out.sort(key=lambda entry: entry.bundle_id)
         return out
 
     def get_skills(self) -> list[A2CSkillRef]:

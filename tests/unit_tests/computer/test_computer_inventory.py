@@ -14,8 +14,9 @@ Computer 级 MCP server 归属 + 活跃 inventory 查询测试（#121，协议 �
   marketplace/plugin/pluginId），后者虽未物化仍出现（§4.8「进程未拉起也可观测」）；
 - AC2 disable / 卸载（账本移除）后：bundled server 不再出现在 inventory；
 - AC3 本地-only pid（无 ``@``）不采集（与 ``collect_enabled_bundled_servers`` 门控一致）；
-- 合并语义：同名时运行期条目优先（disabled 取运行期配置）且按 name 命中 bundled 集标 plugin；
-  结果按 name 排序稳定输出。
+- 合并语义（#144 起 **bundle_id 为键**）：同 bundle_id 时运行期条目优先（disabled 取运行期配置）；归属 F1 纯推导
+  （``∃ origin != plugin 的声明 ⇒ user，否则 plugin``）；异 bundle_id 同名 server 合法共存不塌陷；结果按
+  bundle_id 排序稳定输出。
 """
 
 from __future__ import annotations
@@ -132,8 +133,8 @@ async def test_inventory_boot_reports_user_and_plugin_ownership(tmp_path: Path, 
         assert not plugin.lifecycle.can_start_from_mcp_tab
         assert plugin.lifecycle.manage_from == "marketplace"
 
-        # 结果按 name 排序（稳定可测输出）。
-        assert [e.name for e in inv] == sorted(e.name for e in inv)
+        # 结果按 bundle_id 排序（bundle_id 唯一全序，name 可碰撞非全序）——#144。
+        assert [e.bundle_id for e in inv] == sorted(e.bundle_id for e in inv)
 
 
 # ── AC2：disable / 卸载后 bundled server 不再出现 ──────────────────────────────
@@ -179,19 +180,86 @@ async def test_inventory_skips_local_only_pid(tmp_path: Path, monkeypatch: pytes
     assert not any(e.name == "audit-mcp" for e in comp.list_mcp_servers_with_metadata())
 
 
-# ── 合并语义：同名去重、运行期条目优先 ─────────────────────────────────────────
+# ── 合并语义：同 bundle_id 去重、运行期条目优先、F1 用户主权 ──────────────────────
 @pytest.mark.asyncio
-async def test_inventory_merge_dedupes_by_name_runtime_entry_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """用户配置与 bundled 同名 → 仅一条；disabled 取运行期配置（运行期优先），归属按 name 命中标 plugin（文档化退化）。"""
+async def test_inventory_user_declaration_wins_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """user server 与 plugin bundled **同 bundle_id**（同 display 名、缺省派生）→ 一条，managedBy=user（F1 用户主权）。
+
+    #144 前此处按 name 命中 bundled 集误标 plugin（只读，用户改不了自己的 server）。F1 纯推导：
+    ``∃ origin != plugin 的声明 ⇒ user`` —— 用户 embed 声明胜出，即便与某 plugin 依赖同 bundle_id（§2.5 用户主权）。
+    """
     _isolate_declared_env(tmp_path, monkeypatch)
     home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
 
-    # 运行期物化一条同名 server（disabled=True；bundled 侧 disabled=False）。
+    # 运行期物化一条同名 server（缺省派生 ⇒ bundle_id == "audit-mcp" == bundled 侧；disabled=True，bundled 侧 disabled=False）。
     async with Computer(name="t", mcp_servers={_user_stdio_server("audit-mcp")}, auto_connect=False, skill_home=home) as comp:
-        inv = [e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp"]
-        assert len(inv) == 1, "同名去重：运行期条目优先，不重复补入"
+        inv = [e for e in comp.list_mcp_servers_with_metadata() if e.bundle_id == "audit-mcp"]
+        assert len(inv) == 1, "同 bundle_id 去重：运行期条目优先，不重复补入"
         assert inv[0].disabled, "disabled 应取运行期配置（运行期条目优先）"
-        assert isinstance(inv[0].managed_by, McpPluginOwnership), "name 命中 bundled 集 → 标 plugin（文档化退化）"
+        assert inv[0].managed_by == McpUserOwnership(), "F1：用户 embed 声明胜出 ⇒ user 主权（可编辑），非 plugin 只读"
+        assert inv[0].lifecycle.can_edit_from_mcp_tab
+
+
+# ── #144：异 bundle_id 同名 server 合法共存不塌陷 + 各自正确归属 ─────────────────
+@pytest.mark.asyncio
+async def test_inventory_coexisting_same_name_distinct_bundle_ids_not_collapsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同 display 名、**异 bundle_id** 的 user server 与 plugin bundled server 合法共存（§5.6）→ 两条独立条目。
+
+    这正是 #144 根治的双缺陷：旧 name-join 会把二者去重塌成一条（缺陷 #2），并把用户自己的 server 误标
+    plugin（只读，缺陷 #3）。迁 bundle_id 后二者身份分明、各自正确归属。
+    """
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, servers=["audit-mcp"])  # plugin bundled：name=audit-mcp，缺省 bundle_id=audit-mcp
+
+    # 用户 embed 一条同 display 名但**显式异 bundle_id** 的 server（disabled 免 boot 拉起进程）。
+    user_cfg = StdioServerConfig(
+        name="audit-mcp", bundle_id="user-audit", disabled=True, server_parameters=StdioServerParameters(command="node")
+    )
+    async with Computer(name="t", mcp_servers={user_cfg}, auto_connect=False, skill_home=home) as comp:
+        inv = [e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp"]
+        by_bid = {e.bundle_id: e for e in inv}
+
+        # 两条独立身份都在（不塌陷）。
+        assert set(by_bid) == {"user-audit", "audit-mcp"}, "异 bundle_id 同名 server 不得塌成一条"
+
+        # 用户 server（bundle_id=user-audit）：F1 → user，可编辑（不被误标 plugin）。
+        assert by_bid["user-audit"].managed_by == McpUserOwnership()
+        assert by_bid["user-audit"].lifecycle.can_edit_from_mcp_tab
+
+        # plugin bundled server（bundle_id=audit-mcp）：仅 plugin 声明 → plugin，只读。
+        assert by_bid["audit-mcp"].managed_by == McpPluginOwnership(marketplace="acme", plugin="audit", plugin_id="audit@acme")
+        assert not by_bid["audit-mcp"].lifecycle.can_edit_from_mcp_tab
+
+
+# ── #144：每条条目暴露 bundle_id（客户端关联回 get_config / {bundle_id}__tool），wire camelCase ──
+@pytest.mark.asyncio
+async def test_inventory_entry_exposes_bundle_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """每条 inventory 条目暴露 ``bundle_id``（缺陷 #1：客户端据此关联回 A2C server），wire 出线 camelCase ``bundleId``。
+
+    用户 server 用**显式异值 bundle_id**（``name="user-fs"`` ≠ ``bundle_id="user-filesystem"``）作反致盲锚：
+    若代码错写成 ``bundle_id=cfg.name``，本断言会失败（缺省派生下 name≡bundle_id 会同值致盲）。
+    """
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, servers=["audit-mcp"])
+    user_cfg = StdioServerConfig(
+        name="user-fs", bundle_id="user-filesystem", disabled=True, server_parameters=StdioServerParameters(command="node")
+    )
+
+    async with Computer(name="t", mcp_servers={user_cfg}, auto_connect=False, skill_home=home) as comp:
+        inv = comp.list_mcp_servers_with_metadata()
+
+        user = next(e for e in inv if e.name == "user-fs")
+        assert user.bundle_id == "user-filesystem", "身份取 resolve_bundle_id（显式值），非 display name"
+        assert user.bundle_id == resolve_bundle_id(user_cfg)  # 与统一解析器一致
+        plugin = next(e for e in inv if e.name == "audit-mcp")
+        assert plugin.bundle_id == "audit-mcp"
+
+        # wire 出线 camelCase（对齐 rust serde / #96 示例键名），且 name 与 bundleId 各自独立出线。
+        v = json.loads(user.model_dump_json())
+        assert v["bundleId"] == "user-filesystem"
+        assert v["name"] == "user-fs"
 
 
 @pytest.mark.asyncio
@@ -235,7 +303,7 @@ async def test_inventory_marks_remounted_bundled_server_as_plugin(tmp_path: Path
         assert report.remounted_servers == ["audit-mcp"]
 
         entries = [e for e in comp.list_mcp_servers_with_metadata() if e.name == "audit-mcp"]
-        assert len(entries) == 1, "重挂后运行期条目与 ledger 条目按 name 去重为一条"
+        assert len(entries) == 1, "重挂后运行期条目与 ledger 条目按 bundle_id 去重为一条"
         assert entries[0].managed_by == McpPluginOwnership(marketplace="acme", plugin="audit", plugin_id="audit@acme")
 
 

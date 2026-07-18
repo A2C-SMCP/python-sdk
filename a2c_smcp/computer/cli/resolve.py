@@ -97,12 +97,15 @@ def collect_candidates(comp: Computer, *, settings_flag_path: Path | None = None
        ``amount_server``），归属 ``runtime``。
 
     .. note::
-       **DRY 接缝声明**：:meth:`~a2c_smcp.computer.computer.Computer.list_mcp_servers_with_metadata` 做同类
-       join，但其 join key 是 **display name**（已知缺陷，同名会退化误标 plugin，见该方法 docstring 的 ⚠️ 注；
-       迁 bundle_id 挂 **#144**）。本函数从一开始就 **bundle_id join**，不复制该缺陷；两处收敛属 #144 范围。
-       另：该方法取 ``_resolve_declared_settings()``（**无 flag 层**），本函数取 flag-aware 的
-       :func:`~a2c_smcp.computer.cli.commands.resolved_settings` ⇒ 「谁是 enabled plugin」两处答案在 flag scope
-       上可分叉，一并挂 #144 收敛。
+       **DRY 接缝声明（#144 已收敛 join key）**：
+       :meth:`~a2c_smcp.computer.computer.Computer.list_mcp_servers_with_metadata` 做同类三源 join，**现已同为
+       bundle_id join**（#144 已迁）——两处均按 bundle_id 为键、同一 origin 声明面（``resolve_mcp_declarations``）+
+       同一优先序（声明面 > ledger bundled > 纯运行期），故归属答案一致，旧「同名误标 plugin」缺陷已消。
+       **保留的结构性差异（非缺陷、非 #144 收敛项）**：该方法读核心层 flag-less ``_resolve_declared_settings()``
+       判「谁是 enabled plugin」（Computer 结构上不持 ``--settings`` flag 知识，与 rust 同构文档化），本函数读
+       flag-aware 的 :func:`~a2c_smcp.computer.cli.commands.resolved_settings` ⇒ 经 ``--settings`` flag 启用的
+       plugin 两处答案可分叉。这是核心 / CLI 边界的既有限制（inventory 是任意宿主可调的核心 API，本函数只在
+       CLI/REPL 上下文调用）。
 
     :param settings_flag_path: 全局 ``--settings <file>`` flag 层路径（flag-aware 账本视图）。
     """

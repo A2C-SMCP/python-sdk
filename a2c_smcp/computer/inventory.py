@@ -121,14 +121,20 @@ class McpServerWithMetadata(_InventoryModel):
     ``disabled`` 旗）；``managed_by`` 决定 ``lifecycle``。**不**含运行期「进程是否已启动」状态——那由
     ``MCPServerManager.get_server_status`` 单独提供，本 inventory 只承载「有哪些 + 归谁 + 能否从 MCP tab 管」
     这一稳定归属视图（对齐 #96 示例四字段）。
+
+    **身份 = ``bundle_id``（#144）**：``bundle_id`` 是**唯一身份 + inventory 主键**，client 据此关联回
+    ``client:get_config.servers``（bundle_id 为 key）与工具（``{bundle_id}__{tool}``）；``name`` 降为纯 display
+    （允许碰撞、永不做键/寻址，协议 identity-orthogonality）。异 ``bundle_id`` 的同名 server 合法共存（§5.6），
+    各自独立成条。
     """
 
-    name: str = Field(description="server 名（inventory 主键）/ server name")
+    bundle_id: str = Field(description="唯一身份 bundle_id（inventory 主键，关联 get_config / {bundle_id}__tool）/ identity")
+    name: str = Field(description="display 名（允许碰撞、非键、非寻址）/ display name (may collide, never a key)")
     disabled: bool = Field(description="是否禁用（配置态）/ disabled flag from config")
     managed_by: McpOwnership = Field(description="归属：用户 vs 插件 / ownership")
     lifecycle: McpLifecycle = Field(description="由归属派生的生命周期能力 / lifecycle capabilities derived from ownership")
 
     @classmethod
-    def assemble(cls, name: str, *, disabled: bool, managed_by: McpOwnership) -> McpServerWithMetadata:
-        """由 ``name`` + ``disabled`` + 归属组装（``lifecycle`` 从归属派生）/ assemble; lifecycle derived from ownership。"""
-        return cls(name=name, disabled=disabled, managed_by=managed_by, lifecycle=managed_by.lifecycle())
+    def assemble(cls, name: str, *, bundle_id: str, disabled: bool, managed_by: McpOwnership) -> McpServerWithMetadata:
+        """由 ``name`` + ``bundle_id`` + ``disabled`` + 归属组装（``lifecycle`` 从归属派生）/ assemble; lifecycle derived。"""
+        return cls(bundle_id=bundle_id, name=name, disabled=disabled, managed_by=managed_by, lifecycle=managed_by.lifecycle())

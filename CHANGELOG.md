@@ -12,6 +12,22 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
 
 ### Breaking Changes
+- **MCP inventory projection re-keyed to `bundle_id`; `managedBy` is now pure-derived** (#144, mirrors
+  a2c-smcp-protocol `data-structures.md` identity-orthogonality + `runtime-contract.md` §4.8 and
+  Discussion #23 F1 / F2; rust mirror tracked under rust-sdk#129).
+  - `McpServerWithMetadata` (`Computer.list_mcp_servers_with_metadata()`) **gains a `bundle_id` field**
+    (wire camelCase `bundleId`); `bundle_id` is the identity / primary key, `name` is demoted to pure display
+    (collisions allowed, never a key). Clients (e.g. `tfrobot-client`'s MCP tab) can now correlate an inventory
+    entry back to `client:get_config.servers` (bundle_id keyed) and tools (`{bundle_id}__{tool}`).
+  - **join / dedup / sort are all re-keyed to `bundle_id`.** Two servers sharing a display name but with
+    distinct `bundle_id` (legal coexistence, protocol §5.6) no longer collapse into one entry.
+  - **`managedBy` is F1 pure-derivation**: `∃ a non-plugin-origin declaration ⇒ user, else plugin`, sourced
+    from `Computer.resolve_mcp_declarations()` (origin-carrying, structurally non-plugin). A user's own server
+    that shares a `bundle_id` with a plugin dependency is now `managedBy=user` (editable from the MCP tab),
+    restoring §2.5 user sovereignty — it was previously mis-labeled `plugin` (read-only).
+  - The `McpServerWithMetadata.assemble()` constructor gains a required `bundle_id` keyword. The type stays
+    SDK-facing (not on the `client:*` wire). A structural flag-scope difference vs. the human-facing
+    `cli.resolve.collect_candidates` (the core `Computer` is `--settings`-flag-less) is documented, not a defect.
 - **Input env var naming: `A2C_INPUT_<ID_UPPER>` → `A2C_SMCP_<ENV_SEGMENT(id)>`, hard cut, no dual-read**
   (#155, aligned with a2c-smcp-protocol `computer-mcp-config-guide.md` §"环境变量命名规则（双端统一规范）"
   and Discussion #23 F4 / F5; rust mirror rust-sdk#140).

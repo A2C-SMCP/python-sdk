@@ -27,13 +27,14 @@ from a2c_smcp.computer.inventory import (
 
 def test_user_ownership_serializes_camelcase_and_grants_full_lifecycle() -> None:
     """user 归属：lifecycle 全权（true/true/"mcp"），JSON 键名 camelCase 且判别值 type=user。"""
-    entry = McpServerWithMetadata.assemble("everything", disabled=False, managed_by=McpUserOwnership())
+    entry = McpServerWithMetadata.assemble("everything", bundle_id="everything", disabled=False, managed_by=McpUserOwnership())
     assert entry.lifecycle.can_edit_from_mcp_tab
     assert entry.lifecycle.can_start_from_mcp_tab
     assert entry.lifecycle.manage_from == McpLifecycle.MANAGE_FROM_MCP
 
     v = json.loads(entry.model_dump_json())
     assert v["name"] == "everything"
+    assert v["bundleId"] == "everything"
     assert v["disabled"] is False
     assert v["managedBy"]["type"] == "user"
     assert v["lifecycle"]["canEditFromMcpTab"] is True
@@ -45,6 +46,7 @@ def test_plugin_ownership_serializes_camelcase_and_is_read_only() -> None:
     """plugin 归属：lifecycle 只读（false/false/"marketplace"），JSON 逐字对齐 #96 示例键名。"""
     entry = McpServerWithMetadata.assemble(
         "audit-mcp",
+        bundle_id="audit-mcp",
         disabled=False,
         managed_by=McpPluginOwnership(marketplace="acme", plugin="audit", plugin_id="audit@acme"),
     )
@@ -54,6 +56,7 @@ def test_plugin_ownership_serializes_camelcase_and_is_read_only() -> None:
 
     # 对齐 #96 JSON 示例键名 / mirror the #96 example.
     v = json.loads(entry.model_dump_json())
+    assert v["bundleId"] == "audit-mcp"
     assert v["managedBy"]["type"] == "plugin"
     assert v["managedBy"]["marketplace"] == "acme"
     assert v["managedBy"]["plugin"] == "audit"
@@ -65,9 +68,11 @@ def test_metadata_roundtrips_through_serialization() -> None:
     """camelCase JSON 序列化 → 反序列化 roundtrip 闭环（判别联合正确还原 plugin 分支）。"""
     entry = McpServerWithMetadata.assemble(
         "audit-mcp",
+        bundle_id="audit-mcp",
         disabled=True,
         managed_by=McpPluginOwnership(marketplace="acme", plugin="audit", plugin_id="audit@acme"),
     )
     back = McpServerWithMetadata.model_validate_json(entry.model_dump_json())
     assert back == entry
     assert isinstance(back.managed_by, McpPluginOwnership)
+    assert back.bundle_id == "audit-mcp"
