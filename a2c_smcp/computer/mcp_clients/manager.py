@@ -12,6 +12,7 @@ from mcp.client.session import MessageHandlerFnT
 from mcp.types import CallToolResult, ReadResourceResult, Resource, Tool
 from vrl_python import VRLRuntime
 
+from a2c_smcp.computer.mcp_clients.auth_error import build_auth_error_result, classify_auth_error
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
 from a2c_smcp.computer.mcp_clients.utils import client_factory
@@ -453,6 +454,13 @@ class MCPServerManager:
         except TimeoutError:
             raise TimeoutError(f"Tool '{tool_name}' execution timed out") from None
         except Exception as e:
+            # 上游授权失败（4006/4007）→ 以 CallToolResult 携结果级 meta surface（协议 error-handling.md §4006/4007；
+            # meta.mcp_server = 路由所用 bundle_id，供 Agent correlate + 区分「需授权」vs「工具坏了」，#133）。
+            # 其它失败保持通用 RuntimeError（无授权正面信号绝不误判）。此处是全链唯一 bundle_id ∧ 原始异常同在处。
+            # Upstream auth failure → surface as CallToolResult with result-level meta (mcp_server = routing bundle_id).
+            error_code = classify_auth_error(e)
+            if error_code is not None:
+                return build_auth_error_result(bundle_id, error_code)
             raise RuntimeError(f"Tool execution failed: {e}") from e
 
     async def aexecute_tool(self, tool_name: EXPOSED_TOOL_NAME, parameters: dict, timeout: float | None = None) -> CallToolResult:

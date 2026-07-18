@@ -209,6 +209,23 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     divergence deferred to a separate protocol-first effort.
 
 ### Added
+- **Upstream MCP tool authorization-error surfacing (4006/4007)** (#133, implements
+  a2c-smcp-protocol `error-handling.md` §4006/4007 + `security.md`; mirrors rust-sdk's
+  `build_auth_error_result`, rust-sdk#120). When a tool call fails due to **upstream**
+  MCP authorization, the Computer now returns a `CallToolResult(isError=True)` carrying
+  result-level `meta`: `error_code` (4006 = authorization required / 4007 = authorization
+  failed, mapped per the protocol decision table — HTTP 401→4006, 403→4007,
+  OAuth token refresh/exchange failure→4007, never-configured/other OAuth flow→4006),
+  `mcp_server` (the failed server's **bundle_id**, so the Agent can correlate to a
+  specific server and distinguish "needs auth" from "tool is broken"), and a non-sensitive
+  `auth_hint` (`{action, message}`). New pure module
+  `a2c_smcp/computer/mcp_clients/auth_error.py` (`classify_auth_error` / `build_auth_error_result`),
+  wired into `MCPServerManager.acall_tool`. **Reactive classification only** (keyed off the
+  failure signal via `httpx.HTTPStatusError` / `mcp.client.auth` OAuth exceptions, walking
+  `__cause__` + `BaseExceptionGroup` but deliberately not the implicit `__context__` chain
+  to avoid false-positive misclassification); non-authorization failures keep the existing
+  generic behavior. A2C does not drive the upstream OAuth handshake (owned by the MCP
+  library/host); proactively predicting "never authorized" before a call is out of scope.
 - **Plugin lifecycle follow-ups** (#125, closing out the #123 isolated-review items;
   rust mirror evaluation via rust-sdk#103):
   - **Re-materialization scope inference** — boot recovery now infers the original
