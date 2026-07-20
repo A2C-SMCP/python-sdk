@@ -32,9 +32,29 @@ __all__ = [
     "META_AUTH_HINT_KEY",
     "META_ERROR_CODE_KEY",
     "META_MCP_SERVER_KEY",
+    "UpstreamAuthError",
     "build_auth_error_result",
     "classify_auth_error",
 ]
+
+
+class UpstreamAuthError(Exception):
+    """传输层已观测到上游授权失败信号（401/403）但 MCP 库拆连接致 ``call_tool`` 挂起时，由 HTTP client 兜底抛出。
+
+    A typed signal raised by the HTTP client when it observed an upstream auth-failure (401/403) at the transport
+    layer but the MCP library tore down the connection so ``call_tool`` would hang (协议 error-handling.md §可观测判据：
+    授权失败 MUST NOT 表现为挂起至超时；Computer MUST 自身层面兜底)。
+
+    携带**结构化**的 HTTP 状态码（及可选 ``WWW-Authenticate`` 响应头），供 :func:`classify_auth_error` 精确映射，
+    不依赖字符串匹配。``www_authenticate_header`` 仅为将来更精确的 ``auth_hint`` 预留通道，**当前不外泄**（见
+    build_auth_error_result：auth_hint 为静态非敏感值）。
+    """
+
+    def __init__(self, status_code: int, www_authenticate_header: str | None = None) -> None:
+        self.status_code = status_code
+        self.www_authenticate_header = www_authenticate_header
+        super().__init__(f"upstream auth failure: HTTP {status_code}")
+
 
 # 结果级 meta 字段键（协议字面键，非 A2C_ 前缀）/ result-level meta keys (protocol literal keys).
 META_ERROR_CODE_KEY = "error_code"
@@ -96,6 +116,15 @@ def classify_auth_error(exc: BaseException) -> ErrorCode | None:
     误判为「需授权」。
     """
     for e in _iter_exception_chain(exc):
+        # 传输层兜底信号（HTTP client 观测到 401/403 但 MCP 库拆连接致 call_tool 挂起 → 兜底抛此）：结构化状态码，
+        # 优先判定、无字符串歧义。见协议 §可观测判据「自身层面兜底」。
+        if isinstance(e, UpstreamAuthError):
+            if e.status_code == httpx.codes.UNAUTHORIZED:  # 401
+                return ErrorCode.TOOL_AUTHORIZATION_REQUIRED
+            if e.status_code == httpx.codes.FORBIDDEN:  # 403
+                return ErrorCode.TOOL_AUTHORIZATION_FAILED
+            # 已判定属授权类但状态码非 401/403（理论不达：捕获点只收 401/403）→ 协议 §降级语义兜底 4006。
+            return ErrorCode.TOOL_AUTHORIZATION_REQUIRED
         if isinstance(e, httpx.HTTPStatusError):
             status = e.response.status_code
             if status == httpx.codes.UNAUTHORIZED:  # 401
