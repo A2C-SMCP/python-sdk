@@ -160,3 +160,75 @@ async def test_call_tool_raises_upstream_auth_when_signal_fires_while_call_hung(
             await fire_task
     finally:
         httpc_mod.BaseMCPClient.call_tool = original  # type: ignore[assignment]
+
+
+# ── 回归守卫（隔离审查建议）：并发、正常路径、非授权异常 ──────────────────────────
+def _make_connected_client(start_request_id: int) -> HttpMCPClient:
+    """构造一个 connected 态 + 假 session（``_request_id`` 起始值可调）的 HttpMCPClient，绕开握手。"""
+    from mcp.client.session_group import StreamableHttpParameters
+
+    client = HttpMCPClient(StreamableHttpParameters(url="http://127.0.0.1:1/mcp"))
+    object.__setattr__(client, "state", STATES.connected)
+    fake_session = MagicMock()
+    fake_session._request_id = start_request_id
+    client._async_session = fake_session  # type: ignore[attr-defined]
+    return client
+
+
+@pytest.mark.asyncio
+async def test_concurrent_call_tools_each_surfaces_own_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """同 client 两个并发 call_tool —— Lock 串行化后各读独立 ``_request_id``、各自信号到达即抛 UpstreamAuthError。
+
+    反 🔴 回归：修复前并发两路读同一 ``_request_id``，第二路 register 冲突退化为未保护直通（挂起）。mock super
+    忠实模拟 send_request「读 N → 用 N → 自增 N+1」并在用 N 后为该 id 触发 403 信号，再挂起。
+    """
+    client = _make_connected_client(start_request_id=100)
+
+    async def super_reads_uses_increments_then_fires_and_hangs(self, tool_name, params):  # noqa: ARG001
+        sess = self._async_session
+        used_id = sess._request_id  # call_tool 已为此 id 注册 observer
+        await asyncio.sleep(0)  # 让出循环（模拟 send_request 调度）
+        sess._request_id = used_id + 1  # send_request 自增（供下一个并发 call_tool 读到独立 id）
+        self._auth_observer.capture_auth_signal(used_id, 403, None)  # 上游对该 id 返 403
+        await asyncio.Event().wait()  # mcp 拆连接 → call_tool 挂起
+
+    monkeypatch.setattr(
+        "a2c_smcp.computer.mcp_clients.http_client.BaseMCPClient.call_tool",
+        super_reads_uses_increments_then_fires_and_hangs,
+    )
+
+    results = await asyncio.wait_for(
+        asyncio.gather(client.call_tool("t1", {}), client.call_tool("t2", {}), return_exceptions=True),
+        timeout=10.0,
+    )
+    # 两路均抛 UpstreamAuthError（无一路退化直通挂死、无 deadlock）。
+    assert all(isinstance(r, UpstreamAuthError) and r.status_code == 403 for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_call_tool_normal_success_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """合法成功调用（无授权信号）→ 原样返回基类结果，override 不破坏正常路径。"""
+    from mcp.types import CallToolResult, TextContent
+
+    client = _make_connected_client(start_request_id=1)
+    ok = CallToolResult(content=[TextContent(type="text", text="ok")])
+
+    async def returning_super(self, tool_name, params):  # noqa: ARG001
+        return ok
+
+    monkeypatch.setattr("a2c_smcp.computer.mcp_clients.http_client.BaseMCPClient.call_tool", returning_super)
+    result = await asyncio.wait_for(client.call_tool("t", {}), timeout=5.0)
+    assert result is ok
+
+
+@pytest.mark.asyncio
+async def test_call_tool_non_auth_exception_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """非授权异常（工具坏了 / 网络抖动，无 401/403 信号）→ 原样重抛，绝不误产 UpstreamAuthError（防 false-positive）。"""
+    client = _make_connected_client(start_request_id=1)
+
+    async def raising_super(self, tool_name, params):  # noqa: ARG001
+        raise RuntimeError("tool blew up")
+
+    monkeypatch.setattr("a2c_smcp.computer.mcp_clients.http_client.BaseMCPClient.call_tool", raising_super)
+    with pytest.raises(RuntimeError, match="tool blew up"):
+        await asyncio.wait_for(client.call_tool("t", {}), timeout=5.0)

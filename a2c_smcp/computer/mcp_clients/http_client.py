@@ -145,6 +145,10 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
         assert isinstance(params, StreamableHttpParameters), "params must be an instance of StreamableHttpParameters"
         super().__init__(params, state_change_callback, message_handler)
         self._auth_observer = _AuthSignalObserver()
+        # 串行化 call_tool：``_request_id`` 在 ``await async_session`` 之后同步读、但实际自增发生在
+        # ``super().call_tool()`` 任务里（ensure_future 调度后才跑 send_request）→ 并发 call_tool 会读到同一 id，
+        # 致 observer 注册冲突 + 信号错配（隔离审查 🔴）。单 MCP server 工具调用并发非性能瓶颈，串行化最简且正确。
+        self._call_tool_lock = asyncio.Lock()
 
     async def _create_async_session(self) -> ClientSession:
         """
@@ -192,31 +196,36 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
         # self.async_session`` 的惰性建连绕过它（否则「未连接调用」行为回归）。
         if self.state != STATES.connected:
             raise ConnectionError("Not connected to server")
-        session = await self.async_session
-        request_id = getattr(session, "_request_id", None)
-        event = self._auth_observer.register(request_id)
-        if event is None:
-            # 无法关联（session 不暴露 _request_id）→ 退化为基类直通，不引入回归。
-            return await super().call_tool(tool_name, params)
+        # 串行化：见 ``_call_tool_lock`` 注释（并发 call_tool 的 _request_id 读竞态，隔离审查 🔴）。
+        async with self._call_tool_lock:
+            session = await self.async_session
+            request_id = getattr(session, "_request_id", None)
+            event = self._auth_observer.register(request_id)
+            if event is None:
+                # 无法关联（session 不暴露 _request_id）→ 退化为基类直通，不引入回归。
+                return await super().call_tool(tool_name, params)
 
-        call_task = asyncio.ensure_future(super().call_tool(tool_name, params))
-        event_task = asyncio.ensure_future(event.wait())
-        try:
-            await asyncio.wait({call_task, event_task}, return_when=asyncio.FIRST_COMPLETED)
-            if event.is_set():
-                # 已观测授权失败信号：取消挂起的 super().call_tool（触发基类 #96 best-effort 通知远端），再兜底抛 UpstreamAuthError。
-                # mcp 的 session.call_tool 在传输被拆后可能不响应取消（挂在已关流上）→ 用有限等待兜底，超时即弃
-                # （传输已断、任务终将随 session 关闭回收），绝不拖住本调用（协议 §可观测判据「MUST NOT 挂至超时」）。
-                call_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception, asyncio.TimeoutError):
-                    await asyncio.wait_for(call_task, timeout=3.0)
-                signal = self._auth_observer.take(request_id)
-                if signal is not None:
-                    raise UpstreamAuthError(signal.status_code, signal.www_authenticate_header)
-            # 调用先完成（正常结果或非授权异常）→ 原样返回/重抛。
-            return call_task.result()
-        finally:
-            event_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await event_task
-            self._auth_observer.discard(request_id)
+            call_task = asyncio.ensure_future(super().call_tool(tool_name, params))
+            event_task = asyncio.ensure_future(event.wait())
+            try:
+                await asyncio.wait({call_task, event_task}, return_when=asyncio.FIRST_COMPLETED)
+                if event.is_set():
+                    # 已观测授权失败信号：取消挂起的 super().call_tool（触发基类 #96 best-effort 通知远端），再兜底抛 UpstreamAuthError。
+                    # mcp 的 session.call_tool 在传输被拆后可能不响应取消（挂在已关流上）→ 用有限等待兜底，超时即弃
+                    # （传输已断、任务终将随 session 关闭回收），绝不拖住本调用（协议 §可观测判据「MUST NOT 挂至超时」）。
+                    call_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception, asyncio.TimeoutError):
+                        await asyncio.wait_for(call_task, timeout=3.0)
+                    # event.is_set() 保证 signal 已写入（capture 先写信号再 set event）；take 取出。
+                    # 防御：理论不达的 None（如 event 被外部误 set）→ 不落到 call_task.result()（call_task 已
+                    # cancel，会冒 CancelledError 给上层不被 except Exception 捕获），而是按 §降级语义兜底 4006。
+                    signal = self._auth_observer.take(request_id)
+                    status = signal.status_code if signal is not None else httpx.codes.UNAUTHORIZED
+                    raise UpstreamAuthError(status, signal.www_authenticate_header if signal is not None else None)
+                # 调用先完成（正常结果或非授权异常）→ 原样返回/重抛。
+                return call_task.result()
+            finally:
+                event_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await event_task
+                self._auth_observer.discard(request_id)
