@@ -210,21 +210,31 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 - **Upstream MCP tool authorization-error surfacing (4006/4007)** (#133, implements
-  a2c-smcp-protocol `error-handling.md` §4006/4007 + `security.md`; mirrors rust-sdk's
-  `build_auth_error_result`, rust-sdk#120). When a tool call fails due to **upstream**
-  MCP authorization, the Computer now returns a `CallToolResult(isError=True)` carrying
-  result-level `meta`: `error_code` (4006 = authorization required / 4007 = authorization
-  failed, mapped per the protocol decision table — HTTP 401→4006, 403→4007,
+  a2c-smcp-protocol `error-handling.md` §4006/4007 + `security.md` and conformance §4.8;
+  mirrors rust-sdk's `build_auth_error_result`, rust-sdk#120/#150). When a tool call fails
+  due to **upstream** MCP authorization, the Computer returns a `CallToolResult(isError=True)`
+  carrying result-level `meta`: `error_code` (4006 = authorization required / 4007 =
+  authorization failed, mapped per the protocol decision table — HTTP 401→4006, 403→4007,
   OAuth token refresh/exchange failure→4007, never-configured/other OAuth flow→4006),
-  `mcp_server` (the failed server's **bundle_id**, so the Agent can correlate to a
-  specific server and distinguish "needs auth" from "tool is broken"), and a non-sensitive
-  `auth_hint` (`{action, message}`). New pure module
-  `a2c_smcp/computer/mcp_clients/auth_error.py` (`classify_auth_error` / `build_auth_error_result`),
-  wired into `MCPServerManager.acall_tool`. **Reactive classification only** (keyed off the
-  failure signal via `httpx.HTTPStatusError` / `mcp.client.auth` OAuth exceptions, walking
-  `__cause__` + `BaseExceptionGroup` but deliberately not the implicit `__context__` chain
-  to avoid false-positive misclassification); non-authorization failures keep the existing
-  generic behavior. A2C does not drive the upstream OAuth handshake (owned by the MCP
+  `mcp_server` (the failed server's **bundle_id**, so the Agent can correlate to a specific
+  server and distinguish "needs auth" from "tool is broken"), and a non-sensitive `auth_hint`
+  (`{action, message}`). `a2c_smcp/computer/mcp_clients/auth_error.py` provides the pure
+  `classify_auth_error` (also recognizes OAuth exceptions, walking `__cause__` +
+  `BaseExceptionGroup` but deliberately not the implicit `__context__` chain) and
+  `build_auth_error_result`, wired into `MCPServerManager.acall_tool`.
+  **Transport-layer capture (the reactive classifier alone is unreachable for HTTP):** the
+  mcp Python SDK swallows a `tools/call` 401/403 into its streamable-http task group and
+  tears down the connection, so `session.call_tool` hangs (never raises) and the reactive
+  classifier never sees it. `HttpMCPClient` therefore injects a custom `httpx_client_factory`
+  (`_AuthWatchingClient`) that observes 401/403 at the transport layer (before mcp's
+  `raise_for_status`), correlates the signal to the in-flight call by JSON-RPC id, and races
+  the hung `call_tool` against the signal — on arrival it cancels the hung call and raises a
+  typed `UpstreamAuthError` (→ classifier → 4006/4007), satisfying the protocol's
+  "MUST NOT hang to timeout" (§可观测判据). Per-client `call_tool` is serialized (a
+  concurrent-call `_request_id` race was caught in isolated review). **Coverage:** conformance
+  §4.8 scenarios 1–3 (initial-response 401/403, the dominant case); scenario 4 (POST 200 +
+  in-stream 401) is a documented follow-up — mcp-python surfaces stream-death opaquely, needing
+  SSE body interception. A2C does not drive the upstream OAuth handshake (owned by the MCP
   library/host); proactively predicting "never authorized" before a call is out of scope.
 - **Plugin lifecycle follow-ups** (#125, closing out the #123 isolated-review items;
   rust mirror evaluation via rust-sdk#103):
