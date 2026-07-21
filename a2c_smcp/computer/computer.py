@@ -61,7 +61,7 @@ from a2c_smcp.computer.blob import (
 )
 from a2c_smcp.computer.desktop.organize import organize_desktop
 from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
-from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
+from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolutionError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
@@ -371,9 +371,20 @@ class Computer(BaseComputer[PromptSession]):
         for server_cfg in self._mcp_servers:
             try:
                 raw_cfg, validated = await self._arender_and_validate_server(server_cfg, session=session)
+            except InputResolutionError as e:
+                # #173（对齐 rust-sdk#144）：D1 结构化 input 解析错误（Missing/ResolverFailed）须上抛供 client
+                # 驱动补录（非仅日志，对齐 mount_server / add_or_update_server）。此处位于 ainitialize
+                # （commit/spawn/watcher）之前 ⇒ 无残留 manager/task/transport，boot 可安全重试（补值后同实例重试成功）。
+                logger.error(
+                    "boot 渲染 server 配置失败 '%s'（code %d）/ input resolution error: %s",
+                    getattr(server_cfg, "name", "unknown"),
+                    e.error_code,
+                    e,
+                )
+                raise
             except Exception as e:
                 logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
-                # 按稳妥策略: 保留原配置继续（raw == rendered == 原始未渲染 config）
+                # 其余渲染/校验错误：按稳妥策略保留原配置继续（对齐 rust「其余渲染错误维持容错」，不连坐上抛）。
                 raw_cfg = validated = server_cfg
             validated_servers.append(validated)
             self._active_raw.setdefault(resolve_bundle_id(validated), raw_cfg)
@@ -955,7 +966,11 @@ class Computer(BaseComputer[PromptSession]):
         Args 同 :meth:`amount_server`（保留 ``plugin`` / ``marketplace`` D2 上下文 kwargs）。
         """
         await self.aadd_or_aupdate_server_in_scope(
-            server, McpWriteScope.LOCAL, session=session, plugin=plugin, marketplace=marketplace,
+            server,
+            McpWriteScope.LOCAL,
+            session=session,
+            plugin=plugin,
+            marketplace=marketplace,
         )
 
     async def aadd_or_aupdate_server_in_scope(
@@ -1070,9 +1085,7 @@ class Computer(BaseComputer[PromptSession]):
             await self.aunmount_server_by_id(bundle_id)
             return
         # 4. 无声明 ∧ 运行期仍活跃 ⇒ plugin/治理投影，拒删、导向 plugin uninstall（origin==plugin 的可观测等价）。
-        if self.mcp_manager is not None and any(
-            resolve_bundle_id(cfg) == bundle_id for cfg in self.mcp_manager.server_configs()
-        ):
+        if self.mcp_manager is not None and any(resolve_bundle_id(cfg) == bundle_id for cfg in self.mcp_manager.server_configs()):
             raise McpWriteTargetError(
                 f"bundle_id={bundle_id!r} has no mcp.json declaration but is active at runtime; "
                 "it is a runtime-only projection (a plugin/governance mount, or an ad-hoc amount_server), "
@@ -1799,9 +1812,7 @@ class Computer(BaseComputer[PromptSession]):
         home = self.skill_home
         # F1「∃ origin != plugin 的声明」判据的 bundle_id 集 = 非-plugin 声明面（携 origin，结构性 ∈ 非-plugin：
         # durable + flag --mcp-config + embed）。与 `aremove_server` / `cli.resolve.collect_candidates` 同接缝。
-        non_plugin_bundle_ids = {
-            resolve_bundle_id(srv.config) for srv in self.resolve_mcp_declarations(env=os.environ).servers.values()
-        }
+        non_plugin_bundle_ids = {resolve_bundle_id(srv.config) for srv in self.resolve_mcp_declarations(env=os.environ).servers.values()}
         # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图），**按 bundle_id 为键**（#144）。
         declared = self._resolve_declared_settings()
         bundled: dict[str, BundledServerRecord] = {

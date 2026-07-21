@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from a2c_smcp.computer.inputs.resolver import InputResolutionError
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("computer")
@@ -132,8 +133,14 @@ class ConfigRender:
             try:
                 return True, await resolve_input(input_id)
             except KeyError:
+                # 未定义占位符（不在 inputs 池）→ 字面保留（VS Code parity），不上抛。
                 logger.warning(f"未找到输入项: {input_id} / Input id not found: {input_id}")
                 return False, None
+            except InputResolutionError:
+                # #173（对齐 rust-sdk#144）：D1 结构化解析错误（Missing/ResolverFailed）→ 上抛供 boot_up
+                # surfacing（非仅日志），**不**塌成字面保留（区别于未定义占位符）。须在通用 ``except Exception``
+                # 之前显式放行，否则会被其吞成字面保留。
+                raise
             except Exception as e:  # pragma: no cover
                 logger.error(f"解析输入失败: {input_id}, 错误: {e}", exc_info=True)
                 return False, None

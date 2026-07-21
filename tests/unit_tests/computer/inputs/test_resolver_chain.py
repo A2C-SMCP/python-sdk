@@ -9,7 +9,8 @@
 
 链序：cache → env(`A2C_SMCP_<ENV_SEGMENT(id)>`) → keyring(password) → 明文 value store(非密钥) → prompt → default。
 持久化：仅**交互 prompt 得值**（有 TTY/session）按类落盘；env 命中/headless/command 不落盘。
-密钥 headless（无 env+无 keyring+无 TTY）→ ``SecretResolutionError``，绝不落明文。
+#173（对齐 rust-sdk#144 D1）：headless 下已定义但 resolver/env/default 均无法提供的 input/secret →
+结构化 ``MissingInputError``（value 无 default / secret 一律），**非仅日志**、绝不落明文；client 据此补录重试。
 """
 
 from __future__ import annotations
@@ -21,7 +22,13 @@ import pytest
 
 import a2c_smcp.computer.inputs.resolver as resolver_mod
 from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
-from a2c_smcp.computer.inputs.resolver import InputResolver, SecretResolutionError
+from a2c_smcp.computer.inputs.resolver import (
+    InputKind,
+    InputResolutionError,
+    InputResolver,
+    MissingInputError,
+    ResolverFailedError,
+)
 from a2c_smcp.computer.inputs.value_store import ValueStore
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerCommandInput,
@@ -145,26 +152,120 @@ async def test_prompt_persists_non_password_to_value_store(tmp_path: Path, monke
 
 
 @pytest.mark.asyncio
-async def test_headless_password_hard_errors_without_persist(tmp_path: Path) -> None:
+async def test_headless_password_raises_missing_secret(tmp_path: Path) -> None:
+    """#173（对齐 rust-sdk#144）：password headless（无 env+无 keyring+无 TTY）→ 结构化 Missing(SECRET)，
+    绝不落明文。Missing 无值字段 ⇒ 错误天然不含明文。"""
     inputs = [MCPServerPromptStringInput(id="sec", description="d", password=True)]
     vs = _vstore(tmp_path)
-    # session=None + 无 env + keyring 不可用 → headless 硬错误（密钥不落明文）
+    # session=None + 无 env + keyring 不可用 → headless Missing(SECRET)（密钥不落明文）
     r = InputResolver(inputs, env={}, value_store=vs, secret_store=_Secret(available=False))
-    with pytest.raises(SecretResolutionError):
+    with pytest.raises(MissingInputError) as ei:
         await r.aresolve_by_id("sec", session=None)
+    err = ei.value
+    assert err.kind is InputKind.SECRET
+    assert err.id == "sec"
+    assert err.env_hint == "A2C_SMCP_sec"
+    assert err.error_code == 400
+    # 错误文案不得含任何疑似明文 / 不得用 "password" 字样（rust parity）
+    assert "password" not in str(err).lower()
     assert vs.get("sec") is None  # 绝不落明文 / never written to plaintext
 
 
 @pytest.mark.asyncio
-async def test_headless_password_hard_errors_when_keyring_available_but_unseeded(tmp_path: Path) -> None:
-    """keyring 可用但该密钥未播种 + 无 TTY → 仍硬错误（#65 fix-review #1，中间态）/ available-but-unseeded headless hard-errors。"""
+async def test_headless_password_missing_when_keyring_available_but_unseeded(tmp_path: Path) -> None:
+    """keyring 可用但该密钥未播种 + 无 TTY → 仍 Missing(SECRET)（#65 fix-review #1 中间态 + #173 结构化）。"""
     inputs = [MCPServerPromptStringInput(id="sec", description="d", password=True)]
     vs = _vstore(tmp_path)
-    # available=True 但 seed 为空（步骤 3 keyring miss）+ session=None + 无 env → 应硬错误，不走 prompt
+    # available=True 但 seed 为空（步骤 3 keyring miss）+ session=None + 无 env → Missing(SECRET)，不走 prompt
     r = InputResolver(inputs, env={}, value_store=vs, secret_store=_Secret(available=True))
-    with pytest.raises(SecretResolutionError):
+    with pytest.raises(MissingInputError) as ei:
         await r.aresolve_by_id("sec", session=None)
+    assert ei.value.kind is InputKind.SECRET
     assert vs.get("sec") is None  # 绝不落明文 / never written to plaintext
+
+
+@pytest.mark.asyncio
+async def test_headless_password_missing_even_with_default(tmp_path: Path) -> None:
+    """#173 守卫：password:true 即便带 default、headless 仍 Missing(SECRET)——secret 绝不降级用 default / 落明文。"""
+    inputs = [MCPServerPromptStringInput(id="sec", description="d", password=True, default="should-not-use")]
+    vs = _vstore(tmp_path)
+    r = InputResolver(inputs, env={}, value_store=vs, secret_store=_Secret(available=False))
+    with pytest.raises(MissingInputError) as ei:
+        await r.aresolve_by_id("sec", session=None)
+    assert ei.value.kind is InputKind.SECRET
+    assert vs.get("sec") is None  # 绝不落明文 / never written to plaintext
+
+
+@pytest.mark.asyncio
+async def test_headless_value_no_default_raises_missing(tmp_path: Path) -> None:
+    """#173（对齐 rust-sdk#144）：已定义 value input、headless、无 env/store/default → Missing(VALUE)，
+    而非静默回退空串。"""
+    inputs = [MCPServerPromptStringInput(id="val", description="d")]  # default=None, password=None
+    vs = _vstore(tmp_path)
+    r = InputResolver(inputs, env={}, value_store=vs, secret_store=_Secret(available=False))
+    with pytest.raises(MissingInputError) as ei:
+        await r.aresolve_by_id("val", session=None)
+    err = ei.value
+    assert err.kind is InputKind.VALUE
+    assert err.id == "val"
+    assert err.env_hint == "A2C_SMCP_val"
+    assert err.error_code == 400
+
+
+@pytest.mark.asyncio
+async def test_headless_value_with_default_uses_default(tmp_path: Path) -> None:
+    """#173 守卫：value input headless 但**有 default** → 用 default，不报 Missing（rust：default 存在 ⇒ 不 Missing）。"""
+    inputs = [MCPServerPromptStringInput(id="val", description="d", default="fallback")]
+    vs = _vstore(tmp_path)
+    r = InputResolver(inputs, env={}, value_store=vs, secret_store=_Secret(available=False))
+    # headless + default → 返回 default，不抛
+    assert await r.aresolve_by_id("val", session=None) == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_env_fallback_avoids_missing(tmp_path: Path) -> None:
+    """#173 守卫：env 命中（headless 安全）→ 解析成功，不报 Missing（补录闭环的 env 注入路径）。"""
+    inputs = [MCPServerPromptStringInput(id="val", description="d")]  # 无 default
+    vs = _vstore(tmp_path)
+    r = InputResolver(inputs, env={"A2C_SMCP_val": "from-env"}, value_store=vs, secret_store=_Secret(available=False))
+    assert await r.aresolve_by_id("val", session=None) == "from-env"
+
+
+@pytest.mark.asyncio
+async def test_resolver_failed_error_carries_reason(tmp_path: Path) -> None:
+    """#173（对齐 rust-sdk#144）：ResolverFailed 结构化错误字段（id/reason/error_code=400）。"""
+
+    class _Failing(InputResolver):
+        async def aresolve_by_id(
+            self, input_id: str, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None
+        ) -> Any:
+            raise ResolverFailedError(id=input_id, reason="boom")
+
+    inputs = [MCPServerPromptStringInput(id="fail", description="d")]
+    r = _Failing(inputs, env={}, value_store=_vstore(tmp_path), secret_store=_Secret(available=False))
+    with pytest.raises(ResolverFailedError) as ei:
+        await r.aresolve_by_id("fail", session=_SESSION)
+    err = ei.value
+    assert err.id == "fail"
+    assert "boom" in err.reason
+    assert err.error_code == 400
+    # ResolverFailed 也是 InputResolutionError（base 类捕获）
+    assert isinstance(err, InputResolutionError)
+
+
+def test_missing_error_constructor_fields() -> None:
+    """#173：MissingInputError 构造子自动派生 env_hint（A2C_SMCP_<ENV_SEGMENT(id)>），字段齐全。"""
+    err = MissingInputError(id="figma_token", kind=InputKind.SECRET)
+    assert err.id == "figma_token"
+    assert err.kind is InputKind.SECRET
+    assert err.env_hint == "A2C_SMCP_figma_token"
+    assert err.error_code == 400
+    # Display 面向 client 补录：含 id + 种类 + env 补录名，不含 "password" 字样
+    msg = str(err)
+    assert "figma_token" in msg
+    assert "secret" in msg
+    assert "A2C_SMCP_figma_token" in msg
+    assert "password" not in msg.lower()
 
 
 @pytest.mark.asyncio

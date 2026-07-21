@@ -105,6 +105,20 @@ async def test_resolver_cache_and_clear(monkeypatch):
     import a2c_smcp.computer.inputs.resolver as resolver_mod
 
     monkeypatch.setattr(resolver_mod, "ainput_prompt", fake_prompt)
+    # #173：headless（无 TTY）下 value 无 default → Missing(VALUE)；本测试意图为「prompt + 缓存」路径，
+    # 故模拟交互（_has_tty→True）走 prompt，与 test_resolver_prompt_path 同型。_has_tty=True 会触发
+    # value_store 持久化，用 noop store 隔离，使 clear_cache 后重解析强制 re-prompt（验证 _cache 记忆
+    # 语义而非 value_store）。
+    monkeypatch.setattr(resolver_mod.InputResolver, "_has_tty", staticmethod(lambda session: True))
+
+    class _NoopStore:
+        def get(self, key):  # noqa: ANN001
+            return None
+
+        def set(self, key, value) -> bool:  # noqa: ANN001
+            return True
+
+    r._value_store = _NoopStore()  # type: ignore[assignment]
 
     v1 = await r.aresolve_by_id("p")
     v2 = await r.aresolve_by_id("p")
