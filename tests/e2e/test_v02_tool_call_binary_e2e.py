@@ -64,7 +64,7 @@ async def test_oversize_image_tool_call_sideband_roundtrip(tmp_path) -> None:
     async with running_server() as base:
         agent, _comp_client = await connect_agent_and_computer(base, office_id, computer, agent_id="robot-bin")
         try:
-            ret = await agent.emit_tool_call(computer="comp-bin", tool_name="big_image", params={}, timeout=15)
+            ret = await agent.emit_tool_call(computer="comp-bin", tool_name="img-srv__big_image", params={}, timeout=15)
             assert ret.isError is False, f"工具调用失败 / tool call failed: {ret}"
             assert len(ret.content) == 1
             item = ret.content[0]
@@ -91,7 +91,7 @@ async def test_small_image_tool_call_inline(tmp_path) -> None:
     async with running_server() as base:
         agent, _comp_client = await connect_agent_and_computer(base, office_id, computer, agent_id="robot-bin-s")
         try:
-            ret = await agent.emit_tool_call(computer="comp-bin-s", tool_name="small_image", params={}, timeout=15)
+            ret = await agent.emit_tool_call(computer="comp-bin-s", tool_name="img-srv__small_image", params={}, timeout=15)
             assert ret.isError is False, f"工具调用失败 / tool call failed: {ret}"
             item = ret.content[0]
             assert item.type == "image"

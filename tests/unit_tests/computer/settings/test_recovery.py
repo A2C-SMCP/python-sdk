@@ -1,0 +1,369 @@
+# -*- coding: utf-8 -*-
+# filename: test_recovery.py
+# @Time    : 2026/07/06
+# @Author  : JQQ
+# @Email   : jqq1716@gmail.com
+# @Software: PyCharm
+"""
+治理启动恢复单元测试（#117；#123 起对齐协议 v0.3.0 §4.8）/ Governance boot-recovery unit tests。
+
+镜像 rust-sdk recovery.rs 的 hermetic 套件（无 git、无网络：预置 catalog clone 树 + ``refresh=False``
+就地复用）。测试意图 / Test intentions（v0.3.0：安装集 = declared ``installedPlugins``；活跃 =
+installed ∧ ``enabledPlugins[pid] is True``，缺省翻转）:
+- ``recover_marketplace_skills``：installed ∧ enabled plugin 的 bundled SKILL 恢复 + 幂等；
+  absent/``false`` 惰性不复活（缺省翻转 + disable 负向）；意图无条目不恢复（uninstall 负向，账本仅派生缓存）；
+  known_marketplaces 缺记录 / clone 缺失且源不可达 → ``failed_marketplaces`` 降级不抛；空 home noop。
+  重物化（账本删除重建）见 test_install_enable_separation.py。
+- ``collect_enabled_bundled_servers``：含归属（plugin/marketplace）纯函数输出（§4.8.3）；
+  跨 plugin 同名 server 首见去重；installPath 缺失 / JSON 损坏 → WARN 跳过不阻断。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
+
+from a2c_smcp.computer.settings.recovery import (
+    collect_enabled_bundled_servers,
+    recover_marketplace_skills,
+)
+from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
+from a2c_smcp.computer.skills.home import marketplace_skill_dir
+from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
+
+_SRC = {"type": "git", "url": "https://example.com/acme.git"}
+
+
+# ── 辅助 / helpers ───────────────────────────────────────────────────────────
+def _home(tmp_path: Path) -> Path:
+    h = tmp_path / "skill-home"
+    h.mkdir()
+    return h
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    """重定向 XDG_CONFIG_HOME → tmp（隔离 user settings 读写）。"""
+    return {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+
+def _write_json(path: Path, obj: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj), encoding="utf-8")
+
+
+def _stdio(name: str, command: str = "node") -> dict:
+    return {"name": name, "type": "stdio", "server_parameters": {"command": command}}
+
+
+def _skill_md(name: str, description: str = "a skill") -> str:
+    return f"---\nname: {name}\ndescription: {description}\nlicense: MIT\n---\n# {name}\nbody\n"
+
+
+def _setup_catalog(
+    home: Path,
+    mp: str,
+    plugin: str,
+    *,
+    servers: Sequence[str] = (),
+    skills: Sequence[str] = (),
+    seed_known: bool = True,
+) -> Path:
+    """预置 catalog clone 树（marketplace.json + plugin 的 mcp-servers/ + skills/）+ 可选 seed known_marketplaces。
+
+    返回 plugin 根 ``<catalog>/plugins/<plugin>``。``refresh=False`` 下真实 staging 就地复用此树（零 git）。
+    """
+    catalog = marketplace_skill_dir(home, mp)
+    manifest = {
+        "name": mp,
+        "owner": {"name": "X"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": plugin, "source": plugin, "version": "1.2.0"}],
+    }
+    _write_json(catalog / ".tfrobot-plugin" / "marketplace.json", manifest)
+    plugin_root = catalog / "plugins" / plugin
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    for sname in servers:
+        _write_json(plugin_root / "mcp-servers" / f"{sname}.json", _stdio(sname))
+    for sk in skills:
+        p = plugin_root / "skills" / sk / "SKILL.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_skill_md(sk), encoding="utf-8")
+    if seed_known:
+        save_known_marketplaces(
+            {"version": 1, "marketplaces": {mp: {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc123"}}},
+            home=home,
+        )
+    return plugin_root
+
+
+def _seed_installed(home: Path, plugins: dict[str, list[dict]]) -> None:
+    save_installed_plugins({"version": 1, "plugins": plugins}, home=home)
+
+
+def _record(plugin_root: Path, *, scope: str = "user", servers: Sequence[str] = ()) -> dict:
+    return {
+        "scope": scope,
+        "installPath": str(plugin_root),
+        "version": "1.2.0",
+        "commitSha": "abc123",
+        "installedAt": "2026-07-06T00:00:00Z",
+        "mcpServers": list(servers),
+    }
+
+
+# ── recover_marketplace_skills ────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_recover_restages_enabled_installed_plugin_and_idempotent(tmp_path: Path) -> None:
+    """installed ∧ enabled=true plugin → bundled SKILL 恢复进 Registry；二次调用幂等。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert "audit@acme" in report.restored_plugins
+    assert "audit:lint" in report.restored_skills
+    assert reg.resolve("audit:lint") is not None
+    assert report.failed_marketplaces == [] and report.skipped_disabled == []
+
+    # 幂等：registry 不重复注册
+    report2 = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+    assert "audit:lint" in report2.restored_skills
+    assert len(reg) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_disabled_plugin_and_collect_skips(tmp_path: Path) -> None:
+    """enabledPlugins=false → skipped_disabled、SKILL 不复活、collect 同步跳过（disable 负向）。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root, servers=["figma"])]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": False}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.skipped_disabled == ["audit@acme"]
+    assert report.restored_skills == [] and report.restored_plugins == []
+    assert reg.resolve("audit:lint") is None
+    assert collect_enabled_bundled_servers(home, declared, env=_env(tmp_path)) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_without_intent_is_noop(tmp_path: Path) -> None:
+    """安装意图无条目（uninstall 后）→ 即使 catalog 树 / 账本仍在也不恢复（意图是唯一权威，账本仅派生缓存）。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])  # 树在
+    _seed_installed(home, {"audit@acme": [_record(root)]})  # 账本残留（未 gc）
+    reg = SkillRegistry()
+
+    report = await recover_marketplace_skills(reg, home, {"enabledPlugins": {"audit@acme": True}}, env=_env(tmp_path))
+
+    assert report.restored_plugins == [] and report.restored_skills == []
+    assert len(reg) == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_degrades_when_marketplace_record_absent(tmp_path: Path) -> None:
+    """known_marketplaces 缺该 marketplace 记录 → failed_marketplaces 降级、不抛、不阻断。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.failed_marketplaces == ["acme"]
+    assert report.restored_skills == []
+
+
+@pytest.mark.asyncio
+async def test_recover_degrades_when_clone_missing_and_unreachable(tmp_path: Path) -> None:
+    """clone 树缺失且源不可达（file:// 不存在路径，git 快速失败离线安全）→ failed_marketplaces 降级。"""
+    home = _home(tmp_path)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": f"file://{tmp_path}/no-such-repo"}}}},
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(tmp_path / "gone")]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.failed_marketplaces == ["acme"]
+    assert report.restored_skills == []
+
+
+@pytest.mark.asyncio
+async def test_local_only_pid_without_at_is_skipped(tmp_path: Path) -> None:
+    """账本 pid 无 ``@marketplace`` 段（本地-only 形态）→ 恢复与 collect 均静默跳过、不炸、不误纳入。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma"], skills=["lint"])
+    _seed_installed(home, {"localplugin": [_record(root, servers=["figma"])]})
+    reg = SkillRegistry()
+
+    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+
+    assert report.restored_plugins == [] and report.restored_skills == []
+    assert report.skipped_disabled == [] and report.failed_marketplaces == []
+    assert len(reg) == 0
+    assert collect_enabled_bundled_servers(home, {}, env=_env(tmp_path)) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_revives_orphaned_skill(tmp_path: Path) -> None:
+    """已 orphan 的 bundled SKILL（同会话 disable 内存态）经 recover 重扫复活回活跃集（register_or_update 语义）。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+    await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+    assert reg.mark_orphan("audit:lint") is True
+    assert reg.resolve("audit:lint") is None  # 孤儿不可解析
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert "audit:lint" in report.restored_skills
+    assert reg.resolve("audit:lint") is not None  # 复活
+
+
+@pytest.mark.asyncio
+async def test_recover_empty_home_is_noop(tmp_path: Path) -> None:
+    """空 home（双账本皆无）→ 空报告 noop。"""
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    report = await recover_marketplace_skills(reg, home, {}, env=_env(tmp_path))
+
+    assert report.restored_plugins == []
+    assert report.restored_skills == []
+    assert report.failed_marketplaces == []
+    assert report.skipped_disabled == []
+    assert len(reg) == 0
+
+
+# ── collect_enabled_bundled_servers ──────────────────────────────────────────
+def _declared_enabled(*pids: str) -> dict:
+    """installed ∧ enabled=true 的 declared 视图速造（v0.3.0 门控两键）。"""
+    return {"installedPlugins": list(pids), "enabledPlugins": {pid: True for pid in pids}}
+
+
+def test_collect_returns_enabled_bundled_servers_with_ownership(tmp_path: Path) -> None:
+    """installed ∧ enabled plugin 的 bundled server 可查询，且归属（plugin/marketplace/installPath）为纯函数输出（§4.8.3）。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma", "blender"])
+    _seed_installed(home, {"audit@acme": [_record(root, servers=["figma", "blender"])]})
+
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme"), env=_env(tmp_path))
+
+    assert {r.config.name for r in records} == {"figma", "blender"}
+    for r in records:
+        assert r.plugin_id == "audit@acme"
+        assert r.plugin == "audit" and r.marketplace == "acme"
+        assert r.install_path == root
+
+
+def test_collect_dedupes_same_server_name_across_plugins(tmp_path: Path) -> None:
+    """跨 plugin 同名 server → 首见保留去重且**归属为首见者**（账本插入序，与 rust "first seen wins" 一致）。"""
+    home = _home(tmp_path)
+    root_a = _setup_catalog(home, "acme", "audit", servers=["shared"])
+    root_b = _setup_catalog(home, "beta", "fmt", servers=["shared"])
+    _seed_installed(
+        home,
+        {"audit@acme": [_record(root_a, servers=["shared"])], "fmt@beta": [_record(root_b, servers=["shared"])]},
+    )
+
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme", "fmt@beta"), env=_env(tmp_path))
+
+    assert len(records) == 1
+    assert records[0].config.name == "shared"
+    assert records[0].plugin_id == "audit@acme"  # 首见胜：归属锁定账本序首个
+    assert records[0].install_path == root_a
+
+
+def test_collect_keeps_same_name_distinct_bundle_id(tmp_path: Path) -> None:
+    """跨 plugin **同 display 名 + 显式异 bundle_id** → 两条都保留（去重键 = bundle_id，非 name）。
+
+    English: same display name but explicitly distinct bundle_id ⇒ both kept (dedup key is bundle_id, not name).
+
+    #150 R5②/site4：display 名允许碰撞、``bundle_id`` 才是身份（协议 no-double-open 同键）。现码按
+    ``config.name`` 去重会把两个**不同身份**的 server 误并成一条（server-name-as-identity Bug，本用例即其红灯守卫）；
+    去重键改 ``resolve_bundle_id(config)`` 后二者共存。
+    """
+    home = _home(tmp_path)
+    root_a = _setup_catalog(home, "acme", "audit", servers=[])
+    root_b = _setup_catalog(home, "beta", "fmt", servers=[])
+    # 同 display 名 "shared"，两 plugin 根不同 → 文件名不碰撞；显式异 bundle_id → 两个不同身份的 server。
+    _write_json(root_a / "mcp-servers" / "shared.json", {**_stdio("shared"), "bundle_id": "shared-a"})
+    _write_json(root_b / "mcp-servers" / "shared.json", {**_stdio("shared"), "bundle_id": "shared-b"})
+    _seed_installed(
+        home,
+        {"audit@acme": [_record(root_a, servers=["shared"])], "fmt@beta": [_record(root_b, servers=["shared"])]},
+    )
+
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme", "fmt@beta"), env=_env(tmp_path))
+
+    # 现码红（按 name 并成 1）→ 去重键改 bundle_id 后绿（两条都保留）。
+    assert len(records) == 2
+    assert {resolve_bundle_id(r.config) for r in records} == {"shared-a", "shared-b"}
+    assert all(r.config.name == "shared" for r in records)  # display 名碰撞合法、非身份
+
+
+def test_collect_enumerates_multi_scope_records_with_dedup(tmp_path: Path) -> None:
+    """单 pid 多 scope record（user + project 不同 installPath）→ 逐 record 枚举 + 跨 record 同名首见去重。"""
+    home = _home(tmp_path)
+    root_user = _setup_catalog(home, "acme", "audit", servers=["figma"])
+    root_proj = home / "alt-install" / "audit"
+    _write_json(root_proj / "mcp-servers" / "figma.json", _stdio("figma"))
+    _write_json(root_proj / "mcp-servers" / "extra.json", _stdio("extra"))
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                _record(root_user, servers=["figma"]),
+                _record(root_proj, scope="project", servers=["figma", "extra"]),
+            ],
+        },
+    )
+
+    records = collect_enabled_bundled_servers(home, _declared_enabled("audit@acme"), env=_env(tmp_path))
+
+    assert {r.config.name for r in records} == {"figma", "extra"}
+    figma = next(r for r in records if r.config.name == "figma")
+    assert figma.install_path == root_user  # 首见（user record 在前）胜
+    extra = next(r for r in records if r.config.name == "extra")
+    assert extra.install_path == root_proj
+
+
+def test_collect_skips_missing_install_path_and_corrupt_json(tmp_path: Path) -> None:
+    """installPath 缺失 / mcp-servers JSON 损坏 → WARN 跳过该 plugin，不阻断其余、不抛。"""
+    home = _home(tmp_path)
+    good_root = _setup_catalog(home, "acme", "audit", servers=["figma"])
+    corrupt_root = _setup_catalog(home, "beta", "fmt")
+    (corrupt_root / "mcp-servers").mkdir(parents=True, exist_ok=True)
+    (corrupt_root / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
+    no_path_record = {"scope": "user", "version": "1.0.0"}  # 无 installPath
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [_record(good_root, servers=["figma"])],
+            "fmt@beta": [_record(corrupt_root)],
+            "ghost@acme": [no_path_record],
+        },
+    )
+
+    records = collect_enabled_bundled_servers(
+        home, _declared_enabled("audit@acme", "fmt@beta", "ghost@acme"), env=_env(tmp_path),
+    )
+
+    assert {r.config.name for r in records} == {"figma"}

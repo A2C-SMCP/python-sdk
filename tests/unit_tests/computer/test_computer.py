@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp import Tool
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from polyfactory.factories.pydantic_factory import ModelFactory
 from prompt_toolkit import PromptSession
 from pydantic import ValidationError
@@ -26,6 +26,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     StdioServerParameters,
     ToolMeta,
 )
+from a2c_smcp.utils.env_segment import EnvNameCollisionError
 
 
 class ToolFactory(ModelFactory[Tool]):
@@ -54,7 +55,8 @@ async def test_aget_available_tools(monkeypatch):
     tool = ToolFactory.build(description="mock_desc")
     # 构造mock manager/Build mock manager
     mock_manager = MagicMock(spec=MCPServerManager)
-    mock_manager.available_tools.return_value = DummyAsyncIterator([tool])
+    # #152 D1：available_tools 现产出 (bundle_id, Tool) 元组；夹具 bundle_id ≠ tool.name 分叉
+    mock_manager.available_tools.return_value = DummyAsyncIterator([("srv_mock", tool)])
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     # 实例化Computer/Instantiate Computer
     computer = Computer(name="test")
@@ -68,6 +70,7 @@ async def test_aget_available_tools(monkeypatch):
     # 检查SMCPTool结构/Check SMCPTool structure
     assert isinstance(t, dict)
     assert t["name"] == tool.name
+    assert t["bundle_id"] == "srv_mock"  # #152 D1：归属填的是 available_tools 产出的 bundle_id
     assert t["description"] == tool.description
     assert t["params_schema"] == tool.inputSchema
     assert t["return_schema"] == tool.outputSchema
@@ -95,7 +98,8 @@ async def test_aget_available_tools_meta_branches(monkeypatch):
     tool5.annotations = dummy_annotations
     # 构造mock manager
     mock_manager = MagicMock(spec=MCPServerManager)
-    mock_manager.available_tools.return_value = DummyAsyncIterator([tool1, tool2, tool3, tool4, tool5])
+    # #152 D1：available_tools 现产出 (bundle_id, Tool) 元组
+    mock_manager.available_tools.return_value = DummyAsyncIterator([("srv_mock", t) for t in (tool1, tool2, tool3, tool4, tool5)])
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
     computer = Computer(name="test")
     await computer.boot_up()
@@ -358,12 +362,64 @@ async def test_aexecute_tool_cancelled_returns_error_result(monkeypatch):
     result = await task
     assert result.isError is True
     assert ("取消" in result.content[0].text) or ("cancel" in result.content[0].text.lower())
+    # #115：取消态须带协议结果级 meta 标记，使 Agent 能区分「取消 / 超时 / 普通失败」三态
+    # #115: cancelled result MUST carry protocol result-level meta markers so the Agent can tell
+    # cancellation apart from timeout / ordinary failure (protocol 32eea98 / protocol#5)
+    assert result.meta is not None
+    assert result.meta["a2c_cancelled"] is True
+    assert result.meta["a2c_cancel_reason"] == "agent_requested"
     assert ran["completed"] is False  # 慢体被中断未跑完 / interrupted before completion
     assert "req-cancel" not in computer._inflight_tool_tasks  # 注册表已清 / registry cleaned
     # 历史须把「被取消」与其它失败区分（fix-review 🟡1）/ history distinguishes cancelled from other failures
     assert computer._tool_call_history[-1]["success"] is False
     assert computer._tool_call_history[-1]["error"] == "cancelled"
     assert "req-cancel" not in computer._cancelled_req_ids  # 取消标记已清 / cancel marker cleared
+
+
+@pytest.mark.asyncio
+async def test_aexecute_tool_timeout_marks_a2c_timeout(monkeypatch):
+    """#115：Computer 端工具执行超时（Manager 抛 TimeoutError）→ 结果级 meta.a2c_timeout=True。
+
+    专门 except TimeoutError 分支（非通用兜底）使「超时」与「普通失败」可被 Agent 区分；
+    此 ack 会回到 Agent，故此标记是「三态可区分」对 Computer 执行超时一态成立的前提。
+    #115: Computer-side tool execution timeout (Manager raises TimeoutError) → result-level
+    meta.a2c_timeout=True, distinguishable from ordinary failure (protocol 32eea98 / protocol#5).
+    """
+    mock_manager = MagicMock(spec=MCPServerManager)
+    mock_manager.avalidate_tool_call = AsyncMock(return_value=("server", "tool"))
+    mock_manager.get_tool_meta = MagicMock(return_value=ToolMeta(auto_apply=True))
+    mock_manager.acall_tool = AsyncMock(side_effect=TimeoutError("Tool 'tool' execution timed out"))
+    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **kw: mock_manager)
+    computer = Computer(name="test")
+    await computer.boot_up()
+
+    result = await computer.aexecute_tool("req-timeout", "tool", {"a": 1}, timeout=0.01)
+    assert result.isError is True
+    assert result.meta is not None
+    assert result.meta["a2c_timeout"] is True
+    # 历史记录此次为失败 / history records this as a failure
+    assert computer._tool_call_history[-1]["success"] is False
+
+
+def test_calltoolresult_meta_serializes_top_level_meta_not_underscore():
+    """#115 回归：结果级 meta 默认 model_dump(mode="json")（不 by_alias）出线 key 必须是顶层 `meta`，非 `_meta`。
+
+    锁死历史易错点：MCP `Result.meta` 字段 alias=`_meta`；若误传 by_alias=True 会回退到 `_meta`，破坏协议
+    data-structures.md §结果级 `meta` 契约（client.py on_tool_call 出线即依赖此默认行为）。
+    #115 regression: default model_dump(mode="json") (no by_alias) MUST emit top-level `meta`, not `_meta`.
+    """
+    # 按生产代码同构方式写真实 meta 字段（属性赋值），而非构造器 meta=（后者会落 extra，字段 alias 为 _meta）。
+    # Populate the real meta field the same way production does (attribute assignment), NOT ctor meta= (which
+    # would land in extra since the field alias is _meta).
+    r = CallToolResult(content=[TextContent(text="x", type="text")], isError=True)
+    r.meta = {"a2c_cancelled": True, "a2c_cancel_reason": "agent_requested"}
+    # 真实字段已被填充（非 extra）/ the real field is populated (not extra)
+    assert r.meta is not None and r.meta["a2c_cancelled"] is True
+    assert r.__pydantic_extra__ == {}
+    dumped = r.model_dump(mode="json")
+    assert "meta" in dumped
+    assert "_meta" not in dumped
+    assert dumped["meta"]["a2c_cancelled"] is True
 
 
 @pytest.mark.asyncio
@@ -448,8 +504,11 @@ class DummyResolver(InputResolver):
         return self.mapping[input_id]
 
 
+# NOTE(#137 ②/③): 以下三例原测 ``aadd_or_aupdate_server`` 的「render + validate + manager 委派」——该语义已 flip
+# 为 durable（落盘）后**原状迁至 transient** ``amount_server``。此处改测 ``amount_server`` 以在**不触碰磁盘**下保持
+# 对渲染/校验/委派的等价覆盖；durable 落盘专属行为另见 ``test_computer_dual_path_crud.py``。
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(monkeypatch):
+async def test_amount_server_with_raw_dict_uses_inputs_and_validates(monkeypatch):
     # Arrange manager mock
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aadd_or_aupdate_server = AsyncMock()
@@ -477,7 +536,7 @@ async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(mo
     }
 
     # Act
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)
 
     # Assert: forwarded to manager with validated model instance and placeholders resolved
     mock_manager.aadd_or_aupdate_server.assert_called_once()
@@ -490,7 +549,7 @@ async def test_aadd_or_aupdate_server_with_raw_dict_uses_inputs_and_validates(mo
 
 
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
+async def test_amount_server_with_model_instance(monkeypatch):
     # Arrange manager mock
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aadd_or_aupdate_server = AsyncMock()
@@ -507,7 +566,7 @@ async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
     )
 
     # Act
-    await computer.aadd_or_aupdate_server(cfg)
+    await computer.amount_server(cfg)
 
     # Assert: same model (after dump/render/validate) is sent
     mock_manager.aadd_or_aupdate_server.assert_called_once()
@@ -519,7 +578,7 @@ async def test_aadd_or_aupdate_server_with_model_instance(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatch):
+async def test_amount_server_missing_input_keeps_placeholder(monkeypatch):
     # Arrange manager mock (should be called with placeholder preserved)
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aadd_or_aupdate_server = AsyncMock()
@@ -547,7 +606,7 @@ async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatc
     }
 
     # Act: should not raise; placeholder remains
-    await computer.aadd_or_aupdate_server(cfg_dict)
+    await computer.amount_server(cfg_dict)
     mock_manager.aadd_or_aupdate_server.assert_called_once()
     (validated_cfg,), _ = mock_manager.aadd_or_aupdate_server.call_args
     # Assert placeholder preserved after rendering+validation
@@ -555,13 +614,19 @@ async def test_aadd_or_aupdate_server_missing_input_keeps_placeholder(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_aremove_server_delegates(monkeypatch):
+async def test_aunmount_server_by_id_delegates(monkeypatch):
+    # #137 ②：旧 ``aremove_server`` 的纯运行期停摘语义现为 transient ``aunmount_server_by_id``。
+    cfg = StdioServerConfig(
+        name="echo",
+        server_parameters=StdioServerParameters(command="/bin/echo", args=[], env=None, cwd=None),
+    )
     mock_manager = MagicMock(spec=MCPServerManager)
     mock_manager.aremove_server = AsyncMock()
+    mock_manager.server_configs = MagicMock(return_value=(cfg,))  # bundle_id("echo") == "echo"
     computer = Computer(name="test")
     computer.mcp_manager = mock_manager
 
-    await computer.aremove_server("echo")
+    await computer.aunmount_server_by_id("echo")
 
     mock_manager.aremove_server.assert_called_once_with("echo")
 
@@ -584,6 +649,69 @@ def test_update_inputs_replaces_resolver_and_clears_cache():
     assert not isinstance(computer._input_resolver, DummyResolver)
     # The new resolver should be able to clear cache without error
     computer._input_resolver.clear_cache()
+
+
+def test_add_or_update_input_env_collision_leaves_state_unchanged():
+    """#155：坍缩被拒时 Computer 状态 MUST 完全不变（池未污染 + resolver 仍可用）。
+
+    fail-fast 在 ``BaseInputResolver.__init__``；若 CRUD 仍是「先改池再重建 resolver」，
+    异常会留下「池已含肇事 id + resolver 是旧的」的裂开状态——本用例正是钉住这点。
+    """
+    computer = Computer(name="test", inputs={MCPServerPromptStringInput(id="figma-token", description="d")})
+    resolver_before = computer._input_resolver
+
+    with pytest.raises(EnvNameCollisionError):
+        computer.add_or_update_input(MCPServerPromptStringInput(id="figma_token", description="d"))
+
+    # 池未被污染：肇事 id 不得留在定义池里
+    assert {i.id for i in computer.list_inputs()} == {"figma-token"}
+    # resolver 未被换掉：仍是拒绝前那个可用实例
+    assert computer._input_resolver is resolver_before
+
+
+def test_update_inputs_env_collision_leaves_state_unchanged():
+    """#155：整体替换路径同款——拒绝后旧池/旧 resolver 原样保留。"""
+    computer = Computer(name="test", inputs={MCPServerPromptStringInput(id="kept", description="d")})
+    resolver_before = computer._input_resolver
+
+    with pytest.raises(EnvNameCollisionError):
+        computer.update_inputs(
+            {
+                MCPServerPromptStringInput(id="a-b", description="d"),
+                MCPServerPromptStringInput(id="a_b", description="d"),
+            },
+        )
+
+    assert {i.id for i in computer.list_inputs()} == {"kept"}
+    assert computer._input_resolver is resolver_before
+
+
+def test_init_rejects_collision_even_with_injected_resolver():
+    """#155：注入 input_resolver 时 **`or` 短路**会跳过 resolver 自检 ⇒ __init__ 必须无条件补检。
+
+    input_resolver 是公开构造参数（嵌入式宿主是一等消费者），不能只靠「只有测试才传」兜底：
+    漏检的池会带着坍缩存活到后续任一 CRUD 才炸，届时报的还是与本次调用无关的既有 id。
+    """
+    with pytest.raises(EnvNameCollisionError):
+        Computer(
+            name="t",
+            inputs={
+                MCPServerPromptStringInput(id="a-b", description="d"),
+                MCPServerPromptStringInput(id="a_b", description="d"),
+            },
+            input_resolver=DummyResolver({}),  # 短路掉 InputResolver 自检的那条路
+        )
+
+
+def test_update_inputs_copies_and_does_not_alias_caller_set():
+    """#155：池带「无坍缩」不变量后，持有入参引用即成静默漏洞——调用方事后 add 可绕过全部校验。"""
+    caller_set = {MCPServerPromptStringInput(id="kept", description="d")}
+    computer = Computer(name="t")
+    computer.update_inputs(caller_set)
+
+    caller_set.add(MCPServerPromptStringInput(id="sneaked", description="d"))
+
+    assert {i.id for i in computer.list_inputs()} == {"kept"}, "Computer 池被调用方的后续 mutate 污染（别名）"
 
 
 @pytest.mark.asyncio

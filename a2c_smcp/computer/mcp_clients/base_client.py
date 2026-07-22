@@ -59,8 +59,8 @@ class MCPCapabilityNotSupportedError(Exception):
 
 class MCPServerNotFoundError(Exception):
     """
-    中文: 引用的 MCP Server 名称在 Manager 中未注册。
-    英文: The referenced MCP Server name is not registered in the Manager.
+    中文: 引用的 MCP Server bundle_id 在 Manager 中未注册（Manager 一律按 bundle_id 寻址，非 display name）。
+    英文: The referenced MCP Server bundle_id is not registered in the Manager (never the display name).
 
     上层（`client:get_resources` 处理器）应映射为 wire-level `4014 MCP_SERVER_NOT_FOUND`。
     Upper layers (`client:get_resources` handler) should map this to wire-level

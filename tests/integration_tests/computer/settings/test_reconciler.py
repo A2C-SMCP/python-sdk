@@ -118,6 +118,7 @@ async def test_reconcile_clones_and_registers_only_enabled_plugin(tmp_path: Path
     reg = SkillRegistry()
     declared = {
         "extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare))}},
+        "installedPlugins": ["audit@acme-skills", "fmt@acme-skills"],  # 两个都安装（v0.3.0 双意图）
         "enabledPlugins": {"audit@acme-skills": True},  # 仅启用 audit；fmt 不启用
     }
 
@@ -139,7 +140,7 @@ async def test_reconcile_source_changed_switches_repo(tmp_path: Path) -> None:
     bare2 = _make_bare(tmp_path, "repo2", _one_plugin_files("p", "new-skill"))
     home = _home(tmp_path)
     reg = SkillRegistry()
-    enabled = {"enabledPlugins": {"p@acme-skills": True}}
+    enabled = {"installedPlugins": ["p@acme-skills"], "enabledPlugins": {"p@acme-skills": True}}
 
     await reconcile(reg, home, {"extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare1))}}, **enabled}, env=_env(home))
     assert reg.resolve("p:old-skill") is not None
@@ -163,7 +164,11 @@ async def test_prune_removes_clone_tree_and_record(tmp_path: Path) -> None:
     await reconcile(
         reg,
         home,
-        {"extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare))}}, "enabledPlugins": {"p@acme-skills": True}},
+        {
+            "extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare))}},
+            "installedPlugins": ["p@acme-skills"],
+            "enabledPlugins": {"p@acme-skills": True},
+        },
         env=_env(home),
     )
     clone = marketplace_skill_dir(home, "acme-skills")

@@ -119,12 +119,14 @@ class MockSyncSMCPNamespace(Namespace):
         tools = [
             SMCPTool(
                 name="echo",
+                bundle_id="mocksrv",  # #152 D1：name ≠ bundle_id 分叉（同 server 两工具共享 bundle_id）
                 description="echo text",
                 params_schema={"type": "object", "properties": {"text": {"type": "string"}}},
                 return_schema=None,
             ),
             SMCPTool(
                 name="test_tool",
+                bundle_id="mocksrv",
                 description="test tool",
                 params_schema={},
                 return_schema=None,

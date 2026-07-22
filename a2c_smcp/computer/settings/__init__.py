@@ -16,14 +16,17 @@ management UX.
 已落地模块 / Landed modules：
 - :mod:`a2c_smcp.computer.settings.schema` —— settings.json TypedDict + 字段级容错校验
   （passthrough / 无 version / policy-only 越权过滤）（S4，#56）
-- :mod:`a2c_smcp.computer.settings.scope`  —— 五级 scope 路径解析 + 读/写两套合并 customizer +
-  active-workdir 单根 / 能力层全局并集解析（S4，#56）
+- :mod:`a2c_smcp.computer.settings.scope`  —— 五级 scope 路径解析 + 读/写两套合并 customizer；
+  project/local 锚定进程 cwd（S4，#56；#116 瘦身）
 - :mod:`a2c_smcp.computer.settings.policy` —— policy 四子源 first-source-wins（remote stub + OS-MDM +
   managed-settings[+.d] + HKCU）（S4，#56）
 - :mod:`a2c_smcp.computer.settings.store`  —— 物化文件（known_marketplaces / installed_plugins）原子写 +
   文件锁 + ``.corrupt-<ts>.bak`` 损坏恢复 + 写保护头（带 version）（S5，#58）
 - :mod:`a2c_smcp.computer.settings.reconciler` —— 启动对账（additive-only 四分支）+ 孤儿清理
   （marketplace prune / plugin gc）（S9，#62）
+- :mod:`a2c_smcp.computer.settings.recovery` —— 治理启动恢复（ledger 驱动：boot 恢复 enabled plugin 的
+  bundled SKILL + bundled MCP server 可查询/hooks 重挂）（#117，协议 v0.2.3 §4.8；与 reconciler/installer
+  同因**刻意不在此 re-export**——直接 ``from a2c_smcp.computer.settings.recovery import ...``）
 
 SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5 / §7。
 """
@@ -40,9 +43,9 @@ from a2c_smcp.computer.settings.policy import (
 )
 from a2c_smcp.computer.settings.schema import (
     BOOL_FIELDS,
-    CAPABILITY_FIELDS,
     POLICY_ONLY_FIELDS,
     STRING_ARRAY_FIELDS,
+    TRUSTED_SCOPE_ONLY_FIELDS,
     ComputerSettings,
     SettingsScope,
     SettingsValidationError,
@@ -55,7 +58,6 @@ from a2c_smcp.computer.settings.scope import (
     DELETE,
     ResolvedSettings,
     apply_write,
-    filter_capability_fields,
     load_settings_file,
     merge_layers,
     merge_read,
@@ -104,9 +106,9 @@ from a2c_smcp.computer.settings.store import (
 __all__ = [
     # schema
     "BOOL_FIELDS",
-    "CAPABILITY_FIELDS",
     "POLICY_ONLY_FIELDS",
     "STRING_ARRAY_FIELDS",
+    "TRUSTED_SCOPE_ONLY_FIELDS",
     "ComputerSettings",
     "SettingsScope",
     "SettingsValidationError",
@@ -118,7 +120,6 @@ __all__ = [
     "DELETE",
     "ResolvedSettings",
     "apply_write",
-    "filter_capability_fields",
     "load_settings_file",
     "merge_layers",
     "merge_read",

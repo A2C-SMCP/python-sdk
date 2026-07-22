@@ -13,7 +13,7 @@ import pytest
 from mcp.types import CallToolResult, TextContent
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
-from a2c_smcp.agent.base import BaseAgentSyncClient
+from a2c_smcp.agent.base import BaseAgentClient, BaseAgentSyncClient
 from a2c_smcp.agent.types import AgentEventHandler
 from a2c_smcp.smcp import EnterOfficeNotification, GetToolsRet, LeaveOfficeNotification, SMCPTool, UpdateMCPConfigNotification
 
@@ -205,6 +205,80 @@ def test_handle_tool_call_timeout():
     assert isinstance(result.content[0], TextContent)
     assert "工具调用超时" in result.content[0].text
     assert req_id in result.content[0].text
+    # #115：超时态须带协议结果级 meta.a2c_timeout，使 Agent 能区分「超时 / 取消 / 普通失败」三态
+    # #115: timeout result MUST carry result-level meta.a2c_timeout (protocol 32eea98 / protocol#5)
+    assert result.meta is not None
+    assert result.meta["a2c_timeout"] is True
+
+
+class MockAsyncAgentClient(BaseAgentClient):
+    """中文：用于测试的 async Mock Agent 客户端。English: Async Mock Agent client for testing."""
+
+    async def emit(self, event, data=None, namespace=None, callback=None):
+        pass
+
+    async def call(self, event, data=None, namespace=None, timeout=60):
+        return {"success": True}
+
+    def register_event_handlers(self):
+        pass
+
+
+def test_handle_tool_call_timeout_async():
+    """
+    中文：验证 async 客户端（BaseAgentClient）的工具调用超时处理也带 meta.a2c_timeout（#115）。
+    English: Verify the async client (BaseAgentClient) timeout handling also carries meta.a2c_timeout (#115).
+    """
+    auth = DefaultAgentAuthProvider(agent_id="test-agent", office_id="test-office")
+    client = MockAsyncAgentClient(auth_provider=auth)
+
+    req_id = "test-req-id-async"
+    result = client.handle_tool_call_timeout(req_id)
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert "工具调用超时" in result.content[0].text
+    assert result.meta is not None
+    assert result.meta["a2c_timeout"] is True
+
+
+def test_tool_call_result_meta_roundtrip_three_states():
+    """#115 端到端锁：Computer 产出的 wire dict 经 Agent 反序列化（model_validate(by_name=True)，同
+    client.py:261 / sync_client.py:247）后，结果级 `meta` 标记可读，且取消 / 超时 / 普通失败三态可区分。
+
+    锁住验收标准 4：仅靠 Producer 侧构造不足以证明 Agent 真能读到——必须走 Producer→wire→Consumer 往返。
+    #115 end-to-end lock: result-level `meta` survives the Computer→wire→Agent round-trip and the three
+    states (cancelled / timeout / ordinary failure) stay distinguishable on the consumer side.
+    """
+
+    def producer_wire(meta: dict | None) -> dict:
+        # 复刻 Computer 产出路径：属性赋值写真实 meta 字段 + 默认 model_dump（不 by_alias），见 client.py:367
+        # Mirror the Computer producer path: attribute-assign the real meta field + default model_dump (no by_alias)
+        r = CallToolResult(content=[TextContent(text="x", type="text")], isError=True)
+        if meta is not None:
+            r.meta = meta
+        return r.model_dump(mode="json")
+
+    def agent_consume(wire: dict) -> CallToolResult:
+        # 复刻 Agent 消费路径 client.py:261 / sync_client.py:247
+        # Mirror the Agent consumer path
+        return CallToolResult.model_validate(wire, by_name=True)
+
+    cancelled = agent_consume(producer_wire({"a2c_cancelled": True, "a2c_cancel_reason": "agent_requested"}))
+    timed_out = agent_consume(producer_wire({"a2c_timeout": True}))
+    plain = agent_consume(producer_wire(None))
+
+    # 取消态 / cancelled
+    assert cancelled.meta is not None and cancelled.meta["a2c_cancelled"] is True
+    assert cancelled.meta["a2c_cancel_reason"] == "agent_requested"
+    assert cancelled.__pydantic_extra__ == {}  # 落真实字段而非 extra / lands in the real field, not extra
+    # 超时态 / timeout
+    assert timed_out.meta is not None and timed_out.meta["a2c_timeout"] is True
+    assert "a2c_cancelled" not in timed_out.meta  # 与取消可区分 / distinguishable from cancellation
+    # 普通失败态 / ordinary failure
+    assert plain.meta is None  # 无标记 → 普通失败桶 / no markers → ordinary-failure bucket
+    # 三态互不混淆：取消不带 timeout 标记，超时不带 cancelled 标记 / mutually exclusive markers
+    assert "a2c_timeout" not in cancelled.meta
 
 
 def test_validate_office_data_valid():
@@ -353,12 +427,14 @@ def test_process_tools_response():
     tools = [
         SMCPTool(
             name="tool1",
+            bundle_id="srv1",  # #152 D1：name ≠ bundle_id 分叉
             description="Test tool 1",
             params_schema={"type": "object"},
             return_schema=None,
         ),
         SMCPTool(
             name="tool2",
+            bundle_id="srv1",  # #152 D1：name ≠ bundle_id 分叉（与 tool1 同 server）
             description="Test tool 2",
             params_schema={"type": "string"},
             return_schema=None,
@@ -473,6 +549,7 @@ def test_sio_param_passed_to_handlers():
     tools = [
         SMCPTool(
             name="tool1",
+            bundle_id="srv1",  # #152 D1：name ≠ bundle_id 分叉
             description="Test tool 1",
             params_schema={"type": "object"},
             return_schema=None,

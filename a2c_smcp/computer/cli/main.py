@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,8 +23,8 @@ from typing import Any
 import typer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
-from pydantic import TypeAdapter
 
+from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
@@ -45,17 +45,23 @@ from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.computer.utils import console as console_util
 from a2c_smcp.smcp import SMCP_NAMESPACE
-from a2c_smcp.smcp import MCPServerConfig as SMCPServerConfigDict
-from a2c_smcp.smcp import MCPServerInput as SMCPServerInputDict
 
 app = typer.Typer(add_completion=False, help="A2C Computer CLI")
 # 使用全局 Console（引用模块属性，便于后续动态切换）
 console = console_util.console
 
-# ``--add-dir`` 是可重复 list 选项；提取为模块级 OptionInfo 单例规避 ruff B008（list 注解 + call-in-default），
-# 为 ruff 官方推荐做法。``_root`` 与 ``run`` 共用同一选项定义。/ module-level Option singleton to satisfy B008.
-_ADD_DIR_OPTION = typer.Option(
-    None, "--add-dir", help="注册工作目录（可重复；首个作 active-workdir）/ register a workdir (repeatable)",
+# flag scope 的**文件对**（协议 §2.5-3）：`--mcp-config`（flag 层 mcp.json）+ `--settings`（flag 层 settings.json），
+# 与其余 scope 的双文件形态对称。二者均在根回调与 `run` 上各声明一份（根回调 `invoke_without_command=True` 时
+# **就是** run 路径，故 `a2c-computer --mcp-config x.json` 必须可用）⇒ help 文案抽常量，杜绝两份漂移。
+# The flag-scope **file pair**; declared on both the root callback and `run` (the root callback *is* the run path
+# when no subcommand is given) ⇒ help text is a shared constant so the two copies cannot drift.
+_MCP_CONFIG_HELP = (
+    "额外 mcp.json（flag scope，含 servers/inputs；优先级次高、仅低于 policy）。支持 @file 语法或直接文件路径 / "
+    "extra mcp.json (flag scope, with servers/inputs; second-highest precedence, below policy only)"
+)
+_SETTINGS_HELP = (
+    "额外 settings.json（flag scope，优先级次高、仅低于 policy）/ extra settings.json (flag scope, second-highest "
+    "precedence, below policy only)"
 )
 
 
@@ -67,33 +73,68 @@ _ADD_DIR_OPTION = typer.Option(
 class _RootState:
     """根回调采集、供 ``settings`` 子命令读取的根级上下文（经 ``ctx.obj`` 在 Click 子上下文间继承）。
 
-    #97：``--settings`` / ``--add-dir`` 此前仅透传给 ``run`` 路径，``settings`` 子命令读不到 → flag scope
-    恒返回 ``{}``、project|local scope 缺 ``active_workdir`` 误报。统一收口到 ``ctx.obj``。
+    #97：``--settings`` 此前仅透传给 ``run`` 路径，``settings`` 子命令读不到 → flag scope
+    恒返回 ``{}``。统一收口到 ``ctx.obj``。#116：project/local scope 锚定进程 cwd，
+    不再有 ``--add-dir`` / workdir 状态。
     Root-level context gathered by the callback and read by `settings` subcommands via inherited ``ctx.obj``.
+
+    **#154（隔离审查 🔴2）**：flag scope 的**文件对**（``--settings`` + ``--mcp-config``）在根回调与 ``run``
+    上各声明一份，但根那份此前**只在无子命令时**被消费 ⇒ ``a2c-computer --mcp-config x.json run``（flag 置于
+    子命令之前）会把文件**静默丢弃**（连 fail-fast 都碰不到，用户落进空 REPL）。二者现统一收口到本状态，
+    由 ``run`` 兜底回读（``run`` 自身的显式值优先）。
     """
 
-    flag_path: Path | None = None
-    registered_workdirs: tuple[Path, ...] = ()
-    active_workdir: Path | None = None
-
-
-def _resolve_workdirs(add_dir: list[str] | None) -> tuple[tuple[Path, ...], Path | None]:
-    """``--add-dir`` → ``(registered_workdirs, active_workdir)``：绝对化、去重保序；``active`` 取首个（镜像
-    :attr:`Computer.active_workdir`）。直接调用 ``run()``（绕过 Typer）时 ``add_dir`` 可能泄漏 OptionInfo（非
-    list）→ isinstance 守卫为空（同 ``computer_factory`` 容错姿态）。/ Resolve ``--add-dir`` to workdirs。
-    """
-    registered: list[Path] = []
-    for d in add_dir if isinstance(add_dir, list) else []:
-        rp = Path(d).expanduser().resolve()
-        if rp not in registered:
-            registered.append(rp)
-    return tuple(registered), (registered[0] if registered else None)
+    flag_path: Path | None = None  # --settings <file>（flag 层 settings.json）
+    mcp_config: str | None = None  # --mcp-config <file>（flag 层 mcp.json；未剥 `@`、未校验）
 
 
 def _root_state(ctx: typer.Context) -> _RootState:
     """从 Typer 上下文取根状态；缺失（未经根回调，如单测直呼）时回退空状态。/ Read root state, empty fallback。"""
     obj = ctx.obj
     return obj if isinstance(obj, _RootState) else _RootState()
+
+
+def _mcp_flag_path(raw: str | None) -> Path | None:
+    """
+    ``--mcp-config`` → 校验过的 :class:`Path`；形状不符 **fail-fast** / Validate the flag file's shape, fail-fast。
+
+    **为何在此 fail-fast，而非交给** :func:`~a2c_smcp.computer.settings.mcp_config.load_mcp_config_file`：后者按 §5.6
+    对**全部五个 durable scope** 共用地容错（人编文件：损坏 → 空视图 + 诊断 + 保留原文件），在那里 fail-fast 会让一份
+    陈旧的 user-scope ``mcp.json`` 阻断启动。不对称是**刻意**的：durable 文件是**环境既有**的 ⇒ 容错；flag 文件是
+    **操作员此刻在命令行上点名**的 ⇒ 形状不符意味着他要的**每个 server 都没加载**，静默降级会把人丢进一个空的 REPL、
+    而那行红字早已滚出屏幕。
+
+    这也是对历史 ``--config`` 那两个裸 ``except Exception`` + ``# pragma: no cover`` 吞异常块的**刻意反转**——
+    拼错的路径本会静默降级启动。退出码 2 = Click 的 usage-error 惯例。
+
+    **v0.3.0 破坏性变更**：文件形状由旧 ``--config`` 的「裸 server 对象 / server 数组」硬切为 ``mcp.json`` 形状
+    ``{"servers": {...}, "inputs": [...]}``（协议 §2.5-3：flag scope 的文件对 = ``--mcp-config`` + ``--settings``）。
+    无存量用户，按通用口径不做兼容设计。
+    """
+    if not isinstance(raw, str):  # 直呼 _run_impl 时 OptionInfo 可能泄漏 → 守卫（同 settings_file 姿态）
+        return None
+    path = Path(raw[1:] if raw.startswith("@") else raw)  # ``@file`` 是可选糖，与裸路径等价
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]✗ 无法读取 --mcp-config 文件 / cannot read --mcp-config file: {path}: {e}[/red]")
+        raise typer.Exit(2) from e
+    if isinstance(data, Mapping) and ("servers" in data or "inputs" in data):
+        return path
+    # 形状不符：尽量说清「实际是什么」+ 给出可照抄的改写形状。
+    shape = "server 数组 / an array of servers" if isinstance(data, list) else f"{type(data).__name__}"
+    if isinstance(data, Mapping):
+        shape = "裸 server 对象（无 servers/inputs 键）/ a bare server object (no servers/inputs key)"
+    console.print(
+        f"[red]✗ --mcp-config 文件格式无效 / invalid --mcp-config file: {path}[/red]\n"
+        f"[red]  期望 mcp.json 形状 {{'servers': {{...}}, 'inputs': [...]}}，实际为 {shape}。[/red]\n"
+        f"[red]  Expected the mcp.json shape {{'servers': {{...}}, 'inputs': [...]}}.[/red]\n"
+        "[yellow]  提示：v0.3.0 起 --config 的裸 server 格式已废止，server 身份由 map key 承载"
+        "（**去掉 body 里的 name 字段**，否则会因 name≠key 被丢弃）：[/yellow]\n"
+        '[yellow]  Hint: the legacy bare-server format is removed; the map key is the identity (drop the "name" field):[/yellow]\n'
+        '[dim]  {"servers": {"<server-name>": {"type": "stdio", "server_parameters": {...}}}, "inputs": []}[/dim]',
+    )
+    raise typer.Exit(2)
 
 
 # ------------------------------
@@ -145,10 +186,8 @@ def _root(
         help="关闭彩色输出（PyCharm控制台不渲染ANSI时可使用） / Disable ANSI colors",
     ),
     json_output: bool = typer.Option(False, "--json", help="非交互默认 JSON 输出（子命令亦各带 --json）/ JSON output"),
-    settings_file: str | None = typer.Option(
-        None, "--settings", help="额外 settings.json（flag scope，最低优先级）/ extra settings.json (flag scope)",
-    ),
-    add_dir: list[str] | None = _ADD_DIR_OPTION,
+    mcp_config: str | None = typer.Option(None, "--mcp-config", "-c", help=_MCP_CONFIG_HELP),
+    settings_file: str | None = typer.Option(None, "--settings", help=_SETTINGS_HELP),
     approve_all_mcp: bool = typer.Option(
         False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
     ),
@@ -165,18 +204,16 @@ def _root(
         # 重新绑定本地引用
         console = console_util.console
 
-    # #97：采集根级上下文（--settings flag scope 文件 + --add-dir 工作目录）存入 ctx.obj，供 settings 子命令读取。
+    # #97：采集根级上下文（--settings flag scope 文件）存入 ctx.obj，供 settings 子命令读取。
     # Click 子上下文默认继承父 ctx.obj，故无论是否带子命令都先填充（无子命令时 run 路径仍走显式参数）。
-    registered, active = _resolve_workdirs(add_dir)
     ctx.obj = _RootState(
         flag_path=Path(settings_file) if isinstance(settings_file, str) else None,
-        registered_workdirs=registered,
-        active_workdir=active,
+        mcp_config=mcp_config if isinstance(mcp_config, str) else None,
     )
 
     if ctx.invoked_subcommand is None:
         # 注意：不要直接调用被 @app.command 装饰的 run()，否则未传入的参数会保留 OptionInfo 默认值
-        # 这里改为调用纯实现函数 _run_impl，并显式传入 config=None 与 inputs=None。
+        # 这里改为调用纯实现函数 _run_impl。
         _run_impl(
             auto_connect=auto_connect,
             auto_reconnect=auto_reconnect,
@@ -185,9 +222,7 @@ def _root(
             auth=auth,
             headers=headers,
             computer_factory=computer_factory,
-            config=None,
-            inputs=None,
-            add_dir=add_dir,
+            mcp_config=mcp_config,
             approve_all_mcp=approve_all_mcp,
             settings_file=settings_file,
         )
@@ -198,11 +233,15 @@ async def _interactive_loop(
     init_client: SMCPComputerClient | None = None,
     *,
     approve_all_mcp: bool = False,
-    mcp_flag_config: Path | None = None,
+    settings_flag_path: Path | None = None,
 ) -> None:
     """
     中文: 兼容外部引用的包装器，委托到 interactive_impl，并注入依赖。
     English: Backward-compatible wrapper that delegates to interactive_impl with dependencies injected.
+
+    ``settings_flag_path`` = ``--settings <file>``（flag 层 **settings.json**）。旧名 ``mcp_flag_config`` 已更名：
+    它从来不是 mcp.json，那个名字主动误导（#154）。flag 层 **mcp.json**（``--mcp-config``）走另一条路——注入
+    :class:`Computer`（boot 声明式输入），不经本参数。
     """
     await _interactive_loop_impl(
         comp,
@@ -212,7 +251,7 @@ async def _interactive_loop(
         init_client=init_client,
         completer=A2CCompleter(comp),
         approve_all_mcp=approve_all_mcp,
-        mcp_flag_config=mcp_flag_config,
+        settings_flag_path=settings_flag_path,
     )
 
 
@@ -225,9 +264,7 @@ def _run_impl(
     auth: str | None,
     headers: str | None,
     computer_factory: str | None,
-    config: str | None,
-    inputs: str | None,
-    add_dir: list[str] | None = None,
+    mcp_config: str | None,
     approve_all_mcp: bool = False,
     settings_file: str | None = None,
 ) -> None:
@@ -235,10 +272,17 @@ def _run_impl(
     纯实现函数：不要在此处使用 Typer 的 Option 默认值，避免 OptionInfo 泄露到运行时。
     Both CLI (@app.command) 与回调 (@app.callback) 在需要时调用本函数。
 
-    add_dir / approve_all_mcp / settings_file 来自全局 flag ``--add-dir`` / ``--approve-all-mcp`` / ``--settings``
-    （#69 Group B/D）：``--add-dir`` 注册工作目录（→ ``registered_workdirs`` → ``active_workdir``，project/local
-    scope 与 ``${workspaceFolder}`` 的前置）；后两者透传启动期 MCP 批准框。
+    approve_all_mcp / settings_file / mcp_config 来自全局 flag ``--approve-all-mcp`` / ``--settings`` /
+    ``--mcp-config``：透传启动期 MCP 批准框 + flag scope 的**文件对**（settings.json + mcp.json，§2.5-3）。
+
+    ``--mcp-config`` **不在此急切挂载**（#154）：它是 flag 层 mcp.json，经 :class:`Computer` 注入、由
+    :func:`~a2c_smcp.computer.cli.commands.plugin.run_mcp_approval` 与其余 scope **同一条**解析/门控/挂载路径处理。
+    历史 ``--config`` 在此 ``json.loads`` → ``amount_server`` 直挂，**绕开 scope 合并、origin 记录与审批门**——
+    正是 origin 缺失（§2.5-5 MUST）与 §4.9.1-2 连坐停摘用户 server 的根源。
     """
+    # 形状 fail-fast **先于任何副作用**：历史解析在 ``connect`` 之后（旧 :255 vs :275），坏文件会留下一个已连接的
+    # socket 和一个已 boot 的 Computer。/ Validate before any side effect (the old parse ran post-connect).
+    flag_mcp_path = _mcp_flag_path(mcp_config)
 
     async def _amain() -> None:
         # 初始化空配置，后续通过交互动态维护 / init with empty config, then manage dynamically
@@ -256,16 +300,16 @@ def _run_impl(
             console.print("[red]计算机构造目标不可调用，将回退到默认 Computer[/red]")
             comp_factory_obj = Computer
 
-        # --add-dir → registered_workdirs（能力发现并集 + active_workdir=首个）。解析复用 _resolve_workdirs（#97 DRY）。
-        registered_workdirs, _active_workdir = _resolve_workdirs(add_dir)
-
+        # inputs / mcp_servers 恒空：CLI **不是**嵌入式宿主 —— 所有 server 经声明面（mcp.json 各 scope，含
+        # ``--mcp-config`` flag 层）解析后由审批门挂载，或经 REPL 运行期挂载。``mcp_servers`` 是 embed 层的
+        # 声明面（§2.5-3），CLI 下恒空是正确表现、非缺陷（见 ``Computer.__init__``）。
         comp = comp_factory_obj(
             name="friday_hands",
             inputs=set(),
             mcp_servers=set(),
             auto_connect=auto_connect,
             auto_reconnect=auto_reconnect,
-            registered_workdirs=registered_workdirs or None,
+            mcp_flag_config=flag_mcp_path,
         )
         async with comp:
             init_client: SMCPComputerClient | None = None
@@ -285,49 +329,14 @@ def _run_impl(
                 await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
                 console.print("[green]已通过启动参数连接到 Socket.IO / Connected via CLI options[/green]")
 
-            # 启动参数加载 inputs 与 servers 配置
-            # Load inputs first (so that servers config rendering can use them if needed later via interactive commands)
-            if inputs:
-                try:
-                    ipath = inputs[1:] if inputs.startswith("@") else inputs
-                    data = json.loads(Path(ipath).read_text(encoding="utf-8"))
-                    # 允许单个对象或数组
-                    if isinstance(data, list):
-                        raw_items = TypeAdapter(list[SMCPServerInputDict]).validate_python(data)
-                        models: set[MCPServerInputModel] = {TypeAdapter(MCPServerInputModel).validate_python(item) for item in raw_items}
-                        comp.update_inputs(models)
-                    else:
-                        item: SMCPServerInputDict = TypeAdapter(SMCPServerInputDict).validate_python(data)
-                        comp.add_or_update_input(TypeAdapter(MCPServerInputModel).validate_python(item))
-                    console.print("[green]已加载 Inputs 配置 / Inputs loaded[/green]")
-                except Exception as e:  # pragma: no cover
-                    console.print(f"[red]加载 Inputs 失败 / Failed to load inputs: {e}[/red]")
-
-            if config:
-                try:
-                    spath = config[1:] if config.startswith("@") else config
-                    data = json.loads(Path(spath).read_text(encoding="utf-8"))
-                    # 允许单个对象或数组
-
-                    async def _add_server(cfg_obj: dict[str, Any]) -> None:
-                        validated: dict[str, Any] = TypeAdapter(SMCPServerConfigDict).validate_python(cfg_obj)
-                        await comp.aadd_or_aupdate_server(validated)
-
-                    if isinstance(data, list):
-                        for cfg in data:
-                            await _add_server(cfg)
-                    else:
-                        await _add_server(data)
-                    console.print("[green]已加载 Servers 配置 / Servers loaded[/green]")
-                except Exception as e:  # pragma: no cover
-                    console.print(f"[red]加载 Servers 失败 / Failed to load servers: {e}[/red]")
-
-            # settings_file 直接调用 run() 时可能泄漏 OptionInfo → isinstance 守卫（同 add_dir / computer_factory 容错姿态）。
+            # `--mcp-config` 的 servers/inputs 不在此加载：它是 flag 层 mcp.json，已注入 Computer，由
+            # `run_mcp_approval` 与 user/project/local/policy 各层**同路**解析（含 inputs 入池）+ 过审批门 + 挂载。
+            # settings_file 直接调用 run() 时可能泄漏 OptionInfo → isinstance 守卫（同 computer_factory 容错姿态）。
             await _interactive_loop(
                 comp,
                 init_client=init_client,
                 approve_all_mcp=approve_all_mcp is True,
-                mcp_flag_config=Path(settings_file) if isinstance(settings_file, str) else None,
+                settings_flag_path=Path(settings_file) if isinstance(settings_file, str) else None,
             )
 
     asyncio.run(_amain())
@@ -335,6 +344,7 @@ def _run_impl(
 
 @app.command()
 def run(
+    ctx: typer.Context,
     auto_connect: bool = typer.Option(True, help="是否自动连接 / Auto connect"),
     auto_reconnect: bool = typer.Option(True, help="是否自动重连 / Auto reconnect"),
     url: str | None = typer.Option(None, help="Socket.IO 服务器URL，例如 https://host:port"),
@@ -354,30 +364,21 @@ def run(
             "不支持以 '.' 开头的相对导入；模块解析相对于运行 a2c-computer 时的工作目录可导入包环境。"
         ),
     ),
-    config: str | None = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="在启动时从文件加载 MCP Servers 配置（支持 @file 语法或直接文件路径） / Load MCP Servers from file at startup",
-    ),
-    inputs: str | None = typer.Option(
-        None,
-        "--inputs",
-        "-i",
-        help="在启动时从文件加载 Inputs 定义（支持 @file 语法或直接文件路径） / Load Inputs from file at startup",
-    ),
-    settings_file: str | None = typer.Option(
-        None, "--settings", help="额外 settings.json（flag scope，最低优先级）/ extra settings.json (flag scope)",
-    ),
-    add_dir: list[str] | None = _ADD_DIR_OPTION,
+    mcp_config: str | None = typer.Option(None, "--mcp-config", "-c", help=_MCP_CONFIG_HELP),
+    settings_file: str | None = typer.Option(None, "--settings", help=_SETTINGS_HELP),
     approve_all_mcp: bool = typer.Option(
         False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
     ),
 ) -> None:
     """
-    中文: 启动计算机并进入持续运行模式。后续将支持从配置文件加载 servers 与 inputs。
-    English: Boot the computer and enter persistent loop. Config-file loading will be added later.
+    中文: 启动计算机并进入持续运行模式。servers 与 inputs 经 mcp.json 各 scope（含 ``--mcp-config`` flag 层）声明。
+    English: Boot the computer and enter the persistent loop. Servers/inputs come from mcp.json scopes.
     """
+    # flag 文件对兜底回读根级（隔离审查 🔴2）：``a2c-computer --mcp-config x.json run`` 里 flag 被 Click 归给
+    # 根回调，``run`` 自身收到 None ⇒ 不回读就**静默丢弃**（连 fail-fast 都碰不到）。``run`` 自身显式值优先。
+    st = _root_state(ctx)
+    mcp_config = mcp_config if isinstance(mcp_config, str) else st.mcp_config
+    settings_file = settings_file if isinstance(settings_file, str) else (str(st.flag_path) if st.flag_path else None)
     _run_impl(
         auto_connect=auto_connect,
         auto_reconnect=auto_reconnect,
@@ -386,9 +387,7 @@ def run(
         auth=auth,
         headers=headers,
         computer_factory=computer_factory,
-        config=config,
-        inputs=inputs,
-        add_dir=add_dir,
+        mcp_config=mcp_config,
         approve_all_mcp=approve_all_mcp,
         settings_file=settings_file,
     )
@@ -520,7 +519,9 @@ def _plugin_uninstall(
     """卸载 plugin / Uninstall a plugin."""
     code = asyncio.run(
         plugin_cmd.plugin_uninstall(
-            SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, keep_servers=keep_servers, json_output=json_output,
+            SkillRegistry(), ensure_skill_home(), os.environ, plugin_id,
+            non_plugin_bundle_ids=files_only_non_plugin_bundle_ids(os.environ),
+            keep_servers=keep_servers, json_output=json_output,
         ),
     )
     raise typer.Exit(code)
@@ -539,14 +540,20 @@ def _plugin_enable(plugin_id: str = typer.Argument(...), json_output: bool = typ
 def _plugin_disable(plugin_id: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
     """禁用 plugin = 整 plugin 下线 / Disable a plugin (whole-plugin offline)."""
     code = asyncio.run(
-        plugin_cmd.plugin_disable(SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, json_output=json_output),
+        plugin_cmd.plugin_disable(
+            SkillRegistry(), ensure_skill_home(), os.environ, plugin_id,
+            non_plugin_bundle_ids=files_only_non_plugin_bundle_ids(os.environ),
+            json_output=json_output,
+        ),
     )
     raise typer.Exit(code)
 
 
 @plugin_app.command("list")
 def _plugin_list(
-    available: bool = typer.Option(False, "--available", help="含 disabled / include disabled"),
+    available: bool = typer.Option(
+        False, "--available", help="[deprecated] 已弃用：v0.3.0 起默认列全部已安装 / no-op, listing all is the default",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """列出 installed plugin / List installed plugins."""
@@ -560,15 +567,26 @@ def _plugin_info(plugin_id: str = typer.Argument(...), json_output: bool = typer
 
 
 @plugin_app.command("gc")
-def _plugin_gc(json_output: bool = typer.Option(False, "--json")) -> None:
-    """清理孤儿 plugin（非交互无 confirm → 直接清）/ GC orphan plugins (no confirm non-interactively)."""
-    code = asyncio.run(plugin_cmd.plugin_gc(SkillRegistry(), ensure_skill_home(), os.environ, confirm=None, json_output=json_output))
+def _plugin_gc(
+    prune_dangling: bool = typer.Option(
+        False, "--prune-dangling", help="连带 prune 悬挂安装意图（意图 ∖ 账本 ∧ 不可达）/ also prune dangling intents",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """清理孤儿 plugin + 诊断悬挂意图（非交互删权威意图须显式 --prune-dangling）/ GC orphans + diagnose dangling."""
+    code = asyncio.run(
+        plugin_cmd.plugin_gc(
+            SkillRegistry(), ensure_skill_home(), os.environ,
+            non_plugin_bundle_ids=files_only_non_plugin_bundle_ids(os.environ),
+            confirm=None, prune_dangling=prune_dangling, json_output=json_output,
+        ),
+    )
     raise typer.Exit(code)
 
 
 # ── settings 子命令 / settings subcommands ────────────────────────────────────
-# 四个 settings 子命令经 ``ctx: typer.Context`` 取根状态（#97）：show/get 需 flag_path + workdirs 才能读 flag
-# scope 与 project|local；set/edit 需 active_workdir 才能写 project|local（flag/policy 本就只读，无 flag_path）。
+# 四个 settings 子命令经 ``ctx: typer.Context`` 取根状态（#97）：show/get 需 flag_path 才能读 flag scope；
+# project|local 锚定进程 cwd（#116），无需额外状态（flag/policy 本就只读，无 flag_path）。
 @settings_app.command("show")
 def _settings_show(
     ctx: typer.Context,
@@ -580,7 +598,6 @@ def _settings_show(
     raise typer.Exit(
         settings_cmd.settings_show(
             ensure_skill_home(), os.environ, scope=scope,
-            registered_workdirs=st.registered_workdirs, active_workdir=st.active_workdir,
             flag_path=st.flag_path, json_output=json_output,
         ),
     )
@@ -598,7 +615,6 @@ def _settings_get(
     raise typer.Exit(
         settings_cmd.settings_get(
             ensure_skill_home(), os.environ, key, scope=scope,
-            registered_workdirs=st.registered_workdirs, active_workdir=st.active_workdir,
             flag_path=st.flag_path, json_output=json_output,
         ),
     )
@@ -606,32 +622,28 @@ def _settings_get(
 
 @settings_app.command("set")
 def _settings_set(
-    ctx: typer.Context,
     key: str = typer.Argument(...),
     value: str = typer.Argument(..., help="JSON 优先，回退字面字符串 / JSON preferred, else literal"),
     scope: str = typer.Option("user", "--scope", help="user|project|local（flag/policy 只读）"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """写单字段（flag/policy 只读）/ Write a single field (flag/policy read-only)."""
-    st = _root_state(ctx)
     raise typer.Exit(
         settings_cmd.settings_set(
             ensure_skill_home(), os.environ, key, value, scope=scope,
-            active_workdir=st.active_workdir, json_output=json_output,
+            json_output=json_output,
         ),
     )
 
 
 @settings_app.command("edit")
 def _settings_edit(
-    ctx: typer.Context,
     scope: str = typer.Option("user", "--scope", help="user|project|local"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """用 $EDITOR 打开该层 settings.json（非交互无 reconcile）/ Open settings.json in $EDITOR."""
-    st = _root_state(ctx)
     code, _post = settings_cmd.settings_edit(
-        ensure_skill_home(), os.environ, scope=scope, active_workdir=st.active_workdir, json_output=json_output,
+        ensure_skill_home(), os.environ, scope=scope, json_output=json_output,
     )
     raise typer.Exit(code)
 

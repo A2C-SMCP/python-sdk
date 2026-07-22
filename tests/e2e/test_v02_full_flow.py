@@ -56,12 +56,13 @@ from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
 from a2c_smcp.utils.handshake import HANDSHAKE_CONNECT_ERRORS
 from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
+from tests.protocol_versions import INCOMPATIBLE_PEER
 
 pytestmark = pytest.mark.e2e
 
 _SIO_PATH = "/socket.io"
-# 与 SDK PROTOCOL_VERSION(0.2.x) MINOR 不匹配 → 不兼容 / MINOR mismatch → incompatible
-_INCOMPATIBLE_SERVER = "0.3.0"
+# 从 PROTOCOL_VERSION 派生的不兼容 server 版本（MINOR 不匹配）——不耦合具体协议版本值
+_INCOMPATIBLE_SERVER = INCOMPATIBLE_PEER
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _MCP_SERVERS_DIR = _PROJECT_ROOT / "tests" / "integration_tests" / "computer" / "mcp_servers"
 # subscribe-srv：暴露 window:// 资源（annotations priority / _meta fullscreen）+ 工具 mark_a
@@ -193,7 +194,7 @@ async def test_v02_full_flow_compatible(compat_server: int) -> None:
         assert any(u.startswith("window://example.desktop.paged/p2") for u in uris)
 
         # —— 工具调用链路：Agent → Server → Computer 真实 MCP Server → 结果回传 ——
-        result = await agent.emit_tool_call(computer="comp-v02", tool_name="mark_a", params={}, timeout=15)
+        result = await agent.emit_tool_call(computer="comp-v02", tool_name="subscribe-srv__mark_a", params={}, timeout=15)
         assert result.isError is False, f"工具调用失败 / tool call failed: {result}"
         assert len(result.content) >= 1
         assert "ok:mark_a" in result.content[0].text

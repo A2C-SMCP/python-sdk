@@ -203,6 +203,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
             "tools": [
                 {
                     "name": "t1",
+                    "bundle_id": "srv_t1",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "d",
                     "params_schema": {"type": "object", "properties": {}, "required": []},
                     "return_schema": None,

@@ -14,8 +14,8 @@ Unit tests for the SKILL name lexer & synthesis (v0.2.1 bare-name model)
 - 段数消歧：1 段 user / 2 段 marketplace / 3 段 mcp（首段字面 mcp）
 - 缺 ``:`` 的 user 裸名**被接受**（不报错）—— 0.2.1 关键回归点
 - 非法 name → SkillNameError（映射协议 4016）
-- MCP <server> 段规范化（skill.md §1.3 表格，不实现 claude.ai 特例）
-- 三源合成 + 规范化越界判废 + parse/synthesize 往返一致
+- MCP <server> 段 = bundle_id 原样（skill.md §1.3，#142：不再规范化 display 名）
+- 三源合成 + 段字符集判废 + parse/synthesize 往返一致
 """
 
 import pytest
@@ -25,29 +25,12 @@ from a2c_smcp.computer.skills.naming import (
     ParsedSkillName,
     SkillNameError,
     is_valid_skill_name,
-    normalize_mcp_server_segment,
     parse_skill_name,
     synthesize_marketplace_name,
     synthesize_mcp_name,
     synthesize_user_name,
 )
-
-
-# ---------------------------------------------------------------------------
-# normalize_mcp_server_segment —— skill.md §1.3 规范化表格
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("tfrobot-tools", "tfrobot-tools"),  # 合规字符原样
-        ("my.api server", "my_api_server"),  # 点 + 空格 → _
-        ("My_Server", "My_Server"),  # 大小写 + 下划线保留
-        ("服务器", "___"),  # 3 个非 ASCII → 3 个 _
-        ("claude.ai my.server", "claude_ai_my_server"),  # 不做 claude.ai 特例折叠
-    ],
-)
-def test_normalize_mcp_server_segment(raw: str, expected: str) -> None:
-    assert normalize_mcp_server_segment(raw) == expected
+from a2c_smcp.utils.bundle_id import is_valid_bundle_id
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +77,12 @@ def test_bare_user_name_not_rejected_for_missing_colon() -> None:
         ":x",  # 空首段（2 段 marketplace plugin 空）
         "x:",  # 空尾段
         "plugin:Skill",  # marketplace skill 大写
-        "mcp::leaf",  # mcp server 段空
+        "mcp::leaf",  # mcp server 段空（bundle_id 恒非空）
         "mcp:srv:Leaf",  # mcp leaf 大写
-        "mcp:bad server:x",  # mcp server 含空格（规范化前的非法字符集）
+        "mcp:bad server:x",  # mcp server 含空格（非 bundle_id 字符集）
         "mcp:bad/srv:x",  # mcp server 含 /
+        "mcp:bad.srv:x",  # mcp server 含 .（bundle_id MUST NOT 含 `.`）
+        "mcp:a__b:x",  # mcp server 含 __（bundle_id MUST NOT 含连续下划线）
     ],
 )
 def test_parse_invalid_raises_4016(name: str) -> None:
@@ -108,12 +93,51 @@ def test_parse_invalid_raises_4016(name: str) -> None:
 
 
 def test_segment_length_boundary() -> None:
-    """各段 1–64：64 字符合法，65 字符非法（skill.md §1.4）。"""
+    """user / marketplace / mcp-leaf 段 1–64：64 字符合法，65 字符非法（skill.md §1.4）。"""
     ok = "a" * MAX_SEGMENT_LEN
     too_long = "a" * (MAX_SEGMENT_LEN + 1)
     assert parse_skill_name(ok).skill == ok
     with pytest.raises(SkillNameError):
         parse_skill_name(too_long)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "tfrobot-tools",
+        "My_Server",
+        "bundle_a1b2c3d4e5f60718",
+        "a" * (MAX_SEGMENT_LEN + 16),
+        "",
+        "a__b",
+        "my.api",
+        "my api",
+        "_leading",
+        "-x-",
+    ],
+)
+def test_mcp_server_segment_predicate_is_bundle_id_predicate(candidate: str) -> None:
+    """``<server>`` 段判据 **≡** :func:`is_valid_bundle_id` —— 钉死单一权威，防两处漂移。
+
+    ``<server>`` 段**就是** bundle_id（skill.md §1.3），故合法性判据只能有一个来源。若 naming 侧
+    另存一份等价谓词，协议调整 BundleID 字符集时两处会静默分叉 → mcp 段拒绝合法 bundle_id →
+    SKILL 对 Agent 隐身，即 #142 要消灭的失效模式复活。本用例即该耦合的守卫。
+    """
+    name = f"mcp:{candidate}:x"
+    assert is_valid_skill_name(name) is is_valid_bundle_id(candidate)
+
+
+def test_mcp_server_segment_has_no_length_cap() -> None:
+    """mcp ``<server>`` 段（= bundle_id）**无长度上限**（skill.md §1.3/§1.4，#142）。
+
+    §1.4 的「1–64」上限已随「``<server>`` = bundle_id」删除，§1.5 亦删掉「长度 > 64 → 判废」失效路径：
+    BundleID 规范本身不设长度上限，且 §1.3 断言 bundle_id「是 lexer 字符集的严格子集，**直接合法**」。
+    若此处仍卡 64，name 超 64 字符的 server 其 SKILL 会对 Agent 隐身——正是本 issue 要消灭的失效模式。
+    """
+    long_bundle_id = "a" * (MAX_SEGMENT_LEN + 16)
+    parsed = parse_skill_name(f"mcp:{long_bundle_id}:x")
+    assert parsed.kind == "mcp"
+    assert parsed.server == long_bundle_id
 
 
 # ---------------------------------------------------------------------------
@@ -133,28 +157,38 @@ def test_synthesize_marketplace_name() -> None:
         synthesize_marketplace_name("acme", "Audit")
 
 
-def test_synthesize_mcp_name_normalizes_server() -> None:
-    assert synthesize_mcp_name("tfrobot-tools", "code-review") == "mcp:tfrobot-tools:code-review"
-    # server 含点/空格 → 规范化后嵌入
-    assert synthesize_mcp_name("my.api", "csv-aggregator") == "mcp:my_api:csv-aggregator"
+@pytest.mark.parametrize(
+    ("bundle_id", "desc"),
+    [
+        ("tfrobot-tools", "auto-derive 常规 / plain auto-derive"),
+        ("My_Server", "大小写 + 下划线保留 / case & underscore preserved"),
+        ("bundle_a1b2c3d4e5f60718", "hash fallback"),
+        ("a" * (MAX_SEGMENT_LEN + 16), "超 64：协议 §1.4 已删该上限 / no length cap"),
+    ],
+)
+def test_synthesize_mcp_name_takes_bundle_id_verbatim(bundle_id: str, desc: str) -> None:
+    """``<server>`` 段 = bundle_id **原样**（skill.md §1.3，#142）——不再规范化。"""
+    assert synthesize_mcp_name(bundle_id, "code-review") == f"mcp:{bundle_id}:code-review", desc
 
 
 @pytest.mark.parametrize(
-    ("server", "skill"),
+    ("bundle_id", "skill", "why"),
     [
-        ("", "code-review"),  # 规范化后长度 0 → 判废（skill.md §1.5）
-        ("a" * (MAX_SEGMENT_LEN + 1), "code-review"),  # 规范化后 > 64 → 判废
-        ("tfrobot-tools", "Bad-Leaf"),  # leaf 非严格 kebab
+        ("", "code-review", "空段：bundle_id 恒非空，空值即调用方 bug"),
+        ("my.api", "csv-aggregator", "含 `.`：bundle_id 字符集禁 `.`（#142 起不再规范化兜底）"),
+        ("my api", "csv-aggregator", "含空格：非 bundle_id 字符集"),
+        ("a__b", "code-review", "含连续 `__`：`__` 是 bundle_id 与工具名的保留分隔符"),
+        ("tfrobot-tools", "Bad-Leaf", "leaf 非严格 kebab"),
     ],
 )
-def test_synthesize_mcp_name_rejects(server: str, skill: str) -> None:
+def test_synthesize_mcp_name_rejects(bundle_id: str, skill: str, why: str) -> None:
     with pytest.raises(SkillNameError):
-        synthesize_mcp_name(server, skill)
+        synthesize_mcp_name(bundle_id, skill)
 
 
 def test_parse_synthesize_roundtrip() -> None:
-    """合成 → 解析往返一致（规范化后的 server 段被 lexer 接受）。"""
-    name = synthesize_mcp_name("my.api", "x")
+    """合成 → 解析往返一致（bundle_id 段被 lexer 原样接受）。"""
+    name = synthesize_mcp_name("my_api", "x")
     parsed = parse_skill_name(name)
     assert parsed.kind == "mcp"
     assert parsed.server == "my_api"

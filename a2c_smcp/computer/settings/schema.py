@@ -24,9 +24,14 @@ definitions / inputs (those live in ``.tfrobot/mcp.json``).
   其余保留、错误收进 :class:`SettingsValidationError` 列表（照 CC：错误不阻断启动、不整文件作废）。
   Field-level tolerance: a single bad known key / map entry / array element is filtered out
   per-item, the rest is kept, and the error is collected — never invalidating the whole file.
-- **scope 越权**：``allowedMcpServers`` / ``deniedMcpServers`` 是 **policy-only**；出现在非 policy
-  scope → 过滤不用 + 记 ValidationError（杜绝用户态自我提权）。
-  Scope overreach: policy-only fields appearing in a non-policy scope are filtered + recorded.
+- **scope 越权**（两个平行类目，共用「过滤 + 记 ValidationError」管线）/ Scope overreach (two parallel categories):
+
+  1. :data:`POLICY_ONLY_FIELDS`：``allowedMcpServers`` / ``deniedMcpServers`` 是 **policy-only**；出现在
+     非 policy scope → 过滤不用 + 记错（杜绝用户态自我提权）。
+     Policy-only fields appearing outside the policy scope are filtered + recorded.
+  2. :data:`TRUSTED_SCOPE_ONLY_FIELDS`：审批门 **enable 方向**判据；出现在 **project** scope → 过滤 + 记错
+     （杜绝**不受信 scope 自我批准**，#157 / 协议 ``guides/mcp-approval-gate-alignment.md`` §2.1）。
+     Approval-gate ENABLE-direction inputs supplied by the project scope are filtered + recorded.
 """
 
 from __future__ import annotations
@@ -43,21 +48,63 @@ logger = get_logger(__name__)
 
 class SettingsScope(StrEnum):
     """
-    settings 来源 scope（低 → 高，high 覆盖 low）/ Settings source scope (low → high)。
+    配置来源 scope（低 → 高，high 覆盖 low）/ Config source scope (low → high)。
 
-    ``CAPABILITY`` 是 A2C 特有的**能力发现层**（最低优先级）：跨**全部登记工作目录**取
-    ``enabledPlugins`` / ``extraKnownMarketplaces`` 并集，让 Agent 能力面稳定、不随 active
-    workdir 跳变（§5.0/§5.1）。其余五级 = Claude Code 完整对齐（user/project/local/flag/policy）。
-    ``CAPABILITY`` is the A2C-specific capability-discovery layer (lowest); the other five align
-    with Claude Code.
+    与 Claude Code 对齐（user/project/local/flag/policy）；project/local 锚定进程 cwd（#116）。
+    ``embed`` 为 A2C 特有的**宿主构造挂载层**，仅存在于 mcp.json 轴（settings.json 无此来源，见 :data:`SCOPE_ORDER`）。
+    Aligned with Claude Code, plus A2C's ``embed`` (mcp.json axis only).
+
+    **顺序权威在 :data:`SCOPE_ORDER`，不在本枚举的成员声明序**——成员序只是巧合一致，勿依赖。
     """
 
-    CAPABILITY = "capability"  # 能力发现层（最低）/ capability-discovery (lowest)
     USER = "user"
     PROJECT = "project"
     LOCAL = "local"
+    EMBED = "embed"  # 宿主构造入参 Computer(mcp_servers=...)；仅 mcp.json 轴 / embedded-constructor, mcp.json axis only
     FLAG = "flag"
     POLICY = "policy"  # 最高 / highest
+
+
+# 协议 ``runtime-contract.md`` §2.5-3 来源优先序（低 → 高）的**唯一**权威 / The single authority for §2.5-3。
+#
+#     plugin 声明 < user < project < local < embed < flag < policy
+#
+# **settings.json 与 mcp.json 两套 resolve MUST 由本元组派生顺序，MUST NOT 各写列表字面量**——两份字面量
+# 漂移（mcp.json 曾把 flag 排最低、settings.json 排次高，差四格）正是 #154 的根因。改序只需改本元组，
+# 两边同时翻转；任何一边改回字面量都会被 ``test_scope_order_matches_protocol_and_has_no_plugin_member``
+# 与两套 resolve 的层位守卫抓住。
+#
+# **为何无 ``PLUGIN`` 成员**（#154 裁决，刻意的结构性缺席）：plugin 声明基线层**不经任一 resolve**——它经
+# transient ``amount_server`` 从 plugin manifest 挂载；plugin-lowest 由 boot 序保证（``run_mcp_approval``
+# 先于 ``run_governance_remount``，后者跳过 ``bundle_id`` 已活跃者，见 ``installer.py`` 的「existing wins」）。
+# 无任一消费者需要 plugin 层：审批门 MUST 滤掉它（F8）、回收判据要 ``origin != plugin``、``upsert_mcp_server``
+# 只认可写 scope ⇒ 对上述三个消费者而言，「合并进来再处处滤掉」与「从不合并」**输出同集**。加一个无生产者的
+# ``PLUGIN`` 成员会让「迭代层过滤」沦为永假守卫（死代码），且正是 #148 那个 P0「进门后豁免」档位复活的诱因。
+# F8 的可验收信号取**缺席**（「成员不存在」比「文档说别用」可靠）。
+#
+# ⚠️ **等价的边界**（隔离审查订正，勿把「等价」读成无限定）：现设计保证「plugin 输给任何**已挂载**的 server」，
+# **非**「输给任何**声明**」——若某用户声明被审批门拦下（DISABLED / PENDING 未批 / 挂载抛异常）而未挂，其
+# bundle_id 空出，governance remount 会挂上 plugin 那份；真有 PLUGIN 层时用户声明会在 merge 层遮蔽它、
+# 什么都不挂。二者行为不同。但协议 §5 item 10 明定 plugin 声明 MUST NOT 进审批门（门控结果本就不该反向决定
+# plugin 基线），且 rust ``collect_enabled_bundled_servers`` 同为「plugin 集内 first-wins、不与用户声明比对」
+# ⇒ **parity 保持**，结论仍成立。
+#
+# ⚠️ 与 rust-sdk#137（显式 ``ProvenanceScope::Plugin`` 变体 + 迭代层过滤）**代码形态分叉、行为等价**：
+# rust 无本 SDK 这套 approval→remount boot 序。协议 §2.5-5 明许「scope 纯推导与挂载时标记**行为等价即合规**」。
+# **须盯的唯一差异**：rust 的权威集**能观测到** ``origin==plugin`` 条目、python 的不能——若将来 conformance
+# 出现「权威集须含 origin==plugin 条目」这类向量，python 会失败（双端跟踪 Issue 已记）。
+#
+# ⚠️ 与 rust-sdk#137（显式 ``ProvenanceScope::Plugin`` 变体 + 迭代层过滤）**代码形态分叉、行为等价**：
+# rust 无本 SDK 这套 approval→remount boot 序，其 ``collect_enabled_bundled_servers`` 是 plugin 集内
+# first-wins、不与用户声明比对。协议 §2.5-5 明许「scope 纯推导与挂载时标记**行为等价即合规**」。
+SCOPE_ORDER: tuple[SettingsScope, ...] = (
+    SettingsScope.USER,
+    SettingsScope.PROJECT,
+    SettingsScope.LOCAL,
+    SettingsScope.EMBED,
+    SettingsScope.FLAG,
+    SettingsScope.POLICY,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +112,7 @@ class SettingsScope(StrEnum):
 # ---------------------------------------------------------------------------
 FIELD_SCHEMA = "$schema"
 FIELD_EXTRA_KNOWN_MARKETPLACES = "extraKnownMarketplaces"
+FIELD_INSTALLED_PLUGINS = "installedPlugins"
 FIELD_ENABLED_PLUGINS = "enabledPlugins"
 FIELD_STRICT_KNOWN_MARKETPLACES = "strictKnownMarketplaces"
 FIELD_TRUSTED_MARKETPLACES = "trustedMarketplaces"
@@ -76,12 +124,32 @@ FIELD_ALLOWED_MCP_SERVERS = "allowedMcpServers"
 FIELD_DENIED_MCP_SERVERS = "deniedMcpServers"
 FIELD_PERMISSIONS = "permissions"
 
-# 仅能在能力发现层取并集的字段（§5.0 (A) 层）/ Fields contributed by the capability layer.
-CAPABILITY_FIELDS: frozenset[str] = frozenset({FIELD_ENABLED_PLUGINS, FIELD_EXTRA_KNOWN_MARKETPLACES})
-
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
 POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS})
+
+# 审批门 **enable 方向**判据：出现在 **project** scope → 过滤 + 记错（#157）。
+# Approval-gate ENABLE-direction inputs: filtered + recorded if supplied by the **project** scope.
+#
+# 协议依据：``guides/mcp-approval-gate-alignment.md`` §2.1 通则（MUST）——
+#   「审批门的输入 MUST 来自比被判定 server 更高信任的来源；任何 scope 都不得为『自身是否受信』提供判据。」
+#
+# ``.tfrobot/settings.json``（project scope）与 ``mcp.json`` 一样**入 git、随仓库分发**。若门接受它供给
+# 档⑤/⑥，被 clone 的仓库携一份 ``{"enableAllProjectMcpServers": true}`` 即可让其 ``mcp.json`` 里的任意
+# server 启动期免批准框直挂 —— 与 #148 删掉的档④ **同构且更易达成**（无需装任何插件、无需猜任何名字）。
+#
+# 为何**只拒 PROJECT**（而非复用 :mod:`a2c_smcp.computer.settings.mcp_config` 的 ``_TRUSTED_ORIGINS``）：
+#   受信供给方 = ``user`` / ``local`` / ``flag`` / ``policy``（§2.1 表）——**含 LOCAL**。这与 mcp.json
+#   **声明面**的 ``_TRUSTED_ORIGINS``（``{USER, FLAG, POLICY}``，**不含 LOCAL**）**有意不同**，勿混用：
+#   三个批准写助手（``approve_mcp_server`` / ``deny_mcp_server`` / ``approve_all_project_mcp``）**只写 local
+#   scope**（个人决定不污染共享层）。若把 LOCAL 也判为不受信，**每次批准都会在读回时被自己过滤掉、批准
+#   永远不生效**。读面与写面 MUST 对称。
+#
+# 为何**不含** ``disabledMcpjsonServers``：
+#   那是 **DENY** 方向（§2.1 表第 3 行）：**任意 scope（含 project）可供给** —— fail-safe，仓库禁自己的
+#   server 无安全影响，更严格永远安全。把它收进本类目属**过度矫正**，由单测
+#   ``test_disabled_mcpjson_allowed_from_any_scope`` 守护。
+TRUSTED_SCOPE_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP})
 
 # 字符串数组字段（读合并：拼接去重；写回：整体替换，§5.4）/ String-array fields.
 STRING_ARRAY_FIELDS: frozenset[str] = frozenset(
@@ -169,6 +237,7 @@ class ComputerSettings(TypedDict, total=False):
     """
 
     extraKnownMarketplaces: dict[str, MarketplaceEntry]
+    installedPlugins: list[str]
     enabledPlugins: dict[str, bool]
     strictKnownMarketplaces: bool
     trustedMarketplaces: list[str]
@@ -230,6 +299,23 @@ def _validate_string_array(key: str, value: Any, scope: SettingsScope) -> tuple[
             cleaned.append(item)
         else:
             errors.append(_err(scope, f"{key}[{idx}]", f"expected string, got {type(item).__name__}"))
+    return cleaned, errors
+
+
+def _validate_installed_plugins(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
+    """``installedPlugins``（全局安装意图，协议 v0.3.0 §2.4）：字符串数组，元素须 ``<plugin>@<marketplace>`` 形态。"""
+    if not isinstance(value, list):
+        return _DROP, [_err(scope, key, f"expected array, got {type(value).__name__}")]
+    cleaned: list[str] = []
+    errors: list[SettingsValidationError] = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, str):
+            errors.append(_err(scope, f"{key}[{idx}]", f"expected string, got {type(item).__name__}"))
+            continue
+        if not is_valid_enabled_plugin_key(item):
+            errors.append(_err(scope, f"{key}[{idx}]", "entry must be '<plugin>@<marketplace>' (strict kebab)"))
+            continue
+        cleaned.append(item)
     return cleaned, errors
 
 
@@ -313,6 +399,7 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
 # 字段 → 校验器映射（缺席 = 未知字段，passthrough）/ field → validator map (absent = unknown, passthrough).
 _FIELD_VALIDATORS = {
     FIELD_EXTRA_KNOWN_MARKETPLACES: _validate_extra_marketplaces,
+    FIELD_INSTALLED_PLUGINS: _validate_installed_plugins,
     FIELD_ENABLED_PLUGINS: _validate_enabled_plugins,
     FIELD_STRICT_KNOWN_MARKETPLACES: _validate_bool,
     FIELD_TRUSTED_MARKETPLACES: _validate_string_array,
@@ -340,6 +427,8 @@ def validate_settings(
     - 非 dict 根 → 返回 ``({}, [error])``（整层判废，回退空）。Non-dict root → empty + error.
     - ``$schema``：原样保留、CLI 不消费 / preserved verbatim, not consumed.
     - **policy-only 字段在非 policy scope** → 过滤 + 记错 / filtered + recorded.
+    - **审批门 enable 方向判据在 project scope** → 过滤 + 记错（#157，§2.1）/ approval-gate ENABLE
+      inputs in the project scope are filtered + recorded.
     - 已知字段：经对应校验器**逐条过滤**非法 map 项 / 数组元素；整字段类型错 → 回退默认（剔除）。
       Known fields: per-item filtered; whole-field type error → dropped (falls back to default).
     - 未知字段：**静默保留**（passthrough）/ unknown fields: silently preserved.
@@ -364,6 +453,19 @@ def validate_settings(
             continue
         if key in POLICY_ONLY_FIELDS and scope is not SettingsScope.POLICY:
             errors.append(_err(scope, key, "policy-only field not allowed outside the policy scope (filtered)"))
+            continue
+        # #157：审批门 enable 方向判据 MUST NOT 由 project scope（入 git、随仓库分发）供给——否则被 clone 的
+        # 仓库可自我批准（与档④ 同构）。协议指南 §2.1。DENY 方向不在本类目（fail-safe），见常量注释。
+        if key in TRUSTED_SCOPE_ONLY_FIELDS and scope is SettingsScope.PROJECT:
+            errors.append(
+                _err(
+                    scope,
+                    key,
+                    "approval-gate field not allowed in the project scope (filtered): it is a personal decision "
+                    "and project settings.json is git-tracked — move it to settings.local.json (not git-tracked) "
+                    "or the user scope",
+                ),
+            )
             continue
         validator = _FIELD_VALIDATORS.get(key)
         if validator is None:

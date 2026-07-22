@@ -79,9 +79,18 @@ class GetToolsReq(AgentCallData):
 
 
 class SMCPTool(TypedDict):
-    """在Computer端侧管理多个MCP时，无法保证ToolName不重复。因此alias字段被添加以帮助用户进行区分不同工具。如果alias被设置，创建工具时将会使用alias。"""
+    """在Computer端侧管理多个MCP时，无法保证ToolName不重复。因此alias字段被添加以帮助用户进行区分不同工具。如果alias被设置，创建工具时将会使用alias。
+
+    #152 D1：``bundle_id`` 显式承载工具归属。``name`` 为聚合后 exposed_tool_name（恒 ``{bundle_id}__``
+    开头），Agent 据 ``bundle_id`` 把工具关联回具体 server（分组展示、关联 config/resources），
+    **MUST NOT** 切分 ``name`` 的 ``__`` 前缀反推归属（``name`` 对 Agent 不透明）。wire 字段名 = snake_case
+    ``bundle_id``（与 rust 逐字一致，协议 data-structures.md）。
+    """
 
     name: str
+    # 所属 MCP Server 的**解析后** bundle_id（resolve_bundle_id 产物，恒非空；非配置中的显式声明值）。
+    # 与 GetComputerConfigRet.servers 的 key、错误码 meta.mcp_server 属**同一身份空间**。
+    bundle_id: str
     description: str
     params_schema: dict
     return_schema: dict | None
@@ -150,8 +159,8 @@ class ToolMeta(TypedDict, total=False):
     # 不同MCP工具返回值并不统一，虽然其满足MCP标准的返回格式，但具体的原始内容命名仍然无法避免出现不一致的情况。通过object_mapper可以方便
     # 前端对其进行转换，以使用标准组件渲染解析。
     ret_object_mapper: NotRequired[dict | None]
-    # 工具别名，与 model.ToolMeta.alias 对齐，用于解决不同 Server 下工具重名冲突
-    # Tool alias, align with model.ToolMeta.alias, used to resolve name conflicts across servers
+    # 工具别名（BundleID 模型，协议 0.3.0）。仅替换 exposed_tool_name 的**工具名部分**，仍带 {bundle_id}__ 前缀。
+    # Tool alias (BundleID model): replaces only the tool-name part of exposed_tool_name, keeps the {bundle_id}__ prefix.
     alias: NotRequired[str | None]
     # 工具标签，用于对工具进行分类
     # Tool tags, used to categorize tools
@@ -162,6 +171,9 @@ class BaseMCPServerConfig(TypedDict):
     """MCP服务器配置基类"""
 
     name: SERVER_NAME  # MCP Server的名称
+    # MCP Server 唯一身份（BundleID 模型，协议 0.3.0）。省略/未解析为 None；注册边界 derive 后恒有值。
+    # MCP Server unique identity (BundleID model). None when omitted/unresolved; always set after derive.
+    bundle_id: NotRequired[str | None]
     disabled: bool
     forbidden_tools: list[str]  # 禁用的工具列表，因为一个mcp可能有非常多工具，有些工具用户需要禁用。
     tool_meta: dict[TOOL_NAME, ToolMeta]
@@ -294,7 +306,13 @@ MCPServerConfig = MCPServerStdioConfig | MCPServerStreamableHttpConfig | MCPSSEC
 
 
 class GetComputerConfigRet(TypedDict):
-    """完整的Computer配置文件类型"""
+    """完整的Computer配置文件类型。
+
+    #152 D1 不变量：``servers`` 的 **key = 解析后 bundle_id**，且每个 entry 的 ``bundle_id`` 字段 = 同值
+    （运行期注入，见 #149 on_get_config）——与 SMCPTool.bundle_id 属**同一身份空间**，Agent 据此把工具
+    归属回 server。注意 ``MCPServerConfig.bundle_id`` 类型为 ``str | None`` 承载的是**显式声明值**，
+    wire 投影 MUST 物化为解析后值（绝不直接序列化模型字段，缺省会得 null）。
+    """
 
     inputs: NotRequired[list[MCPServerInput] | None]
     servers: dict[str, MCPServerConfig]
@@ -492,7 +510,7 @@ class GetResourcesReq(AgentCallData, total=True):
     """
 
     computer: str
-    mcp_server: str  # 必填：MCP Server 名称 / Required: MCP Server name
+    mcp_server: str  # 必填：目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Required: target server bundle_id
     cursor: NotRequired[str]
 
 
@@ -518,8 +536,8 @@ class ErrorPayload(TypedDict, total=False):
 
     分流字段顶层平铺 / Code-specific dispatch fields are top-level:
       - 4008: server_version / client_version / min_supported / max_supported
-      - 4014: mcp_server_name
-      - 4015: mcp_server_name / capability
+      - 4014: mcp_server（bundle_id）
+      - 4015: mcp_server（bundle_id）/ capability
 
     v0.2.1 起，4016 / 4017 / 4018 的 code-specific 字段下沉到 ``details`` 子对象（无顶层平铺新字段）：
     From v0.2.1, code-specific fields for 4016 / 4017 / 4018 live under ``details`` (no new top-level fields):
@@ -540,8 +558,8 @@ class ErrorPayload(TypedDict, total=False):
     client_version: str
     min_supported: str
     max_supported: str
-    # 4014 / MCP Server not found；4015 / MCP Capability not supported
-    mcp_server_name: str
+    # 4014 / MCP Server not found；4015 / MCP Capability not supported。值 = 目标 server 的 **bundle_id**（协议 #18）
+    mcp_server: str
     # 4015 / 缺失的 capability 名（如 "resources"）/ Missing capability name (e.g. "resources")
     capability: str
     # 诊断容器 / Diagnostic container
@@ -576,24 +594,31 @@ class A2CSkillRef(TypedDict):
         Required 4: name/source/path/description (total=True + ``NotRequired[]`` optionals). Producer MUST
         send all 4; Consumer MUST NOT assume any optional field is present.
       - ``name`` 是协议主键（合成全局唯一名，自 0.2.1 起为**裸名**：user 1 段 ``<skill>`` /
-        marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<server>:<skill>``），Agent **MUST**
+        marketplace 2 段 ``<plugin>:<skill>`` / mcp 3 段 ``mcp:<bundle_id>:<skill>``），Agent **MUST**
         当作不透明可比较字符串（**勿**解析结构，判来源用 ``source``）
         ``name`` is the protocol primary key (synthesized globally-unique **bare** name since 0.2.1:
         user 1-seg ``<skill>`` / marketplace 2-seg ``<plugin>:<skill>`` / mcp 3-seg
-        ``mcp:<server>:<skill>``); Agent **MUST** treat it as an opaque comparable string.
+        ``mcp:<bundle_id>:<skill>``); Agent **MUST** treat it as an opaque comparable string.
+      - mcp 形态的 server 段取 **``bundle_id``**（server 唯一身份，= ``get_config.servers`` 字典 key），
+        **非** display ``name``——后者允许碰撞。故 mcp 形态 name 构造上不碰撞，且 Agent 可据 ``source``
+        把一条 SKILL 关联回对应 A2C server（skill.md §1.3，协议 #142 supersede #18 的正交结论）
+        The mcp server segment is the ``bundle_id`` (unique identity), never the collision-allowed display name.
       - ``path`` 必选（staging 落盘是所有 source 的统一第一步，故进入 Registry 的 SKILL 必有可读本地目录）
         ``path`` is required (staging is the unified first step for all sources; any SKILL in Registry
         has a readable local directory).
-      - **无 ``mcp_server`` 字段** —— Agent 侧协议表面与 source 无关；来源追溯由 ``source``（完整
-        provenance，**不**进 ``name``）与（仅 MCP）``uri`` 承担（skill.md §1.6）
-        **No ``mcp_server`` field** — Agent-facing protocol surface is source-agnostic; provenance is
-        carried by ``source`` and (MCP only) ``uri``.
+      - **无 raw display server 名字段** —— Agent 侧协议表面与 source 无关；server 身份由 ``source`` 里的
+        ``bundle_id`` 承载，来源追溯由 ``source``（完整 provenance，**不**进 ``name``）与（仅 MCP）
+        ``uri`` 承担（skill.md §1.6）
+        **No raw display server-name field** — provenance is carried by ``source`` (which embeds the
+        ``bundle_id``) and (MCP only) ``uri``.
     """
 
     # 主键 / Primary key（必选 / required）
-    name: str  # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:tfrobot-tools:code-review`
+    # 合成全局唯一裸名；如 user `my-helper` / marketplace `acme-audit:audit` / mcp `mcp:<bundle_id>:<skill>`
+    # （mcp 例：`mcp:tfrobot-tools:code-review`；hash-fallback 例：`mcp:bundle_a1b2c3d4e5f60718:summarize`）
+    name: str
     # 来源元数据 / Provenance（完整溯源；**不**进 name）（必选 / required）
-    source: str  # 如 mcp:tfrobot-tools / marketplace:acme-skills / user
+    source: str  # 如 mcp:<bundle_id>（例 mcp:tfrobot-tools）/ marketplace:acme-skills / user
     uri: NotRequired[str]  # 仅 MCP 来源：skill://host/skill-name；Agent 非权威（skill.md §2）
     # 物化输出 / Materialization output（必选 / required）
     path: str  # 必选：Computer 本地绝对目录路径，面向 Agent SDK（脚本执行/文件访问），LLM 永不可见

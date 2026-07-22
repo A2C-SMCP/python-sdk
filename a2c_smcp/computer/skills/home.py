@@ -58,9 +58,6 @@ XDG_DATA_HOME_ENV = "XDG_DATA_HOME"
 _A2C_DATA_SUBPATH = ("a2c", "skills")
 _DOTDIR_SUBPATH = (".a2c", "skills")
 
-# workspace 登记工作目录内的 user 源 DropIn 子路径 / Per-workdir user-source DropIn subpath。
-_WORKDIR_SKILL_SUBPATH = (".tfrobot", "skills")
-
 # 每用户私有目录权限 / Per-user-private directory mode（防御性写，隔离交给 OS）。
 SKILL_HOME_MODE = 0o700
 
@@ -119,9 +116,14 @@ def ensure_skill_home(env: Mapping[str, str] | None = None) -> Path:
     return home
 
 
-def mcp_skill_dir(home: Path, server: str, skill: str) -> Path:
-    """mcp 源安装目录 / mcp-source install dir：``<home>/mcp/<server>/<skill>/``。"""
-    return home / SOURCE_MCP / server / skill
+def mcp_skill_dir(home: Path, bundle_id: str, skill: str) -> Path:
+    """mcp 源安装目录 / mcp-source install dir：``<home>/mcp/<bundle_id>/<skill>/``。
+
+    按 **bundle_id**（server 唯一身份）分组，非 display ``name``——后者允许碰撞，用作路径段会让两个
+    合法共存的同名 server 撞进同一目录（skill.md §1.3）。
+    Grouped by ``bundle_id`` (the server's unique identity), never the collision-allowed display name.
+    """
+    return home / SOURCE_MCP / bundle_id / skill
 
 
 def marketplace_skill_dir(home: Path, repo: str, *inner: str) -> Path:
@@ -142,17 +144,3 @@ def user_skill_dir(home: Path, skill: str) -> Path:
 def user_dropin_root(home: Path) -> Path:
     """SKILL Home 内的 user 源 DropIn 发现根 / Global user-source DropIn root：``<home>/user/``。"""
     return home / SOURCE_USER
-
-
-def workdir_skill_root(workdir: Path) -> Path:
-    """
-    workspace 登记工作目录的 user 源 DropIn 发现根 / Per-workdir user-source DropIn root。
-
-    ``<workdir>/.tfrobot/skills/``——**就地发现、不 staging 进 SKILL Home**（与 marketplace clone 树相反，
-    见 design-0.2.1-cli-marketplace-ux.md §5.0）。skill 属能力发现层：跨**全部已登记工作目录**全局并集、
-    置最低优先级、**不随 active workdir 切换**（§2.3/§5.1）。
-    ``<workdir>/.tfrobot/skills/`` — discovered **in place** (not staged into SKILL Home, unlike the
-    marketplace clone tree). User skills form a workspace-global capability set across all registered
-    workdirs (lowest precedence, independent of the active workdir).
-    """
-    return workdir.joinpath(*_WORKDIR_SKILL_SUBPATH)

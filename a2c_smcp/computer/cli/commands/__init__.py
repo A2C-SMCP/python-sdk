@@ -15,8 +15,8 @@ CLI 命令核心（REPL 与 Typer 非交互共用）/ CLI command core shared by
 Typer 子命令则构造轻量上下文（不 boot Computer、不连 socket）。
 
 本模块只放 **跨命令共享的接缝**：:func:`build_mcp_callbacks`——从 ``Computer`` 装配 installer / 卸载级联所需的
-MCP 注入回调（``existing_server_names`` / ``register_server`` / ``remove_server``）。plugin / settings 命令（#69）
-将复用本接缝。
+MCP 注入回调（``existing_bundle_ids`` / ``register_server`` / ``remove_server``，身份一律 **bundle_id**，
+数据源为**运行期权威配置集**，#153）。plugin / settings 命令（#69）将复用本接缝。
 This package holds the command business logic as pure-ish handlers (explicit resources, not the whole Computer)
 so they unit-test in isolation. Only the cross-command seam lives here: :func:`build_mcp_callbacks`.
 """
@@ -28,43 +28,88 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
+
 if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodge runtime import cycle
     from a2c_smcp.computer.computer import Computer
     from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-    from a2c_smcp.computer.settings.installer import ExistingServerNames, RegisterServer, RemoveServer
+    from a2c_smcp.computer.settings.installer import ExistingBundleIds, NonPluginBundleIds, RegisterServer, RemoveServer
+    from a2c_smcp.computer.settings.schema import SettingsValidationError
+    from a2c_smcp.computer.settings.scope import ResolvedSettings
 
 
 @dataclass(frozen=True, slots=True)
 class McpCallbacks:
-    """installer / 卸载级联所需的三个 MCP 注入回调 / The three MCP injection callbacks installer/cascade needs。"""
+    """installer / 卸载级联所需的 MCP 注入回调 / The MCP injection callbacks installer/cascade needs。"""
 
-    existing_server_names: ExistingServerNames
+    existing_bundle_ids: ExistingBundleIds
     register_server: RegisterServer
     remove_server: RemoveServer
+    non_plugin_bundle_ids: NonPluginBundleIds
 
 
 def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
     """
     从 ``Computer`` 装配 installer / uninstall 级联所需的 MCP 注入回调 / Wire MCP callbacks from a live Computer。
 
-    - ``existing_server_names``：当前已注册 MCP server 名集合（冲突预检用）；
-    - ``register_server``：注册 / 更新一个 ``MCPServerConfig``（enable / install remount 用）；
-    - ``remove_server``：按 name 停并摘除 server（disable / uninstall teardown 用）。
+    - ``existing_bundle_ids``：当前**运行期活跃** server 的 bundle_id 集（依赖预检用）；
+    - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / 治理重挂用）；
+    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 回收用）；
+    - ``non_plugin_bundle_ids``：**声明面**中 ``origin != plugin`` 的 bundle_id 集（§4.9.1-2 回收判据的
+      「X 非用户声明」项，#164）——与 ``existing_bundle_ids`` **判然不同**，勿混用：前者是「谁被声明了（且非 plugin
+      带入）」，后者是「谁挂起来了」。协议**明禁**用裸活跃集判回收（无 origin ⇒ flag/embed/plugin 三条挂载路径
+      可观测同形 ⇒ 连坐停摘用户 / 宿主自有 server）。
 
     设计 §12.2：marketplace remove 的级联卸载（→ :func:`installer.uninstall_plugin`）与 #69 的 plugin
     enable/disable/install/uninstall 共用此接缝，避免各处重复装配。
+
+    **#153 数据源 = 运行期权威配置集**：``existing`` 取 ``comp.mcp_manager.server_configs()``
+    （:meth:`MCPServerManager.server_configs`），**不是** ``comp.mcp_servers``——后者是**构造期快照**，
+    仅 ``Computer.__init__`` 赋值一次，而 CLI 恒传 ``mcp_servers=set()``、所有 server 走 ``amount_server`` /
+    ``aadd_or_aupdate_server`` 挂载 ⇒ 快照恒空 ⇒ 依赖预检把「已满足」全判成「未满足」（协议 §2.5-4 明禁）。
+    亦**不用** :meth:`Computer.active_server_configs`：它 fail-closed 省略缺 raw 记录的 server，用于预检会漏判。
+
+    **#137 ③ transient 分流**：本接缝**唯一**消费方是 plugin enable/disable/install/uninstall 与 marketplace
+    级联卸载——皆**治理投影**（依赖声明的真相在 ledger，非用户此刻声明），故走 transient
+    :meth:`Computer.amount_server` / :meth:`Computer.aunmount_server_by_id`，**不回写** mcp.json（否则 disable
+    后复活 + scope 漂移，见 #138）。用户显式 ``server add``/``rm`` 是另一条（REPL）durable 路径，与此无关。
     """
 
     def _existing() -> set[str]:
-        return {cfg.name for cfg in comp.mcp_servers}
+        if comp.mcp_manager is None:  # pre-boot：无活跃集 → 空（预检只提示，不影响正确性）
+            return set()
+        return {resolve_bundle_id(cfg) for cfg in comp.mcp_manager.server_configs()}
 
     async def _register(cfg: MCPServerConfig) -> None:
-        await comp.aadd_or_aupdate_server(cfg)
+        await comp.amount_server(cfg)
 
-    async def _remove(name: str) -> None:
-        await comp.aremove_server(name)
+    async def _remove(bundle_id: str) -> None:
+        await comp.aunmount_server_by_id(bundle_id)
 
-    return McpCallbacks(existing_server_names=_existing, register_server=_register, remove_server=_remove)
+    def _non_plugin() -> set[str]:
+        # 声明面（含 flag/embed 层，携 origin）；每次重算、零持久态（§2.5-5 禁落盘为快照）。
+        return {resolve_bundle_id(srv.config) for srv in comp.resolve_mcp_declarations().servers.values()}
+
+    return McpCallbacks(
+        existing_bundle_ids=_existing,
+        register_server=_register,
+        remove_server=_remove,
+        non_plugin_bundle_ids=_non_plugin,
+    )
+
+
+def files_only_non_plugin_bundle_ids(env: Mapping[str, str] | None = None) -> NonPluginBundleIds:
+    """
+    **无 Computer** 的非交互进程的非-plugin 声明面 / The non-plugin declaration surface for Computer-less processes。
+
+    非交互 ``plugin uninstall|disable|gc`` / ``marketplace remove`` 是 **ledger-only**（无 MCP 回调、不挂载、
+    ``remove_server=None`` ⇒ 回收判据结果实际未被消费，见 :func:`~a2c_smcp.computer.settings.installer.uninstall_plugin`）。
+    该进程**既无宿主构造入参（embed）、也无 ``--mcp-config``（flag 仅存在于 ``run``）** ⇒ 声明面 = durable scopes，
+    这不是「漏传两层」而是「那两层在此进程确实不存在」。REPL / boot 路径请用 :func:`build_mcp_callbacks`。
+    """
+    from a2c_smcp.computer.settings.mcp_config import non_plugin_declared_bundle_ids
+
+    return lambda: non_plugin_declared_bundle_ids(env=env)
 
 
 # ── 跨命令解析 / 视图接缝（marketplace / skill / plugin / settings 共用）/ shared parse & view seams ──
@@ -80,26 +125,55 @@ def flag_value(args: list[str], flag: str) -> str | None:
     return None
 
 
-def resolved_settings(
-    registered_workdirs: Sequence[Path],
-    active_workdir: Path | None,
+def resolved_settings_with_errors(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
-) -> dict[str, Any]:
-    """六层合并 settings（含 policy first-source-wins）/ Six-layer merged settings incl. policy。
+) -> ResolvedSettings:
+    """五层合并 settings **连同校验错误**（含 policy first-source-wins；#116 锚 cwd）/ Merged settings **with errors**。
 
-    plugin（``enabledPlugins`` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
-    allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。函数内 lazy import 沿用本仓
-    dodge-cycle 范式（settings.scope / settings.policy 不反向依赖 cli，无环，仅避免 ``import cli.commands`` 拉重）。
+    :func:`resolved_settings` 是本函数的薄包装（只取 ``.settings``）。需要向用户**呈现**越权/畸形字段的
+    调用方（boot 批准流程、``settings show``）用本函数拿完整 :class:`ResolvedSettings`。
+    Callers that must surface filtered/malformed fields use this; :func:`resolved_settings` wraps it.
+
+    函数内 lazy import 沿用本仓 dodge-cycle 范式（settings.scope / settings.policy 不反向依赖 cli，无环，
+    仅避免 ``import cli.commands`` 拉重）。
     """
     from a2c_smcp.computer.settings.policy import resolve_policy_settings
     from a2c_smcp.computer.settings.scope import resolve_settings
 
     return resolve_settings(
-        registered_workdirs=registered_workdirs,
-        active_workdir=active_workdir,
         env=env,
         flag_settings_path=flag_path,
         policy_settings=resolve_policy_settings(env=env),
-    ).settings
+    )
+
+
+def resolved_settings(
+    env: Mapping[str, str] | None,
+    *,
+    flag_path: Path | None = None,
+) -> dict[str, Any]:
+    """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
+
+    plugin（``enabledPlugins`` / gc 声明视图）与 settings（merged show / get）共用。policy 层承载企业
+    allowed/deniedMcpServers（POLICY_ONLY 字段，批准门控须读到），故统一注入。
+
+    **丢弃校验错误**——只在「不向用户呈现诊断」的声明视图用；要呈现的走
+    :func:`resolved_settings_with_errors` + :func:`format_settings_errors`（#157）。
+    Drops validation errors; use the ``_with_errors`` variant where diagnostics must surface.
+    """
+    return resolved_settings_with_errors(env, flag_path=flag_path).settings
+
+
+def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[str]:
+    """把 settings 校验错误格式化为人读警示行（**纯函数**，供 boot 批准流程与 ``settings show`` 共用）/ format。
+
+    #157：scope 越权过滤（policy-only / 审批门 enable 方向判据）**静默丢弃字段**——若连错误也不呈现，用户
+    只会看到「我的 settings 莫名不生效」（协议 §2.1 要求**响亮失败**，``SettingsValidationError`` 的契约亦
+    自称「经 ``settings show`` / 诊断命令呈现」）。抽为纯函数以便**单测文案与 scope/field 拼装**，杜绝未来
+    重构把「呈现」半程静默回退成吞错误——呈现行为在 ``run_mcp_approval`` 这类 ``Session``-泛型异步副作用
+    函数里无法直接断言。对拍 rust ``cli/commands/mod.rs::format_settings_errors``。
+    Pure function so the wording/assembly is unit-testable; the call sites are thin by design.
+    """
+    return [f"⚠ settings.json[{e.scope.value}]: {e.field} — {e.reason}" for e in errors]

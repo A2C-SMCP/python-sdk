@@ -28,6 +28,10 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1（
   （生产由 #63 写入、本工单测试直接 seed）。
 - bundled MCP server 的起停经 :func:`gc_plugins` 的 ``mcp_teardown`` 回调注入；真正接线（MCP manager）
   由 computer.py 集成承担，不在 #62。
+- **与治理启动恢复的分工（#117/#123）**：本模块是**marketplace 声明式**对账（``extraKnownMarketplaces``
+  驱动的 catalog 物化 + 启用 plugin 的 SKILL 注册）；boot 恢复走 :mod:`~a2c_smcp.computer.settings.recovery`
+  （**intent 驱动**：``installedPlugins`` 为安装事实源、活跃集 = installed ∧ ``enabledPlugins[id] is True``
+  （v0.3.0 缺省翻转）、账本缺失时重物化），两者 additive-only 语义一致、职责不同。
 
 并发 / Concurrency：:func:`reconcile` **串行** stage 各 marketplace（不 ``asyncio.gather``），遵守
 :func:`stage_marketplace_skills` 文档化的同步 ``file_lock`` 阻塞约束（store.py 同步设计的固有约束）。
@@ -36,7 +40,7 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1（
 from __future__ import annotations
 
 import shutil
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,6 +54,12 @@ from a2c_smcp.computer.settings.store import (
     update_known_marketplaces,
 )
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
+from a2c_smcp.computer.skills.manifest import (
+    PluginManifestError,
+    find_plugin_entry,
+    load_bundled_servers,
+    read_marketplace_manifest,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
@@ -112,32 +122,34 @@ def declared_marketplace_names(declared: Mapping[str, object]) -> set[str]:
     return set(_declared_marketplaces(declared))
 
 
-def declared_plugin_ids(declared: Mapping[str, object]) -> set[str]:
+def declared_installed_plugin_ids(declared: Mapping[str, object]) -> set[str]:
     """
-    所有**声明过**的 plugin id（``<plugin>@<mp>``，含 ``false`` 禁用项）/ All declared plugin ids。
+    merged ``installedPlugins``（全局安装意图，协议 v0.3.0 §2.4）中的合法 pid 集合 / Declared install intent。
 
-    用于 :func:`list_orphan_plugins` 的孤儿判定——``false`` = 声明禁用（**非**孤儿），仅 key 完全缺失才算孤儿。
+    用于 :func:`list_orphan_plugins` 的孤儿判定与「活跃集 = installed ∧ enabled」门控（#123）：
+    ``installed_disabled``（已安装未启用）是合法静止态、**非**孤儿；仅账本 pid ∉ 安装意图才算孤儿。
     """
-    raw = declared.get("enabledPlugins")
-    if not isinstance(raw, Mapping):
+    raw = declared.get("installedPlugins")
+    if not isinstance(raw, list):
         return set()
-    return {k for k in raw if is_valid_enabled_plugin_key(k)}
+    return {item for item in raw if isinstance(item, str) and is_valid_enabled_plugin_key(item)}
 
 
 def _enabled_plugin_names_for(marketplace: str, declared: Mapping[str, object]) -> set[str]:
     """
-    某 marketplace 下**启用**（``true``）的 plugin 名集合 / Enabled (``true``) plugin names for a marketplace。
+    某 marketplace 下**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0 §4.8.1）的 plugin 名集合。
 
     ``enabledPlugins`` key 形如 ``<plugin>@<mp>``；返回去掉 ``@<mp>`` 后缀的 ``<plugin>`` 集合，作
-    :func:`stage_marketplace_skills` 的 ``plugin_filter``（缺启用项 → 空集 → 仅 clone catalog、不注册 SKILL）。
+    :func:`stage_marketplace_skills` 的 ``plugin_filter``（缺启用项/未安装 → 空集 → 仅 clone catalog、不注册 SKILL）。
     """
     raw = declared.get("enabledPlugins")
     if not isinstance(raw, Mapping):
         return set()
+    installed = declared_installed_plugin_ids(declared)
     suffix = f"@{marketplace}"
     names: set[str] = set()
     for key, enabled in raw.items():
-        if enabled is True and is_valid_enabled_plugin_key(key) and key.endswith(suffix):
+        if enabled is True and key in installed and key.endswith(suffix):
             names.add(key[: -len(suffix)])
     return names
 
@@ -206,8 +218,9 @@ async def reconcile(
     - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ ``git pull``。
     - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 :func:`prune_marketplaces` 显式清）。
 
-    每个 declared marketplace 物化其 ``enabledPlugins`` 中**启用**的 plugin 的 SKILL（``plugin_filter``）；
-    禁用 / 未声明 plugin 不注册。失败降级：stage 吞错返回空 → 本函数据 clone 树是否存在判 ``failed``。
+    每个 declared marketplace 物化其**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0）plugin 的
+    SKILL（``plugin_filter``）；未安装 / 禁用 / 未声明 plugin 不注册。失败降级：stage 吞错返回空 →
+    本函数据 clone 树是否存在判 ``failed``。
 
     :param registry: 目标 :class:`SkillRegistry`。
     :param home: SKILL Home 绝对根（调用方保证存在）。
@@ -343,16 +356,212 @@ def list_orphan_plugins(
     env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """
-    列出"所有 scope 都不再声明"的孤儿 plugin（installed 有、enabledPlugins 无此 key）/ List orphan plugins。
+    列出孤儿 plugin：账本有记录、``installedPlugins`` 安装意图不再包含（v0.3.0 §2.3 账本=派生缓存）/ Orphans。
 
-    ``false`` = 声明禁用（key 仍在）→ **非**孤儿；仅 key 完全缺失才算孤儿（见 :func:`declared_plugin_ids`）。
+    ``installed_disabled``（意图在、未启用）是合法静止态 → **非**孤儿；``enabledPlugins``（含 ``false``）
+    不参与孤儿判定（enablement 与 installation 正交，§2.4）。
 
-    :param declared: 单一声明视图（取 ``enabledPlugins`` 全部 key——含 ``false``——作"仍声明"集）。
-    :return: ``installed_plugins.json`` 中 plugin id ∉ 声明集 的列表（保持物化顺序）。
+    :param declared: 单一声明视图（取 ``installedPlugins`` 合法条目作"仍安装"集，见
+        :func:`declared_installed_plugin_ids`）。
+    :return: ``installed_plugins.json`` 中 plugin id ∉ 安装意图 的列表（保持物化顺序）。
     """
-    declared_ids = declared_plugin_ids(declared)
+    declared_ids = declared_installed_plugin_ids(declared)
     installed = load_installed_plugins(home=home, env=env)
     return [pid for pid in installed.get("plugins", {}) if pid not in declared_ids]
+
+
+def ledger_record_materialized(rec: object) -> bool:
+    """
+    单条账本记录是否仍有效物化：「``installPath`` 目录存在 ∧ bundled JSON 可解析」/ Per-record live check。
+
+    v0.3.0 §5.8（安装路径非权威，boot MUST 重新校验）+ #125 任务 4：仅查目录存在会漏掉「目录在、bundled JSON
+    事后损坏」——stage 后 skill 亮而 :func:`~a2c_smcp.computer.settings.recovery.collect_enabled_bundled_servers`
+    WARN-skip，即 rust-sdk#102 同型半态。判据升级为可解析：:class:`PluginManifestError` → 该记录失效 →
+    触发重物化（catalog 完好则修复指回；不可修复则整体保持 ``installed_disabled``，skill 不单独亮）。
+    记录级单点：entry 级 any/all 变体与 recovery 死记录清扫共用（判据对称，隔离审查 🟡#4）。
+    """
+    install_path = rec.get("installPath") if isinstance(rec, Mapping) else None
+    if not (isinstance(install_path, str) and install_path and Path(install_path).is_dir()):
+        return False
+    try:
+        load_bundled_servers(Path(install_path))
+    except PluginManifestError as e:
+        logger.warning("ledger record %s has corrupt bundled server JSON, treated as unmaterialized: %s", install_path, e)
+        return False
+    return True
+
+
+def ledger_entry_materialized(records: object) -> bool:
+    """
+    某 pid 是否**存在**有效物化记录（∃ 语义）/ Whether any record is live。
+
+    原 ``recovery._ledger_materialized`` 迁入公开化（#125 任务 2）：作 :func:`list_dangling_plugin_intents`
+    的悬挂判据——只要还有一条活记录就不是「意图 ∖ 账本」悬挂（prune 对象须是零有效物化）。
+    boot 重物化触发请用 :func:`ledger_entry_fully_materialized`（∀ 语义——混合健康度也要修复）。
+    """
+    if not isinstance(records, list):
+        return False
+    return any(ledger_record_materialized(rec) for rec in records)
+
+
+def ledger_entry_fully_materialized(records: object) -> bool:
+    """
+    某 pid 的账本记录是否**全部**有效物化（∀ 语义，非空）/ Whether every record is live。
+
+    boot 重物化触发判据（#125 隔离审查 🟡#4）：∃ 语义会让「一条健康 + 一条损坏」的混合健康度 pid 永不进
+    ``needs_materialize``——损坏 scope 记录每次 boot 被 collect WARN-skip、又不被清扫，即窄化半态回归口。
+    ∀ 语义下混合健康度触发重物化：健康 scope 幂等重建、损坏残留由 sweep（同记录级判据）清扫。
+    """
+    if not isinstance(records, list) or not records:
+        return False
+    return all(ledger_record_materialized(rec) for rec in records)
+
+
+# ---------------------------------------------------------------------------
+# 账本 MCP 依赖 + 回收判据（协议 runtime-contract §4.9.1，#153/D3+F1）/ Ledger MCP deps & reclaim criterion
+# ---------------------------------------------------------------------------
+def ledger_mcp_deps_of(records: object) -> set[str]:
+    """
+    某 pid 全部账本记录声明依赖的 MCP Server bundle_id 并集（§4.9.1-1）/ Declared MCP deps (bundle_ids) of a pid。
+
+    值域是 **bundle_id**（身份），非 display name——账本 MUST NOT 记 name（§4.9.1-1）。跨 scope 记录取并集。
+    """
+    out: set[str] = set()
+    if not isinstance(records, list):
+        return out
+    for rec in records:
+        if not isinstance(rec, Mapping):
+            continue
+        deps = rec.get("mcpServers")
+        if isinstance(deps, list):
+            out.update(d for d in deps if isinstance(d, str))
+    return out
+
+
+def other_plugin_mcp_deps(
+    plugins: Mapping[str, object],
+    *,
+    exclude_pid: str,
+    retained_records: Sequence[object] = (),
+) -> set[str]:
+    """
+    **本次操作后**仍有 plugin 声明依赖的 bundle_id 并集（回收判据第一项的数据源，#153）/ Deps still declared by others。
+
+    :param plugins: 账本 ``plugins`` 映射（**移除本次记录之前**的视图——§4.9.1-3 要求停摘名单在账本移除前取得）。
+    :param exclude_pid: 正在 disable/uninstall/gc 的 plugin id（其记录不算「其他 plugin」）。
+    :param retained_records: ``exclude_pid`` 本次**未被移除**的记录（scoped uninstall 时的其余 scope）——它们
+        仍声明依赖，故仍算依赖者。整 pid 移除（disable / 全 scope uninstall / gc）时传空。
+
+    「其他 plugin」= 账本中的 **installed** 记录（**含 disabled**），不按 enabled 过滤：协议 §4.9.1-2 字面为
+    「无其他 plugin **声明依赖** X」（声明 = 账本有记录），``conformance-tests.md`` §285「**最后一个依赖者卸载**
+    时回收」亦印证判据看记录存在性而非启用态。后果是 installed-but-disabled 的依赖者会令 X 保留（保守），但其
+    卸载时仍回收 ⇒ **不泄漏**。与 rust-sdk#139 同字面。
+    """
+    out: set[str] = set()
+    for pid, records in plugins.items():
+        if pid == exclude_pid:
+            continue
+        out |= ledger_mcp_deps_of(records)
+    out |= ledger_mcp_deps_of(list(retained_records))
+    return out
+
+
+# §4.9.1-2 回收判据「X 非用户声明」项的数据源接缝（同步）/ The criterion's "not user-declared" data-source seam。
+# = **声明面**中 ``origin != plugin`` 的 bundle_id 集；CLI 包 ``Computer.resolve_mcp_declarations()``
+# （durable scopes + flag ``--mcp-config`` + embed 构造入参，每次重算、零持久态，§2.5-5 禁落盘为快照）。
+#
+# 定义在此（而非 :mod:`.installer` 那组回调别名旁）有二：① 判据本体 :func:`reclaimable_mcp_deps` 在本模块，
+# 数据源与判据同源易改不易漂；② installer **导入**本模块，反向导入会成环。installer 转导出本名。
+#
+# ⚠️ **与 :data:`~a2c_smcp.computer.settings.installer.ExistingBundleIds` 判然不同，勿混用**：本接缝是
+# 「谁被声明了（且非 plugin 带入）」，那个是「谁挂起来了」。协议 §4.9.1-2 **明禁**以裸活跃集判回收——无 origin
+# ⇒ flag / embed / plugin 三条挂载路径可观测同形 ⇒ 连坐停摘用户 / 宿主自有 server。
+NonPluginBundleIds = Callable[[], set[str]]
+
+
+def reclaimable_mcp_deps(
+    deps: Iterable[str],
+    *,
+    other_deps: set[str],
+    user_declared: set[str],
+) -> list[str]:
+    """
+    §4.9.1-2 **回收判据**（纯函数、零落盘状态、零 IO）/ The reclaim criterion。
+
+    **回收 X ⟺ 无其他 plugin 声明依赖 X ∧ X 非用户声明**。disable / uninstall / gc **三个消费者全部委托本函数**，
+    MUST NOT 各写副本（判据分叉 = 用户 server 被连坐或 server 泄漏；#142 `is_valid_bundle_id` 同款教训）。
+
+    D5 措辞已由「只收回**自己带入**的」正式重写为「只收回**无人再依赖 ∧ 非用户声明**的」：前者把**时点快照**
+    （安装时谁带入）写进了**长期判据**，正是传递性泄漏之源——A 引入 X、B 装时已在、卸 A 后 A 的记录连同
+    「X 由 A 引入」这一事实一并消失 ⇒ 卸 B 时无人认领 X ⇒ **永久泄漏**。故账本 MUST NOT 存 provenance
+    （§4.9.1-1），判据只用**现时**事实。
+
+    :param deps: 本次 disable/uninstall 的 plugin 所声明的依赖（``ledger_mcp_deps_of`` 产出）。
+    :param other_deps: :func:`other_plugin_mcp_deps` 产出。
+    :param user_declared: :func:`~a2c_smcp.computer.settings.mcp_config.non_plugin_declared_bundle_ids` 产出
+        ——**带 origin 的运行期权威配置集中 ``origin != plugin`` 的 bundle_id 集**（协议 §2.5-5 + §4.9.1-2，
+        Discussion #32 裁决落地于 #164）。它覆盖**全部**非-plugin 挂载路径：durable scopes、flag
+        （``--mcp-config``）、embed（``Computer(mcp_servers=...)``）⇒ 用户 / 宿主自有 server **永不连坐**。
+        MUST NOT 退回只读 mcp.json 声明面（那正是 #153 遗留缺口的形状：经 flag/embed 挂载者会被误判为
+        「非用户声明」而连坐停摘）。
+    :return: 可回收的 bundle_id（保 ``deps`` 迭代序）。
+    """
+    return [d for d in deps if d not in other_deps and d not in user_declared]
+
+
+# 悬挂意图 reason 分档（#125 任务 2；wire 值入 CLI JSON 输出，rust 镜像同字面）/ dangling reason tiers.
+DANGLING_MARKETPLACE_NOT_ADDED = "marketplace-not-added"
+DANGLING_CATALOG_MISSING = "catalog-missing"
+DANGLING_MANIFEST_UNREADABLE = "manifest-unreadable"
+DANGLING_ENTRY_MISSING = "entry-missing"
+
+
+def list_dangling_plugin_intents(
+    home: Path,
+    declared: Mapping[str, object],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """
+    列出悬挂安装意图：``installedPlugins`` 声明 ∧ 账本无有效物化 ∧ **静态不可达**（#125 任务 2）/ Dangling intents。
+
+    与 :func:`list_orphan_plugins` 互为反向：孤儿 = 账本 ∖ 意图（删派生缓存，恒安全）；悬挂 = 意图 ∖ 账本且
+    离线判定无法重物化（prune 删的是**权威意图**，须 confirm / 显式 flag——§4.8.4 删除走显式路径）。
+    「静态可达但未物化」**不**列入——下次 boot 由 recovery 重物化自愈，非 prune 对象。
+
+    纯本地零网络。reason 四档供 CLI 分档提示（``catalog-missing`` 可能只是临时断网后 clone 未建，裁量留给调用方）：
+
+    - :data:`DANGLING_MARKETPLACE_NOT_ADDED`：known_marketplaces 无记录（无自愈路径，最强 prune 信号）；
+    - :data:`DANGLING_CATALOG_MISSING`：known 在、catalog clone 缺失（boot/refresh 会重试 clone）;
+    - :data:`DANGLING_MANIFEST_UNREADABLE`：clone 在、marketplace.json 损坏/缺失（先 ``marketplace refresh``）;
+    - :data:`DANGLING_ENTRY_MISSING`：manifest 合法但无该 plugin entry（上游已移除才 prune）。
+
+    :return: ``[(pid, reason)]``，按 pid 排序稳定输出。
+    """
+    ledger = load_installed_plugins(home=home, env=env).get("plugins", {})
+    known = load_known_marketplaces(home=home, env=env).get("marketplaces", {})
+    out: list[tuple[str, str]] = []
+    for pid in sorted(declared_installed_plugin_ids(declared)):
+        if ledger_entry_materialized(ledger.get(pid)):
+            continue
+        plugin, _, marketplace = pid.partition("@")
+        record = known.get(marketplace)
+        if not isinstance(record, Mapping) or not isinstance(record.get("source"), Mapping):
+            out.append((pid, DANGLING_MARKETPLACE_NOT_ADDED))
+            continue
+        catalog_dir = marketplace_skill_dir(home, marketplace)
+        if not catalog_dir.is_dir():
+            out.append((pid, DANGLING_CATALOG_MISSING))
+            continue
+        try:
+            manifest = read_marketplace_manifest(catalog_dir)
+        except PluginManifestError:
+            out.append((pid, DANGLING_MANIFEST_UNREADABLE))
+            continue
+        if find_plugin_entry(manifest, plugin) is None:
+            out.append((pid, DANGLING_ENTRY_MISSING))
+        # else：静态可达（known ∧ clone ∧ entry）→ recoverable，boot 自愈，不列
+    return out
 
 
 async def gc_plugins(
@@ -360,17 +569,22 @@ async def gc_plugins(
     registry: SkillRegistry,
     home: Path,
     *,
+    non_plugin_bundle_ids: NonPluginBundleIds,
     env: Mapping[str, str] | None = None,
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> list[str]:
     """
-    清理孤儿 plugin（installPath 树 + installed_plugins.json 条目 + Registry SKILL + bundled MCP）/ GC plugins。
+    清理孤儿 plugin（installPath 树 + installed_plugins.json 条目 + Registry SKILL + MCP 依赖回收）/ GC plugins。
 
     y/N 确认交 CLI 层（#68）；``plugin_ids`` 应为 :func:`list_orphan_plugins` 的子集（用户确认后传入）。
-    每条记录的 ``installPath`` 仅在词法位于 SKILL Home 内才删（:func:`_safe_rmtree`）；``bundledMcpServers``
-    汇总后经 ``mcp_teardown`` 回调停/摘（真正接线由 computer.py 集成承担，#62 只触发回调）。
+    每条记录的 ``installPath`` 仅在词法位于 SKILL Home 内才删（:func:`_safe_rmtree`）；其声明依赖的 MCP Server
+    经 **§4.9.1-2 回收判据**（:func:`reclaimable_mcp_deps`）过滤后才交 ``mcp_teardown`` 停/摘——gc 是 uninstall
+    的批量形态，同样 **MUST NOT 连坐用户自有 server**（#153）。
 
-    :param mcp_teardown: 可选异步回调，入参为本次清理涉及的全部 bundled MCP server name；``None`` = 不处理。
+    逐 pid 处理且账本随之逐个删除 ⇒ 同批两 plugin 共享同一依赖时，先处理者因后者仍在账本而保留、后处理者
+    （前者已删）回收 —— 自动满足「最后一个依赖者回收」。
+
+    :param mcp_teardown: 可选异步回调，入参为本次**判定可回收**的 MCP Server **bundle_id** 列表；``None`` = 不处理。
     :return: 实际清理的 plugin id 列表。
     """
     installed = load_installed_plugins(home=home, env=env)
@@ -380,26 +594,32 @@ async def gc_plugins(
         records = plugins.get(pid)
         if records is None:
             continue
-        bundled: list[str] = []
+        # 停摘候选（账本字段自足，§4.9.1-3）须在删树/删账本前取得。
+        deps = ledger_mcp_deps_of(records)
+        reclaim = reclaimable_mcp_deps(
+            sorted(deps),
+            other_deps=other_plugin_mcp_deps(plugins, exclude_pid=pid),
+            user_declared=non_plugin_bundle_ids(),
+        )
         for rec in records:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
                 _safe_rmtree(Path(install_path), home)
-            servers = rec.get("bundledMcpServers")
-            if isinstance(servers, list):
-                bundled.extend(s for s in servers if isinstance(s, str))
 
         plugin, _, marketplace = pid.partition("@")
         if marketplace:
             _unregister_marketplace_skills(registry, marketplace, plugin=plugin)
 
-        if mcp_teardown is not None and bundled:
-            await mcp_teardown(bundled)
+        if mcp_teardown is not None and reclaim:
+            await mcp_teardown(reclaim)
 
         def _drop(data: InstalledPluginsFile, _p: str = pid) -> None:
             data.get("plugins", {}).pop(_p, None)
 
         update_installed_plugins(_drop, home=home, env=env)
+        # 内存视图与磁盘同步：否则后续 pid 的 other_plugin_mcp_deps 会把**已 gc 的 pid** 误算作依赖者，
+        # 令同批共享的依赖永不回收（泄漏）。
+        plugins.pop(pid, None)
         removed.append(pid)
-        logger.info("gc: removed orphan plugin %r (bundled MCP: %s)", pid, bundled or "none")
+        logger.info("gc: removed orphan plugin %r (MCP deps reclaimed: %s)", pid, reclaim or "none")
     return removed

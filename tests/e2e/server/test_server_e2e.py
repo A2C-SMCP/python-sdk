@@ -122,6 +122,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
             "tools": [
                 {
                     "name": "echo",
+                    "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "echo input",
                     "params_schema": {"type": "object"},
                     "return_schema": {"type": "object"},

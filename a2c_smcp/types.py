@@ -27,3 +27,7 @@ AttributesAsKey = tuple[
 ]
 TOOL_NAME: TypeAlias = str
 SERVER_NAME: TypeAlias = str
+# BundleID 模型（协议 0.3.0，a2c-smcp-protocol#15）：MCP Server 唯一身份 + 聚合暴露名。
+# BUNDLE_ID：MCP Server 软件级唯一标识；EXPOSED_TOOL_NAME：暴露给 LLM 的 `{bundle_id}__{alias??原始名}`。
+BUNDLE_ID: TypeAlias = str
+EXPOSED_TOOL_NAME: TypeAlias = str

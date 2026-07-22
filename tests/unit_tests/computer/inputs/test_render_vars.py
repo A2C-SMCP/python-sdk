@@ -55,15 +55,15 @@ async def test_env_missing_empty_and_warn(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_predefined_vars() -> None:
-    vars_ = {"workspaceFolder": "/work", "userHome": "/home/u", "pathSeparator": ":"}
-    out = await ConfigRender.arender_str("${workspaceFolder}/x:${userHome}${pathSeparator}", _noop_resolve, variables=vars_)
-    assert out == "/work/x:/home/u:"
+    vars_ = {"userHome": "/home/u", "pathSeparator": ":"}
+    out = await ConfigRender.arender_str("${userHome}${pathSeparator}x", _noop_resolve, variables=vars_)
+    assert out == "/home/u:x"
 
 
 @pytest.mark.asyncio
 async def test_predefined_missing_empty_and_warn(caplog) -> None:
     caplog.set_level("WARNING", logger="a2c_smcp")
-    out = await ConfigRender.arender_str("${workspaceFolder}", _noop_resolve, variables={})
+    out = await ConfigRender.arender_str("${userHome}", _noop_resolve, variables={})
     assert out == ""
     assert any("预定义变量未提供" in rec.message for rec in caplog.records)
 
@@ -83,12 +83,12 @@ async def test_mixed_input_env_predefined() -> None:
         return "TOK"
 
     out = await ConfigRender.arender_str(
-        "${input:t}@${env:HOST}:${workspaceFolder}",
+        "${input:t}@${env:HOST}:${userHome}",
         resolver,
-        variables={"workspaceFolder": "/w"},
+        variables={"userHome": "/home/u"},
         env={"HOST": "localhost"},
     )
-    assert out == "TOK@localhost:/w"
+    assert out == "TOK@localhost:/home/u"
 
 
 @pytest.mark.asyncio
@@ -100,12 +100,29 @@ async def test_unknown_placeholder_left_as_is() -> None:
 @pytest.mark.asyncio
 async def test_recursive_dict_and_list() -> None:
     cr = ConfigRender()
-    data = {"env": {"LOG": "${env:LV}", "WS": "${workspaceFolder}"}, "args": ["${env:LV}"]}
-    out = await cr.arender(data, _noop_resolve, variables={"workspaceFolder": "/w"}, env={"LV": "info"})
-    assert out == {"env": {"LOG": "info", "WS": "/w"}, "args": ["info"]}
+    data = {"env": {"LOG": "${env:LV}", "HOME": "${userHome}"}, "args": ["${env:LV}"]}
+    out = await cr.arender(data, _noop_resolve, variables={"userHome": "/home/u"}, env={"LV": "info"})
+    assert out == {"env": {"LOG": "info", "HOME": "/home/u"}, "args": ["info"]}
 
 
 @pytest.mark.asyncio
 async def test_single_env_placeholder_returns_string() -> None:
     out = await ConfigRender.arender_str("${env:X}", _noop_resolve, env={"X": "val"})
     assert out == "val"
+
+
+# ---------------------------------------------------------------------------
+# #116 概念瘦身：${workspaceFolder} 退出预定义变量 / #116: ${workspaceFolder} no longer predefined
+# ---------------------------------------------------------------------------
+def test_predefined_vars_slimmed_to_two() -> None:
+    """#116: 预定义变量仅剩 userHome / pathSeparator。"""
+    from a2c_smcp.computer.inputs.render import _PREDEFINED_VARS
+
+    assert _PREDEFINED_VARS == ("userHome", "pathSeparator")
+
+
+@pytest.mark.asyncio
+async def test_workspace_folder_left_verbatim_even_if_supplied() -> None:
+    """#116: 即便调用方在 variables 提供 workspaceFolder，也按未知占位符原样保留。"""
+    out = await ConfigRender.arender_str("${workspaceFolder}/x", _noop_resolve, variables={"workspaceFolder": "/work"})
+    assert out == "${workspaceFolder}/x"

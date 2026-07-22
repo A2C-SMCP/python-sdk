@@ -6,7 +6,6 @@
 # @Software: PyTest
 """
 中文：覆盖 `a2c_smcp/computer/computer.py` 缺失分支，包括：
-- boot_up 渲染异常兜底（163-166）
 - _on_manager_change 的 ToolListChanged/ResourceListChanged/ResourceUpdated 多分支（193-200, 205-233, 243-252）
 - _acollect_window_uris（262-266）
 - _arender_and_validate_server 异常分支（327-330）
@@ -21,7 +20,6 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.computer import Computer
-from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, StdioServerConfig, StdioServerParameters
 from a2c_smcp.utils.window_uri import is_window_uri
 
 
@@ -131,30 +129,6 @@ async def test_acollect_window_uris_filters_and_none_manager(monkeypatch: pytest
     comp.mcp_manager = _Mgr()  # type: ignore
     uris = await comp._acollect_window_uris()
     assert uris == {"window://ok"}
-
-
-@pytest.mark.asyncio
-async def test_boot_up_render_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 构造一个初始 server 配置
-    cfg = StdioServerConfig(name="s", server_parameters=StdioServerParameters(command="/bin/echo"))
-    # 注入自定义 Computer，覆写 _config_render.arender 抛出异常
-    comp = Computer(name="test", mcp_servers={cfg})
-
-    class _CR:
-        async def arender(self, *_: Any, **__: Any) -> dict:
-            raise RuntimeError("render fail")
-
-    comp._config_render = _CR()  # type: ignore
-
-    # 替换 MCPServerManager 以避免真实调用
-    class _Mgr:
-        async def ainitialize(self, servers: list[MCPServerConfig]) -> None:  # noqa: D401
-            # 应接受到原始 cfg，因为渲染失败走保底
-            assert isinstance(servers[0], MCPServerConfig)
-
-    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", lambda *a, **k: _Mgr())
-
-    await comp.boot_up()
 
 
 @pytest.mark.asyncio

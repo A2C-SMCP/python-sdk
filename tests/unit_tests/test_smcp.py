@@ -38,22 +38,37 @@ from a2c_smcp.smcp import (
     build_computer_not_found_error,
     is_protocol_error_payload,
 )
+from a2c_smcp.version import ProtocolVersion
 
 
 class TestProtocolVersion:
     """协议版本常量导出 / Protocol version constant export."""
 
     def test_protocol_version_importable_from_package(self) -> None:
-        """from a2c_smcp import PROTOCOL_VERSION 可用 / importable."""
-        assert PROTOCOL_VERSION == "0.2.0"
+        """from a2c_smcp import PROTOCOL_VERSION 可用且为合法 semver（不耦合具体值）/ importable & valid semver."""
+        assert isinstance(PROTOCOL_VERSION, str) and PROTOCOL_VERSION
+        # 合法 semver → parse 不抛；不断言具体值（协议版本会经常升级）
+        ProtocolVersion.parse(PROTOCOL_VERSION)
 
     def test_protocol_version_attribute_on_module(self) -> None:
-        """模块级属性可访问 / accessible as module attribute."""
-        assert a2c_smcp.PROTOCOL_VERSION == "0.2.0"
+        """模块级属性可访问且与包导出同值 / accessible as module attribute, consistent with package export."""
+        assert a2c_smcp.PROTOCOL_VERSION == PROTOCOL_VERSION
 
     def test_protocol_version_independent_from_package_version(self) -> None:
-        """协议版本与包版本独立 / protocol version is independent from package version."""
-        assert a2c_smcp.__version__ != PROTOCOL_VERSION
+        """协议版本与包版本独立 / protocol version is independent from package version.
+
+        PROTOCOL_VERSION 锁定协议兼容性契约（干净 ``X.Y.Z``），不随包版本
+        ``__version__`` 的 PEP 440 预发布/开发后缀变化——包处于 a/b/rc 阶段时
+        协议版本仍保持稳定 ``X.Y.Z``。故断言 PROTOCOL_VERSION 为干净三段版本，
+        而非与 ``__version__`` 比值：SDK 正式发布协议同号版本时两者数值相同是
+        合理且预期的（如 SDK 0.3.0 实现协议 0.3.0）。
+        """
+        import re
+
+        assert re.fullmatch(r"\d+\.\d+\.\d+", PROTOCOL_VERSION), (
+            f"PROTOCOL_VERSION={PROTOCOL_VERSION!r} 必须是干净的 X.Y.Z 协议契约版本，"
+            "独立于 PEP 440 包发布标识（不含预发布/开发后缀）"
+        )
 
 
 class TestErrorCode:

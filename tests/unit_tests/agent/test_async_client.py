@@ -191,6 +191,28 @@ async def test_get_tools_from_computer_invalid_response(mock_call: AsyncMock, cl
 
 
 @pytest.mark.asyncio
+@patch("socketio.AsyncClient.call", new_callable=AsyncMock)
+async def test_get_config_from_computer_success(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
+    """
+    中文：#149 B 半——异步从 Computer 获取 MCP 配置（servers 键 = bundle_id）。
+    English: #149 B half — async get_config_from_computer returns servers keyed by bundle_id.
+
+    实现落地前该方法不存在 → AttributeError（红灯）。GetComputerConfigRet 无 req_id → 不做 req_id 校验。
+    """
+    mock_call.return_value = {
+        "servers": {"my_srv": {"name": "my.srv", "type": "stdio", "bundle_id": "my_srv"}},
+        "inputs": None,
+    }
+
+    ret = await client.get_config_from_computer("comp-1")
+    assert "my_srv" in ret["servers"]
+    assert ret["servers"]["my_srv"]["name"] == "my.srv"
+    # 校验 emit 走 GET_CONFIG_EVENT（args[0]=self、args[1]=event，同 test_emit_cancel_tool_call 约定）。
+    args, _ = mock_call.call_args
+    assert args[1] == "client:get_config"
+
+
+@pytest.mark.asyncio
 async def test_process_tools_response_calls_handler(client: AsyncSMCPAgentClient, handler: _AsyncEH) -> None:
     """
     中文：处理工具响应时调用事件处理器。

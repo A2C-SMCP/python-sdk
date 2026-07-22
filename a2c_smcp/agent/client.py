@@ -23,6 +23,7 @@ from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
     GET_BLOB_EVENT,
+    GET_CONFIG_EVENT,
     GET_DESKTOP_EVENT,
     GET_RESOURCES_EVENT,
     GET_SKILL_EVENT,
@@ -35,9 +36,11 @@ from a2c_smcp.smcp import (
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
     UPDATE_SKILLS_NOTIFICATION,
+    UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
     GetBlobRet,
+    GetComputerConfigRet,
     GetDeskTopRet,
     GetResourcesRet,
     GetSkillRet,
@@ -47,6 +50,7 @@ from a2c_smcp.smcp import (
     ListRoomReq,
     SessionInfo,
     UpdateMCPConfigNotification,
+    UpdateToolListNotification,
 )
 from a2c_smcp.utils.blob import drain_blob
 from a2c_smcp.utils.handshake import (
@@ -314,6 +318,30 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             logger.error(f"Failed to get tools from computer {computer}: {e}", exc_info=True)
             raise
 
+    async def get_config_from_computer(self, computer: str, timeout: int = 20) -> GetComputerConfigRet:
+        """
+        异步从指定计算机获取 MCP 配置（servers 键 = bundle_id，协议 #18）（#149）
+        Async get MCP config from the specified computer (servers keyed by bundle_id) (#149)
+
+        Args:
+            computer (str): 计算机名称 / Computer Name
+            timeout (int): 超时时间 / Timeout duration
+
+        Returns:
+            GetComputerConfigRet: 配置响应（``servers[bundle_id]`` + 可选 ``inputs``）/ Config response.
+
+        备注 / Notes:
+            ``GetComputerConfigRet`` 无 ``req_id`` 字段、``on_get_config`` 也不 echo req_id，故**不做** req_id 校验
+            （与 get_tools / get_resources 不同）；``on_get_config`` 无 flat ErrorPayload 路径，故**不需** raise_for_error_payload。
+        """
+        req = self.create_get_config_request(computer)
+        logger.debug(f"Getting config from computer {computer}")
+        response = await self.call(GET_CONFIG_EVENT, req, namespace=self._namespace, timeout=timeout)
+        ret: GetComputerConfigRet = {"servers": response.get("servers", {})}
+        if response.get("inputs") is not None:
+            ret["inputs"] = response["inputs"]
+        return ret
+
     def register_event_handlers(self) -> None:
         """
         注册SMCP协议事件处理器
@@ -325,6 +353,8 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         self.on(UPDATE_DESKTOP_NOTIFICATION, self._on_desktop_updated, namespace=self._namespace)
         # v0.2.1 SKILL 集合更新自动重拉（仿 notify:update_*）/ v0.2.1 auto-refresh on SKILL set change
         self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
+        # #127 MCP 运行期工具集变化自动重拉（仿 notify:update_config）/ #127 auto-refresh on runtime tool-set change
+        self.on(UPDATE_TOOL_LIST_NOTIFICATION, self._on_computer_update_tool_list, namespace=self._namespace)
 
     async def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -377,6 +407,32 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         except Exception as e:
             logger.error(f"Error in _on_computer_update_config: {e}", exc_info=True)
 
+    async def _on_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        处理Computer工具列表更新事件的内部方法（#127）
+        Internal handler for a Computer's tool-list-changed event (#127)
+
+        镜像 ``_on_computer_update_config`` 的三段式：先派发预清回调 ``on_computer_update_tool_list``
+        （供消费方清理旧工具，见 base.handle_computer_update_tool_list），再全量回拉 ``client:get_tools``，
+        最后经 ``process_tools_response`` 触发 ``on_tools_received`` 重加。纯 MCP 运行期工具增删
+        （不伴随 config 变更）由此在 Agent 侧可见。
+
+        Mirrors ``_on_computer_update_config``: pre-clean hook → full refetch → ``on_tools_received`` re-add.
+        """
+        try:
+            # 使用父类的异步处理方法（预清回调）
+            # Use parent class async handling method (pre-clean hook)
+            await self.handle_computer_update_tool_list(data)
+
+            # 重新获取工具列表
+            # Re-get tools list
+            computer = data["computer"]
+            tools_response = await self.get_tools_from_computer(computer)
+            await self.process_tools_response(tools_response, computer)
+
+        except Exception as e:
+            logger.error(f"Error in _on_computer_update_tool_list: {e}", exc_info=True)
+
     async def get_desktop_from_computer(
         self,
         computer: str,
@@ -415,7 +471,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         Args:
             computer (str): 目标 Computer 名称 / Target Computer name
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
             timeout (int): 超时时间（秒）/ Timeout in seconds
 

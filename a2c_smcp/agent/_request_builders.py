@@ -26,6 +26,7 @@ import uuid
 from a2c_smcp.agent.types import AgentConfig
 from a2c_smcp.smcp import (
     GetBlobReq,
+    GetComputerConfigReq,
     GetDeskTopReq,
     GetResourcesReq,
     GetSkillReq,
@@ -86,6 +87,25 @@ def build_get_tools_request(agent_config: AgentConfig, computer: str) -> GetTool
     )
 
 
+def build_get_config_request(agent_config: AgentConfig, computer: str) -> GetComputerConfigReq:
+    """
+    创建获取 Computer MCP 配置请求对象（#149）
+    Create get-config request object (#149)
+
+    Args:
+        agent_config (AgentConfig): Agent 配置 / Agent configuration
+        computer (str): 目标计算机ID / Target computer ID
+
+    Returns:
+        GetComputerConfigReq: 获取配置请求 / Get config request
+    """
+    return GetComputerConfigReq(
+        computer=computer,
+        agent=agent_config["agent"],
+        req_id=uuid.uuid4().hex,
+    )
+
+
 def build_get_resources_request(
     agent_config: AgentConfig,
     computer: str,
@@ -99,7 +119,7 @@ def build_get_resources_request(
     Args:
         agent_config (AgentConfig): Agent 配置 / Agent configuration
         computer (str): 目标计算机ID / Target computer ID
-        mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+        mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
         cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
 
     Returns:

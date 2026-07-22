@@ -34,8 +34,9 @@ from werkzeug.test import Client
 
 from a2c_smcp import PROTOCOL_VERSION
 from tests.e2e.conftest import create_local_async_server, create_local_sync_server
+from tests.protocol_versions import max_supported_of, min_supported_of
 
-_INCOMPATIBLE = "99.0.0"  # 与 SDK PROTOCOL_VERSION(0.2.0) MINOR 不匹配 / MINOR mismatch vs 0.2.0
+_INCOMPATIBLE = "99.0.0"  # 与任意 0.x/1.x 均不兼容的定值 MAJOR 差异（不耦合具体 PROTOCOL_VERSION）
 
 
 def _poll_path(version: str) -> str:
@@ -49,8 +50,8 @@ def _assert_4008_body(body: dict) -> None:
     assert body["message"] == "Protocol version mismatch"
     assert body["server_version"] == PROTOCOL_VERSION
     assert body["client_version"] == _INCOMPATIBLE
-    assert body["min_supported"] == "0.2.0"
-    assert body["max_supported"] == "0.2.999"
+    assert body["min_supported"] == min_supported_of(PROTOCOL_VERSION)
+    assert body["max_supported"] == max_supported_of(PROTOCOL_VERSION)
 
 
 # ============================================================================

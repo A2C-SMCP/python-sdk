@@ -218,7 +218,7 @@ async def test_async_integration_computer_agent_server_basic_flow(
 
         # 验证工具列表包含 mark_a 工具 / Verify tool list contains mark_a tool
         tool_names = [t["name"] for t in tools]
-        assert "mark_a" in tool_names, f"Expected 'mark_a' in tools, got {tool_names}"
+        assert "e2e-async-integration-server__mark_a" in tool_names, f"Expected exposed 'mark_a' in tools, got {tool_names}"
 
         print(f"[E2E] Test assertions completed in {time.time() - start_time:.2f}s")
 
@@ -321,7 +321,7 @@ async def test_async_integration_agent_call_computer_tool(
         # 2. Agent 调用 mark_a 工具 / Agent calls mark_a tool
         result = await agent_client.emit_tool_call(
             computer=computer_sid,
-            tool_name="mark_a",
+            tool_name="e2e-async-integration-server-2__mark_a",
             params={},
             timeout=15,  # 增加超时时间 / Increase timeout
         )
@@ -432,7 +432,9 @@ async def test_async_integration_agent_cancel_inflight_tool_call(
         # 显式铸 req（控 req_id），调用 slow_echo（delay=5s）；用底层 call 以便与 cancel 解耦地并发等待。
         # Explicitly mint req (control req_id) calling slow_echo (delay=5s); use low-level call to await independently.
         slow_delay = 5.0
-        req = agent_client.create_tool_call_request(computer=computer_sid, tool_name="slow_echo", params={"delay": slow_delay}, timeout=15)
+        req = agent_client.create_tool_call_request(
+            computer=computer_sid, tool_name="e2e-async-integration-server-cancel__slow_echo", params={"delay": slow_delay}, timeout=15,
+        )
         t0 = time.time()
         call_task = asyncio.ensure_future(agent_client.call(TOOL_CALL_EVENT, req, namespace=SMCP_NAMESPACE, timeout=15))
 
@@ -657,7 +659,7 @@ async def test_async_integration_multiple_tool_calls(
         for _ in range(3):
             result = await agent_client.emit_tool_call(
                 computer=computer_sid,
-                tool_name="mark_a",
+                tool_name="e2e-async-integration-server-4__mark_a",
                 params={},
                 timeout=15,  # 增加超时时间 / Increase timeout
             )
@@ -675,7 +677,7 @@ async def test_async_integration_multiple_tool_calls(
         concurrent_tasks = [
             agent_client.emit_tool_call(
                 computer=computer_sid,
-                tool_name="mark_a",
+                tool_name="e2e-async-integration-server-4__mark_a",
                 params={},
                 timeout=15,  # 增加超时时间 / Increase timeout
             )
@@ -788,7 +790,7 @@ async def test_async_integration_desktop_sync_after_tool_call(
         # 3. 调用工具 / Call tool
         result = await agent_client.emit_tool_call(
             computer=computer_sid,
-            tool_name="mark_a",
+            tool_name="e2e-async-integration-server-5__mark_a",
             params={},
             timeout=15,  # 增加超时时间 / Increase timeout
         )

@@ -82,7 +82,7 @@ async def test_list_skill_resources_server_filter() -> None:
     mgr = MCPServerManager()
     mgr._active_clients = {"s1": c1, "s2": c2}  # type: ignore[assignment]
 
-    out = await mgr.list_skill_resources(server_name="s2")
+    out = await mgr.list_skill_resources(bundle_id="s2")
     assert [(s, str(r.uri)) for s, r in out] == [("s2", "skill://h/b")]
 
 

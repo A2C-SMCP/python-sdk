@@ -8,11 +8,14 @@
 描述:
   中文: MCP 配置按需渲染器。识别占位符并替换，支持递归容器与深度限制。
         v0.2.1 #65（§9.1，对标 VS Code）：除 ``${input:<id>}``（经回调走解析链）外，新增
-        ``${env:<VAR>}``（进程环境变量，缺失→空串 + WARN）与预定义变量 ``${workspaceFolder}`` /
-        ``${userHome}`` / ``${pathSeparator}``。未知占位符保持原样（向后兼容）。
+        ``${env:<VAR>}``（进程环境变量，缺失→空串 + WARN）与预定义变量 ``${userHome}`` /
+        ``${pathSeparator}``。未知占位符保持原样（向后兼容）。
+        #116：``${workspaceFolder}`` 已随 workdir 概念瘦身移除（按未知占位符原样保留），
+        下游请改用 ``${input:<id>}`` 或绝对路径。
   English: On-demand renderer for MCP configs. v0.2.1 adds ``${env:VAR}`` (process env, missing → empty
-           + WARN) and predefined ``${workspaceFolder}`` / ``${userHome}`` / ``${pathSeparator}`` on top
-           of ``${input:id}``. Unknown placeholders are left untouched (backward compatible).
+           + WARN) and predefined ``${userHome}`` / ``${pathSeparator}`` on top of ``${input:id}``.
+           Unknown placeholders are left untouched (backward compatible). #116 removed
+           ``${workspaceFolder}``; use ``${input:<id>}`` or absolute paths instead.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from a2c_smcp.computer.inputs.resolver import InputResolutionError
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("computer")
@@ -34,7 +38,7 @@ def load_env_file(path: Path) -> dict[str, str]:
 
     解析规则：跳过空行与 ``#`` 注释；容忍前缀 ``export ``；去除值两端成对引号；无 ``=`` 的行跳过 + WARN。
     文件缺失 / 读失败 → ``{}`` + WARN（容错，不抛）。变量展开**不**在此发生——envFile 值按字面取，
-    占位符（如 ``${workspaceFolder}``）由调用方在渲染整份配置时（含 envFile **路径**）先行替换。
+    占位符（如 ``${input:<id>}``）由调用方在渲染整份配置时（含 envFile **路径**）先行替换。
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -69,7 +73,7 @@ def load_env_file(path: Path) -> dict[str, str]:
 # English: Match any ${...} placeholder; the inner token is dispatched by prefix in _aresolve_token.
 PLACEHOLDER_PATTERN = re.compile(r"\$\{([^}]+)}")
 
-_PREDEFINED_VARS = ("workspaceFolder", "userHome", "pathSeparator")
+_PREDEFINED_VARS = ("userHome", "pathSeparator")
 
 ResolveInput = Callable[[str], Awaitable[Any]]
 
@@ -96,7 +100,7 @@ class ConfigRender:
         中文: 递归渲染任意结构的数据，字符串中按需替换占位符。
         English: Recursively render arbitrary structured data, replacing placeholders in strings on demand.
 
-        :param variables: 预定义变量映射（workspaceFolder/userHome/pathSeparator）/ predefined variables.
+        :param variables: 预定义变量映射（userHome/pathSeparator）/ predefined variables.
         :param env: ``${env:VAR}`` 取值来源（默认 ``os.environ``，可注入便于测试）/ source for ``${env:VAR}``.
         """
         if _depth > self._max_depth:
@@ -129,8 +133,14 @@ class ConfigRender:
             try:
                 return True, await resolve_input(input_id)
             except KeyError:
+                # 未定义占位符（不在 inputs 池）→ 字面保留（VS Code parity），不上抛。
                 logger.warning(f"未找到输入项: {input_id} / Input id not found: {input_id}")
                 return False, None
+            except InputResolutionError:
+                # #173（对齐 rust-sdk#144）：D1 结构化解析错误（Missing/ResolverFailed）→ 上抛供 boot_up
+                # surfacing（非仅日志），**不**塌成字面保留（区别于未定义占位符）。须在通用 ``except Exception``
+                # 之前显式放行，否则会被其吞成字面保留。
+                raise
             except Exception as e:  # pragma: no cover
                 logger.error(f"解析输入失败: {input_id}, 错误: {e}", exc_info=True)
                 return False, None

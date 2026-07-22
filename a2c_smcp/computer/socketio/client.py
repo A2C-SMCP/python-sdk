@@ -68,6 +68,7 @@ from a2c_smcp.smcp import (
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
 )
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
     HANDSHAKE_CONNECT_ERRORS,
@@ -364,6 +365,12 @@ class SMCPComputerClient(AsyncClient):
                 timeout=data["timeout"],
             )
             # 将 CallToolResult 转换为字典以便 JSON 序列化 / Convert CallToolResult to dict for JSON serialization
+            # 注意：**禁止**传 ``by_alias=True``——协议要求结果级元数据出线 key 为顶层 ``meta``（见 data-structures.md
+            # §「结果级 meta vs 子级 _meta」/ #115）。默认（按字段名）dump 才得 ``meta``；by_alias 会回退到 alias ``_meta``，
+            # 破坏 Agent 对 ``meta.a2c_cancelled`` / ``a2c_timeout`` 的解析。
+            # NOTE: do NOT pass ``by_alias=True`` — the protocol requires result-level metadata to wire out under the
+            # top-level key ``meta`` (data-structures.md / #115). Default (by field name) dump yields ``meta``; by_alias
+            # would fall back to the alias ``_meta`` and break the Agent's reading of ``meta.a2c_cancelled`` / ``a2c_timeout``.
             raw = ret.model_dump(mode="json")
             # v0.2.1 二进制旁路铸造（不动 isError 路径）/ v0.2.1 binary sideband minting (isError untouched)
             self._mint_oversize_binary_content(raw)
@@ -529,13 +536,22 @@ class SMCPComputerClient(AsyncClient):
             raise SMCPNamespaceError("计算机标识不匹配")
 
         servers: dict[str, dict] = {}
-        # 从 Computer 中获取初始化时传入的配置集合（不可变元组）
-        # From Computer, get the immutable tuple of initial MCP server configs
-        for cfg in self.computer.mcp_servers:
+        # #149：数据源 = **运行期活跃集的 raw 投影**（F2/PROTO-2：wire 投影 MUST 读运行期权威、MUST NOT 读构造期死快照）。
+        # active_server_configs() 的 SET 取 manager 运行期权威、body 取未渲染 raw（占位符字面保留、绝不外泄已解析 secret）。
+        # #149: source = raw projection of the runtime-active set (F2/PROTO-2: wire MUST read runtime authority, never the
+        # construction-time dead snapshot). SET from manager authority; body kept raw (placeholders literal, no secret leak).
+        for cfg in self.computer.active_server_configs():
+            # 身份键 = bundle_id（协议 #18）；从 raw config derive（与注册边界 seam 一致，raw #17）。
+            # no-double-open：同 bundle_id 保留首个（与 manager boot first-wins 一致）。
+            bundle_id = resolve_bundle_id(cfg)
+            if bundle_id in servers:
+                continue
             # 使用强校验转换为协议定义（中英文）/ Validate strictly to protocol definition (bilingual)
             # 若类型不匹配，抛出异常，属于硬性 Bug / If mismatched, raise to surface a hard bug.
             validated_server: dict = TypeAdapter(SMCPServerConfigDict).validate_python(cfg.model_dump(mode="json"), from_attributes=True)
-            servers[cfg.name] = validated_server
+            # 物化解析后 bundle_id（entry 携 bundle_id + name(display)，供 Agent tool→server 归属桥）
+            validated_server["bundle_id"] = bundle_id
+            servers[bundle_id] = validated_server
 
         inputs: list[MCPServerInput] = []
         for i in self.computer.inputs:
@@ -579,14 +595,14 @@ class SMCPComputerClient(AsyncClient):
             return ErrorPayload(
                 code=int(ErrorCode.MCP_SERVER_NOT_FOUND),
                 message="MCP Server not registered",
-                mcp_server_name=mcp_server,
+                mcp_server=mcp_server,
             )
         except MCPCapabilityNotSupportedError as e:
             logger.warning(f"client:get_resources MCP Server '{mcp_server}' 未声明 resources 能力 / capability missing: {e}")
             return ErrorPayload(
                 code=int(ErrorCode.MCP_CAPABILITY_NOT_SUPPORTED),
                 message="MCP Server does not support 'resources' capability",
-                mcp_server_name=mcp_server,
+                mcp_server=mcp_server,
                 capability="resources",
             )
         ret: GetResourcesRet = {
@@ -734,7 +750,7 @@ def _skill_not_found(name: str) -> ErrorPayload:
     """``4014`` 复用 flat ErrorPayload：name 合法但 Registry 未命中（未注册 / 卸载 / 孤儿）。
 
     SKILL 通道复用 ``MCP_SERVER_NOT_FOUND`` 语义（error-handling.md §SKILL）；``name`` 经 ``details`` 下沉
-    （非 mcp_server，故不平铺 ``mcp_server_name``）。
+    （SKILL 按 name 寻址、非 mcp_server(bundle_id)，故不平铺 ``mcp_server``）。
     """
     return ErrorPayload(code=int(ErrorCode.MCP_SERVER_NOT_FOUND), message="Skill not found", details={"name": name})
 

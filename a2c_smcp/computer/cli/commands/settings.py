@@ -14,9 +14,9 @@
 写经 :func:`...scope.apply_write`（**数组整体替换**、``undefined`` 删键，§5.4）+ store 原子写/锁。
 
 - **scope**：``user`` / ``project`` / ``local`` 可写；``flag`` / ``policy`` **只读**（set/edit 拒绝，退出码 1）；
-  ``merged``（默认 show）= 六层合并视图。project/local 需 active workdir。
+  ``merged``（默认 show）= 五层合并视图。project/local 锚定进程 cwd（#116）。
 - settings.json **无 version 字段**（复刻 CC passthrough，§5）；写不注 version/保护头（``header=None``）。
-- ``edit`` 用 ``$EDITOR`` 打开该层文件，保存后经回调 reconcile（能力层对账 + 重跑 MCP 批准门控）。
+- ``edit`` 用 ``$EDITOR`` 打开该层文件，保存后经回调 reconcile（重跑 MCP 批准门控）。
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from a2c_smcp.computer.cli.commands import flag_value, resolved_settings
-from a2c_smcp.computer.cli.utils import console
+from a2c_smcp.computer.cli.commands import flag_value, format_settings_errors, resolved_settings_with_errors
+from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.policy import resolve_policy_settings
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError
 from a2c_smcp.computer.settings.scope import (
     apply_write,
     load_settings_file,
@@ -57,46 +57,64 @@ def _err(msg: str, *, json_output: bool) -> int:
     return EXIT_USER_ERROR
 
 
-def _writable_path(scope: str, active_workdir: Path | None, env: Mapping[str, str] | None) -> tuple[Path, SettingsScope]:
-    """解析可写 scope 的 settings.json 路径 + enum；flag/policy/unknown → ``ValueError``。"""
+def _writable_path(scope: str, env: Mapping[str, str] | None) -> tuple[Path, SettingsScope]:
+    """解析可写 scope 的 settings.json 路径 + enum（project/local 锚 cwd，#116）；flag/policy/unknown → ``ValueError``。"""
     if scope == "user":
         return user_settings_path(env), SettingsScope.USER
     if scope in ("project", "local"):
-        if active_workdir is None:
-            raise ValueError(f"scope {scope!r} requires an active workdir (use --add-dir at startup)")
+        cwd = Path(os.getcwd())
         if scope == "project":
-            return workdir_project_settings_path(active_workdir), SettingsScope.PROJECT
-        return workdir_local_settings_path(active_workdir), SettingsScope.LOCAL
+            return workdir_project_settings_path(cwd), SettingsScope.PROJECT
+        return workdir_local_settings_path(cwd), SettingsScope.LOCAL
     raise ValueError(f"scope {scope!r} is read-only (writable: user|project|local)")
 
 
-def _read_scope(
+def _read_scope_with_errors(
     scope: str,
     home: Path,
     env: Mapping[str, str] | None,
     *,
-    registered_workdirs: tuple[Path, ...],
-    active_workdir: Path | None,
     flag_path: Path | None,
-) -> dict[str, Any] | None:
-    """读单 scope（或 merged）settings dict；scope 非法或缺 active workdir → ``None``（调用方报错）。"""
+) -> tuple[dict[str, Any], list[SettingsValidationError]] | None:
+    """读单 scope（或 merged）settings dict **连同校验错误**；scope 非法 → ``None``。project/local 锚 cwd（#116）。
+
+    #157：**每个 scope 都带出 errors**（非仅 merged）——``settings show --scope project`` 正是用户排查
+    「我的 settings 莫名不生效」时最先跑的命令，若此处吞掉越权错误则诊断回路断裂（字段静默蒸发、
+    ``settings get`` 还会答「not set in scope」主动误导）。协议 §3「响亮失败」；对拍 rust
+    ``settings.rs::read_scope_with_errors``。呈现由调用方统一走 stderr（见 :func:`_emit_errors`）。
+    Every scope carries its errors out; the callers surface them on stderr.
+    """
     if scope == "merged":
-        return resolved_settings(registered_workdirs, active_workdir, env, flag_path=flag_path)
+        resolved_st = resolved_settings_with_errors(env, flag_path=flag_path)
+        return resolved_st.settings, list(resolved_st.errors)
     if scope == "user":
-        return load_settings_file(user_settings_path(env), SettingsScope.USER)[0]
+        return load_settings_file(user_settings_path(env), SettingsScope.USER)
     if scope in ("project", "local"):
-        if active_workdir is None:
-            return None
-        path = workdir_project_settings_path(active_workdir) if scope == "project" else workdir_local_settings_path(active_workdir)
+        cwd = Path(os.getcwd())
+        path = workdir_project_settings_path(cwd) if scope == "project" else workdir_local_settings_path(cwd)
         enum = SettingsScope.PROJECT if scope == "project" else SettingsScope.LOCAL
-        return load_settings_file(path, enum)[0]
+        return load_settings_file(path, enum)
     if scope == "flag":
         if flag_path is None:
-            return {}
-        return load_settings_file(flag_path, SettingsScope.FLAG)[0]
+            return {}, []
+        return load_settings_file(flag_path, SettingsScope.FLAG)
     if scope == "policy":
-        return resolve_policy_settings(env=env)
+        # policy 层 = resolve_policy_settings 的 first-source-wins 结果，此处**未经 validate_settings**、
+        # 按原始 dict 返回（与 rust ``read_scope_with_errors`` 的 policy 分支同形，双端一致）。
+        # 已知缺口（#157 fix-review 🟡）：故 ``settings show --scope policy`` 看到的字段可能在 merged 路径
+        # 被判废（如 allowedMcpServers 类型错）却在此零警告。**不是「没有校验通道」**——validate_settings
+        # 就在同模块、``scope.py`` 的 resolve_settings 正是这么用的；只是行为变更须双端同步，另立 issue。
+        return resolve_policy_settings(env=env), []
     return None
+
+
+def _emit_errors(errors: list[SettingsValidationError]) -> None:
+    """把 settings 校验错误打 **stderr**（#157）——stdout 恒为机读 JSON，``settings show | jq`` 须仍可用。
+
+    Diagnostics on stderr; stdout stays pure JSON.
+    """
+    for line in format_settings_errors(errors):
+        console_err.print(f"[yellow]{line}[/yellow]")
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
@@ -105,17 +123,17 @@ def settings_show(
     env: Mapping[str, str] | None,
     *,
     scope: str = "merged",
-    registered_workdirs: tuple[Path, ...] = (),
-    active_workdir: Path | None = None,
     flag_path: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """展示某 scope 的 settings（默认 merged 合并视图）/ Show settings of a scope (default merged)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    data = _read_scope(scope, home, env, registered_workdirs=registered_workdirs, active_workdir=active_workdir, flag_path=flag_path)
-    if data is None:
-        return _err(f"scope {scope!r} requires an active workdir (use --add-dir at startup)", json_output=json_output)
+    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path)
+    if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
+        return _err(f"unknown scope {scope!r}", json_output=json_output)
+    data, errors = read
+    _emit_errors(errors)  # #157：被 scope 越权过滤的字段在此有解释（stderr，不污染 stdout JSON）
     console.print_json(data=data)
     return EXIT_OK
 
@@ -126,17 +144,18 @@ def settings_get(
     key: str,
     *,
     scope: str = "merged",
-    registered_workdirs: tuple[Path, ...] = (),
-    active_workdir: Path | None = None,
     flag_path: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """读取单字段（默认 merged 视图）/ Read a single field (default merged view)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    data = _read_scope(scope, home, env, registered_workdirs=registered_workdirs, active_workdir=active_workdir, flag_path=flag_path)
-    if data is None:
-        return _err(f"scope {scope!r} requires an active workdir (use --add-dir at startup)", json_output=json_output)
+    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path)
+    if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
+        return _err(f"unknown scope {scope!r}", json_output=json_output)
+    data, errors = read
+    # #157：越权字段会被过滤出 data —— 若不呈现，下面的 "not set in scope" 会**主动误导**（文件里明明写了）。
+    _emit_errors(errors)
     if key not in data:
         return _err(f"key {key!r} not set in scope {scope!r}", json_output=json_output)
     console.print_json(data={key: data[key]})
@@ -150,7 +169,6 @@ def settings_set(
     value: str,
     *,
     scope: str = "user",
-    active_workdir: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """写单字段（user|project|local；flag/policy 只读）/ Write a single field (flag/policy read-only)。
@@ -161,7 +179,7 @@ def settings_set(
     if scope not in _WRITABLE:
         return _err(f"scope {scope!r} is read-only (writable: {'|'.join(sorted(_WRITABLE))})", json_output=json_output)
     try:
-        path, enum = _writable_path(scope, active_workdir, env)
+        path, enum = _writable_path(scope, env)
     except ValueError as e:
         return _err(str(e), json_output=json_output)
 
@@ -187,7 +205,6 @@ def settings_edit(
     env: Mapping[str, str] | None,
     *,
     scope: str = "user",
-    active_workdir: Path | None = None,
     editor: str | None = None,
     reconcile_cb: Callable[[], Awaitable[None]] | None = None,
     json_output: bool = False,
@@ -200,7 +217,7 @@ def settings_edit(
     if scope not in _WRITABLE:
         return _err(f"scope {scope!r} is read-only (editable: {'|'.join(sorted(_WRITABLE))})", json_output=json_output), None
     try:
-        path, _enum = _writable_path(scope, active_workdir, env)
+        path, _enum = _writable_path(scope, env)
     except ValueError as e:
         return _err(str(e), json_output=json_output), None
 
@@ -228,22 +245,14 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     scope = flag_value(args, "--scope")
-    registered = comp._registered_workdirs
-    aw = comp.active_workdir
 
     if sub == "show":
-        settings_show(
-            home, env, scope=scope or "merged",
-            registered_workdirs=registered, active_workdir=aw, json_output=json_output,
-        )
+        settings_show(home, env, scope=scope or "merged", json_output=json_output)
     elif sub == "get":
         if not pos:
             console.print("[yellow]usage: settings get <key> [--scope user|project|local|flag|policy|merged][/yellow]")
             return
-        settings_get(
-            home, env, pos[0], scope=scope or "merged",
-            registered_workdirs=registered, active_workdir=aw, json_output=json_output,
-        )
+        settings_get(home, env, pos[0], scope=scope or "merged", json_output=json_output)
     elif sub == "set":
         if len(pos) < 2:
             console.print("[yellow]usage: settings set <key> <value> [--scope user|project|local][/yellow]")
@@ -257,12 +266,12 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
                 break
             value_tokens.append(tok)
         value = " ".join(value_tokens)
-        code = settings_set(home, env, key, value, scope=scope or "user", active_workdir=aw, json_output=json_output)
-        _emit_keys = {"enabledPlugins", "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"}
+        code = settings_set(home, env, key, value, scope=scope or "user", json_output=json_output)
+        _emit_keys = {"installedPlugins", "enabledPlugins", "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"}
         if code == EXIT_OK and key in _emit_keys:
             comp.mark_skills_dirty()
     elif sub == "edit":
-        code, post_save = settings_edit(home, env, scope=scope or "user", active_workdir=aw, reconcile_cb=None, json_output=json_output)
+        code, post_save = settings_edit(home, env, scope=scope or "user", reconcile_cb=None, json_output=json_output)
         if code == EXIT_OK:
             comp.mark_skills_dirty()  # 编辑可能改 enabledPlugins/MCP 字段 → 触发去抖 emit
             if post_save is not None:

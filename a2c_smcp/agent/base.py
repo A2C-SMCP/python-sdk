@@ -22,6 +22,7 @@ from a2c_smcp.smcp import (
     EnterOfficeNotification,
     EnterOfficeReq,
     GetBlobReq,
+    GetComputerConfigReq,
     GetDeskTopReq,
     GetDeskTopRet,
     GetResourcesReq,
@@ -33,6 +34,7 @@ from a2c_smcp.smcp import (
     LeaveOfficeReq,
     ToolCallReq,
     UpdateMCPConfigNotification,
+    UpdateToolListNotification,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -119,6 +121,19 @@ class BaseAgentClient(ABC):
         """
         return _rb.build_get_tools_request(self.auth_provider.get_agent_config(), computer)
 
+    def create_get_config_request(self, computer: str) -> GetComputerConfigReq:
+        """
+        创建获取 Computer MCP 配置请求对象（#149）
+        Create get-config request object (#149)
+
+        Args:
+            computer (str): 目标计算机ID / Target computer ID
+
+        Returns:
+            GetComputerConfigReq: 获取配置请求 / Get config request
+        """
+        return _rb.build_get_config_request(self.auth_provider.get_agent_config(), computer)
+
     def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
         """
         创建获取资源请求对象（透明转发 MCP resources/list）
@@ -126,7 +141,7 @@ class BaseAgentClient(ABC):
 
         Args:
             computer (str): 目标计算机ID / Target computer ID
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
 
         Returns:
@@ -204,10 +219,17 @@ class BaseAgentClient(ABC):
         Returns:
             CallToolResult: 超时错误结果 / Timeout error result
         """
-        return CallToolResult(
+        result = CallToolResult(
             content=[TextContent(text=f"工具调用超时 / Tool call timeout, req_id={req_id}", type="text")],
             isError=True,
         )
+        # 协议结果级标记（32eea98 / protocol#5）：标识此结果为超时返回，使 Agent 能区分「超时 / 取消 / 普通失败」。
+        # 经 ``.meta`` 写入真实 meta 字段（出线默认 dump→key=meta）；构造器传 ``meta=`` 会落 extra（字段 alias 为 ``_meta``）。
+        # Protocol result-level marker (32eea98 / protocol#5): mark this result as a timeout return so the Agent can
+        # distinguish timeout from cancellation / ordinary failure. Set via ``.meta`` (real field, wire key ``meta``);
+        # passing ``meta=`` to the ctor would land in ``extra`` since the field alias is ``_meta``.
+        result.meta = {"a2c_timeout": True}
+        return result
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
@@ -287,6 +309,33 @@ class BaseAgentClient(ABC):
 
         except Exception as e:
             logger.error(f"Error handling computer update config: {e}", exc_info=True)
+
+    async def handle_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        异步处理Computer工具列表更新事件的**预清**回调（#127）
+        Async pre-clean dispatch for a Computer's tool-list-changed event (#127)
+
+        语义对齐 ``handle_computer_update_config``：派发消费方的预清回调 ``on_computer_update_tool_list``，
+        供其清理该 Computer 的旧工具（回拉后经 ``on_tools_received`` 重加）。与 ``on_skills_received`` 一致，
+        对新回调使用 ``hasattr`` 守卫保持向后兼容；本方法自有 try/except 隔离 hook 异常，**不**阻断上层回拉。
+
+        Mirrors ``handle_computer_update_config`` but guards the new callback with ``hasattr`` (backward compat,
+        same convention as ``on_skills_received``). Hook errors are isolated here and never block the caller's refetch.
+
+        Args:
+            data: 工具列表更新通知数据 / Tool list update notification data
+        """
+        try:
+            computer = data["computer"]
+            logger.info(f"Computer {computer} updated tool list")
+
+            # 调用异步事件处理器（强制携带 client 引用）；新回调经 hasattr 守卫兼容旧 handler
+            # Call async event handler (force passing client reference); hasattr guard keeps legacy handlers working
+            if self.event_handler and hasattr(self.event_handler, "on_computer_update_tool_list"):
+                await self.event_handler.on_computer_update_tool_list(data, self)  # type: ignore[arg-type]
+
+        except Exception as e:
+            logger.error(f"Error handling computer update tool list: {e}", exc_info=True)
 
     async def process_tools_response(self, response: GetToolsRet, computer: str) -> None:
         """
@@ -429,6 +478,19 @@ class BaseAgentSyncClient(ABC):
         """
         return _rb.build_get_tools_request(self.auth_provider.get_agent_config(), computer)
 
+    def create_get_config_request(self, computer: str) -> GetComputerConfigReq:
+        """
+        创建获取 Computer MCP 配置请求对象（#149）
+        Create get-config request object (#149)
+
+        Args:
+            computer (str): 目标计算机ID / Target computer ID
+
+        Returns:
+            GetComputerConfigReq: 获取配置请求 / Get config request
+        """
+        return _rb.build_get_config_request(self.auth_provider.get_agent_config(), computer)
+
     def create_get_resources_request(self, computer: str, mcp_server: str, cursor: str | None = None) -> GetResourcesReq:
         """
         创建获取资源请求对象（透明转发 MCP resources/list）
@@ -436,7 +498,7 @@ class BaseAgentSyncClient(ABC):
 
         Args:
             computer (str): 目标计算机ID / Target computer ID
-            mcp_server (str): 目标 MCP Server 名称 / Target MCP Server name
+            mcp_server (str): 目标 MCP Server 的 bundle_id（= get_config servers 字典 key，协议 #18）/ Target server bundle_id
             cursor (str | None): MCP 标准翻页游标；首次传 None / MCP pagination cursor; None for first page
 
         Returns:
@@ -514,10 +576,17 @@ class BaseAgentSyncClient(ABC):
         Returns:
             CallToolResult: 超时错误结果 / Timeout error result
         """
-        return CallToolResult(
+        result = CallToolResult(
             content=[TextContent(text=f"工具调用超时 / Tool call timeout, req_id={req_id}", type="text")],
             isError=True,
         )
+        # 协议结果级标记（32eea98 / protocol#5）：标识此结果为超时返回，使 Agent 能区分「超时 / 取消 / 普通失败」。
+        # 经 ``.meta`` 写入真实 meta 字段（出线默认 dump→key=meta）；构造器传 ``meta=`` 会落 extra（字段 alias 为 ``_meta``）。
+        # Protocol result-level marker (32eea98 / protocol#5): mark this result as a timeout return so the Agent can
+        # distinguish timeout from cancellation / ordinary failure. Set via ``.meta`` (real field, wire key ``meta``);
+        # passing ``meta=`` to the ctor would land in ``extra`` since the field alias is ``_meta``.
+        result.meta = {"a2c_timeout": True}
+        return result
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
@@ -597,6 +666,30 @@ class BaseAgentSyncClient(ABC):
 
         except Exception as e:
             logger.error(f"Error handling computer update config: {e}", exc_info=True)
+
+    def handle_computer_update_tool_list(self, data: UpdateToolListNotification) -> None:
+        """
+        处理Computer工具列表更新事件的**预清**回调（#127 sync mirror）
+        Pre-clean dispatch for a Computer's tool-list-changed event (#127, sync mirror)
+
+        语义对齐 ``handle_computer_update_config``：派发消费方的预清回调 ``on_computer_update_tool_list``，
+        供其清理该 Computer 的旧工具（回拉后经 ``on_tools_received`` 重加）。对新回调使用 ``hasattr`` 守卫保持
+        向后兼容；自有 try/except 隔离 hook 异常，**不**阻断上层回拉。
+
+        Args:
+            data: 工具列表更新通知数据 / Tool list update notification data
+        """
+        try:
+            computer = data["computer"]
+            logger.info(f"Computer {computer} updated tool list")
+
+            # 调用事件处理器（强制携带 client 引用）；新回调经 hasattr 守卫兼容旧 handler
+            # Call event handler (force passing client reference); hasattr guard keeps legacy handlers working
+            if self.event_handler and hasattr(self.event_handler, "on_computer_update_tool_list"):
+                self.event_handler.on_computer_update_tool_list(data, self)  # type: ignore[arg-type]
+
+        except Exception as e:
+            logger.error(f"Error handling computer update tool list: {e}", exc_info=True)
 
     def process_tools_response(self, response: GetToolsRet, computer: str) -> None:
         """

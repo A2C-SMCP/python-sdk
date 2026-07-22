@@ -41,11 +41,14 @@ def no_patch_stdout():
 
 
 @pytest.mark.asyncio
-async def test_cli_desktop_with_subscribe_resources_server(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cli_desktop_with_subscribe_resources_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     中文: 使用 resources_subscribe_stdio_server 启动后，执行 desktop 命令应输出非空列表。
     英文: After starting resources_subscribe_stdio_server, 'desktop' should output a non-empty list.
     """
+    # #137 ②：REPL `server add` 现为 durable 落盘——隔离 cwd/XDG 到 tmp，防写真实仓库 .tfrobot/。
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)
     server_py = Path(__file__).resolve().parents[2] / "computer" / "mcp_servers" / "resources_subscribe_stdio_server.py"
     assert server_py.exists()
 

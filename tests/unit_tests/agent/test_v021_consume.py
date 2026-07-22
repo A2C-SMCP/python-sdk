@@ -57,13 +57,13 @@ class TestSMCPProtocolErrorV021:
         assert ei.value.code == 4018
         assert ei.value.reason == "gone"
 
-    def test_4014_passthrough_keeps_mcp_server_name_top_level(self) -> None:
-        """v0.2.1 兼容性：4014 仍保留顶层 mcp_server_name（v0.2 已有）.
-        Backward-compat: 4014 keeps top-level mcp_server_name from v0.2."""
-        payload = {"code": 4014, "message": "x", "mcp_server_name": "absent"}
+    def test_4014_passthrough_keeps_mcp_server_top_level(self) -> None:
+        """0.3.0（协议 #18）：4014 顶层字段为 ``mcp_server``（值=bundle_id；由 mcp_server_name 改名）.
+        4014 keeps top-level ``mcp_server`` (renamed from ``mcp_server_name``; value = bundle_id)."""
+        payload = {"code": 4014, "message": "x", "mcp_server": "absent"}
         with pytest.raises(SMCPProtocolError) as ei:
             raise_for_error_payload(payload)
-        assert ei.value.mcp_server_name == "absent"
+        assert ei.value.mcp_server == "absent"
         # details 容器为空（4014 无 details）/ details container empty for 4014
         assert ei.value.details == {}
         assert ei.value.reason is None

@@ -264,21 +264,22 @@ async def test_computer_handles_tool_call_timeout(computer, computer_server, bas
 async def test_computer_handles_get_config(computer_server: MockComputerServerNamespace, basic_server_port: int):
     """测试处理获取MCP配置请求 / Handle GET_CONFIG_EVENT and validate response"""
     computer_name = "test_computer"
-    # 构造具备 mcp_servers 属性的 Computer 替身 / Fake Computer with mcp_servers
+    # 构造具备 mcp_servers 属性的 Computer 替身 / Fake Computer with mcp_servers。
+    # #150 R5①：display name 取值分叉（含空格/括号）→ bundle_id 与 name 逐字不同，键断言从此能鉴别按 name 还是按 bundle_id 取。
     stdio_cfg = StdioServerConfig(
-        name="stdio-srv",
+        name="stdio srv (display)",
         server_parameters=StdioServerParameters(command="bash", args=["-lc", "echo hi"], env={}),
         forbidden_tools=["ban1"],
         tool_meta={"toolA": ToolMeta(auto_apply=True)},
     )
     sse_cfg = SseServerConfig(
-        name="sse-srv",
+        name="sse srv (display)",
         server_parameters=SseServerParameters(url="http://localhost:18080/sse"),
         forbidden_tools=[],
         tool_meta={},
     )
     http_cfg = StreamableHttpServerConfig(
-        name="http-srv",
+        name="http srv (display)",
         server_parameters=StreamableHttpParameters(url="http://localhost:18081"),
         forbidden_tools=[],
         tool_meta={},
@@ -297,6 +298,10 @@ async def test_computer_handles_get_config(computer_server: MockComputerServerNa
         @property
         def name(self) -> str:
             return computer_name
+
+        def active_server_configs(self):
+            # #149：on_get_config 现从运行期活跃集的 raw 投影取数；本 fake 直接回等价配置集。
+            return (stdio_cfg, sse_cfg, http_cfg)
 
         # 兼容其他测试中会用到的方法（此测试用例中不会调用）/ compatibility no-op
         aget_available_tools = AsyncMock(return_value=[])
@@ -329,17 +334,20 @@ async def test_computer_handles_get_config(computer_server: MockComputerServerNa
     # 校验返回结构 / Validate response structure
     assert "servers" in resp
     servers = resp["servers"]
-    assert set(servers.keys()) == {"stdio-srv", "sse-srv", "http-srv"}
+    # #150：键 = **bundle_id**（与 display name 分叉）；误按 name 取键此断言即红（泄漏守卫）。
+    assert set(servers.keys()) == {"stdio_srv_display", "sse_srv_display", "http_srv_display"}
+    assert servers["stdio_srv_display"]["name"] == "stdio srv (display)"
+    assert servers["stdio_srv_display"]["bundle_id"] == "stdio_srv_display"
 
-    assert servers["stdio-srv"]["type"] == "stdio"
-    assert servers["sse-srv"]["type"] == "sse"
-    assert servers["http-srv"]["type"] == "streamable"
+    assert servers["stdio_srv_display"]["type"] == "stdio"
+    assert servers["sse_srv_display"]["type"] == "sse"
+    assert servers["http_srv_display"]["type"] == "streamable"
 
-    assert servers["stdio-srv"]["forbidden_tools"] == ["ban1"]
-    assert "toolA" in servers["stdio-srv"]["tool_meta"]
+    assert servers["stdio_srv_display"]["forbidden_tools"] == ["ban1"]
+    assert "toolA" in servers["stdio_srv_display"]["tool_meta"]
 
-    assert isinstance(servers["stdio-srv"]["server_parameters"], dict)
-    assert isinstance(servers["sse-srv"]["server_parameters"], dict)
-    assert isinstance(servers["http-srv"]["server_parameters"], dict)
+    assert isinstance(servers["stdio_srv_display"]["server_parameters"], dict)
+    assert isinstance(servers["sse_srv_display"]["server_parameters"], dict)
+    assert isinstance(servers["http_srv_display"]["server_parameters"], dict)
 
     await client.disconnect()

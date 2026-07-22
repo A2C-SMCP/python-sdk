@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from vrl_python import VRLRuntime
 
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
+from a2c_smcp.utils.bundle_id import validate_explicit_bundle_id
 
 if TYPE_CHECKING:
     from a2c_smcp.computer.mcp_clients.base_client import STATES
@@ -27,7 +28,11 @@ class ToolMeta(BaseModel):
     alias: str | None = Field(
         default=None,
         title="工具别名",
-        description="如果不同MCP Server中存在同名工具，允许通过此别名修改，从而解决名称冲突",
+        description=(
+            "工具别名（BundleID 模型，协议 0.3.0）。仅替换 exposed_tool_name 的**工具名部分**，"
+            "仍带 `{bundle_id}__` 前缀（非对整个 exposed_tool_name 的完全替换）。含连字符/冲突的原始名"
+            "可借此适配下游命名约束。"
+        ),
     )
     tags: list[str] | None = Field(default=None, title="工具标签", description="用于对工具进行分类")
     # 不同MCP工具返回值并不统一，虽然其满足MCP标准的返回格式，但具体的原始内容命名仍然无法避免出现不一致的情况。通过object_mapper可以方便
@@ -45,6 +50,14 @@ class BaseMCPServerConfig(BaseModel):
     """MCP服务器配置基类"""
 
     name: SERVER_NAME  # MCP Server的名称
+    # BundleID 模型（协议 0.3.0，a2c-smcp-protocol#15）：MCP Server 软件级唯一身份。
+    # 省略时由 name 经确定性算法在 Computer 注册边界（derive-on-load）生成，解析后恒有值；
+    # 此处仅承载**显式**值并校验（生成不在 Pydantic，因 config frozen=True）。见 utils/bundle_id.py。
+    bundle_id: str | None = Field(
+        default=None,
+        title="Bundle 唯一标识",
+        description="MCP Server 唯一身份（BundleID）。省略则由 name 确定性生成；显式值须为 [A-Za-z0-9_-] 且无连续 '__'。",
+    )
     disabled: bool = Field(default=False, title="是否禁用", description="是否禁用MCP Server")
     forbidden_tools: list[TOOL_NAME] = Field(
         default_factory=list,
@@ -106,8 +119,28 @@ class BaseMCPServerConfig(BaseModel):
 
         return v
 
+    @field_validator("bundle_id")
+    @classmethod
+    def validate_bundle_id(cls, v: str | None) -> str | None:
+        """仅校验**显式**提供的 bundle_id（非空、无连续 `__`、字符集 `[A-Za-z0-9_-]`）。
+
+        Validate an explicitly-provided bundle_id only. 省略（None）不校验——触发注册边界缺省生成
+        （:func:`a2c_smcp.utils.bundle_id.resolve_bundle_id`）。
+        """
+        if v is None:
+            return v
+        return validate_explicit_bundle_id(v)
+
     def __hash__(self) -> int:
-        """对于MCP Server配置，以name作为唯一标识凭证，如果name相同则表示完全相同"""
+        """以 ``name`` 作**哈希桶**键——**不**是身份判定 / Hash bucket only, NOT an identity claim.
+
+        身份是 ``bundle_id``（BundleID 模型，协议 #18）：``name`` 已降级为纯 display、**允许碰撞**，
+        故同名 ≠ 同一 Server。这里仍按 ``name`` 取哈希是**合法且安全**的——相等性由 Pydantic 的
+        全字段 ``__eq__`` 判定，同名不同 config 只是落进同一哈希桶（碰撞），在 ``set`` 中**仍各自共存**，
+        不会被误去重。真正的 Server 去重（no-double-open）由 Manager 按 ``bundle_id`` 负责，不在此处。
+        Equal objects always share a name ⇒ the hash contract holds; same-name-different-config
+        entries merely collide in a bucket and still coexist in a ``set``.
+        """
         return hash(self.name)
 
 

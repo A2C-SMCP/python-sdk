@@ -1,5 +1,10 @@
 # 设计文档：0.2.1 — CLI Marketplace/Plugin/Skill 管理 UX
 
+> ⚠️ **部分内容已被 [#116](https://github.com/A2C-SMCP/python-sdk/issues/116) 取代（v0.2.2 workdir 概念瘦身）**：
+> `--add-dir` / `active_workdir` / `registered_workdirs` / `${workspaceFolder}` / 能力发现层（跨登记目录并集）
+> 已整体移除——workdir 范围 SKILL 下沉 IDE4AI 等 MCP 服务经 `skill://` Resource 承载；settings/mcp 的
+> project·local scope 锚定进程 cwd。本文涉及上述概念的章节（决策 #28、§5.0、§5.1、§9.1 等）仅作历史记录保留。
+
 > **性质**：python-sdk 的 **CLI 表面**设计（如何让用户在 `a2c-computer` 上管理 marketplace/plugin/skill）。**不是协议规范**，也不是内部模型规范（后者归 [`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md)）。
 > **范本**：Claude Code 的 marketplace/plugin/skill 三层模型 + 意图/物化两层 + reconciler；本文档逐项对齐，仅在 A2C 分布式架构（Agent ↔ Server ↔ Computer 三进程）下调整必要的事件机制。
 > **追踪**：GitHub Issue [#39](https://github.com/A2C-SMCP/python-sdk/issues/39) 拓展范围。原 #39 仅落 `computer/skills/` 内部六模块；本设计补 CLI 命令/REPL/settings.json/reconciler 表面 UX。
@@ -35,12 +40,12 @@
 | 19 | Uninstall 级联 | 默认 stop+remove plugin 携带的 MCP server；`--keep-servers` 跳过 | |
 | 20 | settings.json 职责 | **只**放 `enabledPlugins` + `extraKnownMarketplaces` + MCP 门控字段 + trust policy 字段；**不放** MCP server 定义/inputs | 校正：MCP defs 移出 settings.json（见 #25） |
 | 21 | Reconciler | **additive-only 只增不删**（true-CC）；孤儿靠显式 `plugin uninstall` / `plugin gc` 清 | 校正：CC 不自动清理「声明没、物化有」 |
-| 22 | 老 flag 迁移 | settings.json 与 `--config/--inputs` **并存**；启动合并，settings 优先 | 不破坏老脚本 |
+| 22 | ~~老 flag 迁移~~ | **#154 已 supersede**：`--config`→`--mcp-config`（flag 层 mcp.json，次高）；`--inputs` 删除（inputs 段并入该文件）。无存量用户，不做兼容 | 见 §5.5 |
 | 23 | JSON 输出 | 启动时**全局** `--json` flag | REPL 内也默认 JSON |
 | 24 | 非交互形态 | Typer 子命令 + REPL 同名同义 | `a2c-computer marketplace add ...` 与 REPL `marketplace add ...` 走同一逻辑 |
 | 25 | MCP server 定义文件 | A2C **原生 schema**（`{servers,inputs}`）→ workspace/project `.tfrobot/mcp.json` + user `$XDG_CONFIG_HOME/a2c/mcp.json` | `server_parameters` 嵌套 + 治理字段与标准 `.mcp.json` 不兼容，**不同名混用**（§9.1） |
 | 26 | MCP 批准门控 | **全套 CC**：首见未知 server 弹批准框；`enableAllProjectMcpServers`/`enabledMcpjsonServers`/`disabledMcpjsonServers`；批准状态写 **local scope** | MCP 执行任意命令，每用户先批准（§9.2） |
-| 27 | inputs/env/secret | **完整对标 VS Code**：`${env:VAR}` + `${input:id}` + 预定义变量；`password:true` 走 **OS keyring**（`keyring` 库）；env 注入 `A2C_INPUT_<ID>`；`envFile`；**密钥永不落明文** | §9.3，含 headless 降级 |
+| 27 | inputs/env/secret | **完整对标 VS Code**：`${env:VAR}` + `${input:id}` + 预定义变量；`password:true` 走 **OS keyring**（`keyring` 库）；env 注入 `A2C_SMCP_<ENV_SEGMENT(ID)>`；`envFile`；**密钥永不落明文** | §9.3，含 headless 降级 |
 | 28 | scope 聚合 | **user 为主** + workspace **active workdir 单根**作 project/local（根随任务切换）+ **能力层**（`enabledPlugins`/`extraKnownMarketplaces`/skills）跨全部登记目录全局并集 | 访谈定稿；映射 CC `--add-dir`（详见 §5.0/§5.1） |
 
 ---
@@ -51,7 +56,7 @@
 
 1. **CLI 命令表面**：marketplace / plugin / skill 三组命名空间命令（add/install/list/info/enable/disable/refresh/remove）+ 现有命令保持。
 2. **REPL UX**：tab 补全、help 重组、Rich 进度反馈、Banner、zero-state 引导。
-3. **意图层文件**：`settings.json` 格式 + 五级 scope 合并；与现有 `--config/--inputs` 共存。
+3. **意图层文件**：`settings.json` 格式 + 多级 scope 合并（#154：与 `mcp.json` **同序**，flag 次高）；flag scope 的文件对 = `--settings` + `--mcp-config`。
 4. **Reconciler**：启动时声明 vs 物化对账；自动 clone 缺失、自动清理废弃。
 5. **事件触发链**：CLI 动作 → 缓存失效 → debounce 300ms → emit_update_skills；与文件 watcher 同节奏。
 6. **Trust 流程**：首次 add 弹 y/N；持久化进 `known_marketplaces.json`。
@@ -284,7 +289,7 @@ MCP server 走 **`<plugin>/mcp-servers/<name>.json`** 文件式（mcp-servers �
 
 | 命令 | 行为 |
 |---|---|
-| `plugin install <plugin>@<marketplace> [--version <v>]` | 安装单个 plugin。检查 MCP server 名冲突：bundled server name 已存在**且不归属本 plugin**（不在其 `bundledMcpServers` 记录里）→ **硬抛、原子失败、不留半装状态**（无 rename/force 逃生口）。`--version` 锁版本（暂用 git tag/SHA，v0.2.1 默认 latest）。 |
+| `plugin install <plugin>@<marketplace> [--version <v>]` | 安装单个 plugin。**MCP 依赖预检**（#153/D3）：声明依赖的 `bundle_id` 已存在于运行期权威配置集 → **依赖已满足 → 提示 + 正常安装**（MUST NOT 拒绝，§2.5-1；原「外来同名硬抛」已作废）。`--version` 锁版本（暂用 git tag/SHA，v0.2.1 默认 latest）。 |
 | `plugin uninstall <plugin>@<marketplace> [--keep-servers]` | 卸载。默认 stop+remove plugin 携带的 MCP server；`--keep-servers` 保留 MCP server config。 |
 | `plugin enable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = true`；emit_update_skills。 |
 | `plugin disable <plugin>@<marketplace>` | 写 `enabledPlugins[<id>] = false`；**停掉并从生效 MCP 定义层摘除该 plugin 携带的 MCP server**（与 §7.1 步骤 5「禁用 plugin 不合并其 mcp_servers」对齐——禁用 = 整 plugin 贡献下线）；**物化层保留**（clone 树 + installed_plugins.json 记录不动），`enable` 可廉价复原（重新挂载 server + 暴露 skill），无需重 clone/重装；emit_update_skills（server 停所引发的 tools 变更经 `server:update_tool_list` 同步广播）。区别于 `uninstall`：disable 留 installed 记录、可一键回滚；uninstall 删 installed 记录、移除 server config。 |
@@ -481,18 +486,30 @@ $XDG_CONFIG_HOME/a2c/                     # → ~/.config/a2c
 - **删字段**：写 `undefined`（= 删 key）。
 - 写后 `markInternalWrite(<path>)` 给 file-watcher 打标，**避免把自己的写回当用户手编触发重载循环**（CC `settings.ts:~500` 同款机制）。
 
-### 5.5 与现有 `--config @file` / `--inputs @file` 共存
+### 5.5 flag scope 的**文件对**：`--mcp-config @file` + `--settings @file`
 
-老 flag 现在喂的是 **MCP 定义层**（§9.1），不是 settings.json：
+> **#154 起（breaking）**：旧 `--config`（收「裸 server 对象/数组」、排最低优先级、绕开审批门直挂）→ 更名
+> **`--mcp-config`**（保留 `-c`）、形状硬切为 mcp.json 的 `{servers, inputs}`、**排次高**、与其余 scope 同路
+> 过审批门；旧 `--inputs` **已删除**（其职责由 `--mcp-config` 文件的 `inputs` 段承载）。旧格式文件 **fail-fast**
+> （exit 2）并提示改写。无存量用户，按通用口径不做兼容设计。
+
+`--mcp-config`（flag 层 mcp.json）与 `--settings`（flag 层 settings.json）构成 flag scope 的**文件对**，
+与其余 scope 的双文件形态对称（协议 runtime-contract §2.5-3）。它喂的是 **MCP 定义层**（§9.1），不是 settings.json：
 
 ```
 MCP 定义合并顺序（高 → 低，§9.1 scope；同 §5.1 active-workdir 单根模型）：
   1. policy（managed-mcp.json）            ← 最高
-  2. active workdir local (.tfrobot/mcp.local.json)
-  3. active workdir project (.tfrobot/mcp.json)
-  4. user ($XDG_CONFIG_HOME/a2c/mcp.json)
-  5. --config / --inputs flag             ← 老接口，最低优先级
-  6. 默认值
+  2. --mcp-config <file> flag             ← 次高，仅低于 policy（#154）
+  3. embed（Computer(mcp_servers=...) 构造入参）  ← 宿主代码级显式意图（#164）
+  4. active workdir local (.tfrobot/mcp.local.json)
+  5. active workdir project (.tfrobot/mcp.json)
+  6. user ($XDG_CONFIG_HOME/a2c/mcp.json)
+  7. plugin 声明（基线，**不经 resolve**——由 boot 序「existing wins」保证，见 §12）
+  8. 默认值
+
+  ⚠️ **本序自 #154/#164 起翻转**：历史把 `--config` flag 排**最低**（老接口遗留），协议
+  runtime-contract §2.5-3 已**废止**该形态——settings 与 mcp.json MUST 同序、flag 统一次高。
+  **顺序的唯一权威 = `settings/schema.py` 的 `SCOPE_ORDER`**，两个 resolve 均由它派生，勿再手写字面量。
 
   注：MCP 定义层同构 settings 的 (B) 层——**只取 active workdir** 的 mcp.json/mcp.local.json，
   **不**跨登记目录并集（无 active 时仅 user + flag + 默认）；批准门控随之一致。
@@ -501,8 +518,8 @@ MCP 定义合并顺序（高 → 低，§9.1 scope；同 §5.1 active-workdir �
 settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 ```
 
-- `--config @servers.json` / `--inputs @inputs.json` 等价于在 MCP 定义层最低优先级注入；
-- 老脚本零迁移即可继续工作；新场景推荐 `.tfrobot/mcp.json` + settings.json + GitOps。
+- `--mcp-config @flag-mcp.json` 等价于在 MCP 定义层**次高**优先级注入（仅低于 policy）；其 `inputs` 段与 servers 同路消费；
+- **旧 `--config`/`--inputs` 脚本需迁移**（形状硬切 + 更名，旧文件 fail-fast 并给出改写提示）；新场景推荐 `.tfrobot/mcp.json` + settings.json + GitOps。
 
 ### 5.6 校验与前向兼容（复刻 CC：passthrough + 全可选，无版本字段）
 
@@ -553,16 +570,27 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
         "commitSha": "abc1234",
         "installedAt": "2026-05-10T...",
         "lastUpdated": "2026-05-10T...",
-        "bundledMcpServers": ["figma-mcp"]
+        "mcpServers": ["figma-mcp"]
       }
     ]
   }
 }
 ```
 
-- `bundledMcpServers`：**A2C 扩展字段**（CC 的 installed_plugins.json **没有**此字段——CC 把 bundled MCP 存在 plugin 目录的 `.mcp.json` 里，uninstall 随 `deletePluginDataDir` 清）。A2C 为做 uninstall 级联（§4.3 决策 #19）显式记录该 plugin install 时注册的 MCP server name，用于精准清理。
+- `mcpServers`：**A2C 扩展字段**（CC 的 installed_plugins.json **没有**此字段）。语义 = 该 plugin **声明依赖**的
+  MCP Server **`bundle_id` 纯数组**（协议 runtime-contract §4.9.1-1，#153/D3+F1）。三条硬约束：
+  - **只记 `bundle_id`**，MUST NOT 记 display `name`（显式 `bundleId` 的 server 改名后账本名即过期）；
+  - MUST NOT 记「安装时本地是否已有」一类**时点快照事实**（provenance/introduced）——它随其他 plugin 卸载而
+    失真，是**传递性泄漏**之源（A 引入 X → B 装时已在 → 卸 A 后「X 由 A 引入」的事实随记录一起消失 → 卸 B 时
+    无人认领 ⇒ X 永久泄漏）。任何回收/门控/归属判定 MUST NOT 依赖此类字段；
+  - 语义是**依赖**而非**所有**：卸载 plugin **不等于**回收这些 server。
+- **回收判据**（§4.9.1-2，纯函数、零落盘状态）：disable/uninstall/gc 时对每个 `bundle_id` X ——
+  **回收 X ⟺ 无其他 plugin 声明依赖 X ∧ X 非用户声明**（`resolve_mcp_config()` 里无该 `bundle_id`）。
+  由此「用户自有 server 永不连坐」与「多 plugin 共享依赖不被提前摘、最后一个依赖者卸载时回收（无泄漏）」同时成立。
+  > 原字段名 `bundledMcpServers`（display **name** 数组，「uninstall 无条件级联清理」语义）已作废。旧格式账本
+  > **整条丢弃 + 从 `installedPlugins` 意图重建**（§4.9.1-4），**MUST NOT** 写 name→bundle_id 映射迁移逻辑。
 - 数组化：scope 维度（`scope`+`projectPath` 精确匹配），为「user + workspace 工作目录同时装、不同版本」预留（对齐 CC V2 schema，实际已支持多 scope 并存；v0.2.1 常见为单元素）。
-- 字段集对齐 CC：`scope`(managed|user|project|local) / `projectPath`(project/local 必填) / `installPath`(版本化路径) / `version` / `installedAt` / `lastUpdated` / `commitSha` + A2C 扩展 `bundledMcpServers`。
+- 字段集对齐 CC：`scope`(managed|user|project|local) / `projectPath`(project/local 必填) / `installPath`(版本化路径) / `version` / `installedAt` / `lastUpdated` / `commitSha` + A2C 扩展 `mcpServers`。
 
 ### 6.3 文件级写保护、原子写与损坏恢复
 
@@ -603,10 +631,13 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 ### 7.2 失败降级
 
 - git clone/pull 失败：记 ERROR、不阻断其余 marketplace、该 marketplace 标记为 `lastError`、对 Agent 不可见（Registry 不入册）。
-- **MCP server name 冲突（非对称处理）**：
-  - **冲突判定**：bundled server name 已存在 **且** 该 server 不在「待装 plugin 的 `bundledMcpServers` 记录」里（即不是它自己上次装的）。重装/重启时 plugin 自有的 server 命中自己 → **不算冲突**（幂等再物化）。
-  - **交互/CLI `plugin install`**：外来同名 → **硬抛**（`MCPServerNameConflictError`），原子失败、不留半装状态。用户自行解决（删/改自己的同名 server，或在自有 marketplace 仓库里改 plugin manifest 的 server name）。**不**提供 `--rename`/`--force-override`（类比「软件双开」：name 即身份，不给官方旁路；force-override 会静默毁用户配置，rename 会让 `mcp:<server>:*` 命名映射与 manifest 声明对不上）。
-  - **reconciler 启动自动加载**：外来同名 → **跳过该 plugin 加载 + WARN + 留意图层 `enabled` 不动**（不能让一个冲突 plugin 拖垮整个启动；冲突消解后重启即恢复）。
+- **MCP 依赖已满足（不是冲突）**——**已按 D3 重写，#153**：
+  - **判定**：plugin 声明依赖的 `bundle_id` 已存在于**运行期权威配置集** → **依赖已满足**。数据源 MUST 是
+    `manager.server_configs()`，**MUST NOT** 是构造期快照 `Computer.mcp_servers`（协议 §2.5-4）。
+  - **交互/CLI `plugin install`**：提示「依赖已满足、复用既有实例、卸载不移除它」→ **正常安装**（退出码 0）。
+    原「外来同名硬抛、原子失败、无 rename/force 逃生口」已作废（详见 §10.6）。
+  - **reconciler 启动自动加载 / 治理重挂**：同 `bundle_id` 已有 → **skip register**（复用既有实例，用户配置胜），
+    不覆盖、不阻断其余。
 - known_marketplaces.json 文件损坏：备份 `.corrupt-<ts>.bak` + 降级空配置 + 下次 reconcile 按 settings 声明重装（§6.3）。
 
 ### 7.3 显式 sync 与孤儿清理
@@ -704,7 +735,7 @@ class SkillEventDebouncer:
 | project | **active workdir** `<workdir>/.tfrobot/mcp.json` | 入 git、团队共享；**单根、不跨目录并集**；无 active 时空 |
 | local | **active workdir** `<workdir>/.tfrobot/mcp.local.json` | 不入 git；同上 |
 | policy | managed 路径下 `managed-mcp.json` | 企业下发 |
-| flag | `--config @file`（老接口，最低优先级） | 兼容 |
+| flag | `--mcp-config @file`（flag 层 mcp.json，**次高**、仅低于 policy；#154 由 `--config` 更名 + 形状硬切） | 与 `--settings` 构成 flag scope 文件对 |
 
 查找优先级 policy > active-local > active-project > user > flag（对齐 CC enterprise > local > project > user，A2C 主根随任务动态切换）。**无 active workdir** 时只取 user + flag + 默认；MCP server 定义**不**像能力层那样跨登记目录并集（敏感面隔离，与 §5.1 (B) 一致）。
 
@@ -761,7 +792,7 @@ A2C input 定义本就照搬 VS Code（promptString/pickString + `password`，A2
 **取值解析链**（`${input:id}` 按序解析，命中即止）：
 ```
 1. 进程内 cache (_cache)                          ← 本会话已解析
-2. 环境变量 A2C_INPUT_<ID_UPPER>                  ← 编排层/CI 注入（12-factor，密钥不落 A2C 盘）
+2. 环境变量 A2C_SMCP_<ENV_SEGMENT(ID)>            ← 编排层/CI 注入（12-factor，密钥不落 A2C 盘）
 3. OS keyring（仅 password:true）                 ← VS Code SecretStorage 等价（keyring 库）
 4. 非密钥持久化值（仅非 password）                ← $XDG_STATE_HOME/a2c/input-values.json
 5. 交互 prompt（仅 TTY；promptString/pickString/command 按现有 resolver）
@@ -780,8 +811,8 @@ A2C input 定义本就照搬 VS Code（promptString/pickString + `password`，A2
 **OS keyring 后端（对标 VS Code SecretStorage）**：`keyring` 库自动选 macOS Keychain / Windows Credential Manager / Linux Secret Service（libsecret）。
 
 **headless / keyring 不可用降级**（容器/CI/无 Secret Service）：
-- `password:true` 仍可经**步骤 2 env**（`A2C_INPUT_<ID>`）解析——这条永远在；
-- 若无 env 且无 keyring 且无 TTY → **硬错误**「secret `<id>` 无法解析；请用 `A2C_INPUT_<ID>` 环境变量或在 TTY 重试」，**绝不写明文**（杜绝 AWS Q 把密钥明文落盘的反模式）。
+- `password:true` 仍可经**步骤 2 env**（`A2C_SMCP_<ENV_SEGMENT(ID)>`）解析——这条永远在；
+- 若无 env 且无 keyring 且无 TTY → **硬错误**「secret `<id>` 无法解析；请用 `A2C_SMCP_<ENV_SEGMENT(ID)>` 环境变量或在 TTY 重试」，**绝不写明文**（杜绝 AWS Q 把密钥明文落盘的反模式）。
 
 **与 `.skillenv` 的边界（D1，与 tfrobot SKILL 协议 §5 交叉核对）**：本节的 `${input:}`/keyring/env 机制**只**服务 **MCP server 配置**的占位符解析；与 SKILL 的 `.skillenv` 是**不同层、不同机制、不重叠**：
 
@@ -933,26 +964,31 @@ a2c> marketplace add git@github.com:team/skills.git
 > **威胁模型有意只收紧非交互路径、放过交互 desync**：交互 add 必由在场真人敲入命令+URL，风险与非交互无人
 > 值守脚本不可同日而语，desync 由人把关。回归守卫见 `test_add_pretrusted_name_interactive_skips_prompt`。
 
-### 10.6 Plugin MCP server 冲突（硬抛、无逃生口）
+### 10.6 Plugin MCP 依赖已满足（提示、不拒绝）
 
-name 即身份，外来同名直接抛错——交互与非交互行为一致（无 prompt、无 flag 旁路）：
+> **⚠️ 本节已按协议 D3 重写（#153）**。原文为「name 即身份，外来同名硬抛、原子失败、无 rename/force 逃生口」
+> ——该裁决已被 [protocol Discussion #23](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/23) 终审
+> **正面推翻**：plugin 与 MCP Server 是 **依赖关系而非所有关系**（runtime-contract §2.5）。
+> `MCPServerNameConflictError` 已退役。
+
+plugin 以 `bundle_id` **声明依赖**；同 `bundle_id` 本地已有 = **依赖已满足** → 提示 + 正常安装：
 
 ```
 a2c> plugin install frontend-design@my-team-skills
 
-  ✗ MCP server name conflict: 'figma-mcp'
-    Existing: figma-mcp (added manually 2026-05-19, owner=user)
-    Plugin brings: figma-mcp (transport=stdio, command=node)
-
-  Install aborted. No changes made.
-  Resolve by one of:
-    • rename/remove your existing server:  server rm figma-mcp
-    • or rename the server in the plugin's own manifest (if you own the repo)
+  ℹ dependency satisfied: MCP server 'figma-mcp' already exists locally; this plugin
+    reuses it rather than creating a new one. Configs reconcile by scope precedence.
+    Uninstalling this plugin will not remove it.
+  ✓ installed 'frontend-design@my-team-skills' (1 MCP server(s) declared as dependencies,
+    not mounted) (disabled; run 'plugin enable ...' to activate)
 ```
 
-- **原子失败**：抛 `MCPServerNameConflictError`，plugin 与其 skills 一个都不装、不写 `installed_plugins.json`。
-- **判定排除自有**：若 `figma-mcp` 本就是该 plugin 上次装的（命中 `bundledMcpServers`）→ 不算冲突，正常幂等再物化。
-- 非交互 / `--json`：同样硬抛，退出码 1 + JSON error（`{"error":"mcp_server_name_conflict","name":"figma-mcp","owner":"user"}`）。
+- **MUST NOT 拒绝**（协议 §2.5-1）；退出码 0，交互与非交互一致。
+- **复用既有实例**：`plugin enable` 对已满足的依赖 **skip register**，不覆盖既有 server 配置。
+- **display name 相同、`bundle_id` 不同 = 合法共存**（§5.6），MUST NOT 视为冲突。
+- **唯一硬错误**：同一声明文件内多 key 归一到同一 `bundle_id`（fail-fast，§2.5-2）——那是**声明面**写法错误，
+  与本处**依赖面**是两回事。
+- **卸载不连坐**：见 §6.2 回收判据。
 
 ---
 
@@ -1026,7 +1062,7 @@ a2c_smcp/computer/
 | 文件 | 改动 |
 |---|---|
 | `computer.py` | 持有 `SettingsStore`、`Reconciler`、`SkillEventDebouncer`；启动调 reconcile（additive-only）；扩展 `_on_manager_change` 调 debouncer（与 [`design-0.2.1-skill-computer-management.md`](design-0.2.1-skill-computer-management.md) §5.1 同步） |
-| `inputs/resolver.py` | 解析链前插 env(`A2C_INPUT_<ID>`)→keyring→明文 state；prompt 后按类持久化（§9.3） |
+| `inputs/resolver.py` | 解析链前插 env(`A2C_SMCP_<ENV_SEGMENT(ID)>`)→keyring→明文 state；prompt 后按类持久化（§9.3） |
 | `inputs/render.py` | `${env:VAR}`/`${input:id}`/`${workspaceFolder}` 等变量替换 + `envFile` 加载（§9.1） |
 | `socketio/client.py` | `emit_update_skills` 改为通过 debouncer 触发（不裸调） |
 | `cli/main.py` | 新增 `--json` / `--settings <file>` / `--add-dir <dir>` / `--approve-all-mcp` 全局 flag；新增 typer 子命令（marketplace/plugin/skill/settings/migrate-settings） |
@@ -1058,12 +1094,12 @@ a2c_smcp/computer/
 ### 13.2 集成
 
 - `marketplace add` 全链路：trust prompt → 写 settings.json `trustedMarketplaces` → git clone → known_marketplaces.json（**无 trusted 字段**）落盘 → emit_update_skills。
-- `plugin install` 外来同名 MCP server → 硬抛 + 原子失败（不留半装）；自有同名 → 幂等放行；`plugin uninstall` 清理 bundledMcpServers。
+- `plugin install` 同 bundle_id 已有 → **依赖已满足：提示 + 正常安装**（#153/D3）；`plugin uninstall` 按 §4.9.1-2 回收判据处理 `mcpServers` 声明的依赖（无人再依赖 ∧ 非用户声明才回收）。
 - **MCP 批准门控**：workspace `.tfrobot/mcp.json` 未知 server → pending → 批准框 → 写 **local** `enabledMcpjsonServers`；plugin-bundled server 免批准直连。
-- **inputs 解析链**：env `A2C_INPUT_<ID>` 命中 → 不落盘；password prompt → keyring 存 → 重启不再问；非密钥 → 明文 state；keyring 不可用 + 无 env + 无 TTY → 硬错误。
+- **inputs 解析链**：env `A2C_SMCP_<ENV_SEGMENT(ID)>` 命中 → 不落盘；password prompt → keyring 存 → 重启不再问；非密钥 → 明文 state；keyring 不可用 + 无 env + 无 TTY → 硬错误。
 - File watcher：user/project 目录 SKILL.md 增删改 → debounce → emit；CLI 写回 settings 经 `markInternalWrite` 不触发重载循环。
 - Reconciler additive-only：物化多于声明的条目重启后**仍在**；`plugin gc` 才清。
-- `--config @file` + `.tfrobot/mcp.json` 同时存在 → settings/mcp 定义层优先合并。
+- `--mcp-config @file` + `.tfrobot/mcp.json` 同时存在 → 按 `SCOPE_ORDER` 合并，**flag 胜出**（#154）。
 
 ### 13.3 E2E（pexpect）
 
@@ -1076,7 +1112,7 @@ a2c_smcp/computer/
 
 - Sandbox 穿越 / `.skillenv` forbidden / `too_large` 不铸句柄 / staging 隔离 / name 寻址防越权。
 - Trust 拒绝：`strictKnownMarketplaces=true` + 不在 `trustedMarketplaces` + 非交互 `--json` → 退出码 1 + JSON error。
-- MCP server 外来同名冲突（交互/非交互一致）→ 硬抛 `MCPServerNameConflictError`、退出码 1、不留半装状态；自有同名 → 不触发。
+- MCP 依赖已满足（交互/非交互一致）→ 提示 + 退出码 0 正常安装；`enable` 复用既有实例不覆盖（#153/D3，原 `MCPServerNameConflictError` 已退役）。
 - **密钥不落明文**：`password:true` 值绝不出现在 `.tfrobot/mcp.json`/`input-values.json`/日志；keyring 不可用且无 env → 硬错误而非明文落盘。
 - **占位符不外泄**：`get_config`/`get_skills` payload 中 `${input:}`/`${env:}` 不展开，密钥不离开 Computer。
 
@@ -1132,13 +1168,13 @@ A ⫫ B（并行）；C 依赖 A+B；D 依赖 A；E 依赖 A/B/C/D；F 依赖 A/
 - [ ] **inputs/secret（VS Code 对标）**：解析链 env→keyring→明文 state→prompt→default；password 走 keyring 重启不再问；keyring 不可用降级 env，**绝不写明文**。
 - [ ] Trust：CC 风格 settings.json policy 字段计算（`strictKnownMarketplaces`/`trustedMarketplaces`/`blockedMarketplaces`）；known_marketplaces.json **无** trusted 字段。
 - [ ] `marketplace add/list/info/remove/refresh/set` 六命令完整；trust prompt 流程红→绿。
-- [ ] `plugin install/uninstall/enable/disable/list/info` + `plugin gc` 完整；MCP server 外来同名硬抛 + 原子失败、自有同名幂等放行；bundledMcpServers 联动卸载。
+- [ ] `plugin install/uninstall/enable/disable/list/info` + `plugin gc` 完整；MCP 依赖已满足 → 提示不拒绝、enable 复用不覆盖；`mcpServers` 依赖按回收判据卸载（用户自有永不连坐）。
 - [ ] **Reconciler additive-only**：物化多于声明不自动清理；孤儿靠 `plugin gc`/`marketplace prune`。
 - [ ] 物化文件**原子写 + 锁 + .corrupt 备份**（优于 CC writeFileSync）。
 - [ ] `skill list/info` 跨三源扁平视图。
 - [ ] `settings show/edit/get/set` 四命令；非编辑器场景纯 CLI 可改；写回经 `markInternalWrite` 不触发 watcher 重载循环。
 - [ ] `--json` 全局 flag：所有命令机器可读输出；JSON line-delimited 进度。
-- [ ] `--config/--inputs` 老 flag 与 `.tfrobot/mcp.json` 共存，启动合并。
+- [x] `--mcp-config` 与 `.tfrobot/mcp.json` 各 scope 按统一序合并（flag 次高）；旧 `--config`/`--inputs` 已移除（#154）。
 - [ ] Tab 补全：动词/子命令/flag/动态名称/文件路径全覆盖。
 - [ ] Help 分组：默认列 namespace、`help <ns>` 详情。
 - [ ] Banner 仅 `plugins=0 AND servers=0` 触发。

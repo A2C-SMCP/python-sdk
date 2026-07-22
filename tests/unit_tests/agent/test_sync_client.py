@@ -162,6 +162,7 @@ class TestSMCPAgentClient:
             "tools": [
                 {
                     "name": "test_tool",
+                    "bundle_id": "srv_x",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "Test tool",
                     "params_schema": {},
                     "return_schema": None,
@@ -194,6 +195,24 @@ class TestSMCPAgentClient:
 
         with pytest.raises(ValueError, match="Invalid response"):
             client.get_tools_from_computer("test_computer")
+
+    @patch("socketio.Client.call")
+    def test_get_config_from_computer_success(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """#149 B 半（sync 镜像）：从 Computer 获取 MCP 配置（servers 键 = bundle_id）。
+
+        实现落地前该方法不存在 → AttributeError（红灯）。GetComputerConfigRet 无 req_id → 不做 req_id 校验。
+        """
+        mock_call.return_value = {
+            "servers": {"my_srv": {"name": "my.srv", "type": "stdio", "bundle_id": "my_srv"}},
+            "inputs": None,
+        }
+
+        result = client.get_config_from_computer("test_computer")
+        assert "my_srv" in result["servers"]
+        assert result["servers"]["my_srv"]["name"] == "my.srv"
+        # args[0]=self、args[1]=event（同 test_emit_cancel_tool_call 约定）。
+        args, _ = mock_call.call_args
+        assert args[1] == "client:get_config"
 
     def test_handle_computer_enter_office(self, client: SMCPAgentClient, event_handler: MockEventHandler) -> None:
         """测试处理Computer加入办公室事件 / Test handle Computer enter office event"""
@@ -295,6 +314,7 @@ class TestSMCPAgentClient:
         tools = [
             SMCPTool(
                 name="test_tool",
+                bundle_id="srv_x",  # #152 D1：夹具 name ≠ bundle_id 分叉
                 description="Test tool",
                 params_schema={},
                 return_schema=None,

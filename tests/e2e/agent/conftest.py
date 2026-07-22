@@ -161,12 +161,14 @@ def _mock_computer_client(url: str) -> Iterator[socketio.Client]:
             "tools": [
                 {
                     "name": "echo",
+                    "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "echo input",
                     "params_schema": {"type": "object", "properties": {"message": {"type": "string"}}},
                     "return_schema": {"type": "object"},
                 },
                 {
                     "name": "add",
+                    "bundle_id": "addsrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "add two numbers",
                     "params_schema": {
                         "type": "object",
@@ -329,12 +331,14 @@ async def async_mock_computer_client(async_socketio_server, async_server_port: i
             "tools": [
                 {
                     "name": "echo",
+                    "bundle_id": "echosrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "echo input",
                     "params_schema": {"type": "object", "properties": {"message": {"type": "string"}}},
                     "return_schema": {"type": "object"},
                 },
                 {
                     "name": "add",
+                    "bundle_id": "addsrv",  # #152 D1：required，name ≠ bundle_id 分叉
                     "description": "add two numbers",
                     "params_schema": {
                         "type": "object",

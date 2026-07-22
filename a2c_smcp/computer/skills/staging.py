@@ -38,21 +38,21 @@ plugin install / #53）；``plugin_filter`` 形参供 #62 注入 ``enabledPlugin
 mcp 流程 / mcp flow：
 1. 经 ``manager.list_skill_resources`` 完整消费 cursor 拿到 server 全量 ``skill://`` 资源；
 2. 其中带 ``_meta.source∈{mounted,archive,resources}`` 者为 **SKILL 根**，按模式物化到
-   ``<home>/mcp/<normalized-server>/<skill>/``（marketplace SKILL v1 §2 包结构）：
+   ``<home>/mcp/<bundle_id>/<skill>/``（marketplace SKILL v1 §2 包结构）：
    - **mounted**：``_meta.mount_dir`` 本地目录 → 复制进 staging（自包含，避免符号链接绕过沙箱）；
    - **archive**：HTTP 拉 ``_meta.archive_uri`` → 校验 ``archive_sha256``（若有）+ 大小/解压/成员数上限（防 tar·zip bomb）
      → 安全解包（防穿越/拒符号链接）；
    - **resources**：枚举 ``skill://<root>/**`` 子资源，逐个 ``resources/read``，按相对路径安全写入 staging。
 3. 读 staged ``SKILL.md`` 的 YAML frontmatter 作为元数据权威源（§3：不镜像进 ``_meta``）；
    包根目录名校正为 ``frontmatter.name``（§4）；
-4. 合成 ``A2CSkillRef``（name = ``mcp:<normalized-server>:<frontmatter.name>``）→ 注册进 :class:`SkillRegistry`。
+4. 合成 ``A2CSkillRef``（name = ``mcp:<bundle_id>:<frontmatter.name>``，``<server>`` 段 = server 的
+   **bundle_id 原样**——skill.md §1.3；display ``name`` 允许碰撞、永不做键）→ 注册进 :class:`SkillRegistry`。
 
 user 流程 / user flow（与 mcp 的关键差异）：**就地发现、不复制进 SKILL Home**。扫描发现根
-``$A2C_SKILL_HOME/user/``（全局个人）+ **全部已登记工作目录** ``<workdir>/.tfrobot/skills/``（能力发现层、
-跨目录全局并集、不随 active workdir 切换）；发现单元 ``<root>/<skill>/SKILL.md``（根下**一级**）。
+``$A2C_SKILL_HOME/user/``（全局个人；#116 起仅 home 单根，workdir 维度 SKILL 已下沉 MCP 服务经
+``skill://`` 承载）；发现单元 ``<root>/<skill>/SKILL.md``（根下**一级**）。
 - **name = 目录 basename**（单段裸名，§5.0）——就地目录不可改名，与 sandbox 的 name 寻址（S2）一致；
   ``frontmatter.name`` 仅参考（不一致记 DEBUG）；basename 非严格 kebab → 跳过。
-- **优先级（低→高）**：``user/`` < 各 workdir（按登记序，**后者覆盖前者** + WARN）。
 - 深于一级的 ``SKILL.md``（``<root>/a/b/SKILL.md``）→ 忽略 + DEBUG（user 源单段命名，不嵌套）。
 - 重扫幂等：已注册 → ``update``（含孤儿恢复），否则 ``register``；磁盘删除项的孤儿标记交 reconciler（#62）/
   watcher（#67）按返回的发现 name 列表 diff，本函数不负责。
@@ -89,7 +89,6 @@ from a2c_smcp.computer.skills.home import (
     marketplace_skill_dir,
     mcp_skill_dir,
     user_dropin_root,
-    workdir_skill_root,
 )
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
@@ -105,7 +104,6 @@ from a2c_smcp.computer.skills.manifest import (
 )
 from a2c_smcp.computer.skills.naming import (
     SkillNameError,
-    normalize_mcp_server_segment,
     synthesize_marketplace_name,
     synthesize_mcp_name,
     synthesize_user_name,
@@ -414,7 +412,7 @@ def _apply_frontmatter_optional_fields(ref: A2CSkillRef, frontmatter: dict[str, 
 
 def _build_ref(
     name: str,
-    normalized_server: str,
+    bundle_id: str,
     frontmatter: dict[str, Any],
     meta: dict[str, Any],
     path: Path,
@@ -423,7 +421,9 @@ def _build_ref(
     """从已合成 ``name`` + frontmatter + ``_meta`` 组装 A2CSkillRef / Assemble A2CSkillRef from precomputed name + frontmatter。"""
     ref: A2CSkillRef = {
         "name": name,
-        "source": f"mcp:{normalized_server}",
+        # source 与 name 同头，server 部分统一取 bundle_id（skill.md §1.2）——Agent 据此把一条 SKILL
+        # 关联回 get_config.servers / get_resources.mcp_server 里的同一 A2C server。
+        "source": f"mcp:{bundle_id}",
         "uri": uri,
         "path": str(path),
         "description": str(frontmatter["description"]),
@@ -441,30 +441,33 @@ async def stage_mcp_skills(
     registry: SkillRegistry,
     home: Path,
     *,
-    server_name: str | None = None,
+    bundle_id: str | None = None,
     archive_fetch: ArchiveFetcher | None = None,
 ) -> list[str]:
     """
     枚举并物化 mcp 源 SKILL，注册进 Registry / Enumerate, materialize and register mcp-source SKILLs。
 
-    :param manager: 提供 ``list_skill_resources(server_name)`` 与 ``read_resource(server, uri)`` 的 MCP 管理器。
+    :param manager: 提供 ``list_skill_resources(bundle_id)`` 与 ``read_resource(bundle_id, uri)`` 的 MCP 管理器。
     :param registry: 目标 :class:`SkillRegistry`。
     :param home: SKILL Home 绝对根（见 :mod:`~a2c_smcp.computer.skills.home`）。
-    :param server_name: 若提供仅物化该 server（ResourceListChanged 单 server 重物化）；否则全部活跃 server。
+    :param bundle_id: 若提供仅物化该 server（ResourceListChanged 单 server 重物化）；否则全部活跃 server。
     :param archive_fetch: 归档拉取替身（默认 aiohttp）；便于测试注入。
     :return: 成功注册（或刷新）的 SKILL name 列表 / names successfully registered (or refreshed).
     """
     fetch = archive_fetch or _default_archive_fetch
-    pairs: list[tuple[str, Resource]] = await manager.list_skill_resources(server_name)
+    pairs: list[tuple[str, Resource]] = await manager.list_skill_resources(bundle_id)
 
     by_server: dict[str, list[Resource]] = defaultdict(list)
-    for sname, res in pairs:
-        by_server[sname].append(res)
+    for bid, res in pairs:
+        by_server[bid].append(res)
 
     registered: list[str] = []
     seen_this_run: set[str] = set()  # 本 run 已处理的合成 name，用于真冲突检测（§1.5 保留先到者）
-    for sname, resources in by_server.items():
-        normalized_server = normalize_mcp_server_segment(sname)
+    # 循环变量刻意用 `bid` 而非 `bundle_id`：后者是本函数形参（单 server 过滤器），同名重绑定会让
+    # 循环后任何对形参的读取静默拿到「最后一个 server 的 id」。
+    for bid, resources in by_server.items():
+        # bid = manager 身份键，同时即 SKILL ``<server>`` 段与磁盘路径分组键（skill.md §1.3）。
+        # display ``name`` 纯展示、允许碰撞、永不做键——不参与此处任何构造。
         for res in resources:
             meta = dict(getattr(res, "meta", None) or {})
             mode = meta.get("source")
@@ -477,7 +480,7 @@ async def stage_mcp_skills(
                 logger.error("skill root URI has no path segment, skipped: %s", root_uri)
                 continue
 
-            staged = mcp_skill_dir(home, normalized_server, leaf)
+            staged = mcp_skill_dir(home, bid, leaf)
             try:
                 if mode == "mounted":
                     _materialize_mounted(meta, staged)
@@ -485,21 +488,20 @@ async def stage_mcp_skills(
                     await _materialize_archive(meta, staged, fetch)
                 else:  # resources
                     subs = [r for r in resources if str(r.uri).startswith(root_uri + "/")]
-                    await _materialize_resources(partial(manager.read_resource, sname), root_uri, subs, staged)
+                    await _materialize_resources(partial(manager.read_resource, bid), root_uri, subs, staged)
             except Exception as e:
                 logger.error("materialize failed for %s (mode=%s): %s", root_uri, mode, e, exc_info=True)
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
 
-            name = _finalize_and_register(sname, normalized_server, meta, staged, root_uri, home, registry, seen_this_run)
+            name = _finalize_and_register(bid, meta, staged, root_uri, home, registry, seen_this_run)
             if name is not None:
                 registered.append(name)
     return registered
 
 
 def _finalize_and_register(
-    server_name: str,
-    normalized_server: str,
+    bundle_id: str,
     meta: dict[str, Any],
     staged: Path,
     root_uri: str,
@@ -521,7 +523,7 @@ def _finalize_and_register(
         return None
 
     try:
-        name = synthesize_mcp_name(server_name, str(frontmatter["name"]))
+        name = synthesize_mcp_name(bundle_id, str(frontmatter["name"]))
     except SkillNameError as e:
         logger.error("skill name synthesis failed, skipped: %s (%s)", root_uri, e.reason)
         shutil.rmtree(staged, ignore_errors=True)
@@ -536,38 +538,20 @@ def _finalize_and_register(
     seen_this_run.add(name)
 
     # 包根目录名校正为 frontmatter.name（skill.md §4）
-    final = mcp_skill_dir(home, normalized_server, str(frontmatter["name"]))
+    final = mcp_skill_dir(home, bundle_id, str(frontmatter["name"]))
     if final != staged:
         if final.exists():
             shutil.rmtree(final, ignore_errors=True)
         final.parent.mkdir(parents=True, exist_ok=True)
         staged.rename(final)
 
-    ref = _build_ref(name, normalized_server, frontmatter, meta, final, root_uri)
+    ref = _build_ref(name, bundle_id, frontmatter, meta, final, root_uri)
     # 本 run 已 seen 去重；此处 name in registry 必为跨 run 既存的同一 SKILL → update（刷新/孤儿恢复）
     ok = registry.register_or_update(ref)
     return name if ok else None
 
 
 # ── user 源 DropIn（就地发现，不 staging）/ user-source in-place DropIn ────────
-def _user_dropin_roots(home: Path, workdirs: Sequence[Path]) -> list[Path]:
-    """
-    user 源 DropIn 发现根，按优先级**升序**（低→高，后者覆盖）+ 解析去重 / Ascending-priority deduped roots。
-
-    顺序 = ``[<home>/user]`` + ``[<workdir>/.tfrobot/skills ...]``（登记序）。``resolve()`` 后按路径去重保序，
-    避免同一目录被登记两次造成重复扫描 + 假 WARN（首次出现定其优先级槽位）。
-    """
-    ordered: list[Path] = [user_dropin_root(home).resolve()]
-    ordered.extend(workdir_skill_root(wd).resolve() for wd in workdirs)
-    seen: set[Path] = set()
-    deduped: list[Path] = []
-    for root in ordered:
-        if root not in seen:
-            seen.add(root)
-            deduped.append(root)
-    return deduped
-
-
 def _iter_user_skill_dirs(root: Path) -> Iterator[Path]:
     """
     枚举发现根下的 SKILL 目录 / Yield ``<root>/<skill>/`` whose ``<skill>/SKILL.md`` exists（根下**一级**）。
@@ -630,44 +614,32 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
 def stage_user_skills(
     registry: SkillRegistry,
     home: Path,
-    workdirs: Sequence[Path] = (),
 ) -> list[str]:
     """
     枚举 user 源 DropIn 并注册进 Registry（**就地发现、不复制**）/ Discover user-source DropIn skills in place。
 
-    扫描 ``<home>/user/`` + 各 ``<workdir>/.tfrobot/skills/``（能力发现层全局并集，**不随 active workdir 切换**）；
-    发现单元 ``<root>/<skill>/SKILL.md``（根下一级），name = 目录 basename（单段裸名）。同名按发现根优先级
-    **后者覆盖前者**（``user/`` 最低 < 各 workdir 登记序），覆盖时记 WARN（便于诊断「为何我的 skill 不显示」）。
+    扫描 ``<home>/user/``（#116 起仅 home 单根；workdir 维度 SKILL 已下沉 MCP 服务经 ``skill://`` 承载）；
+    发现单元 ``<root>/<skill>/SKILL.md``（根下一级），name = 目录 basename（单段裸名）。
 
     :param registry: 目标 :class:`SkillRegistry`。
     :param home: SKILL Home 绝对根（见 :mod:`~a2c_smcp.computer.skills.home`）。
-    :param workdirs: workspace **已登记工作目录**（按登记序；调用方提供，本函数不耦合 workspace 登记模块）。
     :return: 本次发现并成功注册/刷新的 SKILL name 列表 / discovered & registered names（供 reconciler/watcher diff 孤儿）。
     """
-    winners: dict[str, tuple[A2CSkillRef, Path]] = {}  # name → (ref, 发现目录)；后者覆盖前者
-    for root in _user_dropin_roots(home, workdirs):
-        for skill_dir in _iter_user_skill_dirs(root):
-            basename = skill_dir.name
-            try:
-                name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
-            except SkillNameError as e:
-                logger.error("user DropIn skill dir name invalid, skipped: %s (%s)", skill_dir, e.reason)
-                continue
-            ref = _build_user_ref(name, skill_dir)
-            if ref is None:
-                continue
-            prev = winners.get(name)
-            if prev is not None:
-                logger.warning(
-                    "user SKILL %r at %s shadows earlier DropIn at %s (later root wins)",
-                    name,
-                    skill_dir,
-                    prev[1],
-                )
-            winners[name] = (ref, skill_dir)
+    winners: dict[str, A2CSkillRef] = {}  # name → ref（单根下 basename 唯一，无跨根遮蔽）
+    for skill_dir in _iter_user_skill_dirs(user_dropin_root(home).resolve()):
+        basename = skill_dir.name
+        try:
+            name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
+        except SkillNameError as e:
+            logger.error("user DropIn skill dir name invalid, skipped: %s (%s)", skill_dir, e.reason)
+            continue
+        ref = _build_user_ref(name, skill_dir)
+        if ref is None:
+            continue
+        winners[name] = ref
 
     registered: list[str] = []
-    for name, (ref, _) in winners.items():
+    for name, ref in winners.items():
         # 跨 run 既存（active 或 orphan）→ update（刷新 / 孤儿恢复）；否则 register。
         if registry.register_or_update(ref):
             registered.append(name)

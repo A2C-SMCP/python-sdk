@@ -35,9 +35,11 @@ NAMESPACES: dict[str, str] = {
 NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
     "server": [
         ("server add <json|@file>", "添加或更新 MCP 配置 / add or update config"),
-        ("server rm <name>", "移除 MCP 配置 / remove config"),
-        ("start <name>|all", "启动客户端 / start client(s)"),
-        ("stop <name>|all", "停止客户端 / stop client(s)"),
+        # #143：三个动词收 <name|bundle_id>——CLI 经 resolve.py 解析（name 唯一命中 → 其 bundle_id；同名多条
+        # 则列候选要求改用 bundle_id）。bundle_id 可经 `status` 查看。
+        ("server rm <name|bundle_id>", "移除 MCP 配置 / remove config"),
+        ("start <name|bundle_id>|all", "启动客户端 / start client(s)"),
+        ("stop <name|bundle_id>|all", "停止客户端 / stop client(s)"),
     ],
     "inputs": [
         ("inputs load <@file>", "从文件加载 inputs 定义 / load inputs"),
@@ -56,9 +58,9 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("plugin install <plugin>@<mp> [--version V] [--scope S]", "安装 plugin（外来 MCP 同名硬抛）/ install (name conflict aborts)"),
         ("plugin uninstall <plugin>@<mp> [--keep-servers]", "卸载 plugin / uninstall"),
         ("plugin enable|disable <plugin>@<mp>", "启用 / 禁用（整 plugin 上/下线）/ enable / disable (whole plugin)"),
-        ("plugin list [--available] [--json]", "列出 installed plugin / list plugins"),
+        ("plugin list [--json]", "列出全部 installed plugin（--available 已弃用）/ list plugins (--available deprecated)"),
         ("plugin info <plugin>@<mp> [--json]", "plugin 详情 / plugin detail"),
-        ("plugin gc", "清理孤儿 plugin / gc orphan plugins"),
+        ("plugin gc [--prune-dangling]", "清理孤儿 plugin + 诊断/prune 悬挂意图 / gc orphans + dangling intents"),
     ],
     "skill": [
         ("skill list [--source mp|mcp|user] [--json]", "跨源列出可见 SKILL / list skills"),
@@ -121,9 +123,9 @@ FLAGS: dict[tuple[str, str], list[str]] = {
     ("plugin", "uninstall"): ["--keep-servers", "--json"],
     ("plugin", "enable"): ["--json"],
     ("plugin", "disable"): ["--json"],
-    ("plugin", "list"): ["--available", "--json"],
+    ("plugin", "list"): ["--available", "--json"],  # --available 已弃用（兼容 no-op），保留补全至移除
     ("plugin", "info"): ["--json"],
-    ("plugin", "gc"): ["--json"],
+    ("plugin", "gc"): ["--prune-dangling", "--json"],
     ("settings", "show"): ["--scope", "--json"],
     ("settings", "get"): ["--scope", "--json"],
     ("settings", "set"): ["--scope", "--json"],

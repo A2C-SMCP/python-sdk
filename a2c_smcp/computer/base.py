@@ -54,7 +54,7 @@ class BaseComputer(Generic[S], ABC):
 
     # -------- MCP Server lifecycle --------
     @abstractmethod
-    async def aremove_server(self, server_name: str, *, session: S | None = None) -> None:  # pragma: no cover
+    async def aremove_server(self, bundle_id: str, *, session: S | None = None) -> None:  # pragma: no cover
         """
         中文: 动态移除某个服务配置。
         English: Remove a server config dynamically.

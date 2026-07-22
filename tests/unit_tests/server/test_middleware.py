@@ -20,7 +20,12 @@ from a2c_smcp.server.middleware import (
     check_a2c_version,
 )
 from a2c_smcp.version import ProtocolVersion
+from tests.protocol_versions import COMPATIBLE_PEER, INCOMPATIBLE_PEER
 
+# 注：``SERVER`` / ``TestCheckA2CVersion`` 用固定 0.2.0 输入验证 check_a2c_version 的判定**逻辑**，
+# 不耦合 SDK ``PROTOCOL_VERSION``，无需随协议升级改动。
+# 而下方 ASGI/WSGI 中间件用例走 **默认 server_version(=PROTOCOL_VERSION)**，故其兼容/不兼容 client
+# 版本从 ``COMPATIBLE_PEER`` / ``INCOMPATIBLE_PEER`` 派生（不硬编码具体协议版本值）。
 SERVER = ProtocolVersion.parse("0.2.0")
 
 
@@ -85,13 +90,13 @@ class TestASGIMiddleware:
         mw = A2CProtocolVersionASGIMiddleware(app, socketio_path="/socket.io")
         out = await _drive_asgi(
             mw,
-            {"type": "http", "path": "/socket.io/", "query_string": b"EIO=4&transport=polling&a2c_version=0.3.0"},
+            {"type": "http", "path": "/socket.io/", "query_string": f"EIO=4&transport=polling&a2c_version={INCOMPATIBLE_PEER}".encode()},
         )
         start = out["messages"][0]
         body = json.loads(out["messages"][1]["body"])
         assert start["status"] == 400
         assert (b"x-a2c-error-code", b"4008") in start["headers"]
-        assert body["code"] == 4008 and body["client_version"] == "0.3.0"
+        assert body["code"] == 4008 and body["client_version"] == INCOMPATIBLE_PEER
         assert called["hit"] is False  # 不得进入下游 socketio handler
 
     @pytest.mark.asyncio
@@ -108,7 +113,7 @@ class TestASGIMiddleware:
         app, called = downstream_marker
         mw = A2CProtocolVersionASGIMiddleware(app, socketio_path="/socket.io")
         out = await _drive_asgi(
-            mw, {"type": "http", "path": "/socket.io/", "query_string": b"a2c_version=0.2.5"}
+            mw, {"type": "http", "path": "/socket.io/", "query_string": f"a2c_version={COMPATIBLE_PEER}".encode()}
         )
         assert called["hit"] is True
         assert out["messages"][1]["body"] == b"DOWNSTREAM"
@@ -141,7 +146,7 @@ class TestASGIMiddleware:
             {
                 "type": "websocket",
                 "path": "/socket.io/",
-                "query_string": b"a2c_version=0.3.0",
+                "query_string": f"a2c_version={INCOMPATIBLE_PEER}".encode(),
                 "extensions": {"websocket.http.response": {}},
             },
             recv_events=[{"type": "websocket.connect"}],
@@ -159,13 +164,13 @@ class TestASGIMiddleware:
             {
                 "type": "websocket",
                 "path": "/socket.io/",
-                "query_string": b"a2c_version=0.3.0",
+                "query_string": f"a2c_version={INCOMPATIBLE_PEER}".encode(),
                 "extensions": {"websocket.http.response": {}},
             },
             recv_events=[{"type": "websocket.connect"}],
         )
         http_out = await _drive_asgi(
-            mw, {"type": "http", "path": "/socket.io/", "query_string": b"a2c_version=0.3.0"}
+            mw, {"type": "http", "path": "/socket.io/", "query_string": f"a2c_version={INCOMPATIBLE_PEER}".encode()}
         )
         ws_start, ws_body = ws_out["messages"][0], ws_out["messages"][1]
         http_start, http_body = http_out["messages"][0], http_out["messages"][1]
@@ -191,7 +196,7 @@ class TestASGIMiddleware:
         mw = A2CProtocolVersionASGIMiddleware(app, socketio_path="/socket.io")
         out = await _drive_asgi(
             mw,
-            {"type": "websocket", "path": "/socket.io/", "query_string": b"a2c_version=0.3.0"},
+            {"type": "websocket", "path": "/socket.io/", "query_string": f"a2c_version={INCOMPATIBLE_PEER}".encode()},
             recv_events=[{"type": "websocket.connect"}],
         )
         close = out["messages"][-1]
@@ -210,7 +215,7 @@ class TestASGIMiddleware:
             {
                 "type": "websocket",
                 "path": "/socket.io/",
-                "query_string": b"a2c_version=0.3.0",
+                "query_string": f"a2c_version={INCOMPATIBLE_PEER}".encode(),
                 "extensions": {"websocket.http.response": {}},
             },
             recv_events=[{"type": "websocket.disconnect"}],  # 首事件非 connect
@@ -225,7 +230,7 @@ class TestASGIMiddleware:
         mw = A2CProtocolVersionASGIMiddleware(app, socketio_path="/socket.io")
         await _drive_asgi(
             mw,
-            {"type": "websocket", "path": "/socket.io/", "query_string": b"a2c_version=0.2.7"},
+            {"type": "websocket", "path": "/socket.io/", "query_string": f"a2c_version={COMPATIBLE_PEER}".encode()},
             recv_events=[{"type": "websocket.connect"}],
         )
         assert called["hit"] is True
@@ -305,7 +310,7 @@ class TestWSGIMiddleware:
 
         mw = A2CProtocolVersionWSGIMiddleware(app, socketio_path="/socket.io")
         sr, cap = self._start_response_collector()
-        body = b"".join(mw({"PATH_INFO": "/socket.io/", "QUERY_STRING": "a2c_version=0.3.0"}, sr))
+        body = b"".join(mw({"PATH_INFO": "/socket.io/", "QUERY_STRING": f"a2c_version={INCOMPATIBLE_PEER}"}, sr))
         assert cap["status"].startswith("400")
         assert ("x-a2c-error-code", "4008") in cap["headers"]
         assert json.loads(body)["code"] == 4008
@@ -317,7 +322,7 @@ class TestWSGIMiddleware:
 
         mw = A2CProtocolVersionWSGIMiddleware(app, socketio_path="/socket.io")
         sr, _ = self._start_response_collector()
-        body = b"".join(mw({"PATH_INFO": "/socket.io/", "QUERY_STRING": "a2c_version=0.2.0"}, sr))
+        body = b"".join(mw({"PATH_INFO": "/socket.io/", "QUERY_STRING": f"a2c_version={COMPATIBLE_PEER}"}, sr))
         assert body == b"DOWNSTREAM"
 
     def test_path_scope_non_socketio_untouched(self) -> None:
@@ -367,7 +372,7 @@ class TestWSGIMiddleware:
         sr, cap = self._start_response_collector()
         environ = {
             "PATH_INFO": "/socket.io/",
-            "QUERY_STRING": "EIO=4&transport=websocket&a2c_version=0.3.0",
+            "QUERY_STRING": f"EIO=4&transport=websocket&a2c_version={INCOMPATIBLE_PEER}",
             "HTTP_UPGRADE": "websocket",
             "HTTP_CONNECTION": "Upgrade",
         }
