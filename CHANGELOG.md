@@ -5,11 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) versioning.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-22
 
-> A2C-SMCP protocol **v0.2.0 GA** implementation. SDK package version bump to
-> `0.2.0` is performed separately at release cut. Tracking issue:
-> [#8](https://github.com/A2C-SMCP/python-sdk/issues/8).
+> **A2C-SMCP 协议 v0.3.0 GA** 实现。SDK 包版本 `0.3.0`。
+> 主线：server-name-as-identity 历史残留彻底清除——`bundle_id` 成为 MCP Server
+> 唯一身份/主键/路由键，`name` 降为纯展示（允许同名合法共存）。三方共识见
+> a2c-smcp-protocol Discussion #23（F1–F8 终审，无遗留裁决）。
+>
+> 注：v0.2.0 / v0.2.1 发版时 CHANGELOG 未单独切段，本段累积 [0.1.5a1] 以来的全部
+> 变更。其中 v0.2 协议面（连接握手 `a2c_version` / `client:get_resources` /
+> `window://` URI 纯标识符化 / DPE 移除）已随 v0.2.x 发布；本版本（v0.3）新增为
+> BundleID 身份模型、两套 scope 层序统一、env 命名全迁、审批门档④根治、上游授权
+> 错误 4006/4007 surfacing、plugin install/enable 分离。
 
 ### Breaking Changes
 - **MCP inventory projection re-keyed to `bundle_id`; `managedBy` is now pure-derived** (#144, mirrors
