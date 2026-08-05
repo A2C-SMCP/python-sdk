@@ -31,7 +31,7 @@ from typing import Any
 from a2c_smcp.computer.cli.commands import flag_value, format_settings_errors, resolved_settings_with_errors
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.policy import resolve_policy_settings
-from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError
+from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError, validate_settings
 from a2c_smcp.computer.settings.scope import (
     apply_write,
     load_settings_file,
@@ -99,12 +99,12 @@ def _read_scope_with_errors(
             return {}, []
         return load_settings_file(flag_path, SettingsScope.FLAG)
     if scope == "policy":
-        # policy 层 = resolve_policy_settings 的 first-source-wins 结果，此处**未经 validate_settings**、
-        # 按原始 dict 返回（与 rust ``read_scope_with_errors`` 的 policy 分支同形，双端一致）。
-        # 已知缺口（#157 fix-review 🟡）：故 ``settings show --scope policy`` 看到的字段可能在 merged 路径
-        # 被判废（如 allowedMcpServers 类型错）却在此零警告。**不是「没有校验通道」**——validate_settings
-        # 就在同模块、``scope.py`` 的 resolve_settings 正是这么用的；只是行为变更须双端同步，另立 issue。
-        return resolve_policy_settings(env=env), []
+        # #161：policy 层 = resolve_policy_settings 的 first-source-wins 结果，再经 validate_settings
+        # 做字段级容错校验（类型错等）。其他 scope 均经 load_settings_file → validate_settings 或
+        # resolve_settings 内 validate_settings——policy 不能例外，否则 ``settings show --scope policy``
+        # 对 type-error 字段零警告（企业白名单失效 = 安全事故）。对拍 rust 同构缺口（待跟修）。
+        raw = resolve_policy_settings(env=env)
+        return validate_settings(raw, SettingsScope.POLICY)
     return None
 
 

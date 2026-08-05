@@ -163,6 +163,64 @@ def test_get_overreach_field_explains_instead_of_bare_not_set(
     assert "settings.local.json" in captured.err
 
 
+# ── policy scope validation（#161）/ policy scope validation ────────────────────
+def test_show_policy_surfaces_validation_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#161：``settings show --scope policy`` 须经 validate_settings，策略含类型错 → stderr 出警告。
+
+    用 monkeypatch 直接替换 resolve_policy_settings 返回含类型错的 dict（无需操作系统路径）。
+    Before: policy 分支绕过 validate_settings，返回空 [] → stdout 含 invalid 字段、stderr 空。
+    After: 经 validate_settings → 类型错字段被过滤 + stderr 呈现。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    capsys.readouterr()
+
+    # 模拟 policy 返回含类型错的 dict：allowedMcpServers 应为 array，这里给 string
+    import a2c_smcp.computer.cli.commands.settings as settings_cmd_mod
+
+    monkeypatch.setattr(
+        settings_cmd_mod,
+        "resolve_policy_settings",
+        lambda **kw: {"allowedMcpServers": "not-a-list", "trustedMarketplaces": ["mp"]},
+    )
+
+    assert settings_cmd.settings_show(home, env, scope="policy", json_output=True) == 0
+    captured = capsys.readouterr()
+
+    data = json.loads(captured.out)
+    # allowedMcpServers 因类型错已被 validate_settings 过滤出 cleaned
+    assert "allowedMcpServers" not in data
+    # 同 dict 中合法字段照常保留
+    assert data.get("trustedMarketplaces") == ["mp"]
+    # stderr 有警告
+    assert "allowedMcpServers" in captured.err
+
+
+def test_show_policy_valid_fields_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#161：policy 全有效 → stderr 空，stdout JSON 正确。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    capsys.readouterr()
+
+    import a2c_smcp.computer.cli.commands.settings as settings_cmd_mod
+
+    monkeypatch.setattr(
+        settings_cmd_mod,
+        "resolve_policy_settings",
+        lambda **kw: {"allowedMcpServers": ["a"], "trustedMarketplaces": ["mp"]},
+    )
+
+    assert settings_cmd.settings_show(home, env, scope="policy", json_output=True) == 0
+    captured = capsys.readouterr()
+
+    data = json.loads(captured.out)
+    assert data["allowedMcpServers"] == ["a"]
+    assert data["trustedMarketplaces"] == ["mp"]
+    assert captured.err == ""
+
+
 # ── edit ──────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_edit_opens_editor_and_returns_reconcile_cb(tmp_path: Path) -> None:

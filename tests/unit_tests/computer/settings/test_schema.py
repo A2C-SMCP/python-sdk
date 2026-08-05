@@ -290,3 +290,25 @@ def test_permissions_additional_directories_absolute_only() -> None:
 def test_source_path_backfilled_into_errors() -> None:
     _, errors = validate_settings({"strictKnownMarketplaces": 1}, SettingsScope.USER, source_path="/x/settings.json")
     assert errors[0].source_path == "/x/settings.json"
+
+
+# ---------------------------------------------------------------------------
+# #161：policy scope 经 validate_settings 检测字段类型错 / type-error detection for policy scope
+# ---------------------------------------------------------------------------
+def test_validate_settings_policy_scope_detects_type_errors() -> None:
+    """policy scope 中字段类型错（如 allowedMcpServers 不是 array）→ 过滤 + 记错。"""
+    raw = {
+        "allowedMcpServers": "not-a-list",  # 应为 array
+        "deniedMcpServers": ["legit-deny"],
+        "trustedMarketplaces": ["mp"],
+    }
+    cleaned, errors = validate_settings(raw, SettingsScope.POLICY)
+    # allowedMcpServers 类型错 → 从 cleaned 中剔除
+    assert "allowedMcpServers" not in cleaned
+    # deniedMcpServers 类型正确 → 保留
+    assert cleaned.get("deniedMcpServers") == ["legit-deny"]
+    # 非 policy-only 字段正常保留
+    assert cleaned.get("trustedMarketplaces") == ["mp"]
+    # 类型错产出 errors
+    assert len(errors) >= 1
+    assert any("allowedMcpServers" in e.field for e in errors)
