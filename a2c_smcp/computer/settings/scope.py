@@ -227,10 +227,14 @@ class ResolvedSettings:
     ``settings show`` / 诊断命令呈现，§5.6），已按出现顺序去重。
     ``settings`` is the merged view; ``errors`` aggregates field-level validation errors
     (non-fatal, deduped, surfaced via diagnostics).
+
+    ``per_scope_layers``（v0.3.2）为 per-scope 校验后的原始层，供 enable origin 判定等需要
+    scope 来源保真的下游消费（#159 Option B / 协议 §5 item 10 条件化）。
     """
 
     settings: dict[str, Any]
     errors: list[SettingsValidationError] = field(default_factory=list)
+    per_scope_layers: dict[SettingsScope, dict[str, Any]] = field(default_factory=dict)
 
 
 def _dedup_errors(errors: Sequence[SettingsValidationError]) -> list[SettingsValidationError]:
@@ -291,7 +295,7 @@ def resolve_settings(
     errors.extend(policy_errors)
 
     # 顺序**派生**自 SCOPE_ORDER（协议 §2.5-3 唯一权威），不手写字面量 / order derived, never hand-written.
-    by_scope: dict[SettingsScope, Mapping[str, Any]] = {
+    by_scope: dict[SettingsScope, dict[str, Any]] = {
         SettingsScope.USER: user_layer,
         SettingsScope.PROJECT: project_layer,
         SettingsScope.LOCAL: local_layer,
@@ -299,4 +303,8 @@ def resolve_settings(
         SettingsScope.POLICY: policy_layer,
     }
     merged = merge_layers([by_scope[s] for s in SCOPE_ORDER if s in by_scope])
-    return ResolvedSettings(settings=merged, errors=_dedup_errors(errors))
+    return ResolvedSettings(
+        settings=merged,
+        errors=_dedup_errors(errors),
+        per_scope_layers=by_scope,
+    )

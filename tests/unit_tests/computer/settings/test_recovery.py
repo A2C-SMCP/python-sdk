@@ -28,9 +28,11 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.settings.recovery import (
+    _plugin_enable_origin,
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
+from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
 from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -367,3 +369,100 @@ def test_collect_skips_missing_install_path_and_corrupt_json(tmp_path: Path) -> 
     )
 
     assert {r.config.name for r in records} == {"figma"}
+
+
+# ── _plugin_enable_origin ─────────────────────────────────────────────────────
+def _layers(**overrides: dict) -> dict[SettingsScope, dict]:
+    """速造 per-scope layers dict（全部 scope 默认空，用 scope 名字符串覆盖）"""
+    empty: dict[SettingsScope, dict] = {s: {} for s in SCOPE_ORDER}
+    for key, v in overrides.items():
+        empty[SettingsScope(key)] = v
+    return empty
+
+
+def test_enable_origin_user_true_returns_user() -> None:
+    """user scope enabledPlugins[pid]=true → 返回 USER"""
+    layers = _layers(user={"enabledPlugins": {"x@mp": True}})
+    assert _plugin_enable_origin(layers, "x@mp") is SettingsScope.USER
+
+
+def test_enable_origin_user_true_project_true_returns_project() -> None:
+    """user=true + project=true → 返回 PROJECT（更高 scope 胜）"""
+    layers = _layers(
+        user={"enabledPlugins": {"x@mp": True}},
+        project={"enabledPlugins": {"x@mp": True}},
+    )
+    assert _plugin_enable_origin(layers, "x@mp") is SettingsScope.PROJECT
+
+
+def test_enable_origin_user_true_project_false_returns_none() -> None:
+    """user=true + project=false → 返回 None（被显式禁用覆盖）"""
+    layers = _layers(
+        user={"enabledPlugins": {"x@mp": True}},
+        project={"enabledPlugins": {"x@mp": False}},
+    )
+    assert _plugin_enable_origin(layers, "x@mp") is None
+
+
+def test_enable_origin_only_project_true_returns_project() -> None:
+    """仅 project scope enabledPlugins[pid]=true → 返回 PROJECT"""
+    layers = _layers(project={"enabledPlugins": {"x@mp": True}})
+    assert _plugin_enable_origin(layers, "x@mp") is SettingsScope.PROJECT
+
+
+def test_enable_origin_all_absent_returns_none() -> None:
+    """全部 scope 无 enabledPlugins[pid] → 返回 None"""
+    layers = _layers()
+    assert _plugin_enable_origin(layers, "x@mp") is None
+
+
+def test_enable_origin_local_overrides_project() -> None:
+    """project=true + local=true → 返回 LOCAL（最高 scope 胜）"""
+    layers = _layers(
+        project={"enabledPlugins": {"x@mp": True}},
+        local={"enabledPlugins": {"x@mp": True}},
+    )
+    assert _plugin_enable_origin(layers, "x@mp") is SettingsScope.LOCAL
+
+
+def test_enable_origin_local_false_overrides_all() -> None:
+    """user=true + project=true + local=false → 返回 None（local 显式禁用胜）"""
+    layers = _layers(
+        user={"enabledPlugins": {"x@mp": True}},
+        project={"enabledPlugins": {"x@mp": True}},
+        local={"enabledPlugins": {"x@mp": False}},
+    )
+    assert _plugin_enable_origin(layers, "x@mp") is None
+
+
+# ── BundledServerRecord.enabled_origin ─────────────────────────────────────────
+def test_collect_sets_enabled_origin_from_per_scope_layers(tmp_path: Path) -> None:
+    """per_scope_layers 传入时 record 的 enabled_origin 被正确赋值"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma"])
+    _seed_installed(home, {"audit@acme": [_record(root, servers=["figma"])]})
+
+    layers: dict[SettingsScope, dict] = {s: {} for s in SCOPE_ORDER}
+    layers[SettingsScope.PROJECT] = {"enabledPlugins": {"audit@acme": True}}
+
+    # merged declared 须与 layers 一致：_plugin_boot_active 读取 merged 视图，
+    # per_scope_layers 仅用于 origin 判定
+    declared = _declared_enabled("audit@acme")
+    records = collect_enabled_bundled_servers(
+        home, declared, env=_env(tmp_path), per_scope_layers=layers,
+    )
+    assert len(records) == 1
+    assert records[0].enabled_origin is SettingsScope.PROJECT
+
+
+def test_collect_enabled_origin_none_without_per_scope_layers(tmp_path: Path) -> None:
+    """未传 per_scope_layers 时 enabled_origin 保持 None（向后兼容）"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=["figma"])
+    _seed_installed(home, {"audit@acme": [_record(root, servers=["figma"])]})
+
+    records = collect_enabled_bundled_servers(
+        home, _declared_enabled("audit@acme"), env=_env(tmp_path),
+    )
+    assert len(records) == 1
+    assert records[0].enabled_origin is None

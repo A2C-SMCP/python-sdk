@@ -67,10 +67,12 @@ from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
+    McpApprovalStatus,
     McpWriteScope,
     McpWriteTargetError,
     ResolvedMcpConfig,
     is_writable_origin,
+    mcp_server_status,
     remove_mcp_server,
     resolve_mcp_config,
     upsert_mcp_server,
@@ -82,6 +84,7 @@ from a2c_smcp.computer.settings.recovery import (
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
+from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
     SkillEventDebouncer,
@@ -111,6 +114,7 @@ _SKILL_URI_PREFIX = "skill://"
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
+    from a2c_smcp.computer.settings.scope import ResolvedSettings
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
 
 
@@ -1683,8 +1687,8 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._skill_debouncer.mark_dirty()
 
-    def _resolve_declared_settings(self) -> dict[str, Any]:
-        """治理恢复的 declared 合并视图（user/project/local/policy；无 flag——Computer 不持 ``--settings`` 知识）。
+    def _resolve_declared_settings(self) -> "ResolvedSettings":
+        """治理恢复的 declared 视图（含合并 settings + per-scope 层，供 #159 Option B 审批门分叉）。
 
         已知限制（与 rust 同构文档化）：flag scope 的 ``enabledPlugins`` 不在此视图；CLI 接线时经
         ``reconcile_governance(declared=...)`` 显式传 flag-aware 视图。跨重启可靠 disable 请写 user scope。
@@ -1693,7 +1697,7 @@ class Computer(BaseComputer[PromptSession]):
         from a2c_smcp.computer.settings.policy import resolve_policy_settings
         from a2c_smcp.computer.settings.scope import resolve_settings
 
-        return resolve_settings(policy_settings=resolve_policy_settings()).settings
+        return resolve_settings(policy_settings=resolve_policy_settings())
 
     async def reconcile_governance(
         self,
@@ -1732,8 +1736,14 @@ class Computer(BaseComputer[PromptSession]):
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
         home = self.skill_home
+        per_scope_layers: Mapping[SettingsScope, Mapping[str, Any]] | None = None
         if declared is None:
-            declared = self._resolve_declared_settings()
+            resolved = self._resolve_declared_settings()
+            declared = resolved.settings
+            per_scope_layers = resolved.per_scope_layers
+        else:
+            # 调用方显式传 declared 时通常不带 per-scope 层 → 保持向后兼容（enabled_origin=None）
+            per_scope_layers = None
 
         report = await recover_marketplace_skills(self._skill_registry, home, declared)
         if report.restored_skills:
@@ -1744,7 +1754,9 @@ class Computer(BaseComputer[PromptSession]):
 
         existing = set(existing_bundle_ids()) if existing_bundle_ids is not None else set()
         injected_roots: set[Path] = set()
-        for record in collect_enabled_bundled_servers(home, declared):
+        for record in collect_enabled_bundled_servers(
+            home, declared, per_scope_layers=per_scope_layers,
+        ):
             # 身份 = bundle_id：按 display name 判会误伤「同名异 id」——协议 §5.6 明定其为**合法共存**，
             # MUST NOT 视为冲突；同 bundle_id 才是「依赖已满足」（§2.5-1），此时复用既有实例、不覆盖。
             bundle_id = resolve_bundle_id(record.config)
@@ -1756,6 +1768,21 @@ class Computer(BaseComputer[PromptSession]):
                     record.plugin_id,
                 )
                 continue
+            # #159 Option B：project scope enabledPlugins=true 激活的 bundled server 回落审批门
+            # （协议 §5 item 10 条件化 / 指南 §2.2）。不进门的受信 scope 保持免批准。
+            if record.enabled_origin is SettingsScope.PROJECT:
+                verdict = mcp_server_status(bundle_id, settings=declared, trusted_origin=False)
+                if verdict is McpApprovalStatus.PENDING:
+                    logger.info(
+                        "governance recovery: bundled server %r (plugin %s) enabled by project scope — "
+                        "PENDING approval, not auto-mounted (user must approve)",
+                        bundle_id,
+                        record.plugin_id,
+                    )
+                    report.pending_bundled_servers.append(record)
+                    continue
+                # 非 PENDING（如 policy deny → DISABLED、或用户已手动加到 enabledMcpjsonServers →
+                # ENABLED）→ 继续正常挂载流程（DISABLED 也继续——register_server 调用方自有禁用逻辑）。
             try:
                 if inject_inputs is not None and record.install_path not in injected_roots:
                     await inject_inputs(record)
@@ -1814,9 +1841,13 @@ class Computer(BaseComputer[PromptSession]):
         # durable + flag --mcp-config + embed）。与 `aremove_server` / `cli.resolve.collect_candidates` 同接缝。
         non_plugin_bundle_ids = {resolve_bundle_id(srv.config) for srv in self.resolve_mcp_declarations(env=os.environ).servers.values()}
         # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图），**按 bundle_id 为键**（#144）。
-        declared = self._resolve_declared_settings()
+        resolved = self._resolve_declared_settings()
+        declared = resolved.settings
         bundled: dict[str, BundledServerRecord] = {
-            resolve_bundle_id(record.config): record for record in collect_enabled_bundled_servers(home, declared)
+            resolve_bundle_id(record.config): record
+            for record in collect_enabled_bundled_servers(
+                home, declared, per_scope_layers=resolved.per_scope_layers,
+            )
         }
 
         def ownership_for(bundle_id: str) -> McpOwnership:
