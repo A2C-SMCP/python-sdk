@@ -39,12 +39,12 @@ def test_unique_name_hit_resolves_to_bundle_id() -> None:
 
 
 def test_zero_name_hit_but_valid_registered_bundle_id_resolves_as_id() -> None:
-    """步骤 2: 0 个 name 命中 ∧ token 是合法且**已注册**的 bundle_id → 按 bundle_id 执行。"""
+    """步骤 4: 0 个 name 命中 ∧ token 是合法且**已注册**的 bundle_id → 按 bundle_id 执行。"""
     assert resolve_target("my_server", (_MY_SERVER, _CAP_SERVER)) == "my_server"
 
 
 def test_valid_but_unregistered_bundle_id_raises_not_found() -> None:
-    """步骤 2 后半 + 步骤 5: token 形如合法 bundle_id 但**不在候选集** → 必须报「未找到」。
+    """步骤 4 后半 + 步骤 6: token 形如合法 bundle_id 但**不在候选集** → 必须报「未找到」。
 
     这是杀死 ``stop <未注册 token>`` 静默假成功的关键断言：语法合法 ≠ 存在。
     """
@@ -53,17 +53,17 @@ def test_valid_but_unregistered_bundle_id_raises_not_found() -> None:
 
 
 def test_unknown_token_raises_not_found() -> None:
-    """步骤 4/5: 既非 name 又非合法已注册 bundle_id → 报「未找到」，MUST NOT 静默成功。"""
+    """步骤 6: 既非 name 又非合法已注册 bundle_id → 报「未找到」，MUST NOT 静默成功。"""
     with pytest.raises(TargetNotFoundError):
         resolve_target("nonexistent", (_MY_SERVER, _CAP_SERVER))
 
 
 def test_name_collision_raises_ambiguous_with_full_candidates() -> None:
-    """步骤 3 + PROTO-10 扩条: 多命中 → 报错并列出**每个候选的 bundle_id + name + 归属三者**。
+    """步骤 3: 多命中（且 token 不等于任何候选的 bundle_id）→ 报错并列出**每个候选的 bundle_id + name + 归属三者**。
 
     只列 bundle_id 用户分不清哪个是自己的（协议 §5.1-3）。
     """
-    user_fs = ServerCandidate(bundle_id="filesystem", name="filesystem", attribution="user")
+    user_fs = ServerCandidate(bundle_id="filesystem_user", name="filesystem", attribution="user")
     plugin_fs = ServerCandidate(bundle_id="bundle_a3f9c2e1", name="filesystem", attribution="plugin:fs-tools")
 
     with pytest.raises(AmbiguousTargetError) as exc:
@@ -77,7 +77,7 @@ def test_name_collision_raises_ambiguous_with_full_candidates() -> None:
 
 
 def test_ambiguous_never_silently_picks_lexicographically_smallest() -> None:
-    """步骤 4: MUST NOT 以字典序最小等任意规则「确定性地选一个」——那是把不确定的错变成确定的错。
+    """步骤 5: MUST NOT 以字典序最小等任意规则「确定性地选一个」——那是把不确定的错变成确定的错。
 
     变异守卫: 若实现退化为 ``return min(hits)``，本例会拿到 ``"bundle_a"`` 而非抛错 ⇒ 转红。
     """
@@ -89,7 +89,7 @@ def test_ambiguous_never_silently_picks_lexicographically_smallest() -> None:
 
 
 def test_name_hit_takes_precedence_over_bundle_id_hit() -> None:
-    """步骤序: name 反查（步骤 1）先于 bundle_id 反查（步骤 2）——步骤 2 的门是「0 个 name 命中」。
+    """步骤序: name 反查（步骤 1）先于 bundle_id 反查（步骤 4）——步骤 4 的门是「0 个 name 命中」。
 
     A(name='foo', id='foo_1') 与 B(name='bar', id='foo') 共存时，``foo`` 命中 A 的 **name** ⇒ 解析为 foo_1。
     """
@@ -99,17 +99,6 @@ def test_name_hit_takes_precedence_over_bundle_id_hit() -> None:
     assert resolve_target("foo", (a, b)) == "foo_1"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "协议 sdk-api-guidance §5.1 步骤序缺口（#143 决策 4，待协议裁决）: 步骤 2「0 命中且是合法 "
-        "bundle_id → 当 id」的门是**「0 命中」**，故同名多命中时够不到步骤 2；而步骤 3 要求多命中 MUST "
-        "报错、步骤 4 禁任意规则选一。⇒ A(name='foo', 缺省派生 id='foo') 与 B(name='foo', 显式 "
-        "id='bundle_x') 合法共存（§5.6）时，A 的 bundle_id 恰等于那个冲突的名字，用户照「请用 bundle_id "
-        "重试」再敲 'foo' 仍是 name 多命中 ⇒ **A 永远不可寻址**。修它属改协议明文，且该语义 MUST 双端逐字"
-        "一致 ⇒ 不单端发明。本轮严格实现协议并以本例钉住缺口（不靠文档降级）。求裁于 #170。"
-    ),
-    strict=True,
-)
 def test_deadlock_corner_bundle_id_equal_to_colliding_name_should_be_addressable() -> None:
     """死锁角落: 同名冲突 ∧ 其中一条的 bundle_id 恰等于那个名字 → 该条应仍可用 bundle_id 寻址。"""
     a = ServerCandidate(bundle_id="foo", name="foo", attribution="user")
