@@ -75,6 +75,8 @@ from a2c_smcp.computer.settings.mcp_config import (
     mcp_server_status,
     remove_mcp_server,
     resolve_mcp_config,
+    security_layer_check,
+    trust_layer_check,
     upsert_mcp_server,
 )
 from a2c_smcp.computer.settings.recovery import (
@@ -368,6 +370,14 @@ class Computer(BaseComputer[PromptSession]):
         #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
         # English: Render (resolution chain + predefined vars) + envFile merge + validate, reusing
         #          _arender_and_validate_server (DRY). On failure, keep the original config and continue.
+        # #165 Gap A：读取 settings 用于嵌入模式下 embed server 的安全层判定。
+        # _resolve_declared_settings 不依赖 _skill_home，在 boot 早期安全调用；容错：读不到则空。
+        try:
+            declared_st = self._resolve_declared_settings()
+            boot_settings = declared_st.settings
+        except Exception:
+            logger.debug("boot_up: settings unavailable for security layer check, all embed servers pass")
+            boot_settings = {}
         # #149：boot 重建运行期活跃集 → 先重置 raw 投影缓存，逐条登记（setdefault=first-wins，与 ainitialize
         # no-double-open 同序：同 bundle_id 保配置顺序首个）。
         self._active_raw.clear()
@@ -390,8 +400,18 @@ class Computer(BaseComputer[PromptSession]):
                 logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 其余渲染/校验错误：按稳妥策略保留原配置继续（对齐 rust「其余渲染错误维持容错」，不连坐上抛）。
                 raw_cfg = validated = server_cfg
+            # #165 Gap A：embed server 经全门判定（trusted_origin=True ⇒ Gate 4 ENABLED，Gate 1-3 仍判）。
+            # 被安全层拒绝的 server 不挂载（不进 validated_servers、不进 _active_raw）。
+            bid = resolve_bundle_id(validated)
+            if mcp_server_status(bid, settings=boot_settings, trusted_origin=True) is McpApprovalStatus.DISABLED:
+                logger.warning(
+                    "boot_up: embed server %r (bundle_id=%r) denied by policy — not mounted",
+                    getattr(validated, "name", "unknown"),
+                    bid,
+                )
+                continue
             validated_servers.append(validated)
-            self._active_raw.setdefault(resolve_bundle_id(validated), raw_cfg)
+            self._active_raw.setdefault(bid, raw_cfg)
 
         await self.mcp_manager.ainitialize(validated_servers)
 
@@ -1768,10 +1788,21 @@ class Computer(BaseComputer[PromptSession]):
                     record.plugin_id,
                 )
                 continue
-            # #159 Option B：project scope enabledPlugins=true 激活的 bundled server 回落审批门
-            # （协议 §5 item 10 条件化 / 指南 §2.2）。不进门的受信 scope 保持免批准。
+            # #165 Gap B：安全层判定（Gate 1-3）——所有 server（含 plugin baseline）必经。
+            # 协议 §5 item 10 条件化 + 审批门对齐指南 §2.3。
+            if security_layer_check(bundle_id, settings=declared) is McpApprovalStatus.DISABLED:
+                logger.info(
+                    "governance recovery: bundled server %r (plugin %s) denied by security layer (Gate 1-3) — "
+                    "not mounted",
+                    bundle_id,
+                    record.plugin_id,
+                )
+                continue
+            # #159 Option B：信任层（Gate 4-7）——仅 project scope enabledPlugins 激活的 bundled server 进门。
+            # （协议 §5 item 10 条件化 / 指南 §2.2）。受信 scope enable 的跳过信任层，直接挂载。
+            # 安全层已通过（上方 security_layer_check），此处直接判信任层避免冗余 Gate 1-3 重查。
             if record.enabled_origin is SettingsScope.PROJECT:
-                verdict = mcp_server_status(bundle_id, settings=declared, trusted_origin=False)
+                verdict = trust_layer_check(bundle_id, settings=declared, trusted_origin=False)
                 if verdict is McpApprovalStatus.PENDING:
                     logger.info(
                         "governance recovery: bundled server %r (plugin %s) enabled by project scope — "
@@ -1781,8 +1812,7 @@ class Computer(BaseComputer[PromptSession]):
                     )
                     report.pending_bundled_servers.append(record)
                     continue
-                # 非 PENDING（如 policy deny → DISABLED、或用户已手动加到 enabledMcpjsonServers →
-                # ENABLED）→ 继续正常挂载流程（DISABLED 也继续——register_server 调用方自有禁用逻辑）。
+                # ENABLED（用户手动加到 enabledMcpjsonServers / enableAllProject → fall through to mount）
             try:
                 if inject_inputs is not None and record.install_path not in injected_roots:
                     await inject_inputs(record)

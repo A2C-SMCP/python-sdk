@@ -422,6 +422,37 @@ def _str_list(settings: Mapping[str, Any], key: str) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
+def security_layer_check(name: str, *, settings: Mapping[str, Any]) -> McpApprovalStatus | None:
+    """安全层判定（Gate 1-3）：所有 server（含 plugin baseline）必经 / Security-layer check for all servers.
+
+    协议依据 / per: runtime-contract §5 item 10（条件化） + 审批门对齐指南 §2.3。
+    返回 ``DISABLED`` = 被安全层拒绝（不进投影）；``None`` = 通过安全层，进入信任层判定（Gate 4-7）。
+    """
+    if name in _str_list(settings, FIELD_DENIED_MCP_SERVERS):
+        return McpApprovalStatus.DISABLED
+    allowed = _str_list(settings, FIELD_ALLOWED_MCP_SERVERS)
+    if allowed and name not in allowed:
+        return McpApprovalStatus.DISABLED
+    if name in _str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS):
+        return McpApprovalStatus.DISABLED
+    return None
+
+
+def trust_layer_check(name: str, *, settings: Mapping[str, Any], trusted_origin: bool) -> McpApprovalStatus:
+    """信任层判定（Gate 4-7）：仅声明 server + project-enable bundled server 进入 / Trust-layer check.
+
+    调用方 MUST 保证安全层（:func:`security_layer_check`）已通过——本函数不重复 Gate 1-3。
+    协议依据 / per: runtime-contract §5 item 10 + 审批门对齐指南 §2。
+    """
+    if trusted_origin:
+        return McpApprovalStatus.ENABLED
+    if name in _str_list(settings, FIELD_ENABLED_MCPJSON_SERVERS):
+        return McpApprovalStatus.ENABLED
+    if settings.get(FIELD_ENABLE_ALL_PROJECT_MCP) is True:
+        return McpApprovalStatus.ENABLED
+    return McpApprovalStatus.PENDING
+
+
 def mcp_server_status(name: str, *, settings: Mapping[str, Any], trusted_origin: bool) -> McpApprovalStatus:
     """
     判定单个 MCP server 的批准状态（**顺序即优先级**）/ Decide one server's approval status。
@@ -455,20 +486,12 @@ def mcp_server_status(name: str, *, settings: Mapping[str, Any], trusted_origin:
     :param settings: 多层合并后的 resolved settings（含 #56 落地的 MCP 门控字段）。
     :param trusted_origin: 该 server 是否来自预信任 scope（见 :attr:`ResolvedMcpServer.trusted_origin`）。
     """
-    if name in _str_list(settings, FIELD_DENIED_MCP_SERVERS):
-        return McpApprovalStatus.DISABLED
-    allowed = _str_list(settings, FIELD_ALLOWED_MCP_SERVERS)
-    if allowed and name not in allowed:
-        return McpApprovalStatus.DISABLED
-    if name in _str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS):
-        return McpApprovalStatus.DISABLED
-    if trusted_origin:
-        return McpApprovalStatus.ENABLED
-    if name in _str_list(settings, FIELD_ENABLED_MCPJSON_SERVERS):
-        return McpApprovalStatus.ENABLED
-    if settings.get(FIELD_ENABLE_ALL_PROJECT_MCP) is True:
-        return McpApprovalStatus.ENABLED
-    return McpApprovalStatus.PENDING
+    # 安全层（Gate 1-3）——所有 server 必经
+    security = security_layer_check(name, settings=settings)
+    if security is not None:
+        return security
+    # 信任层（Gate 4-7）——仅声明 server + project-enable bundled server 进入
+    return trust_layer_check(name, settings=settings, trusted_origin=trusted_origin)
 
 
 def gate_mcp_servers(

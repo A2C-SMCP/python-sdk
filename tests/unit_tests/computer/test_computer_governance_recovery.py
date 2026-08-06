@@ -269,6 +269,75 @@ async def test_project_scope_enabled_plugin_bundled_server_pending(
         assert report.pending_bundled_servers[0].enabled_origin == SettingsScope.PROJECT
 
 
+# ── #165 Gap B：安全层（Gate 1-3）对 plugin bundled server 生效 ─────────────────
+@pytest.mark.asyncio
+async def test_bundled_server_denied_by_security_layer_not_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """policy deny → plugin bundled server（user scope enabled）不挂载。"""
+    import a2c_smcp.computer.settings.policy as policy_mod
+
+    _isolate_declared_env(tmp_path, monkeypatch)
+    # 注入 policy 拒绝名单
+    monkeypatch.setattr(
+        policy_mod, "resolve_policy_settings",
+        lambda **_: {"deniedMcpServers": [FIGMA_BID]},
+    )
+    home, _plugin_root = _seed_home(tmp_path, servers=[FIGMA_NAME])
+
+    # user scope：安装意图 + 启用
+    user_dir = tmp_path / "cfg" / "a2c"
+    _write_settings(user_dir / "settings.json", {
+        "installedPlugins": ["audit@acme"],
+        "enabledPlugins": {"audit@acme": True},
+    })
+
+    mounted: list[str] = []
+
+    async def register(cfg, record: BundledServerRecord) -> None:
+        mounted.append(cfg.name)
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance(
+            existing_bundle_ids=lambda: set(),
+            register_server=register,
+        )
+        # 安全层拒绝 → register 不被调用
+        assert mounted == []
+        assert report.remounted_servers == []
+        # 不在 PENDING 中（协议 §2.3：安全层 DISABLED 不进 pending）
+        assert report.pending_bundled_servers == []
+
+
+@pytest.mark.asyncio
+async def test_bundled_server_passes_security_layer_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无 policy deny → plugin bundled server 正常挂载（回归守卫）。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _plugin_root = _seed_home(tmp_path, servers=[FIGMA_NAME])
+
+    user_dir = tmp_path / "cfg" / "a2c"
+    _write_settings(user_dir / "settings.json", {
+        "installedPlugins": ["audit@acme"],
+        "enabledPlugins": {"audit@acme": True},
+    })
+
+    mounted: list[str] = []
+
+    async def register(cfg, record: BundledServerRecord) -> None:
+        mounted.append(cfg.name)
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance(
+            existing_bundle_ids=lambda: set(),
+            register_server=register,
+        )
+        assert mounted == [FIGMA_NAME]
+        assert report.remounted_servers == [FIGMA_BID]
+        assert report.pending_bundled_servers == []
+
+
 @pytest.mark.asyncio
 async def test_user_scope_enabled_plugin_bundled_server_auto_mounted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
