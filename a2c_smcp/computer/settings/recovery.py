@@ -239,6 +239,7 @@ async def recover_marketplace_skills(
     declared: Mapping[str, Any],
     *,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
     timeout: float = DEFAULT_GIT_TIMEOUT,
 ) -> GovernanceRecoveryReport:
     """
@@ -259,6 +260,9 @@ async def recover_marketplace_skills(
     user scope + WARN + ``report.scope_normalized`` 显式标注；完美复原需 committed 记录承载，属可选
     pin-lock 扩展（§4.9.2）范畴。
 
+    :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+    :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()``。
+
     :param registry: 目标 :class:`SkillRegistry`（恢复注册进当前活跃集）。
     :param home: SKILL Home 绝对根。
     :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控）。
@@ -271,8 +275,8 @@ async def recover_marketplace_skills(
         return report
     ledger = load_installed_plugins(home=home, env=env).get("plugins", {})
     known = load_known_marketplaces(home=home, env=env).get("marketplaces", {})
-    cwd = Path.cwd()
-    layers = _intent_layer_snapshot(env, cwd)  # scope 推回线索快照（循环外一次，#125 任务 1）
+    resolved_cwd = cwd if cwd is not None else Path.cwd()
+    layers = _intent_layer_snapshot(env, resolved_cwd)  # scope 推回线索快照（循环外一次，#125 任务 1）
 
     # installed pid 按 marketplace 分组（plugin → 是否活跃）/ group intent pids by marketplace.
     by_marketplace: dict[str, dict[str, bool]] = {}
@@ -324,7 +328,7 @@ async def recover_marketplace_skills(
         #    scope 经分层线索推回（#125 任务 1）；无线索 → 归一 user + WARN + scope_normalized 标注。
         for plugin in needs_materialize:
             pid = f"{plugin}@{marketplace}"
-            targets = _infer_record_scopes(pid, layers, cwd)
+            targets = _infer_record_scopes(pid, layers, resolved_cwd)
             normalized = not targets
             if normalized:
                 targets = [("user", None)]
