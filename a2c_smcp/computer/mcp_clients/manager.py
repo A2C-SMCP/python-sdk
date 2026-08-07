@@ -16,7 +16,7 @@ from a2c_smcp.computer.mcp_clients.auth_error import build_auth_error_result, cl
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
 from a2c_smcp.computer.mcp_clients.utils import client_factory
-from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, TOOL_NAME
+from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, SERVER_NAME, TOOL_NAME
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger, truncate
 
@@ -492,11 +492,16 @@ class MCPServerManager:
             raise MCPServerNotFoundError(f"MCP Server bundle_id={bundle_id!r} is not registered")
         return await client.list_resources_page(cursor)
 
-    def get_server_status(self) -> list[tuple[BUNDLE_ID, bool, str]]:
-        """获取服务器状态列表 [(bundle_id, 是否活跃, 状态), ...]（身份=bundle_id）。"""
+    def get_server_status(self) -> list[tuple[BUNDLE_ID, SERVER_NAME, bool, str]]:
+        """获取服务器状态列表 [(bundle_id, display_name, 是否活跃, 状态), ...]。
+
+        #166：返回 display name（``_servers_config[bundle_id].name``），供 CLI status 表渲染
+        人机面的 "Name" 列。bundle_id 留给 ``server rm/stop`` 等命令寻址使用。
+        """
         return [
             (
                 bundle_id,
+                self._servers_config[bundle_id].name,
                 bundle_id in self._active_clients,
                 "pending" if bundle_id not in self._active_clients else self._active_clients[bundle_id].state,
             )

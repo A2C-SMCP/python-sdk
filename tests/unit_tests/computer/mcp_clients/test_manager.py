@@ -146,11 +146,25 @@ async def test_initialize_with_servers(manager):
     assert manager._exposed_tools["server1__tool2"] == ("server1", "tool2")
     assert "server2__tool3" not in manager._exposed_tools  # 禁用的服务器
 
-    # 验证状态检查
+    # 验证状态检查（#166：返回 (bundle_id, display_name, active, state)）
     statuses = manager.get_server_status()
-    assert ("server1", True, "connected") in statuses
-    assert ("server2", False, "pending") in statuses
-    assert ("sse_server", True, "connected") in statuses
+    assert ("server1", "server1", True, "connected") in statuses
+    assert ("server2", "server2", False, "pending") in statuses
+    assert ("sse_server", "sse_server", True, "connected") in statuses
+
+
+@pytest.mark.asyncio
+async def test_get_server_status_returns_display_name(manager):
+    """#166：display name 与 bundle_id 分叉时，status 返回正确的 display name。
+
+    `normalize_name` 折叠 `.`→`_` 但**不折叠 `-`** ⇒ 夹具名 `my.server` → bundle_id `my_server`
+    → name ≠ bundle_id，因此断言可鉴别 display name 被正确传递（同值致盲第六例）。
+    """
+    cfg = create_server_config("my.server")
+    await manager.ainitialize([cfg])
+    await manager.astart_all()
+    statuses = manager.get_server_status()
+    assert ("my_server", "my.server", True, "connected") in statuses
 
 
 @pytest.mark.asyncio
