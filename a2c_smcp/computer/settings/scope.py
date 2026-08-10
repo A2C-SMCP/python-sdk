@@ -227,10 +227,14 @@ class ResolvedSettings:
     ``settings show`` / 诊断命令呈现，§5.6），已按出现顺序去重。
     ``settings`` is the merged view; ``errors`` aggregates field-level validation errors
     (non-fatal, deduped, surfaced via diagnostics).
+
+    ``per_scope_layers``（v0.3.2）为 per-scope 校验后的原始层，供 enable origin 判定等需要
+    scope 来源保真的下游消费（#159 Option B / 协议 §5 item 10 条件化）。
     """
 
     settings: dict[str, Any]
     errors: list[SettingsValidationError] = field(default_factory=list)
+    per_scope_layers: dict[SettingsScope, dict[str, Any]] = field(default_factory=dict)
 
 
 def _dedup_errors(errors: Sequence[SettingsValidationError]) -> list[SettingsValidationError]:
@@ -245,6 +249,7 @@ def _dedup_errors(errors: Sequence[SettingsValidationError]) -> list[SettingsVal
 def resolve_settings(
     *,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
     flag_settings_path: Path | None = None,
     policy_settings: Mapping[str, Any] | None = None,
 ) -> ResolvedSettings:
@@ -262,6 +267,7 @@ def resolve_settings(
     ``registered_workdirs`` / ``active_workdir`` 概念移除收敛为单 cwd 锚点。
 
     :param env: 环境映射（解析 user config dir），默认 ``os.environ`` / env mapping for the user config dir.
+    :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()`` / project/local anchor, ``None`` → process cwd.
     :param flag_settings_path: ``--settings <file>`` 指定文件 / the ``--settings`` flag file, if any.
     :param policy_settings: policy scope 原始 dict（来自 :mod:`a2c_smcp.computer.settings.policy`
         的 first-source-wins 结果），在此按 POLICY scope 校验 / raw policy dict, validated here.
@@ -272,10 +278,10 @@ def resolve_settings(
     user_layer, user_errors = load_settings_file(user_settings_path(env), SettingsScope.USER)
     errors.extend(user_errors)
 
-    # project/local：锚定进程 cwd / anchored at process cwd (#116)
-    cwd = Path(os.getcwd())
-    project_layer, proj_errors = load_settings_file(workdir_project_settings_path(cwd), SettingsScope.PROJECT)
-    local_layer, local_errors = load_settings_file(workdir_local_settings_path(cwd), SettingsScope.LOCAL)
+    # project/local：锚定注入 cwd，None 回退进程 cwd / anchored at injected cwd or process cwd (#116, #134)
+    resolved_cwd = cwd if cwd is not None else Path(os.getcwd())
+    project_layer, proj_errors = load_settings_file(workdir_project_settings_path(resolved_cwd), SettingsScope.PROJECT)
+    local_layer, local_errors = load_settings_file(workdir_local_settings_path(resolved_cwd), SettingsScope.LOCAL)
     errors.extend(proj_errors)
     errors.extend(local_errors)
 
@@ -291,7 +297,7 @@ def resolve_settings(
     errors.extend(policy_errors)
 
     # 顺序**派生**自 SCOPE_ORDER（协议 §2.5-3 唯一权威），不手写字面量 / order derived, never hand-written.
-    by_scope: dict[SettingsScope, Mapping[str, Any]] = {
+    by_scope: dict[SettingsScope, dict[str, Any]] = {
         SettingsScope.USER: user_layer,
         SettingsScope.PROJECT: project_layer,
         SettingsScope.LOCAL: local_layer,
@@ -299,4 +305,8 @@ def resolve_settings(
         SettingsScope.POLICY: policy_layer,
     }
     merged = merge_layers([by_scope[s] for s in SCOPE_ORDER if s in by_scope])
-    return ResolvedSettings(settings=merged, errors=_dedup_errors(errors))
+    return ResolvedSettings(
+        settings=merged,
+        errors=_dedup_errors(errors),
+        per_scope_layers=by_scope,
+    )

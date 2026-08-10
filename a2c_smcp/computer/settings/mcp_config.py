@@ -290,6 +290,7 @@ def _embed_layer(embed_servers: Iterable[MCPServerConfig]) -> dict[str, Any]:
 def resolve_mcp_config(
     *,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
     flag_config_path: Path | None = None,
     embed_servers: Iterable[MCPServerConfig] | None = None,
     managed_mcp_path: Path | None = None,
@@ -315,6 +316,7 @@ def resolve_mcp_config(
     - 单 server / input 畸形 → drop + :class:`SettingsValidationError`，**不 abort**（§5.6 人编文件容错）。
 
     :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+    :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()`` / project/local anchor, ``None`` → process cwd.
     :param flag_config_path: ``--mcp-config <file>``（flag 层 mcp.json，含 ``servers``/``inputs``；
         **次高优先级、仅低于 policy**，§2.5-3）。历史 ``--config`` 老接口曾把本层排**最低**，协议已废止该形态。
     :param embed_servers: 宿主构造入参 ``Computer(mcp_servers=...)``（embed 层，§2.5-3）。
@@ -323,13 +325,13 @@ def resolve_mcp_config(
     """
     managed_path = managed_mcp_path if managed_mcp_path is not None else managed_mcp_config_path(platform)
 
-    # 各 scope 的数据源（未排序；顺序由 SCOPE_ORDER 唯一决定）；project/local 锚 cwd（#116）。
-    # Per-scope sources (unordered here — SCOPE_ORDER alone decides precedence); cwd-anchored.
-    cwd = Path(os.getcwd())
+    # 各 scope 的数据源（未排序；顺序由 SCOPE_ORDER 唯一决定）；project/local 锚注入 cwd 或进程 cwd（#116, #134）。
+    # Per-scope sources (unordered here — SCOPE_ORDER alone decides precedence); cwd-anchored or injected.
+    resolved_cwd = cwd if cwd is not None else Path(os.getcwd())
     file_sources: dict[SettingsScope, Path] = {
         SettingsScope.USER: user_mcp_config_path(env),
-        SettingsScope.PROJECT: workdir_mcp_config_path(cwd),
-        SettingsScope.LOCAL: workdir_mcp_local_config_path(cwd),
+        SettingsScope.PROJECT: workdir_mcp_config_path(resolved_cwd),
+        SettingsScope.LOCAL: workdir_mcp_local_config_path(resolved_cwd),
         SettingsScope.POLICY: managed_path,
     }
     if flag_config_path is not None:
@@ -422,6 +424,37 @@ def _str_list(settings: Mapping[str, Any], key: str) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
+def security_layer_check(name: str, *, settings: Mapping[str, Any]) -> McpApprovalStatus | None:
+    """安全层判定（Gate 1-3）：所有 server（含 plugin baseline）必经 / Security-layer check for all servers.
+
+    协议依据 / per: runtime-contract §5 item 10（条件化） + 审批门对齐指南 §2.3。
+    返回 ``DISABLED`` = 被安全层拒绝（不进投影）；``None`` = 通过安全层，进入信任层判定（Gate 4-7）。
+    """
+    if name in _str_list(settings, FIELD_DENIED_MCP_SERVERS):
+        return McpApprovalStatus.DISABLED
+    allowed = _str_list(settings, FIELD_ALLOWED_MCP_SERVERS)
+    if allowed and name not in allowed:
+        return McpApprovalStatus.DISABLED
+    if name in _str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS):
+        return McpApprovalStatus.DISABLED
+    return None
+
+
+def trust_layer_check(name: str, *, settings: Mapping[str, Any], trusted_origin: bool) -> McpApprovalStatus:
+    """信任层判定（Gate 4-7）：仅声明 server + project-enable bundled server 进入 / Trust-layer check.
+
+    调用方 MUST 保证安全层（:func:`security_layer_check`）已通过——本函数不重复 Gate 1-3。
+    协议依据 / per: runtime-contract §5 item 10 + 审批门对齐指南 §2。
+    """
+    if trusted_origin:
+        return McpApprovalStatus.ENABLED
+    if name in _str_list(settings, FIELD_ENABLED_MCPJSON_SERVERS):
+        return McpApprovalStatus.ENABLED
+    if settings.get(FIELD_ENABLE_ALL_PROJECT_MCP) is True:
+        return McpApprovalStatus.ENABLED
+    return McpApprovalStatus.PENDING
+
+
 def mcp_server_status(name: str, *, settings: Mapping[str, Any], trusted_origin: bool) -> McpApprovalStatus:
     """
     判定单个 MCP server 的批准状态（**顺序即优先级**）/ Decide one server's approval status。
@@ -455,20 +488,12 @@ def mcp_server_status(name: str, *, settings: Mapping[str, Any], trusted_origin:
     :param settings: 多层合并后的 resolved settings（含 #56 落地的 MCP 门控字段）。
     :param trusted_origin: 该 server 是否来自预信任 scope（见 :attr:`ResolvedMcpServer.trusted_origin`）。
     """
-    if name in _str_list(settings, FIELD_DENIED_MCP_SERVERS):
-        return McpApprovalStatus.DISABLED
-    allowed = _str_list(settings, FIELD_ALLOWED_MCP_SERVERS)
-    if allowed and name not in allowed:
-        return McpApprovalStatus.DISABLED
-    if name in _str_list(settings, FIELD_DISABLED_MCPJSON_SERVERS):
-        return McpApprovalStatus.DISABLED
-    if trusted_origin:
-        return McpApprovalStatus.ENABLED
-    if name in _str_list(settings, FIELD_ENABLED_MCPJSON_SERVERS):
-        return McpApprovalStatus.ENABLED
-    if settings.get(FIELD_ENABLE_ALL_PROJECT_MCP) is True:
-        return McpApprovalStatus.ENABLED
-    return McpApprovalStatus.PENDING
+    # 安全层（Gate 1-3）——所有 server 必经
+    security = security_layer_check(name, settings=settings)
+    if security is not None:
+        return security
+    # 信任层（Gate 4-7）——仅声明 server + project-enable bundled server 进入
+    return trust_layer_check(name, settings=settings, trusted_origin=trusted_origin)
 
 
 def gate_mcp_servers(
@@ -616,20 +641,22 @@ def is_writable_origin(scope: SettingsScope) -> bool:
     return scope in _SETTINGS_TO_WRITE_SCOPE
 
 
-def mcp_write_path(scope: McpWriteScope, *, env: Mapping[str, str] | None = None) -> Path:
+def mcp_write_path(
+    scope: McpWriteScope, *, env: Mapping[str, str] | None = None, cwd: Path | None = None,
+) -> Path:
     """
     某写 scope 的 ``mcp.json`` 落点路径 / The ``mcp.json`` write path for a given scope。
 
-    project/local 锚定进程 ``os.getcwd()``（#116，cwd 恒存在）；user 走 ``$XDG_CONFIG_HOME/a2c``（``env``
-    覆盖，便于测试隔离）。复用既有路径原语 :func:`user_mcp_config_path` / :func:`workdir_mcp_config_path` /
+    project/local 锚定注入 cwd 或进程 ``os.getcwd()``（#116/#134）；user 走 ``$XDG_CONFIG_HOME/a2c``
+    （``env`` 覆盖，便于测试隔离）。复用既有路径原语 :func:`user_mcp_config_path` / :func:`workdir_mcp_config_path` /
     :func:`workdir_mcp_local_config_path`。
     """
     if scope is McpWriteScope.USER:
         return user_mcp_config_path(env)
-    cwd = Path(os.getcwd())
+    resolved_cwd = cwd if cwd is not None else Path(os.getcwd())
     if scope is McpWriteScope.PROJECT:
-        return workdir_mcp_config_path(cwd)
-    return workdir_mcp_local_config_path(cwd)  # LOCAL
+        return workdir_mcp_config_path(resolved_cwd)
+    return workdir_mcp_local_config_path(resolved_cwd)  # LOCAL
 
 
 def _write_servers_map(path: Path, servers: dict[str, Any], inputs: list[Any]) -> None:
@@ -649,6 +676,7 @@ def upsert_mcp_server(
     *,
     scope: McpWriteScope,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> McpUpsertResult:
     """
     持锁原子 upsert **单个** MCP server 定义到指定 / origin scope / Locked atomic upsert of one server def。
@@ -685,19 +713,20 @@ def upsert_mcp_server(
     :param body: **未渲染** server 定义体（不含 map key；``name`` 由 key 承载）/ the un-rendered server body.
     :param scope: 请求写 scope（仅新声明生效）/ requested write scope (honored only for a new declaration).
     :param env: 环境映射（解析 user config dir + origin 快照），默认 ``os.environ``。
+    :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()``。
     :raises McpConfigCorruptError: 目标 ``mcp.json`` 结构损坏（拒绝覆盖以免销毁既有内容）。
     :returns: :class:`McpUpsertResult`（实际落盘 scope + 是否真写）。
     """
     # 改已有恒落 origin scope；新声明（或 origin 只读 policy/flag）落请求 scope / existing → origin, else → requested.
     target = scope
-    existing = resolve_mcp_config(env=env).servers.get(name)
+    existing = resolve_mcp_config(env=env, cwd=cwd).servers.get(name)
     if existing is not None:
         origin_write = _SETTINGS_TO_WRITE_SCOPE.get(existing.origin)
         if origin_write is not None:
             target = origin_write
 
     raw_body = dict(body)  # 脱离调用方映射；raw、未渲染 / detach caller's mapping; raw, un-rendered.
-    path = mcp_write_path(target, env=env)
+    path = mcp_write_path(target, env=env, cwd=cwd)
     settings_scope = _WRITE_SCOPE_TO_SETTINGS[target]
     with file_lock(path):
         data, errors = load_mcp_config_file(path, settings_scope)  # 容错读 {servers, inputs}
@@ -713,7 +742,7 @@ def upsert_mcp_server(
     return McpUpsertResult(scope=target, changed=True)
 
 
-def remove_mcp_server(name: str, *, env: Mapping[str, str] | None = None) -> bool:
+def remove_mcp_server(name: str, *, env: Mapping[str, str] | None = None, cwd: Path | None = None) -> bool:
     """
     从**所有可写 scope** 删除同名 server 声明 / Remove a server declaration from all writable scopes。
 
@@ -728,11 +757,12 @@ def remove_mcp_server(name: str, *, env: Mapping[str, str] | None = None) -> boo
 
     :param name: 待删 server 名 / the server name to remove.
     :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+    :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()``。
     :returns: 是否从至少一个 scope 删除了声明 / whether it removed a declaration from ≥1 scope。
     """
     removed = False
     for wscope in _WRITABLE_SCOPES:
-        path = mcp_write_path(wscope, env=env)
+        path = mcp_write_path(wscope, env=env, cwd=cwd)
         if not path.exists():
             continue  # 该 scope 无 mcp.json → 无可删，不创建 .lock/目录、不触碰 / skip untouched.
         settings_scope = _WRITE_SCOPE_TO_SETTINGS[wscope]

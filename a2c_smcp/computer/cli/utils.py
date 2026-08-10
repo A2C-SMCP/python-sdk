@@ -193,16 +193,14 @@ def print_status(comp: Computer) -> None:
 
     rows = comp.mcp_manager.get_server_status()
     table = Table(title="MCP 服务器状态 / MCP Servers Status")
-    # #143：``get_server_status`` 返回的是 **bundle_id**（manager 以 bundle_id 为键），历史表头写 "Name" 主动
-    # 误导——用户照本表抄下来的其实是 bundle_id。本表是 bundle_id 的发现入口（寻址多命中时提示「请用
-    # bundle_id 重试」即指这里）。
-    # 注：本表**不显示 display name**，故「我的 server 叫 X，它的 bundle_id 是哪个」需借多命中列表或 `mcp`。
-    # 是否补 Name 列属 #166 未决项（本轮刻意只做表头订正，不抢先裁定）。
+    # #166：两列互补——"Name" 为用户配置的 display name（人可读），"Bundle ID" 为命令
+    # ``server rm/stop`` 的寻址参数（copy-paste 源 + 多命中时的发现入口）。
+    table.add_column("Name", style="green")
     table.add_column("Bundle ID", style="cyan")
     table.add_column("Active", style="magenta")
     table.add_column("State", style="yellow")
-    for name, active, state in rows:
-        table.add_row(name, "[green]✓[/green]" if active else "[red]✗[/red]", state)
+    for bid, display_name, active, state in rows:
+        table.add_row(display_name, bid, "[green]✓[/green]" if active else "[red]✗[/red]", state)
     console.print(table)
 
 

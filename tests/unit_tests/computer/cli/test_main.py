@@ -45,6 +45,7 @@ class FakeComputer:
         input_resolver: Any | None = None,
         registered_workdirs: Any | None = None,
         mcp_flag_config: Any | None = None,
+        flag_settings_path: Any | None = None,
     ) -> None:
         self.init_args = {
             "inputs": inputs,
@@ -55,6 +56,7 @@ class FakeComputer:
             "input_resolver": input_resolver,
             "registered_workdirs": registered_workdirs,
             "mcp_flag_config": mcp_flag_config,
+            "flag_settings_path": flag_settings_path,
         }
 
     async def __aenter__(self) -> FakeComputer:
@@ -1137,3 +1139,31 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_SKILL_EVENT,
         CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器
     }, f"Unexpected event handlers under {custom_ns!r}: {registered!r}"
+
+
+# ---------------------------------------------------------------------------
+# #167 子问题 2：python -m a2c_smcp.computer.cli.main 必须有 __main__ 守卫，
+# 否则导入后静默 exit 0 而 CLAUDE.md 将其列为受支持入口。
+# ---------------------------------------------------------------------------
+def test_main_module_has_name_main_guard() -> None:
+    """#167：cli/main.py 必须有 ``if __name__ == "__main__": main()`` 守卫。
+
+    若缺失则 ``python -m a2c_smcp.computer.cli.main run`` 导入后静默 exit 0。
+    """
+    source = Path(cli_main.__file__).read_text(encoding="utf-8")
+    lines = source.splitlines()
+    guard_line = 'if __name__ == "__main__":'
+    # 全文件搜索守卫（不限定尾部 N 行，避免守卫后加代码误报）
+    guard_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == guard_line:
+            guard_idx = i
+            break
+    assert guard_idx is not None, (
+        f"cli/main.py MUST contain {guard_line!r} so that `python -m` invokes main()"
+    )
+    # 守卫后紧跟 main() 调用
+    assert guard_idx + 1 < len(lines), "Guard must not be the last line"
+    assert lines[guard_idx + 1].strip() == "main()", (
+        f"Expected 'main()' immediately after the guard, got: {lines[guard_idx + 1].strip()!r}"
+    )

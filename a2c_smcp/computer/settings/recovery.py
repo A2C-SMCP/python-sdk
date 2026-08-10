@@ -47,7 +47,7 @@ from a2c_smcp.computer.settings.reconciler import (
     ledger_entry_fully_materialized,
     ledger_record_materialized,
 )
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
 from a2c_smcp.computer.settings.scope import (
     load_settings_file,
     user_settings_path,
@@ -84,6 +84,8 @@ class GovernanceRecoveryReport:
     - ``rematerialized``：意图有、账本缺 → 本轮重物化成功重建账本的 pid（§4.9 删除无损）。
     - ``scope_normalized``：重物化时**无任何层线索**、记录归一 user scope 的 pid（#125 任务 1 显式标注；
       有线索时经 :func:`_infer_record_scopes` 推回原 scope，不入此列）。
+    - ``pending_bundled_servers``：project scope enabledPlugins 激活 → 回落审批门 PENDING 的 bundled
+      server 记录（#159 Option B / 协议 §2.2）；client 据此展示审批 UI。
     """
 
     restored_plugins: list[str] = field(default_factory=list)
@@ -93,6 +95,7 @@ class GovernanceRecoveryReport:
     skipped_disabled: list[str] = field(default_factory=list)
     rematerialized: list[str] = field(default_factory=list)
     scope_normalized: list[str] = field(default_factory=list)
+    pending_bundled_servers: list[BundledServerRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +112,8 @@ class BundledServerRecord:
     marketplace: str
     install_path: Path
     config: MCPServerConfig
+    # v0.3.2 (#159 Option B)：激活该 plugin 的 enabledPlugins 来源 scope（None = 未传 per_scope_layers 或无法判定）
+    enabled_origin: SettingsScope | None = None
 
 
 # 阶段二重挂回调：携归属记录（供 client 带 plugin/marketplace 上下文注册，D2 ${input:} 前缀回退解析）。
@@ -122,6 +127,37 @@ def _plugin_boot_active(declared: Mapping[str, Any], pid: str) -> bool:
     if isinstance(enabled, Mapping):
         return enabled.get(pid) is True
     return False
+
+
+def _plugin_enable_origin(
+    per_scope_layers: Mapping[SettingsScope, Mapping[str, Any]],
+    pid: str,
+) -> SettingsScope | None:
+    """返回激活该 plugin 的最高 scope（按 SCOPE_ORDER 优先级），用于 #159 Option B 审批门分叉。
+
+    ``enabledPlugins`` 三态合并（协议 §2.4）：absent=无意见、true=启用、false=显式禁用。
+    逐 scope（低→高）检查 raw 层：遇到 ``false`` → 被显式禁用 → 返回 None；
+    遇到 ``true`` → 该 scope 是当前激活来源 → 继续检查更高 scope 覆盖。
+    最终返回最后一个 ``true`` 的 scope（即最高激活 scope）；全部 absent 返回 None。
+
+    :param per_scope_layers: per-scope 校验后 raw 层（如 :class:`ResolvedSettings.per_scope_layers`）。
+    :param pid: plugin id（``<plugin>@<marketplace>``）。
+    :return: 最高激活 scope，或 None（被禁用或未在任何 scope 启用）。
+    """
+    origin: SettingsScope | None = None
+    for s in SCOPE_ORDER:
+        layer = per_scope_layers.get(s)
+        if not isinstance(layer, Mapping):
+            continue
+        enabled = layer.get("enabledPlugins")
+        if not isinstance(enabled, Mapping):
+            continue
+        val = enabled.get(pid)
+        if val is False:
+            origin = None  # 显式禁用覆盖一切
+        elif val is True:
+            origin = s  # 该 scope 激活
+    return origin
 
 
 def _split_pid(pid: str) -> tuple[str, str] | None:
@@ -203,6 +239,7 @@ async def recover_marketplace_skills(
     declared: Mapping[str, Any],
     *,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
     timeout: float = DEFAULT_GIT_TIMEOUT,
 ) -> GovernanceRecoveryReport:
     """
@@ -223,6 +260,9 @@ async def recover_marketplace_skills(
     user scope + WARN + ``report.scope_normalized`` 显式标注；完美复原需 committed 记录承载，属可选
     pin-lock 扩展（§4.9.2）范畴。
 
+    :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+    :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()``。
+
     :param registry: 目标 :class:`SkillRegistry`（恢复注册进当前活跃集）。
     :param home: SKILL Home 绝对根。
     :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控）。
@@ -235,8 +275,8 @@ async def recover_marketplace_skills(
         return report
     ledger = load_installed_plugins(home=home, env=env).get("plugins", {})
     known = load_known_marketplaces(home=home, env=env).get("marketplaces", {})
-    cwd = Path.cwd()
-    layers = _intent_layer_snapshot(env, cwd)  # scope 推回线索快照（循环外一次，#125 任务 1）
+    resolved_cwd = cwd if cwd is not None else Path.cwd()
+    layers = _intent_layer_snapshot(env, resolved_cwd)  # scope 推回线索快照（循环外一次，#125 任务 1）
 
     # installed pid 按 marketplace 分组（plugin → 是否活跃）/ group intent pids by marketplace.
     by_marketplace: dict[str, dict[str, bool]] = {}
@@ -288,7 +328,7 @@ async def recover_marketplace_skills(
         #    scope 经分层线索推回（#125 任务 1）；无线索 → 归一 user + WARN + scope_normalized 标注。
         for plugin in needs_materialize:
             pid = f"{plugin}@{marketplace}"
-            targets = _infer_record_scopes(pid, layers, cwd)
+            targets = _infer_record_scopes(pid, layers, resolved_cwd)
             normalized = not targets
             if normalized:
                 targets = [("user", None)]
@@ -334,6 +374,7 @@ def collect_enabled_bundled_servers(
     declared: Mapping[str, Any],
     *,
     env: Mapping[str, str] | None = None,
+    per_scope_layers: Mapping[SettingsScope, Mapping[str, Any]] | None = None,
 ) -> list[BundledServerRecord]:
     """
     阶段二输入（纯读、无锁、无副作用）：枚举 enabled installed plugin 的 bundled MCP server / Phase-2 pure collect。
@@ -352,6 +393,8 @@ def collect_enabled_bundled_servers(
     :param home: SKILL Home 绝对根。
     :param declared: 合并声明视图（``installedPlugins`` + ``enabledPlugins`` 两键）。
     :param env: 环境映射（账本路径解析），默认 ``os.environ``。
+    :param per_scope_layers: per-scope 校验后 raw 层（#159 Option B / 协议 §2.2）。
+        ``None`` = 不填充 ``BundledServerRecord.enabled_origin``（向后兼容）。
     """
     out: list[BundledServerRecord] = []
     seen: set[str] = set()
@@ -384,7 +427,13 @@ def collect_enabled_bundled_servers(
                     logger.debug("governance recovery: bundled server bundle_id %r duplicated across plugins/scopes, first seen wins", bid)
                     continue
                 seen.add(bid)
+                origin = None
+                if per_scope_layers is not None:
+                    origin = _plugin_enable_origin(per_scope_layers, pid)
                 out.append(
-                    BundledServerRecord(plugin_id=pid, plugin=plugin, marketplace=marketplace, install_path=root, config=config),
+                    BundledServerRecord(
+                        plugin_id=pid, plugin=plugin, marketplace=marketplace,
+                        install_path=root, config=config, enabled_origin=origin,
+                    ),
                 )
     return out

@@ -162,28 +162,29 @@ def resolve_target(token: str, candidates: tuple[ServerCandidate, ...]) -> BUNDL
     步骤序（**顺序有意义**，勿重排）:
 
     1. token 按 **display name** 反查，**唯一命中** → 其 bundle_id；
-    2. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身（语法合法 ≠ 存在：未注册须报「未找到」，
+    2. **多命中**，且 token 精确等于其中某候选的 bundle_id → 该 bundle_id（用户已显式表达身份意图，
+       不应报「请用 bundle_id 重试」；协议 §5.1 步骤 2，#170 修复）；
+    3. **多命中**，且 token 不等于任何候选的 bundle_id →
+       :class:`AmbiguousTargetError`（列候选，要求改用 bundle_id 重试）；
+    4. **0 命中** ∧ token 是**合法且已注册**的 bundle_id → token 本身（语法合法 ≠ 存在：未注册须报「未找到」，
        否则 ``stop <合法但不存在的 id>`` 会一路走到底层的静默 no-op ⇒ 假成功复活）；
-    3. **多命中** → :class:`AmbiguousTargetError`（列候选，要求改用 bundle_id 重试）；
-    4. 其余 → :class:`TargetNotFoundError`。
+    5. **MUST NOT** 以字典序最小等任意规则「确定性地选一个」——精确 bundle_id 匹配（步骤 2）是执行用户
+       已显式表达的身份意图，不属「任意规则」范畴；
+    6. 其余 → :class:`TargetNotFoundError`。
 
-    .. warning::
-       **步骤 4（协议）：MUST NOT 以字典序最小等任意规则「确定性地选一个」**——那是把不确定的错变成确定的错。
-
-    .. note::
-       **已知缺口（协议 §5.1 步骤序，#143 决策 4，待协议裁决后双端同步修）**：步骤 2 的门是**「0 命中」**，
-       故多命中时够不到步骤 2。⇒ ``A(name='foo', 缺省派生 id='foo')`` 与 ``B(name='foo', 显式 id='bundle_x')``
-       合法共存（§5.6）时，A 的 bundle_id 恰等于那个冲突的名字，用户照「请用 bundle_id 重试」再敲 ``foo``
-       仍是 name 多命中 ⇒ **A 永远不可寻址**。修它属改协议明文，且该语义 MUST 双端逐字一致 ⇒ 不单端发明。
-       缺口由 ``tests/unit_tests/computer/cli/test_resolve.py`` 的 xfail 用例钉住，求裁于 **#170**。
-
-    :raises AmbiguousTargetError: token 作为 display name 命中多条。
+    :raises AmbiguousTargetError: token 作为 display name 命中多条，且不精确等于任何候选的 bundle_id。
     :raises TargetNotFoundError: token 既非已知 name 也非已注册的合法 bundle_id。
     """
     name_hits = tuple(c for c in candidates if c.name == token)
     if len(name_hits) == 1:
         return name_hits[0].bundle_id
     if len(name_hits) > 1:
+        # 步骤 2：同名冲突时，token 精确等于某候选 bundle_id → 直接命中（#170 死锁修复）。
+        # bundle_id 是全局唯一的，token == A.bundle_id 排除了 token 是 B 的 bundle_id 的可能，
+        # 此时唯一确定的语义是：用户在用 A 的身份标识精确指代 A。不构成真实二义性。
+        for cand in name_hits:
+            if cand.bundle_id == token:
+                return token
         raise AmbiguousTargetError(token, name_hits)
     if is_valid_bundle_id(token):
         for cand in candidates:

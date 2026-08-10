@@ -41,7 +41,15 @@ import pytest
 
 from a2c_smcp.computer.cli.commands.plugin import run_mcp_approval
 from a2c_smcp.computer.computer import Computer
-from a2c_smcp.computer.inputs.resolver import InputResolver
+from a2c_smcp.computer.inputs.resolver import (
+    InputKind,
+    InputResolver,
+    MissingInputError,
+)
+from a2c_smcp.computer.inputs.value_store import ValueStore
+from a2c_smcp.computer.mcp_clients.model import (
+    MCPServerPromptStringInput,
+)
 from a2c_smcp.computer.settings.mcp_config import (
     McpWriteScope,
     McpWriteTargetError,
@@ -49,6 +57,36 @@ from a2c_smcp.computer.settings.mcp_config import (
     resolve_mcp_config,
 )
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.env_segment import env_var_name
+
+# ---- group 7 helpers (scoped-first resolver parity) ----
+_SESSION: Any = object()  # 非 None → _has_tty 视为可交互
+
+
+class _Secret:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self._store: dict[str, str] = {}
+
+    def get(self, k: str) -> str | None:
+        return self._store.get(k) if self.available else None
+
+    def set(self, k: str, v: str) -> bool:
+        if not self.available:
+            return False
+        self._store[k] = v
+        return True
+
+
+def _resolver(inputs, *, env=None):
+    """构造 scoped-first 测试用的 InputResolver（headless 默认, keyring 不可用）。"""
+    from pathlib import Path as _Path
+    return InputResolver(
+        inputs,
+        env=env or {},
+        value_store=ValueStore({"XDG_STATE_HOME": str(_Path("/tmp"))}),
+        secret_store=_Secret(available=False),
+    )
 
 
 class _MapResolver(InputResolver):
@@ -342,3 +380,67 @@ async def test_alignment_same_name_distinct_bundle_id_coexist(tmp_path: Path, mo
     # 佐证：两条 display name 逐字相同——证明区分靠 bundle_id 而非 name。
     names = [c.name for c in comp.mcp_manager.server_configs()]
     assert names.count("dup.disp") == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 组 7 — §5.11 plugin input 解析序四景对拍（#175，conformance §5，镜像 rust-sdk#155）
+# ═══════════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_conformance_scoped_wins_over_global_same_kind(tmp_path: Path) -> None:
+    """conformance §5 ①：scoped 与 global 同 kind 并存 → scoped 胜（§5.11 scoped-first）。
+
+    直接测 resolver（不经过 Computer），确保定义定位层 scoped 优先。对应 rust-sdk#155
+    ``scoped_def_wins_over_global_when_both_present``。
+    """
+    from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
+
+    scoped_id = prefix_input_id("figma", "acme", "token")
+    inputs = [
+        MCPServerPromptStringInput(id=scoped_id, description="scoped"),
+        MCPServerPromptStringInput(id="token", description="global"),
+    ]
+    r = _resolver(inputs, env={env_var_name(scoped_id): "scoped-v", env_var_name("token"): "global-v"})
+    assert await r.aresolve_by_id("token", plugin="figma", marketplace="acme", session=_SESSION) == "scoped-v"
+
+
+@pytest.mark.asyncio
+async def test_conformance_scoped_missing_global_fallback(tmp_path: Path) -> None:
+    """conformance §5 ②：scoped 未定义、global 存在 → 回退 global（§5.11 rule 2）。"""
+    inputs = [MCPServerPromptStringInput(id="token", description="global")]
+    r = _resolver(inputs, env={env_var_name("token"): "global-v"})
+    assert await r.aresolve_by_id("token", plugin="figma", marketplace="acme", session=_SESSION) == "global-v"
+
+
+@pytest.mark.asyncio
+async def test_conformance_explicit_scoped_ref_no_global_fallback(tmp_path: Path) -> None:
+    """conformance §5 ④：显式完整引用直接命中 scoped、不回退 global（即使 global 同池）。"""
+    from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
+
+    scoped_id = prefix_input_id("figma", "acme", "token")
+    inputs = [
+        MCPServerPromptStringInput(id=scoped_id, description="scoped"),
+        MCPServerPromptStringInput(id="token", description="global"),
+    ]
+    r = _resolver(inputs, env={env_var_name(scoped_id): "scoped-v", env_var_name("token"): "global-v"})
+    assert await r.aresolve_by_id(scoped_id, plugin="figma", marketplace="acme", session=_SESSION) == "scoped-v"
+
+
+@pytest.mark.asyncio
+async def test_conformance_cross_kind_scoped_secret_no_global_value_fallback(tmp_path: Path) -> None:
+    """conformance §5 ③：scoped secret 取值失败 → MissingInputError(SECRET, scoped_id)，MUST NOT 回退 global value。
+
+    scoped-first 定义定位层保证 scoped 命中后绝不再试 global，跨 kind 守卫自然满足。
+    """
+    from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
+
+    scoped_id = prefix_input_id("figma", "acme", "api_key")
+    inputs = [
+        MCPServerPromptStringInput(id=scoped_id, description="scoped-secret", password=True),
+        MCPServerPromptStringInput(id="api_key", description="global-value"),  # 不同 kind
+    ]
+    r = _resolver(inputs, env={})  # 无 env + headless → scoped secret 不可解析
+    with pytest.raises(MissingInputError) as ei:
+        await r.aresolve_by_id("api_key", plugin="figma", marketplace="acme", session=None)
+    err = ei.value
+    assert err.kind is InputKind.SECRET
+    assert err.id == scoped_id  # scoped id，非裸 "api_key"

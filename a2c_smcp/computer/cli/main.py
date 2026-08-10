@@ -197,12 +197,9 @@ def _root(
     - 若未指定子命令，则等价于执行 `run`，保持 `a2c-computer` 和 `a2c-computer run` 两种用法都可用。
     - 若指定了子命令，则不做处理，交给子命令。
     """
-    # 根据 no_color 动态调整全局 Console
+    # 根据 no_color 动态调整全局 Console（就地 mutate，所有引用自动跟随）
     if no_color:
-        global console
         console_util.set_no_color(True)
-        # 重新绑定本地引用
-        console = console_util.console
 
     # #97：采集根级上下文（--settings flag scope 文件）存入 ctx.obj，供 settings 子命令读取。
     # Click 子上下文默认继承父 ctx.obj，故无论是否带子命令都先填充（无子命令时 run 路径仍走显式参数）。
@@ -310,6 +307,7 @@ def _run_impl(
             auto_connect=auto_connect,
             auto_reconnect=auto_reconnect,
             mcp_flag_config=flag_mcp_path,
+            flag_settings_path=Path(settings_file) if isinstance(settings_file, str) else None,
         )
         async with comp:
             init_client: SMCPComputerClient | None = None
@@ -659,3 +657,7 @@ def main() -> None:  # pragma: no cover
     # 使用 Typer 应用入口，而不是直接调用命令函数
     # 直接调用被 @app.command 装饰的函数会传入 OptionInfo 默认值，导致参数类型错误
     app()
+
+
+if __name__ == "__main__":
+    main()

@@ -67,12 +67,16 @@ from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
+    McpApprovalStatus,
     McpWriteScope,
     McpWriteTargetError,
     ResolvedMcpConfig,
     is_writable_origin,
+    mcp_server_status,
     remove_mcp_server,
     resolve_mcp_config,
+    security_layer_check,
+    trust_layer_check,
     upsert_mcp_server,
 )
 from a2c_smcp.computer.settings.recovery import (
@@ -82,6 +86,7 @@ from a2c_smcp.computer.settings.recovery import (
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
+from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
     SkillEventDebouncer,
@@ -111,6 +116,7 @@ _SKILL_URI_PREFIX = "skill://"
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
+    from a2c_smcp.computer.settings.scope import ResolvedSettings
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
 
 
@@ -129,6 +135,9 @@ class Computer(BaseComputer[PromptSession]):
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
         mcp_flag_config: Path | None = None,
+        flag_settings_path: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        project_root: Path | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -168,6 +177,20 @@ class Computer(BaseComputer[PromptSession]):
                 Computer 即该 boot 对象，故二者同住于此，经 :meth:`resolve_mcp_declarations` 一并投影。
                 The flag-layer mcp.json path (CLI ``--mcp-config``); a boot-declarative input alongside
                 ``mcp_servers`` (the embed layer). See :meth:`resolve_mcp_declarations`.
+            flag_settings_path (Path | None): flag 层 ``settings.json`` 路径（CLI ``--settings <file>``，
+                优先级**次高、仅低于 policy**，§2.5-3）。与 ``mcp_flag_config`` 同为 flag scope **文件对**，
+                此前仅在 CLI ``run_mcp_approval`` 路径注入，``_resolve_declared_settings`` 不可见（#167 子问题 3）。
+                ``None``（缺省）= 无 flag 层 settings（向后兼容）。
+                The flag-layer settings.json path (CLI ``--settings``); paired with ``mcp_flag_config``
+                as the flag-scope file pair per §2.5-3. ``None`` = no flag settings (backward compat).
+            env (Mapping[str, str] | None): 环境映射注入（#134，对齐 rust-sdk#121 ``with_config_env``）。
+                ``None``（缺省）= ``os.environ``（保 CLI 向后兼容）；嵌入式多实例注入 per-instance 映射
+                使 XDG / HOME 等配置锚点与 ledger ``skill_home`` 同源，消除 ownership/enablement 归属混源。
+                Per-instance env override; ``None`` falls back to ``os.environ`` (backward compat).
+            project_root (Path | None): project/local scope 锚定目录（#134，对齐 rust-sdk#121 ``with_config_dir``）。
+                ``None``（缺省）= ``os.getcwd()``（保 CLI 向后兼容）；嵌入式多实例注入使 project/local
+                层（``.tfrobot/settings.json`` 等）与实例而非宿主进程绑定。
+                Per-instance project anchor; ``None`` falls back to ``os.getcwd()`` (backward compat).
         """
         self.name = name
         self.mcp_manager: MCPServerManager | None = None
@@ -189,6 +212,12 @@ class Computer(BaseComputer[PromptSession]):
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
         # flag 层 mcp.json 路径（`--mcp-config`）：与 `_mcp_servers` 同为当次 boot 的声明式输入（§2.5-5）。
         self._mcp_flag_config: Path | None = mcp_flag_config
+        # flag 层 settings.json 路径（`--settings`）：与 `_mcp_flag_config` 同为 flag scope 文件对（#167 子问题 3）。
+        self._flag_settings_path: Path | None = flag_settings_path
+        # #134（对齐 rust-sdk#121）：per-instance env/project_root 注入接缝。None = 进程 ambient（backward compat）。
+        # 嵌入式宿主注入使 settings 解析轴（XDG / project cwd）与 ledger（skill_home）同锚点，消除归属混源。
+        self._env: Mapping[str, str] | None = env
+        self._project_root: Path | None = project_root
         # #149：运行期活跃集的**声明面 raw 投影**缓存（bundle_id → raw-with-bundle 未渲染 config）。get_config wire
         # 从此取 body（占位符字面保留、绝不外泄已解析 secret）；SET 仍以 manager 运行期权威为准（见 active_server_configs）。
         # #149: raw (un-rendered) projection of the runtime-active set, keyed by bundle_id — the body source for the
@@ -345,6 +374,18 @@ class Computer(BaseComputer[PromptSession]):
         cid = self._toolspool_store.put(payload, mime)
         return encode_toolspool_handle(cid=cid, mime=mime)
 
+    # ── #134 per-instance env/cwd 注入接缝（对齐 rust-sdk#121） ──────────────
+
+    def _resolve_env(self) -> Mapping[str, str] | None:
+        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。"""
+        return self._env
+
+    def _resolve_cwd(self) -> Path | None:
+        """注入 project_root（``None`` = 延迟回退 ``os.getcwd()``，保 CLI 向后兼容）。"""
+        return self._project_root
+
+    # ── boot ───────────────────────────────────────────────────────────────
+
     async def boot_up(self, *, session: PromptSession | None = None) -> None:
         """
         启动计算机，初始化 MCP 服务器管理器。
@@ -364,6 +405,14 @@ class Computer(BaseComputer[PromptSession]):
         #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
         # English: Render (resolution chain + predefined vars) + envFile merge + validate, reusing
         #          _arender_and_validate_server (DRY). On failure, keep the original config and continue.
+        # #165 Gap A：读取 settings 用于嵌入模式下 embed server 的安全层判定。
+        # _resolve_declared_settings 不依赖 _skill_home，在 boot 早期安全调用；容错：读不到则空。
+        try:
+            declared_st = self._resolve_declared_settings()
+            boot_settings = declared_st.settings
+        except Exception:
+            logger.debug("boot_up: settings unavailable for security layer check, all embed servers pass")
+            boot_settings = {}
         # #149：boot 重建运行期活跃集 → 先重置 raw 投影缓存，逐条登记（setdefault=first-wins，与 ainitialize
         # no-double-open 同序：同 bundle_id 保配置顺序首个）。
         self._active_raw.clear()
@@ -386,8 +435,18 @@ class Computer(BaseComputer[PromptSession]):
                 logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 其余渲染/校验错误：按稳妥策略保留原配置继续（对齐 rust「其余渲染错误维持容错」，不连坐上抛）。
                 raw_cfg = validated = server_cfg
+            # #165 Gap A：embed server 经全门判定（trusted_origin=True ⇒ Gate 4 ENABLED，Gate 1-3 仍判）。
+            # 被安全层拒绝的 server 不挂载（不进 validated_servers、不进 _active_raw）。
+            bid = resolve_bundle_id(validated)
+            if mcp_server_status(bid, settings=boot_settings, trusted_origin=True) is McpApprovalStatus.DISABLED:
+                logger.warning(
+                    "boot_up: embed server %r (bundle_id=%r) denied by policy — not mounted",
+                    getattr(validated, "name", "unknown"),
+                    bid,
+                )
+                continue
             validated_servers.append(validated)
-            self._active_raw.setdefault(resolve_bundle_id(validated), raw_cfg)
+            self._active_raw.setdefault(bid, raw_cfg)
 
         await self.mcp_manager.ainitialize(validated_servers)
 
@@ -408,7 +467,7 @@ class Computer(BaseComputer[PromptSession]):
         # 显式重挂（设计 Y）。One-time legacy migration, then intent-driven skills-only recovery.
         if self._skill_home is not None:
             try:
-                migrated = migrate_legacy_installs(self._skill_home)
+                migrated = migrate_legacy_installs(self._skill_home, env=self._resolve_env())
                 if migrated:
                     logger.info("v0.3.0 governance migration: %d legacy install(s) migrated to installedPlugins", len(migrated))
             except Exception as e:  # pragma: no cover — 失败隔离：迁移失败不阻断启动（下次 boot 重试）
@@ -803,9 +862,9 @@ class Computer(BaseComputer[PromptSession]):
         # English: Resolve input value by input_id; raise InputNotFoundError if not defined
         async def _resolve_input_by_id(input_id: str) -> Any:
             try:
-                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此回退到
-                # 带前缀池条目 <plugin>@<marketplace>/<id>（§9.3 D2）。非 plugin 来源传 None=现状。
-                # plugin/marketplace context lets a bundled server's bare ${input:id} fall back to the prefixed pool entry.
+                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此优先查
+                # scoped 池条目 <plugin>@<marketplace>/<id>（§5.11 scoped-first，#175）。非 plugin 来源传 None=现状。
+                # plugin/marketplace context lets a bundled server's bare ${input:id} look up the scoped pool entry first.
                 return await self._input_resolver.aresolve_by_id(input_id, session=session, plugin=plugin, marketplace=marketplace)
             except InputNotFoundError:
                 logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
@@ -998,11 +1057,26 @@ class Computer(BaseComputer[PromptSession]):
         raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         # 2. 取未渲染 raw 落盘（D1：占位字面保留、绝不写 secret）。
         name, raw_body = self._raw_body_for_disk(server)
-        upsert_mcp_server(name, raw_body, scope=scope, env=os.environ)
+        result = upsert_mcp_server(name, raw_body, scope=scope, env=self._resolve_env(), cwd=self._resolve_cwd())
         # 3. 复用 render 结果物化（capability 自动上报；config 上报由调用方驱动，见分账注释）。
         await self._amount_rendered(raw_cfg, validated)
+        # 4. #167 子问题 1：后置遮蔽检测——写入成功但被更高优先级只读层（flag/embed/policy）遮蔽时 WARN。
+        #    upsert_mcp_server 的 origin 快照不传 flag_config_path/embed_servers（见其 docstring 已知代价），
+        #    故此处补全量解析。对标 aremove_server 的只读 origin 检测（L1124-1137）。
+        if result.changed:
+            declarations = self.resolve_mcp_declarations(env=self._resolve_env(), cwd=self._resolve_cwd())
+            resolved_srv = declarations.servers.get(name)
+            if resolved_srv is not None and not is_writable_origin(resolved_srv.origin):
+                logger.warning(
+                    "server %s was written to scope %s but is SHADOWED by the %s layer (higher priority). "
+                    "The effective configuration comes from the %s layer, not from your write. "
+                    "To make your change take effect, remove or modify the declaration in the shadowing layer.",
+                    name, result.scope.value, resolved_srv.origin.value, resolved_srv.origin.value,
+                )
 
-    def resolve_mcp_declarations(self, *, env: Mapping[str, str] | None = None) -> ResolvedMcpConfig:
+    def resolve_mcp_declarations(
+        self, *, env: Mapping[str, str] | None = None, cwd: Path | None = None,
+    ) -> ResolvedMcpConfig:
         """当次 boot 的**非-plugin 声明面**（协议 §2.5-5 权威集的非-plugin 部分）/ This boot's non-plugin declaration surface。
 
         = :func:`resolve_mcp_config` 全量层 + 本 Computer 的两条 **boot 声明式输入**：
@@ -1016,9 +1090,13 @@ class Computer(BaseComputer[PromptSession]):
         **与 `active_server_configs()` 的分工**（勿混）：本方法是**声明面**（谁被声明了、以何 origin）；
         ``active_server_configs()`` / ``mcp_manager.server_configs()`` 是**运行期活跃集**（谁真的挂起来了）。
         依赖预检与 wire 投影读后者（§2.5-4）；回收判据的「X 非用户声明」读前者（§4.9.1-2）。
+
+        :param env: 环境映射（解析 user config dir），默认 ``os.environ``。
+        :param cwd: project/local 锚定目录（#134），``None`` = ``os.getcwd()``。
         """
         return resolve_mcp_config(
             env=env,
+            cwd=cwd,
             flag_config_path=self._mcp_flag_config,
             embed_servers=self._mcp_servers,
         )
@@ -1063,9 +1141,9 @@ class Computer(BaseComputer[PromptSession]):
         Raises:
             McpWriteTargetError: 档 3（声明只存在于只读 scope）或档 4（纯运行期投影）。
         """
-        env = os.environ
+        env = self._resolve_env()
         # 1. 声明优先：快照解析声明名（未渲染 config，derive-on-raw 与注册边界同源）。含 flag/embed 层（§2.5-5）。
-        snapshot = self.resolve_mcp_declarations(env=env)
+        snapshot = self.resolve_mcp_declarations(env=env, cwd=self._resolve_cwd())
         matched = {name: srv.origin for name, srv in snapshot.servers.items() if resolve_bundle_id(srv.config) == bundle_id}
         if matched:
             # 3. 胜出声明落只读 scope ⇒ 删不掉，拒删而非静默假成功（见 docstring 档 3）。
@@ -1081,7 +1159,7 @@ class Computer(BaseComputer[PromptSession]):
                 )
             # 2. origin 可写 ⇒ 放行：删所有可写 scope + 停摘（用户覆盖权，即便与某 bundled 同 bundle_id 亦可删）。
             for name in matched:
-                remove_mcp_server(name, env=env)
+                remove_mcp_server(name, env=env, cwd=self._resolve_cwd())
             await self.aunmount_server_by_id(bundle_id)
             return
         # 4. 无声明 ∧ 运行期仍活跃 ⇒ plugin/治理投影，拒删、导向 plugin uninstall（origin==plugin 的可观测等价）。
@@ -1683,17 +1761,23 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._skill_debouncer.mark_dirty()
 
-    def _resolve_declared_settings(self) -> dict[str, Any]:
-        """治理恢复的 declared 合并视图（user/project/local/policy；无 flag——Computer 不持 ``--settings`` 知识）。
+    def _resolve_declared_settings(self) -> "ResolvedSettings":
+        """治理恢复的 declared 视图（含合并 settings + per-scope 层，供 #159 Option B 审批门分叉）。
 
-        已知限制（与 rust 同构文档化）：flag scope 的 ``enabledPlugins`` 不在此视图；CLI 接线时经
-        ``reconcile_governance(declared=...)`` 显式传 flag-aware 视图。跨重启可靠 disable 请写 user scope。
-        The declared view for governance recovery (no flag scope at boot); pass flag-aware ``declared`` explicitly.
+        flag scope 由 :attr:`_flag_settings_path`（CLI ``--settings <file>``）注入；
+        ``None``（缺省）= 无 flag 层 settings，向后兼容。#167 子问题 3 前此项不可达。
+        The declared view for governance recovery; ``flag_settings_path`` (CLI ``--settings``) is
+        injected when set, ``None`` = no flag settings (backward compat). Fixed in #167 sub-issue 3.
         """
         from a2c_smcp.computer.settings.policy import resolve_policy_settings
         from a2c_smcp.computer.settings.scope import resolve_settings
 
-        return resolve_settings(policy_settings=resolve_policy_settings()).settings
+        return resolve_settings(
+            env=self._resolve_env(),
+            cwd=self._resolve_cwd(),
+            flag_settings_path=self._flag_settings_path,
+            policy_settings=resolve_policy_settings(env=self._resolve_env()),
+        )
 
     async def reconcile_governance(
         self,
@@ -1732,10 +1816,18 @@ class Computer(BaseComputer[PromptSession]):
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
         home = self.skill_home
+        per_scope_layers: Mapping[SettingsScope, Mapping[str, Any]] | None = None
         if declared is None:
-            declared = self._resolve_declared_settings()
+            resolved = self._resolve_declared_settings()
+            declared = resolved.settings
+            per_scope_layers = resolved.per_scope_layers
+        else:
+            # 调用方显式传 declared 时通常不带 per-scope 层 → 保持向后兼容（enabled_origin=None）
+            per_scope_layers = None
 
-        report = await recover_marketplace_skills(self._skill_registry, home, declared)
+        report = await recover_marketplace_skills(
+            self._skill_registry, home, declared, env=self._resolve_env(), cwd=self._resolve_cwd(),
+        )
         if report.restored_skills:
             self.mark_skills_dirty()
 
@@ -1744,7 +1836,9 @@ class Computer(BaseComputer[PromptSession]):
 
         existing = set(existing_bundle_ids()) if existing_bundle_ids is not None else set()
         injected_roots: set[Path] = set()
-        for record in collect_enabled_bundled_servers(home, declared):
+        for record in collect_enabled_bundled_servers(
+            home, declared, per_scope_layers=per_scope_layers, env=self._resolve_env(),
+        ):
             # 身份 = bundle_id：按 display name 判会误伤「同名异 id」——协议 §5.6 明定其为**合法共存**，
             # MUST NOT 视为冲突；同 bundle_id 才是「依赖已满足」（§2.5-1），此时复用既有实例、不覆盖。
             bundle_id = resolve_bundle_id(record.config)
@@ -1756,6 +1850,31 @@ class Computer(BaseComputer[PromptSession]):
                     record.plugin_id,
                 )
                 continue
+            # #165 Gap B：安全层判定（Gate 1-3）——所有 server（含 plugin baseline）必经。
+            # 协议 §5 item 10 条件化 + 审批门对齐指南 §2.3。
+            if security_layer_check(bundle_id, settings=declared) is McpApprovalStatus.DISABLED:
+                logger.info(
+                    "governance recovery: bundled server %r (plugin %s) denied by security layer (Gate 1-3) — "
+                    "not mounted",
+                    bundle_id,
+                    record.plugin_id,
+                )
+                continue
+            # #159 Option B：信任层（Gate 4-7）——仅 project scope enabledPlugins 激活的 bundled server 进门。
+            # （协议 §5 item 10 条件化 / 指南 §2.2）。受信 scope enable 的跳过信任层，直接挂载。
+            # 安全层已通过（上方 security_layer_check），此处直接判信任层避免冗余 Gate 1-3 重查。
+            if record.enabled_origin is SettingsScope.PROJECT:
+                verdict = trust_layer_check(bundle_id, settings=declared, trusted_origin=False)
+                if verdict is McpApprovalStatus.PENDING:
+                    logger.info(
+                        "governance recovery: bundled server %r (plugin %s) enabled by project scope — "
+                        "PENDING approval, not auto-mounted (user must approve)",
+                        bundle_id,
+                        record.plugin_id,
+                    )
+                    report.pending_bundled_servers.append(record)
+                    continue
+                # ENABLED（用户手动加到 enabledMcpjsonServers / enableAllProject → fall through to mount）
             try:
                 if inject_inputs is not None and record.install_path not in injected_roots:
                     await inject_inputs(record)
@@ -1812,11 +1931,18 @@ class Computer(BaseComputer[PromptSession]):
         home = self.skill_home
         # F1「∃ origin != plugin 的声明」判据的 bundle_id 集 = 非-plugin 声明面（携 origin，结构性 ∈ 非-plugin：
         # durable + flag --mcp-config + embed）。与 `aremove_server` / `cli.resolve.collect_candidates` 同接缝。
-        non_plugin_bundle_ids = {resolve_bundle_id(srv.config) for srv in self.resolve_mcp_declarations(env=os.environ).servers.values()}
+        non_plugin_bundle_ids = {
+            resolve_bundle_id(srv.config)
+            for srv in self.resolve_mcp_declarations(env=self._resolve_env(), cwd=self._resolve_cwd()).servers.values()
+        }
         # ledger 派生的已启用 bundled server（归属纯函数，与 reconcile_governance 同解析视图），**按 bundle_id 为键**（#144）。
-        declared = self._resolve_declared_settings()
+        resolved = self._resolve_declared_settings()
+        declared = resolved.settings
         bundled: dict[str, BundledServerRecord] = {
-            resolve_bundle_id(record.config): record for record in collect_enabled_bundled_servers(home, declared)
+            resolve_bundle_id(record.config): record
+            for record in collect_enabled_bundled_servers(
+                home, declared, per_scope_layers=resolved.per_scope_layers, env=self._resolve_env(),
+            )
         }
 
         def ownership_for(bundle_id: str) -> McpOwnership:

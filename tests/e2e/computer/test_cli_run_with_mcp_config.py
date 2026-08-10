@@ -119,7 +119,7 @@ def _assert_status(child: pexpect.spawn, server: str, retries: int = 8, delay: f
 def test_run_with_mcp_config_param_loads_server() -> None:
     """
     启动参数含 --mcp-config @tests/e2e/computer/configs/mcp_flag_direct_execution.json，应能加载并启动服务：
-    - 进入 a2c> 后检查 status 含 e2e.direct
+    - 进入 a2c> 后检查 status 含 e2e.direct（display name）和 e2e_direct（bundle_id）
     - tools 中包含 hello
     若自动启动存在延迟，调用一次 start all 作为补偿
 
@@ -128,11 +128,8 @@ def test_run_with_mcp_config_param_loads_server() -> None:
 
     保留 `--mcp-config=@...` 的**等号形**：这是全仓唯一钉住等号形解析的地方。
 
-    ⚠️ **status 断言的是 bundle_id `e2e_direct`，不是 display name** —— `MCPServerManager.get_server_status()`
-    刻意以 **bundle_id 为身份**返回（#129/#130/#131 BundleID 模型），而 `cli/utils.py` 把它渲染在标着 "Name"
-    的列下。**旧夹具 `e2e-test` 看不见这个分叉**（`-` 不折叠 ⇒ name ≡ bundle_id ⇒ 同值致盲，正是 Epic #147
-    「stub 同值陷阱」那一族）；换成分叉夹具后才暴露出来。「人机面该显示 display name」属 REPL 寻址/展示轴
-    （#143 / #144），**不在本 Issue 范围**——此处如实断言**今日行为**，勿改成 `e2e.direct` 掩盖它。
+    #166 已修复：status 表同时显示 "Name"（display name）和 "Bundle ID" 两列，
+    e2e 断言两者均出现——display name `e2e.direct` 在人机面可见，bundle_id `e2e_direct` 留作寻址。
     """
     cfg_arg = "--mcp-config=@tests/e2e/computer/configs/mcp_flag_direct_execution.json"
     with _spawn_cli_with_args(cfg_arg) as child:
@@ -155,6 +152,7 @@ def test_run_with_mcp_config_param_loads_server() -> None:
         child.sendline("start all")
         _wait_prompt(child)
 
-        # 身份 = bundle_id（见 docstring：status 渲染 get_server_status() 的 bundle_id，非 display name）
+        # #166：status 表同时显示 Name（display name）和 Bundle ID（寻址标识）
+        _assert_status(child, "e2e.direct", retries=10, delay=0.8)
         _assert_status(child, "e2e_direct", retries=10, delay=0.8)
         _assert_tools(child, "hello", retries=12, delay=1.0)

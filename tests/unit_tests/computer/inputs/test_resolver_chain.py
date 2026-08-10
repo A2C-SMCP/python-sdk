@@ -24,6 +24,7 @@ import a2c_smcp.computer.inputs.resolver as resolver_mod
 from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
 from a2c_smcp.computer.inputs.resolver import (
     InputKind,
+    InputNotFoundError,
     InputResolutionError,
     InputResolver,
     MissingInputError,
@@ -282,15 +283,119 @@ async def test_command_not_persisted(tmp_path: Path, monkeypatch) -> None:
     assert vs.get("cmd") is None  # command 真相是命令，不持久化值
 
 
+# ---- §5.11 plugin input 解析序 / scoped-first resolution order ------------------
+
+
+@pytest.mark.asyncio
+async def test_plugin_scoped_wins_when_both_defined(tmp_path: Path) -> None:
+    """§5.11 ①：scoped 与 global 同存同 kind → scoped 胜（scoped-first，旧行为 global 胜）。"""
+    scoped = prefix_input_id("frontend", "my-team", "api_token")
+    inputs = [
+        MCPServerPromptStringInput(id=scoped, description="scoped"),
+        MCPServerPromptStringInput(id="api_token", description="global"),
+    ]
+    vs = _vstore(tmp_path)
+    r = InputResolver(
+        inputs,
+        env={env_var_name(scoped): "scoped-v", env_var_name("api_token"): "global-v"},
+        value_store=vs,
+        secret_store=_Secret(),
+    )
+    assert await r.aresolve_by_id("api_token", plugin="frontend", marketplace="my-team", session=_SESSION) == "scoped-v"
+
+
 @pytest.mark.asyncio
 async def test_plugin_prefix_fallback(tmp_path: Path) -> None:
-    """裸 id 在 plugin 上下文回退到带前缀池条目（D2）/ bare id resolves to prefixed pool entry in plugin context。"""
+    """§5.11 ②：裸 id 在 plugin 上下文先查 scoped，scoped 命中 → 直接取 scoped 池条目（D2）。"""
     pid = prefix_input_id("frontend", "my-team", "api_token")
     inputs = [MCPServerPromptStringInput(id=pid, description="d")]
     vs = _vstore(tmp_path)
     # env 用前缀归一名命中 → 验证 resolved_id 用的是带前缀 id
     r = InputResolver(inputs, env={env_var_name(pid): "v"}, value_store=vs, secret_store=_Secret())
     assert await r.aresolve_by_id("api_token", plugin="frontend", marketplace="my-team", session=_SESSION) == "v"
+
+
+@pytest.mark.asyncio
+async def test_scoped_missing_global_exists_fallback(tmp_path: Path) -> None:
+    """§5.11 ②：scoped 不存在、global 存在（同 kind）→ 回退 global。"""
+    inputs = [MCPServerPromptStringInput(id="api_token", description="global")]
+    vs = _vstore(tmp_path)
+    r = InputResolver(
+        inputs,
+        env={env_var_name("api_token"): "global-v"},
+        value_store=vs,
+        secret_store=_Secret(),
+    )
+    assert await r.aresolve_by_id("api_token", plugin="frontend", marketplace="my-team", session=_SESSION) == "global-v"
+
+
+@pytest.mark.asyncio
+async def test_plugin_bound_both_miss_error_carries_scoped_id() -> None:
+    """§5.11 ③：plugin 上下文下裸引用皆不可命中 → InputNotFoundError.id 为完整 scoped id。"""
+    r = InputResolver([], env={}, value_store=_vstore(Path("/tmp")), secret_store=_Secret())
+    with pytest.raises(InputNotFoundError) as ei:
+        await r.aresolve_by_id("api_token", plugin="frontend", marketplace="my-team", session=_SESSION)
+    assert ei.value.args[0] == "frontend@my-team/api_token"  # scoped id，非裸 "api_token"
+
+
+@pytest.mark.asyncio
+async def test_explicit_scoped_reference_no_global_fallback(tmp_path: Path) -> None:
+    """§5.11 补充：显式完整引用 ${input:<P>@<M>/<id>} 直接命中 scoped、不回退 global。"""
+    scoped = prefix_input_id("frontend", "my-team", "api_token")
+    inputs = [
+        MCPServerPromptStringInput(id=scoped, description="scoped"),
+        MCPServerPromptStringInput(id="api_token", description="global"),
+    ]
+    vs = _vstore(tmp_path)
+    r = InputResolver(
+        inputs,
+        env={env_var_name(scoped): "scoped-v", env_var_name("api_token"): "global-v"},
+        value_store=vs,
+        secret_store=_Secret(),
+    )
+    # 显式 scoped 引用：id 含 @ → 直接查 scoped 池条目，不回退 global
+    assert await r.aresolve_by_id(scoped, plugin="frontend", marketplace="my-team", session=_SESSION) == "scoped-v"
+
+
+@pytest.mark.asyncio
+async def test_unbound_server_bare_ref_global_only(tmp_path: Path) -> None:
+    """§5.11 补充：未绑定 plugin 的 server 裸引用仅解析 global（行为不变）。"""
+    inputs = [MCPServerPromptStringInput(id="api_token", description="global")]
+    vs = _vstore(tmp_path)
+    r = InputResolver(
+        inputs,
+        env={env_var_name("api_token"): "global-v"},
+        value_store=vs,
+        secret_store=_Secret(),
+    )
+    # 无 plugin/marketplace → 仅 global 查
+    assert await r.aresolve_by_id("api_token", session=_SESSION) == "global-v"
+
+
+@pytest.mark.asyncio
+async def test_scoped_defined_but_unresolvable_no_global_fallback(tmp_path: Path) -> None:
+    """§5.11 跨 kind 守卫：scoped 已定位但取值失败 → MissingInputError(scoped_id)，不回退 global。
+
+    scoped-first 结构上保证：scoped 命中池后绝不因取值失败而尝试 global（跨 kind 约束自然满足）。"""
+    scoped = prefix_input_id("frontend", "my-team", "secret")
+    inputs = [
+        MCPServerPromptStringInput(id=scoped, description="scoped-secret", password=True),
+        MCPServerPromptStringInput(id="secret", description="global-value"),  # 不同 kind（无 password）
+    ]
+    vs = _vstore(tmp_path)
+    r = InputResolver(
+        inputs,
+        env={},  # 无 env → scoped secret 无法解析
+        value_store=vs,
+        secret_store=_Secret(available=False),  # keyring 不可用
+    )
+    # headless：scoped secret 无法解析 → MissingInputError(SECRET, scoped_id)，绝不回退 global
+    with pytest.raises(MissingInputError) as ei:
+        await r.aresolve_by_id("secret", plugin="frontend", marketplace="my-team", session=None)
+    err = ei.value
+    assert err.kind is InputKind.SECRET
+    assert err.id == scoped  # scoped id，非裸 "secret"
+    assert vs.get("secret") is None  # 绝不落明文
 
 
 @pytest.mark.asyncio

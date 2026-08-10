@@ -143,17 +143,44 @@ class InputResolver(BaseInputResolver[PromptSession]):
         plugin: str | None = None,
         marketplace: str | None = None,
     ) -> Any:
-        # 1. 定位定义：裸 id 未命中且给了 plugin 上下文 → 回退查带前缀池条目（§9.3 D2）
-        #    Locate the definition; with plugin context, bare id falls back to the prefixed pool entry.
-        cfg = self._inputs.get(input_id)
+        # 1. 定位定义（§5.11 plugin input 解析序，v0.3.1）：
+        #    显式完整 scoped 引用（id 含 @）= 精确命中、不回退全局；
+        #    绑定 plugin 的 server 裸引用 = scoped 先 → 全局回退（仅同 kind 分支，scoped 已定位则绝不再试全局）；
+        #    未绑定 plugin 的 server（用户自定义）= 仅全局（行为不变）。
+        #    §5.11 def-location: explicit scoped (@)=direct; plugin-bound bare=scoped-first→global fallback; unbound=global only.
+        # NOTE: Heuristic assumes bare input IDs never contain "@" (true in A2C ecosystem).
+        # IDs like "api_token" are never explicit scoped refs; users write
+        # ${input:<P>@<M>/<id>} for cross-plugin refs, which always contain "@".
+        is_explicit_scoped = "@" in input_id
+        scoped_id: str | None = None
+        if plugin and marketplace and not is_explicit_scoped:
+            scoped_id = prefix_input_id(plugin, marketplace, input_id)
+
+        cfg = None
         resolved_id = input_id
-        if cfg is None and plugin and marketplace:
-            prefixed = prefix_input_id(plugin, marketplace, input_id)
-            prefixed_cfg = self._inputs.get(prefixed)
-            if prefixed_cfg is not None:
-                cfg, resolved_id = prefixed_cfg, prefixed
+
+        if is_explicit_scoped:
+            cfg = self._inputs.get(input_id)
+            if cfg is not None:
+                resolved_id = input_id
+        elif scoped_id is not None:
+            # Scoped first（§5.11 规则 ①）
+            scoped_cfg = self._inputs.get(scoped_id)
+            if scoped_cfg is not None:
+                cfg, resolved_id = scoped_cfg, scoped_id
+            else:
+                # Scoped 未定义 → 全局回退（§5.11 规则 ②）
+                global_cfg = self._inputs.get(input_id)
+                if global_cfg is not None:
+                    cfg, resolved_id = global_cfg, input_id
+        else:
+            cfg = self._inputs.get(input_id)
+            if cfg is not None:
+                resolved_id = input_id
+
         if cfg is None:
-            raise InputNotFoundError(input_id)
+            # §5.11 规则 ③：皆不可命中 → 错误 id = scoped id（plugin 上下文），裸 id 否则
+            raise InputNotFoundError(scoped_id if scoped_id is not None else input_id)
 
         # 2. 进程内 cache（按解析后的池 id 缓存，避免不同 plugin 的同裸 id 串味）
         if resolved_id in self._cache:

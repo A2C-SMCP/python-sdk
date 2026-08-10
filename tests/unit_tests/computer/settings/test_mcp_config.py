@@ -44,6 +44,8 @@ from a2c_smcp.computer.settings.mcp_config import (
     mcp_write_path,
     remove_mcp_server,
     resolve_mcp_config,
+    security_layer_check,
+    trust_layer_check,
     upsert_mcp_server,
 )
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
@@ -404,6 +406,95 @@ def test_gate_mcp_servers_maps_all(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     out = resolve_mcp_config(env=env, managed_mcp_path=tmp_path / "absent.json")
     statuses = gate_mcp_servers(out, settings={})
     assert statuses == {"user-srv": McpApprovalStatus.ENABLED, "proj-srv": McpApprovalStatus.PENDING}
+
+
+# ── security_layer_check（安全层 Gate 1-3，协议 §2.3）────────────────────────
+def test_security_layer_check_denied() -> None:
+    """Gate 1：deniedMcpServers 拒绝。"""
+    s = {"deniedMcpServers": ["x"]}
+    assert security_layer_check("x", settings=s) == McpApprovalStatus.DISABLED
+
+
+def test_security_layer_check_allowed_empty_pass() -> None:
+    """Gate 2：空白名单视为不启用白名单 → 通过。"""
+    s: dict[str, list[str]] = {}
+    assert security_layer_check("x", settings=s) is None
+
+
+def test_security_layer_check_allowed_not_in_list() -> None:
+    """Gate 2：非空白名单且不在其中 → 拒绝。"""
+    s = {"allowedMcpServers": ["other"]}
+    assert security_layer_check("x", settings=s) == McpApprovalStatus.DISABLED
+
+
+def test_security_layer_check_allowed_in_list_pass() -> None:
+    """Gate 2：在白名单内 → 通过。"""
+    s = {"allowedMcpServers": ["x", "y"]}
+    assert security_layer_check("x", settings=s) is None
+
+
+def test_security_layer_check_disabled_mcpjson() -> None:
+    """Gate 3：disabledMcpjsonServers 拒绝。"""
+    s = {"disabledMcpjsonServers": ["x"]}
+    assert security_layer_check("x", settings=s) == McpApprovalStatus.DISABLED
+
+
+def test_security_layer_check_pass() -> None:
+    """全部通过安全层 → 返回 None。"""
+    s: dict[str, list[str]] = {}
+    assert security_layer_check("some_server", settings=s) is None
+
+
+def test_security_layer_check_priority_denied_over_allowed() -> None:
+    """Gate 1 优先于 Gate 2：同时被 deny 和不在 allow → deny 胜。"""
+    s = {"deniedMcpServers": ["x"], "allowedMcpServers": ["x"]}
+    assert security_layer_check("x", settings=s) == McpApprovalStatus.DISABLED
+
+
+def test_security_layer_check_priority_disabled_over_pass() -> None:
+    """Gate 3 拒绝即使 enabledMcpjsonServers 含此名（安全层不管信任层字段）。"""
+    s = {"disabledMcpjsonServers": ["x"], "enabledMcpjsonServers": ["x"]}
+    assert security_layer_check("x", settings=s) == McpApprovalStatus.DISABLED
+
+
+def test_mcp_server_status_delegates_to_security_layer() -> None:
+    """重构后 mcp_server_status 行为不变：安全层拒绝仍返回 DISABLED。"""
+    s = {"deniedMcpServers": ["x"], "enabledMcpjsonServers": ["x"]}
+    # trusted_origin=True 本应在 Gate 4 放行，但 Gate 1 的安全层拒绝在前
+    assert mcp_server_status("x", settings=s, trusted_origin=True) == McpApprovalStatus.DISABLED
+    # trusted_origin=False 也同样被 Gate 1 拒绝
+    assert mcp_server_status("x", settings=s, trusted_origin=False) == McpApprovalStatus.DISABLED
+
+
+# ── trust_layer_check（信任层 Gate 4-7，协议 §2）─────────────────────────────
+def test_trust_layer_check_trusted_origin() -> None:
+    """Gate 4：trusted_origin → ENABLED。"""
+    s: dict[str, list[str]] = {}
+    assert trust_layer_check("x", settings=s, trusted_origin=True) == McpApprovalStatus.ENABLED
+
+
+def test_trust_layer_check_enabled_mcpjson() -> None:
+    """Gate 5：enabledMcpjsonServers 含此名 → ENABLED。"""
+    s = {"enabledMcpjsonServers": ["x"]}
+    assert trust_layer_check("x", settings=s, trusted_origin=False) == McpApprovalStatus.ENABLED
+
+
+def test_trust_layer_check_enable_all_project() -> None:
+    """Gate 6：enableAllProjectMcpServers=True → ENABLED。"""
+    s = {"enableAllProjectMcpServers": True}
+    assert trust_layer_check("x", settings=s, trusted_origin=False) == McpApprovalStatus.ENABLED
+
+
+def test_trust_layer_check_pending() -> None:
+    """Gate 7：否则 → PENDING。"""
+    s: dict[str, list[str]] = {}
+    assert trust_layer_check("x", settings=s, trusted_origin=False) == McpApprovalStatus.PENDING
+
+
+def test_trust_layer_check_trusted_origin_overrides_enabled() -> None:
+    """Gate 4 在 Gate 5 之前：trusted_origin=True → ENABLED 无论 enabledMcpjsonServers。"""
+    s: dict[str, list[str]] = {}
+    assert trust_layer_check("x", settings=s, trusted_origin=True) == McpApprovalStatus.ENABLED
 
 
 # ── 批准写助手（local scope）─────────────────────────────────────────────────
