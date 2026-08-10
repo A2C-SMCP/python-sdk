@@ -275,3 +275,55 @@ def test_default_none_uses_ambient(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         resolved = c._resolve_declared_settings()
         enabled = resolved.settings.get("enabledPlugins", {})
         assert enabled.get("ambient-plugin@acme") is True
+
+
+# ── #167 子问题 3：flag_settings_path 注入贯通 settings 解析 ──────────────
+
+def test_constructor_accepts_flag_settings_path():
+    """Computer 接受 flag_settings_path 可选参数，缺省为 None（向后兼容）。"""
+    c = Computer(name="test")
+    assert c._flag_settings_path is None
+
+
+def test_flag_settings_path_injected_flag_layer_visible(tmp_path: Path):
+    """注入 flag_settings_path 后 _resolve_declared_settings 应包含 flag 层 enabledPlugins。
+
+    flag 层与 user 层对**同一** plugin id 设不同值，验证 flag 优先级高于 user（flag:true > user:false）。
+    """
+    # 构造 flag 层 settings.json（flag:true）
+    flag_file = tmp_path / "flag-settings.json"
+    flag_file.write_text(
+        json.dumps({"enabledPlugins": {"same-plugin@acme": True}}),
+        encoding="utf-8",
+    )
+    # user 层同一个 plugin 设为 False（flag 应覆盖 user，最终为 True）
+    xdg = _make_config_home(tmp_path / "xdg")
+    _write_settings(xdg, {"enabledPlugins": {"same-plugin@acme": False}})
+    home = tmp_path / "skill-home"
+    _seed_plugin(home, pid="same-plugin@acme")
+
+    env = {"XDG_CONFIG_HOME": str(xdg.parent), "HOME": str(tmp_path / "fake-home")}
+    c = Computer(
+        name="test", env=env, skill_home=home,
+        flag_settings_path=flag_file,
+    )
+    resolved = c._resolve_declared_settings()
+    enabled = resolved.settings.get("enabledPlugins", {})
+    # flag 层 (True) 优先级高于 user 层 (False) → 最终应为 True
+    assert enabled.get("same-plugin@acme") is True, (
+        f"Expected flag layer (True) to override user layer (False), got: {enabled}"
+    )
+
+
+def test_flag_settings_path_default_none_no_flag_layer(tmp_path: Path):
+    """flag_settings_path=None 时 flag 层为空（行为不变，向后兼容）。"""
+    xdg = _make_config_home(tmp_path / "xdg")
+    _write_settings(xdg, {"enabledPlugins": {"user-plugin@acme": True}})
+    home = tmp_path / "skill-home"
+    _seed_plugin(home, pid="user-plugin@acme")
+
+    env = {"XDG_CONFIG_HOME": str(xdg.parent), "HOME": str(tmp_path / "fake-home")}
+    c = Computer(name="test", env=env, skill_home=home)  # 不传 flag_settings_path
+    resolved = c._resolve_declared_settings()
+    enabled = resolved.settings.get("enabledPlugins", {})
+    assert enabled.get("user-plugin@acme") is True

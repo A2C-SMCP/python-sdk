@@ -307,6 +307,7 @@ def _run_impl(
             auto_connect=auto_connect,
             auto_reconnect=auto_reconnect,
             mcp_flag_config=flag_mcp_path,
+            flag_settings_path=Path(settings_file) if isinstance(settings_file, str) else None,
         )
         async with comp:
             init_client: SMCPComputerClient | None = None
@@ -656,3 +657,7 @@ def main() -> None:  # pragma: no cover
     # 使用 Typer 应用入口，而不是直接调用命令函数
     # 直接调用被 @app.command 装饰的函数会传入 OptionInfo 默认值，导致参数类型错误
     app()
+
+
+if __name__ == "__main__":
+    main()

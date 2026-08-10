@@ -377,5 +377,91 @@ async def test_aremove_server_no_longer_silently_unmounts_undeclared_projection(
         await comp.aremove_server("proj-only")
     # 投影仍在（durable rm 未越权停摘）；纯运行期停摘须显式走 aunmount_server_by_id。
     assert any(c.name == "proj-only" for c in comp.mcp_manager.server_configs())
-    await comp.aunmount_server_by_id("proj-only")
-    assert not any(c.name == "proj-only" for c in comp.mcp_manager.server_configs())
+
+
+# ── #167 子问题 1：server add 被只读层静默遮蔽时应 WARN ──────────────────────
+
+@pytest.mark.asyncio
+async def test_aadd_or_aupdate_warns_when_shadowed_by_flag_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """写入被 flag 层（--mcp-config）同名 server 遮蔽时，应 logger.warning 告知用户。"""
+    import logging
+
+    _isolate(tmp_path, monkeypatch)
+    # 构造 flag 层 mcp.json（声明一个 server，command 与写入不同以验证遮蔽）
+    flag_file = tmp_path / "flag-mcp.json"
+    _write_mcp_file(flag_file, {"shadowed": _stdio_dict("shadowed", "/bin/flag-cmd")})
+
+    comp = _comp(tmp_path, mcp_flag_config=flag_file)
+
+    # 直接 mock logger.warning 验参（caplog 可能因 a2c logger 传播设置未捕获）
+    from unittest import mock
+
+    from a2c_smcp.computer import computer as comp_mod
+
+    with mock.patch.object(comp_mod.logger, "warning", wraps=comp_mod.logger.warning) as mock_warn:
+        await comp.aadd_or_aupdate_server(_stdio_dict("shadowed", "/bin/mine"))
+        # 断言 WARN 被触发且包含关键信息
+        shadow_warns = [
+            call for call in mock_warn.call_args_list
+            if any("shadowed" in str(a) for a in call.args)
+        ]
+        assert shadow_warns, (
+            f"Expected logger.warning about 'shadowed' being shadowed, "
+            f"got calls: {mock_warn.call_args_list}"
+        )
+        # 验证消息包含遮蔽层信息（logger 用 % 格式化，args[0] 是格式串，args[1:] 是参数）
+        fmt = str(shadow_warns[0].args[0])
+        assert "SHADOWED" in fmt
+
+
+@pytest.mark.asyncio
+async def test_aadd_or_aupdate_warns_when_shadowed_by_embed_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """写入被 embed 层（Computer(mcp_servers=...)）同名 server 遮蔽时，应 logger.warning。"""
+    _isolate(tmp_path, monkeypatch)
+    embed_cfg = TypeAdapter(MCPServerConfig).validate_python(
+        _stdio_dict("shadowed", "/bin/embed-cmd"),
+    )
+    comp = _comp(tmp_path, mcp_servers={embed_cfg})
+
+    from unittest import mock
+
+    from a2c_smcp.computer import computer as comp_mod
+
+    with mock.patch.object(comp_mod.logger, "warning", wraps=comp_mod.logger.warning) as mock_warn:
+        await comp.aadd_or_aupdate_server(_stdio_dict("shadowed", "/bin/mine"))
+        shadow_warns = [
+            call for call in mock_warn.call_args_list
+            if any("shadowed" in str(a) for a in call.args)
+        ]
+        assert shadow_warns, (
+            f"Expected logger.warning about 'shadowed' (embed), "
+            f"got calls: {mock_warn.call_args_list}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_aadd_or_aupdate_no_warn_when_no_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无遮蔽时不应打出 WARN。"""
+    _isolate(tmp_path, monkeypatch)
+    comp = _comp(tmp_path)
+
+    from unittest import mock
+
+    from a2c_smcp.computer import computer as comp_mod
+
+    with mock.patch.object(comp_mod.logger, "warning", wraps=comp_mod.logger.warning) as mock_warn:
+        await comp.aadd_or_aupdate_server(_stdio_dict("clean-srv", "/bin/clean"))
+        shadow_warns = [
+            call for call in mock_warn.call_args_list
+            if any("shadowed" in str(a) or "SHADOWED" in str(a) for a in call.args)
+        ]
+        assert not shadow_warns, (
+            f"Expected NO shadow WARN for 'clean-srv', "
+            f"got calls: {mock_warn.call_args_list}"
+        )

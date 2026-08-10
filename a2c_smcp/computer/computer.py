@@ -135,6 +135,7 @@ class Computer(BaseComputer[PromptSession]):
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
         mcp_flag_config: Path | None = None,
+        flag_settings_path: Path | None = None,
         env: Mapping[str, str] | None = None,
         project_root: Path | None = None,
     ) -> None:
@@ -176,6 +177,12 @@ class Computer(BaseComputer[PromptSession]):
                 Computer 即该 boot 对象，故二者同住于此，经 :meth:`resolve_mcp_declarations` 一并投影。
                 The flag-layer mcp.json path (CLI ``--mcp-config``); a boot-declarative input alongside
                 ``mcp_servers`` (the embed layer). See :meth:`resolve_mcp_declarations`.
+            flag_settings_path (Path | None): flag 层 ``settings.json`` 路径（CLI ``--settings <file>``，
+                优先级**次高、仅低于 policy**，§2.5-3）。与 ``mcp_flag_config`` 同为 flag scope **文件对**，
+                此前仅在 CLI ``run_mcp_approval`` 路径注入，``_resolve_declared_settings`` 不可见（#167 子问题 3）。
+                ``None``（缺省）= 无 flag 层 settings（向后兼容）。
+                The flag-layer settings.json path (CLI ``--settings``); paired with ``mcp_flag_config``
+                as the flag-scope file pair per §2.5-3. ``None`` = no flag settings (backward compat).
             env (Mapping[str, str] | None): 环境映射注入（#134，对齐 rust-sdk#121 ``with_config_env``）。
                 ``None``（缺省）= ``os.environ``（保 CLI 向后兼容）；嵌入式多实例注入 per-instance 映射
                 使 XDG / HOME 等配置锚点与 ledger ``skill_home`` 同源，消除 ownership/enablement 归属混源。
@@ -205,6 +212,8 @@ class Computer(BaseComputer[PromptSession]):
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
         # flag 层 mcp.json 路径（`--mcp-config`）：与 `_mcp_servers` 同为当次 boot 的声明式输入（§2.5-5）。
         self._mcp_flag_config: Path | None = mcp_flag_config
+        # flag 层 settings.json 路径（`--settings`）：与 `_mcp_flag_config` 同为 flag scope 文件对（#167 子问题 3）。
+        self._flag_settings_path: Path | None = flag_settings_path
         # #134（对齐 rust-sdk#121）：per-instance env/project_root 注入接缝。None = 进程 ambient（backward compat）。
         # 嵌入式宿主注入使 settings 解析轴（XDG / project cwd）与 ledger（skill_home）同锚点，消除归属混源。
         self._env: Mapping[str, str] | None = env
@@ -1048,9 +1057,22 @@ class Computer(BaseComputer[PromptSession]):
         raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
         # 2. 取未渲染 raw 落盘（D1：占位字面保留、绝不写 secret）。
         name, raw_body = self._raw_body_for_disk(server)
-        upsert_mcp_server(name, raw_body, scope=scope, env=self._resolve_env(), cwd=self._resolve_cwd())
+        result = upsert_mcp_server(name, raw_body, scope=scope, env=self._resolve_env(), cwd=self._resolve_cwd())
         # 3. 复用 render 结果物化（capability 自动上报；config 上报由调用方驱动，见分账注释）。
         await self._amount_rendered(raw_cfg, validated)
+        # 4. #167 子问题 1：后置遮蔽检测——写入成功但被更高优先级只读层（flag/embed/policy）遮蔽时 WARN。
+        #    upsert_mcp_server 的 origin 快照不传 flag_config_path/embed_servers（见其 docstring 已知代价），
+        #    故此处补全量解析。对标 aremove_server 的只读 origin 检测（L1124-1137）。
+        if result.changed:
+            declarations = self.resolve_mcp_declarations(env=self._resolve_env(), cwd=self._resolve_cwd())
+            resolved_srv = declarations.servers.get(name)
+            if resolved_srv is not None and not is_writable_origin(resolved_srv.origin):
+                logger.warning(
+                    "server %s was written to scope %s but is SHADOWED by the %s layer (higher priority). "
+                    "The effective configuration comes from the %s layer, not from your write. "
+                    "To make your change take effect, remove or modify the declaration in the shadowing layer.",
+                    name, result.scope.value, resolved_srv.origin.value, resolved_srv.origin.value,
+                )
 
     def resolve_mcp_declarations(
         self, *, env: Mapping[str, str] | None = None, cwd: Path | None = None,
@@ -1742,9 +1764,10 @@ class Computer(BaseComputer[PromptSession]):
     def _resolve_declared_settings(self) -> "ResolvedSettings":
         """治理恢复的 declared 视图（含合并 settings + per-scope 层，供 #159 Option B 审批门分叉）。
 
-        已知限制（与 rust 同构文档化）：flag scope 的 ``enabledPlugins`` 不在此视图；CLI 接线时经
-        ``reconcile_governance(declared=...)`` 显式传 flag-aware 视图。跨重启可靠 disable 请写 user scope。
-        The declared view for governance recovery (no flag scope at boot); pass flag-aware ``declared`` explicitly.
+        flag scope 由 :attr:`_flag_settings_path`（CLI ``--settings <file>``）注入；
+        ``None``（缺省）= 无 flag 层 settings，向后兼容。#167 子问题 3 前此项不可达。
+        The declared view for governance recovery; ``flag_settings_path`` (CLI ``--settings``) is
+        injected when set, ``None`` = no flag settings (backward compat). Fixed in #167 sub-issue 3.
         """
         from a2c_smcp.computer.settings.policy import resolve_policy_settings
         from a2c_smcp.computer.settings.scope import resolve_settings
@@ -1752,6 +1775,7 @@ class Computer(BaseComputer[PromptSession]):
         return resolve_settings(
             env=self._resolve_env(),
             cwd=self._resolve_cwd(),
+            flag_settings_path=self._flag_settings_path,
             policy_settings=resolve_policy_settings(env=self._resolve_env()),
         )
 

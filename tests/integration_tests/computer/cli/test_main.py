@@ -151,7 +151,9 @@ class _FakeComputer:
         input_resolver: Any | None = None,
         registered_workdirs: Any | None = None,  # #69/S16：CLI --add-dir → registered_workdirs，替身需接受
 
-        mcp_flag_config: Any | None = None) -> None:
+        mcp_flag_config: Any | None = None,
+        flag_settings_path: Any | None = None,
+    ) -> None:
         self.init_args = {
             "name": name,
             "inputs": inputs,
@@ -161,6 +163,7 @@ class _FakeComputer:
             "confirm_callback": confirm_callback,
             "input_resolver": input_resolver,
             "registered_workdirs": registered_workdirs,
+            "flag_settings_path": flag_settings_path,
         }
 
     async def __aenter__(self) -> _FakeComputer:
