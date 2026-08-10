@@ -862,9 +862,9 @@ class Computer(BaseComputer[PromptSession]):
         # English: Resolve input value by input_id; raise InputNotFoundError if not defined
         async def _resolve_input_by_id(input_id: str) -> Any:
             try:
-                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此回退到
-                # 带前缀池条目 <plugin>@<marketplace>/<id>（§9.3 D2）。非 plugin 来源传 None=现状。
-                # plugin/marketplace context lets a bundled server's bare ${input:id} fall back to the prefixed pool entry.
+                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此优先查
+                # scoped 池条目 <plugin>@<marketplace>/<id>（§5.11 scoped-first，#175）。非 plugin 来源传 None=现状。
+                # plugin/marketplace context lets a bundled server's bare ${input:id} look up the scoped pool entry first.
                 return await self._input_resolver.aresolve_by_id(input_id, session=session, plugin=plugin, marketplace=marketplace)
             except InputNotFoundError:
                 logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
