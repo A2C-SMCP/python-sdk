@@ -43,9 +43,10 @@ class TestOAuthCredentialRecordKind:
         assert OAuthCredentialRecordKind.Credentials.value == "credentials"
         assert OAuthCredentialRecordKind.IssuerIndex.value == "issuerIndex"
 
-    def test_str_roundtrip(self) -> None:
-        assert str(OAuthCredentialRecordKind.Credentials) == "credentials"
-        assert str(OAuthCredentialRecordKind.IssuerIndex) == "issuerIndex"
+    def test_str_equals_value(self) -> None:
+        """StrEnum 的 str(member) == member.value 是语言保证。"""
+        assert str(OAuthCredentialRecordKind.Credentials) == OAuthCredentialRecordKind.Credentials.value
+        assert str(OAuthCredentialRecordKind.IssuerIndex) == OAuthCredentialRecordKind.IssuerIndex.value
 
 
 # ============================================================================
@@ -479,6 +480,56 @@ class TestScopedCredentialStore:
         with pytest.raises(OAuthCredentialStoreError) as exc:
             await store._try_load_credentials()
         assert exc.value.kind == "operationFailed"
+
+    async def test_credentials_field_none_or_non_str_deletes_and_returns_none(
+        self, store: ScopedCredentialStore, backend: InMemoryOAuthCredentialStore,
+    ) -> None:
+        """credentials 字段为 None 或非 str 时清除脏数据并返回 None。"""
+        await store.set_issuer("https://as.example.com")
+        key = await store._active_key()
+        # 写入 credentials=None 的信封（version/fingerprint 匹配但凭据字段损坏）
+        envelope = json.dumps({"version": 1, "modeFingerprint": store._mode_fingerprint})
+        await backend.save(key, envelope)
+        loaded = await store._try_load_credentials()
+        assert loaded is None
+        assert await backend.load(key) is None, "stale data with missing credentials must be deleted"
+
+        # 写入 credentials 为数字（非 str）
+        envelope2 = json.dumps({"version": 1, "modeFingerprint": store._mode_fingerprint, "credentials": 123})
+        await backend.save(key, envelope2)
+        loaded2 = await store._try_load_credentials()
+        assert loaded2 is None
+        assert await backend.load(key) is None
+
+    async def test_load_from_legacy_per_issuer_envelope(
+        self, store: ScopedCredentialStore, backend: InMemoryOAuthCredentialStore,
+    ) -> None:
+        """正向：index.active 为空时从 per-issuer envelope 正常加载（legacy 兼容）。"""
+        await store.set_issuer("https://as.example.com")
+        key = await store._active_key()
+        # 直接写 per-issuer envelope（模拟旧版数据：index 存在但 active=null）
+        envelope = json.dumps({"version": 1, "modeFingerprint": store._mode_fingerprint, "credentials": "legacy-token"})
+        await backend.save(key, envelope)
+        # 确认 index 存在且 active 为空（set_issuer 会写 index，但未 save_credentials 故 active=null）
+        index_raw = await backend.load(store._index_key())
+        assert index_raw is not None
+        assert '"active":null' in index_raw or '"active": null' in index_raw
+
+        loaded = await store._try_load_credentials()
+        assert loaded == "legacy-token"
+
+    async def test_load_or_empty_index_corrupt_json_cleans_up(
+        self, store: ScopedCredentialStore, backend: InMemoryOAuthCredentialStore,
+    ) -> None:
+        """_load_or_empty_index 遇损坏 JSON 时清理脏数据。"""
+        # 写损坏的 index
+        await backend.save(store._index_key(), "not valid json {{{")
+        # 第一次调用应返回空 index 并清理
+        index = await store._load_or_empty_index()
+        assert index.active is None
+        assert index.issuers == ()
+        # 第二次调用应直接返回空（脏数据已被清理）
+        assert await backend.load(store._index_key()) is None
 
     # -- clear ---------------------------------------------------------------
 

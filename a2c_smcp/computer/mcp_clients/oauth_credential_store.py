@@ -362,34 +362,39 @@ class ScopedCredentialStore:
         - per-issuer envelope 不存在 → 返回 None
         - JSON 解析失败 → 上抛 ``OAuthCredentialStoreError``（不静默）
         - version / fingerprint 不匹配 → 调 ``backend.delete`` 清除脏数据后返回 None
-        """
-        # Step 1: 先查 index.active（对齐 Rust:1428-1431）
-        index = await self._load_or_empty_index()
-        if index.active is not None and index.active.issuer == self._issuer:
-            return index.active.credentials
 
-        # Step 2: fallback 到 per-issuer envelope key
-        key = await self._active_key()
-        encoded = await self._backend.load(key)
-        if encoded is None:
-            return None
-        try:
-            data = json.loads(encoded)
-        except (json.JSONDecodeError, TypeError):
-            raise OAuthCredentialStoreError.operation_failed() from None
-        version = data.get("version")
-        if version != StoredCredentialEnvelope.CURRENT_VERSION:
-            await self._backend.delete(key)
-            return None
-        fingerprint = data.get("modeFingerprint", data.get("mode_fingerprint"))
-        if fingerprint != self._mode_fingerprint:
-            await self._backend.delete(key)
-            return None
-        credentials = data.get("credentials")
-        if credentials is None or not isinstance(credentials, str):
-            await self._backend.delete(key)
-            return None
-        return cast(str, credentials)
+        ``self._lock`` 保护 index RMW + per-issuer envelope delete 序列不被并发插入写入。
+        """
+        async with self._lock:
+            # Step 1: 先查 index.active（对齐 Rust:1428-1431）
+            index = await self._load_or_empty_index()
+            if index.active is not None and index.active.issuer == self._issuer:
+                return index.active.credentials
+
+            # Step 2: fallback 到 per-issuer envelope key
+            key = await self._active_key()
+            encoded = await self._backend.load(key)
+            if encoded is None:
+                return None
+            try:
+                data = json.loads(encoded)
+            except (json.JSONDecodeError, TypeError):
+                raise OAuthCredentialStoreError.operation_failed() from None
+            version = data.get("version")
+            if version != StoredCredentialEnvelope.CURRENT_VERSION:
+                await self._backend.delete(key)
+                return None
+            # 同时兼容 "modeFingerprint"（camelCase，Python / Rust 主流）与 "mode_fingerprint"
+            # （snake_case，预留跨 SDK / 旧版本兼容；当前两端序列化均为 camelCase，此分支暂不触发）
+            fingerprint = data.get("modeFingerprint", data.get("mode_fingerprint"))
+            if fingerprint != self._mode_fingerprint:
+                await self._backend.delete(key)
+                return None
+            credentials = data.get("credentials")
+            if credentials is None or not isinstance(credentials, str):
+                await self._backend.delete(key)
+                return None
+            return cast(str, credentials)
 
     # -- issuer management ---------------------------------------------------
 
@@ -398,12 +403,13 @@ class ScopedCredentialStore:
 
         对齐 Rust ``ScopedCredentialStore::set_issuer()``。
         """
-        await self._persist_issuer_index_with(issuer)
-        self._known_issuers.add(issuer)
-        self._issuer = issuer
+        async with self._lock:
+            await self._persist_issuer_index_with(issuer)
+            self._known_issuers.add(issuer)
+            self._issuer = issuer
 
     async def _persist_issuer_index_with(self, issuer: str | None) -> None:
-        """写入 issuer-index 记录。"""
+        """写入 issuer-index 记录。调用方须持有 ``self._lock``。"""
         index = await self._load_or_empty_index()
         issuers: set[str | None] = set(index.issuers)
         issuers.add(issuer)
@@ -445,6 +451,8 @@ class ScopedCredentialStore:
         try:
             data = json.loads(encoded)
         except (json.JSONDecodeError, TypeError):
+            # 清理损坏数据避免永久循环
+            await self._backend.delete(self._index_key())
             return StoredCredentialIndex(
                 version=StoredCredentialIndex.CURRENT_VERSION,
                 issuers=(),
@@ -476,26 +484,29 @@ class ScopedCredentialStore:
 
         Rust 仅写入 index（含 active 字段），不写独立 per-issuer envelope。
         ``_try_load_credentials`` 优先读 index.active，per-issuer envelope 仅作 legacy fallback。
+
+        ``self._lock`` 保护 index RMW 不被并发写入覆盖。
         """
-        index = await self._load_or_empty_index()
-        issuers: set[str | None] = set(index.issuers)
-        issuers.add(self._issuer)
-        sorted_issuers: list[str | None] = sorted(
-            issuers,
-            key=lambda x: (x if x is not None else ""),
-        )
-        encoded = json.dumps(
-            {
-                "version": StoredCredentialIndex.CURRENT_VERSION,
-                "issuers": [i for i in sorted_issuers],
-                "active": {
-                    "issuer": self._issuer,
-                    "credentials": credentials,
+        async with self._lock:
+            index = await self._load_or_empty_index()
+            issuers: set[str | None] = set(index.issuers)
+            issuers.add(self._issuer)
+            sorted_issuers: list[str | None] = sorted(
+                issuers,
+                key=lambda x: (x if x is not None else ""),
+            )
+            encoded = json.dumps(
+                {
+                    "version": StoredCredentialIndex.CURRENT_VERSION,
+                    "issuers": [i for i in sorted_issuers],
+                    "active": {
+                        "issuer": self._issuer,
+                        "credentials": credentials,
+                    },
                 },
-            },
-            separators=(",", ":"),
-        )
-        await self._backend.save(self._index_key(), encoded)
+                separators=(",", ":"),
+            )
+            await self._backend.save(self._index_key(), encoded)
 
     # -- clear ---------------------------------------------------------------
 
@@ -507,12 +518,14 @@ class ScopedCredentialStore:
         仅清除当前 ``resource + mode_fingerprint`` 范围的凭据。
 
         对齐 Rust ``ScopedCredentialStore::clear()``。
+        ``self._lock`` 保护 issuer 枚举 + delete 序列不被并发 save 插入新凭据。
         """
-        issuers = self._known_issuers.copy()
-        issuers.update(await self._persisted_issuers())
-        for issuer in issuers:
-            await self._backend.delete(self._key_for_issuer(issuer))
-        await self._backend.delete(self._index_key())
+        async with self._lock:
+            issuers = self._known_issuers.copy()
+            issuers.update(await self._persisted_issuers())
+            for issuer in issuers:
+                await self._backend.delete(self._key_for_issuer(issuer))
+            await self._backend.delete(self._index_key())
 
 
 # ============================================================================
