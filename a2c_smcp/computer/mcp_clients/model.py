@@ -11,6 +11,7 @@ from mcp.types import CallToolResult, ReadResourceResult, Resource
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from vrl_python import VRLRuntime
 
+from a2c_smcp.computer.mcp_clients.oauth_types import OAuthOptions
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
 from a2c_smcp.utils.bundle_id import validate_explicit_bundle_id
 
@@ -157,6 +158,11 @@ class SseServerConfig(BaseMCPServerConfig):
 class StreamableHttpServerConfig(BaseMCPServerConfig):
     type: Literal["streamable"] = "streamable"
     server_parameters: StreamableHttpParameters = Field(title="MCP HTTP Server连接参数", description="引用自MCP Python SDK 官方配置")
+    oauth: OAuthOptions | None = Field(
+        default=None,
+        title="OAuth 配置",
+        description="对齐 Rust HttpServerConfig.oauth（SDK 层，非 SMCP 协议）",
+    )
 
 
 MCPServerConfig: TypeAlias = StdioServerConfig | SseServerConfig | StreamableHttpServerConfig
