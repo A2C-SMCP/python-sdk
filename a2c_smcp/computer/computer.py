@@ -64,7 +64,11 @@ from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolutionError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
-from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
+from a2c_smcp.computer.mcp_clients.model import (
+    MCPServerConfig,
+    MCPServerInput,
+    MCPServerRuntimeStatus,
+)
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
     McpApprovalStatus,
@@ -1978,6 +1982,21 @@ class Computer(BaseComputer[PromptSession]):
 
         out.sort(key=lambda entry: entry.bundle_id)
         return out
+
+    # ── #184 正交运行时状态 / Orthogonal runtime status ──────────────────────────
+
+    def get_server_runtime_statuses(self) -> list[MCPServerRuntimeStatus]:
+        """获取 MCP Server 正交运行时状态快照（纯内存读取） / Orthogonal runtime status snapshot.
+
+        **不依赖 async / 不发起 MCP RPC**——仅读取 manager 的内存态。
+
+        Returns:
+            list[MCPServerRuntimeStatus]: 每个已注册 server 的正交状态；
+            若 manager 未初始化则返回空列表。
+        """
+        if self.mcp_manager is None:
+            return []
+        return self.mcp_manager.get_server_runtime_statuses()
 
     def get_skills(self) -> list[A2CSkillRef]:
         """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。

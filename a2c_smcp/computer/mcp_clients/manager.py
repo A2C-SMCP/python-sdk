@@ -14,7 +14,16 @@ from vrl_python import VRLRuntime
 
 from a2c_smcp.computer.mcp_clients.auth_error import build_auth_error_result, classify_auth_error
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
-from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
+from a2c_smcp.computer.mcp_clients.model import (
+    A2C_TOOL_META,
+    A2C_VRL_TRANSFORMED,
+    MCPClientProtocol,
+    MCPServerActivationState,
+    MCPServerConfig,
+    MCPServerConnectionState,
+    MCPServerRuntimeStatus,
+    ToolMeta,
+)
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, SERVER_NAME, TOOL_NAME
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -55,6 +64,12 @@ class MCPServerManager:
         self._servers_config: dict[BUNDLE_ID, MCPServerConfig] = {}
         # 活动客户端 {bundle_id: client}
         self._active_clients: dict[BUNDLE_ID, MCPClientProtocol] = {}
+        # #184: 已接受的启动意图（不因 OAuth 未授权或连接失败而丢失）
+        # Accepted activation intents; not lost on OAuth or connect failure.
+        self._activation_intents: set[BUNDLE_ID] = set()
+        # #184: 最近一次数据面连接状态（与 _activation_intents 正交）
+        # Latest data-plane connection state; orthogonal to activation_intents.
+        self._connection_states: dict[BUNDLE_ID, MCPServerConnectionState] = {}
         # ExposedToolMapping：exposed_tool_name -> (bundle_id, 原始工具名)。list_tools 与 tool_call **共用同一份**表
         # （协议 §ExposedToolMapping）。exposed = {bundle_id}__{alias ?? 原始名}，bundle_id 无 `__` 保证单射→查表不 split。
         # 被 forbidden 的工具**不进本表**（不可见不可调用）；跨 bundle_id 天然唯一，无需跨 server 对账。
@@ -226,13 +241,30 @@ class MCPServerManager:
         if config.disabled:
             raise RuntimeError(f"Cannot start disabled server bundle_id={bundle_id!r} (name={config.name!r})")
 
+        # #184：先记录控制面启动意图——后续 OAuth challenge / transport error 只改 connection 状态，
+        # 不清除 activation。只有显式 stop 才清除 / Record activation intent first; subsequent
+        # OAuth or transport errors affect only connection state.
+        self._activation_intents.add(bundle_id)
+
         if bundle_id in self._active_clients:
+            self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
             return  # 已经启动
+
+        # 设置连接状态为 connecting / Set connection state to connecting.
+        self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTING
 
         # 根据配置类型创建客户端
         client = client_factory(config, message_handler=self._message_handler)
-        await client.aconnect()
+        try:
+            await client.aconnect()
+        except Exception:
+            # 连接失败：保留 activation intent，仅更新 connection 状态 / Keep activation
+            # intent; only update connection state. 精确 OAuth error 检测由后续 #185 补齐。
+            self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+            raise
+
         self._active_clients[bundle_id] = client
+        self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
         # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚
         await self._arefresh_tool_mapping()
 
@@ -247,16 +279,29 @@ class MCPServerManager:
         #    代价：**报错义务落在人机面** :mod:`a2c_smcp.computer.cli.resolve` —— REPL 先 ``resolve_target``
         #    解析并校验「已注册」，未命中不下传。**绕过 CLI 直调本方法的调用方拿不到任何未命中信号**
         #    （历史 P0「stop <未知 token> 却打印 ✅ 停止完成」即由此而来，见 #143）。新增调用方请自行判存。
-        """停止单个服务器客户端（按 bundle_id）。"""
+        """停止单个服务器客户端（按 bundle_id）。
+
+        #184：同时清除 control-plane activation intent 与 data-plane connection 状态。
+        只有显式 stop 才清除 activation；OAuth 凭据变化只影响 connection。
+        """
+        # 清除 control-plane activation intent
+        self._activation_intents.discard(bundle_id)
+        self._connection_states.pop(bundle_id, None)
+
         client = self._active_clients.pop(bundle_id, None)
         if client:
             await client.adisconnect()
             await self._arefresh_tool_mapping()
 
     async def _astop_all(self) -> None:
-        """停止所有客户端"""
-        for name in list(self._active_clients.keys()):
-            await self._astop_client(name)
+        """停止所有客户端。
+
+        #184：收集 ``active_clients`` 与 ``activation_intents`` 的**并集**，
+        确保 OAuth-pending server（有 activation 但无活跃连接）也被停止。
+        """
+        all_ids = set(self._active_clients.keys()) | self._activation_intents
+        for bid in list(all_ids):
+            await self._astop_client(bid)
 
     async def astop_all(self) -> None:
         """停止所有客户端"""
@@ -268,6 +313,8 @@ class MCPServerManager:
         """清空所有连接与映射 / Clear all state。"""
         self._servers_config.clear()
         self._active_clients.clear()
+        self._activation_intents.clear()
+        self._connection_states.clear()
         self._exposed_tools.clear()
 
     async def aclose(self) -> None:
@@ -492,20 +539,66 @@ class MCPServerManager:
             raise MCPServerNotFoundError(f"MCP Server bundle_id={bundle_id!r} is not registered")
         return await client.list_resources_page(cursor)
 
+    # ── #184 启动/连接状态正交化 runtime status API ──────────────────────────
+
+    # 将 per-client STATES 字符串映射到 MCPServerConnectionState
+    _CLIENT_STATE_TO_CONNECTION: dict[str, MCPServerConnectionState] = {
+        "initialized": MCPServerConnectionState.CONNECTING,
+        "connected": MCPServerConnectionState.CONNECTED,
+        "disconnected": MCPServerConnectionState.DISCONNECTED,
+        "error": MCPServerConnectionState.ERROR,
+    }
+
+    def get_server_runtime_statuses(self) -> list[MCPServerRuntimeStatus]:
+        """获取所有已注册 server 的正交运行时状态快照 / Orthogonal runtime status snapshot.
+
+        **纯内存读取、无 I/O**。从 _servers_config / _activation_intents /
+        _connection_states / _active_clients 四源合成，每个 server 返回其
+        control-plane activation 与 data-plane connection 的当前状态。
+        """
+        results: list[MCPServerRuntimeStatus] = []
+        for bid, config in self._servers_config.items():
+            activation = (
+                MCPServerActivationState.STARTED
+                if bid in self._activation_intents
+                else MCPServerActivationState.STOPPED
+            )
+
+            remembered = self._connection_states.get(bid)
+            if activation == MCPServerActivationState.STOPPED:
+                connection = MCPServerConnectionState.DISCONNECTED
+            elif remembered is MCPServerConnectionState.AUTHORIZATION_REQUIRED:
+                # 终端用户动作边界（如 clear_oauth）：优先取 committed 状态，
+                # 而非并发采样的 live client state。
+                connection = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+            elif bid in self._active_clients:
+                live_state = self._active_clients[bid].state
+                connection = self._CLIENT_STATE_TO_CONNECTION.get(
+                    live_state, MCPServerConnectionState.DISCONNECTED
+                )
+            else:
+                connection = remembered or MCPServerConnectionState.DISCONNECTED
+
+            results.append(
+                MCPServerRuntimeStatus(
+                    bundle_id=bid,
+                    name=config.name,
+                    activation=activation,
+                    connection=connection,
+                )
+            )
+        return results
+
     def get_server_status(self) -> list[tuple[BUNDLE_ID, SERVER_NAME, bool, str]]:
         """获取服务器状态列表 [(bundle_id, display_name, 是否活跃, 状态), ...]。
 
-        #166：返回 display name（``_servers_config[bundle_id].name``），供 CLI status 表渲染
-        人机面的 "Name" 列。bundle_id 留给 ``server rm/stop`` 等命令寻址使用。
+        #184 backward compat：委托 :meth:`get_server_runtime_statuses`。
+        ``is_active`` 现在投影 ``is_started()``（原为 ``bundle_id in _active_clients``）；
+        ``state`` 投影 connection state snake_case 字符串（原为 ``"pending"`` 或 client.state）。
         """
         return [
-            (
-                bundle_id,
-                self._servers_config[bundle_id].name,
-                bundle_id in self._active_clients,
-                "pending" if bundle_id not in self._active_clients else self._active_clients[bundle_id].state,
-            )
-            for bundle_id in self._servers_config
+            (s.bundle_id, s.name, s.is_started(), s.connection.value)
+            for s in self.get_server_runtime_statuses()
         ]
 
     async def available_tools(self) -> AsyncGenerator[tuple[BUNDLE_ID, Tool], Any]:

@@ -495,6 +495,68 @@ class TestOAuthCoordinator:
             await coordinator.cancel_callback(cancellation)
         assert exc.value.code == OAuthErrorCode.InvalidCancellationReason
 
+    # ── begin/complete/cancel happy path 测试缺口（xfail） ──────────────────
+    # 这些方法需要 OAuthClientProvider 触发 redirect_handler 闭包回调才能走通
+    # 成功路径。当前测试仅覆盖 guard clause 和错误路径。需要以下 mock 基础设施：
+    #  - 可注入的 OAuthClientProvider mock（拦截 redirect_handler）
+    #  - 可控的 PKCE state store（注入预存 state→verifier 映射）
+    #  - 可控的 token store（注入预存 token 供 complete 路径读取）
+    # TODO(#184-followup): 补齐 mock 基础设施后移除此 xfail 标记
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="begin() happy path 需要 OAuthClientProvider mock 支持"
+    )
+    async def test_begin_happy_path(self, coordinator: OAuthCoordinator) -> None:
+        """begin() → 返回 OAuthLaunch，flow 进入 PENDING。"""
+        request = OAuthBeginRequest(mode="AuthCodeDynamic")
+        launch = await coordinator.begin(request)
+        assert launch.authorization_url
+        assert launch.state
+
+        status = await coordinator.status()
+        assert status.state == "authorizationPending"  # _OAuthStatusAuthorizationPending
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="cancel() happy path 需要先设置 PENDING flow + mock redirect_handler"
+    )
+    async def test_cancel_happy_path(self, coordinator: OAuthCoordinator) -> None:
+        """cancel(Cancelled) → 清理 flow，返回 Terminated。"""
+        # 需要 begin() 先走通 → 此处 xfail 作为测试意图文档
+        cancellation = OAuthCancellation(
+            state="mock-state", reason=OAuthCancellationReason.Cancelled
+        )
+        outcome = await coordinator.cancel(cancellation)
+        assert outcome.outcome == "terminated"  # _OAuthOutcomeTerminated discriminator
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="complete() happy path 需要 begin→provider callback→token exchange 全链 mock"
+    )
+    async def test_complete_happy_path(self, coordinator: OAuthCoordinator) -> None:
+        """complete(code, state) → 交换 token，返回 Authorized。"""
+        callback = OAuthCallback(code="mock-code", state="mock-state")
+        outcome = await coordinator.complete(callback)
+        assert outcome.outcome == "authorized"  # _OAuthOutcomeAuthorized discriminator
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="cancel_callback(Timeout) happy path 需要 callback_handler mock 支持",
+        strict=False,  # 允许 XPASS（当前测试仅命中 guard clause→StateMismatch 错误路径）
+    )
+    async def test_cancel_callback_happy_path(self, coordinator: OAuthCoordinator) -> None:
+        """cancel_callback(Timeout) → 返回 Terminated。
+
+        注：成功路径依赖 callback_handler 注入 → 待补齐 mock 基础设施。
+        当前测试命中 guard clause（无 PENDING flow → StateMismatch），预期 future xfail。
+        """
+        cancellation = OAuthCancellation(
+            state="mock-state", reason=OAuthCancellationReason.Timeout
+        )
+        outcome = await coordinator.cancel_callback(cancellation)
+        assert outcome.outcome == "terminated"  # _OAuthOutcomeTerminated discriminator
+
 
 # ============================================================================
 # Integration tests (OAuthCoordinator + TokenStorageAdapter + ScopedCredentialStore)

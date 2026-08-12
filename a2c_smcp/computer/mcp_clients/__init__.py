@@ -4,6 +4,11 @@
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
 
+from a2c_smcp.computer.mcp_clients.model import (  # noqa: F401 — #184 activation/connection orthogonality
+    MCPServerActivationState,
+    MCPServerConnectionState,
+    MCPServerRuntimeStatus,
+)
 from a2c_smcp.computer.mcp_clients.oauth_coordinator import (  # noqa: F401 — #178 Sub 2
     ExpiringStateStore,
     OAuthCoordinator,
@@ -27,6 +32,9 @@ from a2c_smcp.computer.mcp_clients.oauth_credential_store import (  # noqa: F401
 from a2c_smcp.computer.mcp_clients.oauth_types import OAuthOptions  # noqa: F401 — re-export for Sub 2+
 
 __all__ = [
+    "MCPServerActivationState",
+    "MCPServerConnectionState",
+    "MCPServerRuntimeStatus",
     "ExpiringStateStore",
     "InMemoryOAuthCredentialStore",
     "OAuthCoordinator",

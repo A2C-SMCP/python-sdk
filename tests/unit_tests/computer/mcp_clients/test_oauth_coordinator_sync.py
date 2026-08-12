@@ -176,6 +176,13 @@ class TestSyncOAuthCoordinator:
         # Clean up to avoid polluting atexit handlers for other tests
         coord._cleanup_loop()
 
+    # ── begin/complete/cancel happy path 测试缺口 ──────────────────────────
+    # SyncOAuthCoordinator 的 begin() / complete() / cancel() / cancel_callback()
+    # 公开方法的成功路径未覆盖——它们委托给 OAuthCoordinator 的对应方法，后者同样
+    # 未覆盖 happy path。补齐依赖与 test_oauth_coordinator.py 中相同的 mock 基础设施
+    # （可注入 OAuthClientProvider、可控 PKCE state store、可控 token store）。
+    # TODO(#184-followup): 补齐 mock 基础设施后补充 sync happy path 测试。
+
 
 class TestSyncOAuthCoordinatorWithCredentials:
     """Tests requiring pre-stored credentials."""

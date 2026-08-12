@@ -221,11 +221,11 @@ class TokenStorageAdapter:
     async def get_tokens(self) -> OAuthToken | None:
         """Load OAuthToken from scoped credential store.
 
-        ``_try_load_credentials`` returns the raw credential content stored
+        ``try_load_credentials`` returns the raw credential content stored
         by ``save_credentials`` (the token JSON string).
         """
         try:
-            raw = await self._store._try_load_credentials()
+            raw = await self._store.try_load_credentials()
         except OAuthCredentialStoreError:
             return None
         if raw is None:
@@ -429,11 +429,10 @@ class OAuthCoordinator:
         # Build OAuthClientProvider if needed
         self._rebuild_provider_if_needed()
 
-        # Create launch future — will be resolved by redirect_handler
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
+        # Create launch future — will be resolved by redirect_handler.
+        # _begin_under_lock is async def → always inside a running loop; get_running_loop()
+        # can never raise RuntimeError here.
+        loop = asyncio.get_running_loop()
         self._launch_future = loop.create_future()
         self._callback_future = loop.create_future()
 

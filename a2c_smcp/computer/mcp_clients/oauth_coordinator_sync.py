@@ -83,6 +83,22 @@ class SyncOAuthCoordinator:
         if self._loop is not None and not self._loop.is_closed():
             self._loop.close()
 
+    def close(self) -> None:
+        """显式关闭，注销 atexit handler / Explicit close, unregister atexit handler.
+
+        调用此方法后实例不可再用。若实例被 GC 前未调用 close()，
+        atexit handler 仍作为 fallback 清理 loop。
+        """
+        if self._async is not None:
+            self._async = None
+        if self._loop is not None:
+            try:
+                atexit.unregister(self._cleanup_loop)
+            except Exception:
+                pass  # not registered (already called? never registered?)
+            self._cleanup_loop()
+            self._loop = None
+
     def _ensure_async(self) -> OAuthCoordinator:
         if self._async is None:
             # Wrap sync callbacks as coroutines

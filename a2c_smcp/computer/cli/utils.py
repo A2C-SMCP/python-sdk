@@ -19,6 +19,10 @@ from typing import Any
 from rich.table import Table
 
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.mcp_clients.model import (
+    MCPServerActivationState,
+    MCPServerConnectionState,
+)
 from a2c_smcp.computer.utils import console as console_util
 from a2c_smcp.smcp import SMCPTool
 
@@ -123,6 +127,26 @@ def parse_kv_pairs(text: str | None) -> dict[str, Any] | None:
     return result if result else None
 
 
+# ── #184 activation/connection 正交状态→CLI 显示标签 ──────────────────────────
+
+_CONNECTION_LABELS: dict[MCPServerConnectionState, str] = {
+    MCPServerConnectionState.CONNECTED: "[green]运行中 / Running[/green]",
+    MCPServerConnectionState.CONNECTING: "[yellow]连接中 / Connecting[/yellow]",
+    MCPServerConnectionState.AUTHORIZATION_REQUIRED: "[bold yellow]等待授权 / Authorization required[/bold yellow]",
+    MCPServerConnectionState.ERROR: "[red]连接错误 / Connection error[/red]",
+    MCPServerConnectionState.DISCONNECTED: "[dim]已启动但未连接 / Started, disconnected[/dim]",
+}
+
+
+def _format_activation_status(
+    activation: MCPServerActivationState, connection: MCPServerConnectionState
+) -> str:
+    """将正交状态映射为 Rich 格式化标签 / Map orthogonal states to Rich-formatted label."""
+    if activation == MCPServerActivationState.STOPPED:
+        return "[red]已停止 / Stopped[/red]"
+    return _CONNECTION_LABELS.get(connection, str(connection))
+
+
 def print_status(comp: Computer) -> None:
     """
     中文: 打印系统状态，包括 MCP 服务器状态和 SocketIO 连接状态。
@@ -191,16 +215,15 @@ def print_status(comp: Computer) -> None:
         console.print("[yellow]MCP Manager 未初始化 / MCP Manager not initialized[/yellow]")
         return
 
-    rows = comp.mcp_manager.get_server_status()
+    # #184：使用正交运行时状态（6 种组合）替换二元 Active/State 展示
+    statuses = comp.mcp_manager.get_server_runtime_statuses()
     table = Table(title="MCP 服务器状态 / MCP Servers Status")
-    # #166：两列互补——"Name" 为用户配置的 display name（人可读），"Bundle ID" 为命令
-    # ``server rm/stop`` 的寻址参数（copy-paste 源 + 多命中时的发现入口）。
     table.add_column("Name", style="green")
     table.add_column("Bundle ID", style="cyan")
-    table.add_column("Active", style="magenta")
-    table.add_column("State", style="yellow")
-    for bid, display_name, active, state in rows:
-        table.add_row(display_name, bid, "[green]✓[/green]" if active else "[red]✗[/red]", state)
+    table.add_column("Status", style="magenta")
+    for s in statuses:
+        label = _format_activation_status(s.activation, s.connection)
+        table.add_row(s.name, s.bundle_id, label)
     console.print(table)
 
 

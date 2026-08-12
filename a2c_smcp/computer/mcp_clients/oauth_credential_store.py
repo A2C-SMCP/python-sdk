@@ -404,6 +404,14 @@ class ScopedCredentialStore:
                 return None
             return cast(str, credentials)
 
+    async def try_load_credentials(self) -> str | None:
+        """公开入口：加载当前 issuer 的凭据 / Public entry: load credentials for current issuer.
+
+        适配层（如 ``TokenStorageAdapter``）使用此公开方法，而非直接访问
+        ``_try_load_credentials`` 私有方法。行为与 :meth:`_try_load_credentials` 一致。
+        """
+        return await self._try_load_credentials()
+
     # -- key construction (for cooperating adapters) ------------------------
 
     def make_key(self, record_kind: OAuthCredentialRecordKind) -> OAuthCredentialKey:

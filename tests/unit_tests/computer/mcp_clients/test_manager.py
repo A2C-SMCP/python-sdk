@@ -16,7 +16,10 @@ from mcp.types import CallToolResult
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import (
     MCPClientProtocol,
+    MCPServerActivationState,
     MCPServerConfig,
+    MCPServerConnectionState,
+    MCPServerRuntimeStatus,
     SseServerConfig,
     StdioServerConfig,
     StreamableHttpServerConfig,
@@ -51,9 +54,19 @@ def create_mock_tool(name: str, meta: dict | None = None) -> Tool:
     return Tool(name=name, inputSchema={"type": "object"}, _meta=meta)
 
 
+# #184：测试用 fail-connect 名单 / Test-only fail-connect server names
+_FAIL_CONNECT_SERVERS: set[str] = set()
+
+
 # 模拟client_factory函数
 def mock_client_factory(config: MCPServerConfig, message_handler=None) -> MockMCPClient:
     # 简化处理：根据配置名称返回不同的工具列表
+    # #184：测试 fail-connect 场景
+    client: MockMCPClient
+    if config.name in _FAIL_CONNECT_SERVERS:
+        client = MockMCPClient(message_handler=message_handler)
+        client.aconnect = AsyncMock(side_effect=RuntimeError("Simulated connect failure"))
+        return client
     if "server1" in config.name:
         return MockMCPClient([create_mock_tool("tool1", meta={"test": "meta"}), create_mock_tool("tool2")], message_handler=message_handler)
     elif "server2" in config.name:
@@ -146,10 +159,10 @@ async def test_initialize_with_servers(manager):
     assert manager._exposed_tools["server1__tool2"] == ("server1", "tool2")
     assert "server2__tool3" not in manager._exposed_tools  # 禁用的服务器
 
-    # 验证状态检查（#166：返回 (bundle_id, display_name, active, state)）
+    # 验证状态检查（#166：返回 (bundle_id, display_name, active, state)；#184：state 改为 connection value）
     statuses = manager.get_server_status()
     assert ("server1", "server1", True, "connected") in statuses
-    assert ("server2", "server2", False, "pending") in statuses
+    assert ("server2", "server2", False, "disconnected") in statuses
     assert ("sse_server", "sse_server", True, "connected") in statuses
 
 
@@ -966,3 +979,198 @@ async def test_forbidden_tool_not_exposed_and_uncallable(manager):
     assert "server1__tool2" not in manager._exposed_tools
     with pytest.raises(ValueError):
         await manager.aexecute_tool("server1__tool2", {})
+
+
+# ── #184 启动/连接状态正交化 测试 / Activation/connection orthogonality tests ──
+
+
+@pytest.mark.asyncio
+async def test_activation_intent_persists_on_connect_failure(manager):
+    """start 失败后 activation intent 仍保留，连接状态为 error。"""
+    _FAIL_CONNECT_SERVERS.add("server1")
+    try:
+        servers = [create_server_config("server1")]
+        await manager.ainitialize(servers)
+
+        with pytest.raises(Exception):
+            await manager.astart_client("server1")
+
+        # activation intent 已记录
+        assert "server1" in manager._activation_intents
+        # 但 active_clients 中没有
+        assert "server1" not in manager._active_clients
+        # connection state 为 error
+        assert manager._connection_states["server1"] == MCPServerConnectionState.ERROR
+    finally:
+        _FAIL_CONNECT_SERVERS.discard("server1")
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_activation_intent(manager):
+    """stop 同时清除 activation intent + connection state。"""
+    servers = [create_server_config("server1")]
+    await manager.ainitialize(servers)
+    await manager.astart_client("server1")
+
+    assert "server1" in manager._activation_intents
+    assert "server1" in manager._active_clients
+
+    await manager.astop_client("server1")
+
+    assert "server1" not in manager._activation_intents
+    assert "server1" not in manager._active_clients
+    assert "server1" not in manager._connection_states
+
+
+@pytest.mark.asyncio
+async def test_stop_all_includes_activation_only(manager):
+    """stop_all 覆盖未连接但已启动的 server（activation-only）。"""
+    _FAIL_CONNECT_SERVERS.add("server1")
+    try:
+        servers = [create_server_config("server1"), create_server_config("server2")]
+        await manager.ainitialize(servers)
+
+        # server1: start 失败，但有 activation intent
+        with pytest.raises(Exception):
+            await manager.astart_client("server1")
+        # server2: 正常启动
+        await manager.astart_client("server2")
+
+        assert "server1" in manager._activation_intents
+        assert "server2" in manager._activation_intents
+
+        await manager.astop_all()
+
+        # 两者都清除了
+        assert "server1" not in manager._activation_intents
+        assert "server2" not in manager._activation_intents
+    finally:
+        _FAIL_CONNECT_SERVERS.discard("server1")
+
+
+@pytest.mark.asyncio
+async def test_get_server_runtime_statuses_activation_started(manager):
+    """get_server_runtime_statuses 正确反映 activation STARTED 状态。"""
+    servers = [create_server_config("server1")]
+    await manager.ainitialize(servers)
+    await manager.astart_client("server1")
+
+    statuses = manager.get_server_runtime_statuses()
+    assert len(statuses) == 1
+    s = statuses[0]
+    assert s.bundle_id == "server1"
+    assert s.name == "server1"
+    assert s.activation == MCPServerActivationState.STARTED
+    assert s.connection == MCPServerConnectionState.CONNECTED
+    assert s.is_started() is True
+    assert s.is_connected() is True
+
+
+@pytest.mark.asyncio
+async def test_get_server_runtime_statuses_stopped(manager):
+    """未启动的 server 显示 STOPPED + DISCONNECTED。"""
+    servers = [create_server_config("server1")]
+    await manager.ainitialize(servers)
+
+    statuses = manager.get_server_runtime_statuses()
+    assert len(statuses) == 1
+    s = statuses[0]
+    assert s.activation == MCPServerActivationState.STOPPED
+    assert s.connection == MCPServerConnectionState.DISCONNECTED
+    assert s.is_started() is False
+    assert s.is_connected() is False
+
+
+@pytest.mark.asyncio
+async def test_get_server_runtime_statuses_connect_failure(manager):
+    """连接失败后显示 STARTED + ERROR，activation intent 保留。"""
+    _FAIL_CONNECT_SERVERS.add("server1")
+    try:
+        servers = [create_server_config("server1")]
+        await manager.ainitialize(servers)
+
+        with pytest.raises(Exception):
+            await manager.astart_client("server1")
+
+        statuses = manager.get_server_runtime_statuses()
+        s = statuses[0]
+        assert s.activation == MCPServerActivationState.STARTED
+        assert s.connection == MCPServerConnectionState.ERROR
+        assert s.is_started() is True
+        assert s.is_connected() is False
+    finally:
+        _FAIL_CONNECT_SERVERS.discard("server1")
+
+
+def test_get_server_status_backward_compat(manager):
+    """旧 get_server_status() 返回格式不变：4-tuple (bundle_id, name, bool, str)。"""
+    servers = [create_server_config("server1")]
+    manager._servers_config = {s.name: s for s in servers}
+
+    statuses = manager.get_server_status()
+    assert len(statuses) == 1
+    bid, name, is_started, state = statuses[0]
+    assert bid == "server1"
+    assert name == "server1"
+    assert is_started is False  # 未启动
+    assert state == "disconnected"
+
+    # 添加激活意图后
+    manager._activation_intents.add("server1")
+    manager._connection_states["server1"] = MCPServerConnectionState.CONNECTING
+    statuses = manager.get_server_status()
+    _, _, is_started, state = statuses[0]
+    assert is_started is True
+    assert state == "connecting"
+
+
+def test_clear_all_clears_new_fields():
+    """_clear_all 清空 activation_intents 和 connection_states。"""
+    manager = MCPServerManager()
+    manager._activation_intents.add("test")
+    manager._connection_states["test"] = MCPServerConnectionState.CONNECTING
+    manager._exposed_tools["k"] = ("test", "t")
+
+    manager._clear_all()
+
+    assert len(manager._activation_intents) == 0
+    assert len(manager._connection_states) == 0
+    assert len(manager._exposed_tools) == 0
+
+
+def test_mcpserver_runtime_status_helpers():
+    """MCPServerRuntimeStatus.is_started / is_connected 行为正确。"""
+    started_connected = MCPServerRuntimeStatus(
+        bundle_id="a", name="A",
+        activation=MCPServerActivationState.STARTED,
+        connection=MCPServerConnectionState.CONNECTED,
+    )
+    assert started_connected.is_started() is True
+    assert started_connected.is_connected() is True
+
+    stopped = MCPServerRuntimeStatus(
+        bundle_id="b", name="B",
+        activation=MCPServerActivationState.STOPPED,
+        connection=MCPServerConnectionState.DISCONNECTED,
+    )
+    assert stopped.is_started() is False
+    assert stopped.is_connected() is False
+
+    started_auth = MCPServerRuntimeStatus(
+        bundle_id="c", name="C",
+        activation=MCPServerActivationState.STARTED,
+        connection=MCPServerConnectionState.AUTHORIZATION_REQUIRED,
+    )
+    assert started_auth.is_started() is True
+    assert started_auth.is_connected() is False
+
+
+def test_mcpserver_runtime_status_immutable():
+    """frozen dataclass 不可变。"""
+    s = MCPServerRuntimeStatus(
+        bundle_id="a", name="A",
+        activation=MCPServerActivationState.STARTED,
+        connection=MCPServerConnectionState.CONNECTED,
+    )
+    with pytest.raises(Exception):
+        s.activation = MCPServerActivationState.STOPPED  # type: ignore[misc]
