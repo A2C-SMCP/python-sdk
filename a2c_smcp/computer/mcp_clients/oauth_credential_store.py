@@ -36,18 +36,26 @@ from a2c_smcp.computer.mcp_clients.oauth_types import OAuthOptions
 class OAuthCredentialRecordKind(StrEnum):
     """凭据存储的记录类型（对齐 Rust ``OAuthCredentialRecordKind``）。
 
-    两种记录由同一个 ``OAuthCredentialStore`` 承载：
-    - ``Credentials``：序列化的 OAuth 客户端注册与 token 凭据
+    三种记录由同一个 ``OAuthCredentialStore`` 承载：
+    - ``Credentials``：序列化的 token 凭据
     - ``IssuerIndex``：Core 拥有的 issuer 索引 + 活跃凭据快照
+    - ``ClientRegistration``：DCR 注册信息（client_id / client_secret / redirect_uris）
     """
 
     Credentials = "credentials"
-    """序列化的 OAuth 客户端注册和 token 凭据。"""
+    """序列化的 token 凭据。"""
     IssuerIndex = "issuerIndex"
     """Core 拥有的 issuer 索引和活跃凭据快照。
 
     将活跃快照保留在此单一记录中，宿主可原子替换凭据集，同时保留 issuer 列表
     用于 network-free 清理。
+    """
+    ClientRegistration = "clientRegistration"
+    """DCR 客户端注册信息（client_id / client_secret / redirect_uris）。
+
+    token 交换前 DCR 即完成，注册信息需独立存储以避免与 token envelope
+    产生 key 冲突（两者共享 bundle_id + resource + issuer + grant_fingerprint
+    组合，仅 record_kind 不同）。
     """
 
 
@@ -396,6 +404,35 @@ class ScopedCredentialStore:
                 return None
             return cast(str, credentials)
 
+    # -- key construction (for cooperating adapters) ------------------------
+
+    def make_key(self, record_kind: OAuthCredentialRecordKind) -> OAuthCredentialKey:
+        """为适配层提供由 store 封装的 key 构造，无需访问私有属性。
+
+        ``TokenStorageAdapter`` 等适配层通过此方法派生 client-info / token 等
+        不同 ``record_kind`` 的 key，避免跨类访问 ``_bundle_id`` / ``_resource`` /
+        ``_issuer`` / ``_mode_fingerprint``。
+        """
+        return OAuthCredentialKey(
+            bundle_id=self._bundle_id,
+            resource=self._resource,
+            issuer=self._issuer,
+            grant_fingerprint=self._mode_fingerprint,
+            record_kind=record_kind,
+        )
+
+    # -- raw backend access (for cooperating adapters) -----------------------
+
+    async def load_raw(self, key: OAuthCredentialKey) -> str | None:
+        """公开的原始 key 读取入口，供适配层（如 ``TokenStorageAdapter``）在不访问
+        ``_backend`` 私有属性的前提下读写凭据存储。
+        """
+        return await self._backend.load(key)
+
+    async def save_raw(self, key: OAuthCredentialKey, value: str) -> None:
+        """公开的原始 key 写入入口，供适配层存储非凭据类数据（如 DCR 注册信息）。"""
+        await self._backend.save(key, value)
+
     # -- issuer management ---------------------------------------------------
 
     async def set_issuer(self, issuer: str | None) -> None:
@@ -523,8 +560,18 @@ class ScopedCredentialStore:
         async with self._lock:
             issuers = self._known_issuers.copy()
             issuers.update(await self._persisted_issuers())
+            # Delete per-issuer Credentials + ClientRegistration keys in one pass
             for issuer in issuers:
                 await self._backend.delete(self._key_for_issuer(issuer))
+                await self._backend.delete(
+                    OAuthCredentialKey(
+                        bundle_id=self._bundle_id,
+                        resource=self._resource,
+                        issuer=issuer,
+                        grant_fingerprint=self._mode_fingerprint,
+                        record_kind=OAuthCredentialRecordKind.ClientRegistration,
+                    )
+                )
             await self._backend.delete(self._index_key())
 
 

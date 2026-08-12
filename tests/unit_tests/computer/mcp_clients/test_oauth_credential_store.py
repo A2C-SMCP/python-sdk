@@ -800,3 +800,137 @@ class TestOAuthCredentialStoreProtocol:
 
         store = IncompleteStore()
         assert not isinstance(store, OAuthCredentialStore)
+
+
+# ============================================================================
+# load_raw / save_raw 公开 API 测试（🟡5）
+# ============================================================================
+
+
+class TestLoadSaveRaw:
+    """ScopedCredentialStore.load_raw / save_raw 边界测试."""
+
+    @pytest.fixture
+    def backend(self) -> InMemoryOAuthCredentialStore:
+        return InMemoryOAuthCredentialStore()
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_raw(self, backend: InMemoryOAuthCredentialStore) -> None:
+        store = ScopedCredentialStore(
+            bundle_id="b-raw", resource="https://api.example.com",
+            mode_fingerprint="fp", backend=backend,
+        )
+        key = OAuthCredentialKey(
+            bundle_id="b-raw",
+            resource="https://api.example.com",
+            issuer=None,
+            grant_fingerprint="fp",
+            record_kind=OAuthCredentialRecordKind.ClientRegistration,
+        )
+        await store.save_raw(key, '{"hello":"world"}')
+        loaded = await store.load_raw(key)
+        assert loaded == '{"hello":"world"}'
+
+    @pytest.mark.asyncio
+    async def test_load_raw_missing_key(self, backend: InMemoryOAuthCredentialStore) -> None:
+        store = ScopedCredentialStore(
+            bundle_id="b-raw2", resource="https://api.example.com",
+            mode_fingerprint="fp", backend=backend,
+        )
+        key = OAuthCredentialKey(
+            bundle_id="b-raw2",
+            resource="https://api.example.com",
+            issuer=None,
+            grant_fingerprint="fp",
+            record_kind=OAuthCredentialRecordKind.ClientRegistration,
+        )
+        assert await store.load_raw(key) is None
+
+    @pytest.mark.asyncio
+    async def test_load_raw_propagates_store_error(self) -> None:
+        class FailingBackend:
+            async def load(self, key: OAuthCredentialKey) -> str | None:
+                raise OAuthCredentialStoreError.operation_failed()
+
+            async def save(self, key: OAuthCredentialKey, value: str) -> None:
+                raise OAuthCredentialStoreError.operation_failed()
+
+            async def delete(self, key: OAuthCredentialKey) -> None:
+                pass
+
+        store = ScopedCredentialStore(
+            bundle_id="b-fail",
+            resource="https://api.example.com",
+            mode_fingerprint="fp",
+            backend=FailingBackend(),  # type: ignore[arg-type]
+        )
+        key = store.make_key(OAuthCredentialRecordKind.Credentials)
+        with pytest.raises(OAuthCredentialStoreError):
+            await store.load_raw(key)
+
+
+# ============================================================================
+# clear() 清理 ClientRegistration 键测试（🟡6）
+# ============================================================================
+
+
+class TestClearClientRegistration:
+    """clear() 应正确删除 ClientRegistration 类型的 key."""
+
+    @pytest.fixture
+    def backend(self) -> InMemoryOAuthCredentialStore:
+        return InMemoryOAuthCredentialStore()
+
+    @pytest.mark.asyncio
+    async def test_clear_removes_client_registration_key(self, backend: InMemoryOAuthCredentialStore) -> None:
+        store = ScopedCredentialStore(
+            bundle_id="b-cr", resource="https://api.example.com",
+            mode_fingerprint="fp", backend=backend,
+        )
+        cr_key = store.make_key(OAuthCredentialRecordKind.ClientRegistration)
+
+        # 存入 client-info
+        await store.save_raw(cr_key, '{"client_id":"c1"}')
+        # 确认存在
+        assert await store.load_raw(cr_key) is not None
+
+        # 清除
+        await store.clear()
+
+        # 确认已删除
+        assert await store.load_raw(cr_key) is None
+
+    @pytest.mark.asyncio
+    async def test_clear_removes_credentials_and_client_registration(
+        self, backend: InMemoryOAuthCredentialStore
+    ) -> None:
+        store = ScopedCredentialStore(
+            bundle_id="b-cr2", resource="https://api.example.com",
+            mode_fingerprint="fp-cr2", backend=backend,
+        )
+        cred_key = store.make_key(OAuthCredentialRecordKind.Credentials)
+        cr_key = store.make_key(OAuthCredentialRecordKind.ClientRegistration)
+
+        await store.save_raw(cred_key, '"token"')
+        await store.save_raw(cr_key, '"client"')
+
+        await store.clear()
+
+        assert await store.load_raw(cred_key) is None
+        assert await store.load_raw(cr_key) is None
+
+    @pytest.mark.asyncio
+    async def test_make_key_encapsulates_fields(self, backend: InMemoryOAuthCredentialStore) -> None:
+        """make_key 封装了 bundle_id/resource/issuer/fingerprint 组合."""
+        store = ScopedCredentialStore(
+            bundle_id="b-mk",
+            resource="https://rs.example.com",
+            mode_fingerprint="fp-mk",
+            backend=backend,
+        )
+        key = store.make_key(OAuthCredentialRecordKind.Credentials)
+        assert key.bundle_id == "b-mk"
+        assert key.resource == "https://rs.example.com"
+        assert key.issuer is None
+        assert key.grant_fingerprint == "fp-mk"
+        assert key.record_kind == OAuthCredentialRecordKind.Credentials

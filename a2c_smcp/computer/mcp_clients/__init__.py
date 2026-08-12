@@ -4,6 +4,13 @@
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
 
+from a2c_smcp.computer.mcp_clients.oauth_coordinator import (  # noqa: F401 — #178 Sub 2
+    ExpiringStateStore,
+    OAuthCoordinator,
+    TokenStorageAdapter,
+    parse_bearer_resource_metadata,
+)
+from a2c_smcp.computer.mcp_clients.oauth_coordinator_sync import SyncOAuthCoordinator  # noqa: F401 — #178 Sub 2
 from a2c_smcp.computer.mcp_clients.oauth_credential_store import (  # noqa: F401 — re-export for Sub 2+
     InMemoryOAuthCredentialStore,
     OAuthCredentialKey,
@@ -20,7 +27,9 @@ from a2c_smcp.computer.mcp_clients.oauth_credential_store import (  # noqa: F401
 from a2c_smcp.computer.mcp_clients.oauth_types import OAuthOptions  # noqa: F401 — re-export for Sub 2+
 
 __all__ = [
+    "ExpiringStateStore",
     "InMemoryOAuthCredentialStore",
+    "OAuthCoordinator",
     "OAuthCredentialKey",
     "OAuthCredentialRecordKind",
     "OAuthCredentialStore",
@@ -30,6 +39,9 @@ __all__ = [
     "StoredActiveCredential",
     "StoredCredentialEnvelope",
     "StoredCredentialIndex",
+    "SyncOAuthCoordinator",
+    "TokenStorageAdapter",
     "clear_stored_oauth_credentials",
     "oauth_mode_fingerprint",
+    "parse_bearer_resource_metadata",
 ]

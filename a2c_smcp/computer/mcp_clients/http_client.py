@@ -11,7 +11,7 @@ import contextlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from mcp import ClientSession
@@ -22,6 +22,9 @@ from mcp.types import CallToolResult
 
 from a2c_smcp.computer.mcp_clients.auth_error import UpstreamAuthError
 from a2c_smcp.computer.mcp_clients.base_client import STATES, BaseMCPClient
+
+if TYPE_CHECKING:
+    from a2c_smcp.computer.mcp_clients.oauth_coordinator import OAuthCoordinator
 
 
 @dataclass(frozen=True)
@@ -137,14 +140,22 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
         params: StreamableHttpParameters,
         state_change_callback: Callable[[str, str], None | Awaitable[None]] | None = None,
         message_handler: MessageHandlerFnT | None = None,
+        oauth_coordinator: OAuthCoordinator | None = None,
     ) -> None:
         """
         初始化HTTP客户端，支持传入自定义 message_handler
-        Initialize HTTP client with optional message_handler
+
+        Args:
+            params: Streamable HTTP 连接参数
+            state_change_callback: 状态变更回调
+            message_handler: 自定义消息处理器
+            oauth_coordinator: 可选 OAuth 协调器（#178），注入后 HTTP 客户端在连接时
+                              携带 OAuthClientProvider 处理 Bearer challenge。
         """
         assert isinstance(params, StreamableHttpParameters), "params must be an instance of StreamableHttpParameters"
         super().__init__(params, state_change_callback, message_handler)
         self._auth_observer = _AuthSignalObserver()
+        self._oauth = oauth_coordinator
         # 串行化 call_tool：``_request_id`` 在 ``await async_session`` 之后同步读、但实际自增发生在
         # ``super().call_tool()`` 任务里（ensure_future 调度后才跑 send_request）→ 并发 call_tool 会读到同一 id，
         # 致 observer 注册冲突 + 信号错配（隔离审查 🔴）。单 MCP server 工具调用并发非性能瓶颈，串行化最简且正确。
@@ -168,7 +179,13 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
             timeout: httpx.Timeout | None = None,
             auth: httpx.Auth | None = None,
         ) -> httpx.AsyncClient:
-            return _AuthWatchingClient(observer=self._auth_observer, headers=headers, timeout=timeout, auth=auth)
+            # OAuth (#178)：若 coordinator 需要注入 OAuthClientProvider，以它为 auth。
+            # 注意：mcp streamablehttp_client 已透传 auth 参数给 httpx_client_factory，
+            # 此处确保 coordinator 提供的 provider 覆盖 mcp 层 auth（后者通常为 None）。
+            effective_auth = auth
+            if self._oauth is not None and self._oauth.needs_oauth_provider():
+                effective_auth = self._oauth.build_oauth_provider()
+            return _AuthWatchingClient(observer=self._auth_observer, headers=headers, timeout=timeout, auth=effective_auth)
 
         aread_stream, awrite_stream, _ = await self._aexit_stack.enter_async_context(
             streamablehttp_client(**self.params.model_dump(mode="python"), httpx_client_factory=_httpx_factory),
