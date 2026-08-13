@@ -69,6 +69,20 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput,
     MCPServerRuntimeStatus,
 )
+from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
+    InMemoryOAuthCredentialStore,
+    OAuthCredentialStore,
+)
+from a2c_smcp.computer.mcp_clients.oauth_flow import OAuthFlow
+from a2c_smcp.computer.mcp_clients.oauth_types import (
+    OAuthBeginRequest,
+    OAuthCallback,
+    OAuthCancellation,
+    OAuthError,
+    OAuthErrorCode,
+    OAuthFlowOutcome,
+    OAuthStatus,
+)
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
     McpApprovalStatus,
@@ -229,6 +243,9 @@ class Computer(BaseComputer[PromptSession]):
         self._active_raw: dict[str, MCPServerConfig] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
+        # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
+        # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
+        self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
         self._confirm_callback = confirm_callback
         # 中文: 按需解析器与渲染器（惰性解析 inputs，保持配置不可变）
         # English: Lazy input resolver and renderer (on-demand inputs, keep config immutable)
@@ -404,6 +421,7 @@ class Computer(BaseComputer[PromptSession]):
             auto_connect=self._auto_connect,
             auto_reconnect=self._auto_reconnect,
             message_handler=self._on_manager_change,
+            oauth_credential_store=self._oauth_credential_store,
         )
         # 中文: 对每个 Server 配置执行：渲染(占位符解析链 + 预定义变量) + envFile 合并 + 校验生成不可变对象。
         #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
@@ -949,6 +967,7 @@ class Computer(BaseComputer[PromptSession]):
                 auto_connect=self._auto_connect,
                 auto_reconnect=self._auto_reconnect,
                 message_handler=self._on_manager_change,
+                oauth_credential_store=self._oauth_credential_store,
             )
         # 先物化进 manager，**成功后**再登记 raw（事务性一致：manager add 失败——如 server 活跃 ∧ 非 auto_reconnect
         # 抛 RuntimeError——则不留 attempted≠running 的 map 漂移；raw 恒未渲染故无安全影响，此为展示一致性加固）。
@@ -1997,6 +2016,101 @@ class Computer(BaseComputer[PromptSession]):
         if self.mcp_manager is None:
             return []
         return self.mcp_manager.get_server_runtime_statuses()
+
+    # ── #179 公共 OAuth facade（签名对齐 Rust Computer；宿主持有 callback） ──────
+
+    def with_oauth_credential_store(self, store: OAuthCredentialStore) -> "Computer":
+        """注入 OAuth 凭据存储（builder，返回 self） / Inject the OAuth credential store (builder).
+
+        默认进程内 :class:`InMemoryOAuthCredentialStore`；跨进程恢复（Sub 4）由宿主
+        注入持久化实现。须在 :meth:`boot_up` 之前调用（manager 构建时透传）。
+
+        Args:
+            store: 宿主提供的凭据存储实现（load/save/delete 协议）。
+
+        Returns:
+            Computer: self（链式调用）。
+        """
+        self._oauth_credential_store = store
+        return self
+
+    async def oauth_status(self, bundle_id: str) -> OAuthStatus:
+        """查询指定 MCP Server 的 OAuth 授权状态 / Query a server's OAuth authorization status.
+
+        Raises:
+            OAuthError: ``NotConfigured``（manager 未初始化 / 未准入 / 未知 bundle）；
+                ``UnsupportedTransport``（非 Streamable HTTP）。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return await self.mcp_manager.oauth_status(bundle_id)
+
+    def create_oauth_flow(self, bundle_id: str, request: OAuthBeginRequest) -> OAuthFlow:
+        """注册交互式授权 flow（**同步、无 I/O**） / Stage an interactive OAuth flow (no I/O).
+
+        相同请求幂等返回同一 :class:`OAuthFlow` handle；不同请求 →
+        ``AuthorizationAlreadyPending``。SDK 全程不开浏览器 / 不绑端口 / 不等待回调——
+        :meth:`OAuthFlow.launch` 返回授权 URL + state，回调由宿主提交
+        :meth:`complete_oauth` / :meth:`cancel_oauth`。
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+            request: 宿主回调参数（redirect_uri 为宿主拥有）。
+
+        Returns:
+            OAuthFlow: 该 flow 的 handle。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return self.mcp_manager.create_oauth_flow(bundle_id, request)
+
+    async def complete_oauth(self, bundle_id: str, callback: OAuthCallback) -> OAuthFlowOutcome:
+        """提交宿主浏览器回调并等待终态结果 / Submit the host browser callback.
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+            callback: 回调解析值（code + state + 可选 issuer）。
+
+        Returns:
+            OAuthFlowOutcome: ``authorized`` / ``terminated`` 结构化结果。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return await self.mcp_manager.complete_oauth(bundle_id, callback)
+
+    async def cancel_oauth(self, bundle_id: str, cancellation: OAuthCancellation) -> OAuthFlowOutcome:
+        """宿主取消 / AS 错误回调（按 reason 分派） / Host cancellation or provider error callback.
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+            cancellation: 结构化取消输入（state + reason + 可选 issuer）。
+
+        Returns:
+            OAuthFlowOutcome: 结构化终态结果。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return await self.mcp_manager.cancel_oauth(bundle_id, cancellation)
+
+    async def clear_oauth(self, bundle_id: str) -> None:
+        """清除该 server 的 OAuth 授权（凭据 + 流程 + 状态 commit + 退役 client）。
+
+        能力撤销**传播**（capability revision bump + tool-list 广播）由 #185 接管。
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        await self.mcp_manager.clear_oauth(bundle_id)
+
+    def _require_oauth_manager(self) -> None:
+        """facade 前置守卫：manager 未初始化（boot 前）→ ``NotConfigured``（Rust 语义）。"""
+        if self.mcp_manager is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
 
     def get_skills(self) -> list[A2CSkillRef]:
         """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。

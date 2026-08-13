@@ -84,6 +84,46 @@ class TestSyncOAuthCoordinator:
         status = sync_coordinator.status()
         assert isinstance(status, _OAuthStatusUnauthorized)
 
+    def test_register_and_has_registered(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """🟡8 staged API sync 镜像：register → has_registered_request / current_generation。"""
+        from a2c_smcp.computer.mcp_clients.oauth_types import OAuthBeginRequest
+
+        gen_before = sync_coordinator.current_generation()
+        sync_coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/callback"))
+        assert sync_coordinator.has_registered_request()
+        assert sync_coordinator.has_active_flow()
+        assert sync_coordinator.current_generation() == gen_before + 1
+
+    def test_fail_launch_waiter_and_retry(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """fail_launch 镜像：wait_launch 抛 typed error；同请求重试可恢复。"""
+        from a2c_smcp.computer.mcp_clients.oauth_types import (
+            OAuthBeginRequest,
+            OAuthError,
+            OAuthErrorCode,
+        )
+
+        sync_coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/callback"))
+        sync_coordinator.fail_launch(
+            OAuthError(OAuthErrorCode.Protocol, "OAuth protocol error: authorizationRequired")
+        )
+        with pytest.raises(OAuthError):
+            sync_coordinator.wait_launch()
+        # 重试可注册（完整拆解后同请求不再命中陈旧 future）
+        sync_coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/callback"))
+        assert sync_coordinator.has_registered_request()
+
+    def test_clear(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """#179 clear() sync 镜像：清整个 OAuth slot 的运行时态。"""
+        sync_coordinator.clear()
+        status = sync_coordinator.status()
+        assert isinstance(status, _OAuthStatusUnauthorized)
+
     def test_handle_insufficient_scope(
         self, sync_coordinator: SyncOAuthCoordinator
     ) -> None:

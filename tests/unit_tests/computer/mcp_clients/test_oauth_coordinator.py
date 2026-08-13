@@ -36,6 +36,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
     OAuthCallback,
     OAuthCancellation,
     OAuthCancellationReason,
+    OAuthError,
     OAuthErrorCode,
     OAuthLaunch,
     OAuthOptions,
@@ -499,67 +500,516 @@ class TestOAuthCoordinator:
             await coordinator.cancel_callback(cancellation)
         assert exc.value.code == OAuthErrorCode.InvalidCancellationReason
 
-    # ── begin/complete/cancel happy path 测试缺口（xfail） ──────────────────
-    # 这些方法需要 OAuthClientProvider 触发 redirect_handler 闭包回调才能走通
-    # 成功路径。当前测试仅覆盖 guard clause 和错误路径。需要以下 mock 基础设施：
-    #  - 可注入的 OAuthClientProvider mock（拦截 redirect_handler）
-    #  - 可控的 PKCE state store（注入预存 state→verifier 映射）
-    #  - 可控的 token store（注入预存 token 供 complete 路径读取）
-    # TODO(#184-followup): 补齐 mock 基础设施后移除此 xfail 标记
+    # ── begin/complete/cancel happy path（#179 解封：直驱 _make_redirect_handler 闭包） ──
+    # 401 触发式 mcp inline auth 流程中，redirect_handler 由 provider 在收到
+    # Bearer challenge 后调用；单元测试不经真实 transport，直接驱动该闭包
+    # （#178 xfail 注释所指「可注入 mock」的落地形态）。
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="begin() happy path 需要 OAuthClientProvider mock 支持"
-    )
     async def test_begin_happy_path(self, coordinator: OAuthCoordinator) -> None:
-        """begin() → 返回 OAuthLaunch，flow 进入 PENDING。"""
-        request = OAuthBeginRequest(mode="AuthCodeDynamic")
-        launch = await coordinator.begin(request)
+        """begin() → 返回 OAuthLaunch，flow 进入 PENDING（compat = register + wait_launch）。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        begin_task = asyncio.create_task(coordinator.begin(request))
+        await asyncio.sleep(0)  # 让 register() 先落地
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        launch = await asyncio.wait_for(begin_task, timeout=5)
         assert launch.authorization_url
-        assert launch.state
+        assert launch.state == "st1"
 
         status = await coordinator.status()
         assert status.state == "authorizationPending"  # _OAuthStatusAuthorizationPending
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="cancel() happy path 需要先设置 PENDING flow + mock redirect_handler"
-    )
     async def test_cancel_happy_path(self, coordinator: OAuthCoordinator) -> None:
-        """cancel(Cancelled) → 清理 flow，返回 Terminated。"""
-        # 需要 begin() 先走通 → 此处 xfail 作为测试意图文档
-        cancellation = OAuthCancellation(
-            state="mock-state", reason=OAuthCancellationReason.Cancelled
+        """cancel(Cancelled) → 清理 flow，返回 Terminated，status 回落 unauthorized。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
         )
+        cancellation = OAuthCancellation(state="st1", reason=OAuthCancellationReason.Cancelled)
         outcome = await coordinator.cancel(cancellation)
         assert outcome.outcome == "terminated"  # _OAuthOutcomeTerminated discriminator
 
+        status = await coordinator.status()
+        assert status.state == "unauthorized"
+
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="complete() happy path 需要 begin→provider callback→token exchange 全链 mock"
-    )
     async def test_complete_happy_path(self, coordinator: OAuthCoordinator) -> None:
         """complete(code, state) → 交换 token，返回 Authorized。"""
-        callback = OAuthCallback(code="mock-code", state="mock-state")
-        outcome = await coordinator.complete(callback)
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        complete_task = asyncio.create_task(
+            coordinator.complete(OAuthCallback(code="mock-code", state="st1"))
+        )
+        await asyncio.sleep(0)  # 让 claim_for_exchange 先落地
+        # 模拟 provider 的 token 交换持久化（set_tokens → _on_token_saved → exchange_done）
+        token = OAuthToken(access_token="at1", token_type="Bearer", scope="read write")
+        await coordinator._token_storage.set_tokens(token)
+        outcome = await asyncio.wait_for(complete_task, timeout=5)
         assert outcome.outcome == "authorized"  # _OAuthOutcomeAuthorized discriminator
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="cancel_callback(Timeout) happy path 需要 callback_handler mock 支持",
-        strict=False,  # 允许 XPASS（当前测试仅命中 guard clause→StateMismatch 错误路径）
-    )
     async def test_cancel_callback_happy_path(self, coordinator: OAuthCoordinator) -> None:
-        """cancel_callback(Timeout) → 返回 Terminated。
+        """cancel_callback(AccessDenied) → 返回 Terminated。
 
-        注：成功路径依赖 callback_handler 注入 → 待补齐 mock 基础设施。
-        当前测试命中 guard clause（无 PENDING flow → StateMismatch），预期 future xfail。
+        provider 路径仅接受 AccessDenied / AuthorizationError（Timeout 属宿主路径，
+        由 cancel() 处理；原 xfail 断言误用 Timeout，#179 一并修正）。
         """
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
         cancellation = OAuthCancellation(
-            state="mock-state", reason=OAuthCancellationReason.Timeout
+            state="st1", reason=OAuthCancellationReason.AccessDenied
         )
         outcome = await coordinator.cancel_callback(cancellation)
         assert outcome.outcome == "terminated"  # _OAuthOutcomeTerminated discriminator
+
+
+# ============================================================================
+# #179 隔离复核补测：stale-generation complete 路径 + expire 探测复位 suppress
+# ============================================================================
+
+
+class TestStaleGenerationConvergence:
+    """🟡3 / 🟡b 复核补测：PENDING 相 stale generation 与 suppress 残留。"""
+
+    @pytest.mark.asyncio
+    async def test_complete_stale_generation_expired(self, coordinator: OAuthCoordinator) -> None:
+        """complete 时 pending 已陈旧（refresh save 曾 bump generation）→ AuthorizationExpired。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        coordinator._generation += 1  # 模拟 pending 期间的凭据 save/refresh bump
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.complete(OAuthCallback(code="c1", state="st1"))
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+        assert coordinator._flow.phase == _FlowPhase.EXPIRED
+
+    @pytest.mark.asyncio
+    async def test_cancel_stale_generation_expired(self, coordinator: OAuthCoordinator) -> None:
+        """cancel 同判据（与 complete 对齐）。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        coordinator._generation += 1
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.cancel(OAuthCancellation(state="st1", reason=OAuthCancellationReason.Cancelled))
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+
+    @pytest.mark.asyncio
+    async def test_expire_restores_authorized_with_stored_credentials(
+        self, memory_store: InMemoryOAuthCredentialStore, oauth_options: OAuthOptions
+    ) -> None:
+        """register 驱动 PENDING（suppress 置位）+ 预存凭据 + stale → expire 探测复位
+        suppress 并恢复 Authorized（🟡b：旧凭据仍可用，不得恒判 Unauthorized）。"""
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        coord = OAuthCoordinator(
+            bundle_id="b1",
+            server_url="https://api.example.com",
+            resource="https://api.example.com",
+            options=oauth_options,
+            credential_store=memory_store,
+        )
+        # 预存旧授权凭据（register 之前 → 不受 suppress 影响）
+        await coord._token_storage.set_tokens(
+            OAuthToken(access_token="at1", token_type="Bearer", scope="read")
+        )
+        await coord._token_storage.set_client_info(
+            OAuthClientInformationFull(
+                client_id="dcr-1",
+                client_secret=None,
+                redirect_uris=["https://host.example/callback"],
+                client_name="A2C Test",
+            )
+        )
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coord.register(request)
+        handler = coord._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        coord._generation += 1  # stale
+        status = await coord.status()  # Pending → 触发 expire 收敛
+        assert status.state == "authorized"  # 旧凭据仍可用（suppress 已复位）
+        assert coord.has_registered_request() is False
+
+
+# ============================================================================
+# #179 staged-flow：register（无 I/O 注册）vs wait_launch（等 401 触发的 URL）
+# ============================================================================
+
+
+class TestStagedRegistration:
+    """宿主在 challenge 之前即可注册 flow；注册无 I/O、幂等、冲突结构化报错。"""
+
+    @pytest.mark.asyncio
+    async def test_register_is_idempotent_for_identical_request(self, coordinator: OAuthCoordinator) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        await coordinator.register(request)  # 幂等，不抛
+        assert coordinator.has_registered_request()
+
+    @pytest.mark.asyncio
+    async def test_register_conflicting_request_raises(self, coordinator: OAuthCoordinator) -> None:
+        request1 = OAuthBeginRequest(redirect_uri="https://host.example/cb1")
+        request2 = OAuthBeginRequest(redirect_uri="https://host.example/cb2")
+        await coordinator.register(request1)
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.register(request2)
+        assert exc.value.code == OAuthErrorCode.AuthorizationAlreadyPending
+
+    @pytest.mark.asyncio
+    async def test_register_pre_challenge_builds_no_provider(self, coordinator: OAuthCoordinator) -> None:
+        await coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/callback"))
+        assert coordinator._provider is None  # 无 I/O：provider 留待 challenge 后重建
+
+    @pytest.mark.asyncio
+    async def test_register_sets_pending_status(self, coordinator: OAuthCoordinator) -> None:
+        await coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/callback"))
+        status = await coordinator.status()
+        assert status.state == "authorizationPending"
+
+    @pytest.mark.asyncio
+    async def test_pre_challenge_cancel_clears_registered(self, coordinator: OAuthCoordinator) -> None:
+        """pre-challenge cancel 终态收敛清注册（原 clear_registered_request 死 API 已删，
+        语义由 cancel_pending 的 teardown 覆盖）。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        outcome = await coordinator.cancel_pending(
+            OAuthCancellationReason.Cancelled,
+            expected_generation=coordinator.current_generation(),
+        )
+        assert outcome.outcome == "terminated"
+        assert not coordinator.has_registered_request()
+
+    # ── redirect_uri 校验矩阵（对齐 Rust validate_redirect_uri，oauth.rs:2976） ──
+
+    @pytest.mark.asyncio
+    async def test_register_accepts_https(self, coordinator: OAuthCoordinator) -> None:
+        await coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/cb"))
+
+    @pytest.mark.asyncio
+    async def test_register_accepts_loopback_ip(self, coordinator: OAuthCoordinator) -> None:
+        await coordinator.register(OAuthBeginRequest(redirect_uri="http://127.0.0.1:8080/cb"))
+
+    @pytest.mark.asyncio
+    async def test_register_accepts_loopback_localhost(self, coordinator: OAuthCoordinator) -> None:
+        await coordinator.register(OAuthBeginRequest(redirect_uri="http://localhost/cb"))
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_http_non_loopback(self, coordinator: OAuthCoordinator) -> None:
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.register(OAuthBeginRequest(redirect_uri="http://10.0.0.1/cb"))
+        assert exc.value.code == OAuthErrorCode.InvalidRedirectUri
+
+    @pytest.mark.asyncio
+    async def test_register_accepts_reverse_domain_private_use(self, coordinator: OAuthCoordinator) -> None:
+        await coordinator.register(
+            OAuthBeginRequest(redirect_uri="com.example.app:/oauth/callback")
+        )
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_single_label_private_use(self, coordinator: OAuthCoordinator) -> None:
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.register(OAuthBeginRequest(redirect_uri="custom:/callback"))
+        assert exc.value.code == OAuthErrorCode.InvalidRedirectUri
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_authority_bearing_private_use(self, coordinator: OAuthCoordinator) -> None:
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.register(
+                OAuthBeginRequest(redirect_uri="com.example.app://host/cb")
+            )
+        assert exc.value.code == OAuthErrorCode.InvalidRedirectUri
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_fragment(self, coordinator: OAuthCoordinator) -> None:
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.register(
+                OAuthBeginRequest(redirect_uri="https://host.example/cb#frag")
+            )
+        assert exc.value.code == OAuthErrorCode.InvalidRedirectUri
+
+
+class TestRedirectHandlerContract:
+    """#179：redirect_handler 只在宿主已注册 flow 时发布 launch；challenge-only 路径不伪造 pending。"""
+
+    @pytest.mark.asyncio
+    async def test_redirect_with_registered_request_populates_pending(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        assert coordinator._flow.phase == _FlowPhase.PENDING
+        assert coordinator._flow.pending is not None
+        # pending 携带宿主 request 对象（非 URL 反构），供幂等/冲突判定
+        assert coordinator._flow.pending.request == request
+        assert coordinator._flow.pending.request.redirect_uri == "https://host.example/callback"
+
+    @pytest.mark.asyncio
+    async def test_redirect_without_registered_request_raises(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        handler = coordinator._make_redirect_handler()
+        with pytest.raises(OAuthError) as exc:
+            await handler("https://auth.example/authorize?state=st1")
+        assert exc.value.code == OAuthErrorCode.Protocol
+        assert coordinator._flow.phase == _FlowPhase.IDLE  # 不伪造 pending
+
+    @pytest.mark.asyncio
+    async def test_redirect_resolves_launch_future(self, coordinator: OAuthCoordinator) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        launch = await coordinator.wait_launch()
+        assert launch.state == "st1"
+        assert launch.authorization_url.startswith("https://auth.example/authorize")
+
+    @pytest.mark.asyncio
+    async def test_redirect_captures_provider_issuer(self, coordinator: OAuthCoordinator) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        # 模拟 provider 已发现 AS metadata 且带 issuer（mcp 公共属性）
+        provider = MagicMock()
+        provider.context.oauth_metadata.issuer = "https://auth.example"
+        coordinator._provider = provider
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        assert coordinator._issuer == "https://auth.example"
+        assert coordinator._flow.pending is not None
+        assert coordinator._flow.pending.issuer == "https://auth.example"
+
+
+class TestProviderRebuild:
+    """#179：redirect_uri 权威来源 = 宿主 OAuthBeginRequest（Rust 宿主契约）。"""
+
+    @pytest.mark.asyncio
+    async def test_provider_uses_host_redirect_uri(self, coordinator: OAuthCoordinator) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        provider = coordinator.build_oauth_provider()
+        assert str(provider.context.client_metadata.redirect_uris[0]) == "https://host.example/callback"
+
+
+class TestStagedValidationDetails:
+    """#179：cancel issuer 校验 + 终态清 registered/futures + restore 采纳持久化 issuer。"""
+
+    @pytest.mark.asyncio
+    async def test_cancel_issuer_mismatch(self, coordinator: OAuthCoordinator) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        provider = MagicMock()
+        provider.context.oauth_metadata.issuer = "https://auth.example"
+        coordinator._provider = provider
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        cancellation = OAuthCancellation(
+            state="st1",
+            issuer="https://other.example",
+            reason=OAuthCancellationReason.Cancelled,
+        )
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.cancel(cancellation)
+        assert exc.value.code == OAuthErrorCode.IssuerMismatch
+
+    @pytest.mark.asyncio
+    async def test_cancel_clears_registered_request(self, coordinator: OAuthCoordinator) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        outcome = await coordinator.cancel(
+            OAuthCancellation(state="st1", reason=OAuthCancellationReason.Cancelled)
+        )
+        assert outcome.outcome == "terminated"
+        assert not coordinator.has_registered_request()
+        # 终态后同请求可重新注册（fresh flow）
+        await coordinator.register(request)
+
+    @pytest.mark.asyncio
+    async def test_restore_credentials_adopts_persisted_issuer(
+        self,
+        memory_store: InMemoryOAuthCredentialStore,
+        oauth_options: OAuthOptions,
+    ) -> None:
+        # 第一个 coordinator 完成授权（issuer 已持久化到 index + 凭据已保存）
+        first = OAuthCoordinator(
+            bundle_id="b1",
+            server_url="https://api.example.com",
+            resource="https://api.example.com",
+            options=oauth_options,
+            credential_store=memory_store,
+        )
+        await first._store.set_issuer("https://auth.example")
+        token = OAuthToken(access_token="at1", token_type="Bearer", scope="read")
+        await first._token_storage.set_tokens(token)
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        await first._token_storage.set_client_info(
+            OAuthClientInformationFull(
+                client_id="dcr-1",
+                client_secret="secret-1",
+                redirect_uris=["https://host.example/callback"],
+                client_name="A2C Test",
+            )
+        )
+
+        # 第二个 coordinator（模拟进程重启后重建）从同一 store restore
+        second = OAuthCoordinator(
+            bundle_id="b1",
+            server_url="https://api.example.com",
+            resource="https://api.example.com",
+            options=oauth_options,
+            credential_store=memory_store,
+        )
+        status = await second.restore_credentials()
+        assert status.state == "authorized"
+        assert second._issuer == "https://auth.example"
+        assert second._granted_scopes == ["read"]
+
+
+# ============================================================================
+# fix-review 回归：槽终结一致性 / clear waiter / 注册 TTL
+# ============================================================================
+
+
+class TestSlotTeardownConsistency:
+    """🔴1 / 🔴2 / clear-waiter：任何终结路径不留陈旧 launch future 或半拆解槽。"""
+
+    @pytest.mark.asyncio
+    async def test_expired_flow_then_new_register_gets_fresh_url(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """🔴1：过期收敛必须置空 launch future——新注册的 wait_launch 不得返回旧 flow 的 URL。"""
+        req1 = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(req1)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st1"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        coordinator._generation += 1  # stale → expire
+        await coordinator.status()
+
+        # 新注册（不同请求）→ 直驱 handler → wait_launch 必须是**新** state
+        req2 = OAuthBeginRequest(redirect_uri="https://host.example/cb2")
+        await coordinator.register(req2)
+        await handler(
+            "https://auth.example/authorize?state=st2"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcb2"
+        )
+        launch = await coordinator.wait_launch()
+        assert launch.state == "st2"
+
+    @pytest.mark.asyncio
+    async def test_fail_launch_then_same_request_retry_recovers(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """🔴2：fail_launch 完整拆解——同请求重试不得重抛陈旧异常，新 connect 可发布新 URL。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        coordinator.fail_launch(
+            OAuthError(OAuthErrorCode.Protocol, "OAuth protocol error: authorizationRequired")
+        )
+        with pytest.raises(OAuthError):
+            await coordinator.wait_launch()
+
+        # 同请求重试：注册可落位 + 新 connect 任务的 URL 可发布（不再命中陈旧 future）
+        await coordinator.register(request)
+        handler = coordinator._make_redirect_handler()
+        await handler(
+            "https://auth.example/authorize?state=st2"
+            "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+        )
+        launch = await coordinator.wait_launch()
+        assert launch.state == "st2"
+
+    @pytest.mark.asyncio
+    async def test_clear_resolves_in_flight_launch_waiter(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """clear() 终态必须解除在途 wait_launch 等待者（teardown 升格）。"""
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        waiter = asyncio.create_task(coordinator.wait_launch())
+        await asyncio.sleep(0)
+        await coordinator.clear()
+        with pytest.raises(OAuthError) as exc:
+            await asyncio.wait_for(waiter, timeout=5)
+        assert exc.value.code == OAuthErrorCode.AuthorizationCancelled
+
+
+class TestRegistrationTtl:
+    """🟡3：register-only 阶段（从未 challenge）超时过期，不得无限阻塞新 flow。"""
+
+    @pytest.mark.asyncio
+    async def test_stale_registration_replaced_by_new_request(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        req1 = OAuthBeginRequest(redirect_uri="https://host.example/cb1")
+        await coordinator.register(req1)
+        assert coordinator.has_active_flow()
+        # 回拨注册时间模拟超时（TTL 600s）
+        coordinator._registered_at = (
+            time.monotonic() - 700.0  # type: ignore[union-attr]
+        )
+        assert not coordinator.has_active_flow()  # 时间感知：过期视为非活跃
+        req2 = OAuthBeginRequest(redirect_uri="https://host.example/cb2")
+        await coordinator.register(req2)  # 放行（不再 AlreadyPending）
+        assert coordinator.has_registered_request()
+
+    @pytest.mark.asyncio
+    async def test_fresh_registration_blocks_conflicting_request(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        await coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/cb1"))
+        with pytest.raises(OAuthError) as exc:
+            await coordinator.register(OAuthBeginRequest(redirect_uri="https://host.example/cb2"))
+        assert exc.value.code == OAuthErrorCode.AuthorizationAlreadyPending
 
 
 # ============================================================================
@@ -947,18 +1397,21 @@ class TestOAuthCoordinatorExpiredFlow:
         assert isinstance(coord._status, _OAuthStatusReauthorizationRequired)
         assert coord._status.required_scope == "admin.write"
 
-    # ── _begin_under_lock expire coverage (line 406) ───────────────────
+    # ── register expire coverage（原 _begin_under_lock，#179 staged 化） ───
 
     @pytest.mark.asyncio
-    async def test_begin_under_lock_expires_stale_flow(
+    async def test_register_expires_stale_flow_then_supersedes(
         self, coordinator_with_pending: OAuthCoordinator
     ) -> None:
-        """_begin_under_lock expires a stale PENDING flow before proceeding."""
+        """register 先过期 stale PENDING（#186 语义），随后新注册**取代** EXPIRED
+        （新 flow 的 intent 以 registered_request 为准；旧 state 的 late callback
+        此后按新 flow 判 StateMismatch）。"""
         coord = coordinator_with_pending
         coord._generation += 1  # stale
         request = OAuthBeginRequest(
             redirect_uri="http://127.0.0.1:0/callback",
             required_scope=None,
         )
-        await coord._begin_under_lock(request)
-        assert coord._flow.phase == _FlowPhase.EXPIRED
+        await coord._register_under_lock(request)
+        assert coord._flow.phase == _FlowPhase.IDLE  # EXPIRED 已被新注册取代
+        assert coord.has_registered_request()

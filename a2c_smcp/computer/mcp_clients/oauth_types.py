@@ -203,6 +203,13 @@ class OAuthBeginRequest(_OAuthBaseModel):
     required_scope: str | None = None
     """可选的最小 scope 要求。"""
 
+    def __repr__(self) -> str:
+        """脱敏 repr（验收 6）：宿主 callback URI 不得入日志/普通 repr。"""
+        return (
+            f"OAuthBeginRequest(redirect_uri={_REDACTED!r}, "
+            f"required_scope={self.required_scope!r})"
+        )
+
 
 # ============================================================================
 # OAuthLaunch（repr 脱敏）
@@ -411,6 +418,45 @@ class OAuthErrorCode(StrEnum):
     Protocol = "protocol"
 
 
+# ============================================================================
+# OAuthError（公共异常，对齐 Rust ``OAuthError`` 枚举）
+# ============================================================================
+
+
+class OAuthError(Exception):
+    """OAuth 错误（#179 facade 的 typed error 契约）。
+
+    对齐 Rust ``OAuthError`` 枚举变体（``NotConfigured`` / ``StateMismatch`` /
+    ``IssuerMismatch`` / ``AuthorizationExpired`` / ``AuthorizationAlreadyPending`` /
+    ``Protocol(OAuthProtocolError)`` 等），变体经 :class:`OAuthErrorCode` 承载。
+
+    **安全约定**：``message`` 必须为静态文案，绝不携带 provider 响应体 / token /
+    authorization URL / code / state / ``error_description``（Rust 宿主契约的日志脱敏规则）。
+    """
+
+    def __init__(self, code: OAuthErrorCode, message: str) -> None:
+        super().__init__(f"{code.value}: {message}")
+        self.code: OAuthErrorCode = code
+        self.message: str = message
+
+    @classmethod
+    def protocol(cls, category: OAuthProtocolError) -> OAuthError:
+        """构造 ``Protocol`` 分类错误（对齐 Rust ``OAuthError::Protocol(OAuthProtocolError)``）。
+
+        仅携带稳定、非敏感的分类名，宿主可据此做控制流与诊断。
+        """
+        return cls(OAuthErrorCode.Protocol, f"OAuth protocol error: {category.value}")
+
+
+def default_oauth_options() -> OAuthOptions:
+    """automatic-only（Rust #180）默认选项：Auth Code + DCR、无预设 scopes。
+
+    无显式 ``oauth`` 配置时由 manager 用于 challenge 准入（scopes / resource 从
+    metadata 派生）。私有变体类型（``_OAuthModeAuthCodeDynamic``）不跨界导出。
+    """
+    return OAuthOptions(mode=_OAuthModeAuthCodeDynamic())
+
+
 __all__ = [
     "OAuthBeginRequest",
     "OAuthCallback",
@@ -418,7 +464,9 @@ __all__ = [
     "OAuthCancellationReason",
     "OAuthClientMode",
     "OAuthClientRegistration",
+    "OAuthError",
     "OAuthErrorCode",
+    "default_oauth_options",
     "OAuthFlowOutcome",
     "OAuthLaunch",
     "OAuthOptions",

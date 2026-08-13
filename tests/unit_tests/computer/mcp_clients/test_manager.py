@@ -43,6 +43,16 @@ class MockMCPClient:
         call_ret.meta = ret_meta
         self.call_tool = AsyncMock(return_value=call_ret)
         self.state = "connected"
+        # #179：connect-phase challenge 事件（bounded connect 竞速的 mock 面）。
+        # 永不触发 → manager 的竞速以 aconnect 完成收尾（mock 语义 = 匿名连通）。
+        self._challenge_event: asyncio.Event | None = None
+
+        def connect_challenge_event() -> asyncio.Event:
+            if self._challenge_event is None:
+                self._challenge_event = asyncio.Event()
+            return self._challenge_event
+
+        self.connect_challenge_event = connect_challenge_event
         # 保存透传进来的 message_handler，便于测试断言
         self.message_handler = message_handler
 
@@ -114,7 +124,10 @@ def create_server_config(
             forbidden_tools=forbidden_tools,
             tool_meta=tool_meta,
             default_tool_meta=default_tool_meta,
-            server_parameters=MagicMock(spec=StreamableHttpParameters),
+            # 真实模型（非 MagicMock）：#179 起 manager 对 streamable config 读取
+            # server_parameters.url 做 OAuth 通道判定——MagicMock(spec=pydantic 模型)
+            # 无法解析字段（pydantic v2 字段不在类属性上），属 wire-invalid 夹具。
+            server_parameters=StreamableHttpParameters(url="http://localhost:8000/mcp"),
         )
     else:
         return StdioServerConfig(

@@ -453,6 +453,24 @@ class ScopedCredentialStore:
             self._known_issuers.add(issuer)
             self._issuer = issuer
 
+    async def adopt_persisted_issuer(self) -> str | None:
+        """采纳持久化 index 的 active issuer（restore 路径，#179）。
+
+        新 coordinator 实例（进程重启 / 重建）的 ``_issuer`` 默认 ``None``，而
+        ``_try_load_credentials`` 要求 ``index.active.issuer == self._issuer`` 才命中——
+        非 ``None`` issuer 的凭据不采纳即永远恢复失败。本方法读取 index 并把
+        ``active.issuer``（非 None 时）设为当前 issuer。
+
+        Returns:
+            采纳后的当前 issuer（无持久化 active 时为 ``None``）。
+        """
+        async with self._lock:
+            index = await self._load_or_empty_index()
+            if index.active is not None and index.active.issuer is not None:
+                self._issuer = index.active.issuer
+                self._known_issuers.add(index.active.issuer)
+            return self._issuer
+
     async def _persist_issuer_index_with(self, issuer: str | None) -> None:
         """写入 issuer-index 记录。调用方须持有 ``self._lock``。"""
         index = await self._load_or_empty_index()

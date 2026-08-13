@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from mcp.client.auth import OAuthClientProvider
 
     from a2c_smcp.computer.mcp_clients.oauth_types import (
+        OAuthCancellationReason,
+        OAuthError,
         OAuthFlowOutcome,
         OAuthLaunch,
         OAuthStatus,
@@ -169,9 +171,53 @@ class SyncOAuthCoordinator:
     def invalidate_credentials(self) -> None:
         self._ensure_loop().run_until_complete(self._ensure_async().invalidate_credentials())
 
+    def clear(self) -> None:
+        """清除整个 OAuth slot 的运行时态（#179 ``clear_oauth`` 的 sync 镜像）。"""
+        self._ensure_loop().run_until_complete(self._ensure_async().clear())
+
+    # -- #179 staged API 镜像（🟡8：与 async 版对齐，防双实现分叉） -----------
+
+    def register(self, request: OAuthBeginRequest) -> None:
+        self._ensure_loop().run_until_complete(self._ensure_async().register(request))
+
+    def wait_launch(self) -> OAuthLaunch:
+        return self._ensure_loop().run_until_complete(self._ensure_async().wait_launch())
+
+    def fail_launch(self, error: OAuthError) -> None:
+        self._ensure_async().fail_launch(error)
+
+    def cancel_pending(
+        self,
+        reason: OAuthCancellationReason,
+        expected_generation: int | None = None,
+        expected_request: OAuthBeginRequest | None = None,
+    ) -> OAuthFlowOutcome:
+        return self._ensure_loop().run_until_complete(
+            self._ensure_async().cancel_pending(
+                reason,
+                expected_generation=expected_generation,
+                expected_request=expected_request,
+            )
+        )
+
     # Sync delegation (these are sync on OAuthCoordinator)
     def needs_oauth_provider(self) -> bool:
         return self._ensure_async().needs_oauth_provider()
+
+    def has_registered_request(self) -> bool:
+        return self._ensure_async().has_registered_request()
+
+    def has_active_flow(self) -> bool:
+        return self._ensure_async().has_active_flow()
+
+    def launch_awaiting(self) -> bool:
+        return self._ensure_async().launch_awaiting()
+
+    def current_generation(self) -> int:
+        return self._ensure_async().current_generation()
+
+    def flow_aborted_event(self) -> asyncio.Event:
+        return self._ensure_async().flow_aborted_event()
 
     def build_oauth_provider(self) -> OAuthClientProvider:
         return self._ensure_async().build_oauth_provider()

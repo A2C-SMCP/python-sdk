@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class _AuthSignal:
+class AuthSignal:
     """传输层观测到的一次上游授权失败信号 / one observed upstream auth-failure signal."""
 
     status_code: int
@@ -51,10 +51,12 @@ def _parse_jsonrpc_id(content: bytes | None) -> int | str | None:
 class _AuthWatchingClient(httpx.AsyncClient):
     """``httpx.AsyncClient`` 子类：在 ``stream()`` 响应为 401/403 时，把信号经 ``observer`` 回投给 HttpMCPClient。
 
-    mcp Python SDK 在 ``streamable_http.py`` ``post_writer`` 里把 ``tools/call`` 的 401/403 抛进传输任务组、
-    拆连接关 ``read_stream``，导致 ``session.call_tool`` **挂起**（不是抛异常）。故授权失败信号须在 mcp 吞掉它
-    **之前**于传输层截获，再经 side-channel 让 ``HttpMCPClient.call_tool`` 自身兜底合成（协议 error-handling.md
-    §可观测判据：已观测授权失败信号但 ``CallToolResult`` 不会经原路径返回时，Computer MUST 自身层面兜底）。
+    mcp Python SDK（上游 ``mcp/client/streamable_http.py`` ``post_writer`` / ``_handle_post_request``）在
+    401/403 时把异常抛进传输任务组、拆连接关 ``read_stream``，导致请求侧（``session.call_tool`` /
+    ``on_enter_connected``）**挂起**而非抛异常（上游吞没行为，#133 实证；无已知上游 issue）。故授权
+    失败信号须在 mcp 吞掉它**之前**于传输层截获，再经 side-channel 让 ``HttpMCPClient.call_tool``
+    自身兜底合成（协议 error-handling.md §可观测判据：已观测授权失败信号但 ``CallToolResult`` 不会经
+    原路径返回时，Computer MUST 自身层面兜底）。
 
     截获点：``stream()`` 拿到响应、在 mcp 调 ``raise_for_status()`` 之前——状态码 + ``WWW-Authenticate`` 均可得，
     且请求体（``response.request.content``）携带 JSON-RPC ``id`` 供关联。
@@ -90,10 +92,17 @@ class _AuthWatchingClient(httpx.AsyncClient):
         async with super().stream(method, url, **kwargs) as response:
             if response.status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN):
                 rpc_id = _parse_jsonrpc_id(response.request.content)
+                www_auth = response.headers.get("www-authenticate")
                 self._observer.capture_auth_signal(
                     rpc_id,
                     response.status_code,
-                    response.headers.get("www-authenticate"),
+                    www_auth,
+                )
+                # #179：connect-phase 通道（aconnect 的 401/403 challenge 无 rpc_id 关联；
+                # call_tool 路径同时写两条通道互不干扰——connect 槽由 manager 消费一次）。
+                self._observer.capture_connect_signal(
+                    response.status_code,
+                    www_auth,
                 )
             yield response
 
@@ -106,8 +115,12 @@ class _AuthSignalObserver:
     """
 
     def __init__(self) -> None:
-        self._signals: dict[object, _AuthSignal] = {}
+        self._signals: dict[object, AuthSignal] = {}
         self._events: dict[object, asyncio.Event] = {}
+        # #179 connect-phase 槽：aconnect 期间的 401/403 challenge（无 rpc_id 关联）。
+        # 与 call_tool 的 per-request 通道正交——stream() 两个通道都写。
+        self._connect_signal: AuthSignal | None = None
+        self._connect_event: asyncio.Event = asyncio.Event()
 
     def register(self, rpc_id: object) -> asyncio.Event | None:
         """登记一次在途调用，返回供其 race 的 Event；``rpc_id`` 为 None（无法关联）则返回 None（退化为直通）。"""
@@ -123,10 +136,29 @@ class _AuthSignalObserver:
         """传输层回调：仅在已有在途监听者时记录信号并唤醒（迟到的/无主的信号丢弃——调用已正常返回则不追溯失败）。"""
         if rpc_id is None or rpc_id not in self._events:
             return
-        self._signals[rpc_id] = _AuthSignal(status_code, www_authenticate_header)
+        self._signals[rpc_id] = AuthSignal(status_code, www_authenticate_header)
         self._events[rpc_id].set()
 
-    def take(self, rpc_id: object) -> _AuthSignal | None:
+    def capture_connect_signal(
+        self, status_code: int, www_authenticate_header: str | None
+    ) -> None:
+        """记录首个 connect-phase 授权信号（幂等；``take_connect_signal`` 消费后重置）。"""
+        if self._connect_signal is None:
+            self._connect_signal = AuthSignal(status_code, www_authenticate_header)
+            self._connect_event.set()
+
+    def connect_event(self) -> asyncio.Event:
+        """connect-phase challenge 的唤醒事件（manager bounded connect 竞速用）。"""
+        return self._connect_event
+
+    def take_connect_signal(self) -> AuthSignal | None:
+        """取走并重置 connect-phase 信号（manager 准入判定消费一次）。"""
+        signal = self._connect_signal
+        self._connect_signal = None
+        self._connect_event = asyncio.Event()
+        return signal
+
+    def take(self, rpc_id: object) -> AuthSignal | None:
         return self._signals.pop(rpc_id, None)
 
     def discard(self, rpc_id: object) -> None:
@@ -141,6 +173,7 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
         state_change_callback: Callable[[str, str], None | Awaitable[None]] | None = None,
         message_handler: MessageHandlerFnT | None = None,
         oauth_coordinator: OAuthCoordinator | None = None,
+        httpx_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         """
         初始化HTTP客户端，支持传入自定义 message_handler
@@ -151,15 +184,28 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
             message_handler: 自定义消息处理器
             oauth_coordinator: 可选 OAuth 协调器（#178），注入后 HTTP 客户端在连接时
                               携带 OAuthClientProvider 处理 Bearer challenge。
+            httpx_transport: 仅测试/诊断注入的 httpx transport（``httpx.MockTransport``
+                             假 AS 组件测试，沿用 #133 接缝）；生产路径不传（None → 真实网络）。
         """
         assert isinstance(params, StreamableHttpParameters), "params must be an instance of StreamableHttpParameters"
         super().__init__(params, state_change_callback, message_handler)
         self._auth_observer = _AuthSignalObserver()
         self._oauth = oauth_coordinator
+        self._httpx_transport = httpx_transport
         # 串行化 call_tool：``_request_id`` 在 ``await async_session`` 之后同步读、但实际自增发生在
         # ``super().call_tool()`` 任务里（ensure_future 调度后才跑 send_request）→ 并发 call_tool 会读到同一 id，
         # 致 observer 注册冲突 + 信号错配（隔离审查 🔴）。单 MCP server 工具调用并发非性能瓶颈，串行化最简且正确。
         self._call_tool_lock = asyncio.Lock()
+
+    # ── #179 connect-phase challenge 通道（manager bounded connect 用） ──────
+
+    def connect_challenge_event(self) -> asyncio.Event:
+        """connect-phase 401/403 challenge 的唤醒事件（与 :meth:`aconnect` 竞速）。"""
+        return self._auth_observer.connect_event()
+
+    def take_connect_challenge(self) -> AuthSignal | None:
+        """取走并重置 connect-phase challenge 信号（manager 准入判定消费一次）。"""
+        return self._auth_observer.take_connect_signal()
 
     async def _create_async_session(self) -> ClientSession:
         """
@@ -185,7 +231,13 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
             effective_auth = auth
             if self._oauth is not None and self._oauth.needs_oauth_provider():
                 effective_auth = self._oauth.build_oauth_provider()
-            return _AuthWatchingClient(observer=self._auth_observer, headers=headers, timeout=timeout, auth=effective_auth)
+            return _AuthWatchingClient(
+                observer=self._auth_observer,
+                headers=headers,
+                timeout=timeout,
+                auth=effective_auth,
+                transport=self._httpx_transport,
+            )
 
         aread_stream, awrite_stream, _ = await self._aexit_stack.enter_async_context(
             streamablehttp_client(**self.params.model_dump(mode="python"), httpx_client_factory=_httpx_factory),

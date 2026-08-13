@@ -23,6 +23,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
     OAuthCancellationReason,
     OAuthClientMode,
     OAuthClientRegistration,
+    OAuthError,
     OAuthErrorCode,
     OAuthFlowOutcome,
     OAuthLaunch,
@@ -778,3 +779,29 @@ class TestErrorEnums:
         assert OAuthErrorCode.InvalidRedirectUri.value == "invalidRedirectUri"
         assert OAuthErrorCode.ConflictingAuthorizationHeader.value == "conflictingAuthorizationHeader"
         assert OAuthErrorCode.Protocol.value == "protocol"
+
+
+class TestOAuthError:
+    """公共 OAuthError 异常（#179 facade 的 typed error 契约）。"""
+
+    def test_code_and_message(self) -> None:
+        err = OAuthError(OAuthErrorCode.NotConfigured, "OAuth has not been admitted for this server")
+        assert err.code is OAuthErrorCode.NotConfigured
+        assert err.message == "OAuth has not been admitted for this server"
+        assert isinstance(err, Exception)
+
+    def test_protocol_classmethod(self) -> None:
+        err = OAuthError.protocol(OAuthProtocolError.Metadata)
+        assert err.code is OAuthErrorCode.Protocol
+        assert OAuthProtocolError.Metadata.value in str(err)
+
+    def test_str_contains_code_value(self) -> None:
+        err = OAuthError(OAuthErrorCode.StateMismatch, "Callback state does not match pending flow")
+        assert OAuthErrorCode.StateMismatch.value in str(err)
+        assert "Callback state" in str(err)
+
+    def test_coordinator_error_alias(self) -> None:
+        # #178 遗留的内部名在 #179 收敛为公共类型（back-compat alias）
+        from a2c_smcp.computer.mcp_clients.oauth_coordinator import _OAuthCoordinatorError
+
+        assert _OAuthCoordinatorError is OAuthError

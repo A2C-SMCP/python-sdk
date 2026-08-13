@@ -4,9 +4,11 @@
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator, Iterable
-from typing import Any
+from typing import Any, NoReturn, cast
+from urllib.parse import urlparse
 
 from mcp.client.session import MessageHandlerFnT
 from mcp.types import CallToolResult, ReadResourceResult, Resource, Tool
@@ -14,6 +16,7 @@ from vrl_python import VRLRuntime
 
 from a2c_smcp.computer.mcp_clients.auth_error import build_auth_error_result, classify_auth_error
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
+from a2c_smcp.computer.mcp_clients.http_client import AuthSignal, HttpMCPClient
 from a2c_smcp.computer.mcp_clients.model import (
     A2C_TOOL_META,
     A2C_VRL_TRANSFORMED,
@@ -22,7 +25,29 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerConfig,
     MCPServerConnectionState,
     MCPServerRuntimeStatus,
+    StreamableHttpServerConfig,
     ToolMeta,
+)
+from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+    OAuthCoordinator,
+    parse_bearer_resource_metadata,
+)
+from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
+    InMemoryOAuthCredentialStore,
+    OAuthCredentialStore,
+)
+from a2c_smcp.computer.mcp_clients.oauth_flow import OAuthFlow
+from a2c_smcp.computer.mcp_clients.oauth_types import (
+    OAuthBeginRequest,
+    OAuthCallback,
+    OAuthCancellation,
+    OAuthError,
+    OAuthErrorCode,
+    OAuthFlowOutcome,
+    OAuthOptions,
+    OAuthProtocolError,
+    OAuthStatus,
+    default_oauth_options,
 )
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, SERVER_NAME, TOOL_NAME
@@ -34,6 +59,46 @@ logger = get_logger("computer")
 # SKILL 资源枚举翻页安全上界：防御恒非空 cursor（server bug / 恶意）导致的无限循环挂死物化。
 # Pagination safety bound for SKILL enumeration: guard against a never-terminating cursor hanging staging.
 _MAX_SKILL_LIST_PAGES = 1000
+
+# #179 bounded connect：匿名/恢复路径的 connect 竞速上界（Rust CONNECT_TIMEOUT_SECS）。
+# 交互式路径不套此界——生命周期由 pending flow TTL（10 分钟）+ 取消链约束。
+_CONNECT_TIMEOUT = 30.0
+
+# automatic-only（Rust #180）：无显式 oauth 配置时也按 challenge 准入，参数从 metadata 派生。
+# 私有变体类型不跨界——经 oauth_types 公开工厂获取默认选项（🟡7）。
+_DEFAULT_OAUTH_OPTIONS = default_oauth_options()
+
+# OAuthRequired 错误的稳定形态（宿主经 facade 驱动授权；auto 启动路径吞掉并保留 activation）。
+# 与 coordinator redirect_handler 的 OAuthError.protocol(AuthorizationRequired) 同源——
+# 单一权威经 classmethod 派生，防两文件文案漂移（#179 隔离审查 🔵9）。
+_OAUTH_REQUIRED_MSG = OAuthError.protocol(OAuthProtocolError.AuthorizationRequired).message
+
+
+def _raise_oauth_required() -> NoReturn:
+    raise OAuthError.protocol(OAuthProtocolError.AuthorizationRequired)
+
+
+def _is_oauth_required_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, OAuthError)
+        and exc.code == OAuthErrorCode.Protocol
+        and exc.message == _OAUTH_REQUIRED_MSG
+    )
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """Same-origin 判定（scheme + host + 默认端口归一的 port）——PRM metadata URL 准入门槛。"""
+    a, b = urlparse(url_a), urlparse(url_b)
+    default_ports = {"http": 80, "https": 443}
+
+    def port_of(scheme: str, port: int | None) -> int:
+        return port if port is not None else default_ports.get(scheme.lower(), 0)
+
+    return (
+        a.scheme.lower() == b.scheme.lower()
+        and a.hostname == b.hostname
+        and port_of(a.scheme, a.port) == port_of(b.scheme, b.port)
+    )
 
 
 class ToolNameDuplicatedError(Exception):
@@ -58,6 +123,7 @@ class MCPServerManager:
         auto_connect: bool = False,
         auto_reconnect: bool = True,
         message_handler: MessageHandlerFnT | None = None,
+        oauth_credential_store: OAuthCredentialStore | None = None,
     ) -> None:
         # 存储所有服务器配置，以 bundle_id 为唯一身份键（协议 #15/#18：身份=bundle_id，name 降纯 display 不做键）
         # Server configs keyed by bundle_id (unique identity; name is pure display, never a key — protocol #15/#18).
@@ -82,6 +148,15 @@ class MCPServerManager:
         self._message_handler: MessageHandlerFnT | None = message_handler
         # 内部锁防止并发修改
         self._lock = asyncio.Lock()
+        # #179 OAuth 接线：可注入凭据 store（构造参数或 builder；默认进程内）、per-bundle
+        # coordinator 注册表（challenge 准入后单例）、per-bundle OAuthFlow handle 注册表、
+        # 在途 connect 任务。
+        self._oauth_credential_store: OAuthCredentialStore = (
+            oauth_credential_store or InMemoryOAuthCredentialStore()
+        )
+        self._oauth_coordinators: dict[BUNDLE_ID, OAuthCoordinator] = {}
+        self._oauth_flows: dict[BUNDLE_ID, OAuthFlow] = {}
+        self._oauth_connect_tasks: dict[BUNDLE_ID, asyncio.Task[None]] = {}
 
     def get_server_config(self, bundle_id: BUNDLE_ID) -> MCPServerConfig:
         """通过 bundle_id 获取服务配置 / Get server config by bundle_id。"""
@@ -181,12 +256,31 @@ class MCPServerManager:
                 # 配置存在但客户端未激活，更新配置并根据 auto_connect 决定是否启动
                 # Config exists but client is not active, update config and start if auto_connect is enabled
                 self._servers_config[bundle_id] = config
+                # #179：transport 类型切换（streamable→stdio/sse）→ 退役陈旧 OAuth
+                # 运行时态（coordinator/flow/connect task），勿沿用旧 server_url/store。
+                if self._oauth_spec(config) is None and bundle_id in self._oauth_coordinators:
+                    self._retire_oauth_bundle(bundle_id)
                 if self._auto_connect:
-                    await self._astart_client(bundle_id)
+                    await self._astart_client_auto(bundle_id)
         else:
             self._servers_config[bundle_id] = config
             if self._auto_connect:
-                await self._astart_client(bundle_id)
+                await self._astart_client_auto(bundle_id)
+
+    async def _astart_client_auto(self, bundle_id: BUNDLE_ID) -> None:
+        """auto 路径启动（配置挂载/重启触发）：OAuthRequired 吞掉并记录（activation 保留），
+        其余错误照常上抛——单 server 显式 :meth:`astart_client` 仍向调用方传播 OAuthRequired。
+        """
+        try:
+            await self._astart_client(bundle_id)
+        except OAuthError as exc:
+            if not _is_oauth_required_error(exc):
+                raise
+            logger.info(
+                f"Server bundle_id={bundle_id!r} requires OAuth authorization "
+                f"(state=Started+AuthorizationRequired); host drives the flow via "
+                f"create_oauth_flow/complete_oauth.",
+            )
 
     async def aadd_or_aupdate_server(self, config: MCPServerConfig) -> None:
         """添加或更新服务器配置。运行期同 ``bundle_id`` = **原地更新**（不算 no-double-open 冲突）。"""
@@ -199,6 +293,9 @@ class MCPServerManager:
         async with self._lock:
             if bundle_id in self._active_clients:
                 await self._astop_client(bundle_id)
+            # #179：退役 OAuth 运行时态（coordinator/flow/connect task）——配置移除后
+            # 再以同 bundle_id 挂回不同 transport 时不得沿用陈旧 coordinator。
+            self._retire_oauth_bundle(bundle_id)
             del self._servers_config[bundle_id]
             await self._arefresh_tool_mapping()
 
@@ -214,17 +311,23 @@ class MCPServerManager:
         if bundle_id in self._active_clients:
             await self._astop_client(bundle_id)
 
-        # 只有启用的配置才能重启
+        # 只有启用的配置才能重启（OAuthRequired 走 auto 路径吞掉：restart 属配置变更触发的自动动作）
         if not config.disabled:
-            await self._astart_client(bundle_id)
+            await self._astart_client_auto(bundle_id)
 
     async def astart_all(self) -> None:
-        """启动所有启用的服务器"""
+        """启动所有启用的服务器
+
+        #179：boot 批量启动中单个 server 的 OAuthRequired 不打断整体——逐 server 走
+        :meth:`_astart_client_auto`（单一吞并权威，🟡4）；其余错误照常上抛。单 server
+        显式启动（:meth:`astart_client`）仍向调用方传播。
+        """
         async with self._lock:
             logger.debug(f"Manager Start all async task: {asyncio.current_task()}")
             for bundle_id in self._servers_config:
-                if not self._servers_config[bundle_id].disabled:
-                    await self._astart_client(bundle_id)
+                if self._servers_config[bundle_id].disabled:
+                    continue
+                await self._astart_client_auto(bundle_id)
 
     async def astart_client(self, bundle_id: BUNDLE_ID) -> None:
         """启动单个服务器客户端（按 bundle_id）。"""
@@ -232,7 +335,24 @@ class MCPServerManager:
             await self._astart_client(bundle_id)
 
     async def _astart_client(self, bundle_id: BUNDLE_ID) -> None:
-        """启动单个服务器客户端（按 bundle_id）。"""
+        """启动单个服务器客户端（按 bundle_id）。
+
+        #179 OAuth bounded transaction（对齐 Rust #179，一次调用内完成）：
+        1. 记录 activation intent（#184 语义：只显式 stop 才清除）
+        2. 无 coordinator 的 Streamable HTTP server：**匿名 initialize 至多一次**，
+           与 connect-phase challenge 信号竞速（30s 上界；aconnect 在 401 下会挂起，
+           见 #133 实证）
+        3. challenge（Bearer + resource_metadata + same-origin）→ 构造 coordinator =
+           **凭据恢复 + 初始化**：restore 后 Authorized → 带 provider initialize（成功即
+           连接）；Unauthorized + 宿主已注册 flow → 派发 detached connect 任务（交互式
+           flow 的驱动者，**不持 manager 锁**——provider 在 callback 上阻塞可达分钟级）
+        4. 真正缺用户授权（未注册 flow）→ 连接状态 AUTHORIZATION_REQUIRED + OAuthRequired
+           错上抛（activation 保留）
+
+        Raises:
+            OAuthError: ``Protocol(authorizationRequired)`` —— 需要宿主经 facade 驱动授权；
+                非 streamable 的 challenge / 非 challenge 失败按原异常传播。
+        """
         config = self._servers_config.get(bundle_id)
         if not config:
             # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
@@ -253,20 +373,322 @@ class MCPServerManager:
         # 设置连接状态为 connecting / Set connection state to connecting.
         self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTING
 
-        # 根据配置类型创建客户端
-        client = client_factory(config, message_handler=self._message_handler)
-        try:
-            await client.aconnect()
-        except Exception:
-            # 连接失败：保留 activation intent，仅更新 connection 状态 / Keep activation
-            # intent; only update connection state. 精确 OAuth error 检测由后续 #185 补齐。
-            self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
-            raise
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        oauth_spec = self._oauth_spec(config)
 
+        if oauth_spec is None:
+            # ── 非 OAuth 通道（stdio / sse）：原 plain connect 路径 ──
+            # 若存在陈旧 coordinator（运行期 transport 类型切换，如 streamable→stdio），
+            # 先退役——否则下方 coordinator 分支会对 stdio client 调
+            # connect_challenge_event()（不存在该面）直接 AttributeError。
+            if coordinator is not None:
+                self._retire_oauth_bundle(bundle_id)
+            client = client_factory(config, message_handler=self._message_handler)
+            try:
+                await client.aconnect()
+            except Exception:
+                # 连接失败：保留 activation intent，仅更新 connection 状态（#184 语义）
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise
+            await self._commit_active_client(bundle_id, client)
+            return
+
+        if coordinator is None:
+            # ── anonymous-first（每 client 生命周期至多一次） ──
+            client = cast(
+                HttpMCPClient, client_factory(config, message_handler=self._message_handler)
+            )
+            signal = await self._bounded_connect(client)
+            if signal is None:
+                await self._commit_active_client(bundle_id, client)  # 匿名连通
+                return
+            coordinator = self._admit_oauth_coordinator(bundle_id, config, signal)
+            if coordinator is None:
+                # Bearer 无 resource_metadata / cross-origin → 不准入（Rust UnsupportedChallenge 语义；
+                # 精确分类留 #185）
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise RuntimeError(
+                    f"MCP Server bundle_id={bundle_id!r} returned an unsupported authentication challenge"
+                )
+            self._oauth_coordinators[bundle_id] = coordinator
+
+        if coordinator is not None:
+            status = await coordinator.restore_credentials()
+            if status.state == "authorized":
+                # 凭据恢复 → 带 provider 的 authenticated initialize（单次；401 → 凭据失效）
+                client = cast(
+                    HttpMCPClient,
+                    client_factory(
+                        config, message_handler=self._message_handler, oauth_coordinator=coordinator
+                    ),
+                )
+                signal = await self._bounded_connect(client, coordinator)
+                if signal is None:
+                    await self._commit_active_client(bundle_id, client)
+                    return
+                if signal.status_code == 401:
+                    # 恢复的凭据已被服务端拒绝 → 清槽（generation bump + store 清空 +
+                    # status→Unauthorized），否则每次重启/重 start 都 restore→401→
+                    # OAuthRequired 死循环（Rust invalidate_credentials 语义）。
+                    await coordinator.invalidate_credentials()
+                else:
+                    # 403 insufficient_scope 等：交给 observe 通道（#133 共享钩子）
+                    await coordinator.observe_service_error(
+                        signal.status_code, signal.www_authenticate_header
+                    )
+                self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+                _raise_oauth_required()
+            if coordinator.has_registered_request():
+                # status() 在 Pending 下先行 expire 陈旧 flow（gen 不符 / PKCE 过 TTL），
+                # 防「僵尸注册 → ghost flow 再派发」；fresh 时 no-op 返回 Pending。
+                await coordinator.status()
+                if coordinator.has_registered_request():
+                    # 宿主已注册 flow → 交互式 connect 任务驱动 launch/complete（不阻塞本调用方）
+                    self._ensure_oauth_connect_task(bundle_id, coordinator)
+                    return
+
+        # 真正缺用户授权：activation 保留，仅 connection 状态落 AUTHORIZATION_REQUIRED
+        self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+        _raise_oauth_required()
+
+    async def _commit_active_client(self, bundle_id: BUNDLE_ID, client: MCPClientProtocol) -> None:
+        """登记活跃 client（须持 ``_lock``）+ 刷新 ExposedToolMapping。"""
         self._active_clients[bundle_id] = client
         self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
         # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚
         await self._arefresh_tool_mapping()
+
+    async def _bounded_connect(
+        self, client: HttpMCPClient, coordinator: OAuthCoordinator | None = None
+    ) -> AuthSignal | None:
+        """aconnect() 与 connect-phase challenge 信号（+ 可选 flow-aborted）竞速（30s 界）。
+
+        ``coordinator is None`` = anonymous-first 尝试（信号通道可得 401/403）。
+        ``coordinator`` 提供 = 带 provider 的 authenticated 尝试——关键差异（#179 实证）：
+        auth-attached 的 401 由 httpx auth 机制在 ``stream()`` **内部**消费（provider
+        全流程 inline，见上游 ``mcp/client/auth.py`` ``async_auth_flow``——无已知上游
+        issue），connect-phase 信号通道**看不到**；死路径为 provider 流程死亡后 aconnect
+        挂起（上游 ``mcp/client/streamable_http.py`` ``post_writer`` 异常吞没致请求侧
+        不 resolve，#133 实证——无已知上游 issue）。故增竞速 ``flow_aborted``
+        （redirect_handler 无注册请求时置位）：aborted 先到 ⇒ 恢复的凭据被 401
+        challenge 拒绝（mcp auth 仅在 401 时跑全流程）⇒ 合成 401 信号。403
+        （insufficient_scope 等）作为 final response 正常透过 → 信号通道可得。
+
+        返回 challenge 信号（client 未登记、随 GC 弃置，**不得** ``adisconnect``
+        未连上的 client——会递归 aconnect）；连通返回 None。
+
+        #179 隔离审查 🔴3：try/finally 保证本协程以**任何方式**退出（含被外层取消）
+        时内层任务全部回收——``asyncio.wait`` 不级联取消 pending 内层任务（asyncio
+        语义，已最小复现证实），孤儿 aconnect 会以 #133 挂起模式永久泄漏 httpx 会话。
+
+        Raises:
+            TimeoutError: 30s 内既未连通也未收到 challenge。
+            BaseException: 非 challenge 的 connect 失败原样上抛。
+        """
+        if coordinator is not None:
+            # 本次 connect 为全新尝试：旧 flow 的 abort 标记与本次无关
+            coordinator.flow_aborted_event().clear()
+        connect_task = asyncio.create_task(client.aconnect())
+        challenge_wait = asyncio.create_task(client.connect_challenge_event().wait())
+        aborted_wait = (
+            asyncio.create_task(coordinator.flow_aborted_event().wait())
+            if coordinator is not None
+            else None
+        )
+        inner = [connect_task, challenge_wait] + ([aborted_wait] if aborted_wait is not None else [])
+        try:
+            try:
+                done, _pending = await asyncio.wait(
+                    set(inner),
+                    timeout=_CONNECT_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except TimeoutError:
+                raise TimeoutError(
+                    f"connect neither succeeded nor received an auth challenge within {_CONNECT_TIMEOUT}s"
+                ) from None
+
+            if challenge_wait in done:
+                signal = client.take_connect_challenge()
+                return signal
+            if aborted_wait is not None and aborted_wait in done:
+                # provider 全流程死亡 = 401 challenge 拒绝了恢复的凭据（无注册 flow 的
+                # redirect_handler 抛 authorizationRequired）→ 合成 401 信号供调用方清槽
+                return AuthSignal(401, None)
+            # connect 先完成：成功 → None；失败 → 原异常上抛（未登记 client，随弃置）
+            if connect_task in done and not connect_task.cancelled():
+                exc = connect_task.exception()
+                if exc is not None:
+                    raise exc
+            return None
+        finally:
+            for t in inner:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*inner, return_exceptions=True)
+
+    def _oauth_spec(self, config: MCPServerConfig) -> tuple[str, OAuthOptions] | None:
+        """Streamable HTTP → ``(server_url, effective options)``；非 streamable → None（无 OAuth 通道）。
+
+        automatic-only（Rust #180）：无显式 ``oauth`` 配置也按 challenge 准入，
+        options 落默认（AuthCode + DCR），scopes / resource 从 metadata 派生。
+        """
+        if not isinstance(config, StreamableHttpServerConfig):
+            return None
+        options = config.oauth if config.oauth is not None else _DEFAULT_OAUTH_OPTIONS
+        return (str(config.server_parameters.url), options)
+
+    def _admit_oauth_coordinator(
+        self, bundle_id: BUNDLE_ID, config: MCPServerConfig, signal: AuthSignal
+    ) -> OAuthCoordinator | None:
+        """按 challenge 证据准入并构造 coordinator（automatic admission）。
+
+        准入门槛（Rust auto-admission 的 python 面）：Bearer challenge 携带
+        ``resource_metadata`` 且与端点 same-origin。PRM / AS metadata 的深层校验由
+        mcp inline 流程 + #181 安全不变量承担。不准入返回 None（调用方落 ERROR + 报错）。
+        """
+        metadata_url = parse_bearer_resource_metadata(signal.www_authenticate_header)
+        if metadata_url is None:
+            return None
+        assert isinstance(config, StreamableHttpServerConfig)  # 调用方已按 _oauth_spec 收窄
+        server_url = str(config.server_parameters.url)
+        if not _same_origin(metadata_url, server_url):
+            return None
+        spec = self._oauth_spec(config)
+        if spec is None:  # pragma: no cover — 防御分支
+            return None
+        _url, options = spec
+        resource = options.resource or server_url
+        return OAuthCoordinator(
+            bundle_id=bundle_id,
+            server_url=server_url,
+            resource=resource,
+            options=options,
+            credential_store=self._oauth_credential_store,
+        )
+
+    def _ensure_oauth_connect_task(
+        self, bundle_id: BUNDLE_ID, coordinator: OAuthCoordinator
+    ) -> None:
+        """确保至多一次带 provider 的 connect 尝试在途（交互式 flow 的 transport 驱动者）。
+
+        detached task：provider 在 callback_handler 上可阻塞分钟级（等宿主 complete），
+        **不得**持 manager 锁——complete_oauth 需要锁之外的 coordinator 锁即可推进。
+        """
+        existing = self._oauth_connect_tasks.get(bundle_id)
+        if existing is not None and not existing.done():
+            # 已在途（Rust get_or_try_init 单例语义）。但旧任务可能正随上一 flow 的
+            # 终态失败收尾——若届时仍有 launch 等待者（终态后新 flow 已注册），
+            # 续派发一次，防「旧任务刚好结束、新 launch 无 transport 驱动」挂起。
+            def _rekick(_t: asyncio.Task[None]) -> None:
+                if coordinator.launch_awaiting():
+                    self._ensure_oauth_connect_task(bundle_id, coordinator)
+
+            existing.add_done_callback(_rekick)
+            return
+        task = asyncio.create_task(self._aoauth_connect(bundle_id, coordinator))
+        self._oauth_connect_tasks[bundle_id] = task
+
+        def _cleanup(t: asyncio.Task[None]) -> None:
+            if self._oauth_connect_tasks.get(bundle_id) is t:
+                self._oauth_connect_tasks.pop(bundle_id, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _aoauth_connect(self, bundle_id: BUNDLE_ID, coordinator: OAuthCoordinator) -> None:
+        """交互式 OAuth connect（detached）：401 → mcp inline auth flow → 发布 URL → 等回调 → 交换 → 重试。
+
+        生命周期由 pending flow TTL（10 分钟）+ 取消链约束，不套 30s 上界（用户授权可达分钟级）。
+        成功 → 锁内 commit；失败 → ``fail_launch`` 解 wait_launch 等待者 + 连接状态 ERROR。
+        """
+        config = self._servers_config.get(bundle_id)
+        if config is None:  # pragma: no cover — 防御分支
+            return
+        if self._oauth_coordinators.get(bundle_id) is not coordinator:
+            # coordinator 已退役（transport 切换 / 配置移除）——ghost 任务守卫：
+            # 勿以陈旧 coordinator 对旧端点建立连接 / 写连接状态（#179 隔离复核 🟡c）
+            return
+        client = client_factory(config, message_handler=self._message_handler, oauth_coordinator=coordinator)
+        connect_task = asyncio.create_task(client.aconnect())
+        aborted_wait = asyncio.create_task(coordinator.flow_aborted_event().wait())
+        inner = [connect_task, aborted_wait]
+        try:
+            done, _pending = await asyncio.wait(
+                set(inner),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if aborted_wait in done:
+                # flow 已终止/失败（cancel / expire / clear / complete-Terminated）：provider
+                # 流程死亡后 mcp 请求侧挂起（#133 实证）——取消之，防 connect 任务泄漏、
+                # 并让 done_callback 的 re-kick 能为终态后新 flow 续派发。
+                async with self._lock:
+                    self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                return
+            if connect_task.cancelled():
+                return  # pragma: no cover — 防御分支
+            exc = connect_task.exception()
+            if exc is not None:
+                coordinator.fail_launch(
+                    OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG)
+                )
+                async with self._lock:
+                    self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                return
+            async with self._lock:
+                await self._commit_active_client(bundle_id, client)
+        finally:
+            # #179 隔离审查 🔴3：外层取消（clear_oauth / _clear_all cancel 本任务）不级联
+            # 内层任务——finally 统一回收，防孤儿 aconnect 挂起泄漏 + 跨 flow 污染。
+            for t in inner:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*inner, return_exceptions=True)
+
+    async def _ensure_oauth_coordinator(self, bundle_id: BUNDLE_ID) -> OAuthCoordinator:
+        """OAuthFlow.launch 入口：coordinator 存在即返回；否则跑一次 bounded connect 触发
+        challenge 捕获与准入（OAuthRequired 属预期，吞掉后复查注册表）。
+
+        Raises:
+            OAuthError: ``NotConfigured`` —— 未准入（无 challenge 证据）。
+        """
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is not None:
+            return coordinator
+        try:
+            async with self._lock:
+                await self._astart_client(bundle_id)
+        except OAuthError as exc:
+            if not _is_oauth_required_error(exc):
+                raise
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        return coordinator
+
+    def _discard_oauth_flow(self, bundle_id: BUNDLE_ID) -> None:
+        """撤下注册的 OAuthFlow handle（handle.cancel pre-admission 路径）。"""
+        self._oauth_flows.pop(bundle_id, None)
+
+    def _retire_oauth_bundle(self, bundle_id: BUNDLE_ID) -> None:
+        """撤下 bundle 的全部 OAuth 运行时态（coordinator / flow handle / 在途 connect 任务）。
+
+        用于 transport 类型切换（streamable→stdio/sse）与 aremove_server——凭据 store
+        不清（仅运行时态退役，clear_oauth 才清凭据槽）。
+        """
+        coordinator = self._oauth_coordinators.pop(bundle_id, None)
+        self._oauth_flows.pop(bundle_id, None)
+        # 解出旧 coordinator 的 launch 等待者（若有）→ launch_awaiting() 回落 False，
+        # 挂在该任务上的 _rekick 不再复活 ghost connect（#179 隔离复核 🟡c）。
+        if coordinator is not None:
+            coordinator.fail_launch(
+                OAuthError(OAuthErrorCode.AuthorizationCancelled, "Authorization was cancelled")
+            )
+        task = self._oauth_connect_tasks.pop(bundle_id, None)
+        if task is not None:
+            task.cancel()
 
     async def astop_client(self, bundle_id: BUNDLE_ID) -> None:
         """停止单个服务器客户端（按 bundle_id）。"""
@@ -316,6 +738,12 @@ class MCPServerManager:
         self._activation_intents.clear()
         self._connection_states.clear()
         self._exposed_tools.clear()
+        # #179 OAuth 注册表随清（detached connect 任务取消弃置；coordinator/store 凭宿主注入）
+        self._oauth_coordinators.clear()
+        self._oauth_flows.clear()
+        for task in self._oauth_connect_tasks.values():
+            task.cancel()
+        self._oauth_connect_tasks.clear()
 
     async def aclose(self) -> None:
         """关闭所有连接（别名）"""
@@ -600,6 +1028,152 @@ class MCPServerManager:
             (s.bundle_id, s.name, s.is_started(), s.connection.value)
             for s in self.get_server_runtime_statuses()
         ]
+
+    # ── #179 公共 OAuth facade（签名对齐 Rust Computer/Manager） ─────────────
+
+    def with_oauth_credential_store(self, store: OAuthCredentialStore) -> "MCPServerManager":
+        """注入凭据存储（builder，返回 self）。缺省 :class:`InMemoryOAuthCredentialStore`；
+        跨进程恢复由宿主注入持久化 store（Epic Sub 4，Rust ``with_oauth_credential_store``）。
+
+        注意：对**已准入**的 coordinator 不生效（coordinator 构造时已绑定 store）——
+        请在首次 connect 之前注入（Computer 版同约定：须在 boot_up 前调用）。
+        """
+        self._oauth_credential_store = store
+        return self
+
+    async def oauth_status(self, bundle_id: BUNDLE_ID) -> OAuthStatus:
+        """查询指定 server 的 OAuth 授权状态。
+
+        Raises:
+            OAuthError: ``NotConfigured`` —— bundle 未注册 / 未准入（从未见过 Bearer challenge）；
+                ``UnsupportedTransport`` —— 非 Streamable HTTP（无 OAuth 通道）。
+        """
+        config = self._servers_config.get(bundle_id)
+        if config is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        if self._oauth_spec(config) is None:
+            raise OAuthError(
+                OAuthErrorCode.UnsupportedTransport,
+                f"Server bundle_id={bundle_id!r} does not support OAuth",
+            )
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        return await coordinator.status()
+
+    def create_oauth_flow(self, bundle_id: BUNDLE_ID, request: OAuthBeginRequest) -> OAuthFlow:
+        """注册交互式授权 flow（**同步、无 I/O**；对齐 Rust ``create_oauth_flow``）。
+
+        相同请求幂等返回同一 handle；不同请求 → ``AuthorizationAlreadyPending``。
+        准入推迟到 :meth:`OAuthFlow.launch`（跑 bounded connect）。
+        """
+        config = self._servers_config.get(bundle_id)
+        if config is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        if self._oauth_spec(config) is None:
+            raise OAuthError(
+                OAuthErrorCode.UnsupportedTransport,
+                f"Server bundle_id={bundle_id!r} does not support OAuth",
+            )
+        existing = self._oauth_flows.get(bundle_id)
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        # Rust ``!flow.is_terminal()`` 过滤：只有**非终态**的既有 flow 参与幂等/冲突
+        # 判定。终态后（completed / cancelled / expired）新请求**替换**注册表槽——
+        # 宿主 loopback retry 每次换 ephemeral port（新 redirect_uri）正是此模式。
+        if existing is not None and (coordinator is None or coordinator.has_active_flow()):
+            if existing._request == request:
+                return existing  # 幂等：同一 flow 的 clone
+            raise OAuthError(
+                OAuthErrorCode.AuthorizationAlreadyPending,
+                "A different authorization flow is already pending",
+            )
+        flow = OAuthFlow(manager=self, bundle_id=bundle_id, request=request)
+        self._oauth_flows[bundle_id] = flow
+        return flow
+
+    async def complete_oauth(
+        self, bundle_id: BUNDLE_ID, callback: OAuthCallback
+    ) -> OAuthFlowOutcome:
+        """提交宿主浏览器回调（经注册的 handle 委托 coordinator 完成交换）。
+
+        Raises:
+            OAuthError: ``StateMismatch`` —— 无注册 flow；其余按 coordinator 语义。
+        """
+        flow = self._oauth_flows.get(bundle_id)
+        if flow is None:
+            raise OAuthError(
+                OAuthErrorCode.StateMismatch,
+                "No pending authorization flow",
+            )
+        return await flow.complete(callback)
+
+    async def cancel_oauth(
+        self, bundle_id: BUNDLE_ID, cancellation: OAuthCancellation
+    ) -> OAuthFlowOutcome:
+        """宿主取消/AS 错误回调（经注册 handle 按 reason 分派；Rust ``cancel_compat``）。
+
+        Raises:
+            OAuthError: ``StateMismatch`` —— 无注册 flow。
+        """
+        flow = self._oauth_flows.get(bundle_id)
+        if flow is None:
+            raise OAuthError(
+                OAuthErrorCode.StateMismatch,
+                "No pending authorization flow",
+            )
+        return await flow._cancel_compat(cancellation)
+
+    async def clear_oauth(self, bundle_id: BUNDLE_ID) -> None:
+        """清除该 server 的 OAuth 授权（#179 范围：凭据 + 流程 + 状态 commit + 退役 client）。
+
+        排干 pending flow（cancel + 撤销在途 connect 任务）→ 清凭据槽（DCR 注册 +
+        token + issuer index）→ status 回落 Unauthorized → 连接状态 commit
+        （Started → AUTHORIZATION_REQUIRED，否则 DISCONNECTED）→ 退役活跃 client
+        （机械路径，顺带撤回 ExposedToolMapping 路由）。
+
+        **#185 接管**：capability revision bump + ``server:update_tool_list`` 广播 +
+        三向竞态安全 + 精确授权错误分类（manager._astart_client 注释处）。
+
+        Raises:
+            OAuthError: ``NotConfigured`` —— 未准入。
+        """
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        # 撤销在途 connect 任务（交互式 flow 的 transport 驱动者）
+        task = self._oauth_connect_tasks.pop(bundle_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._oauth_flows.pop(bundle_id, None)
+        # 排干 pending flow + 清凭据 + status→Unauthorized（coordinator 自身锁）
+        await coordinator.clear()
+        async with self._lock:
+            # 退役活跃 client（机械路径；路由撤回随 _arefresh_tool_mapping 完成）。
+            # 注意 _astop_client 是「显式 stop」语义（会清 activation intent）——clear_oauth
+            # 是凭据动作、**不清 activation**（#184：只有显式 stop 才清），故先记录再恢复。
+            was_started = bundle_id in self._activation_intents
+            if bundle_id in self._active_clients:
+                await self._astop_client(bundle_id)
+            # 连接状态 commit（get_server_runtime_statuses 的 committed 分支渲染）
+            if was_started:
+                self._activation_intents.add(bundle_id)
+                self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+            else:
+                self._connection_states[bundle_id] = MCPServerConnectionState.DISCONNECTED
 
     async def available_tools(self) -> AsyncGenerator[tuple[BUNDLE_ID, Tool], Any]:
         """获取暴露给 Agent 的工具及其归属；产出 ``(bundle_id, Tool)``，``Tool.name`` = **exposed_tool_name**。
