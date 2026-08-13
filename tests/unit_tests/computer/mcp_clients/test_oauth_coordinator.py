@@ -18,8 +18,11 @@ from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
     ExpiringStateStore,
     OAuthCoordinator,
     TokenStorageAdapter,
+    _AuthorizationFlowState,
+    _FlowPhase,
     _OAuthCoordinatorError,
     _parse_insufficient_scope,
+    _PendingAuthorization,
     parse_bearer_resource_metadata,
 )
 from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
@@ -34,6 +37,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
     OAuthCancellation,
     OAuthCancellationReason,
     OAuthErrorCode,
+    OAuthLaunch,
     OAuthOptions,
     _OAuthModeAuthCodeDynamic,
     _OAuthStatusAuthorizationPending,
@@ -663,3 +667,298 @@ class TestOAuthIntegration:
         status = await coord.restore_credentials()
         assert isinstance(status, _OAuthStatusAuthorized)
         assert status.scopes == ["read"]
+
+
+# ============================================================================
+# ExpiredFlow tests — Issue #186: 补全 expire_invalid_authorization_flow
+# ============================================================================
+
+
+@pytest.fixture
+def coordinator_with_pending(
+    memory_store: InMemoryOAuthCredentialStore, oauth_options: OAuthOptions
+) -> OAuthCoordinator:
+    """Create coordinator with PENDING flow and valid state in store."""
+    coord = OAuthCoordinator(
+        bundle_id="test-bundle",
+        server_url="https://api.example.com",
+        resource="https://api.example.com",
+        options=oauth_options,
+        credential_store=memory_store,
+    )
+    state = "test-pkce-state-123"
+    coord._state_store.store(
+        state,
+        pkce_verifier="test-verifier",
+        issuer="https://accounts.example.com",
+        redirect_uri="http://127.0.0.1:0/callback",
+        scopes=["read", "write"],
+    )
+    launch = OAuthLaunch(
+        authorization_url="https://accounts.example.com/auth?state=test-pkce-state-123",
+        state=state,
+    )
+    coord._flow = _AuthorizationFlowState(
+        phase=_FlowPhase.PENDING,
+        pending=_PendingAuthorization(
+            launch=launch,
+            request=OAuthBeginRequest(
+                redirect_uri="http://127.0.0.1:0/callback",
+                required_scope=None,
+            ),
+            requested_scopes=["read", "write"],
+            generation=coord._generation,
+            issuer="https://accounts.example.com",
+        ),
+    )
+    coord._status = _OAuthStatusAuthorizationPending()
+    return coord
+
+
+class TestOAuthCoordinatorExpiredFlow:
+    """Issue #186: expire_invalid_authorization_flow + EXPIRED flow handling."""
+
+    # ── _expire_invalid_authorization_flow ──────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_expire_invalid_valid_flow_noop(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """Valid PENDING flow with matching generation + PKCE state → no-op."""
+        coord = coordinator_with_pending
+        assert coord._flow.phase == _FlowPhase.PENDING
+        result = await coord._expire_invalid_authorization_flow()
+        assert result is False
+        assert coord._flow.phase == _FlowPhase.PENDING  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_expire_invalid_stale_generation(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """Generation mismatch → flow expired."""
+        coord = coordinator_with_pending
+        original_state = coord._flow.pending.launch.state  # type: ignore[union-attr]
+        # Simulate stale generation (e.g. after credential invalidation)
+        coord._generation += 1
+        result = await coord._expire_invalid_authorization_flow()
+        assert result is True
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+        assert coord._flow.expired_state == original_state
+        assert isinstance(coord._status, _OAuthStatusUnauthorized)
+        # PKCE state should have been removed
+        assert coord._state_store.lookup(original_state) is None
+
+    @pytest.mark.asyncio
+    async def test_expire_invalid_expired_pkce_state(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """PKCE state expired from store → flow expired."""
+        coord = coordinator_with_pending
+        original_state = coord._flow.pending.launch.state  # type: ignore[union-attr]
+        # Remove PKCE state from store
+        coord._state_store.finalize_exchange(original_state)
+        result = await coord._expire_invalid_authorization_flow()
+        assert result is True
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+
+    @pytest.mark.asyncio
+    async def test_expire_invalid_no_pending_flow(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """IDLE flow → expire is no-op."""
+        assert coordinator._flow.phase == _FlowPhase.IDLE
+        result = await coordinator._expire_invalid_authorization_flow()
+        assert result is False
+        assert coordinator._flow.phase == _FlowPhase.IDLE
+
+    @pytest.mark.asyncio
+    async def test_expire_invalid_with_stored_token_restores_authorized(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """Store probe: stale flow with still-valid stored credentials → Authorized.
+
+        Mirrors Rust restore_status_after_termination for the step-up scenario
+        (scope-upgrade flow expiring while the previous grant remains usable).
+        """
+        coord = coordinator_with_pending
+        # Pre-store credentials (simulates a previous completed authorization)
+        await coord._token_storage.set_tokens(
+            OAuthToken(
+                access_token="previous-token",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="read",
+                refresh_token="previous-refresh",
+            )
+        )
+        coord._generation += 1  # stale flow
+        result = await coord._expire_invalid_authorization_flow()
+        assert result is True
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+        assert isinstance(coord._status, _OAuthStatusAuthorized)
+        assert coord._status.scopes == ["read"]
+        assert coord._granted_scopes == ["read"]
+
+    # ── status() auto-expires stale flows ──────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_status_auto_expires_stale_flow(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """status() calls _expire_invalid_authorization_flow → Unauthorized."""
+        coord = coordinator_with_pending
+        coord._generation += 1  # stale
+        status = await coord.status()
+        assert isinstance(status, _OAuthStatusUnauthorized)
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+
+    # ── complete() with Expired flow ───────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_complete_with_expired_flow_state_mismatch(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """Expired flow + mismatched callback state → StateMismatch."""
+        coordinator._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="original-state"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            await coordinator.complete(
+                OAuthCallback(code="code-1", state="different-state")
+            )
+        assert exc.value.code == OAuthErrorCode.StateMismatch
+        # Mismatch keeps the flow EXPIRED so a later matching callback
+        # can still be classified (aligns with Rust).
+        assert coordinator._flow.phase == _FlowPhase.EXPIRED
+
+    @pytest.mark.asyncio
+    async def test_complete_with_expired_flow_match(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """Expired flow + matching callback state → AuthorizationExpired."""
+        coordinator._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="original-state"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            await coordinator.complete(
+                OAuthCallback(code="code-1", state="original-state")
+            )
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+        assert coordinator._flow.phase == _FlowPhase.IDLE  # cleared
+
+    # ── cancel() with Expired flow ─────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_cancel_with_expired_flow_match(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """Expired flow + matching state → AuthorizationExpired."""
+        coordinator._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            await coordinator.cancel(
+                OAuthCancellation(state="s1", reason=OAuthCancellationReason.Cancelled)
+            )
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+        assert coordinator._flow.phase == _FlowPhase.IDLE
+
+    @pytest.mark.asyncio
+    async def test_cancel_with_expired_flow_mismatch(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """Expired flow + mismatched state → StateMismatch."""
+        coordinator._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            await coordinator.cancel(
+                OAuthCancellation(state="s2", reason=OAuthCancellationReason.Cancelled)
+            )
+        assert exc.value.code == OAuthErrorCode.StateMismatch
+        # Mismatch keeps the flow EXPIRED so a later matching callback
+        # can still be classified (aligns with Rust).
+        assert coordinator._flow.phase == _FlowPhase.EXPIRED
+
+    # ── cancel_callback() with Expired flow ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_cancel_callback_with_expired_flow(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """Expired flow + matching state → AuthorizationExpired."""
+        coordinator._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            await coordinator.cancel_callback(
+                OAuthCancellation(
+                    state="s1", reason=OAuthCancellationReason.AccessDenied
+                )
+            )
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+        assert coordinator._flow.phase == _FlowPhase.IDLE
+
+    @pytest.mark.asyncio
+    async def test_cancel_callback_with_expired_flow_state_mismatch(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        """Expired flow + mismatched state → StateMismatch."""
+        coordinator._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            await coordinator.cancel_callback(
+                OAuthCancellation(
+                    state="different", reason=OAuthCancellationReason.AccessDenied
+                )
+            )
+        assert exc.value.code == OAuthErrorCode.StateMismatch
+        # Mismatch keeps the flow EXPIRED so a later matching callback
+        # can still be classified (aligns with Rust).
+        assert coordinator._flow.phase == _FlowPhase.EXPIRED
+
+    # ── handle_insufficient_scope with PENDING flow ───────────────────
+
+    @pytest.mark.asyncio
+    async def test_handle_insufficient_scope_pending_flow_noop(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """handle_insufficient_scope with valid PENDING flow → no-op (don't override)."""
+        coord = coordinator_with_pending
+        assert isinstance(coord._status, _OAuthStatusAuthorizationPending)
+        await coord.handle_insufficient_scope("admin.write")
+        # Status should remain AuthorizationPending (not ReauthorizationRequired)
+        assert isinstance(coord._status, _OAuthStatusAuthorizationPending)
+
+    @pytest.mark.asyncio
+    async def test_handle_insufficient_scope_stale_pending_expires_then_reauthorizes(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """Stale PENDING flow → expire → ReauthorizationRequired is set."""
+        coord = coordinator_with_pending
+        coord._generation += 1  # stale
+        await coord.handle_insufficient_scope("admin.write")
+        from a2c_smcp.computer.mcp_clients.oauth_types import (
+            _OAuthStatusReauthorizationRequired,
+        )
+
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+        assert isinstance(coord._status, _OAuthStatusReauthorizationRequired)
+        assert coord._status.required_scope == "admin.write"
+
+    # ── _begin_under_lock expire coverage (line 406) ───────────────────
+
+    @pytest.mark.asyncio
+    async def test_begin_under_lock_expires_stale_flow(
+        self, coordinator_with_pending: OAuthCoordinator
+    ) -> None:
+        """_begin_under_lock expires a stale PENDING flow before proceeding."""
+        coord = coordinator_with_pending
+        coord._generation += 1  # stale
+        request = OAuthBeginRequest(
+            redirect_uri="http://127.0.0.1:0/callback",
+            required_scope=None,
+        )
+        await coord._begin_under_lock(request)
+        assert coord._flow.phase == _FlowPhase.EXPIRED

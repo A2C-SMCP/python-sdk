@@ -256,3 +256,136 @@ class TestSyncOAuthCoordinatorWithCredentials:
         assert handled is True
         status_after = populated_coordinator.status()
         assert isinstance(status_after, _OAuthStatusUnauthorized)
+
+
+# ============================================================================
+# ExpiredFlow tests — Issue #186: sync mirror
+# ============================================================================
+
+
+class TestSyncOAuthCoordinatorExpiredFlow:
+    """Issue #186: EXPIRED flow handling through sync wrapper."""
+
+    def test_complete_with_expired_flow_sync(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """Expired flow → complete returns AuthorizationExpired via sync bridge."""
+        from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+            _AuthorizationFlowState,
+            _FlowPhase,
+            _OAuthCoordinatorError,
+        )
+        from a2c_smcp.computer.mcp_clients.oauth_types import OAuthCallback, OAuthErrorCode
+
+        # Set internal state to EXPIRED
+        coord = sync_coordinator._ensure_async()
+        coord._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="original-state"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            sync_coordinator.complete(
+                OAuthCallback(code="c", state="original-state")
+            )
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+
+    def test_cancel_with_expired_flow_sync(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """Expired flow → cancel returns AuthorizationExpired via sync bridge."""
+        from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+            _AuthorizationFlowState,
+            _FlowPhase,
+            _OAuthCoordinatorError,
+        )
+        from a2c_smcp.computer.mcp_clients.oauth_types import (
+            OAuthCancellation,
+            OAuthCancellationReason,
+            OAuthErrorCode,
+        )
+
+        coord = sync_coordinator._ensure_async()
+        coord._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            sync_coordinator.cancel(
+                OAuthCancellation(state="s1", reason=OAuthCancellationReason.Cancelled)
+            )
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired
+
+    def test_complete_with_expired_flow_sync_mismatch(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """Expired flow + mismatched state → StateMismatch via sync bridge."""
+        from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+            _AuthorizationFlowState,
+            _FlowPhase,
+            _OAuthCoordinatorError,
+        )
+        from a2c_smcp.computer.mcp_clients.oauth_types import OAuthCallback, OAuthErrorCode
+
+        coord = sync_coordinator._ensure_async()
+        coord._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="original-state"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            sync_coordinator.complete(
+                OAuthCallback(code="c", state="wrong-state")
+            )
+        assert exc.value.code == OAuthErrorCode.StateMismatch
+        # Mismatch keeps the flow EXPIRED for a later matching callback
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+
+    def test_cancel_with_expired_flow_sync_mismatch(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """Expired flow + mismatched state → StateMismatch via sync bridge."""
+        from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+            _AuthorizationFlowState,
+            _FlowPhase,
+            _OAuthCoordinatorError,
+        )
+        from a2c_smcp.computer.mcp_clients.oauth_types import (
+            OAuthCancellation,
+            OAuthCancellationReason,
+            OAuthErrorCode,
+        )
+
+        coord = sync_coordinator._ensure_async()
+        coord._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            sync_coordinator.cancel(
+                OAuthCancellation(state="wrong", reason=OAuthCancellationReason.Cancelled)
+            )
+        assert exc.value.code == OAuthErrorCode.StateMismatch
+        # Mismatch keeps the flow EXPIRED for a later matching callback
+        assert coord._flow.phase == _FlowPhase.EXPIRED
+
+    def test_cancel_callback_with_expired_flow_sync(
+        self, sync_coordinator: SyncOAuthCoordinator
+    ) -> None:
+        """Expired flow → cancel_callback returns AuthorizationExpired via sync bridge."""
+        from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+            _AuthorizationFlowState,
+            _FlowPhase,
+            _OAuthCoordinatorError,
+        )
+        from a2c_smcp.computer.mcp_clients.oauth_types import (
+            OAuthCancellation,
+            OAuthCancellationReason,
+            OAuthErrorCode,
+        )
+
+        coord = sync_coordinator._ensure_async()
+        coord._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state="s1"
+        )
+        with pytest.raises(_OAuthCoordinatorError) as exc:
+            sync_coordinator.cancel_callback(
+                OAuthCancellation(
+                    state="s1", reason=OAuthCancellationReason.AccessDenied
+                )
+            )
+        assert exc.value.code == OAuthErrorCode.AuthorizationExpired

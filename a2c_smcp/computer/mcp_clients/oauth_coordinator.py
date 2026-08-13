@@ -83,6 +83,7 @@ class _AuthorizationFlowState:
 
     phase: _FlowPhase = _FlowPhase.IDLE
     pending: _PendingAuthorization | None = None
+    expired_state: str | None = None  # PKCE state when phase==EXPIRED (Rust Expired{state})
 
 
 # ============================================================================
@@ -378,9 +379,7 @@ class OAuthCoordinator:
         async with self._lock:
             self._state_store.expire_stale()
             if isinstance(self._status, _OAuthStatusAuthorizationPending):
-                if self._flow.phase == _FlowPhase.EXPIRED:
-                    self._status = _OAuthStatusUnauthorized()
-                    self._flow = _AuthorizationFlowState()
+                await self._expire_invalid_authorization_flow()
             return self._status
 
     async def begin(self, request: OAuthBeginRequest) -> OAuthLaunch:
@@ -404,6 +403,7 @@ class OAuthCoordinator:
     async def _begin_under_lock(self, request: OAuthBeginRequest) -> None:
         """Core begin logic under self._lock."""
         self._state_store.expire_stale()
+        await self._expire_invalid_authorization_flow()
 
         # Validate mode — only Auth Code supported in Sub #178 (automatic-only)
         mode_dict = self._options.mode.model_dump(by_alias=False)
@@ -454,6 +454,9 @@ class OAuthCoordinator:
         code and persists credentials.
         """
         async with self._lock:
+            # Handle Expired flow — late callback after PKCE state expiry
+            self._reject_expired_flow(callback.state)
+
             if self._flow.phase != _FlowPhase.PENDING or self._flow.pending is None:
                 raise _OAuthCoordinatorError(
                     OAuthErrorCode.StateMismatch,
@@ -544,6 +547,9 @@ class OAuthCoordinator:
             )
 
         async with self._lock:
+            # Handle Expired flow — late cancellation after expiry
+            self._reject_expired_flow(cancellation.state)
+
             if self._flow.phase != _FlowPhase.PENDING or self._flow.pending is None:
                 raise _OAuthCoordinatorError(
                     OAuthErrorCode.StateMismatch,
@@ -590,6 +596,9 @@ class OAuthCoordinator:
             )
 
         async with self._lock:
+            # Handle Expired flow — late provider error after expiry
+            self._reject_expired_flow(cancellation.state)
+
             if self._flow.phase != _FlowPhase.PENDING or self._flow.pending is None:
                 raise _OAuthCoordinatorError(
                     OAuthErrorCode.StateMismatch,
@@ -797,6 +806,11 @@ class OAuthCoordinator:
 
         Caller must hold ``_lock``.
         """
+        # Expire stale flows before proceeding (aligns with Rust handle_insufficient_scope)
+        await self._expire_invalid_authorization_flow()
+        # If a pending flow is still active, don't override its status
+        if self._flow.phase == _FlowPhase.PENDING:
+            return
         self._set_status(_OAuthStatusReauthorizationRequired(required_scope=required_scope))
 
     def _set_status(self, status: OAuthStatus) -> None:
@@ -859,6 +873,75 @@ class OAuthCoordinator:
                 await self._store.clear()
             except OAuthCredentialStoreError:
                 pass
+
+    def _reject_expired_flow(self, state: str) -> None:
+        """Classify a late callback against an EXPIRED flow.
+
+        Must be called under ``_lock``. No-op when the flow is not EXPIRED.
+
+        Raises:
+            _OAuthCoordinatorError: ``StateMismatch`` when the state doesn't
+                match the expired flow's retained state (the flow stays
+                EXPIRED for a later matching callback); ``AuthorizationExpired``
+                when it matches (the flow is cleared back to Idle).
+        """
+        if self._flow.phase != _FlowPhase.EXPIRED:
+            return
+        if self._flow.expired_state != state:
+            raise _OAuthCoordinatorError(
+                OAuthErrorCode.StateMismatch,
+                "State does not match expired flow",
+            )
+        self._flow = _AuthorizationFlowState()  # clear to Idle
+        raise _OAuthCoordinatorError(
+            OAuthErrorCode.AuthorizationExpired,
+            "Authorization flow has expired",
+        )
+
+    async def _expire_invalid_authorization_flow(self) -> bool:
+        """Expire the pending authorization flow if the PKCE state or generation is stale.
+
+        Aligns with Rust ``expire_invalid_authorization_flow`` (oauth.rs:2418).
+
+        Must be called under ``_lock``. Returns ``True`` if the flow was expired,
+        ``False`` if no-op (no pending flow, or flow still valid).
+
+        On expiry, mirrors Rust ``restore_status_after_termination``: probes the
+        credential store and restores ``Authorized`` when still-valid credentials
+        exist (e.g. a scope-upgrade flow expiring while the previous grant remains
+        usable), ``Unauthorized`` otherwise.
+        """
+        if self._flow.phase != _FlowPhase.PENDING or self._flow.pending is None:
+            return False
+
+        pending = self._flow.pending
+        state = pending.launch.state
+
+        # Valid if generation matches AND PKCE state still in store
+        state_is_valid = (
+            pending.generation == self._generation
+            and self._state_store.lookup(state) is not None
+        )
+        if state_is_valid:
+            return False
+
+        # Flow is stale — remove PKCE state, transition to EXPIRED
+        self._state_store.finalize_exchange(state)
+        self._flow = _AuthorizationFlowState(
+            phase=_FlowPhase.EXPIRED, expired_state=state
+        )
+        # Restore status from the credential store (aligns with Rust
+        # restore_status_after_termination → restore_authorization_status).
+        token = await self._token_storage.get_tokens()
+        if token is not None:
+            if token.scope:
+                self._granted_scopes = [
+                    s.strip() for s in token.scope.split(" ") if s.strip()
+                ]
+            self._status = _OAuthStatusAuthorized(scopes=list(self._granted_scopes))
+        else:
+            self._status = _OAuthStatusUnauthorized()
+        return True
 
 
 # ============================================================================
