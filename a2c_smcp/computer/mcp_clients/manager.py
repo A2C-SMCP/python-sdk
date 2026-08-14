@@ -482,16 +482,15 @@ class MCPServerManager:
                 )
             coordinator = self._admit_oauth_coordinator(bundle_id, config, signal)
             if coordinator is None:
-                # Bearer 无 resource_metadata / cross-origin / 非安全端点 → 不准入。
-                # 精确分类（#185，对齐 Rust HttpAuthenticationError）：challenge 非 Bearer
-                # 或缺 resource_metadata → OAuthDiscoveryFailed 语义；Bearer 但 cross-origin
-                # 或非 HTTPS → UnsupportedChallenge 语义。二者均以 Protocol + 判别文案
-                # surface（与 authorizationRequired 文案区分 → 不被 _astart_client_auto
-                # 吞掉，向调用方传播）。
-                scheme, metadata_url = _bearer_challenge_parts(signal.www_authenticate_header)
-                if scheme is not None and metadata_url is None:
-                    message = f"OAuth resource metadata missing from Bearer challenge (bundle_id={bundle_id!r})"
-                elif not _is_secure_endpoint(config):
+                # 非 Bearer challenge / cross-origin resource_metadata / 非安全端点 → 不准入。
+                # 精确分类（#185，对齐 Rust HttpAuthenticationError）：challenge 非 Bearer →
+                # UnsupportedChallenge 语义；Bearer 但 cross-origin 或非 HTTPS → 同语义。
+                # 裸 Bearer（无 resource_metadata）**不再走本分支**——准入后 AS 发现交由
+                # mcp ≥1.29 的 well-known 回退链（PRM path 插入/根 → 服务器 origin 的
+                # RFC 8414 AS metadata）。均以 Protocol + 判别文案 surface（与
+                # authorizationRequired 文案区分 → 不被 _astart_client_auto 吞掉）。
+                scheme, _metadata_url = _bearer_challenge_parts(signal.www_authenticate_header)
+                if not _is_secure_endpoint(config):
                     # #181：protected resource 端点非 HTTPS 且非 loopback——安全不变量 1
                     # 拒绝，消息与 cross-origin 区分（排障友好）
                     message = (
@@ -502,7 +501,7 @@ class MCPServerManager:
                 else:
                     message = (
                         f"Unsupported authentication challenge for bundle_id={bundle_id!r} "
-                        "(challenge not Bearer, or resource_metadata cross-origin)"
+                        f"(challenge scheme={scheme!r}, or resource_metadata cross-origin)"
                     )
                 self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
                 raise OAuthError(OAuthErrorCode.Protocol, message)
@@ -676,20 +675,25 @@ class MCPServerManager:
     ) -> OAuthCoordinator | None:
         """按 challenge 证据准入并构造 coordinator（automatic admission）。
 
-        准入门槛（Rust auto-admission 的 python 面）：Bearer challenge 携带
-        ``resource_metadata`` 且与端点 same-origin。PRM / AS metadata 的深层校验由
-        mcp inline 流程 + #181 安全不变量承担。不准入返回 None（调用方落 ERROR + 报错）。
+        准入门槛（Rust auto-admission 的 python 面）：
+        - Bearer challenge **携带** ``resource_metadata``：须与端点 same-origin（#185/#181）；
+        - Bearer challenge **无** ``resource_metadata``（裸 challenge）：仍准入——AS 发现
+          交由 mcp ≥1.29 的 well-known 回退链（PRM path 插入 / 根 → 服务器 origin 的
+          RFC 8414 AS metadata）。回退链 URL 均由 mcp 从 server_url 派生（安全面自约束）；
+          链上全部 404 时由 coordinator 的 discovery 校验 / fail_launch 收敛为 typed error。
+        PRM / AS metadata 的深层校验由 mcp inline 流程 + #181 安全不变量承担。
+        不准入返回 None（调用方落 ERROR + 报错）。
 
         #185：scheme 判据复用 :func:`_bearer_challenge_parts`（与调用方精确分类单一权威）——
         非 Bearer challenge 即便携带 resource_metadata 字样也不准入（#179 的 regex 搜索
         会把 ``Basic resource_metadata=...`` 误判为准入；两套判据分叉即分类死分支）。
         """
         scheme, metadata_url = _bearer_challenge_parts(signal.www_authenticate_header)
-        if scheme is None or metadata_url is None:
+        if scheme is None:
             return None
         assert isinstance(config, StreamableHttpServerConfig)  # 调用方已按 _oauth_spec 收窄
         server_url = str(config.server_parameters.url)
-        if not same_origin(metadata_url, server_url):
+        if metadata_url is not None and not same_origin(metadata_url, server_url):
             return None
         # #181：protected resource 端点 HTTPS-only（localhost/loopback http 豁免）——
         # 非 https 且非 loopback 的明文 server 不进 OAuth 通道（对齐 Rust validate_secure_url）

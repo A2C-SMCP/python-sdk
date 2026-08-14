@@ -1139,9 +1139,30 @@ class OAuthCoordinator:
                 validate_secure_url(resource)
             metadata = context.oauth_metadata
             if metadata is None:
-                # mcp 在 discovery 全失败时 fallback {base}/authorize；Rust 自动路径
-                # 无此分支（admission 已证明 challenge 携带 resource_metadata，PRM
-                # discovery 必须产出 metadata）——按 Rust 语义拒绝
+                if self._registered_request is None:
+                    # mcp ≥1.29 的 403 insufficient_scope inline step-up：从未 discovery
+                    # （凭据恢复直连、未见过 401 challenge）时也会自动跑授权——这会绕过
+                    # 宿主契约（未经 facade 注册 flow 即弹浏览器）且无 metadata 无从校验
+                    # 安全不变量。以 InsufficientScope sentinel 挡回：传输层据此合成等效
+                    # 403 信号 → SDK 既有 4007 分类面 + 宿主驱动重授权（#133 语义保持）。
+                    raise OAuthError.protocol(OAuthProtocolError.InsufficientScope)
+                # 宿主 flow 在途（401 路径）但 discovery 全失败：mcp 会 fallback
+                # {base}/authorize；Rust 自动路径无此分支（admission 已证明 challenge
+                # 携带 resource_metadata，PRM discovery 必须产出 metadata）——按 Rust
+                # 语义拒绝
+                raise OAuthError.protocol(OAuthProtocolError.Metadata)
+            # 2026-07-28 MUST：ASM issuer 必须与构造 well-known URL 的 issuer 一致
+            # （RFC 8414 §3.3）。mcp ≥1.29 不做此校验——本方法兜底。仅 PRM 路径校验
+            # （auth_server_url 来自 PRM authorization_servers[0]）；legacy 路径
+            # （无 PRM，ASM 直接取自服务器 origin 的 well-known）豁免——issuer 指向
+            # AS 自身托管域（如 Atlassian ``cf.mcp.atlassian.com`` ≠ 服务器域），
+            # 这是 mcp 回退链的构造语义、非伪造面。
+            auth_server_url = getattr(context, "auth_server_url", None)
+            if (
+                isinstance(auth_server_url, str)
+                and auth_server_url
+                and _normalize_issuer(str(metadata.issuer)) != _normalize_issuer(auth_server_url)
+            ):
                 raise OAuthError.protocol(OAuthProtocolError.Metadata)
             # require_pkce 恒 True：_register_under_lock 已 gate 仅 authorizationCode
             # 模式（#180 automatic-only）

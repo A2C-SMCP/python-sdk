@@ -29,6 +29,11 @@ from a2c_smcp.computer.mcp_clients.oauth_security import (
     CROSS_ORIGIN_REDIRECT_STOP_MARKER,
     OAuthGuardTransport,
 )
+from a2c_smcp.computer.mcp_clients.oauth_types import (
+    SYNTH_INSUFFICIENT_SCOPE_CHALLENGE,
+    OAuthError,
+    is_stepup_insufficient_scope_error,
+)
 
 if TYPE_CHECKING:
     from a2c_smcp.computer.mcp_clients.oauth_coordinator import OAuthCoordinator
@@ -52,6 +57,21 @@ def _parse_jsonrpc_id(content: bytes | None) -> int | str | None:
         return None
     if isinstance(msg, dict):
         return msg.get("id")
+    return None
+
+
+def _parse_jsonrpc_id_from_stream_kwargs(kwargs: dict[str, Any]) -> int | str | None:
+    """从 ``stream()`` 的调用参数解析 JSON-RPC ``id``（异常路径无 response 对象可用）。
+
+    mcp 1.15 以 ``content=<bytes>`` 传 POST 体；mcp ≥1.29 以 ``json=<dict>`` 传
+    （``streamable_http._handle_post_request``）——两形态兼容，任一成功即返回。
+    """
+    from_content = _parse_jsonrpc_id(kwargs.get("content"))
+    if from_content is not None:
+        return from_content
+    payload = kwargs.get("json")
+    if isinstance(payload, dict):
+        return payload.get("id")
     return None
 
 
@@ -99,28 +119,40 @@ class _AuthWatchingClient(httpx.AsyncClient):
 
     @contextlib.asynccontextmanager
     async def stream(self, method: str, url: str, **kwargs: Any) -> AsyncIterator[httpx.Response]:  # type: ignore[override]
-        async with super().stream(method, url, **kwargs) as response:
-            if response.status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN):
-                rpc_id = _parse_jsonrpc_id(response.request.content)
-                www_auth = response.headers.get("www-authenticate")
-                self._observer.capture_auth_signal(
-                    rpc_id,
-                    response.status_code,
-                    www_auth,
-                )
-                # #179：connect-phase 通道（aconnect 的 401/403 challenge 无 rpc_id 关联；
-                # call_tool 路径同时写两条通道互不干扰——connect 槽由 manager 消费一次）。
-                self._observer.capture_connect_signal(
-                    response.status_code,
-                    www_auth,
-                )
-            elif response.extensions.get(CROSS_ORIGIN_REDIRECT_STOP_MARKER) is not None:
-                # #181：安全守卫 stop 的跨 origin redirect（非授权错误，不走 auth 通道）——
-                # mcp 吞掉 3xx 异常致请求侧挂起（#133 同款），经同机制双通道合成 typed error
-                rpc_id = _parse_jsonrpc_id(response.request.content)
-                self._observer.capture_redirect_stopped_signal(rpc_id, response.status_code)
-                self._observer.capture_connect_redirect_stopped(response.status_code)
-            yield response
+        try:
+            async with super().stream(method, url, **kwargs) as response:
+                if response.status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN):
+                    rpc_id = _parse_jsonrpc_id(response.request.content)
+                    www_auth = response.headers.get("www-authenticate")
+                    self._observer.capture_auth_signal(
+                        rpc_id,
+                        response.status_code,
+                        www_auth,
+                    )
+                    # #179：connect-phase 通道（aconnect 的 401/403 challenge 无 rpc_id 关联；
+                    # call_tool 路径同时写两条通道互不干扰——connect 槽由 manager 消费一次）。
+                    self._observer.capture_connect_signal(
+                        response.status_code,
+                        www_auth,
+                    )
+                elif response.extensions.get(CROSS_ORIGIN_REDIRECT_STOP_MARKER) is not None:
+                    # #181：安全守卫 stop 的跨 origin redirect（非授权错误，不走 auth 通道）——
+                    # mcp 吞掉 3xx 异常致请求侧挂起（#133 同款），经同机制双通道合成 typed error
+                    rpc_id = _parse_jsonrpc_id(response.request.content)
+                    self._observer.capture_redirect_stopped_signal(rpc_id, response.status_code)
+                    self._observer.capture_connect_redirect_stopped(response.status_code)
+                yield response
+        except OAuthError as exc:
+            # mcp ≥1.29 的 403 insufficient_scope inline step-up 在 auth 层吞掉 403 响应并
+            # 自动跑授权；coordinator 以 InsufficientScope sentinel 挡回（绕宿主契约 + 无
+            # metadata 无从校验）——此处把 auth 层异常重新合成为**等效 403 信号**，走 SDK
+            # 既有 4007 分类面（call_tool 竞速取消兜底，与 403 响应截获路径同构）。request
+            # 关联键从 kwargs 的 POST 体解析（异常路径拿不到 response.request）。
+            if is_stepup_insufficient_scope_error(exc):
+                rpc_id = _parse_jsonrpc_id_from_stream_kwargs(kwargs)
+                self._observer.capture_auth_signal(rpc_id, httpx.codes.FORBIDDEN, SYNTH_INSUFFICIENT_SCOPE_CHALLENGE)
+                self._observer.capture_connect_signal(httpx.codes.FORBIDDEN, SYNTH_INSUFFICIENT_SCOPE_CHALLENGE)
+            raise
 
 
 class _AuthSignalObserver:

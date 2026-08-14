@@ -46,6 +46,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
     _OAuthStatusAuthorizationPending,
     _OAuthStatusAuthorized,
     _OAuthStatusUnauthorized,
+    is_stepup_insufficient_scope_error,
 )
 
 # ============================================================================
@@ -1472,13 +1473,51 @@ class TestValidateDiscoveredMetadata:
         assert "pkceUnsupported" in str(exc_info.value)
         assert coordinator.flow_aborted_event().is_set()
 
-    def test_missing_metadata_rejects(self, coordinator: OAuthCoordinator) -> None:
-        # mcp discovery 全失败时的 fallback /authorize 路径（Rust 无此分支）→ 拒绝
+    def test_missing_metadata_with_registered_flow_rejects(self, coordinator: OAuthCoordinator) -> None:
+        # 宿主 flow 在途但 mcp discovery 全失败时的 fallback /authorize 路径
+        # （Rust 无此分支）→ Metadata 拒绝
         coordinator._provider = _FakeProvider(None)
+        coordinator._registered_request = OAuthBeginRequest(redirect_uri="http://127.0.0.1:12345/callback")
         with pytest.raises(OAuthError) as exc_info:
             coordinator._validate_discovered_metadata()
         assert "metadata" in str(exc_info.value)
         assert coordinator.flow_aborted_event().is_set()
+
+    def test_missing_metadata_without_flow_stepup_sentinel(self, coordinator: OAuthCoordinator) -> None:
+        # mcp ≥1.29 403 insufficient_scope inline step-up（从未 discovery、无宿主 flow）
+        # → InsufficientScope sentinel 挡回（传输层据此合成等效 403 信号 → 4007 分类面）
+        coordinator._provider = _FakeProvider(None)
+        with pytest.raises(OAuthError) as exc_info:
+            coordinator._validate_discovered_metadata()
+        assert "insufficientScope" in str(exc_info.value)
+        assert is_stepup_insufficient_scope_error(exc_info.value)
+        assert coordinator.flow_aborted_event().is_set()
+
+    def test_prm_path_issuer_mismatch_rejects(self, coordinator: OAuthCoordinator) -> None:
+        # 2026-07-28 MUST（RFC 8414 §3.3）：PRM 路径（auth_server_url 非空）ASM issuer
+        # 必须与构造 well-known URL 的 issuer 一致——不一致拒绝
+        provider = _FakeProvider(_fake_metadata(issuer="https://evil.example"))
+        provider.context.auth_server_url = "https://issuer.example"
+        coordinator._provider = provider
+        with pytest.raises(OAuthError) as exc_info:
+            coordinator._validate_discovered_metadata()
+        assert "metadata" in str(exc_info.value)
+        assert coordinator.flow_aborted_event().is_set()
+
+    def test_prm_path_issuer_match_passes(self, coordinator: OAuthCoordinator) -> None:
+        provider = _FakeProvider(_fake_metadata(issuer="https://issuer.example"))
+        provider.context.auth_server_url = "https://issuer.example"
+        coordinator._provider = provider
+        coordinator._validate_discovered_metadata()  # 不抛
+
+    def test_legacy_path_issuer_exempt(self, coordinator: OAuthCoordinator) -> None:
+        # 无 PRM（auth_server_url 空）= legacy 回退路径：issuer 指向 AS 自身托管域
+        # （如 Atlassian cf.mcp.atlassian.com ≠ 服务器域）豁免——mcp 回退链的构造
+        # 语义、非伪造面
+        provider = _FakeProvider(_fake_metadata(issuer="https://cf.other.example"))
+        provider.context.auth_server_url = None
+        coordinator._provider = provider
+        coordinator._validate_discovered_metadata()  # 不抛
 
     def test_cross_origin_prm_resource_rejects(self, coordinator: OAuthCoordinator) -> None:
         coordinator._provider = _FakeProvider(_fake_metadata(), prm_resource="https://evil.example/mcp")
