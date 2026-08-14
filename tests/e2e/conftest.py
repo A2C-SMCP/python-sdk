@@ -11,141 +11,27 @@ English: Root-level E2E test fixtures providing infrastructure for Computer-Agen
 
 from __future__ import annotations
 
-import contextlib
 import json
-import multiprocessing
 import socket
 import sys
 import time
 from collections.abc import Iterator
-from multiprocessing.synchronize import Event
 from pathlib import Path
 from typing import Any
 
 import pytest
-import socketio
-from socketio import Namespace, Server, WSGIApp
-from werkzeug.serving import make_server
 
-from a2c_smcp import PROTOCOL_VERSION
-from a2c_smcp.server import SyncSMCPNamespace
-from a2c_smcp.server.middleware import A2CProtocolVersionASGIMiddleware, A2CProtocolVersionWSGIMiddleware
-from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
-
-# ============================================================================
-# 中文: 测试用认证提供者 / English: Test authentication provider
-# ============================================================================
-
-
-class _PassSyncAuth(SyncAuthenticationProvider):
-    """中文: 测试用的放行认证提供者 / English: Permissive auth provider for testing"""
-
-    def authenticate(self, sio: Server, environ: dict, auth: dict | None, headers: list) -> bool:  # type: ignore[override]
-        return True
-
-
-class LocalSyncSMCPNamespace(SyncSMCPNamespace):
-    """中文: 同步命名空间，继承自正式实现，仅替换认证 / English: Sync namespace with test auth"""
-
-    def __init__(self) -> None:
-        super().__init__(auth_provider=_PassSyncAuth())
-
-
-def create_local_sync_server() -> tuple[Server, Namespace, A2CProtocolVersionWSGIMiddleware]:
-    """中文: 创建同步 Socket.IO Server 并注册本地命名空间 / English: Create sync Socket.IO Server with local namespace
-
-    中文: 返回的 app 包裹 ``A2CProtocolVersionWSGIMiddleware``，与生产部署等价——在 HTTP 传输层
-        校验 ``a2c_version`` query，不兼容客户端被拒（HTTP 400 + 4008）。否则 UAT F-05（版本不兼容
-        拒绝）会被静默跳过（#93）。SDK 客户端经 build_handshake_url 自动携带兼容版本，故正常连接不受影响。
-    English: The returned app wraps ``A2CProtocolVersionWSGIMiddleware`` (production-equivalent),
-        validating ``a2c_version`` at the HTTP transport layer; incompatible clients get HTTP 400 +
-        4008. Without it the protocol version gate is skipped and UAT F-05 silently passes (#93).
-    """
-    sio = Server(
-        cors_allowed_origins="*",
-        ping_timeout=5,  # 中文: 测试环境使用较短超时 / English: Use shorter timeout for testing
-        ping_interval=3,  # 中文: 测试环境使用较短间隔 / English: Use shorter interval for testing
-        async_handlers=True,  # 如果想使用 call 方法，则必定需要将此参数设置为True / Required for call method
-        always_connect=True,
-    )
-    ns = LocalSyncSMCPNamespace()
-    sio.register_namespace(ns)
-    wsgi_app = WSGIApp(sio, socketio_path="/socket.io")
-    app = A2CProtocolVersionWSGIMiddleware(wsgi_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
-    return sio, ns, app
-
+from a2c_smcp.testing import (
+    UvicornTestServer,
+    create_local_async_server,
+    create_local_sync_server,
+    run_http_server,
+)
 
 # ============================================================================
-# 中文: 多进程服务器启动函数 / English: Multiprocess server startup
+# 中文: 服务端装配与 runner 已下沉至 a2c_smcp.testing（#187），此处仅 re-export 供本目录测试引用
+# English: Assembly + runners now live in a2c_smcp.testing (#187); re-exported here for local tests
 # ============================================================================
-
-
-def _run_server_process(port: int, ready_event: Event) -> None:
-    """
-    中文: 在独立进程中运行服务器
-    English: Run server in a separate process
-    """
-    try:
-        sio, ns, wsgi_app = create_local_sync_server()
-        # 禁用监控任务避免关闭时出错 / Disable monitoring task to avoid shutdown errors
-        sio.eio.start_service_task = False
-
-        server = make_server("127.0.0.1", port, wsgi_app, threaded=True)
-
-        # 通知主进程服务器已准备好 / Notify main process that server is ready
-        ready_event.set()
-
-        # 运行服务器 / Run server
-        server.serve_forever()
-    except Exception as e:
-        print(f"服务器进程错误 / Server process error: {e}")
-        ready_event.set()  # 即使出错也要设置事件，避免主进程无限等待 / Set event even on error
-
-
-@contextlib.contextmanager
-def run_http_server() -> Iterator[tuple[str, int]]:
-    """
-    中文: 启动一个基于多进程的同步 Socket.IO Server（真实 HTTP 服务），返回 (host, port)。
-    English: Start a multiprocess sync Socket.IO server over real HTTP, return (host, port).
-    """
-    # 选取随机可用端口 / pick a free port
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    host, port = sock.getsockname()
-    sock.close()
-
-    # 创建进程间通信事件 / Create inter-process communication event
-    ready_event = multiprocessing.Event()
-
-    # 启动服务器进程 / Start server process
-    server_process = multiprocessing.Process(
-        target=_run_server_process,
-        args=(port, ready_event),
-        daemon=True,
-    )
-    server_process.start()
-
-    # 等待服务器准备好 / Wait for server to be ready
-    if not ready_event.wait(timeout=10):
-        server_process.terminate()
-        server_process.join(timeout=2)
-        raise RuntimeError("服务器进程启动超时 / Server process startup timeout")
-
-    # 额外等待确保端口完全可用 / Extra wait to ensure port is fully available
-    time.sleep(0.3)
-
-    try:
-        yield host, port
-    finally:
-        # 终止服务器进程 / Terminate server process
-        if server_process.is_alive():
-            server_process.terminate()
-            server_process.join(timeout=3)
-
-        # 如果进程仍然存活，强制杀死 / Force kill if still alive
-        if server_process.is_alive():
-            server_process.kill()
-            server_process.join(timeout=1)
 
 
 @pytest.fixture(scope="session")
@@ -210,49 +96,9 @@ def mcp_server_config_path(tmp_path: Path) -> Path:
 
 
 # ============================================================================
-# 中文: 异步服务器相关 fixtures
-# English: Async server related fixtures
+# 中文: 异步服务器相关 fixtures（装配下沉至 a2c_smcp.testing，#187）
+# English: Async server related fixtures (assembly now from a2c_smcp.testing, #187)
 # ============================================================================
-
-
-def create_local_async_server() -> tuple[socketio.AsyncServer, socketio.AsyncNamespace, Any]:
-    """
-    中文: 创建本地异步 SMCP 服务器，用于测试。返回的 app 包裹 ``A2CProtocolVersionASGIMiddleware``，
-        与生产等价——HTTP/WebSocket 传输层校验 ``a2c_version``，不兼容客户端被拒（#93）。
-    English: Create local async SMCP server for testing. The returned app wraps
-        ``A2CProtocolVersionASGIMiddleware`` (production-equivalent), validating ``a2c_version`` at the
-        transport layer so incompatible clients are rejected (#93).
-    """
-    from a2c_smcp.server import SMCPNamespace
-    from a2c_smcp.server.auth import AuthenticationProvider
-
-    class _PassAsyncAuth(AuthenticationProvider):
-        """中文: 测试用的放行认证提供者 / English: Permissive auth provider for testing"""
-
-        async def authenticate(self, sio: socketio.AsyncServer, environ: dict, auth: dict | None, headers: list) -> bool:  # type: ignore[override]
-            return True
-
-    class LocalAsyncSMCPNamespace(SMCPNamespace):
-        """中文: 异步命名空间，继承自正式实现，仅替换认证 / English: Async namespace with test auth"""
-
-        def __init__(self) -> None:
-            super().__init__(auth_provider=_PassAsyncAuth())
-
-    sio = socketio.AsyncServer(
-        async_mode="asgi",
-        cors_allowed_origins="*",
-        ping_timeout=5,  # 中文: 测试环境使用较短超时 / English: Use shorter timeout for testing
-        ping_interval=3,  # 中文: 测试环境使用较短间隔 / English: Use shorter interval for testing
-        logger=False,
-        engineio_logger=False,
-    )
-    # 避免关闭时后台任务异常 / avoid background task issues on shutdown
-    sio.eio.start_service_task = False
-    ns = LocalAsyncSMCPNamespace()
-    sio.register_namespace(ns)
-    asgi_app = socketio.ASGIApp(sio, socketio_path="/socket.io")
-    app = A2CProtocolVersionASGIMiddleware(asgi_app, socketio_path="/socket.io", server_version=PROTOCOL_VERSION)
-    return sio, ns, app
 
 
 @pytest.fixture
@@ -274,8 +120,6 @@ async def async_integration_socketio_server(async_integration_server_port: int):
     中文: 启动基于 SMCPNamespace 的异步集成测试服务器，返回命名空间。
     English: Start async integration test server based on SMCPNamespace and return the namespace.
     """
-    from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
-
     setup_start = time.time()
     sio, ns, asgi_app = create_local_async_server()
     print(f"[E2E Fixture] Server creation took {time.time() - setup_start:.2f}s")

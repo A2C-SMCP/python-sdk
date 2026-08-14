@@ -52,8 +52,8 @@ from a2c_smcp.smcp import (
     GetBlobReq,
     GetBlobRet,
 )
+from a2c_smcp.testing import UvicornTestServer
 from a2c_smcp.utils.blob import BlobTransferError, drain_blob, drain_blob_sync
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import (
     MockComputerServerNamespace,
     MockComputerServerSyncNamespace,

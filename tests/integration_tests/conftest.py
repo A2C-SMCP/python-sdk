@@ -16,7 +16,7 @@ import pytest
 from socketio import ASGIApp
 
 from a2c_smcp.smcp import SMCP_NAMESPACE
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
+from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace, create_computer_test_socketio
 
 

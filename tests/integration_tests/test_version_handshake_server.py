@@ -27,7 +27,7 @@ from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.server.middleware import A2CProtocolVersionASGIMiddleware
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, LIST_ROOM_EVENT, SMCP_NAMESPACE
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
+from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
 from tests.protocol_versions import COMPATIBLE_PEER, INCOMPATIBLE_PEER, max_supported_of, min_supported_of
 

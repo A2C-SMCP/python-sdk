@@ -32,7 +32,7 @@ from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
+from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
 
 

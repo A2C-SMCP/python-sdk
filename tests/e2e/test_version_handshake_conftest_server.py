@@ -33,8 +33,14 @@ import pytest
 from werkzeug.test import Client
 
 from a2c_smcp import PROTOCOL_VERSION
-from tests.e2e.conftest import create_local_async_server, create_local_sync_server
+from a2c_smcp.testing import create_local_async_server, create_local_sync_server
 from tests.protocol_versions import max_supported_of, min_supported_of
+
+# 中文: 曾缺失 e2e marker 导致本文件 4 个用例从未被收集（-m e2e 全部 deselect，#93 回归网失活）。
+#       现补回：进程内断言、零多进程 flakiness，e2e 套件开销可忽略。
+# English: this file once lacked the e2e marker, so its 4 tests were never collected (#93 guard was
+#       dead). Re-marked: in-process assertions, zero multiprocess flakiness, negligible e2e cost.
+pytestmark = pytest.mark.e2e
 
 _INCOMPATIBLE = "99.0.0"  # 与任意 0.x/1.x 均不兼容的定值 MAJOR 差异（不耦合具体 PROTOCOL_VERSION）
 

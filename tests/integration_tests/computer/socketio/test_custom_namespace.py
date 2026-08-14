@@ -41,8 +41,8 @@ from socketio import ASGIApp, AsyncNamespace, AsyncServer
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import TOOL_CALL_EVENT
+from a2c_smcp.testing import UvicornTestServer
 from a2c_smcp.utils.logger import logger
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 
 CUSTOM_NAMESPACE = "/tf-smcp"
 
