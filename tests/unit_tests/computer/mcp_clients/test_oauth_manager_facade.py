@@ -45,6 +45,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
     _OAuthStatusUnauthorized,
 )
 from a2c_smcp.computer.mcp_clients.utils import client_factory
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 MCP_URL = "https://mcp.example.com/mcp"
 PRM_URL = "https://mcp.example.com/.well-known/oauth-protected-resource"
@@ -130,16 +131,20 @@ def make_fake_as_handler(extra: dict[str, Any] | None = None) -> tuple[Callable,
                 headers={"content-type": "application/json"},
             )
         if request.method == "GET" and url.startswith(f"{AS_ISSUER}/.well-known/oauth-authorization-server"):
+            as_metadata = {
+                "issuer": AS_ISSUER,
+                "authorization_endpoint": f"{AS_ISSUER}/authorize",
+                "token_endpoint": f"{AS_ISSUER}/token",
+                "registration_endpoint": f"{AS_ISSUER}/register",
+                "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": ["read", "write"],
+            }
+            # #181：允许测试覆盖 AS metadata 字段（如去掉 PKCE S256 声明构造安全校验失败）
+            as_metadata.update((extra or {}).get("as_metadata", {}))
             return httpx.Response(
                 200,
-                json={
-                    "issuer": AS_ISSUER,
-                    "authorization_endpoint": f"{AS_ISSUER}/authorize",
-                    "token_endpoint": f"{AS_ISSUER}/token",
-                    "registration_endpoint": f"{AS_ISSUER}/register",
-                    "response_types_supported": ["code"],
-                    "scopes_supported": ["read", "write"],
-                },
+                json=as_metadata,
                 headers={"content-type": "application/json"},
             )
         if request.method == "POST" and url == f"{AS_ISSUER}/register":
@@ -815,3 +820,619 @@ class TestClearOAuth:
         with pytest.raises(OAuthError) as exc:
             await manager.clear_oauth("oauth-server")
         assert exc.value.code == OAuthErrorCode.NotConfigured
+
+
+# ============================================================================
+# #181 static-only：静态 Authorization header 绝不回退 OAuth（Rust #180）
+# ============================================================================
+
+
+class TestStaticAuthorizationStaticOnly:
+    async def test_static_header_server_401_never_falls_back_to_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # reject_bearer：静态凭据被服务端拒绝（401 challenge 无 resource_metadata）——
+        # static-only 判据在 challenge 分类之前，绝不进入 OAuth 准入
+        handler, stats = make_fake_as_handler(extra={"reject_bearer": True})
+        config = StreamableHttpServerConfig(
+            name="static-server",
+            server_parameters=StreamableHttpParameters(
+                url=MCP_URL,
+                headers={"Authorization": "Bearer static-token"},
+            ),
+            oauth=None,
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([config])
+        bundle_id = resolve_bundle_id(config)
+        with pytest.raises(OAuthError) as exc_info:
+            await manager.astart_client(bundle_id)
+        assert "static Authorization" in exc_info.value.message
+        # 双向断言：未准入 coordinator + 未发起任何 discovery 请求（PRM 零获取）
+        assert manager._oauth_coordinators == {}
+        assert stats["prm_fetches"] == 0
+        assert _connection_state(manager, bundle_id) == MCPServerConnectionState.ERROR
+
+    async def test_static_header_server_200_connects_normally(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 双向断言（正对照）：静态凭据有效时正常连通——static-only 只拦截 OAuth 回退，
+        # 不破坏静态认证本身（bearer 分支 200）
+        handler, stats = make_fake_as_handler()
+        config = StreamableHttpServerConfig(
+            name="static-server",
+            server_parameters=StreamableHttpParameters(
+                url=MCP_URL,
+                headers={"Authorization": "Bearer static-token"},
+            ),
+            oauth=None,
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([config])
+        bundle_id = resolve_bundle_id(config)
+        await manager.astart_client(bundle_id)  # 不抛
+        # 双向断言：静态凭据有效时正常连通（bearer 请求 ≥1；start 附带 tools/list 刷新）
+        assert stats["bearer_seen"] >= 1
+        assert _connection_state(manager, bundle_id) == MCPServerConnectionState.CONNECTED
+
+
+# ============================================================================
+# #181 4006/4007 分类保持（AUTH-01 三路径回归：无 OAuth / 静态 header / OAuth）
+# ============================================================================
+
+
+def _handler_with_probe_tool(base_handler: Callable, stats: dict[str, Any], tools_call_status: int) -> Callable:
+    """包装 fake AS：tools/list 返回一个 probe 工具；tools/call 返回给定状态码。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if request.method == "POST" and url == MCP_URL:
+            body = json.loads(request.content)
+            method = body.get("method", "")
+            req_id = body.get("id")
+            if method == "tools/list":
+                stats["tools_list_calls"] = stats.get("tools_list_calls", 0) + 1
+                return _jsonrpc_response(
+                    req_id,
+                    {
+                        "tools": [
+                            {
+                                "name": "probe-tool",
+                                "description": "probe",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }
+                        ]
+                    },
+                )
+            if method == "tools/call":
+                stats["tools_call_calls"] = stats.get("tools_call_calls", 0) + 1
+                return httpx.Response(
+                    tools_call_status,
+                    headers={"www-authenticate": 'Bearer error="insufficient_scope"'},
+                )
+        return base_handler(request)
+
+    return handler
+
+
+class TestAuthClassificationThreePaths:
+    """#181：OAuth 引入后 4006/4007（AUTH-01）分类不回退——三条路径逐一回归。
+
+    无 OAuth 路径由 ``test_http_auth_error.py`` / ``test_auth_error.py`` 覆盖；此处补
+    静态 header 路径（401→4006）与 OAuth 路径（403 insufficient_scope→4007）的组件级
+    断言——关键判据双向：不仅结果 isError，且 error_code 精确等于预期。
+    """
+
+    @pytest.mark.asyncio
+    async def test_static_header_path_tool_401_maps_4006(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 静态 header server：connect 成功、tools/call 401 → 传输层信号竞速 →
+        # UpstreamAuthError(401) → 4006（与无 OAuth 路径同构；OAuth 回退已被
+        # static-only 阻断，分类不受影响）
+        base_handler, stats = make_fake_as_handler()
+        handler = _handler_with_probe_tool(base_handler, stats, tools_call_status=401)
+        config = StreamableHttpServerConfig(
+            name="static-server",
+            server_parameters=StreamableHttpParameters(
+                url=MCP_URL,
+                headers={"Authorization": "Bearer static-token"},
+            ),
+            oauth=None,
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([config])
+        bundle_id = resolve_bundle_id(config)
+        await manager.astart_client(bundle_id)  # 静态凭据有效，正常连通
+        result = await manager.acall_tool(bundle_id, "probe-tool", {})
+        assert result.isError is True
+        assert result.meta is not None
+        assert result.meta["error_code"] == 4006
+        assert result.meta["mcp_server"] == bundle_id
+        # 双向断言：tools/call 确实发出且收到 401（非其它路径伪造的失败）
+        assert stats["tools_call_calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_oauth_path_tool_403_insufficient_scope_maps_4007(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        # OAuth server：已授权凭据连接成功后 tools/call 403 insufficient_scope →
+        # 403 作为 final response 透过（不被 auth 管道吞掉，#179 实证）→ 信号竞速 →
+        # UpstreamAuthError(403) → 4007
+        base_handler, stats = make_fake_as_handler()
+        handler = _handler_with_probe_tool(base_handler, stats, tools_call_status=403)
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        bundle_id = "oauth-server"
+        await _seed_credentials(manager, oauth_config)
+        await manager.astart_client(bundle_id)  # restore authorized → 直连
+        result = await manager.acall_tool(bundle_id, "probe-tool", {})
+        assert result.isError is True
+        assert result.meta is not None
+        assert result.meta["error_code"] == 4007
+        assert result.meta["mcp_server"] == bundle_id
+        assert stats["tools_call_calls"] == 1
+
+
+# ============================================================================
+# #181 discovery probe 结论锁定（Rust DiscoveryCleanupOAuthHttpClient 的 python 面）
+# ============================================================================
+
+
+class TestDiscoveryProbeAbsence:
+    """#181：mcp-python 的 discovery 为 plain GET、无 synthetic initialize probe →
+    不产生孤儿 MCP session，无需 Rust ``DiscoveryCleanupOAuthHttpClient`` 的 DELETE
+    清理（上游 modelcontextprotocol/rust-sdk #1048 规避）。
+
+    本测试**锁定该结论**：若 mcp 升级引入 probe（POST + MCP-Protocol-Version 或响应
+    带 mcp-session-id 的 discovery），本测试转红提醒补等价清理。
+    """
+
+    @pytest.mark.asyncio
+    async def test_discovery_issues_only_plain_gets_and_no_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        base_handler, stats = make_fake_as_handler()
+        requests_log: list[tuple[str, str, dict[str, str]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_log.append((request.method, str(request.url), dict(request.headers)))
+            return base_handler(request)
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        # 注册 flow → 交互式 connect 任务驱动 discovery；launch 发布 = discovery + DCR 已走完
+        flow = manager.create_oauth_flow("oauth-server", _request())
+        launch = await asyncio.wait_for(flow.launch(), timeout=10)
+        assert launch.state
+        await asyncio.sleep(0.05)
+
+        # 断言：PRM / AS well-known discovery 全部为 plain GET；全程无 mcp-session-id 请求头
+        discovery = [(m, u, h) for m, u, h in requests_log if "well-known" in u]
+        assert discovery, "discovery 面零请求（测试前置失真）"
+        assert all(m == "GET" for m, _, _ in discovery), f"discovery 出现非 GET 请求（mcp 升级引入 probe？）：{discovery}"
+        assert all("mcp-session-id" not in h for _, _, h in requests_log), "存在携带 mcp-session-id 的请求（mcp 升级引入 session 面？）"
+        # 无 DELETE（无需 Rust 的孤儿 session 清理）
+        assert all(m != "DELETE" for m, _, _ in requests_log)
+        # 双向断言：DCR 面确实走通（POST 存在——discovery 结论不是「全流程没跑」的假绿）
+        assert any(m == "POST" and u == f"{AS_ISSUER}/register" for m, u, _ in requests_log)
+
+        # 清理：cancel 收尾（勿留 pending flow 影响后续测试）
+        outcome = await flow.cancel(OAuthCancellationReason.Cancelled)
+        assert outcome.outcome == "terminated"
+
+
+class TestPkceWireShape:
+    """#181 两端一致性向量：authorization URL 的 PKCE 参数形态（Rust 验收矩阵
+    Auth Code + PKCE S256 + DCR 的 wire 面锁定——若 mcp 降级 plain 会红）。"""
+
+    @pytest.mark.asyncio
+    async def test_authorization_url_carries_pkce_s256(
+        self, fake_as: tuple[dict[str, Any], dict[str, Any]], oauth_config: StreamableHttpServerConfig
+    ) -> None:
+        manager = await _make_manager(fake_as, oauth_config)
+        flow = manager.create_oauth_flow("oauth-server", _request())
+        launch = await asyncio.wait_for(flow.launch(), timeout=10)
+        assert "code_challenge_method=S256" in launch.authorization_url
+        assert "code_challenge=" in launch.authorization_url
+        assert "code_verifier" not in launch.authorization_url  # verifier 绝不外发
+        outcome = await flow.cancel(OAuthCancellationReason.Cancelled)
+        assert outcome.outcome == "terminated"
+
+
+class TestMetadataValidationFailureConvergesLaunch:
+    """#181 隔离审查 🔴1：metadata 安全校验失败时 ``flow.launch()`` 必须以 typed error
+    收敛（不得挂起）——provider 流程死于校验异常，manager 的 aborted 竞速分支只写
+    ERROR 状态；收敛责任在 coordinator（fail_launch 同步原子路径）。"""
+
+    @pytest.mark.asyncio
+    async def test_launch_raises_typed_error_when_as_lacks_s256(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        handler, stats = make_fake_as_handler(
+            extra={"as_metadata": {"code_challenge_methods_supported": None}}
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        flow = manager.create_oauth_flow("oauth-server", _request())
+        # launch 必须以 typed error 收敛（而非挂起——wait_for 超时即失败）
+        with pytest.raises(OAuthError) as exc_info:
+            await asyncio.wait_for(flow.launch(), timeout=10)
+        assert "pkceUnsupported" in str(exc_info.value)
+        # 双向断言：等待者已解、无 pending 残留、连接状态 ERROR
+        coordinator = manager._oauth_coordinators["oauth-server"]
+        assert not coordinator.launch_awaiting()
+        assert coordinator._flow.pending is None
+        # 连接状态由 manager aborted 分支落 ERROR（epoch 守卫放行）
+        for _ in range(50):
+            if _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR:
+                break
+            await asyncio.sleep(0.05)
+        assert _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR
+
+    @pytest.mark.asyncio
+    async def test_launch_raises_typed_error_on_insecure_token_endpoint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        handler, stats = make_fake_as_handler(
+            extra={"as_metadata": {"token_endpoint": "http://as.example/token"}}
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        flow = manager.create_oauth_flow("oauth-server", _request())
+        with pytest.raises(OAuthError) as exc_info:
+            await asyncio.wait_for(flow.launch(), timeout=10)
+        assert "invalidUrl" in str(exc_info.value)
+        coordinator = manager._oauth_coordinators["oauth-server"]
+        assert not coordinator.launch_awaiting()
+
+
+class TestCrossOriginRedirectStopSurfaces:
+    """#181 隔离审查二轮 🔴：跨 origin redirect stop 返回裸 3xx → mcp post_writer
+    吞掉 → 在途调用/连接无限挂起（#133 同款吞没）。守卫须经 side-channel 合成
+    typed error 解出竞速——工具调用抛错（不挂）、connect 抛错（不挂 30s）。"""
+
+    def _handler_302_cross_origin(
+        self, base_handler: Callable, stats: dict[str, Any]
+    ) -> Callable:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if request.method == "POST" and url == MCP_URL:
+                body = json.loads(request.content)
+                if body.get("method") == "tools/call":
+                    stats["cross_origin_redirects"] = stats.get("cross_origin_redirects", 0) + 1
+                    return httpx.Response(
+                        302,
+                        headers={"location": "https://attacker.example/capture"},
+                    )
+            return base_handler(request)
+
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_tool_call_302_cross_origin_raises_instead_of_hanging(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base_handler, stats = make_fake_as_handler()
+        handler = _handler_with_probe_tool(base_handler, stats, tools_call_status=200)
+        redirect_handler = self._handler_302_cross_origin(handler, stats)
+        config = StreamableHttpServerConfig(
+            name="static-server",
+            server_parameters=StreamableHttpParameters(
+                url=MCP_URL,
+                headers={"Authorization": "Bearer static-token"},
+            ),
+            oauth=None,
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(redirect_handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([config])
+        bundle_id = resolve_bundle_id(config)
+        await manager.astart_client(bundle_id)
+        # tools/call 遇跨 origin 302 stop：must raise（不挂——wait_for 超时即红）
+        with pytest.raises(RuntimeError, match="cross-origin|redirect"):
+            await asyncio.wait_for(manager.acall_tool(bundle_id, "probe-tool", {}), timeout=10)
+        # 双向断言：跨 origin 目标零请求（stop 成立，非 follow 后失败）
+        assert stats["cross_origin_redirects"] == 1
+
+    @pytest.mark.asyncio
+    async def test_connect_302_cross_origin_raises_instead_of_30s_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base_handler, stats = make_fake_as_handler()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if request.method == "POST" and url == MCP_URL:
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://attacker.example/capture"},
+                )
+            return base_handler(request)
+
+        config = StreamableHttpServerConfig(
+            name="plain-server",
+            server_parameters=StreamableHttpParameters(url=MCP_URL),
+            oauth=None,
+        )
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([config])
+        bundle_id = resolve_bundle_id(config)
+        with pytest.raises(Exception, match="cross-origin|redirect"):
+            await asyncio.wait_for(manager.astart_client(bundle_id), timeout=10)
+        assert _connection_state(manager, bundle_id) == MCPServerConnectionState.ERROR
+
+
+class TestStaticOnlyConfigSwitch:
+    """#181 二轮审查 🟡5：bundle 先经 challenge 准入 coordinator，随后配置加入静态
+    Authorization header——start 须退役陈旧 coordinator 重走 anonymous-first
+    （静态凭据 200 直连 / 401 → static-only 精确拒绝），绝不回退 OAuth。"""
+
+    @pytest.mark.asyncio
+    async def test_config_switch_to_static_header_retires_coordinator(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        # 第一步：fake AS 正常 challenge → 准入 coordinator（OAuthRequired 无注册 flow）
+        handler, stats = make_fake_as_handler()
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        with pytest.raises(OAuthError):
+            await manager.astart_client("oauth-server")
+        assert "oauth-server" in manager._oauth_coordinators  # 已准入
+
+        # 第二步：配置切换为静态 header（仍 streamable）→ 退役 coordinator
+        static_config = StreamableHttpServerConfig(
+            name="oauth-server",
+            server_parameters=StreamableHttpParameters(
+                url=MCP_URL,
+                headers={"Authorization": "Bearer static-token"},
+            ),
+            oauth=None,
+        )
+        await manager.aadd_or_aupdate_server(static_config)
+        await manager.astart_client("oauth-server")  # 静态凭据 200 → 正常连通
+        # 双向断言：coordinator 已退役、连接 CONNECTED（静态路径生效，非 OAuth 回退）
+        assert "oauth-server" not in manager._oauth_coordinators
+        assert _connection_state(manager, "oauth-server") == MCPServerConnectionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_config_switch_to_rejected_static_header_raises_static_only(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        # 同场景但静态凭据被拒（reject_bearer）→ static-only 精确拒绝文案（非 OAuthRequired）
+        handler, stats = make_fake_as_handler(extra={"reject_bearer": True})
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        with pytest.raises(OAuthError):
+            await manager.astart_client("oauth-server")
+
+        static_config = StreamableHttpServerConfig(
+            name="oauth-server",
+            server_parameters=StreamableHttpParameters(
+                url=MCP_URL,
+                headers={"Authorization": "Bearer static-token"},
+            ),
+            oauth=None,
+        )
+        await manager.aadd_or_aupdate_server(static_config)
+        with pytest.raises(OAuthError) as exc_info:
+            await manager.astart_client("oauth-server")
+        assert "static Authorization" in exc_info.value.message
+        assert "oauth-server" not in manager._oauth_coordinators
+        assert _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR
+
+
+class TestInteractiveFlowRedirectStop:
+    """#181 三轮审查 🔴：交互式 OAuth 路径（_aoauth_connect）的 redirect-stop 竞速——
+    跨 origin redirect stop 须以 typed error 收敛 launch（不挂起），连接状态 ERROR。"""
+
+    @pytest.mark.asyncio
+    async def test_registration_redirect_cross_origin_converges_launch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        oauth_config: StreamableHttpServerConfig,
+    ) -> None:
+        # resource-origin 的注册兜底端点 302 跨 origin（PRM 无 registration_endpoint
+        # 时 mcp 注册到 {server_url base}/register——protected 面请求）：守卫 stop →
+        # mcp _handle_registration_response 抛 OAuthRegistrationError → broad except
+        # 吞掉 → aconnect 永不 resolve（#133 同款挂起）
+        base_handler, stats = make_fake_as_handler(
+            extra={"as_metadata": {"registration_endpoint": "https://mcp.example.com/register"}}
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and str(request.url) == "https://mcp.example.com/register":
+                stats["dcr_redirects"] = stats.get("dcr_redirects", 0) + 1
+                return httpx.Response(
+                    302, headers={"location": "https://attacker.example/register"}
+                )
+            return base_handler(request)
+
+        def factory(
+            config: Any,
+            message_handler: Any = None,
+            oauth_coordinator: OAuthCoordinator | None = None,
+        ) -> BaseMCPClient:
+            return client_factory(
+                config,
+                message_handler=message_handler,
+                oauth_coordinator=oauth_coordinator,
+                httpx_transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
+        manager = MCPServerManager(auto_connect=False)
+        await manager.ainitialize([oauth_config])
+        flow = manager.create_oauth_flow("oauth-server", _request())
+        # launch 以 typed error 收敛（wait_for 超时即红——不挂起）
+        with pytest.raises(OAuthError) as exc_info:
+            await asyncio.wait_for(flow.launch(), timeout=10)
+        assert "cross-origin" in str(exc_info.value)
+        # 双向断言：DCR 端点确实收到请求且被守卫 stop（非其它路径失败）
+        assert stats["dcr_redirects"] == 1
+        coordinator = manager._oauth_coordinators["oauth-server"]
+        assert not coordinator.launch_awaiting()
+        # 连接状态 ERROR（epoch 守卫放行）
+        for _ in range(50):
+            if _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR:
+                break
+            await asyncio.sleep(0.05)
+        assert _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR

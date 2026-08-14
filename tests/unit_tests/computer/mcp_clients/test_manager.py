@@ -53,6 +53,20 @@ class MockMCPClient:
             return self._challenge_event
 
         self.connect_challenge_event = connect_challenge_event
+        # #181：connect-phase redirect stop 事件（同款 mock 面——永不触发）
+        self._redirect_event: asyncio.Event | None = None
+
+        def connect_redirect_event() -> asyncio.Event:
+            if self._redirect_event is None:
+                self._redirect_event = asyncio.Event()
+            return self._redirect_event
+
+        self.connect_redirect_event = connect_redirect_event
+
+        def take_connect_redirect_stop() -> None:
+            return None
+
+        self.take_connect_redirect_stop = take_connect_redirect_stop
         # 保存透传进来的 message_handler，便于测试断言
         self.message_handler = message_handler
 

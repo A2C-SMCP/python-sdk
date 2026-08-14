@@ -17,7 +17,6 @@ PKCE/CSRF TTL 管理与 TokenStorage→ScopedCredentialStore 桥接。
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import re
 import time
 from collections.abc import Callable
@@ -37,6 +36,13 @@ from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
     OAuthCredentialStoreError,
     ScopedCredentialStore,
     oauth_mode_fingerprint,
+)
+from a2c_smcp.computer.mcp_clients.oauth_security import (
+    install_mcp_auth_log_redaction,
+    is_loopback_host,
+    same_origin,
+    validate_authorization_metadata,
+    validate_secure_url,
 )
 from a2c_smcp.computer.mcp_clients.oauth_types import (
     OAuthBeginRequest,
@@ -1023,6 +1029,11 @@ class OAuthCoordinator:
             timeout=self._timeout,
         )
         self._provider_needs_rebuild = False
+        # #181：provider 存在 = OAuth 启用 → mcp.client.auth 日志脱敏（幂等）。
+        # mcp 的 logger.exception 携带 pydantic ValidationError 的 input_value（可能含
+        # token / code），Rust 以 SensitiveAuthClient 的 NoSubscriber 压制；python 等价物
+        # 为日志 Filter（见 oauth_security.install_mcp_auth_log_redaction）。
+        install_mcp_auth_log_redaction()
 
     # =========================================================================
     # Redirect / callback handler factories
@@ -1058,6 +1069,10 @@ class OAuthCoordinator:
                 candidate = getattr(oauth_metadata, "issuer", None) if oauth_metadata is not None else None
                 if candidate is not None:
                     issuer = _normalize_issuer(str(candidate))
+                # #181：authorization 前校验 mcp discovery 产物（HTTPS-only 端点 / PKCE
+                # S256 / PRM resource 同源）——失败置 aborted + 抛 Protocol，provider
+                # 流程死亡、manager 竞速通道收敛（#133 挂起模式防御）
+                coordinator._validate_discovered_metadata()
 
             async with coordinator._lock:
                 # 锁内复核注册（竞态：检查与持锁之间 flow 可能已被 cancel/complete 终态清除）
@@ -1095,6 +1110,51 @@ class OAuthCoordinator:
                     coordinator._launch_future.set_result(launch)
 
         return redirect_handler
+
+    def _validate_discovered_metadata(self) -> None:
+        """#181：authorization 前校验 mcp discovery 产物（Rust ``validate_authorization_metadata``
+        + ``observe_admitted_resource_metadata`` 的 python 面）。
+
+        mcp 不校验 AS metadata 端点的 HTTPS-only / PKCE S256 支持，PRM document 的
+        ``resource`` 字段也不与 server_url 复核——本方法兜底（``redirect_handler`` 是
+        flow 必经点，discovery 已全部完成）。失败置 aborted（manager 竞速通道）+
+        抛 ``Protocol`` 分类错误（静态 message，不携带 URL / metadata 本体）。
+        """
+        provider = self._provider
+        if provider is None:  # pragma: no cover — 防御分支（仅 redirect_handler 调用）
+            return
+        context = provider.context
+        try:
+            # protected resource 端点 HTTPS-only（纵深：manager 准入已校验，外部构造
+            # coordinator 的路径亦被覆盖）
+            validate_secure_url(self._server_url)
+            # PRM resource 复核：mcp 自行从 401 challenge 提取 metadata URL 并请求，
+            # manager 准入的 same-origin 校验不直接约束 mcp 的第二次请求——按 PRM
+            # document 的 resource 字段与 server_url 复核（Rust admitted resource 匹配）
+            prm = context.protected_resource_metadata
+            if prm is not None and prm.resource is not None:
+                resource = str(prm.resource)
+                if not same_origin(resource, self._server_url):
+                    raise OAuthError.protocol(OAuthProtocolError.Metadata)
+                validate_secure_url(resource)
+            metadata = context.oauth_metadata
+            if metadata is None:
+                # mcp 在 discovery 全失败时 fallback {base}/authorize；Rust 自动路径
+                # 无此分支（admission 已证明 challenge 携带 resource_metadata，PRM
+                # discovery 必须产出 metadata）——按 Rust 语义拒绝
+                raise OAuthError.protocol(OAuthProtocolError.Metadata)
+            # require_pkce 恒 True：_register_under_lock 已 gate 仅 authorizationCode
+            # 模式（#180 automatic-only）
+            validate_authorization_metadata(metadata, require_pkce=True)
+        except OAuthError as exc:
+            # #181 隔离审查 🔴1：校验失败必须**当场收敛** launch 等待者——fail_launch
+            # 为同步原子路径（体内无 await，单事件循环下与持锁路径天然串行，免锁
+            # 成立，见其 docstring），置 aborted + 以 typed error 解 wait_launch +
+            # 完整拆解 flow slot。若仅置 aborted 等 manager 分支收敛，manager 的
+            # aborted 分支只写连接状态 ERROR、不触 fail_launch → wait_launch 永久
+            # 挂起（#133「授权失败 MUST NOT 表现为挂起」）。
+            self.fail_launch(exc)
+            raise
 
     def _make_callback_handler(self) -> Any:
         """Create the callback_handler for OAuthClientProvider.
@@ -1388,19 +1448,6 @@ def _normalize_issuer(value: str | None) -> str | None:
     return normalized or None
 
 
-def _is_loopback_host(parsed: Any) -> bool:
-    """True if the parsed URL's host is loopback（对齐 Rust ``is_loopback_host``）。"""
-    host = parsed.hostname
-    if host is None:
-        return False
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _validate_redirect_uri(uri: str) -> None:
     """Validate a host-provided redirect URI（Rust 宿主契约的三种合法形态）。
 
@@ -1428,7 +1475,7 @@ def _validate_redirect_uri(uri: str) -> None:
     if scheme == "https":
         return
     if scheme == "http":
-        if _is_loopback_host(parsed):
+        if is_loopback_host(parsed):
             return
         raise OAuthError(
             OAuthErrorCode.InvalidRedirectUri,

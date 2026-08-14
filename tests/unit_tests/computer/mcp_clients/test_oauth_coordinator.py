@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.shared.auth import OAuthToken
+from mcp.shared.auth import OAuthMetadata, OAuthToken
 
 from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
     ExpiringStateStore,
@@ -804,9 +806,11 @@ class TestRedirectHandlerContract:
     async def test_redirect_captures_provider_issuer(self, coordinator: OAuthCoordinator) -> None:
         request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
         await coordinator.register(request)
-        # 模拟 provider 已发现 AS metadata 且带 issuer（mcp 公共属性）
+        # 模拟 provider 已发现 AS metadata 且带 issuer（mcp 公共属性）；
+        # #181：_validate_discovered_metadata 要求完整合法 metadata（夹具不得失真）
         provider = MagicMock()
-        provider.context.oauth_metadata.issuer = "https://auth.example"
+        provider.context.oauth_metadata = _fake_metadata(issuer="https://auth.example")
+        provider.context.protected_resource_metadata = None
         coordinator._provider = provider
         handler = coordinator._make_redirect_handler()
         await handler(
@@ -837,7 +841,9 @@ class TestStagedValidationDetails:
         request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
         await coordinator.register(request)
         provider = MagicMock()
-        provider.context.oauth_metadata.issuer = "https://auth.example"
+        # #181：完整合法 metadata（夹具不得失真）
+        provider.context.oauth_metadata = _fake_metadata(issuer="https://auth.example")
+        provider.context.protected_resource_metadata = None
         coordinator._provider = provider
         handler = coordinator._make_redirect_handler()
         await handler(
@@ -1415,3 +1421,118 @@ class TestOAuthCoordinatorExpiredFlow:
         await coord._register_under_lock(request)
         assert coord._flow.phase == _FlowPhase.IDLE  # EXPIRED 已被新注册取代
         assert coord.has_registered_request()
+
+
+# ============================================================================
+# #181 _validate_discovered_metadata（安全不变量 1+2：HTTPS-only / PKCE S256）
+# ============================================================================
+
+
+class _FakeProvider:
+    """假 provider：仅暴露 context（protected_resource_metadata / oauth_metadata）。"""
+
+    def __init__(self, oauth_metadata: Any | None, prm_resource: str | None = None) -> None:
+        prm = SimpleNamespace(resource=prm_resource) if prm_resource is not None else None
+        self.context = SimpleNamespace(
+            protected_resource_metadata=prm,
+            oauth_metadata=oauth_metadata,
+        )
+
+
+def _fake_metadata(**overrides: Any) -> Any:
+    defaults: dict[str, Any] = {
+        "issuer": "https://issuer.example",
+        "authorization_endpoint": "https://issuer.example/authorize",
+        "token_endpoint": "https://issuer.example/token",
+        "code_challenge_methods_supported": ["S256"],
+    }
+    defaults.update(overrides)
+    return OAuthMetadata.model_validate(defaults)
+
+
+class TestValidateDiscoveredMetadata:
+    """#181：authorization 前校验 mcp discovery 产物（Rust validate_authorization_metadata）。"""
+
+    def test_valid_metadata_passes(self, coordinator: OAuthCoordinator) -> None:
+        coordinator._provider = _FakeProvider(_fake_metadata())
+        coordinator._validate_discovered_metadata()  # 不抛
+
+    def test_insecure_token_endpoint_rejects_and_aborts(self, coordinator: OAuthCoordinator) -> None:
+        coordinator._provider = _FakeProvider(_fake_metadata(token_endpoint="http://issuer.example/token"))
+        aborted = coordinator.flow_aborted_event()
+        with pytest.raises(OAuthError) as exc_info:
+            coordinator._validate_discovered_metadata()
+        assert "invalidUrl" in str(exc_info.value)
+        assert aborted.is_set()
+
+    def test_missing_s256_rejects(self, coordinator: OAuthCoordinator) -> None:
+        coordinator._provider = _FakeProvider(_fake_metadata(code_challenge_methods_supported=["plain"]))
+        with pytest.raises(OAuthError) as exc_info:
+            coordinator._validate_discovered_metadata()
+        assert "pkceUnsupported" in str(exc_info.value)
+        assert coordinator.flow_aborted_event().is_set()
+
+    def test_missing_metadata_rejects(self, coordinator: OAuthCoordinator) -> None:
+        # mcp discovery 全失败时的 fallback /authorize 路径（Rust 无此分支）→ 拒绝
+        coordinator._provider = _FakeProvider(None)
+        with pytest.raises(OAuthError) as exc_info:
+            coordinator._validate_discovered_metadata()
+        assert "metadata" in str(exc_info.value)
+        assert coordinator.flow_aborted_event().is_set()
+
+    def test_cross_origin_prm_resource_rejects(self, coordinator: OAuthCoordinator) -> None:
+        coordinator._provider = _FakeProvider(_fake_metadata(), prm_resource="https://evil.example/mcp")
+        with pytest.raises(OAuthError) as exc_info:
+            coordinator._validate_discovered_metadata()
+        assert "metadata" in str(exc_info.value)
+        assert coordinator.flow_aborted_event().is_set()
+
+    def test_plain_http_server_url_rejects(self, memory_store: InMemoryOAuthCredentialStore, oauth_options: OAuthOptions) -> None:
+        # protected resource 端点 HTTPS-only（非 loopback 明文 http 拒绝）
+        coord = OAuthCoordinator(
+            bundle_id="test-bundle",
+            server_url="http://api.example.com",
+            resource="http://api.example.com",
+            options=oauth_options,
+            credential_store=memory_store,
+        )
+        coord._provider = _FakeProvider(_fake_metadata())
+        with pytest.raises(OAuthError) as exc_info:
+            coord._validate_discovered_metadata()
+        assert "invalidUrl" in str(exc_info.value)
+
+    def test_loopback_http_server_url_passes(self, memory_store: InMemoryOAuthCredentialStore, oauth_options: OAuthOptions) -> None:
+        coord = OAuthCoordinator(
+            bundle_id="test-bundle",
+            server_url="http://127.0.0.1:8080/mcp",
+            resource="http://127.0.0.1:8080/mcp",
+            options=oauth_options,
+            credential_store=memory_store,
+        )
+        coord._provider = _FakeProvider(_fake_metadata())
+        coord._validate_discovered_metadata()  # 不抛（loopback http 豁免）
+
+
+class TestRedirectHandlerInvokesValidation:
+    """#181 调用点测试：redirect_handler 路径触发 _validate_discovered_metadata
+    （变异「删调用点」会红——与 TestValidateDiscoveredMetadata 的方法本体测试互补）。"""
+
+    @pytest.mark.asyncio
+    async def test_redirect_handler_rejects_insecure_metadata(
+        self, coordinator: OAuthCoordinator
+    ) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback")
+        await coordinator.register(request)
+        coordinator._provider = _FakeProvider(
+            _fake_metadata(token_endpoint="http://issuer.example/token")
+        )
+        handler = coordinator._make_redirect_handler()
+        with pytest.raises(OAuthError) as exc_info:
+            await handler(
+                "https://issuer.example/authorize?state=st1"
+                "&redirect_uri=https%3A%2F%2Fhost.example%2Fcallback"
+            )
+        assert "invalidUrl" in str(exc_info.value)
+        assert coordinator.flow_aborted_event().is_set()
+        # 双向断言：校验失败即 abort——不产生 pending flow
+        assert coordinator._flow.pending is None

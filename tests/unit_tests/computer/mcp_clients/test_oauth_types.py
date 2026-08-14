@@ -805,3 +805,52 @@ class TestOAuthError:
         from a2c_smcp.computer.mcp_clients.oauth_coordinator import _OAuthCoordinatorError
 
         assert _OAuthCoordinatorError is OAuthError
+
+
+# ============================================================================
+# #181 secret 脱敏：str() / f-string 不得绕过 __repr__（pydantic __str__ 绕过实测）
+# ============================================================================
+
+
+class TestSecretRedactedStr:
+    """#181 不变量 4：pydantic v2 的 ``__str__`` 走 ``__repr_str__``、绕过子类
+    ``__repr__``——f-string / ``str()`` / ``logging %s`` 曾实测泄露 secret。
+    """
+
+    def _assert_redacted(self, obj: object, *secrets: str) -> None:
+        rendered = str(obj)
+        for secret in secrets:
+            assert secret not in rendered, f"secret {secret!r} leaked via str(): {rendered}"
+        # 双向断言：脱敏标记存在（不是空串假绿）
+        assert "[REDACTED]" in rendered
+
+    def test_launch_str_redacted(self) -> None:
+        launch = OAuthLaunch(
+            authorization_url="https://as.example/authorize?code=abc&state=xyz",
+            state="super-secret-state",
+        )
+        self._assert_redacted(launch, "https://as.example/authorize", "super-secret-state", "abc")
+
+    def test_callback_str_redacted(self) -> None:
+        callback = OAuthCallback(code="auth-code-123", state="state-456", issuer="https://as.example")
+        self._assert_redacted(callback, "auth-code-123", "state-456")
+        # issuer 非 secret（显式保留，对齐 repr 契约）
+        assert "https://as.example" in str(callback)
+
+    def test_cancellation_str_redacted(self) -> None:
+        cancellation = OAuthCancellation(
+            state="state-789",
+            issuer=None,
+            reason=OAuthCancellationReason.Cancelled,
+        )
+        self._assert_redacted(cancellation, "state-789")
+
+    def test_begin_request_str_redacted(self) -> None:
+        request = OAuthBeginRequest(redirect_uri="https://host.example/callback", required_scope=None)
+        self._assert_redacted(request, "https://host.example/callback")
+
+    def test_fstring_uses_str(self) -> None:
+        # 最常见的泄露形态：f-string / logging "%s"
+        launch = OAuthLaunch(authorization_url="https://as.example/authorize?code=abc", state="xyz")
+        rendered = f"{launch}"
+        assert "abc" not in rendered and "xyz" not in rendered

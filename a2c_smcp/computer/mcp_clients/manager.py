@@ -8,13 +8,16 @@ import contextlib
 import json
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any, NoReturn, cast
-from urllib.parse import urlparse
 
 from mcp.client.session import MessageHandlerFnT
 from mcp.types import CallToolResult, ReadResourceResult, Resource, Tool
 from vrl_python import VRLRuntime
 
-from a2c_smcp.computer.mcp_clients.auth_error import build_auth_error_result, classify_auth_error
+from a2c_smcp.computer.mcp_clients.auth_error import (
+    UpstreamRedirectStoppedError,
+    build_auth_error_result,
+    classify_auth_error,
+)
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.http_client import AuthSignal, HttpMCPClient
 from a2c_smcp.computer.mcp_clients.model import (
@@ -37,6 +40,10 @@ from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
     OAuthCredentialStore,
 )
 from a2c_smcp.computer.mcp_clients.oauth_flow import OAuthFlow
+from a2c_smcp.computer.mcp_clients.oauth_security import (
+    same_origin,
+    validate_secure_url,
+)
 from a2c_smcp.computer.mcp_clients.oauth_types import (
     OAuthBeginRequest,
     OAuthCallback,
@@ -86,21 +93,6 @@ def _is_oauth_required_error(exc: BaseException) -> bool:
     )
 
 
-def _same_origin(url_a: str, url_b: str) -> bool:
-    """Same-origin 判定（scheme + host + 默认端口归一的 port）——PRM metadata URL 准入门槛。"""
-    a, b = urlparse(url_a), urlparse(url_b)
-    default_ports = {"http": 80, "https": 443}
-
-    def port_of(scheme: str, port: int | None) -> int:
-        return port if port is not None else default_ports.get(scheme.lower(), 0)
-
-    return (
-        a.scheme.lower() == b.scheme.lower()
-        and a.hostname == b.hostname
-        and port_of(a.scheme, a.port) == port_of(b.scheme, b.port)
-    )
-
-
 def _bump_active_client_generation(generations: dict[BUNDLE_ID, int], bundle_id: BUNDLE_ID) -> None:
     """per-bundle 世代 +1（ABA 检测计数器；Rust ``bump_active_client_generation`` 的 python 面）。
 
@@ -123,6 +115,34 @@ def _bearer_challenge_parts(www_authenticate: str | None) -> tuple[str | None, s
     if scheme.lower() != "bearer":
         return None, None
     return scheme, parse_bearer_resource_metadata(rest)
+
+
+def _has_static_authorization_header(config: MCPServerConfig) -> bool:
+    """配置是否携带静态 Authorization header（#181 static-only 判据）。
+
+    Rust #180 移除显式 OAuth 配置后，带静态 Authorization 的 HTTP server 走 static-only
+    路径——其 401 是静态凭据失败，绝不触发 OAuth（两条路径天然分离，无需互斥检测）。
+    """
+    if not isinstance(config, StreamableHttpServerConfig):
+        return False
+    headers = config.server_parameters.headers
+    if not headers:
+        return False
+    return any(name.lower() == "authorization" for name in headers)
+
+
+def _is_secure_endpoint(config: MCPServerConfig) -> bool:
+    """protected resource 端点是否 HTTPS 或 loopback HTTP（#181 安全不变量 1）。
+
+    与 :func:`validate_secure_url` 同判据——准入失败分类时以 bool 面复用（不抛异常）。
+    """
+    if not isinstance(config, StreamableHttpServerConfig):
+        return False  # pragma: no cover — 调用方已按 _oauth_spec 收窄
+    try:
+        validate_secure_url(str(config.server_parameters.url))
+        return True
+    except OAuthError:
+        return False
 
 
 class ToolNameDuplicatedError(Exception):
@@ -427,25 +447,58 @@ class MCPServerManager:
             await self._commit_active_client(bundle_id, client, clear_epoch)
             return
 
+        if coordinator is not None and _has_static_authorization_header(config):
+            # #181 static-only 配置切换窗口（二轮审查 🟡5）：bundle 先前经 challenge
+            # 准入持有 coordinator，随后配置加入静态 Authorization header（仍 streamable
+            # → 不退役）——退役陈旧 coordinator，让 anonymous-first 重走：静态凭据
+            # 200 直连，或 401 → static-only 精确拒绝（绝不回退 OAuth）
+            self._retire_oauth_bundle(bundle_id)
+            coordinator = None
+
         if coordinator is None:
             # ── anonymous-first（每 client 生命周期至多一次） ──
             client = cast(
                 HttpMCPClient, client_factory(config, message_handler=self._message_handler)
             )
-            signal = await self._bounded_connect(client)
+            try:
+                signal = await self._bounded_connect(client)
+            except UpstreamRedirectStoppedError:
+                # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise
             if signal is None:
                 await self._commit_active_client(bundle_id, client, clear_epoch)  # 匿名连通
                 return
+            # #181 static-only（Rust #180）：配置了静态 Authorization header 的 server
+            # 永远走静态认证——401 即静态凭据被拒（4006 分类面），**绝不回退 OAuth**。
+            # 两条认证路径天然分离，无需互斥检测逻辑。
+            if _has_static_authorization_header(config):
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise OAuthError(
+                    OAuthErrorCode.Protocol,
+                    f"static Authorization header configured for bundle_id={bundle_id!r}; "
+                    f"upstream rejected it with HTTP {signal.status_code} — "
+                    "OAuth is never attempted for this server (static-only)",
+                )
             coordinator = self._admit_oauth_coordinator(bundle_id, config, signal)
             if coordinator is None:
-                # Bearer 无 resource_metadata / cross-origin → 不准入。精确分类（#185，对齐 Rust
-                # HttpAuthenticationError）：challenge 非 Bearer 或缺 resource_metadata →
-                # OAuthDiscoveryFailed 语义；Bearer 但 cross-origin → UnsupportedChallenge 语义。
-                # 二者均以 Protocol + 判别文案 surface（与 authorizationRequired 文案区分 → 不被
-                # _astart_client_auto 吞掉，向调用方传播）。
+                # Bearer 无 resource_metadata / cross-origin / 非安全端点 → 不准入。
+                # 精确分类（#185，对齐 Rust HttpAuthenticationError）：challenge 非 Bearer
+                # 或缺 resource_metadata → OAuthDiscoveryFailed 语义；Bearer 但 cross-origin
+                # 或非 HTTPS → UnsupportedChallenge 语义。二者均以 Protocol + 判别文案
+                # surface（与 authorizationRequired 文案区分 → 不被 _astart_client_auto
+                # 吞掉，向调用方传播）。
                 scheme, metadata_url = _bearer_challenge_parts(signal.www_authenticate_header)
                 if scheme is not None and metadata_url is None:
                     message = f"OAuth resource metadata missing from Bearer challenge (bundle_id={bundle_id!r})"
+                elif not _is_secure_endpoint(config):
+                    # #181：protected resource 端点非 HTTPS 且非 loopback——安全不变量 1
+                    # 拒绝，消息与 cross-origin 区分（排障友好）
+                    message = (
+                        f"protected resource endpoint for bundle_id={bundle_id!r} must use "
+                        "HTTPS (or loopback HTTP for development) — OAuth is never attempted "
+                        "over plaintext HTTP"
+                    )
                 else:
                     message = (
                         f"Unsupported authentication challenge for bundle_id={bundle_id!r} "
@@ -465,7 +518,12 @@ class MCPServerManager:
                         config, message_handler=self._message_handler, oauth_coordinator=coordinator
                     ),
                 )
-                signal = await self._bounded_connect(client, coordinator)
+                try:
+                    signal = await self._bounded_connect(client, coordinator)
+                except UpstreamRedirectStoppedError:
+                    # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛
+                    self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                    raise
                 if signal is None:
                     await self._commit_active_client(bundle_id, client, clear_epoch)
                     return
@@ -557,12 +615,15 @@ class MCPServerManager:
             coordinator.flow_aborted_event().clear()
         connect_task = asyncio.create_task(client.aconnect())
         challenge_wait = asyncio.create_task(client.connect_challenge_event().wait())
+        redirect_stop_wait = asyncio.create_task(client.connect_redirect_event().wait())
         aborted_wait = (
             asyncio.create_task(coordinator.flow_aborted_event().wait())
             if coordinator is not None
             else None
         )
-        inner = [connect_task, challenge_wait] + ([aborted_wait] if aborted_wait is not None else [])
+        inner = [connect_task, challenge_wait, redirect_stop_wait] + (
+            [aborted_wait] if aborted_wait is not None else []
+        )
         try:
             try:
                 done, _pending = await asyncio.wait(
@@ -578,6 +639,11 @@ class MCPServerManager:
             if challenge_wait in done:
                 signal = client.take_connect_challenge()
                 return signal
+            if redirect_stop_wait in done:
+                # #181：安全守卫 stop 的跨 origin redirect——mcp 吞掉 3xx 异常致
+                # aconnect 挂起（#133 同款）；立即解出为 typed error（非授权错误）
+                status = client.take_connect_redirect_stop() or 0
+                raise UpstreamRedirectStoppedError(status)
             if aborted_wait is not None and aborted_wait in done:
                 # provider 全流程死亡 = 401 challenge 拒绝了恢复的凭据（无注册 flow 的
                 # redirect_handler 抛 authorizationRequired）→ 合成 401 信号供调用方清槽
@@ -623,7 +689,13 @@ class MCPServerManager:
             return None
         assert isinstance(config, StreamableHttpServerConfig)  # 调用方已按 _oauth_spec 收窄
         server_url = str(config.server_parameters.url)
-        if not _same_origin(metadata_url, server_url):
+        if not same_origin(metadata_url, server_url):
+            return None
+        # #181：protected resource 端点 HTTPS-only（localhost/loopback http 豁免）——
+        # 非 https 且非 loopback 的明文 server 不进 OAuth 通道（对齐 Rust validate_secure_url）
+        try:
+            validate_secure_url(server_url)
+        except OAuthError:
             return None
         spec = self._oauth_spec(config)
         if spec is None:  # pragma: no cover — 防御分支
@@ -689,15 +761,38 @@ class MCPServerManager:
             # coordinator 已退役（transport 切换 / 配置移除）——ghost 任务守卫：
             # 勿以陈旧 coordinator 对旧端点建立连接 / 写连接状态（#179 隔离复核 🟡c）
             return
-        client = client_factory(config, message_handler=self._message_handler, oauth_coordinator=coordinator)
+        client = cast(
+            HttpMCPClient,
+            client_factory(config, message_handler=self._message_handler, oauth_coordinator=coordinator),
+        )
         connect_task = asyncio.create_task(client.aconnect())
         aborted_wait = asyncio.create_task(coordinator.flow_aborted_event().wait())
-        inner = [connect_task, aborted_wait]
+        redirect_stop_wait = asyncio.create_task(client.connect_redirect_event().wait())
+        inner = [connect_task, aborted_wait, redirect_stop_wait]
         try:
             done, _pending = await asyncio.wait(
                 set(inner),
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if redirect_stop_wait in done:
+                # #181 三轮审查 🔴：交互式路径的 redirect-stop 竞速——跨 origin redirect
+                # 被安全守卫 stop 时（如 DCR 端点 3xx 跨 origin），mcp 的
+                # _handle_registration_response 抛 OAuthRegistrationError → broad except
+                # 吞掉 → aconnect 永不 resolve（#133 同款挂起）。以 typed error 收敛
+                # launch 等待者（fail_launch 同步原子免锁）+ epoch 守卫写 ERROR（同
+                # aborted 分支模式）。
+                status = client.take_connect_redirect_stop() or 0
+                async with self._lock:
+                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
+                        coordinator.fail_launch(
+                            OAuthError(
+                                OAuthErrorCode.Protocol,
+                                f"cross-origin redirect (HTTP {status}) stopped by "
+                                "same-origin guard during interactive OAuth flow",
+                            )
+                        )
+                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                return
             if aborted_wait in done:
                 # flow 已终止/失败（cancel / expire / clear / complete-Terminated）：provider
                 # 流程死亡后 mcp 请求侧挂起（#133 实证）——取消之，防 connect 任务泄漏、

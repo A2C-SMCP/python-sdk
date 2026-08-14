@@ -20,8 +20,15 @@ from mcp.client.session_group import StreamableHttpParameters
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import CallToolResult
 
-from a2c_smcp.computer.mcp_clients.auth_error import UpstreamAuthError
+from a2c_smcp.computer.mcp_clients.auth_error import (
+    UpstreamAuthError,
+    UpstreamRedirectStoppedError,
+)
 from a2c_smcp.computer.mcp_clients.base_client import STATES, BaseMCPClient
+from a2c_smcp.computer.mcp_clients.oauth_security import (
+    CROSS_ORIGIN_REDIRECT_STOP_MARKER,
+    OAuthGuardTransport,
+)
 
 if TYPE_CHECKING:
     from a2c_smcp.computer.mcp_clients.oauth_coordinator import OAuthCoordinator
@@ -75,9 +82,12 @@ class _AuthWatchingClient(httpx.AsyncClient):
         auth: httpx.Auth | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        # 复刻 mcp ``create_mcp_http_client`` 的默认（follow_redirects=True、timeout 兜底 30s）。
-        # ``transport`` 仅用于测试注入（httpx.MockTransport）；生产路径不传（默认 None → 真实网络）。
-        kwargs: dict[str, Any] = {"follow_redirects": True, "timeout": timeout or httpx.Timeout(30.0)}
+        # timeout 兜底 30s（mcp ``create_mcp_http_client`` 同款；OAUTH_HTTP_TIMEOUT 对齐面）。
+        # #181：``follow_redirects=False`` —— redirect 处理由 ``OAuthGuardTransport`` 手工
+        # follow（resource-origin 仅同源、跨 origin stop；httpx 内置 redirect 会把自定义
+        # header 跟随到跨 origin，GHSA-9g45-5xwm-f3wc 面）。``transport`` 由调用方注入
+        # guard（生产/测试同构；测试传 ``httpx.MockTransport`` 内层即可）。
+        kwargs: dict[str, Any] = {"follow_redirects": False, "timeout": timeout or httpx.Timeout(30.0)}
         if headers is not None:
             kwargs["headers"] = headers
         if auth is not None:
@@ -104,6 +114,12 @@ class _AuthWatchingClient(httpx.AsyncClient):
                     response.status_code,
                     www_auth,
                 )
+            elif response.extensions.get(CROSS_ORIGIN_REDIRECT_STOP_MARKER) is not None:
+                # #181：安全守卫 stop 的跨 origin redirect（非授权错误，不走 auth 通道）——
+                # mcp 吞掉 3xx 异常致请求侧挂起（#133 同款），经同机制双通道合成 typed error
+                rpc_id = _parse_jsonrpc_id(response.request.content)
+                self._observer.capture_redirect_stopped_signal(rpc_id, response.status_code)
+                self._observer.capture_connect_redirect_stopped(response.status_code)
             yield response
 
 
@@ -117,10 +133,15 @@ class _AuthSignalObserver:
     def __init__(self) -> None:
         self._signals: dict[object, AuthSignal] = {}
         self._events: dict[object, asyncio.Event] = {}
+        # #181：跨 origin redirect stop 信号（非授权错误，独立槽防与 auth 信号混类）
+        self._redirect_stops: dict[object, int] = {}
         # #179 connect-phase 槽：aconnect 期间的 401/403 challenge（无 rpc_id 关联）。
         # 与 call_tool 的 per-request 通道正交——stream() 两个通道都写。
         self._connect_signal: AuthSignal | None = None
         self._connect_event: asyncio.Event = asyncio.Event()
+        # #181 connect-phase 的 redirect stop 槽（幂等；take 后重置）
+        self._connect_redirect_stop: int | None = None
+        self._connect_redirect_event: asyncio.Event = asyncio.Event()
 
     def register(self, rpc_id: object) -> asyncio.Event | None:
         """登记一次在途调用，返回供其 race 的 Event；``rpc_id`` 为 None（无法关联）则返回 None（退化为直通）。"""
@@ -158,12 +179,45 @@ class _AuthSignalObserver:
         self._connect_event = asyncio.Event()
         return signal
 
+    def capture_redirect_stopped_signal(self, rpc_id: object, status_code: int) -> None:
+        """跨 origin redirect stop：与 auth 信号同通道唤醒（#181 二轮审查 🔴）。"""
+        if rpc_id is None or rpc_id not in self._events:
+            return
+        self._redirect_stops[rpc_id] = status_code
+        self._events[rpc_id].set()
+
+    def notify_redirect_stopped(self, status_code: int, request: httpx.Request) -> None:
+        """transport 层回调（#181 三轮审查 🔴）：auth 管道内请求不经 ``stream()``
+        override——唯一可靠截获点在 transport；双通道写入（per-rpc + connect）。"""
+        rpc_id = _parse_jsonrpc_id(request.content)
+        self.capture_redirect_stopped_signal(rpc_id, status_code)
+        self.capture_connect_redirect_stopped(status_code)
+
+    def take_redirect_stop(self, rpc_id: object) -> int | None:
+        return self._redirect_stops.pop(rpc_id, None)
+
+    def capture_connect_redirect_stopped(self, status_code: int) -> None:
+        """记录首个 connect-phase redirect stop（幂等；take 后重置）。"""
+        if self._connect_redirect_stop is None:
+            self._connect_redirect_stop = status_code
+            self._connect_redirect_event.set()
+
+    def connect_redirect_event(self) -> asyncio.Event:
+        return self._connect_redirect_event
+
+    def take_connect_redirect_stop(self) -> int | None:
+        status = self._connect_redirect_stop
+        self._connect_redirect_stop = None
+        self._connect_redirect_event = asyncio.Event()
+        return status
+
     def take(self, rpc_id: object) -> AuthSignal | None:
         return self._signals.pop(rpc_id, None)
 
     def discard(self, rpc_id: object) -> None:
         self._events.pop(rpc_id, None)
         self._signals.pop(rpc_id, None)
+        self._redirect_stops.pop(rpc_id, None)
 
 
 class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
@@ -207,6 +261,14 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
         """取走并重置 connect-phase challenge 信号（manager 准入判定消费一次）。"""
         return self._auth_observer.take_connect_signal()
 
+    def connect_redirect_event(self) -> asyncio.Event:
+        """connect-phase 跨 origin redirect stop 的唤醒事件（#181，bounded connect 竞速用）。"""
+        return self._auth_observer.connect_redirect_event()
+
+    def take_connect_redirect_stop(self) -> int | None:
+        """取走并重置 connect-phase redirect stop 信号。"""
+        return self._auth_observer.take_connect_redirect_stop()
+
     async def _create_async_session(self) -> ClientSession:
         """
         创建异步会话
@@ -231,12 +293,24 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
             effective_auth = auth
             if self._oauth is not None and self._oauth.needs_oauth_provider():
                 effective_auth = self._oauth.build_oauth_provider()
+            # #181：安全传输守卫（same-origin redirect + config header 注入面 + OAuth 面
+            # 响应体上限）。生产/测试同构：测试注入的 MockTransport 作内层、守卫行为
+            # 与生产一致（防假绿）。
+            base_transport: httpx.AsyncBaseTransport = self._httpx_transport or httpx.AsyncHTTPTransport()
+            guard = OAuthGuardTransport(
+                base_transport,
+                protected_resource_url=str(self.params.url),
+                config_header_names=frozenset(self.params.headers or {}),
+                # #181 三轮审查 🔴：auth 管道内请求不经 stream() override——transport
+                # 层回调写入 observer 双通道（per-rpc + connect）
+                on_redirect_stop=self._auth_observer.notify_redirect_stopped,
+            )
             return _AuthWatchingClient(
                 observer=self._auth_observer,
                 headers=headers,
                 timeout=timeout,
                 auth=effective_auth,
-                transport=self._httpx_transport,
+                transport=guard,
             )
 
         aread_stream, awrite_stream, _ = await self._aexit_stack.enter_async_context(
@@ -285,6 +359,11 @@ class HttpMCPClient(BaseMCPClient[StreamableHttpParameters]):
                     call_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception, asyncio.TimeoutError):
                         await asyncio.wait_for(call_task, timeout=3.0)
+                    # #181：redirect stop 与 auth 信号共用唤醒事件——先判别 redirect 槽
+                    # （非授权错误，typed error 走通用失败路径而非 4006/4007）
+                    redirect_status = self._auth_observer.take_redirect_stop(request_id)
+                    if redirect_status is not None:
+                        raise UpstreamRedirectStoppedError(redirect_status)
                     # event.is_set() 保证 signal 已写入（capture 先写信号再 set event）；take 取出。
                     # 防御：理论不达的 None（如 event 被外部误 set）→ 不落到 call_task.result()（call_task 已
                     # cancel，会冒 CancelledError 给上层不被 except Exception 捕获），而是按 §降级语义兜底 4006。

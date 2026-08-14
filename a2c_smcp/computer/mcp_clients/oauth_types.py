@@ -210,6 +210,11 @@ class OAuthBeginRequest(_OAuthBaseModel):
             f"required_scope={self.required_scope!r})"
         )
 
+    def __str__(self) -> str:
+        """#181：pydantic v2 的 ``__str__`` 走 ``__repr_str__``、绕过子类 ``__repr__``——
+        f-string / ``str()`` / ``logging %s`` 会泄露 redirect_uri。覆写为脱敏 repr。"""
+        return repr(self)
+
 
 # ============================================================================
 # OAuthLaunch（repr 脱敏）
@@ -230,6 +235,10 @@ class OAuthLaunch(_OAuthBaseModel):
         """脱敏 repr：避免 authorization_url / state 进入日志。"""
         return f"OAuthLaunch(authorization_url={_REDACTED!r}, state={_REDACTED!r})"
 
+    def __str__(self) -> str:
+        """#181：pydantic ``__str__`` 绕过 ``__repr__``（f-string / logging 泄露面）——覆写为脱敏 repr。"""
+        return repr(self)
+
 
 # ============================================================================
 # OAuthCallback（repr 脱敏）
@@ -249,6 +258,10 @@ class OAuthCallback(_OAuthBaseModel):
     def __repr__(self) -> str:
         """脱敏 repr：避免 code / state 进入日志。"""
         return f"OAuthCallback(code={_REDACTED!r}, state={_REDACTED!r}, issuer={self.issuer!r})"
+
+    def __str__(self) -> str:
+        """#181：pydantic ``__str__`` 绕过 ``__repr__``（f-string / logging 泄露面）——覆写为脱敏 repr。"""
+        return repr(self)
 
 
 # ============================================================================
@@ -272,6 +285,10 @@ class OAuthCancellation(_OAuthBaseModel):
             f"OAuthCancellation(state={_REDACTED!r}, "
             f"issuer={self.issuer!r}, reason={self.reason!r})"
         )
+
+    def __str__(self) -> str:
+        """#181：pydantic ``__str__`` 绕过 ``__repr__``（f-string / logging 泄露面）——覆写为脱敏 repr。"""
+        return repr(self)
 
 
 # ============================================================================
