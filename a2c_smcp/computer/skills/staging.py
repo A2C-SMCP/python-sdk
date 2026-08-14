@@ -391,12 +391,17 @@ def _uri_leaf(uri: str) -> str:
     return path.split("/", 1)[0] if path else ""
 
 
+def _is_under(uri: str, root_uri: str) -> bool:
+    """真前缀归属：``uri`` 位于 ``root_uri`` 之下（以 ``root_uri + "/"`` 为界，全 URI 串口径）。"""
+    return uri.startswith(root_uri + "/")
+
+
 def _partition_roots(resources: Sequence[Resource]) -> tuple[list[Resource], dict[str, str]]:
     """
     把单 server 全量 skill:// 资源切分为「根」与「被覆盖者」（#188：URI 前缀归属优先于 _meta.source）。
 
-    带 ``_meta.source`` ∈ ``_MCP_SOURCE_MODES`` 者先全量收集为候选；候选间按真前缀 ``<other>/``
-    （与 resources 子资源过滤同口径：全 URI 串 startswith）判定覆盖——被覆盖者从根集合排除：
+    带 ``_meta.source`` ∈ ``_MCP_SOURCE_MODES`` 者先全量收集为候选；候选间按真前缀
+    :func:`_is_under`（与 resources 子资源过滤同一谓词）判定覆盖——被覆盖者从根集合排除：
     其 meta 是 provider 在非根资源上的多余声明，物化 / 注册一律跳过，日志降级由调用方负责。
     最长前缀 = 立即父（嵌套链经逐条 DEBUG 可重建）。
     覆盖者须为有效根（``_uri_leaf`` 非空）：leaf-less 候选自身走调用方既有 ERROR 分支，
@@ -419,7 +424,7 @@ def _partition_roots(resources: Sequence[Resource]) -> tuple[list[Resource], dic
             other_uri = str(other.uri)
             if other_uri == uri or not _uri_leaf(other_uri):
                 continue
-            if uri.startswith(other_uri + "/") and (coverer is None or len(other_uri) > len(coverer)):
+            if _is_under(uri, other_uri) and (coverer is None or len(other_uri) > len(coverer)):
                 coverer = other_uri
         if coverer is not None:
             covered[uri] = coverer
@@ -514,7 +519,12 @@ async def stage_mcp_skills(
                 len(covered),
             )
             for uri, coverer in covered.items():
-                logger.debug("bundle %s: skill resource %s covered by root %s; skipping", bid, uri, coverer)
+                logger.debug(
+                    "bundle %s: skill resource %s covered by skill resource %s (immediate parent); skipping",
+                    bid,
+                    uri,
+                    coverer,
+                )
         for res in roots:
             meta = dict(getattr(res, "meta", None) or {})
             mode = meta.get("source")  # _partition_roots 已保证 ∈ _MCP_SOURCE_MODES
@@ -532,7 +542,7 @@ async def stage_mcp_skills(
                 elif mode == "archive":
                     await _materialize_archive(meta, staged, fetch)
                 else:  # resources
-                    subs = [r for r in resources if str(r.uri).startswith(root_uri + "/")]
+                    subs = [r for r in resources if _is_under(str(r.uri), root_uri)]
                     await _materialize_resources(partial(manager.read_resource, bid), root_uri, subs, staged)
             except Exception as e:
                 logger.error("materialize failed for %s (mode=%s): %s", root_uri, mode, e, exc_info=True)

@@ -463,7 +463,7 @@ async def test_covered_child_with_source_meta_not_materialized_as_root(
     assert not any(r.levelno == logging.ERROR for r in staging_logs.records)
     assert any(r.levelno == logging.WARNING and "covered by other roots" in r.getMessage() for r in staging_logs.records)
     assert any(
-        r.levelno == logging.DEBUG and sub1_uri in r.getMessage() and "covered by root" in r.getMessage()
+        r.levelno == logging.DEBUG and sub1_uri in r.getMessage() and "covered by skill resource" in r.getMessage()
         for r in staging_logs.records
     )
     assert any(r.levelno == logging.DEBUG and sub2_uri in r.getMessage() for r in staging_logs.records)
@@ -502,11 +502,13 @@ async def test_nested_covered_roots_all_excluded(tmp_path: Path, staging_logs: p
     assert any(r.levelno == logging.WARNING and "covered by other roots" in r.getMessage() for r in staging_logs.records)
     # 立即父语义：B→A、C→B（最长前缀覆盖者）
     assert any(
-        r.levelno == logging.DEBUG and "skill://h/a/b covered by root skill://h/a" in r.getMessage()
+        r.levelno == logging.DEBUG
+        and "skill://h/a/b covered by skill resource skill://h/a (immediate parent)" in r.getMessage()
         for r in staging_logs.records
     )
     assert any(
-        r.levelno == logging.DEBUG and "skill://h/a/b/c covered by root skill://h/a/b" in r.getMessage()
+        r.levelno == logging.DEBUG
+        and "skill://h/a/b/c covered by skill resource skill://h/a/b (immediate parent)" in r.getMessage()
         for r in staging_logs.records
     )
 
