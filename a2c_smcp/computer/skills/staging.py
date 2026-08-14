@@ -391,6 +391,41 @@ def _uri_leaf(uri: str) -> str:
     return path.split("/", 1)[0] if path else ""
 
 
+def _partition_roots(resources: Sequence[Resource]) -> tuple[list[Resource], dict[str, str]]:
+    """
+    把单 server 全量 skill:// 资源切分为「根」与「被覆盖者」（#188：URI 前缀归属优先于 _meta.source）。
+
+    带 ``_meta.source`` ∈ ``_MCP_SOURCE_MODES`` 者先全量收集为候选；候选间按真前缀 ``<other>/``
+    （与 resources 子资源过滤同口径：全 URI 串 startswith）判定覆盖——被覆盖者从根集合排除：
+    其 meta 是 provider 在非根资源上的多余声明，物化 / 注册一律跳过，日志降级由调用方负责。
+    最长前缀 = 立即父（嵌套链经逐条 DEBUG 可重建）。
+    覆盖者须为有效根（``_uri_leaf`` 非空）：leaf-less 候选自身走调用方既有 ERROR 分支，
+    不得静默吞掉其名下的合法根。无 ``source`` 的资源不是候选、不覆盖别人、也不被排除
+    （仍由覆盖者按 resources 模式作为普通子资源物化）。
+    保持 candidates 原相对顺序（``seen_this_run`` 先到者语义依赖此序）。
+
+    :return: ``(roots, covered)``——根列表（保序）与被覆盖映射 ``{被覆盖 URI: 覆盖者 URI}``。
+    """
+    candidates = [
+        res
+        for res in resources
+        if dict(getattr(res, "meta", None) or {}).get("source") in _MCP_SOURCE_MODES
+    ]
+    covered: dict[str, str] = {}
+    for res in candidates:
+        uri = str(res.uri)
+        coverer: str | None = None
+        for other in candidates:
+            other_uri = str(other.uri)
+            if other_uri == uri or not _uri_leaf(other_uri):
+                continue
+            if uri.startswith(other_uri + "/") and (coverer is None or len(other_uri) > len(coverer)):
+                coverer = other_uri
+        if coverer is not None:
+            covered[uri] = coverer
+    return [r for r in candidates if str(r.uri) not in covered], covered
+
+
 # ── A2CSkillRef 合成 / ref construction ─────────────────────────────────────
 def _apply_frontmatter_optional_fields(ref: A2CSkillRef, frontmatter: dict[str, Any]) -> None:
     """
@@ -468,11 +503,21 @@ async def stage_mcp_skills(
     for bid, resources in by_server.items():
         # bid = manager 身份键，同时即 SKILL ``<server>`` 段与磁盘路径分组键（skill.md §1.3）。
         # display ``name`` 纯展示、允许碰撞、永不做键——不参与此处任何构造。
-        for res in resources:
+        # #188：先按 URI 前缀归属切分——被其他根覆盖的资源（provider 在非根资源上多声明了
+        # _meta.source）不再走根物化路径，日志降级（归属判断优先于 meta 判断）。
+        roots, covered = _partition_roots(resources)
+        if covered:
+            logger.warning(
+                "bundle %s: %d skill:// resource(s) declared as SKILL roots are covered by other roots "
+                "(provider-declared _meta.source on non-root resources); root materialization skipped",
+                bid,
+                len(covered),
+            )
+            for uri, coverer in covered.items():
+                logger.debug("bundle %s: skill resource %s covered by root %s; skipping", bid, uri, coverer)
+        for res in roots:
             meta = dict(getattr(res, "meta", None) or {})
-            mode = meta.get("source")
-            if mode not in _MCP_SOURCE_MODES:
-                continue  # 非 SKILL 根（子资源 / 未声明 source）→ 跳过
+            mode = meta.get("source")  # _partition_roots 已保证 ∈ _MCP_SOURCE_MODES
 
             root_uri = str(res.uri)
             leaf = _uri_leaf(root_uri)

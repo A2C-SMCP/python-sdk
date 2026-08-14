@@ -31,7 +31,7 @@ from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextRe
 
 import a2c_smcp.computer.skills.staging as staging_mod
 from a2c_smcp.computer.skills.registry import SkillRegistry
-from a2c_smcp.computer.skills.staging import stage_mcp_skills, stage_user_skills
+from a2c_smcp.computer.skills.staging import _partition_roots, stage_mcp_skills, stage_user_skills
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
@@ -470,22 +470,26 @@ async def test_covered_child_with_source_meta_not_materialized_as_root(
 
 
 async def test_nested_covered_roots_all_excluded(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
-    """#188 嵌套链 A>B>C：B、C 均被排除（覆盖判定不看覆盖者自身是否被覆盖），仅 A 注册。"""
-    a_uri = "skill://h/a"
-    b_uri = "skill://h/a/b"
-    c_uri = "skill://h/a/b/c"
-    md_uri = "skill://h/a/SKILL.md"
-    a = _root(a_uri, {"source": "resources"})
-    b = _root(b_uri, {"source": "resources"})
-    c = _root(c_uri, {"source": "resources"})
-    sub_md = Resource(uri=md_uri, name="SKILL.md")
-    # B/C 是「目录型」节点，也在 A 的子资源前缀内 → 必须齐备 reads，否则父根物化 KeyError 误红
-    reads = {
-        md_uri: ReadResourceResult(contents=[TextResourceContents(uri=md_uri, text=_skill_md(name="a"))]),
-        b_uri: ReadResourceResult(contents=[TextResourceContents(uri=b_uri, text="b")]),
-        c_uri: ReadResourceResult(contents=[TextResourceContents(uri=c_uri, text="c")]),
-    }
-    mgr = FakeManager([("srv", a), ("srv", b), ("srv", c), ("srv", sub_md)], reads=reads)
+    """#188 嵌套链 A>B>C：B、C 均被排除（覆盖判定不看覆盖者自身是否被覆盖），仅 A 注册。
+
+    三者均用 mounted：resources 父根会把 B/C 这类「目录型节点」也当子资源逐个 read——
+    落盘为文件后再遇更深子资源会路径冲突，那是 provider 畸形形状的既存毒丸（与归属排除正交）；
+    mounted 无子资源枚举，链式覆盖可干净表达。
+    """
+    mount_a = tmp_path / "mount" / "a"
+    mount_a.mkdir(parents=True)
+    (mount_a / "SKILL.md").write_text(_skill_md(name="a"), encoding="utf-8")
+    mount_b = tmp_path / "mount" / "b"
+    mount_b.mkdir(parents=True)
+    (mount_b / "SKILL.md").write_text(_skill_md(name="b"), encoding="utf-8")
+    mount_c = tmp_path / "mount" / "c"
+    mount_c.mkdir(parents=True)
+    (mount_c / "SKILL.md").write_text(_skill_md(name="c"), encoding="utf-8")
+
+    a = _root("skill://h/a", {"source": "mounted", "mount_dir": str(mount_a)})
+    b = _root("skill://h/a/b", {"source": "mounted", "mount_dir": str(mount_b)})
+    c = _root("skill://h/a/b/c", {"source": "mounted", "mount_dir": str(mount_c)})
+    mgr = FakeManager([("srv", a), ("srv", b), ("srv", c)])
     reg = SkillRegistry()
     home = tmp_path / "home"
 
@@ -496,8 +500,15 @@ async def test_nested_covered_roots_all_excluded(tmp_path: Path, staging_logs: p
     assert (Path(reg.resolve("mcp:srv:a")["path"]) / "SKILL.md").is_file()  # type: ignore[index]
     assert not any(r.levelno == logging.ERROR for r in staging_logs.records)
     assert any(r.levelno == logging.WARNING and "covered by other roots" in r.getMessage() for r in staging_logs.records)
-    assert any(r.levelno == logging.DEBUG and b_uri in r.getMessage() for r in staging_logs.records)
-    assert any(r.levelno == logging.DEBUG and c_uri in r.getMessage() for r in staging_logs.records)
+    # 立即父语义：B→A、C→B（最长前缀覆盖者）
+    assert any(
+        r.levelno == logging.DEBUG and "skill://h/a/b covered by root skill://h/a" in r.getMessage()
+        for r in staging_logs.records
+    )
+    assert any(
+        r.levelno == logging.DEBUG and "skill://h/a/b/c covered by root skill://h/a/b" in r.getMessage()
+        for r in staging_logs.records
+    )
 
 
 async def test_prefix_boundary_sibling_xy_not_covered(tmp_path: Path) -> None:
@@ -565,6 +576,32 @@ async def test_independent_bad_root_still_errors_sibling_unaffected(
     assert len(reg) == 1
     assert any(r.levelno == logging.ERROR and "materialize failed" in r.getMessage() for r in staging_logs.records)
     assert not (home / "mcp" / "srv" / "lonely").exists()
+
+
+def test_partition_roots_leafless_guard_and_order() -> None:
+    """#188 纯函数：leaf-less 候选不得覆盖别人；未被覆盖的 leaf-less 保留在 roots（ERROR 分支可达）；保序。"""
+    leafless = _root("skill://h", {"source": "resources"})
+    a = _root("skill://h/a", {"source": "resources"})
+    sub_a = _root("skill://h/a/SKILL.md", {"source": "resources"})  # 被 a 覆盖
+    plain = Resource(uri="skill://h/a/notes.md", name="notes.md")  # 无 source：非候选、不覆盖、不被排除
+
+    roots, covered = _partition_roots([leafless, a, sub_a, plain])
+
+    assert [str(r.uri) for r in roots] == ["skill://h", "skill://h/a"]  # 保序；leafless 未被覆盖
+    assert covered == {"skill://h/a/SKILL.md": "skill://h/a"}
+
+
+def test_partition_roots_nested_chain_and_duplicate_uri() -> None:
+    """#188 纯函数：嵌套 A>B>C 记立即父（B→A、C→B）；重复 URI 不自覆盖（去重属范围外，保持现状）。"""
+    a = _root("skill://h/a", {"source": "resources"})
+    b = _root("skill://h/a/b", {"source": "resources"})
+    c = _root("skill://h/a/b/c", {"source": "resources"})
+    dup = _root("skill://h/a", {"source": "resources"})
+
+    roots, covered = _partition_roots([a, b, c, dup])
+
+    assert [str(r.uri) for r in roots] == ["skill://h/a", "skill://h/a"]  # 重复副本都留在 roots
+    assert covered == {"skill://h/a/b": "skill://h/a", "skill://h/a/b/c": "skill://h/a/b"}
 
 
 # ── user 源 DropIn（就地发现，不 staging，#60）────────────────────────────────
