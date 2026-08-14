@@ -465,6 +465,28 @@ class OAuthError(Exception):
         return cls(OAuthErrorCode.Protocol, f"OAuth protocol error: {category.value}")
 
 
+# mcp ≥1.29 的 403 insufficient_scope inline step-up 在**从未 discovery**（如凭据恢复直连、
+# 未见过 401 challenge）时会绕过宿主契约自动跑授权——coordinator 以本 sentinel 挡回
+# （等效 403 信号面），传输层据它合成 401/403 信号走 SDK 既有 4007 分类。sentinel 值由
+# 工厂生成（单一权威，杜绝两处字符串漂移）。
+_STEPUP_INSUFFICIENT_SCOPE_SENTINEL = OAuthError.protocol(OAuthProtocolError.InsufficientScope).message
+# 合成 WWW-Authenticate（传输层信号面的 403 等效形态；分类器只读状态码，本头为诊断面）
+SYNTH_INSUFFICIENT_SCOPE_CHALLENGE = 'Bearer error="insufficient_scope"'
+
+
+def is_stepup_insufficient_scope_error(exc: BaseException) -> bool:
+    """判定异常是否为「mcp inline 403 step-up 被挡回」的 sentinel（跨模块稳定判据）。
+
+    与 Rust 对齐面无关（python 内部分类面），仅用于传输层把 auth 层吞掉的 403 重新
+    合成为可观测信号。
+    """
+    return (
+        isinstance(exc, OAuthError)
+        and exc.code == OAuthErrorCode.Protocol
+        and exc.message == _STEPUP_INSUFFICIENT_SCOPE_SENTINEL
+    )
+
+
 def default_oauth_options() -> OAuthOptions:
     """automatic-only（Rust #180）默认选项：Auth Code + DCR、无预设 scopes。
 
@@ -489,4 +511,6 @@ __all__ = [
     "OAuthOptions",
     "OAuthProtocolError",
     "OAuthStatus",
+    "SYNTH_INSUFFICIENT_SCOPE_CHALLENGE",
+    "is_stepup_insufficient_scope_error",
 ]

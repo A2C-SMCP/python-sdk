@@ -293,12 +293,12 @@ class TestBoundedConnect:
         assert state == MCPServerConnectionState.AUTHORIZATION_REQUIRED
 
     @pytest.mark.asyncio
-    async def test_bearer_without_metadata_no_admission(
+    async def test_bearer_without_metadata_admits_oauth_required(
         self, monkeypatch: pytest.MonkeyPatch, oauth_config: StreamableHttpServerConfig
     ) -> None:
-        """Bearer 无 resource_metadata → 不准入 → ERROR + OAuthError 精确分类（#185，Rust
-        ``BearerWithoutMetadata`` → ``OAuthDiscoveryFailed`` 语义：Protocol + 判别文案，
-        与 authorizationRequired 文案区分 → 不被 auto 路径吞掉）。"""
+        """裸 Bearer challenge（无 resource_metadata）→ 仍准入（AS 发现交由 mcp well-known
+        回退链），未授权时上抛 **OAuthRequired**（非 DiscoveryFailed）——auto 路径吞掉、
+        显式 start 向调用方传播（宿主经 facade 驱动授权）。"""
         handler, stats = make_fake_as_handler(extra={"challenge_header": "Bearer"})
 
         def factory(
@@ -318,11 +318,13 @@ class TestBoundedConnect:
         await manager.ainitialize([oauth_config])
         with pytest.raises(OAuthError) as exc:
             await manager.astart_client("oauth-server")
-        assert exc.value.code == OAuthErrorCode.Protocol
-        assert "resource metadata missing" in exc.value.message
-        # 精确分类 ≠ authorizationRequired：auto 路径**不得**吞掉本错误
-        assert not _is_oauth_required_error(exc.value)
-        assert _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR
+        # 语义反转（升级 mcp ≥1.29 + well-known 回退准入）：不再 ERROR + DiscoveryFailed，
+        # 而是 AUTHORIZATION_REQUIRED + OAuthRequired（等待宿主 facade 驱动授权）
+        assert _is_oauth_required_error(exc.value)
+        assert (
+            _connection_state(manager, "oauth-server")
+            == MCPServerConnectionState.AUTHORIZATION_REQUIRED
+        )
 
     @pytest.mark.asyncio
     async def test_cross_origin_metadata_no_admission(
