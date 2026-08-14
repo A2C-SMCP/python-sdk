@@ -39,6 +39,21 @@ poetry add a2c-smcp --allow-prereleases
 # 注：可将版本号替换为你期望的上界/下界约束，如 "^0.1.0" 或 "0.1.0rc*"
 ```
 
+### 可选依赖（extras）
+
+按角色能力拆分，按需声明，避免基础安装携带无关依赖：
+
+| Extra | 用途 | 内容 |
+|-------|------|------|
+| `a2c-smcp[server]` | 起真实信令 Server（e2e / 联调），配合 `a2c_smcp.testing` 使用 | werkzeug（WSGI 同步 runner）+ uvicorn（ASGI 异步 runner） |
+| `a2c-smcp[cli]` | Computer 交互式 CLI | typer + rich + prompt-toolkit |
+| `a2c-smcp[keyring]` | `password:true` input 的 OS 凭据后端（SecretStorage） | keyring |
+
+```bash
+pip install "a2c-smcp[server]"          # pip
+poetry add a2c-smcp -E server           # Poetry
+```
+
 
 ## 协议兼容性 (SDK ↔ A2C-SMCP Protocol)
 
@@ -147,6 +162,9 @@ socket_app = A2CProtocolVersionASGIMiddleware(socket_app, socketio_path="/socket
 
 同步版本、会话查询与自定义认证示例请参考 `docs/server.md`。
 
+> **e2e / 联调提示**：测试环境起 Server 不必手写上方装配（permissive auth、`async_handlers=True`、
+> `start_service_task=False`、版本握手包裹等易错细节），直接用 [`a2c_smcp.testing`](#下游-e2e-测试支持a2c_smcptesting)。
+
 
 ## 模块三：Agent（业务侧智能体客户端）
 
@@ -201,6 +219,34 @@ asyncio.run(main())
 ```
 
 事件回调（同步/异步）、拉取工具列表与错误处理等完整示例请参考 `docs/agent.md`。
+
+
+## 下游 e2e 测试支持（a2c_smcp.testing）
+
+需要搭「Agent → 信令 Server → Computer」真实链路测试的下游项目，无需再从 SDK 私有测试「考古」装配
+细节——`a2c_smcp.testing` 提供生产等价的装配配方（放行认证、`async_handlers=True` + `always_connect=True`、
+`start_service_task=False`、协议版本握手中间件包裹，缺任何一项都会埋雷）。SDK 自己的 e2e 套件消费同一
+模块，契约演进时下游随升级自动对齐。
+
+```python
+# pyproject.toml（依赖声明）
+# dependencies = ["a2c-smcp[server]"]
+
+# conftest.py —— 5 行起步：起一个真实 HTTP 信令服务
+from a2c_smcp.testing import create_local_sync_server, run_http_server
+
+with run_http_server() as (host, port):   # 多进程 werkzeug 服务，含版本握手中间件
+    ...
+```
+
+- **同步 WSGI 形态**：`create_local_sync_server()` 返回 `(sio, 命名空间, 握手中间件包裹的 WSGI app)`；
+  `run_http_server()` 以多进程方式把 app 跑成真实 HTTP 服务（含就绪同步与进程回收）。
+- **异步 ASGI 形态**：`create_local_async_server()` 返回 `(sio, 命名空间, ASGI app)`；配合
+  `UvicornTestServer(app, port=...).up()/.down(force=True)` 进程内起停。
+- **惰性导入契约**：未安装 `a2c-smcp[server]` 时 `import a2c_smcp.testing` 不报错；仅调用起服务
+  函数时才抛出携带安装提示（`pip install "a2c-smcp[server]"`）的 `ImportError`。
+- 放行认证：`PermissiveSyncAuthenticationProvider` / `PermissiveAuthenticationProvider` 与
+  `LocalSyncSMCPNamespace` / `LocalSMCPNamespace` 亦公开可组合。
 
 
 ## 桌面模式与窗口资源（Desktop）

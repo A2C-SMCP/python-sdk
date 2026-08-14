@@ -64,7 +64,25 @@ from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolutionError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
-from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
+from a2c_smcp.computer.mcp_clients.model import (
+    MCPServerConfig,
+    MCPServerInput,
+    MCPServerRuntimeStatus,
+)
+from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
+    InMemoryOAuthCredentialStore,
+    OAuthCredentialStore,
+)
+from a2c_smcp.computer.mcp_clients.oauth_flow import OAuthFlow
+from a2c_smcp.computer.mcp_clients.oauth_types import (
+    OAuthBeginRequest,
+    OAuthCallback,
+    OAuthCancellation,
+    OAuthError,
+    OAuthErrorCode,
+    OAuthFlowOutcome,
+    OAuthStatus,
+)
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
     McpApprovalStatus,
@@ -225,6 +243,12 @@ class Computer(BaseComputer[PromptSession]):
         self._active_raw: dict[str, MCPServerConfig] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
+        # #185：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——仅
+        # clear_oauth 的**实际能力撤回**时 +1（见 clear_oauth；config 轴分账见类内 §12 R2 注释）。
+        self._capability_revision: int = 0
+        # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
+        # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
+        self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
         self._confirm_callback = confirm_callback
         # 中文: 按需解析器与渲染器（惰性解析 inputs，保持配置不可变）
         # English: Lazy input resolver and renderer (on-demand inputs, keep config immutable)
@@ -400,6 +424,7 @@ class Computer(BaseComputer[PromptSession]):
             auto_connect=self._auto_connect,
             auto_reconnect=self._auto_reconnect,
             message_handler=self._on_manager_change,
+            oauth_credential_store=self._oauth_credential_store,
         )
         # 中文: 对每个 Server 配置执行：渲染(占位符解析链 + 预定义变量) + envFile 合并 + 校验生成不可变对象。
         #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
@@ -945,6 +970,7 @@ class Computer(BaseComputer[PromptSession]):
                 auto_connect=self._auto_connect,
                 auto_reconnect=self._auto_reconnect,
                 message_handler=self._on_manager_change,
+                oauth_credential_store=self._oauth_credential_store,
             )
         # 先物化进 manager，**成功后**再登记 raw（事务性一致：manager add 失败——如 server 活跃 ∧ 非 auto_reconnect
         # 抛 RuntimeError——则不留 attempted≠running 的 map 漂移；raw 恒未渲染故无安全影响，此为展示一致性加固）。
@@ -1978,6 +2004,144 @@ class Computer(BaseComputer[PromptSession]):
 
         out.sort(key=lambda entry: entry.bundle_id)
         return out
+
+    # ── #184 正交运行时状态 / Orthogonal runtime status ──────────────────────────
+
+    def get_server_runtime_statuses(self) -> list[MCPServerRuntimeStatus]:
+        """获取 MCP Server 正交运行时状态快照（纯内存读取） / Orthogonal runtime status snapshot.
+
+        **不依赖 async / 不发起 MCP RPC**——仅读取 manager 的内存态。
+
+        Returns:
+            list[MCPServerRuntimeStatus]: 每个已注册 server 的正交状态；
+            若 manager 未初始化则返回空列表。
+        """
+        if self.mcp_manager is None:
+            return []
+        return self.mcp_manager.get_server_runtime_statuses()
+
+    # ── #179 公共 OAuth facade（签名对齐 Rust Computer；宿主持有 callback） ──────
+
+    def with_oauth_credential_store(self, store: OAuthCredentialStore) -> "Computer":
+        """注入 OAuth 凭据存储（builder，返回 self） / Inject the OAuth credential store (builder).
+
+        默认进程内 :class:`InMemoryOAuthCredentialStore`；跨进程恢复（Sub 4）由宿主
+        注入持久化实现。须在 :meth:`boot_up` 之前调用（manager 构建时透传）。
+
+        Args:
+            store: 宿主提供的凭据存储实现（load/save/delete 协议）。
+
+        Returns:
+            Computer: self（链式调用）。
+        """
+        self._oauth_credential_store = store
+        return self
+
+    async def oauth_status(self, bundle_id: str) -> OAuthStatus:
+        """查询指定 MCP Server 的 OAuth 授权状态 / Query a server's OAuth authorization status.
+
+        Raises:
+            OAuthError: ``NotConfigured``（manager 未初始化 / 未准入 / 未知 bundle）；
+                ``UnsupportedTransport``（非 Streamable HTTP）。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return await self.mcp_manager.oauth_status(bundle_id)
+
+    def create_oauth_flow(self, bundle_id: str, request: OAuthBeginRequest) -> OAuthFlow:
+        """注册交互式授权 flow（**同步、无 I/O**） / Stage an interactive OAuth flow (no I/O).
+
+        相同请求幂等返回同一 :class:`OAuthFlow` handle；不同请求 →
+        ``AuthorizationAlreadyPending``。SDK 全程不开浏览器 / 不绑端口 / 不等待回调——
+        :meth:`OAuthFlow.launch` 返回授权 URL + state，回调由宿主提交
+        :meth:`complete_oauth` / :meth:`cancel_oauth`。
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+            request: 宿主回调参数（redirect_uri 为宿主拥有）。
+
+        Returns:
+            OAuthFlow: 该 flow 的 handle。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return self.mcp_manager.create_oauth_flow(bundle_id, request)
+
+    async def complete_oauth(self, bundle_id: str, callback: OAuthCallback) -> OAuthFlowOutcome:
+        """提交宿主浏览器回调并等待终态结果 / Submit the host browser callback.
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+            callback: 回调解析值（code + state + 可选 issuer）。
+
+        Returns:
+            OAuthFlowOutcome: ``authorized`` / ``terminated`` 结构化结果。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return await self.mcp_manager.complete_oauth(bundle_id, callback)
+
+    async def cancel_oauth(self, bundle_id: str, cancellation: OAuthCancellation) -> OAuthFlowOutcome:
+        """宿主取消 / AS 错误回调（按 reason 分派） / Host cancellation or provider error callback.
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+            cancellation: 结构化取消输入（state + reason + 可选 issuer）。
+
+        Returns:
+            OAuthFlowOutcome: 结构化终态结果。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        return await self.mcp_manager.cancel_oauth(bundle_id, cancellation)
+
+    @property
+    def capability_revision(self) -> int:
+        """capability 轴修订计数（#185，对齐 Rust ``Computer::capability_revision``）。
+
+        仅当 :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）
+        时 +1；幂等重复 clear 不递增。config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
+        """
+        return self._capability_revision
+
+    async def clear_oauth(self, bundle_id: str) -> None:
+        """清除该 server 的 OAuth 授权并传播能力撤销（#185）。
+
+        凭据 + 流程 + 状态 commit + 退役 client（manager 层），随后**仅当有实际能力变化**
+        （``capability_changed``）时：bump :attr:`capability_revision` + 经 Socket.IO 发射
+        ``server:update_tool_list``（Server 广播 ``notify:update_tool_list`` → Agent 重拉工具
+        列表，被清除 server 的工具即时从 Agent 可见面消失）。重复 clear 已清除的 bundle =
+        ``capability_changed=False`` → 不 bump、不广播（幂等）。
+
+        传播失败不吞：bump 为本地状态必然发生；emit 失败记 ERROR 日志（与
+        ``_on_manager_change`` 的 ToolListChanged 上报同姿态）。
+
+        Args:
+            bundle_id: 目标 server 的 bundle_id。
+        """
+        self._require_oauth_manager()
+        assert self.mcp_manager is not None
+        capability_changed = await self.mcp_manager.clear_oauth(bundle_id)
+        if not capability_changed:
+            return
+        self._capability_revision += 1
+        client = self.socketio_client
+        if client is None:
+            logger.debug("Socket.IO 客户端不存在或已释放，忽略能力撤销上报")
+            return
+        try:
+            # 直接通过事件常量发送（工具列表更新；office_id 守卫在 emit_update_tool_list 内）
+            await client.emit_update_tool_list()
+        except Exception:
+            logger.error("上报能力撤销（工具变更）失败", exc_info=True)
+
+    def _require_oauth_manager(self) -> None:
+        """facade 前置守卫：manager 未初始化（boot 前）→ ``NotConfigured``（Rust 语义）。"""
+        if self.mcp_manager is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
 
     def get_skills(self) -> list[A2CSkillRef]:
         """当前已安装且可用 SKILL（排除孤儿；不排序、不去重）—— ``client:get_skills`` 数据源。

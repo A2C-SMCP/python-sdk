@@ -40,7 +40,12 @@ from a2c_smcp.smcp import (
     UPDATE_CONFIG_EVENT,
     ErrorCode,
 )
-from tests.integration_tests.server._local_sync_server import create_local_sync_server
+from a2c_smcp.testing import create_local_sync_server
+
+
+def _url(port: int) -> str:
+    """中文: 携带 a2c_version 的裸客户端连接 URL（装配已含版本握手中间件，#187）。"""
+    return f"http://localhost:{port}?a2c_version={PROTOCOL_VERSION}"
 
 
 @pytest.fixture
@@ -131,11 +136,11 @@ def test_enter_and_broadcast_sync(startup_and_shutdown_local_sync_server, sync_s
     def _on_enter(data: dict):  # noqa: ANN001
         enter_events.append(data)
 
-    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    agent.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     office_id = "office-sync-s1"
     _join_office(agent, role="agent", office_id=office_id, name="robot-S1")
 
-    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     _join_office(computer, role="computer", office_id=office_id, name="comp-S1")
 
     time.sleep(0.2)
@@ -155,11 +160,11 @@ def test_leave_and_broadcast_sync(startup_and_shutdown_local_sync_server, sync_s
     def _on_leave(data: dict):  # noqa: ANN001
         leave_events.append(data)
 
-    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    agent.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     office_id = "office-sync-s2"
     _join_office(agent, role="agent", office_id=office_id, name="robot-S2")
 
-    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     _join_office(computer, role="computer", office_id=office_id, name="comp-S2")
 
     ok, err = computer.call(LEAVE_OFFICE_EVENT, {"office_id": office_id}, namespace=SMCP_NAMESPACE)
@@ -192,7 +197,7 @@ def _run_computer_client_process(port: int, computer_name_queue: multiprocessing
         }
 
     try:
-        computer.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        computer.connect(_url(port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         office_id = "office-sync-s3"
         computer_name = "comp-S3"
         _join_office(computer, role="computer", office_id=office_id, name=computer_name)
@@ -218,7 +223,7 @@ def _run_agent_client_process(
     try:
         agent = Client()
         agent_id = "robot-S3"
-        agent.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        agent.connect(_url(port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         office_id = "office-sync-s3"
         _join_office(agent, role="agent", office_id=office_id, name=agent_id)
 
@@ -316,11 +321,11 @@ def test_update_config_broadcast_sync(startup_and_shutdown_local_sync_server, sy
     def _on_update(data: dict):  # noqa: ANN001
         received["count"] += 1
 
-    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    agent.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     office_id = "office-sync-s4"
     _join_office(agent, role="agent", office_id=office_id, name="robot-S4")
 
-    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     _join_office(computer, role="computer", office_id=office_id, name="comp-S4")
 
     computer.call(UPDATE_CONFIG_EVENT, {"computer": computer.get_sid(namespace=SMCP_NAMESPACE)}, namespace=SMCP_NAMESPACE)
@@ -353,7 +358,7 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
     def run_computer_client():
         """在独立线程中运行Computer客户端"""
         try:
-            computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+            computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
             office_id = "office-sync-s5"
             _join_office(computer, role="computer", office_id=office_id, name="comp-S5")
             computer_ready.set()  # 通知Computer客户端已准备好
@@ -370,7 +375,7 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
                 pass
 
     # 先连接Agent客户端
-    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    agent.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     office_id = "office-sync-s5"
     _join_office(agent, role="agent", office_id=office_id, name="robot-S5")
 
@@ -444,9 +449,9 @@ def test_tool_call_target_disconnect_midflight_returns_404_sync(
         return {"ok": True}
 
     office_id = "office-sync-disc"
-    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     _join_office(computer, role="computer", office_id=office_id, name="comp-SD")
-    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    agent.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     _join_office(agent, role="agent", office_id=office_id, name="robot-SD")
 
     def run_agent_call() -> None:
@@ -494,7 +499,7 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
     try:
         # 连接第一个 Computer
         # Connect first Computer
-        computer1.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        computer1.connect(_url(sync_server_port), namespace=SMCP_NAMESPACE)
         office_id = "office-sync-dup-test"
         computer_name = "duplicate-comp-sync"
 
@@ -508,7 +513,7 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
 
         # 连接第二个 Computer（同名）
         # Connect second Computer (same name)
-        computer2.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        computer2.connect(_url(sync_server_port), namespace=SMCP_NAMESPACE)
 
         # 第二个 Computer 尝试加入同一房间，应该失败
         # Second Computer tries to join same room, should fail
@@ -539,7 +544,7 @@ def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server,
     try:
         # 连接第一个 Computer
         # Connect first Computer
-        computer1.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        computer1.connect(_url(sync_server_port), namespace=SMCP_NAMESPACE)
         office_id = "office-sync-diff-name-test"
 
         # 第一个 Computer 加入
@@ -552,7 +557,7 @@ def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server,
 
         # 连接第二个 Computer（不同名）
         # Connect second Computer (different name)
-        computer2.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        computer2.connect(_url(sync_server_port), namespace=SMCP_NAMESPACE)
 
         # 第二个 Computer 加入同一房间，应该成功
         # Second Computer joins same room, should succeed
@@ -581,7 +586,7 @@ def test_computer_switch_room_with_same_name_allowed(startup_and_shutdown_local_
     try:
         # 连接 Computer
         # Connect Computer
-        computer.connect(f"http://localhost:{sync_server_port}", namespace=SMCP_NAMESPACE)
+        computer.connect(_url(sync_server_port), namespace=SMCP_NAMESPACE)
         computer_name = "switching-comp-sync"
 
         # 加入第一个房间
@@ -624,7 +629,7 @@ def test_list_room_session_info_contains_a2c_version_sync(
     auth = DefaultAgentAuthProvider(agent_id="robot-ver-sync", office_id=office_id)
     agent = SMCPAgentClient(auth_provider=auth)
     agent.connect_to_server(
-        f"http://localhost:{sync_server_port}",
+        _url(sync_server_port),
         namespace=SMCP_NAMESPACE,
         socketio_path="/socket.io",
     )
@@ -667,8 +672,8 @@ def test_get_tools_cross_office_rejected_sync(startup_and_shutdown_local_sync_se
         computer_invoked.set()
         return {"tools": [], "req_id": data.get("req_id", "")}
 
-    agent.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
-    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    agent.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     try:
         _join_office(agent, role="agent", office_id="office-sync-neg-A", name="robot-sneg-1")
         _join_office(computer, role="computer", office_id="office-sync-neg-B", name="comp-sneg-1")
@@ -689,7 +694,7 @@ def test_get_tools_cross_office_rejected_sync(startup_and_shutdown_local_sync_se
 def test_tool_call_wrong_role_rejected_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
     """错角色 client:tool_call（同步）：Computer 发起工具调用 → 被拒绝（超时，无 ACK）。"""
     computer = Client()
-    computer.connect(f"http://localhost:{sync_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     try:
         _join_office(computer, role="computer", office_id="office-sync-neg-C", name="comp-sneg-2")
 
@@ -743,7 +748,7 @@ def _run_computer_config_client_process(port: int, computer_name_queue: multipro
         }
 
     try:
-        computer.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        computer.connect(_url(port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         office_id = "office-sync-cfg"
         computer_name = "comp-Scfg"
         _join_office(computer, role="computer", office_id=office_id, name=computer_name)
@@ -765,7 +770,7 @@ def _run_agent_config_client_process(
     try:
         agent = Client()
         agent_id = "robot-Scfg"
-        agent.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        agent.connect(_url(port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         _join_office(agent, role="agent", office_id="office-sync-cfg", name=agent_id)
         time.sleep(0.2)
         res = agent.call(

@@ -20,6 +20,10 @@
       ┌ MF-02 裸 FastMCP 布局（bare，当前不注册）──────────────────────────────────┐
       │ skill://bare-demo/SKILL.md                          无 _meta.source 根       │
       └──────────────────────────────────────────────────────────────────────────┘
+      ┌ MF-03 畸形段（#188，theseus-kit 修复前形态）──────────────────────────────┐
+      │ skill://fastmcp.demo.example/fastmcp-demo/notes/extra.md                  │
+      │                    子资源误打 _meta.source=resources ——SDK 按 URI 前缀归属排除│
+      └──────────────────────────────────────────────────────────────────────────┘
 
 启动 / Run: python fastmcp_skill_stdio_server.py  （仅 stdin/stdout，不监听端口）
 """
@@ -50,16 +54,20 @@ _REG_REFERENCE_MD = "# Reference\n\n中文: 附带参考文件。英文: support
 BARE_ROOT = "skill://bare-demo"
 _BARE_SKILL_MD = "---\nname: bare-demo\ndescription: bare FastMCP layout without a _meta.source root\n---\n# Bare Demo\n"
 
+# ── MF-03 畸形段 / malformed shape（#188：子资源误打 _meta.source=resources）────
+_REG_NOTES_MD = "# Notes\n\n中文: 被根前缀覆盖、却误带 source 的子资源。英文: covered sub-resource carrying source.\n"
+
 # uri -> resources/read 文本内容 / uri -> read content
 _CONTENT: dict[str, str] = {
     f"{REG_ROOT}/SKILL.md": _REG_SKILL_MD,
     f"{REG_ROOT}/reference.md": _REG_REFERENCE_MD,
+    f"{REG_ROOT}/notes/extra.md": _REG_NOTES_MD,
     f"{BARE_ROOT}/SKILL.md": _BARE_SKILL_MD,
 }
 
 
 def build_resources() -> list[types.Resource]:
-    """枚举 MF-01 根+子资源 与 MF-02 裸 SKILL.md。"""
+    """枚举 MF-01 根+子资源、MF-03 畸形子资源 与 MF-02 裸 SKILL.md。"""
     return [
         # MF-01 根（带 _meta.source=resources）/ registrable root
         types.Resource.model_validate(
@@ -74,6 +82,17 @@ def build_resources() -> list[types.Resource]:
         types.Resource.model_validate({"uri": f"{REG_ROOT}/SKILL.md", "name": "SKILL.md", "mimeType": "text/markdown"}),
         types.Resource.model_validate(
             {"uri": f"{REG_ROOT}/reference.md", "name": "reference.md", "mimeType": "text/markdown"},
+        ),
+        # MF-03 畸形子资源（#188）：被根前缀覆盖却误带 _meta.source。
+        # 刻意放在真根**之后**——pre-fix 它会被当独立根物化，与真根同 leaf → _reset_dir
+        # 删掉已注册真根包，令落盘断言确定性失败。
+        types.Resource.model_validate(
+            {
+                "uri": f"{REG_ROOT}/notes/extra.md",
+                "name": "extra.md",
+                "mimeType": "text/markdown",
+                "_meta": {"source": "resources"},
+            },
         ),
         # MF-02 裸 FastMCP 入口（无根、无 _meta.source）/ bare entry
         types.Resource.model_validate({"uri": f"{BARE_ROOT}/SKILL.md", "name": "SKILL.md", "mimeType": "text/markdown"}),

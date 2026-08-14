@@ -31,7 +31,7 @@ from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextRe
 
 import a2c_smcp.computer.skills.staging as staging_mod
 from a2c_smcp.computer.skills.registry import SkillRegistry
-from a2c_smcp.computer.skills.staging import stage_mcp_skills, stage_user_skills
+from a2c_smcp.computer.skills.staging import _partition_roots, stage_mcp_skills, stage_user_skills
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
@@ -430,6 +430,180 @@ async def test_resource_without_source_meta_skipped(tmp_path: Path) -> None:
     names = await stage_mcp_skills(FakeManager([("srv", plain)]), reg, tmp_path / "home")
     assert names == []
     assert len(reg) == 0
+
+
+# ── #188 根归属：URI 前缀优先于 _meta.source ────────────────────────────────────
+async def test_covered_child_with_source_meta_not_materialized_as_root(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """#188 规则 1+2：provider 给根+子资源全部打 ``_meta.source`` → 被根前缀覆盖的子资源
+    不再当独立根物化（无 ERROR 刷屏、无目录抖动）——归属判断优先于 meta 判断。"""
+    root_uri = "skill://h/my-skill"
+    sub1_uri = "skill://h/my-skill/SKILL.md"
+    sub2_uri = "skill://h/my-skill/assets/logo.bin"
+    root = _root(root_uri, {"source": "resources"})
+    sub1 = _root(sub1_uri, {"source": "resources"})  # 不合规：子资源携带 source
+    sub2 = _root(sub2_uri, {"source": "resources"})
+    reads = {
+        sub1_uri: ReadResourceResult(contents=[TextResourceContents(uri=sub1_uri, text=_skill_md())]),
+        sub2_uri: ReadResourceResult(contents=[BlobResourceContents(uri=sub2_uri, blob=base64.b64encode(b"\x00\x01\x02").decode())]),
+    }
+    mgr = FakeManager([("srv", root), ("srv", sub1), ("srv", sub2)], reads=reads)
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(mgr, reg, home)
+
+    assert names == ["mcp:srv:my-skill"]  # 仅真根注册一次
+    assert len(reg) == 1
+    path = Path(reg.resolve("mcp:srv:my-skill")["path"])  # type: ignore[index]
+    assert (path / "SKILL.md").is_file()
+    assert (path / "assets" / "logo.bin").read_bytes() == b"\x00\x01\x02"
+    # 被覆盖资源：汇总 WARNING + 逐条 DEBUG；不得出现任何 ERROR（pre-fix 是 ERROR 刷屏）
+    assert not any(r.levelno == logging.ERROR for r in staging_logs.records)
+    assert any(r.levelno == logging.WARNING and "covered by other roots" in r.getMessage() for r in staging_logs.records)
+    assert any(
+        r.levelno == logging.DEBUG and sub1_uri in r.getMessage() and "covered by skill resource" in r.getMessage()
+        for r in staging_logs.records
+    )
+    assert any(r.levelno == logging.DEBUG and sub2_uri in r.getMessage() for r in staging_logs.records)
+
+
+async def test_nested_covered_roots_all_excluded(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """#188 嵌套链 A>B>C：B、C 均被排除（覆盖判定不看覆盖者自身是否被覆盖），仅 A 注册。
+
+    三者均用 mounted：resources 父根会把 B/C 这类「目录型节点」也当子资源逐个 read——
+    落盘为文件后再遇更深子资源会路径冲突，那是 provider 畸形形状的既存毒丸（与归属排除正交）；
+    mounted 无子资源枚举，链式覆盖可干净表达。
+    """
+    mount_a = tmp_path / "mount" / "a"
+    mount_a.mkdir(parents=True)
+    (mount_a / "SKILL.md").write_text(_skill_md(name="a"), encoding="utf-8")
+    mount_b = tmp_path / "mount" / "b"
+    mount_b.mkdir(parents=True)
+    (mount_b / "SKILL.md").write_text(_skill_md(name="b"), encoding="utf-8")
+    mount_c = tmp_path / "mount" / "c"
+    mount_c.mkdir(parents=True)
+    (mount_c / "SKILL.md").write_text(_skill_md(name="c"), encoding="utf-8")
+
+    a = _root("skill://h/a", {"source": "mounted", "mount_dir": str(mount_a)})
+    b = _root("skill://h/a/b", {"source": "mounted", "mount_dir": str(mount_b)})
+    c = _root("skill://h/a/b/c", {"source": "mounted", "mount_dir": str(mount_c)})
+    mgr = FakeManager([("srv", a), ("srv", b), ("srv", c)])
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(mgr, reg, home)
+
+    assert names == ["mcp:srv:a"]
+    assert len(reg) == 1
+    assert (Path(reg.resolve("mcp:srv:a")["path"]) / "SKILL.md").is_file()  # type: ignore[index]
+    assert not any(r.levelno == logging.ERROR for r in staging_logs.records)
+    assert any(r.levelno == logging.WARNING and "covered by other roots" in r.getMessage() for r in staging_logs.records)
+    # 立即父语义：B→A、C→B（最长前缀覆盖者）
+    assert any(
+        r.levelno == logging.DEBUG
+        and "skill://h/a/b covered by skill resource skill://h/a (immediate parent)" in r.getMessage()
+        for r in staging_logs.records
+    )
+    assert any(
+        r.levelno == logging.DEBUG
+        and "skill://h/a/b/c covered by skill resource skill://h/a/b (immediate parent)" in r.getMessage()
+        for r in staging_logs.records
+    )
+
+
+async def test_prefix_boundary_sibling_xy_not_covered(tmp_path: Path) -> None:
+    """#188 前缀边界：``skill://h/x`` 不得覆盖 ``skill://h/xy``（必须整段 ``x/`` 为界）。"""
+    m_x = tmp_path / "m" / "x"
+    m_x.mkdir(parents=True)
+    (m_x / "SKILL.md").write_text(_skill_md(name="x"), encoding="utf-8")
+    m_xy = tmp_path / "m" / "xy"
+    m_xy.mkdir(parents=True)
+    (m_xy / "SKILL.md").write_text(_skill_md(name="xy"), encoding="utf-8")
+
+    res_x = _root("skill://h/x", {"source": "mounted", "mount_dir": str(m_x)})
+    res_xy = _root("skill://h/xy", {"source": "mounted", "mount_dir": str(m_xy)})
+    reg = SkillRegistry()
+
+    names = await stage_mcp_skills(FakeManager([("srv", res_x), ("srv", res_xy)]), reg, tmp_path / "home")
+
+    assert sorted(names) == ["mcp:srv:x", "mcp:srv:xy"]
+    assert len(reg) == 2
+
+
+async def test_mounted_child_covered_by_resources_parent_uniform(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """#188 mode 统一：resources 父根下挂 mounted 子根 → 归属优先于 meta，子根不当根。"""
+    parent_uri = "skill://h/p"
+    child_uri = "skill://h/p/child"
+    md_uri = "skill://h/p/SKILL.md"
+    mount = tmp_path / "mount" / "child"
+    mount.mkdir(parents=True)
+    (mount / "SKILL.md").write_text(_skill_md(name="child"), encoding="utf-8")
+
+    parent = _root(parent_uri, {"source": "resources"})
+    child = _root(child_uri, {"source": "mounted", "mount_dir": str(mount)})
+    sub_md = Resource(uri=md_uri, name="SKILL.md")
+    reads = {
+        md_uri: ReadResourceResult(contents=[TextResourceContents(uri=md_uri, text=_skill_md(name="parent"))]),
+        child_uri: ReadResourceResult(contents=[TextResourceContents(uri=child_uri, text="covered")]),
+    }
+    mgr = FakeManager([("srv", parent), ("srv", child), ("srv", sub_md)], reads=reads)
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(mgr, reg, home)
+
+    assert names == ["mcp:srv:parent"]  # mounted 子根被排除，不注册
+    assert len(reg) == 1
+    assert (Path(reg.resolve("mcp:srv:parent")["path"]) / "SKILL.md").is_file()  # type: ignore[index]
+    assert not any(r.levelno == logging.ERROR for r in staging_logs.records)
+    assert any(r.levelno == logging.DEBUG and child_uri in r.getMessage() for r in staging_logs.records)
+
+
+async def test_independent_bad_root_still_errors_sibling_unaffected(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """#188 规则 3：真正独立的坏根（resources 无任何子资源）仍 ERROR + 跳过，且不阻断兄弟。"""
+    good = await _mount_skill(tmp_path, "good", "fine-skill")
+    bad = _root("skill://h/lonely", {"source": "resources"})  # 无子资源 → 物化失败
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(FakeManager([("srv", good), ("srv", bad)]), reg, home)
+
+    assert names == ["mcp:srv:fine-skill"]  # 合法兄弟不受牵连
+    assert len(reg) == 1
+    assert any(r.levelno == logging.ERROR and "materialize failed" in r.getMessage() for r in staging_logs.records)
+    assert not (home / "mcp" / "srv" / "lonely").exists()
+
+
+def test_partition_roots_leafless_guard_and_order() -> None:
+    """#188 纯函数：leaf-less 候选不得覆盖别人；未被覆盖的 leaf-less 保留在 roots（ERROR 分支可达）；保序。"""
+    leafless = _root("skill://h", {"source": "resources"})
+    a = _root("skill://h/a", {"source": "resources"})
+    sub_a = _root("skill://h/a/SKILL.md", {"source": "resources"})  # 被 a 覆盖
+    plain = Resource(uri="skill://h/a/notes.md", name="notes.md")  # 无 source：非候选、不覆盖、不被排除
+
+    roots, covered = _partition_roots([leafless, a, sub_a, plain])
+
+    assert [str(r.uri) for r in roots] == ["skill://h", "skill://h/a"]  # 保序；leafless 未被覆盖
+    assert covered == {"skill://h/a/SKILL.md": "skill://h/a"}
+
+
+def test_partition_roots_nested_chain_and_duplicate_uri() -> None:
+    """#188 纯函数：嵌套 A>B>C 记立即父（B→A、C→B）；重复 URI 不自覆盖（去重属范围外，保持现状）。"""
+    a = _root("skill://h/a", {"source": "resources"})
+    b = _root("skill://h/a/b", {"source": "resources"})
+    c = _root("skill://h/a/b/c", {"source": "resources"})
+    dup = _root("skill://h/a", {"source": "resources"})
+
+    roots, covered = _partition_roots([a, b, c, dup])
+
+    assert [str(r.uri) for r in roots] == ["skill://h/a", "skill://h/a"]  # 重复副本都留在 roots
+    assert covered == {"skill://h/a/b": "skill://h/a", "skill://h/a/b/c": "skill://h/a/b"}
 
 
 # ── user 源 DropIn（就地发现，不 staging，#60）────────────────────────────────

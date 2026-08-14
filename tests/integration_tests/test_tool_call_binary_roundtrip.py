@@ -37,7 +37,7 @@ from a2c_smcp.computer.blob import BlobThresholds
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import SMCP_NAMESPACE
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
+from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace
 
 

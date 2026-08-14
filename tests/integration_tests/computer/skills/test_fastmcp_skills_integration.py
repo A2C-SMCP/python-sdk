@@ -92,3 +92,27 @@ async def test_mf02_bare_layout_not_registered(tmp_path: Path) -> None:
         assert not any("bare-demo" in n for n in names)
         # 可注册形状仍正常入册（裸布局未连累）
         assert _EXPECTED_SKILL in names
+
+
+@pytest.mark.anyio
+async def test_mf03_covered_child_with_source_meta_not_double_materialized(tmp_path: Path) -> None:
+    """MF-03 (#188): 子资源误打 _meta.source → 按 URI 前缀归属排除，不再当独立根物化。
+
+    pre-fix：notes/extra.md 被当根 → 与真根同 leaf（fastmcp-demo）→ ``_reset_dir`` 删掉已注册
+    真根包 → ``(pkg / "SKILL.md").is_file()`` 确定性失败。post-fix：真根注册一次、包完整、
+    被覆盖子资源按普通子资源还原进包内。
+    """
+    async with _booted_computer(tmp_path) as comp:
+        registered = await comp._restage_mcp_skills()
+        assert registered.count(_EXPECTED_SKILL) == 1  # 真根恰好注册一次
+
+        names = [s["name"] for s in comp.get_skills()]
+        assert names.count(_EXPECTED_SKILL) == 1
+
+        ref = comp.get_skill_ref(_EXPECTED_SKILL)
+        assert ref is not None
+        pkg = Path(ref["path"])
+        # 包未被「覆盖子资源当根」的 _reset_dir 误删：真根子资源全部还原
+        assert (pkg / "SKILL.md").is_file()
+        assert (pkg / "reference.md").is_file()
+        assert (pkg / "notes" / "extra.md").is_file()

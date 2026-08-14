@@ -4,17 +4,58 @@
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator, Iterable
-from typing import Any
+from typing import Any, NoReturn, cast
 
 from mcp.client.session import MessageHandlerFnT
 from mcp.types import CallToolResult, ReadResourceResult, Resource, Tool
 from vrl_python import VRLRuntime
 
-from a2c_smcp.computer.mcp_clients.auth_error import build_auth_error_result, classify_auth_error
+from a2c_smcp.computer.mcp_clients.auth_error import (
+    UpstreamRedirectStoppedError,
+    build_auth_error_result,
+    classify_auth_error,
+)
 from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
-from a2c_smcp.computer.mcp_clients.model import A2C_TOOL_META, A2C_VRL_TRANSFORMED, MCPClientProtocol, MCPServerConfig, ToolMeta
+from a2c_smcp.computer.mcp_clients.http_client import AuthSignal, HttpMCPClient
+from a2c_smcp.computer.mcp_clients.model import (
+    A2C_TOOL_META,
+    A2C_VRL_TRANSFORMED,
+    MCPClientProtocol,
+    MCPServerActivationState,
+    MCPServerConfig,
+    MCPServerConnectionState,
+    MCPServerRuntimeStatus,
+    StreamableHttpServerConfig,
+    ToolMeta,
+)
+from a2c_smcp.computer.mcp_clients.oauth_coordinator import (
+    OAuthCoordinator,
+    parse_bearer_resource_metadata,
+)
+from a2c_smcp.computer.mcp_clients.oauth_credential_store import (
+    InMemoryOAuthCredentialStore,
+    OAuthCredentialStore,
+)
+from a2c_smcp.computer.mcp_clients.oauth_flow import OAuthFlow
+from a2c_smcp.computer.mcp_clients.oauth_security import (
+    same_origin,
+    validate_secure_url,
+)
+from a2c_smcp.computer.mcp_clients.oauth_types import (
+    OAuthBeginRequest,
+    OAuthCallback,
+    OAuthCancellation,
+    OAuthError,
+    OAuthErrorCode,
+    OAuthFlowOutcome,
+    OAuthOptions,
+    OAuthProtocolError,
+    OAuthStatus,
+    default_oauth_options,
+)
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, SERVER_NAME, TOOL_NAME
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -25,6 +66,83 @@ logger = get_logger("computer")
 # SKILL 资源枚举翻页安全上界：防御恒非空 cursor（server bug / 恶意）导致的无限循环挂死物化。
 # Pagination safety bound for SKILL enumeration: guard against a never-terminating cursor hanging staging.
 _MAX_SKILL_LIST_PAGES = 1000
+
+# #179 bounded connect：匿名/恢复路径的 connect 竞速上界（Rust CONNECT_TIMEOUT_SECS）。
+# 交互式路径不套此界——生命周期由 pending flow TTL（10 分钟）+ 取消链约束。
+_CONNECT_TIMEOUT = 30.0
+
+# automatic-only（Rust #180）：无显式 oauth 配置时也按 challenge 准入，参数从 metadata 派生。
+# 私有变体类型不跨界——经 oauth_types 公开工厂获取默认选项（🟡7）。
+_DEFAULT_OAUTH_OPTIONS = default_oauth_options()
+
+# OAuthRequired 错误的稳定形态（宿主经 facade 驱动授权；auto 启动路径吞掉并保留 activation）。
+# 与 coordinator redirect_handler 的 OAuthError.protocol(AuthorizationRequired) 同源——
+# 单一权威经 classmethod 派生，防两文件文案漂移（#179 隔离审查 🔵9）。
+_OAUTH_REQUIRED_MSG = OAuthError.protocol(OAuthProtocolError.AuthorizationRequired).message
+
+
+def _raise_oauth_required() -> NoReturn:
+    raise OAuthError.protocol(OAuthProtocolError.AuthorizationRequired)
+
+
+def _is_oauth_required_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, OAuthError)
+        and exc.code == OAuthErrorCode.Protocol
+        and exc.message == _OAUTH_REQUIRED_MSG
+    )
+
+
+def _bump_active_client_generation(generations: dict[BUNDLE_ID, int], bundle_id: BUNDLE_ID) -> None:
+    """per-bundle 世代 +1（ABA 检测计数器；Rust ``bump_active_client_generation`` 的 python 面）。
+
+    #185：每次 `_active_clients` 插入/移除/替换都必须 bump——同一 client 对象被
+    remove 再 reinsert 时，仅靠对象身份（``is``）无法检出 ABA 变化，generation 补齐。
+    """
+    generations[bundle_id] = generations.get(bundle_id, 0) + 1
+
+
+def _bearer_challenge_parts(www_authenticate: str | None) -> tuple[str | None, str | None]:
+    """拆解 WWW-Authenticate challenge（#185 精确分类）：返回 ``(scheme, resource_metadata_url)``。
+
+    - 非 Bearer challenge → ``(None, None)``（Rust ``ChallengeAdmission::Unsupported`` 面）；
+    - Bearer 但无 ``resource_metadata`` → ``(scheme, None)``（Rust ``BearerWithoutMetadata`` 面，
+      即 ``HttpAuthenticationError::OAuthDiscoveryFailed`` 语义）。
+    """
+    if not www_authenticate:
+        return None, None
+    scheme, _, rest = www_authenticate.strip().partition(" ")
+    if scheme.lower() != "bearer":
+        return None, None
+    return scheme, parse_bearer_resource_metadata(rest)
+
+
+def _has_static_authorization_header(config: MCPServerConfig) -> bool:
+    """配置是否携带静态 Authorization header（#181 static-only 判据）。
+
+    Rust #180 移除显式 OAuth 配置后，带静态 Authorization 的 HTTP server 走 static-only
+    路径——其 401 是静态凭据失败，绝不触发 OAuth（两条路径天然分离，无需互斥检测）。
+    """
+    if not isinstance(config, StreamableHttpServerConfig):
+        return False
+    headers = config.server_parameters.headers
+    if not headers:
+        return False
+    return any(name.lower() == "authorization" for name in headers)
+
+
+def _is_secure_endpoint(config: MCPServerConfig) -> bool:
+    """protected resource 端点是否 HTTPS 或 loopback HTTP（#181 安全不变量 1）。
+
+    与 :func:`validate_secure_url` 同判据——准入失败分类时以 bool 面复用（不抛异常）。
+    """
+    if not isinstance(config, StreamableHttpServerConfig):
+        return False  # pragma: no cover — 调用方已按 _oauth_spec 收窄
+    try:
+        validate_secure_url(str(config.server_parameters.url))
+        return True
+    except OAuthError:
+        return False
 
 
 class ToolNameDuplicatedError(Exception):
@@ -49,16 +167,31 @@ class MCPServerManager:
         auto_connect: bool = False,
         auto_reconnect: bool = True,
         message_handler: MessageHandlerFnT | None = None,
+        oauth_credential_store: OAuthCredentialStore | None = None,
     ) -> None:
         # 存储所有服务器配置，以 bundle_id 为唯一身份键（协议 #15/#18：身份=bundle_id，name 降纯 display 不做键）
         # Server configs keyed by bundle_id (unique identity; name is pure display, never a key — protocol #15/#18).
         self._servers_config: dict[BUNDLE_ID, MCPServerConfig] = {}
         # 活动客户端 {bundle_id: client}
         self._active_clients: dict[BUNDLE_ID, MCPClientProtocol] = {}
+        # #184: 已接受的启动意图（不因 OAuth 未授权或连接失败而丢失）
+        # Accepted activation intents; not lost on OAuth or connect failure.
+        self._activation_intents: set[BUNDLE_ID] = set()
+        # #184: 最近一次数据面连接状态（与 _activation_intents 正交）
+        # Latest data-plane connection state; orthogonal to activation_intents.
+        self._connection_states: dict[BUNDLE_ID, MCPServerConnectionState] = {}
         # ExposedToolMapping：exposed_tool_name -> (bundle_id, 原始工具名)。list_tools 与 tool_call **共用同一份**表
         # （协议 §ExposedToolMapping）。exposed = {bundle_id}__{alias ?? 原始名}，bundle_id 无 `__` 保证单射→查表不 split。
         # 被 forbidden 的工具**不进本表**（不可见不可调用）；跨 bundle_id 天然唯一，无需跨 server 对账。
         self._exposed_tools: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
+        # #185：per-bundle 活跃 client 世代计数（ABA 检测）——每次 _active_clients 插入/移除/替换 +1。
+        # available_tools 发布前与 _arefresh_tool_mapping 提交前按「client 身份 + generation」二次校验，
+        # 同一 client 对象被 remove 再 reinsert（ABA）也能被检出（Rust active_client_generations 的 python 面）。
+        self._active_client_generations: dict[BUNDLE_ID, int] = {}
+        # #185：per-bundle clear epoch——clear_oauth 的零 await 快速段每次 +1。_astart_client 入口捕获、
+        # _commit_active_client 提交前比对：clear 在 start 连接 RPC 在途时发生 → 提交被拒（凭据已撤销），
+        # 弥补 python 单一全局锁无法复刻 Rust per-bundle lifecycle lock 的 start-vs-clear 串行化。
+        self._oauth_clear_epochs: dict[BUNDLE_ID, int] = {}
         # 自动重连标志
         self._auto_reconnect: bool = auto_reconnect
         # 自动连接标志
@@ -67,6 +200,15 @@ class MCPServerManager:
         self._message_handler: MessageHandlerFnT | None = message_handler
         # 内部锁防止并发修改
         self._lock = asyncio.Lock()
+        # #179 OAuth 接线：可注入凭据 store（构造参数或 builder；默认进程内）、per-bundle
+        # coordinator 注册表（challenge 准入后单例）、per-bundle OAuthFlow handle 注册表、
+        # 在途 connect 任务。
+        self._oauth_credential_store: OAuthCredentialStore = (
+            oauth_credential_store or InMemoryOAuthCredentialStore()
+        )
+        self._oauth_coordinators: dict[BUNDLE_ID, OAuthCoordinator] = {}
+        self._oauth_flows: dict[BUNDLE_ID, OAuthFlow] = {}
+        self._oauth_connect_tasks: dict[BUNDLE_ID, asyncio.Task[None]] = {}
 
     def get_server_config(self, bundle_id: BUNDLE_ID) -> MCPServerConfig:
         """通过 bundle_id 获取服务配置 / Get server config by bundle_id。"""
@@ -166,12 +308,31 @@ class MCPServerManager:
                 # 配置存在但客户端未激活，更新配置并根据 auto_connect 决定是否启动
                 # Config exists but client is not active, update config and start if auto_connect is enabled
                 self._servers_config[bundle_id] = config
+                # #179：transport 类型切换（streamable→stdio/sse）→ 退役陈旧 OAuth
+                # 运行时态（coordinator/flow/connect task），勿沿用旧 server_url/store。
+                if self._oauth_spec(config) is None and bundle_id in self._oauth_coordinators:
+                    self._retire_oauth_bundle(bundle_id)
                 if self._auto_connect:
-                    await self._astart_client(bundle_id)
+                    await self._astart_client_auto(bundle_id)
         else:
             self._servers_config[bundle_id] = config
             if self._auto_connect:
-                await self._astart_client(bundle_id)
+                await self._astart_client_auto(bundle_id)
+
+    async def _astart_client_auto(self, bundle_id: BUNDLE_ID) -> None:
+        """auto 路径启动（配置挂载/重启触发）：OAuthRequired 吞掉并记录（activation 保留），
+        其余错误照常上抛——单 server 显式 :meth:`astart_client` 仍向调用方传播 OAuthRequired。
+        """
+        try:
+            await self._astart_client(bundle_id)
+        except OAuthError as exc:
+            if not _is_oauth_required_error(exc):
+                raise
+            logger.info(
+                f"Server bundle_id={bundle_id!r} requires OAuth authorization "
+                f"(state=Started+AuthorizationRequired); host drives the flow via "
+                f"create_oauth_flow/complete_oauth.",
+            )
 
     async def aadd_or_aupdate_server(self, config: MCPServerConfig) -> None:
         """添加或更新服务器配置。运行期同 ``bundle_id`` = **原地更新**（不算 no-double-open 冲突）。"""
@@ -184,6 +345,9 @@ class MCPServerManager:
         async with self._lock:
             if bundle_id in self._active_clients:
                 await self._astop_client(bundle_id)
+            # #179：退役 OAuth 运行时态（coordinator/flow/connect task）——配置移除后
+            # 再以同 bundle_id 挂回不同 transport 时不得沿用陈旧 coordinator。
+            self._retire_oauth_bundle(bundle_id)
             del self._servers_config[bundle_id]
             await self._arefresh_tool_mapping()
 
@@ -199,17 +363,23 @@ class MCPServerManager:
         if bundle_id in self._active_clients:
             await self._astop_client(bundle_id)
 
-        # 只有启用的配置才能重启
+        # 只有启用的配置才能重启（OAuthRequired 走 auto 路径吞掉：restart 属配置变更触发的自动动作）
         if not config.disabled:
-            await self._astart_client(bundle_id)
+            await self._astart_client_auto(bundle_id)
 
     async def astart_all(self) -> None:
-        """启动所有启用的服务器"""
+        """启动所有启用的服务器
+
+        #179：boot 批量启动中单个 server 的 OAuthRequired 不打断整体——逐 server 走
+        :meth:`_astart_client_auto`（单一吞并权威，🟡4）；其余错误照常上抛。单 server
+        显式启动（:meth:`astart_client`）仍向调用方传播。
+        """
         async with self._lock:
             logger.debug(f"Manager Start all async task: {asyncio.current_task()}")
             for bundle_id in self._servers_config:
-                if not self._servers_config[bundle_id].disabled:
-                    await self._astart_client(bundle_id)
+                if self._servers_config[bundle_id].disabled:
+                    continue
+                await self._astart_client_auto(bundle_id)
 
     async def astart_client(self, bundle_id: BUNDLE_ID) -> None:
         """启动单个服务器客户端（按 bundle_id）。"""
@@ -217,7 +387,24 @@ class MCPServerManager:
             await self._astart_client(bundle_id)
 
     async def _astart_client(self, bundle_id: BUNDLE_ID) -> None:
-        """启动单个服务器客户端（按 bundle_id）。"""
+        """启动单个服务器客户端（按 bundle_id）。
+
+        #179 OAuth bounded transaction（对齐 Rust #179，一次调用内完成）：
+        1. 记录 activation intent（#184 语义：只显式 stop 才清除）
+        2. 无 coordinator 的 Streamable HTTP server：**匿名 initialize 至多一次**，
+           与 connect-phase challenge 信号竞速（30s 上界；aconnect 在 401 下会挂起，
+           见 #133 实证）
+        3. challenge（Bearer + resource_metadata + same-origin）→ 构造 coordinator =
+           **凭据恢复 + 初始化**：restore 后 Authorized → 带 provider initialize（成功即
+           连接）；Unauthorized + 宿主已注册 flow → 派发 detached connect 任务（交互式
+           flow 的驱动者，**不持 manager 锁**——provider 在 callback 上阻塞可达分钟级）
+        4. 真正缺用户授权（未注册 flow）→ 连接状态 AUTHORIZATION_REQUIRED + OAuthRequired
+           错上抛（activation 保留）
+
+        Raises:
+            OAuthError: ``Protocol(authorizationRequired)`` —— 需要宿主经 facade 驱动授权；
+                非 streamable 的 challenge / 非 challenge 失败按原异常传播。
+        """
         config = self._servers_config.get(bundle_id)
         if not config:
             # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
@@ -226,15 +413,486 @@ class MCPServerManager:
         if config.disabled:
             raise RuntimeError(f"Cannot start disabled server bundle_id={bundle_id!r} (name={config.name!r})")
 
+        # #184：先记录控制面启动意图——后续 OAuth challenge / transport error 只改 connection 状态，
+        # 不清除 activation。只有显式 stop 才清除 / Record activation intent first; subsequent
+        # OAuth or transport errors affect only connection state.
+        self._activation_intents.add(bundle_id)
+        # #185：捕获 clear epoch——后续各 commit 点比对，clear 在连接 RPC 在途时发生则提交被拒。
+        clear_epoch = self._oauth_clear_epochs.get(bundle_id, 0)
+
         if bundle_id in self._active_clients:
+            self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
             return  # 已经启动
 
-        # 根据配置类型创建客户端
-        client = client_factory(config, message_handler=self._message_handler)
-        await client.aconnect()
+        # 设置连接状态为 connecting / Set connection state to connecting.
+        self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTING
+
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        oauth_spec = self._oauth_spec(config)
+
+        if oauth_spec is None:
+            # ── 非 OAuth 通道（stdio / sse）：原 plain connect 路径 ──
+            # 若存在陈旧 coordinator（运行期 transport 类型切换，如 streamable→stdio），
+            # 先退役——否则下方 coordinator 分支会对 stdio client 调
+            # connect_challenge_event()（不存在该面）直接 AttributeError。
+            if coordinator is not None:
+                self._retire_oauth_bundle(bundle_id)
+            client = client_factory(config, message_handler=self._message_handler)
+            try:
+                await client.aconnect()
+            except Exception:
+                # 连接失败：保留 activation intent，仅更新 connection 状态（#184 语义）
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise
+            await self._commit_active_client(bundle_id, client, clear_epoch)
+            return
+
+        if coordinator is not None and _has_static_authorization_header(config):
+            # #181 static-only 配置切换窗口（二轮审查 🟡5）：bundle 先前经 challenge
+            # 准入持有 coordinator，随后配置加入静态 Authorization header（仍 streamable
+            # → 不退役）——退役陈旧 coordinator，让 anonymous-first 重走：静态凭据
+            # 200 直连，或 401 → static-only 精确拒绝（绝不回退 OAuth）
+            self._retire_oauth_bundle(bundle_id)
+            coordinator = None
+
+        if coordinator is None:
+            # ── anonymous-first（每 client 生命周期至多一次） ──
+            client = cast(
+                HttpMCPClient, client_factory(config, message_handler=self._message_handler)
+            )
+            try:
+                signal = await self._bounded_connect(client)
+            except UpstreamRedirectStoppedError:
+                # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise
+            if signal is None:
+                await self._commit_active_client(bundle_id, client, clear_epoch)  # 匿名连通
+                return
+            # #181 static-only（Rust #180）：配置了静态 Authorization header 的 server
+            # 永远走静态认证——401 即静态凭据被拒（4006 分类面），**绝不回退 OAuth**。
+            # 两条认证路径天然分离，无需互斥检测逻辑。
+            if _has_static_authorization_header(config):
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise OAuthError(
+                    OAuthErrorCode.Protocol,
+                    f"static Authorization header configured for bundle_id={bundle_id!r}; "
+                    f"upstream rejected it with HTTP {signal.status_code} — "
+                    "OAuth is never attempted for this server (static-only)",
+                )
+            coordinator = self._admit_oauth_coordinator(bundle_id, config, signal)
+            if coordinator is None:
+                # 非 Bearer challenge / cross-origin resource_metadata / 非安全端点 → 不准入。
+                # 精确分类（#185，对齐 Rust HttpAuthenticationError）：challenge 非 Bearer →
+                # UnsupportedChallenge 语义；Bearer 但 cross-origin 或非 HTTPS → 同语义。
+                # 裸 Bearer（无 resource_metadata）**不再走本分支**——准入后 AS 发现交由
+                # mcp ≥1.29 的 well-known 回退链（PRM path 插入/根 → 服务器 origin 的
+                # RFC 8414 AS metadata）。均以 Protocol + 判别文案 surface（与
+                # authorizationRequired 文案区分 → 不被 _astart_client_auto 吞掉）。
+                scheme, _metadata_url = _bearer_challenge_parts(signal.www_authenticate_header)
+                if not _is_secure_endpoint(config):
+                    # #181：protected resource 端点非 HTTPS 且非 loopback——安全不变量 1
+                    # 拒绝，消息与 cross-origin 区分（排障友好）
+                    message = (
+                        f"protected resource endpoint for bundle_id={bundle_id!r} must use "
+                        "HTTPS (or loopback HTTP for development) — OAuth is never attempted "
+                        "over plaintext HTTP"
+                    )
+                else:
+                    message = (
+                        f"Unsupported authentication challenge for bundle_id={bundle_id!r} "
+                        f"(challenge scheme={scheme!r}, or resource_metadata cross-origin)"
+                    )
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise OAuthError(OAuthErrorCode.Protocol, message)
+            self._oauth_coordinators[bundle_id] = coordinator
+
+        if coordinator is not None:
+            status = await coordinator.restore_credentials()
+            if status.state == "authorized":
+                # 凭据恢复 → 带 provider 的 authenticated initialize（单次；401 → 凭据失效）
+                client = cast(
+                    HttpMCPClient,
+                    client_factory(
+                        config, message_handler=self._message_handler, oauth_coordinator=coordinator
+                    ),
+                )
+                try:
+                    signal = await self._bounded_connect(client, coordinator)
+                except UpstreamRedirectStoppedError:
+                    # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛
+                    self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                    raise
+                if signal is None:
+                    await self._commit_active_client(bundle_id, client, clear_epoch)
+                    return
+                if signal.status_code == 401:
+                    # 恢复的凭据已被服务端拒绝 → 清槽（generation bump + store 清空 +
+                    # status→Unauthorized），否则每次重启/重 start 都 restore→401→
+                    # OAuthRequired 死循环（Rust invalidate_credentials 语义）。
+                    await coordinator.invalidate_credentials()
+                else:
+                    # 403 insufficient_scope 等：交给 observe 通道（#133 共享钩子）
+                    await coordinator.observe_service_error(
+                        signal.status_code, signal.www_authenticate_header
+                    )
+                self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+                _raise_oauth_required()
+            if coordinator.has_registered_request():
+                # status() 在 Pending 下先行 expire 陈旧 flow（gen 不符 / PKCE 过 TTL），
+                # 防「僵尸注册 → ghost flow 再派发」；fresh 时 no-op 返回 Pending。
+                await coordinator.status()
+                if coordinator.has_registered_request():
+                    # 宿主已注册 flow → 交互式 connect 任务驱动 launch/complete（不阻塞本调用方）
+                    self._ensure_oauth_connect_task(bundle_id, coordinator)
+                    return
+
+        # 真正缺用户授权：activation 保留，仅 connection 状态落 AUTHORIZATION_REQUIRED
+        self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+        _raise_oauth_required()
+
+    async def _commit_active_client(self, bundle_id: BUNDLE_ID, client: MCPClientProtocol, clear_epoch: int | None = None) -> None:
+        """登记活跃 client（须持 ``_lock``）+ 刷新 ExposedToolMapping。
+
+        #185：提交前做 clear epoch 校验——start 连接 RPC 在途时若 :meth:`clear_oauth` 已发生
+        （凭据已撤销、clear 快速段已过），提交被拒并转 OAuthRequired。Rust 以 per-bundle
+        lifecycle lock 串行化 start-vs-clear；python 单一全局锁由 clear 的**零 await 快速段**
+        绕过（#185 关键不变量：clear 从不等待上游 MCP I/O），故以 epoch 补偿同一串行化语义。
+        未传 ``clear_epoch`` 的调用方（无此竞态面）跳过校验。
+        """
+        if clear_epoch is not None and self._oauth_clear_epochs.get(bundle_id, 0) != clear_epoch:
+            # 凭据已被并发 clear 撤销：不得登记 client。已建立的 transport 做 best-effort 退役
+            # （隔离审查 🔴1：拒绝后 client 无处置即丢弃 → 连接泄漏 + keep-alive 任务悬挂）；
+            # 断开失败仅 WARN、绝不吞掉 OAuthRequired 主异常。连接状态由 clear 快速段 commit
+            # （AUTHORIZATION_REQUIRED / DISCONNECTED），此处不覆盖。auto 路径按 OAuthRequired
+            # 吞掉、显式 start 向调用方传播。stdio 路径不可达（clear 对无 coordinator bundle 抛
+            # NotConfigured → epoch 恒不失配），统一处置仅为防御。
+            try:
+                await client.adisconnect()
+            except Exception:
+                logger.warning(
+                    f"start for bundle_id={bundle_id!r} rejected by concurrent clear_oauth, "
+                    "and transport disconnect failed",
+                    exc_info=True,
+                )
+            _raise_oauth_required()
         self._active_clients[bundle_id] = client
+        _bump_active_client_generation(self._active_client_generations, bundle_id)
+        self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
         # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚
         await self._arefresh_tool_mapping()
+
+    async def _bounded_connect(
+        self, client: HttpMCPClient, coordinator: OAuthCoordinator | None = None
+    ) -> AuthSignal | None:
+        """aconnect() 与 connect-phase challenge 信号（+ 可选 flow-aborted）竞速（30s 界）。
+
+        ``coordinator is None`` = anonymous-first 尝试（信号通道可得 401/403）。
+        ``coordinator`` 提供 = 带 provider 的 authenticated 尝试——关键差异（#179 实证）：
+        auth-attached 的 401 由 httpx auth 机制在 ``stream()`` **内部**消费（provider
+        全流程 inline，见上游 ``mcp/client/auth.py`` ``async_auth_flow``——无已知上游
+        issue），connect-phase 信号通道**看不到**；死路径为 provider 流程死亡后 aconnect
+        挂起（上游 ``mcp/client/streamable_http.py`` ``post_writer`` 异常吞没致请求侧
+        不 resolve，#133 实证——无已知上游 issue）。故增竞速 ``flow_aborted``
+        （redirect_handler 无注册请求时置位）：aborted 先到 ⇒ 恢复的凭据被 401
+        challenge 拒绝（mcp auth 仅在 401 时跑全流程）⇒ 合成 401 信号。403
+        （insufficient_scope 等）作为 final response 正常透过 → 信号通道可得。
+
+        返回 challenge 信号（client 未登记、随 GC 弃置，**不得** ``adisconnect``
+        未连上的 client——会递归 aconnect）；连通返回 None。
+
+        #179 隔离审查 🔴3：try/finally 保证本协程以**任何方式**退出（含被外层取消）
+        时内层任务全部回收——``asyncio.wait`` 不级联取消 pending 内层任务（asyncio
+        语义，已最小复现证实），孤儿 aconnect 会以 #133 挂起模式永久泄漏 httpx 会话。
+
+        Raises:
+            TimeoutError: 30s 内既未连通也未收到 challenge。
+            BaseException: 非 challenge 的 connect 失败原样上抛。
+        """
+        if coordinator is not None:
+            # 本次 connect 为全新尝试：旧 flow 的 abort 标记与本次无关
+            coordinator.flow_aborted_event().clear()
+        connect_task = asyncio.create_task(client.aconnect())
+        challenge_wait = asyncio.create_task(client.connect_challenge_event().wait())
+        redirect_stop_wait = asyncio.create_task(client.connect_redirect_event().wait())
+        aborted_wait = (
+            asyncio.create_task(coordinator.flow_aborted_event().wait())
+            if coordinator is not None
+            else None
+        )
+        inner = [connect_task, challenge_wait, redirect_stop_wait] + (
+            [aborted_wait] if aborted_wait is not None else []
+        )
+        try:
+            try:
+                done, _pending = await asyncio.wait(
+                    set(inner),
+                    timeout=_CONNECT_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except TimeoutError:
+                raise TimeoutError(
+                    f"connect neither succeeded nor received an auth challenge within {_CONNECT_TIMEOUT}s"
+                ) from None
+
+            if challenge_wait in done:
+                signal = client.take_connect_challenge()
+                return signal
+            if redirect_stop_wait in done:
+                # #181：安全守卫 stop 的跨 origin redirect——mcp 吞掉 3xx 异常致
+                # aconnect 挂起（#133 同款）；立即解出为 typed error（非授权错误）
+                status = client.take_connect_redirect_stop() or 0
+                raise UpstreamRedirectStoppedError(status)
+            if aborted_wait is not None and aborted_wait in done:
+                # provider 全流程死亡 = 401 challenge 拒绝了恢复的凭据（无注册 flow 的
+                # redirect_handler 抛 authorizationRequired）→ 合成 401 信号供调用方清槽
+                return AuthSignal(401, None)
+            # connect 先完成：成功 → None；失败 → 原异常上抛（未登记 client，随弃置）
+            if connect_task in done and not connect_task.cancelled():
+                exc = connect_task.exception()
+                if exc is not None:
+                    raise exc
+            return None
+        finally:
+            for t in inner:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*inner, return_exceptions=True)
+
+    def _oauth_spec(self, config: MCPServerConfig) -> tuple[str, OAuthOptions] | None:
+        """Streamable HTTP → ``(server_url, effective options)``；非 streamable → None（无 OAuth 通道）。
+
+        automatic-only（Rust #180）：无显式 ``oauth`` 配置也按 challenge 准入，
+        options 落默认（AuthCode + DCR），scopes / resource 从 metadata 派生。
+        """
+        if not isinstance(config, StreamableHttpServerConfig):
+            return None
+        options = config.oauth if config.oauth is not None else _DEFAULT_OAUTH_OPTIONS
+        return (str(config.server_parameters.url), options)
+
+    def _admit_oauth_coordinator(
+        self, bundle_id: BUNDLE_ID, config: MCPServerConfig, signal: AuthSignal
+    ) -> OAuthCoordinator | None:
+        """按 challenge 证据准入并构造 coordinator（automatic admission）。
+
+        准入门槛（Rust auto-admission 的 python 面）：
+        - Bearer challenge **携带** ``resource_metadata``：须与端点 same-origin（#185/#181）；
+        - Bearer challenge **无** ``resource_metadata``（裸 challenge）：仍准入——AS 发现
+          交由 mcp ≥1.29 的 well-known 回退链（PRM path 插入 / 根 → 服务器 origin 的
+          RFC 8414 AS metadata）。回退链 URL 均由 mcp 从 server_url 派生（安全面自约束）；
+          链上全部 404 时由 coordinator 的 discovery 校验 / fail_launch 收敛为 typed error。
+        PRM / AS metadata 的深层校验由 mcp inline 流程 + #181 安全不变量承担。
+        不准入返回 None（调用方落 ERROR + 报错）。
+
+        #185：scheme 判据复用 :func:`_bearer_challenge_parts`（与调用方精确分类单一权威）——
+        非 Bearer challenge 即便携带 resource_metadata 字样也不准入（#179 的 regex 搜索
+        会把 ``Basic resource_metadata=...`` 误判为准入；两套判据分叉即分类死分支）。
+        """
+        scheme, metadata_url = _bearer_challenge_parts(signal.www_authenticate_header)
+        if scheme is None:
+            return None
+        assert isinstance(config, StreamableHttpServerConfig)  # 调用方已按 _oauth_spec 收窄
+        server_url = str(config.server_parameters.url)
+        if metadata_url is not None and not same_origin(metadata_url, server_url):
+            return None
+        # #181：protected resource 端点 HTTPS-only（localhost/loopback http 豁免）——
+        # 非 https 且非 loopback 的明文 server 不进 OAuth 通道（对齐 Rust validate_secure_url）
+        try:
+            validate_secure_url(server_url)
+        except OAuthError:
+            return None
+        spec = self._oauth_spec(config)
+        if spec is None:  # pragma: no cover — 防御分支
+            return None
+        _url, options = spec
+        resource = options.resource or server_url
+        return OAuthCoordinator(
+            bundle_id=bundle_id,
+            server_url=server_url,
+            resource=resource,
+            options=options,
+            credential_store=self._oauth_credential_store,
+        )
+
+    def _ensure_oauth_connect_task(
+        self, bundle_id: BUNDLE_ID, coordinator: OAuthCoordinator
+    ) -> None:
+        """确保至多一次带 provider 的 connect 尝试在途（交互式 flow 的 transport 驱动者）。
+
+        detached task：provider 在 callback_handler 上可阻塞分钟级（等宿主 complete），
+        **不得**持 manager 锁——complete_oauth 需要锁之外的 coordinator 锁即可推进。
+        """
+        existing = self._oauth_connect_tasks.get(bundle_id)
+        if existing is not None and not existing.done():
+            # 已在途（Rust get_or_try_init 单例语义）。但旧任务可能正随上一 flow 的
+            # 终态失败收尾——若届时仍有 launch 等待者（终态后新 flow 已注册），
+            # 续派发一次，防「旧任务刚好结束、新 launch 无 transport 驱动」挂起。
+            def _rekick(_t: asyncio.Task[None]) -> None:
+                if coordinator.launch_awaiting():
+                    self._ensure_oauth_connect_task(bundle_id, coordinator)
+
+            existing.add_done_callback(_rekick)
+            return
+        # #185：clear epoch 在 **dispatch 时**捕获（而非任务首轮调度时）——clear 的 cancel 链
+        # 经 done callback 同步重派发（_rekick）后，本任务的首轮调度可能晚于 clear 快速段的
+        # epoch bump；dispatch 时捕获才能让任务携带「意图创立时」的 epoch，供状态写点比对。
+        clear_epoch = self._oauth_clear_epochs.get(bundle_id, 0)
+        task = asyncio.create_task(self._aoauth_connect(bundle_id, coordinator, clear_epoch))
+        self._oauth_connect_tasks[bundle_id] = task
+
+        def _cleanup(t: asyncio.Task[None]) -> None:
+            if self._oauth_connect_tasks.get(bundle_id) is t:
+                self._oauth_connect_tasks.pop(bundle_id, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _aoauth_connect(
+        self, bundle_id: BUNDLE_ID, coordinator: OAuthCoordinator, clear_epoch: int
+    ) -> None:
+        """交互式 OAuth connect（detached）：401 → mcp inline auth flow → 发布 URL → 等回调 → 交换 → 重试。
+
+        生命周期由 pending flow TTL（10 分钟）+ 取消链约束，不套 30s 上界（用户授权可达分钟级）。
+        成功 → 锁内 commit（epoch 守卫，见 :meth:`_commit_active_client`）；失败 → ``fail_launch``
+        解 wait_launch 等待者 + 连接状态 ERROR——**两处状态写点均先比对 dispatch 时捕获的
+        ``clear_epoch``**：clear 快速段已过（epoch 失配）则不写（隔离审查 🔴2：ghost 重派发
+        任务不得覆盖 clear 的 committed 状态；真实时序 = clear 的 cancel 链触发 _rekick 重派发，
+        任务首轮调度晚于 clear 快速段，其 aborted/fail 分支若照写 ERROR 会覆盖 AUTHORIZATION_REQUIRED）。
+        """
+        config = self._servers_config.get(bundle_id)
+        if config is None:  # pragma: no cover — 防御分支
+            return
+        if self._oauth_coordinators.get(bundle_id) is not coordinator:
+            # coordinator 已退役（transport 切换 / 配置移除）——ghost 任务守卫：
+            # 勿以陈旧 coordinator 对旧端点建立连接 / 写连接状态（#179 隔离复核 🟡c）
+            return
+        client = cast(
+            HttpMCPClient,
+            client_factory(config, message_handler=self._message_handler, oauth_coordinator=coordinator),
+        )
+        connect_task = asyncio.create_task(client.aconnect())
+        aborted_wait = asyncio.create_task(coordinator.flow_aborted_event().wait())
+        redirect_stop_wait = asyncio.create_task(client.connect_redirect_event().wait())
+        inner = [connect_task, aborted_wait, redirect_stop_wait]
+        try:
+            done, _pending = await asyncio.wait(
+                set(inner),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if redirect_stop_wait in done:
+                # #181 三轮审查 🔴：交互式路径的 redirect-stop 竞速——跨 origin redirect
+                # 被安全守卫 stop 时（如 DCR 端点 3xx 跨 origin），mcp 的
+                # _handle_registration_response 抛 OAuthRegistrationError → broad except
+                # 吞掉 → aconnect 永不 resolve（#133 同款挂起）。以 typed error 收敛
+                # launch 等待者（fail_launch 同步原子免锁）+ epoch 守卫写 ERROR（同
+                # aborted 分支模式）。
+                status = client.take_connect_redirect_stop() or 0
+                async with self._lock:
+                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
+                        coordinator.fail_launch(
+                            OAuthError(
+                                OAuthErrorCode.Protocol,
+                                f"cross-origin redirect (HTTP {status}) stopped by "
+                                "same-origin guard during interactive OAuth flow",
+                            )
+                        )
+                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                return
+            if aborted_wait in done:
+                # flow 已终止/失败（cancel / expire / clear / complete-Terminated）：provider
+                # 流程死亡后 mcp 请求侧挂起（#133 实证）——取消之，防 connect 任务泄漏、
+                # 并让 done_callback 的 re-kick 能为终态后新 flow 续派发。
+                # epoch 比对与状态写**同锁内同步段**（复核 R1）：比对在锁外时，锁获取
+                # await 会给 clear 快速段（持久化 store 的 clear() 有让出点）留插入窗口，
+                # 使陈旧比对结论覆盖 committed 状态。锁内重读 epoch 恒反映最新。
+                async with self._lock:
+                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
+                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                return
+            if connect_task.cancelled():
+                return  # pragma: no cover — 防御分支
+            exc = connect_task.exception()
+            if exc is not None:
+                # 同 aborted 分支：比对 + fail_launch + 状态写同锁内同步段（复核 R1）。
+                async with self._lock:
+                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
+                        coordinator.fail_launch(
+                            OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG)
+                        )
+                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                return
+            try:
+                async with self._lock:
+                    await self._commit_active_client(bundle_id, client, clear_epoch)
+            except OAuthError as commit_exc:
+                if not _is_oauth_required_error(commit_exc):
+                    # 非 OAuthRequired 的意外错误（当前 commit 链只抛 OAuthRequired，本分支
+                    # 不可达属防御）：响亮上抛 + 异常日志——宁可未回收任务异常留痕，不静默吞
+                    # 掉未来 commit 链引入的错误类别（detached 任务禁则的权衡依据）。
+                    logger.exception(
+                        f"oauth connect task for bundle_id={bundle_id!r} failed at commit "
+                        "with unexpected OAuthError"
+                    )
+                    raise
+                # #185：clear 在交互式 connect 在途时到达（cancel 链之外的窗口）→ epoch 守卫
+                # 拒绝提交。本任务是 detached 的 fire-and-forget——异常不得成为未回收任务异常；
+                # 使命已终结，静默收尾（不写状态：clear 快速段已 commit 正确状态）。
+                logger.debug(
+                    f"oauth connect task for bundle_id={bundle_id!r} rejected at commit: "
+                    "credentials cleared concurrently (clear epoch mismatch)",
+                )
+        finally:
+            # #179 隔离审查 🔴3：外层取消（clear_oauth / _clear_all cancel 本任务）不级联
+            # 内层任务——finally 统一回收，防孤儿 aconnect 挂起泄漏 + 跨 flow 污染。
+            for t in inner:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*inner, return_exceptions=True)
+
+    async def _ensure_oauth_coordinator(self, bundle_id: BUNDLE_ID) -> OAuthCoordinator:
+        """OAuthFlow.launch 入口：coordinator 存在即返回；否则跑一次 bounded connect 触发
+        challenge 捕获与准入（OAuthRequired 属预期，吞掉后复查注册表）。
+
+        Raises:
+            OAuthError: ``NotConfigured`` —— 未准入（无 challenge 证据）。
+        """
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is not None:
+            return coordinator
+        try:
+            async with self._lock:
+                await self._astart_client(bundle_id)
+        except OAuthError as exc:
+            if not _is_oauth_required_error(exc):
+                raise
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        return coordinator
+
+    def _discard_oauth_flow(self, bundle_id: BUNDLE_ID) -> None:
+        """撤下注册的 OAuthFlow handle（handle.cancel pre-admission 路径）。"""
+        self._oauth_flows.pop(bundle_id, None)
+
+    def _retire_oauth_bundle(self, bundle_id: BUNDLE_ID) -> None:
+        """撤下 bundle 的全部 OAuth 运行时态（coordinator / flow handle / 在途 connect 任务）。
+
+        用于 transport 类型切换（streamable→stdio/sse）与 aremove_server——凭据 store
+        不清（仅运行时态退役，clear_oauth 才清凭据槽）。
+        """
+        coordinator = self._oauth_coordinators.pop(bundle_id, None)
+        self._oauth_flows.pop(bundle_id, None)
+        # 解出旧 coordinator 的 launch 等待者（若有）→ launch_awaiting() 回落 False，
+        # 挂在该任务上的 _rekick 不再复活 ghost connect（#179 隔离复核 🟡c）。
+        if coordinator is not None:
+            coordinator.fail_launch(
+                OAuthError(OAuthErrorCode.AuthorizationCancelled, "Authorization was cancelled")
+            )
+        task = self._oauth_connect_tasks.pop(bundle_id, None)
+        if task is not None:
+            task.cancel()
 
     async def astop_client(self, bundle_id: BUNDLE_ID) -> None:
         """停止单个服务器客户端（按 bundle_id）。"""
@@ -247,16 +905,31 @@ class MCPServerManager:
         #    代价：**报错义务落在人机面** :mod:`a2c_smcp.computer.cli.resolve` —— REPL 先 ``resolve_target``
         #    解析并校验「已注册」，未命中不下传。**绕过 CLI 直调本方法的调用方拿不到任何未命中信号**
         #    （历史 P0「stop <未知 token> 却打印 ✅ 停止完成」即由此而来，见 #143）。新增调用方请自行判存。
-        """停止单个服务器客户端（按 bundle_id）。"""
+        """停止单个服务器客户端（按 bundle_id）。
+
+        #184：同时清除 control-plane activation intent 与 data-plane connection 状态。
+        只有显式 stop 才清除 activation；OAuth 凭据变化只影响 connection。
+        """
+        # 清除 control-plane activation intent
+        self._activation_intents.discard(bundle_id)
+        self._connection_states.pop(bundle_id, None)
+
         client = self._active_clients.pop(bundle_id, None)
         if client:
+            # #185：每次 active-client 移除都必须 bump 世代（ABA 检测，见 _bump_active_client_generation）
+            _bump_active_client_generation(self._active_client_generations, bundle_id)
             await client.adisconnect()
             await self._arefresh_tool_mapping()
 
     async def _astop_all(self) -> None:
-        """停止所有客户端"""
-        for name in list(self._active_clients.keys()):
-            await self._astop_client(name)
+        """停止所有客户端。
+
+        #184：收集 ``active_clients`` 与 ``activation_intents`` 的**并集**，
+        确保 OAuth-pending server（有 activation 但无活跃连接）也被停止。
+        """
+        all_ids = set(self._active_clients.keys()) | self._activation_intents
+        for bid in list(all_ids):
+            await self._astop_client(bid)
 
     async def astop_all(self) -> None:
         """停止所有客户端"""
@@ -268,7 +941,17 @@ class MCPServerManager:
         """清空所有连接与映射 / Clear all state。"""
         self._servers_config.clear()
         self._active_clients.clear()
+        self._activation_intents.clear()
+        self._connection_states.clear()
         self._exposed_tools.clear()
+        self._active_client_generations.clear()
+        self._oauth_clear_epochs.clear()
+        # #179 OAuth 注册表随清（detached connect 任务取消弃置；coordinator/store 凭宿主注入）
+        self._oauth_coordinators.clear()
+        self._oauth_flows.clear()
+        for task in self._oauth_connect_tasks.values():
+            task.cancel()
+        self._oauth_connect_tasks.clear()
 
     async def aclose(self) -> None:
         """关闭所有连接（别名）"""
@@ -277,8 +960,25 @@ class MCPServerManager:
         # 2. 清空所有状态存储
         self._clear_all()
 
+    def _withdraw_bundle_tool_routes(self, bundle_id: BUNDLE_ID) -> bool:
+        """确定性撤回单个 server 的缓存工具投影（**无 await、不取锁、不接触任何 MCP**）。
+
+        Fail-closed 原语（Rust ``withdraw_bundle_tool_routes`` 的 python 面）：即便上游 MCP
+        server 已不可达，本地授权撤销也立即生效。与全量 :meth:`_arefresh_tool_mapping` 不同，
+        本方法**只移除**指定 bundle 的路由、不发起任何 ``tools/list`` RPC。
+
+        **rebind 而非 in-place del**：在途迭代器（如 :meth:`available_tools` 的发布校验段）
+        读旧 dict 对象不受影响，避免「dictionary changed size during iteration」。
+
+        Returns:
+            bool: 实际是否有路由被移除（供 capability_changed 判定）。
+        """
+        before = len(self._exposed_tools)
+        self._exposed_tools = {exposed: route for exposed, route in self._exposed_tools.items() if route[0] != bundle_id}
+        return len(self._exposed_tools) != before
+
     async def _arefresh_tool_mapping(self) -> None:
-        """重建 ExposedToolMapping：``_exposed_tools[exposed_tool_name] = (bundle_id, 原始工具名)``。
+        """重建 ExposedToolMapping（**须持 ``_lock``**）：快照 → 构建新表 → 提交前世代校验 → 失配整轮重试。
 
         Rebuild the shared ExposedToolMapping used by both ``available_tools`` and ``tool_call`` routing.
 
@@ -286,43 +986,69 @@ class MCPServerManager:
         天然唯一——**无需**跨 server 重名对账（旧 ``ToolNameDuplicatedError`` 场景消失）。forbidden 工具**不进表**
         （不可见不可调用）。同一 bundle_id 内两工具经 ``alias`` 撞出相同 exposed → 保留首个 + Computer 本地诊断
         （WARN，非协议错误码）。
+
+        #185：:meth:`clear_oauth` 的**零 await 快速段不取锁**，可在本方法 RPC 在途时并发撤回路由 /
+        退役 client——若直接覆写活表，已撤回的路由会被陈旧快照**复活**。故：① 快照物化（list，
+        锁内 RPC 在途时 clear 对 ``_active_clients`` 的 pop 是就地变异，直接迭代活字典会 RuntimeError）；
+        ② 构建**新表**（不再原地 clear + 增量写，锁外读者只见旧表或新整表，与 Rust「原子换出」同构）；
+        ③ 提交前按「活跃 client 集合 + client 身份 + per-bundle 世代」校验快照一致性，失配则整轮重试
+        （Rust ``refresh_tool_routes`` 的 snapshot-validate-retry 同构）。重试**无界**（Rust 同为无界
+        ``continue``）：仅高频世代抖动（start/stop/clear 风暴）下多轮，最终一致；勿加 sleep——
+        抖动平息后一轮即收敛。
         """
-        self._exposed_tools.clear()
-        for bundle_id, client in self._active_clients.items():
-            config = self._servers_config[bundle_id]
-            # #151 R1'：default_tool_meta.alias 天生病态（alias 是 per-tool 改名）→ 已忽略（见 _merged_tool_meta），
-            # 每次刷新各 server 各打一次响亮配置诊断（方案 d，与 no-double-open「不静默丢 + 配置诊断」同姿态；非协议错误码）。
-            # 跨 SDK：rust 侧同款 R1' 待以**同方案 d**跟修（否则 python 各以原始名暴露 / rust 塌名 = 双端分叉，向量测不出；
-            # #142 教训）——镜像 follow-up 追踪于 Epic #147。
-            if config.default_tool_meta is not None and config.default_tool_meta.alias:
-                logger.warning(
-                    f"default_tool_meta.alias={config.default_tool_meta.alias!r}（bundle_id={bundle_id!r}）已忽略："
-                    f"alias 是 per-tool 改名，放 default 位会令该 server 所有工具塌成同名。"
-                    f"如需改名请在具体 tool_meta.<工具名> 内单独配 alias（Computer 本地诊断，非协议错误码）。",
+        while True:
+            snapshot: list[tuple[BUNDLE_ID, MCPClientProtocol, int]] = [
+                (
+                    bundle_id,
+                    client,
+                    self._active_client_generations.get(bundle_id, 0),
                 )
-            try:
-                tools = await client.list_tools()
-            except Exception as e:
-                logger.error(f"Error listing tools for bundle_id={bundle_id!r} (name={config.name!r}): {e}", exc_info=True)
-                continue
-            for t in tools or []:
-                original_tool_name = t.name
-                # 合并后的工具元数据（具体 tool_meta 优先，回落 default_tool_meta）
-                tool_meta = self._merged_tool_meta(config, original_tool_name)
-                # alias 仅替换 exposed 的**工具名部分**（协议新语义，仍带 {bundle_id}__ 前缀）；无 alias 回退原始名
-                tool_part = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
-                # forbidden：按**原始名**或 **alias 后工具名**匹配（用户可用任一禁用）；命中即不暴露、不路由
-                if original_tool_name in (config.forbidden_tools or []) or tool_part in (config.forbidden_tools or []):
-                    continue
-                exposed = f"{bundle_id}__{tool_part}"
-                if exposed in self._exposed_tools:
-                    # 同一 bundle_id 内 alias 撞名（跨 bundle_id 不可能撞）→ 保留首个 + 诊断，指导修正 alias
+                for bundle_id, client in self._active_clients.items()
+            ]
+            new_routes: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
+            for bundle_id, client, _generation in snapshot:
+                config = self._servers_config[bundle_id]
+                # #151 R1'：default_tool_meta.alias 天生病态（alias 是 per-tool 改名）→ 已忽略（见 _merged_tool_meta），
+                # 每次刷新各 server 各打一次响亮配置诊断（方案 d，与 no-double-open「不静默丢 + 配置诊断」同姿态；非协议错误码）。
+                # 跨 SDK：rust 侧同款 R1' 待以**同方案 d**跟修（否则 python 各以原始名暴露 / rust 塌名 = 双端分叉，向量测不出；
+                # #142 教训）——镜像 follow-up 追踪于 Epic #147。
+                if config.default_tool_meta is not None and config.default_tool_meta.alias:
                     logger.warning(
-                        f"exposed_tool_name 冲突（同 bundle_id={bundle_id!r} 内 alias 撞名）：'{exposed}'——保留首个、"
-                        f"跳过原始工具 '{original_tool_name}'；请修正 tool_meta.alias（Computer 本地诊断，非协议错误码）。",
+                        f"default_tool_meta.alias={config.default_tool_meta.alias!r}（bundle_id={bundle_id!r}）已忽略："
+                        f"alias 是 per-tool 改名，放 default 位会令该 server 所有工具塌成同名。"
+                        f"如需改名请在具体 tool_meta.<工具名> 内单独配 alias（Computer 本地诊断，非协议错误码）。",
                     )
+                try:
+                    tools = await client.list_tools()
+                except Exception as e:
+                    logger.error(f"Error listing tools for bundle_id={bundle_id!r} (name={config.name!r}): {e}", exc_info=True)
                     continue
-                self._exposed_tools[exposed] = (bundle_id, original_tool_name)
+                for t in tools or []:
+                    original_tool_name = t.name
+                    # 合并后的工具元数据（具体 tool_meta 优先，回落 default_tool_meta）
+                    tool_meta = self._merged_tool_meta(config, original_tool_name)
+                    # alias 仅替换 exposed 的**工具名部分**（协议新语义，仍带 {bundle_id}__ 前缀）；无 alias 回退原始名
+                    tool_part = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
+                    # forbidden：按**原始名**或 **alias 后工具名**匹配（用户可用任一禁用）；命中即不暴露、不路由
+                    if original_tool_name in (config.forbidden_tools or []) or tool_part in (config.forbidden_tools or []):
+                        continue
+                    exposed = f"{bundle_id}__{tool_part}"
+                    if exposed in new_routes:
+                        # 同一 bundle_id 内 alias 撞名（跨 bundle_id 不可能撞）→ 保留首个 + 诊断，指导修正 alias
+                        logger.warning(
+                            f"exposed_tool_name 冲突（同 bundle_id={bundle_id!r} 内 alias 撞名）：'{exposed}'——保留首个、"
+                            f"跳过原始工具 '{original_tool_name}'；请修正 tool_meta.alias（Computer 本地诊断，非协议错误码）。",
+                        )
+                        continue
+                    new_routes[exposed] = (bundle_id, original_tool_name)
+            # 提交前校验：活跃 client 集合 + 身份 + 世代是否与快照一致（clear 快速段 / stop / start
+            # 均会造成失配）→ 失配则整轮重试，绝不以陈旧快照覆写更新的投影
+            if len(self._active_clients) == len(snapshot) and all(
+                self._active_clients.get(bundle_id) is client and self._active_client_generations.get(bundle_id, 0) == generation
+                for bundle_id, client, generation in snapshot
+            ):
+                self._exposed_tools = new_routes
+                return
 
     async def arefresh_tools(self) -> None:
         """公开的工具映射刷新入口：锁内重建 ExposedToolMapping（``_exposed_tools``）（#127）。
@@ -492,21 +1218,235 @@ class MCPServerManager:
             raise MCPServerNotFoundError(f"MCP Server bundle_id={bundle_id!r} is not registered")
         return await client.list_resources_page(cursor)
 
+    # ── #184 启动/连接状态正交化 runtime status API ──────────────────────────
+
+    # 将 per-client STATES 字符串映射到 MCPServerConnectionState
+    _CLIENT_STATE_TO_CONNECTION: dict[str, MCPServerConnectionState] = {
+        "initialized": MCPServerConnectionState.CONNECTING,
+        "connected": MCPServerConnectionState.CONNECTED,
+        "disconnected": MCPServerConnectionState.DISCONNECTED,
+        "error": MCPServerConnectionState.ERROR,
+    }
+
+    def get_server_runtime_statuses(self) -> list[MCPServerRuntimeStatus]:
+        """获取所有已注册 server 的正交运行时状态快照 / Orthogonal runtime status snapshot.
+
+        **纯内存读取、无 I/O**。从 _servers_config / _activation_intents /
+        _connection_states / _active_clients 四源合成，每个 server 返回其
+        control-plane activation 与 data-plane connection 的当前状态。
+        """
+        results: list[MCPServerRuntimeStatus] = []
+        for bid, config in self._servers_config.items():
+            activation = (
+                MCPServerActivationState.STARTED
+                if bid in self._activation_intents
+                else MCPServerActivationState.STOPPED
+            )
+
+            remembered = self._connection_states.get(bid)
+            if activation == MCPServerActivationState.STOPPED:
+                connection = MCPServerConnectionState.DISCONNECTED
+            elif remembered is MCPServerConnectionState.AUTHORIZATION_REQUIRED:
+                # 终端用户动作边界（如 clear_oauth）：优先取 committed 状态，
+                # 而非并发采样的 live client state。
+                connection = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+            elif bid in self._active_clients:
+                live_state = self._active_clients[bid].state
+                connection = self._CLIENT_STATE_TO_CONNECTION.get(
+                    live_state, MCPServerConnectionState.DISCONNECTED
+                )
+            else:
+                connection = remembered or MCPServerConnectionState.DISCONNECTED
+
+            results.append(
+                MCPServerRuntimeStatus(
+                    bundle_id=bid,
+                    name=config.name,
+                    activation=activation,
+                    connection=connection,
+                )
+            )
+        return results
+
     def get_server_status(self) -> list[tuple[BUNDLE_ID, SERVER_NAME, bool, str]]:
         """获取服务器状态列表 [(bundle_id, display_name, 是否活跃, 状态), ...]。
 
-        #166：返回 display name（``_servers_config[bundle_id].name``），供 CLI status 表渲染
-        人机面的 "Name" 列。bundle_id 留给 ``server rm/stop`` 等命令寻址使用。
+        #184 backward compat：委托 :meth:`get_server_runtime_statuses`。
+        ``is_active`` 现在投影 ``is_started()``（原为 ``bundle_id in _active_clients``）；
+        ``state`` 投影 connection state snake_case 字符串（原为 ``"pending"`` 或 client.state）。
         """
         return [
-            (
-                bundle_id,
-                self._servers_config[bundle_id].name,
-                bundle_id in self._active_clients,
-                "pending" if bundle_id not in self._active_clients else self._active_clients[bundle_id].state,
-            )
-            for bundle_id in self._servers_config
+            (s.bundle_id, s.name, s.is_started(), s.connection.value)
+            for s in self.get_server_runtime_statuses()
         ]
+
+    # ── #179 公共 OAuth facade（签名对齐 Rust Computer/Manager） ─────────────
+
+    def with_oauth_credential_store(self, store: OAuthCredentialStore) -> "MCPServerManager":
+        """注入凭据存储（builder，返回 self）。缺省 :class:`InMemoryOAuthCredentialStore`；
+        跨进程恢复由宿主注入持久化 store（Epic Sub 4，Rust ``with_oauth_credential_store``）。
+
+        注意：对**已准入**的 coordinator 不生效（coordinator 构造时已绑定 store）——
+        请在首次 connect 之前注入（Computer 版同约定：须在 boot_up 前调用）。
+        """
+        self._oauth_credential_store = store
+        return self
+
+    async def oauth_status(self, bundle_id: BUNDLE_ID) -> OAuthStatus:
+        """查询指定 server 的 OAuth 授权状态。
+
+        Raises:
+            OAuthError: ``NotConfigured`` —— bundle 未注册 / 未准入（从未见过 Bearer challenge）；
+                ``UnsupportedTransport`` —— 非 Streamable HTTP（无 OAuth 通道）。
+        """
+        config = self._servers_config.get(bundle_id)
+        if config is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        if self._oauth_spec(config) is None:
+            raise OAuthError(
+                OAuthErrorCode.UnsupportedTransport,
+                f"Server bundle_id={bundle_id!r} does not support OAuth",
+            )
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        return await coordinator.status()
+
+    def create_oauth_flow(self, bundle_id: BUNDLE_ID, request: OAuthBeginRequest) -> OAuthFlow:
+        """注册交互式授权 flow（**同步、无 I/O**；对齐 Rust ``create_oauth_flow``）。
+
+        相同请求幂等返回同一 handle；不同请求 → ``AuthorizationAlreadyPending``。
+        准入推迟到 :meth:`OAuthFlow.launch`（跑 bounded connect）。
+        """
+        config = self._servers_config.get(bundle_id)
+        if config is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        if self._oauth_spec(config) is None:
+            raise OAuthError(
+                OAuthErrorCode.UnsupportedTransport,
+                f"Server bundle_id={bundle_id!r} does not support OAuth",
+            )
+        existing = self._oauth_flows.get(bundle_id)
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        # Rust ``!flow.is_terminal()`` 过滤：只有**非终态**的既有 flow 参与幂等/冲突
+        # 判定。终态后（completed / cancelled / expired）新请求**替换**注册表槽——
+        # 宿主 loopback retry 每次换 ephemeral port（新 redirect_uri）正是此模式。
+        if existing is not None and (coordinator is None or coordinator.has_active_flow()):
+            if existing._request == request:
+                return existing  # 幂等：同一 flow 的 clone
+            raise OAuthError(
+                OAuthErrorCode.AuthorizationAlreadyPending,
+                "A different authorization flow is already pending",
+            )
+        flow = OAuthFlow(manager=self, bundle_id=bundle_id, request=request)
+        self._oauth_flows[bundle_id] = flow
+        return flow
+
+    async def complete_oauth(
+        self, bundle_id: BUNDLE_ID, callback: OAuthCallback
+    ) -> OAuthFlowOutcome:
+        """提交宿主浏览器回调（经注册的 handle 委托 coordinator 完成交换）。
+
+        Raises:
+            OAuthError: ``StateMismatch`` —— 无注册 flow；其余按 coordinator 语义。
+        """
+        flow = self._oauth_flows.get(bundle_id)
+        if flow is None:
+            raise OAuthError(
+                OAuthErrorCode.StateMismatch,
+                "No pending authorization flow",
+            )
+        return await flow.complete(callback)
+
+    async def cancel_oauth(
+        self, bundle_id: BUNDLE_ID, cancellation: OAuthCancellation
+    ) -> OAuthFlowOutcome:
+        """宿主取消/AS 错误回调（经注册 handle 按 reason 分派；Rust ``cancel_compat``）。
+
+        Raises:
+            OAuthError: ``StateMismatch`` —— 无注册 flow。
+        """
+        flow = self._oauth_flows.get(bundle_id)
+        if flow is None:
+            raise OAuthError(
+                OAuthErrorCode.StateMismatch,
+                "No pending authorization flow",
+            )
+        return await flow._cancel_compat(cancellation)
+
+    async def clear_oauth(self, bundle_id: BUNDLE_ID) -> bool:
+        """清除该 server 的 OAuth 授权并报告 Agent 面能力是否被**实际撤回**（#185）。
+
+        排干 pending flow（cancel + 撤销在途 connect 任务）→ 清凭据槽（DCR 注册 +
+        token + issuer index）→ status 回落 Unauthorized → **零 await 快速段** commit：
+        clear epoch +1 → 退役活跃 client → 确定性撤回本 bundle 路由 → 连接状态 commit
+        （Started → AUTHORIZATION_REQUIRED，否则 DISCONNECTED；**不清 activation**，
+        #184：只有显式 stop 才清）→ 传输断开（撤销已 commit 后才做，fallible 仅 WARN）。
+
+        **关键不变量（#185，对齐 Rust ``clear_oauth_with_outcome``）**：快速段不取
+        ``_lock``、不含任何 await → 在 asyncio 单线程事件循环内原子，**从不等待**任何
+        锁内 inflight 上游 MCP I/O（tools/list / connect / disconnect）——即便上游 server
+        永远不应答，本地授权撤销也立即生效。start-vs-clear 竞态由
+        :meth:`_commit_active_client` 的 clear epoch 校验补偿（见该处注释）。
+
+        Returns:
+            bool: ``True`` = 有活跃 client 被退役或路由被实际撤回（capability_changed，
+                调用方据此 bump revision + 广播 update_tool_list）；``False`` = 无事发生
+                （幂等：重复 clear 已清除的 bundle 不触发二次传播）。
+
+        Raises:
+            OAuthError: ``NotConfigured`` —— 未准入。
+        """
+        coordinator = self._oauth_coordinators.get(bundle_id)
+        if coordinator is None:
+            raise OAuthError(
+                OAuthErrorCode.NotConfigured,
+                "OAuth has not been admitted for this server",
+            )
+        # 撤销在途 connect 任务（交互式 flow 的 transport 驱动者）
+        task = self._oauth_connect_tasks.pop(bundle_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._oauth_flows.pop(bundle_id, None)
+        # 排干 pending flow + 清凭据 + status→Unauthorized（coordinator 自身锁；本地 store I/O）
+        await coordinator.clear()
+        # ── 能力撤销快速段（零 await → asyncio 原子，不取 _lock）────────────────────
+        # ① clear epoch +1：start 提交守卫（Rust 以 per-bundle lifecycle lock 串行化 start-vs-clear；
+        #    python 单一全局锁由本快速段绕过，故以 epoch 补偿同一语义，见 _commit_active_client）
+        self._oauth_clear_epochs[bundle_id] = self._oauth_clear_epochs.get(bundle_id, 0) + 1
+        # ② 退役活跃 client（pop 就地变异；与 _arefresh_tool_mapping 的快照化配合防迭代 RuntimeError）
+        client = self._active_clients.pop(bundle_id, None)
+        had_connected_client = client is not None
+        if had_connected_client:
+            _bump_active_client_generation(self._active_client_generations, bundle_id)
+        # ③ 确定性撤回本 bundle 路由（纯本地、无 RPC、fail-closed）
+        routes_withdrawn = self._withdraw_bundle_tool_routes(bundle_id)
+        # ④ 连接状态 commit（get_server_runtime_statuses 的 committed 分支渲染）
+        if bundle_id in self._activation_intents:
+            self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
+        else:
+            self._connection_states[bundle_id] = MCPServerConnectionState.DISCONNECTED
+        # ── 传输断开（撤销已 commit 后才做；fallible 仅 WARN，Rust 同款）────────────
+        if client is not None:
+            try:
+                await client.adisconnect()
+            except Exception:
+                logger.warning(
+                    f"OAuth credentials cleared for bundle_id={bundle_id!r}, but transport disconnect failed",
+                    exc_info=True,
+                )
+        return had_connected_client or routes_withdrawn
 
     async def available_tools(self) -> AsyncGenerator[tuple[BUNDLE_ID, Tool], Any]:
         """获取暴露给 Agent 的工具及其归属；产出 ``(bundle_id, Tool)``，``Tool.name`` = **exposed_tool_name**。
@@ -516,29 +1456,69 @@ class MCPServerManager:
         ``SMCPTool.bundle_id`` 填充，显式归属、禁前缀反推）。Agent 即以 exposed_tool_name 寻址，
         ``aexecute_tool`` 经 ExposedToolMapping 解析回原始名调用上游。与 ``list_windows`` / ``list_resources``
         返回 ``(bundle_id, X)`` 的既定约定一致。
-        """
-        async with self._lock:
-            servers_cached_tools: dict[BUNDLE_ID, list[Tool]] = {}
-            for exposed_name, (bundle_id, original_tool_name) in self._exposed_tools.items():
-                if bundle_id not in self._active_clients:
-                    continue
-                if bundle_id not in servers_cached_tools:
-                    servers_cached_tools[bundle_id] = await self._active_clients[bundle_id].list_tools()
-                tools = servers_cached_tools[bundle_id]
-                config = self._servers_config[bundle_id]
 
-                tool = next((t for t in tools if t.name == original_tool_name), None)
-                if tool:
-                    a2c_meta = self._merged_tool_meta(config, original_tool_name)
-                    # 产出名字改写后的**副本**（改 name 为 exposed_name），避免原地 mutate 缓存对象。
-                    # Yield a renamed copy (name=exposed_name) to avoid mutating the cached tool object.
-                    update: dict[str, Any] = {"name": exposed_name}
-                    if a2c_meta:
-                        merged_meta = dict(tool.meta) if tool.meta else {}
-                        merged_meta[A2C_TOOL_META] = a2c_meta
-                        update["meta"] = merged_meta
-                    # 携归属 bundle_id 产出（#152 D1）；bundle_id 即 _exposed_tools 键的解析后身份。
-                    yield bundle_id, tool.model_copy(update=update)
+        #185：快照 → **锁外** RPC（每 bundle 至多一次 tools/list）→ 发布前锁外二次校验
+        （零 await 同步段 → asyncio 原子）——「路由值未变 + client 身份未变 + 世代未变」三项全真才产出，
+        任一失配（:meth:`clear_oauth` 快速段已撤回该 bundle）→ 丢弃该候选。与 Rust
+        ``list_available_tools_with_bundle_id`` 发布前重验证同构：clear 要么先于本拉取完成
+        （候选被过滤），要么后于本拉取（capability 广播触发 Agent 重拉）——Agent **永不**在
+        clear 完成后拿到含已撤回 bundle 的过期工具列表。
+        """
+        # ① 快照（锁内一次性取：路由 + client 身份 + 世代 + config；此后全部 RPC 在锁外——
+        #    clear 快速段绝不因本拉取的 tools/list RPC 而阻塞）
+        snapshots: list[tuple[EXPOSED_TOOL_NAME, BUNDLE_ID, TOOL_NAME, MCPClientProtocol, int, MCPServerConfig]] = []
+        async with self._lock:
+            for exposed_name, (bundle_id, original_tool_name) in self._exposed_tools.items():
+                client = self._active_clients.get(bundle_id)
+                if client is None:
+                    continue
+                snapshots.append((
+                    exposed_name,
+                    bundle_id,
+                    original_tool_name,
+                    client,
+                    self._active_client_generations.get(bundle_id, 0),
+                    self._servers_config[bundle_id],
+                ))
+        # ② 锁外 RPC：每 bundle_id 仅拉一次 tools/list（跨该 server 的多个 routed tool 复用，
+        #    同 #91 per-server 缓存约定；异常照旧向调用方传播，与历史行为一致）
+        servers_cached_tools: dict[BUNDLE_ID, list[Tool]] = {}
+        for _exposed_name, bundle_id, _original_tool_name, client, _generation, _config in snapshots:
+            if bundle_id not in servers_cached_tools:
+                servers_cached_tools[bundle_id] = await client.list_tools()
+        # ③ 组装候选（改名副本 + A2C meta；携发布校验所需的路由/身份/世代证据）
+        candidates: list[tuple[EXPOSED_TOOL_NAME, BUNDLE_ID, TOOL_NAME, MCPClientProtocol, int, Tool]] = []
+        for exposed_name, bundle_id, original_tool_name, client, generation, config in snapshots:
+            tools = servers_cached_tools.get(bundle_id)
+            if tools is None:
+                continue
+            tool = next((t for t in tools if t.name == original_tool_name), None)
+            if tool is None:
+                continue
+            a2c_meta = self._merged_tool_meta(config, original_tool_name)
+            # 产出名字改写后的**副本**（改 name 为 exposed_name），避免原地 mutate 缓存对象。
+            # Yield a renamed copy (name=exposed_name) to avoid mutating the cached tool object.
+            update: dict[str, Any] = {"name": exposed_name}
+            if a2c_meta:
+                merged_meta = dict(tool.meta) if tool.meta else {}
+                merged_meta[A2C_TOOL_META] = a2c_meta
+                update["meta"] = merged_meta
+            candidates.append((
+                exposed_name,
+                bundle_id,
+                original_tool_name,
+                client,
+                generation,
+                tool.model_copy(update=update),
+            ))
+        # ④ 发布前锁外二次校验（零 await 同步段 → asyncio 原子）：三项全真才产出；
+        #    携归属 bundle_id 产出（#152 D1）；bundle_id 即 _exposed_tools 键的解析后身份。
+        for exposed_name, bundle_id, original_tool_name, client, generation, tool in candidates:
+            route_is_current = self._exposed_tools.get(exposed_name) == (bundle_id, original_tool_name)
+            client_is_current = self._active_clients.get(bundle_id) is client
+            generation_is_current = self._active_client_generations.get(bundle_id, 0) == generation
+            if route_is_current and client_is_current and generation_is_current:
+                yield bundle_id, tool
 
     async def list_windows(self, window_uri: str | None = None) -> list[tuple[BUNDLE_ID, Resource]]:
         """

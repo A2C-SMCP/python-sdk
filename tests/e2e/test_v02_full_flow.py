@@ -53,8 +53,8 @@ from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.exceptions import ProtocolVersionError
 from a2c_smcp.server.middleware import A2CProtocolVersionASGIMiddleware
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
+from a2c_smcp.testing import UvicornTestServer
 from a2c_smcp.utils.handshake import HANDSHAKE_CONNECT_ERRORS
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
 from tests.protocol_versions import INCOMPATIBLE_PEER
 

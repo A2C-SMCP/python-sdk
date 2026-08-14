@@ -3,6 +3,8 @@
 # @Author  : JQQ
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAlias, runtime_checkable
 
 from mcp import StdioServerParameters, Tool
@@ -11,6 +13,7 @@ from mcp.types import CallToolResult, ReadResourceResult, Resource
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from vrl_python import VRLRuntime
 
+from a2c_smcp.computer.mcp_clients.oauth_types import OAuthOptions
 from a2c_smcp.types import SERVER_NAME, TOOL_NAME
 from a2c_smcp.utils.bundle_id import validate_explicit_bundle_id
 
@@ -157,6 +160,11 @@ class SseServerConfig(BaseMCPServerConfig):
 class StreamableHttpServerConfig(BaseMCPServerConfig):
     type: Literal["streamable"] = "streamable"
     server_parameters: StreamableHttpParameters = Field(title="MCP HTTP Server连接参数", description="引用自MCP Python SDK 官方配置")
+    oauth: OAuthOptions | None = Field(
+        default=None,
+        title="OAuth 配置",
+        description="对齐 Rust HttpServerConfig.oauth（SDK 层，非 SMCP 协议）",
+    )
 
 
 MCPServerConfig: TypeAlias = StdioServerConfig | SseServerConfig | StreamableHttpServerConfig
@@ -282,3 +290,68 @@ class GetSkillRet(BaseModel):
                 "protocol data-structures.md §GetSkillRet / skill.md §9",
             )
         return self
+
+
+# ── #184 启动/连接状态正交化 / Activation/connection state orthogonality ──────────
+
+
+class MCPServerActivationState(StrEnum):
+    """控制面启动意图 / Control-plane activation intent.
+
+    该状态与传输连接正交：OAuth 授权尚未完成时，Server 仍可保持 ``started``，但连接状态为
+    :attr:`MCPServerConnectionState.authorization_required`。
+    """
+
+    STOPPED = "stopped"
+    """未启动或已被显式停止 / Not started or explicitly stopped."""
+
+    STARTED = "started"
+    """已接受启动请求（不因 OAuth 未授权而丢失） / Start request accepted."""
+
+
+class MCPServerConnectionState(StrEnum):
+    """数据面连接状态 / Data-plane connection state."""
+
+    DISCONNECTED = "disconnected"
+    """当前没有连接 / No current connection."""
+
+    CONNECTING = "connecting"
+    """正在建立连接 / Establishing a connection."""
+
+    CONNECTED = "connected"
+    """已连接，可提供 MCP 能力 / Connected and able to provide MCP capabilities."""
+
+    AUTHORIZATION_REQUIRED = "authorization_required"
+    """连接被 OAuth 授权前置条件阻塞 / Connection blocked on OAuth authorization."""
+
+    ERROR = "error"
+    """最近一次连接尝试失败 / The latest connection attempt failed."""
+
+
+@dataclass(frozen=True)
+class MCPServerRuntimeStatus:
+    """MCP Server 的正交运行时状态 / Orthogonal MCP server runtime status.
+
+    将控制面启动意图与数据面连接状态解耦：activation 跟踪用户是否请求了启动，
+    connection 跟踪传输层状态。
+    """
+
+    bundle_id: str
+    """稳定身份键 / Stable identity key."""
+
+    name: str
+    """展示名称（可碰撞，非身份） / Display name (may collide; NOT identity)."""
+
+    activation: MCPServerActivationState
+    """控制面启动意图 / Control-plane activation intent."""
+
+    connection: MCPServerConnectionState
+    """数据面连接状态 / Data-plane connection state."""
+
+    def is_started(self) -> bool:
+        """是否已接受启动请求 / Whether activation has been requested and retained."""
+        return self.activation == MCPServerActivationState.STARTED
+
+    def is_connected(self) -> bool:
+        """是否已连接并可提供 MCP 能力 / Whether the data plane is connected."""
+        return self.connection == MCPServerConnectionState.CONNECTED

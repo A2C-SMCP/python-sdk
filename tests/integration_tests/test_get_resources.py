@@ -33,6 +33,7 @@ from mcp import StdioServerParameters
 from socketio import ASGIApp, AsyncClient, Client
 from werkzeug.serving import make_server
 
+from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.errors import SMCPProtocolError
@@ -41,9 +42,8 @@ from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import GET_RESOURCES_EVENT, JOIN_OFFICE_EVENT, SMCP_NAMESPACE
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
+from a2c_smcp.testing import UvicornTestServer, create_local_sync_server
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
-from tests.integration_tests.server._local_sync_server import create_local_sync_server
 
 MCP_SERVERS_DIR = Path(__file__).resolve().parent / "computer" / "mcp_servers"
 PAGED_SERVER = MCP_SERVERS_DIR / "resources_paged_mixed_stdio_server.py"
@@ -307,7 +307,7 @@ def _run_mock_computer_process(port: int, ready_q: multiprocessing.Queue, err_q:
         }
 
     try:
-        computer.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+        computer.connect(f"http://localhost:{port}?a2c_version={PROTOCOL_VERSION}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         _sync_join(computer, role="computer", office_id=_SYNC_OFFICE, name=_SYNC_COMPUTER)
         ready_q.put(_SYNC_COMPUTER)
         computer.wait()

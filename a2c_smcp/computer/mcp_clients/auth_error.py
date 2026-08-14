@@ -33,6 +33,7 @@ __all__ = [
     "META_ERROR_CODE_KEY",
     "META_MCP_SERVER_KEY",
     "UpstreamAuthError",
+    "UpstreamRedirectStoppedError",
     "build_auth_error_result",
     "classify_auth_error",
 ]
@@ -54,6 +55,23 @@ class UpstreamAuthError(Exception):
         self.status_code = status_code
         self.www_authenticate_header = www_authenticate_header
         super().__init__(f"upstream auth failure: HTTP {status_code}")
+
+
+class UpstreamRedirectStoppedError(Exception):
+    """安全传输守卫拒绝跨 origin redirect（#181 不变量 5）时，由 HTTP client 兜底抛出的 typed error。
+
+    mcp 的 ``post_writer`` 会把 3xx 的 ``raise_for_status`` 异常吞掉并拆连接（#133 同款吞没），
+    请求侧会无限挂起——与 401/403 同通道，守卫在响应上打标记、``_AuthWatchingClient`` 截获、
+    ``call_tool`` 竞速解出后抛本异常。**非授权错误**：:func:`classify_auth_error` 不认识它，
+    走通用失败路径（不退化为 4006/4007）。
+    """
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(
+            f"cross-origin redirect (HTTP {status_code}) stopped by same-origin guard "
+            "(OAuth security invariant 5)"
+        )
 
 
 # 结果级 meta 字段键（协议字面键，非 A2C_ 前缀）/ result-level meta keys (protocol literal keys).

@@ -22,8 +22,8 @@ from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig, ToolMeta
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import GET_CONFIG_EVENT, GET_TOOLS_EVENT, SMCP_NAMESPACE, TOOL_CALL_EVENT
+from a2c_smcp.testing import UvicornTestServer
 from a2c_smcp.utils.logger import logger
-from tests.integration_tests.computer.socketio.mock_uv_server import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace, create_computer_test_socketio
 
 
