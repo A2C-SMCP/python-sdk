@@ -243,6 +243,9 @@ class Computer(BaseComputer[PromptSession]):
         self._active_raw: dict[str, MCPServerConfig] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
+        # #185：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——仅
+        # clear_oauth 的**实际能力撤回**时 +1（见 clear_oauth；config 轴分账见类内 §12 R2 注释）。
+        self._capability_revision: int = 0
         # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
         # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
         self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
@@ -2092,17 +2095,45 @@ class Computer(BaseComputer[PromptSession]):
         assert self.mcp_manager is not None
         return await self.mcp_manager.cancel_oauth(bundle_id, cancellation)
 
-    async def clear_oauth(self, bundle_id: str) -> None:
-        """清除该 server 的 OAuth 授权（凭据 + 流程 + 状态 commit + 退役 client）。
+    @property
+    def capability_revision(self) -> int:
+        """capability 轴修订计数（#185，对齐 Rust ``Computer::capability_revision``）。
 
-        能力撤销**传播**（capability revision bump + tool-list 广播）由 #185 接管。
+        仅当 :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）
+        时 +1；幂等重复 clear 不递增。config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
+        """
+        return self._capability_revision
+
+    async def clear_oauth(self, bundle_id: str) -> None:
+        """清除该 server 的 OAuth 授权并传播能力撤销（#185）。
+
+        凭据 + 流程 + 状态 commit + 退役 client（manager 层），随后**仅当有实际能力变化**
+        （``capability_changed``）时：bump :attr:`capability_revision` + 经 Socket.IO 发射
+        ``server:update_tool_list``（Server 广播 ``notify:update_tool_list`` → Agent 重拉工具
+        列表，被清除 server 的工具即时从 Agent 可见面消失）。重复 clear 已清除的 bundle =
+        ``capability_changed=False`` → 不 bump、不广播（幂等）。
+
+        传播失败不吞：bump 为本地状态必然发生；emit 失败记 ERROR 日志（与
+        ``_on_manager_change`` 的 ToolListChanged 上报同姿态）。
 
         Args:
             bundle_id: 目标 server 的 bundle_id。
         """
         self._require_oauth_manager()
         assert self.mcp_manager is not None
-        await self.mcp_manager.clear_oauth(bundle_id)
+        capability_changed = await self.mcp_manager.clear_oauth(bundle_id)
+        if not capability_changed:
+            return
+        self._capability_revision += 1
+        client = self.socketio_client
+        if client is None:
+            logger.debug("Socket.IO 客户端不存在或已释放，忽略能力撤销上报")
+            return
+        try:
+            # 直接通过事件常量发送（工具列表更新；office_id 守卫在 emit_update_tool_list 内）
+            await client.emit_update_tool_list()
+        except Exception:
+            logger.error("上报能力撤销（工具变更）失败", exc_info=True)
 
     def _require_oauth_manager(self) -> None:
         """facade 前置守卫：manager 未初始化（boot 前）→ ``NotConfigured``（Rust 语义）。"""

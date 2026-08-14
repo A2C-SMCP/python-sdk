@@ -11,6 +11,7 @@ httpx.MockTransport 假 AS 全家桶（#133 先例：真实 AS 子进程在 CI �
 进程内稳定复现）——覆盖 bounded connect（anonymous-first → 准入 → 恢复/交互）、
 callback 校验（重放/错 state/错 issuer）、取消、clear_oauth、并发幂等。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +25,7 @@ from mcp.client.session_group import StreamableHttpParameters
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from a2c_smcp.computer.mcp_clients.base_client import BaseMCPClient
-from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
+from a2c_smcp.computer.mcp_clients.manager import MCPServerManager, _is_oauth_required_error
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerConnectionState,
     StreamableHttpServerConfig,
@@ -91,7 +92,7 @@ def make_fake_as_handler(extra: dict[str, Any] | None = None) -> tuple[Callable,
                     # 服务端拒绝恢复的凭据（死凭据场景：restore→401 循环探测）
                     return httpx.Response(
                         401,
-                        headers={"www-authenticate": "Bearer error=\"invalid_token\""},
+                        headers={"www-authenticate": 'Bearer error="invalid_token"'},
                     )
                 body = json.loads(request.content)
                 req_id = body.get("id")
@@ -203,9 +204,7 @@ def fake_as(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
     return handler, stats
 
 
-async def _make_manager(
-    fake_as: tuple[dict[str, Any], dict[str, Any]], config: StreamableHttpServerConfig
-) -> MCPServerManager:
+async def _make_manager(fake_as: tuple[dict[str, Any], dict[str, Any]], config: StreamableHttpServerConfig) -> MCPServerManager:
     _handler, _stats = fake_as
     manager = MCPServerManager(auto_connect=False)
     await manager.ainitialize([config])
@@ -292,7 +291,9 @@ class TestBoundedConnect:
     async def test_bearer_without_metadata_no_admission(
         self, monkeypatch: pytest.MonkeyPatch, oauth_config: StreamableHttpServerConfig
     ) -> None:
-        """Bearer 无 resource_metadata → 不准入 → ERROR + RuntimeError（精确分类挂 #185）。"""
+        """Bearer 无 resource_metadata → 不准入 → ERROR + OAuthError 精确分类（#185，Rust
+        ``BearerWithoutMetadata`` → ``OAuthDiscoveryFailed`` 语义：Protocol + 判别文案，
+        与 authorizationRequired 文案区分 → 不被 auto 路径吞掉）。"""
         handler, stats = make_fake_as_handler(extra={"challenge_header": "Bearer"})
 
         def factory(
@@ -310,19 +311,22 @@ class TestBoundedConnect:
         monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
         manager = MCPServerManager(auto_connect=False)
         await manager.ainitialize([oauth_config])
-        with pytest.raises(RuntimeError, match="unsupported authentication challenge"):
+        with pytest.raises(OAuthError) as exc:
             await manager.astart_client("oauth-server")
+        assert exc.value.code == OAuthErrorCode.Protocol
+        assert "resource metadata missing" in exc.value.message
+        # 精确分类 ≠ authorizationRequired：auto 路径**不得**吞掉本错误
+        assert not _is_oauth_required_error(exc.value)
         assert _connection_state(manager, "oauth-server") == MCPServerConnectionState.ERROR
 
     @pytest.mark.asyncio
     async def test_cross_origin_metadata_no_admission(
         self, monkeypatch: pytest.MonkeyPatch, oauth_config: StreamableHttpServerConfig
     ) -> None:
-        """cross-origin resource_metadata → 不准入（same-origin 门槛）。"""
+        """cross-origin resource_metadata → 不准入（same-origin 门槛）→ OAuthError 精确分类
+        （#185，Rust ``ChallengeAdmission::Unsupported`` → ``UnsupportedChallenge`` 语义）。"""
         handler, stats = make_fake_as_handler(
-            extra={
-                "challenge_header": 'Bearer resource_metadata="https://evil.example/.well-known/oauth-protected-resource"'
-            }
+            extra={"challenge_header": 'Bearer resource_metadata="https://evil.example/.well-known/oauth-protected-resource"'}
         )
 
         def factory(
@@ -340,8 +344,12 @@ class TestBoundedConnect:
         monkeypatch.setattr("a2c_smcp.computer.mcp_clients.manager.client_factory", factory)
         manager = MCPServerManager(auto_connect=False)
         await manager.ainitialize([oauth_config])
-        with pytest.raises(RuntimeError, match="unsupported authentication challenge"):
+        with pytest.raises(OAuthError) as exc:
             await manager.astart_client("oauth-server")
+        assert exc.value.code == OAuthErrorCode.Protocol
+        assert "Unsupported authentication challenge" in exc.value.message
+        # 精确分类 ≠ authorizationRequired：auto 路径**不得**吞掉本错误
+        assert not _is_oauth_required_error(exc.value)
 
     @pytest.mark.asyncio
     async def test_restore_authorized_connects_directly(
@@ -445,9 +453,7 @@ class TestInteractiveFlow:
         launch = await asyncio.wait_for(flow.launch(), timeout=10)
         await asyncio.sleep(0.05)
         with pytest.raises(OAuthError) as exc:
-            await flow.complete(
-                OAuthCallback(code="fake-code", state=launch.state, issuer="https://other.example")
-            )
+            await flow.complete(OAuthCallback(code="fake-code", state=launch.state, issuer="https://other.example"))
         assert exc.value.code == OAuthErrorCode.IssuerMismatch
         # 有效 flow 未被消费——正确 issuer 仍可完成
         outcome = await asyncio.wait_for(
@@ -658,20 +664,16 @@ class TestFacadeGuards:
         assert exc.value.code == OAuthErrorCode.NotConfigured
 
     @pytest.mark.asyncio
-    async def test_oauth_status_stdio_unsupported_transport(
-        self, fake_as: tuple[dict[str, Any], dict[str, Any]]
-    ) -> None:
+    async def test_oauth_status_stdio_unsupported_transport(self, fake_as: tuple[dict[str, Any], dict[str, Any]]) -> None:
         from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 
         manager = MCPServerManager(auto_connect=False)
-        await manager.ainitialize(
-            [
-                StdioServerConfig(
-                    name="stdio-srv",
-                    server_parameters={"command": "python3", "args": ["-c", "pass"]},
-                )
-            ]
-        )
+        await manager.ainitialize([
+            StdioServerConfig(
+                name="stdio-srv",
+                server_parameters={"command": "python3", "args": ["-c", "pass"]},
+            )
+        ])
         with pytest.raises(OAuthError) as exc:
             await manager.oauth_status("stdio-srv")
         assert exc.value.code == OAuthErrorCode.UnsupportedTransport
@@ -734,6 +736,7 @@ class TestClearOAuth:
         connect 的 initialize）挂起响应体——waiter 必在 clear 时仍 PENDING，
         不依赖「URL 先发布还是 clear 先到」的竞速。
         """
+
         async def _hang_body():  # noqa: ANN202
             await asyncio.Event().wait()  # 永不返回：aconnect 挂起于响应体读取
             yield b""  # pragma: no cover — 不可达

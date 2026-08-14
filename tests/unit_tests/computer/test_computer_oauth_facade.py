@@ -8,6 +8,7 @@
 Computer 公共 OAuth facade 测试（#179）：pre-boot 守卫、with_oauth_credential_store
 builder、boot 后委托 + store 到达两处 manager 构建点。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -122,3 +123,100 @@ class TestComputerOAuthFacade:
     def test_default_store_is_in_memory(self) -> None:
         computer = Computer(name="test")
         assert isinstance(computer._oauth_credential_store, InMemoryOAuthCredentialStore)
+
+
+class _RecordingClient:
+    """记录 emit_update_tool_list 调用次数的伪 Socket.IO 客户端（#185 传播面）。"""
+
+    def __init__(self) -> None:
+        self.update_called = 0
+
+    async def emit_update_tool_list(self) -> None:
+        self.update_called += 1
+
+
+class TestClearOAuthCapabilityPropagation:
+    """#185：clear_oauth 能力撤销传播——revision bump + update_tool_list 广播 + 幂等。"""
+
+    @staticmethod
+    async def _booted_computer() -> Computer:
+        computer = Computer(name="test", auto_connect=False)
+        await computer.boot_up()
+        assert computer.mcp_manager is not None
+        return computer
+
+    @pytest.mark.asyncio
+    async def test_capability_changed_bumps_revision_and_emits(self) -> None:
+        computer = await self._booted_computer()
+        client = _RecordingClient()
+        computer.socketio_client = client  # type: ignore[assignment]
+
+        async def fake_clear(bundle_id: str) -> bool:
+            assert bundle_id == "b1"
+            return True
+
+        computer.mcp_manager.clear_oauth = fake_clear  # type: ignore[method-assign]
+        assert computer.capability_revision == 0
+
+        await computer.clear_oauth("b1")
+
+        assert computer.capability_revision == 1
+        assert client.update_called == 1
+
+    @pytest.mark.asyncio
+    async def test_no_change_no_bump_no_emit(self) -> None:
+        """capability_changed=False（幂等重复 clear）→ 不 bump、不广播。"""
+        computer = await self._booted_computer()
+        client = _RecordingClient()
+        computer.socketio_client = client  # type: ignore[assignment]
+
+        async def fake_clear(bundle_id: str) -> bool:
+            return False
+
+        computer.mcp_manager.clear_oauth = fake_clear  # type: ignore[method-assign]
+
+        await computer.clear_oauth("b1")
+
+        assert computer.capability_revision == 0
+        assert client.update_called == 0
+
+    @pytest.mark.asyncio
+    async def test_repeated_clear_idempotent_at_computer_level(self) -> None:
+        """第一次有效（bump + 广播）、第二次无效（零传播）——端到端幂等。"""
+        computer = await self._booted_computer()
+        client = _RecordingClient()
+        computer.socketio_client = client  # type: ignore[assignment]
+
+        calls: list[bool] = [True, False]
+
+        async def fake_clear(bundle_id: str) -> bool:
+            return calls.pop(0)
+
+        computer.mcp_manager.clear_oauth = fake_clear  # type: ignore[method-assign]
+
+        await computer.clear_oauth("b1")
+        await computer.clear_oauth("b1")
+
+        assert computer.capability_revision == 1
+        assert client.update_called == 1
+
+    @pytest.mark.asyncio
+    async def test_emit_failure_does_not_lose_revision_bump(self) -> None:
+        """emit 失败仅记日志（与 _on_manager_change 同姿态）——revision bump 为本地状态必然发生。"""
+        computer = await self._booted_computer()
+
+        class _FailingClient:
+            async def emit_update_tool_list(self) -> None:
+                raise RuntimeError("socketio gone")
+
+        client = _FailingClient()
+        computer.socketio_client = client  # type: ignore[assignment]
+
+        async def fake_clear(bundle_id: str) -> bool:
+            return True
+
+        computer.mcp_manager.clear_oauth = fake_clear  # type: ignore[method-assign]
+
+        await computer.clear_oauth("b1")  # 不抛
+
+        assert computer.capability_revision == 1
