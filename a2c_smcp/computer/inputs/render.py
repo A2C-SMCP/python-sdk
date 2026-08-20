@@ -78,6 +78,28 @@ _PREDEFINED_VARS = ("userHome", "pathSeparator")
 ResolveInput = Callable[[str], Awaitable[Any]]
 
 
+def collect_referenced_input_ids(data: Any) -> list[str]:
+    """
+    中文: 收集配置树中引用的 ``${input:<id>}`` id（去重保序）/ collect referenced input ids (dedup, order-preserving).
+
+    §5.13（协议 v0.3.2，镜像 rust ``collect_referenced_input_ids``）：实际启动从 raw 重解析前先收集引用 id、
+    逐 id **解析一次**成 per-render map，再渲染——单次渲染中相同 id 只解析一次（6景⑤），command 类 input
+    每次实际启动恰好执行一次。JSON 串行化 + 占位符正则扫描，与渲染器同模式同局限（占位符面向字符串字段）。
+    """
+    import json
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for m in PLACEHOLDER_PATTERN.finditer(json.dumps(data, ensure_ascii=False)):
+        token = m.group(1)
+        if token.startswith("input:"):
+            input_id = token[len("input:") :]
+            if input_id not in seen:
+                seen.add(input_id)
+                ids.append(input_id)
+    return ids
+
+
 class ConfigRender:
     """
     中文: 配置渲染器，按需解析字符串中的占位符，并递归处理字典与列表。

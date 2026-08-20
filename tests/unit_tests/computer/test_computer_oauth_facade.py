@@ -55,7 +55,7 @@ class TestComputerOAuthFacade:
 
     @pytest.mark.asyncio
     async def test_with_oauth_credential_store_reaches_lazy_manager(self) -> None:
-        """惰性 manager 构建点（_amount_rendered）同样透传注入的 store（构造点 2）。"""
+        """惰性 manager 构建点（_amount_raw，#192 起 _amount_rendered 更名）同样透传注入的 store（构造点 2）。"""
         store = InMemoryOAuthCredentialStore()
         # auto_connect=False：只验证 store 到达构建点，不发起真实网络连接
         computer = Computer(name="test", auto_connect=False).with_oauth_credential_store(store)
@@ -66,8 +66,7 @@ class TestComputerOAuthFacade:
             name="lazy-server",
             server_parameters={"url": "https://mcp.example.com/mcp"},
         )
-        validated = StreamableHttpServerConfig.model_validate(raw)
-        await computer._amount_rendered(raw, validated)
+        await computer._amount_raw(raw, plugin=None, marketplace=None)  # type: ignore[attr-defined]
         assert computer.mcp_manager is not None
         assert computer.mcp_manager._oauth_credential_store is store
 

@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.table import Table
 
+from a2c_smcp.computer.mcp_clients.model import PickStringOption
 from a2c_smcp.computer.utils import console as console_util
 
 
@@ -60,15 +62,18 @@ async def ainput_prompt(
 
 async def ainput_pick(
     message: str,
-    options: list[str] | tuple[str, ...],
+    options: Sequence[str | PickStringOption],
     *,
     default_index: int | None = None,
     multi: bool = False,
     session: PromptSession | None = None,
-) -> None | list[str] | str | list[Any]:
+) -> None | str | PickStringOption | list[Any]:
     """
-    中文: 让用户以序号选择一个或多个字符串。
-    English: Let user pick one or multiple strings by index.
+    中文: 让用户以序号选择一个或多个条目。支持 ``str`` 与 ``PickStringOption`` 两种条目
+          （#192：PickStringOption 表格展示 ``label``、**返回条目本身**——label 允许重复，
+          按条目返回才可无歧义映射 value）。str 入参 → str 返回（向后兼容）。
+    English: Let user pick one or multiple items by index. ``PickStringOption`` items display their
+             ``label`` and are returned as-is (labels may duplicate); ``str`` in → ``str`` out.
     """
     if not options:
         return [] if multi else ""
@@ -77,7 +82,7 @@ async def ainput_pick(
     table.add_column("#", justify="right")
     table.add_column("Option", overflow="fold")
     for idx, opt in enumerate(options):
-        table.add_row(str(idx), opt)
+        table.add_row(str(idx), opt.label if isinstance(opt, PickStringOption) else opt)
     console_util.console.print(table)
 
     tip = "输入序号，多个用逗号分隔" if multi else "输入序号"
@@ -89,13 +94,14 @@ async def ainput_pick(
         try:
             raw = await sess.prompt_async(f"{tip}: ")
         except (EOFError, KeyboardInterrupt):
-            if default_index is not None and 0 <= default_index < len(options):
-                return [options[default_index]] if multi else options[default_index]
+            # #192 / §5.12：default 回退语义**上移至调用方**（resolver 层独占决策——EOF 视为「无用户值」，
+            # 由调用方回退 default / 首项且**不反向持久化**）。本函数为纯选择原语：EOF → ""。
             return [] if multi else ""
 
         raw = raw.strip()
-        if raw == "" and default_index is not None and 0 <= default_index < len(options):
-            return [options[default_index]] if multi else options[default_index]
+        if raw == "":
+            # 空输入同上：结束选择、回退交给调用方（若调用方需接受默认，须自判——resolver 走 §5.12 解析链）。
+            return [] if multi else ""
 
         try:
             if multi:
@@ -105,8 +111,8 @@ async def ainput_pick(
                     continue
                 picked = [options[i] for i in idxs]
                 # 去重保持顺序
-                seen: set[str] = set()
-                result: list[str] = []
+                seen: set[Any] = set()
+                result: list[Any] = []
                 for p in picked:
                     if p not in seen:
                         seen.add(p)

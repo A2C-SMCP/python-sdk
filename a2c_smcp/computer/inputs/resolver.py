@@ -25,7 +25,7 @@ import os
 import sys
 from collections.abc import Iterable, Mapping
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from prompt_toolkit import PromptSession
 
@@ -39,6 +39,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput,
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
+    PickStringOption,
 )
 from a2c_smcp.utils.env_segment import env_var_name
 from a2c_smcp.utils.logger import get_logger
@@ -109,6 +110,27 @@ class ResolverFailedError(InputResolutionError):
     def __init__(self, *, id: str, reason: str) -> None:
         self.reason = reason
         super().__init__(id=id, message=f"resolver failed for input '{id}': {reason}")
+
+
+class InvalidSelectionError(InputResolutionError):
+    """
+    中文: 已存 PickString 值不匹配任一 option.value（runtime-contract §5.12）→ 结构化 InvalidSelection。
+
+          **MUST NOT** 回退 default / 首项——失效即报错，静默改值会掩盖用户改选意图。MUST 至少携带 ``id``；
+          ``value`` 字段对齐 rust ``InvalidSelection { id, value }``（pick 值非 secret，可安全携带；
+          message 与 rust 同款含值，便于用户识别哪个旧选择已失效）。
+    English: A stored pickString value matches no option.value → structured InvalidSelection (aligns rust-sdk).
+    """
+
+    def __init__(self, *, id: str, value: str) -> None:
+        self.value = value
+        super().__init__(
+            id=id,
+            message=(
+                f"invalid selection for input '{id}': stored value {value!r} does not match any allowed "
+                f"option.value; re-pick a valid option"
+            ),
+        )
 
 
 class InputResolver(BaseInputResolver[PromptSession]):
@@ -182,9 +204,13 @@ class InputResolver(BaseInputResolver[PromptSession]):
             # §5.11 规则 ③：皆不可命中 → 错误 id = scoped id（plugin 上下文），裸 id 否则
             raise InputNotFoundError(scoped_id if scoped_id is not None else input_id)
 
-        # 2. 进程内 cache（按解析后的池 id 缓存，避免不同 plugin 的同裸 id 串味）
-        if resolved_id in self._cache:
-            return self._cache[resolved_id]
+        is_command = isinstance(cfg, MCPServerCommandInput)
+
+        # 2. 进程内 cache（按解析后的池 id 缓存，避免不同 plugin 的同裸 id 串味）。
+        #    §5.12：cache 是 client 注入值的通道（set_cached_value）——命中即按候选校验；
+        #    command 例外：仅在实际解析时执行（§5.13 每次实际启动重执行），不进缓存。
+        if not is_command and resolved_id in self._cache:
+            return self._validate_candidate(cfg, self._cache[resolved_id])
 
         sess = session or self.session
         is_password = isinstance(cfg, MCPServerPromptStringInput) and bool(cfg.password)
@@ -195,7 +221,7 @@ class InputResolver(BaseInputResolver[PromptSession]):
         env_val = self._env.get(env_var_name(resolved_id))
         if env_val is not None:
             self._cache[resolved_id] = env_val
-            return env_val
+            return self._validate_candidate(cfg, env_val)
 
         # 解析链步骤 3：OS keyring（仅 password:true）
         if is_password:
@@ -209,25 +235,29 @@ class InputResolver(BaseInputResolver[PromptSession]):
             stored = self._value_store.get(resolved_id)
             if stored is not None:
                 self._cache[resolved_id] = stored
-                return stored
+                return self._validate_candidate(cfg, stored)
 
         # 解析链步骤 5：解析。headless（无 TTY）下无交互可能 → 结构化 Missing（#173，对齐 rust-sdk#144 D1），
         # 非仅日志、非空串，供 client 驱动补录 UI 并重试：
         #   - secret（password:true）一律 Missing(SECRET)——绝不落明文、绝不静默回退（keyring 已在步骤 3 穷尽 miss，
         #     无 TTY 时无论 keyring 是否可用都拿不到密钥，统一结构化硬错误而非落到 prompt 抛不透明 OSError / 返回 ""）。
-        #   - value（promptString/pickString）无 default → Missing(VALUE)；有 default → 落到下方 prompt 经
-        #     EOFError 回退返回 default（rust：default 存在 ⇒ 不 Missing）。
+        #   - value 无 default → 仅 promptString 报 Missing(VALUE)；pickString 走 §5.12 首项回退
+        #     （default → 首项 value，对齐 rust SilentSession，自协议 0.3.2 入典）。
         #   - command 在 headless 仍可执行（真相=命令输出），不在此报 Missing。
         has_tty = self._has_tty(sess)
         if not has_tty and is_password:
             raise MissingInputError(id=resolved_id, kind=InputKind.SECRET)
-        if not has_tty and isinstance(cfg, (MCPServerPromptStringInput, MCPServerPickStringInput)) and cfg.default is None:
+        if not has_tty and isinstance(cfg, MCPServerPromptStringInput) and cfg.default is None:
             raise MissingInputError(id=resolved_id, kind=InputKind.VALUE)
 
+        pick_from_user: bool | None = None
         if isinstance(cfg, MCPServerPromptStringInput):
             value = await self._aresolve_prompt(cfg, session=sess)
         elif isinstance(cfg, MCPServerPickStringInput):
-            value = await self._aresolve_pick(cfg, session=sess)
+            value, pick_from_user = await self._aresolve_pick(cfg, session=sess)
+            if not pick_from_user:
+                # §5.12 回退值（default / 首项）：**不反向持久化**——不落盘、不写缓存，下次解析仍从解析链开始。
+                return value
         elif isinstance(cfg, MCPServerCommandInput):
             value = await self._aresolve_command(cfg)
         else:  # pragma: no cover
@@ -243,7 +273,20 @@ class InputResolver(BaseInputResolver[PromptSession]):
             elif is_plain_persistable:
                 self._value_store.set(resolved_id, value)
 
+        # 缓存写规则：command 不缓存（每次解析重执行）；pickString 回退值已在上方短路（§5.12 不反向持久化）。
+        if is_command:
+            return value
         self._cache[resolved_id] = value
+        return value
+
+    @staticmethod
+    def _validate_candidate(cfg: MCPServerInput, value: Any) -> Any:
+        """§5.12：pickString 已存候选（cache/env/value store）逐一校验——不匹配任一 option.value →
+        :class:`InvalidSelectionError`（MUST NOT 回退 default / 首项）。非 pickString / None 直通。"""
+        if isinstance(cfg, MCPServerPickStringInput) and value is not None:
+            value_str = value if isinstance(value, str) else str(value)
+            if not any(o.value == value_str for o in cfg.options):
+                raise InvalidSelectionError(id=cfg.id, value=value_str)
         return value
 
     @staticmethod
@@ -261,14 +304,34 @@ class InputResolver(BaseInputResolver[PromptSession]):
         pwd = bool(cfg.password)
         return await ainput_prompt(msg, password=pwd, default=cfg.default, session=session)
 
-    async def _aresolve_pick(self, cfg: MCPServerPickStringInput, *, session: PromptSession | None = None) -> str:
+    async def _aresolve_pick(
+        self, cfg: MCPServerPickStringInput, *, session: PromptSession | None = None
+    ) -> tuple[str, bool]:
+        options = cfg.options  # schema 保证 ≥1 项（model validator）
+        default_value = cfg.default
+        # default_index 按 **value** 匹配（default 与 option.value 比较，非 label）；value 允许重复 → 首个匹配即默认标注。
+        default_index = (
+            next((i for i, o in enumerate(options) if o.value == default_value), None)
+            if default_value is not None
+            else None
+        )
+
+        if not self._has_tty(session):
+            # headless：不触发 prompt 机制，直接走 §5.12 解析链回退 default → 首项 value
+            # （对齐 rust SilentSession；from_user=False ⇒ 上游不持久化、不写缓存）。
+            return (default_value if default_value is not None else options[0].value, False)
+
         msg = cfg.description or f"请选择 {cfg.id} / Please pick {cfg.id}"
-        options = cfg.options or []
-        default_index = None
-        if cfg.default is not None and cfg.default in options:
-            default_index = options.index(cfg.default)
+        # ainput_pick 以 PickStringOption 入参时**返回条目本身**（表格展示 label；label 允许重复，
+        # 按序号返回条目才可无歧义映射 value——MUST NOT 按 label 反查）。
         picked = await ainput_pick(msg, options, default_index=default_index, multi=False, session=session)
-        return str(picked) or (cfg.default or "")
+        if isinstance(picked, PickStringOption):
+            return picked.value, True
+        # EOF / 空输入（"" 或 None）→ 解析链回退 default → 首项 value（无用户值，§5.12 不反向持久化）。
+        if picked is None or picked == "":
+            return (default_value if default_value is not None else options[0].value, False)
+        # 防御性：直接调用方以 str 列表入参时返回 str——按候选校验（匹配 option.value 才合法），按用户实选对待。
+        return cast("str", self._validate_candidate(cfg, picked)), True
 
     async def _aresolve_command(self, cfg: MCPServerCommandInput) -> Any:
         # 约定: command 为完整可执行字符串，由 shell 执行。args 如存在，暂不拼接，后续可扩展。

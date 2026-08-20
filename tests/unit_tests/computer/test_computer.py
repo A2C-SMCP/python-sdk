@@ -22,6 +22,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerConfig,
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
+    PickStringOption,
     StdioServerConfig,
     StdioServerParameters,
     ToolMeta,
@@ -538,14 +539,15 @@ async def test_amount_server_with_raw_dict_uses_inputs_and_validates(monkeypatch
     # Act
     await computer.amount_server(cfg_dict)
 
-    # Assert: forwarded to manager with validated model instance and placeholders resolved
+    # Assert（#192 / §5.13）：mount 只做形状校验 + 登记 raw——manager 收到**未渲染 raw**
+    # （占位符字面保留），input 解析推迟到实际启动（materializer）。
     mock_manager.aadd_or_aupdate_server.assert_called_once()
-    (validated_cfg,), _ = mock_manager.aadd_or_aupdate_server.call_args
-    assert isinstance(validated_cfg, MCPServerConfig)
-    assert isinstance(validated_cfg, StdioServerConfig)
-    assert validated_cfg.name == "echo"
-    assert validated_cfg.server_parameters.command == "/bin/echo"
-    assert validated_cfg.server_parameters.args == ["--port", "9000"]
+    (raw_cfg,), _ = mock_manager.aadd_or_aupdate_server.call_args
+    assert isinstance(raw_cfg, MCPServerConfig)
+    assert isinstance(raw_cfg, StdioServerConfig)
+    assert raw_cfg.name == "echo"
+    assert raw_cfg.server_parameters.command == "${input:cmd}"
+    assert raw_cfg.server_parameters.args == ["--port", "${input:port}"]
 
 
 @pytest.mark.asyncio
@@ -640,7 +642,12 @@ def test_update_inputs_replaces_resolver_and_clears_cache():
     computer.update_inputs(
         [
             MCPServerPromptStringInput(id="p", description="prompt", default="x"),
-            MCPServerPickStringInput(id="k", description="pick", options=["a", "b"], default="a"),
+            MCPServerPickStringInput(
+                id="k",
+                description="pick",
+                options=[PickStringOption(label="a", value="a"), PickStringOption(label="b", value="b")],
+                default="a",
+            ),
             MCPServerCommandInput(id="c", description="cmd", command="echo hi"),
         ],
     )
@@ -716,6 +723,7 @@ def test_update_inputs_copies_and_does_not_alias_caller_set():
 
 @pytest.mark.asyncio
 async def test_boot_up_renders_all_initial_servers(monkeypatch):
+    """#192 / §5.13：boot 只登记 raw 声明、**不解析 input**——ainitialize 收到未渲染 raw（占位符字面保留）。"""
     # Arrange an initial server with placeholders
     inputs = [MCPServerPromptStringInput(id="cmd", description="", default="/bin/echo")]
     cfg = StdioServerConfig(
@@ -742,4 +750,4 @@ async def test_boot_up_renders_all_initial_servers(monkeypatch):
     assert len(servers) == 1
     s0 = servers[0]
     assert isinstance(s0, StdioServerConfig)
-    assert s0.server_parameters.command == "/bin/echo"
+    assert s0.server_parameters.command == "${input:cmd}"  # raw：占位符字面保留（解析推迟到实际启动）

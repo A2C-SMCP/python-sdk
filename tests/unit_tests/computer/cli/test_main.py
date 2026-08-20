@@ -770,7 +770,8 @@ async def test_inputs_cli_crud_commands(monkeypatch: pytest.MonkeyPatch) -> None
         "inputs list",
         # update 批量（数组）
         'inputs update [{"id":"USER","type":"promptString","description":"d2","default":"b"},'
-        ' {"id":"REG","type":"pickString","description":"r","options":["us","eu"],"default":"us"}]',
+        ' {"id":"REG","type":"pickString","description":"r",'
+        ' "options":[{"label":"us","value":"us"},{"label":"eu","value":"eu"}],"default":"us"}]',
         "inputs list",
         # rm
         "inputs rm USER",

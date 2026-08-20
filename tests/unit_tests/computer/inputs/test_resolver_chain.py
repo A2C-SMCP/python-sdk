@@ -35,6 +35,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerCommandInput,
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
+    PickStringOption,
 )
 from a2c_smcp.utils.env_segment import EnvNameCollisionError, detect_env_name_collisions, env_var_name
 
@@ -140,7 +141,14 @@ async def test_prompt_persists_password_to_keyring(tmp_path: Path, monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_prompt_persists_non_password_to_value_store(tmp_path: Path, monkeypatch) -> None:
-    inputs = [MCPServerPickStringInput(id="region", description="d", options=["us", "eu"], default="us")]
+    inputs = [
+        MCPServerPickStringInput(
+            id="region",
+            description="d",
+            options=[PickStringOption(label="us", value="us"), PickStringOption(label="eu", value="eu")],
+            default="us",
+        )
+    ]
     vs = _vstore(tmp_path)
 
     async def fake_pick(*_a, **_k):

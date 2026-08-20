@@ -32,6 +32,7 @@ import os
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -60,8 +61,8 @@ from a2c_smcp.computer.blob import (
     default_thresholds,
 )
 from a2c_smcp.computer.desktop.organize import organize_desktop
-from a2c_smcp.computer.inputs.render import ConfigRender, load_env_file
-from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolutionError, InputResolver
+from a2c_smcp.computer.inputs.render import ConfigRender, collect_referenced_input_ids, load_env_file
+from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import (
@@ -136,6 +137,18 @@ if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
     from a2c_smcp.computer.settings.scope import ResolvedSettings
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
+
+
+@dataclass(frozen=True)
+class _RawServerEntry:
+    """raw 声明 + 渲染上下文（#192 / §5.13）：实际启动从 raw 重解析时须重现挂载时的 §5.11 plugin scope。
+
+    对齐 rust ``RawMcpServerEntry { config, input_scope }``——config 与 scope 是同一期望态的原子项，
+    并发 start 不得观察到「新 raw 配旧 scope」。"""
+
+    config: MCPServerConfig
+    plugin: str | None
+    marketplace: str | None
 
 
 class Computer(BaseComputer[PromptSession]):
@@ -240,7 +253,7 @@ class Computer(BaseComputer[PromptSession]):
         # 从此取 body（占位符字面保留、绝不外泄已解析 secret）；SET 仍以 manager 运行期权威为准（见 active_server_configs）。
         # #149: raw (un-rendered) projection of the runtime-active set, keyed by bundle_id — the body source for the
         # client:get_config wire (placeholders kept literal, resolved secrets never leave the Computer). SET = manager authority.
-        self._active_raw: dict[str, MCPServerConfig] = {}
+        self._active_raw: dict[str, _RawServerEntry] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
         # #185：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——仅
@@ -415,21 +428,18 @@ class Computer(BaseComputer[PromptSession]):
         启动计算机，初始化 MCP 服务器管理器。
         Boot up the computer and initialize the MCP server manager.
 
-        1. 将 self._mcp_servers 逐个进行 model_dump 拿到dict配置，然后配合 self._inputs 进行ConfigRender。因为在具体配置中可能存在动态变量
-            的引用。需要在此消解
-        2. 通过当前类的 _resolve_prompt_string _resolve_pick_string _resolve_command 等方法对 MCPServerInput 做解析拿到最终结果进行替换
-        3. 对于 self._mcp_servers 配置的符合变量提取模式但没有提供对应 input 定义时，不做任何处理，使用原值传递。
+        #192 / §5.13：boot 只做 **raw 声明形状校验 + 登记**，**不解析 input 值**（对齐 rust PR#190——input
+        值与 command 不在 boot 解析，其结构化错误从下一次实际 start/restart surface）。auto-connect server
+        的实际启动经 manager materializer 从 raw 重解析；重解析失败（如 Missing input）发生在 ainitialize
+        中途 → 回滚已启动 client 后上抛（#173 retry-safe 保持：无残留 manager/task/transport，补值后同实例重试成功）。
         """
         self.mcp_manager = MCPServerManager(
             auto_connect=self._auto_connect,
             auto_reconnect=self._auto_reconnect,
             message_handler=self._on_manager_change,
             oauth_credential_store=self._oauth_credential_store,
+            materializer=self._materialize_for_start,
         )
-        # 中文: 对每个 Server 配置执行：渲染(占位符解析链 + 预定义变量) + envFile 合并 + 校验生成不可变对象。
-        #       统一复用 _arender_and_validate_server（DRY，#65）；失败时按稳妥策略保留原配置继续。
-        # English: Render (resolution chain + predefined vars) + envFile merge + validate, reusing
-        #          _arender_and_validate_server (DRY). On failure, keep the original config and continue.
         # #165 Gap A：读取 settings 用于嵌入模式下 embed server 的安全层判定。
         # _resolve_declared_settings 不依赖 _skill_home，在 boot 早期安全调用；容错：读不到则空。
         try:
@@ -441,39 +451,39 @@ class Computer(BaseComputer[PromptSession]):
         # #149：boot 重建运行期活跃集 → 先重置 raw 投影缓存，逐条登记（setdefault=first-wins，与 ainitialize
         # no-double-open 同序：同 bundle_id 保配置顺序首个）。
         self._active_raw.clear()
-        validated_servers: list[MCPServerConfig] = []
+        raw_servers: list[MCPServerConfig] = []
         for server_cfg in self._mcp_servers:
             try:
-                raw_cfg, validated = await self._arender_and_validate_server(server_cfg, session=session)
-            except InputResolutionError as e:
-                # #173（对齐 rust-sdk#144）：D1 结构化 input 解析错误（Missing/ResolverFailed）须上抛供 client
-                # 驱动补录（非仅日志，对齐 mount_server / add_or_update_server）。此处位于 ainitialize
-                # （commit/spawn/watcher）之前 ⇒ 无残留 manager/task/transport，boot 可安全重试（补值后同实例重试成功）。
-                logger.error(
-                    "boot 渲染 server 配置失败 '%s'（code %d）/ input resolution error: %s",
-                    getattr(server_cfg, "name", "unknown"),
-                    e.error_code,
-                    e,
-                )
-                raise
+                raw_cfg = self._validate_raw_shape(server_cfg)
             except Exception as e:
-                logger.error(f"配置渲染或校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
-                # 其余渲染/校验错误：按稳妥策略保留原配置继续（对齐 rust「其余渲染错误维持容错」，不连坐上抛）。
-                raw_cfg = validated = server_cfg
+                logger.error(f"配置校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
+                # 形状非法：无法派生 bundle_id 身份 → **跳过挂载**（不连坐上抛，对齐旧「非 InputResolution
+                # 渲染错误容错」精神；解析类错误推迟到实际启动 surface）。
+                continue
             # #165 Gap A：embed server 经全门判定（trusted_origin=True ⇒ Gate 4 ENABLED，Gate 1-3 仍判）。
-            # 被安全层拒绝的 server 不挂载（不进 validated_servers、不进 _active_raw）。
-            bid = resolve_bundle_id(validated)
+            # 被安全层拒绝的 server 不挂载（不进 raw_servers、不进 _active_raw）。
+            bid = resolve_bundle_id(raw_cfg)
             if mcp_server_status(bid, settings=boot_settings, trusted_origin=True) is McpApprovalStatus.DISABLED:
                 logger.warning(
                     "boot_up: embed server %r (bundle_id=%r) denied by policy — not mounted",
-                    getattr(validated, "name", "unknown"),
+                    getattr(raw_cfg, "name", "unknown"),
                     bid,
                 )
                 continue
-            validated_servers.append(validated)
-            self._active_raw.setdefault(bid, raw_cfg)
+            raw_servers.append(raw_cfg)
+            self._active_raw.setdefault(bid, _RawServerEntry(config=raw_cfg, plugin=None, marketplace=None))
 
-        await self.mcp_manager.ainitialize(validated_servers)
+        try:
+            await self.mcp_manager.ainitialize(raw_servers)
+        except Exception:
+            # §5.13：auto-connect 的实际启动在 ainitialize 内 materialize——失败（Missing/InvalidSelection/
+            # 连接错误等）时回滚已启动 client，保 #173 retry-safe（下次 boot 重建 manager，无残留）。
+            logger.error(
+                "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients",
+                exc_info=True,
+            )
+            await self.mcp_manager.aclose()
+            raise
 
         # v0.2.1 SKILL 子系统启动初始化（设计 §5.1，#66）：解析 SKILL Home → 治理启动恢复（#117）→
         # 物化 mcp 源 skill:// → 填充 Registry → 初始化 skill:// 缓存。失败隔离：记 ERROR、**不**阻断
@@ -839,6 +849,35 @@ class Computer(BaseComputer[PromptSession]):
         rendered["server_parameters"] = params
         return rendered
 
+    def _validate_raw_shape(self, server: MCPServerConfig | dict[str, Any]) -> MCPServerConfig:
+        """**仅形状校验** + bundle_id 物化，**不解析 input**（#192 / §5.13：渲染推迟到实际启动）。
+
+        boot / mount（amount_server / durable add）登记 raw 声明前调用；InputResolution 类错误
+        不在此 surface（值解析在 materialize 时发生）。dict 入参经 TypeAdapter 归一为模型。
+        """
+        if isinstance(server, dict):
+            raw_model: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(server)
+        else:
+            raw_model = server
+        return raw_model.model_copy(update={"bundle_id": resolve_bundle_id(raw_model)})
+
+    async def _materialize_for_start(self, bundle_id: str, raw: MCPServerConfig) -> MCPServerConfig:
+        """manager materializer（§5.13）：实际启动/restart 前从 raw 声明重解析出 rendered config。
+
+        §5.11 scope 取自挂载时登记的 :class:`_RawServerEntry`（``_amount_raw`` 在 manager 调用前登记
+        新条目，故 restart-with-update 时读到的是**新** entry 的 scope——同 bundle_id 下 scope 稳定）。
+        session 复用 resolver 持有的会话（REPL/交互宿主经 update_inputs 注入）。
+        """
+        entry = self._active_raw.get(bundle_id)
+        plugin = entry.plugin if entry is not None else None
+        marketplace = entry.marketplace if entry is not None else None
+        # 注入的自定义 resolver（如测试/嵌入宿主的 dict resolver）可能不继承 BaseInputResolver（无 session 属性）→ getattr 容错。
+        session = getattr(self._input_resolver, "session", None)
+        _raw, rendered = await self._arender_and_validate_server(
+            raw, session=session, plugin=plugin, marketplace=marketplace
+        )
+        return rendered
+
     async def _arender_and_validate_server(
         self,
         server: MCPServerConfig | dict[str, Any],
@@ -883,18 +922,25 @@ class Computer(BaseComputer[PromptSession]):
           - English: If input is a dict, TypeAdapter(MCPServerConfig) is used; if it's a model instance, its concrete type validates.
         """
 
-        # 中文: 根据 input_id 解析输入值，未定义时抛出 InputNotFoundError
-        # English: Resolve input value by input_id; raise InputNotFoundError if not defined
-        async def _resolve_input_by_id(input_id: str) -> Any:
+        # §5.13（#192，镜像 rust）per-render map：先收集 raw 中引用的 ${input:<id>} → 逐 id 解析**一次** →
+        # 渲染查 map。保证单次渲染中相同 id 只解析一次（6景⑤；command 每次实际启动恰好执行一次）；
+        # 未定义 id（InputNotFound）跳过 → 渲染期 KeyError 字面保留（VS Code parity，行为不变）；
+        # 其余结构化错误（Missing/InvalidSelection/ResolverFailed）立即上抛（与旧惰性解析同序等价——
+        # 引用即使用）。§5.11 scoped 解析仍经 aresolve_by_id(plugin=..., marketplace=...) 内部完成。
+        referenced = collect_referenced_input_ids(server if isinstance(server, dict) else server.model_dump(mode="json"))
+        resolved_values: dict[str, Any] = {}
+        for input_id in referenced:
             try:
-                # plugin/marketplace 上下文（#69 Group A）：bundled server 的裸 ${input:id} 经此优先查
-                # scoped 池条目 <plugin>@<marketplace>/<id>（§5.11 scoped-first，#175）。非 plugin 来源传 None=现状。
-                # plugin/marketplace context lets a bundled server's bare ${input:id} look up the scoped pool entry first.
-                return await self._input_resolver.aresolve_by_id(input_id, session=session, plugin=plugin, marketplace=marketplace)
+                resolved_values[input_id] = await self._input_resolver.aresolve_by_id(
+                    input_id, session=session, plugin=plugin, marketplace=marketplace
+                )
             except InputNotFoundError:
                 logger.warning(f"未定义的输入占位符: {input_id} / Undefined input placeholder: {input_id}")
-                # 透传异常到上层，由上层决定是否回退或继续
-                raise
+                continue  # 未定义 → 占位符字面保留
+
+        async def _resolve_from_map(input_id: str) -> Any:
+            # map 未命中（未定义 input）→ KeyError → render._aresolve_token 字面保留（VS Code parity）
+            return resolved_values[input_id]
 
         variables = self._render_variables()
         try:
@@ -904,14 +950,14 @@ class Computer(BaseComputer[PromptSession]):
                 # （占位 ${input:*} 按字面参与摘要）。注：raw 若在**非字符串**字段（如 timeout）含占位会在此
                 # 提前校验失败——属边角（§9.4 占位面向字符串字段），正常配置不触及。
                 raw_model: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(raw)
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
+                rendered = await self._config_render.arender(raw, _resolve_from_map, variables=variables)
                 rendered = self._apply_env_file(rendered)
                 # 使用 TypeAdapter 将 union 类型解析为具体模型
                 validated: MCPServerConfig = TypeAdapter(MCPServerConfig).validate_python(rendered)
             else:
                 raw = server.model_dump(mode="json")
                 raw_model = server  # 模型入参即未渲染 raw（self._mcp_servers / 调用方原样）
-                rendered = await self._config_render.arender(raw, _resolve_input_by_id, variables=variables)
+                rendered = await self._config_render.arender(raw, _resolve_from_map, variables=variables)
                 rendered = self._apply_env_file(rendered)
                 validated = type(server).model_validate(rendered)
             # 物化 bundle_id：在 RAW 配置上 derive-on-load（protocol#15/#17），注入渲染后 config——
@@ -955,15 +1001,20 @@ class Computer(BaseComputer[PromptSession]):
     #   config（保持既有「client owns Socket.IO 上报」分层，#93；rust 内部 bump 属实现细节，概念对齐即可，#135）。
     # ════════════════════════════════════════════════════════════════════════════
 
-    async def _amount_rendered(self, raw_cfg: MCPServerConfig, validated: MCPServerConfig) -> None:
-        """物化**已渲染校验**的 config 进 manager（内存投影 + capability 上报）/ Mount an already-rendered config。
+    async def _amount_raw(
+        self,
+        raw_cfg: MCPServerConfig,
+        *,
+        plugin: str | None,
+        marketplace: str | None,
+    ) -> None:
+        """物化 **raw 声明** 进 manager（#192 / §5.13：**不 eager render**——实际启动时经 materializer 从 raw 重解析）。
 
-        对齐 rust ``mount_rendered``：durable 与 transient 两路径的**共享核**——durable 落盘后复用同一次 render 结果
-        经此物化，**避免重复触发** input/secret resolver 副作用（不二次渲染）。manager 惰性初始化于此单点。
+        durable 与 transient 两路径的**共享核**。manager 惰性初始化于此单点（注入 materializer）。
 
-        #149：``raw_cfg`` = 同一 server 的**未渲染 raw**（bundle_id 已物化），随物化登记进 ``_active_raw`` 供 get_config
-        wire 取 body（占位符字面保留）。运行期同 bundle_id = 覆盖（与 manager ``_add_or_update`` 原地更新语义一致）。
-        #149: ``raw_cfg`` is the un-rendered raw of the same server; register it into ``_active_raw`` for the wire body.
+        #149：``raw_cfg`` 随物化登记进 ``_active_raw``（含 §5.11 plugin scope 上下文）供 get_config wire 取 body
+        （占位符字面保留）与 materializer 重现挂载时的 scoped 解析。运行期同 bundle_id = 覆盖（与 manager
+        ``_add_or_update`` 原地更新语义一致）。
         """
         if self.mcp_manager is None:
             self.mcp_manager = MCPServerManager(
@@ -971,12 +1022,26 @@ class Computer(BaseComputer[PromptSession]):
                 auto_reconnect=self._auto_reconnect,
                 message_handler=self._on_manager_change,
                 oauth_credential_store=self._oauth_credential_store,
+                materializer=self._materialize_for_start,
             )
-        # 先物化进 manager，**成功后**再登记 raw（事务性一致：manager add 失败——如 server 活跃 ∧ 非 auto_reconnect
-        # 抛 RuntimeError——则不留 attempted≠running 的 map 漂移；raw 恒未渲染故无安全影响，此为展示一致性加固）。
-        # Register raw only after a successful manager add, so a failed update leaves no attempted≠running drift.
-        await self.mcp_manager.aadd_or_aupdate_server(validated)
-        self._active_raw[resolve_bundle_id(validated)] = raw_cfg
+        bid = resolve_bundle_id(raw_cfg)
+        # 先登记 raw（auto-connect start 的 materializer 需按 bundle_id 查 scope），manager add 失败则**恢复旧条目**
+        # （transactional：attempted≠running 不变式——失败不留 map 漂移，且**不得销毁仍在运行的旧 raw**：
+        # update-in-place restart 的 materialize 失败时旧进程按 §5.13 保留，wire 投影（get_config）必须仍可 join 回
+        # 旧 raw，否则 fail-closed 省略仍在运行的 server）。身份复核防并发：仅当自己的登记仍在位才撤销/恢复
+        # （并发 mount 同 bid 时不得误删后到的条目）。
+        entry = _RawServerEntry(config=raw_cfg, plugin=plugin, marketplace=marketplace)
+        previous = self._active_raw.get(bid)
+        self._active_raw[bid] = entry
+        try:
+            await self.mcp_manager.aadd_or_aupdate_server(raw_cfg)
+        except Exception:
+            if self._active_raw.get(bid) is entry:
+                if previous is not None:
+                    self._active_raw[bid] = previous
+                else:
+                    self._active_raw.pop(bid, None)
+            raise
 
     @staticmethod
     def _raw_body_for_disk(server: MCPServerConfig | dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -1016,8 +1081,10 @@ class Computer(BaseComputer[PromptSession]):
             plugin / marketplace: plugin 实时挂载 D2 上下文（#69 Group A）；非 None 时 bundled server 的裸
                 ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None。
         """
-        raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
-        await self._amount_rendered(raw_cfg, validated)
+        # #192 / §5.13：mount 只做形状校验 + 登记 raw（**不解析 input**——实际启动经 materializer 从 raw 重解析，
+        # 对齐 rust ``mount_server``）。
+        raw_cfg = self._validate_raw_shape(server)
+        await self._amount_raw(raw_cfg, plugin=plugin, marketplace=marketplace)
 
     async def aunmount_server_by_id(self, bundle_id: str) -> None:
         """按 **bundle_id** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by bundle_id。
@@ -1073,19 +1140,21 @@ class Computer(BaseComputer[PromptSession]):
         ``Project``（``mcp.json`` 入 git、团队共享）/ ``User``（``$XDG_CONFIG_HOME/a2c`` 全局）。**改已有 server 恒落其
         origin scope**（① :func:`upsert_mcp_server` 已保证，``scope`` 仅对新声明生效，杜绝跨 scope 漂移）。
 
-        流程（对齐 rust）：**先 render 校验**（早失败、不落盘）→ 取**未渲染 raw**（D1）→ 经 ① 落盘 raw → **复用**同一
-        次 render 结果 :meth:`_amount_rendered` 物化（不二次渲染）。落盘属 config 轴、物化属 capability 轴（分账见类内
-        双路径块注释）。
+        流程（对齐 rust）：**先形状校验**（早失败、不落盘；#192 起不解析 input——渲染推迟到实际启动）→ 取
+        **未渲染 raw**（D1）→ 经 ① 落盘 raw → :meth:`_amount_raw` 物化 raw 声明。落盘属 config 轴、物化属
+        capability 轴（分账见类内双路径块注释）。
 
         :raises McpConfigCorruptError: 目标 ``mcp.json`` 结构损坏（① 拒绝覆盖以免销毁既有内容）。
         """
-        # 1. 先渲染校验（早失败：损坏配置在落盘前抛出，绝不留下盘上声明而运行期未挂的半态）。
-        raw_cfg, validated = await self._arender_and_validate_server(server, session=session, plugin=plugin, marketplace=marketplace)
+        # 1. 先形状校验（早失败：损坏配置在落盘前抛出，绝不留下盘上声明而运行期未挂的半态）。
+        #    #192 / §5.13：**不解析 input**（对齐 rust——落盘 raw + mount raw；input 值在下次实际启动解析，
+        #    缺失 input 不再阻断声明落盘，而是 start/restart 时 surface 结构化错误）。
+        raw_cfg = self._validate_raw_shape(server)
         # 2. 取未渲染 raw 落盘（D1：占位字面保留、绝不写 secret）。
         name, raw_body = self._raw_body_for_disk(server)
         result = upsert_mcp_server(name, raw_body, scope=scope, env=self._resolve_env(), cwd=self._resolve_cwd())
-        # 3. 复用 render 结果物化（capability 自动上报；config 上报由调用方驱动，见分账注释）。
-        await self._amount_rendered(raw_cfg, validated)
+        # 3. 物化 raw 声明（capability 自动上报；config 上报由调用方驱动，见分账注释）。
+        await self._amount_raw(raw_cfg, plugin=plugin, marketplace=marketplace)
         # 4. #167 子问题 1：后置遮蔽检测——写入成功但被更高优先级只读层（flag/embed/policy）遮蔽时 WARN。
         #    upsert_mcp_server 的 origin 快照不传 flag_config_path/embed_servers（见其 docstring 已知代价），
         #    故此处补全量解析。对标 aremove_server 的只读 origin 检测（L1124-1137）。
@@ -1398,7 +1467,7 @@ class Computer(BaseComputer[PromptSession]):
           secret**，§9.1 值不离 Computer）。manager 存的是渲染后 config（供 spawn），故此处按 bundle_id join 回 raw。
         - manager 未建（pre-boot）→ 空元组（无运行期活跃集）。
 
-        不变式：每个运行期活跃 bundle_id 必有 raw 记录（boot 与 :meth:`_amount_rendered` 两挂载漏斗均登记）。若缺失
+        不变式：每个运行期活跃 bundle_id 必有 raw 记录（boot 与 :meth:`_amount_raw` 两挂载漏斗均登记）。若缺失
         （某挂载路径漏登记的 Bug）→ **fail-closed**：从 wire **省略**该 server（大声 WARN 可诊断），**绝不**回退渲染后
         config——那会把已解析 secret 送上「MUST 为 raw」的 wire（§9.1）。宁可 Agent 少看到一个 server，也不泄漏一把
         secret。正常路径两漏斗均登记 raw，不触发。
@@ -1411,8 +1480,8 @@ class Computer(BaseComputer[PromptSession]):
         out: list[MCPServerConfig] = []
         for cfg in self.mcp_manager.server_configs():
             bundle_id = resolve_bundle_id(cfg)
-            raw = self._active_raw.get(bundle_id)
-            if raw is None:
+            entry = self._active_raw.get(bundle_id)
+            if entry is None:
                 # fail-closed（安全纵深）：缺 raw 记录 = 某挂载漏斗漏登记的 Bug。**省略**该 server、绝不回退 ``cfg``
                 # （渲染后 config，含已解析 secret）——避免在「MUST 为 raw」的 wire 上泄漏 secret。大声 WARN 供诊断。
                 # Fail-closed: omit the server rather than leak the rendered config's resolved secrets onto a raw-only wire.
@@ -1421,7 +1490,7 @@ class Computer(BaseComputer[PromptSession]):
                     f"（某挂载路径未登记 raw，属 Bug；绝不回退渲染值以免 secret 外泄）/ omitting server (no raw record)",
                 )
                 continue
-            out.append(raw)
+            out.append(entry.config)
         return tuple(out)
 
     @property

@@ -6,7 +6,7 @@
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from typing import Any, NoReturn, cast
 
 from mcp.client.session import MessageHandlerFnT
@@ -150,6 +150,13 @@ class ToolNameDuplicatedError(Exception):
         super().__init__(*args)
 
 
+MaterializeFunc = Callable[[BUNDLE_ID, MCPServerConfig], Awaitable[MCPServerConfig]]
+"""#192 / §5.13：raw 声明 → rendered config 物化回调（Computer 注入）。
+
+``(bundle_id, raw) -> rendered``——restart-with-update 场景传入**新** raw（尚未登记进 Computer._active_raw），
+故 raw 显式作参数而非按 bundle_id 回查；scope（§5.11 plugin 上下文）由回调方自行按 bundle_id 取挂载时登记值。"""
+
+
 class MCPServerManager:
     """
     MCP Server管理器
@@ -168,10 +175,18 @@ class MCPServerManager:
         auto_reconnect: bool = True,
         message_handler: MessageHandlerFnT | None = None,
         oauth_credential_store: OAuthCredentialStore | None = None,
+        materializer: MaterializeFunc | None = None,
     ) -> None:
         # 存储所有服务器配置，以 bundle_id 为唯一身份键（协议 #15/#18：身份=bundle_id，name 降纯 display 不做键）
+        # #192 / §5.13：``_servers_config`` 为「当前配置」（挂载时=raw 声明、materialize 后=rendered 进程配置，
+        # 单店语义保持既有消费点不变）；``_servers_config_raw`` 为 **raw 声明店**（materialize 的解析源——
+        # 每次实际启动 MUST 从 raw 重解析，rendered 品绝不作为解析结果来源）。
+        # standalone manager（materializer=None）调用方传入即已渲染，两店同值。
         # Server configs keyed by bundle_id (unique identity; name is pure display, never a key — protocol #15/#18).
         self._servers_config: dict[BUNDLE_ID, MCPServerConfig] = {}
+        self._servers_config_raw: dict[BUNDLE_ID, MCPServerConfig] = {}
+        # #192 / §5.13：raw → rendered 物化回调（由 Computer 注入，闭包读其 _active_raw 与 §5.11 scope）。
+        self._materializer: MaterializeFunc | None = materializer
         # 活动客户端 {bundle_id: client}
         self._active_clients: dict[BUNDLE_ID, MCPClientProtocol] = {}
         # #184: 已接受的启动意图（不因 OAuth 未授权或连接失败而丢失）
@@ -298,8 +313,9 @@ class MCPServerManager:
             # Runtime same bundle_id = update-in-place (protocol §no-double-open runtime branch).
             if bundle_id in self._active_clients:
                 if self._auto_reconnect:
-                    self._servers_config[bundle_id] = config
-                    await self._arestart_server(bundle_id)
+                    # #192 / §5.13：**不预写**新 config——_arestart_server 先 materialize（失败旧配置/旧进程不动），
+                    # 成功后才替换存储（运行中不热更新、失败不留下 raw/rendered 半态）。
+                    await self._arestart_server(bundle_id, config)
                 else:
                     raise RuntimeError(
                         f"Server bundle_id={bundle_id!r} (name={config.name!r}) is active. Stop it before updating config",
@@ -308,6 +324,7 @@ class MCPServerManager:
                 # 配置存在但客户端未激活，更新配置并根据 auto_connect 决定是否启动
                 # Config exists but client is not active, update config and start if auto_connect is enabled
                 self._servers_config[bundle_id] = config
+                self._servers_config_raw[bundle_id] = config
                 # #179：transport 类型切换（streamable→stdio/sse）→ 退役陈旧 OAuth
                 # 运行时态（coordinator/flow/connect task），勿沿用旧 server_url/store。
                 if self._oauth_spec(config) is None and bundle_id in self._oauth_coordinators:
@@ -316,6 +333,7 @@ class MCPServerManager:
                     await self._astart_client_auto(bundle_id)
         else:
             self._servers_config[bundle_id] = config
+            self._servers_config_raw[bundle_id] = config
             if self._auto_connect:
                 await self._astart_client_auto(bundle_id)
 
@@ -349,23 +367,40 @@ class MCPServerManager:
             # 再以同 bundle_id 挂回不同 transport 时不得沿用陈旧 coordinator。
             self._retire_oauth_bundle(bundle_id)
             del self._servers_config[bundle_id]
+            self._servers_config_raw.pop(bundle_id, None)
             await self._arefresh_tool_mapping()
 
-    async def _arestart_server(self, bundle_id: BUNDLE_ID) -> None:
-        """重启服务器客户端（按 bundle_id）。"""
-        # 明确使用当前管理器中的最新配置
-        config = self._servers_config.get(bundle_id)
-        if not config:
-            # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
-            raise ValueError(f"Server bundle_id={bundle_id!r} not found in config")  # pragma: no cover
+    async def _arestart_server(self, bundle_id: BUNDLE_ID, config: MCPServerConfig) -> None:
+        """重启服务器客户端（按 bundle_id）。``config`` = 调用方提供的新 raw/rendered 声明（update-in-place 入参）。
 
-        # 确保使用最新配置重启
+        §5.13（#192，对齐 rust ``restart_client_by_id_materialized``）：**先 materialize**——失败即上抛，
+        旧进程与旧配置**不动**（尽量保留仍在运行的旧进程）；成功后才 stop 旧 → 以新 rendered spawn
+        （不二次 materialize，command 不会重复执行）。
+        """
+        if config.disabled:
+            # 停用配置：仅停止旧进程（对齐 rust disabled → stop，不 materialize），两店存新声明供状态面读取。
+            if bundle_id in self._active_clients:
+                await self._astop_client(bundle_id)
+            self._servers_config[bundle_id] = config
+            self._servers_config_raw[bundle_id] = config
+            return
+
+        rendered = await self._amaterialize(bundle_id, config)
         if bundle_id in self._active_clients:
             await self._astop_client(bundle_id)
-
-        # 只有启用的配置才能重启（OAuthRequired 走 auto 路径吞掉：restart 属配置变更触发的自动动作）
-        if not config.disabled:
-            await self._astart_client_auto(bundle_id)
+        self._servers_config[bundle_id] = rendered
+        self._servers_config_raw[bundle_id] = config  # 新 raw 声明（下一次实际启动的重解析源）
+        # OAuthRequired 吞掉（restart 属配置变更触发的自动动作，与 auto 路径同语义）
+        try:
+            await self._aspawn_client(bundle_id, rendered, self._oauth_clear_epochs.get(bundle_id, 0))
+        except OAuthError as exc:
+            if not _is_oauth_required_error(exc):
+                raise
+            logger.info(
+                f"Server bundle_id={bundle_id!r} requires OAuth authorization "
+                f"(state=Started+AuthorizationRequired); host drives the flow via "
+                f"create_oauth_flow/complete_oauth.",
+            )
 
     async def astart_all(self) -> None:
         """启动所有启用的服务器
@@ -385,6 +420,24 @@ class MCPServerManager:
         """启动单个服务器客户端（按 bundle_id）。"""
         async with self._lock:
             await self._astart_client(bundle_id)
+
+    async def _amaterialize(self, bundle_id: BUNDLE_ID, raw: MCPServerConfig) -> MCPServerConfig:
+        """§5.13（#192）：实际启动前把 raw 声明重解析为 rendered config。
+
+        - standalone manager（无 materializer）→ 调用方传入即已渲染，原样返回（既有行为不变）。
+        - 身份复核（对齐 rust ``replace_materialized_config``）：渲染不得改变 bundle_id 身份
+          （raw/rendered 连接身份漂移 = 硬错误）。
+        """
+        if self._materializer is None:
+            return raw
+        rendered = await self._materializer(bundle_id, raw)
+        resolved = resolve_bundle_id(rendered)
+        if resolved != bundle_id:
+            raise RuntimeError(
+                f"materialized config identity changed from {bundle_id!r} to {resolved!r} — "
+                f"raw/rendered bundle_id 漂移（渲染不得改变身份）"
+            )
+        return rendered
 
     async def _astart_client(self, bundle_id: BUNDLE_ID) -> None:
         """启动单个服务器客户端（按 bundle_id）。
@@ -424,6 +477,20 @@ class MCPServerManager:
             self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
             return  # 已经启动
 
+        # §5.13（#192，对齐 rust start_client_by_id_materialized）：从 stopped 实际启动 → 从 **raw 声明店**
+        # materialize（rendered 品绝不作为解析结果来源；结构化错误上抛、不落 CONNECTING、不改任何状态），
+        # 再以 rendered config spawn。standalone（无 raw 条目）回退当前配置（调用方传入即已渲染）。
+        raw = self._servers_config_raw.get(bundle_id, config)
+        rendered = await self._amaterialize(bundle_id, raw)
+        self._servers_config[bundle_id] = rendered
+        await self._aspawn_client(bundle_id, rendered, clear_epoch)
+
+    async def _aspawn_client(self, bundle_id: BUNDLE_ID, config: MCPServerConfig, clear_epoch: int) -> None:
+        """以**已 materialize 的 rendered config** spawn（``_astart_client`` / ``_arestart_server`` 共用，不二次解析）。
+
+        中文: 自「置 CONNECTING」起的既有 spawn 流程（OAuth bounded transaction 等）整体原样保留。
+        English: Spawn with an already-materialized config; the existing flow from CONNECTING onward is unchanged.
+        """
         # 设置连接状态为 connecting / Set connection state to connecting.
         self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTING
 
@@ -940,6 +1007,7 @@ class MCPServerManager:
     def _clear_all(self) -> None:
         """清空所有连接与映射 / Clear all state。"""
         self._servers_config.clear()
+        self._servers_config_raw.clear()
         self._active_clients.clear()
         self._activation_intents.clear()
         self._connection_states.clear()

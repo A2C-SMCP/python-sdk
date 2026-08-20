@@ -5,8 +5,9 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 from enum import IntEnum
-from typing import Any, Literal, NotRequired, TypeAlias
+from typing import Annotated, Any, Literal, NotRequired, TypeAlias
 
+from pydantic import BeforeValidator
 from typing_extensions import TypedDict
 
 from a2c_smcp import types
@@ -205,11 +206,31 @@ class MCPServerPromptStringInput(MCPServerInputBase):
     password: NotRequired[bool | None]
 
 
+def _reject_legacy_pick_options(v: Any) -> Any:
+    """⑦ 旧 ``options: list[str]`` 直接拒绝并指路新结构（协议 v0.3.2，无 alias、无迁移期）。
+
+    REPL ``inputs load`` 先经 smcp.py TypedDict 适配器校验（早于 model 层）——若无此 BeforeValidator，
+    旧形式只会得到泛化的 pydantic 类型错误而非「指路新结构」报错。"""
+    if isinstance(v, list) and v and all(isinstance(item, str) for item in v):
+        raise ValueError(
+            "旧 options: list[str] 形式已废弃（协议 v0.3.2）：请改用 "
+            "[{'label': ..., 'value': ...}] 结构化形式（label=展示、value=注入值）"
+        )
+    return v
+
+
+class PickStringOption(TypedDict):
+    """PickString 选项（wire 镜像，协议 v0.3.2）：``label``=展示、``value``=注入值；两者允许重复。"""
+
+    label: str
+    value: str
+
+
 class MCPServerPickStringInput(MCPServerInputBase):
     """选择输入类型，参考：https://code.visualstudio.com/docs/reference/variables-reference#_input-variables"""
 
     type: Literal["pickString"]
-    options: list[str]
+    options: Annotated[list[PickStringOption], BeforeValidator(_reject_legacy_pick_options)]
     default: NotRequired[str | None]
 
 

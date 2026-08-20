@@ -92,7 +92,7 @@ async def test_ainput_pick_multi_with_dedup_and_order(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ainput_pick_default_on_interrupt_and_empty(monkeypatch):
-    # first raise KeyboardInterrupt then return empty; both should yield default
+    # first raise KeyboardInterrupt then return empty; both yield "" (default 回退语义上移至调用方，#192 / §5.12)
     calls = {"n": 0}
 
     class DummySession:
@@ -108,12 +108,12 @@ async def test_ainput_pick_default_on_interrupt_and_empty(monkeypatch):
     monkeypatch.setattr(cli_io.console_util.console, "print", lambda *a, **k: None)
 
     picked = await ainput_pick("Pick one", ["a", "b"], default_index=1, multi=False)
-    assert picked == "b"
+    assert picked == ""
 
     # empty input path
     calls["n"] = 0
     picked2 = await ainput_pick("Pick one", ["a", "b"], default_index=0, multi=True)
-    assert picked2 == ["a"]
+    assert picked2 == []
 
 
 @pytest.mark.asyncio
