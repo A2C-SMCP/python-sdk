@@ -143,11 +143,15 @@ async def test_mcp_flag_config_inputs_segment_consumed_and_server_rendered(
         # ① inputs 段真的入池（旧 --config schema 根本没有 inputs 字段 ⇒ 此断言在旧通路上无从谈起）
         assert "SCRIPT" in {i.id for i in comp.inputs}, "--mcp-config 的 inputs 段未被消费"
 
-        # ② server 已挂 且 ${input:SCRIPT} 已渲染（证明 inputs 段确实参与了渲染，而不只是入池）
+        # ② server 已挂（raw 声明）且 ${input:SCRIPT} 可渲染（证明 inputs 段确实参与了渲染，而不只是入池）。
+        #    #192 / §5.13：挂载不再 eager render（渲染推迟到实际启动）——此处直接调用实际启动所用的
+        #    materialize 引擎验证「inputs 段 → 渲染」链路（夹具 disabled=True 免真拉进程，不走 start）。
         assert comp.mcp_manager is not None
         active = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
         assert SRV_BID in active, "flag 层声明的 server 未挂载"
-        assert active[SRV_BID].server_parameters.args == [script], "${input:SCRIPT} 未渲染"
+        assert active[SRV_BID].server_parameters.args == ["${input:SCRIPT}"], "挂载为 raw 声明（占位符保留，#192）"
+        _raw, rendered = await comp._arender_and_validate_server(active[SRV_BID])  # type: ignore[attr-defined]
+        assert rendered.server_parameters.args == [script], "${input:SCRIPT} 未渲染"
 
         # ③ 该 server 的 origin 可观测为 flag（§2.5-5：权威集 MUST 携带 origin）
         declared = comp.resolve_mcp_declarations(env=env)
@@ -323,16 +327,22 @@ async def test_embed_with_placeholder_is_not_remounted_when_config_unchanged(
     """
     **`_ensure_mounted` 的比较必须 raw-对-raw**：含 ``${input:}`` 的 embed server 在配置未变时**不得**被重挂。
 
-    陷阱：``mcp_manager.server_configs()`` 存的是**渲染后**配置（供 spawn），而 ``resolved.servers[*].config``
-    是**未渲染 raw**（D1：盘上/声明面恒 raw）。若直接拿两者比较，**任何带占位符的 config 都恒不相等** ⇒ 每次
-    ``run_mcp_approval`` 都重挂 ⇒ 客户端 restart，``auto_reconnect=False`` 时更直接抛 ``RuntimeError``。
-    正确基准 = :meth:`Computer.active_server_configs`（#149 的 **raw 投影**，按 bundle_id join 回 ``_active_raw``）。
+    陷阱：``mcp_manager.server_configs()`` 在**实际启动后**存的是**渲染后**配置（供 spawn），而
+    ``resolved.servers[*].config`` 是**未渲染 raw**（D1：盘上/声明面恒 raw）。若直接拿两者比较，**任何带占位符的
+    config 都恒不相等** ⇒ 每次 ``run_mcp_approval`` 都重挂 ⇒ 客户端 restart，``auto_reconnect=False`` 时更直接抛
+    ``RuntimeError``。正确基准 = :meth:`Computer.active_server_configs`（#149 的 **raw 投影**，按 bundle_id join
+    回 ``_active_raw``）。
+
+    #192 / §5.13：挂载不再 eager render ⇒ **未实际启动时** server_configs() 即 raw（rendered==raw 同值致盲）。
+    故判别性重构为：**先实际 start（fake client、不真 spawn）→ server_configs() 落 rendered**（占位符已解析、
+    rendered≠raw），此后若实现误用 server_configs() 与声明 raw 比较仍会被「恒不等 ⇒ 重挂」抓住。
 
     无占位符的 config 恰好 rendered == raw ⇒ **同值致盲**：不带占位符的夹具测不出此 bug（本仓「同值陷阱」同族）。
     故本例夹具**必须**带占位符。
     """
     _isolate(tmp_path, monkeypatch)
     embed_cfg = TypeAdapter(MCPServerConfig).validate_python({"name": SRV_NAME, **_server_body("${input:SCRIPT}")})
+    embed_cfg = embed_cfg.model_copy(update={"disabled": False})  # 允许 start（fake client，不真拉进程）
 
     comp = _real_computer(tmp_path)
     comp._mcp_servers = {embed_cfg}
@@ -341,11 +351,32 @@ async def test_embed_with_placeholder_is_not_remounted_when_config_unchanged(
             {"id": "SCRIPT", "type": "promptString", "description": "d", "default": "real.py"},
         ),
     )
+
+    class _FakeClient:
+        def __init__(self, config: Any = None, message_handler: Any = None) -> None:
+            self.state = "stopped"
+            self.list_tools = None
+
+        async def aconnect(self) -> None:
+            self.state = "connected"
+
+        async def adisconnect(self) -> None:
+            self.state = "disconnected"
+
+    import a2c_smcp.computer.mcp_clients.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "client_factory", lambda config, message_handler=None: _FakeClient(config, message_handler))
+
     async with comp:
         assert comp.mcp_manager is not None
-        # 前置：boot_up 已挂**渲染后**那份（占位符已解析）——正是 rendered≠raw 的来源
+        # 前置（#192）：boot 挂**raw 声明**（占位符字面保留）
         pre = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
-        assert pre[SRV_BID].server_parameters.args == ["real.py"], "前置：boot_up 挂的是渲染后配置"
+        assert pre[SRV_BID].server_parameters.args == ["${input:SCRIPT}"], "前置：boot 挂的是 raw 声明"
+
+        # 实际 start → materialize → server_configs() 落 rendered（占位符已解析）——rendered≠raw 的判别性来源
+        await comp.mcp_manager.astart_client(SRV_BID)
+        pre = {resolve_bundle_id(c): c for c in comp.mcp_manager.server_configs()}
+        assert pre[SRV_BID].server_parameters.args == ["real.py"], "前置：实际启动后 server_configs() 为渲染后配置"
 
         mounts: list[Any] = []
         orig = comp.amount_server

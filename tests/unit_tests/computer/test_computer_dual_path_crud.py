@@ -120,7 +120,8 @@ async def test_aadd_or_aupdate_server_persists_local_reprojects_and_survives_res
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path, resolver=_MapResolver({"cmd": "/bin/echo"}))
 
-    # command 带占位符 ${input:cmd}：证明 D1（盘上 raw 未渲染、内存投影已渲染）。
+    # command 带占位符 ${input:cmd}：证明 D1（盘上 raw 未渲染）。注入可解析 resolver ⇒ 若实现「落渲染后
+    # body」，盘上必是 /bin/echo 而断言失败——D1 判别性由本断言单独坐实（#192 起渲染推迟到实际启动）。
     await comp.aadd_or_aupdate_server(_stdio_dict("echo", "${input:cmd}"))
 
     # 1) 落 **Local**（mcp.local.json），非 project 层。
@@ -134,11 +135,12 @@ async def test_aadd_or_aupdate_server_persists_local_reprojects_and_survives_res
     assert disk.config.server_parameters.command == "${input:cmd}", "盘上必须是未渲染 raw（D1）"
     assert disk.origin.value == "local"
 
-    # 3) 重投影：manager 运行期活跃集含该 server，且为**已渲染**结果。
+    # 3) 重投影：manager 运行期活跃集含该 server；#192 / §5.13 下未实际启动 ⇒ 投影即 raw 声明
+    #    （占位符保留；渲染推迟到 start/restart 的 materialize）。
     assert comp.mcp_manager is not None
     runtime = {c.name: c for c in comp.mcp_manager.server_configs()}
     assert "echo" in runtime
-    assert runtime["echo"].server_parameters.command == "/bin/echo", "内存投影用渲染后结果"
+    assert runtime["echo"].server_parameters.command == "${input:cmd}", "内存投影为 raw 声明（实际启动才渲染，§5.13）"
 
     # 4) 重启存活：新 Computer（同 cwd/XDG）经 resolve_mcp_config 仍读得该声明。
     assert "echo" in resolve_mcp_config(env=os.environ).servers

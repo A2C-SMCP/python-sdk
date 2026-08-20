@@ -13,6 +13,7 @@ from a2c_smcp.computer.mcp_clients.model import (
     MCPServerCommandInput,
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
+    PickStringOption,
 )
 
 
@@ -58,7 +59,18 @@ async def test_resolver_prompt_path(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolver_pick_path_default_fallback(monkeypatch):
-    inputs = [MCPServerPickStringInput(id="k", description="pick one", options=["a", "b", "c"], default="b")]
+    inputs = [
+        MCPServerPickStringInput(
+            id="k",
+            description="pick one",
+            options=[
+                PickStringOption(label="a", value="a"),
+                PickStringOption(label="b", value="b"),
+                PickStringOption(label="c", value="c"),
+            ],
+            default="b",
+        )
+    ]
     r = InputResolver(inputs)
 
     async def fake_pick(message, options, *, default_index=None, multi=False, session: PromptSession | None = None):

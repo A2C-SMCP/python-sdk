@@ -5,7 +5,7 @@
 # @Software: PyCharm
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, Self, TypeAlias, runtime_checkable
 
 from mcp import StdioServerParameters, Tool
 from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
@@ -199,12 +199,47 @@ class MCPServerPromptStringInput(MCPServerInputBase):
     password: bool | None = Field(default=None)
 
 
+class PickStringOption(BaseModel):
+    """PickString 选项（协议 v0.3.2，a2c-smcp-protocol#48）：``label``=展示、``value``=注入值。
+
+    约束：label / value 非空（min_length=1）；label 与 value 均**允许重复**（不要求唯一）——
+    SDK / client MUST NOT 按 value 反推原选 label（重复 label 下按序号返回条目本身）。
+    """
+
+    label: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", arbitrary_types_allowed=False, frozen=True)
+
+
 class MCPServerPickStringInput(MCPServerInputBase):
     """选择输入类型，参考：https://code.visualstudio.com/docs/reference/variables-reference#_input-variables"""
 
     type: Literal["pickString"] = Field(default="pickString")
-    options: list[str] = Field(default_factory=list)
+    options: list[PickStringOption]
     default: str | None = Field(default=None)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _reject_legacy_string_options(cls, v: Any) -> Any:
+        """⑦ 旧 ``options: list[str]`` 直接拒绝（协议 v0.3.2 破坏性变更：无 alias、无迁移期），报错指路新结构。"""
+        if isinstance(v, list) and v and all(isinstance(item, str) for item in v):
+            raise ValueError(
+                "旧 options: list[str] 形式已废弃（协议 v0.3.2）：请改用 "
+                "[{'label': ..., 'value': ...}] 结构化形式（label=展示、value=注入值）"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_options_and_default(self) -> Self:
+        """⑤ options 至少一项；④ default 若存在且非 None MUST 匹配至少一个 option.value（显式 null 视为无默认）。"""
+        if not self.options:
+            raise ValueError("options 至少一项 / options must contain at least one entry")
+        if self.default is not None and not any(o.value == self.default for o in self.options):
+            raise ValueError(
+                f"default {self.default!r} 不匹配任一 option.value / default must match at least one option.value"
+            )
+        return self
 
 
 class MCPServerCommandInput(MCPServerInputBase):

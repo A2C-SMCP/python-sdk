@@ -6,6 +6,7 @@ from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerPickStringInput,
     MCPServerPromptStringInput,
+    PickStringOption,
 )
 
 
@@ -16,7 +17,12 @@ def test_inputs_crud_and_set_uniqueness() -> None:
     assert comp.inputs == ()
 
     i1 = MCPServerPromptStringInput(id="USER", description="user name", default="alice", password=False)
-    i2 = MCPServerPickStringInput(id="REGION", description="region", options=["us", "eu"], default="us")
+    i2 = MCPServerPickStringInput(
+        id="REGION",
+        description="region",
+        options=[PickStringOption(label="us", value="us"), PickStringOption(label="eu", value="eu")],
+        default="us",
+    )
 
     # add
     comp.add_or_update_input(i1)

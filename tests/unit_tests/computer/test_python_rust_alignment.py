@@ -196,12 +196,14 @@ def _runtime_bundle_ids(comp: Computer) -> set[str]:
 async def test_alignment_durable_add_persists_raw_to_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """durable ``aadd_or_aupdate_server`` → ``mcp.local.json`` 出现该 server，body 为 **raw 未渲染**（``${input:}`` 原样）。
 
-    **判别性守护 D1**：注入 resolver 令 ``${input:cmd}`` → ``/bin/echo``，故 raw（盘上）与 rendered（内存）**不同**；
-    断言盘上=占位字面 **且** 内存投影=渲染值——若实现改为「落渲染后 body」（secret 落盘泄漏回归）则前一条断言必然失败。
+    **判别性守护 D1**：注入 resolver 令 ``${input:cmd}`` → ``/bin/echo``，若实现改为「落渲染后 body」
+    （secret 落盘泄漏回归）则盘上断言必然失败（注入的 resolver 可解析、盘上却必须是占位字面）。
+    #192 / §5.13（对齐 rust PR#190）：挂载/落盘只登记 raw 声明，**渲染推迟到实际启动**——未实际启动
+    时内存投影即 raw（占位符保留），与 rust ``mount only records the raw declaration`` 同构。
     """
     _isolate(tmp_path, monkeypatch)
     comp = _comp(tmp_path, resolver=_MapResolver({"cmd": "/bin/echo"}))
-    # command 带占位符：resolver 使 raw≠rendered，证明盘上写的是 raw 未渲染（D1：绝不写渲染后 secret）。
+    # command 带占位符：resolver 使「若渲染则必为 /bin/echo」可证伪，证明盘上写的是 raw 未渲染（D1：绝不写渲染后 secret）。
     # #150 R5①：display name "svc.disp" → bundle_id "svc_disp"（分叉）；盘上 map key = name（wontfix 正交项）。
     await comp.aadd_or_aupdate_server(_stdio_dict("svc.disp", "${input:cmd}"))
 
@@ -209,9 +211,9 @@ async def test_alignment_durable_add_persists_raw_to_local(tmp_path: Path, monke
     assert "svc.disp" in local, "durable 默认落 Local（mcp.local.json）；盘上按 name 键"
     assert local["svc.disp"]["server_parameters"]["command"] == "${input:cmd}", "盘上为 raw 未渲染（占位字面保留、非 /bin/echo）"
     assert "svc.disp" not in _read_servers(mcp_write_path(McpWriteScope.PROJECT, env=os.environ)), "不碰 git 共享 project 层"
-    # 内存投影为**渲染后**值——与盘上 raw 形成对照，坐实「盘上确为未渲染 raw」而非二者恰好相等的假阳性。
+    # 内存投影（未实际启动）= raw 声明（§5.13：渲染推迟到实际启动的 materialize）。
     runtime = {c.name: c for c in comp.mcp_manager.server_configs()}
-    assert runtime["svc.disp"].server_parameters.command == "/bin/echo", "内存投影用渲染后结果（raw≠rendered，D1 断言可证伪）"
+    assert runtime["svc.disp"].server_parameters.command == "${input:cmd}", "内存投影为 raw 声明（实际启动才渲染，§5.13）"
 
 
 @pytest.mark.asyncio

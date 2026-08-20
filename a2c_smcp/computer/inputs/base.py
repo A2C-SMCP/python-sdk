@@ -127,10 +127,13 @@ class BaseInputResolver(Generic[S], ABC):
         cfg: MCPServerPickStringInput,
         *,
         session: S | None = None,
-    ) -> str:  # pragma: no cover - interface
+    ) -> tuple[str, bool]:  # pragma: no cover - interface
         """
-        中文: 解析 pickString 类型输入。
-        English: Resolve a pickString type input.
+        中文: 解析 pickString 类型输入，返回 ``(value, from_user)``。
+          - ``from_user=True``：用户实选值（可持久化/缓存）；
+          - ``from_user=False``：解析链回退值（default / 首项，§5.12 **不反向持久化**——不写任何存储）。
+        English: Resolve a pickString type input, returning ``(value, from_user)``; fallback values
+                 (default / first option) MUST NOT be persisted or cached.
         """
         raise NotImplementedError
 

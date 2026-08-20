@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 # filename: test_computer_exceptions.py
+"""
+#173 结构化错误 + #192 / §5.13 语义迁移：
+- boot / mount **不解析 input**（渲染推迟到实际启动）——Missing / ResolverFailed 从实际 start/restart surface；
+- boot auto_connect 的 materialize 失败 → 回滚已启动 client 后上抛（retry-safe 保持）；
+- durable add：形状非法仍早失败不落盘；input 缺失**不再阻断落盘**（raw 声明落盘，start 时 surface）；
+- 未定义占位符字面保留（VS Code parity）行为不变。
+"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcp import StdioServerParameters
+from pydantic import ValidationError
 
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.inputs.resolver import (
@@ -18,7 +27,8 @@ from a2c_smcp.computer.inputs.resolver import (
 )
 from a2c_smcp.computer.inputs.value_store import ValueStore
 from a2c_smcp.computer.mcp_clients.model import MCPServerPromptStringInput, StdioServerConfig
-from a2c_smcp.computer.settings.mcp_config import McpWriteScope
+from a2c_smcp.computer.settings.mcp_config import McpWriteScope, mcp_write_path
+from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 
 class _NoSecret:
@@ -42,12 +52,54 @@ class _StubManager:
     async def ainitialize(self, servers: Any) -> None:
         self.received_servers = list(servers)
 
+    async def aclose(self) -> None:
+        pass
+
+
+class _FakeClient:
+    """最小 fake client（boot auto_connect 重试路径需真实 manager spawn）。"""
+
+    def __init__(self, config: Any = None, message_handler: Any = None) -> None:
+        self.state = "stopped"
+
+    async def aconnect(self) -> None:
+        self.state = "connected"
+
+    async def adisconnect(self) -> None:
+        self.state = "disconnected"
+
+    def list_tools(self):  # noqa: ANN201
+        import asyncio
+
+        async def _empty():
+            return []
+
+        return asyncio.sleep(0, result=[])
+
+
+def _patch_client_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "a2c_smcp.computer.mcp_clients.manager.client_factory",
+        lambda config, message_handler=None: _FakeClient(config, message_handler),
+    )
+
 
 def _stdio_cfg(name: str, arg: str) -> StdioServerConfig:
-    """单 server，env 中引用 ``${input:<id>}``（boot_up 读 self._mcp_servers 渲染）。"""
+    """单 server，env 中引用 ``${input:<id>}``（materialize 时经 resolver 解析）。"""
     return StdioServerConfig(
         name=name,
         server_parameters=StdioServerParameters(command="/bin/echo", env={"X": arg}),
+    )
+
+
+def _comp(inputs: set, mcp_servers: set, *, resolver: InputResolver, auto_connect: bool = False) -> Computer:
+    return Computer(
+        name="c",
+        inputs=inputs,
+        mcp_servers=mcp_servers,
+        auto_connect=auto_connect,
+        auto_reconnect=False,
+        input_resolver=resolver,
     )
 
 
@@ -76,25 +128,21 @@ async def test_arender_and_validate_server_missing_input_keeps_original() -> Non
     assert validated.server_parameters.env.get("FOO") == "${input:NOT_DEFINED}"
 
 
-# ── #173（对齐 rust-sdk#144）：boot_up 须把 D1 结构化 InputResolution 上抛（非仅日志），对齐 mount_server ──
+# ── #192 / §5.13：boot/mount 不解析 input——Missing/ResolverFailed 从实际 start surface ──
 
 
 @pytest.mark.asyncio
 async def test_boot_up_propagates_missing_value_input(tmp_path: Path) -> None:
-    """已定义 value input、headless 无 env/store/default → boot_up 上抛 MissingInputError(VALUE)（非吞错保底）。"""
+    """已定义 value input、headless 无 env/store/default → boot 不抛（只登记 raw），实际 start 上抛
+    MissingInputError(VALUE)（非吞错保底）。"""
     inputs = [MCPServerPromptStringInput(id="b173_val", description="d")]  # default=None
     resolver = InputResolver(inputs, env={}, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)}))
     cfg = _stdio_cfg("s", "${input:b173_val}")
-    comp = Computer(
-        name="c",
-        inputs=set(inputs),
-        mcp_servers={cfg},
-        auto_connect=False,
-        auto_reconnect=False,
-        input_resolver=resolver,
-    )
+    comp = _comp({inputs[0]}, {cfg}, resolver=resolver)
+    await comp.boot_up()  # 不抛：boot 不解析 input
+    assert comp.mcp_manager is not None
     with pytest.raises(MissingInputError) as ei:
-        await comp.boot_up()
+        await comp.mcp_manager.astart_client(resolve_bundle_id(cfg))
     err = ei.value
     assert err.kind is InputKind.VALUE
     assert err.id == "b173_val"
@@ -104,20 +152,15 @@ async def test_boot_up_propagates_missing_value_input(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_boot_up_propagates_missing_secret_input_no_plaintext(tmp_path: Path) -> None:
-    """password:true secret 缺失 → Missing(SECRET)；Missing 无值字段 ⇒ 错误天然不含明文。"""
+    """password:true secret 缺失 → start 上抛 Missing(SECRET)；Missing 无值字段 ⇒ 错误天然不含明文。"""
     inputs = [MCPServerPromptStringInput(id="b173_sec", description="d", password=True)]
     resolver = InputResolver(inputs, env={}, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)}), secret_store=_NoSecret())
     cfg = _stdio_cfg("s", "${input:b173_sec}")
-    comp = Computer(
-        name="c",
-        inputs=set(inputs),
-        mcp_servers={cfg},
-        auto_connect=False,
-        auto_reconnect=False,
-        input_resolver=resolver,
-    )
+    comp = _comp({inputs[0]}, {cfg}, resolver=resolver)
+    await comp.boot_up()
+    assert comp.mcp_manager is not None
     with pytest.raises(MissingInputError) as ei:
-        await comp.boot_up()
+        await comp.mcp_manager.astart_client(resolve_bundle_id(cfg))
     err = ei.value
     assert err.kind is InputKind.SECRET
     assert err.id == "b173_sec"
@@ -127,7 +170,7 @@ async def test_boot_up_propagates_missing_secret_input_no_plaintext(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_boot_up_propagates_resolver_hard_failure(tmp_path: Path) -> None:
-    """client resolver 硬失败 → boot_up 上抛 ResolverFailedError（区别于 Missing 的未提供）。"""
+    """client resolver 硬失败 → start 上抛 ResolverFailedError（区别于 Missing 的未提供）。"""
 
     class _Failing(InputResolver):
         async def aresolve_by_id(  # type: ignore[override]
@@ -143,16 +186,11 @@ async def test_boot_up_propagates_resolver_hard_failure(tmp_path: Path) -> None:
     inputs = [MCPServerPromptStringInput(id="b173_fail", description="d")]
     resolver = _Failing(inputs, env={}, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)}))
     cfg = _stdio_cfg("s", "${input:b173_fail}")
-    comp = Computer(
-        name="c",
-        inputs=set(inputs),
-        mcp_servers={cfg},
-        auto_connect=False,
-        auto_reconnect=False,
-        input_resolver=resolver,
-    )
+    comp = _comp({inputs[0]}, {cfg}, resolver=resolver)
+    await comp.boot_up()
+    assert comp.mcp_manager is not None
     with pytest.raises(ResolverFailedError) as ei:
-        await comp.boot_up()
+        await comp.mcp_manager.astart_client(resolve_bundle_id(cfg))
     assert ei.value.id == "b173_fail"
     assert "boom" in ei.value.reason
     assert isinstance(ei.value, InputResolutionError)
@@ -161,37 +199,32 @@ async def test_boot_up_propagates_resolver_hard_failure(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_boot_up_retry_succeeds_after_value_provided(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """boot 失败后生命周期可安全重试——补值（env）后同实例重试成功（无残留 manager/task/transport 阻塞）。
-    注：python Computer 无 rust 的 lifecycle 状态机，故以「重试成功」证无残留（对齐 rust retry 测试意图）。"""
+    注：python Computer 无 rust 的 lifecycle 状态机，故以「重试成功 + 回滚后无残留」证无残留（对齐 rust retry 测试意图）。"""
     var = "A2C_SMCP_b173_retry"
     monkeypatch.delenv(var, raising=False)  # 确保首轮缺失
-    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", _StubManager)
+    _patch_client_factory(monkeypatch)
 
     inputs = [MCPServerPromptStringInput(id="b173_retry", description="d")]
     # env=os.environ（live）便于中途 setenv；value_store 走 tmp_path 隔离。
     resolver = InputResolver(inputs, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)}))
     cfg = _stdio_cfg("s", "${input:b173_retry}")
-    comp = Computer(
-        name="c",
-        inputs=set(inputs),
-        mcp_servers={cfg},
-        auto_connect=False,
-        auto_reconnect=False,
-        input_resolver=resolver,
-    )
+    comp = _comp({inputs[0]}, {cfg}, resolver=resolver, auto_connect=True)
 
-    # 首轮：值缺失 → Missing → boot 失败
+    # 首轮：值缺失 → auto-connect 实际启动 materialize 抛 Missing → boot 失败并回滚
     with pytest.raises(MissingInputError):
         await comp.boot_up()
+    assert comp.mcp_manager is not None
+    assert comp.mcp_manager._active_clients == {}  # type: ignore[attr-defined]  # 回滚：无残留活跃 client
 
     # 补值（env 回退路径）→ 同一 Computer 重试成功（证明无残留状态阻塞重试）
     monkeypatch.setenv(var, "provided")
     await comp.boot_up()  # 不抛即成功
+    assert len(comp.mcp_manager._active_clients) == 1  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
-async def test_boot_up_tolerates_undefined_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """未定义占位符（不在 inputs 池）≠ 已定义但解析失败。前者保留字面、不上抛（VS Code parity），
-    仅后者（InputResolution）上抛。本测试守护「不连坐误伤」。"""
+async def test_boot_up_tolerates_undefined_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """未定义占位符（不在 inputs 池）≠ 已定义但解析失败。boot 登记 raw 声明、占位符字面保留（VS Code parity）。"""
     monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", _StubManager)
     # 无 inputs 定义 → b173_undef 为未定义占位符
     comp = Computer(
@@ -201,71 +234,71 @@ async def test_boot_up_tolerates_undefined_placeholder(tmp_path: Path, monkeypat
         auto_connect=False,
         auto_reconnect=False,
     )
-    await comp.boot_up()  # 不抛即成功（字面保留）
-
-
-@pytest.mark.asyncio
-async def test_boot_up_tolerates_non_input_render_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """#173 守卫：非 InputResolution 的渲染错误（如 renderer 自身抛 RuntimeError）仍按稳妥策略保留原配置
-    继续（对齐 rust「其余渲染错误维持容错」），不连坐上抛——只有 InputResolution 才上抛。"""
-    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", _StubManager)
-    comp = Computer(name="test", inputs=[], mcp_servers=set(), auto_connect=False, auto_reconnect=False)
-    cfg = StdioServerConfig(name="keep", server_parameters=StdioServerParameters(command="/bin/echo"))
-    comp._mcp_servers = {cfg}  # type: ignore[attr-defined]
-
-    async def boom(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        raise RuntimeError("render failed")
-
-    comp._config_render.arender = boom  # type: ignore[assignment,method-assign]
-
-    # 非 InputResolution 错误 → 保留原配置继续，boot 不抛
-    await comp.boot_up()
-    assert comp.mcp_manager is not None
-    # 稳妥策略核心承诺：ainitialize 收到的是**原始未渲染 cfg**（保留而非丢弃），对齐被取代的旧测试
-    # `test_boot_up_render_error_path` 的 `isinstance(servers[0], MCPServerConfig)` 守卫强度。
+    await comp.boot_up()  # 不抛即成功（raw 声明登记）
     received = comp.mcp_manager.received_servers  # type: ignore[attr-defined]
     assert len(received) == 1
-    assert received[0].name == "keep"
+    assert received[0].server_parameters.env.get("X") == "${input:b173_undef}"  # 占位符字面保留
 
 
 @pytest.mark.asyncio
-async def test_amount_server_propagates_input_resolution_error(tmp_path: Path) -> None:
-    """#173：transient mount 路径同样上抛 InputResolution（render 放行 ⇒ 免费对齐 rust ``mount_server``）。
-    钉契约防回归——避免未来 render.py 改动无意重新吞回 InputResolution 时，此「免费对齐」静默蒸发。"""
+async def test_boot_up_tolerates_invalid_shape_keeps_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#192：boot 只做形状校验——形状非法**跳过挂载、不连坐上抛**（对齐旧「非 InputResolution 渲染错误容错」
+    精神；非法声明无法派生 bundle_id 身份，解析类错误推迟到实际启动 surface）。"""
+    monkeypatch.setattr("a2c_smcp.computer.computer.MCPServerManager", _StubManager)
+    comp = Computer(name="test", inputs=[], mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    # 有 name（bundle_id 可派生）但缺必填 server_parameters → 形状非法
+    bad = {"type": "stdio", "name": "keep"}
+    comp._mcp_servers = [bad]  # type: ignore[attr-defined]  # list：boot 仅迭代（dict 不可入 set）
+
+    # 形状校验失败 → 跳过挂载，boot 不抛
+    await comp.boot_up()
+    assert comp.mcp_manager is not None
+    received = comp.mcp_manager.received_servers  # type: ignore[attr-defined]
+    assert received == []  # 非法声明被跳过（不挂载、不连坐）
+
+
+@pytest.mark.asyncio
+async def test_amount_server_then_start_propagates_input_resolution_error(tmp_path: Path) -> None:
+    """#192：transient mount 只登记 raw（不解析）——Missing 从实际 start surface（对齐 rust ``mount_server``
+    只记录声明、start 时 surface）。"""
     inputs = [MCPServerPromptStringInput(id="b173_mount", description="d")]
     resolver = InputResolver(inputs, env={}, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)}))
-    comp = Computer(
-        name="c",
-        inputs=set(inputs),
-        mcp_servers=set(),
-        auto_connect=False,
-        auto_reconnect=False,
-        input_resolver=resolver,
-    )
+    comp = _comp({inputs[0]}, set(), resolver=resolver)
+    cfg = _stdio_cfg("s", "${input:b173_mount}")
+    await comp.amount_server(cfg)  # 不抛：mount 只登记 raw
+    assert comp.mcp_manager is not None
     with pytest.raises(MissingInputError) as ei:
-        await comp.amount_server(_stdio_cfg("s", "${input:b173_mount}"))
+        await comp.mcp_manager.astart_client(resolve_bundle_id(cfg))
     assert ei.value.kind is InputKind.VALUE
 
 
 @pytest.mark.asyncio
-async def test_aadd_or_aupdate_server_propagates_input_resolution_error(
+async def test_durable_add_persists_raw_and_start_surfaces_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#173：durable 声明路径同样上抛 InputResolution（render 先于落盘 ⇒ 早失败不残留半态盘声明，对齐 rust）。
-    钉契约防回归。"""
-    monkeypatch.chdir(tmp_path)  # 隔离 mcp.local.json（render 先失败，本不应触盘，此为 hygiene）
+    """#192：durable 声明不再被 input 缺失阻断——raw 落盘 + mount（对齐 rust：落盘 raw + mount raw），
+    Missing 从实际 start surface。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)  # 隔离落盘面（project/local 锚 cwd、user 锚 XDG，#116/#134）
     inputs = [MCPServerPromptStringInput(id="b173_add", description="d")]
     resolver = InputResolver(inputs, env={}, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)}))
-    comp = Computer(
-        name="c",
-        inputs=set(inputs),
-        mcp_servers=set(),
-        auto_connect=False,
-        auto_reconnect=False,
-        input_resolver=resolver,
-    )
+    comp = _comp({inputs[0]}, set(), resolver=resolver)
+    cfg = _stdio_cfg("s", "${input:b173_add}")
+    await comp.aadd_or_aupdate_server_in_scope(cfg, McpWriteScope.LOCAL)  # 不抛：raw 声明落盘 + mount
+    assert mcp_write_path(McpWriteScope.LOCAL, env=os.environ).exists()
+    assert comp.mcp_manager is not None
     with pytest.raises(MissingInputError) as ei:
-        await comp.aadd_or_aupdate_server_in_scope(_stdio_cfg("s", "${input:b173_add}"), McpWriteScope.LOCAL)
+        await comp.mcp_manager.astart_client(resolve_bundle_id(cfg))
     assert ei.value.kind is InputKind.VALUE
-    # render 先失败 ⇒ 未落盘半态声明（D1 早失败承诺：绝不留下盘上声明而运行期未挂的半态）
+
+
+@pytest.mark.asyncio
+async def test_durable_add_invalid_shape_fails_before_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """形状非法仍**早失败不落盘**（绝不留下盘上声明而运行期未挂的半态）——早失败口径收窄为形状校验
+    （#192：input 解析已推迟到实际启动，不再参与落盘前校验）。"""
+    monkeypatch.chdir(tmp_path)
+    comp = _comp(set(), set(), resolver=InputResolver([], env={}, value_store=ValueStore({"XDG_STATE_HOME": str(tmp_path)})))
+    bad = {"type": "stdio", "name": "bad"}  # 缺必填 server_parameters → 形状非法
+    with pytest.raises(ValidationError):
+        await comp.aadd_or_aupdate_server_in_scope(bad, McpWriteScope.LOCAL)
     assert not (tmp_path / "mcp.local.json").exists()
