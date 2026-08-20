@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) versioning.
 
+> 注：v0.3.1 / v0.3.2 发版时未单独切段（Bugfix / OAuth 收敛类），本段累积至 [0.3.0]。
+
+## [0.3.3] - 2026-08-20
+
+> **A2C-SMCP 协议 v0.3.2 GA 实现**。SDK 包版本 `0.3.3`，`PROTOCOL_VERSION` 同步为 `0.3.2`。
+> 主线：PickString options 结构化 `{label, value}`（旧 `string[]` 直接拒绝）+ 实际
+> start/restart 从 raw 声明重解析 input（镜像 protocol#48 / rust-sdk#187+#193）。
+
+### Breaking Changes
+- **PickString `options` 结构化：`list[str]` → `list[PickStringOption{label, value}]`**（#192，协议
+  `data-structures.md` 0.3.2 破坏性变更）。
+  - 旧 `"options": ["a", "b"]` 字符串数组形式以 `validation` 错误**直接拒绝**（报错指路新结构），
+    **无 alias、无迁移期**；model 层与 wire TypedDict 层双收口（REPL `inputs load` / plugin 入池均生效）。
+  - `options` 至少一项；`label` / `value` 非空；`label` / `value` 允许重复（MUST NOT 按 value 反推 label）；
+    `default` 若存在且非 None MUST 匹配至少一个 option.value（显式 `null` 视为无默认）。
+  - 交互选择表展示 `label`、注入 `value`。
+
+### Changed
+- **实际 start/restart 从 raw 重解析 input**（#192，runtime-contract §5.13）：boot / mount 不再 eager render
+  （仅形状校验 + 登记 raw 声明）；每次从 stopped 实际启动（含 restart / start-all）从 raw 声明重新解析
+  input 再创建 client——用户改选后重启**不再静默沿用旧渲染品**；运行中不热更新；幂等 start no-op。
+  restart 解析失败 → 结构化错误并**保留仍在运行的旧进程**。
+- **取值与失效语义**（§5.12）：已存值（cache / env / value store）不匹配任一 option.value → 结构化
+  `InvalidSelectionError`（携带 `id` + `value`），**不回退** default / 首项；真正无用户值 → default →
+  首项 value（**不反向持久化**）；command 输入仅在实际启动时执行（每次实际启动恰执行一次）。
+- 交互 prompt 时机随渲染点后移：`server add` / boot 不再弹输入提示，提示发生在实际 `start` 时
+  （auto-connect 流程下无感知差异）。
+
 ## [0.3.0] - 2026-07-22
 
 > **A2C-SMCP 协议 v0.3.0 GA** 实现。SDK 包版本 `0.3.0`。
