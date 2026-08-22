@@ -20,9 +20,10 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (  # noqa: F401 — #179 �
     OAuthLaunch,
     OAuthStatus,
 )
-from a2c_smcp.computer.socketio.client import SMCPComputerClient
+from a2c_smcp.computer.socketio.client import AuthProvider, SMCPComputerClient  # noqa: F401 — #200 动态 auth provider 类型面
 
 __all__ = [
+    "AuthProvider",
     "Computer",
     "SMCPComputerClient",
     "InMemoryOAuthCredentialStore",

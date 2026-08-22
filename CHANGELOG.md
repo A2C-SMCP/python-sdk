@@ -7,6 +7,21 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 > 注：v0.3.1 / v0.3.2 发版时未单独切段（Bugfix / OAuth 收敛类），本段累积至 [0.3.0]。
 
+## [Unreleased]
+
+### Added
+- **ToolMeta 三层合并：Server 声明 tags**（#199，镜像 protocol#51 / PR#57 裁决，v0.4.0）：MCP Server 可在
+  `Tool._meta["a2c_tool_meta"]` 声明默认 `tags`，合并语义升为
+  `tool_meta[tool] > default_tool_meta > Server 声明`（tags 整体替换不 union；缺失/null 继承、
+  `[]` 显式清除）。`available_tools` 对每个 Tool 无条件 reconcile 并校验声明，畸形声明（非对象 /
+  `tags` 非 `list[str]`）丢弃 + warning 诊断（每 server 每次刷新至多一次），MUST NOT 令 `tools/list` 失败。
+
+### Breaking Changes
+- **`a2c_tool_meta` 白名单化：Server 声明仅 `tags` 生效**（#199，裁决意图）：`auto_apply` / `alias` /
+  `ret_object_mapper` 等白名单外字段**不再经 Server 声明透传**——字段级过滤，reconcile 后彻底消失
+  （终值恒为 Computer 写入的 canonical，全字段含 null）。下游第三方若曾依赖 `Tool._meta["a2c_tool_meta"]`
+  的偶然原生透传（如 Server 自声明 `auto_apply=true`）将失效，请改由 Computer 配置侧指定。
+
 ## [0.3.3] - 2026-08-20
 
 > **A2C-SMCP 协议 v0.3.2 GA 实现**。SDK 包版本 `0.3.3`，`PROTOCOL_VERSION` 同步为 `0.3.2`。

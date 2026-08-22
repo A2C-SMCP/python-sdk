@@ -5,7 +5,8 @@
 # @Software: PyCharm
 import base64
 import hashlib
-from typing import Any, cast
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeAlias, cast
 
 from mcp.types import CallToolResult, Resource
 from pydantic import TypeAdapter
@@ -80,6 +81,34 @@ from a2c_smcp.utils.handshake import (
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+AuthProvider: TypeAlias = Callable[[], Awaitable[dict[str, Any]]]
+"""
+动态 auth provider 类型别名（#200 方案 C）/ Dynamic auth provider type alias (#200 plan C).
+
+零参 **async** callable，返回通用、可序列化的 Socket.IO auth dict，
+供 ``SMCPComputerClient.connect(url, auth_provider=...)`` 注入。
+Zero-arg **async** callable returning a generic, serializable Socket.IO auth dict,
+injected via ``SMCPComputerClient.connect(url, auth_provider=...)``.
+
+原生透传语义 / Native passthrough semantics (zero SDK machinery):
+  - python-socketio 在**每次握手**（首连 + 每次自动重连尝试）都会 ``await`` 重新求值 →
+    轮换短期凭证无需拆除健康连接 / re-evaluated by python-socketio at EVERY handshake
+    (first connect + every auto-reconnect attempt) — rotate short-lived credentials
+    without tearing down healthy connections;
+  - provider 异常表现为连接失败，重试节奏沿用 socketio 有界重试，瞬时失败可自愈 /
+    provider exceptions surface as connection failure; bounded socketio retry applies,
+    transient failures self-heal on the next attempt;
+  - 同步 callable 亦被原生路径接受（推荐 async）/ sync callables are also accepted by the
+    native path (async is recommended).
+
+Provider 契约（务必遵守）/ Provider contract (must follow):
+  - 异常**不得内嵌 secret**——engineio 会对 provider 异常打印 traceback（上游限制，跟踪 #201）/
+    exceptions MUST NOT embed secrets (engineio logs their traceback; upstream limitation #201);
+  - 无超时保障：provider 永不返回会无限挂起握手（上游缺陷，跟踪 #201）/
+    no timeout guarantee: a never-returning provider hangs the handshake (upstream defect #201);
+  - SDK 不持久化、不打印 auth payload / the SDK never persists or logs the auth payload.
+"""
 
 
 def _to_a2c_resource(res: Resource) -> A2CResource:
@@ -177,7 +206,13 @@ class SMCPComputerClient(AsyncClient):
         """
         return self._namespace
 
-    async def connect(self, url: str, *args: Any, **kwargs: Any) -> None:
+    async def connect(
+        self,
+        url: str,
+        *args: Any,
+        auth_provider: AuthProvider | None = None,
+        **kwargs: Any,
+    ) -> None:
         """
         覆盖 ``AsyncClient.connect``：注入协议版本握手，使所有调用点（CLI / 交互式 / 测试）
         自动合规，无需各处重复拼接。
@@ -187,7 +222,34 @@ class SMCPComputerClient(AsyncClient):
         - 协议 MUST：自动从 ``PROTOCOL_VERSION`` 常量拼接 ``a2c_version``（保留调用方既有 query）
         - 协议 §1 polling-first MUST 护栏：调用方显式 WS-only 不静默放行，强制重注入 polling-first
         - 捕获 4008 → 主动 ``disconnect()`` → 抛 :class:`ProtocolVersionError`；非 4008 保持原异常
+        - #200 动态 auth（方案 C 原生透传，零新增机制）：``auth_provider`` 与静态 ``auth`` 互斥
+          （同时传入 → ValueError）、非 callable → TypeError 早失败；底层每次握手（首连 + 自动重连）
+          重新求值。 / #200 dynamic auth (plan C, native passthrough): ``auth_provider`` is mutually
+          exclusive with static ``auth`` (ValueError), non-callable fails fast (TypeError); the
+          underlying client re-evaluates it at every handshake (first connect + auto-reconnects).
         """
+        # #200 方案 C：显式 auth_provider → 原生 auth 路径，零新增机制
+        # #200 plan C: explicit auth_provider routed to the native auth path (no new machinery)
+        if auth_provider is not None:
+            # 与静态 auth 互斥（含按上游签名位置传入：url 之后第 2 个位置参数 = auth）
+            # Mutually exclusive with static auth (incl. positional per upstream signature:
+            # the 2nd positional arg after url is auth).
+            if kwargs.get("auth") is not None or (len(args) > 1 and args[1] is not None):
+                raise ValueError(
+                    "auth 与 auth_provider 互斥，只能二选一 / 'auth' and 'auth_provider' are mutually exclusive; provide only one",
+                )
+            # 运行时防御：类型注解已保证 callable，此处拦截非类型化调用方传入的非 callable 值
+            # Runtime defense: the annotation already guarantees callable; this intercepts
+            # non-callable values injected by untyped callers.
+            if not callable(cast(Any, auth_provider)):
+                # 运行时不探测签名（对 partial/builtins 脆弱）——零参 async 由 AuthProvider 契约保证
+                # The signature is not probed at runtime (fragile for partials/builtins) —
+                # zero-arg async is guaranteed by the AuthProvider contract.
+                raise TypeError(
+                    "auth_provider 必须是 callable（零参 async 契约见 AuthProvider 文档）"
+                    "/ 'auth_provider' must be a callable (zero-arg async per the AuthProvider contract)",
+                )
+            kwargs["auth"] = auth_provider
         handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
         kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
         # 协议 §1 polling-first MUST 护栏（统一接线，详见 handshake.apply_polling_first_guard）

@@ -13,7 +13,7 @@ from mcp import StdioServerParameters, Tool
 from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
 from mcp.types import CallToolResult
 
-from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
+from a2c_smcp.computer.mcp_clients.manager import MCPServerManager, _ServerDeclaredToolMeta
 from a2c_smcp.computer.mcp_clients.model import (
     MCPClientProtocol,
     MCPServerActivationState,
@@ -80,6 +80,9 @@ def create_mock_tool(name: str, meta: dict | None = None) -> Tool:
 
 # #184：测试用 fail-connect 名单 / Test-only fail-connect server names
 _FAIL_CONNECT_SERVERS: set[str] = set()
+# #199：test-only server-declared tools 注册表（沿用 _FAIL_CONNECT_SERVERS try/finally 模式）——
+# 按 config.name 命中时，该 server 的 list_tools 返回注册的工具（Tool._meta 携带 Server 声明）。
+_DECLARED_TOOLS: dict[str, list[Tool]] = {}
 
 
 # 模拟client_factory函数
@@ -91,6 +94,8 @@ def mock_client_factory(config: MCPServerConfig, message_handler=None) -> MockMC
         client = MockMCPClient(message_handler=message_handler)
         client.aconnect = AsyncMock(side_effect=RuntimeError("Simulated connect failure"))
         return client
+    if config.name in _DECLARED_TOOLS:
+        return MockMCPClient(_DECLARED_TOOLS[config.name], message_handler=message_handler)
     if "server1" in config.name:
         return MockMCPClient([create_mock_tool("tool1", meta={"test": "meta"}), create_mock_tool("tool2")], message_handler=message_handler)
     elif "server2" in config.name:
@@ -1201,3 +1206,316 @@ def test_mcpserver_runtime_status_immutable():
     )
     with pytest.raises(Exception):
         s.activation = MCPServerActivationState.STOPPED  # type: ignore[misc]
+
+
+# ==============================================================================
+# #199：ToolMeta tags 三层合并（Server 声明层）——protocol#51 / PR#57 裁决已定；wire 契约见
+# a2c-smcp-protocol develop data-structures.md §ToolMeta 三层合并规则；对拍 rust-sdk#200（V9）。
+# ==============================================================================
+
+# conformance fixture 形态：Tool._meta["a2c_tool_meta"] 声明（原生 dict，白名单仅 tags）。
+# Server 自声明 auto_apply=true 必须经字段级过滤后彻底消失（提权向量，裁决不变量 2）。
+_DECLARED_TOOL_META: dict[str, Any] = {"custom_key": "v", "a2c_tool_meta": {"tags": ["read"], "auto_apply": True}}
+
+
+def _canonical(tool: Tool) -> dict:
+    """reconcile 后 ``a2c_tool_meta`` 的 wire canonical 形式（全字段含 null，key 序不参与判定）。"""
+    return tool.meta["a2c_tool_meta"].model_dump(mode="json")
+
+
+def _declared_tool_meta() -> Any:
+    """V1/V6/V8 共用的合法声明 fixture（即 conformance §2.6 fixture server 形态）。"""
+    return dict(_DECLARED_TOOL_META)
+
+
+def test_merged_tool_meta_three_layer_server_tags_fallback():
+    """#199 V2/V3/V4/V10：三层合并语义（``_merged_tool_meta`` 直测，免 manager 启动）。
+
+    ``tool_meta[tool] > default_tool_meta > Server 声明``；tags 按字段整体替换不 union；
+    缺失/null 继承下一层、``[]`` 显式清除（裁决④，无需三态）。
+    """
+    server = _ServerDeclaredToolMeta(tags=["read"])
+
+    # V2: default 覆盖 Server 声明
+    config = create_server_config("server1", default_tool_meta=ToolMeta(tags=["default"]))
+    assert MCPServerManager._merged_tool_meta(config, "tool1", server_declared=server).tags == ["default"]
+
+    # V3: per-tool 覆盖 default（Server 声明恒最低层）
+    config = create_server_config(
+        "server1",
+        tool_meta={"tool1": ToolMeta(tags=["specific"])},
+        default_tool_meta=ToolMeta(tags=["default"]),
+    )
+    assert MCPServerManager._merged_tool_meta(config, "tool1", server_declared=server).tags == ["specific"]
+
+    # V4: per-tool [] 显式清除所有下层值（不回落 Server 声明）
+    config = create_server_config(
+        "server1",
+        tool_meta={"tool1": ToolMeta(tags=[])},
+        default_tool_meta=ToolMeta(tags=["default"]),
+    )
+    assert MCPServerManager._merged_tool_meta(config, "tool1", server_declared=server).tags == []
+
+    # V10: per-tool 显式 null 与缺失等价 → 继承 default（Server 声明仍最低层）
+    config = create_server_config(
+        "server1",
+        tool_meta={"tool1": ToolMeta(tags=None)},
+        default_tool_meta=ToolMeta(tags=["default"]),
+    )
+    assert MCPServerManager._merged_tool_meta(config, "tool1", server_declared=server).tags == ["default"]
+
+    # V5: 配置只含 auto_apply（无 tags）→ tags 仍回落 Server 声明；auto_apply 来自配置
+    config = create_server_config("server1", tool_meta={"tool1": ToolMeta(auto_apply=True)})
+    merged = MCPServerManager._merged_tool_meta(config, "tool1", server_declared=server)
+    assert merged.tags == ["read"]
+    assert merged.auto_apply is True
+
+
+def test_merged_tool_meta_no_config_tags_only_canonical():
+    """#199 合法声明 + 无配置 → tags-only canonical（全字段含 null）；无声明 → None（现状不变）。
+
+    V9 对拍锚点：canonical 出线形式钉死（全字段含 null，双 SDK 同形）。
+    """
+    config = create_server_config("server1")
+    merged = MCPServerManager._merged_tool_meta(config, "tool1", server_declared=_ServerDeclaredToolMeta(tags=["read"]))
+    assert merged is not None
+    assert merged.model_dump(mode="json") == {
+        "auto_apply": None,
+        "alias": None,
+        "tags": ["read"],
+        "ret_object_mapper": None,
+    }
+    # server_declared=None（默认参数）→ config-only 语义不变（裁决③：acall_tool / get_tool_meta /
+    # _arefresh_tool_mapping 三个消费点零行为差）
+    assert MCPServerManager._merged_tool_meta(config, "tool1") is None
+
+
+@pytest.mark.asyncio
+async def test_available_tools_server_declared_tags_vector1(manager):
+    """#199 conformance §2.6 V1：无任何配置 + Server 声明 tags → tags-only canonical 覆写；
+    白名单外字段（auto_apply=true）字段级过滤**不进入终值**（裁决不变量 2）；原生 ``_meta`` key 原样保留。
+    """
+    _DECLARED_TOOLS["decl_server"] = [create_mock_tool("safe_read", meta=_declared_tool_meta())]
+    try:
+        servers = [create_server_config("decl_server")]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        assert "decl_server__safe_read" in tools
+        tool = tools["decl_server__safe_read"]
+        assert tool.meta["custom_key"] == "v"
+        assert _canonical(tool) == {
+            "auto_apply": None,
+            "alias": None,
+            "tags": ["read"],
+            "ret_object_mapper": None,
+        }
+    finally:
+        _DECLARED_TOOLS.pop("decl_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_declared_auto_apply_config_wins(manager):
+    """#199 V6：声明含 auto_apply=true（任意配置）→ 终值 auto_apply 恒来自配置，声明值不进入终值。"""
+    _DECLARED_TOOLS["decl_server"] = [create_mock_tool("safe_read", meta=_declared_tool_meta())]
+    try:
+        servers = [create_server_config("decl_server", tool_meta={"safe_read": ToolMeta(auto_apply=False)})]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        assert _canonical(tools["decl_server__safe_read"])["auto_apply"] is False
+    finally:
+        _DECLARED_TOOLS.pop("decl_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_native_meta_preserved_canonical_replaced(manager):
+    """#199 V8：声明合法 + 配置覆盖 → 原生 ``_meta`` key（custom_key）原样保留；
+    原 ``a2c_tool_meta`` 被 canonical **整体覆写**（不字段级残留——声明 auto_apply 消失）。"""
+    _DECLARED_TOOLS["decl_server"] = [create_mock_tool("safe_read", meta=_declared_tool_meta())]
+    try:
+        servers = [create_server_config(
+            "decl_server",
+            tool_meta={"safe_read": ToolMeta(tags=["specific"], auto_apply=False)},
+        )]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        tool = tools["decl_server__safe_read"]
+        assert tool.meta["custom_key"] == "v"
+        assert _canonical(tool) == {
+            "auto_apply": False,
+            "alias": None,
+            "tags": ["specific"],
+            "ret_object_mapper": None,
+        }
+    finally:
+        _DECLARED_TOOLS.pop("decl_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_malformed_declaration_discarded_no_config(manager, monkeypatch):
+    """#199 V7a：畸形声明（tags 非 list[str] / 声明非对象）→ 丢弃 + 诊断；tools/list 正常、
+    工具可用；无配置终值 → ``a2c_tool_meta`` 键**删除**；同 server 多畸形工具诊断**至多一次**（防刷屏）。"""
+    import a2c_smcp.computer.mcp_clients.manager as mgr_mod
+
+    warns: list[str] = []
+    monkeypatch.setattr(mgr_mod.logger, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+
+    _DECLARED_TOOLS["malformed_server"] = [
+        create_mock_tool("bad_tags", meta={"a2c_tool_meta": {"tags": "read", "auto_apply": True}}),
+        create_mock_tool("bad_shape", meta={"a2c_tool_meta": "not-an-object"}),
+        create_mock_tool("good_tool"),
+    ]
+    try:
+        servers = [create_server_config("malformed_server")]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        assert set(tools) == {
+            "malformed_server__bad_tags",
+            "malformed_server__bad_shape",
+            "malformed_server__good_tool",
+        }
+        assert "a2c_tool_meta" not in tools["malformed_server__bad_tags"].meta
+        assert "a2c_tool_meta" not in tools["malformed_server__bad_shape"].meta
+        assert "a2c_tool_meta" not in tools["malformed_server__good_tool"].meta
+        # 每 server 每次 tools/list 刷新至多一次诊断（#151 R1' 防刷屏先例）
+        malformed_warns = [w for w in warns if "畸形 ToolMeta Server 声明" in w]
+        assert len(malformed_warns) == 1, f"畸形声明诊断应恰一次，实际: {malformed_warns}"
+        assert "malformed_server" in malformed_warns[0]
+    finally:
+        _DECLARED_TOOLS.pop("malformed_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_malformed_declaration_config_canonical_kept(manager, monkeypatch):
+    """#199 V7b：畸形声明 + 有配置终值 → 维持配置 canonical（现状）；声明值（含 auto_apply）不进入。"""
+    import a2c_smcp.computer.mcp_clients.manager as mgr_mod
+
+    warns: list[str] = []
+    monkeypatch.setattr(mgr_mod.logger, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+
+    _DECLARED_TOOLS["malformed_server"] = [
+        create_mock_tool("bad_tags", meta={"a2c_tool_meta": {"tags": "read", "auto_apply": True}}),
+    ]
+    try:
+        servers = [create_server_config("malformed_server", tool_meta={"bad_tags": ToolMeta(tags=["cfg"])})]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        tool = tools["malformed_server__bad_tags"]
+        assert _canonical(tool)["tags"] == ["cfg"]
+        assert _canonical(tool)["auto_apply"] is None
+        assert len([w for w in warns if "畸形 ToolMeta Server 声明" in w]) == 1
+    finally:
+        _DECLARED_TOOLS.pop("malformed_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_null_declaration_discarded(manager, monkeypatch):
+    """#199 显式 null 声明（``a2c_tool_meta: null``）属「声明非对象」畸形判据 → 丢弃 + 诊断
+    （canonical-final：该 key 最终值恒为 Computer 写入，Server null 不得原样出线）；
+    无配置终值 → key **删除**；有配置终值 → 配置 canonical。
+    """
+    import a2c_smcp.computer.mcp_clients.manager as mgr_mod
+
+    warns: list[str] = []
+    monkeypatch.setattr(mgr_mod.logger, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+
+    _DECLARED_TOOLS["null_server"] = [
+        create_mock_tool("null_no_config", meta={"a2c_tool_meta": None}),
+        create_mock_tool("null_with_config", meta={"a2c_tool_meta": None}),
+    ]
+    try:
+        servers = [create_server_config("null_server", tool_meta={"null_with_config": ToolMeta(tags=["cfg"])})]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        assert set(tools) == {"null_server__null_no_config", "null_server__null_with_config"}
+        # 无配置 → key 删除（不得以 "null" 字符串原样出线）
+        assert "a2c_tool_meta" not in tools["null_server__null_no_config"].meta
+        # 有配置 → 配置 canonical
+        assert _canonical(tools["null_server__null_with_config"])["tags"] == ["cfg"]
+        # 同 server 两畸形声明 → 诊断恰一次
+        assert len([w for w in warns if "畸形 ToolMeta Server 声明" in w]) == 1
+    finally:
+        _DECLARED_TOOLS.pop("null_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_malformed_tags_with_non_str_element(manager, monkeypatch):
+    """#199 畸形判据 2 子路径：``tags`` 为 list 但含非 ``str`` 元素（``all(isinstance(t, str))`` False）→ 丢弃 + 诊断。"""
+    import a2c_smcp.computer.mcp_clients.manager as mgr_mod
+
+    warns: list[str] = []
+    monkeypatch.setattr(mgr_mod.logger, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+
+    _DECLARED_TOOLS["malformed_server"] = [
+        create_mock_tool("bad_elem", meta={"a2c_tool_meta": {"tags": ["read", 1]}}),
+    ]
+    try:
+        servers = [create_server_config("malformed_server")]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        assert "malformed_server__bad_elem" in tools
+        assert "a2c_tool_meta" not in tools["malformed_server__bad_elem"].meta
+        assert len([w for w in warns if "畸形 ToolMeta Server 声明" in w]) == 1
+    finally:
+        _DECLARED_TOOLS.pop("malformed_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_declared_null_tags_canonical(manager):
+    """#199 声明层 ``tags: null``（合法，与缺失等价，继承下一层）→ 无配置时恒写 tags-only canonical
+    （全字段 null）——声明 dict 连同白名单外字段（auto_apply）整体被 canonical 覆写、无残留。"""
+    _DECLARED_TOOLS["decl_server"] = [
+        create_mock_tool("safe_read", meta={"a2c_tool_meta": {"tags": None, "auto_apply": True}}),
+    ]
+    try:
+        servers = [create_server_config("decl_server")]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        tools = {t.name: t async for _bid, t in manager.available_tools()}
+        assert _canonical(tools["decl_server__safe_read"]) == {
+            "auto_apply": None,
+            "alias": None,
+            "tags": None,
+            "ret_object_mapper": None,
+        }
+    finally:
+        _DECLARED_TOOLS.pop("decl_server", None)
+
+
+@pytest.mark.asyncio
+async def test_available_tools_malformed_warns_per_refresh(manager, monkeypatch):
+    """#199 诊断「每 server 每次 tools/list 刷新至多一次」：两次 ``available_tools()`` 各打一次（跨刷新不累计抑制）。"""
+    import a2c_smcp.computer.mcp_clients.manager as mgr_mod
+
+    warns: list[str] = []
+    monkeypatch.setattr(mgr_mod.logger, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+
+    _DECLARED_TOOLS["malformed_server"] = [
+        create_mock_tool("bad_tags", meta={"a2c_tool_meta": {"tags": "read"}}),
+        create_mock_tool("bad_shape", meta={"a2c_tool_meta": "not-an-object"}),
+    ]
+    try:
+        servers = [create_server_config("malformed_server")]
+        await manager.ainitialize(servers)
+        await manager.astart_all()
+
+        for _ in range(2):
+            {t.name async for _bid, t in manager.available_tools()}
+        malformed_warns = [w for w in warns if "畸形 ToolMeta Server 声明" in w]
+        assert len(malformed_warns) == 2, f"两次刷新应各 1 条诊断，实际: {malformed_warns}"
+    finally:
+        _DECLARED_TOOLS.pop("malformed_server", None)
