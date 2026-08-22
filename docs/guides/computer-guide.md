@@ -250,6 +250,47 @@ await client.join_office("my_office")
 await client.emit_update_tool_list()
 ```
 
+### 动态 auth provider
+
+> #200（方案 C 原生透传）：python-socketio 原生支持 auth callable，且**每次握手**
+> （首连 + 每次自动重连）都会重新求值。SDK 以显式 `auth_provider` 参数公开该能力，
+> 零新增机制、纯 asyncio。
+
+```python
+from a2c_smcp.computer.socketio import SMCPComputerClient
+
+async def fresh_auth() -> dict:
+    # 每次握手前调用：轮换短期凭证无需拆除健康连接
+    return {"token": await token_exchange.fetch()}  # 例：最新短期 Token
+
+client = SMCPComputerClient(computer=computer)
+await client.connect(
+    "http://localhost:8000",
+    auth_provider=fresh_auth,  # 类型：AuthProvider = Callable[[], Awaitable[dict]]
+    namespaces=["/smcp"],
+)
+```
+
+**语义**：
+
+- provider 在首次连接和每次自动重连的握手前被 `await` 重新求值——重连携带调用时最新
+  auth；静态 `auth` 调用方式不受影响（零回归）。
+- `auth` 与 `auth_provider` 互斥：同时传入 → `ValueError`；非 callable → `TypeError`（早失败）。
+
+> 注意与 Agent 侧 `AgentAuthProvider`（ABC，`get_connection_auth()`）区分：那是服务端鉴权的
+> 提供者抽象；本节的 `AuthProvider` 是 Computer 客户端**连接面**的零参 callable 别名（每次握手
+> 重新求值）。命名相近、语义不同，勿混用。
+
+**Provider 契约（务必遵守）**：
+
+1. **异常不得内嵌 secret**——engineio 会对 provider 异常打印 traceback（上游限制，跟踪
+   [#201](https://github.com/A2C-SMCP/python-sdk/issues/201)）。
+2. **无超时保障**——provider 永不返回会无限挂起握手（上游缺陷，跟踪 #201）；获取、等待、
+   重试凭证由 provider 实现方负责。
+3. provider 异常表现为连接失败，重试节奏沿用 socketio 有界重试，瞬时失败可自愈。
+4. SDK 不持久化、不打印 auth payload。
+5. 推荐 async callable（同步 callable 亦被原生路径接受）。
+
 ### 事件回调
 
 Computer 内部会自动处理以下事件：

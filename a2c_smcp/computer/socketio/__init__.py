@@ -3,3 +3,9 @@
 # @Author  : JQQ
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
+from a2c_smcp.computer.socketio.client import AuthProvider, SMCPComputerClient
+
+__all__ = [
+    "AuthProvider",
+    "SMCPComputerClient",
+]
