@@ -648,6 +648,7 @@ class A2CSkillRef(TypedDict):
     license: NotRequired[str]
     compatibility: NotRequired[str]
     allowed_tools: NotRequired[list[str]]  # frontmatter "allowed-tools" 规范化为 list
+    tags: NotRequired[list[str]]  # frontmatter "tags" 透传（分类元数据）；纯透传不校验：非 list[str] → 省略（skill.md §1.5）
     version: NotRequired[str]
     skill_metadata: NotRequired[dict[str, Any]]  # frontmatter.metadata 透传；A2C 不解释 / passthrough, A2C does not interpret
 

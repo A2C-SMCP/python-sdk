@@ -31,7 +31,7 @@ from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextRe
 
 import a2c_smcp.computer.skills.staging as staging_mod
 from a2c_smcp.computer.skills.registry import SkillRegistry
-from a2c_smcp.computer.skills.staging import _partition_roots, stage_mcp_skills, stage_user_skills
+from a2c_smcp.computer.skills.staging import _build_marketplace_ref, _partition_roots, stage_mcp_skills, stage_user_skills
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
@@ -75,8 +75,14 @@ class FakeManager:
         return SimpleNamespace(name=self._display_names.get(bundle_id, f"{bundle_id} (display)"))
 
 
-def _skill_md(name: str = "my-skill", description: str = "聚合 CSV") -> str:
-    return f"---\nname: {name}\ndescription: {description}\nlicense: MIT\nallowed-tools:\n  - read\n  - write\n---\n# {name}\nbody\n"
+def _skill_md(name: str = "my-skill", description: str = "聚合 CSV", *, tags: list[str] | None = None) -> str:
+    tags_line = ""
+    if tags is not None:
+        tags_line = "tags: []\n" if not tags else "tags:\n" + "".join(f"  - {t}\n" for t in tags)
+    return (
+        f"---\nname: {name}\ndescription: {description}\nlicense: MIT\n"
+        f"allowed-tools:\n  - read\n  - write\n{tags_line}---\n# {name}\nbody\n"
+    )
 
 
 def _root(uri: str, meta: dict) -> Resource:
@@ -132,6 +138,31 @@ async def test_stage_mounted(tmp_path: Path) -> None:
     assert ref["license"] == "MIT"
     assert ref["allowed_tools"] == ["read", "write"]
     assert ref["description"] == "聚合 CSV"
+
+
+async def test_stage_mounted_tags_passthrough(tmp_path: Path) -> None:
+    # mcp 源 frontmatter tags → ref["tags"] 透传（三源共用 _apply_frontmatter_optional_fields 单点；skill.md §1.5）
+    mount = tmp_path / "mount" / "tagged"
+    mount.mkdir(parents=True)
+    (mount / "SKILL.md").write_text(_skill_md(name="tagged", tags=["finance", "report"]), encoding="utf-8")
+    res = _root("skill://h/tagged", {"source": "mounted", "mount_dir": str(mount)})
+    reg = SkillRegistry()
+    home = tmp_path / "home"
+
+    names = await stage_mcp_skills(FakeManager([("srv", res)]), reg, home)
+
+    assert names == ["mcp:srv:tagged"]
+    ref = reg.resolve("mcp:srv:tagged")
+    assert ref is not None
+    assert ref["tags"] == ["finance", "report"]
+
+
+def test_marketplace_ref_tags_passthrough() -> None:
+    # marketplace 源 ref 构造：frontmatter tags → ref["tags"] 透传（与 mcp/user 同走 _apply_frontmatter_optional_fields）
+    ref = _build_marketplace_ref(
+        "acme-audit:audit", "acme-skills", {"name": "audit", "description": "d", "tags": ["sec", "audit"]}, "1.0.0", Path("/x")
+    )
+    assert ref["tags"] == ["sec", "audit"]
 
 
 # ── archive ────────────────────────────────────────────────────────────────────
@@ -607,11 +638,15 @@ def test_partition_roots_nested_chain_and_duplicate_uri() -> None:
 
 
 # ── user 源 DropIn（就地发现，不 staging，#60）────────────────────────────────
-def _write_user_skill(root: Path, skill_dir_name: str, *, fm_name: str | None = None, description: str = "do thing") -> Path:
+def _write_user_skill(
+    root: Path, skill_dir_name: str, *, fm_name: str | None = None, description: str = "do thing", tags: list[str] | None = None
+) -> Path:
     """在发现根下写一个 ``<skill_dir_name>/SKILL.md`` / write a DropIn skill dir under a root。"""
     d = root / skill_dir_name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "SKILL.md").write_text(_skill_md(name=skill_dir_name if fm_name is None else fm_name, description=description), encoding="utf-8")
+    (d / "SKILL.md").write_text(
+        _skill_md(name=skill_dir_name if fm_name is None else fm_name, description=description, tags=tags), encoding="utf-8"
+    )
     return d
 
 
@@ -633,6 +668,70 @@ def test_user_global_only_in_place(tmp_path: Path) -> None:
     assert ref["description"] == "第一"
     assert ref["license"] == "MIT"
     assert ref["allowed_tools"] == ["read", "write"]
+
+
+def test_user_tags_passthrough(tmp_path: Path) -> None:
+    # user 源 frontmatter tags → ref["tags"] 透传（三源共用单点之二）
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "tagged", tags=["report"])
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == ["tagged"]
+    ref = reg.resolve("tagged")
+    assert ref is not None
+    assert ref["tags"] == ["report"]
+
+
+def test_user_no_tags_key_absent(tmp_path: Path) -> None:
+    # frontmatter 无 tags → A2CSkillRef 键**整个缺席**（非 null；skill.md §1.5 wire 契约）
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "plain")
+    reg = SkillRegistry()
+
+    stage_user_skills(reg, home)
+
+    ref = reg.resolve("plain")
+    assert ref is not None
+    assert "tags" not in ref
+
+
+def test_user_tags_empty_list_passthrough(tmp_path: Path) -> None:
+    # `tags: []` 显式空列表 = 合法 list[str]（0–10 条含 0）→ 填 []，与「键缺席」语义不同
+    home = tmp_path / "home"
+    d = home / "user" / "empty-tags"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: empty-tags\ndescription: d\ntags: []\n---\n# body\n", encoding="utf-8")
+    reg = SkillRegistry()
+
+    stage_user_skills(reg, home)
+
+    ref = reg.resolve("empty-tags")
+    assert ref is not None
+    assert ref["tags"] == []
+
+
+@pytest.mark.parametrize(
+    "tags_yaml",
+    ["tags: not-a-list", "tags: [ok, 1]", "tags: 123", "tags:"],
+)
+def test_user_tags_malformed_omitted_with_debug(tmp_path: Path, staging_logs: pytest.LogCaptureFixture, tags_yaml: str) -> None:
+    # 畸形 tags（非 list / 混合元素 / 非 str / None）→ 省略该字段 + DEBUG 日志，SKILL 照常注册（skill.md §1.5：
+    # 纯透传不校验，不触发任何拒绝路径）。**勿照抄 allowed-tools 强制规范化**（非 list 也包 [str(t)]）。
+    home = tmp_path / "home"
+    d = home / "user" / "tagged"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: tagged\ndescription: d\n{tags_yaml}\n---\n# body\n", encoding="utf-8")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == ["tagged"]  # 照常注册
+    ref = reg.resolve("tagged")
+    assert ref is not None
+    assert "tags" not in ref  # 键整个缺席（非 null）
+    assert any(r.levelno == logging.DEBUG and "not list[str]" in r.getMessage() for r in staging_logs.records)
 
 
 def test_user_home_only_no_workdir_dimension(tmp_path: Path) -> None:
