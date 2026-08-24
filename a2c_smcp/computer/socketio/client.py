@@ -35,6 +35,7 @@ from a2c_smcp.smcp import (
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
+    PUT_BLOB_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -62,6 +63,8 @@ from a2c_smcp.smcp import (
     GetToolsRet,
     LeaveOfficeReq,
     MCPServerInput,
+    PutBlobReq,
+    PutBlobRet,
     ResourceAnnotations,
     ToolCallReq,
     UpdateComputerConfigReq,
@@ -190,6 +193,8 @@ class SMCPComputerClient(AsyncClient):
         self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
         self.on(GET_RESOURCES_EVENT, self.on_get_resources, namespace=self._namespace)
         self.on(GET_BLOB_EVENT, self.on_get_blob, namespace=self._namespace)
+        # v0.4.0 上行写入通道 / upload write channel (#196)
+        self.on(PUT_BLOB_EVENT, self.on_put_blob, namespace=self._namespace)
         # v0.2.1 SKILL 通道发现 / 渐进式披露 / SKILL channel discovery & progressive disclosure (#66)
         self.on(GET_SKILLS_EVENT, self.on_get_skills, namespace=self._namespace)
         self.on(GET_SKILL_EVENT, self.on_get_skill, namespace=self._namespace)
@@ -706,6 +711,43 @@ class SMCPComputerClient(AsyncClient):
         # eliminating dual-maintenance of equivalent sync/async handler bodies (PR #52 fix-review).
         return _process_get_blob(data, self.computer)
 
+    async def on_put_blob(self, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
+        """
+        上行写入单块处理 / Upload-write chunk handling（``client:put_blob``，v0.4.0 #196）.
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md §client:put_blob + blob-transfer.md §3/§7。
+        与 ``client:get_blob`` 的**方向镜像**：``chunk_offset`` / ``eof`` 由 Agent 驱动推进，
+        ``sha256`` / ``total_size`` 由 Agent 声明、Computer 校验。核心逻辑（声明校验 / in-order /
+        ``.part`` + 增量 sha256 / 原子 rename / 有界会话）全部在
+        :class:`a2c_smcp.computer.blob.upload.BlobUploadStore`。
+
+        安全 / Security (blob-transfer.md §7):
+          - 写入沙箱由写入原语强制：落盘目标 = settings ``landingRoot``（config-first，仅受信 scope
+            可设，project 供给已被 ``TRUSTED_SCOPE_ONLY_FIELDS`` 过滤）；``landing_path`` 构造上
+            严格落于 root 内，Agent 拿不到写任意路径的能力
+          - fail-closed：landing root 未配置 / 不可写 → ``4019 forbidden``（零字节落盘）
+
+        错误语义（flat ErrorPayload，无嵌套 envelope）/ Errors (flat ErrorPayload, §4019 开放枚举):
+          - ``invalid_declaration``：首块声明非法（``total_size < 1`` / 字段缺失 / sha256 非 64-hex /
+            后续块重复携带声明字段 / blob 非 base64）
+          - ``too_large``：声明超 ``upload_max_bytes``（首块决断，零字节落盘）
+          - ``busy``：并发在途会话达上限（Agent SHOULD 退避后从 0 重传）
+          - ``invalid_upload``：``upload_id`` 未知 / 闲置超时作废
+          - ``range``：``chunk_offset != 已收字节``；末块总量不闭合
+          - ``integrity``：末块重算 sha256 与声明不符（丢弃 ``.part``，不返回 path）
+          - ``forbidden`` / ``io_error``：沙箱不可写 / 落盘 IO 失败
+
+        Args:
+            data (PutBlobReq): ``computer`` / 可选 ``upload_id``（缺省首块）/ ``chunk_offset`` /
+                ``eof`` / 首块声明（``total_size`` / ``sha256`` / 可选 ``name_hint``）/ ``blob`` / ``req_id``。
+
+        Returns:
+            PutBlobRet | ErrorPayload: 成功为块 ack（末块含 ``landing_path``），失败为 flat 4019。
+        """
+        # 与 on_get_blob 同款抽取：模块级纯函数核心（_process_put_blob），同步 wire 测试复用。
+        # Same extraction as on_get_blob: module-level pure core shared with sync wire tests.
+        return _process_put_blob(data, self.computer)
+
     async def on_get_skills(self, data: GetSkillsReq) -> GetSkillsRet:
         """
         SKILL 清单发现 / SKILL inventory discovery（``client:get_skills``）.
@@ -921,3 +963,28 @@ def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | Erro
         "req_id": data["req_id"],
     }
     return ret
+
+
+def _process_put_blob(data: PutBlobReq, computer: Computer) -> PutBlobRet | ErrorPayload:
+    """上行写入单块的纯同步核心逻辑 / Pure synchronous core for one ``client:put_blob`` chunk.
+
+    与 :func:`_process_get_blob` 同款抽取（v0.4.0 #196）：同步 ``socketio.Client`` wire 测试 mock
+    与 async :meth:`SMCPComputerClient.on_put_blob` 复用同一份实现。会话/落盘细节全部委托
+    :class:`a2c_smcp.computer.blob.upload.BlobUploadStore`（有界会话 MUST / landing 沙箱 / 4019 映射）。
+    Same extraction pattern as ``_process_get_blob``; session & disk details live in BlobUploadStore.
+
+    Args:
+        data: ``PutBlobReq`` payload.
+        computer: 持有 ``name`` / ``blob_upload_store`` 的 ``Computer`` 实例.
+
+    Returns:
+        ``PutBlobRet`` (成功；末块含 ``landing_path``) 或 ``ErrorPayload`` (4019).
+
+    Raises:
+        SMCPNamespaceError: ``computer.name`` 与 ``data["computer"]`` 不匹配（防御纵深，理论不可达）.
+    """
+    # office/role 隔离：Server 已保证同房间路由，但 ``computer`` 标识仍需匹配
+    # office/role isolation: Server guarantees same-room routing, but ``computer`` MUST match
+    if computer.name != data["computer"]:
+        raise SMCPNamespaceError("计算机标识不匹配")
+    return computer.blob_upload_store.handle_chunk(data)

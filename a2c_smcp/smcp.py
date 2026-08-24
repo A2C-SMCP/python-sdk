@@ -30,6 +30,9 @@ GET_RESOURCES_EVENT = "client:get_resources"
 GET_SKILLS_EVENT = "client:get_skills"
 GET_SKILL_EVENT = "client:get_skill"
 GET_BLOB_EVENT = "client:get_blob"
+# v0.4.0 新增：上行写入通道（Agent → Computer 分块落盘）/ v0.4.0 added: upload write channel
+# 协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3（上行）/ §7（landing 沙箱）
+PUT_BLOB_EVENT = "client:put_blob"
 # 服务端事件 由server:开头的事件服务端执行
 JOIN_OFFICE_EVENT = "server:join_office"
 LEAVE_OFFICE_EVENT = "server:leave_office"
@@ -452,7 +455,7 @@ class ErrorCode(IntEnum):
     SKILL channel does **not** use 4015 — servers lacking the ``resources`` capability are filtered out at
     staging time and never surface to the Agent.
 
-    4017 / 4018 ``details.reason`` 为开放枚举 / open enum: 解析方 **MUST** 容忍未知值并兜底
+    4017 / 4018 / 4019 ``details.reason`` 为开放枚举 / open enum: 解析方 **MUST** 容忍未知值并兜底
     （默认「不重试 + 诊断」），未来可非破坏新增 reason.
     ``details.reason`` is an open enum: parsers **MUST** tolerate unknown values with a default of
     "do not retry + diagnose"; new reasons may be added non-breakingly.
@@ -478,6 +481,11 @@ class ErrorCode(IntEnum):
     # v0.2.1 新增：通用二进制传输 / Generic binary transfer
     # 协议依据 / Protocol: error-handling.md §4018
     BLOB_NOT_ACCESSIBLE = 4018  # client:get_blob 拉取期：invalid_handle / forbidden / gone / range
+    # v0.4.0 新增：上行写入通道 / v0.4.0 added: upload write channel
+    # 协议依据 / Protocol: error-handling.md §4019（4018 下行拉取 / 4019 上行写入，方向相反互不重叠）
+    # client:put_blob 写入期 reason：invalid_upload / invalid_declaration / range / too_large /
+    # busy / forbidden / integrity / io_error（开放枚举）
+    BLOB_WRITE_FAILED = 4019
 
 
 # WebSocket close code（RFC 6455 私有段 4000-4999），用于 WS-only 直连握手按版本不匹配拒绝
@@ -565,7 +573,10 @@ class ErrorPayload(TypedDict, total=False):
       - 4016: details.name
       - 4017: details.reason (traversal/forbidden/not_found/too_large) / details.rel_path / details.total_size
       - 4018: details.reason (invalid_handle/forbidden/gone/range)
-    协议依据 / Protocol: error-handling.md §各错误码标准字段总表 / §4016 / §4017 / §4018.
+    v0.4.0 起，4019 同样 ``details`` 下沉：
+    From v0.4.0, 4019 follows the same ``details`` convention:
+      - 4019: details.reason (invalid_upload/invalid_declaration/range/too_large/busy/forbidden/integrity/io_error)
+    协议依据 / Protocol: error-handling.md §各错误码标准字段总表 / §4016 / §4017 / §4018 / §4019.
 
     details 是诊断容器；Agent MUST NOT 透传给最终用户（防泄露）。
     details is a diagnostic container; Agent MUST NOT propagate to end users.
@@ -785,6 +796,58 @@ class GetBlobRet(TypedDict, total=False):
     chunk_offset: int  # 本块起始字节偏移
     eof: bool  # ⟺ chunk_offset + 本块字节数 == total_size
     blob: str  # base64，本块字节
+    req_id: str
+
+
+class PutBlobReq(AgentCallData, total=True):
+    """
+    上行写入单块请求（``client:put_blob``，v0.4.0）。``client:get_blob`` 的方向镜像：
+    ``chunk_offset`` / ``eof`` 由 **Agent 驱动推进**，``sha256`` / ``total_size`` 由 **Agent 声明、
+    Computer 校验**（下行是 Computer 声明、Agent 校验）。
+    Upload chunk request, the directional mirror of ``client:get_blob``: the Agent drives
+    ``chunk_offset`` / ``eof``; ``sha256`` / ``total_size`` are Agent-declared, Computer-verified.
+
+    协议依据 / Protocol: events.md §client:put_blob；data-structures.md §PutBlobReq；
+    blob-transfer.md §3 (bounded session) / §7 (landing sandbox).
+
+    会话语义 / Session semantics (blob-transfer.md §3):
+      - 首块 = 无 ``upload_id``（``chunk_offset`` 0），携带声明（``total_size`` / ``sha256`` / 可选
+        ``name_hint``）→ Computer 创建会话并回传 ``upload_id``
+      - 后续块 MUST NOT 携带声明字段（违反 → ``4019 invalid_declaration``）；in-order 强制
+        （``chunk_offset`` == Computer 已收字节，无稀疏缓冲，违反 → ``4019 range``）
+      - 有界会话 MUST：闲置超时 / 并发上限 / 孤儿 ``.part`` GC（阈值 SDK 自治）；过期或未知
+        ``upload_id`` → ``4019 invalid_upload``；无跨尝试断点（失败重试 = 新 ``upload_id`` 从 0 重传）
+    """
+
+    computer: str
+    upload_id: NotRequired[str]  # 可选：缺省即首块（offset 0），Computer 分配并回传
+    chunk_offset: int  # 本块起始字节偏移；MUST == Computer 已收字节（in-order，无稀疏缓冲）
+    eof: bool  # 末块标志
+    total_size: NotRequired[int]  # 仅首块：声明总字节（MUST ≥ 1）
+    sha256: NotRequired[str]  # 仅首块：声明全量 sha256（十六进制）
+    name_hint: NotRequired[str]  # 仅首块可选：建议文件名；Computer 消毒后采用或自定
+    blob: str  # base64，本块字节
+
+
+class PutBlobRet(TypedDict, total=False):
+    """
+    上行写入块响应（v0.4.0）。
+    Upload chunk response (v0.4.0).
+
+    协议依据 / Protocol: data-structures.md §PutBlobRet；blob-transfer.md §3。
+
+    完整性 / Integrity:
+      - 仅末块 ack 携带 ``landing_path`` / ``total_size`` / ``sha256``；``sha256`` 为 Computer
+        重算全量值（== 首块声明才成功），Agent **SHOULD** 比对声明
+      - ``landing_path`` 为 landing root 内**绝对路径**（Computer 生成安全名 = ``upload_id``
+        派生 + 消毒后 ``name_hint``），构造上严格落于 root 内；Agent 原样嵌入后续 ``client:tool_call``
+    """
+
+    upload_id: str  # 首块 ack 回传；后续块回显
+    chunk_offset: int  # 回显本块起始字节偏移
+    landing_path: str  # 仅末块 ack：landing root 内绝对路径（安全名）
+    total_size: int  # 仅末块 ack：实际落盘字节（== 声明值才成功）
+    sha256: str  # 仅末块 ack：Computer 重算全量 sha256（== 声明值）
     req_id: str
 
 

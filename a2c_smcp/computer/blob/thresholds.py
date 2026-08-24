@@ -19,10 +19,22 @@ DEFAULT_INLINE_BUDGET: int = 32 * 1024  # 32 KiB — 文本资源 ≤ 此 → bo
 DEFAULT_TOO_LARGE_CAP: int = 100 * 1024 * 1024  # 100 MiB — 超此 → 4017 too_large，零字节传输
 DEFAULT_CHUNK_MAX_BYTES: int = 256 * 1024  # 256 KiB — 单块原始字节上限（clamp 后远低于 1 MiB buffer）
 
+# 上行写入（client:put_blob，v0.4.0 #196）有界会话阈值 — 协议 MUST「会话有界」，具体数值 SDK 自治
+# （blob-transfer.md §3 上传会话生命周期；与下行键完全独立，勿混调）。
+# Upload-write bounded-session thresholds (v0.4.0 #196) — protocol mandates bounded sessions;
+# concrete values are SDK-autonomous. Fully independent of the download-direction keys.
+DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS: int = 120  # 闲置超时：超时作废，此后 upload_id → 4019 invalid_upload
+DEFAULT_UPLOAD_MAX_CONCURRENT: int = 4  # 并发在途上传会话上限：打满 → 4019 busy（Agent SHOULD 退避后重传）
+DEFAULT_UPLOAD_MAX_BYTES: int = 100 * 1024 * 1024  # 100 MiB — 首块声明 total_size 超此 → 4019 too_large（零字节落盘）
+
 # 环境变量键 / Env override keys
 ENV_INLINE_BUDGET: str = "A2C_SKILL_INLINE_BUDGET"
 ENV_TOO_LARGE_CAP: str = "A2C_SKILL_MAX_SIZE"
 ENV_CHUNK_MAX_BYTES: str = "A2C_BLOB_CHUNK_BYTES"
+# 上行 env 兄弟键（沿 A2C_BLOB_CHUNK_BYTES 先例；秒 / 个数 / 字节）
+ENV_UPLOAD_IDLE_TIMEOUT_SECONDS: str = "A2C_UPLOAD_IDLE_TIMEOUT"
+ENV_UPLOAD_MAX_CONCURRENT: str = "A2C_UPLOAD_MAX_CONCURRENT"
+ENV_UPLOAD_MAX_BYTES: str = "A2C_UPLOAD_MAX_BYTES"
 
 
 @dataclass(frozen=True)
@@ -43,6 +55,16 @@ class BlobThresholds:
     inline_budget: int = DEFAULT_INLINE_BUDGET
     too_large_cap: int = DEFAULT_TOO_LARGE_CAP
     chunk_max_bytes: int = DEFAULT_CHUNK_MAX_BYTES
+    upload_idle_timeout_seconds: int = DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS
+    """``client:put_blob`` 会话闲置超时（秒）。超时作废（删 ``.part``）；此后该 ``upload_id``
+    → ``4019 invalid_upload``（Agent 从 0 重传、新 ``upload_id``）。协议 MUST，数值 SDK 自治。
+    Idle timeout (seconds) for upload sessions; expired → ``4019 invalid_upload``."""
+    upload_max_concurrent: int = DEFAULT_UPLOAD_MAX_CONCURRENT
+    """并发在途上传会话上限。打满 → 首块 ``4019 busy``（Agent SHOULD 退避后从 0 重传）。
+    Protocol MUST, value SDK-autonomous. Over-limit first chunks → ``4019 busy``."""
+    upload_max_bytes: int = DEFAULT_UPLOAD_MAX_BYTES
+    """上行绝对上限（字节）。首块声明 ``total_size`` 超此 → ``4019 too_large``（零字节落盘）。
+    独立于下行 ``too_large_cap``（4017 铸句柄期），互不牵连。Upload hard cap → ``4019 too_large``."""
 
     def clamp_chunk(self, requested: int | None) -> int:
         """clamp 客户建议的单块大小到 ``[1, chunk_max_bytes]``；缺省取 ``chunk_max_bytes``。
@@ -63,6 +85,11 @@ def default_thresholds() -> BlobThresholds:
         inline_budget=_read_positive_int_env(ENV_INLINE_BUDGET, DEFAULT_INLINE_BUDGET),
         too_large_cap=_read_positive_int_env(ENV_TOO_LARGE_CAP, DEFAULT_TOO_LARGE_CAP),
         chunk_max_bytes=_read_positive_int_env(ENV_CHUNK_MAX_BYTES, DEFAULT_CHUNK_MAX_BYTES),
+        upload_idle_timeout_seconds=_read_positive_int_env(
+            ENV_UPLOAD_IDLE_TIMEOUT_SECONDS, DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS
+        ),
+        upload_max_concurrent=_read_positive_int_env(ENV_UPLOAD_MAX_CONCURRENT, DEFAULT_UPLOAD_MAX_CONCURRENT),
+        upload_max_bytes=_read_positive_int_env(ENV_UPLOAD_MAX_BYTES, DEFAULT_UPLOAD_MAX_BYTES),
     )
 
 

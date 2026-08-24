@@ -29,9 +29,10 @@ definitions / inputs (those live in ``.tfrobot/mcp.json``).
   1. :data:`POLICY_ONLY_FIELDS`：``allowedMcpServers`` / ``deniedMcpServers`` 是 **policy-only**；出现在
      非 policy scope → 过滤不用 + 记错（杜绝用户态自我提权）。
      Policy-only fields appearing outside the policy scope are filtered + recorded.
-  2. :data:`TRUSTED_SCOPE_ONLY_FIELDS`：审批门 **enable 方向**判据；出现在 **project** scope → 过滤 + 记错
-     （杜绝**不受信 scope 自我批准**，#157 / 协议 ``guides/mcp-approval-gate-alignment.md`` §2.1）。
-     Approval-gate ENABLE-direction inputs supplied by the project scope are filtered + recorded.
+  2. :data:`TRUSTED_SCOPE_ONLY_FIELDS`：仅受信 scope 可设字段（审批门 **enable 方向**判据 #157 +
+     ``landingRoot`` 写目标 #196）；出现在 **project** scope → 过滤 + 记错（杜绝**不受信 scope 自我
+     批准 / 写入沙箱重定向**，协议 ``guides/mcp-approval-gate-alignment.md`` §2.1 / ``blob-transfer.md`` §7）。
+     Trusted-scope-only fields supplied by the project scope are filtered + recorded.
 """
 
 from __future__ import annotations
@@ -123,13 +124,18 @@ FIELD_DISABLED_MCPJSON_SERVERS = "disabledMcpjsonServers"
 FIELD_ALLOWED_MCP_SERVERS = "allowedMcpServers"
 FIELD_DENIED_MCP_SERVERS = "deniedMcpServers"
 FIELD_PERMISSIONS = "permissions"
+# v0.4.0 新增（#196）：client:put_blob 上行写入的落盘根（绝对路径，顶层标量）。
+# v0.4.0 added (#196): the landing root for client:put_blob uploads (absolute path, top-level scalar).
+FIELD_LANDING_ROOT = "landingRoot"
 
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
 POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS})
 
-# 审批门 **enable 方向**判据：出现在 **project** scope → 过滤 + 记错（#157）。
-# Approval-gate ENABLE-direction inputs: filtered + recorded if supplied by the **project** scope.
+# 仅受信 scope 可设字段：出现在 **project** scope → 过滤 + 记错。两类成员共用「project 供给即拒」管线：
+# 1) 审批门 **enable 方向**判据（#157）；2) ``landingRoot``（v0.4.0 #196，写目标重定向面）。
+# Trusted-scope-only fields: filtered + recorded when supplied by the **project** scope. Two member
+# families share this pipeline: approval-gate ENABLE inputs (#157) and ``landingRoot`` (#196).
 #
 # 协议依据：``guides/mcp-approval-gate-alignment.md`` §2.1 通则（MUST）——
 #   「审批门的输入 MUST 来自比被判定 server 更高信任的来源；任何 scope 都不得为『自身是否受信』提供判据。」
@@ -137,6 +143,12 @@ POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD
 # ``.tfrobot/settings.json``（project scope）与 ``mcp.json`` 一样**入 git、随仓库分发**。若门接受它供给
 # 档⑤/⑥，被 clone 的仓库携一份 ``{"enableAllProjectMcpServers": true}`` 即可让其 ``mcp.json`` 里的任意
 # server 启动期免批准框直挂 —— 与 #148 删掉的档④ **同构且更易达成**（无需装任何插件、无需猜任何名字）。
+#
+# ``landingRoot``（v0.4.0 #196，协议 blob-transfer.md §7 MUST）：project settings 入 git 随仓库分发，
+# clone 的仓库不得把 ``client:put_blob`` 的写目标重定向到任意路径（如 ``~/.ssh``）——否则掏空「写入
+# 沙箱由写入原语强制」不变量（computer-management §7 不变量 #6）。协议受信集合为
+# ``user/local/flag/policy/embed``；``embed`` 仅存在于 mcp.json 轴（settings.json 无此来源），settings
+# 轴实际生效受信面即 ``user/local/flag/policy``——与下述「只拒 PROJECT」的差集完全一致，无需额外枚举。
 #
 # 为何**只拒 PROJECT**（而非复用 :mod:`a2c_smcp.computer.settings.mcp_config` 的 ``_TRUSTED_ORIGINS``）：
 #   受信供给方 = ``user`` / ``local`` / ``flag`` / ``policy``（§2.1 表）——**含 LOCAL**。这与 mcp.json
@@ -149,7 +161,9 @@ POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD
 #   那是 **DENY** 方向（§2.1 表第 3 行）：**任意 scope（含 project）可供给** —— fail-safe，仓库禁自己的
 #   server 无安全影响，更严格永远安全。把它收进本类目属**过度矫正**，由单测
 #   ``test_disabled_mcpjson_allowed_from_any_scope`` 守护。
-TRUSTED_SCOPE_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP})
+TRUSTED_SCOPE_ONLY_FIELDS: frozenset[str] = frozenset(
+    {FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP, FIELD_LANDING_ROOT}
+)
 
 # 字符串数组字段（读合并：拼接去重；写回：整体替换，§5.4）/ String-array fields.
 STRING_ARRAY_FIELDS: frozenset[str] = frozenset(
@@ -248,6 +262,7 @@ class ComputerSettings(TypedDict, total=False):
     allowedMcpServers: list[str]
     deniedMcpServers: list[str]
     permissions: PermissionsBlock
+    landingRoot: str  # v0.4.0 #196：client:put_blob 落盘根（绝对路径；仅受信 scope 可设）
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +411,21 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
     return cleaned, errors
 
 
+def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
+    """``landingRoot``（v0.4.0 #196）：字符串 + 绝对路径（镜像 ``permissions.additionalDirectories``
+    的判据：POSIX ``/`` 或 Windows 盘符）；相对路径 / 非字符串 → 整字段判废（fail-closed）。
+
+    String + absolute path, mirroring the ``permissions.additionalDirectories`` predicate;
+    relative or non-string → dropped (fail-closed). 合并策略为顶层标量「高 scope 覆盖」
+    （:func:`a2c_smcp.computer.settings.scope.merge_read` 默认语义），无需分类注册。
+    """
+    if not isinstance(value, str):
+        return _DROP, [_err(scope, key, f"expected string, got {type(value).__name__}")]
+    if not value.startswith("/") and not re.match(r"^[A-Za-z]:[\\/]", value):
+        return _DROP, [_err(scope, key, "must be an absolute path")]
+    return value, []
+
+
 # 字段 → 校验器映射（缺席 = 未知字段，passthrough）/ field → validator map (absent = unknown, passthrough).
 _FIELD_VALIDATORS = {
     FIELD_EXTRA_KNOWN_MARKETPLACES: _validate_extra_marketplaces,
@@ -410,6 +440,7 @@ _FIELD_VALIDATORS = {
     FIELD_ALLOWED_MCP_SERVERS: _validate_string_array,
     FIELD_DENIED_MCP_SERVERS: _validate_string_array,
     FIELD_PERMISSIONS: _validate_permissions,
+    FIELD_LANDING_ROOT: _validate_landing_root,
 }
 
 
@@ -454,14 +485,15 @@ def validate_settings(
         if key in POLICY_ONLY_FIELDS and scope is not SettingsScope.POLICY:
             errors.append(_err(scope, key, "policy-only field not allowed outside the policy scope (filtered)"))
             continue
-        # #157：审批门 enable 方向判据 MUST NOT 由 project scope（入 git、随仓库分发）供给——否则被 clone 的
-        # 仓库可自我批准（与档④ 同构）。协议指南 §2.1。DENY 方向不在本类目（fail-safe），见常量注释。
+        # #157 / #196：仅受信 scope 可设字段 MUST NOT 由 project scope（入 git、随仓库分发）供给——
+        # 审批门判据会让被 clone 的仓库自我批准（与档④ 同构）；landingRoot 会让其重定向写入沙箱目标。
+        # 协议指南 §2.1 / blob-transfer.md §7。DENY 方向不在本类目（fail-safe），见常量注释。
         if key in TRUSTED_SCOPE_ONLY_FIELDS and scope is SettingsScope.PROJECT:
             errors.append(
                 _err(
                     scope,
                     key,
-                    "approval-gate field not allowed in the project scope (filtered): it is a personal decision "
+                    "field not allowed in the project scope (filtered): it is a personal/trusted decision "
                     "and project settings.json is git-tracked — move it to settings.local.json (not git-tracked) "
                     "or the user scope",
                 ),

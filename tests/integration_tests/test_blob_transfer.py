@@ -35,6 +35,8 @@ import socket
 import time
 from collections.abc import AsyncGenerator, Generator, Mapping
 from multiprocessing import synchronize
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
@@ -47,13 +49,21 @@ from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import (
     GET_BLOB_EVENT,
     JOIN_OFFICE_EVENT,
+    PUT_BLOB_EVENT,
     SMCP_NAMESPACE,
     ErrorCode,
     GetBlobReq,
     GetBlobRet,
+    PutBlobReq,
 )
 from a2c_smcp.testing import UvicornTestServer
-from a2c_smcp.utils.blob import BlobTransferError, drain_blob, drain_blob_sync
+from a2c_smcp.utils.blob import (
+    BlobTransferError,
+    BlobUploadError,
+    drain_blob,
+    drain_blob_sync,
+    pump_blob,
+)
 from tests.integration_tests.mock_socketio_server import (
     MockComputerServerNamespace,
     MockComputerServerSyncNamespace,
@@ -840,3 +850,202 @@ def test_blob_transfer_sync_wire_round_trip(sync_blob_server: int, tmp_path) -> 
         if comp_proc.is_alive():
             comp_proc.terminate()
             comp_proc.join(timeout=2)
+
+
+# ======================================================================
+# Part 1b — In-process upload integration（client:put_blob，v0.4.0 #196）
+# ======================================================================
+#
+# 真实 Computer.on_put_blob（handler 全链路：computer 名校验 → BlobUploadStore）× 真实
+# pump_blob（Agent 发送循环），验证上行通道跨抽象边界的完整性（声明-校验镜像 / in-order /
+# 原子定稿 / fail-closed）。settings 注入经 _resolve_declared_settings 桩（landingRoot 是
+# settings resolve 的运行期读面）。
+
+
+def _make_in_proc_put_call(client: SMCPComputerClient) -> Any:
+    """构造 in-process 异步上行 call adapter，直连 client.on_put_blob。"""
+
+    async def call(
+        upload_id: str | None, chunk_offset: int, eof: bool, chunk: bytes, declaration: Mapping[str, Any] | None
+    ) -> Mapping[str, Any]:
+        import base64 as _b64mod
+
+        req: dict[str, Any] = {
+            "agent": "agent-it",
+            "req_id": "r-put",
+            "computer": "comp-blob-1",
+            "chunk_offset": chunk_offset,
+            "eof": eof,
+            "blob": _b64mod.b64encode(chunk).decode("ascii"),
+        }
+        if upload_id is not None:
+            req["upload_id"] = upload_id
+        if declaration is not None:
+            req["total_size"] = int(declaration["total_size"])
+            req["sha256"] = str(declaration["sha256"])
+            if declaration.get("name_hint") is not None:
+                req["name_hint"] = str(declaration["name_hint"])
+        return await client.on_put_blob(req)  # type: ignore[arg-type]
+
+    return call
+
+
+@pytest.fixture()
+def computer_with_landing_root(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Computer, SMCPComputerClient, Path]:
+    """构造带 landingRoot 配置的 Computer（settings resolve 桩注入）。"""
+    comp = Computer(name="comp-blob-1", blob_cache_root=tmp_path)
+    landing = tmp_path / "landing"
+    stub = SimpleNamespace(settings={"landingRoot": str(landing)})
+    monkeypatch.setattr(comp, "_resolve_declared_settings", lambda: stub)
+    cli = SMCPComputerClient(computer=comp)
+    return comp, cli, landing
+
+
+class TestInProcUpload:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("size", [64, 1024, 300 * 1024])  # 单块 / 多块 / > 默认 chunk
+    async def test_upload_roundtrip_landing_path_bytes(
+        self,
+        computer_with_landing_root: tuple[Computer, SMCPComputerClient, Path],
+        size: int,
+    ) -> None:
+        """pump → on_put_blob → landing_path 落盘逐字节一致（含 >256KiB 多块路径）。"""
+        _comp, cli, landing = computer_with_landing_root
+        data = bytes((i * 17 + 3) % 256 for i in range(size))
+        call = _make_in_proc_put_call(cli)
+        result = await pump_blob(call, "comp-blob-1", data, name_hint="it-upload.bin")
+        assert result.landing_path.startswith(str(landing))
+        assert Path(result.landing_path).read_bytes() == data
+        assert result.total_size == size
+        assert result.sha256 == hashlib.sha256(data).hexdigest()
+
+    @pytest.mark.asyncio
+    async def test_upload_forbidden_when_landing_root_unset(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """未配置 landingRoot → fail-closed：4019 forbidden 经 pump 归一为 BlobUploadError。"""
+        comp = Computer(name="comp-blob-1", blob_cache_root=tmp_path)
+        stub = SimpleNamespace(settings={})
+        monkeypatch.setattr(comp, "_resolve_declared_settings", lambda: stub)
+        cli = SMCPComputerClient(computer=comp)
+        call = _make_in_proc_put_call(cli)
+        with pytest.raises(BlobUploadError) as ei:
+            await pump_blob(call, "comp-blob-1", b"no-landing-configured")
+        assert ei.value.reason == "forbidden"
+
+
+class TestRealWireAsyncPutBlob:
+    """真 Socket.IO transport 上行（v0.4.0 #196）：``SMCPNamespace.on_client_put_blob`` 路由
+    （``TypeAdapter(PutBlobRet)`` 成功形校验 + 4019 flat 透传）× pump_blob 跨 wire 完整性。"""
+
+    @pytest.mark.asyncio
+    async def test_put_blob_full_round_trip_over_wire(
+        self,
+        real_blob_server: None,
+        real_blob_server_port: int,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        office_id = "office-blob-wire-put-1"
+        landing = tmp_path / "landing"
+        comp = Computer(name="comp-wire-1", blob_cache_root=tmp_path)
+        stub = SimpleNamespace(settings={"landingRoot": str(landing)})
+        monkeypatch.setattr(comp, "_resolve_declared_settings", lambda: stub)
+        comp_client = SMCPComputerClient(computer=comp)
+        await comp_client.connect(
+            f"http://localhost:{real_blob_server_port}",
+            socketio_path="/socket.io",
+            auth={"mock": "ok"},
+            namespaces=[SMCP_NAMESPACE],
+        )
+        await comp_client.join_office(office_id)
+
+        agent = AsyncClient()
+        await agent.connect(
+            f"http://localhost:{real_blob_server_port}",
+            socketio_path="/socket.io",
+            auth={"mock": "ok"},
+            namespaces=[SMCP_NAMESPACE],
+        )
+        await _agent_join(agent, office_id, "agent-wire-put-1")
+        try:
+            payload = b"upload over the wire " * 300  # ~6 KiB → 多块（chunk_size=1024）
+            call = _make_wire_put_call(agent)
+            result = await pump_blob(call, comp.name, payload, name_hint="wire.bin", chunk_size=1024)
+            assert result.landing_path.startswith(str(landing))
+            assert Path(result.landing_path).read_bytes() == payload
+            assert result.sha256 == hashlib.sha256(payload).hexdigest()
+        finally:
+            await agent.disconnect()
+            await comp_client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_put_blob_forbidden_4019_passthrough_over_wire(
+        self,
+        real_blob_server: None,
+        real_blob_server_port: int,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """未配置 landingRoot → Computer 4019 flat 负载经 Server 原样透传 → pump 归一 forbidden。"""
+        office_id = "office-blob-wire-put-2"
+        comp = Computer(name="comp-wire-1", blob_cache_root=tmp_path)
+        stub = SimpleNamespace(settings={})
+        monkeypatch.setattr(comp, "_resolve_declared_settings", lambda: stub)
+        comp_client = SMCPComputerClient(computer=comp)
+        await comp_client.connect(
+            f"http://localhost:{real_blob_server_port}",
+            socketio_path="/socket.io",
+            auth={"mock": "ok"},
+            namespaces=[SMCP_NAMESPACE],
+        )
+        await comp_client.join_office(office_id)
+
+        agent = AsyncClient()
+        await agent.connect(
+            f"http://localhost:{real_blob_server_port}",
+            socketio_path="/socket.io",
+            auth={"mock": "ok"},
+            namespaces=[SMCP_NAMESPACE],
+        )
+        await _agent_join(agent, office_id, "agent-wire-put-2")
+        try:
+            call = _make_wire_put_call(agent)
+            with pytest.raises(BlobUploadError) as ei:
+                await pump_blob(call, comp.name, b"no landing root configured")
+            assert ei.value.reason == "forbidden"
+        finally:
+            await agent.disconnect()
+            await comp_client.disconnect()
+
+
+def _make_wire_put_call(agent_client: AsyncClient) -> Any:
+    """将真实 socketio.AsyncClient.call 适配为 pump_blob 的 call 签名."""
+
+    async def call(
+        upload_id: str | None, chunk_offset: int, eof: bool, chunk: bytes, declaration: Mapping[str, Any] | None
+    ) -> Mapping[str, Any]:
+        import base64 as _b64mod
+
+        req: dict[str, Any] = {
+            "agent": "agent-wire-put",
+            "req_id": f"r-put-{chunk_offset}",
+            "computer": "comp-wire-1",
+            "chunk_offset": chunk_offset,
+            "eof": eof,
+            "blob": _b64mod.b64encode(chunk).decode("ascii"),
+        }
+        if upload_id is not None:
+            req["upload_id"] = upload_id
+        if declaration is not None:
+            req["total_size"] = int(declaration["total_size"])
+            req["sha256"] = str(declaration["sha256"])
+            if declaration.get("name_hint") is not None:
+                req["name_hint"] = str(declaration["name_hint"])
+        ack = await agent_client.call(PUT_BLOB_EVENT, req, namespace=SMCP_NAMESPACE)
+        assert isinstance(ack, dict)
+        return ack
+
+    return call
