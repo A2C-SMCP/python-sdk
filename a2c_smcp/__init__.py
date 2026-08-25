@@ -4,7 +4,7 @@
 # @Author  : JQQ
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
-__version__: str = "0.4.0b1"
+__version__: str = "0.4.0rc1"
 
 # A2C-SMCP 协议版本号 / A2C-SMCP protocol version.
 # 与 SDK 包版本（__version__）独立：MAJOR.MINOR 锁定协议 MAJOR.MINOR，PATCH 自由。
