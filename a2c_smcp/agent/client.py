@@ -8,6 +8,7 @@
 * 描述: 异步Agent客户端实现 / Asynchronous Agent client implementation
 """
 
+from collections.abc import Mapping
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
@@ -31,6 +32,7 @@ from a2c_smcp.smcp import (
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
+    PUT_BLOB_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -52,7 +54,7 @@ from a2c_smcp.smcp import (
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
 )
-from a2c_smcp.utils.blob import drain_blob
+from a2c_smcp.utils.blob import PutBlobResult, drain_blob, pump_blob
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
     HANDSHAKE_CONNECT_ERRORS,
@@ -618,6 +620,65 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         async def _call(computer: str, blob_handle: str, chunk_offset: int, max_chunk_bytes: int) -> dict:
             req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
             ack = await self.call(GET_BLOB_EVENT, req, namespace=self._namespace)
+            return cast(dict, ack)
+
+        return _call
+
+    async def put_blob(
+        self,
+        computer: str,
+        data: bytes,
+        *,
+        name_hint: str | None = None,
+        chunk_size: int | None = None,
+        timeout: int = 30,
+    ) -> PutBlobResult:
+        """异步上行落盘：把 ``data`` 分块推送至 Computer landing root（v0.4.0 #196）.
+
+        Upload bytes to the Computer's landing root (high-level API; protocol SHOULD-wrap).
+        首块声明 ``total_size`` / ``sha256`` → ack-paced 顺序发送 → 末块取绝对 ``landing_path``，
+        可直接嵌入后续 ``client:tool_call`` 参数（Bash / MCP 工具路径参数）使用。
+
+        协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3（in-order / 有界会话）/ §7.
+        能力门控 = 自身 minor ≥ 0.4（版本握手 MINOR 严格匹配 + 同房间传递，协议 §3）；首块超时
+        → :class:`BlobUploadUnsupportedError`（载荷随异常保留，字节留上下文不落盘——防御性兜底，
+        非正式回退路径）。
+
+        Args:
+            computer: 目标 Computer 名.
+            data: 完整载荷字节（至少 1 字节）.
+            name_hint: 建议文件名（Computer 消毒后采用或自定）.
+            chunk_size: 单块字节数；缺省 256 KiB（与 Computer clamp 上限一致）.
+            timeout: 单块 ack 超时（秒）.
+
+        Returns:
+            PutBlobResult: ``landing_path`` / ``total_size`` / ``sha256``（Computer 回显重算值）.
+
+        Raises:
+            BlobUploadError: 4019 各 reason（``busy`` / ``too_large`` 等；任何失败重试 = 新
+                ``upload_id`` 从 0 重传，无断点续传）/ 空载荷 / 末块回显不符.
+            BlobUploadUnsupportedError: 首块超时（目标疑为 0.4.0 前实现；``data`` 随异常保留）.
+        """
+        call = self._make_put_blob_call(computer, timeout)
+        return await pump_blob(call, computer, data, name_hint=name_hint, chunk_size=chunk_size)
+
+    def _make_put_blob_call(self, computer: str, timeout: int) -> Any:
+        """构造 :func:`pump_blob` 的 ``call`` 适配器（绑定目标 Computer + 本 client 的 socketio）.
+
+        Build a ``call`` adapter for :func:`pump_blob` bound to the target Computer + this
+        client's socketio + namespace（与 :meth:`_make_blob_call` 同款适配器模式；pump 的 call
+        签名不含 ``computer``，故在工厂处绑定）.
+        """
+
+        async def _call(
+            upload_id: str | None,
+            chunk_offset: int,
+            eof: bool,
+            chunk: bytes,
+            declaration: Mapping[str, Any] | None,
+        ) -> dict:
+            req = self.create_put_blob_request(computer, upload_id, chunk_offset, eof, chunk, declaration)
+            ack = await self.call(PUT_BLOB_EVENT, req, namespace=self._namespace, timeout=timeout)
             return cast(dict, ack)
 
         return _call

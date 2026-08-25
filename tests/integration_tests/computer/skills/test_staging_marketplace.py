@@ -49,8 +49,11 @@ def _write(root: Path, files: dict[str, str]) -> None:
         p.write_text(content, encoding="utf-8")
 
 
-def _skill_md(name: str, description: str = "a skill") -> str:
-    return f"---\nname: {name}\ndescription: {description}\nlicense: MIT\n---\n# {name}\nbody\n"
+def _skill_md(name: str, description: str = "a skill", *, tags: list[str] | None = None) -> str:
+    tags_line = ""
+    if tags is not None:
+        tags_line = "tags:\n" + "".join(f"  - {t}\n" for t in tags)
+    return f"---\nname: {name}\ndescription: {description}\nlicense: MIT\n{tags_line}---\n# {name}\nbody\n"
 
 
 def _make_bare(tmp_path: Path, name: str, files: dict[str, str], *, allow_filter: bool = False) -> tuple[Path, Path]:
@@ -106,7 +109,7 @@ def _marketplace_files() -> dict[str, str]:
     }
     return {
         ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
-        "plugins/audit/skills/audit-code/SKILL.md": _skill_md("audit-code"),
+        "plugins/audit/skills/audit-code/SKILL.md": _skill_md("audit-code", tags=["sec", "audit"]),
         "plugins/audit/skills/lint/SKILL.md": _skill_md("lint"),
         "plugins/fmt/skills/format/SKILL.md": _skill_md("format"),
     }
@@ -126,6 +129,7 @@ async def test_eager_clone_registers_relative_plugins(tmp_path: Path) -> None:
     assert ref is not None
     assert ref["source"] == "marketplace:acme-skills"
     assert ref["version"] == "1.0.0"  # entry.version 优先
+    assert ref["tags"] == ["sec", "audit"]  # frontmatter tags 透传（skill.md §1.5，三源共用单点）
     skill_path = Path(ref["path"])
     assert skill_path.is_dir()
     assert (skill_path / "SKILL.md").is_file()

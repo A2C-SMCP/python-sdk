@@ -42,8 +42,12 @@ import hashlib
 import logging
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any
 
+import socketio.exceptions
+
+from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.smcp import ErrorCode
 
 # ── 公开类型 / Public types ──────────────────────────────────────────────
@@ -486,4 +490,256 @@ def _raise_for_blob_error(payload: Mapping[str, Any]) -> None:
     raise BlobTransferError(
         reason=f"protocol_error_{code}",
         message=str(payload.get("message", f"Protocol error code {code}")),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 上行写入例程（client:put_blob，v0.4.0 #196）/ Upload-write routine
+#
+# ``drain_blob`` 的方向镜像：ack-paced **顺序**发送（协议 in-order 强制，无并行红利——与下行
+# 「无服务端状态、可并行 offset」形成对照）。协议依据 / Protocol: blob-transfer.md §3/§7。
+# The directional mirror of ``drain_blob``: ack-paced SEQUENTIAL sends (protocol mandates
+# in-order chunks; no parallel dividend, unlike the stateless download direction).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class PutBlobResult:
+    """上行落盘成功结果（末块 ack 的三要素）/ The final-chunk ack essentials.
+
+    ``landing_path`` 为 Computer landing root 内**绝对路径**（安全名），Agent 原样嵌入后续
+    ``client:tool_call`` 参数使用（Bash / MCP 工具路径参数）。
+    """
+
+    landing_path: str
+    total_size: int  # 实际落盘字节（== 声明值才成功）
+    sha256: str  # Computer 重算全量 sha256（== 声明值）
+
+
+class BlobUploadError(Exception):
+    """``pump_blob`` 上行阶段错误基类 / Base error for the ``pump_blob`` upload routine.
+
+    Attributes:
+        reason: 协议 ``4019 details.reason`` 值（开放枚举——``invalid_upload`` / ``invalid_declaration``
+            / ``range`` / ``too_large`` / ``busy`` / ``forbidden`` / ``integrity`` / ``io_error``），
+            或 ``"empty_payload"` / ``"echo_mismatch"`` / ``"protocol_error_*"`` 这类客户端自检失败.
+    """
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        super().__init__(message or reason)
+        self.reason = reason
+
+
+class BlobUploadUnsupportedError(BlobUploadError):
+    """首块超时 → 防御性判定目标 Computer 不支持 ``client:put_blob``（v0.4.0 前实现）。
+
+    First chunk timed out → the target Computer is heuristically deemed not to implement
+    ``client:put_blob`` (pre-0.4.0 implementation). 协议 §3「能力门控」：这**不是**正式回退路径，
+    仅 ``-dev`` 周期实现进度不同步 / 不合规实现的边界兜底。
+
+    ⚠️ 捕获的是 ``socketio.exceptions.TimeoutError``——它**不是** builtin ``TimeoutError`` 的子类
+    （python-socketio 5.x），通用 ``except TimeoutError`` 抓不到，本类已代为归一。
+
+    字节留上下文（协议措辞「字节留上下文不落盘」）：完整载荷与声明随异常携带，调用方
+    （业务 SDK）可自行决定降级处置（如留在会话上下文、换通道），SDK 不擅自落盘。
+    The full payload + declaration ride on the exception ("bytes stay in context, nothing
+    written"); the business SDK decides the fallback — the SDK never writes them anywhere.
+    """
+
+    def __init__(  # noqa: PLR0913 — 上下文字段即协议要求的信息保全
+        self,
+        data: bytes,
+        total_size: int,
+        sha256: str,
+        name_hint: str | None,
+        message: str = "",
+    ) -> None:
+        super().__init__("upload_unsupported", message or "first chunk timed out; Computer likely lacks put_blob support")
+        self.data = data
+        self.total_size = total_size
+        self.sha256 = sha256
+        self.name_hint = name_hint
+
+
+AsyncPutCall = Callable[[str | None, int, bool, bytes, Mapping[str, Any] | None], Awaitable[Mapping[str, Any]]]
+"""
+异步单块上行函数签名 / Async single-chunk upload callable signature.
+
+``(upload_id, chunk_offset, eof, chunk_bytes, declaration) -> PutBlobRet | ErrorPayload dict``：
+``upload_id`` 为 ``None`` 即首块（携带 ``declaration`` = ``{"total_size", "sha256", "name_hint"?}``）；
+调用方（Agent SDK）封装底层 ``socketio.AsyncClient.call``，注入 ``namespace`` / ``agent`` /
+``req_id`` 等业务字段后再传入本例程（与 :data:`AsyncBlobCall` 同款适配器模式）。
+"""
+
+SyncPutCall = Callable[[str | None, int, bool, bytes, Mapping[str, Any] | None], Mapping[str, Any]]
+"""同步单块上行函数签名 / Sync mirror of :data:`AsyncPutCall`（直接返回 dict）."""
+
+
+def _check_upload_supported() -> None:
+    """能力门控（协议 §3）：自身 ``PROTOCOL_VERSION`` minor ≥ 0.4 才可发起上行。
+
+    版本握手 MINOR 严格匹配 + 同房间传递 ⇒ 连上即保证房间内 Computer 同 minor。本检查是
+    编译期常量的运行时断言（旧 SDK 不可达、常量回退时 fail-fast），首块超时兜底另见
+    :class:`BlobUploadUnsupportedError`。
+    """
+    try:
+        minor = int(PROTOCOL_VERSION.split(".")[1])
+    except (IndexError, ValueError) as e:  # pragma: no cover - 常量形态被破坏的防御
+        raise BlobUploadError("bad_protocol_version", f"unparseable PROTOCOL_VERSION {PROTOCOL_VERSION!r}") from e
+    if minor < 4:
+        raise BlobUploadError(
+            "upload_unsupported_by_sdk",
+            f"client:put_blob requires protocol minor >= 0.4; this SDK speaks {PROTOCOL_VERSION}",
+        )
+
+
+def _raise_for_put_blob_error(payload: Mapping[str, Any]) -> None:
+    """检测 flat ErrorPayload (``code=4019``)，按 ``details.reason`` 抛 :class:`BlobUploadError`。"""
+    code = payload.get("code")
+    if code is None:
+        return
+    if code == int(ErrorCode.BLOB_WRITE_FAILED):
+        details = payload.get("details") or {}
+        reason = str(details.get("reason", "invalid_upload"))
+        raise BlobUploadError(reason=reason, message=str(payload.get("message", "Blob write failed")))
+    raise BlobUploadError(
+        reason=f"protocol_error_{code}",
+        message=str(payload.get("message", f"Protocol error code {code}")),
+    )
+
+
+async def pump_blob(
+    call: AsyncPutCall,
+    computer: str,
+    data: bytes,
+    *,
+    name_hint: str | None = None,
+    chunk_size: int | None = None,
+) -> PutBlobResult:
+    """异步上行落盘：分块推送 ``data`` 至 Computer landing root / Upload bytes to the landing root.
+
+    ack-paced **顺序**发送（协议 in-order 强制，无并行）：首块声明 ``total_size`` / ``sha256`` /
+    可选 ``name_hint`` → 逐块 ``base64`` → 末块 ``eof`` 取 ``landing_path``。末块 ack 的回显
+    ``sha256`` 与声明比对（协议 SHOULD；不符视为损坏信号抛 ``echo_mismatch``）。
+
+    Args:
+        call: 单块上行函数（异步），签名见 :data:`AsyncPutCall`.
+        computer: 目标 Computer 名（仅诊断；call 已具体路由）.
+        data: 完整载荷字节（**至少 1 字节**，协议 ``total_size >= 1``）.
+        name_hint: 建议文件名（Computer 消毒后采用或自定；仅诊断性建议）.
+        chunk_size: 单块字节数；缺省 :data:`DEFAULT_CHUNK_SIZE`（256 KiB——与 Computer 端
+            clamp 上限一致，base64 +33% 后仍远低于 Server 默认 1 MiB buffer）.
+
+    Returns:
+        :class:`PutBlobResult`: ``landing_path``（绝对路径，直接嵌入后续 tool_call 参数）+
+        ``total_size`` / ``sha256``（Computer 回显重算值）.
+
+    Raises:
+        BlobUploadError: 空载荷 / 末块回显不符 / 4019 各 reason（``busy`` / ``too_large`` 等
+            ——调用方可按 reason 决定退避重试：任何失败重试 = 新 ``upload_id`` 从 0 重传）.
+        BlobUploadUnsupportedError: 首块超时（目标 Computer 疑似不支持 put_blob；载荷随异常保留）.
+        socketio.exceptions.TimeoutError: 非首块超时（传输故障，原样上抛）.
+    """
+    declaration = _prepare_declaration(data, name_hint, chunk_size)
+    effective_chunk = chunk_size or DEFAULT_CHUNK_SIZE
+    upload_id: str | None = None
+    offset = 0
+    while True:
+        chunk = data[offset : offset + effective_chunk]
+        eof = offset + len(chunk) == declaration["total_size"]
+        first = upload_id is None
+        try:
+            ack = await call(upload_id, offset, eof, chunk, declaration if first else None)
+        except socketio.exceptions.TimeoutError as e:
+            if first:
+                # 协议 §3 防御性兜底：首块超时视为不支持（字节留上下文，不落盘）。
+                raise BlobUploadUnsupportedError(
+                    data=data,
+                    total_size=int(declaration["total_size"]),
+                    sha256=str(declaration["sha256"]),
+                    name_hint=name_hint,
+                    message=f"put_blob first chunk to computer {computer!r} timed out; "
+                    f"target likely predates protocol 0.4.0",
+                ) from e
+            raise
+        _raise_for_put_blob_error(ack)
+        upload_id = str(ack["upload_id"])
+        if eof:
+            return _finalize_result(ack, declaration)
+        offset += len(chunk)
+
+
+def pump_blob_sync(
+    call: SyncPutCall,
+    computer: str,
+    data: bytes,
+    *,
+    name_hint: str | None = None,
+    chunk_size: int | None = None,
+) -> PutBlobResult:
+    """同步上行落盘（async 镜像）/ Synchronous mirror of :func:`pump_blob`.
+
+    ``socketio.Client`` 引擎在后台线程驱动收发，阻塞 ``call`` 不阻塞事件循环；错误面与
+    async 版完全一致（含首块 ``TimeoutError`` → :class:`BlobUploadUnsupportedError` 归一）。
+    """
+    declaration = _prepare_declaration(data, name_hint, chunk_size)
+    effective_chunk = chunk_size or DEFAULT_CHUNK_SIZE
+    upload_id: str | None = None
+    offset = 0
+    while True:
+        chunk = data[offset : offset + effective_chunk]
+        eof = offset + len(chunk) == declaration["total_size"]
+        first = upload_id is None
+        try:
+            ack = call(upload_id, offset, eof, chunk, declaration if first else None)
+        except socketio.exceptions.TimeoutError as e:
+            if first:
+                raise BlobUploadUnsupportedError(
+                    data=data,
+                    total_size=int(declaration["total_size"]),
+                    sha256=str(declaration["sha256"]),
+                    name_hint=name_hint,
+                    message=f"put_blob first chunk to computer {computer!r} timed out; "
+                    f"target likely predates protocol 0.4.0",
+                ) from e
+            raise
+        _raise_for_put_blob_error(ack)
+        upload_id = str(ack["upload_id"])
+        if eof:
+            return _finalize_result(ack, declaration)
+        offset += len(chunk)
+
+
+def _prepare_declaration(data: bytes, name_hint: str | None, chunk_size: int | None = None) -> dict[str, Any]:
+    """构造首块声明并做入口自检（空载荷 / 能力门控 / chunk_size 合法性）。"""
+    _check_upload_supported()
+    if not data:
+        raise BlobUploadError("empty_payload", "put_blob requires at least one byte (protocol total_size >= 1)")
+    if chunk_size is not None and chunk_size < 1:
+        # 负 / 零 chunk_size 会让切片恒空 → offset 永不前进 → 死循环空块（脚枪防御，入口收口）。
+        # A non-positive chunk_size yields empty slices forever; reject at the entry.
+        raise BlobUploadError("bad_chunk_size", f"chunk_size must be >= 1, got {chunk_size}")
+    declaration: dict[str, Any] = {
+        "total_size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if name_hint is not None:
+        declaration["name_hint"] = name_hint
+    return declaration
+
+
+def _finalize_result(ack: Mapping[str, Any], declaration: Mapping[str, Any]) -> PutBlobResult:
+    """末块 ack 收口：取 ``landing_path``，回显 ``sha256`` 与声明比对（协议 SHOULD）。"""
+    landing_path = ack.get("landing_path")
+    if not isinstance(landing_path, str) or not landing_path:
+        raise BlobUploadError("incomplete_ack", "final chunk ack missing landing_path")
+    echo_sha = str(ack.get("sha256", ""))
+    declared_sha = str(declaration["sha256"])
+    if echo_sha and echo_sha != declared_sha:
+        # 协议 §6「末块 ack 回显重算值，Agent SHOULD 比对」：不符即落盘内容与声明不符的损坏信号。
+        raise BlobUploadError("echo_mismatch", f"Computer echo sha256 {echo_sha} != declared {declared_sha}")
+    return PutBlobResult(
+        landing_path=landing_path,
+        total_size=int(ack.get("total_size", declaration["total_size"])),
+        sha256=echo_sha or declared_sha,
     )

@@ -188,8 +188,11 @@ def test_disabled_mcpjson_allowed_from_any_scope(scope: SettingsScope) -> None:
 def test_field_sets_exact() -> None:
     """字段集合内容精确（对拍 rust ``test_field_sets_exact``）——防「顺手增删」漂移。"""
     assert POLICY_ONLY_FIELDS == frozenset({"allowedMcpServers", "deniedMcpServers"})
-    # #157：enable 方向判据（拒 project）。**不含** disabledMcpjsonServers —— DENY 方向 fail-safe。
-    assert TRUSTED_SCOPE_ONLY_FIELDS == frozenset({"enabledMcpjsonServers", "enableAllProjectMcpServers"})
+    # #157：enable 方向判据（拒 project）；#196：landingRoot（写目标重定向面，协议 blob-transfer.md §7）。
+    # **不含** disabledMcpjsonServers —— DENY 方向 fail-safe。
+    assert TRUSTED_SCOPE_ONLY_FIELDS == frozenset(
+        {"enabledMcpjsonServers", "enableAllProjectMcpServers", "landingRoot"}
+    )
     assert BOOL_FIELDS == frozenset({"strictKnownMarketplaces", "enableAllProjectMcpServers"})
     assert len(STRING_ARRAY_FIELDS) == 6
 
@@ -312,3 +315,42 @@ def test_validate_settings_policy_scope_detects_type_errors() -> None:
     # 类型错产出 errors
     assert len(errors) >= 1
     assert any("allowedMcpServers" in e.field for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# landingRoot（v0.4.0 #196，client:put_blob 落盘根）
+# ---------------------------------------------------------------------------
+class TestLandingRoot:
+    """顶层键 ``landingRoot``：字符串 + 绝对路径；project scope 供给 MUST 拒绝（协议 blob-transfer.md §7）。"""
+
+    def test_valid_absolute_path_kept_in_user_scope(self) -> None:
+        cleaned, errors = validate_settings({"landingRoot": "/var/lib/a2c/landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/var/lib/a2c/landing"
+        assert errors == []
+
+    def test_windows_drive_path_valid(self) -> None:
+        cleaned, errors = validate_settings({"landingRoot": "D:\\a2c\\landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "D:\\a2c\\landing"
+        assert errors == []
+
+    @pytest.mark.parametrize("bad", ["relative/path", "./here", "", 123, True, ["/abs"]])
+    def test_relative_or_non_string_dropped(self, bad: object) -> None:
+        cleaned, errors = validate_settings({"landingRoot": bad}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned  # 整字段判废（fail-closed）
+        assert len(errors) == 1
+
+    def test_project_scope_filtered_and_recorded(self) -> None:
+        """协议 MUST：project settings 入 git 随仓库分发，不得重定向写入沙箱目标（§7 不变量 #6）。"""
+        cleaned, errors = validate_settings({"landingRoot": "/tmp/evil"}, SettingsScope.PROJECT)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+        assert "project scope" in errors[0].reason
+
+    @pytest.mark.parametrize(
+        "scope",
+        [SettingsScope.USER, SettingsScope.LOCAL, SettingsScope.FLAG, SettingsScope.POLICY],
+    )
+    def test_trusted_scopes_kept(self, scope: SettingsScope) -> None:
+        cleaned, errors = validate_settings({"landingRoot": "/srv/landing"}, scope)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []

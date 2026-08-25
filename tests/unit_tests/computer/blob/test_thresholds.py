@@ -17,9 +17,15 @@ from a2c_smcp.computer.blob.thresholds import (
     DEFAULT_CHUNK_MAX_BYTES,
     DEFAULT_INLINE_BUDGET,
     DEFAULT_TOO_LARGE_CAP,
+    DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_UPLOAD_MAX_BYTES,
+    DEFAULT_UPLOAD_MAX_CONCURRENT,
     ENV_CHUNK_MAX_BYTES,
     ENV_INLINE_BUDGET,
     ENV_TOO_LARGE_CAP,
+    ENV_UPLOAD_IDLE_TIMEOUT_SECONDS,
+    ENV_UPLOAD_MAX_BYTES,
+    ENV_UPLOAD_MAX_CONCURRENT,
     BlobThresholds,
     default_thresholds,
 )
@@ -93,3 +99,40 @@ class TestImmutability:
         t = BlobThresholds()
         with pytest.raises((AttributeError, Exception)):
             t.inline_budget = 999  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# upload 类阈值（v0.4.0 #196，client:put_blob 有界会话）
+# ---------------------------------------------------------------------------
+class TestUploadThresholds:
+    def test_upload_defaults(self) -> None:
+        """温和默认：闲置 120s / 并发 4 / 上限 100 MiB（用户拍板，独立于下行键）。"""
+        assert DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS == 120
+        assert DEFAULT_UPLOAD_MAX_CONCURRENT == 4
+        assert DEFAULT_UPLOAD_MAX_BYTES == 100 * 1024 * 1024
+
+    def test_upload_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(ENV_UPLOAD_IDLE_TIMEOUT_SECONDS, "30")
+        monkeypatch.setenv(ENV_UPLOAD_MAX_CONCURRENT, "2")
+        monkeypatch.setenv(ENV_UPLOAD_MAX_BYTES, "4096")
+        t = default_thresholds()
+        assert t.upload_idle_timeout_seconds == 30
+        assert t.upload_max_concurrent == 2
+        assert t.upload_max_bytes == 4096
+
+    def test_upload_env_invalid_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """非整数 / 非正值静默回退硬编码默认（沿 _read_positive_int_env 先例）。"""
+        monkeypatch.setenv(ENV_UPLOAD_IDLE_TIMEOUT_SECONDS, "not-a-number")
+        monkeypatch.setenv(ENV_UPLOAD_MAX_CONCURRENT, "-3")
+        t = default_thresholds()
+        assert t.upload_idle_timeout_seconds == DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS
+        assert t.upload_max_concurrent == DEFAULT_UPLOAD_MAX_CONCURRENT
+
+    def test_upload_keys_independent_of_download(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """上行 env 键与下行键完全独立：调上行不牵连下行默认。"""
+        for key in (ENV_INLINE_BUDGET, ENV_TOO_LARGE_CAP, ENV_CHUNK_MAX_BYTES):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(ENV_UPLOAD_MAX_BYTES, "2048")
+        t = default_thresholds()
+        assert t.upload_max_bytes == 2048
+        assert t.too_large_cap == DEFAULT_TOO_LARGE_CAP  # 下行不受影响

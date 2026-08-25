@@ -208,6 +208,72 @@ a2c> start playwright
 a2c> tools
 ```
 
+## Plugin / Marketplace 配置校验（非交互 CLI）
+
+面向 marketplace plugin 作者与维护者：在发布或安装前发现不合法配置，本地开发与 CI 均可自动检查。校验
+**零副作用**——不 clone、不安装 plugin、不修改用户配置或物化状态。
+
+```bash
+# <path> 可以是 marketplace 仓库根目录，也可以是单个 plugin 目录（自动识别）
+a2c-computer plugin validate <path>
+a2c-computer marketplace validate <path>   # 双入口别名，同一实现
+
+# CI 中消费机器可读输出
+a2c-computer plugin validate <path> --json
+```
+
+**校验范围**（复用安装路径同一套解析规则，不另立规则）：
+
+- `.tfrobot-plugin/marketplace.json`：JSON 语法、必填字段（`name` / `owner` / `plugins`）、字段类型、
+  kebab 命名规则（§3）；
+- 每个 plugin 条目（§4）：必填 `name` / `source`、source 5 类形态（§5）、`strict` 冲突（§4.4）、
+  引用路径存在性；**畸形条目（install 时被静默跳过的）会显式报出**；
+- `.tfrobot-plugin/plugin.json`（§6）：语法 / `name` 必填 / 命名；损坏的 plugin.json（install 时仅记
+  WARNING 后按空兜底）会报 error；缺失则记 warning（合法但建议保留）；
+- `mcp-servers/*.json`（§8）：MCP Server 配置校验 + 文件名（去 `.json`）必须等于配置内 `name`；
+  `inputs.json` 做语法检查；
+- `skills/` SKILL 深检：`SKILL.md` 存在性、frontmatter `description`、skill 目录名 kebab 规则、
+  跨容器重名；marketplace 条目 / plugin.json 的 `skills` 覆写路径存在性与越界检查。
+
+**远程 source 跳过**：条目引用 git 远程仓库（`url` / `github` / `cnb` / `git-subdir`）时仅校验 source
+字段本身格式，plugin 本体记 warning 跳过深检（本地零网络校验）。
+
+**退出码**：`0` = 无错误（warnings 不影响）；`1` = 存在任一错误。每条诊断含**文件路径、配置位置
+（如 `plugins[2].source`）与可理解原因**。
+
+成功示例：
+
+```console
+$ a2c-computer plugin validate ./my-marketplace
+Validating marketplace at /abs/my-marketplace
+✓ valid — 4 file(s) checked, 0 warning(s)
+```
+
+失败示例：
+
+```console
+$ a2c-computer plugin validate ./my-marketplace
+Validating marketplace at /abs/my-marketplace
+✗ .tfrobot-plugin/marketplace.json:plugins[1].source [path-missing] local plugin directory not found: 'plugins/auth-tools' (...)
+✗ plugins/data-toolkit/skills/Bad_Name [invalid-skill-name] skill dir name 'Bad_Name' is not strict kebab-case (...)
+✗ invalid — 2 error(s), 0 warning(s)
+$ echo $?
+1
+```
+
+`--json` 输出结构（CI 消费契约面）：
+
+```json
+{
+  "valid": false,
+  "mode": "marketplace",
+  "path": "/abs/my-marketplace",
+  "checked_files": [".tfrobot-plugin/marketplace.json"],
+  "errors":  [{"code": "path-missing", "file": ".tfrobot-plugin/marketplace.json", "location": "plugins[1].source", "message": "..."}],
+  "warnings": [{"code": "remote-source-skipped", "file": ".tfrobot-plugin/marketplace.json", "location": "plugins[0].source", "message": "..."}]
+}
+```
+
 ## 注意事项
 
 1. **Server 名称唯一性**: 相同工具名会冲突，使用 `tool_meta.alias` 设置别名

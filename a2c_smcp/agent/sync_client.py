@@ -8,6 +8,7 @@
 * 描述: 同步Agent客户端实现 / Synchronous Agent client implementation
 """
 
+from collections.abc import Mapping
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
@@ -31,6 +32,7 @@ from a2c_smcp.smcp import (
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
+    PUT_BLOB_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -52,7 +54,7 @@ from a2c_smcp.smcp import (
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
 )
-from a2c_smcp.utils.blob import drain_blob_sync
+from a2c_smcp.utils.blob import PutBlobResult, drain_blob_sync, pump_blob_sync
 from a2c_smcp.utils.handshake import (
     DEFAULT_HANDSHAKE_TRANSPORTS,
     HANDSHAKE_CONNECT_ERRORS,
@@ -562,6 +564,41 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         def _call(computer: str, blob_handle: str, chunk_offset: int, max_chunk_bytes: int) -> dict:
             req = self.create_get_blob_request(computer, blob_handle, chunk_offset, max_chunk_bytes)
             ack = self.call(GET_BLOB_EVENT, req, namespace=self._namespace)
+            return cast(dict, ack)
+
+        return _call
+
+    def put_blob(
+        self,
+        computer: str,
+        data: bytes,
+        *,
+        name_hint: str | None = None,
+        chunk_size: int | None = None,
+        timeout: int = 30,
+    ) -> PutBlobResult:
+        """同步上行落盘（sync mirror of async ``put_blob``；v0.4.0 #196）.
+
+        ``socketio.Client`` 引擎在后台线程驱动收发，阻塞 ``call`` 不阻塞事件循环；错误面与
+        async 版完全一致（含首块 ``TimeoutError`` → ``BlobUploadUnsupportedError`` 归一）。
+        协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3/§7. 完整语义文档
+        见 :meth:`a2c_smcp.agent.client.AsyncSMCPAgentClient.put_blob`.
+        """
+        call = self._make_put_blob_call(computer, timeout)
+        return pump_blob_sync(call, computer, data, name_hint=name_hint, chunk_size=chunk_size)
+
+    def _make_put_blob_call(self, computer: str, timeout: int) -> Any:
+        """构造 :func:`pump_blob_sync` 的 ``call`` 适配器（sync mirror of async ``_make_put_blob_call``）."""
+
+        def _call(
+            upload_id: str | None,
+            chunk_offset: int,
+            eof: bool,
+            chunk: bytes,
+            declaration: Mapping[str, Any] | None,
+        ) -> dict:
+            req = self.create_put_blob_request(computer, upload_id, chunk_offset, eof, chunk, declaration)
+            ack = self.call(PUT_BLOB_EVENT, req, namespace=self._namespace, timeout=timeout)
             return cast(dict, ack)
 
         return _call

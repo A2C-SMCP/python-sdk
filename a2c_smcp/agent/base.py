@@ -9,6 +9,7 @@
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
@@ -32,6 +33,7 @@ from a2c_smcp.smcp import (
     GetToolsRet,
     LeaveOfficeNotification,
     LeaveOfficeReq,
+    PutBlobReq,
     ToolCallReq,
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
@@ -195,6 +197,30 @@ class BaseAgentClient(ABC):
             blob_handle,
             chunk_offset,
             max_chunk_bytes,
+        )
+
+    def create_put_blob_request(
+        self,
+        computer: str,
+        upload_id: str | None,
+        chunk_offset: int,
+        eof: bool,
+        blob: bytes,
+        declaration: Mapping[str, Any] | None = None,
+    ) -> PutBlobReq:
+        """创建上行写入单块请求对象（v0.4.0 #196）/ Create put-blob chunk request object.
+
+        协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3/§7.
+        ``upload_id`` 为 ``None`` 即首块（须携 ``declaration``）；``blob`` 为原始字节（内部 base64）.
+        """
+        return _rb.build_put_blob_request(
+            self.auth_provider.get_agent_config(),
+            computer,
+            upload_id,
+            chunk_offset,
+            eof,
+            blob,
+            declaration,
         )
 
     def process_desktop_response(self, response: GetDeskTopRet, computer: str) -> None:
@@ -552,6 +578,30 @@ class BaseAgentSyncClient(ABC):
             blob_handle,
             chunk_offset,
             max_chunk_bytes,
+        )
+
+    def create_put_blob_request(
+        self,
+        computer: str,
+        upload_id: str | None,
+        chunk_offset: int,
+        eof: bool,
+        blob: bytes,
+        declaration: Mapping[str, Any] | None = None,
+    ) -> PutBlobReq:
+        """创建上行写入单块请求对象（v0.4.0 #196）/ Create put-blob chunk request object.
+
+        协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3/§7.
+        ``upload_id`` 为 ``None`` 即首块（须携 ``declaration``）；``blob`` 为原始字节（内部 base64）.
+        """
+        return _rb.build_put_blob_request(
+            self.auth_provider.get_agent_config(),
+            computer,
+            upload_id,
+            chunk_offset,
+            eof,
+            blob,
+            declaration,
         )
 
     def process_desktop_response(self, response: GetDeskTopRet, computer: str) -> None:

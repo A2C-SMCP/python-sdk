@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import os
+import threading
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
@@ -55,6 +56,7 @@ from a2c_smcp.computer.blob import (
     BlobResolver,
     BlobThresholds,
     BlobTooLargeError,
+    BlobUploadStore,
     SkillBlobResolver,
     ToolspoolBlobResolver,
     ToolspoolBlobStore,
@@ -321,6 +323,10 @@ class Computer(BaseComputer[PromptSession]):
             default_resolvers.update(blob_resolvers)
         self._blob_resolvers: dict[str, BlobResolver] = default_resolvers
         self._blob_thresholds: BlobThresholds = blob_thresholds or default_thresholds()
+        # v0.4.0 #196：client:put_blob 上行会话 store + landingRoot（lazy；见 landing_root / blob_upload_store）
+        self._blob_upload_store: BlobUploadStore | None = None
+        self._landing_root: Path | None = None
+        self._blob_upload_lock = threading.Lock()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
     # The tool call record type is extracted to ToolCallRecord for reuse across modules
@@ -373,6 +379,44 @@ class Computer(BaseComputer[PromptSession]):
         Content-addressed ``.blobspool`` store; written when minting tool_call binary sideband.
         """
         return self._toolspool_store
+
+    @property
+    def landing_root(self) -> Path | None:
+        """``client:put_blob`` 落盘根（v0.4.0 #196，settings 键 ``landingRoot``，config-first）。
+
+        从 settings resolve 取 ``landingRoot``（绝对路径，仅受信 scope 可设——project 供给已被
+        ``TRUSTED_SCOPE_ONLY_FIELDS`` 过滤）。**已配置时进程内缓存**（运行期改值需重启 Computer，
+        部署决策，协议不向 Agent 暴露 root 位置）；未配置时不缓存（每次重查，允许事后落盘配置
+        热启用——:attr:`blob_upload_store` 对 ``None`` root 同样不缓存，二者语义对齐）。
+        未配置 → ``None`` → ``client:put_blob`` 一律 ``4019 forbidden``（fail-closed，零字节落盘）。
+        Cached once resolved-and-set; unset re-queries (hot-enable friendly). ``None`` → fail-closed.
+        """
+        if self._landing_root is None:
+            raw = self._resolve_declared_settings().settings.get("landingRoot")
+            if isinstance(raw, str) and raw:
+                self._landing_root = Path(raw).expanduser()
+        return self._landing_root
+
+    @property
+    def blob_upload_store(self) -> BlobUploadStore:
+        """``client:put_blob`` 上传会话表（双检锁 lazy 构造；v0.4.0 #196）。
+
+        **已配置 landing root 后进程内单例**（会话状态只在 store 内存里，替换实例即丢会话；
+        async 事件并发首访由 :attr:`_blob_upload_lock` 双检锁串行化）。**未配置时不缓存**：
+        ``None``-root store 拒绝一切上传（4019 forbidden）、不可能持有任何会话，重建零代价——
+        与 :attr:`landing_root` 的「未配置热启用」语义对齐（先 forbidden 后补配置可即时生效）。
+        Singleton once a landing root is resolved; ``None``-root stores are never cached.
+        """
+        store = self._blob_upload_store
+        if store is not None:
+            return store
+        with self._blob_upload_lock:
+            if self._blob_upload_store is None:
+                candidate = BlobUploadStore(self.landing_root, self._blob_thresholds)
+                if candidate.landing_root is None:
+                    return candidate  # 未配置：不缓存（与 landing_root 热启用语义对齐）
+                self._blob_upload_store = candidate
+            return self._blob_upload_store
 
     def mint_toolspool_handle(self, payload: bytes, mime: str) -> str:
         """铸造 ``kind=toolspool`` 不透明句柄并写盘 / Mint an opaque ``kind=toolspool`` handle.

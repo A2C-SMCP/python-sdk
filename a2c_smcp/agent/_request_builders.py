@@ -21,7 +21,10 @@
     The `uuid.uuid4().hex` semantics are unchanged (one call per request).
 """
 
+import base64
 import uuid
+from collections.abc import Mapping
+from typing import Any
 
 from a2c_smcp.agent.types import AgentConfig
 from a2c_smcp.smcp import (
@@ -32,6 +35,7 @@ from a2c_smcp.smcp import (
     GetSkillReq,
     GetSkillsReq,
     GetToolsReq,
+    PutBlobReq,
     ToolCallReq,
 )
 
@@ -228,6 +232,42 @@ def build_get_blob_request(
         req["chunk_offset"] = chunk_offset
     if max_chunk_bytes is not None:
         req["max_chunk_bytes"] = max_chunk_bytes
+    return req
+
+
+def build_put_blob_request(
+    agent_config: AgentConfig,
+    computer: str,
+    upload_id: str | None,
+    chunk_offset: int,
+    eof: bool,
+    blob: bytes,
+    declaration: Mapping[str, Any] | None = None,
+) -> PutBlobReq:
+    """创建上行写入单块请求对象（v0.4.0 #196）/ Create put-blob chunk request object.
+
+    协议依据 / Protocol: events.md §client:put_blob；data-structures.md §PutBlobReq；
+    blob-transfer.md §3（in-order ack-paced）/ §7（landing 沙箱）.
+
+    ``upload_id`` 为 ``None`` 即首块，此时 ``declaration``（``total_size`` / ``sha256`` /
+    可选 ``name_hint``）**必须**提供；后续块 ``declaration`` 必须为 ``None``（协议 MUST NOT
+    携带声明字段）。``blob`` 为**原始字节**，本函数内 base64 编码。
+    """
+    req: PutBlobReq = {
+        "agent": agent_config["agent"],
+        "req_id": uuid.uuid4().hex,
+        "computer": computer,
+        "chunk_offset": chunk_offset,
+        "eof": eof,
+        "blob": base64.b64encode(blob).decode("ascii"),
+    }
+    if upload_id is not None:
+        req["upload_id"] = upload_id
+    if declaration is not None:
+        req["total_size"] = int(declaration["total_size"])
+        req["sha256"] = str(declaration["sha256"])
+        if declaration.get("name_hint") is not None:
+            req["name_hint"] = str(declaration["name_hint"])
     return req
 
 

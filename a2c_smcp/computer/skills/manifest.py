@@ -179,6 +179,25 @@ def _as_str_path_list(value: Any) -> list[str]:
     return []
 
 
+def skill_override_raw_paths(
+    entry: Mapping[str, Any],
+    plugin_manifest: Mapping[str, Any],
+    *,
+    strict: bool,
+) -> list[str]:
+    """归一后的 ``skills`` 覆写**原始**路径列表（未做存在性 / 越界过滤）/ Normalized raw skills override paths.
+
+    源 = ``entry.skills``（恒取）+ ``plugin_manifest.skills``（仅 strict=true），``string | array<string>``
+    归一、非 str 项静默跳过（:func:`_as_str_path_list` 同姿态）。:func:`resolve_skill_override_dirs`
+    （装载路径，容错跳过）与 :mod:`~a2c_smcp.computer.skills.validator`（校验路径，逐项报错）共同消费本
+    函数——归一规则单一权威 / Consumed by both the tolerant loader and the strict validator.
+    """
+    raw: list[str] = _as_str_path_list(entry.get("skills"))
+    if strict:
+        raw.extend(_as_str_path_list(plugin_manifest.get("skills")))
+    return raw
+
+
 def resolve_skill_override_dirs(
     entry: Mapping[str, Any],
     plugin_manifest: Mapping[str, Any],
@@ -193,9 +212,7 @@ def resolve_skill_override_dirs(
     （越界记 ERROR 跳过，**不抛**），非目录记 WARNING 跳过；override 间按 resolve 后路径去重保序（与约定 ``skills/``
     的去重交扫描方）。返回的是**容器**目录（其下 ``<name>/SKILL.md`` 为单个 SKILL，与约定 ``skills/`` 同构）。
     """
-    raw: list[str] = _as_str_path_list(entry.get("skills"))
-    if strict:
-        raw.extend(_as_str_path_list(plugin_manifest.get("skills")))
+    raw = skill_override_raw_paths(entry, plugin_manifest, strict=strict)
 
     plugin_root_resolved = plugin_root.resolve()
     out: list[Path] = []

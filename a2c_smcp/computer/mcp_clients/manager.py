@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, NoReturn, cast
 
 from mcp.client.session import MessageHandlerFnT
@@ -62,6 +63,38 @@ from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
+
+
+@dataclass(frozen=True)
+class _ServerDeclaredToolMeta:
+    """Server 声明层白名单输入（协议 §ToolMeta 三层合并规则：白名单**仅 tags** 一项）。
+
+    MUST NOT 复用完整 ``ToolMeta`` 作输入模型——``ToolMeta`` 为 ``extra="allow"``，直接构造会把
+    ``auto_apply`` 等白名单外字段静默收进 canonical（提权向量，Disc#56 本侧确认 P1、裁决不变量 2）。
+    """
+
+    tags: list[str] | None = None
+
+
+def _parse_server_declared_tool_meta(raw: Any) -> tuple[_ServerDeclaredToolMeta | None, str | None]:
+    """解析 ``Tool._meta["a2c_tool_meta"]`` Server 声明 → ``(合法提取物, None)`` 或 ``(None, 丢弃原因)``。
+
+    畸形判据仅两条（协议 §ToolMeta 三层合并规则）：声明非对象 / ``tags`` 非 ``list[str]``；
+    含白名单外字段（``auto_apply`` 等）**合法**——字段级过滤，值不参与合并、声明其余部分仍生效。
+
+    Parse the server-declared ``a2c_tool_meta`` (native dict in ``Tool._meta``, NOT a JSON string):
+    malformed = non-object or ``tags`` not ``list[str]``; extra whitelist-external fields are fine (field-level filter).
+    """
+    if not isinstance(raw, dict):
+        return None, "声明非对象"
+    raw_tags = raw.get("tags")
+    if raw_tags is None:
+        # 缺失或显式 null：合法声明但无 tags → 继承下一层。
+        return _ServerDeclaredToolMeta(tags=None), None
+    if isinstance(raw_tags, list) and all(isinstance(t, str) for t in raw_tags):
+        return _ServerDeclaredToolMeta(tags=raw_tags), None
+    return None, "tags 非 list[str]"
+
 
 # SKILL 资源枚举翻页安全上界：防御恒非空 cursor（server bug / 恶意）导致的无限循环挂死物化。
 # Pagination safety bound for SKILL enumeration: guard against a never-terminating cursor hanging staging.
@@ -1556,6 +1589,8 @@ class MCPServerManager:
                 servers_cached_tools[bundle_id] = await client.list_tools()
         # ③ 组装候选（改名副本 + A2C meta；携发布校验所需的路由/身份/世代证据）
         candidates: list[tuple[EXPOSED_TOOL_NAME, BUNDLE_ID, TOOL_NAME, MCPClientProtocol, int, Tool]] = []
+        # 畸形声明诊断：每 server 每次 tools/list 刷新至多一次（#151 R1' 防刷屏先例，协议 config-diagnostics 按 server 聚合）。
+        warned_servers: set[BUNDLE_ID] = set()
         for exposed_name, bundle_id, original_tool_name, client, generation, config in snapshots:
             tools = servers_cached_tools.get(bundle_id)
             if tools is None:
@@ -1563,14 +1598,41 @@ class MCPServerManager:
             tool = next((t for t in tools if t.name == original_tool_name), None)
             if tool is None:
                 continue
-            a2c_meta = self._merged_tool_meta(config, original_tool_name)
+            # 无条件 reconcile（协议 §ToolMeta 三层合并规则，protocol#51 / PR#57 裁决）：对每个 Tool 消费并校验
+            # Server 声明（即使 tool_meta 与 default_tool_meta 均不存在）；恒以 dict(tool.meta) 起底，按四分支
+            # 覆写/pop：无声明→现状（配置非空才写）／合法→三层 canonical 恒覆写／非法→丢弃+诊断+配置 canonical
+            # 或 pop。原生 _meta 其它 key 全程原样保留（shallow copy）。
+            # 以 **key 存在性**判定有无声明——显式 null 声明（a2c_tool_meta: null）属「声明非对象」畸形判据，
+            # 不得以值判空短路为「无声明」（否则 key 原样出线、违反 canonical-final）。
+            config_meta = self._merged_tool_meta(config, original_tool_name)
+            merged_meta = dict(tool.meta) if tool.meta else {}
+            if A2C_TOOL_META not in merged_meta:
+                # 无声明：维持现状（配置合并产物非空才写）。
+                if config_meta:
+                    merged_meta[A2C_TOOL_META] = config_meta
+            else:
+                declared, invalid_reason = _parse_server_declared_tool_meta(merged_meta[A2C_TOOL_META])
+                if invalid_reason is not None:
+                    # 畸形声明 → 丢弃 + 本地诊断（MUST NOT 令 tools/list 失败或工具消失）。
+                    if bundle_id not in warned_servers:
+                        warned_servers.add(bundle_id)
+                        logger.warning(
+                            f"畸形 ToolMeta Server 声明（bundle_id={bundle_id!r}, server={config.name!r}, "
+                            f"tool={original_tool_name!r}）：{invalid_reason}——声明已丢弃（Computer 本地诊断，非协议错误码）。"
+                        )
+                    # 有配置终值 → 配置 canonical（维持现状）；无 → 删除该 key。
+                    if config_meta:
+                        merged_meta[A2C_TOOL_META] = config_meta
+                    else:
+                        merged_meta.pop(A2C_TOOL_META, None)
+                else:
+                    # 合法声明：三层合并 canonical 恒覆写（含「合法+无配置」→ tags-only canonical）。
+                    merged_meta[A2C_TOOL_META] = self._merged_tool_meta(
+                        config, original_tool_name, server_declared=declared
+                    )
             # 产出名字改写后的**副本**（改 name 为 exposed_name），避免原地 mutate 缓存对象。
             # Yield a renamed copy (name=exposed_name) to avoid mutating the cached tool object.
-            update: dict[str, Any] = {"name": exposed_name}
-            if a2c_meta:
-                merged_meta = dict(tool.meta) if tool.meta else {}
-                merged_meta[A2C_TOOL_META] = a2c_meta
-                update["meta"] = merged_meta
+            update: dict[str, Any] = {"name": exposed_name, "meta": merged_meta}
             candidates.append((
                 exposed_name,
                 bundle_id,
@@ -1706,10 +1768,21 @@ class MCPServerManager:
         return details
 
     @staticmethod
-    def _merged_tool_meta(config: MCPServerConfig, tool_name: TOOL_NAME) -> ToolMeta | None:
+    def _merged_tool_meta(
+        config: MCPServerConfig,
+        tool_name: TOOL_NAME,
+        server_declared: _ServerDeclaredToolMeta | None = None,
+    ) -> ToolMeta | None:
         """
-        浅层合并工具元数据：优先使用具体 tool_meta，若字段缺失则回落到 default_tool_meta。
-        Shallow merge ToolMeta: prefer per-tool meta; fallback to default for missing root-level fields.
+        三层合并工具元数据（协议 v0.4.0 §ToolMeta 三层合并规则，protocol#51 / PR#57 裁决）：
+
+            tool_meta[tool]（配置最具体） > default_tool_meta（配置默认） > Server 声明（最低层，白名单仅 tags）
+
+        Server 声明层恒为最低层：配置 tags 缺失/null 时回落声明值（``[]`` 显式清除、不回落）；其余字段
+        （auto_apply/alias/ret_object_mapper）仅来自配置。``server_declared=None`` 时保持纯 config 两层合并
+        （#199 裁决③：acall_tool / get_tool_meta / _arefresh_tool_mapping 三个 config-only 消费点零行为差）。
+
+        Three-layer merge: per-tool meta > default meta > server-declared tags (whitelist only `tags`).
 
         **例外（#151 R1'）**：``alias`` **绝不**从 ``default_tool_meta`` 继承——``alias`` 语义天生 per-tool（把某个工具
         改名），放 default 位会落到该 server 每一个未单独配 alias 的工具、令其 exposed 名全塌成同一个（first-wins 静默
@@ -1723,17 +1796,28 @@ class MCPServerManager:
         specific = (config.tool_meta or {}).get(tool_name)
         default = config.default_tool_meta
         if specific is None and default is None:
-            return None
+            # 无配置：合法声明 → tags-only canonical（可能全 null）；无声明 → None（维持现状）。
+            if server_declared is None:
+                return None
+            return ToolMeta(tags=server_declared.tags)
         if specific is None:
             # 无 per-tool meta：继承 default 的非 alias 字段，alias 强制置空（#151 R1'）。
-            return default.model_copy(update={"alias": None}) if default is not None else None
-        if default is None:
-            return specific
-        # 仅根级字段浅合并；specific优先
-        merged: dict = {}
-        # Pydantic v2: model_dump 可排除 None，以避免用 None 覆盖
-        merged.update(default.model_dump(exclude_none=True))
-        merged.update(specific.model_dump(exclude_none=True))
-        # #151 R1'：alias 只认 per-tool（specific），绝不采纳 default 带入的 alias。
-        merged["alias"] = specific.alias
-        return ToolMeta(**merged)
+            config_meta = default.model_copy(update={"alias": None}) if default is not None else None
+        elif default is None:
+            config_meta = specific
+        else:
+            # 仅根级字段浅合并；specific优先
+            merged: dict = {}
+            # Pydantic v2: model_dump 可排除 None，以避免用 None 覆盖
+            merged.update(default.model_dump(exclude_none=True))
+            merged.update(specific.model_dump(exclude_none=True))
+            # #151 R1'：alias 只认 per-tool（specific），绝不采纳 default 带入的 alias。
+            merged["alias"] = specific.alias
+            config_meta = ToolMeta(**merged)
+        if config_meta is None:
+            # 不可达（specific/default 双 None 已提前返回）——仅满足类型收窄。
+            return None
+        # 第三层回落：config 终值 tags 缺失/null（exclude_none 已剔除）→ 采纳 Server 声明 tags。
+        if server_declared is not None and config_meta.tags is None:
+            return config_meta.model_copy(update={"tags": server_declared.tags})
+        return config_meta

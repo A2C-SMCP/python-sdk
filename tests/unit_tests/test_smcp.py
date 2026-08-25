@@ -183,7 +183,7 @@ class TestTypedDictsV021:
         v0.2.2: 4 required fields encoded in ``__required_keys__`` so the type checker catches omissions."""
         assert A2CSkillRef.__required_keys__ == frozenset({"name", "source", "path", "description"})
         assert A2CSkillRef.__optional_keys__ == frozenset(
-            {"uri", "license", "compatibility", "allowed_tools", "version", "skill_metadata"},
+            {"uri", "license", "compatibility", "allowed_tools", "tags", "version", "skill_metadata"},
         )
         # 含全部 4 必选的最小 ref 合法 / minimal ref carrying all 4 required is valid
         ref: A2CSkillRef = {
@@ -207,10 +207,12 @@ class TestTypedDictsV021:
             "license": "MIT",
             "compatibility": ">=0.2.1",
             "allowed_tools": ["read", "grep"],
+            "tags": ["dev", "review"],
             "version": "1.0.0",
             "skill_metadata": {"author": "alice"},
         }
         assert ref["allowed_tools"] == ["read", "grep"]
+        assert ref["tags"] == ["dev", "review"]
         assert ref["skill_metadata"]["author"] == "alice"
 
     def test_a2c_skill_ref_uri_only_for_mcp_source(self) -> None:

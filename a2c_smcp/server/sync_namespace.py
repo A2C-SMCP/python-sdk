@@ -30,6 +30,7 @@ from a2c_smcp.smcp import (
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    PUT_BLOB_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -58,6 +59,8 @@ from a2c_smcp.smcp import (
     LeaveOfficeReq,
     ListRoomReq,
     ListRoomRet,
+    PutBlobReq,
+    PutBlobRet,
     SessionInfo,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
@@ -527,6 +530,17 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         return cast(
             "GetBlobRet | ErrorPayload",
             self._relay_client_call(sid, data, GET_BLOB_EVENT, TypeAdapter(GetBlobRet)),
+        )
+
+    def on_client_put_blob(self, sid: str, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
+        """同步：透明转发 ``client:put_blob`` / Sync relay of ``client:put_blob`` (v0.4.0 #196).
+
+        Server **不**缓冲 / 重组，按 ``computer`` 逐 ack 透传（与 async 一致）.
+        Server does NOT buffer/reassemble; each chunk is a separate ack (mirrors async).
+        """
+        return cast(
+            "PutBlobRet | ErrorPayload",
+            self._relay_client_call(sid, data, PUT_BLOB_EVENT, TypeAdapter(PutBlobRet)),
         )
 
     def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq) -> None:

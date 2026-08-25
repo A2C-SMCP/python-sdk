@@ -31,6 +31,7 @@ from a2c_smcp.smcp import (
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    PUT_BLOB_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -59,6 +60,8 @@ from a2c_smcp.smcp import (
     LeaveOfficeReq,
     ListRoomReq,
     ListRoomRet,
+    PutBlobReq,
+    PutBlobRet,
     SessionInfo,
     ToolCallReq,
     UpdateComputerConfigReq,
@@ -649,6 +652,18 @@ class SMCPNamespace(BaseNamespace):
         return cast(
             "GetBlobRet | ErrorPayload",
             await self._relay_client_call(sid, data, GET_BLOB_EVENT, TypeAdapter(GetBlobRet)),
+        )
+
+    async def on_client_put_blob(self, sid: str, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
+        """透明转发 ``client:put_blob`` 至目标 Computer / Relay ``client:put_blob`` (v0.4.0 #196).
+
+        与 ``client:get_blob`` 同构：Server **不**缓冲 / 重组，按 ``computer`` 逐 ack 透传；
+        in-order 推进（ack-paced）由 Agent 侧 pump 例程保证，Computer 的 4019 flat ErrorPayload
+        原样回传。协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3（上行）.
+        """
+        return cast(
+            "PutBlobRet | ErrorPayload",
+            await self._relay_client_call(sid, data, PUT_BLOB_EVENT, TypeAdapter(PutBlobRet)),
         )
 
     async def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq) -> None:

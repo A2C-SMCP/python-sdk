@@ -434,9 +434,9 @@ def _partition_roots(resources: Sequence[Resource]) -> tuple[list[Resource], dic
 # ── A2CSkillRef 合成 / ref construction ─────────────────────────────────────
 def _apply_frontmatter_optional_fields(ref: A2CSkillRef, frontmatter: dict[str, Any]) -> None:
     """
-    把 frontmatter 派生的**可选**字段写入 ref（两源共用）/ Apply frontmatter-derived optional fields。
+    把 frontmatter 派生的**可选**字段写入 ref（三源共用）/ Apply frontmatter-derived optional fields。
 
-    ``license`` / ``compatibility`` / ``allowed-tools`` / ``metadata`` 的语义不分源；``name`` / ``source`` /
+    ``license`` / ``compatibility`` / ``allowed-tools`` / ``tags`` / ``metadata`` 的语义不分源；``name`` / ``source`` /
     ``path`` / ``description`` / ``version`` 由各源各自填（语义不同，见 :func:`_build_ref` / :func:`_build_user_ref`）。
     """
     if frontmatter.get("license") is not None:
@@ -446,6 +446,17 @@ def _apply_frontmatter_optional_fields(ref: A2CSkillRef, frontmatter: dict[str, 
     allowed = frontmatter.get("allowed-tools", frontmatter.get("allowed_tools"))
     if allowed is not None:
         ref["allowed_tools"] = [str(t) for t in allowed] if isinstance(allowed, (list, tuple)) else [str(allowed)]
+    # tags 纯透传不校验（skill.md §1.5）：严格 list[str] 才填 ref；畸形（含 None）→ 省略 + DEBUG，
+    # SKILL 照常注册。**勿照抄 allowed-tools 的强制规范化**——tags 无键时响应键整个缺席（非 null）。
+    if "tags" in frontmatter:
+        tags = frontmatter["tags"]
+        if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
+            ref["tags"] = tags
+        else:
+            logger.debug(
+                "frontmatter 'tags' is not list[str] (%r); field omitted, SKILL still registers (skill.md §1.5)",
+                tags,
+            )
     if isinstance(frontmatter.get("metadata"), dict):
         ref["skill_metadata"] = frontmatter["metadata"]
 
@@ -639,9 +650,10 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
     缺 ``description`` / SKILL.md 不可读 → 记 ERROR + ``None``（跳过该 SKILL）。``frontmatter.name`` 与
     目录 basename 不一致 → DEBUG（basename 权威，就地不可改名）。
 
-    **无 ``version``**：SKILL.md frontmatter 恰好 6 字段（name/description/license/compatibility/metadata/
-    allowed-tools），不含 version（协议 skill.md §6 / 设计 §1.2）；``version`` 仅来自 manifest——mcp 取自
-    ``_meta``、marketplace 取自 plugin.json/entry，而 user 源无任何 manifest，故 user SKILL 不带 version。
+    **无 ``version``**：SKILL.md frontmatter 恰好 7 字段（name/description/license/compatibility/tags/metadata/
+    allowed-tools，marketplace SKILL v1 §3），不含 version（协议 skill.md §6 / 设计 §1.2）；``version`` 仅来自
+    manifest——mcp 取自 ``_meta``、marketplace 取自 plugin.json/entry，而 user 源无任何 manifest，故 user SKILL
+    不带 version。``tags`` 纯透传不校验（skill.md §1.5）。
     """
     skill_md = skill_dir / SKILL_MD
     try:

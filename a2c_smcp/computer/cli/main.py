@@ -29,6 +29,7 @@ from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.cli.commands import skill as skill_cmd
+from a2c_smcp.computer.cli.commands import validate as validate_cmd
 from a2c_smcp.computer.cli.completer import A2CCompleter
 from a2c_smcp.computer.cli.interactive_impl import interactive_loop as _interactive_loop_impl
 from a2c_smcp.computer.cli.utils import (
@@ -580,6 +581,18 @@ def _plugin_gc(
         ),
     )
     raise typer.Exit(code)
+
+
+# plugin validate / marketplace validate 双入口 alias（#193 用户裁决）：同一 handler，两族各挂一名。
+# Dual entry alias: one handler registered under both the plugin and marketplace sub-apps.
+@plugin_app.command("validate")
+@marketplace_app.command("validate")
+def _validate(
+    path: str = typer.Argument(..., help="marketplace 根或 plugin 目录 / marketplace root or plugin dir"),
+    json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
+) -> None:
+    """校验 marketplace/plugin 配置（零副作用；0=通过 非0=有错）/ Validate manifests (side-effect free)."""
+    raise typer.Exit(validate_cmd.plugin_validate(Path(path), json_output=json_output))
 
 
 # ── settings 子命令 / settings subcommands ────────────────────────────────────
