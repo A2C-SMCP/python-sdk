@@ -7,10 +7,24 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 > 注：v0.3.1 / v0.3.2 发版时未单独切段（Bugfix / OAuth 收敛类），本段累积至 [0.3.0]。
 
-## [Unreleased]
+## [0.4.0] - 2026-08-25
+
+> **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。
 
 ### Added
-- **ToolMeta 三层合并：Server 声明 tags**（#199，镜像 protocol#51 / PR#57 裁决，v0.4.0）：MCP Server 可在
+- **CLI `plugin validate` / `marketplace validate` 配置校验命令**（#193）：`a2c plugin validate <path>` /
+  `a2c marketplace validate <path>` 校验 marketplace 根或 plugin 目录的配置，零副作用（只读校验，不做任何
+  写入/安装），退出码 0=通过 / 非 0=有错，`--json` 输出结构化诊断，供自动化管线部署前把关。
+- **`client:put_blob` 上行写入通道**（#196，protocol#12/PR#53）：Agent 侧新增 `create_put_blob_request()`
+  （async + sync 双面），构建上行 blob 写入请求（`PutBlobReq`），打通 Agent → Computer 的大对象上行通道，
+  与既有下行 `drain_blob` 对称。
+- **A2CSkillRef.tags 加性字段透传**（#198，protocol#50/PR#55 裁决）：`client:get_skills` 返回的
+  `A2CSkillRef` 新增可选 `tags`（SKILL.md frontmatter `tags` 透传，分类元数据；非 `list[str]` → 字段省略，
+  纯透传不校验）。
+- **动态 Socket.IO auth provider 暴露**（#200，方案 C 原生透传）：`AuthProvider` 类型面从
+  `a2c_smcp.computer` 导出，`SMCPComputerClient` 支持宿主在运行期注入/更新连接鉴权 provider，不再限于
+  构造期静态配置。
+- **ToolMeta 三层合并：Server 声明 tags**（#199，镜像 protocol#51 / PR#57 裁决）：MCP Server 可在
   `Tool._meta["a2c_tool_meta"]` 声明默认 `tags`，合并语义升为
   `tool_meta[tool] > default_tool_meta > Server 声明`（tags 整体替换不 union；缺失/null 继承、
   `[]` 显式清除）。`available_tools` 对每个 Tool 无条件 reconcile 并校验声明，畸形声明（非对象 /
