@@ -60,6 +60,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
 from a2c_smcp.computer.mcp_clients.utils import client_factory
 from a2c_smcp.types import BUNDLE_ID, EXPOSED_TOOL_NAME, SERVER_NAME, TOOL_NAME
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.cancellation import restores_cancellation
 from a2c_smcp.utils.logger import get_logger, truncate
 
 logger = get_logger("computer")
@@ -476,6 +477,9 @@ class MCPServerManager:
                 f"create_oauth_flow/complete_oauth.",
             )
 
+    # #211：CLI REPL 的 `start all` 直接 await 本入口（外层 `except Exception` 捕不到 CancelledError，
+    # 吞掉取消会表现为「回车没反应」）；其子树经 client 状态机，故在此还原信号。
+    @restores_cancellation
     async def astart_all(self) -> None:
         """启动所有启用的服务器
 
@@ -490,6 +494,9 @@ class MCPServerManager:
                     continue
                 await self._astart_client_auto(bundle_id)
 
+    # #211：同上（CLI `start <target>`）；私有 `_astart_client` 保持裸奔 —— 它位于逐 client 循环内，
+    # 在此层补抛才会中断循环。
+    @restores_cancellation
     async def astart_client(self, bundle_id: BUNDLE_ID) -> None:
         """启动单个服务器客户端（按 bundle_id）。"""
         async with self._lock:
@@ -1035,6 +1042,8 @@ class MCPServerManager:
         if task is not None:
             task.cancel()
 
+    # #211：同上（CLI `stop <target>`）；私有 `_astop_client` 保持裸奔，理由见上。
+    @restores_cancellation
     async def astop_client(self, bundle_id: BUNDLE_ID) -> None:
         """停止单个服务器客户端（按 bundle_id）。"""
         async with self._lock:
@@ -1072,6 +1081,8 @@ class MCPServerManager:
         for bid in list(all_ids):
             await self._astop_client(bid)
 
+    # #211：同上（CLI `stop all`）；私有 `_astop_all` 保持裸奔，理由见上。
+    @restores_cancellation
     async def astop_all(self) -> None:
         """停止所有客户端"""
         async with self._lock:
@@ -1096,8 +1107,16 @@ class MCPServerManager:
             task.cancel()
         self._oauth_connect_tasks.clear()
 
+    @restores_cancellation
     async def aclose(self) -> None:
-        """关闭所有连接（别名）"""
+        """关闭所有连接（别名）。
+
+        #211：``@restores_cancellation`` —— 其下的 ``client.adisconnect()`` 会经过 client 状态机，
+        而 ``AsyncMachine.process_context`` **按设计**吞掉回调内抛出的 ``CancelledError``；不还原的话，
+        宿主 ``wait_for(manager.aclose(), t)`` 会「正常返回」、拿不到超时信号。装饰点必须是本层（最外层
+        入口）而非更内层：在 ``_astop_all`` 循环中途补抛会让**剩余 client 不再被停止**、``_clear_all`` 被
+        跳过 —— 见 :mod:`a2c_smcp.utils.cancellation` 的「只挂最外层」约束。
+        """
         await self.astop_all()
 
         # 2. 清空所有状态存储

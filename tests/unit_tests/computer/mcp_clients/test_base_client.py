@@ -5,10 +5,12 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 import asyncio
+import logging
 from asyncio import Queue
 from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 from mcp import ClientSession
 from mcp.types import (
@@ -24,6 +26,7 @@ from mcp.types import (
 from pydantic import BaseModel
 from transitions.core import MachineError
 
+from a2c_smcp.computer.mcp_clients import base_client as base_client_mod
 from a2c_smcp.computer.mcp_clients.base_client import STATES, BaseMCPClient
 
 
@@ -506,3 +509,123 @@ async def test_emit_mcp_cancelled_builds_client_notification(client):
     # send_notification 抛错也不应外泄（best-effort）/ failures are swallowed
     session.send_notification = AsyncMock(side_effect=RuntimeError("boom"))
     await client_instance._emit_mcp_cancelled(session, 100)  # 不抛异常即通过
+
+
+# ------------------------------
+# #211 停机收敛：关闭信号是无条件承诺 + 断开等待有上界
+# ------------------------------
+
+
+class _ExplodingExitStack:
+    """替身 exit stack：``aclose()`` 抛 ``ExceptionGroup(BrokenResourceError)``。
+
+    即 #211 的真实拆除异常形态 —— 拆除窗口内服务端消息到达时，mcp stdio 的 ``stdout_reader``
+    向已关闭的读流 ``send`` → anyio task group 聚合为该 ExceptionGroup。
+    """
+
+    def __init__(self) -> None:
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [anyio.BrokenResourceError()])
+
+
+async def _connected_client() -> InitializeResultTestClient:
+    """连上假会话的 client（供 #211 用例复用）。"""
+    client = InitializeResultTestClient(DummyParams())
+    await client.aconnect()
+    await client._create_session_success_event.wait()
+    return client
+
+
+@pytest.mark.asyncio
+async def test_closed_signal_survives_teardown_exception():
+    """#211：``aclose()`` 抛异常不得让关闭信号与状态清理缺席 —— 否则 on_enter_disconnected 永久等待。"""
+    client = await _connected_client()
+    # 前置非空断言：确有需要被清理的状态（防空过）/ preconditions must be non-vacuous
+    assert client.initialize_result is not None
+    assert not client._async_session_closed_event.is_set()
+
+    # 播种非空，令「已清空」断言非空过 / seed non-empty so the cleared-assertion is not vacuous
+    client._subscribed_window_uris.add("window://seed.example/main")
+    exploding = _ExplodingExitStack()
+    client._aexit_stack = exploding  # type: ignore[assignment]
+
+    # 缺陷形态：拆除异常跳过 finally 后半段 → 信号缺席 → 只能在 wait_for 超时处「正常返回」
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+
+    assert exploding.aclose_calls == 1, "拆除必须真的发生过（否则后续断言整体空过）"
+    assert client._async_session_closed_event.is_set(), "aclose() 抛异常时关闭信号仍须照常置位"
+    assert client._async_session is None, "会话引用必须被清理"
+    assert client.initialize_result is None, "初始化结果必须被清理"
+    assert client._subscribed_window_uris == set(), "会话级订阅集合必须随会话拆除清空"
+
+
+@pytest.mark.asyncio
+async def test_closed_signal_and_cleanup_on_normal_teardown():
+    """阴性对照：正常拆除路径同样置位并清理（防上条断言只在异常路径下成立）。"""
+    client = await _connected_client()
+    assert client.initialize_result is not None
+    client._subscribed_window_uris.add("window://seed.example/main")
+
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+
+    assert client._async_session_closed_event.is_set()
+    assert client._async_session is None
+    assert client.initialize_result is None
+    assert client._subscribed_window_uris == set()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_wait_is_bounded_when_signal_never_arrives(monkeypatch):
+    """#211 兜底：``_close_task`` 的早退分支可能永不置位信号 → 断开等待必须有上界，不得永久等待。"""
+    monkeypatch.setattr(base_client_mod, "_TEARDOWN_TIMEOUT", 0.3)
+    client = await _connected_client()
+
+    async def _never_signals() -> None:
+        """桩：既不拆除也不置位关闭信号（等价于 _close_task 的早退分支）"""
+
+    client._close_task = _never_signals  # type: ignore[method-assign]
+    kill_spy = AsyncMock()
+    client._aforce_kill = kill_spy  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    elapsed = loop.time() - started
+
+    assert elapsed < 1.0, f"断开必须在有界时间内返回，实测 {elapsed:.2f}s"
+    assert client.state == STATES.disconnected
+    assert kill_spy.await_count == 1, "信号缺席 = 拆除状态未知 → 兜底须强杀子进程树"
+
+    # 清理：_close_task 被桩掉 → keep-alive 任务仍在等关闭信号
+    client._close_event.set()
+    task = client._session_keep_alive_task
+    if task is not None and not task.done():
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_teardown_error_is_logged_as_warning_not_error():
+    """#211：拆除异常属非致命（信号已置位、停机已收敛）→ 日志级别须为 WARNING，不得暗示「启动失败」。"""
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    # a2c_smcp 包 logger propagate=False（不向根传播），故直接挂到子 logger 上捕获
+    target = logging.getLogger("a2c_smcp.computer")
+    handler = _Collect()
+    target.addHandler(handler)
+    try:
+        client = await _connected_client()
+        client._aexit_stack = _ExplodingExitStack()  # type: ignore[assignment]
+        await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    finally:
+        target.removeHandler(handler)
+
+    teardown = [r for r in records if "teardown error" in r.getMessage()]
+    assert teardown, "拆除异常必须留下日志记录（否则本断言空过）"
+    assert [r.levelname for r in teardown] == ["WARNING"] * len(teardown), [r.levelname for r in teardown]

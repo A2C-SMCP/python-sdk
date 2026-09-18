@@ -124,6 +124,7 @@ from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.cancellation import restores_cancellation
 from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.env_segment import raise_on_env_name_collisions
 from a2c_smcp.utils.logger import get_logger, truncate
@@ -485,10 +486,15 @@ class Computer(BaseComputer[PromptSession]):
 
     # ── boot ───────────────────────────────────────────────────────────────
 
+    @restores_cancellation
     async def boot_up(self, *, session: PromptSession | None = None) -> None:
         """
         启动计算机，初始化 MCP 服务器管理器。
         Boot up the computer and initialize the MCP server manager.
+
+        #211：``@restores_cancellation`` —— 内部 ``manager.ainitialize`` 会经过 client 状态机，其
+        ``process_context`` 按设计吞掉外部取消；装饰器在收尾处还原信号（见
+        :mod:`a2c_smcp.utils.cancellation`）。
 
         #192 / §5.13：boot 只做 **raw 声明形状校验 + 登记**，**不解析 input 值**（对齐 rust PR#190——input
         值与 command 不在 boot 解析，其结构化错误从下一次实际 start/restart surface）。auto-connect server
@@ -1593,6 +1599,7 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._input_resolver.clear_cache(input_id)
 
+    @restores_cancellation
     async def shutdown(self, *, session: PromptSession | None = None) -> None:
         """
         关闭计算机，关闭 MCP 服务器管理器。
@@ -1600,6 +1607,11 @@ class Computer(BaseComputer[PromptSession]):
 
         v0.2.1（#67）：先停 user 源文件 watcher（不再产生新事件），再关去抖器（丢弃挂起 emit），最后关
         MCP 管理器。Stop the file watcher, close the debouncer (drop pending emit), then the MCP manager.
+
+        #211：``@restores_cancellation`` —— 停机链路上多处按设计吞掉 ``CancelledError``（第三方状态机的
+        ``process_context``、``_close_task`` 的等待、``contextlib.suppress``），会让 ``wait_for`` /
+        ``asyncio.timeout`` 因协程「正常返回」而不抛 ``TimeoutError``，嵌入宿主拿不到超时信号。装饰器在
+        收尾处按**计数快照**还原本次调用期间被吞的取消。详见 :mod:`a2c_smcp.utils.cancellation`。
         """
         if self._skill_watcher is not None:
             self._skill_watcher.stop()

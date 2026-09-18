@@ -288,16 +288,33 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
 
         finally:
             # 关闭上下文
-            await self._aexit_stack.aclose()
-            # 清理session
-            self._async_session = None
-            # 清理初始化结果，确保会话真正关闭时协议初始化态一并清理
-            # Cleanup InitializeResult to align with actual session teardown
-            self._initialize_result = None
-            # 会话关闭即清空已订阅集合：订阅随会话失效，重连后须重新订阅（幂等性以会话为界）。
-            # Subscriptions die with the session; clear so a reconnect re-subscribes (idempotency is per-session).
-            self._subscribed_window_uris.clear()
-            self._async_session_closed_event.set()
+            #
+            # ⚠️ #211 不变量：**关闭信号是无条件承诺**。``_async_session_closed_event`` 的语义是
+            #    「拆除已结束（无论成败）」，它是 ``on_enter_disconnected`` 唯一的放行条件；内层 try/finally
+            #    保证该信号与下方三项状态清理**永不缺席**。
+            #    旧实现把它们与 ``aclose()`` 平铺在同一层：``aclose()`` 抛异常（拆除窗口内服务端消息到达时，
+            #    mcp stdio 的 ``stdout_reader`` 向已关闭读流 send → ``ExceptionGroup(BrokenResourceError)``）
+            #    会跳过其后的**全部**语句 → 信号永久缺失 → ``on_enter_disconnected`` 永久等待 →
+            #    ``MCPServerManager._astop_all`` 持 ``_lock`` 卡死 → ``Computer.shutdown()`` 不返回。
+            #    刻意用**裸 try/finally 而非 except**：拆除异常照旧向上抛（由 ``_close_task`` 记账），
+            #    只是不再阻断信号与清理 —— 这不是吞异常。**禁止**把清理/置位再挪回 ``aclose()`` 之下，
+            #    也禁止把 ``set()`` 提到 ``aclose()`` 之前（那会让等待方在会话仍开着时被放行）。
+            #    ⚠️ 内层 finally **必须保持无 await**：一旦引入 await，正在传播的拆除异常会被新异常顶替，
+            #    ``_close_task`` 记账到的就不再是真实原因。
+            #    Do NOT move the cleanup/signal back below aclose(), do NOT set the event before it, and keep
+            #    the inner finally await-free (an await there would replace the in-flight teardown exception).
+            try:
+                await self._aexit_stack.aclose()
+            finally:
+                # 清理session
+                self._async_session = None
+                # 清理初始化结果，确保会话真正关闭时协议初始化态一并清理
+                # Cleanup InitializeResult to align with actual session teardown
+                self._initialize_result = None
+                # 会话关闭即清空已订阅集合：订阅随会话失效，重连后须重新订阅（幂等性以会话为界）。
+                # Subscriptions die with the session; clear so a reconnect re-subscribes (idempotency is per-session).
+                self._subscribed_window_uris.clear()
+                self._async_session_closed_event.set()
 
     # region 状态转换回调函数基类实现
     async def aprepare_connect(self, event: EventData) -> None:
@@ -348,8 +365,23 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         # 关闭异步会话，保证资源的正常释放
         logger.debug(f"Enter disconnected state async task: {asyncio.current_task().get_name()}")
         await self._close_task()
-        # 等待会话关闭
-        await self._async_session_closed_event.wait()
+        # 等待会话关闭，**带兜底上界**（#211）：``_close_task`` 有两条**确实会**让信号缺席的路径 ——
+        #   ① 首段早退（``task is None or task.done()``）—— 无信号可等；
+        #   ② 首段等待被取消的 ``except asyncio.CancelledError: return`` —— 被 shield 的收尾任务仍在跑。
+        # （``except Exception`` 分支曾是第三条，F1 之后其 finally 已保证置位，不再算缺口；``except TimeoutError``
+        #  分支会落入强杀并补发信号，也不算缺口。此处按**分支内容**而非行号指代——行号会随每次 diff 腐化。）
+        # 任何单点异常都不该把「断开」变成永久等待；正常路径信号已置位 → 本 wait 立即返回，零额外时延。
+        # Bounded wait: a single failure point must never turn disconnect into a permanent wait.
+        try:
+            await asyncio.wait_for(self._async_session_closed_event.wait(), timeout=_TEARDOWN_TIMEOUT)
+        except TimeoutError:
+            logger.error(
+                f"MCP 会话关闭信号等待超时（{_TEARDOWN_TIMEOUT}s），强制继续断开并强杀子进程；"
+                f" server params: {truncate(self.params)}",
+            )
+            # 信号缺席即「拆除状态未知」→ 按 _close_task 同款姿态兑底强杀，确保子进程不会比本进程活得久。
+            # best-effort，绝不抛出 / same escalation as _close_task: never let a child outlive us.
+            await self._aforce_kill()
 
     async def aafter_disconnect(self, event: EventData) -> None:
         """断开后操作（可重写）"""
@@ -651,7 +683,10 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             logger.debug("Session keep-alive task close-wait was cancelled")
             return
         except Exception as e:
-            logger.error(f"Session keep-alive task failed: {e}", exc_info=True)
+            # #211：拆除期上下文报错（典型为 anyio ``ExceptionGroup(BrokenResourceError)``）属**非致命** ——
+            # ``_keep_alive_task`` 的 finally 已保证关闭信号与状态清理照常执行、停机已收敛，故降为 WARNING，
+            # 但保留堆栈（真出别的问题时仍需第一手线索）。级别不再暗示「启动失败」。
+            logger.warning(f"Session keep-alive task ended with teardown error (关闭信号已照常置位): {e}", exc_info=True)
             return
         # 3. 兑底强杀 + 再次有限等待 / force-kill fallback then bounded re-wait
         await self._aforce_kill()
