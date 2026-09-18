@@ -8,6 +8,7 @@
 * 描述: 异步Agent客户端实现 / Asynchronous Agent client implementation
 """
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -30,6 +31,7 @@ from a2c_smcp.smcp import (
     GET_SKILL_EVENT,
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
+    JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
     PUT_BLOB_EVENT,
@@ -41,6 +43,7 @@ from a2c_smcp.smcp import (
     UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
+    EnterOfficeReq,
     GetBlobRet,
     GetComputerConfigRet,
     GetDeskTopRet,
@@ -65,6 +68,7 @@ from a2c_smcp.utils.handshake import (
 )
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 from a2c_smcp.utils.mime import is_text_mime
+from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
 
 logger = get_logger("agent")
 
@@ -357,6 +361,94 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
         # #127 MCP 运行期工具集变化自动重拉（仿 notify:update_config）/ #127 auto-refresh on runtime tool-set change
         self.on(UPDATE_TOOL_LIST_NOTIFICATION, self._on_computer_update_tool_list, namespace=self._namespace)
+        # #203 引擎级 namespace 生命周期钩子（自动重连后回房）。两个 handler 刻意写成**同步函数**：
+        # engineio 以 run_async=False 内联触发 'disconnect'，在其中 await 会卡住拆链。
+        # Engine-level namespace hooks (#203), deliberately sync — 'disconnect' is dispatched inline.
+        self.on("connect", self._on_namespace_connect, namespace=self._namespace)
+        self.on("disconnect", self._on_namespace_disconnect, namespace=self._namespace)
+        self.on("__disconnect_final", self._on_namespace_disconnect_final, namespace=self._namespace)
+
+    # ── #203 Office 成员关系：自动回房（与 Computer 侧同构）──────────────────────────────────
+
+    def _on_namespace_connect(self) -> None:
+        """
+        namespace (重)连接钩子：desired 仍在则调度自动回房。**必须零 await**。
+
+        Namespace (re)connect hook: schedule the office replay while a desired membership remains.
+
+        Agent 侧的 ``join_office`` 是无 ack 的 emit，房间成员关系又随会话销毁（服务端
+        ``on_disconnect`` 会退房并清 ``session["office_id"]``），故重连后必须由客户端重放。
+        Room membership is session-scoped, so a reconnected namespace must replay the join.
+
+        甩任务而非内联 await：本钩子被 ``_handle_connect`` 内联 await，其后才 ``_connect_event.set()``；
+        内联等 ACK 会推迟连接完成信号，且钩子内抛异常会让它永不执行。/ Detached task because the hook
+        is awaited inline before ``_connect_event.set()``.
+
+        守卫用 ``self._namespace in self.namespaces`` 而非 ``self.connected``（后者在 connect() 返回后
+        才置位，早于本任务第一步）。/ Guard on the registered namespace, not ``self.connected``.
+        """
+        self._bump_office_generation()
+        self._cancel_office_rejoin()
+        desired = self._desired_office
+        if desired is None:
+            return
+        self._office_rejoin_task = asyncio.create_task(self._arejoin_office(desired, self._office_generation))
+
+    def _on_namespace_disconnect(self, reason: str | None = None) -> None:
+        """namespace 断连钩子：按原因决定回房意图去留。**必须零 await**（内联触发路径）。
+
+        仅"传输中断且底层会自动重连"保留意图；手工断开 / 服务端踢出 / 未启用重连一律清空。
+        Retained only for a transport error that will be retried; every other reason clears it.
+        """
+        if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
+            self._bump_office_generation()
+            self._cancel_office_rejoin()
+            return
+        self._drop_desired_office()
+
+    def _on_namespace_disconnect_final(self) -> None:
+        """重连彻底放弃 → 清空回房意图。**必须零 await**。"""
+        self._drop_desired_office()
+
+    async def _arejoin_office(self, desired: tuple[str, str], generation: int) -> None:
+        """
+        自动回房：重放 ``server:join_office`` 并校验 ACK。
+
+        Replay ``server:join_office`` on the fresh namespace and validate its ack.
+
+        与显式 ``join_office``（无 ack 的 emit）不同，回房用 ``call`` 取得服务端裁决：被拒（如旧会话
+        尚未回收导致的一房一 Agent 拒绝）时清空意图 + 错误日志，状态不得撒谎。
+        Unlike the explicit emit-only join, the replay uses ``call`` to obtain the server's verdict.
+
+        单次尝试（镜像 rust-sdk#204）；结果只在 generation 仍新鲜时落到状态上。
+        """
+        async with self._office_op_lock:
+            if generation != self._office_generation or self._desired_office != desired:
+                return  # 已被更新的操作接管 / superseded
+            if self._namespace not in self.namespaces:
+                return  # 连接又断了：交给下一次 connect 钩子
+            office_id, agent_name = desired
+            try:
+                result = await self.call(
+                    JOIN_OFFICE_EVENT,
+                    EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                    namespace=self._namespace,
+                    timeout=OFFICE_REJOIN_TIMEOUT,
+                )
+            except Exception as e:
+                if generation != self._office_generation or self._desired_office != desired:
+                    return
+                self._desired_office = None
+                logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
+                return
+            if generation != self._office_generation or self._desired_office != desired:
+                return
+            ok, error_msg = parse_join_ack(result)
+            if ok:
+                logger.info(f"已自动重新加入 Office: {office_id}")
+            else:
+                self._desired_office = None
+                logger.error(f"自动重新加入 Office 被拒绝: {office_id} - {error_msg}")
 
     async def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """

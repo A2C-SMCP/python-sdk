@@ -36,6 +36,10 @@ EXPECTED_NOTIFY_EVENTS = {
     UPDATE_SKILLS_NOTIFICATION,
     # #127：MCP 运行期工具变化 → Agent 须订阅 notify:update_tool_list 回拉 client:get_tools
     UPDATE_TOOL_LIST_NOTIFICATION,
+    # #203：引擎级 namespace 生命周期钩子（自动重连后重放入房 / 断连清意图）
+    "connect",
+    "disconnect",
+    "__disconnect_final",
 }
 
 

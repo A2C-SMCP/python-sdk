@@ -8,6 +8,8 @@
 * 描述: Agent基础客户端抽象类（异步和同步版本）/ Agent base client abstract classes (async and sync versions)
 """
 
+import asyncio
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, cast
@@ -64,6 +66,34 @@ class BaseAgentClient(ABC):
         """
         self.auth_provider = auth_provider
         self.event_handler = event_handler
+        # ── #203 Office 成员关系：desired + generation（与 Computer 侧同构）─────────────────────
+        # ``_desired_office`` = 调用方最后一次声明的入房意图 ``(office_id, agent_name)``。Agent 侧的
+        # ``join_office`` 是**无 ack 的 emit**、且服务端房间成员关系随会话销毁，断线重连后必须由客户端
+        # 重放 ``server:join_office``；``agent_name`` 只存在于 join 调用实参，故这里必须记住它。
+        # The last declared membership intent; replayed after an auto-reconnect because room
+        # membership is session-scoped and ``agent_name`` only exists as a call argument.
+        self._desired_office: tuple[str, str] | None = None
+        self._office_generation = 0
+        self._office_rejoin_task: asyncio.Task[None] | None = None
+        self._office_op_lock = asyncio.Lock()
+
+    def _bump_office_generation(self) -> int:
+        """推进 generation（作废在途自动回房）并返回新值 / advance the generation, invalidating in-flight replays."""
+        self._office_generation += 1
+        return self._office_generation
+
+    def _cancel_office_rejoin(self) -> None:
+        """作废在途自动回房（同步 cancel，不 await——调用点可能在内联路径上）。"""
+        task = self._office_rejoin_task
+        self._office_rejoin_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _drop_desired_office(self) -> None:
+        """清空回房意图（显式退房 / 手工断开 / 服务端踢出 / 重连彻底放弃 / 回房失败）。"""
+        self._bump_office_generation()
+        self._cancel_office_rejoin()
+        self._desired_office = None
 
     @abstractmethod
     async def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
@@ -395,12 +425,25 @@ class BaseAgentClient(ABC):
             agent_name (str): Agent名称，提供给前端展示用
                             / Agent name, for frontend display
             namespace (str | None): 命名空间 / Namespace
+
+        Note:
+            #203：本方法同时声明 **desired 意图**——``(office_id, agent_name)`` 被记住，断线自动重连后
+            由客户端重放入房（room 成员关系属于会话）。``leave_office`` / 手工断开 / 服务端踢出会清空它。
+            Also declares the desired membership intent, replayed after an auto-reconnect.
         """
-        await self.emit(
-            JOIN_OFFICE_EVENT,
-            EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
-            namespace=namespace,
-        )
+        self._bump_office_generation()
+        self._cancel_office_rejoin()
+        self._desired_office = (office_id, agent_name)
+        # 与自动回房共用 office 操作锁（对称 Computer 侧）：回房在途时本 join 排队等候，避免
+        # JOIN/LEAVE 在 wire 上重排（例如 LEAVE 抢先于在途 JOIN 落地 ⇒ 客户端以为已退房、服务端
+        # 仍在房间里）。取消在途回房使等待是瞬时的，不会吃满回房超时。
+        # Serialize with the replay so JOIN/LEAVE cannot be reordered on the wire.
+        async with self._office_op_lock:
+            await self.emit(
+                JOIN_OFFICE_EVENT,
+                EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                namespace=namespace,
+            )
 
     async def leave_office(self, office_id: str, namespace: str | None = None) -> None:
         """
@@ -411,7 +454,10 @@ class BaseAgentClient(ABC):
             office_id (str): 房间ID / Room ID
             namespace (str | None): 命名空间 / Namespace
         """
-        await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+        self._drop_desired_office()
+        # 与自动回房共用 office 操作锁（同 join_office：避免 LEAVE 抢先于在途 JOIN 落地）
+        async with self._office_op_lock:
+            await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
 
     @abstractmethod
     def register_event_handlers(self) -> None:
@@ -445,6 +491,36 @@ class BaseAgentSyncClient(ABC):
         """
         self.auth_provider = auth_provider
         self.event_handler = event_handler
+        # ── #203 Office 成员关系：desired + generation（与异步侧、Computer 侧同构）────────────
+        # 同步侧差异：回房跑在独立 daemon 线程里（connect 钩子内联在读循环的分发线程上，``call`` 阻塞），
+        # 线程**不可取消**，故只用 generation 判据作废陈旧结果，状态变更用锁保护（短临界区、不跨网络等待）。
+        # Sync difference: the replay runs on a daemon thread (not cancellable), so staleness is
+        # handled purely by the generation guard, with a short lock around state mutations only.
+        self._desired_office: tuple[str, str] | None = None
+        self._office_generation = 0
+        self._office_rejoin_thread: threading.Thread | None = None
+        self._office_state_lock = threading.Lock()
+
+    def _bump_office_generation(self) -> int:
+        """推进 generation（作废在途自动回房）并返回新值 / advance the generation, invalidating in-flight replays."""
+        with self._office_state_lock:
+            self._office_generation += 1
+            return self._office_generation
+
+    def _cancel_office_rejoin(self) -> None:
+        """作废在途自动回房 / invalidate any in-flight replay.
+
+        同步侧无法取消线程：只摘引用 + 推进 generation，线程自身的 generation 双检会丢弃其结果。
+        Threads are not cancellable: the stale thread's own generation checks discard its result.
+        """
+        self._office_rejoin_thread = None
+
+    def _drop_desired_office(self) -> None:
+        """清空回房意图（显式退房 / 手工断开 / 服务端踢出 / 重连彻底放弃 / 回房失败）。"""
+        self._bump_office_generation()
+        self._cancel_office_rejoin()
+        with self._office_state_lock:
+            self._desired_office = None
 
     @abstractmethod
     def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
@@ -773,7 +849,15 @@ class BaseAgentSyncClient(ABC):
             agent_name (str): Agent名称，提供给前端展示用
                             / Agent name, for frontend display
             namespace (str | None): 命名空间 / Namespace
+
+        Note:
+            #203：同异步侧——本方法同时声明 **desired 意图**，断线自动重连后由客户端重放入房。
+            Also declares the desired membership intent, replayed after an auto-reconnect.
         """
+        self._bump_office_generation()
+        self._cancel_office_rejoin()
+        with self._office_state_lock:
+            self._desired_office = (office_id, agent_name)
         self.emit(
             JOIN_OFFICE_EVENT,
             EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
@@ -789,6 +873,7 @@ class BaseAgentSyncClient(ABC):
             office_id (str): 房间ID / Room ID
             namespace (str | None): 命名空间 / Namespace
         """
+        self._drop_desired_office()
         self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
 
     @abstractmethod

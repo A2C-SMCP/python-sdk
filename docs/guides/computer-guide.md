@@ -291,6 +291,24 @@ await client.connect(
 4. SDK 不持久化、不打印 auth payload。
 5. 推荐 async callable（同步 callable 亦被原生路径接受）。
 
+### 断线重连后的 Office 自动回房
+
+> #203：Socket.IO 的房间成员关系属于**会话**——传输层断线自动重连后 namespace 换新 SID，
+> 服务端已销毁旧会话的成员关系。SDK 会在重连成功后自动重放 `server:join_office`
+> （镜像 rust-sdk#204），无需宿主干预。
+
+**语义**：
+
+- `office_id` 是**期望成员关系（desired）**：传输中断且底层会自动重连时保留，重连成功后自动回房；
+  回房**失败**（房间已删 / 重名被拒 / 一房一 Agent 被拒等）立即清空并打错误日志——**不会**停留在
+  "看起来还在房间、实际收不到流量"的状态（该状态是本 Issue 修复的核心）。
+- **手工断开**（`client.disconnect()`）、服务端踢出、重连彻底放弃（重试次数用尽）均清空期望，
+  下次 `connect()` 不会静默回旧房间。
+- 回房为**单次尝试**，不做重试；有界等待 10 秒。重连窗口内 `emit_update_*` 系列自动 no-op
+  （未真正在房间时不发无效包）。
+- Agent 侧（`AsyncSMCPAgentClient` / `SMCPAgentClient`）同语义：`join_office(office_id, agent_name)`
+  会记住该意图，自动重连后重放；`leave_office` / 手工断开清空。
+
 ### 事件回调
 
 Computer 内部会自动处理以下事件：

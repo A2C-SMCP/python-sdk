@@ -66,6 +66,10 @@ def test_computer_client_custom_namespace_registers_all_handlers() -> None:
         GET_SKILLS_EVENT,
         GET_SKILL_EVENT,
         CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器
+        # #203：引擎级 namespace 生命周期钩子（自动重连后回房 / 断连清意图）
+        "connect",
+        "disconnect",
+        "__disconnect_final",
     }
 
 

@@ -8,6 +8,7 @@
 * 描述: 同步Agent客户端实现 / Synchronous Agent client implementation
 """
 
+import threading
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -30,6 +31,7 @@ from a2c_smcp.smcp import (
     GET_SKILL_EVENT,
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
+    JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
     PUT_BLOB_EVENT,
@@ -41,6 +43,7 @@ from a2c_smcp.smcp import (
     UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
     EnterOfficeNotification,
+    EnterOfficeReq,
     GetBlobRet,
     GetComputerConfigRet,
     GetDeskTopRet,
@@ -65,6 +68,7 @@ from a2c_smcp.utils.handshake import (
 )
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 from a2c_smcp.utils.mime import is_text_mime
+from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
 
 logger = get_logger("agent")
 
@@ -76,6 +80,13 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
     注意：当前Client操作是非线程安全的，不可以在多线程环境下使用
     Note: Current Client operations are not thread-safe, cannot be used in multi-threaded environments
+
+    #203 例外：自动回房跑在**独立 daemon 线程**（``_rejoin_office``）。它是本类唯一允许的
+    跨线程操作，且只做"发出 join + 等 ACK"这一件事——由 generation 双检（发包前 / 应用结果前）
+    保证陈旧结果不落状态。可接受的最坏后果是：若等待期间连接被拆，该线程吃满
+    ``OFFICE_REJOIN_TIMEOUT``（10s）后退出（socketio ``call()`` 不会在断链时快速失败）。
+    / #203 exception: the office replay runs on a daemon thread — the only sanctioned cross-thread
+    operation here (join + bounded ack wait, guarded by generation checks on both ends).
     """
 
     def __init__(
@@ -343,6 +354,96 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
         # #127 MCP 运行期工具集变化自动重拉 / #127 auto-refresh on runtime tool-set change
         self.on(UPDATE_TOOL_LIST_NOTIFICATION, self._on_computer_update_tool_list, namespace=self._namespace)
+        # #203 引擎级 namespace 生命周期钩子（自动重连后回房）。两个 handler 刻意写成**同步函数**：
+        # engineio 以 run_async=False 内联触发 'disconnect'，在其中做阻塞调用会卡住拆链。
+        # Engine-level namespace hooks (#203), deliberately sync — 'disconnect' is dispatched inline.
+        self.on("connect", self._on_namespace_connect, namespace=self._namespace)
+        self.on("disconnect", self._on_namespace_disconnect, namespace=self._namespace)
+        self.on("__disconnect_final", self._on_namespace_disconnect_final, namespace=self._namespace)
+
+    # ── #203 Office 成员关系：自动回房（与异步侧 / Computer 侧同构）──────────────────────────
+
+    def _on_namespace_connect(self) -> None:
+        """
+        namespace (重)连接钩子：desired 仍在则起 daemon 线程回房。**不得阻塞**。
+
+        Namespace (re)connect hook: spawn a daemon thread to replay the join. Must not block —
+        本钩子内联在读循环的分发线程上（engineio 对 MESSAGE 包 run_async 派发，socketio 的
+        ``_handle_connect`` 在其中 await 本钩子），而在其中同步 ``call`` 等 ACK 会把连接完成信号
+        （``connect()`` 的 wait_timeout）一并拖住。
+        Runs on the read-loop dispatch thread, where a blocking ack wait would also stall the
+        connect-completion signal.
+
+        守卫用 ``self._namespace in self.namespaces`` 而非 ``self.connected``（后者要等
+        ``connect()`` 返回后才置位）。/ Guard on the registered namespace, not ``self.connected``.
+        """
+        self._bump_office_generation()
+        self._cancel_office_rejoin()
+        desired = self._desired_office
+        if desired is None:
+            return
+        generation = self._office_generation
+        thread = threading.Thread(
+            target=self._rejoin_office,
+            args=(desired, generation),
+            name="a2c-agent-office-rejoin",
+            daemon=True,
+        )
+        self._office_rejoin_thread = thread
+        thread.start()
+
+    def _on_namespace_disconnect(self, reason: str | None = None) -> None:
+        """namespace 断连钩子：按原因决定回房意图去留。**不得阻塞**（内联触发路径）。
+
+        仅"传输中断且底层会自动重连"保留意图；手工断开 / 服务端踢出 / 未启用重连一律清空。
+        """
+        if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
+            self._bump_office_generation()
+            self._cancel_office_rejoin()
+            return
+        self._drop_desired_office()
+
+    def _on_namespace_disconnect_final(self) -> None:
+        """重连彻底放弃 → 清空回房意图。"""
+        self._drop_desired_office()
+
+    def _rejoin_office(self, desired: tuple[str, str], generation: int) -> None:
+        """
+        自动回房（daemon 线程）：重放 ``server:join_office`` 并校验 ACK。
+
+        Replay ``server:join_office`` on the fresh namespace and validate its ack.
+
+        同步侧无法取消线程，故以 generation **双检**（发包前 / 应用结果前）作废陈旧结果；被拒时清空
+        意图 + 错误日志（单次尝试，镜像 rust-sdk#204）。
+        Threads are not cancellable, so the generation is re-checked before sending and before
+        applying the verdict; a rejection clears the intent (single attempt, mirrors rust-sdk#204).
+        """
+        if generation != self._office_generation or self._desired_office != desired:
+            return  # 已被更新的操作接管 / superseded
+        if self._namespace not in self.namespaces:
+            return  # 连接又断了：交给下一次 connect 钩子
+        office_id, agent_name = desired
+        try:
+            result = self.call(
+                JOIN_OFFICE_EVENT,
+                EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                namespace=self._namespace,
+                timeout=OFFICE_REJOIN_TIMEOUT,
+            )
+        except Exception as e:
+            if generation != self._office_generation or self._desired_office != desired:
+                return
+            self._drop_desired_office()
+            logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
+            return
+        if generation != self._office_generation or self._desired_office != desired:
+            return
+        ok, error_msg = parse_join_ack(result)
+        if ok:
+            logger.info(f"已自动重新加入 Office: {office_id}")
+        else:
+            self._drop_desired_office()
+            logger.error(f"自动重新加入 Office 被拒绝: {office_id} - {error_msg}")
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """

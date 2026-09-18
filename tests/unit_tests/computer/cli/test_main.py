@@ -1141,6 +1141,10 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_SKILLS_EVENT,
         GET_SKILL_EVENT,
         CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器
+        # #203：引擎级 namespace 生命周期钩子（自动重连后回房 / 断连清意图）
+        "connect",
+        "disconnect",
+        "__disconnect_final",
     }, f"Unexpected event handlers under {custom_ns!r}: {registered!r}"
 
 

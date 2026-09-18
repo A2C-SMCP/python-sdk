@@ -3,6 +3,7 @@
 # @Author  : JQQ
 # @Email   : jiaqia@qknode.com
 # @Software: PyCharm
+import asyncio
 import base64
 import hashlib
 from collections.abc import Awaitable, Callable
@@ -82,6 +83,7 @@ from a2c_smcp.utils.handshake import (
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
 
 logger = get_logger(__name__)
 
@@ -201,7 +203,25 @@ class SMCPComputerClient(AsyncClient):
         # v0.2.1 工具调用取消 / tool_call cancellation（#96）：接收 Server 广播的 notify:tool_call_cancel，
         # 按 req_id 中断本机在途工具调用。notify:* 仅接收、不回执。
         self.on(CANCEL_TOOL_CALL_NOTIFICATION, self.on_tool_call_cancel, namespace=self._namespace)
+        # ── #203 Office 成员关系：desired + generation ──────────────────────────────────────
+        # ``office_id`` 语义 = **desired**（"想要加入的房间"）：传输中断且底层会自动重连时**保留**，
+        # 等 namespace 重连后自动回房；显式 leave / 手工断开 / 服务端踢出 / 重连彻底放弃 / 回房失败
+        # 时清空。Socket.IO 房间成员关系属于**会话**，断线重连后服务端已销毁旧会话的成员关系，故
+        # 客户端必须主动重放 ``server:join_office``（协议 runtime-contract §4.5.3：reconnect MUST
+        # 投影当前 desired state）。/ ``office_id`` is the *desired* membership: retained across a
+        # transport drop when socketio will reconnect, cleared when it cannot be honored.
         self.office_id: str | None = None
+        self._office_generation: int = 0
+        self._office_rejoin_task: asyncio.Task[None] | None = None
+        self._office_op_lock = asyncio.Lock()
+        # 引擎级（非协议）namespace 生命周期钩子。两个 handler 刻意写成**同步函数**：engineio 以
+        # ``run_async=False`` 内联触发 'disconnect'（engineio/async_client.py:614），在其中 await 会把
+        # 拆链与 ``eio.disconnect()`` 一起卡住——函数签名是"零 await"的结构性保证。
+        # Engine-level namespace hooks, deliberately **sync** functions: engineio dispatches
+        # 'disconnect' inline (run_async=False), where awaiting would stall the teardown.
+        self.on("connect", self._on_namespace_connect, namespace=self._namespace)
+        self.on("disconnect", self._on_namespace_disconnect, namespace=self._namespace)
+        self.on("__disconnect_final", self._on_namespace_disconnect_final, namespace=self._namespace)
 
     @property
     def namespace(self) -> str:
@@ -210,6 +230,19 @@ class SMCPComputerClient(AsyncClient):
         Return the Socket.IO namespace used by this instance
         """
         return self._namespace
+
+    def _in_office(self) -> bool:
+        """
+        ``server:update_*`` 上报守卫：是否"已入房**且**连接可用"。
+
+        Guard for the ``server:update_*`` emitters: in an office *and* on a live namespace.
+
+        #203：不能只看 ``office_id``——desired 在重连窗口内被刻意保留，此时 namespace 不在册，
+        ``emit`` 会抛 ``BadNamespaceError``（破坏 ``Computer`` 侧记录的"未入房 → no-op"契约）。
+        Since #203 the desired office survives a reconnect window, where the namespace is not
+        registered and ``emit`` would raise ``BadNamespaceError``.
+        """
+        return self.office_id is not None and self._namespace in self.namespaces
 
     async def connect(
         self,
@@ -296,10 +329,125 @@ class SMCPComputerClient(AsyncClient):
         effective_namespace = namespace if namespace is not None else self._namespace
         await super().emit(event, data, effective_namespace, callback)
 
+    def _cancel_office_rejoin(self) -> None:
+        """
+        作废在途自动回房（**同步 cancel，不 await**）。
+
+        Cancel any in-flight office replay without awaiting it — call sites sit on inline paths
+        (engineio 的 namespace 钩子) where awaiting is not allowed.
+        """
+        task = self._office_rejoin_task
+        self._office_rejoin_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _on_namespace_connect(self) -> None:
+        """
+        namespace (重)连接钩子：desired 仍在则调度自动回房。**必须零 await**。
+        Namespace (re)connect hook: schedule the office replay when a desired office remains.
+
+        #203：Socket.IO 房间成员关系随会话销毁，重连后新 SID 不在房间里——这里重放
+        ``server:join_office`` 恢复成员关系。/ Room membership is session-scoped, so the new SID
+        must replay ``server:join_office``.
+
+        为什么甩后台任务而不是内联 await（上游时序，实测）：本钩子被 ``_handle_connect`` **内联
+        await**，其返回后才会 ``_connect_event.set()``；内联等 JOIN 的 ACK 会推迟"连接完成"信号，
+        且钩子内抛出的异常会让 ``set()`` 永不执行（重连周期被拖到 wait_timeout）。
+        Why a detached task instead of an inline await: this hook is awaited inline by
+        ``_handle_connect`` *before* ``_connect_event.set()``; an inline ack wait delays that
+        signal and any exception would skip it entirely.
+
+        守卫用 ``self._namespace in self.namespaces`` 而**不是** ``self.connected``：socketio 的
+        ``connected`` 要等覆写的 ``connect()`` 返回后才置位，早于本任务第一步（实测），用它会让
+        回房被静默跳过。 / Guard on the registered namespace, never on ``self.connected``: the
+        latter is still False when the replay task first runs (verified empirically).
+        """
+        self._office_generation += 1
+        self._cancel_office_rejoin()
+        desired = self.office_id
+        if desired is None:
+            return
+        self._office_rejoin_task = asyncio.create_task(self._arejoin_office(desired, self._office_generation))
+
+    def _on_namespace_disconnect(self, reason: str | None = None) -> None:
+        """
+        namespace 断连钩子：按断开原因决定 desired 的去留。**必须零 await**（内联触发路径）。
+        Namespace disconnect hook: decide whether the desired office survives, keyed on the reason.
+
+        - ``transport error`` 且底层会自动重连 → **保留** desired（等重连后自动回房）；
+        - 其余（手工断开 ``client disconnect`` / 服务端踢出 ``server disconnect`` / 未启用重连）
+          → **清空**，下次连接不得静默回旧房间。/ Retained only for a transport error that will be
+          retried; every other reason clears the intent.
+        """
+        self._office_generation += 1
+        self._cancel_office_rejoin()
+        if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
+            return
+        self.office_id = None
+
+    def _on_namespace_disconnect_final(self) -> None:
+        """
+        重连彻底放弃（重试次数用尽 / ``shutdown()`` 中止）→ 清空 desired。**必须零 await**。
+
+        socketio 只在"不会再重连"时触发 ``__disconnect_final``；此时若保留旧 ``office_id``，状态会
+        长期撒谎（emit 守卫放行却无连接可用）。/ ``__disconnect_final`` is socketio's only reliable
+        "will not reconnect" signal; keeping the stale id past it would be a standing lie.
+        """
+        self._office_generation += 1
+        self._cancel_office_rejoin()
+        self.office_id = None
+
+    async def _arejoin_office(self, office_id: str, generation: int) -> None:
+        """
+        自动回房：在新建立的 namespace 连接上重放 ``server:join_office``。
+
+        Replay ``server:join_office`` on the freshly re-established namespace connection (#203).
+
+        结果只在 generation 仍新鲜时落到状态上：期间用户显式换房/退房（generation 前进）则整条结果
+        作废——陈旧回房的失败**不得**清掉用户刚设好的房号。/ Results are applied only while the
+        generation is still current, so a superseded replay can never clobber a newer office.
+
+        单次尝试：被拒即清空 desired + 错误日志（镜像 rust-sdk#204 语义，不做重试）。
+        Single attempt, mirroring rust-sdk#204: a rejection clears the desired office and logs.
+        """
+        async with self._office_op_lock:
+            if generation != self._office_generation or self.office_id != office_id:
+                return  # 已被更新的操作接管 / superseded by a newer operation
+            if self._namespace not in self.namespaces:
+                return  # 连接又断了：交给下一次 connect 钩子 / the connection dropped again
+            try:
+                result = await self.call(
+                    JOIN_OFFICE_EVENT,
+                    EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
+                    namespace=self._namespace,
+                    timeout=OFFICE_REJOIN_TIMEOUT,
+                )
+            except Exception as e:
+                if generation != self._office_generation or self.office_id != office_id:
+                    return  # 结果已作废，不得用陈旧结果改状态
+                self.office_id = None
+                logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
+                return
+            if generation != self._office_generation or self.office_id != office_id:
+                return
+            ok, error_msg = parse_join_ack(result)
+            if ok:
+                logger.info(f"已自动重新加入 Office: {office_id}")
+            else:
+                self.office_id = None
+                logger.error(f"自动重新加入 Office 被拒绝: {office_id} - {error_msg}")
+
     async def join_office(self, office_id: str) -> None:
         """
         加入一个Office（Socket.IO中的Room）
         Join an Office (Room in Socket.IO)
+
+        #203：本方法同时是"desired 意图"的声明点——入口**先同步**推进 generation 并作废在途自动回房，
+        再写入 ``office_id``，最后才抢 office 操作锁。顺序不可反转：若在途回房的失败路径能清状态，
+        会把这里刚写入的房号抹掉（四个 emit 守卫随之静默失效）。
+        This method also declares the desired intent: the generation is advanced and any in-flight
+        replay invalidated *before* the new id is written, so a superseded replay's failure path can
+        never clear it.
 
         Args:
             office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID / Room ID, in A2C-smcp protocol,
@@ -308,42 +456,56 @@ class SMCPComputerClient(AsyncClient):
         Raises:
             RuntimeError: 当加入房间失败时（例如重名）/ When joining room fails (e.g., duplicate name)
         """
+        generation = self._office_generation + 1
+        self._office_generation = generation
+        self._cancel_office_rejoin()
         # 提前设置 office_id，避免服务器广播事件时 office_id 仍为 None 的时序竞争问题
         # Set office_id before sending request to avoid race condition when server broadcasts events
         self.office_id = office_id
 
         try:
             # 使用 call 方法等待服务器返回结果 / Use call method to wait for server response
-            result = await self.call(
-                JOIN_OFFICE_EVENT,
-                EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
-                namespace=self._namespace,
-            )
+            async with self._office_op_lock:
+                result = await self.call(
+                    JOIN_OFFICE_EVENT,
+                    EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
+                    namespace=self._namespace,
+                )
 
             # 检查返回结果 / Check return result
-            if isinstance(result, (list, tuple)) and len(result) >= 2:
-                success, error_msg = result[0], result[1]
-                if not success:
-                    # 加入失败，重置 office_id / Reset office_id on failure
-                    self.office_id = None
-                    raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
-            elif not result:
-                # 加入失败，重置 office_id / Reset office_id on failure
-                self.office_id = None
-                raise RuntimeError("加入房间失败：服务器未返回结果 / Failed to join office: No response from server")
+            ok, error_msg = parse_join_ack(result)
+            if not ok:
+                raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
         except Exception:
-            # 发生异常时重置 office_id / Reset office_id on exception
-            self.office_id = None
+            # 失败清空 office_id —— 但仅当本次操作仍是最新意图时才清（compare-and-clear）：
+            # 并发/后到的 join 或 leave 已推进 generation 时，其写入的房号不得被本次失败抹掉。
+            # Compare-and-clear: a newer operation's office id must survive this failure.
+            #
+            # 已知语义（有意，非副作用）：若 generation 的推进来自 **断连钩子**（传输中断且会自动重连），
+            # 则这里**保留** office_id = 本次声明的房号——失败的是"这一次尝试"，不是"想要在这个房间"的
+            # 意图；重连后回房会重新裁决，成功即恢复、被拒才清空（#203 口径 1）。调用方看到 RuntimeError
+            # 表示本次未落地，可自行重试；此时 office_id 非空**不代表**已在房间，判断"是否真在房间里"
+            # 请用 `_in_office()`。
+            # Deliberate: a disconnect-driven generation bump keeps the intent (the attempt failed,
+            # not the wish to be in that room); the post-reconnect replay re-adjudicates it.
+            if self._office_generation == generation:
+                self.office_id = None
             raise
 
     async def leave_office(self, office_id: str) -> None:
         """
         离开一个Office（Socket.IO中的Room）
 
+        #203：退房同时作废 desired 与在途自动回房——重连不得把用户刚退掉的房间再回一遍。
+        Leaving also invalidates the desired intent and any in-flight replay.
+
         Args:
             office_id (str): 房间ID
         """
-        await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id))
+        self._office_generation += 1
+        self._cancel_office_rejoin()
+        async with self._office_op_lock:
+            await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id))
         self.office_id = None
 
     async def emit_update_config(self) -> None:
@@ -352,7 +514,7 @@ class SMCPComputerClient(AsyncClient):
 
         不需要传递当前的配置参数，因为Agnet会通过其它接口进行刷新
         """
-        if self.office_id:
+        if self._in_office():
             await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def update_config(self) -> None:
@@ -368,7 +530,7 @@ class SMCPComputerClient(AsyncClient):
         工具列表变更时需要触发此事件向信令服务器推送，服务端会广播 notify:update_tool_list。
         When tool list changes, emit event to server; it will broadcast notify:update_tool_list.
         """
-        if self.office_id:
+        if self._in_office():
             await self.emit(UPDATE_TOOL_LIST_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def emit_refresh_desktop(self) -> None:
@@ -376,7 +538,7 @@ class SMCPComputerClient(AsyncClient):
         桌面刷新触发：当资源列表或资源内容变化时，通知信令服务器。服务端会广播 notify:update_desktop。
         Desktop refresh trigger: notify server when resources list/content changed; server will broadcast notify:update_desktop.
         """
-        if self.office_id:
+        if self._in_office():
             await self.emit(UPDATE_DESKTOP_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def emit_update_skills(self) -> None:
@@ -395,7 +557,7 @@ class SMCPComputerClient(AsyncClient):
         This is the low-level emit sink for the Computer-owned ``SkillEventDebouncer``; event handlers must
         route through the debouncer (300ms coalescing) rather than calling this directly.
         """
-        if self.office_id:
+        if self._in_office():
             await self.emit(UPDATE_SKILLS_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
 
     async def on_tool_call(self, data: ToolCallReq) -> dict:

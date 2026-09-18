@@ -47,6 +47,9 @@ async def test_emit_refresh_desktop_emits(monkeypatch: pytest.MonkeyPatch) -> No
     comp = _DummyComputer(name="test", auto_connect=False, auto_reconnect=False)
     client = SMCPComputerClient(computer=comp)
     client.office_id = "office-1"
+    # #203：emit 守卫 = "已入房**且** namespace 在册"（desired 在重连窗口内被保留，
+    # 此时 namespace 不在册，放行会抛 BadNamespaceError）
+    client.namespaces[SMCP_NAMESPACE] = "sid-x"
 
     called: dict[str, Any] = {}
 

@@ -1,0 +1,240 @@
+# -*- coding: utf-8 -*-
+"""
+#203 自动重连后恢复 Office 成员关系（Agent 侧，异步，真实 wire）。
+
+Agent 的 ``join_office`` 是**无 ack 的 emit**、且不保存任何本地成员状态；服务端房间成员关系随会话
+销毁（``server/namespace.py`` 断连时退房并清 ``session["office_id"]``）。因此传输层断线自动重连后，
+新 SID 不在房间里：Agent 发出的 ``client:*`` 会被服务端按 office 校验拒绝，也收不到任何 ``notify:*``
+广播。本文件验证：重连完成后客户端重放 ``server:join_office``，新 SID 重新成为该 Office 成员；
+无法恢复时清空回房意图，不保留"看似还在房间"的状态。
+
+Real-wire coverage for #203 on the Agent side (async): the agent's ``join_office`` is a
+fire-and-forget emit with no local membership state, while room membership is session-scoped — so
+after an auto-reconnect the new SID is not in the room and the agent is silently unreachable. The
+client must replay ``server:join_office`` and, when it cannot, drop the intent instead of keeping
+a plausible-looking membership.
+
+断线模拟同 Computer 侧：服务端主动 CLOSE 会让 socketio ``will_reconnect=False``，只有传输层突然
+断开才走 ``TRANSPORT_ERROR`` → 自动重连。/ Drop simulation mirrors the Computer-side test.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator
+from typing import Any
+
+import pytest
+from socketio import ASGIApp, AsyncServer
+
+from a2c_smcp.agent.auth import DefaultAgentAuthProvider
+from a2c_smcp.agent.client import AsyncSMCPAgentClient
+from a2c_smcp.smcp import SMCP_NAMESPACE
+from a2c_smcp.testing import UvicornTestServer
+from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace
+
+_CONNECT_TIMEOUT = 10.0
+_WAIT_INTERVAL = 0.01
+_QUIESCENCE = 0.3
+_OFFICE = "agent-rejoin-office"
+_AGENT_NAME = "agent-rejoin-1"
+
+
+class _OfficeRecordingNamespace(MockComputerServerNamespace):
+    """按到达顺序记录 ``server:join_office``（跨 SID，故 append 而非 sid 覆盖写）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.join_record: list[tuple[str, dict]] = []
+        self.joined = asyncio.Event()
+        # 自第 N 次（1-based）join 起一律拒绝（复现"旧会话尚未回收"的瞬态拒绝）
+        self.reject_from: int | None = None
+
+    async def on_server_join_office(self, sid: str, data: Any):  # type: ignore[override]
+        if self.reject_from is not None and len(self.join_record) + 1 >= self.reject_from:
+            payload = dict(data)
+            self.join_record.append((sid, payload))
+            self.joined.set()
+            return False, "Internal server error: Agent already in room"
+        result = await super().on_server_join_office(sid, data)
+        self.join_record.append((sid, dict(data)))
+        self.joined.set()
+        return result
+
+
+@pytest.fixture
+async def office_server(basic_server_port: int) -> AsyncGenerator[_OfficeRecordingNamespace, None]:
+    """真实 ASGI Socket.IO 服务端（记录 agent 入房的命名空间）。"""
+    sio = AsyncServer(
+        async_mode="asgi",
+        cors_allowed_origins="*",
+        ping_timeout=10,
+        ping_interval=10,
+        async_handlers=True,
+    )
+    sio.eio.start_service_task = False
+    ns = _OfficeRecordingNamespace()
+    sio.register_namespace(ns)
+    asgi_app = ASGIApp(sio, socketio_path="/socket.io")
+    server = UvicornTestServer(asgi_app, port=basic_server_port)
+    await server.up()
+    try:
+        yield ns
+    finally:
+        await server.down(force=True)
+
+
+def _make_agent(**kwargs: Any) -> AsyncSMCPAgentClient:
+    """构造测试用 Agent（收紧重连节奏以提速，语义不变）。"""
+    auth = DefaultAgentAuthProvider(agent_id=_AGENT_NAME, office_id=_OFFICE)
+    return AsyncSMCPAgentClient(
+        auth_provider=auth,
+        reconnection=True,
+        reconnection_attempts=10,
+        reconnection_delay=0.1,
+        reconnection_delay_max=0.3,
+        **kwargs,
+    )
+
+
+async def _connect(agent: AsyncSMCPAgentClient, port: int) -> None:
+    await agent.connect_to_server(f"http://localhost:{port}", socketio_path="/socket.io")
+
+
+async def _wait_for_new_sid(agent: AsyncSMCPAgentClient, first_sid: str) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _CONNECT_TIMEOUT
+    while True:
+        sid = agent.namespaces.get(SMCP_NAMESPACE)
+        if sid is not None and sid != first_sid:
+            return sid
+        if loop.time() > deadline:
+            raise AssertionError("重连后命名空间未在期限内重建 / namespace not re-established after reconnect")
+        await asyncio.sleep(_WAIT_INTERVAL)
+
+
+async def _wait_until(predicate: Any, message: str) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _CONNECT_TIMEOUT
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError(message)
+        await asyncio.sleep(_WAIT_INTERVAL)
+
+
+@pytest.mark.asyncio
+async def test_agent_rejoins_office_after_auto_reconnect(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """自动重连后，Agent 必须重放入房，新 SID 重新成为 Office 成员（服务端可见）。"""
+    agent = _make_agent()
+    try:
+        await _connect(agent, basic_server_port)
+        first_sid = agent.namespaces[SMCP_NAMESPACE]
+        await agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+        assert len(office_server.join_record) == 1
+        assert office_server.join_record[0][0] == first_sid
+
+        office_server.joined.clear()
+        ws = agent.eio.ws
+        assert ws is not None
+        await ws.close()
+        new_sid = await _wait_for_new_sid(agent, first_sid)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+
+        assert len(office_server.join_record) == 2, f"重连后未重放入房：{office_server.join_record}"
+        sid, payload = office_server.join_record[-1]
+        assert sid == new_sid, "重放的 join 必须来自重连后的新 SID"
+        assert payload["office_id"] == _OFFICE
+        assert payload["role"] == "agent"
+        assert payload["name"] == _AGENT_NAME
+    finally:
+        await agent.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_agent_rejected_rejoin_clears_desired_office(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """回房被拒（如旧会话未回收导致的一房一 Agent 拒绝）→ 清空意图，不得保留假成员状态。"""
+    office_server.reject_from = 2
+    agent = _make_agent()
+    try:
+        await _connect(agent, basic_server_port)
+        first_sid = agent.namespaces[SMCP_NAMESPACE]
+        await agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+
+        office_server.joined.clear()
+        ws = agent.eio.ws
+        assert ws is not None
+        await ws.close()
+        await _wait_for_new_sid(agent, first_sid)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+
+        assert len(office_server.join_record) == 2
+        await _wait_until(
+            lambda: agent._desired_office is None,
+            "回房被拒后回房意图未清空 / desired office not cleared after a rejected replay",
+        )
+        # 单次尝试：被拒后不得重试
+        await asyncio.sleep(_QUIESCENCE)
+        assert len(office_server.join_record) == 2, "回房被拒后不得重试"
+    finally:
+        await agent.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_agent_manual_disconnect_drops_membership_intent(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """手工断开清空意图：再次连接不得静默回旧房间。"""
+    agent = _make_agent()
+    try:
+        await _connect(agent, basic_server_port)
+        await agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+        assert len(office_server.join_record) == 1
+
+        await agent.disconnect()
+        assert agent._desired_office is None, "手工断开后回房意图必须清空"
+
+        await _connect(agent, basic_server_port)
+        await _wait_until(
+            lambda: SMCP_NAMESPACE in agent.namespaces,
+            "重新连接后命名空间未建立 / namespace not established on reconnect",
+        )
+        await asyncio.sleep(_QUIESCENCE)
+        assert len(office_server.join_record) == 1, "手工断开后的连接不得自动回房"
+    finally:
+        await agent.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_agent_leave_office_then_reconnect_does_not_rejoin(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """显式退房后断线重连不回房。"""
+    agent = _make_agent()
+    try:
+        await _connect(agent, basic_server_port)
+        first_sid = agent.namespaces[SMCP_NAMESPACE]
+        await agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+        await agent.leave_office(_OFFICE, namespace=SMCP_NAMESPACE)
+        assert agent._desired_office is None
+
+        ws = agent.eio.ws
+        assert ws is not None
+        await ws.close()
+        await _wait_for_new_sid(agent, first_sid)
+        await asyncio.sleep(_QUIESCENCE)
+
+        assert len(office_server.join_record) == 1, "显式退房后重连不得回房"
+    finally:
+        await agent.disconnect()

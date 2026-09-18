@@ -31,7 +31,7 @@ from a2c_smcp.computer.blob import BlobThresholds, decode_blob_handle
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.exceptions import SMCPNamespaceError
-from a2c_smcp.smcp import UPDATE_SKILLS_EVENT, A2CSkillRef, ErrorCode
+from a2c_smcp.smcp import SMCP_NAMESPACE, UPDATE_SKILLS_EVENT, A2CSkillRef, ErrorCode
 
 _SKILL_MD = "---\nname: demo\nversion: 1.0.0\n---\n# Demo\n\nshort body\n"
 _SKILL_BODY = "# Demo\n\nshort body\n"  # frontmatter 剥离后正文
@@ -264,6 +264,9 @@ class TestEmitUpdateSkills:
     async def test_emits_when_in_office(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         client = SMCPComputerClient(computer=_computer(tmp_path, name="comp-x"))
         client.office_id = "office-1"
+        # #203：emit 守卫 = "已入房**且** namespace 在册"（desired 在重连窗口内被保留，
+        # 此时 namespace 不在册，放行会抛 BadNamespaceError）
+        client.namespaces[SMCP_NAMESPACE] = "sid-x"
         called: dict[str, Any] = {}
 
         async def fake_emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
