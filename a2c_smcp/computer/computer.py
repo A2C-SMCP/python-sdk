@@ -266,6 +266,19 @@ class Computer(BaseComputer[PromptSession]):
         # 接收循环内联执行（会话级重入死锁，#127 实证；本 issue 复验 window 刷新内联 RPC 实测挂起）。
         self._tool_refresh_task: asyncio.Task[None] | None = None
         self._tool_refresh_dirty: bool = False
+        # #210：资源刷新后台任务句柄 + **按动作**分设的三个脏位。三条路径都含对**同一 MCP 会话**的真实 RPC
+        # （list_windows / list_skill_resources / read_resource），同样不得在接收循环内联执行。
+        #   ① ``_windows_list_dirty``   ：window:// 集合比对 → 变则 emit 桌面刷新
+        #   ② ``_skills_list_dirty``    ：skill:// 集合比对 → 变则重物化 + 提交 ``_skills_cache`` + 标脏去抖器
+        #   ③ ``_skills_content_dirty`` ：skill 内容级更新 → **无条件**重物化 + 标脏去抖器（**不比对、不提交缓存**）
+        # ② 与 ③ **不可合并**：``resources/updated`` 存在的意义正是「URI 集合不变、内容变了」，共用一位会让
+        # 比对把内容级更新挡掉 → Registry 永远停在旧内容（静默丢更新）。
+        # Resource-refresh background task handle + per-**action** dirty flags (#210); ② compares the
+        # resource set while ③ must not, so they cannot share a single flag.
+        self._resource_refresh_task: asyncio.Task[None] | None = None
+        self._windows_list_dirty: bool = False
+        self._skills_list_dirty: bool = False
+        self._skills_content_dirty: bool = False
         # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
         # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
         self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
@@ -600,10 +613,15 @@ class Computer(BaseComputer[PromptSession]):
         message: RequestResponder[types.ServerRequest, types.ClientResult] | types.ServerNotification | Exception,
     ) -> None:
         """
-        当 MCPServerManager 检测到变化时的回调。
+        MCP 变化通知回调（``MCPServerManager`` 的 ``message_handler``）。
 
-        目前仅处理工具列表变化：若存在 Socket.IO 连接，则向服务端发送 UPDATE_TOOL_LIST_EVENT。
-        其它变化类型暂未实现，打印 Warning 日志。
+        **#210 硬约束：本方法由 MCP ``ClientSession`` 接收循环内联 await，其中不得 await 任何对同一会话的
+        请求**（响应只能由正阻塞的接收循环读取 → 自阻塞，传参即永久失能：后续通知收不到、工具调用一并挂起）。
+        三条含真实 RPC 的刷新路径（工具投影 / 资源集合 / SKILL 内容）一律经**后台任务**调度；仅 Socket.IO
+        emit（异会话）保持内联。详见 :meth:`_schedule_tool_projection_refresh` 与 :meth:`_schedule_resource_refresh`。
+
+        Dispatch MCP change notifications. This callback runs **inline inside the MCP receive loop**, so it must
+        never await a same-session request; all RPC-bearing refreshes are scheduled onto background tasks.
         """
         if isinstance(getattr(message, "root", None), ToolListChangedNotification):
             # #197：能力轴推进**先于** Socket.IO 早退（本地状态先行，与 clear_oauth 的既定姿态一致）——
@@ -621,30 +639,31 @@ class Computer(BaseComputer[PromptSession]):
             except Exception as e:  # pragma: no cover
                 logger.error(f"上报工具变更失败: {e}", exc_info=True)
         elif isinstance(getattr(message, "root", None), ResourceListChangedNotification):
-            # 资源列表变化：window:// 与 skill:// **并行独立**处理（互不阻断，设计 §5.1）。
-            # Resource list changed: window:// and skill:// handled in parallel & independently.
-            client = self.socketio_client
-            if client is None:
-                logger.debug("Socket.IO 客户端不存在或已释放，忽略资源列表变化上报")
-                return
-            await self._on_resource_list_changed_windows(client)
-            await self._on_resource_list_changed_skills()
+            # #210：window:// 与 skill:// 两条路径的刷新都含**对同一会话的真实 RPC**，必须离开接收循环。
+            # 本地状态先行（对齐 #197 tools 路径姿态）：未加入 office 也更新窗口缓存 / 重物化 SKILL，
+            # emit 由各自的 client 守卫兜住 —— 否则未入房间期间 MCP 推的 skill:// 永不进 Registry，
+            # 入房后 client:get_skills 会拿到陈旧集合。
+            # Both refresh paths carry same-session RPCs; local state advances regardless of Office membership.
+            self._schedule_resource_refresh(windows_list=True, skills_list=True)
         elif isinstance(getattr(message, "root", None), ResourceUpdatedNotification):
             # 资源内容更新按 scheme 分流：window:// → 桌面刷新；skill:// → 重物化并上报 SKILL 更新。
             # Resource content updated, dispatched by scheme: window:// → desktop; skill:// → restage skills.
-            client = self.socketio_client
-            if client is None:
-                logger.debug("Socket.IO 客户端不存在或已释放，忽略资源更新上报")
-                return
             uri = getattr(getattr(getattr(message, "root", None), "params", None), "uri", None)
             uri_str = str(uri) if uri is not None else ""
             if uri is not None and is_window_uri(uri_str):
+                # 窗口内容更新无本地状态可更，仅需 Socket.IO emit（异会话、无 RPC）→ 保持内联。
+                client = self.socketio_client
+                if client is None:
+                    logger.debug("Socket.IO 客户端不存在或已释放，忽略资源更新上报")
+                    return
                 try:
                     await client.emit_refresh_desktop()
                 except Exception as e:  # pragma: no cover
                     logger.error(f"上报桌面刷新失败: {e}")
             elif uri_str.startswith(_SKILL_URI_PREFIX):
-                await self._on_skill_resource_updated()
+                # #210：重物化含真实 RPC（list_skill_resources + 每子资源 read_resource）→ 后台调度。
+                # **不比对集合**（内容级更新时 URI 集合不变），故走独立的 content 动作，见 :meth:`_schedule_resource_refresh`。
+                self._schedule_resource_refresh(skills_content=True)
             else:
                 logger.debug("收到资源更新但非 window/skill scheme，放行 / Non-window/skill resource updated, ignore")
         else:
@@ -694,8 +713,77 @@ class Computer(BaseComputer[PromptSession]):
                 return
             self._tool_refresh_dirty = False  # 在途期间到达过通知 → 补跑一轮
 
-    async def _on_resource_list_changed_windows(self, client: "SMCPComputerClient") -> None:
+    def _schedule_resource_refresh(
+        self,
+        *,
+        windows_list: bool = False,
+        skills_list: bool = False,
+        skills_content: bool = False,
+    ) -> None:
+        """调度一次资源刷新后台任务（#210）：变更侧只标脏，刷新在 MCP 接收循环**之外**执行。
+
+        为何必须离开接收循环 / Why it must leave the receive loop: 本调度点由 :meth:`_on_manager_change`
+        触发，而该回调在 MCP ``ClientSession`` 接收循环内被**内联** await —— 在那里 await
+        ``list_windows`` / ``list_skill_resources`` / ``read_resource``（均对同一会话）会自阻塞：响应只能由
+        正阻塞的接收循环读取，接收循环永远读不到（#127 会话级重入死锁；#210 实测该 server 永久失能、
+        连通话一并挂起）。
+
+        三个按**动作**分设的开关 / Per-action switches: ``windows_list`` 走 window:// 集合比对、
+        ``skills_list`` 走 skill:// 集合比对、``skills_content`` 走**无条件**重物化。内容级更新
+        （``resources/updated``）的 URI 集合不变，故**不能**复用集合那位 —— 否则比对会把它挡掉。
+
+        合并规则 / Coalescing: 已有在途任务时仅置脏位，由在途轮次结算后**补跑一轮**（既不丢通知，也不并发
+        多轮 RPC）；``skills_content`` 在补跑轮里**吃掉** ``skills_list``（无条件重物化 ⊇ 集合路径的效果，
+        唯一代价是 ``_skills_cache`` 本轮不提交 → 下一次集合通知多跑一轮重物化，自愈）。
+        """
+        if self.mcp_manager is None:
+            logger.debug("MCP 管理器不存在（未 boot/已停机），忽略资源刷新调度")
+            return
+        self._windows_list_dirty |= windows_list
+        self._skills_list_dirty |= skills_list
+        self._skills_content_dirty |= skills_content
+        if self._resource_refresh_task is not None and not self._resource_refresh_task.done():
+            return  # 在途 → 标脏已生效，结算后补跑（不得丢弃）
+        self._resource_refresh_task = asyncio.create_task(self._arefresh_resources())
+
+    async def _arefresh_resources(self) -> None:
+        """后台消费资源刷新（#210）：一轮内先 window 后 skill；结算后若又被标脏则补跑一轮。
+
+        失败策略 / Failure policy: 本轮任一步抛异常即记 ERROR 并**结束整轮**（不冒泡到接收循环）—— 与
+        #197 的 ``_arefresh_tool_projection`` 同姿态（不确定即不做，宁可漏一轮也不在半途状态上继续）。
+
+        锁不变量 / Lock invariant: 资源路径**刻意**只走 manager 的不取锁 API（``list_windows`` /
+        ``list_skill_resources`` / ``read_resource`` 仅做 ``_active_clients`` 快照），而工具路径的
+        ``arefresh_tools`` 会**持锁跨 RPC**、``manager.aclose()`` 也取同一把锁 —— 两个后台任务之间因此
+        **没有锁边**，可安全并发。**禁止**把本方法改走持锁的 manager API，「统一」即造出真耦合。
+        """
+        while True:
+            windows_list = self._windows_list_dirty
+            skills_content = self._skills_content_dirty
+            skills_list = self._skills_list_dirty
+            self._windows_list_dirty = False
+            self._skills_content_dirty = False
+            self._skills_list_dirty = False
+            try:
+                if windows_list:
+                    await self._on_resource_list_changed_windows()
+                if skills_content:
+                    await self._on_skill_resource_updated()  # ③ 无条件重物化（内容级更新）
+                elif skills_list:
+                    await self._on_resource_list_changed_skills()  # ② 集合比对后再决定
+            except Exception as e:
+                logger.error(f"资源刷新失败，本轮跳过: {e}", exc_info=True)
+                return
+            if not (self._windows_list_dirty or self._skills_content_dirty or self._skills_list_dirty):
+                return
+
+    async def _on_resource_list_changed_windows(self) -> None:
         """window:// 集合变化 → 比对缓存 → 触发桌面刷新（行为同 v0.2 既有逻辑，原样抽取）。
+
+        #210：本方法由资源刷新**后台任务**调用（其采集含对同一 MCP 会话的真实 RPC，不得在接收循环内联）。
+        emit 目标在此处**重读** ``socketio_client``（weakref）而非由调用方传入强引用 —— 与既有的
+        :meth:`_emit_update_skills_now` 同形，保住「Computer 不持有客户端」的 weakref 语义；无客户端则仅
+        跳过上报（本地缓存照常推进，见 :meth:`_schedule_resource_refresh`）。
 
         window:// set changed → compare cache → trigger desktop refresh (behavior-neutral extraction).
         """
@@ -717,6 +805,10 @@ class Computer(BaseComputer[PromptSession]):
             if removed:
                 logger.debug(f"移除窗口: {removed}")
             self._windows_cache = new_windows
+            client = self.socketio_client  # 重读 weakref（不捕获强引用）；本地缓存已提交，无客户端仅跳过上报
+            if client is None:
+                logger.debug("无 Socket.IO 客户端，跳过桌面刷新上报 / no client, skip desktop refresh report")
+                return
             try:
                 await client.emit_refresh_desktop()
             except Exception as e:  # pragma: no cover
@@ -1513,15 +1605,22 @@ class Computer(BaseComputer[PromptSession]):
             self._skill_watcher.stop()
             self._skill_watcher = None
         await self._skill_debouncer.aclose()
-        # #197：**先摘引用、再作废在途刷新**（照 debouncer ``aclose`` 的 closed 门语义）——停机窗口内到达的
-        # 通知因 ``mcp_manager is None`` 不再调度新任务；在途任务 cancel 后 await 结算，避免其继续对已关闭的
-        # manager 取锁。仅 cancel 不置位会在 ``aclose`` 的 await 窗口里被新通知复活出一个必炸的任务。
+        # #197 / #210：**先摘引用、再作废在途刷新**（照 debouncer ``aclose`` 的 closed 门语义）——停机窗口内
+        # 到达的通知因 ``mcp_manager is None`` 不再调度新任务；在途任务 cancel 后 await 结算，避免其继续对已
+        # 关闭的 manager 发请求（或对工具路径持锁）。仅 cancel 不置位会在 ``aclose`` 的 await 窗口里被新通知
+        # 复活出一个必炸的任务；顺序也不可反转——放到 ``manager.aclose()`` 之后即变成对已销毁 client 发请求。
         manager = self.mcp_manager
         self.mcp_manager = None
-        task = self._tool_refresh_task
+        inflight = [
+            task
+            for task in (self._tool_refresh_task, self._resource_refresh_task)
+            if task is not None and not task.done()
+        ]
         self._tool_refresh_task = None
-        if task is not None and not task.done():
+        self._resource_refresh_task = None
+        for task in inflight:
             task.cancel()
+        for task in inflight:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         if manager:

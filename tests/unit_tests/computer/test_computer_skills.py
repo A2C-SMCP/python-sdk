@@ -85,6 +85,21 @@ def _computer(tmp_path: Path) -> Computer:
     return Computer(name="comp-test", blob_cache_root=tmp_path / "blobspool", auto_connect=False, auto_reconnect=False)
 
 
+async def _settle_resource_refresh(comp: Computer) -> None:
+    """#210：资源刷新改由后台任务执行 —— 断言效果前必须结算（含结算后又起的新一轮）。"""
+    while True:
+        task = getattr(comp, "_resource_refresh_task", None)
+        if task is None or task.done():
+            return
+        await task
+
+
+def _with_manager(comp: Computer) -> Computer:
+    """#210：资源刷新经后台任务调度，需 manager 就绪（否则调度被前置守卫挡下 → 断言恒真）。"""
+    comp.mcp_manager = _FakeManager([])  # type: ignore[assignment]
+    return comp
+
+
 # ===========================================================================
 # 接线 / wiring
 # ===========================================================================
@@ -209,7 +224,7 @@ async def test_reconcile_does_not_touch_non_mcp_sources(tmp_path: Path) -> None:
 async def test_resource_list_changed_skill_set_changed_emits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mcp.types import ResourceListChangedNotification
 
-    comp = _computer(tmp_path)
+    comp = _with_manager(_computer(tmp_path))
     client = _DummyClient()
     comp.socketio_client = client  # type: ignore[assignment]
 
@@ -231,8 +246,9 @@ async def test_resource_list_changed_skill_set_changed_emits(tmp_path: Path, mon
     comp._skills_cache = set()  # 原为空 → 变化
 
     await comp._on_manager_change(SimpleNamespace(root=ResourceListChangedNotification()))  # type: ignore[arg-type]
+    await _settle_resource_refresh(comp)  # #210：刷新在后台任务里，须结算后再断言
     assert restaged["n"] == 1
-    assert comp._skills_cache == {"skill://srv/demo"}  # 缓存在处理器内同步更新
+    assert comp._skills_cache == {"skill://srv/demo"}  # 缓存由后台轮次提交（不再是处理器内同步更新）
     await comp._skill_debouncer.aflush()  # 结算去抖窗口 → emit（#67：emit 经去抖器，不再裸调）
     assert client.update_skills_called == 1
 
@@ -241,7 +257,7 @@ async def test_resource_list_changed_skill_set_changed_emits(tmp_path: Path, mon
 async def test_resource_list_changed_skill_set_unchanged_skips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mcp.types import ResourceListChangedNotification
 
-    comp = _computer(tmp_path)
+    comp = _with_manager(_computer(tmp_path))
     client = _DummyClient()
     comp.socketio_client = client  # type: ignore[assignment]
 
@@ -263,6 +279,8 @@ async def test_resource_list_changed_skill_set_unchanged_skips(tmp_path: Path, m
     comp._skills_cache = {"skill://srv/demo"}  # 与采集一致 → 跳过
 
     await comp._on_manager_change(SimpleNamespace(root=ResourceListChangedNotification()))  # type: ignore[arg-type]
+    # #210：阴性断言必须在**后台轮次结算之后**才有效 —— 否则「0 次」可能只是任务还没跑（假绿）
+    await _settle_resource_refresh(comp)
     assert restaged["n"] == 0
     assert client.update_skills_called == 0
 
@@ -271,7 +289,7 @@ async def test_resource_list_changed_skill_set_unchanged_skips(tmp_path: Path, m
 async def test_resource_updated_skill_uri_emits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mcp.types import ResourceUpdatedNotification, ResourceUpdatedNotificationParams
 
-    comp = _computer(tmp_path)
+    comp = _with_manager(_computer(tmp_path))
     client = _DummyClient()
     comp.socketio_client = client  # type: ignore[assignment]
 
@@ -285,6 +303,7 @@ async def test_resource_updated_skill_uri_emits(tmp_path: Path, monkeypatch: pyt
 
     note = ResourceUpdatedNotification(params=ResourceUpdatedNotificationParams(uri="skill://srv/demo"))
     await comp._on_manager_change(SimpleNamespace(root=note))  # type: ignore[arg-type]
+    await _settle_resource_refresh(comp)  # #210：内容级重物化含真实 RPC → 已移至后台任务
     assert restaged["n"] == 1
     await comp._skill_debouncer.aflush()  # 结算去抖窗口 → emit
     assert client.update_skills_called == 1
