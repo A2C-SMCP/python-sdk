@@ -1519,3 +1519,94 @@ async def test_available_tools_malformed_warns_per_refresh(manager, monkeypatch)
         assert len(malformed_warns) == 2, f"两次刷新应各 1 条诊断，实际: {malformed_warns}"
     finally:
         _DECLARED_TOOLS.pop("malformed_server", None)
+
+
+# ── #197：暴露工具投影指纹（arefresh_tools 的变化判定） ─────────────────────────
+#    Computer.capability_revision 的推进判据 = 「工具投影是否真实变化」。以下用例钉死 arefresh_tools()
+#    的变化报告语义：未变 → False（防虚假 revision）、schema-only 变化 → True（对齐 Rust PR #199 拒绝
+#    name-only 捷径）、失败 bundle → 不参与比对（不得被误报为「工具被移除」，对齐 Rust 失败姿态）。
+#    Projection-change reporting consumed by Computer.capability_revision (#197).
+
+
+@pytest.mark.asyncio
+async def test_arefresh_tools_reports_unchanged_projection(manager):
+    """投影未变 → ``arefresh_tools()`` 返回 False（#197 阴性对照：防虚假 revision）。"""
+    servers = [create_server_config("server1")]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    assert await manager.arefresh_tools() is False
+
+
+@pytest.mark.asyncio
+async def test_arefresh_tools_reports_added_tool(manager):
+    """新增工具 → ``arefresh_tools()`` 返回 True；再次刷新（未再变）→ False（#197）。"""
+    servers = [create_server_config("server1")]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    manager._active_clients["server1"].list_tools = AsyncMock(
+        return_value=[create_mock_tool("tool1"), create_mock_tool("tool2"), create_mock_tool("tool3")],
+    )
+
+    assert await manager.arefresh_tools() is True, "新增工具须报告投影变化"
+    assert await manager.arefresh_tools() is False, "未再变化须回落 False"
+
+
+@pytest.mark.asyncio
+async def test_arefresh_tools_reports_schema_only_change(manager):
+    """同名工具仅 ``inputSchema`` 变化 → 仍须报告变化（拒绝 name-only 捷径，对齐 Rust PR #199）。"""
+    servers = [create_server_config("server1")]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    manager._active_clients["server1"].list_tools = AsyncMock(
+        return_value=[
+            Tool(name="tool1", inputSchema={"type": "object", "properties": {"alpha": {"type": "string"}}}),
+            create_mock_tool("tool2"),
+        ],
+    )
+
+    assert await manager.arefresh_tools() is True, "schema-only 变化须报告（name-only 比对会漏报）"
+
+
+@pytest.mark.asyncio
+async def test_arefresh_tools_failed_bundle_is_not_a_removal(manager):
+    """某 bundle ``list_tools`` 失败 → 不得被误报为「工具被移除」（失败不 commit，对齐 Rust 姿态）。
+
+    序列覆盖「连续失败」与「失败→恢复」：三者均不得报告变化。失败 bundle 的**携带投影条目**须经
+    **exposed 名前缀**归属剔除——经路由表反查会在首次失败提交后失同步（路由已无该 bundle，陈旧条目
+    被误判为他人所有），使第二次失败与恢复各产生一次虚假 revision。
+    """
+    servers = [create_server_config("server1"), create_server_config("server2")]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    manager._active_clients["server2"].list_tools = AsyncMock(side_effect=RuntimeError("list_tools boom"))
+
+    assert await manager.arefresh_tools() is False, "首轮失败不得报告变化"
+    assert await manager.arefresh_tools() is False, "连续失败（投影未变）不得报告变化"
+
+    # 恢复：工具与失败前逐字段相同 → 仍不得报告变化（否则「故障→恢复」抖动出一次虚假 revision）
+    manager._active_clients["server2"].list_tools = AsyncMock(return_value=[create_mock_tool("tool3"), create_mock_tool("tool4")])
+    assert await manager.arefresh_tools() is False, "失败→恢复不得抖动出一次虚假 revision"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_bundle_routes_also_drops_projection(manager):
+    """``_withdraw_bundle_tool_routes`` 须**同步裁剪投影指纹**（#197）：否则紧随的 ``arefresh_tools()``
+    会因残留条目再报一次变化，令 ``clear_oauth`` 的能力撤销被计成两次 revision（Rust 同名方法
+    routes / disabled / projection 三表齐撤）。
+
+    形态复刻 clear_oauth 的**零 await 快速段**：退役活跃 client（pop）→ 确定性撤回路由 → 该 bundle 不再
+    进入任何后续投影，故首次刷新必须报「未变化」。
+    """
+    servers = [create_server_config("server1"), create_server_config("server2")]
+    await manager.ainitialize(servers)
+    await manager.astart_all()
+
+    manager._active_clients.pop("server2")  # 复刻快速段：退役 client（就地变异）
+    assert manager._withdraw_bundle_tool_routes("server2") is True
+
+    assert manager._tool_projection.keys() == manager._exposed_tools.keys(), "两表须同步（投影不得留残影）"
+    assert await manager.arefresh_tools() is False, "撤回后首次刷新不得再报一次变化（否则 clear_oauth 双计数）"

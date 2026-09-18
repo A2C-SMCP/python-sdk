@@ -258,9 +258,14 @@ class Computer(BaseComputer[PromptSession]):
         self._active_raw: dict[str, _RawServerEntry] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
-        # #185：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——仅
-        # clear_oauth 的**实际能力撤回**时 +1（见 clear_oauth；config 轴分账见类内 §12 R2 注释）。
+        # #185/#197：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——两条推进
+        # 路径：① clear_oauth 的**实际能力撤回**；② 运行期工具投影的真实变化（tools/list_changed）。均经
+        # ``_bump_capability_revision`` 单一出口（config 轴分账见类内 §12 R2 注释）。
         self._capability_revision: int = 0
+        # #197：工具投影后台刷新任务句柄 + 在途标脏位。收到 tools/list_changed 时调度——刷新**不得**在 MCP
+        # 接收循环内联执行（会话级重入死锁，#127 实证；本 issue 复验 window 刷新内联 RPC 实测挂起）。
+        self._tool_refresh_task: asyncio.Task[None] | None = None
+        self._tool_refresh_dirty: bool = False
         # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
         # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
         self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
@@ -601,6 +606,10 @@ class Computer(BaseComputer[PromptSession]):
         其它变化类型暂未实现，打印 Warning 日志。
         """
         if isinstance(getattr(message, "root", None), ToolListChangedNotification):
+            # #197：能力轴推进**先于** Socket.IO 早退（本地状态先行，与 clear_oauth 的既定姿态一致）——
+            # 未加入 office 不代表本地 capability_revision 应停滞。刷新经后台任务执行：本回调运行在 MCP
+            # 接收循环内，其中 await 任何对**同一会话**的请求都会自阻塞（#127 会话级重入死锁）。
+            self._schedule_tool_projection_refresh()
             client = self.socketio_client
             if client is None:
                 logger.debug("Socket.IO 客户端不存在或已释放，忽略更新上报")
@@ -640,6 +649,50 @@ class Computer(BaseComputer[PromptSession]):
                 logger.debug("收到资源更新但非 window/skill scheme，放行 / Non-window/skill resource updated, ignore")
         else:
             logger.warning(f"收到未处理的变化类型: {truncate(message)}，当前版本仅处理工具列表变化")
+
+    def _schedule_tool_projection_refresh(self) -> None:
+        """调度一次工具投影后台刷新（#197）：变更侧只标脏，刷新在 MCP 接收循环**之外**执行。
+
+        为何必须离开接收循环 / Why it must leave the receive loop: 本调度点由 :meth:`_on_manager_change`
+        触发，而该回调在 MCP ``ClientSession`` 接收循环内被**内联** await —— 在那里 await ``list_tools``
+        （对同一会话）会自阻塞，接收循环永远读不到自己的响应（#127 会话级重入死锁；#197 复验：window 刷新
+        的内联 RPC 实测使连通话一并挂起）。
+
+        在途合并 / Coalescing: 已有在途刷新时仅置标脏位，由在途任务结算后**补跑一轮** —— 既不丢通知，
+        也不并发多轮 RPC。
+        """
+        if self.mcp_manager is None:
+            logger.debug("MCP 管理器不存在（未 boot），忽略工具投影刷新调度")
+            return
+        if self._tool_refresh_task is not None and not self._tool_refresh_task.done():
+            self._tool_refresh_dirty = True  # 在途 → 标脏，结算后补跑（不得丢弃）
+            return
+        self._tool_refresh_dirty = False
+        self._tool_refresh_task = asyncio.create_task(self._arefresh_tool_projection())
+
+    async def _arefresh_tool_projection(self) -> None:
+        """后台刷新工具投影，并在**真实变化**时推进 capability 轴（#197）。
+
+        ``manager.arefresh_tools()`` 的返回值即「投影是否变化」（含 schema 的全字段比对，失败 bundle 已在
+        manager 侧对称剔除），**仅其为真时** bump —— 重复通知而投影未变不得产生虚假 revision（对齐 Rust
+        PR #199 的阴性对照）。
+
+        刷新失败（RPC / 连接错误）视为**本轮不可判定**：记 ERROR、不推进、不冒泡 —— 不确定即不推进，
+        宁可漏报一次也不虚增能力版本。
+        """
+        assert self.mcp_manager is not None  # 由 _schedule_tool_projection_refresh 前置守卫
+        manager = self.mcp_manager  # 捕获引用：结算期间 shutdown 可能已把属性置 None
+        while True:
+            try:
+                changed = await manager.arefresh_tools()
+            except Exception as e:
+                logger.error(f"工具投影刷新失败，本轮不推进能力轴: {e}", exc_info=True)
+                return
+            if changed:
+                self._bump_capability_revision()
+            if not self._tool_refresh_dirty:
+                return
+            self._tool_refresh_dirty = False  # 在途期间到达过通知 → 补跑一轮
 
     async def _on_resource_list_changed_windows(self, client: "SMCPComputerClient") -> None:
         """window:// 集合变化 → 比对缓存 → 触发桌面刷新（行为同 v0.2 既有逻辑，原样抽取）。
@@ -1460,9 +1513,19 @@ class Computer(BaseComputer[PromptSession]):
             self._skill_watcher.stop()
             self._skill_watcher = None
         await self._skill_debouncer.aclose()
-        if self.mcp_manager:
-            await self.mcp_manager.aclose()
+        # #197：**先摘引用、再作废在途刷新**（照 debouncer ``aclose`` 的 closed 门语义）——停机窗口内到达的
+        # 通知因 ``mcp_manager is None`` 不再调度新任务；在途任务 cancel 后 await 结算，避免其继续对已关闭的
+        # manager 取锁。仅 cancel 不置位会在 ``aclose`` 的 await 窗口里被新通知复活出一个必炸的任务。
+        manager = self.mcp_manager
         self.mcp_manager = None
+        task = self._tool_refresh_task
+        self._tool_refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if manager:
+            await manager.aclose()
         self._active_raw.clear()  # #149：运行期活跃集销毁 → 清空 raw 投影缓存
 
     async def __aenter__(self) -> "Computer":
@@ -2210,12 +2273,25 @@ class Computer(BaseComputer[PromptSession]):
 
     @property
     def capability_revision(self) -> int:
-        """capability 轴修订计数（#185，对齐 Rust ``Computer::capability_revision``）。
+        """capability 轴修订计数（#185/#197，对齐 Rust ``Computer::capability_revision``）。
 
-        仅当 :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）
-        时 +1；幂等重复 clear 不递增。config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
+        两条推进路径，均经 :meth:`_bump_capability_revision` 单一出口：
+
+        ① :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）时 +1；
+           幂等重复 clear 不递增。
+        ② 运行期**工具投影真实变化**（MCP ``tools/list_changed``，#197）时 +1 —— 判据为含 schema 的
+           全字段投影比对（``manager.arefresh_tools()`` 的返回值）；重复通知而投影未变**不**推进。
+           config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
         """
         return self._capability_revision
+
+    def _bump_capability_revision(self) -> None:
+        """capability 轴推进**单一出口**（#197）：OAuth 撤销与工具投影变化共用，杜绝多路径语义漂移。
+
+        Single bump outlet for the capability axis (#197) — shared by OAuth revocation and tool-projection
+        changes so the two paths cannot drift apart. 本地状态先行：调用方**不得**把它置于 Socket.IO 早退之后。
+        """
+        self._capability_revision += 1
 
     async def clear_oauth(self, bundle_id: str) -> None:
         """清除该 server 的 OAuth 授权并传播能力撤销（#185）。
@@ -2237,7 +2313,7 @@ class Computer(BaseComputer[PromptSession]):
         capability_changed = await self.mcp_manager.clear_oauth(bundle_id)
         if not capability_changed:
             return
-        self._capability_revision += 1
+        self._bump_capability_revision()
         client = self.socketio_client
         if client is None:
             logger.debug("Socket.IO 客户端不存在或已释放，忽略能力撤销上报")

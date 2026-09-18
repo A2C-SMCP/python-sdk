@@ -178,6 +178,42 @@ def _is_secure_endpoint(config: MCPServerConfig) -> bool:
         return False
 
 
+def _tool_projection_fingerprint(tool: Tool) -> str:
+    """工具定义的**全字段**规范化指纹（#197）：含 name / description / inputSchema / annotations / meta。
+
+    Full-field canonical fingerprint of a tool definition (#197). 同名换 schema 也能被检出——拒绝
+    name-only 捷径（对齐 Rust PR #199 的 projection 比对）。``exclude_none`` 保证「字段由 None 变为实际值」
+    同样计入变化；``sort_keys`` 抹平 dict 键序抖动，避免同一投影因序列化顺序被判成变化。
+    """
+    return json.dumps(
+        tool.model_dump(mode="json", exclude_none=True),
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _projection_excluding_failed(
+    projection: dict[EXPOSED_TOOL_NAME, str],
+    failed: set[BUNDLE_ID],
+) -> dict[EXPOSED_TOOL_NAME, str]:
+    """剔除失败 bundle 的投影条目（#197）：临时故障不得被读成「工具被移除」。
+
+    Drop projection entries owned by failed bundles so a transient ``list_tools`` failure is never
+    mistaken for a real capability change — mirrors Rust's "a failure must not masquerade as a tool
+    removal or publish a false capability revision".
+
+    归属以 **exposed 名前缀**（``exposed = {bundle_id}__{tool}``，bundle_id 无连续 ``__`` 保证单射）判定，
+    **不**经路由表反查：失败 bundle 的**携带条目**在提交后已不在路由表中（路由被摘掉，而投影条目为防
+    「失败 → 恢复」抖动被有意保留），反查会把它们误判为他人所有 —— 于是「连续失败」与「失败 → 恢复」
+    各产生一次虚假 revision。
+    """
+    if not failed:
+        return projection
+    prefixes = tuple(f"{bundle}__" for bundle in failed)
+    return {key: value for key, value in projection.items() if not key.startswith(prefixes)}
+
+
 class ToolNameDuplicatedError(Exception):
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
@@ -232,6 +268,11 @@ class MCPServerManager:
         # （协议 §ExposedToolMapping）。exposed = {bundle_id}__{alias ?? 原始名}，bundle_id 无 `__` 保证单射→查表不 split。
         # 被 forbidden 的工具**不进本表**（不可见不可调用）；跨 bundle_id 天然唯一，无需跨 server 对账。
         self._exposed_tools: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
+        # #197：暴露工具投影指纹（exposed_tool_name → 工具定义规范化 JSON，见 _tool_projection_fingerprint）。
+        # 与 _exposed_tools（只有名字映射）不同，本表含 description / inputSchema / annotations / meta，
+        # 故「同名换 schema」也能被检出——``Computer.capability_revision`` 的变化判据即基于本表比对。
+        # Projection fingerprint (#197); the change predicate behind Computer.capability_revision.
+        self._tool_projection: dict[EXPOSED_TOOL_NAME, str] = {}
         # #185：per-bundle 活跃 client 世代计数（ABA 检测）——每次 _active_clients 插入/移除/替换 +1。
         # available_tools 发布前与 _arefresh_tool_mapping 提交前按「client 身份 + generation」二次校验，
         # 同一 client 对象被 remove 再 reinsert（ABA）也能被检出（Rust active_client_generations 的 python 面）。
@@ -1045,6 +1086,7 @@ class MCPServerManager:
         self._activation_intents.clear()
         self._connection_states.clear()
         self._exposed_tools.clear()
+        self._tool_projection.clear()  # #197：投影指纹随路由同清（两表同步不变量，勿留残影）
         self._active_client_generations.clear()
         self._oauth_clear_epochs.clear()
         # #179 OAuth 注册表随清（detached connect 任务取消弃置；coordinator/store 凭宿主注入）
@@ -1066,7 +1108,12 @@ class MCPServerManager:
 
         Fail-closed 原语（Rust ``withdraw_bundle_tool_routes`` 的 python 面）：即便上游 MCP
         server 已不可达，本地授权撤销也立即生效。与全量 :meth:`_arefresh_tool_mapping` 不同，
-        本方法**只移除**指定 bundle 的路由、不发起任何 ``tools/list`` RPC。
+        本方法**只移除**指定 bundle 的路由**并同步裁剪其投影指纹**（#197，两表同步不变量）、
+        不发起任何 ``tools/list`` RPC。
+
+        返回值维持**纯路由口径**（Rust 为 ``routes_changed || disabled_changed || projection_changed``）：
+        当前可达状态下投影变化 ⊆ 路由变化，故口径差异不漏 bump；若将来出现「投影多于路由」的可达状态
+        （如 clear 后路由已空但投影仍携带），需一并纳入返回值。
 
         **rebind 而非 in-place del**：在途迭代器（如 :meth:`available_tools` 的发布校验段）
         读旧 dict 对象不受影响，避免「dictionary changed size during iteration」。
@@ -1076,12 +1123,25 @@ class MCPServerManager:
         """
         before = len(self._exposed_tools)
         self._exposed_tools = {exposed: route for exposed, route in self._exposed_tools.items() if route[0] != bundle_id}
+        # #197：投影指纹**同步裁剪** —— 否则紧随其后的 ``arefresh_tools()`` 会因残留条目报告一次变化，
+        # 令 clear_oauth 的能力撤销被计成两次 revision（Rust 同名方法 routes / disabled / projection 三表齐撤）。
+        # 按前缀裁剪（此处的 rebind 已丢失旧路由，无法反查归属）。
+        _prefix = f"{bundle_id}__"
+        self._tool_projection = {exposed: fp for exposed, fp in self._tool_projection.items() if not exposed.startswith(_prefix)}
         return len(self._exposed_tools) != before
 
-    async def _arefresh_tool_mapping(self) -> None:
+    async def _arefresh_tool_mapping(self) -> bool:
         """重建 ExposedToolMapping（**须持 ``_lock``**）：快照 → 构建新表 → 提交前世代校验 → 失配整轮重试。
 
         Rebuild the shared ExposedToolMapping used by both ``available_tools`` and ``tool_call`` routing.
+
+        #197：返回**暴露工具投影是否真实变化** —— ``Computer`` 据此推进 ``capability_revision``。判据是含
+        description / inputSchema / annotations / meta 的**全字段**投影指纹（拒绝 name-only 捷径，对齐
+        Rust PR #199 的 ``projection_changed``）；``list_tools`` 失败的 bundle 在**新旧两侧对称剔除**
+        （对齐 Rust「失败不 commit、不视为工具被移除」），故临时故障不会被误报成一次能力变化。
+
+        Returns whether the exposed tool projection actually changed (#197), feeding
+        ``Computer.capability_revision``. Failures are excluded symmetrically so they never read as removals.
 
         ``exposed_tool_name = {bundle_id}__{alias ?? 原始名}``（协议 §exposed_tool_name）。跨 bundle_id 因前缀
         天然唯一——**无需**跨 server 重名对账（旧 ``ToolNameDuplicatedError`` 场景消失）。forbidden 工具**不进表**
@@ -1107,6 +1167,9 @@ class MCPServerManager:
                 for bundle_id, client in self._active_clients.items()
             ]
             new_routes: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
+            # #197：本轮投影指纹 + list_tools 失败的 bundle（失败 bundle 不参与变化判定）
+            new_projection: dict[EXPOSED_TOOL_NAME, str] = {}
+            failed: set[BUNDLE_ID] = set()
             for bundle_id, client, _generation in snapshot:
                 config = self._servers_config[bundle_id]
                 # #151 R1'：default_tool_meta.alias 天生病态（alias 是 per-tool 改名）→ 已忽略（见 _merged_tool_meta），
@@ -1123,6 +1186,7 @@ class MCPServerManager:
                     tools = await client.list_tools()
                 except Exception as e:
                     logger.error(f"Error listing tools for bundle_id={bundle_id!r} (name={config.name!r}): {e}", exc_info=True)
+                    failed.add(bundle_id)  # #197：本轮无法判定该 bundle → 不参与投影比对（见提交块对称剔除）
                     continue
                 for t in tools or []:
                     original_tool_name = t.name
@@ -1142,17 +1206,32 @@ class MCPServerManager:
                         )
                         continue
                     new_routes[exposed] = (bundle_id, original_tool_name)
+                    new_projection[exposed] = _tool_projection_fingerprint(t)
             # 提交前校验：活跃 client 集合 + 身份 + 世代是否与快照一致（clear 快速段 / stop / start
             # 均会造成失配）→ 失配则整轮重试，绝不以陈旧快照覆写更新的投影
             if len(self._active_clients) == len(snapshot) and all(
                 self._active_clients.get(bundle_id) is client and self._active_client_generations.get(bundle_id, 0) == generation
                 for bundle_id, client, generation in snapshot
             ):
+                # #197：变化判定 —— 失败 bundle 在**旧侧**显式剔除（新侧天然不含：其 ``continue`` 跳过了
+                # 路由与指纹写入）。两侧都含失败 bundle 的条目时，「本次失败」会被读成「工具被移除」。
+                changed = new_projection != _projection_excluding_failed(self._tool_projection, failed)
+                # 投影提交时**保留失败 bundle 的携带条目**：否则「失败 → 恢复」会被判成一次变化，产生虚假
+                # revision。归属按 exposed 名前缀（不依赖路由表 —— 路由表本轮已被换成不含失败 bundle 的新表）。
+                merged_projection = dict(new_projection)
+                for _exposed, _fingerprint in self._tool_projection.items():
+                    if _exposed not in merged_projection and _exposed.startswith(tuple(f"{bundle}__" for bundle in failed)):
+                        merged_projection[_exposed] = _fingerprint
                 self._exposed_tools = new_routes
-                return
+                self._tool_projection = merged_projection
+                return changed
 
-    async def arefresh_tools(self) -> None:
+    async def arefresh_tools(self) -> bool:
         """公开的工具映射刷新入口：锁内重建 ExposedToolMapping（``_exposed_tools``）（#127）。
+
+        返回值 / Returns（#197）: 本次刷新的**暴露工具投影是否真实变化** —— ``Computer`` 据此推进
+        ``capability_revision``（变化才推进，未变不产生虚假 revision）。既有调用方忽略返回值不受影响。
+        Whether the exposed tool projection actually changed (#197); existing callers may ignore it.
 
         Public tool-mapping refresh entry: rebuild the ExposedToolMapping under the lock (#127).
 
@@ -1166,7 +1245,7 @@ class MCPServerManager:
         MUST NOT be awaited inline inside an MCP ``message_handler`` (session-reentrant deadlock, see #127).
         """
         async with self._lock:
-            await self._arefresh_tool_mapping()
+            return await self._arefresh_tool_mapping()
 
     async def avalidate_tool_call(self, tool_name: EXPOSED_TOOL_NAME, parameters: dict) -> tuple[BUNDLE_ID, TOOL_NAME]:
         """校验 ``exposed_tool_name`` 并经 ExposedToolMapping 解析到 ``(bundle_id, 原始工具名)``。
