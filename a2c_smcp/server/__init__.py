@@ -25,6 +25,7 @@ from .utils import (
     aget_computers_in_office,
     get_all_sessions_in_office,
     get_computers_in_office,
+    require_office_id,
 )
 
 __all__ = [
@@ -58,4 +59,6 @@ __all__ = [
     "get_computers_in_office",
     "aget_all_sessions_in_office",
     "get_all_sessions_in_office",
+    # 隔离不变量 / Isolation invariant
+    "require_office_id",
 ]

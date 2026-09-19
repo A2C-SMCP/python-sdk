@@ -148,6 +148,8 @@ def test_on_server_join_office_ok_and_rollback_on_error():
 
 def test_on_server_leave_office_ok_and_error():
     ns = SyncSMCPNamespace(_DummyAuthProv())
+    # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
+    ns.get_session = MagicMock(return_value={"role": "agent", "office_id": "o"})
     ns.leave_room = MagicMock()
     ok, err = ns.on_server_leave_office("sid", {"office_id": "o"})
     assert ok is True and err is None
@@ -160,14 +162,16 @@ def test_on_server_leave_office_ok_and_error():
 def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     ns = SyncSMCPNamespace(_DummyAuthProv())
 
-    # cancel 仅允许 agent
-    ns.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
+    # cancel 仅允许 agent；广播必须锁定发起者自己的 office（#212：未入房的拒绝路径见
+    # tests/unit_tests/server/test_smcp_namespace_sync.py::TestServerBroadcastOfficeIsolationSync）
+    ns.get_session = MagicMock(return_value={"role": "agent", "office_id": "roomA", "name": "a1"})
     ns.emit = MagicMock()
     ns.on_server_tool_call_cancel("a1", {"agent": "a1", "req_id": "r1"})
     ns.emit.assert_called_once()
     args1, kwargs1 = ns.emit.call_args
     assert args1[0] == CANCEL_TOOL_CALL_NOTIFICATION
     assert kwargs1.get("skip_sid") == "a1"
+    assert kwargs1.get("room") == "roomA"
 
     # update_config 仅允许 computer
     ns.get_session = MagicMock(return_value={"role": "computer", "office_id": "roomR"})

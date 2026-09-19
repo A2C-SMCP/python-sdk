@@ -18,7 +18,7 @@ from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.sync_base import SyncBaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
-from a2c_smcp.server.utils import get_all_sessions_in_office
+from a2c_smcp.server.utils import get_all_sessions_in_office, require_office_id
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
@@ -255,9 +255,39 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         同步：Computer/Agent离开房间
         Sync: Computer or Agent leaves room
+
+        房间号**只取服务端权威的会话状态**，绝不用客户端载荷（载荷可携带任意房间号 ⇒ 跨房注入，
+        或携带 None ⇒ ``room=None`` 即全命名空间广播）。无房可退时幂等成功。
+        The room comes from the authoritative session only, never from the client payload.
         """
         try:
-            self.leave_room(sid, data["office_id"])
+            session = self.get_session(sid)
+
+            office_id = session.get("office_id")
+            if not office_id:
+                # 无房可退：清理路径幂等成功。但会话可能已与真实成员关系**漂移**（旧版采信载荷
+                # ⇒ 清空会话却把人留在原房），故按服务端权威的 socketio 成员关系收敛一次。
+                # Idempotent success, but first converge the authoritative socketio membership.
+                # 本分支假定 rooms(sid) 中的非 sid 房**均为 office 房**（仅由本 namespace 的
+                # enter_room 建立）——这是「房间号取自服务端 ⇒ 客户端无法借此广播」的另一半前提。
+                # Assumes every non-sid room in rooms(sid) is an office room created by this
+                # namespace's enter_room; that is what keeps the target set off the payload.
+                for room in self.rooms(sid):
+                    if room == sid:
+                        continue
+                    self.leave_room(sid, room)
+                return True, None
+
+            claimed = data.get("office_id") if isinstance(data, dict) else None
+            if claimed != office_id:
+                # 载荷与会话不一致：仅告警并按会话执行（不引入新的拒绝语义）
+                # Payload disagrees with the session: warn and follow the session.
+                logger.warning(
+                    f"leave_office: payload claims office {claimed!r} but session {sid} is in {office_id!r}; "
+                    f"leaving the session's office",
+                )
+
+            self.leave_room(sid, office_id)
             return True, None
         except Exception as e:
             return False, f"Internal server error: {str(e)}"
@@ -276,11 +306,10 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             raise SMCPNamespaceError("取消工具调用的广播仅可以由对应Agent发出")
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
-        office_id = session.get("office_id")
         self.emit(
             CANCEL_TOOL_CALL_NOTIFICATION,
             agent_call,
-            room=office_id,
+            room=require_office_id(session, sid),
             skip_sid=sid,
         )
 
@@ -297,7 +326,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         self.emit(
             UPDATE_CONFIG_NOTIFICATION,
             UpdateMCPConfigNotification(computer=update_config["computer"]),
-            room=session["office_id"],
+            room=require_office_id(session, sid),
             skip_sid=sid,
         )
 
@@ -315,7 +344,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         self.emit(
             UPDATE_TOOL_LIST_NOTIFICATION,
             {"computer": update_req["computer"]},
-            room=session.get("office_id"),
+            room=require_office_id(session, sid),
             skip_sid=sid,
         )
 
@@ -560,7 +589,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         self.emit(
             UPDATE_DESKTOP_NOTIFICATION,
             {"computer": update_req["computer"]},
-            room=session.get("office_id"),
+            room=require_office_id(session, sid),
             skip_sid=sid,
         )
 
@@ -578,7 +607,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         self.emit(
             UPDATE_SKILLS_NOTIFICATION,
             {"computer": update_req["computer"]},
-            room=session.get("office_id"),
+            room=require_office_id(session, sid),
             skip_sid=sid,
         )
 

@@ -22,15 +22,18 @@ from a2c_smcp.server import (
 )
 from a2c_smcp.server.base import BaseNamespace
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_NOTIFICATION,
     GET_BLOB_EVENT,
     GET_DESKTOP_EVENT,
     GET_SKILL_EVENT,
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     SMCP_NAMESPACE,
+    UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_EVENT,
     UPDATE_DESKTOP_NOTIFICATION,
     UPDATE_SKILLS_NOTIFICATION,
+    UPDATE_TOOL_LIST_NOTIFICATION,
     EnterOfficeReq,
     ErrorCode,
     GetDeskTopReq,
@@ -187,6 +190,8 @@ class TestSMCPNamespace:
     @pytest.mark.asyncio
     async def test_leave_office(self, smcp_namespace):
         """测试离开房间 / Test leaving office"""
+        # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "office_123"})
         smcp_namespace.leave_room = AsyncMock()
 
         # 测试数据
@@ -1049,3 +1054,178 @@ class TestInflightTargetDisconnectGuard:
         await ns.on_disconnect(comp_sid)
         assert seen_set_at_super == [False]  # super 先于 fire / super ran before fire
         assert ev.is_set()  # fire 在 super 之后 / fire ran after super
+
+
+#: 两类「向发起者所在房间广播」的 handler——都应「未入房即拒、绝不降级为全命名空间广播」。
+#: Both families of "broadcast to the initiator's office" handlers must reject office-less
+#: sessions outright instead of degrading to a namespace-wide broadcast.
+UPDATE_HANDLERS = [
+    ("on_server_update_config", UPDATE_CONFIG_NOTIFICATION),
+    ("on_server_update_tool_list", UPDATE_TOOL_LIST_NOTIFICATION),
+    ("on_server_update_desktop", UPDATE_DESKTOP_NOTIFICATION),
+    ("on_server_update_skills", UPDATE_SKILLS_NOTIFICATION),
+]
+
+
+class TestServerBroadcastOfficeIsolation:
+    """#212 附带：未入房不得把「房间广播」降级为「全命名空间广播」的隔离不变量。
+
+    ``emit(..., room=None)`` 的 socketio 语义是「广播给整个命名空间」——一旦发起者尚未
+    入房（回房窗口内等），用 ``session.get("office_id")`` 取到的 ``None`` 就会把通知泄漏
+    给所有 office 的成员。隔离不变量只允许显式 raise（#31 口径）。
+    Cross-office broadcast isolation: ``room=None`` means namespace-wide in socketio, so an
+    office-less initiator must be rejected explicitly rather than silently leaked.
+    """
+
+    @pytest.mark.parametrize(("handler", "expected_event"), UPDATE_HANDLERS)
+    @pytest.mark.asyncio
+    async def test_update_handlers_require_office_membership(
+        self, smcp_namespace, mock_server, handler, expected_event
+    ):
+        """未入房的 Computer 上报 ``server:update_*`` → 显式 raise 且**不得产生任何广播**。"""
+        smcp_namespace.server = mock_server
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "computer", "name": "c1"})
+        smcp_namespace.emit = AsyncMock()
+        with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
+            await getattr(smcp_namespace, handler)("c-sid", {"computer": "c1"})
+        smcp_namespace.emit.assert_not_awaited()
+
+    @pytest.mark.parametrize(("handler", "expected_event"), UPDATE_HANDLERS)
+    @pytest.mark.asyncio
+    async def test_update_handlers_broadcast_only_to_own_office(
+        self, smcp_namespace, mock_server, handler, expected_event
+    ):
+        """正对照：已入房的上报仍只投递到自己的 office，且投递的是本 handler 对应的事件。
+
+        English: positive control — an in-office reporter still reaches exactly its own room,
+        emitting the event that belongs to *this* handler.
+        """
+        smcp_namespace.server = mock_server
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "computer", "office_id": "room1", "name": "c1"})
+        smcp_namespace.emit = AsyncMock()
+        await getattr(smcp_namespace, handler)("c-sid", {"computer": "c1"})
+        smcp_namespace.emit.assert_awaited_once()
+        args, kwargs = smcp_namespace.emit.call_args
+        assert args[0] == expected_event
+        assert kwargs["room"] == "room1"
+        assert kwargs["skip_sid"] == "c-sid"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_cancel_requires_office_membership(self, smcp_namespace, mock_server):
+        """未入房的 Agent 发 ``server:tool_call_cancel`` → 显式 raise 且**不得产生任何广播**。
+
+        Agent 侧该 emit **没有** office 守卫（与 Computer 的 ``_in_office()`` 不同）：工具
+        调用 ack 超时分支会直接发取消，此时若回房尚未落地，服务端 session 无 ``office_id``
+        ⇒ 载荷（agent 名 + req_id）会泄漏给全部 office。rust 同事件已在缺省时直接拒绝
+        （``handler.rs`` "session not in office"），本用例对齐该行为。
+        """
+        smcp_namespace.server = mock_server
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
+        smcp_namespace.emit = AsyncMock()
+        with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
+            await smcp_namespace.on_server_tool_call_cancel("a-sid", {"agent": "a1", "req_id": "r1"})
+        smcp_namespace.emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tool_call_cancel_broadcasts_only_to_own_office(self, smcp_namespace, mock_server):
+        """正对照：已入房的 Agent 发取消 → 只投递到自己的 office。"""
+        smcp_namespace.server = mock_server
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "room1", "name": "a1"})
+        smcp_namespace.emit = AsyncMock()
+        await smcp_namespace.on_server_tool_call_cancel("a-sid", {"agent": "a1", "req_id": "r1"})
+        smcp_namespace.emit.assert_awaited_once()
+        args, kwargs = smcp_namespace.emit.call_args
+        assert args[0] == CANCEL_TOOL_CALL_NOTIFICATION
+        assert kwargs["room"] == "room1"
+        assert kwargs["skip_sid"] == "a-sid"
+
+    # ── leave_office：广播目标只取服务端权威会话，绝不用客户端载荷 ──────────────
+
+    @pytest.mark.asyncio
+    async def test_leave_office_ignores_client_supplied_room(self, smcp_namespace):
+        """载荷声称的房间号不得作为广播目标：A 房成员不能向 B 房注入 ``notify:leave_office``。
+
+        此前 ``leave_room(sid, data["office_id"])`` 直接采信客户端载荷，同一条事件既向
+        任意房间广播、又把自身会话清理掉 ⇒ 跨房注入 + 会话与真实房间状态漂移。
+        """
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "roomA", "name": "a1"})
+        smcp_namespace.leave_room = AsyncMock()
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+        assert ok is True and err is None
+        smcp_namespace.leave_room.assert_awaited_once_with("a-sid", "roomA")
+
+    @pytest.mark.asyncio
+    async def test_leave_office_without_office_is_idempotent_noop(self, smcp_namespace):
+        """未入房时退房是**幂等空操作**：既不得 raise，也绝不得回退到载荷里的房间号。
+
+        载荷可携带 ``office_id=None``（TypedDict 不做校验），一旦回退到它就会得到
+        ``room=None`` ⇒ 与 ``server:update_*`` 同类的全命名空间广播泄漏。
+        """
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
+        # 真实未入房的 socket 只在自己的 sid 房间里 / an office-less socket sits only in its own sid room
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid"])
+        smcp_namespace.leave_room = AsyncMock()
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
+        assert ok is True and err is None
+        smcp_namespace.leave_room.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_leave_office_without_office_ignores_truthy_payload_room(self, smcp_namespace):
+        """会话无房时，载荷里的**真房间号**同样不得成为广播目标（兜底写法会复活跨房注入）。
+
+        仅用 ``office_id=None`` 作载荷不足以钉死：一个 ``session.get("office_id") or
+        data["office_id"]`` 式的「载荷兜底」实现能通过全部其它用例，却把跨房注入原样带回。
+        A truthy payload room must not be used as a fallback target when the session has none.
+        """
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid"])
+        smcp_namespace.leave_room = AsyncMock()
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+        assert ok is True and err is None
+        smcp_namespace.leave_room.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_leave_office_without_session_office_converges_actual_rooms(self, smcp_namespace):
+        """会话与真实成员关系**漂移**时（会话无 office_id 但 socket 仍在房），退房须收敛真实成员关系。
+
+        漂移态来自旧版实现（采信载荷 ⇒ 清空会话却把人留在原房）。房间号只取会话之后，若
+        无房分支直接早退，这类 socket 将永远留在房里——旧码反倒能把它逐出，属修复引入的行为收缩。
+        收敛依据是服务端权威的 socketio 成员关系（非载荷），客户端无法借此向未加入的房间广播。
+        """
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])  # 含自身 sid 房间
+        smcp_namespace.leave_room = AsyncMock()
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
+        assert ok is True and err is None
+        smcp_namespace.leave_room.assert_awaited_once_with("a-sid", "roomA")
+
+    @pytest.mark.asyncio
+    async def test_leave_office_convergence_is_exhaustive_and_payload_independent(self, smcp_namespace):
+        """收敛必须**遍历全部**非 sid 房，且载荷不参与目标选择（载荷只当过滤器会漏收敛）。
+
+        载荷房刻意取一个**不在**成员关系里的值：任何「载荷当过滤器」或「只退第一个额外房」的
+        欠收敛写法都会在此暴露（这两类写法在其余场景下全绿）。
+        """
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA", "roomB"])
+        smcp_namespace.leave_room = AsyncMock()
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomC"})
+        assert ok is True and err is None
+        assert {c.args for c in smcp_namespace.leave_room.await_args_list} == {("a-sid", "roomA"), ("a-sid", "roomB")}
+
+    @pytest.mark.asyncio
+    async def test_leave_office_convergence_error_is_reported(self, smcp_namespace):
+        """收敛分支自身的失败出口：``leave_room`` 抛错 → ``(False, "Internal server error: ...")``。"""
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])
+        smcp_namespace.leave_room = AsyncMock(side_effect=RuntimeError("boom"))
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
+        assert ok is False and "Internal server error" in err
+
+    @pytest.mark.asyncio
+    async def test_leave_office_leave_room_error_is_reported(self, smcp_namespace):
+        """退房过程中抛错 → ``(False, "Internal server error: ...")``（与 sync 镜像对等）。"""
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "roomA"})
+        smcp_namespace.leave_room = AsyncMock(side_effect=RuntimeError("boom"))
+        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
+        assert ok is False and "Internal server error" in err
