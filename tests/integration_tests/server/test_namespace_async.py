@@ -28,6 +28,7 @@ from a2c_smcp.smcp import (
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    LIST_ROOM_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -742,6 +743,137 @@ async def test_get_config_success_same_office(socketio_server, basic_server_port
 
     await agent.disconnect()
     await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_rejected_cross_office_join_never_enters_room(socketio_server, basic_server_port: int, monkeypatch):
+    """#213：跨 office 同名被拒的客户端**从未**进入目标房——入房记录 + 成员关系 + 广播隔离三重断言。
+
+    修复前：``enter_room`` 先真入房、后 ``_register_name`` 抛错，回滚只覆盖会话 ⇒ 被拒客户端留在
+    目标房里持续收 ``notify:*``，而会话说它不在任何房。
+
+    断言「从未入房」必须钩住 **socketio 层**（``server.enter_room``）：只断言终态（成员关系为空 /
+    收不到广播）会被「已入房→失败收敛」的实现同样满足，属**空转**——变异验证证实过
+    （去掉前置闸门后仅凭收敛，终态断言仍然全绿）。
+    ``server.enter_room`` 只承载 namespace 层的房加入（自身 sid 房间由 manager 直接建），故记录精确。
+    """
+    entered: list[tuple[str, str]] = []
+    real_enter_room = socketio_server.server.enter_room
+
+    async def _recording_enter_room(sid: str, room: str, namespace: str | None = None) -> None:
+        entered.append((sid, room))
+        await real_enter_room(sid, room, namespace=namespace)
+
+    monkeypatch.setattr(socketio_server.server, "enter_room", _recording_enter_room)
+
+    holder = AsyncClient()  # office-A 持有名字 "c213"
+    subject = AsyncClient()  # 以同名进 office-B → 被拒
+    control = AsyncClient()  # office-B 的合法成员（正对照）
+    joiner = AsyncClient()  # 触发 office-B 的 notify:enter_office
+
+    on_control: list[dict] = []
+    on_subject: list[dict] = []
+
+    @control.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_enter_control(data: dict):  # noqa: ANN202
+        on_control.append(data)
+
+    @subject.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_enter_subject(data: dict):  # noqa: ANN202
+        on_subject.append(data)
+
+    office_a, office_b = "office-213-a", "office-213-b"
+    holder_sid = await _connect_join(holder, basic_server_port, "computer", office_a, "c213")
+    control_sid = await _connect_join(control, basic_server_port, "computer", office_b, "c213-control")
+    # 正对照：钩子确实记录了合法入房（证明下面「未入房」的断言不是钩子失灵）
+    assert (control_sid, office_b) in entered, "入房钩子应记录合法成员的加入"
+
+    await subject.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    # 目标房闸门放行（office-B 里没有同名），名字注册表（裸名全局）才是冲突点
+    payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "c213"}
+    ok, err = await subject.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert ok is False and err is not None, "跨 office 同名应被拒"
+
+    subject_sid = subject.get_sid(namespace=SMCP_NAMESPACE)
+    assert subject_sid is not None
+
+    # 验收口径 ①：**从未**进入目标房（顺序保证：校验先于副作用）
+    assert (subject_sid, office_b) not in entered, "被拒的加入不得触碰目标房"
+    # 验收口径 ②：终态一致——真实成员关系里不含目标房
+    assert [r for r in socketio_server.rooms(subject_sid) if r != subject_sid] == [], "被拒客户端不得留在目标房"
+    # 正对照：持有者的成员关系确实可被 rooms() 读出（证明上面的断言不是空转）
+    assert [r for r in socketio_server.rooms(holder_sid) if r != holder_sid] == [office_a]
+
+    # 验收口径 ③：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
+    await _connect_join(joiner, basic_server_port, "computer", office_b, "c213-joiner")
+    await asyncio.sleep(0.3)
+    assert on_control, "正对照：office-B 合法成员应收到 notify:enter_office"
+    assert on_subject == [], "被拒客户端不得收到目标房任何 notify:*"
+
+    for client in (holder, subject, control, joiner):
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_rejected_rename_move_keeps_old_room(socketio_server, basic_server_port: int):
+    """#213 换房被拒的另一半：Computer **留在旧房**——对端收不到 ``notify:leave_office``，且它仍是活成员。
+
+    CLI 的 ``socket join <office> <name>`` 会先改名再入房（``computer/cli/interactive_impl.py``），而
+    ``on_server_join_office`` 在 ``enter_room`` **之前**就把新名字写进会话 ⇒ 目标房同名检查比对新名字、
+    与自身旧名字（另一个注册表键）不冲突：**「已在旧房 + 换房被拒」由此可达**（裸名注册表下也成立）。
+    修复前该路径先退旧房再报错，客户端落成「无房」却仍以为在旧房。
+    """
+    peer = AsyncClient()  # office-A 的对端（观察 leave 通知）
+    mover = AsyncClient()  # office-A 成员，改名换房到 office-B → 被拒
+    blocker = AsyncClient()  # office-B 里已占名的 Computer
+    latecomer = AsyncClient()  # 之后加入 office-A，用于证明 mover 仍是活成员
+
+    on_peer_leave: list[dict] = []
+    on_mover_enter: list[dict] = []
+
+    @peer.on(LEAVE_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_peer_leave(data: dict):  # noqa: ANN202
+        on_peer_leave.append(data)
+
+    @mover.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_mover_enter(data: dict):  # noqa: ANN202
+        on_mover_enter.append(data)
+
+    office_a, office_b = "office-213-mv-a", "office-213-mv-b"
+    peer_sid = await _connect_join(peer, basic_server_port, "computer", office_a, "peer-213")
+    mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "mover-213")
+    await _connect_join(blocker, basic_server_port, "computer", office_b, "taken-213")
+
+    # 改名换房：目标房已有同名（"taken-213"）⇒ 被拒。注册表闸门亦独立阻止（裸名已被占）。
+    payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "taken-213"}
+    ok, err = await mover.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert ok is False and err is not None, "换房应被拒"
+    assert "already" in str(err), f"应为目标房/注册表的冲突文案，实际：{err!r}"
+
+    # 验收口径：校验先于副作用 ⇒ 旧房成员关系原封不动，对端也未收到 leave
+    assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_a], "被拒的换房必须留在旧房"
+    assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
+
+    # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
+    await _connect_join(latecomer, basic_server_port, "computer", office_a, "late-213")
+    await asyncio.sleep(0.3)
+    assert on_mover_enter, "旧房仍应把新成员入房广播给 mover"
+
+    # 会话字段级回滚：改名未落地 ⇒ 旧房成员列表里它仍叫 mover-213
+    listed = await peer.call(
+        LIST_ROOM_EVENT,
+        {"agent": peer_sid, "req_id": "req-213-mv", "office_id": office_a},
+        namespace=SMCP_NAMESPACE,
+    )
+    names = sorted(s["name"] for s in listed["sessions"])
+    assert names == ["late-213", "mover-213", "peer-213"], f"改名不得在旧房落地：{names}"
+
+    for client in (peer, mover, blocker, latecomer):
+        await client.disconnect()
 
 
 @pytest.mark.asyncio

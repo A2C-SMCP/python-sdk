@@ -136,6 +136,18 @@ class SMCPNamespace(BaseNamespace):
         Client joins room, adds sid compliance validation compared to parent method.
         Maintains 'sid' and 'name' fields in session.
 
+        #213 两阶段结构（协议 room-model.md §Computer 加入规则 注记 3「校验必须先于副作用」）：
+
+        - **阶段 1 校验**（零成员关系副作用）：角色约束、目标房同名检查、名字注册闸门；
+        - **阶段 2 生效**：退旧房 → 入新房 → 写会话 → 注册 name → 广播 ``notify:enter_office``。
+
+        不变量：本方法抛错后 socketio 的真实成员关系与会话状态**一致**——被拒客户端绝不留在目标房里
+        （否则它会持续收到该房的 ``notify:*``，而会话说它不在任何房）。阶段 2 的任何抛错都会按
+        **提交点**收敛：旧房离开未提交则一切原样，否则该 sid 被摘成「无房」且会话同步。
+
+        #213 two-phase structure: every fallible gate runs before any membership change; any failure
+        afterwards is converged so socketio membership and the session cannot diverge.
+
         Args:
             sid (SID): 客户端ID / Client ID
             room (OFFICE_ID): 房间ID / Room ID
@@ -153,6 +165,8 @@ class SMCPNamespace(BaseNamespace):
         if not session.get("name"):
             session["name"] = f"{session.get('role', 'unknown')}_{sid[:6]}"
 
+        # ── 阶段 1：校验（零成员关系副作用） / Phase 1: validation (no membership side effect) ──
+        past_room: OFFICE_ID | None = None
         if session["role"] == "agent":
             # 如果sid已经存在于某个房间中，并且房间号不是当前房间号
             # If sid already exists in a room and the room number is not the current room
@@ -177,13 +191,15 @@ class SMCPNamespace(BaseNamespace):
                 logger.warning(f"Agent sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
                 return
         else:
-            # Computer可以切换房间，但需要注意向即将离开的房间广播离开消息
-            # Computer can switch rooms, but need to broadcast leave message to the room being left
-            if session.get("office_id") and (past_room := session.get("office_id")) != room:
-                await self.leave_room(sid, past_room)
-            elif session.get("office_id") == room:
+            if session.get("office_id") == room:
                 logger.warning(f"Computer sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
                 return
+
+            # Computer 可以切换房间，但**退房动作推迟到阶段 2**：目标房闸门必须先查完。
+            # 若先退旧房再查目标房，一旦目标房同名被拒，该 Computer 已离开原房且对端已收到
+            # ``notify:leave_office``，落成「无房」中间态却无任何补救语义（协议 注记 3）。
+            # The old room is left in phase 2 — all target-room gates must run first.
+            past_room = session.get("office_id") or None
 
             # 检查房间内是否已有同名的Computer
             # Check if there's already a Computer with the same name in the room
@@ -197,34 +213,81 @@ class SMCPNamespace(BaseNamespace):
                     if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
                         raise ValueError(f"Computer with name '{computer_name}' already exists in room '{room}'")
 
-        # 加入新房间
-        # Join new room
-        await super().enter_room(sid, room)
+        # 名字注册闸门（角色无关）：注册表冲突必须在此刻暴露。若留到阶段 2 的 ``_register_name``，
+        # socket 已经进入房间而回滚只覆盖会话 ⇒ 被拒客户端留在房里继续收 ``notify:*``（本单根因）。
+        # Name-registry gate (role-agnostic): must fire before any membership change.
+        await self._ensure_name_registerable(session["name"], sid)
 
-        # 保存sid与房间号的映射关系
-        # Save mapping between sid and room number
-        session["office_id"] = room
-        await self.save_session(sid, session)
+        # ── 阶段 2：生效（成员关系变更） / Phase 2: effects (membership changes) ──
+        registered = False
+        try:
+            if past_room:
+                # 旧房离开**不可撤销**（``notify:leave_office`` 已发出）⇒ 必须排在校验之后
+                # Leaving the old room is irreversible (the notification is out) — post-validation only.
+                await self.leave_room(sid, past_room)
 
-        # 注册name到sid的映射
-        # Register name-to-sid mapping
-        await self._register_name(session["name"], sid)
+            # 加入新房间
+            # Join new room
+            await super().enter_room(sid, room)
 
-        # 根据角色发送不同的通知 / Send different notifications based on role
-        notification_data: EnterOfficeNotification = {"office_id": room}
-        if session.get("role") == "computer":
-            notification_data["computer"] = session.get("name")
-        else:
-            notification_data["agent"] = session.get("name")
+            # 保存sid与房间号的映射关系
+            # Save mapping between sid and room number
+            session["office_id"] = room
+            await self.save_session(sid, session)
 
-        # 广播加入新房间的消息至房间内其它人
-        # Broadcast join message to others in the room
-        await self.emit(
-            ENTER_OFFICE_NOTIFICATION,
-            notification_data,
-            skip_sid=sid,
-            room=room,
-        )
+            # 注册name到sid的映射
+            # Register name-to-sid mapping
+            await self._register_name(session["name"], sid)
+            registered = True
+
+            # 根据角色发送不同的通知 / Send different notifications based on role
+            notification_data: EnterOfficeNotification = {"office_id": room}
+            if session.get("role") == "computer":
+                notification_data["computer"] = session.get("name")
+            else:
+                notification_data["agent"] = session.get("name")
+
+            # 广播加入新房间的消息至房间内其它人
+            # Broadcast join message to others in the room
+            await self.emit(
+                ENTER_OFFICE_NOTIFICATION,
+                notification_data,
+                skip_sid=sid,
+                room=room,
+            )
+        except Exception:
+            # 失败收敛 / Failure convergence —— 按**提交点**分刀：
+            #   旧房离开若**未提交**（``leave_room`` 推进不到「删除会话 office_id」那一步），则成员关系、
+            #   name 映射、会话、对端视图全未变化，收敛反而会把客户端从它合法所属的旧房**无声摘除**
+            #   （对端永不获知）⇒ 此时什么都不做，原状即一致。
+            #   否则（无旧房可退，或离开已提交）⇒ 把该 sid 从所有非自身房间摘除并清空 office_id，
+            #   与会话保持一致（同 ``on_server_leave_office`` 的无房收敛方向，纯 socketio 层、不发广播）。
+            # Commit-point discrimination, mirroring the convergence direction used by leave_office.
+            if past_room is None or session.get("office_id") != past_room:
+                try:
+                    # name 映射**归属守卫**：并发下该 name 可能已被别的 sid 抢走，绝不可替它注销
+                    # Ownership guard: never unregister a mapping another sid now holds.
+                    if registered and self._name_to_sid_map.get(session.get("name")) == sid:
+                        await self._unregister_name(sid)
+                    for stale_room in list(self.rooms(sid)):
+                        if stale_room == sid:
+                            continue
+                        # 非成员退房是安全 no-op（manager 吞 KeyError）。此处**静默**摘除、不发
+                        # notify:leave_office：目标房从未宣告过本次加入；旧房若已提交离开，其广播也已由
+                        # leave_room 发出，再广播只会向对端投递一次重复/误导的离开。
+                        # 已知边界：若末步 enter 广播**部分投递**后抛错，已收到的对端会留下幻影成员，需靠
+                        # server:list_room 权威视图纠正（协议无撤回原语）。
+                        await super().leave_room(sid, stale_room)
+                    if "office_id" in session:
+                        del session["office_id"]
+                        await self.save_session(sid, session)
+                except Exception as conv_err:
+                    # 收敛不得掩盖原始异常，故只记日志后重抛原始异常。**已知边界**（best-effort）：收敛自身
+                    # 失败（socketio 退房 / save 抛错）时该 sid 可能仍留在目标房且会话仍带 office_id——
+                    # 两者一致但未清零。此处刻意**不做二次收敛**（重试同一失败路径无收益、可能成环），
+                    # 也不上抛（会把「入房失败」误报为别的故障）。
+                    logger.error(f"enter_room 失败收敛未完成 sid={sid} room={room}: {conv_err}", exc_info=True)
+            raise
 
     async def leave_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
@@ -304,9 +367,18 @@ class SMCPNamespace(BaseNamespace):
             return True, None
 
         except Exception as e:
-            # 恢复会话状态
-            # Restore session state
-            await self.save_session(sid, backup_session)
+            # 恢复本处理器写入的 role / name（**房间归属不回滚**）：``enter_room`` 失败时已按提交点
+            # 收敛——它可能已经删掉 office_id（换房中途失败）或保持旧房不变。整体覆盖 backup 会把
+            # backup 里的旧房号复活，使会话与真实成员关系再次分叉（本单根因的同构形态）。
+            # 缺失字段必须**删除**而非赋 None：后者会让 ``session["role"]`` 变成 None，污染后续 role 判定。
+            # Roll back only the fields written here; room ownership belongs to enter_room (#213).
+            live_session = await self.get_session(sid)
+            for field in ("role", "name"):
+                if field in backup_session:
+                    live_session[field] = backup_session[field]
+                else:
+                    live_session.pop(field, None)
+            await self.save_session(sid, live_session)
             return False, f"Internal server error: {str(e)}"
 
     async def on_server_leave_office(self, sid: str, data: LeaveOfficeReq) -> tuple[bool, str | None]:

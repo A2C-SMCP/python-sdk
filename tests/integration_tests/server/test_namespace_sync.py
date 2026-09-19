@@ -832,3 +832,125 @@ def test_get_config_success_sync(startup_and_shutdown_local_sync_server: Namespa
         if computer_process.is_alive():
             computer_process.terminate()
             computer_process.join(timeout=2)
+
+
+def test_rejected_cross_office_join_is_isolated_sync(
+    startup_and_shutdown_local_sync_server,
+    sync_server_port: int,
+) -> None:
+    """#213 sync：跨 office 同名被拒的客户端不留在目标房（服务端权威 ``list_room`` + notify 隔离）。
+
+    同步服务端在**独立进程**中运行，测试侧读不到它的真实成员关系 ⇒ 用服务端权威的
+    ``server:list_room`` 与 wire 上的 ``notify:*`` 断言终态。「**从未**入房」这一顺序保证由单元
+    用例（断言 socketio 层 ``enter_room`` 未被调用）与 async 集成用例（钩住 ``server.enter_room``
+    记录）覆盖——只看终态会把「已入房 → 失败收敛」的实现误判为通过（变异验证证实）。
+    """
+    holder = Client()
+    subject = Client()
+    control = Client()
+    joiner = Client()
+
+    on_control: list[dict] = []
+    on_subject: list[dict] = []
+
+    @control.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    def _on_enter_control(data: dict) -> None:  # noqa: ANN001
+        on_control.append(data)
+
+    @subject.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    def _on_enter_subject(data: dict) -> None:  # noqa: ANN001
+        on_subject.append(data)
+
+    office_a, office_b = "office-213-sync-a", "office-213-sync-b"
+    for client in (holder, subject, control, joiner):
+        client.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+
+    # 目标房闸门放行（office-B 内无同名），名字注册表（裸名全局）才是冲突点
+    _join_office(holder, role="computer", office_id=office_a, name="c213s")
+    _join_office(control, role="computer", office_id=office_b, name="c213s-control")
+
+    ok, err = subject.call(
+        JOIN_OFFICE_EVENT,
+        {"role": "computer", "office_id": office_b, "name": "c213s"},
+        namespace=SMCP_NAMESPACE,
+    )
+    assert not ok and err is not None, "跨 office 同名应被拒"
+
+    # 服务端权威视图：被拒者不得出现在目标房成员列表里
+    listed = control.call(
+        LIST_ROOM_EVENT,
+        {"agent": control.get_sid(namespace=SMCP_NAMESPACE), "req_id": "req-213", "office_id": office_b},
+        namespace=SMCP_NAMESPACE,
+    )
+    names = sorted(s["name"] for s in listed["sessions"])
+    assert names == ["c213s-control"], f"被拒客户端不得出现在目标房成员列表：{names}"
+
+    # 验收口径：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
+    _join_office(joiner, role="computer", office_id=office_b, name="c213s-joiner")
+    time.sleep(0.3)
+    assert on_control, "正对照：目标房合法成员应收到 notify:enter_office"
+    assert on_subject == [], "被拒客户端不得收到目标房任何 notify:*"
+
+    for client in (holder, subject, control, joiner):
+        client.disconnect()
+
+
+def test_rejected_rename_move_keeps_old_room_sync(
+    startup_and_shutdown_local_sync_server,
+    sync_server_port: int,
+) -> None:
+    """#213 sync：换房被拒后仍留在旧房（对端无 leave 通知、权威 ``list_room`` 仍列名其旧名）。
+
+    ``socket join <office> <name>`` 会先改名再入房，而处理器在 ``enter_room`` 之前就把新名字写进会话
+    ⇒ 目标房同名检查比对新名字，与自身旧名字（另一注册表键）不冲突：改名+换房使「已在旧房 + 换房被拒」
+    可达。修复前该路径先退旧房再报错。
+    """
+    peer = Client()
+    mover = Client()
+    blocker = Client()
+    latecomer = Client()
+
+    on_peer_leave: list[dict] = []
+    on_mover_enter: list[dict] = []
+
+    @peer.on(LEAVE_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    def _on_peer_leave(data: dict) -> None:  # noqa: ANN001
+        on_peer_leave.append(data)
+
+    @mover.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    def _on_mover_enter(data: dict) -> None:  # noqa: ANN001
+        on_mover_enter.append(data)
+
+    office_a, office_b = "office-213-mv-sync-a", "office-213-mv-sync-b"
+    for client in (peer, mover, blocker, latecomer):
+        client.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+
+    _join_office(peer, role="computer", office_id=office_a, name="peer-213s")
+    _join_office(mover, role="computer", office_id=office_a, name="mover-213s")
+    _join_office(blocker, role="computer", office_id=office_b, name="taken-213s")
+
+    ok, err = mover.call(
+        JOIN_OFFICE_EVENT,
+        {"role": "computer", "office_id": office_b, "name": "taken-213s"},
+        namespace=SMCP_NAMESPACE,
+    )
+    assert not ok and err is not None, "换房应被拒"
+    time.sleep(0.2)
+    assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
+
+    # 权威视图：mover 仍在 office-A，且会话字段级回滚使其保留旧名
+    listed = peer.call(
+        LIST_ROOM_EVENT,
+        {"agent": peer.get_sid(namespace=SMCP_NAMESPACE), "req_id": "req-213-mv", "office_id": office_a},
+        namespace=SMCP_NAMESPACE,
+    )
+    names = sorted(s["name"] for s in listed["sessions"])
+    assert names == ["mover-213s", "peer-213s"], f"换房被拒后旧房成员应原封不动（含旧名）：{names}"
+
+    # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
+    _join_office(latecomer, role="computer", office_id=office_a, name="late-213s")
+    time.sleep(0.3)
+    assert on_mover_enter, "旧房仍应把新成员入房广播给 mover"
+
+    for client in (peer, mover, blocker, latecomer):
+        client.disconnect()

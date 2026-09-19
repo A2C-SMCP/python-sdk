@@ -295,6 +295,146 @@ async def test_failed_join_does_not_clear_newer_office() -> None:
 
 
 @pytest.mark.asyncio
+async def test_double_rejected_join_never_restores_an_unconfirmed_office() -> None:
+    """两次并发 join 均被服务端拒绝 ⇒ 终态必须是「无房」。
+
+    join 入口会**预写** office_id（避免广播时序竞争，见实现注释）——该值是**意图**，未经服务端确认。
+    若后到 join 的快照恰好读到前一次「在途且未确认」的预写值，一旦自己也被拒，就会把那个**从未加入过**
+    的房号钉回状态：守卫 ``_in_office`` 随之放行 ``server:update_*``，而服务端会话里并无该房（#213）。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def fake_call(event: str, data: Any = None, namespace: str | None = None, **kwargs: Any) -> Any:
+        calls.append(dict(data or {}).get("office_id", ""))
+        if len(calls) == 1:
+            in_flight.set()
+            await release.wait()
+        return [False, "Internal server error: rejected"]
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    first = asyncio.create_task(client.join_office("officeB"))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+    second = asyncio.create_task(client.join_office("officeC"))
+    await asyncio.sleep(0)  # 让 second 完成入口段（bump + 预写 office_id）
+
+    release.set()
+    with pytest.raises(RuntimeError):
+        await first
+    with pytest.raises(RuntimeError):
+        await second
+
+    assert calls == ["officeB", "officeC"]
+    assert client.office_id is None, "两次都被拒 ⇒ 不得钉在从未被确认的房号上"
+
+
+@pytest.mark.asyncio
+async def test_superseded_success_still_records_confirmed() -> None:
+    """被**抢占的成功**也要落账：那次成员变更真实发生过，否则后续被拒会回退到更旧、已失效的房号。
+
+    序列：基线 A → join(B) 在途且服务端**接受**（真实成员关系 = B）→ join(C) 抢占并**被拒**。
+    终态必须回退到 B（事实），而不是 A（更旧）。/ A superseded success is still a server-side fact.
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def fake_call(event: str, data: Any = None, namespace: str | None = None, **kwargs: Any) -> Any:
+        room = dict(data or {}).get("office_id", "")
+        calls.append(room)
+        if room == "officeA":
+            return [True, None]
+        if room == "officeB":
+            in_flight.set()
+            await release.wait()
+            return [True, None]  # 服务端接受，但已被 J2 抢占
+        return [False, "Internal server error: rejected"]
+
+    client.call = fake_call  # type: ignore[method-assign]
+    await client.join_office("officeA")
+
+    first = asyncio.create_task(client.join_office("officeB"))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+    second = asyncio.create_task(client.join_office("officeC"))
+    await asyncio.sleep(0)  # 让 second 完成入口段（bump + 预写）
+    release.set()
+    await first
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await second
+
+    assert calls == ["officeA", "officeB", "officeC"]
+    assert client.office_id == "officeB", "应回退到真实发生的 B，而非更旧的 A"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [_TRANSPORT_ERROR, _SERVER_DISCONNECT])
+async def test_disconnect_then_rejected_join_reports_no_office(reason: str) -> None:
+    """断连后**已确认**房号随之作废（房间成员关系属于会话）⇒ 之后被拒的 join 不得回退宣称旧房。
+
+    传输中断时 desired 仍保留（待回房重放），但那只是「意图」：重连后的新 SID 从未加入过该房。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+
+    async def accept(*args: Any, **kwargs: Any) -> Any:
+        return [True, None]
+
+    client.call = accept  # type: ignore[method-assign]
+    await client.join_office("officeA")
+
+    client._on_namespace_disconnect(reason)
+    if reason == _TRANSPORT_ERROR:
+        assert client.office_id == "officeA", "传输中断保留 desired（#203 口径）"
+
+    async def reject(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Internal server error: rejected"]
+
+    client.call = reject  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id is None, "新 SID 从未加入过的房间不得被回退逻辑复活"
+
+
+@pytest.mark.asyncio
+async def test_superseded_replay_success_still_records_confirmed() -> None:
+    """被抢占的**回房成功**同样落账（同 ``join_office`` 的口径）。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    client._office_generation = 5
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        await release.wait()
+        return [True, None]
+
+    client.call = fake_call  # type: ignore[method-assign]
+    replay = asyncio.create_task(client._arejoin_office("officeA", 5))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+    client._office_generation = 6  # 被更新的操作抢占 / superseded mid-flight
+    release.set()
+    await replay
+
+    async def reject(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Internal server error: rejected"]
+
+    client.call = reject  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id == "officeA", "被抢占的回房成功也必须落账"
+
+
+@pytest.mark.asyncio
 async def test_replay_rejection_clears_office_id() -> None:
     """回房被拒且 generation 仍新鲜（无人接管）→ 清空 office_id（状态不得撒谎）。"""
     client = _make_client(reconnection=True)
@@ -326,6 +466,169 @@ async def test_replay_exception_clears_office_id() -> None:
     client.call = fake_call  # type: ignore[method-assign]
 
     await client._arejoin_office("officeA", 3)
+
+    assert client.office_id is None
+
+
+# ── #213 显式 join 失败时的房号去留 / office id on an explicit join failure ────
+
+
+@pytest.mark.asyncio
+async def test_rejected_switch_restores_previous_office() -> None:
+    """换房被**服务端明确拒绝** ⇒ 回退到已确认的旧房号（它仍在旧房，不得对外宣称"无房"）。
+
+    服务端按协议「校验先于副作用」不改动既有成员关系（#213）：拒绝换房时该 Computer 仍留在旧房，
+    客户端若清空 desired 就等于对宿主撒谎（守卫 ``_in_office`` 随之静默失效）。
+    English: an explicitly rejected switch restores the last server-confirmed office — the server
+    leaves the existing membership untouched, so clearing it would contradict the real state.
+    """
+    client = _make_client()
+    _mark_namespace_registered(client)
+
+    async def accept(*args: Any, **kwargs: Any) -> Any:
+        return [True, None]
+
+    async def reject(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Internal server error: Computer with name 'x' already exists in room 'officeB'"]
+
+    client.call = accept  # type: ignore[method-assign]
+    await client.join_office("officeA")
+    assert client.office_id == "officeA"
+
+    client.call = reject  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id == "officeA", "被拒的换房不得抹掉仍生效的旧房号"
+
+
+@pytest.mark.asyncio
+async def test_leave_then_rejected_join_does_not_resurrect_old_office() -> None:
+    """退房后已确认房号随之作废 ⇒ 之后被拒的 join 不得把旧房号回退回来。"""
+    client = _make_client()
+    _mark_namespace_registered(client)
+
+    async def accept(*args: Any, **kwargs: Any) -> Any:
+        return [True, None]
+
+    emitted: list[Any] = []
+
+    async def fake_emit(*args: Any, **kwargs: Any) -> None:
+        emitted.append(args)
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+    client.call = accept  # type: ignore[method-assign]
+    await client.join_office("officeA")
+    await client.leave_office("officeA")
+    assert client.office_id is None
+
+    async def reject(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Internal server error: rejected"]
+
+    client.call = reject  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id is None, "已退掉的房间不得被回退逻辑复活"
+
+
+@pytest.mark.asyncio
+async def test_rejected_fresh_join_keeps_no_office() -> None:
+    """**正对照**：此前无房时被拒 ⇒ 仍为 ``None``（回退不得凭空造出房号）。"""
+    client = _make_client()
+    _mark_namespace_registered(client)
+    assert client.office_id is None
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Computer with name 'x' already exists in room 'officeB'"]
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id is None
+
+
+@pytest.mark.asyncio
+async def test_switch_transport_failure_still_clears_desired() -> None:
+    """传输层失败（无法判定服务端是否已生效）⇒ 维持清空语义，且**已确认房号一并不再可信**。
+
+    English: a transport failure cannot be adjudicated client-side, so the client must not claim a
+    room it may no longer be in — neither as desired nor as the confirmed fallback.
+    """
+    client = _make_client()
+    _mark_namespace_registered(client)
+
+    async def accept(*args: Any, **kwargs: Any) -> Any:
+        return [True, None]
+
+    client.call = accept  # type: ignore[method-assign]
+    await client.join_office("officeA")  # 建立已确认房号 / establish the confirmed office
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("namespace is not a connected namespace.")
+
+    client.call = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        await client.join_office("officeB")
+
+    assert client.office_id is None
+
+    # 未知结局已使旧房号失效 ⇒ 之后被拒的 join 不得回退到它
+    async def reject(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Internal server error: rejected"]
+
+    client.call = reject  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeC")
+
+    assert client.office_id is None, "未知结局后的被拒 join 不得回退到可能已失效的旧房"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_final_then_rejected_join_reports_no_office() -> None:
+    """重连彻底放弃后**已确认房号一并作废** ⇒ 被拒的 join 不得复活旧房。
+
+    刻意与传输中断分支相反：那里 desired 保留（待重放），这里 desired 与 confirmed 都清——两者在传输
+    分支上分道，故 ``test_disconnect_final_clears_desired_office``（只钉 desired）覆盖不到本行。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+
+    async def accept(*args: Any, **kwargs: Any) -> Any:
+        return [True, None]
+
+    client.call = accept  # type: ignore[method-assign]
+    await client.join_office("officeA")
+
+    client._on_namespace_disconnect_final()
+    assert client.office_id is None, "彻底放弃重连 ⇒ desired 清空"
+
+    async def reject(*args: Any, **kwargs: Any) -> Any:
+        return [False, "Internal server error: rejected"]
+
+    client.call = reject  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id is None, "新连接不得复活一个从未加入的旧房"
+
+
+@pytest.mark.asyncio
+async def test_switch_empty_ack_still_clears_desired() -> None:
+    """空响应（未获裁决）⇒ 同样清空：它不是「拒绝」，不能据此回退房号。"""
+    client = _make_client()
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
 
     assert client.office_id is None
 

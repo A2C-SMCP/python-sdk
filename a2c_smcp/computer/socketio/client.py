@@ -83,7 +83,7 @@ from a2c_smcp.utils.handshake import (
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
+from a2c_smcp.utils.office import NO_RESPONSE_MESSAGE, OFFICE_REJOIN_TIMEOUT, parse_join_ack
 
 logger = get_logger(__name__)
 
@@ -211,6 +211,13 @@ class SMCPComputerClient(AsyncClient):
         # 投影当前 desired state）。/ ``office_id`` is the *desired* membership: retained across a
         # transport drop when socketio will reconnect, cleared when it cannot be honored.
         self.office_id: str | None = None
+        # ``_confirmed_office_id`` = **服务端已确认**的成员关系（#213）：只在 join 裁决为成功时写入，
+        # 在退房 / 服务端踢出 / 重连彻底放弃 / 回房被拒时清空。与 ``office_id``（意图）分离是必需的——
+        # join 入口会预写意图（见下），被抢占的那次 join 会把**未经确认**的房号短暂留在字段里；
+        # 若拒绝回退直接取 ``office_id``，并发下就会把「从未加入过的房间」钉回状态。
+        # ``_confirmed_office_id`` = the last server-confirmed membership, kept apart from the desired
+        # ``office_id`` because the entry pre-write can hold an unconfirmed intent (#213).
+        self._confirmed_office_id: str | None = None
         self._office_generation: int = 0
         self._office_rejoin_task: asyncio.Task[None] | None = None
         self._office_op_lock = asyncio.Lock()
@@ -381,6 +388,11 @@ class SMCPComputerClient(AsyncClient):
         """
         self._office_generation += 1
         self._cancel_office_rejoin()
+        # 无论哪种原因，**已确认**房号都随本次会话作废：房间成员关系属于会话（见类头注释），断开即销毁，
+        # 重连后的新 SID 从未加入过该房——要重新成为成员必须靠回房重放成功（那时才重新落账）。
+        # 与 desired 的差别只在下面这一支：传输中断且会自动重连时 desired **保留**（待重放），
+        # 但它此时只是「意图」，不得当作「已确认」。#213
+        self._confirmed_office_id = None
         if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
             return
         self.office_id = None
@@ -396,6 +408,7 @@ class SMCPComputerClient(AsyncClient):
         self._office_generation += 1
         self._cancel_office_rejoin()
         self.office_id = None
+        self._confirmed_office_id = None
 
     async def _arejoin_office(self, office_id: str, generation: int) -> None:
         """
@@ -426,15 +439,20 @@ class SMCPComputerClient(AsyncClient):
                 if generation != self._office_generation or self.office_id != office_id:
                     return  # 结果已作废，不得用陈旧结果改状态
                 self.office_id = None
+                self._confirmed_office_id = None
                 logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
                 return
-            if generation != self._office_generation or self.office_id != office_id:
-                return
             ok, error_msg = parse_join_ack(result)
+            if ok:
+                # 同 join_office：成功是对服务端事实的陈述，不受 supersession 守卫约束（#213）
+                self._confirmed_office_id = office_id
+            if generation != self._office_generation or self.office_id != office_id:
+                return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
             if ok:
                 logger.info(f"已自动重新加入 Office: {office_id}")
             else:
                 self.office_id = None
+                self._confirmed_office_id = None
                 logger.error(f"自动重新加入 Office 被拒绝: {office_id} - {error_msg}")
 
     async def join_office(self, office_id: str) -> None:
@@ -448,6 +466,16 @@ class SMCPComputerClient(AsyncClient):
         This method also declares the desired intent: the generation is advanced and any in-flight
         replay invalidated *before* the new id is written, so a superseded replay's failure path can
         never clear it.
+
+        #213：失败时的房号去留按**失败形态**分刀（服务端拒绝不改变既有成员关系 ⇒ 客户端也不得清掉
+        仍在的房间）：
+          - 服务端**明确拒绝**（给了裁决文案）⇒ 回退到 ``_confirmed_office_id``（最近一次被服务端确认的
+            房号，通常是旧房；从未确认过则为 ``None``）；
+          - 传输层失败 / 空响应（无法判定服务端是否已生效）⇒ 维持清空语义（不臆断）。
+        回退取的是**已确认**房号而非入口快照：入口预写的意图在并发下可能属于一次「裁决被丢弃」的
+        在途 join，绝不代表真实成员关系。
+        #213: a rejection restores the last *server-confirmed* office — never the desired field, whose
+        value may be an unconfirmed pre-write from a superseded in-flight join.
 
         Args:
             office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID / Room ID, in A2C-smcp protocol,
@@ -473,9 +501,7 @@ class SMCPComputerClient(AsyncClient):
                 )
 
             # 检查返回结果 / Check return result
-            ok, error_msg = parse_join_ack(result)
-            if not ok:
-                raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
+            verdict = parse_join_ack(result)
         except Exception:
             # 失败清空 office_id —— 但仅当本次操作仍是最新意图时才清（compare-and-clear）：
             # 并发/后到的 join 或 leave 已推进 generation 时，其写入的房号不得被本次失败抹掉。
@@ -488,9 +514,37 @@ class SMCPComputerClient(AsyncClient):
             # 请用 `_in_office()`。
             # Deliberate: a disconnect-driven generation bump keeps the intent (the attempt failed,
             # not the wish to be in that room); the post-reconnect replay re-adjudicates it.
+            #
+            # 传输层失败（超时 / 命名空间不可用）**无法判定**服务端是否已生效 ⇒ 保守清空，不臆断房号，
+            # 已确认房号一并不再可信：请求**可能已发出**（超时类确已发出；`BadNamespaceError` 类在发送前
+            # 抛出，但那时会话已销毁、成员关系本就不存在）⇒ 两种情形清空都准确，而继续宣称旧房则可能撒谎。
+            # 只有在「本次仍是最新意图」时才清（被断连抢占时由断连钩子负责）。
+            # An inconclusive outcome invalidates the confirmed room too: the request did go out, so the
+            # old membership may already be gone. Cleared only while this attempt is still current.
             if self._office_generation == generation:
                 self.office_id = None
+                self._confirmed_office_id = None
             raise
+
+        ok, error_msg = verdict
+        if not ok:
+            # 服务端给出了裁决 ⇒ **明确拒绝**。协议 room-model.md「加入时校验失败 ⇒ 拒绝加入」且拒绝
+            # **不改变既有成员关系**（校验先于副作用），故此处回退到**已确认**房号，而不是清空——清空会让
+            # 宿主以为「不在任何房」，与真实成员关系相反（#213 的服务端修正后尤其如此：换房被拒时它仍在
+            # 旧房）。空响应（NO_RESPONSE_MESSAGE）不是裁决，维持清空语义（与上面传输层失败一致）。
+            # An explicit verdict = rejection: the server does not change existing membership, so fall
+            # back to the last *confirmed* office instead of clearing. An empty ack is not a verdict.
+            if self._office_generation == generation:
+                self.office_id = self._confirmed_office_id if error_msg != NO_RESPONSE_MESSAGE else None
+            raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
+
+        # 裁决为成功：记录服务端已确认的成员关系。**刻意不受 supersession 守卫约束**——成功是关于
+        # 服务端**事实**的陈述：即便本次 join 已被后到操作抢占（desired 归后者），这次成员变更**真实
+        # 发生过**，不落账会让之后任何一次「被拒回退」指向更旧、且已失效的房号。
+        # 次序安全：`call` 由 ``_office_op_lock`` 串行，且从锁释放到本行无 await ⇒ 后完成者胜，
+        # 陈旧成功不会覆盖更新的真值。
+        # Recorded regardless of supersession: a success is a statement of server-side fact.
+        self._confirmed_office_id = office_id
 
     async def leave_office(self, office_id: str) -> None:
         """
@@ -507,6 +561,8 @@ class SMCPComputerClient(AsyncClient):
         async with self._office_op_lock:
             await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id))
         self.office_id = None
+        # 已确认房号随之作废：退房后再被拒的 join 不得把旧房号回退回来（#213）
+        self._confirmed_office_id = None
 
     async def emit_update_config(self) -> None:
         """

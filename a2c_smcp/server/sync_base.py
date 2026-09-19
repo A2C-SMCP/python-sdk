@@ -96,6 +96,20 @@ class SyncBaseNamespace(Namespace):
         """
         return super().trigger_event(event.replace(":", "_"), *args)
 
+    def _ensure_name_registerable(self, name: str, sid: SID) -> None:
+        """
+        名字注册闸门：``name`` 被**其它** sid 占用时抛出（本 sid 持有视为可注册，幂等）。
+
+        同步镜像 async ``BaseNamespace._ensure_name_registerable``；#213：``enter_room`` 在**任何
+        成员关系变更之前**调用本闸门，避免「已入房后才失败」导致被拒客户端留在房里收 ``notify:*``。
+        判据与 ``_register_name`` 同源（单点）；注册表键空间收敛（#215）以本方法为**冲突判据**改动点，
+        还须一并处理同以裸名为键的 ``get_sid_by_name`` 与 ``_unregister_name``。
+        Sync mirror of the async gate — the conflict-predicate point for #215's composite key.
+        """
+        existing_sid = self._name_to_sid_map.get(name)
+        if existing_sid is not None and existing_sid != sid:
+            raise ValueError(f"Name '{name}' already registered by sid '{existing_sid}' in namespace {self.namespace}")
+
     def _register_name(self, name: str, sid: SID) -> None:
         """
         注册name到sid的映射，如果name已存在则抛出异常
@@ -108,10 +122,8 @@ class SyncBaseNamespace(Namespace):
         Raises:
             ValueError: 当name已被其他sid使用时 / When name is already used by another sid
         """
+        self._ensure_name_registerable(name, sid)
         if name in self._name_to_sid_map:
-            existing_sid = self._name_to_sid_map[name]
-            if existing_sid != sid:
-                raise ValueError(f"Name '{name}' already registered by sid '{existing_sid}' in namespace {self.namespace}")
             # 如果是同一个sid重新注册，允许（幂等操作）
             # Allow re-registration by the same sid (idempotent operation)
             logger.debug(f"Name '{name}' re-registered by same sid '{sid}'")

@@ -124,6 +124,35 @@ class BaseNamespace(AsyncNamespace):
         """
         return await super().trigger_event(event.replace(":", "_"), *args)
 
+    async def _ensure_name_registerable(self, name: str, sid: SID) -> None:
+        """
+        名字注册闸门：``name`` 被**其它** sid 占用时抛出（本 sid 持有视为可注册，幂等）。
+        Name-registration gate: raise when ``name`` is held by *another* sid.
+
+        #213：``enter_room`` 在**任何成员关系变更之前**调用本闸门。此前该冲突只在
+        ``_register_name`` 内被发现，而那时 socket 已经进入房间；异常回滚又只覆盖会话、不回滚房间
+        ⇒ 被拒客户端留在房里收 ``notify:*``（协议 room-model.md §Computer 加入规则 注记 3
+        「校验必须先于副作用」）。``_register_name`` 亦经本方法判定，判据**单点**、不会漂移。
+
+        注意：本闸门镜像的是**当前注册表的键空间**（裸 ``name``，无 office/role 作用域——过渡态），
+        **不是**协议的名字唯一性规则（协议口径为房内 ``(office_id, role, name)``，见 room-model.md
+        §房内名字唯一性）。注册表键空间收敛由 #215 落地；本方法是**冲突判据**的单点，但 #215 还需
+        一并处理同以裸名为键的 ``get_sid_by_name``（路由）与 ``_unregister_name``（注销）。
+        This gate mirrors the *current registry key space* (bare name, transitional), not the
+        protocol's per-room uniqueness rule; #215 lands the composite key — the single point for the
+        *conflict predicate*, alongside the bare-name ``get_sid_by_name`` / ``_unregister_name``.
+
+        Args:
+            name (str): 客户端名称 / Client name
+            sid (SID): 客户端连接ID / Client connection ID
+
+        Raises:
+            ValueError: 当name已被其他sid使用时 / When name is already used by another sid
+        """
+        existing_sid = self._name_to_sid_map.get(name)
+        if existing_sid is not None and existing_sid != sid:
+            raise ValueError(f"Name '{name}' already registered by sid '{existing_sid}' in namespace {self.namespace}")
+
     async def _register_name(self, name: str, sid: SID) -> None:
         """
         注册name到sid的映射，如果name已存在则抛出异常
@@ -136,10 +165,8 @@ class BaseNamespace(AsyncNamespace):
         Raises:
             ValueError: 当name已被其他sid使用时 / When name is already used by another sid
         """
+        await self._ensure_name_registerable(name, sid)
         if name in self._name_to_sid_map:
-            existing_sid = self._name_to_sid_map[name]
-            if existing_sid != sid:
-                raise ValueError(f"Name '{name}' already registered by sid '{existing_sid}' in namespace {self.namespace}")
             # 如果是同一个sid重新注册，允许（幂等操作）
             # Allow re-registration by the same sid (idempotent operation)
             logger.debug(f"Name '{name}' re-registered by same sid '{sid}'")
