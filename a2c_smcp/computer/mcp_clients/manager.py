@@ -106,6 +106,10 @@ _MAX_SKILL_LIST_PAGES = 1000
 # 交互式路径不套此界——生命周期由 pending flow TTL（10 分钟）+ 取消链约束。
 _CONNECT_TIMEOUT = 30.0
 
+# #208：启动事务的 raw 声明在渲染窗口内被改写时的**重试上限**。每次重试都要重跑一次 materialize
+# （可能含交互提示），故给一个宽松但**有界**的上限；耗尽则放弃本次启动（见 `_astart_client`）。
+_MAX_MATERIALIZE_RETRIES = 8
+
 # automatic-only（Rust #180）：无显式 oauth 配置时也按 challenge 准入，参数从 metadata 派生。
 # 私有变体类型不跨界——经 oauth_types 公开工厂获取默认选项（🟡7）。
 _DEFAULT_OAUTH_OPTIONS = default_oauth_options()
@@ -411,6 +415,12 @@ class MCPServerManager:
         # 1. 终态收敛：关闸（排队/新启动即刻失败）→ 等在途事务收敛（**不得持任何锁**）
         self._start_gate.close()
         await self._start_gate.drain()
+        # 1b. detached OAuth connect 任务结算——与 :meth:`aclose` **对称**，不可省：
+        #     这些任务**不占门计数**，`drain()` 收敛不到它们。宿主正在等交互式 OAuth flow 时调本方法，
+        #     一个停在 `_commit_active_client` 状态锁上的 detached 任务会被 `_astop_all` 逐项释放锁的
+        #     间隙唤醒并于其间提交（此刻 `_servers_config` 未清、epoch 未变、移除守卫亦通过）——
+        #     它不在 `_astop_all` 的快照里 ⇒ **漏停**，而 `_clear_all` 只丢引用不 disconnect ⇒ 进程泄漏。
+        await self._asettle_oauth_connect_tasks()
         # 2. 停止所有活动客户端 + 清空所有状态存储（两者之间不得有 await：清空不 disconnect，
         #    任何在停止与清空之间提交的 client 都会被静默丢弃 ⇒ 进程泄漏）
         #    ⚠️ 不得在 ``self._lock`` 内调用：``_astop_all`` **自取**状态锁（asyncio.Lock 不可重入 ⇒ 自死锁）
@@ -457,6 +467,13 @@ class MCPServerManager:
         Args:
             config (MCPServerConfig): MCP服务器配置
             start: ``False`` = 只登记不启动（治理恢复的 collect-then-batch；#208）。
+                ⚠️ 对**已激活**且 ``auto_reconnect=True`` 的 bundle，``start=False`` 是**静默 no-op**
+                （该分支刻意「不预写新声明」——预写是 restart 成功后才做的）；此时配置**不会**被登记。
+                需要更新运行中的 server 请用缺省 ``start=True``（走 restart）。
+
+        Raises:
+            RuntimeError: 已激活 + ``auto_reconnect=False`` 时更新配置（须先 stop）；
+                ``start=False`` 命中已激活 + ``auto_reconnect=True`` 时（避免「只挂载」被静默误读为已登记）。
         """
         bundle_id = resolve_bundle_id(config)
         action: str | None = None
@@ -468,7 +485,16 @@ class MCPServerManager:
                     if self._auto_reconnect:
                         # #192 / §5.13：**不预写**新 config——_arestart_server 先 materialize（失败旧配置/旧进程不动），
                         # 成功后才替换存储（运行中不热更新、失败不留下 raw/rendered 半态）。
-                        action = "restart" if start else None
+                        if not start:
+                            # #208：此分支**连新声明都不登记**（预写只在 restart 成功后发生），故
+                            # `start=False` 落到这里 = 配置被静默丢弃，与「只登记不启动」的语义不符。
+                            # fail-fast 让调用方看到真相（治理恢复路径由 existing_bundle_ids 前置挡住）。
+                            raise RuntimeError(
+                                f"Server bundle_id={bundle_id!r} (name={config.name!r}) is active; start=False "
+                                "cannot register a new declaration for a running server — use start=True (restart) "
+                                "or stop it first",
+                            )
+                        action = "restart"
                     else:
                         raise RuntimeError(
                             f"Server bundle_id={bundle_id!r} (name={config.name!r}) is active. Stop it before updating config",
@@ -619,6 +645,12 @@ class MCPServerManager:
         input order, failures as values, never cascading cancellation into children.
         """
         ids = list(bundle_ids)
+        # 空集：**任何配置下**都必须返回空结果（不得落到下面的并发分支）。
+        # ``asyncio.wait([])`` 在 Configured 分支会抛 ``ValueError: Set of Tasks/Futures is empty.``——
+        # 而 ``astart_all()`` 在「未挂载任何 server / 全部 disabled」时正会走到这里（#208 前是零次循环
+        # 的 no-op），故这是必须挡住的回归；rust ``join_all(&[])`` 同样返回空 Vec（双端口径一致）。
+        if not ids:
+            return []
         if self._start_gate.max is None:
             outcomes: list[StartOutcome] = []
             for bundle_id in ids:
@@ -634,7 +666,12 @@ class MCPServerManager:
         try:
             await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
         except asyncio.CancelledError:
-            # 收敛而非弃置：等子任务结算（各自释放门许可 / 收尾 transport）后再上抛
+            # 取消**子任务**再结算（收敛而非弃置）：只 `wait` 不 `cancel` 会让入口被**无界等待**的子任务
+            # 卡住（交互式 input 提示 / 用户挂着的 OAuth 可达分钟级），`wait_for` 到点不返回、CLI Ctrl-C
+            # 在提示窗口内表现为「没反应」。先 cancel 再等它们各自收尾 —— 既保住「不弃置半开 transport」，
+            # 又让收敛**有界**（对齐 rust：`join_all` 的 future 被 drop 即取消）。
+            for task in tasks:
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
             raise
@@ -768,11 +805,36 @@ class MCPServerManager:
                     # §5.13（#192，对齐 rust start_client_by_id_materialized）：从 stopped 实际启动 → 从 **raw 声明店**
                     # materialize（rendered 品绝不作为解析结果来源；结构化错误上抛、不落 CONNECTING、不改任何状态），
                     # 再以 rendered config spawn。standalone（无 raw 条目）回退当前配置（调用方传入即已渲染）。
-                    raw = self._servers_config_raw.get(bundle_id, config)
+                    raw_in_store = self._servers_config_raw.get(bundle_id)
+                    raw = raw_in_store if raw_in_store is not None else config
                 # ── phase B：锁外慢路径（用户提示 / 进程握手）——permit + bundle 锁仍持有 ──
-                rendered = await self._amaterialize(bundle_id, raw)
-                async with self._lock:
-                    self._servers_config[bundle_id] = rendered
+                # 🔴 #208 新增竞态（锁域收窄的代价）：决策相（`_add_or_update_server_config` 的登记分支）
+                # 只取**状态锁**、不取 bundle 锁，故它的登记可在本事务 materialize 期间落在 raw 店上。
+                # 若此时仍把 phase A 读到的**旧 raw** 渲染结果写回 ``_servers_config``，就覆盖掉刚登记的
+                # 新声明 —— 更新被静默丢弃 + raw/rendered 分歧（活跃进程仍是旧配置）。#208 前两者同持
+                # 全局锁，不可能交错。
+                # 处置：**渲染前后校验 raw 身份**，变了就重读最新声明重新渲染（重启事务）。带上限避免
+                # 恶意/极端抖动下的活锁；耗尽则**放弃本次事务**（不写也不 spawn）——排在本 bundle 锁后的
+                # 那次更新启动会接手新配置，故不会静默无启动（`astart_client` 显式路径同样如此）。
+                for _attempt in range(_MAX_MATERIALIZE_RETRIES):
+                    rendered = await self._amaterialize(bundle_id, raw)
+                    async with self._lock:
+                        if self._servers_config_raw.get(bundle_id) is raw_in_store:
+                            self._servers_config[bundle_id] = rendered
+                            break
+                        # 声明在渲染窗口内被换过 → 重读并重渲染（不写、不 spawn）
+                        config = self._servers_config.get(bundle_id)
+                        if not config:
+                            # 渲染窗口内被移除/换代 → 与 phase A 的未知 bundle 同判
+                            raise ValueError(f"Unknown server bundle_id={bundle_id!r}")  # pragma: no cover
+                        raw_in_store = self._servers_config_raw.get(bundle_id)
+                        raw = raw_in_store if raw_in_store is not None else config
+                else:  # pragma: no cover — 需宿主以高于一次 render 的频率持续改写声明
+                    logger.warning(
+                        f"bundle_id={bundle_id!r} 的声明在 {_MAX_MATERIALIZE_RETRIES} 次渲染窗口内持续变更，"
+                        f"放弃本次启动（排在 bundle 锁后的更新启动将接手最新声明）",
+                    )
+                    return
                 await self._aspawn_client(bundle_id, rendered, clear_epoch)
 
     async def _aspawn_client(self, bundle_id: BUNDLE_ID, config: MCPServerConfig, clear_epoch: int) -> None:
@@ -1411,10 +1473,19 @@ class MCPServerManager:
         """
         # 1. 关闸：排队者与后来者即刻失败
         self._start_gate.close()
-        # 2. 在途收敛（不得持任何锁）
-        await self._start_gate.drain()
-        # 3. detached OAuth connect 任务结算
-        await self._asettle_oauth_connect_tasks()
+        # 2. 在途收敛（不得持任何锁）+ 3. detached OAuth connect 任务结算
+        # ⚠️ 收敛前导被打断时**不得就此跳过拆除**：`drain()` 是 teardown 的**前置** await 且不是吞点，
+        # 若宿主 `wait_for(shutdown(), t)` 恰在有在途启动事务时到点，取消会从 drain 直接上抛 ——
+        # `_astop_all` / `_clear_all` 全被跳过 ⇒ **一个 client 都不会被停**（比「拆到一半」更彻底地失败）。
+        # 故吞掉该取消、把拆除走完；信号无需手工补抛：`Task.cancelling()` 不因吞掉而自减，
+        # 最外层的 ``@restores_cancellation`` 会在收尾处如实还原（#211 同一契约）。
+        try:
+            await self._start_gate.drain()
+            await self._asettle_oauth_connect_tasks()
+        except asyncio.CancelledError:
+            logger.warning(
+                "aclose 的收敛前导被取消：继续走完 stop/clear（取消信号由最外层入口还原）",
+            )
         # 4. 停止所有客户端（此时快照完整）
         await self.astop_all()
 

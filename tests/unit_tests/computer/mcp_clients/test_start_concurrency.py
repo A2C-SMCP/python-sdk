@@ -17,6 +17,7 @@ tick 足以让任何**被错误放行**的任务跑到 ``on_enter`` 并抬高计
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -360,6 +361,174 @@ async def test_aclose_waits_for_start_transaction_that_has_not_committed_any_sta
 
     assert manager._active_clients == {}, "收敛后仍须被停止干净"
     assert manager._servers_config == {}
+
+
+@pytest.mark.asyncio
+async def test_empty_batch_returns_empty_under_both_configurations(harness: Harness) -> None:
+    """隔离审查 🔴1：**空集**在「已配置上限」下不得炸——`asyncio.wait([])` 会抛 `ValueError`。
+
+    ``astart_all()`` 在「未挂载任何 server / 全部 disabled」时正会走到这里（#208 前是零次循环的
+    no-op），故这是必须挡住的回归；rust ``join_all(&[])`` 亦返回空 Vec（双端口径一致）。
+    """
+    configured = MCPServerManager()
+    configured.with_mcp_start_concurrency(3)
+    assert await configured.astart_clients_batch([]) == []
+    await configured.astart_all()  # 未挂载任何 server ⇒ 同走空集路径，不得抛
+
+    unconfigured = MCPServerManager()
+    assert await unconfigured.astart_clients_batch([]) == []
+    await unconfigured.astart_all()
+
+
+@pytest.mark.asyncio
+async def test_update_during_start_does_not_get_overwritten_by_stale_render(harness: Harness) -> None:
+    """隔离审查 🔴2：启动事务在途时的配置更新**不得被旧 raw 的渲染结果覆盖**。
+
+    竞态（#208 锁域收窄引入）：决策相只取状态锁、不取 bundle 锁 ⇒ 它的登记可落在本事务
+    materialize 期间。若无护栏，phase B 会把**旧 raw** 的渲染写回 ``_servers_config`` ——
+    更新被静默丢弃 + raw/rendered 分歧（活跃进程仍是旧配置）。
+
+    本用例用受控 materializer 在渲染窗口内制造一次真实更新；终态要求：**新配置生效**（不是旧值）。
+    """
+    gate = asyncio.Event()
+    seen: list[str] = []
+
+    async def _materializer(bundle_id: str, raw: MCPServerConfig) -> MCPServerConfig:
+        seen.append(bundle_id)
+        if len(seen) == 1:
+            await gate.wait()  # 第一次渲染时挂住，让更新落在窗口内
+        return raw
+
+    manager = MCPServerManager(materializer=_materializer)
+    ids = await _register(manager, [_cfg("s0")])
+    bid = ids[0]
+
+    original_raw = manager._servers_config_raw[bid]
+    starting = asyncio.create_task(manager.astart_client(bid))
+    for _ in range(5):
+        await _settle()
+        if seen:
+            break
+    assert seen, "第一次渲染应已开始（受控 materializer 已挂住）"
+
+    # 渲染窗口内更新同 bundle 的声明。**必须作为独立任务**：该更新的启动会排队等本事务持有的
+    # bundle 锁，直接 await 即自阻塞（而本事务正等我们放行）。
+    updating = asyncio.create_task(manager.aadd_or_aupdate_server(_cfg("s0")))
+    for _ in range(10):
+        await _settle()
+        if manager._servers_config_raw.get(bid) is not original_raw:
+            break
+    assert manager._servers_config_raw.get(bid) is not original_raw, "更新声明应已登记进 raw 店"
+
+    gate.set()
+    await _drain(starting, harness.control)
+    await asyncio.wait_for(updating, timeout=5)
+
+    # 终态：渲染被**重跑**（seen 至少两次）且两店一致——不得留下「raw 新 / rendered 旧」
+    assert len(seen) >= 2, "声明在渲染窗口内被换过 ⇒ 必须重读重渲染，而非写回旧值"
+    assert bid in manager._servers_config
+    assert bid in manager._active_clients
+
+
+@pytest.mark.asyncio
+async def test_ainitialize_settles_detached_oauth_tasks_like_aclose(harness: Harness) -> None:
+    """隔离审查 🟡4：``ainitialize`` 换代的收敛前导须与 ``aclose`` **对称**——detached OAuth connect
+    任务要在返回前被**取消并结算**，而非只靠 ``_clear_all`` 的裸 ``cancel()`` 兜底。
+
+    为什么必须结算：这些任务不占门计数（``drain()`` 收敛不到），一个停在 ``_commit_active_client``
+    状态锁上的任务会被 ``_astop_all`` 逐项释放锁的间隙唤醒并**在其间提交**（那一刻 ``_servers_config``
+    未清、epoch 未变、移除守卫也通过）⇒ 不在 ``_astop_all`` 快照里 ⇒ 漏停；而 ``_clear_all`` 只丢引用不
+    disconnect ⇒ 进程泄漏。
+
+    此处直接钉**结构契约**（取消 + 结算发生在返回之前），用永不自然结束的假任务做到确定性判定。
+    """
+    manager = MCPServerManager()
+    ids = await _register(manager, _cfgs(1))
+    bid = ids[0]
+
+    settled: list[bool] = []
+
+    async def _detached() -> None:
+        try:
+            await asyncio.sleep(30)  # 永不自然结束；只有被取消才会结算
+        finally:
+            settled.append(True)
+
+    task = asyncio.create_task(_detached())
+    manager._oauth_connect_tasks[bid] = task
+    await _settle(1)  # 让任务真正跑起来（未启动即被取消 ⇒ 协程体不执行，finally 不触发）
+    assert not task.done()
+
+    await manager.ainitialize([_cfg("other")])
+
+    assert task.done(), "detached oauth 任务必须在 ainitialize 返回前被取消并结算（不得留到 _clear_all 兜底）"
+    assert settled == [True], "任务须已收尾"
+    assert manager._oauth_connect_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_start_false_on_running_server_fails_fast(harness: Harness) -> None:
+    """隔离审查 🟡5：``start=False`` 落在「已激活」分支须 fail-fast，而非静默丢弃配置。
+
+    该分支刻意「不预写新声明」（预写只在 restart 成功后发生），故 ``start=False`` 落到这里等于
+    既没登记、也没启动、也不报错——与「只登记不启动」的 docstring 直接矛盾。
+    """
+    manager = MCPServerManager()
+    ids = await _register(manager, _cfgs(1))
+    bid = ids[0]
+
+    await _drain(asyncio.create_task(manager.astart_clients_batch(ids)), harness.control)
+    assert bid in manager._active_clients
+
+    with pytest.raises(RuntimeError, match="start=False"):
+        await manager.aadd_or_aupdate_server(_cfg("s0"), start=False)
+
+
+@pytest.mark.asyncio
+async def test_aclose_cancelled_during_drain_still_tears_down(harness: Harness) -> None:
+    """隔离审查 🟡6：``drain()`` 窗口内到达的取消**不得**跳过整个拆除。
+
+    ``drain()`` 是 teardown 的**前置** await 且不是吞点 —— 若不接住，取消会从这里直接上抛，
+    ``_astop_all`` / ``_clear_all`` 全被跳过 ⇒ **一个 client 都不会被停**（比「拆到一半」更彻底地失败）。
+    正确姿态与 #211 同源：吞掉该取消、把拆除走完，信号由最外层 ``@restores_cancellation`` 还原。
+    """
+    gate = asyncio.Event()
+    entered: list[str] = []
+
+    async def _materializer(bundle_id: str, raw: MCPServerConfig) -> MCPServerConfig:
+        entered.append(bundle_id)
+        await gate.wait()  # 停在渲染窗口 = 事务**持着 bundle 锁** ⇒ drain 必然等待
+        return raw
+
+    manager = MCPServerManager(materializer=_materializer)
+    ids = await _register(manager, [_cfg("s0")])
+    bid = ids[0]
+
+    starting = asyncio.create_task(manager.astart_client(bid))
+    for _ in range(5):
+        await _settle()
+        if entered:
+            break
+    assert entered, "启动事务应已停在渲染窗口"
+
+    closing = asyncio.create_task(manager.aclose())
+    await _settle()
+    assert not closing.done(), "在途未收敛时 aclose 不得返回"
+
+    closing.cancel()  # 取消落在 drain 窗口
+    await _settle()
+
+    gate.set()
+    # 放行在途事务并等两者收尾（closing 以 CancelledError 结束是预期的信号还原）
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await _drain(starting, harness.control)
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await closing
+
+    assert manager._servers_config == {}, "取消不得跳过 _clear_all"
+    assert manager._active_clients == {}, "取消不得跳过 astop_all（否则 client 全部存活）"
+    assert harness.created, "在途事务应已建成 client"
+    assert harness.created[0].adisconnect.await_count >= 1, "已连上的 client 必须被停（拆除走完）"
 
 
 # ────────────────────── T7/T8：并发启动 / 同 bundle 双开与启动中移除 ──────────────────────
