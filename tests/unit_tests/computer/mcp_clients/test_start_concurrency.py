@@ -519,10 +519,14 @@ async def test_aclose_cancelled_during_drain_still_tears_down(harness: Harness) 
     await _settle()
 
     gate.set()
-    # 放行在途事务并等两者收尾（closing 以 CancelledError 结束是预期的信号还原）
+    # 放行在途事务（closing 的收尾在等它释放 bundle 锁）
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await _drain(starting, harness.control)
-    with contextlib.suppress(asyncio.CancelledError, Exception):
+
+    # 两面都要钉：① 拆除走完（吞掉取消之后**继续**执行 stop/clear）；
+    # ② 取消信号**未被吞没**——由最外层 @restores_cancellation 在收尾处还原（`Task.cancelling()`
+    #    不因吞掉而自减）。只 suppress 全吞会让「静默成功」与「正确还原」无从区分。
+    with pytest.raises(asyncio.CancelledError):
         await closing
 
     assert manager._servers_config == {}, "取消不得跳过 _clear_all"
