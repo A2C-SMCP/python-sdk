@@ -294,6 +294,14 @@ client.join_office("my_office", "my_agent")
 await async_client.join_office("my_office", "my_agent")
 ```
 
+> **身份在一条连接内不可变。** 协议规定：同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）。
+> 因此**同一条连接**上不能用不同的 `agent_name` 再次 `join_office`——服务端会拒绝（`403`）。
+>
+> 注意 `server:join_office` 在协议里**有** ack 通道（成功空 ack / 失败 flat `ErrorPayload`），但本 SDK
+> 的 Agent 客户端是用**无 ack 的 `emit`** 发出该请求的（其自动回房路径才用 `call` 读 ack）⇒ **本端收不到
+> 这次拒绝的回执**。要换名请**重新建立连接**（新 sid）后再入房。换房（不同 `office_id`）不受影响，
+> 但 Agent **必须**先 `leave_office` 再入新房（见下文）。
+
 ### 离开房间
 
 ```python

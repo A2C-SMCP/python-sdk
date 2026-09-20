@@ -191,6 +191,28 @@ class TestSMCPNamespace:
         assert_rejected_ack(ack, 403)
 
     @pytest.mark.asyncio
+    async def test_join_office_name_mismatch(self, smcp_namespace):
+        """测试名字不匹配的情况 / Test name mismatch scenario.
+
+        #221：events.md:610 的身份声明一致性覆盖 role **与** name 两半——同一 sid 改自称的 name 同样
+        是身份声明冲突（403），改名须换新连接（faq.md:162「重连或换 sid」）。
+        """
+        session = {"role": "computer", "name": "old_name"}
+        smcp_namespace.get_session = AsyncMock(return_value=session)
+        smcp_namespace.save_session = AsyncMock()
+
+        data = EnterOfficeReq(**{
+            "role": "computer",
+            "name": "test_computer",
+            "office_id": "office_123",
+        })
+
+        ack = await smcp_namespace.on_server_join_office("test_sid", data)
+
+        assert_rejected_ack(ack, 403)
+        assert session["name"] == "old_name", f"被拒请求不得改动会话 name: {session!r}"
+
+    @pytest.mark.asyncio
     async def test_leave_office(self, smcp_namespace):
         """测试离开房间 / Test leaving office"""
         # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
@@ -818,9 +840,13 @@ class TestEnterRoomTransactionalCommit:
 
         用**真实会话存储**（get/save 读写同一 dict 表）观测回滚结果——把 get_session 钉成固定
         stub 会让「保存了备份」这件事不可见，断言随之失明。
+
+        #221 后场景改为**同名单连换房**：身份声明不一致会在此之前被 403 拒掉，故「改了 name 再失败」
+        已不是可达路径。本用例守的是 #213 的核心——``office_id`` 归属 ``enter_room``，处理器整体
+        覆盖 backup 会把已收敛的房号复活。
         """
         smcp_namespace.server = mock_server
-        store: dict[str, dict] = {"c-sid": {"role": "computer", "name": "old-name", "office_id": "roomA", "sid": "c-sid"}}
+        store: dict[str, dict] = {"c-sid": {"role": "computer", "name": "c1", "office_id": "roomA", "sid": "c-sid"}}
         smcp_namespace.get_session = AsyncMock(side_effect=lambda sid, *a, **k: store[sid])
         smcp_namespace.save_session = AsyncMock(side_effect=lambda sid, sess, *a, **k: store.__setitem__(sid, sess))
 
@@ -833,14 +859,36 @@ class TestEnterRoomTransactionalCommit:
 
         ack = await smcp_namespace.on_server_join_office(
             "c-sid",
-            EnterOfficeReq(**{"role": "computer", "name": "new-name", "office_id": "roomB"}),
+            EnterOfficeReq(**{"role": "computer", "name": "c1", "office_id": "roomB"}),
         )
 
         assert_rejected_ack(ack, 500)
         assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
         assert "office_id" not in final, "收敛结果不得被 backup 里的旧房号复活"
-        assert final["role"] == "computer" and final["name"] == "old-name", "role/name 须回滚"
+        assert final["role"] == "computer" and final["name"] == "c1", "role/name 须保持声明值"
+
+    @pytest.mark.asyncio
+    async def test_join_office_rejection_drops_identity_written_on_fresh_session(self, smcp_namespace, mock_server):
+        """失败回滚对**本次新写入**的 ``role`` / ``name`` 是**删除**（而非写 None）。
+
+        会话此前未声明身份 ⇒ 失败后必须回到「无身份」，否则 ``session["role"] = None`` 会污染后续
+        的 role 判据（``is not None`` 判据的正对照）。
+        """
+        smcp_namespace.server = mock_server
+        store: dict[str, dict] = {"c-sid": {"sid": "c-sid"}}
+        smcp_namespace.get_session = AsyncMock(side_effect=lambda sid, *a, **k: store[sid])
+        smcp_namespace.save_session = AsyncMock(side_effect=lambda sid, sess, *a, **k: store.__setitem__(sid, sess))
+        smcp_namespace.enter_room = AsyncMock(side_effect=RuntimeError("boom"))
+
+        ack = await smcp_namespace.on_server_join_office(
+            "c-sid",
+            EnterOfficeReq(**{"role": "computer", "name": "c1", "office_id": "roomB"}),
+        )
+
+        assert_rejected_ack(ack, 500)
+        assert "role" not in store["c-sid"], f"新写入的 role 须被删除而非置 None: {store['c-sid']!r}"
+        assert "name" not in store["c-sid"], f"新写入的 name 须被删除而非置 None: {store['c-sid']!r}"
 
 
 class TestV021ClientRoutesAndUpdateSkills:

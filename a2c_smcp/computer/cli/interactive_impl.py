@@ -17,7 +17,7 @@ import os
 import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer
@@ -38,6 +38,7 @@ from a2c_smcp.computer.cli.resolve import (
 from a2c_smcp.computer.cli.utils import console, parse_kv_pairs, print_mcp_config, print_status, print_tools
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import MCPServerInput as MCPServerInputModel
+from a2c_smcp.smcp import SMCP_NAMESPACE
 from a2c_smcp.smcp import MCPServerConfig as SMCPServerConfigDict
 from a2c_smcp.smcp import MCPServerInput as SMCPServerInputDict
 from a2c_smcp.smcp import ToolCallReq as SMCPToolCallReq
@@ -113,6 +114,114 @@ def _resolve_lifecycle_target(comp: Computer, token: str, *, verb: str, settings
     return None
 
 
+class ConnectionArgs(TypedDict):
+    """一次连接的参数——改名重连所需的最小集合。
+
+    由 ``socket connect`` 分支记录；``--auto-connect`` 启动路径经 ``init_connection`` 注入。
+
+    ``namespace`` 存的是**生效**命名空间（**不留 ``None``**）：``SMCPComputerClient`` 的默认值只在
+    该参数**缺席**时生效，显式传 ``None`` 会把它覆盖成 ``None`` ⇒ 新连接的所有 handler 注册到默认
+    命名空间 ``'/'``、``emit`` 落到一个未连接的命名空间——一条「哑连接」（入房必抛
+    ``BadNamespaceError``，且客户端自己无法恢复）。故记录方须填入实际生效值。
+
+    The **effective** namespace (never ``None``): ``SMCPComputerClient``'s default only applies when
+    the argument is *absent*; passing ``None`` explicitly overrides it and yields a dumb connection
+    whose handlers all land on ``'/'``.
+    """
+
+    url: str
+    namespace: str
+    auth: dict[str, Any] | None
+    headers: dict[str, Any] | None
+
+
+def _client_in_office(client: Any) -> bool:
+    """客户端是否**真实**在房间里——优先用客户端自己的判据，桩对象回退到 ``office_id``。
+
+    ``office_id`` 是 *desired*：重连窗口内它被刻意保留（#203），此时 namespace 并未在册、并不真在
+    房里。客户端已把正确判据固化在 ``SmcpComputerClient._in_office()``（其文档明确要求据此判断），
+    CLI 沿用同一判据以免在断线窗口里对一个并不在的房间发 leave。
+    """
+    probe = getattr(client, "_in_office", None)
+    if callable(probe):
+        return bool(probe())
+    return bool(getattr(client, "office_id", None))
+
+
+async def _rename_via_reconnect(
+    *,
+    smcp_client: Any,
+    smcp_client_cls: type[Any],
+    comp: Computer,
+    connection: ConnectionArgs,
+    office_id: str,
+    new_name: str,
+) -> tuple[Any, bool]:
+    """改名 = **换新连接**（协议 events.md:610——身份在 sid 生命周期内不可变）。
+
+    同一 sid 声明不同的 ``name`` 会被服务端以 ``403`` 拒（``faq.md:162`` 给出的补救即「**重连或换
+    sid**」）。CLI 保留「一条命令换名」的体感，代价是这条命令实际做四步：
+
+    1. 离开旧房——**尽力而为**：``server:leave_office`` 的唯一作用是让旧房对端收到
+       ``notify:leave_office``；随后 ``disconnect()`` 无论如何都会清掉服务端成员关系，故其失败降级为
+       告警而非中止（中止只会把用户卡在「服务器抖一下就改不了名」）。
+    2. 断开当前连接；
+    3. 以新名重连（新 sid ⇒ 新会话，服务端不再有既有身份可冲突）；
+    4. 入房。
+
+    两个**相位**分开收敛（不可合并）：
+
+    - 第 3 步失败 ⇒ 新旧连接都没了。``comp.name`` 回滚为原名后抛异常，调用方把 ``smcp_client`` 置
+      ``None``——此时 CLI「未连接」是**实情**。
+    - 第 4 步失败 ⇒ 连接**已建成**，故**保留**它并返回 ``joined=False``（不抛）。丢弃它会让 CLI
+      自锁为「请先连接」而那条连接其实活着（连接泄漏 + 服务端 sid 会话驻留 + 体感掉线）；且新会话
+      尚未声明任何身份（服务端会回滚 name），用户直接换个名字/换个房重试即可，无需再重连。
+
+    :returns: ``(新的 smcp_client, 是否已入房)``。仅在**第 3 步**失败时抛异常。
+    """
+    # 步号恒定 1-4（即便无旧房可退也占位）：跳号会让用户以为流程出错。
+    # Fixed 1-4 numbering — a skipped step would read as a bug.
+    console.print(f"[dim]  1/4 离开 {smcp_client.office_id if _client_in_office(smcp_client) else '（未在房间，跳过）'}[/dim]")
+    if _client_in_office(smcp_client):
+        try:
+            await smcp_client.leave_office(smcp_client.office_id)
+        except Exception as e:  # noqa: BLE001 - 通知性步骤：最终状态由 disconnect 决定，故降级为告警
+            console.print(f"[yellow]  ⚠ 离开旧房失败（不影响改名）/ leave_office failed: {e}[/yellow]")
+
+    old_name = comp.name
+    console.print("[dim]  2/4 断开当前连接[/dim]")
+    try:
+        await smcp_client.disconnect()
+    except Exception as e:  # noqa: BLE001 - 断开失败不应阻止后续重连尝试（旧连接无论如何都要弃用）
+        console.print(f"[yellow]  ⚠ 断开失败（继续重连）/ disconnect failed: {e}[/yellow]")
+
+    console.print(f"[dim]  3/4 以新名 {new_name} 重连[/dim]")
+    comp.name = new_name
+    try:
+        # 构造与建连同处一个 `except`：构造器抛错（防御面）也必须回滚名字，否则「第 3 步失败 ⇒
+        # 回滚」的不变量漏一个出口，``comp.name`` 会停在一个从未生效的新名上。
+        new_client: Any = smcp_client_cls(computer=comp, namespace=connection["namespace"])
+        await new_client.connect(
+            connection["url"],
+            auth=connection["auth"],
+            headers=connection["headers"],
+            namespaces=[connection["namespace"]],
+        )
+    except Exception:
+        comp.name = old_name  # 改名未生效 ⇒ 名字回到连接时的值，与「未改名」状态一致
+        raise
+
+    console.print(f"[dim]  4/4 加入 {office_id}（{new_name}）[/dim]")
+    try:
+        await new_client.join_office(office_id)
+    except Exception as e:
+        # 连接已建成 ⇒ 保留它（见 docstring 的相位说明）。comp.name 保持 new_name：那条连接日后若
+        # 经 #203 自动重放，用的就是 ``computer.name``，故名字须与「服务端可能落定的身份」一致。
+        console.print(f"[red]加入房间失败 / Failed to join office: {e}[/red]")
+        return new_client, False
+    return new_client, True
+
+
 async def interactive_loop(
     comp: Computer,
     *,
@@ -120,6 +229,7 @@ async def interactive_loop(
     patch_stdout_ctx: PatchStdoutCtx,
     smcp_client_cls: type[Any],
     init_client: Any | None = None,
+    init_connection: ConnectionArgs | None = None,
     completer: Completer | None = None,
     approve_all_mcp: bool = False,
     settings_flag_path: Path | None = None,
@@ -132,9 +242,68 @@ async def interactive_loop(
     approve_all_mcp / settings_flag_path: 全局 flag ``--approve-all-mcp`` / ``--settings <file>``，透传给启动期
     MCP 批准框（#69 Group B）。``settings_flag_path`` 旧名 ``mcp_flag_config`` 已更名——它是 **settings.json**，
     旧名主动误导（#154）；flag 层 **mcp.json**（``--mcp-config``）不走本参数，而是注入 :class:`Computer`。
+
+    init_connection: ``--auto-connect`` 启动路径的连接参数（``main.py`` 已用它建好 ``init_client``）。
+    ``socket join`` 的**改名**需要一条新连接（协议 events.md:610 —— 身份在 sid 生命周期内不可变），
+    故参数须随客户端一并注入；交互式 ``socket connect`` 会自行记录。
+    Connection parameters of the ``--auto-connect`` client, replayed when a rename needs a fresh connection.
     """
     session = session_factory()
     smcp_client = init_client
+    # 改名重连所需的连接参数（``socket connect`` 记录 / 启动路径注入）。
+    connection: ConnectionArgs | None = init_connection
+    # ``attempted_name`` = **本连接已尝试声明过的名字**（``None`` = 本连接从未尝试入房）。把
+    # 「首次入房（任意名可）」「同名换房（直接 join）」「改名（须新连接）」三态分开。
+    #
+    # 刻意在**发起 join 之前**置位，而不是成功之后：客户端在传输层失败时会**保留入房意图**，并在
+    # #203 自动重连时用 ``computer.name`` 重放（``client.py`` 的 desired 重放路径）——「成功才置位」
+    # 会让 CLI 的信念落后于服务端（服务端已落定该名字，CLI 却以为本连接还没有身份），此后任何改名
+    # 都被 403，而普通路径失败不触发重连 ⇒ 只能重启进程。提前置位是**保守高估**：最坏多走一次无谓
+    # 重连，比 403 死锁安全。它也与「普通路径改写 ``comp.name`` 之前必先经改名分支」自洽。
+    # Set *before* the attempt, not on success — the client keeps the intent across a transport failure
+    # and replays ``computer.name`` on auto-reconnect (#203), so "success-only" would let the CLI's
+    # belief lag the server and wedge on 403 forever. Over-estimating costs one redundant reconnect.
+    attempted_name: str | None = None
+
+    async def _join_office(office_id: str, requested_name: str) -> bool:
+        """``socket join`` 的三态分发：首次入房 / 同名换房 / 改名（换新连接）。
+
+        :returns: 是否**已入房**。改名路径下连接可能已换成新连接但入房被拒 ⇒ 返回 ``False``
+            （调用方不得打印成功），但 ``smcp_client`` 已是那条可用连接；仅在**建连失败**时抛异常。
+        """
+        nonlocal smcp_client, attempted_name
+        if smcp_client is None:
+            # 调用点已有「未连接」守卫；此处是闭包自身的前置条件（建连失败会把 client 置 None）
+            raise RuntimeError("未连接 / Not connected")
+        if attempted_name is not None and requested_name != attempted_name:
+            if connection is None:
+                # 无语录可重放 ⇒ 只能拒绝（绝不静默改 comp.name，那会让后续 join 全部 403）
+                raise RuntimeError(
+                    "改名需要重建连接，但本次会话未记录连接参数——请先 `socket connect <url>` 再改名"
+                    " / Renaming needs a new connection but no connection parameters were recorded",
+                )
+            console.print("[dim]改名需新连接（协议 403 ⇒ 重连或换 sid）[/dim]")
+            attempted_name = requested_name
+            try:
+                smcp_client, joined = await _rename_via_reconnect(
+                    smcp_client=smcp_client,
+                    smcp_client_cls=smcp_client_cls,
+                    comp=comp,
+                    connection=connection,
+                    office_id=office_id,
+                    new_name=requested_name,
+                )
+            except Exception:
+                # 建连失败 ⇒ 新旧连接都没了：不留悬空引用，声明状态清零
+                smcp_client = None
+                attempted_name = None
+                raise
+            return joined
+
+        comp.name = requested_name
+        attempted_name = requested_name
+        await smcp_client.join_office(office_id)
+        return True
 
     console.print("[bold]进入交互模式，输入 help 查看命令 / Enter interactive mode, type 'help' for commands[/bold]")
     if not console.is_terminal and not console.no_color:
@@ -473,6 +642,16 @@ async def interactive_loop(
 
                         smcp_client = smcp_client_cls(computer=comp)
                         await smcp_client.connect(url_val, auth=auth, headers=headers)
+                        # 记录连接参数供改名重连重放；新连接 ⇒ 身份声明状态清零（新 sid = 新会话）。
+                        # namespace 记**生效值**（本分支构造客户端时未指定 ⇒ 即默认 SMCP_NAMESPACE）；
+                        # 记成 None 会在重连时显式覆盖掉默认值，把新连接变成哑连接（见 ConnectionArgs）。
+                        connection = {
+                            "url": url_val,
+                            "namespace": SMCP_NAMESPACE,
+                            "auth": auth,
+                            "headers": headers,
+                        }
+                        attempted_name = None
                         console.print("[green]已连接 / Connected[/green]")
                 elif sub == "join":
                     if not smcp_client or not getattr(smcp_client, "connected", False):
@@ -480,19 +659,27 @@ async def interactive_loop(
                     elif len(parts) < 4:
                         console.print("[yellow]用法: socket join <office_id> <computer_name>[/yellow]")
                     else:
-                        # 如果指定了computer_name 会动态地修改运行时computer的name
-                        comp.name = parts[3]
+                        # 指定 computer_name 即声明本连接的运行时名字；若与本连接已尝试过的名字不同，
+                        # 服务端会以 403 拒（协议 events.md:610）⇒ 改走「换新连接」（见 _join_office）。
+                        # 成功提示只在该事件**真的入房**后打印：改名路径可能已换成新连接但入房被拒
+                        # （此时 _join_office 返回 False 并已打印拒因），打印「已加入」会谎报。
                         try:
-                            await smcp_client.join_office(parts[2])
-                            console.print("[green]已加入房间 / Joined office[/green]")
+                            joined = await _join_office(parts[2], parts[3])
                         except RuntimeError as e:
                             console.print(f"[red]{e}[/red]")
                         except Exception as e:
                             console.print(f"[red]加入房间失败 / Failed to join office: {e}[/red]")
+                        else:
+                            if joined:
+                                console.print("[green]已加入房间 / Joined office[/green]")
                 elif sub == "leave":
                     if not smcp_client or not getattr(smcp_client, "connected", False):
                         console.print("[yellow]未连接 / Not connected[/yellow]")
-                    elif not getattr(smcp_client, "office_id", None):
+                    elif not _client_in_office(smcp_client):
+                        # 判据与改名路径的「1/4」统一为 `_client_in_office`（#203 重连窗口内 desired
+                        # 被刻意保留，此时并不真在房里；沿用 desired 会对未在册的 namespace 发
+                        # ``leave_office`` ⇒ 抛 BadNamespaceError ⇒ 只打印笼统「执行失败」，且用户
+                        # 以为退成了、重连后又被自动拉回旧房）。
                         console.print("[yellow]未加入房间 / Not in any office[/yellow]")
                     else:
                         await smcp_client.leave_office(smcp_client.office_id)

@@ -59,10 +59,12 @@ class _Client:
         self._auth = auth
         self._headers = headers
 
-    async def join_office(self, office_id: str, computer_name: str) -> None:  # noqa: D401
+    async def join_office(self, office_id: str) -> None:  # noqa: D401
+        # 形参须与真实 ``SmcpComputerClient.join_office`` 一致（名字经 ``computer.name`` 走线，
+        # 不是形参）——旧桩多一个 ``computer_name`` 形参，令 CLI 的调用抛 TypeError 被笼统 except
+        # 吞掉，socket join 分支实际从未被走到。
         assert self.connected
         self.office_id = office_id
-        self._comp = computer_name
 
     async def leave_office(self, office_id: str) -> None:  # noqa: D401
         assert self.connected

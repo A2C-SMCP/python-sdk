@@ -250,6 +250,11 @@ await client.join_office("my_office")
 await client.emit_update_tool_list()
 ```
 
+> **改名需要新连接。** 协议规定：同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）。
+> `server:join_office` 声明的 `name` 取自 `computer.name`，故**不要**在同一连接上改 `computer.name`
+> 后再次 `join_office`——服务端会以 `403` 拒绝，而客户端会抛 `RuntimeError`。要改名请**新起一条连接**
+> （新 sid）再入房；CLI 的 `socket join <office> <name>` 已按此自动完成（见 cli-guide）。
+
 ### 动态 auth provider
 
 > #200（方案 C 原生透传）：python-socketio 原生支持 auth callable，且**每次握手**

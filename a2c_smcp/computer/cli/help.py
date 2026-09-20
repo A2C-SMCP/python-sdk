@@ -68,7 +68,7 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
     ],
     "socket": [
         ("socket connect [<url>]", "连接 Socket.IO / connect"),
-        ("socket join <office_id> <computer_name>", "加入房间 / join office"),
+        ("socket join <office_id> <computer_name>", "加入房间（改名会自动重建连接）/ join office (rename reconnects)"),
         ("socket leave", "离开房间 / leave office"),
     ],
     "notify": [("notify update", "触发配置更新通知 / emit config updated notification")],

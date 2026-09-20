@@ -87,9 +87,14 @@ a2c> stop filesystem
 | 命令 | 说明 |
 |------|------|
 | `socket connect <url>` | 连接信令服务器 |
-| `socket join <office_id> <name>` | 加入房间 |
+| `socket join <office_id> <name>` | 加入房间；`<name>` 与本连接**已尝试声明过**的名字不同时自动重建连接（见下） |
 | `socket leave` | 离开当前房间 |
 | `notify update` | 通知配置更新 |
+
+> **改名 = 换一条新连接。** 协议规定「同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）」
+> ——身份（role + name）在一条连接的生命周期内不可变。因此 `socket join <office> <new_name>` 若与本
+> 连接已声明的名字不同，CLI 会依次执行：离开旧房 → 断开 → 以新名重连 → 加入新房间（逐步打印进度）。
+> **同名换房**（`socket join <其它房> <当前名>`）不重建连接。
 
 ### 调试工具
 

@@ -117,6 +117,103 @@ class TestJoinOfficeAckShape:
         assert "details" not in ack, f"403 无 code-specific details: {ack!r}"
         _assert_no_leak(ack)
 
+    async def test_name_mismatch_is_403(self) -> None:
+        """同一 sid 声明与会话不同的 name ⇒ `403`（#221：身份声明一致性的 **name** 那一半）。
+
+        协议依据 / Protocol: events.md:610「同一 sid 声明了与既有会话不同的 `role` / `name` ⇒ 拒绝，
+        `403`」——`role` / `name` 是同一条规则的两半，本仓此前**刻意未实现** name 半（#214 记录），
+        #221 对齐。`403` 无 code-specific 字段（error-handling.md §各错误码标准字段总表 无 403 行）。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "old-name"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "new-name", "office_id": "room-a"})
+
+        assert isinstance(ack, dict), f"失败必须是 flat ErrorPayload，实得 {ack!r}"
+        assert ack["code"] == 403, ack
+        assert "details" not in ack, f"403 无 code-specific details: {ack!r}"
+        _assert_no_leak(ack)
+        # 身份声明冲突须先于任何会话写入 ⇒ 名字不得被改成新值
+        assert sessions["sid-1"]["name"] == "old-name", f"被拒请求不得改动会话 name: {sessions['sid-1']!r}"
+
+    async def test_empty_declared_name_mismatch_is_403(self) -> None:
+        """声明**空串** name、而会话已有一个**非归一**名字 ⇒ 仍 `403`（空串也是「另一个身份」）。
+
+        .. note::
+           本用例**不**用于区分「判据写成 `is not None` 还是真值性」——两种写法在此都判 403（既有
+           name 非空，故 `session.get("name")` 真值性为真）。真正能区分的是「既有 name 为空串」，
+           而该态在服务端**不可持久化**：``enter_room`` 会把 falsy name 归一成默认名
+           （``namespace.py`` 的 ``default_session_name``），失败回滚又把它删除。故该差异在本仓
+           **不可观测**，代码取 `is not None` 是为了与 role 侧对称、语义更直白，而非行为差异。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "real-name"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "", "office_id": "room-a"})
+
+        assert isinstance(ack, dict) and ack["code"] == 403, ack
+
+    async def test_repeat_empty_name_join_is_idempotent_not_403(self) -> None:
+        """**声明空名**入房后再声明空名 ⇒ 放行（两次都归一成同一个默认名，不是身份变更）。
+
+        回归守卫：判据若拿「客户端声明的原样空串」去比「服务端归一后的默认名」，第二次会被误判成
+        403——而那个默认名含 ``sid`` 前缀，客户端**无法复现**，只能重连自救。归一必须单点同源。
+
+        **sid 刻意取 9 字符**（非 ``"sid-1"``）：后者只有 5 字符，``sid[:6]`` 与 ``sid[:5]`` 等值，
+        「判据与 ``enter_room`` 各写一份表达式且悄悄漂移」的变异在本用例下会**不可见**。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-abc123": {}}
+        ns = _namespace(sessions)
+
+        first = await ns.on_server_join_office("sid-abc123", {"role": "computer", "name": "", "office_id": "room-a"})
+        assert first is None, f"首次空名入房应放行，实得 {first!r}"
+        normalized = sessions["sid-abc123"]["name"]
+        # 逐字钉死归一形状：长度漂移（[:5]/[:7]）与分隔符漂移都会红
+        assert normalized == "computer_sid-ab", f"会话应被归一成默认名，实得 {normalized!r}"
+
+        second = await ns.on_server_join_office("sid-abc123", {"role": "computer", "name": "", "office_id": "room-a"})
+        assert second is None, f"重复空名入房应幂等放行（默认名同源），实得 {second!r}"
+
+        # 正对照：归一放行**不**放宽改身份——声明一个别的名字仍相撞
+        other = await ns.on_server_join_office(
+            "sid-abc123", {"role": "computer", "name": "alice", "office_id": "room-a"}
+        )
+        assert isinstance(other, dict) and other["code"] == 403, other
+
+    async def test_same_name_rejoin_is_allowed(self) -> None:
+        """同名单连（重复 join / 换房）⇒ 放行——name 一致即无冲突。
+
+        正对照：本条与 `test_name_mismatch_is_403` 成对，防止把「声明过 name」误判成一律拒绝。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "c1", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-b"})
+
+        assert ack is None, f"同名（换房）应放行，实得 {ack!r}"
+        assert sessions["sid-1"]["office_id"] == "room-b"
+
+    async def test_name_may_change_after_failed_join_rolled_it_back(self) -> None:
+        """上次入房**失败**（name 已随回滚清除）后换名重入 ⇒ 放行。
+
+        证明 #213 的字段级回滚确实把身份也一并撤销——否则「失败一次即永久锁死该连接的名字」。
+        """
+        sessions: dict[str, dict[str, Any]] = {
+            "sid-1": {"role": "computer"},
+            PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-a"},
+        }
+        ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
+
+        # 首次入房撞目标房同名 ⇒ 4105，name 回滚（会话身份从未落地）
+        first = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-a"})
+        assert isinstance(first, dict) and first["code"] == 4105, first
+        assert "name" not in sessions["sid-1"], f"被拒后会话不得残留 name: {sessions['sid-1']!r}"
+
+        # 换个名字重入 ⇒ 允许（本连接尚未声明过身份）
+        second = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "other", "office_id": "room-b"})
+        assert second is None, f"身份未落地时应允许任意 name，实得 {second!r}"
+        assert sessions["sid-1"]["name"] == "other"
+
     async def test_room_full_is_4101_with_rejected_target_room(self) -> None:
         """目标房已有 Agent ⇒ `4101`，`details.office_id` = **被拒的目标房**。"""
         sessions: dict[str, dict[str, Any]] = {
@@ -147,9 +244,13 @@ class TestJoinOfficeAckShape:
         _assert_no_leak(ack)
 
     async def test_computer_same_name_in_target_room_is_4105(self) -> None:
-        """目标房已有同 role 同名会话 ⇒ `4105`（`details.office_id` = 目标房 + `role`）。"""
+        """目标房已有同 role 同名会话 ⇒ `4105`（`details.office_id` = 目标房 + `role`）。
+
+        #213「校验先于副作用」：会话**已在旧房**（`room-a`）时，房内同名检查必须先于退旧房
+        （`leave_room`）与进目标房（`enter_room`）——否则失败后客户端已无房、旧房对端还收到了 leave。
+        """
         sessions: dict[str, dict[str, Any]] = {
-            "sid-1": {"role": "computer", "name": "dup"},
+            "sid-1": {"role": "computer", "name": "dup", "office_id": "room-a"},
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
         }
         ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
@@ -159,6 +260,10 @@ class TestJoinOfficeAckShape:
         assert isinstance(ack, dict) and ack["code"] == 4105, ack
         assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
         _assert_no_leak(ack)
+        # 被拒 ⇒ 旧房未退、目标房未进（退房分支在会话带 office_id 时才是活分支）
+        ns.server.leave_room.assert_not_awaited()
+        ns.server.enter_room.assert_not_awaited()
+        assert sessions["sid-1"]["office_id"] == "room-a"
 
     async def test_registry_conflict_is_4105_without_peer_sid(self) -> None:
         """名字注册表冲突（**冲突消息内含对端 sid**）⇒ `4105`，且 ack **绝不**携带该 sid。"""

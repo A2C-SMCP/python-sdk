@@ -893,19 +893,17 @@ def test_rejected_cross_office_join_is_isolated_sync(
         client.disconnect()
 
 
-def test_rejected_rename_move_keeps_old_room_sync(
+def test_rename_on_live_session_rejected_keeps_old_room_sync(
     startup_and_shutdown_local_sync_server,
     sync_server_port: int,
 ) -> None:
-    """#213 sync：换房被拒后仍留在旧房（对端无 leave 通知、权威 ``list_room`` 仍列名其旧名）。
+    """#221 sync：同一连接内改名（并换房）⇒ `403`，且**校验先于副作用** ⇒ 仍留在旧房。
 
-    ``socket join <office> <name>`` 会先改名再入房，而处理器在 ``enter_room`` 之前就把新名字写进会话
-    ⇒ 目标房同名检查比对新名字，与自身旧名字（另一注册表键）不冲突：改名+换房使「已在旧房 + 换房被拒」
-    可达。修复前该路径先退旧房再报错。
+    协议 events.md:610 / faq.md:162：改身份须换新连接。这是「**已在旧房** + 换房被拒」路径的集成
+    守护（#213 原口径不变：修复前该路径先退旧房再报错，客户端落成「无房」却仍以为在旧房）。
     """
     peer = Client()
     mover = Client()
-    blocker = Client()
     latecomer = Client()
 
     on_peer_leave: list[dict] = []
@@ -919,36 +917,36 @@ def test_rejected_rename_move_keeps_old_room_sync(
     def _on_mover_enter(data: dict) -> None:  # noqa: ANN001
         on_mover_enter.append(data)
 
-    office_a, office_b = "office-213-mv-sync-a", "office-213-mv-sync-b"
-    for client in (peer, mover, blocker, latecomer):
+    office_a, office_b = "office-221-mv-sync-a", "office-221-mv-sync-b"
+    for client in (peer, mover, latecomer):
         client.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
 
-    _join_office(peer, role="computer", office_id=office_a, name="peer-213s")
-    _join_office(mover, role="computer", office_id=office_a, name="mover-213s")
-    _join_office(blocker, role="computer", office_id=office_b, name="taken-213s")
+    _join_office(peer, role="computer", office_id=office_a, name="peer-221s")
+    _join_office(mover, role="computer", office_id=office_a, name="mover-221s")
 
     ack = mover.call(
         JOIN_OFFICE_EVENT,
-        {"role": "computer", "office_id": office_b, "name": "taken-213s"},
+        {"role": "computer", "office_id": office_b, "name": "renamed-221s"},
         namespace=SMCP_NAMESPACE,
     )
-    assert_rejected_ack(ack, 4105, action="server:join_office")  # 改名后撞目标房同名 ⇒ 4105
+    assert_rejected_ack(ack, 403, action="server:join_office")
+    assert ack["message"] == "Role or name mismatch with existing session", ack
     time.sleep(0.2)
     assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
 
-    # 权威视图：mover 仍在 office-A，且会话字段级回滚使其保留旧名
+    # 权威视图：mover 仍在 office-A，且身份未落地（仍列旧名）
     listed = peer.call(
         LIST_ROOM_EVENT,
-        {"agent": peer.get_sid(namespace=SMCP_NAMESPACE), "req_id": "req-213-mv", "office_id": office_a},
+        {"agent": peer.get_sid(namespace=SMCP_NAMESPACE), "req_id": "req-221-mv", "office_id": office_a},
         namespace=SMCP_NAMESPACE,
     )
     names = sorted(s["name"] for s in listed["sessions"])
-    assert names == ["mover-213s", "peer-213s"], f"换房被拒后旧房成员应原封不动（含旧名）：{names}"
+    assert names == ["mover-221s", "peer-221s"], f"换房被拒后旧房成员应原封不动（含旧名）：{names}"
 
     # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
-    _join_office(latecomer, role="computer", office_id=office_a, name="late-213s")
+    _join_office(latecomer, role="computer", office_id=office_a, name="late-221s")
     time.sleep(0.3)
     assert on_mover_enter, "旧房仍应把新成员入房广播给 mover"
 
-    for client in (peer, mover, blocker, latecomer):
+    for client in (peer, mover, latecomer):
         client.disconnect()

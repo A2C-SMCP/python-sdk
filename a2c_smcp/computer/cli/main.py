@@ -31,6 +31,7 @@ from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.cli.commands import skill as skill_cmd
 from a2c_smcp.computer.cli.commands import validate as validate_cmd
 from a2c_smcp.computer.cli.completer import A2CCompleter
+from a2c_smcp.computer.cli.interactive_impl import ConnectionArgs
 from a2c_smcp.computer.cli.interactive_impl import interactive_loop as _interactive_loop_impl
 from a2c_smcp.computer.cli.utils import (
     parse_kv_pairs,
@@ -230,6 +231,7 @@ async def _interactive_loop(
     comp: Computer,
     init_client: SMCPComputerClient | None = None,
     *,
+    init_connection: ConnectionArgs | None = None,
     approve_all_mcp: bool = False,
     settings_flag_path: Path | None = None,
 ) -> None:
@@ -240,6 +242,8 @@ async def _interactive_loop(
     ``settings_flag_path`` = ``--settings <file>``（flag 层 **settings.json**）。旧名 ``mcp_flag_config`` 已更名：
     它从来不是 mcp.json，那个名字主动误导（#154）。flag 层 **mcp.json**（``--mcp-config``）走另一条路——注入
     :class:`Computer`（boot 声明式输入），不经本参数。
+
+    ``init_connection`` = 启动参数建连所用的参数，供 ``socket join`` 改名时重放（协议 events.md:610）。
     """
     await _interactive_loop_impl(
         comp,
@@ -247,6 +251,7 @@ async def _interactive_loop(
         patch_stdout_ctx=patch_stdout,
         smcp_client_cls=SMCPComputerClient,
         init_client=init_client,
+        init_connection=init_connection,
         completer=A2CCompleter(comp),
         approve_all_mcp=approve_all_mcp,
         settings_flag_path=settings_flag_path,
@@ -312,6 +317,7 @@ def _run_impl(
         )
         async with comp:
             init_client: SMCPComputerClient | None = None
+            init_connection: ConnectionArgs | None = None
             if url:
                 try:
                     auth_dict = parse_kv_pairs(auth)
@@ -326,6 +332,13 @@ def _run_impl(
                 init_client = SMCPComputerClient(computer=comp, namespace=effective_namespace)
                 # 通过 CLI 指定命名空间，确保连接时建立对应 namespace 会话
                 await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
+                # 记录连接参数：``socket join`` 改名须换新连接（协议 events.md:610），该路径要重放这四个值
+                init_connection = {
+                    "url": url,
+                    "namespace": effective_namespace,
+                    "auth": auth_dict,
+                    "headers": headers_dict,
+                }
                 console.print("[green]已通过启动参数连接到 Socket.IO / Connected via CLI options[/green]")
 
             # `--mcp-config` 的 servers/inputs 不在此加载：它是 flag 层 mcp.json，已注入 Computer，由
@@ -334,6 +347,7 @@ def _run_impl(
             await _interactive_loop(
                 comp,
                 init_client=init_client,
+                init_connection=init_connection,
                 approve_all_mcp=approve_all_mcp is True,
                 settings_flag_path=Path(settings_file) if isinstance(settings_file, str) else None,
             )

@@ -96,15 +96,19 @@ class MockSyncSMCPNamespace(Namespace):
         # 留着它会让本替身与真实服务端在 ack 形状上分叉，用例看起来绿、线上却挂到超时。
         return None
 
-    def on_server_update_config(self, sid: str, data: dict) -> tuple[bool, str | None]:
-        """处理更新配置请求"""
+    def on_server_update_config(self, sid: str, data: dict) -> None:
+        """处理更新配置请求（无 ack 通道 ⇒ 返回空 ack）"""
         logger.info(f"Computer {sid} 更新配置")
         computer = data.get("computer", sid)
 
         # 广播配置更新通知
         notification = UpdateMCPConfigNotification(computer=computer)
         self.emit(UPDATE_CONFIG_NOTIFICATION, notification, skip_sid=sid)
-        return True, "配置更新成功"
+        # ``server:update_*`` 按协议是 fire-and-forget、**无 ack 通道**（events.md §ack 通道）⇒ 返回
+        # ``None``。返回已废除的 ``(True, "…")`` 元组会让消费方的 ``assert_empty_ack`` 在 daemon 线程
+        # 里抛错，而线程异常只落成 ``PytestUnhandledThreadExceptionWarning``：用例照样绿、断言是死的。
+        # `server:update_*` IS fire-and-forget per the protocol — returning a legacy tuple would only
+        # make the consumer's assertion die inside a daemon thread while the test still passes.
 
     def on_client_tool_call(self, sid: str, data: ToolCallReq) -> dict:
         """处理工具调用请求"""
@@ -147,12 +151,17 @@ class MockSyncSMCPNamespace(Namespace):
         desktops = ["window://mock\n\nhello world"]
         return GetDeskTopRet(desktops=desktops, req_id=data["req_id"])
 
-    def on_server_update_desktop(self, sid: str, data: dict) -> tuple[bool, str | None]:
-        """处理桌面更新请求并广播通知。"""
+    def on_server_update_desktop(self, sid: str, data: dict) -> None:
+        """处理桌面更新请求并广播通知。
+
+        ``server:update_desktop`` 按协议是 **fire-and-forget、无 ack 通道**（events.md §ack 通道），
+        故返回 ``None``（空 ack）——返回已废除的 ``(True, None)`` 元组会让消费方
+        ``test_sync_client_desktop.py`` 的 ``assert_empty_ack`` 在 daemon 线程里抛错，而线程异常只落成
+        ``PytestUnhandledThreadExceptionWarning``：用例照样绿、断言实际是**死的**（#214 遗留）。
+        """
         logger.info(f"Computer {sid} 请求广播桌面更新")
         computer = data.get("computer", sid)
         self.emit(UPDATE_DESKTOP_NOTIFICATION, {"computer": computer}, skip_sid=sid)
-        return True, None
 
     def on_server_list_room(self, sid: str, data: ListRoomReq) -> ListRoomRet:
         """

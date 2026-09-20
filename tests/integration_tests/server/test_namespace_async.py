@@ -822,17 +822,21 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
 
 
 @pytest.mark.asyncio
-async def test_rejected_rename_move_keeps_old_room(socketio_server, basic_server_port: int):
-    """#213 换房被拒的另一半：Computer **留在旧房**——对端收不到 ``notify:leave_office``，且它仍是活成员。
+async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, basic_server_port: int):
+    """#221：同一连接内改名（并换房）⇒ `403`，且**校验先于副作用** ⇒ Computer 留在旧房。
 
-    CLI 的 ``socket join <office> <name>`` 会先改名再入房（``computer/cli/interactive_impl.py``），而
-    ``on_server_join_office`` 在 ``enter_room`` **之前**就把新名字写进会话 ⇒ 目标房同名检查比对新名字、
-    与自身旧名字（另一个注册表键）不冲突：**「已在旧房 + 换房被拒」由此可达**（裸名注册表下也成立）。
-    修复前该路径先退旧房再报错，客户端落成「无房」却仍以为在旧房。
+    协议 events.md:610「同一 sid 声明了与既有会话不同的 role / name ⇒ 拒绝，403」；faq.md:162 对
+    403 的补救是「**重连或换 sid**」——即改身份须新连接，不是在同一 sid 上改。CLI 的
+    ``socket join <office> <name>`` 遇到改名时改走透明重连（新 sid，见 ``interactive_impl.py``），
+    本用例守服务端那一半。
+
+    与 #213 的关系：这是「**已在旧房** + 换房被拒」这一路径的集成守护——修复前该路径先退旧房再报错，
+    客户端落成「无房」却仍以为在旧房。现在拒因是 403（身份声明冲突，先于任何房间副作用），
+    「旧房原封不动」的验收口径不变。房内同名（4105）在换房路径上的「校验先于副作用」由单测
+    ``test_computer_same_name_in_target_room_is_4105`` 覆盖（裸名注册表下该路径在线上不可构造）。
     """
     peer = AsyncClient()  # office-A 的对端（观察 leave 通知）
     mover = AsyncClient()  # office-A 成员，改名换房到 office-B → 被拒
-    blocker = AsyncClient()  # office-B 里已占名的 Computer
     latecomer = AsyncClient()  # 之后加入 office-A，用于证明 mover 仍是活成员
 
     on_peer_leave: list[dict] = []
@@ -846,36 +850,36 @@ async def test_rejected_rename_move_keeps_old_room(socketio_server, basic_server
     async def _on_mover_enter(data: dict):  # noqa: ANN202
         on_mover_enter.append(data)
 
-    office_a, office_b = "office-213-mv-a", "office-213-mv-b"
-    peer_sid = await _connect_join(peer, basic_server_port, "computer", office_a, "peer-213")
-    mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "mover-213")
-    await _connect_join(blocker, basic_server_port, "computer", office_b, "taken-213")
+    office_a, office_b = "office-221-mv-a", "office-221-mv-b"
+    peer_sid = await _connect_join(peer, basic_server_port, "computer", office_a, "peer-221")
+    mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "mover-221")
 
-    # 改名换房：目标房已有同名（"taken-213"）⇒ 被拒。注册表闸门亦独立阻止（裸名已被占）。
-    payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "taken-213"}
+    # 改名（并换房）：声明与会话不同的 name ⇒ 身份声明冲突 403
+    payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "renamed-221"}
     ack = await mover.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert_rejected_ack(ack, 4105, action="server:join_office")  # 改名后撞目标房同名 ⇒ 4105
-    assert ack["message"] == "Name already taken in room", ack
+    assert_rejected_ack(ack, 403, action="server:join_office")
+    assert ack["message"] == "Role or name mismatch with existing session", ack
+    assert "details" not in ack, f"403 无 code-specific details: {ack!r}"
 
     # 验收口径：校验先于副作用 ⇒ 旧房成员关系原封不动，对端也未收到 leave
     assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_a], "被拒的换房必须留在旧房"
     assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
 
     # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
-    await _connect_join(latecomer, basic_server_port, "computer", office_a, "late-213")
+    await _connect_join(latecomer, basic_server_port, "computer", office_a, "late-221")
     await asyncio.sleep(0.3)
     assert on_mover_enter, "旧房仍应把新成员入房广播给 mover"
 
-    # 会话字段级回滚：改名未落地 ⇒ 旧房成员列表里它仍叫 mover-213
+    # 身份未落地：旧房成员列表里它仍叫 mover-221
     listed = await peer.call(
         LIST_ROOM_EVENT,
-        {"agent": peer_sid, "req_id": "req-213-mv", "office_id": office_a},
+        {"agent": peer_sid, "req_id": "req-221-mv", "office_id": office_a},
         namespace=SMCP_NAMESPACE,
     )
     names = sorted(s["name"] for s in listed["sessions"])
-    assert names == ["late-213", "mover-213", "peer-213"], f"改名不得在旧房落地：{names}"
+    assert names == ["late-221", "mover-221", "peer-221"], f"改名不得在旧房落地：{names}"
 
-    for client in (peer, mover, blocker, latecomer):
+    for client in (peer, mover, latecomer):
         await client.disconnect()
 
 

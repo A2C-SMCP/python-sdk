@@ -161,7 +161,7 @@ a2c> server add @./my_mcp_config.json  # 添加 MCP Server
 a2c> start all                          # 启动所有服务
 a2c> tools                              # 查看可用工具
 a2c> socket connect http://localhost:8000  # 连接信令服务器
-a2c> socket join my_office "My Computer"   # 加入房间
+a2c> socket join my_office "My Computer"   # 加入房间（改名会自动重建连接，见 cli-guide）
 ```
 
 ### 编程方式

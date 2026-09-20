@@ -147,6 +147,23 @@ class TestSyncSMCPNamespace:
         # 身份声明冲突 ⇒ 403，**非**房间语义
         assert_rejected_ack(ack, 403)
 
+    def test_join_office_name_mismatch(self, smcp_namespace):
+        """#221：events.md:610 的身份声明一致性覆盖 name 半（同步镜像）。"""
+        session = {"role": "computer", "name": "old_name"}
+        smcp_namespace.get_session = MagicMock(return_value=session)
+        smcp_namespace.save_session = MagicMock()
+
+        data = EnterOfficeReq(**{
+            "role": "computer",
+            "name": "test_computer",
+            "office_id": "office_123",
+        })
+
+        ack = smcp_namespace.on_server_join_office("test_sid", data)
+
+        assert_rejected_ack(ack, 403)
+        assert session["name"] == "old_name", f"被拒请求不得改动会话 name: {session!r}"
+
     def test_leave_office(self, smcp_namespace):
         # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "office_id": "office_123"})
@@ -350,9 +367,14 @@ class TestEnterRoomTransactionalCommitSync:
         assert "office_id" not in session
 
     def test_join_office_rejection_does_not_restore_stale_office(self, smcp_namespace, mock_server):
-        """处理器回滚只回 ``role`` / ``name``：``enter_room`` 收敛掉的房号不得被 backup 复活。"""
+        """处理器回滚只回 ``role`` / ``name``：``enter_room`` 收敛掉的房号不得被 backup 复活。
+
+        #221 后场景改为**同名单连换房**：身份声明不一致会在此之前被 403 拒掉，故「改了 name 再失败」
+        已不是可达路径（字段级回滚对**同值**仍是 no-op 安全网）。本用例守的是 #213 的核心——
+        ``office_id`` 归属 ``enter_room``，处理器整体覆盖 backup 会把已收敛的房号复活。
+        """
         smcp_namespace.server = mock_server
-        store: dict[str, dict] = {"c-sid": {"role": "computer", "name": "old-name", "office_id": "roomA", "sid": "c-sid"}}
+        store: dict[str, dict] = {"c-sid": {"role": "computer", "name": "c1", "office_id": "roomA", "sid": "c-sid"}}
         smcp_namespace.get_session = MagicMock(side_effect=lambda sid, *a, **k: store[sid])
         smcp_namespace.save_session = MagicMock(side_effect=lambda sid, sess, *a, **k: store.__setitem__(sid, sess))
 
@@ -364,14 +386,35 @@ class TestEnterRoomTransactionalCommitSync:
 
         ack = smcp_namespace.on_server_join_office(
             "c-sid",
-            EnterOfficeReq(**{"role": "computer", "name": "new-name", "office_id": "roomB"}),
+            EnterOfficeReq(**{"role": "computer", "name": "c1", "office_id": "roomB"}),
         )
 
         assert_rejected_ack(ack, 500)
         assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
         assert "office_id" not in final, "收敛结果不得被 backup 里的旧房号复活"
-        assert final["role"] == "computer" and final["name"] == "old-name", "role/name 须回滚"
+        assert final["role"] == "computer" and final["name"] == "c1", "role/name 须保持声明值"
+
+    def test_join_office_rejection_drops_identity_written_on_fresh_session(self, smcp_namespace, mock_server):
+        """失败回滚对**本次新写入**的 ``role`` / ``name`` 是**删除**（而非写 None）——同步镜像。
+
+        会话此前未声明身份 ⇒ 失败后必须回到「无身份」，否则 ``session["role"] = None`` 会污染后续
+        的 role 判据（``is not None`` 判据的正对照）。
+        """
+        smcp_namespace.server = mock_server
+        store: dict[str, dict] = {"c-sid": {"sid": "c-sid"}}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid, *a, **k: store[sid])
+        smcp_namespace.save_session = MagicMock(side_effect=lambda sid, sess, *a, **k: store.__setitem__(sid, sess))
+        smcp_namespace.enter_room = MagicMock(side_effect=RuntimeError("boom"))
+
+        ack = smcp_namespace.on_server_join_office(
+            "c-sid",
+            EnterOfficeReq(**{"role": "computer", "name": "c1", "office_id": "roomB"}),
+        )
+
+        assert_rejected_ack(ack, 500)
+        assert "role" not in store["c-sid"], f"新写入的 role 须被删除而非置 None: {store['c-sid']!r}"
+        assert "name" not in store["c-sid"], f"新写入的 name 须被删除而非置 None: {store['c-sid']!r}"
 
 
 class TestV021ClientRoutesAndUpdateSkillsSync:

@@ -24,7 +24,12 @@ from a2c_smcp.exceptions import (
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.sync_base import SyncBaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
-from a2c_smcp.server.utils import build_room_rejection_ack, get_all_sessions_in_office, require_office_id
+from a2c_smcp.server.utils import (
+    build_room_rejection_ack,
+    default_session_name,
+    get_all_sessions_in_office,
+    require_office_id,
+)
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
@@ -157,7 +162,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         if session.get("sid") != sid:
             session["sid"] = sid
         if not session.get("name"):
-            session["name"] = f"{session.get('role', 'unknown')}_{sid[:6]}"
+            session["name"] = default_session_name(session.get("role"), sid)
 
         # ── 阶段 1：校验（零成员关系副作用） / Phase 1: validation (no membership side effect) ──
         past_room: OFFICE_ID | None = None
@@ -314,6 +319,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             logger.warning(f"server:join_office 载荷校验失败 sid={sid}: {exc}")
             return build_bad_request_error()
         expected_role = role_info["role"]
+        declared_name = role_info["name"]
         office_id = role_info["office_id"]
         if _extra:
             # 多余位置参数 = 载荷形状非法（协议载荷是**单个** dict）⇒ 400（不静默忽略）
@@ -326,10 +332,25 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         backup_session = copy.deepcopy(session)
 
         try:
-            if session.get("role") and session["role"] != expected_role:
-                # 身份声明冲突 ⇒ 403（非房间语义）；先于任何会话写入，故无需回滚
+            # 身份声明一致性（协议 events.md:610）：同一 sid 声明了与既有会话不同的 role **或**
+            # name ⇒ 403（非房间语义）；先于任何会话写入与房间副作用，故无需回滚。
+            # #221：此前只判 role（name 半刻意未实现）。协议核对结论见 async 版注释——403 的定义即
+            # 「role / name 与会话不符」，faq.md:162 的补救是「重连或换 sid」，rust 亦已实现该半。
+            # 判据用 `is not None`（与 role 侧对称；本仓会话里的 name 必然非空，故与真值性等价——
+            # 详见 async 版注释）。镜像 async 实现。
+            # Identity mismatch in *either* declared field ⇒ 403; identity is immutable per sid.
+            existing_role = session.get("role")
+            existing_name = session.get("name")
+            # 声明空名时 `enter_room` 会归一成默认名 ⇒ 判据须用归一后的期望值比对（理由详见 async 版）。
+            # Empty declarations are compared post-normalization — see the async implementation.
+            expected_name = declared_name or default_session_name(expected_role, sid)
+            if (existing_role is not None and existing_role != expected_role) or (
+                existing_name is not None and existing_name != expected_name
+            ):
                 logger.warning(
-                    f"server:join_office 角色不符 sid={sid}: session={session['role']!r} request={expected_role!r}",
+                    f"server:join_office 身份声明不符 sid={sid}: "
+                    f"session=({existing_role!r}, {existing_name!r}) "
+                    f"request=({expected_role!r}, {declared_name!r})",
                 )
                 return build_room_rejection_error(ErrorCode.FORBIDDEN)
 

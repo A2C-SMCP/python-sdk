@@ -66,6 +66,50 @@ class FakeComputer:
         return None
 
 
+def test_run_impl_forwards_init_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_run_impl`` 必须把 ``init_connection`` 透传给 ``_interactive_loop``（承重接线，无其它覆盖）。
+
+    ``init_connection`` 是改名重连唯一的数据来源；把这一行删掉 mypy 不报、其余用例也不会红（假客户端
+    在 ``_run_impl`` 路径上会把 kwargs 吞掉）——改名会静默退化成「未记录连接参数」提示。
+    """
+    from a2c_smcp.computer.socketio.client import SMCPComputerClient
+
+    monkeypatch.setattr(cli_main, "Computer", FakeComputer, raising=True)
+
+    # 只替掉 I/O：`_run_impl` 用真实客户端建连，否则会真去连 boot:7000
+    async def _noop(self: Any, *a: Any, **kw: Any) -> None:
+        return None
+
+    for name in ("connect", "join_office", "leave_office", "emit_update_config"):
+        monkeypatch.setattr(SMCPComputerClient, name, _noop)
+
+    captured: dict[str, Any] = {}
+
+    async def _spy(comp: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli_main, "_interactive_loop", _spy, raising=True)
+
+    cli_main._run_impl(
+        auto_connect=False,
+        auto_reconnect=False,
+        url="http://boot:7000",
+        namespace="/tf-custom",
+        auth="token:t",
+        headers="X-TF:1",
+        computer_factory=None,
+        mcp_config=None,
+    )
+
+    assert captured.get("init_client") is not None, "应已用启动参数建好客户端"
+    assert captured.get("init_connection") == {
+        "url": "http://boot:7000",
+        "namespace": "/tf-custom",
+        "auth": {"token": "t"},
+        "headers": {"X-TF": "1"},
+    }, f"启动参数须原样透传（改名重连的唯一来源），实得 {captured.get('init_connection')!r}"
+
+
 def test_run_impl_uses_default_computer_when_no_factory(monkeypatch: pytest.MonkeyPatch) -> None:
     # Patch Computer to our fake and _interactive_loop to a dummy coro
     monkeypatch.setattr(cli_main, "Computer", FakeComputer, raising=True)
@@ -973,6 +1017,9 @@ class FakeSMCPClient:
         self.office_id: str | None = None
         self.joined_args: tuple[str, str] | None = None
         self.updated = 0
+        self.computer = kwargs.get("computer")
+        self.namespace = kwargs.get("namespace")
+        self.disconnects = 0
         # 记录最后一个实例，便于断言
         FakeSMCPClient.last = self  # type: ignore[attr-defined]
         self.connect_args: dict[str, Any] | None = None
@@ -990,14 +1037,19 @@ class FakeSMCPClient:
             args["namespaces"] = namespaces
         self.connect_args = args
 
-    async def join_office(self, office_id: str, computer_name: str) -> None:
+    async def join_office(self, office_id: str) -> None:
+        # 形参须与真实 ``SmcpComputerClient.join_office`` 一致（名字经 ``computer.name`` 走线，不是形参）。
         assert self.connected
         self.office_id = office_id
-        self.joined_args = (office_id, computer_name)
+        self.joined_args = (office_id, self.computer.name)
 
     async def leave_office(self, office_id: str) -> None:
         assert self.connected
         self.office_id = None
+
+    async def disconnect(self) -> None:
+        self.connected = False
+        self.disconnects += 1
 
     async def emit_update_config(self) -> None:
         self.updated += 1
@@ -1021,6 +1073,521 @@ async def test_socket_and_notify_branches(monkeypatch: pytest.MonkeyPatch) -> No
 
     comp = Computer(name="test_main_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     await _interactive_loop(comp)
+
+    # 桩的 join_office 形参已对齐真实客户端（见 FakeSMCPClient）——否则这里的 join 会抛 TypeError 被
+    # 笼统 except 吞掉，socket join 分支实际从未被走到（本断言即该假绿的回归守卫）。
+    assert FakeSMCPClient.last.joined_args == ("office-1", "compA"), FakeSMCPClient.last.joined_args
+    assert FakeSMCPClient.last.office_id is None, "socket leave 应已退房"
+
+
+class _ReconnectClient(FakeSMCPClient):
+    """记录**实例序列**与连接参数，用于断言「改名 ⇒ 换新连接」。"""
+
+    instances: list[_ReconnectClient] = []
+    # 类级开关：模拟「尽力而为」两步（离开旧房 / 断开）失败——两者都不应阻断改名重连
+    fail_leave = False
+    fail_disconnect = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        super().__init__(*args, **kwargs)
+        self.joins: list[str] = []
+        self.leaves: list[str] = []
+        # **实例级**失败开关（默认关）：由 _arm_failures_on_second_connection 只武装改名那一跳，
+        # 若做成类级开关会在后续所有实例上持续生效，令「失败后仍可重试」无法被断言。
+        self.fail_connect = False
+        self.fail_join = False
+        _ReconnectClient.instances.append(self)
+
+    async def connect(  # type: ignore[override]
+        self,
+        url: str,
+        auth: dict[str, Any] | None = None,
+        headers: dict[str, Any] | None = None,
+        namespaces: list[str] | None = None,
+    ) -> None:
+        if self.fail_connect:
+            raise RuntimeError("connect boom")
+        await super().connect(url, auth=auth, headers=headers, namespaces=namespaces)
+
+    async def join_office(self, office_id: str) -> None:
+        if self.fail_join:
+            # **一次性**：模拟「目标房同名被占」这类可换房/换名重试的拒绝。若持续失败，就断言不了
+            # 「失败后仍可在保留的连接上直接重试」。
+            self.fail_join = False
+            raise RuntimeError("Name already taken in room")
+        await super().join_office(office_id)
+        self.joins.append(office_id)
+
+    async def leave_office(self, office_id: str) -> None:
+        if _ReconnectClient.fail_leave:
+            raise RuntimeError("leave boom")
+        await super().leave_office(office_id)
+        self.leaves.append(office_id)
+
+    async def disconnect(self) -> None:
+        if _ReconnectClient.fail_disconnect:
+            raise RuntimeError("disconnect boom")
+        await super().disconnect()
+
+
+def _arm_failures_on_second_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    connect: bool = False,
+    join: bool = False,
+) -> None:
+    """只让**第 2 条**连接（即改名那一次重连）的 ``connect`` / ``join_office`` 失败。
+
+    首条连接（``socket connect``）必须正常建立，否则走不到改名分支。
+    """
+    original_init = _ReconnectClient.__init__
+
+    def _init_then_arm(self: _ReconnectClient, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        if len(_ReconnectClient.instances) > 1:  # 本实例即第 2 条及以后
+            self.fail_connect = connect
+            self.fail_join = join
+
+    monkeypatch.setattr(_ReconnectClient, "__init__", _init_then_arm)
+
+
+def _arm_init_failure_on_second_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """让**第 2 条**连接的**构造器**抛错（模拟构造期失败）。
+
+    构造与建连同处一个 ``except``（都在第 3 步相位内），故构造抛错也必须回滚 ``comp.name``——若把
+    构造挪到 ``try`` 之外，``comp.name`` 会停在一个从未生效的新名上，且**其余用例都不会红**。
+    """
+    original_init = _ReconnectClient.__init__
+
+    def _init_then_maybe_boom(self: _ReconnectClient, *args: Any, **kwargs: Any) -> None:
+        if _ReconnectClient.instances:  # 本实例即第 2 条及以后
+            raise RuntimeError("init boom")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(_ReconnectClient, "__init__", _init_then_maybe_boom)
+
+
+def _reset_reconnect_client() -> None:
+    _ReconnectClient.instances = []
+
+
+async def _drive_socket_commands(commands: list[str], monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> Computer:
+    monkeypatch.setattr(cli_main, "SMCPComputerClient", _ReconnectClient)
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+    comp = Computer(name="rename_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    await _interactive_loop(comp, **kwargs)
+    return comp
+
+
+@pytest.mark.asyncio
+async def test_first_join_and_same_name_move_do_not_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """首次入房（本连接尚未声明身份）与**同名换房**都**不**触发重连——只有改名才换连接。
+
+    正对照：若实现按「``requested != comp.name``」判改名，首次入房（``comp.name`` 为默认值）会误触发
+    一次无谓的断连重连，本断言随之变红。
+    """
+    _reset_reconnect_client()
+
+    comp = await _drive_socket_commands(
+        [
+            "socket connect http://localhost:7000",
+            "socket join office-1 alice",  # 首次入房：任意名可
+            "socket join office-2 alice",  # 同名换房：协议允许
+            "exit",
+        ],
+        monkeypatch,
+    )
+
+    assert len(_ReconnectClient.instances) == 1, f"同名换房不得重连，实得 {len(_ReconnectClient.instances)} 个客户端"
+    assert _ReconnectClient.instances[0].joins == ["office-1", "office-2"]
+    assert _ReconnectClient.instances[0].disconnects == 0
+    assert comp.name == "alice"
+
+
+@pytest.mark.asyncio
+async def test_rename_reconnects_with_new_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """改名 ⇒ 换新连接（协议 events.md:610：身份在 sid 生命周期内不可变）。"""
+    _reset_reconnect_client()
+
+    comp = await _drive_socket_commands(
+        [
+            "socket connect http://localhost:7000?token=abc",
+            "socket join office-1 alice",
+            "socket join office-2 bob",  # 改名 ⇒ 1/4 离开 → 2/4 断开 → 3/4 重连 → 4/4 入房
+            "exit",
+        ],
+        monkeypatch,
+    )
+
+    assert len(_ReconnectClient.instances) == 2, "改名必须换新连接"
+    old, new = _ReconnectClient.instances
+    assert old.disconnects == 1, "旧连接应被断开"
+    assert old.leaves == ["office-1"], "应先离开旧房（让对端收到 notify:leave_office）"
+    assert new is not old and new.connected, "新连接须已建立"
+    assert new.joins == ["office-2"], "入房应落在**新**连接上"
+    assert comp.name == "bob", "改名生效后 comp.name 应为新名"
+    # 重放须**逐字段全等**：auth / headers / namespaces 在 `--auth token:...` 部署下是承重的，
+    # 只断言 url 时改坏它们不会变红。
+    assert new.connect_args == {
+        "url": "http://localhost:7000?token=abc",
+        "auth": None,
+        "headers": None,
+        "namespaces": [cli_main.SMCP_NAMESPACE],
+    }, f"重连须原样重放连接参数，实得 {new.connect_args!r}"
+
+
+@pytest.mark.asyncio
+async def test_rename_replays_auto_connect_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--auto-connect`` 路径：改名重连须重放**启动参数**（url / auth / headers / namespace）。
+
+    该路径的连接参数由 ``main.py`` 经 ``init_connection`` 注入，与交互式 ``socket connect`` 是两条
+    独立来源；只覆盖后者会让「启动参数没接上」这一类回归完全无感。
+    """
+    _reset_reconnect_client()
+
+    boot_client = _ReconnectClient(
+        computer=Computer(name="rename_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False),
+        namespace="/tf-custom",
+    )
+    await boot_client.connect("http://boot:7000", auth={"token": "t"}, headers={"X-TF": "1"}, namespaces=["/tf-custom"])
+
+    comp = await _drive_socket_commands(
+        [
+            "socket join office-1 alice",
+            "socket join office-2 bob",  # 改名 ⇒ 重连
+            "exit",
+        ],
+        monkeypatch,
+        init_client=boot_client,
+        init_connection={
+            "url": "http://boot:7000",
+            "namespace": "/tf-custom",
+            "auth": {"token": "t"},
+            "headers": {"X-TF": "1"},
+        },
+    )
+
+    assert len(_ReconnectClient.instances) == 2, "改名必须换新连接"
+    new = _ReconnectClient.instances[1]
+    assert new.connect_args == {
+        "url": "http://boot:7000",
+        "auth": {"token": "t"},
+        "headers": {"X-TF": "1"},
+        "namespaces": ["/tf-custom"],
+    }, f"须重放启动参数，实得 {new.connect_args!r}"
+    assert new.namespace == "/tf-custom", "新客户端须绑定同一 namespace"
+    assert comp.name == "bob"
+
+
+@pytest.mark.asyncio
+async def test_rename_binds_real_client_to_effective_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """用**真实** ``SMCPComputerClient``（只替身 I/O 方法）断言改名后的新客户端绑定到**生效**命名空间。
+
+    桩对象 ``__init__(*args, **kwargs)`` 对 ``namespace`` 无感，故「把 ``namespace=None`` 显式传给
+    构造器 ⇒ 覆盖 ``SMCPComputerClient`` 的默认值 ``SMCP_NAMESPACE`` ⇒ 新连接是**哑连接**（handler 全
+    注册在 ``'/'``、``emit`` 落到未连接命名空间）」这一类回归在纯桩下**物理上无法变红**。本用例专门
+    用真类把这条语义钉死。
+    """
+    from a2c_smcp.computer.socketio.client import SMCPComputerClient
+
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(
+        [
+            "socket connect http://localhost:7000",  # 交互路径：未指定 namespace
+            "socket join office-1 alice",
+            "socket join office-2 bob",  # 改名 ⇒ 重连
+            "exit",
+        ],
+    ))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+
+    # 只替掉 I/O：不真的建 socket，也不注册 handler 之外的网络状态
+    async def _fake_connect(self: Any, url: str, *args: Any, **kwargs: Any) -> None:
+        self.connected = True
+
+    async def _fake_join(self: Any, office_id: str) -> None:
+        self.office_id = office_id
+
+    async def _fake_disconnect(self: Any) -> None:
+        self.connected = False
+
+    monkeypatch.setattr(SMCPComputerClient, "connect", _fake_connect)
+    monkeypatch.setattr(SMCPComputerClient, "join_office", _fake_join)
+    monkeypatch.setattr(SMCPComputerClient, "disconnect", _fake_disconnect)
+
+    built: list[Any] = []
+    real_init = SMCPComputerClient.__init__
+
+    def _recording_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        real_init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(SMCPComputerClient, "__init__", _recording_init)
+
+    comp = Computer(name="rename_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    await _interactive_loop(comp)
+
+    assert len(built) == 2, f"改名应新建一条连接，实得 {len(built)} 个客户端"
+    new = built[1]
+    assert new.namespace == cli_main.SMCP_NAMESPACE, (
+        f"新客户端须绑定生效命名空间（显式传 None 会覆盖默认值 ⇒ 哑连接）：{new.namespace!r}"
+    )
+    # handler 也必须落在同一命名空间（哑连接的特征是所有 handler 都在 '/'）
+    assert cli_main.SMCP_NAMESPACE in new.handlers, f"handler 未落在生效命名空间：{list(new.handlers)}"
+    assert "/" not in new.handlers, f"不得有 handler 落在默认命名空间 '/': {list(new.handlers)}"
+
+
+@pytest.mark.asyncio
+async def test_rename_without_recorded_connection_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """无连接参数可重放（如外部注入 client）⇒ 拒绝改名，且**不得**改动 ``comp.name``。"""
+    _reset_reconnect_client()
+
+    injected = _ReconnectClient(
+        computer=Computer(name="rename_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False),
+    )
+    await injected.connect("http://localhost:7000")
+
+    comp = await _drive_socket_commands(
+        [
+            "socket join office-1 alice",
+            "socket join office-2 bob",
+            "exit",
+        ],
+        monkeypatch,
+        init_client=injected,
+    )
+
+    assert len(_ReconnectClient.instances) == 1, "无参数可重放时不得新建连接"
+    assert injected.joins == ["office-1"], "改名请求不得落到 join"
+    assert comp.name == "alice", "拒绝改名 ⇒ comp.name 保持已声明的名字"
+
+
+@pytest.mark.asyncio
+async def test_rename_rolls_back_name_when_reconnect_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**建连失败** ⇒ ``comp.name`` 回滚为原名（改名未生效），且不留悬空客户端。"""
+    _reset_reconnect_client()
+    _arm_failures_on_second_connection(monkeypatch, connect=True)
+
+    comp = await _drive_socket_commands(
+        [
+            "socket connect http://localhost:7000",
+            "socket join office-1 alice",
+            "socket join office-2 bob",  # 改名 ⇒ 重连失败
+            "socket join office-3 carol",  # 失败后无可用连接 ⇒ 应被「请先连接」拦下
+            "exit",
+        ],
+        monkeypatch,
+    )
+
+    assert len(_ReconnectClient.instances) == 2, "改名应尝试建新连接（失败）"
+    assert not _ReconnectClient.instances[1].connected, "重连失败 ⇒ 新连接未建立"
+    assert _ReconnectClient.instances[1].joins == [], "重连失败 ⇒ 不得入房"
+    assert comp.name == "alice", "重连失败 ⇒ 名字回滚（改名未生效）"
+    assert _ReconnectClient.instances[0].disconnects == 1, "旧连接已断开"
+
+
+@pytest.mark.asyncio
+async def test_rename_rolls_back_name_when_constructor_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**构造器抛错**（第 3 步相位的防御面）同样必须回滚 ``comp.name``。"""
+    _reset_reconnect_client()
+    _arm_init_failure_on_second_connection(monkeypatch)
+
+    comp = await _drive_socket_commands(
+        [
+            "socket connect http://localhost:7000",
+            "socket join office-1 alice",
+            "socket join office-2 bob",  # 改名 ⇒ 构造第 2 条连接时抛错
+            "socket join office-3 carol",  # 失败后无可用连接 ⇒ 应被「请先连接」拦下
+            "exit",
+        ],
+        monkeypatch,
+    )
+
+    assert len(_ReconnectClient.instances) == 1, "构造失败 ⇒ 第 2 条连接未登记"
+    assert comp.name == "alice", "构造失败 ⇒ 名字必须回滚（构造与建连同属第 3 步相位）"
+    assert _ReconnectClient.instances[0].disconnects == 1, "旧连接已断开"
+
+
+@pytest.mark.asyncio
+async def test_rename_keeps_new_connection_when_join_is_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**建连成功、入房被拒**是另一个相位：必须**保留**那条连接，不得丢弃（🔴 回归守卫）。
+
+    丢弃它会有三重代价：连接泄漏（客户端 + 服务端 sid 会话驻留）、``Computer`` 的 weakref 指向孤儿、
+    以及 CLI 自锁为「请先连接」——而那条连接其实活着。且新会话尚未声明任何身份（服务端回滚 name），
+    用户直接换个名字重试即可，**无需**再重连。
+    """
+    _reset_reconnect_client()
+    _arm_failures_on_second_connection(monkeypatch, join=True)
+
+    comp = await _drive_socket_commands(
+        [
+            "socket connect http://localhost:7000",
+            "socket join office-1 alice",
+            "socket join office-2 bob",  # 改名 ⇒ 重连成功但入房被拒
+            "socket join office-3 bob",  # 关键：仍可**直接**重试（无「请先连接」死态）
+            "exit",
+        ],
+        monkeypatch,
+    )
+
+    assert len(_ReconnectClient.instances) == 2, "入房被拒不得再建连接"
+    new = _ReconnectClient.instances[1]
+    assert new.connected, "入房被拒后新连接必须仍然活着（不得丢弃）"
+    assert new.disconnects == 0, "入房被拒不得把新连接断开"
+    # 第 4 条命令能落到 join：证明 CLI 没自锁为「未连接」（旧实现会把 smcp_client 置 None）
+    assert new.joins == ["office-3"], f"应能直接在保留的连接上重试，实得 {new.joins!r}"
+    assert comp.name == "bob", "入房被拒但连接已换 ⇒ 名字保持新名（与 #203 自动重放口径一致）"
+
+
+@pytest.mark.asyncio
+async def test_socket_leave_uses_real_membership_not_desired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``socket leave`` 以**真实成员关系**（``_in_office()``）为准，而非 desired ``office_id``。
+
+    .. important::
+       **真实断线窗口不经过本分支**——实测（真 ASGI 服务端 + 真客户端，掐 WebSocket）断开后
+       socketio 同时清空 ``namespaces`` **与** ``connected``，故窗口内先命中命令入口的「未连接」守卫，
+       ``_client_in_office`` 根本不被求值。本用例的 ``connected=True`` + 命名空间空是**合成**状态，
+       :meth:`_client_in_office` 在此的作用是**防御 socketio 的 connected/namespaces 不一致**
+       （如手工改状态、或未来上游把两者解耦），不是「修复重连窗口」。
+       真实窗口的行为由下一条用例（``connected=False``）覆盖。
+
+    判据若只看 desired，会对一个并不在册的命名空间发 ``leave_office``（对真实客户端即
+    ``BadNamespaceError``）。本用例用**真实**客户端——桩对象没有 ``_in_office``，走不到这条语义。
+    """
+    from a2c_smcp.computer.socketio.client import SMCPComputerClient
+
+    left: list[str] = []
+
+    async def _spy_leave(self: Any, office_id: str) -> None:
+        left.append(office_id)
+
+    async def _noop(self: Any, *a: Any, **kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr(SMCPComputerClient, "leave_office", _spy_leave)
+    monkeypatch.setattr(SMCPComputerClient, "emit_update_config", _noop)
+
+    comp = Computer(name="leave_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    client = SMCPComputerClient(computer=comp)
+    # 重连窗口：desired 在、命名空间**不在册** ⇒ `_in_office()` 为假（#203 刻意保留 desired）
+    client.office_id = "office-old"
+    client.connected = True
+    assert client.office_id is not None and not client.namespaces, "前置：desired 在、不在册"
+    assert not client._in_office(), "前置：该窗口内 `_in_office()` 必须为假"
+
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["socket leave", "exit"]))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+
+    printed: list[str] = []
+    import a2c_smcp.computer.cli.interactive_impl as impl_mod
+
+    monkeypatch.setattr(impl_mod.console, "print", lambda message="", *a, **kw: printed.append(str(message)))
+
+    await _interactive_loop(comp, init_client=client)
+
+    assert left == [], f"未真在房里时不得发 leave_office，实得 {left!r}"
+    assert any("未加入房间" in line for line in printed), f"应如实提示未在房间：{printed!r}"
+
+    # 正对照：命名空间在册（真在房）时确实会退房——防止上面断言被「永远不发 leave」的坏实现同样满足
+    client.office_id = "office-old"
+    client.namespaces[client.namespace] = "eio-sid"
+    assert client._in_office(), "前置：正对照须满足 `_in_office()`"
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["socket leave", "exit"]))
+    await _interactive_loop(comp, init_client=client)
+    assert left == ["office-old"], f"在房时应真的退房，实得 {left!r}"
+
+
+@pytest.mark.asyncio
+async def test_socket_leave_in_real_disconnect_window_reports_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**真实**断线窗口（``connected=False`` + desired 保留）下 ``socket leave`` 提示「未连接」且不发 leave。
+
+    「未连接」在此是**实情**（传输已断），优于对未在册的命名空间发请求；这也标定了上一条用例的
+    ``_client_in_office`` 分支在真实窗口内不被求值。
+    """
+    from a2c_smcp.computer.socketio.client import SMCPComputerClient
+
+    left: list[str] = []
+
+    async def _spy_leave(self: Any, office_id: str) -> None:
+        left.append(office_id)
+
+    monkeypatch.setattr(SMCPComputerClient, "leave_office", _spy_leave)
+
+    comp = Computer(name="leave_c2", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    client = SMCPComputerClient(computer=comp)
+    client.office_id = "office-old"  # desired 仍被 #203 保留
+    assert not client.connected and not client.namespaces, "前置：真实断线窗口"
+
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["socket leave", "exit"]))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+
+    printed: list[str] = []
+    import a2c_smcp.computer.cli.interactive_impl as impl_mod
+
+    monkeypatch.setattr(impl_mod.console, "print", lambda message="", *a, **kw: printed.append(str(message)))
+
+    await _interactive_loop(comp, init_client=client)
+
+    assert left == [], f"断线窗口内不得发 leave_office，实得 {left!r}"
+    assert any("未连接 / Not connected" in line for line in printed), f"应提示未连接：{printed!r}"
+
+
+@pytest.mark.asyncio
+async def test_rename_tolerates_leave_and_disconnect_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """改名路径里 ``leave_office`` / ``disconnect`` 失败**降级为告警**，不阻断重连（尽力而为的设计裁决）。"""
+    _reset_reconnect_client()
+    _ReconnectClient.fail_leave = True
+    _ReconnectClient.fail_disconnect = True
+    try:
+        comp = await _drive_socket_commands(
+            [
+                "socket connect http://localhost:7000",
+                "socket join office-1 alice",
+                "socket join office-2 bob",  # 改名 ⇒ 离开/断开都失败，但仍应重连成功
+                "exit",
+            ],
+            monkeypatch,
+        )
+    finally:
+        _ReconnectClient.fail_leave = False
+        _ReconnectClient.fail_disconnect = False
+
+    assert len(_ReconnectClient.instances) == 2, "离开/断开失败不得阻断重连"
+    assert _ReconnectClient.instances[1].joins == ["office-2"], "重连后的入房应照常发生"
+    assert comp.name == "bob"
+
+
+@pytest.mark.asyncio
+async def test_join_denied_after_rename_does_not_report_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """入房被拒时**不得**打印「已加入房间」——成功提示只在该事件真的入房后出现。"""
+    _reset_reconnect_client()
+    _arm_failures_on_second_connection(monkeypatch, join=True)
+
+    printed: list[str] = []
+    monkeypatch.setattr(cli_main, "SMCPComputerClient", _ReconnectClient)
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(
+        [
+            "socket connect http://localhost:7000",
+            "socket join office-1 alice",
+            "socket join office-2 bob",
+            "exit",
+        ],
+    ))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+
+    import a2c_smcp.computer.cli.interactive_impl as impl_mod
+
+    def _record(message: Any = "", *args: Any, **kwargs: Any) -> None:
+        printed.append(str(message))
+
+    monkeypatch.setattr(impl_mod.console, "print", _record)
+    comp = Computer(name="rename_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    await _interactive_loop(comp)
+
+    # 只有**首次**入房成功；改名那次入房被拒 ⇒ 成功提示恰好一条（不多不少）
+    joined = [line for line in printed if "已加入房间 / Joined office" in line]
+    assert len(joined) == 1, f"入房被拒不得谎报成功（应只有首条入房报成功）：{printed!r}"
+    assert any("加入房间失败" in line for line in printed), f"应如实报告入房失败：{printed!r}"
 
 
 # ---------------------------------------------------------------------------

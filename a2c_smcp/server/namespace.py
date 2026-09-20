@@ -25,7 +25,12 @@ from a2c_smcp.exceptions import (
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.base import BaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
-from a2c_smcp.server.utils import aget_all_sessions_in_office, build_room_rejection_ack, require_office_id
+from a2c_smcp.server.utils import (
+    aget_all_sessions_in_office,
+    build_room_rejection_ack,
+    default_session_name,
+    require_office_id,
+)
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
@@ -173,7 +178,7 @@ class SMCPNamespace(BaseNamespace):
         # 确保session中有name字段（如无可用默认值）
         # Ensure 'name' field exists in session (use default if missing)
         if not session.get("name"):
-            session["name"] = f"{session.get('role', 'unknown')}_{sid[:6]}"
+            session["name"] = default_session_name(session.get("role"), sid)
 
         # ── 阶段 1：校验（零成员关系副作用） / Phase 1: validation (no membership side effect) ──
         past_room: OFFICE_ID | None = None
@@ -358,7 +363,8 @@ class SMCPNamespace(BaseNamespace):
         #214 ack 形态（协议 error-handling.md:177-205；`(bool, str | None)` 元组形态**已废除**）：
 
         - **成功 ⇒ 空 ack**（本方法返回 ``None``，socketio 发零参 ACK）；
-        - **失败 ⇒ flat ``ErrorPayload``**：``400``（载荷畸形）/ ``403``（身份声明冲突）/
+        - **失败 ⇒ flat ``ErrorPayload``**：``400``（载荷畸形）/ ``403``（身份声明冲突——本会话声明的
+          ``role`` **或** ``name`` 与既有会话不符；改身份须新连接，见 §Server 处理规则）/
           ``4101``（目标房已有 Agent）/ ``4105``（房内同名）/ ``4106``（Agent 已在其它房）/
           ``500``（未预期内部异常，笼统文案、原文只进日志）。
         - ``details`` 只含**与发起者自身相关**的上下文（目标房 / 自己声明的 role / 自己当前所在房）。
@@ -389,6 +395,7 @@ class SMCPNamespace(BaseNamespace):
             logger.warning(f"server:join_office 载荷校验失败 sid={sid}: {exc}")
             return build_bad_request_error()
         expected_role = role_info["role"]
+        declared_name = role_info["name"]
         office_id = role_info["office_id"]
         if _extra:
             # 多余位置参数 = 载荷形状非法（协议载荷是**单个** dict）⇒ 400。刻意不静默忽略：
@@ -404,18 +411,40 @@ class SMCPNamespace(BaseNamespace):
         backup_session = copy.deepcopy(session)
 
         try:
-            # 检查角色是否匹配（身份声明冲突 ⇒ 403，**非**房间语义）；先于任何会话写入，故无需回滚
-            # Identity-declaration conflict ⇒ 403; runs before any session write, so no rollback needed.
-            if session.get("role") and session["role"] != expected_role:
+            # 身份声明一致性（协议 events.md:610）：同一 sid 声明了与既有会话不同的 role **或**
+            # name ⇒ 403（**非**房间语义）。先于任何会话写入与房间副作用，故无需回滚。
+            #
+            # #221 对齐：此前只实现了 role 那一半，name 那一半**刻意未实现**——理由是 CLI 的
+            # `socket join <office> <name>` 会在**同一条连接**上先改 comp.name 再 join，实现它会把
+            # 改名判死。协议侧核对结论是该偏离站不住：events.md:610 是全仓唯一的规范陈述（role/name
+            # 共用一条规则、同一个码），error-handling.md:19 把 403 定义为「role / name 与会话不符」，
+            # faq.md:162 对 403 给出的补救正是「**重连或换 sid**」——即改身份须新连接，不是在同一
+            # sid 上改；rust-sdk（handler.rs:515-523）亦已实现该半。故本仓收敛到协议：改名改走
+            # 「新连接」（CLI 见 `interactive_impl.py` 的透明重连路径）。
+            #
+            # 判据用 `is not None`（与 role 侧对称、语义直白）：本仓会话里存的 name **必然非空**
+            # （`enter_room` 会把 falsy name 归一成默认名，见本文件 :180-181；失败回滚则删除该字段），
+            # 故与真值性写法在本仓**行为等价**——差异只在「既有 name 为空串」这一不可持久化的态上。
+            # 声明空串 name 仍属「另一个身份」⇒ 与既有 name 不同即拒。
+            # 会话**未**声明过身份（首次入房，或上次入房失败已被字段级回滚清掉）⇒ 任意 role/name 放行。
+            #
+            # Bidirectional: a mismatch in *either* declared field ⇒ 403 (identity is immutable for the
+            # lifetime of a sid; changing it requires a new connection, per faq.md:162 「重连或换 sid」).
+            existing_role = session.get("role")
+            existing_name = session.get("name")
+            # 声明空名时，`enter_room` 会把它归一成默认名（:180-181，与 `default_session_name` 同源）
+            # ⇒ 判据须用**归一后**的期望值比对：否则「声明空名 → 归一成 X → 再次声明空名」会被误判成
+            # 身份变更（X ≠ ""），而 X 含 sid 前缀、客户端**无法复现**，只能重连自救。
+            # 声明别的名字仍照常相撞 ⇒ 该归一不放宽改身份的约束。
+            expected_name = declared_name or default_session_name(expected_role, sid)
+            if (existing_role is not None and existing_role != expected_role) or (
+                existing_name is not None and existing_name != expected_name
+            ):
                 logger.warning(
-                    f"server:join_office 角色不符 sid={sid}: session={session['role']!r} request={expected_role!r}",
+                    f"server:join_office 身份声明不符 sid={sid}: "
+                    f"session=({existing_role!r}, {existing_name!r}) "
+                    f"request=({expected_role!r}, {declared_name!r})",
                 )
-                # 协议 events.md:610 的 403 还覆盖「同一 sid 声明的 **name** 与会话不符」，本 SDK
-                # **刻意不实现该分支**：改名后再入房是本仓的**合法流程**（CLI `socket join <office>
-                # <name>` 先改 comp.name 再 join；`test_rejected_rename_move_keeps_old_room` 正建立
-                # 在其上），实现它会把该流程判死。属对协议条文的**自觉偏离**，已在 #214 收尾说明中
-                # 列出；取值域类收紧归 #216。/ The name-mismatch half of events.md:610 is deliberately
-                # NOT implemented — renaming via a second join is a supported flow in this SDK.
                 return build_room_rejection_error(ErrorCode.FORBIDDEN)
 
             # 设置会话信息

@@ -939,10 +939,13 @@ def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
 #     被拒的目标房），**MUST NOT** 携带任何对端会话标识（sid 等）——见 :149 / :328。
 # =====================================================================
 
-# 房间管理「业务拒绝」的 code → 协议标准文案（逐字对齐 error-handling.md 各码响应示例）。
-# code → canonical message, verbatim from error-handling.md §房间管理错误响应 examples.
+# 房间管理「业务拒绝」的 code → 协议标准文案（4101/4103-4106 逐字对齐 error-handling.md 与
+# room-model.md 的响应示例；**403 例外**——协议未给该码的示例文案，本仓自拟，须同时覆盖 role 与
+# name 两半，见 #221）。
+# code → canonical message; 4101/4103-4106 verbatim from the protocol examples, 403 is SDK-authored
+# (the protocol ships no 403 example) and must cover both the role and name halves of the rule.
 _ROOM_REJECTION_MESSAGES: dict[int, str] = {
-    int(ErrorCode.FORBIDDEN): "Role mismatch with existing session",
+    int(ErrorCode.FORBIDDEN): "Role or name mismatch with existing session",
     int(ErrorCode.ROOM_FULL): "Room already has an agent",
     int(ErrorCode.NOT_IN_ROOM): "Not in any room",
     int(ErrorCode.CROSS_ROOM_ACCESS): "Cross-room access denied",

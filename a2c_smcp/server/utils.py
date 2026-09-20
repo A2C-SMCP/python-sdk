@@ -22,6 +22,21 @@ from a2c_smcp.utils.logger import get_logger
 logger = get_logger("server")
 
 
+def default_session_name(role: str | None, sid: str) -> str:
+    """客户端**未**（或空串）声明 ``name`` 时，会话采用的归一默认名。
+
+    单一权威：``enter_room`` 写入它，``on_server_join_office`` 的身份一致性判据（协议 events.md:610）
+    也用它预测「本次声明落定后会话里的 name 是什么」。两侧若各写一份表达式，一旦漂移就会出现
+    「声明空名 → 服务端归一成 X → 再次声明空名被判成身份冲突（X ≠ ""）」，而客户端**无法复现**服务端
+    生成的名字（``sid`` 前缀），只能重连自救。
+
+    Single source of truth for the normalized default name: used both when ``enter_room`` stores it and
+    when the identity-consistency check predicts what the session's name will become. Divergence would
+    make a repeat empty-name join look like an identity change the client cannot recover from.
+    """
+    return f"{role or 'unknown'}_{sid[:6]}"
+
+
 def build_room_rejection_ack(
     rejection: RoomRejection,
     *,
