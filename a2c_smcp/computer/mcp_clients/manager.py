@@ -461,21 +461,41 @@ class MCPServerManager:
         如果已存在，检查是否已经建立客户端连接，如果是，检查是否需要自动重连
         如果不存在，直接添加配置
 
-        #208：本方法现在是**决策相**——只在状态锁内判分支、登记配置并返回「待执行动作」，
-        启动动作在**锁外**经统一启动器执行（门 + per-bundle 锁在最外层获取）。
+        #208：**决策与动作同持门 + per-bundle 锁**（由 :meth:`astart_client` / :meth:`_arestart_server`
+        内部转发到 ``_locked`` 变体，不在本层二次取锁）。这一点是承重的——若决策只取状态锁，
+        决策与动作之间就会对在途启动事务敞开窗口，产生「更新被旧配置覆盖 / 进程仍是旧配置而两店是新配置 /
+        restart 写回 clobber 并发更新」整族静默错误（隔离审查 🔴-A/🔴-B/🟡-C）。同持锁后，
+        更新与同 bundle 的启动/重启/停止/移除**全序化**。
 
         Args:
             config (MCPServerConfig): MCP服务器配置
             start: ``False`` = 只登记不启动（治理恢复的 collect-then-batch；#208）。
-                ⚠️ 对**已激活**且 ``auto_reconnect=True`` 的 bundle，``start=False`` 是**静默 no-op**
-                （该分支刻意「不预写新声明」——预写是 restart 成功后才做的）；此时配置**不会**被登记。
-                需要更新运行中的 server 请用缺省 ``start=True``（走 restart）。
+                ⚠️ 对**已激活**且 ``auto_reconnect=True`` 的 bundle，该分支刻意「不预写新声明」
+                （预写是 restart 成功后才做的），故 ``start=False`` 在此**登记不了**任何东西——
+                已改为 fail-fast 而非静默 no-op。需要更新运行中的 server 请用缺省 ``start=True``。
 
         Raises:
             RuntimeError: 已激活 + ``auto_reconnect=False`` 时更新配置（须先 stop）；
                 ``start=False`` 命中已激活 + ``auto_reconnect=True`` 时（避免「只挂载」被静默误读为已登记）。
+            McpStartGateClosed: 门已关（shutdown / ainitialize 换代中）——本入口同样受 Computer 级门控。
         """
         bundle_id = resolve_bundle_id(config)
+        action: str | None = None
+        # 门 → bundle 锁（严格单向；两个动作在 `_locked` 变体里执行，不再取锁）
+        async with await self._start_gate.acquire():
+            async with self._bundle_lock(bundle_id):
+                action = await self._adecide_add_or_update(config, bundle_id, start=start)
+                if action == "restart":
+                    await self._arestart_server_locked(bundle_id, config)
+                elif action == "start":
+                    await self._astart_client_auto_locked(bundle_id)
+
+    async def _adecide_add_or_update(self, config: MCPServerConfig, bundle_id: BUNDLE_ID, *, start: bool) -> str | None:
+        """决策相：判分支 + 登记声明，返回待执行动作（``"start"`` / ``"restart"`` / ``None``）。
+
+        **须已持门许可 + 该 bundle 的生命周期锁**（由本类唯一调用方 ``_add_or_update_server_config`` 保证；
+        决策必须与动作同锁，见该方法的说明）。
+        """
         action: str | None = None
         async with self._lock:
             if bundle_id in self._servers_config:
@@ -515,17 +535,23 @@ class MCPServerManager:
                 self._servers_config_raw[bundle_id] = config
                 if self._auto_connect and start:
                     action = "start"
-        if action == "restart":
-            await self._arestart_server(bundle_id, config)
-        elif action == "start":
-            await self._astart_client_auto(bundle_id)
+        return action
 
     async def _astart_client_auto(self, bundle_id: BUNDLE_ID) -> None:
         """auto 路径启动（配置挂载/重启触发）：OAuthRequired 吞掉并记录（activation 保留），
         其余错误照常上抛——单 server 显式 :meth:`astart_client` 仍向调用方传播 OAuthRequired。
         """
+        async with await self._start_gate.acquire():
+            async with self._bundle_lock(bundle_id):
+                await self._astart_client_auto_locked(bundle_id)
+
+    async def _astart_client_auto_locked(self, bundle_id: BUNDLE_ID) -> None:
+        """auto 路径启动主体。**须已持门许可 + 该 bundle 的生命周期锁**（由调用方获取；#208）。
+
+        ⚠️ 不可重入：持锁调用方（``_add_or_update_server_config``）须调本变体而非 :meth:`_astart_client_auto`。
+        """
         try:
-            await self._astart_client(bundle_id)
+            await self._astart_client_locked(bundle_id)
         except OAuthError as exc:
             if not _is_oauth_required_error(exc):
                 raise
@@ -579,32 +605,42 @@ class MCPServerManager:
         """
         async with await self._start_gate.acquire():
             async with self._bundle_lock(bundle_id):
-                if config.disabled:
-                    # 停用配置：仅停止旧进程（对齐 rust disabled → stop，不 materialize），两店存新声明供状态面读取。
-                    if bundle_id in self._active_clients:
-                        await self._astop_client_locked(bundle_id)
-                    async with self._lock:
-                        self._servers_config[bundle_id] = config
-                        self._servers_config_raw[bundle_id] = config
-                    return
+                await self._arestart_server_locked(bundle_id, config)
 
-                rendered = await self._amaterialize(bundle_id, config)
-                if bundle_id in self._active_clients:
-                    await self._astop_client_locked(bundle_id)
-                async with self._lock:
-                    self._servers_config[bundle_id] = rendered
-                    self._servers_config_raw[bundle_id] = config  # 新 raw 声明（下一次实际启动的重解析源）
-                # OAuthRequired 吞掉（restart 属配置变更触发的自动动作，与 auto 路径同语义）
-                try:
-                    await self._aspawn_client(bundle_id, rendered, self._oauth_clear_epochs.get(bundle_id, 0))
-                except OAuthError as exc:
-                    if not _is_oauth_required_error(exc):
-                        raise
-                    logger.info(
-                        f"Server bundle_id={bundle_id!r} requires OAuth authorization "
-                        f"(state=Started+AuthorizationRequired); host drives the flow via "
-                        f"create_oauth_flow/complete_oauth.",
-                    )
+    async def _arestart_server_locked(self, bundle_id: BUNDLE_ID, config: MCPServerConfig) -> None:
+        """重启主体。**须已持门许可 + 该 bundle 的生命周期锁**（由调用方获取；#208）。
+
+        与 :meth:`_astart_client_locked` 同理由：让更新路径能在同一对锁下「先决策、再 restart」，
+        避免 restart 的写回覆盖并发更新（隔离审查 🟡-C：C 的更新被 A 的 restart 写回静默丢弃）。
+
+        ⚠️ 不可重入：持锁调用方不得再经 :meth:`_arestart_server`。
+        """
+        if config.disabled:
+            # 停用配置：仅停止旧进程（对齐 rust disabled → stop，不 materialize），两店存新声明供状态面读取。
+            if bundle_id in self._active_clients:
+                await self._astop_client_locked(bundle_id)
+            async with self._lock:
+                self._servers_config[bundle_id] = config
+                self._servers_config_raw[bundle_id] = config
+            return
+
+        rendered = await self._amaterialize(bundle_id, config)
+        if bundle_id in self._active_clients:
+            await self._astop_client_locked(bundle_id)
+        async with self._lock:
+            self._servers_config[bundle_id] = rendered
+            self._servers_config_raw[bundle_id] = config  # 新 raw 声明（下一次实际启动的重解析源）
+        # OAuthRequired 吞掉（restart 属配置变更触发的自动动作，与 auto 路径同语义）
+        try:
+            await self._aspawn_client(bundle_id, rendered, self._oauth_clear_epochs.get(bundle_id, 0))
+        except OAuthError as exc:
+            if not _is_oauth_required_error(exc):
+                raise
+            logger.info(
+                f"Server bundle_id={bundle_id!r} requires OAuth authorization "
+                f"(state=Started+AuthorizationRequired); host drives the flow via "
+                f"create_oauth_flow/complete_oauth.",
+            )
 
     async def _araise_first_error(self, outcomes: Iterable["StartOutcome"]) -> None:
         """把批量逐项结果收敛为「首错上抛」（对齐 rust ``start_all_mcp_clients`` 的聚合口径）。
@@ -777,65 +813,66 @@ class MCPServerManager:
         """
         # #208 锁层次（承重）：门 → per-bundle 生命周期锁 —— 事务全程持锁，commit 在锁内。
         # permit 覆盖**完整启动事务**（materialize → spawn → commit），故单启/批量/治理恢复共享同一上限；
-        # bundle 锁使「同 bundle 双开」与「启动中移除/停止」由结构排除（无需 epoch 补偿）。
+        # bundle 锁使「同 bundle 双开」「启动中移除/停止」**以及「启动中配置更新」**三者由结构排除
+        # ——后者是关键：更新路径同样先取门与 bundle 锁（见 :meth:`_add_or_update_server_config`），
+        # 故它的「决策 + 登记 + 动作」与任何在途启动事务互斥，不存在交错窗口。
         # ⚠️ 门可能已关（shutdown/ainitialize）→ 排队者与后来者**即刻失败**，这正是验收标准 6。
         async with await self._start_gate.acquire():
             async with self._bundle_lock(bundle_id):
-                # ── phase A：状态临界区（纯内存读判，无 I/O await）─────────────
-                async with self._lock:
-                    config = self._servers_config.get(bundle_id)
-                    if not config:
-                        # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
-                        raise ValueError(f"Unknown server bundle_id={bundle_id!r}")  # pragma: no cover
+                await self._astart_client_locked(bundle_id)
 
-                    if config.disabled:
-                        raise RuntimeError(f"Cannot start disabled server bundle_id={bundle_id!r} (name={config.name!r})")
+    async def _astart_client_locked(self, bundle_id: BUNDLE_ID) -> None:
+        """启动事务主体。**须已持门许可 + 该 bundle 的生命周期锁**（由调用方获取；#208）。
 
-                    # #184：先记录控制面启动意图——后续 OAuth challenge / transport error 只改 connection 状态，
-                    # 不清除 activation。只有显式 stop 才清除 / Record activation intent first; subsequent
-                    # OAuth or transport errors affect only connection state.
-                    self._activation_intents.add(bundle_id)
-                    # #185：捕获 clear epoch——后续各 commit 点比对，clear 在连接 RPC 在途时发生则提交被拒。
-                    clear_epoch = self._oauth_clear_epochs.get(bundle_id, 0)
+        拆出 ``_locked`` 变体是为了让**配置更新路径**（:meth:`_add_or_update_server_config`）能在同一
+        对锁下「先决策、再执行动作」，从而与在途启动事务互斥——否则更新会落在启动的渲染/握手窗口里
+        被静默丢弃或反向覆盖（隔离审查 🔴-A/🔴-B/🟡-C 同族）。
 
-                    if bundle_id in self._active_clients:
-                        self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
-                        return  # 已经启动（幂等：**早于** materialize ⇒ 不重解析 Input，协议 §5.13）
+        ⚠️ 不可重入：持锁调用方不得再经 :meth:`_astart_client`（会二次取同一 ``asyncio.Lock`` ⇒ 自死锁）。
+        """
+        # ── phase A：状态临界区（纯内存读判，无 I/O await）─────────────
+        for _attempt in range(_MAX_MATERIALIZE_RETRIES):
+            async with self._lock:
+                config = self._servers_config.get(bundle_id)
+                if not config:
+                    # 防御性分支：正常流程不会触发 / Defensive branch, not triggered in normal flow
+                    raise ValueError(f"Unknown server bundle_id={bundle_id!r}")  # pragma: no cover
 
-                    # §5.13（#192，对齐 rust start_client_by_id_materialized）：从 stopped 实际启动 → 从 **raw 声明店**
-                    # materialize（rendered 品绝不作为解析结果来源；结构化错误上抛、不落 CONNECTING、不改任何状态），
-                    # 再以 rendered config spawn。standalone（无 raw 条目）回退当前配置（调用方传入即已渲染）。
-                    raw_in_store = self._servers_config_raw.get(bundle_id)
-                    raw = raw_in_store if raw_in_store is not None else config
-                # ── phase B：锁外慢路径（用户提示 / 进程握手）——permit + bundle 锁仍持有 ──
-                # 🔴 #208 新增竞态（锁域收窄的代价）：决策相（`_add_or_update_server_config` 的登记分支）
-                # 只取**状态锁**、不取 bundle 锁，故它的登记可在本事务 materialize 期间落在 raw 店上。
-                # 若此时仍把 phase A 读到的**旧 raw** 渲染结果写回 ``_servers_config``，就覆盖掉刚登记的
-                # 新声明 —— 更新被静默丢弃 + raw/rendered 分歧（活跃进程仍是旧配置）。#208 前两者同持
-                # 全局锁，不可能交错。
-                # 处置：**渲染前后校验 raw 身份**，变了就重读最新声明重新渲染（重启事务）。带上限避免
-                # 恶意/极端抖动下的活锁；耗尽则**放弃本次事务**（不写也不 spawn）——排在本 bundle 锁后的
-                # 那次更新启动会接手新配置，故不会静默无启动（`astart_client` 显式路径同样如此）。
-                for _attempt in range(_MAX_MATERIALIZE_RETRIES):
-                    rendered = await self._amaterialize(bundle_id, raw)
-                    async with self._lock:
-                        if self._servers_config_raw.get(bundle_id) is raw_in_store:
-                            self._servers_config[bundle_id] = rendered
-                            break
-                        # 声明在渲染窗口内被换过 → 重读并重渲染（不写、不 spawn）
-                        config = self._servers_config.get(bundle_id)
-                        if not config:
-                            # 渲染窗口内被移除/换代 → 与 phase A 的未知 bundle 同判
-                            raise ValueError(f"Unknown server bundle_id={bundle_id!r}")  # pragma: no cover
-                        raw_in_store = self._servers_config_raw.get(bundle_id)
-                        raw = raw_in_store if raw_in_store is not None else config
-                else:  # pragma: no cover — 需宿主以高于一次 render 的频率持续改写声明
-                    logger.warning(
-                        f"bundle_id={bundle_id!r} 的声明在 {_MAX_MATERIALIZE_RETRIES} 次渲染窗口内持续变更，"
-                        f"放弃本次启动（排在 bundle 锁后的更新启动将接手最新声明）",
-                    )
-                    return
-                await self._aspawn_client(bundle_id, rendered, clear_epoch)
+                if config.disabled:
+                    raise RuntimeError(f"Cannot start disabled server bundle_id={bundle_id!r} (name={config.name!r})")
+
+                # #184：先记录控制面启动意图——后续 OAuth challenge / transport error 只改 connection 状态，
+                # 不清除 activation。只有显式 stop 才清除 / Record activation intent first; subsequent
+                # OAuth or transport errors affect only connection state.
+                self._activation_intents.add(bundle_id)
+                # #185：捕获 clear epoch——后续各 commit 点比对，clear 在连接 RPC 在途时发生则提交被拒。
+                clear_epoch = self._oauth_clear_epochs.get(bundle_id, 0)
+
+                if bundle_id in self._active_clients:
+                    self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
+                    return  # 已经启动（幂等：**早于** materialize ⇒ 不重解析 Input，协议 §5.13）
+
+                # §5.13（#192，对齐 rust start_client_by_id_materialized）：从 stopped 实际启动 → 从 **raw 声明店**
+                # materialize（rendered 品绝不作为解析结果来源；结构化错误上抛、不落 CONNECTING、不改任何状态），
+                # 再以 rendered config spawn。standalone（无 raw 条目）回退当前配置（调用方传入即已渲染）。
+                raw_in_store = self._servers_config_raw.get(bundle_id)
+                raw = raw_in_store if raw_in_store is not None else config
+            # ── phase B：锁外慢路径（用户提示 / 进程握手）——两侧锁仍持有 ──
+            rendered = await self._amaterialize(bundle_id, raw)
+            async with self._lock:
+                if self._servers_config_raw.get(bundle_id) is raw_in_store:
+                    self._servers_config[bundle_id] = rendered
+                    break
+            # 声明在渲染窗口内被换过（当下只可能来自**绕过本对锁**的路径，如 `_clear_all` 换代）——
+            # 整轮重跑 phase A：**含 `disabled` 复校**。少校一步就会 spawn 一个「已被禁用」的声明
+            # （隔离审查 🔴-A：禁用却运行，`start all` 面又看不到它）。
+        else:  # pragma: no cover — 需宿主以高于一次 render 的频率持续改写声明
+            logger.warning(
+                f"bundle_id={bundle_id!r} 的声明在 {_MAX_MATERIALIZE_RETRIES} 次渲染窗口内持续变更，"
+                f"放弃本次启动（排在 bundle 锁后的更新启动将接手最新声明）",
+            )
+            return
+        await self._aspawn_client(bundle_id, rendered, clear_epoch)
 
     async def _aspawn_client(self, bundle_id: BUNDLE_ID, config: MCPServerConfig, clear_epoch: int) -> None:
         """以**已 materialize 的 rendered config** spawn（``_astart_client`` / ``_arestart_server`` 共用，不二次解析）。

@@ -110,6 +110,7 @@ class ControlledMCPClient:
 
     def __init__(self, control: ConnectControl, config: MCPServerConfig, message_handler: Any = None) -> None:
         self._control = control
+        self.config = config
         self.name = config.name
         self.state = "connected"
         self.message_handler = message_handler
@@ -411,23 +412,54 @@ async def test_update_during_start_does_not_get_overwritten_by_stale_render(harn
             break
     assert seen, "第一次渲染应已开始（受控 materializer 已挂住）"
 
-    # 渲染窗口内更新同 bundle 的声明。**必须作为独立任务**：该更新的启动会排队等本事务持有的
-    # bundle 锁，直接 await 即自阻塞（而本事务正等我们放行）。
-    updating = asyncio.create_task(manager.aadd_or_aupdate_server(_cfg("s0")))
+    # 渲染窗口内更新同 bundle 的声明（**独立任务**：它要等本事务持有的 bundle 锁）
+    new_cfg = _cfg("s0")
+    updating = asyncio.create_task(manager.aadd_or_aupdate_server(new_cfg))
     for _ in range(10):
         await _settle()
-        if manager._servers_config_raw.get(bid) is not original_raw:
-            break
-    assert manager._servers_config_raw.get(bid) is not original_raw, "更新声明应已登记进 raw 店"
+
+    # 承重断言：更新**必须**阻塞在 bundle 锁上——决策与动作同锁，故登记不得落进启动窗口。
+    # 这正是「更新被旧配置覆盖 / 进程仍旧配置而两店是新配置」整族静默错误的**结构性排除**。
+    assert not updating.done(), "更新不得在启动事务在途时完成"
+    assert manager._servers_config_raw.get(bid) is original_raw, "更新声明不得落进启动的渲染窗口"
 
     gate.set()
     await _drain(starting, harness.control)
-    await asyncio.wait_for(updating, timeout=5)
+    await _drain(updating, harness.control)  # 更新随后 restart，其 connect 同样受控
 
-    # 终态：渲染被**重跑**（seen 至少两次）且两店一致——不得留下「raw 新 / rendered 旧」
-    assert len(seen) >= 2, "声明在渲染窗口内被换过 ⇒ 必须重读重渲染，而非写回旧值"
-    assert bid in manager._servers_config
+    # 终态：启动先以旧声明收尾 → 更新随后**重启**到新声明（进程 = 新声明，非「两店新 / 进程旧」）
+    assert len(seen) >= 2, "更新须触发一次新的渲染（restart）"
+    assert manager._servers_config_raw.get(bid) is new_cfg, "raw 店 = 新声明"
+    assert len(harness.created) >= 2, "更新须重启出**新**进程（而非复用旧 client）"
+    assert harness.created[-1].config is new_cfg, "最后建成的进程必须来自新声明"
     assert bid in manager._active_clients
+
+
+@pytest.mark.asyncio
+async def test_disabled_declaration_never_gets_spawned(harness: Harness) -> None:
+    """隔离审查 🔴-A：**禁用声明永不得被启动**——重试/更新路径都不得绕过 ``disabled`` 校验。
+
+    原先重试分支只重读 raw、重渲染，**没复跑 phase A 的 disabled 校验** ⇒ 启动事务在渲染窗口内
+    遇上「宿主把该 bundle 改为 disabled」就会 spawn 出**禁用却运行**的进程（`start all` 面又看不到它，
+    工具还会进 `_exposed_tools`）。本用例把「禁用 ⇒ 不 spawn」钉死。
+    """
+    manager = MCPServerManager()
+    ids = await _register(manager, [_cfg("s0")])
+    bid = ids[0]
+
+    # `auto_connect=False` ⇒ 挂载禁用声明只是登记（合法）；随后**任何**启动入口都必须拒绝
+    await manager.aadd_or_aupdate_server(_cfg("s0", disabled=True))
+
+    with pytest.raises(RuntimeError, match="disabled"):
+        await manager.astart_client(bid)
+    outcomes = await manager.astart_clients_batch([bid])
+    assert isinstance(outcomes[0].error, RuntimeError)
+    # `astart_all` 只迭代 enabled 集 → 禁用项根本不在输入面（故不抛、也不启动）
+    await manager.astart_all()
+
+    assert harness.created == [], "禁用声明不得 spawn 任何 client"
+    assert bid not in manager._active_clients
+    assert bid not in manager.enabled_bundle_ids()
 
 
 @pytest.mark.asyncio
