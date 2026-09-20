@@ -644,7 +644,8 @@ async def test_arefresh_builds_exposed_mapping_coexist_same_tool(manager, monkey
         "duplicate_server1": always_duplicate_tool(config1),
         "duplicate_server2": always_duplicate_tool(config2),
     }
-    await manager._arefresh_tool_mapping()
+    # #222：私有刷新入口新增强制表态的 ``reuse_cached``（本用例直造活跃集、无缓存，全量重读即可）
+    await manager._arefresh_tool_mapping(reuse_cached=False)
     assert manager._exposed_tools["duplicate_server1__duplicate_tool"] == ("duplicate_server1", "duplicate_tool")
     assert manager._exposed_tools["duplicate_server2__duplicate_tool"] == ("duplicate_server2", "duplicate_tool")
 

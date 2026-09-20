@@ -212,10 +212,13 @@ async def test_batch_caps_at_five_of_six_and_preserves_input_order(harness: Harn
     assert len(manager._active_clients) == 6
     assert harness.control.max_active == 5, "全程不得超过上限"
 
-    # H4 收敛界：6 次提交各触发一次全量刷新 ⇒ list_tools 总次数 ≤ Σ(提交时的活跃数) = 21。
-    # 若 _arefresh_tool_mapping 的无界重试被并发提交拖成空转，此处会远超上限。
-    total_list_tools = sum(int(c.list_tools.await_count) for c in harness.created)
-    assert 6 <= total_list_tools <= 21, f"刷新轮数失控（疑似重试空转）：{total_list_tools}"
+    # H4 收敛界（#222 收紧）：6 次提交各**只真读自身**那个 bundle（其余命中上游观测缓存）⇒ 总数恰为 6，
+    # 且每个 client 恰 1 次。旧行为是「每次提交全量重读」= Σ(提交时的活跃数) = 21。
+    # 下界仍拦「重试空转」，上界收紧为 N 拦「全量重读回归」——两者同时钉住才拦得住 O(N²) 回流。
+    per_client = [int(c.list_tools.await_count) for c in harness.created]
+    total_list_tools = sum(per_client)
+    assert per_client == [1] * 6, f"每个 client 只应在自身提交点被真读一次：{per_client}"
+    assert total_list_tools == 6, f"批量启动的 list_tools 总数须为 N（旧行为 N(N+1)/2 = 21）：{total_list_tools}"
 
 
 @pytest.mark.asyncio
