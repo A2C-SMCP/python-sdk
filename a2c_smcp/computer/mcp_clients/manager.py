@@ -245,32 +245,53 @@ class StartOutcome(NamedTuple):
     error: Exception | None
 
 
+class CachedToolList(NamedTuple):
+    """per-bundle **上游工具列表观测**缓存条目（#222）。
+
+    ``(client, generation, tools)`` 三件套与 :meth:`MCPServerManager._arefresh_tool_mapping` 提交前的校验
+    **同源**：只有「同一 client 对象 + 同一世代」的观测才可复用（#185 的 ABA 检测计数在此兼任缓存世代守卫）。
+
+    **只缓存上游观测，不缓存配置派生物**：投影（routes / 指纹）每轮由「缓存工具 × 当前配置」重算，
+    故 alias / forbidden / tool_meta 变更无需重读上游即可被投影吸收。
+
+    / Per-bundle upstream tool-list observation cache (#222). Same evidence tuple as the commit-time snapshot
+    validation; only the raw upstream observation is cached — the projection is always recomputed against the
+    *current* config, so config-only changes never need an RPC.
+    """
+
+    client: MCPClientProtocol
+    generation: int
+    tools: list[Tool]
+
+
 class MCPServerManager:
     """
     MCP Server管理器
 
     所有以下划线开头的私有方法是非协程安全的。如果外部调用，需要使用普通方法。
 
-    # #208 锁层次（**单向，不可逆序**）/ Lock hierarchy (strictly one-way):
+    # #208/#222 锁层次（**单向，不可逆序**）/ Lock hierarchy (strictly one-way):
 
-        start_gate permit  →  per-bundle 生命周期锁  →  状态锁 ``_lock``
+        start_gate permit  →  per-bundle 生命周期锁  →  tool_refresh 锁  →  状态锁 ``_lock``
 
     推论（改本文件时**必须**遵守）：
-    1. **不得**在持有状态锁 ``_lock`` 时去取门许可或 per-bundle 锁——那会与「bundle 锁 → 状态锁」
-       的正常路径构成环形等待（死锁）。
-    2. 状态锁的语义已收窄为**纯状态临界区**：**不得跨越任何慢 I/O**（用户提示 / ``aconnect`` /
-       ``adisconnect``）、**不得跨越**任何门/bundle 锁的获取。**两处明示例外**（皆为承重，勿擅自
-       「修掉」）：(a) :meth:`_arefresh_tool_mapping` 的全量 ``list_tools``；(b)
-       :meth:`_reject_commit` 的退役 ``adisconnect``（罕见拒绝路径，保持既有原子的
-       「校验→处置→上抛」形状）。
+    1. **不得**在持有状态锁 ``_lock`` 时去取门许可、per-bundle 锁或 tool_refresh 锁——那会与
+       「…… → 状态锁」的正常路径构成环形等待（死锁）。
+    2. 状态锁的语义是**纯状态临界区**：**不得跨越任何慢 I/O**（用户提示 / ``aconnect`` /
+       ``adisconnect`` / ``list_tools``）、**不得跨越**任何其它锁的获取。**唯一明示例外**（承重，
+       勿擅自「修掉」）：:meth:`_reject_commit` 的退役 ``adisconnect``（罕见拒绝路径，保持既有原子的
+       「校验→处置→上抛」形状）。#222 起 ``list_tools`` **不再**在状态锁内发出（对齐 rust
+       「快照 → 放锁 → RPC → 校验重试」，见第 4/5 条）。
     3. per-bundle 锁覆盖**完整启动事务**（materialize → spawn → commit），使「同 bundle 双开」
        与「启动中移除/停止」由**结构**排除，而非靠 epoch 补偿。
-    4. 唯一例外：:meth:`_arefresh_tool_mapping` 在状态锁内做全量 ``list_tools``。其无界重试的
-       收敛性**恰恰依赖**「持有状态锁期间没有别的协程能改 ``_active_clients``」——故它**绝不**
-       得从无锁调用点被调用（见该方法的 docstring）。
+    4. ``tool_refresh_lock`` 串行化**整轮刷新**（含其无界重试），是 rust ``tool_route_refresh_lock``
+       的 python 面。无它时两次并发刷新会互相把对方的快照判成陈旧，各自重试时又去重读对方**尚未提交**
+       的 bundle ⇒ RPC 次数从 N 膨胀回 O(N²)。刷新**自取**该锁；调用方**绝不**持有状态锁去调它。
+    5. :meth:`_arefresh_tool_mapping` 的收敛性由「快照 + 身份/世代/配置校验 + 失配整轮重试」保证
+       （**不再**依赖「持锁期间无人改 ``_active_clients``」）；每次重试复用已观测缓存，故重试廉价。
 
-    / The state lock is a state critical-section lock, not a lifecycle gate; the start gate and
-    per-bundle locks sit outside it, acquired in that order and never in reverse.
+    / The state lock is a state critical-section lock, not a lifecycle gate; the start gate,
+    per-bundle locks and the tool-refresh lock sit outside it, acquired in that order and never in reverse.
 
     # 动态取消（响应 server 端 notify:tool_call_cancel）已在 Computer.aexecute_tool 层实现（#96）：
     #   Computer 以 req_id 为键将 acall_tool 包装为可取消的在途任务（见 Computer._acall_tool_cancellable /
@@ -314,9 +335,16 @@ class MCPServerManager:
         # 故「同名换 schema」也能被检出——``Computer.capability_revision`` 的变化判据即基于本表比对。
         # Projection fingerprint (#197); the change predicate behind Computer.capability_revision.
         self._tool_projection: dict[EXPOSED_TOOL_NAME, str] = {}
+        # #222：per-bundle 上游工具列表观测缓存（见 CachedToolList）。**只缓存上游观测**，投影每轮由
+        # 「缓存工具 × 当前配置」重算 ⇒ 结构变更（启动/更新/移除/停止提交）无需重读未失效的 bundle，
+        # 批量启动的 list_tools 次数由 N(N+1)/2 收敛为 N。
+        # 写入点**只有一处**：经校验的提交点（重绑定为「本快照内可用的观测」）；撤回点同步剪除（无 await 原语）。
+        # Per-bundle upstream tool-list cache (#222): written only at the validated commit point.
+        self._tool_list_cache: dict[BUNDLE_ID, CachedToolList] = {}
         # #185：per-bundle 活跃 client 世代计数（ABA 检测）——每次 _active_clients 插入/移除/替换 +1。
         # available_tools 发布前与 _arefresh_tool_mapping 提交前按「client 身份 + generation」二次校验，
         # 同一 client 对象被 remove 再 reinsert（ABA）也能被检出（Rust active_client_generations 的 python 面）。
+        # #222：本计数同时兼任**缓存世代守卫**（复用判据 = 同一 client 对象 ∧ 同一世代）。
         self._active_client_generations: dict[BUNDLE_ID, int] = {}
         # #185：per-bundle clear epoch——clear_oauth 的零 await 快速段每次 +1。_astart_client 入口捕获、
         # _commit_active_client 提交前比对：clear 在 start 连接 RPC 在途时发生 → 提交被拒（凭据已撤销），
@@ -330,6 +358,10 @@ class MCPServerManager:
         self._message_handler: MessageHandlerFnT | None = message_handler
         # 内部锁防止并发修改（#208：语义收窄为**状态临界区**——不得跨越慢 I/O，见类 docstring 的锁层次）
         self._lock = asyncio.Lock()
+        # #222：工具刷新互斥（rust ``tool_route_refresh_lock`` 的 python 面）——串行化**整轮**刷新
+        # （含其无界重试）。作用：两次并发刷新不再互相把对方快照判陈旧、进而在重试里重复重读对方**尚未
+        # 提交**的 bundle（那会把刚收敛到 O(N) 的 RPC 次数打回 O(N²)）。自取，且**在状态锁之外**获取。
+        self._tool_refresh_lock = asyncio.Lock()
         # #208：Computer 级启动并发门（单启 / 批量 / 治理恢复共享同一把）。未配置 = 不限流但仍计数，
         # 批量驱动据 ``max is None`` 走既有逐项串行语义（分叉在**驱动**、不在门，对齐 rust）。
         # 门装在 **manager** 而非 Computer：``Computer.boot_up`` 每次新建 manager，故 boot 回滚的
@@ -451,8 +483,9 @@ class MCPServerManager:
         # 5. 锁外统一启动（auto 语义：OAuthRequired 吞掉、其余上抛；失败不阻塞其余项）
         if to_start:
             await self._araise_first_error(await self._astart_clients_batch_auto(to_start))
-        async with self._lock:
-            await self._arefresh_tool_mapping()
+        # 6. 收尾刷新（**结构变更**语义，reuse_cached=True）：每个成功提交已在自身提交点刷过一次，
+        #    此处覆盖「全部 disabled / 全部失败 / 未配置 auto_connect」等无提交场景；未失效者不重读。
+        await self._arefresh_tool_mapping(reuse_cached=True)
 
     async def _add_or_update_server_config(self, config: MCPServerConfig, *, start: bool = True) -> None:
         """
@@ -572,8 +605,9 @@ class MCPServerManager:
                 挂载全部完成后经 :meth:`astart_clients_batch` 统一启动）。缺省 ``True`` = 既有语义。
         """
         await self._add_or_update_server_config(config, start=start)
-        async with self._lock:
-            await self._arefresh_tool_mapping()
+        # 结构变更刷新（reuse_cached=True）：其余 bundle 的上游未被动过——更新若换了 client 已 bump 世代
+        # （缓存自然失效），若只改声明则由建表段现读配置吸收，两条路都无需重读未失效者。
+        await self._arefresh_tool_mapping(reuse_cached=True)
 
     async def aremove_server(self, bundle_id: BUNDLE_ID) -> None:
         """按 bundle_id 移除服务器配置 / Remove a server config by bundle_id。
@@ -590,8 +624,8 @@ class MCPServerManager:
                 self._retire_oauth_bundle(bundle_id)
                 del self._servers_config[bundle_id]
                 self._servers_config_raw.pop(bundle_id, None)
-            async with self._lock:
-                await self._arefresh_tool_mapping()
+            # 结构变更刷新（reuse_cached=True）：被移除者已随 client 退役离开快照，其余 bundle 的上游未变。
+            await self._arefresh_tool_mapping(reuse_cached=True)
 
     async def _arestart_server(self, bundle_id: BUNDLE_ID, config: MCPServerConfig) -> None:
         """重启服务器客户端（按 bundle_id）。``config`` = 调用方提供的新 raw/rendered 声明（update-in-place 入参）。
@@ -1003,8 +1037,9 @@ class MCPServerManager:
         """登记活跃 client —— **本方法自取 ``_lock``**（#208）+ 刷新 ExposedToolMapping。
 
         #208：提交点由「调用方持锁」改为「自带锁」，使整个启动事务可以在**锁外**跑慢路径
-        （materialize / aconnect）而不必把 130 行 OAuth 分支迷宫切成多相。锁内的部分**仍**含
-        :meth:`_arefresh_tool_mapping`：其无界重试的收敛性依赖「持锁期间无他人改 ``_active_clients``」。
+        （materialize / aconnect）而不必把 130 行 OAuth 分支迷宫切成多相。
+        #222：登记（状态写入）与刷新**不再同一临界区**——刷新自取 ``tool_refresh_lock`` → 状态锁两段，
+        其 RPC 在锁外；收敛性由刷新的「快照 + 四项校验」保证，不再依赖提交点持锁。
 
         #185：提交前做 clear epoch 校验——start 连接 RPC 在途时若 :meth:`clear_oauth` 已发生
         （凭据已撤销、clear 快速段已过），提交被拒并转 OAuthRequired。Rust 以 per-bundle
@@ -1035,8 +1070,11 @@ class MCPServerManager:
             self._active_clients[bundle_id] = client
             _bump_active_client_generation(self._active_client_generations, bundle_id)
             self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
-            # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚
-            await self._arefresh_tool_mapping()
+        # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚。
+        # #222：刷新移出状态锁（自取锁 + 锁外 RPC），且用**结构变更**语义——本 bundle 刚 bump 世代 ⇒
+        # 缓存天然未命中（**必真读自身** ⇒「astart_client 返回后工具立即可见」契约不变），
+        # 其余 bundle 的上游未被动过 ⇒ 不重读。批量启动 N 个的 RPC 次数由此为 N（旧行为 Σk = N(N+1)/2）。
+        await self._arefresh_tool_mapping(reuse_cached=True)
 
     @staticmethod
     async def _reject_commit(bundle_id: BUNDLE_ID, client: MCPClientProtocol, reason: str) -> None:
@@ -1406,10 +1444,11 @@ class MCPServerManager:
                 # #185：每次 active-client 移除都必须 bump 世代（ABA 检测，见 _bump_active_client_generation）
                 _bump_active_client_generation(self._active_client_generations, bundle_id)
         if client:
-            # disconnect 在状态锁外（慢 I/O），随后再回锁内刷新映射
+            # disconnect 在状态锁外（慢 I/O），随后刷新映射（#222：刷新自取锁，不再需要外包状态锁）
             await client.adisconnect()
-            async with self._lock:
-                await self._arefresh_tool_mapping()
+            # 结构变更刷新（reuse_cached=True）：被停止者已离场（其缓存条目随提交重绑定剪除），
+            # 其余 bundle 的上游未被动过 ⇒ 停机路径的 list_tools 次数由 Σ(剩余活跃数) 归零。
+            await self._arefresh_tool_mapping(reuse_cached=True)
 
     async def _astop_all(self) -> None:
         """停止所有客户端。
@@ -1455,6 +1494,8 @@ class MCPServerManager:
         self._connection_states.clear()
         self._exposed_tools.clear()
         self._tool_projection.clear()  # #197：投影指纹随路由同清（两表同步不变量，勿留残影）
+        self._tool_list_cache.clear()  # #222：上游观测缓存随清（本方法同时清 _active_clients/_generations，
+        # 故「世代归零后旧条目仍可命中」的 ABA 窗口不存在——清空是硬边界，勿删）
         self._active_client_generations.clear()
         self._oauth_clear_epochs.clear()
         # #179 OAuth 注册表随清（detached connect 任务取消弃置；coordinator/store 凭宿主注入）
@@ -1526,8 +1567,8 @@ class MCPServerManager:
 
         Fail-closed 原语（Rust ``withdraw_bundle_tool_routes`` 的 python 面）：即便上游 MCP
         server 已不可达，本地授权撤销也立即生效。与全量 :meth:`_arefresh_tool_mapping` 不同，
-        本方法**只移除**指定 bundle 的路由**并同步裁剪其投影指纹**（#197，两表同步不变量）、
-        不发起任何 ``tools/list`` RPC。
+        本方法**只移除**指定 bundle 的路由**并同步裁剪其投影指纹**（#197，两表同步不变量）**与
+        工具列表缓存条目**（#222）、不发起任何 ``tools/list`` RPC。
 
         返回值维持**纯路由口径**（Rust 为 ``routes_changed || disabled_changed || projection_changed``）：
         当前可达状态下投影变化 ⊆ 路由变化，故口径差异不漏 bump；若将来出现「投影多于路由」的可达状态
@@ -1546,12 +1587,29 @@ class MCPServerManager:
         # 按前缀裁剪（此处的 rebind 已丢失旧路由，无法反查归属）。
         _prefix = f"{bundle_id}__"
         self._tool_projection = {exposed: fp for exposed, fp in self._tool_projection.items() if not exposed.startswith(_prefix)}
+        # #222：工具列表缓存条目同步剪除（同款 rebind，不原地 del）。不变量 = 缓存里的观测必须对应
+        # 「此刻仍在册」的 bundle；剪除后即便在途刷新把该 bundle 观测回来，也会因 client 已被 pop /
+        # 世代已 bump 而在提交校验处失配（绝不复活）——剪除是**卫生**措施，不是唯一防线。
+        self._tool_list_cache = {bid: entry for bid, entry in self._tool_list_cache.items() if bid != bundle_id}
         return len(self._exposed_tools) != before
 
-    async def _arefresh_tool_mapping(self) -> bool:
-        """重建 ExposedToolMapping（**须持 ``_lock``**）：快照 → 构建新表 → 提交前世代校验 → 失配整轮重试。
+    async def _arefresh_tool_mapping(self, *, reuse_cached: bool) -> bool:
+        """重建 ExposedToolMapping（**自取锁**：``tool_refresh_lock`` → 状态锁两段）：快照 → 锁外 RPC/构建
+        → 提交前校验 → 失配整轮重试。
 
         Rebuild the shared ExposedToolMapping used by both ``available_tools`` and ``tool_call`` routing.
+
+        **两段临界区（#222，对齐 rust ``refresh_tool_routes``）**：① 状态锁内快照（活跃 client + 世代 +
+        配置 + 可复用缓存）；② **锁外**发起 ``list_tools`` 与纯 CPU 建表；③ 状态锁内校验 + 原子提交。
+        状态锁因此**不再跨越**任何 RPC（#208 明示的承重例外就此撤销，见类 docstring 第 2 条）。
+
+        ``reuse_cached``（调用点**必须显式二选一**，无缺省）：
+        - ``False`` = **全部强制重读**，用于「上游可能变了」（运行期 ``tools/list_changed`` / 服务
+          ``client:get_tools`` 前 / 显式刷新）。语义与今天逐字相同。
+        - ``True`` = **只重读缓存失效者**，用于「本地结构变了」（启动/更新/移除/停止提交）。复用判据 =
+          「缓存存在 ∧ 条目 client is 当前 client ∧ 条目世代 == 当前世代」；未失效者直接用缓存里的
+          **上游观测**重建投影（配置仍现读现算）⇒ 批量启动 N 个的 RPC 次数由 N(N+1)/2 收敛为 N。
+          **失效面**：无条目 / client 换代 / 世代前进（含 ABA）/ 上一次失败（失败即删条目 ⇒ 下轮必重读）。
 
         #197：返回**暴露工具投影是否真实变化** —— ``Computer`` 据此推进 ``capability_revision``。判据是含
         description / inputSchema / annotations / meta 的**全字段**投影指纹（拒绝 name-only 捷径，对齐
@@ -1568,84 +1626,138 @@ class MCPServerManager:
 
         #185：:meth:`clear_oauth` 的**零 await 快速段不取锁**，可在本方法 RPC 在途时并发撤回路由 /
         退役 client——若直接覆写活表，已撤回的路由会被陈旧快照**复活**。故：① 快照物化（list，
-        锁内 RPC 在途时 clear 对 ``_active_clients`` 的 pop 是就地变异，直接迭代活字典会 RuntimeError）；
+        在途时 clear 对 ``_active_clients`` 的 pop 是就地变异，直接迭代活字典会 RuntimeError）；
         ② 构建**新表**（不再原地 clear + 增量写，锁外读者只见旧表或新整表，与 Rust「原子换出」同构）；
-        ③ 提交前按「活跃 client 集合 + client 身份 + per-bundle 世代」校验快照一致性，失配则整轮重试
-        （Rust ``refresh_tool_routes`` 的 snapshot-validate-retry 同构）。重试**无界**（Rust 同为无界
-        ``continue``）：仅高频世代抖动（start/stop/clear 风暴）下多轮，最终一致；勿加 sleep——
-        抖动平息后一轮即收敛。
+        ③ 提交前按「活跃 client 集合 + client 身份 + per-bundle 世代 + **配置身份**」校验快照一致性，
+        失配则整轮重试（Rust ``refresh_tool_routes`` 的 snapshot-validate-retry 同构）。重试**无界**
+        （Rust 同为无界 ``continue``）：仅高频世代抖动（start/stop/clear 风暴）下多轮，最终一致；
+        勿加 sleep——抖动平息后一轮即收敛。**重试廉价**：已观测者留在本轮 ``resolved`` 里，不再重发 RPC。
+
+        配置身份校验的必要性（#222）：RPC 窗口无锁后，更新路径的配置写入可落在窗口内；缺这项校验，
+        本轮会把**旧配置**算出的投影提交回去，静默吞掉 alias / forbidden 变更。依据：``_servers_config``
+        的全部写点都是**替换对象**（从不原地改写）⇒ 身份比较即「配置未变」的充分判据。
+
+        ``tool_refresh_lock``（最外层）串行化整轮刷新，理由见类 docstring 第 4 条。
         """
-        while True:
-            snapshot: list[tuple[BUNDLE_ID, MCPClientProtocol, int]] = [
-                (
-                    bundle_id,
-                    client,
-                    self._active_client_generations.get(bundle_id, 0),
-                )
-                for bundle_id, client in self._active_clients.items()
-            ]
-            new_routes: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
-            # #197：本轮投影指纹 + list_tools 失败的 bundle（失败 bundle 不参与变化判定）
-            new_projection: dict[EXPOSED_TOOL_NAME, str] = {}
-            failed: set[BUNDLE_ID] = set()
-            for bundle_id, client, _generation in snapshot:
-                config = self._servers_config[bundle_id]
-                # #151 R1'：default_tool_meta.alias 天生病态（alias 是 per-tool 改名）→ 已忽略（见 _merged_tool_meta），
-                # 每次刷新各 server 各打一次响亮配置诊断（方案 d，与 no-double-open「不静默丢 + 配置诊断」同姿态；非协议错误码）。
-                # 跨 SDK：rust 侧同款 R1' 待以**同方案 d**跟修（否则 python 各以原始名暴露 / rust 塌名 = 双端分叉，向量测不出；
-                # #142 教训）——镜像 follow-up 追踪于 Epic #147。
-                if config.default_tool_meta is not None and config.default_tool_meta.alias:
-                    logger.warning(
-                        f"default_tool_meta.alias={config.default_tool_meta.alias!r}（bundle_id={bundle_id!r}）已忽略："
-                        f"alias 是 per-tool 改名，放 default 位会令该 server 所有工具塌成同名。"
-                        f"如需改名请在具体 tool_meta.<工具名> 内单独配 alias（Computer 本地诊断，非协议错误码）。",
-                    )
-                try:
-                    tools = await client.list_tools()
-                except Exception as e:
-                    logger.error(f"Error listing tools for bundle_id={bundle_id!r} (name={config.name!r}): {e}", exc_info=True)
-                    failed.add(bundle_id)  # #197：本轮无法判定该 bundle → 不参与投影比对（见提交块对称剔除）
-                    continue
-                for t in tools or []:
-                    original_tool_name = t.name
-                    # 合并后的工具元数据（具体 tool_meta 优先，回落 default_tool_meta）
-                    tool_meta = self._merged_tool_meta(config, original_tool_name)
-                    # alias 仅替换 exposed 的**工具名部分**（协议新语义，仍带 {bundle_id}__ 前缀）；无 alias 回退原始名
-                    tool_part = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
-                    # forbidden：按**原始名**或 **alias 后工具名**匹配（用户可用任一禁用）；命中即不暴露、不路由
-                    if original_tool_name in (config.forbidden_tools or []) or tool_part in (config.forbidden_tools or []):
-                        continue
-                    exposed = f"{bundle_id}__{tool_part}"
-                    if exposed in new_routes:
-                        # 同一 bundle_id 内 alias 撞名（跨 bundle_id 不可能撞）→ 保留首个 + 诊断，指导修正 alias
-                        logger.warning(
-                            f"exposed_tool_name 冲突（同 bundle_id={bundle_id!r} 内 alias 撞名）：'{exposed}'——保留首个、"
-                            f"跳过原始工具 '{original_tool_name}'；请修正 tool_meta.alias（Computer 本地诊断，非协议错误码）。",
+        async with self._tool_refresh_lock:
+            #: 本轮已确证的观测（命中缓存者与真读者同列），跨重试保留 ⇒ 重试不重发 RPC
+            resolved: dict[BUNDLE_ID, CachedToolList] = {}
+            while True:
+                # ① 快照（状态锁内，零 await ⇒ 与任何状态写入互不穿插）
+                async with self._lock:
+                    snapshot: list[tuple[BUNDLE_ID, MCPClientProtocol, int, MCPServerConfig]] = [
+                        (
+                            bundle_id,
+                            client,
+                            self._active_client_generations.get(bundle_id, 0),
+                            self._servers_config[bundle_id],
                         )
-                        continue
-                    new_routes[exposed] = (bundle_id, original_tool_name)
-                    new_projection[exposed] = _tool_projection_fingerprint(t)
-            # 提交前校验：活跃 client 集合 + 身份 + 世代是否与快照一致（clear 快速段 / stop / start
-            # 均会造成失配）→ 失配则整轮重试，绝不以陈旧快照覆写更新的投影
-            if len(self._active_clients) == len(snapshot) and all(
-                self._active_clients.get(bundle_id) is client and self._active_client_generations.get(bundle_id, 0) == generation
-                for bundle_id, client, generation in snapshot
-            ):
-                # #197：变化判定 —— 失败 bundle 在**旧侧**显式剔除（新侧天然不含：其 ``continue`` 跳过了
-                # 路由与指纹写入）。两侧都含失败 bundle 的条目时，「本次失败」会被读成「工具被移除」。
-                changed = new_projection != _projection_excluding_failed(self._tool_projection, failed)
-                # 投影提交时**保留失败 bundle 的携带条目**：否则「失败 → 恢复」会被判成一次变化，产生虚假
-                # revision。归属按 exposed 名前缀（不依赖路由表 —— 路由表本轮已被换成不含失败 bundle 的新表）。
-                merged_projection = dict(new_projection)
-                for _exposed, _fingerprint in self._tool_projection.items():
-                    if _exposed not in merged_projection and _exposed.startswith(tuple(f"{bundle}__" for bundle in failed)):
-                        merged_projection[_exposed] = _fingerprint
-                self._exposed_tools = new_routes
-                self._tool_projection = merged_projection
-                return changed
+                        for bundle_id, client in self._active_clients.items()
+                    ]
+                    cached: dict[BUNDLE_ID, CachedToolList | None] = (
+                        {bundle_id: self._tool_list_cache.get(bundle_id) for bundle_id, _c, _g, _cfg in snapshot}
+                        if reuse_cached
+                        else dict.fromkeys((bundle_id for bundle_id, _c, _g, _cfg in snapshot), None)
+                    )
+                # ② 锁外：确证观测（命中缓存 or 真读上游）
+                failed: set[BUNDLE_ID] = set()
+                for bundle_id, client, generation, config in snapshot:
+                    entry = resolved.get(bundle_id)
+                    if entry is None:
+                        hit = cached.get(bundle_id)
+                        if hit is not None and hit.client is client and hit.generation == generation:
+                            entry = hit
+                    if entry is None or entry.client is not client or entry.generation != generation:
+                        try:
+                            tools = await client.list_tools()
+                        except Exception as e:
+                            logger.error(f"Error listing tools for bundle_id={bundle_id!r} (name={config.name!r}): {e}", exc_info=True)
+                            # #197：本轮无法判定该 bundle → 不参与投影比对（见提交块的对称剔除）。
+                            # #222：**必须同拍删缓存**——留着旧观测会让下一次结构变更「命中缓存」而把**旧路由复活**，
+                            # 使失败不可见（违背「失败即摘路由、恢复须真读」）；删掉 ⇒ 任何下一次刷新都会重读它。
+                            # 本 pop 无 await（asyncio 单线程 ⇒ 与提交点的重绑定原子互斥），与撤回剪除同族。
+                            resolved.pop(bundle_id, None)
+                            self._tool_list_cache.pop(bundle_id, None)
+                            failed.add(bundle_id)
+                            continue
+                        entry = CachedToolList(client, generation, list(tools or []))
+                    resolved[bundle_id] = entry
+                # ③ 锁外纯 CPU：建新表（config 现读现算 ⇒ 缓存只跳 RPC、不跳语义）
+                new_routes, new_projection = self._build_exposed_tables(snapshot, resolved)
+                # ④ 状态锁内：校验 + 原子提交（失配 ⇒ 整轮重试）
+                async with self._lock:
+                    # 校验：活跃集合规模 + client 身份 + 世代 + **配置身份**（四项全真才提交）
+                    if len(self._active_clients) == len(snapshot) and all(
+                        self._active_clients.get(bundle_id) is client
+                        and self._active_client_generations.get(bundle_id, 0) == generation
+                        and self._servers_config.get(bundle_id) is config
+                        for bundle_id, client, generation, config in snapshot
+                    ):
+                        # #197：变化判定 —— 失败 bundle 在**旧侧**显式剔除（新侧天然不含：其 ``continue`` 跳过了
+                        # 路由与指纹写入）。两侧都含失败 bundle 的条目时，「本次失败」会被读成「工具被移除」。
+                        changed = new_projection != _projection_excluding_failed(self._tool_projection, failed)
+                        # 投影提交时**保留失败 bundle 的携带条目**：否则「失败 → 恢复」会被判成一次变化，产生虚假
+                        # revision。归属按 exposed 名前缀（不依赖路由表 —— 路由表本轮已被换成不含失败 bundle 的新表）。
+                        merged_projection = dict(new_projection)
+                        for _exposed, _fingerprint in self._tool_projection.items():
+                            if _exposed not in merged_projection and _exposed.startswith(tuple(f"{bundle}__" for bundle in failed)):
+                                merged_projection[_exposed] = _fingerprint
+                        self._exposed_tools = new_routes
+                        self._tool_projection = merged_projection
+                        # #222：缓存**只在经校验的提交点**重绑定，且只保留本快照内的观测（离场/失败者随之剪除）。
+                        # 这条纪律是「撤回不复活」的另一半：在途轮的迟到写入会被下一次校验挡在门外。
+                        self._tool_list_cache = dict(resolved)
+                        return changed
+
+    def _build_exposed_tables(
+        self,
+        snapshot: list[tuple[BUNDLE_ID, MCPClientProtocol, int, MCPServerConfig]],
+        resolved: dict[BUNDLE_ID, CachedToolList],
+    ) -> tuple[dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]], dict[EXPOSED_TOOL_NAME, str]]:
+        """由「快照配置 × 已确证工具观测」构建两张新表（**纯 CPU、不取锁、不发 RPC**）。
+
+        配置一律**现读快照值**（不缓存配置派生物）；缺观测者（本轮失败/未在册）自然缺席两张新表
+        —— 失败 bundle 的**携带条目**由提交块另行补齐（#197）。
+        """
+        new_routes: dict[EXPOSED_TOOL_NAME, tuple[BUNDLE_ID, TOOL_NAME]] = {}
+        new_projection: dict[EXPOSED_TOOL_NAME, str] = {}
+        for bundle_id, _client, _generation, config in snapshot:
+            entry = resolved.get(bundle_id)
+            if entry is None:
+                continue
+            # #151 R1'：default_tool_meta.alias 天生病态（alias 是 per-tool 改名）→ 已忽略（见 _merged_tool_meta），
+            # 每次刷新各 server 各打一次响亮配置诊断（方案 d，与 no-double-open「不静默丢 + 配置诊断」同姿态；非协议错误码）。
+            # 跨 SDK：rust 侧同款 R1' 待以**同方案 d**跟修（否则 python 各以原始名暴露 / rust 塌名 = 双端分叉，向量测不出；
+            # #142 教训）——镜像 follow-up 追踪于 Epic #147。
+            if config.default_tool_meta is not None and config.default_tool_meta.alias:
+                logger.warning(
+                    f"default_tool_meta.alias={config.default_tool_meta.alias!r}（bundle_id={bundle_id!r}）已忽略："
+                    f"alias 是 per-tool 改名，放 default 位会令该 server 所有工具塌成同名。"
+                    f"如需改名请在具体 tool_meta.<工具名> 内单独配 alias（Computer 本地诊断，非协议错误码）。",
+                )
+            for t in entry.tools:
+                original_tool_name = t.name
+                # 合并后的工具元数据（具体 tool_meta 优先，回落 default_tool_meta）
+                tool_meta = self._merged_tool_meta(config, original_tool_name)
+                # alias 仅替换 exposed 的**工具名部分**（协议新语义，仍带 {bundle_id}__ 前缀）；无 alias 回退原始名
+                tool_part = tool_meta.alias if tool_meta and tool_meta.alias else original_tool_name
+                # forbidden：按**原始名**或 **alias 后工具名**匹配（用户可用任一禁用）；命中即不暴露、不路由
+                if original_tool_name in (config.forbidden_tools or []) or tool_part in (config.forbidden_tools or []):
+                    continue
+                exposed = f"{bundle_id}__{tool_part}"
+                if exposed in new_routes:
+                    # 同一 bundle_id 内 alias 撞名（跨 bundle_id 不可能撞）→ 保留首个 + 诊断，指导修正 alias
+                    logger.warning(
+                        f"exposed_tool_name 冲突（同 bundle_id={bundle_id!r} 内 alias 撞名）：'{exposed}'——保留首个、"
+                        f"跳过原始工具 '{original_tool_name}'；请修正 tool_meta.alias（Computer 本地诊断，非协议错误码）。",
+                    )
+                    continue
+                new_routes[exposed] = (bundle_id, original_tool_name)
+                new_projection[exposed] = _tool_projection_fingerprint(t)
+        return new_routes, new_projection
 
     async def arefresh_tools(self) -> bool:
-        """公开的工具映射刷新入口：锁内重建 ExposedToolMapping（``_exposed_tools``）（#127）。
+        """公开的工具映射刷新入口：重建 ExposedToolMapping（``_exposed_tools``）（#127）。
 
         返回值 / Returns（#197）: 本次刷新的**暴露工具投影是否真实变化** —— ``Computer`` 据此推进
         ``capability_revision``（变化才推进，未变不产生虚假 revision）。既有调用方忽略返回值不受影响。
@@ -1657,13 +1769,15 @@ class MCPServerManager:
         **新增**工具不在映射中，``available_tools()`` 迭代映射键时永远漏掉它（``client:get_tools`` 看不到新工具）。
         本方法在 **安全上下文**（如 socketio ``on_get_tools`` 服务路径）被调用以刷新映射。
 
+        #222：本入口**恒全量重读**（``reuse_cached=False``）——「上游可能变了」的语义必须真读上游，
+        #127/#197 全链条（通知路径 + ``client:get_tools`` 服务前刷新）都依赖这一条；不要为省 RPC 把它降级。
+
         约束 / Constraint: **禁止**在 MCP ``ClientSession`` 的 ``message_handler`` 内联 ``await`` 本方法——
         其内部 ``list_tools()`` 会向同一会话发起请求，而接收循环正阻塞于 message_handler → **会话级重入死锁**
         （#127 探针实证 ``TimeoutError``）。变化侧仅应触发轻量 socketio emit，刷新交由服务侧安全上下文完成。
         MUST NOT be awaited inline inside an MCP ``message_handler`` (session-reentrant deadlock, see #127).
         """
-        async with self._lock:
-            return await self._arefresh_tool_mapping()
+        return await self._arefresh_tool_mapping(reuse_cached=False)
 
     async def avalidate_tool_call(self, tool_name: EXPOSED_TOOL_NAME, parameters: dict) -> tuple[BUNDLE_ID, TOOL_NAME]:
         """校验 ``exposed_tool_name`` 并经 ExposedToolMapping 解析到 ``(bundle_id, 原始工具名)``。

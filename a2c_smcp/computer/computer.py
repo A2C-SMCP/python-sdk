@@ -761,9 +761,10 @@ class Computer(BaseComputer[PromptSession]):
         #197 的 ``_arefresh_tool_projection`` 同姿态（不确定即不做，宁可漏一轮也不在半途状态上继续）。
 
         锁不变量 / Lock invariant: 资源路径**刻意**只走 manager 的不取锁 API（``list_windows`` /
-        ``list_skill_resources`` / ``read_resource`` 仅做 ``_active_clients`` 快照），而工具路径的
-        ``arefresh_tools`` 会**持锁跨 RPC**、``manager.aclose()`` 也取同一把锁 —— 两个后台任务之间因此
-        **没有锁边**，可安全并发。**禁止**把本方法改走持锁的 manager API，「统一」即造出真耦合。
+        ``list_skill_resources`` / ``read_resource`` 仅做 ``_active_clients`` 快照），而工具路径走
+        ``arefresh_tools``（#222 起：自取 ``tool_refresh_lock`` → 状态锁两段，``list_tools`` 在锁外）、
+        ``manager.aclose()`` 取状态锁 —— 两者没有共同的持锁窗口，两个后台任务因此**没有锁边**，可安全并发。
+        **禁止**把本方法改走持锁的 manager API：「统一」会让资源 RPC 落进状态锁，正是 #222 刚移除的反模式。
         """
         while True:
             windows_list = self._windows_list_dirty
