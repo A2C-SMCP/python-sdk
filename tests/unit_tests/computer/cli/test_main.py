@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import typer
@@ -58,6 +59,12 @@ class FakeComputer:
             "mcp_flag_config": mcp_flag_config,
             "flag_settings_path": flag_settings_path,
         }
+        # #208：记录 with_mcp_start_concurrency 的安装（缺省应为空 ⇒ 保持串行）
+        self.concurrency_calls: list[int] = []
+
+    def with_mcp_start_concurrency(self, max_concurrency: int) -> FakeComputer:
+        self.concurrency_calls.append(max_concurrency)
+        return self
 
     async def __aenter__(self) -> FakeComputer:
         return self
@@ -477,6 +484,8 @@ def test_run_cli_options_renamed_and_inputs_removed() -> None:
         assert "--config" not in opts, f"{name}: 旧 --config 未删"
         assert "--inputs" not in opts, f"{name}: --inputs 未删"
         assert "-i" not in opts, f"{name}: -i 未删"
+        # #208：并发策略入口 root + run **双声明**（同 --mcp-config 的既有形态）
+        assert "--concurrency" in opts, f"{name}: --concurrency 缺失"
 
 
 def test_root_level_mcp_config_reaches_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -980,6 +989,84 @@ async def test_start_stop_all_with_manager_initialized(monkeypatch: pytest.Monke
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
 
     await _interactive_loop(comp)
+
+
+def test_concurrency_flag_reaches_computer_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#208：``--concurrency N`` 必须在 ``boot_up``（``async with comp``）**之前**安装到 Computer。
+
+    只断言「参数被接收」是不够的——漏装则并发策略静默退化为串行（默认行为合法，故无报错），
+    且 ``--concurrency`` 只在构造后、boot 前这一个窗口可装（boot 之后再装会 fail-closed 抛错）。
+    """
+    monkeypatch.setattr(cli_main, "Computer", FakeComputer, raising=True)
+    monkeypatch.setattr(cli_main, "_interactive_loop", DummyInteractive.coro, raising=True)
+
+    cli_main._run_impl(
+        auto_connect=True,
+        auto_reconnect=True,
+        url=None,
+        namespace=None,
+        auth=None,
+        headers=None,
+        computer_factory=None,
+        mcp_config=None,
+        concurrency=5,
+    )
+
+    assert DummyInteractive.last_comp.concurrency_calls == [5], "--concurrency 须在 boot 前安装到 Computer"
+
+
+def test_concurrency_flag_absent_keeps_serial_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """缺省**不传** ``--concurrency`` → 不调用策略安装 ⇒ 保持既有逐项串行（行为不变）。"""
+    monkeypatch.setattr(cli_main, "Computer", FakeComputer, raising=True)
+    monkeypatch.setattr(cli_main, "_interactive_loop", DummyInteractive.coro, raising=True)
+
+    cli_main._run_impl(
+        auto_connect=True,
+        auto_reconnect=True,
+        url=None,
+        namespace=None,
+        auth=None,
+        headers=None,
+        computer_factory=None,
+        mcp_config=None,
+        concurrency=None,
+    )
+
+    assert DummyInteractive.last_comp.concurrency_calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_all_prints_per_item_receipts(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """#208：``start all`` 逐项回执——单项失败只体现在该项，不完全不截断其余项的回执。"""
+    from a2c_smcp.computer.mcp_clients.manager import StartOutcome
+
+    comp = Computer(name="test_main_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    await comp.boot_up()
+    assert comp.mcp_manager is not None
+    monkeypatch.setattr(
+        comp.mcp_manager,
+        "_servers_config",
+        {"a": MagicMock(disabled=False), "b": MagicMock(disabled=False), "c": MagicMock(disabled=False)},
+    )
+    calls: list[list[str]] = []
+
+    async def _fake_batch(ids: list[str]) -> list[StartOutcome]:
+        calls.append(list(ids))
+        return [StartOutcome("a", None), StartOutcome("b", RuntimeError("boom")), StartOutcome("c", None)]
+
+    monkeypatch.setattr(comp.mcp_manager, "astart_clients_batch", _fake_batch)
+
+    commands = ["start all", "exit"]
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(commands))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+
+    await _interactive_loop(comp)
+    out = capsys.readouterr().out
+
+    assert calls == [["a", "b", "c"]], "start all 须经统一批量 API 且覆盖全部未禁用项"
+    assert "a 已启动" in out and "c 已启动" in out, "成功项逐项回执"
+    assert "b 启动失败" in out and "boom" in out, "失败项逐项回执"
+    assert "1 个服务器启动失败" in out, "批次收敛后输出失败汇总"
 
 
 @pytest.mark.asyncio

@@ -193,6 +193,15 @@ def _root(
     approve_all_mcp: bool = typer.Option(
         False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
     ),
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help=(
+            "MCP 最大并发启动数（宿主运行时策略，不落盘；缺省不传 = 保持串行的既有行为，0 按 1 处理）。"
+            "约束单个启动 / `start all` / 治理恢复全路径。"
+            " / max concurrent MCP starts (runtime policy, not persisted; unset = serial as before, 0 → 1)"
+        ),
+    ),
 ) -> None:
     """
     根级入口：
@@ -224,6 +233,7 @@ def _root(
             mcp_config=mcp_config,
             approve_all_mcp=approve_all_mcp,
             settings_file=settings_file,
+            concurrency=concurrency if isinstance(concurrency, int) else None,
         )
 
 
@@ -270,6 +280,7 @@ def _run_impl(
     mcp_config: str | None,
     approve_all_mcp: bool = False,
     settings_file: str | None = None,
+    concurrency: int | None = None,
 ) -> None:
     """
     纯实现函数：不要在此处使用 Typer 的 Option 默认值，避免 OptionInfo 泄露到运行时。
@@ -315,6 +326,10 @@ def _run_impl(
             mcp_flag_config=flag_mcp_path,
             flag_settings_path=Path(settings_file) if isinstance(settings_file, str) else None,
         )
+        # #208：`--concurrency` 为宿主显式注入的运行时策略（不落盘；缺省不传 = 串行、行为不变）。
+        # 单启 / `start all` / 治理恢复共享该 Computer 级上限。须在 boot_up（`async with comp`）之前安装。
+        if isinstance(concurrency, int):
+            comp.with_mcp_start_concurrency(concurrency)
         async with comp:
             init_client: SMCPComputerClient | None = None
             init_connection: ConnectionArgs | None = None
@@ -382,6 +397,15 @@ def run(
     approve_all_mcp: bool = typer.Option(
         False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
     ),
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help=(
+            "MCP 最大并发启动数（宿主运行时策略，不落盘；缺省不传 = 保持串行的既有行为，0 按 1 处理）。"
+            "约束单个启动 / `start all` / 治理恢复全路径。"
+            " / max concurrent MCP starts (runtime policy, not persisted; unset = serial as before, 0 → 1)"
+        ),
+    ),
 ) -> None:
     """
     中文: 启动计算机并进入持续运行模式。servers 与 inputs 经 mcp.json 各 scope（含 ``--mcp-config`` flag 层）声明。
@@ -403,6 +427,7 @@ def run(
         mcp_config=mcp_config,
         approve_all_mcp=approve_all_mcp,
         settings_file=settings_file,
+        concurrency=concurrency if isinstance(concurrency, int) else None,
     )
 
 

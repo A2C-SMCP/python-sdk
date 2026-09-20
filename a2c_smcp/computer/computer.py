@@ -1208,6 +1208,7 @@ class Computer(BaseComputer[PromptSession]):
         *,
         plugin: str | None,
         marketplace: str | None,
+        start: bool = True,
     ) -> None:
         """物化 **raw 声明** 进 manager（#192 / §5.13：**不 eager render**——实际启动时经 materializer 从 raw 重解析）。
 
@@ -1229,7 +1230,7 @@ class Computer(BaseComputer[PromptSession]):
         previous = self._active_raw.get(bid)
         self._active_raw[bid] = entry
         try:
-            await self.mcp_manager.aadd_or_aupdate_server(raw_cfg)
+            await self.mcp_manager.aadd_or_aupdate_server(raw_cfg, start=start)
         except Exception:
             if self._active_raw.get(bid) is entry:
                 if previous is not None:
@@ -1262,6 +1263,7 @@ class Computer(BaseComputer[PromptSession]):
         session: PromptSession | None = None,
         plugin: str | None = None,
         marketplace: str | None = None,
+        start: bool = True,
     ) -> None:
         """**运行期挂载**一个 MCP server（渲染校验 → 物化，**不落盘**）/ Transient mount (no disk write)。
 
@@ -1275,11 +1277,14 @@ class Computer(BaseComputer[PromptSession]):
             session: Computer 管理 Session（交互式 input 解析用）。
             plugin / marketplace: plugin 实时挂载 D2 上下文（#69 Group A）；非 None 时 bundled server 的裸
                 ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None。
+            start: ``False`` = **只挂载不启动**（#208）。治理恢复需要「先挂完所有、再经统一批量启动器启动」
+                （与单启 / ``start all`` 共享同一并发上限）——故其 ``register_server`` 回调传 ``False``，
+                启动收在挂载循环之后。缺省 ``True`` = 既有「挂载并按 ``auto_connect`` 启动」语义不变。
         """
         # #192 / §5.13：mount 只做形状校验 + 登记 raw（**不解析 input**——实际启动经 materializer 从 raw 重解析，
         # 对齐 rust ``mount_server``）。
         raw_cfg = self._validate_raw_shape(server)
-        await self._amount_raw(raw_cfg, plugin=plugin, marketplace=marketplace)
+        await self._amount_raw(raw_cfg, plugin=plugin, marketplace=marketplace, start=start)
 
     async def aunmount_server_by_id(self, bundle_id: str) -> None:
         """按 **bundle_id** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by bundle_id。
@@ -2149,6 +2154,9 @@ class Computer(BaseComputer[PromptSession]):
 
         existing = set(existing_bundle_ids()) if existing_bundle_ids is not None else set()
         injected_roots: set[Path] = set()
+        # #208：重挂成功的 bundled server **只收集**，循环结束后经**统一批量启动器**一次启动——
+        # 与单启 / ``start all`` 共享同一 Computer 级并发上限，避免恢复路径绕过上限（对齐 rust）。
+        pending_starts: list[str] = []
         for record in collect_enabled_bundled_servers(
             home, declared, per_scope_layers=per_scope_layers, env=self._resolve_env(),
         ):
@@ -2192,6 +2200,8 @@ class Computer(BaseComputer[PromptSession]):
                 if inject_inputs is not None and record.install_path not in injected_roots:
                     await inject_inputs(record)
                     injected_roots.add(record.install_path)
+                # #208：``register_server`` 应为**纯挂载**（CLI 参考客户端传 ``start=False``）——启动
+                # 统一收在循环之后，故治理校验 / input 注入 / 挂载全部完成后才批量启动。
                 await register_server(record.config, record)
             except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
                 logger.warning(
@@ -2203,6 +2213,25 @@ class Computer(BaseComputer[PromptSession]):
                 continue
             existing.add(bundle_id)
             report.remounted_servers.append(bundle_id)
+            pending_starts.append(bundle_id)
+
+        # #208：治理校验、input 注入与挂载**全部完成后**，经统一批量启动器启动全部待启动 bundled
+        # server（共享 Computer 级并发上限；结构化并发，非逐项独立 spawn）。best-effort 语义不变：
+        # 失败仅 WARN、不阻断其余（与 register_server 失败降级铁律一致），report 不受启动结果影响。
+        #
+        # ⚠️ 仍受 ``auto_connect`` 约束（**非**无条件启动）：本改动只改「谁来启动、在哪一步启动」
+        # （收拢到统一批量驱动），不改「是否启动」。#208 前一经 ``register_server`` → ``amount_server``
+        # 的启动同样以 ``auto_connect`` 为条件，故此处必须同判——否则 ``auto_connect=False`` 的嵌入宿主
+        # （单测即此形态）会突然拉起真实 MCP 进程。
+        if pending_starts and self.mcp_manager is not None and self._auto_connect:
+            for outcome in await self.mcp_manager.astart_clients_batch(pending_starts):
+                if outcome.error is not None:
+                    logger.warning(
+                        "governance recovery: remounted server %r failed to start "
+                        "(non-blocking; stays pending): %s",
+                        outcome.bundle_id,
+                        outcome.error,
+                    )
         return report
 
     def list_mcp_servers_with_metadata(self) -> list[McpServerWithMetadata]:

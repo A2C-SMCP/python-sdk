@@ -520,13 +520,26 @@ async def test_run_governance_remount_wires_ownership_context(tmp_path: Path, mo
     async with Computer(name="t", skill_home=home) as comp:
         recorded: list[tuple[str, str | None, str | None]] = []
 
-        async def fake_register(server: Any, *, session: Any = None, plugin: str | None = None, marketplace: str | None = None) -> None:
+        starts: list[bool] = []
+
+        async def fake_register(
+            server: Any,
+            *,
+            session: Any = None,
+            plugin: str | None = None,
+            marketplace: str | None = None,
+            start: bool = True,
+        ) -> None:
             recorded.append((server.name, plugin, marketplace))
+            # #208：治理重挂回调必须**只挂载不启动**——启动统一收在挂载循环之后经批量启动器
+            # （共享 Computer 级并发上限）；此处把该契约钉住，防止回退成循环内融合启动。
+            starts.append(start)
 
         monkeypatch.setattr(comp, "amount_server", fake_register)  # #137 ③：治理重挂经 transient amount_server
         await plugin_cmd.run_governance_remount(comp)
 
         assert recorded == [(FIGMA_NAME, "audit", "acme")]
+        assert starts == [False]
 
 
 @pytest.mark.asyncio

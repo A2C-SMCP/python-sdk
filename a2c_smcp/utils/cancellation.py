@@ -27,8 +27,9 @@
 
 **装饰面判据**（避免后人反复重扫）：= **宿主可 await 的生命周期入口**，即
 ``Computer.boot_up`` / ``Computer.shutdown`` / ``MCPServerManager.aclose`` /
-``MCPServerManager.astart_all`` / ``astart_client`` / ``astop_all`` / ``astop_client``
-（CLI REPL 的 ``start``/``stop`` 命令直接 await 后四个）。**RPC 入口刻意不覆盖**（``aexecute_tool`` /
+``MCPServerManager.astart_all`` / ``astart_client`` / ``astart_clients_batch`` / ``astop_all`` /
+``astop_client``（CLI REPL 的 ``start``/``stop`` 命令直接 await 前若干个；``astart_clients_batch``
+为 #208 新增的批量启动入口）。**RPC 入口刻意不覆盖**（``aexecute_tool`` /
 ``aget_available_tools`` / ``get_desktop`` / ``get_resources`` 等）：它们经 ``async_session`` **懒连接**
 才触达同一状态机吞点，且 socketio 事件面对 ``CancelledError`` 没有处置约定——混进来会把「工具调用
 超时/取消」的语义与「生命周期取消」搅在一起。

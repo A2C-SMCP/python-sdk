@@ -265,6 +265,60 @@ async def test_start_entries_restore_swallowed_cancellation(
             await _force_teardown(client)
 
 
+@pytest.mark.asyncio
+async def test_concurrent_batch_converges_children_before_restoring_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#208：**并发**批量启动路径同样须还原被吞的取消，且**先收敛子任务**再上抛。
+
+    并发路径用 ``asyncio.wait``（**非** ``gather``：后者会把取消级联进子任务并弃置未 await 的子任务，
+    子任务可能停在半开的 transport 上）。故本用例同时钉两件事：
+    ① 最外层入口仍抛 ``CancelledError``（``wait_for`` 转 ``TimeoutError``）——取消可观测；
+    ② 取消后**没有孤儿子任务**（``asyncio.all_tasks()`` 不残留批量启动体）——收敛而非弃置。
+
+    若把驱动换成 ``gather``，「可观测」仍可能通过而「无孤儿」失真；若去掉收敛重抛，则①失真。
+    """
+    from a2c_smcp.computer.mcp_clients.stdio_client import StdioMCPClient
+
+    async def _slow_after_connect(_self: Any, _event: Any) -> None:
+        await asyncio.sleep(1.0)
+
+    monkeypatch.setattr(StdioMCPClient, "aafter_connect", _slow_after_connect)
+
+    def _named(suffix: str) -> StdioServerConfig:
+        return StdioServerConfig(
+            name=f"{_SERVER}-{suffix}",
+            server_parameters=StdioServerParameters(command=sys.executable, args=[str(_FIXTURE)]),
+            default_tool_meta=ToolMeta(auto_apply=True),
+        )
+
+    computer = Computer(
+        name="comp-208-concurrent-cancel",
+        mcp_servers={_named("a"), _named("b"), _named("c")},
+        skill_home=tmp_path / "home",
+        auto_connect=False,
+    )
+    await computer.boot_up()
+    assert computer.mcp_manager is not None
+    manager = computer.mcp_manager
+    # 配置并发上限 ⇒ 走结构化并发路径（未配置是串行路径，由 #211 既有用例覆盖）
+    manager.with_mcp_start_concurrency(3)
+    ids = manager.enabled_bundle_ids()
+    assert len(ids) == 3, "三台 server 均应已登记"
+
+    before = asyncio.all_tasks()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(manager.astart_clients_batch(ids), timeout=0.2)
+    finally:
+        for client in list(manager._active_clients.values()):
+            await _force_teardown(client)
+
+    # ② 无孤儿：取消后不得残留批量启动子任务（收敛 = 等子任务结算后才上抛）
+    leaked = [t for t in asyncio.all_tasks() - before if not t.done() and t is not asyncio.current_task()]
+    assert not leaked, f"取消后残留未结算子任务：{leaked}"
+
+
 @pytest.mark.anyio
 async def test_boot_up_restores_swallowed_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """#211：``boot_up()`` 内部经 client 状态机（其 ``process_context`` 按设计吞取消）→ 须还原取消信号。"""

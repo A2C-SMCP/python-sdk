@@ -444,7 +444,7 @@ class MCPServerManager:
         async with self._lock:
             await self._arefresh_tool_mapping()
 
-    async def _add_or_update_server_config(self, config: MCPServerConfig) -> None:
+    async def _add_or_update_server_config(self, config: MCPServerConfig, *, start: bool = True) -> None:
         """
         添加/更新服务器配置
 
@@ -456,6 +456,7 @@ class MCPServerManager:
 
         Args:
             config (MCPServerConfig): MCP服务器配置
+            start: ``False`` = 只登记不启动（治理恢复的 collect-then-batch；#208）。
         """
         bundle_id = resolve_bundle_id(config)
         action: str | None = None
@@ -467,7 +468,7 @@ class MCPServerManager:
                     if self._auto_reconnect:
                         # #192 / §5.13：**不预写**新 config——_arestart_server 先 materialize（失败旧配置/旧进程不动），
                         # 成功后才替换存储（运行中不热更新、失败不留下 raw/rendered 半态）。
-                        action = "restart"
+                        action = "restart" if start else None
                     else:
                         raise RuntimeError(
                             f"Server bundle_id={bundle_id!r} (name={config.name!r}) is active. Stop it before updating config",
@@ -481,12 +482,12 @@ class MCPServerManager:
                     # 运行时态（coordinator/flow/connect task），勿沿用旧 server_url/store。
                     if self._oauth_spec(config) is None and bundle_id in self._oauth_coordinators:
                         self._retire_oauth_bundle(bundle_id)
-                    if self._auto_connect:
+                    if self._auto_connect and start:
                         action = "start"
             else:
                 self._servers_config[bundle_id] = config
                 self._servers_config_raw[bundle_id] = config
-                if self._auto_connect:
+                if self._auto_connect and start:
                     action = "start"
         if action == "restart":
             await self._arestart_server(bundle_id, config)
@@ -508,13 +509,17 @@ class MCPServerManager:
                 f"create_oauth_flow/complete_oauth.",
             )
 
-    async def aadd_or_aupdate_server(self, config: MCPServerConfig) -> None:
+    async def aadd_or_aupdate_server(self, config: MCPServerConfig, *, start: bool = True) -> None:
         """添加或更新服务器配置。运行期同 ``bundle_id`` = **原地更新**（不算 no-double-open 冲突）。
 
         #208：启动动作在 :meth:`_add_or_update_server_config` 内部于**锁外**执行（门 + bundle 锁），
         故本入口不再包状态锁。
+
+        Args:
+            start: ``False`` = **只登记不启动**（#208 治理恢复的 collect-then-batch：调用方自行在
+                挂载全部完成后经 :meth:`astart_clients_batch` 统一启动）。缺省 ``True`` = 既有语义。
         """
-        await self._add_or_update_server_config(config)
+        await self._add_or_update_server_config(config, start=start)
         async with self._lock:
             await self._arefresh_tool_mapping()
 
@@ -684,9 +689,7 @@ class MCPServerManager:
         ``start_all_mcp_clients``）：不再「首错即停」——**全部项都会尝试启动**，批次收敛后返回
         **输入序的第一个失败**（无失败则不抛）。
         """
-        async with self._lock:
-            ids = [bid for bid, cfg in self._servers_config.items() if not cfg.disabled]
-        await self._araise_first_error(await self._astart_clients_batch_auto(ids))
+        await self._araise_first_error(await self._astart_clients_batch_auto(self.enabled_bundle_ids()))
 
     # #211：同上（CLI `start <target>`）；私有 `_astart_client` 保持裸奔 —— 它位于逐 client 循环内，
     # 在此层补抛才会中断循环。
@@ -1807,6 +1810,16 @@ class MCPServerManager:
         """
         self._start_gate.configure(max_concurrency)
         return self
+
+    def enabled_bundle_ids(self) -> list[BUNDLE_ID]:
+        """已挂载且**未禁用**的 bundle_id（按挂载顺序）——批量启动的输入面（#208）。
+
+        对齐 rust ``enabled_mcp_bundle_ids``：``start all`` 与治理恢复只迭代**已挂载** server，
+        不遍历声明面。纯读、无锁（调用方拿到的是一份新 list）。
+
+        / Mounted, non-disabled bundle ids in mount order — the batch-start input surface.
+        """
+        return [bid for bid, cfg in self._servers_config.items() if not cfg.disabled]
 
     def _bundle_lock(self, bundle_id: BUNDLE_ID) -> asyncio.Lock:
         """取该 bundle 的生命周期锁（惰性建档）。

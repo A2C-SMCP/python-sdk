@@ -100,7 +100,15 @@ def test_public_lifecycle_entries_are_decorated() -> None:
 
     required = {
         Computer: ("boot_up", "shutdown"),
-        MCPServerManager: ("aclose", "astart_all", "astart_client", "astop_all", "astop_client"),
+        # astart_clients_batch：#208 新增的宿主可 await 批量启动入口（与 astart_all 同级）。
+        MCPServerManager: (
+            "aclose",
+            "astart_all",
+            "astart_client",
+            "astart_clients_batch",
+            "astop_all",
+            "astop_client",
+        ),
     }
     missing = [
         f"{cls.__name__}.{name}"

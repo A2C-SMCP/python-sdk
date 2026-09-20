@@ -219,7 +219,9 @@ async def run_governance_remount(comp: Any, *, settings_flag_path: Path | None =
 
     async def _register(cfg: Any, record: Any) -> None:
         # #137 ③：治理重挂 = 投影（ledger 是真相），走 transient amount_server，不回写 mcp.json。
-        await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace)
+        # #208：``start=False`` —— 本回调**只挂载**；启动统一收在挂载循环之后，经批量启动器走同一
+        # Computer 级并发上限（否则 mount 与 start 仍在循环内融合，上限被前 N 个绕过）。
+        await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace, start=False)
         console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
 
     async def _inject(record: Any) -> None:

@@ -431,8 +431,25 @@ async def interactive_loop(
                     try:
                         if target == "all":
                             # `all` 是关键字而非 server 标识 → 先短路，不进解析。
-                            await comp.mcp_manager.astart_all()
-                            console.print("[green]✅ 所有服务器启动完成 / All servers started[/green]")
+                            # #208：经统一批量 API **逐项回执**（受 Computer 级并发上限约束）——单项失败只体现
+                            # 在该项、不中断其余；批次收敛后输出汇总。空集短路保持与今天逐字相同的单行输出。
+                            ids = comp.mcp_manager.enabled_bundle_ids()
+                            if not ids:
+                                console.print("[green]✅ 所有服务器启动完成 / All servers started[/green]")
+                            else:
+                                failed = 0
+                                for outcome in await comp.mcp_manager.astart_clients_batch(ids):
+                                    if outcome.error is None:
+                                        console.print(f"[green]✅ {outcome.bundle_id} 已启动 / started[/green]")
+                                    else:
+                                        failed += 1
+                                        console.print(f"[red]❌ {outcome.bundle_id} 启动失败: {outcome.error}[/red]")
+                                if failed == 0:
+                                    console.print("[green]✅ 所有服务器启动完成 / All servers started[/green]")
+                                else:
+                                    console.print(
+                                        f"[yellow]⚠️ {failed} 个服务器启动失败 / {failed} server(s) failed to start[/yellow]"
+                                    )
                         else:
                             bundle_id = _resolve_lifecycle_target(comp, target, verb="start", settings_flag_path=settings_flag_path)
                             if bundle_id is not None:
