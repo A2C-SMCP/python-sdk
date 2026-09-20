@@ -283,6 +283,14 @@ class Computer(BaseComputer[PromptSession]):
         # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
         # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
         self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
+        # #208：Computer 级 MCP 启动并发策略（宿主经 with_mcp_start_concurrency 安装；缺省 None = 保持既有
+        # 逐项串行）。**值存于 Computer、门建于 manager**——boot_up 每次新建 manager，故 boot 回滚的
+        # aclose()（会关闸）随 manager 一起废弃，重试拿全新门，不会把 Computer 永久关死。
+        self._mcp_start_concurrency: int | None = None
+        # #208：Input 解析**全局串行锁**——并发启动期间只允许一个交互请求在飞（对齐 rust
+        # mcp_input_resolve_lock；协议 §5.13 每次实际启动重解析 Input，交互式 resolver 不得并行
+        # 弹多个提示）。锁只覆盖一次 render，**不**覆盖 spawn（提示期间不持任何 manager 锁）。
+        self._mcp_input_lock = asyncio.Lock()
         self._confirm_callback = confirm_callback
         # 中文: 按需解析器与渲染器（惰性解析 inputs，保持配置不可变）
         # English: Lazy input resolver and renderer (on-demand inputs, keep config immutable)
@@ -501,13 +509,7 @@ class Computer(BaseComputer[PromptSession]):
         的实际启动经 manager materializer 从 raw 重解析；重解析失败（如 Missing input）发生在 ainitialize
         中途 → 回滚已启动 client 后上抛（#173 retry-safe 保持：无残留 manager/task/transport，补值后同实例重试成功）。
         """
-        self.mcp_manager = MCPServerManager(
-            auto_connect=self._auto_connect,
-            auto_reconnect=self._auto_reconnect,
-            message_handler=self._on_manager_change,
-            oauth_credential_store=self._oauth_credential_store,
-            materializer=self._materialize_for_start,
-        )
+        self.mcp_manager = self._new_manager()
         # #165 Gap A：读取 settings 用于嵌入模式下 embed server 的安全层判定。
         # _resolve_declared_settings 不依赖 _skill_home，在 boot 早期安全调用；容错：读不到则空。
         try:
@@ -1068,9 +1070,13 @@ class Computer(BaseComputer[PromptSession]):
         marketplace = entry.marketplace if entry is not None else None
         # 注入的自定义 resolver（如测试/嵌入宿主的 dict resolver）可能不继承 BaseInputResolver（无 session 属性）→ getattr 容错。
         session = getattr(self._input_resolver, "session", None)
-        _raw, rendered = await self._arender_and_validate_server(
-            raw, session=session, plugin=plugin, marketplace=marketplace
-        )
+        # #208：Input 解析串行化——并发启动期间**一次至多一个交互请求在飞**。锁只覆盖本次 render
+        # （提示期间的等待），**不**覆盖 spawn；幂等启动在 manager 侧早于本回调返回，故根本不进锁。
+        # 位置对齐 rust：rust 在 materialize 闭包内取 mcp_input_resolve_lock。
+        async with self._mcp_input_lock:
+            _raw, rendered = await self._arender_and_validate_server(
+                raw, session=session, plugin=plugin, marketplace=marketplace
+            )
         return rendered
 
     async def _arender_and_validate_server(
@@ -1212,13 +1218,7 @@ class Computer(BaseComputer[PromptSession]):
         ``_add_or_update`` 原地更新语义一致）。
         """
         if self.mcp_manager is None:
-            self.mcp_manager = MCPServerManager(
-                auto_connect=self._auto_connect,
-                auto_reconnect=self._auto_reconnect,
-                message_handler=self._on_manager_change,
-                oauth_credential_store=self._oauth_credential_store,
-                materializer=self._materialize_for_start,
-            )
+            self.mcp_manager = self._new_manager()
         bid = resolve_bundle_id(raw_cfg)
         # 先登记 raw（auto-connect start 的 materializer 需按 bundle_id 查 scope），manager add 失败则**恢复旧条目**
         # （transactional：attempted≠running 不变式——失败不留 map 漂移，且**不得销毁仍在运行的旧 raw**：
@@ -2323,6 +2323,45 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._oauth_credential_store = store
         return self
+
+    def with_mcp_start_concurrency(self, max_concurrency: int) -> "Computer":
+        """安装 Computer 级 **MCP 最大并发启动数**（构造期策略，builder，返回 self；#208）。
+
+        单个启动、批量启动（含 CLI ``start all``）与 Plugin 治理恢复**共享同一个** Computer 级控制器，
+        故任意时刻总在途启动事务数 ≤ 本值。**未配置**（缺省）= 保持既有行为：批量仍逐项串行、不新增并发。
+
+        对齐 rust ``Computer::with_mcp_start_concurrency``——属**宿主运行时策略**（下游 tfrobot-client
+        产品默认 5），不落盘、不成为用户配置。**Input 交互解析保持串行**（由 :attr:`_mcp_input_lock`
+        保证：并发启动期间一次至多一个交互请求在飞）。
+
+        须在 :meth:`boot_up` 之前调用（manager 构建时透传，与 :meth:`with_oauth_credential_store` 同约定）；
+        若 manager 已存在（``amount_server`` 惰性建台 / 已 boot），则直接透传——此时若已有启动尝试，
+        会 fail-closed 抛 ``RuntimeError``（运行期换门会让已排队者脱离新上限）。
+
+        Args:
+            max_concurrency: 最大并发启动数；``0`` 按 ``1`` 处理。
+
+        Returns:
+            Computer: self（链式调用）。
+        """
+        self._mcp_start_concurrency = max_concurrency
+        if self.mcp_manager is not None:
+            self.mcp_manager.with_mcp_start_concurrency(max_concurrency)
+        return self
+
+    def _new_manager(self) -> MCPServerManager:
+        """构建 MCP 管理器（boot 与惰性建台的**单一构造点**；#208 起透传并发策略）。
+
+        / The single construction site for the manager; threads the #208 concurrency policy through.
+        """
+        return MCPServerManager(
+            auto_connect=self._auto_connect,
+            auto_reconnect=self._auto_reconnect,
+            message_handler=self._on_manager_change,
+            oauth_credential_store=self._oauth_credential_store,
+            materializer=self._materialize_for_start,
+            mcp_start_concurrency=self._mcp_start_concurrency,
+        )
 
     async def oauth_status(self, bundle_id: str) -> OAuthStatus:
         """查询指定 MCP Server 的 OAuth 授权状态 / Query a server's OAuth authorization status.
