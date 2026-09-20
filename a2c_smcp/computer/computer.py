@@ -2364,8 +2364,11 @@ class Computer(BaseComputer[PromptSession]):
         保证：并发启动期间一次至多一个交互请求在飞）。
 
         须在 :meth:`boot_up` 之前调用（manager 构建时透传，与 :meth:`with_oauth_credential_store` 同约定）；
-        若 manager 已存在（``amount_server`` 惰性建台 / 已 boot），则直接透传——此时若已有启动尝试，
+        若 manager 已存在（``amount_server`` 惰性建台 / 已 boot），则直接透传——此时若已有**任何取门尝试**
+        （启动、批量启动、restart，**以及挂载/更新**——#208 起更新路径为与启动事务全序化而同过门），
         会 fail-closed 抛 ``RuntimeError``（运行期换门会让已排队者脱离新上限）。
+        故标准流程是「先装策略，再 boot_up」；惰性建台（未 boot 先 mount）会锁死构造期，
+        之后想改并发上限请重建 Computer/manager。
 
         Args:
             max_concurrency: 最大并发启动数；``0`` 按 ``1`` 处理。

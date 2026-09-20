@@ -437,11 +437,12 @@ async def test_update_during_start_does_not_get_overwritten_by_stale_render(harn
 
 @pytest.mark.asyncio
 async def test_disabled_declaration_never_gets_spawned(harness: Harness) -> None:
-    """隔离审查 🔴-A：**禁用声明永不得被启动**——重试/更新路径都不得绕过 ``disabled`` 校验。
+    """隔离审查 🔴-A：**禁用声明永不得被启动**——单启 / 批量 / `start all` 三入口一致。
 
-    原先重试分支只重读 raw、重渲染，**没复跑 phase A 的 disabled 校验** ⇒ 启动事务在渲染窗口内
-    遇上「宿主把该 bundle 改为 disabled」就会 spawn 出**禁用却运行**的进程（`start all` 面又看不到它，
-    工具还会进 `_exposed_tools`）。本用例把「禁用 ⇒ 不 spawn」钉死。
+    原先重试分支只重读 raw、重渲染，**没复跑 phase A 的 disabled 校验**，可 spawn 出**禁用却运行**的
+    进程（`start all` 面又看不到它，工具还会进 `_exposed_tools`）。根治取结构性修法：更新路径与启动
+    事务全序化 ⇒ 该重试分支如今**不可达**，且 phase A（含 disabled 校验）已移进重试循环内双保险。
+    本用例覆盖的是**入口面**不变量（不是重试分支）。
     """
     manager = MCPServerManager()
     ids = await _register(manager, [_cfg("s0")])

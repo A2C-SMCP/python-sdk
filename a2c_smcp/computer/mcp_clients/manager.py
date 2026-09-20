@@ -336,7 +336,7 @@ class MCPServerManager:
         # ``aclose()``（会关闸）随 manager 一起废弃，重试拿到全新门——不会把 Computer 永久关死。
         self._start_gate = McpStartGate(mcp_start_concurrency)
         # #208：per-bundle 生命周期锁——覆盖该 bundle 的**完整启动事务**（materialize → spawn → commit），
-        # 并被 _astop_client / aremove_server / _arestart_server 同键获取。作用 = 结构性排除
+        # 并被 _astop_client / aremove_server / _arestart_server / 更新路径 同键获取。作用 = 结构性排除
         # 「同 bundle 双开（两个进程）」与「启动中移除/停止后被复活」，无需 epoch 补偿。
         # ⚠️ 本表**绝不**由 _clear_all 清理：中途换表会让「持锁者 A」与「新取锁者 B」并存，
         # 双开静默复开。换表只发生在 ainitialize（先 drain 再换，见该方法的「新一代」语义）。
@@ -461,8 +461,8 @@ class MCPServerManager:
         如果已存在，检查是否已经建立客户端连接，如果是，检查是否需要自动重连
         如果不存在，直接添加配置
 
-        #208：**决策与动作同持门 + per-bundle 锁**（由 :meth:`astart_client` / :meth:`_arestart_server`
-        内部转发到 ``_locked`` 变体，不在本层二次取锁）。这一点是承重的——若决策只取状态锁，
+        #208：**决策与动作同持门 + per-bundle 锁**（两个动作分别由 :meth:`_arestart_server` /
+        :meth:`_astart_client_auto_locked` 执行，均不在本层二次取锁）。这一点是承重的——若决策只取状态锁，
         决策与动作之间就会对在途启动事务敞开窗口，产生「更新被旧配置覆盖 / 进程仍是旧配置而两店是新配置 /
         restart 写回 clobber 并发更新」整族静默错误（隔离审查 🔴-A/🔴-B/🟡-C）。同持锁后，
         更新与同 bundle 的启动/重启/停止/移除**全序化**。
@@ -486,7 +486,7 @@ class MCPServerManager:
             async with self._bundle_lock(bundle_id):
                 action = await self._adecide_add_or_update(config, bundle_id, start=start)
                 if action == "restart":
-                    await self._arestart_server_locked(bundle_id, config)
+                    await self._arestart_server(bundle_id, config)
                 elif action == "start":
                     await self._astart_client_auto_locked(bundle_id)
 
@@ -600,20 +600,12 @@ class MCPServerManager:
         旧进程与旧配置**不动**（尽量保留仍在运行的旧进程）；成功后才 stop 旧 → 以新 rendered spawn
         （不二次 materialize，command 不会重复执行）。
 
-        #208：与单启同门同锁（rust ``restart_mcp_client`` 同样过 gate → per-bundle lock），
-        故 restart 不得游离于 Computer 级上限之外。
-        """
-        async with await self._start_gate.acquire():
-            async with self._bundle_lock(bundle_id):
-                await self._arestart_server_locked(bundle_id, config)
+        #208 锁层次：与单启同门同锁（rust ``restart_mcp_client`` 同样过 gate → per-bundle lock），故 restart
+        不游离于 Computer 级上限之外。**本方法须已持门许可 + 该 bundle 的生命周期锁**——唯一调用方是
+        :meth:`_add_or_update_server_config`，它在同一对锁下「先决策、再 restart」，使 restart 的写回
+        不会覆盖并发更新（隔离审查 🟡-C）。
 
-    async def _arestart_server_locked(self, bundle_id: BUNDLE_ID, config: MCPServerConfig) -> None:
-        """重启主体。**须已持门许可 + 该 bundle 的生命周期锁**（由调用方获取；#208）。
-
-        与 :meth:`_astart_client_locked` 同理由：让更新路径能在同一对锁下「先决策、再 restart」，
-        避免 restart 的写回覆盖并发更新（隔离审查 🟡-C：C 的更新被 A 的 restart 写回静默丢弃）。
-
-        ⚠️ 不可重入：持锁调用方不得再经 :meth:`_arestart_server`。
+        ⚠️ 不可重入：持锁调用方不得让本方法再自行取锁。
         """
         if config.disabled:
             # 停用配置：仅停止旧进程（对齐 rust disabled → stop，不 materialize），两店存新声明供状态面读取。
