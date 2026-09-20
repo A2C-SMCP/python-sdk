@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from mcp.types import CallToolResult
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
@@ -145,7 +146,7 @@ async def test_emit_tool_call_timeout_sends_cancel(mock_call: AsyncMock, mock_em
     中文：工具调用超时触发取消请求并返回错误结果。
     English: Tool call timeout triggers cancel and returns error result.
     """
-    mock_call.side_effect = TimeoutError("Timeout")
+    mock_call.side_effect = SioTimeoutError("Timeout")
 
     res = await client.emit_tool_call("comp-1", "echo", {"text": "hi"}, timeout=1)
 

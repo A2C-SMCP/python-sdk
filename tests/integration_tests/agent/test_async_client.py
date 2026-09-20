@@ -20,6 +20,7 @@ from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.types import AsyncAgentEventHandler
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_NOTIFICATION,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     SMCP_NAMESPACE,
@@ -183,6 +184,70 @@ async def test_agent_tool_call_roundtrip(socketio_server, basic_server_port: int
     assert isinstance(res, CallToolResult)
     assert not res.isError
     assert any(isinstance(c, TextContent) and c.text == "ok" for c in res.content)
+
+    await agent.disconnect()
+    await computer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_call_real_timeout_reaches_timeout_arm(socketio_server, basic_server_port: int):
+    """真实链路上的 ack 等待超时必须落进超时兜底臂：广播取消 + 结果级 ``meta.a2c_timeout``。
+
+    ⚠️ 本用例锁的是一个**只有真 wire 才暴露**的缺陷：python-socketio 在 ``Client.call`` 超时时抛的
+    ``socketio.exceptions.TimeoutError`` **不是** builtin ``TimeoutError`` 的子类，故只写
+    ``except TimeoutError`` 的实现会让超时臂在生产上**永不可达** —— 自身超时被 ``except Exception``
+    接走，既不广播取消也不标超时（协议 error-handling.md §Agent 端超时要求两者都做）。
+    用 mock 传 builtin 异常抬桩的用例抓不到它（曾长期假绿），必须由真实 server + 真实计时器触发。
+
+    / A real-wire lock for the timeout arm: socketio's TimeoutError is not a builtin subclass, so only
+    a genuine transport timeout exercises this path.
+    """
+    computer = AsyncClient()
+    cancels: list[dict] = []
+
+    @computer.on(TOOL_CALL_EVENT, namespace=SMCP_NAMESPACE)
+    async def _on_tool_call(data: dict) -> dict:
+        # 故意远超 Agent 的 timeout 且不回 ack ⇒ 由 Agent 自身 socketio 计时器超时。
+        # Deliberately never acks in time, so the Agent's own socketio timer fires.
+        await asyncio.sleep(10)
+        return CallToolResult(isError=False, content=[TextContent(type="text", text="late")]).model_dump(mode="json")
+
+    @computer.on(CANCEL_TOOL_CALL_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_cancel(data: dict) -> None:
+        cancels.append(data)
+
+    handler = _EH()
+    office_id = "office-timeout"
+    auth = DefaultAgentAuthProvider(agent_id="robot-timeout", office_id=office_id)
+    agent = AsyncSMCPAgentClient(auth_provider=auth, event_handler=handler)
+
+    await agent.connect_to_server(
+        f"http://localhost:{basic_server_port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    await agent.join_office(office_id=office_id, agent_name="robot-timeout", namespace=SMCP_NAMESPACE)
+
+    await computer.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    await _join_office(computer, role="computer", office_id=office_id, name="comp-timeout")
+    await asyncio.sleep(0.3)
+
+    res = await agent.emit_tool_call(computer="comp-timeout", tool_name="echo", params={"text": "hi"}, timeout=1)
+
+    # 超时臂必须被触达：如实标 a2c_timeout（而非空消息的普通失败），且已广播取消。
+    assert res.isError is True
+    assert res.meta == {"a2c_timeout": True}, f"超时臂未触达 / timeout arm not reached: {res.meta}"
+    assert "工具调用超时" in res.content[0].text  # type: ignore[union-attr]
+    # 取消广播是 fire-and-forget，给 Server 广播留一拍。
+    for _ in range(30):
+        if cancels:
+            break
+        await asyncio.sleep(0.1)
+    assert cancels, "超时必须广播 server:tool_call_cancel / timeout must broadcast a cancel"
 
     await agent.disconnect()
     await computer.disconnect()

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from mcp.types import CallToolResult
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.errors import SMCPProtocolError
@@ -133,7 +134,7 @@ class TestSMCPAgentClient:
         """测试工具调用超时 / Test tool call timeout"""
         # 模拟超时异常
         # Mock timeout exception
-        mock_call.side_effect = TimeoutError("Timeout")
+        mock_call.side_effect = SioTimeoutError("Timeout")
 
         result = client.emit_tool_call(
             computer="test_computer",

@@ -16,19 +16,28 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+from socketio import AsyncClient
 
-from a2c_smcp.agent import AsyncSMCPAgentClient, DefaultAgentAuthProvider
+from a2c_smcp import PROTOCOL_VERSION
+from a2c_smcp.agent import (
+    AsyncSMCPAgentClient,
+    DefaultAgentAuthProvider,
+    ToolCallOutcome,
+    classify_tool_call_outcome,
+)
 from a2c_smcp.agent.types import AsyncAgentEventHandler
 from a2c_smcp.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
+    CANCEL_TOOL_CALL_NOTIFICATION,
     JOIN_OFFICE_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
@@ -471,6 +480,277 @@ async def test_async_integration_agent_cancel_inflight_tool_call(
         if computer_client.connected:
             await computer_client.leave_office(office_id)
         await computer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_integration_agent_cancel_signal_interrupts_inflight_tool_call(
+    async_integration_socketio_server,
+    async_integration_server_port: int,
+    tmp_path: Path,
+):
+    """#209 真中断：宿主把取消信号交给 ``emit_tool_call`` → 在途调用被中断，终态**由 ack 如实透出**。
+
+    协议 events.md §server:tool_call_cancel「Agent 侧主动取消的终态来源」：
+    (a) 仅投递信号、继续等原 ack（不本地提早返回）；(b) 不冒充 Computer（不本地合成取消标记）；
+    (c) 按 ack 结果级 ``meta`` 分类透出。
+
+    #209 real interruption: the host hands a cancel signal to ``emit_tool_call``; the in-flight call is
+    interrupted and the terminal state is taken verbatim from the ack (classified as CANCELLED).
+    """
+    agent_id = "async-integration-office-cancel-signal"
+    office_id = agent_id
+    server_url = f"http://127.0.0.1:{async_integration_server_port}"
+
+    server_name = "e2e-async-integration-server-cancel-signal"
+    mcp_config = _create_mcp_config(
+        server_name,
+        "tests/integration_tests/computer/mcp_servers/resources_subscribe_stdio_server.py",
+    )
+    # 完成标记：slow_echo 仅在「跑完」时写此文件；若远端被 notifications/cancelled 中断则永不写。
+    # Completion marker: written only if slow_echo runs to completion; never written if interrupted.
+    marker = tmp_path / "slow_echo_done.marker"
+    mcp_config["server_parameters"]["env"] = {**os.environ, "A2C_TEST_SLOW_ECHO_MARKER": str(marker)}
+    stdio_config = StdioServerConfig(**mcp_config)
+
+    computer = Computer(name="test", mcp_servers={stdio_config}, auto_connect=True)
+    computer_client = SMCPComputerClient(computer=computer)
+
+    auth_provider = DefaultAgentAuthProvider(agent_id=agent_id, office_id=office_id)
+    event_handler = MockAsyncEventHandler()
+    agent_client = AsyncSMCPAgentClient(auth_provider=auth_provider, event_handler=event_handler)
+
+    # 宿主形态的取消信号：仅需 ``is_set()``；由**另一线程**置位（TFRS 内核的真实形态）。
+    # Host-shaped cancel signal: only ``is_set()`` is required; fired from **another thread**.
+    cancel_signal = threading.Event()
+    timer = threading.Timer(1.0, cancel_signal.set)
+
+    try:
+        await agent_client.connect_to_server(server_url)
+        await asyncio.sleep(0.2)
+        await agent_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "name": agent_id, "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        await asyncio.sleep(0.3)
+
+        await computer.boot_up()
+        await computer_client.connect(
+            server_url,
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+            transports=["polling"],
+        )
+        await computer_client.join_office(office_id)
+        await asyncio.sleep(1.0)
+
+        assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
+        computer_sid, _tools = event_handler.tools_received_events[0]
+
+        slow_delay = 5.0
+        timer.start()
+        t0 = time.time()
+        # 走公开入口（req_id 由 SDK 内部铸造、不外露）—— 这正是 TFRS-502 唯一支持路径。
+        # Through the public entry (req_id minted internally, never exposed) — TFRS-502's only supported path.
+        result = await agent_client.emit_tool_call(
+            computer_sid,
+            f"{server_name}__slow_echo",
+            {"delay": slow_delay},
+            timeout=15,
+            cancel=cancel_signal,
+        )
+        elapsed = time.time() - t0
+
+        # (a) 原 ack 在远小于原 delay 内 resolve —— Computer 收到 cancel 沿原 ack 通路即时回复。
+        assert elapsed < slow_delay - 1.0, f"取消未中断在途调用（耗时 {elapsed:.2f}s）/ cancel did not interrupt"
+        # (b)+(c) 终态由 ack 决定：Computer 成功中断 ⇒ 结果级 a2c_cancelled，分类为 CANCELLED。
+        assert result.isError is True, f"期望取消态 isError / expected cancelled isError, got: {result}"
+        assert result.meta is not None and result.meta.get("a2c_cancelled") is True
+        assert classify_tool_call_outcome(result) is ToolCallOutcome.CANCELLED
+
+        # Computer 历史末条应记录失败（被中断）且 error 标为 cancelled。
+        assert await _wait_until(lambda: len(computer._tool_call_history) >= 1, timeout=3)
+        assert computer._tool_call_history[-1]["success"] is False
+        assert computer._tool_call_history[-1]["error"] == "cancelled"
+
+        # 远端真被中断的证明：等过原始 delay 窗口，完成标记仍缺席。
+        # Proof of real remote interruption: wait past the delay window; the completion marker stays absent.
+        await asyncio.sleep(max(0.0, (slow_delay + 1.5) - (time.time() - t0)))
+        assert not marker.exists(), "远端 slow_echo 未被中断：完成标记已写 / remote slow_echo NOT interrupted"
+
+    finally:
+        timer.cancel()
+        await agent_client.disconnect()
+        await asyncio.sleep(0.2)
+        if computer_client.connected:
+            await computer_client.leave_office(office_id)
+        await computer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_integration_agent_cancel_signal_never_set_leaves_result_untouched(
+    async_integration_socketio_server,
+    async_integration_server_port: int,
+    tmp_path: Path,
+):
+    """#209 未中断：信号**从不**置位 ⇒ 终态按实际返回，Agent **不做任何改写**。
+
+    #209 no interruption: a signal that is never set must leave the terminal state entirely to the ack.
+    """
+    agent_id = "async-integration-office-no-cancel"
+    office_id = agent_id
+    server_url = f"http://127.0.0.1:{async_integration_server_port}"
+
+    server_name = "e2e-async-integration-server-no-cancel"
+    mcp_config = _create_mcp_config(
+        server_name,
+        "tests/integration_tests/computer/mcp_servers/resources_subscribe_stdio_server.py",
+    )
+    stdio_config = StdioServerConfig(**mcp_config)
+
+    computer = Computer(name="test", mcp_servers={stdio_config}, auto_connect=True)
+    computer_client = SMCPComputerClient(computer=computer)
+
+    auth_provider = DefaultAgentAuthProvider(agent_id=agent_id, office_id=office_id)
+    event_handler = MockAsyncEventHandler()
+    agent_client = AsyncSMCPAgentClient(auth_provider=auth_provider, event_handler=event_handler)
+
+    cancel_signal = threading.Event()  # 永不置位 / never set
+
+    try:
+        await agent_client.connect_to_server(server_url)
+        await asyncio.sleep(0.2)
+        await agent_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "name": agent_id, "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        await asyncio.sleep(0.3)
+
+        await computer.boot_up()
+        await computer_client.connect(
+            server_url,
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+            transports=["polling"],
+        )
+        await computer_client.join_office(office_id)
+        await asyncio.sleep(1.0)
+
+        assert await _wait_until(lambda: len(event_handler.tools_received_events) >= 1, timeout=5)
+        computer_sid, _tools = event_handler.tools_received_events[0]
+
+        result = await agent_client.emit_tool_call(
+            computer_sid,
+            f"{server_name}__slow_echo",
+            {"delay": 0.2},
+            timeout=15,
+            cancel=cancel_signal,
+        )
+
+        assert result.isError is not True, f"未中断应按实际返回成功 / expected success, got: {result}"
+        # Computer 会随结果附带无关的 ``a2c_tool_meta``（工具元数据），故只断言**终态标记**缺席。
+        # The Computer attaches an unrelated ``a2c_tool_meta`` block, so assert on the terminal markers only.
+        meta = result.meta or {}
+        assert "a2c_cancelled" not in meta and "a2c_timeout" not in meta, (
+            f"未中断不得产生取消/超时标记 / no terminal marker expected, got: {meta}"
+        )
+        assert classify_tool_call_outcome(result) is ToolCallOutcome.COMPLETED
+
+    finally:
+        await agent_client.disconnect()
+        await asyncio.sleep(0.2)
+        if computer_client.connected:
+            await computer_client.leave_office(office_id)
+        await computer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_integration_cancel_signal_set_never_rewrites_terminal_state(
+    async_integration_socketio_server,
+    async_integration_server_port: int,
+):
+    """#209 「已发出取消信号」**不是**「已取消」的充分条件。
+
+    信号在调用**进入前**即已置位（必然投递一次取消广播），但目标 Computer 不存在 ⇒ 该次调用永远
+    无人中断。协议要求：终态按实际情况返回（协议级错误），**MUST NOT** 依据「本端已发出取消信号」
+    改写终态，尤其 **MUST NOT** 本地合成 ``a2c_cancelled``。
+
+    #209 "cancel requested" is not "cancelled": the terminal state must follow the ack, never the
+    fact that this side emitted a cancel — and the Agent must never synthesize ``a2c_cancelled``.
+    """
+    agent_id = "async-integration-office-cancel-unconfirmed"
+    office_id = agent_id
+    server_url = f"http://127.0.0.1:{async_integration_server_port}"
+
+    auth_provider = DefaultAgentAuthProvider(agent_id=agent_id, office_id=office_id)
+    agent_client = AsyncSMCPAgentClient(auth_provider=auth_provider, event_handler=MockAsyncEventHandler())
+
+    cancel_signal = threading.Event()
+    cancel_signal.set()  # 进入前已置位：watcher 必然投递一次取消 / pre-set: a cancel is definitely broadcast
+
+    # **正对照**：同房间的旁观会话须真收到 notify:tool_call_cancel —— 否则「终态未被改写」可能只是因为
+    # 取消根本没发出去（弱断言「只断言不存在」的经典陷阱）。
+    # Positive control: a same-office spectator must actually receive notify:tool_call_cancel.
+    spectator = AsyncClient()
+    observed_cancels: list[dict] = []
+
+    @spectator.on(CANCEL_TOOL_CALL_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_cancel(data: dict) -> None:
+        observed_cancels.append(data)
+
+    try:
+        await agent_client.connect_to_server(server_url)
+        await asyncio.sleep(0.2)
+        await agent_client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "name": agent_id, "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        await asyncio.sleep(0.3)
+
+        # 旁观者以 computer 身份入同一房间（裸客户端须显式携带 a2c_version）。
+        await spectator.connect(
+            f"{server_url}?a2c_version={PROTOCOL_VERSION}",
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+            transports=["polling"],
+        )
+        await spectator.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "name": "spectator", "office_id": office_id},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        await asyncio.sleep(0.3)
+
+        # 目标 Computer 不存在 ⇒ 协议级错误（非取消）；取消广播命中不到任何在途调用、被静默忽略。
+        result = await agent_client.emit_tool_call(
+            "no-such-computer",
+            "some__tool",
+            {},
+            timeout=5,
+            cancel=cancel_signal,
+        )
+
+        assert result.isError is True
+        assert result.meta is None or "a2c_cancelled" not in result.meta, "Agent MUST NOT 本地合成取消标记"
+        assert classify_tool_call_outcome(result) is ToolCallOutcome.FAILED, "终态不得被「已发取消」改写"
+
+        # 正对照：取消**确已投递**（否则上面的「未被改写」是空转断言）。
+        for _ in range(30):
+            if observed_cancels:
+                break
+            await asyncio.sleep(0.1)
+        assert observed_cancels, "取消未被投递：上面的「未被改写」断言失去意义 / cancel was never delivered"
+
+    finally:
+        if spectator.connected:
+            await spectator.disconnect()
+        await agent_client.disconnect()
 
 
 @pytest.mark.asyncio

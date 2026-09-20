@@ -17,12 +17,12 @@ from socketio import AsyncClient
 
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent import _blob_sideband as _sb
+from a2c_smcp.agent._cancel import CancelSendGate
 from a2c_smcp.agent.auth import AgentAuthProvider
-from a2c_smcp.agent.base import BaseAgentClient
+from a2c_smcp.agent.base import TOOL_CALL_TIMEOUT_ERRORS, BaseAgentClient
 from a2c_smcp.agent.errors import SMCPProtocolError, raise_for_error_payload
-from a2c_smcp.agent.types import AsyncAgentEventHandler
+from a2c_smcp.agent.types import AsyncAgentEventHandler, CancelSignal
 from a2c_smcp.smcp import (
-    CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
     GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
@@ -41,7 +41,6 @@ from a2c_smcp.smcp import (
     UPDATE_DESKTOP_NOTIFICATION,
     UPDATE_SKILLS_NOTIFICATION,
     UPDATE_TOOL_LIST_NOTIFICATION,
-    AgentCallData,
     EnterOfficeNotification,
     EnterOfficeReq,
     GetBlobRet,
@@ -228,10 +227,41 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             raise build_protocol_version_error(payload) from e
         logger.info("Connected to SMCP server successfully")
 
-    async def emit_tool_call(self, computer: str, tool_name: str, params: dict, timeout: int) -> CallToolResult:
+    async def emit_tool_call(
+        self,
+        computer: str,
+        tool_name: str,
+        params: dict,
+        timeout: int,
+        cancel: CancelSignal | None = None,
+    ) -> CallToolResult:
         """
         异步发起SMCP工具调用
         Async initiate SMCP tool call
+
+        #209 取消入口 / Cancel entry (#209):
+            宿主传入 ``cancel`` 即可中断一次**在途**工具调用（如用户点「停止」）。语义由协议
+            `events.md §server:tool_call_cancel`（protocol#58 / PR#60）冻结：
+
+            1. **仅投递信号** —— 信号置位后发出 ``server:tool_call_cancel``，随后**继续等待原
+               ``client:tool_call`` 的 ack**，以该 ack 为终态；**不**本地提早返回。Computer 未中断时
+               须**等满本次调用自身的 ``timeout``**（协议不保证提前返回）。
+            2. **不冒充 Computer** —— **不**本地合成 ``meta.a2c_cancelled``（该标记仅由 Computer 产出）。
+            3. **如实透出** —— 终态按 ack 的结果级 ``meta`` 分类，用
+               :func:`~a2c_smcp.agent.types.classify_tool_call_outcome` 读取；
+               **不得**依据「本端已发出取消信号」改写终态。
+
+            故「已请求取消」 **不是**「已取消」的充分条件：取消是协作式的，``req_id`` 命中不到时
+            Computer 静默忽略，该次调用可能照常返回正常结果，或（未中断且自身超时到点）以
+            ``meta.a2c_timeout`` 收尾 —— 后者即「取消未被确认」。
+
+            ``cancel`` 契约见 :class:`~a2c_smcp.agent.types.CancelSignal`：**只要求** ``is_set()``，
+            实现一律轮询（不假定存在可 await 的 ``wait``）。``asyncio.Event.set()`` **非线程安全**，
+            宿主若在非事件循环线程置位须 ``loop.call_soon_threadsafe(event.set)``；
+            ``threading.Event`` 或任意仅含 ``is_set()`` 的对象可直接跨线程置位。
+
+            Cancel entry: pass ``cancel`` to interrupt an in-flight tool call. Only the signal is
+            delivered — the original ack remains the sole terminal-state source.
 
         v0.2.1 二进制一致性 / Binary consistency:
             返回前扫描 ``CallToolResult.content``，命中 ``_meta.a2c_blob_handle`` 的 content item
@@ -252,12 +282,21 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             tool_name (str): 工具名称 / Tool name
             params (dict): 工具调用参数 / Tool call parameters
             timeout (int): 超时时间 / Timeout duration
+            cancel (CancelSignal | None): 宿主取消信号（**只要求** ``is_set()``）/ host cancel signal.
 
         Returns:
             CallToolResult: MCP协议工具调用结果（二进制旁路已还原）/ Result with binary sideband resolved.
+
+        Raises:
+            TypeError: ``cancel`` 非空但不满足 :class:`CancelSignal`（无 ``is_set()``）。
+                这是本方法唯一的非返回路径（调用方传参错误，不做静默降级）。
         """
         req = self.create_tool_call_request(computer, tool_name, params, timeout)
         ctx = ContextLogger(logger, {"computer": computer, "tool": tool_name, "req_id": req["req_id"]})
+
+        # #209：宿主信号 → 至多一次 server:tool_call_cancel 广播。watcher 只投递信号，不参与 await。
+        gate = CancelSendGate()
+        watcher = self._start_cancel_watcher(cancel, gate, req["req_id"], self._namespace)
 
         try:
             ctx.debug("Calling tool")
@@ -270,12 +309,11 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
             res = await self._resolve_tool_call_binary_sideband(res, computer)
             return CallToolResult.model_validate(res, by_name=True)
 
-        except TimeoutError:
-            # 发送取消请求
-            # Send cancel request
-            agent_config = self.auth_provider.get_agent_config()
-            cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req["req_id"])
-            await self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=self._namespace)
+        except TOOL_CALL_TIMEOUT_ERRORS:
+            # 发送取消请求（幂等：宿主信号已广播过则不再重复——闸门保证至多一次）
+            # Send cancel request (idempotent: the gate allows at most one broadcast per call)
+            if gate.try_claim():
+                await self._abroadcast_tool_call_cancel(req["req_id"], self._namespace)
             return self.handle_tool_call_timeout(req["req_id"])
 
         except SMCPProtocolError as e:
@@ -294,6 +332,12 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
                 content=[TextContent(text=f"工具调用失败 / Tool call failed: {str(e)}", type="text")],
                 isError=True,
             )
+
+        finally:
+            # ``stop()`` 内部先「关门」（抢占广播权）再叫停 —— 单一收口缝，杜绝「已返回后迟到广播」。
+            # ``stop()`` seals the gate then tears down: the single seam guaranteeing no late broadcast.
+            if watcher is not None:
+                await watcher.stop()
 
     async def get_tools_from_computer(self, computer: str, timeout: int = 20) -> GetToolsRet:
         """

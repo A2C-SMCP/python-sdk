@@ -9,19 +9,24 @@
 """
 
 import asyncio
+import functools
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, cast
 
 from mcp.types import CallToolResult, TextContent
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
 from a2c_smcp.agent import _request_builders as _rb
+from a2c_smcp.agent._cancel import AsyncCancelWatcher, CancelSendGate, SyncCancelWatcher
 from a2c_smcp.agent.auth import AgentAuthProvider
-from a2c_smcp.agent.types import AgentEventHandler, AsyncAgentEventHandler
+from a2c_smcp.agent.types import AgentEventHandler, AsyncAgentEventHandler, CancelSignal
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
+    AgentCallData,
     EnterOfficeNotification,
     EnterOfficeReq,
     GetBlobReq,
@@ -43,6 +48,19 @@ from a2c_smcp.smcp import (
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("agent")
+
+#: ``client:tool_call`` 等待 ack 的超时异常类型 —— **必须**同时含 socketio 的 ``TimeoutError``。
+#:
+#: ⚠️ python-socketio 5.x 的 ``socketio.exceptions.TimeoutError`` **不是** builtin ``TimeoutError``
+#: 的子类（MRO: ``TimeoutError → SocketIOError → Exception``），只写 ``except TimeoutError`` 会让
+#: 超时兜底臂在真实链路上**永不可达**：自身超时被 ``except Exception`` 接走，于是既不广播
+#: ``server:tool_call_cancel``、也不标结果级 ``meta.a2c_timeout``（协议 error-handling.md
+#: §Agent 端超时要求两者都做），调用方只拿到一条空消息的普通失败。同族陷阱见
+#: ``a2c_smcp/utils/blob.py`` 的 ``BlobUploadUnsupportedError`` 注记。
+#:
+#: / Ack-wait timeout types. socketio's ``TimeoutError`` is NOT a subclass of the builtin, so
+#: catching only the builtin makes the timeout arm unreachable in production.
+TOOL_CALL_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, SioTimeoutError)
 
 
 class BaseAgentClient(ABC):
@@ -286,6 +304,54 @@ class BaseAgentClient(ABC):
         # passing ``meta=`` to the ctor would land in ``extra`` since the field alias is ``_meta``.
         result.meta = {"a2c_timeout": True}
         return result
+
+    async def _abroadcast_tool_call_cancel(self, req_id: str, namespace: str | None) -> None:
+        """广播 ``server:tool_call_cancel``（fire-and-forget，无 ack）——#209 宿主取消信号与自身超时兜底共用。
+
+        载体 ``AgentCallData`` 仅 ``{agent, req_id}``（**无** computer、**无** reason）；``req_id``
+        **MUST** 等于被取消的原 ``client:tool_call`` 的 ``req_id`` —— Computer 据此在在途调用表中定位，
+        且该键全局唯一、永不复用。Server 收到后仅向房间广播 ``notify:tool_call_cancel``、
+        **不回执**：因而本方法用 ``emit``（**非** ``call``）不等待 ack，ack 为 ``None`` 是合规预期。
+
+        ``req_id`` 的铸造与生命周期完全封闭在 ``emit_tool_call`` 内、不外露（protocol#58 裁决），
+        故本方法不对外公开。
+
+        / Broadcast ``server:tool_call_cancel`` (fire-and-forget, no ack); shared by the #209 cancel
+        entry and the self-timeout fallback.
+        """
+        agent_config = self.auth_provider.get_agent_config()
+        cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req_id)
+        await self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=namespace)
+
+    def _start_cancel_watcher(
+        self,
+        cancel: CancelSignal | None,
+        gate: CancelSendGate,
+        req_id: str,
+        namespace: str | None,
+    ) -> AsyncCancelWatcher | None:
+        """校验宿主信号并启动取消 watcher；``cancel is None`` 时不创建（既有路径零改动）。
+
+        入口 **fail-fast**：不满足 :class:`CancelSignal`（无 ``is_set()``）立即抛 ``TypeError`` ——
+        清晰的调用方错误远优于「watcher 里静默 ``AttributeError`` ⇒ 取消永远不生效、只能等满超时」。
+
+        / Validate the host signal and start the async watcher; ``TypeError`` when the shape is wrong.
+        """
+        if cancel is None:
+            return None
+        if not isinstance(cancel, CancelSignal):
+            raise TypeError(
+                "cancel 必须实现 is_set()（CancelSignal）/ cancel must implement is_set(): "
+                f"实际类型 {type(cancel).__name__}"
+            )
+        watcher = AsyncCancelWatcher(
+            signal=cancel,
+            gate=gate,
+            req_id=req_id,
+            broadcast=functools.partial(self._abroadcast_tool_call_cancel, namespace=namespace),
+        )
+        watcher.start()
+        return watcher
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
@@ -713,6 +779,54 @@ class BaseAgentSyncClient(ABC):
         # passing ``meta=`` to the ctor would land in ``extra`` since the field alias is ``_meta``.
         result.meta = {"a2c_timeout": True}
         return result
+
+    def _broadcast_tool_call_cancel(self, req_id: str, namespace: str | None) -> None:
+        """广播 ``server:tool_call_cancel``（fire-and-forget，无 ack）——#209 宿主取消信号与自身超时兜底共用。
+
+        载体 ``AgentCallData`` 仅 ``{agent, req_id}``（**无** computer、**无** reason）；``req_id``
+        **MUST** 等于被取消的原 ``client:tool_call`` 的 ``req_id`` —— Computer 据此在在途调用表中定位，
+        且该键全局唯一、永不复用。Server 收到后仅向房间广播 ``notify:tool_call_cancel``、
+        **不回执**：因而本方法用 ``emit``（**非** ``call``）不等待 ack，ack 为 ``None`` 是合规预期。
+
+        ``req_id`` 的铸造与生命周期完全封闭在 ``emit_tool_call`` 内、不外露（protocol#58 裁决），
+        故本方法不对外公开。
+
+        / Broadcast ``server:tool_call_cancel`` (fire-and-forget, no ack); shared by the #209 cancel
+        entry and the self-timeout fallback.
+        """
+        agent_config = self.auth_provider.get_agent_config()
+        cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req_id)
+        self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=namespace)
+
+    def _start_cancel_watcher(
+        self,
+        cancel: CancelSignal | None,
+        gate: CancelSendGate,
+        req_id: str,
+        namespace: str | None,
+    ) -> SyncCancelWatcher | None:
+        """校验宿主信号并启动取消 watcher；``cancel is None`` 时不创建（既有路径零改动）。
+
+        入口 **fail-fast**：不满足 :class:`CancelSignal`（无 ``is_set()``）立即抛 ``TypeError`` ——
+        清晰的调用方错误远优于「watcher 里静默 ``AttributeError`` ⇒ 取消永远不生效、只能等满超时」。
+
+        / Validate the host signal and start the sync watcher; ``TypeError`` when the shape is wrong.
+        """
+        if cancel is None:
+            return None
+        if not isinstance(cancel, CancelSignal):
+            raise TypeError(
+                "cancel 必须实现 is_set()（CancelSignal）/ cancel must implement is_set(): "
+                f"实际类型 {type(cancel).__name__}"
+            )
+        watcher = SyncCancelWatcher(
+            signal=cancel,
+            gate=gate,
+            req_id=req_id,
+            broadcast=functools.partial(self._broadcast_tool_call_cancel, namespace=namespace),
+        )
+        watcher.start()
+        return watcher
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """

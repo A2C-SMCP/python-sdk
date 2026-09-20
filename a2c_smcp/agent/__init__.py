@@ -19,6 +19,7 @@ from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.agent.types import (
+    DEFAULT_CANCEL_POLL_INTERVAL,
     AgentConfig,
     AgentEventHandler,
     AgentID,
@@ -26,10 +27,13 @@ from a2c_smcp.agent.types import (
     AsyncAgentEventHandler,
     AsyncAgentIDGetter,
     AsyncToolCallCallback,
+    CancelSignal,
     ComputerID,
     RequestID,
     ToolCallCallback,
     ToolCallContext,
+    ToolCallOutcome,
+    classify_tool_call_outcome,
 )
 
 __all__ = [
@@ -56,4 +60,9 @@ __all__ = [
     "AsyncToolCallCallback",
     "AgentIDGetter",
     "AsyncAgentIDGetter",
+    # #209 在途工具调用取消 / In-flight tool-call cancellation (#209)
+    "DEFAULT_CANCEL_POLL_INTERVAL",
+    "CancelSignal",
+    "ToolCallOutcome",
+    "classify_tool_call_outcome",
 ]
