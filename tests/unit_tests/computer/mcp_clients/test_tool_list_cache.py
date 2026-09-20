@@ -427,13 +427,44 @@ async def test_dead_session_is_re_read_and_routes_withdrawn(manager: MCPServerMa
 
 
 @pytest.mark.asyncio
+async def test_dead_session_is_not_reused_by_a_retried_round(manager: MCPServerManager) -> None:
+    """会话在 RPC 窗口内死亡 + 窗口内结构变更触发重试 ⇒ 重试轮**不得**复用「本轮已确证」的旧观测。
+
+    ``resolved`` 跨重试携带；若会话可用性只判在「缓存命中分支」上，重试轮会直接复用死会话的旧观测 ⇒
+    死连接的旧路由被保留 + 陈旧观测写回缓存（改动前每轮都真读 ⇒ 必失败 ⇒ 摘路由，故为不等效）。
+    """
+    ids = await _start_all(manager, ["cache_srv_1", "cache_srv_2", "cache_srv_3"])
+    dying, gated = _probe(manager, ids[1]), _probe(manager, ids[2])
+
+    gate = asyncio.Event()
+    gated.gate = gate
+    gated.entered.clear()
+    refresh = asyncio.create_task(manager.arefresh_tools())
+    await asyncio.wait_for(gated.entered.wait(), timeout=5.0)  # srv1/srv2 已确证入 resolved、srv3 在途
+
+    # 窗口内：srv2 会话死亡（已在 resolved 里）+ 制造一次重试（srv1 世代前进，等价并发 stop/start 提交）
+    dying.state = STATES.error
+    dying.boom = ConnectionError("Not connected to server")
+    manager._active_client_generations[ids[0]] = manager._active_client_generations.get(ids[0], 0) + 1
+
+    gated.gate = None
+    gate.set()
+    await asyncio.wait_for(refresh, timeout=5.0)  # 校验失配 ⇒ 重试
+
+    assert _exposed(ids[1]) not in manager._exposed_tools, "重试轮不得保留死会话的旧路由（须真读 ⇒ 失败 ⇒ 摘路由）"
+    assert ids[1] not in manager._tool_list_cache, "死会话的陈旧观测不得进入缓存"
+
+
+@pytest.mark.asyncio
 async def test_update_path_restart_reads_new_client_once(manager: MCPServerManager) -> None:
     """更新（restart）路径有**两个**刷新点（新 client 的提交点 + 入口收尾），合计只应真读新 client 一次。"""
     ids = await _start_all(manager, ["cache_srv_1"])
+    old = _probe(manager, ids[0])
 
     await manager.aadd_or_aupdate_server(_cfg(ids[0], tool_meta={_default_tool_name(ids[0]): ToolMeta(alias="upd")}))
 
     fresh = _probe(manager, ids[0])  # restart ⇒ 新 client 对象
+    assert fresh is not old, "本用例前提：restart 须换 client 对象（否则「新 client 被真读」无从谈起）"
     assert fresh.calls == 1, f"restart 后两条刷新点合计只应真读一次，实际：{fresh.calls}"
     assert _exposed(ids[0], "upd") in manager._exposed_tools, "新声明须被投影吸收"
 

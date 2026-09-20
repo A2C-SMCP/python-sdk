@@ -271,6 +271,9 @@ def _client_session_usable(client: MCPClientProtocol) -> bool:
     缓存复用点，才能保持旧的 fail-closed 行为：**会话已死的 client 不得按旧观测继续供路由**，而应真读
     一次（必失败）⇒ 计入 ``failed`` ⇒ 其路由被摘（与改动前逐字同效）。
 
+    调用点纪律：必须挂在**真读与否**的判据上、**每轮**判（见 :meth:`_arefresh_tool_mapping` 的复用判据行）
+    —— 只挂在「缓存命中分支」上会漏掉 `resolved` 跨重试携带的观测。
+
     依据：`_active_clients` 的移除点只有显式 stop / clear_oauth 两处，**非错误驱动** —— 会话死亡
     （keep-alive 失败置 ``error``）后 client 仍在册，故「在册」不等于「可用」。
 
@@ -1684,12 +1687,17 @@ class MCPServerManager:
                 # ② 锁外：确证观测（命中缓存 or 真读上游）
                 failed: set[BUNDLE_ID] = set()
                 for bundle_id, client, generation, config in snapshot:
+                    usable = _client_session_usable(client)
                     entry = resolved.get(bundle_id)
-                    if entry is None and _client_session_usable(client):
+                    if entry is None and usable:
                         hit = cached.get(bundle_id)
                         if hit is not None and hit.client is client and hit.generation == generation:
                             entry = hit
-                    if entry is None or entry.client is not client or entry.generation != generation:
+                    # 复用判据（任一不成立 ⇒ 真读上游）：**会话不可用** / 无观测 / 换 client / 世代前进。
+                    # ⚠️「会话不可用」必须**每轮**判、不能只判缓存命中分支：`resolved` 跨重试携带，否则会话在
+                    # RPC 窗口内死亡时，重试轮会直接复用旧观测 ⇒ 死连接的旧路由被保留 + 陈旧观测被写回缓存
+                    # （与改动前「每轮都真读 ⇒ 必失败 ⇒ 摘路由」不等效）。
+                    if not usable or entry is None or entry.client is not client or entry.generation != generation:
                         try:
                             tools = await client.list_tools()
                         except Exception as e:
