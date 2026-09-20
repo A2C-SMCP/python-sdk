@@ -39,6 +39,7 @@ from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import SMCP_NAMESPACE
 from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace
+from tests.room_acks import assert_empty_ack
 
 
 @pytest.fixture()
@@ -113,12 +114,12 @@ class TestToolCallBinaryRoundTrip:
         # 加入同房间 / Join same office
         from a2c_smcp.smcp import JOIN_OFFICE_EVENT
 
-        ok, err = await agent.call(
+        ack = await agent.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "office_id": office_id, "name": "robot-tc-1"},
             namespace=SMCP_NAMESPACE,
         )
-        assert ok and err is None
+        assert_empty_ack(ack)
 
         try:
             ret = await agent.emit_tool_call(
@@ -182,12 +183,12 @@ class TestToolCallBinaryRoundTrip:
         )
         from a2c_smcp.smcp import JOIN_OFFICE_EVENT
 
-        ok, err = await agent.call(
+        ack = await agent.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "office_id": office_id, "name": "robot-tc-2"},
             namespace=SMCP_NAMESPACE,
         )
-        assert ok and err is None
+        assert_empty_ack(ack)
 
         try:
             ret = await agent.emit_tool_call(

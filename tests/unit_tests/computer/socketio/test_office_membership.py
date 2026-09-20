@@ -129,7 +129,7 @@ async def test_connect_with_desired_office_schedules_replay() -> None:
 
     async def fake_call(event: str, data: Any = None, namespace: str | None = None, **kwargs: Any):
         calls.append({"event": event, "data": dict(data or {}), "namespace": namespace, "timeout": kwargs.get("timeout")})
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -169,7 +169,7 @@ async def test_connect_during_inflight_replay_reschedules_cleanly() -> None:
             first_in_flight.set()
             await release.wait()
             raise RuntimeError("namespace is not a connected namespace.")  # 第二次断链
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -208,7 +208,7 @@ async def test_stale_generation_replay_is_dropped() -> None:
     async def fake_call(*args: Any, **kwargs: Any):
         nonlocal called
         called = True
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -238,7 +238,7 @@ async def test_stale_replay_rejection_does_not_clobber_newer_office() -> None:
     async def fake_call(*args: Any, **kwargs: Any):
         in_flight.set()
         await release.wait()
-        return [False, "Internal server error: already exists in room"]
+        return {"code": 4105, "message": "Name already taken in room"}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -275,7 +275,7 @@ async def test_failed_join_does_not_clear_newer_office() -> None:
             in_flight.set()
             await release.wait()
             raise RuntimeError("加入房间失败 / Failed to join office: boom")
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -313,7 +313,7 @@ async def test_double_rejected_join_never_restores_an_unconfirmed_office() -> No
         if len(calls) == 1:
             in_flight.set()
             await release.wait()
-        return [False, "Internal server error: rejected"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -349,12 +349,12 @@ async def test_superseded_success_still_records_confirmed() -> None:
         room = dict(data or {}).get("office_id", "")
         calls.append(room)
         if room == "officeA":
-            return [True, None]
+            return None
         if room == "officeB":
             in_flight.set()
             await release.wait()
-            return [True, None]  # 服务端接受，但已被 J2 抢占
-        return [False, "Internal server error: rejected"]
+            return None  # 服务端接受，但已被 J2 抢占
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = fake_call  # type: ignore[method-assign]
     await client.join_office("officeA")
@@ -383,7 +383,7 @@ async def test_disconnect_then_rejected_join_reports_no_office(reason: str) -> N
     _mark_namespace_registered(client)
 
     async def accept(*args: Any, **kwargs: Any) -> Any:
-        return [True, None]
+        return None
 
     client.call = accept  # type: ignore[method-assign]
     await client.join_office("officeA")
@@ -393,7 +393,7 @@ async def test_disconnect_then_rejected_join_reports_no_office(reason: str) -> N
         assert client.office_id == "officeA", "传输中断保留 desired（#203 口径）"
 
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: rejected"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = reject  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="加入房间失败"):
@@ -415,7 +415,7 @@ async def test_superseded_replay_success_still_records_confirmed() -> None:
     async def fake_call(*args: Any, **kwargs: Any) -> Any:
         in_flight.set()
         await release.wait()
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
     replay = asyncio.create_task(client._arejoin_office("officeA", 5))
@@ -425,7 +425,7 @@ async def test_superseded_replay_success_still_records_confirmed() -> None:
     await replay
 
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: rejected"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = reject  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="加入房间失败"):
@@ -443,7 +443,7 @@ async def test_replay_rejection_clears_office_id() -> None:
     client._office_generation = 7
 
     async def fake_call(*args: Any, **kwargs: Any):
-        return [False, "Internal server error: already exists in room"]
+        return {"code": 4105, "message": "Name already taken in room"}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -486,10 +486,10 @@ async def test_rejected_switch_restores_previous_office() -> None:
     _mark_namespace_registered(client)
 
     async def accept(*args: Any, **kwargs: Any) -> Any:
-        return [True, None]
+        return None
 
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: Computer with name 'x' already exists in room 'officeB'"]
+        return {"code": 4105, "message": "Name already taken in room"}
 
     client.call = accept  # type: ignore[method-assign]
     await client.join_office("officeA")
@@ -509,7 +509,7 @@ async def test_leave_then_rejected_join_does_not_resurrect_old_office() -> None:
     _mark_namespace_registered(client)
 
     async def accept(*args: Any, **kwargs: Any) -> Any:
-        return [True, None]
+        return None
 
     emitted: list[Any] = []
 
@@ -523,7 +523,7 @@ async def test_leave_then_rejected_join_does_not_resurrect_old_office() -> None:
     assert client.office_id is None
 
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: rejected"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = reject  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="加入房间失败"):
@@ -540,7 +540,7 @@ async def test_rejected_fresh_join_keeps_no_office() -> None:
     assert client.office_id is None
 
     async def fake_call(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Computer with name 'x' already exists in room 'officeB'"]
+        return {"code": 4105, "message": "Name already taken in room"}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -561,7 +561,7 @@ async def test_switch_transport_failure_still_clears_desired() -> None:
     _mark_namespace_registered(client)
 
     async def accept(*args: Any, **kwargs: Any) -> Any:
-        return [True, None]
+        return None
 
     client.call = accept  # type: ignore[method-assign]
     await client.join_office("officeA")  # 建立已确认房号 / establish the confirmed office
@@ -577,7 +577,7 @@ async def test_switch_transport_failure_still_clears_desired() -> None:
 
     # 未知结局已使旧房号失效 ⇒ 之后被拒的 join 不得回退到它
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: rejected"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = reject  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="加入房间失败"):
@@ -597,7 +597,7 @@ async def test_disconnect_final_then_rejected_join_reports_no_office() -> None:
     _mark_namespace_registered(client)
 
     async def accept(*args: Any, **kwargs: Any) -> Any:
-        return [True, None]
+        return None
 
     client.call = accept  # type: ignore[method-assign]
     await client.join_office("officeA")
@@ -606,7 +606,7 @@ async def test_disconnect_final_then_rejected_join_reports_no_office() -> None:
     assert client.office_id is None, "彻底放弃重连 ⇒ desired 清空"
 
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: rejected"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = reject  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="加入房间失败"):
@@ -616,14 +616,40 @@ async def test_disconnect_final_then_rejected_join_reports_no_office() -> None:
 
 
 @pytest.mark.asyncio
-async def test_switch_empty_ack_still_clears_desired() -> None:
-    """空响应（未获裁决）⇒ 同样清空：它不是「拒绝」，不能据此回退房号。"""
+async def test_switch_empty_ack_is_success() -> None:
+    """v0.5.0（#214）：空 ack（``None``）= **成功**裁决 ⇒ 落账已确认房号，不再抛错。
+
+    回归守卫：旧模型（v0.5.0 前）把 ``None`` 当「未获裁决」。若解析器未随协议更新，本用例会因
+    抛 RuntimeError 而红——这正是 #213 挂账的「把拒绝/空响应当成功」缺陷的镜像面。
+    """
     client = _make_client()
     _mark_namespace_registered(client)
     client.office_id = "officeA"
 
     async def fake_call(*args: Any, **kwargs: Any) -> Any:
         return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    await client.join_office("officeB")
+
+    assert client.office_id == "officeB"
+    assert client._confirmed_office_id == "officeB"
+
+
+@pytest.mark.asyncio
+async def test_switch_indeterminate_ack_clears_desired() -> None:
+    """形状不认识的响应（未获裁决）⇒ 抛错并清空：它不是「拒绝」，不能据此回退房号。
+
+    此处以**已废除的元组形态**代表「未获裁决」——解析器刻意不再兼容它（见
+    ``a2c_smcp/utils/office.py``），故它必须落进「无法判定」而不是静默成功。
+    """
+    client = _make_client()
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return [True, None]
 
     client.call = fake_call  # type: ignore[method-assign]
 

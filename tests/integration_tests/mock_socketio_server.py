@@ -61,15 +61,18 @@ class MockComputerServerNamespace(SMCPNamespace):
         self.client_operations_record[sid] = ("leave_room", room)
         await super().leave_room(sid, room, namespace)
 
-    async def on_server_join_office(self, sid: str, data):  # type: ignore[override]
+    async def on_server_join_office(self, sid: str, data=None, *_extra):  # type: ignore[override]
         # 记录加入办公室事件 / record join office event
+        # 载荷缺省与 ``*_extra``：**必须**与真实 namespace 的签名一致，否则「不带载荷 emit」
+        # 会在这里先抛 TypeError（异常逃出 handler ⇒ 不发 ACK ⇒ 客户端挂到自身超时），
+        # 让线上用例测不到真实实现的行为（#214 实测踩到）。
         self.client_operations_record[sid] = ("server_join_office", data)
-        return await super().on_server_join_office(sid, data)
+        return await super().on_server_join_office(sid, data, *_extra)
 
-    async def on_server_leave_office(self, sid: str, data):  # type: ignore[override]
+    async def on_server_leave_office(self, sid: str, data=None, *_extra):  # type: ignore[override]
         # 记录离开办公室事件 / record leave office event
         self.client_operations_record[sid] = ("server_leave_office", data)
-        return await super().on_server_leave_office(sid, data)
+        return await super().on_server_leave_office(sid, data, *_extra)
 
     async def on_server_update_config(self, sid: str, data):  # type: ignore[override]
         # 记录更新配置事件 / record update config event

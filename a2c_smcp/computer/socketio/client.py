@@ -83,7 +83,7 @@ from a2c_smcp.utils.handshake import (
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.office import NO_RESPONSE_MESSAGE, OFFICE_REJOIN_TIMEOUT, parse_join_ack
+from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
 
 logger = get_logger(__name__)
 
@@ -442,18 +442,22 @@ class SMCPComputerClient(AsyncClient):
                 self._confirmed_office_id = None
                 logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
                 return
-            ok, error_msg = parse_join_ack(result)
-            if ok:
+            verdict = parse_join_ack(result)
+            if verdict.ok:
                 # 同 join_office：成功是对服务端事实的陈述，不受 supersession 守卫约束（#213）
                 self._confirmed_office_id = office_id
             if generation != self._office_generation or self.office_id != office_id:
                 return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
-            if ok:
+            if verdict.ok:
                 logger.info(f"已自动重新加入 Office: {office_id}")
             else:
                 self.office_id = None
                 self._confirmed_office_id = None
-                logger.error(f"自动重新加入 Office 被拒绝: {office_id} - {error_msg}")
+                # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（#212 将对其做有界退避重试），
+                # 无码则是「未获裁决」（形状不认识 / 空响应）。Transient vs indeterminate, by code.
+                logger.error(
+                    f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
+                )
 
     async def join_office(self, office_id: str) -> None:
         """
@@ -467,11 +471,11 @@ class SMCPComputerClient(AsyncClient):
         replay invalidated *before* the new id is written, so a superseded replay's failure path can
         never clear it.
 
-        #213：失败时的房号去留按**失败形态**分刀（服务端拒绝不改变既有成员关系 ⇒ 客户端也不得清掉
-        仍在的房间）：
-          - 服务端**明确拒绝**（给了裁决文案）⇒ 回退到 ``_confirmed_office_id``（最近一次被服务端确认的
-            房号，通常是旧房；从未确认过则为 ``None``）；
-          - 传输层失败 / 空响应（无法判定服务端是否已生效）⇒ 维持清空语义（不臆断）。
+        #213 / #214：失败时的房号去留按**失败形态**分刀（服务端拒绝不改变既有成员关系 ⇒ 客户端也不得
+        清掉仍在的房间）：
+          - 服务端**明确拒绝**（v0.5.0 起 = flat ErrorPayload，**顶层带协议码**）⇒ 回退到
+            ``_confirmed_office_id``（最近一次被服务端确认的房号，通常是旧房；从未确认过则为 ``None``）；
+          - 传输层失败 / 无码响应（无法判定服务端是否已生效）⇒ 维持清空语义（不臆断）。
         回退取的是**已确认**房号而非入口快照：入口预写的意图在并发下可能属于一次「裁决被丢弃」的
         在途 join，绝不代表真实成员关系。
         #213: a rejection restores the last *server-confirmed* office — never the desired field, whose
@@ -526,17 +530,19 @@ class SMCPComputerClient(AsyncClient):
                 self._confirmed_office_id = None
             raise
 
-        ok, error_msg = verdict
-        if not ok:
-            # 服务端给出了裁决 ⇒ **明确拒绝**。协议 room-model.md「加入时校验失败 ⇒ 拒绝加入」且拒绝
-            # **不改变既有成员关系**（校验先于副作用），故此处回退到**已确认**房号，而不是清空——清空会让
-            # 宿主以为「不在任何房」，与真实成员关系相反（#213 的服务端修正后尤其如此：换房被拒时它仍在
-            # 旧房）。空响应（NO_RESPONSE_MESSAGE）不是裁决，维持清空语义（与上面传输层失败一致）。
+        if not verdict.ok:
+            # 服务端给出了裁决 ⇒ **明确拒绝**（#214 起以 flat ErrorPayload 承载协议码：顶层 `code` 非空
+            # 即「服务端明确判了」）。协议 room-model.md「加入时校验失败 ⇒ 拒绝加入」且拒绝**不改变既有
+            # 成员关系**（校验先于副作用），故此处回退到**已确认**房号，而不是清空——清空会让宿主以为
+            # 「不在任何房」，与真实成员关系相反（#213 的服务端修正后尤其如此：换房被拒时它仍在旧房）。
+            # 无码（形状不认识 / 未获裁决）不是拒绝裁决，维持清空语义（与上面传输层失败一致）。
+            # 判据从「文案哨兵」改为「码是否存在」：哨兵是字符串比较，一旦文案微调就会静默失配。#214
             # An explicit verdict = rejection: the server does not change existing membership, so fall
-            # back to the last *confirmed* office instead of clearing. An empty ack is not a verdict.
+            # back to the last *confirmed* office instead of clearing. Judgment keyed on the presence of
+            # a protocol code (not a string sentinel, which silently misfires if the text changes).
             if self._office_generation == generation:
-                self.office_id = self._confirmed_office_id if error_msg != NO_RESPONSE_MESSAGE else None
-            raise RuntimeError(f"加入房间失败 / Failed to join office: {error_msg}")
+                self.office_id = self._confirmed_office_id if verdict.code is not None else None
+            raise RuntimeError(f"加入房间失败 / Failed to join office: {verdict.message}")
 
         # 裁决为成功：记录服务端已确认的成员关系。**刻意不受 supersession 守卫约束**——成功是关于
         # 服务端**事实**的陈述：即便本次 join 已被后到操作抢占（desired 归后者），这次成员变更**真实

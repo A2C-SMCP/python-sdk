@@ -8,6 +8,7 @@
 * 描述: 同步版 SMCP Namespace 测试用例 / Sync SMCP Namespace test cases
 """
 
+import json
 import threading
 import time
 from unittest.mock import MagicMock
@@ -40,6 +41,7 @@ from a2c_smcp.smcp import (
     LeaveOfficeReq,
     is_protocol_error_payload,
 )
+from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
 
 class MockSyncAuthProvider(SyncAuthenticationProvider):
@@ -123,10 +125,9 @@ class TestSyncSMCPNamespace:
             "office_id": "office_123",
         })
 
-        success, error = smcp_namespace.on_server_join_office("test_sid", data)
+        ack = smcp_namespace.on_server_join_office("test_sid", data)
 
-        assert success is True
-        assert error is None
+        assert_empty_ack(ack)
         assert session["role"] == "computer"
         assert session["name"] == "test_computer"
 
@@ -141,10 +142,10 @@ class TestSyncSMCPNamespace:
             "office_id": "office_123",
         })
 
-        success, error = smcp_namespace.on_server_join_office("test_sid", data)
+        ack = smcp_namespace.on_server_join_office("test_sid", data)
 
-        assert success is False
-        assert "Role mismatch" in error
+        # 身份声明冲突 ⇒ 403，**非**房间语义
+        assert_rejected_ack(ack, 403)
 
     def test_leave_office(self, smcp_namespace):
         # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
@@ -153,10 +154,9 @@ class TestSyncSMCPNamespace:
 
         data = LeaveOfficeReq(**{"office_id": "office_123"})
 
-        success, error = smcp_namespace.on_server_leave_office("test_sid", data)
+        ack = smcp_namespace.on_server_leave_office("test_sid", data)
 
-        assert success is True
-        assert error is None
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_called_once_with("test_sid", "office_123")
 
 
@@ -180,7 +180,7 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.leave_room = MagicMock()
         smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
 
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(ValueError, match="Name already taken in room"):
             smcp_namespace.enter_room("c-sid", "roomB")
 
         smcp_namespace.leave_room.assert_not_called()  # 原实现先退旧房 / old impl left the old room first
@@ -289,12 +289,13 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.save_session = MagicMock(side_effect=lambda sid, sess, *a, **k: store.__setitem__(sid, sess))
         smcp_namespace.enter_room = MagicMock(side_effect=RuntimeError("boom"))
 
-        ok, err = smcp_namespace.on_server_join_office(
+        ack = smcp_namespace.on_server_join_office(
             "c-sid",
             EnterOfficeReq(**{"role": "computer", "name": "n", "office_id": "roomB"}),
         )
 
-        assert ok is False and "Internal server error" in err
+        assert_rejected_ack(ack, 500)
+        assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
         assert "role" not in final and "name" not in final, "backup 缺失的字段须删除而非赋 None"
 
@@ -341,7 +342,7 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.emit = MagicMock()
         smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
 
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(ValueError, match="Name already taken in room"):
             smcp_namespace.enter_room("a-sid", "roomB")
 
         mock_server.enter_room.assert_not_called()
@@ -361,12 +362,13 @@ class TestEnterRoomTransactionalCommitSync:
 
         smcp_namespace.enter_room = MagicMock(side_effect=_enter_boom)
 
-        ok, err = smcp_namespace.on_server_join_office(
+        ack = smcp_namespace.on_server_join_office(
             "c-sid",
             EnterOfficeReq(**{"role": "computer", "name": "new-name", "office_id": "roomB"}),
         )
 
-        assert ok is False and "Internal server error" in err
+        assert_rejected_ack(ack, 500)
+        assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
         assert "office_id" not in final, "收敛结果不得被 backup 里的旧房号复活"
         assert final["role"] == "computer" and final["name"] == "old-name", "role/name 须回滚"
@@ -820,17 +822,19 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA", "roomB"])
         smcp_namespace.leave_room = MagicMock()
-        ok, err = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomC"})
-        assert ok is True and err is None
+        ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomC"})
+        assert_empty_ack(ack, action="server:leave_office")
         assert {c.args for c in smcp_namespace.leave_room.call_args_list} == {("a-sid", "roomA"), ("a-sid", "roomB")}
 
     def test_leave_office_convergence_error_is_reported(self, smcp_namespace):
-        """收敛分支自身的失败出口：``leave_room`` 抛错 → ``(False, "Internal server error: ...")``。"""
+        """收敛分支自身的失败出口：``leave_room`` 抛错 → flat ErrorPayload(500)（笼统文案，原文只进日志）。"""
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])
         smcp_namespace.leave_room = MagicMock(side_effect=RuntimeError("boom"))
-        ok, err = smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
-        assert ok is False and "Internal server error" in err
+        ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+
+        assert_rejected_ack(ack, 500, action="server:leave_office")
+        assert "boom" not in json.dumps(ack)
 
     def test_tool_call_cancel_requires_office_membership(self, smcp_namespace, mock_server):
         """未入房的 Agent 发 ``server:tool_call_cancel`` → 显式 raise 且**不得产生任何广播**。
@@ -868,22 +872,23 @@ class TestServerBroadcastOfficeIsolationSync:
         """
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "office_id": "roomA", "name": "a1"})
         smcp_namespace.leave_room = MagicMock()
-        ok, err = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
-        assert ok is True and err is None
+        ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_called_once_with("a-sid", "roomA")
 
     def test_leave_office_without_office_is_idempotent_noop(self, smcp_namespace):
         """未入房时退房是**幂等空操作**：既不得 raise，也绝不得回退到载荷里的房间号。
 
-        载荷可携带 ``office_id=None``（TypedDict 不做校验），一旦回退到它就会得到
-        ``room=None`` ⇒ 与 ``server:update_*`` 同类的全命名空间广播泄漏。
+        载荷携带 ``office_id=None``：v0.5.0（#214）起它在 **schema 闸门**即被拒（400），
+        故「回退到载荷里的 None 房间」⇒ ``room=None`` ⇒ 全命名空间广播泄漏这条注入路径，
+        现在连业务代码都到不了。本用例同时钉住「拒绝时不得产生任何副作用」。
         """
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
         # 真实未入房的 socket 只在自己的 sid 房间里 / an office-less socket sits only in its own sid room
         smcp_namespace.rooms = MagicMock(return_value=["a-sid"])
         smcp_namespace.leave_room = MagicMock()
-        ok, err = smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
-        assert ok is True and err is None
+        ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
+        assert_rejected_ack(ack, 400, action="server:leave_office")
         smcp_namespace.leave_room.assert_not_called()
 
     def test_leave_office_without_office_ignores_truthy_payload_room(self, smcp_namespace):
@@ -896,8 +901,8 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid"])
         smcp_namespace.leave_room = MagicMock()
-        ok, err = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
-        assert ok is True and err is None
+        ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_not_called()
 
     def test_leave_office_without_session_office_converges_actual_rooms(self, smcp_namespace):
@@ -910,6 +915,6 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])  # 含自身 sid 房间
         smcp_namespace.leave_room = MagicMock()
-        ok, err = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
-        assert ok is True and err is None
+        ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_called_once_with("a-sid", "roomA")

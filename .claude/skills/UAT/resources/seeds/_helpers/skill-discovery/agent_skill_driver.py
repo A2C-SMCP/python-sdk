@@ -123,7 +123,9 @@ def run(args: argparse.Namespace) -> int:
         namespace=SMCP_NAMESPACE,
         timeout=10,
     )
-    if not (isinstance(join_resp, tuple) and join_resp[0]):
+    # v0.5.0（#214）：成功 = **空 ack**（None）；失败 = flat ErrorPayload（顶层含 code）。
+    # 旧的两参元组判据已废除。/ Since v0.5.0 success is the empty ack (None).
+    if join_resp is not None:
         log(f"FAIL: join_office rejected: {join_resp}")
         client.disconnect()
         return 1

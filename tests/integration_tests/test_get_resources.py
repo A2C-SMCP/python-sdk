@@ -44,6 +44,7 @@ from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import GET_RESOURCES_EVENT, JOIN_OFFICE_EVENT, SMCP_NAMESPACE
 from a2c_smcp.testing import UvicornTestServer, create_local_sync_server
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
+from tests.room_acks import assert_empty_ack
 
 MCP_SERVERS_DIR = Path(__file__).resolve().parent / "computer" / "mcp_servers"
 PAGED_SERVER = MCP_SERVERS_DIR / "resources_paged_mixed_stdio_server.py"
@@ -265,12 +266,12 @@ def sync_smcp_server(sync_server_port: int) -> Generator[int, Any, None]:
 
 
 def _sync_join(client: Client, role: Literal["computer", "agent"], office_id: str, name: str) -> None:
-    ok, err = client.call(
+    ack = client.call(
         JOIN_OFFICE_EVENT,
         {"role": role, "office_id": office_id, "name": name},
         namespace=SMCP_NAMESPACE,
     )
-    assert ok and err is None
+    assert_empty_ack(ack)
 
 
 def _run_mock_computer_process(port: int, ready_q: multiprocessing.Queue, err_q: multiprocessing.Queue) -> None:

@@ -25,6 +25,7 @@ from a2c_smcp.smcp import (
     SMCPTool,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack
 
 pytestmark = pytest.mark.e2e
 
@@ -102,24 +103,22 @@ async def test_async_agent_connect_and_join_office(async_socketio_server, async_
         await asyncio.sleep(0.1)
 
         # Agent 加入办公室 / Agent joins office
-        ok, err = await agent_client.call(
+        ack = await agent_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "name": "test-agent-async-1", "office_id": "office-async-1"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True
-        assert err is None
+        assert_empty_ack(ack)
 
         # Computer 加入办公室 / Computer joins office
-        ok, err = await async_mock_computer_client.call(
+        ack = await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "name": "test-computer-async-1", "office_id": "office-async-1"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True
-        assert err is None
+        assert_empty_ack(ack)
 
         # 等待事件处理 / Wait for event processing
         assert await _wait_until(lambda: len(event_handler.enter_office_events) >= 1, timeout=3)

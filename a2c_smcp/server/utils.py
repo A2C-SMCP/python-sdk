@@ -14,9 +14,62 @@ from typing import Any, cast
 from pydantic import TypeAdapter
 from socketio import AsyncServer, Server
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import RoomRejection, SMCPNamespaceError
 from a2c_smcp.server.types import OFFICE_ID, ComputerSession
-from a2c_smcp.smcp import SMCP_NAMESPACE
+from a2c_smcp.smcp import SMCP_NAMESPACE, ErrorPayload, build_internal_error, build_room_rejection_error
+from a2c_smcp.utils.logger import get_logger
+
+logger = get_logger("server")
+
+
+def build_room_rejection_ack(
+    rejection: RoomRejection,
+    *,
+    target_office_id: str | None,
+    declared_role: str | None,
+    current_office_id: str | None,
+) -> ErrorPayload:
+    """领域拒绝 → flat ``ErrorPayload``；**保证不抛**（#214）。
+
+    存在的理由 / Why this exists：``on_server_join_office`` 在 ``except`` 子句里调用本函数——若它
+    自身抛错，新异常会**顶替**原异常逃出 handler，socketio 随即**不发 ACK**，调用方挂到自身超时。
+    那正是本单要消灭的形态。:func:`build_room_rejection_error` 对**未映射的码**抛 ``ValueError``
+    （例如下游直接实例化基类 :class:`RoomRejection`，其 ``code = 0``，或自定义子类带了自己发明的码），
+    故此处兜底成 ``500``：宁可给一个笼统但**有回应**的 ack，也不能让调用方挂起。
+
+    Never raises: the join handlers call this from inside an ``except`` clause, where a secondary
+    exception would replace the original one, escape the handler and leave the caller unacked.
+
+    协议依据 / Protocol: error-handling.md:102-106（具备 ack 通道的事件，失败 **MUST** 产出 ack）。
+
+    Args:
+        rejection: 抛出的领域拒绝 / the raised domain rejection
+        target_office_id: 被拒的目标房（发起者自己声明）/ rejected target office (self-declared)
+        declared_role: 发起者自己声明的 role / the role the initiator declared
+        current_office_id: 会话当前所在房 / the session's current office
+
+    Returns:
+        flat ``ErrorPayload``（永不抛）/ a flat ``ErrorPayload`` (never raises)
+    """
+    try:
+        return build_room_rejection_error(
+            rejection.code,
+            target_office_id=target_office_id,
+            declared_role=declared_role,
+            current_office_id=current_office_id,
+        )
+    except (TypeError, ValueError):
+        # 未映射 / 形态非法的码 ⇒ 降级为 500（仍产出 ack）。原文进日志，便于定位是哪条子类没接好。
+        # 捕获 **TypeError 同样必要**：``build_room_rejection_error`` 入口的 ``int(code)`` 对非 int
+        # （如下游把 ``code`` 写成 ``None`` / 字符串）抛的是 TypeError——漏掉它，这条"二次抛出"就会
+        # 与 ValueError 一样逃出 handler ⇒ 不发 ACK（本单的核心不变量）。两种异常都收，才是"保证不抛"。
+        # TypeError matters too: the builder's `int(code)` raises it for non-int codes.
+        # Unmapped/invalid code ⇒ degrade to 500 (still acked); the detail stays in the log.
+        logger.exception(
+            f"房间拒绝码未接入码表或形态非法，降级为 500 / unmapped or malformed room-rejection code, "
+            f"degraded to 500: {rejection.code!r} ({type(rejection).__name__})",
+        )
+        return build_internal_error()
 
 
 def require_office_id(session: Mapping[str, Any], sid: str) -> OFFICE_ID:

@@ -25,6 +25,7 @@ from a2c_smcp.smcp import (
     SMCPTool,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack
 
 pytestmark = pytest.mark.e2e
 
@@ -110,24 +111,22 @@ def test_sync_agent_connect_and_join_office(server_endpoint: str, mock_computer_
         time.sleep(0.1)
 
         # Agent 加入办公室 / Agent joins office
-        ok, err = agent_client.call(
+        ack = agent_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "name": "test-agent-1", "office_id": "office-sync-1"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True
-        assert err is None
+        assert_empty_ack(ack)
 
         # Computer 加入办公室 / Computer joins office
-        ok, err = mock_computer_client.call(
+        ack = mock_computer_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "name": "test-computer-1", "office_id": "office-sync-1"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True
-        assert err is None
+        assert_empty_ack(ack)
 
         # 等待事件处理 / Wait for event processing
         assert _wait_until(lambda: len(event_handler.enter_office_events) >= 1, timeout=3)
@@ -379,28 +378,26 @@ def test_sync_agent_sio_param_with_real_connection(server_endpoint: str, mock_co
         time.sleep(0.1)
 
         # Agent 加入办公室 / Agent joins office
-        ok, err = agent_client.call(
+        ack = agent_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "name": "test-agent-sio", "office_id": "office-sio-test"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True
-        assert err is None
+        assert_empty_ack(ack)
 
         # 获取Agent的SID / Get Agent's SID
         agent_sid = agent_client.get_sid(namespace=SMCP_NAMESPACE)
         assert agent_sid is not None
 
         # Computer 加入办公室 / Computer joins office
-        ok, err = mock_computer_client.call(
+        ack = mock_computer_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "name": "test-computer-sio", "office_id": "office-sio-test"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True
-        assert err is None
+        assert_empty_ack(ack)
 
         # 等待事件处理 / Wait for event processing
         assert _wait_until(lambda: len(event_handler.enter_office_events) >= 1, timeout=3)

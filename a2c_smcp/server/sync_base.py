@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 
 from socketio import Namespace
 
+from a2c_smcp.exceptions import NameConflictError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.types import SID
 from a2c_smcp.utils.logger import ContextLogger, get_logger
@@ -105,10 +106,19 @@ class SyncBaseNamespace(Namespace):
         判据与 ``_register_name`` 同源（单点）；注册表键空间收敛（#215）以本方法为**冲突判据**改动点，
         还须一并处理同以裸名为键的 ``get_sid_by_name`` 与 ``_unregister_name``。
         Sync mirror of the async gate — the conflict-predicate point for #215's composite key.
+
+        Raises:
+            NameConflictError: ``4105``；``ValueError`` 子类，兼容既有 ``except ValueError`` 契约。
         """
         existing_sid = self._name_to_sid_map.get(name)
         if existing_sid is not None and existing_sid != sid:
-            raise ValueError(f"Name '{name}' already registered by sid '{existing_sid}' in namespace {self.namespace}")
+            # 冗长诊断（含对端 sid）只进日志；异常消息只含自身上下文 ⇒ 泄露构造上不可能（#214）。
+            # Verbose diagnostics (peer sid included) go to logs only (#214).
+            logger.warning(
+                f"名字冲突 / name conflict: name={name!r} held by sid={existing_sid!r}, "
+                f"requested by sid={sid!r}, namespace={self.namespace}",
+            )
+            raise NameConflictError()
 
     def _register_name(self, name: str, sid: SID) -> None:
         """

@@ -22,6 +22,7 @@ client.connect(url, socketio_path="/socket.io", namespaces=[SMCP_NAMESPACE], tra
 
 # Join office
 resp = client.call(JOIN_OFFICE_EVENT, {"role": "agent", "name": agent_name, "office_id": office}, namespace=SMCP_NAMESPACE, timeout=10)
+# v0.5.0（#214）：成功 = 空 ack（None），失败 = flat ErrorPayload（顶层含 code）
 print(f"Join: {resp}", flush=True)
 
 # Phase 1: Send tool_call, Computer will be killed during execution

@@ -120,7 +120,7 @@ async def test_async_connect_with_desired_schedules_replay() -> None:
 
     async def fake_call(event: str, data: Any = None, namespace: str | None = None, **kwargs: Any):
         calls.append({"event": event, "data": dict(data or {}), "namespace": namespace, "timeout": kwargs.get("timeout")})
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -149,7 +149,7 @@ async def test_async_stale_generation_replay_dropped() -> None:
     async def fake_call(*args: Any, **kwargs: Any):
         nonlocal called
         called = True
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -168,7 +168,7 @@ async def test_async_rejected_replay_clears_desired_office() -> None:
     client._office_generation = 7
 
     async def fake_call(*args: Any, **kwargs: Any):
-        return [False, "Internal server error: Agent already in room"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -293,7 +293,7 @@ def test_sync_connect_with_desired_schedules_replay_in_thread() -> None:
 
     def fake_call(event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
         calls.append({"event": event, "data": dict(data or {}), "namespace": namespace, "timeout": timeout})
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -327,7 +327,7 @@ def test_sync_stale_generation_replay_dropped() -> None:
 
     def fake_call(*args: Any, **kwargs: Any) -> Any:
         called.append(1)
-        return [True, None]
+        return None
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -345,7 +345,7 @@ def test_sync_rejected_replay_clears_desired_office() -> None:
     client._office_generation = 7
 
     def fake_call(*args: Any, **kwargs: Any) -> Any:
-        return [False, "Internal server error: Agent already in room"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -364,7 +364,7 @@ def test_sync_rejected_replay_not_retried() -> None:
 
     def fake_call(*args: Any, **kwargs: Any) -> Any:
         attempts.append(1)
-        return [False, "Internal server error: Agent already in room"]
+        return {"code": 4101, "message": "Room already has an agent"}
 
     client.call = fake_call  # type: ignore[method-assign]
 

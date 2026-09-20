@@ -364,6 +364,17 @@ class TestIsProtocolErrorPayload:
         assert not is_protocol_error_payload({"code": None})
         assert not is_protocol_error_payload({"message": "no code field"})
 
+    def test_false_for_call_tool_result_shape_even_with_code(self) -> None:
+        """MCP ``CallToolResult`` 形状（含 ``content``）**优先判否**——即便它带了顶层 ``code``。
+
+        MCP 的 ``CallToolResult`` 是 ``extra="allow"``：工具可携带任意顶层字段，包括恰好叫 ``code``
+        且取值撞上协议码的。``client:tool_call`` 的 ack 直接透传该结果，误判会把**真实工具结果**
+        顶替成协议错误（#214 把 400/403/500 并入码集合后这一类风险上升）。协议 ``ErrorPayload``
+        从不带 ``content``，故形状判别无损。/ A CallToolResult-shaped dict wins over the code set.
+        """
+        assert not is_protocol_error_payload({"content": [], "isError": False, "code": 500})
+        assert not is_protocol_error_payload({"content": [{"type": "text", "text": "x"}], "code": 4014})
+
     def test_false_for_non_dict(self) -> None:
         """非 dict（无嵌套 envelope 不解包）→ False / non-dict inputs."""
         assert not is_protocol_error_payload(None)

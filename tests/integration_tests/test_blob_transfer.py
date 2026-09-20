@@ -68,6 +68,7 @@ from tests.integration_tests.mock_socketio_server import (
     MockComputerServerNamespace,
     MockComputerServerSyncNamespace,
 )
+from tests.room_acks import assert_empty_ack
 
 # ======================================================================
 # Part 1 — In-process integration (no Socket.IO)
@@ -473,12 +474,12 @@ def _make_wire_call(agent_client: AsyncClient) -> Any:
 
 
 async def _agent_join(agent: AsyncClient, office_id: str, name: str) -> None:
-    ok, err = await agent.call(
+    ack = await agent.call(
         JOIN_OFFICE_EVENT,
         {"role": "agent", "office_id": office_id, "name": name},
         namespace=SMCP_NAMESPACE,
     )
-    assert ok and err is None
+    assert_empty_ack(ack)
 
 
 class TestRealWireAsync:
@@ -670,12 +671,12 @@ def sync_blob_server(sync_blob_server_port: int) -> Generator[int, Any, None]:
 
 
 def _sync_join(client: Client, role: Literal["computer", "agent"], office_id: str, name: str) -> None:
-    ok, err = client.call(
+    ack = client.call(
         JOIN_OFFICE_EVENT,
         {"role": role, "office_id": office_id, "name": name},
         namespace=SMCP_NAMESPACE,
     )
-    assert ok and err is None
+    assert_empty_ack(ack)
 
 
 def _run_sync_computer_process(

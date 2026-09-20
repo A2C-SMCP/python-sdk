@@ -7,6 +7,48 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 > 注：v0.3.1 / v0.3.2 发版时未单独切段（Bugfix / OAuth 收敛类），本段累积至 [0.3.0]。
 
+## [Unreleased] — #214 房间事件失败 ack 契约（协议 v0.5.0）
+
+> **A2C-SMCP 协议 v0.5.0 实现**：`PROTOCOL_VERSION` 由 `0.4.0` 抬至 `0.5.0`（v0.x 下 `MINOR` 严格匹配，
+> 抬位后握手层才会正确拒绝 `0.4.x` 对端）。SDK 包版本（`__version__`）由发版流程另行推进。
+
+### Breaking Changes
+
+- **三个房间事件的失败 ack 改为 flat `ErrorPayload`**（#214，protocol#61）：
+  `server:join_office` / `server:leave_office` 的**成功 = 空 ack**（`None`），失败 = 顶层含 `code` 的
+  flat `ErrorPayload`；`server:list_room` 成功仍为 `ListRoomRet`，失败为 flat `ErrorPayload`。
+  **`(bool, str | None)` 元组形态已废除**（该形态的 ack 载荷字节序列与 arity 均变化：由两参 ACK
+  变为零参 / 单 dict）。
+- **`a2c_smcp.utils.parse_join_ack` 返回类型变更**（SDK 公开 API）：由 `tuple[bool, str]` 改为
+  `JoinOfficeVerdict(ok, code, message)`，便于下游按 `code` 机器分流。**刻意不再兼容**旧元组形态——
+  `MINOR` 严格匹配使跨版本对端物理上不可能互联，兼容分支只会掩盖未迁移的调用方。
+- **`enter_room` / `_ensure_name_registerable` 的业务拒绝改抛领域异常**
+  （`RoomFullError` / `NameConflictError` / `AlreadyInRoomError`，均为 `ValueError` 子类，携带 `code`）。
+
+### Added
+
+- `ErrorCode` 新增 `400` / `403` / `500` / `4101`–`4106`（`4102 Room Not Found` 为预留码，
+  builder **构造上拒绝**产出）。载荷构造收敛到 `build_bad_request_error` / `build_internal_error` /
+  `build_room_rejection_error` 三个共享 builder（sync / async 逐字节一致）。
+- **`is_protocol_error_payload` 增加形状守卫**：带 `content` 的 dict（MCP `CallToolResult` 形状）
+  **优先判否**。`CallToolResult` 是 `extra="allow"`，工具可携带恰好撞上协议码的顶层 `code`；
+  `client:tool_call` 的 ack 直接透传该结果，误判会把真实工具结果顶替成协议错误（码集合并入
+  `400/403/500` 后这一风险上升）。协议 `ErrorPayload` 从不带 `content`，判别无损。
+- **载荷校验失败必回 ack**：`server:join_office` / `leave_office` / `list_room` 在载荷畸形
+  （含**框架层参数绑定失败**——不带载荷 emit、多参 emit）时回 `400`，不再"静默不 ack"让调用方挂到
+  自身超时（error-handling.md:102-106）。
+- `server:list_room` 越权统一：无房 → `4103`；显式点名他房 → `4104`（**不再**静默不 ack、
+  **不再**返回空 `sessions`）；且**不调用**会话读取器 ⇒ 目标房成员信息不可能进响应。
+- 三个事件的 handler 都补齐 **catch-all**：未知内部异常一律回 `500` + 笼统文案（原文进日志），
+  不再让异常逃出 handler 导致"根本不发 ACK、调用方挂到自身超时"。
+
+### Fixed
+
+- 失败原因不再以自由文本回传：`message` 使用协议规范文案，`details` 只含**与发起者自身相关**的
+  上下文（目标房 / 自己声明的 role / 自己当前所在房），**MUST NOT** 携带任何对端会话标识（`sid` 等）。
+  名字冲突的冗长诊断（含对端 sid）下沉到服务端日志。
+- 未预期内部异常回 `500` + 笼统文案，原文只进日志（此前把 `str(e)` 原样回给客户端）。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

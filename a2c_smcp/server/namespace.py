@@ -13,13 +13,19 @@ import contextlib
 import copy
 from typing import Any, cast
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import (
+    AlreadyInRoomError,
+    NameConflictError,
+    RoomFullError,
+    RoomRejection,
+    SMCPNamespaceError,
+)
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.base import BaseNamespace
 from a2c_smcp.server.types import OFFICE_ID, SID
-from a2c_smcp.server.utils import aget_all_sessions_in_office, require_office_id
+from a2c_smcp.server.utils import aget_all_sessions_in_office, build_room_rejection_ack, require_office_id
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
@@ -41,6 +47,7 @@ from a2c_smcp.smcp import (
     AgentCallData,
     EnterOfficeNotification,
     EnterOfficeReq,
+    ErrorCode,
     ErrorPayload,
     GetBlobReq,
     GetBlobRet,
@@ -66,7 +73,10 @@ from a2c_smcp.smcp import (
     ToolCallReq,
     UpdateComputerConfigReq,
     UpdateMCPConfigNotification,
+    build_bad_request_error,
     build_computer_not_found_error,
+    build_internal_error,
+    build_room_rejection_error,
     is_protocol_error_payload,
 )
 from a2c_smcp.utils.logger import get_logger
@@ -171,8 +181,12 @@ class SMCPNamespace(BaseNamespace):
             # 如果sid已经存在于某个房间中，并且房间号不是当前房间号
             # If sid already exists in a room and the room number is not the current room
             if session.get("office_id") and session.get("office_id") != room:
-                logger.error(f"Agent sid: {sid} already in room: {session.get('office_id')}, can't join room: {room}")
-                raise ValueError("Agent sid already in room")
+                logger.warning(
+                    f"Agent sid: {sid} already in room: {session.get('office_id')}, can't join room: {room}",
+                )
+                # 领域异常承载协议码（4106）：handler 据此回 flat ErrorPayload（#214）。
+                # 异常消息只含自身上下文（无 sid）⇒ 不可能泄露进 ack 载荷。
+                raise AlreadyInRoomError()
 
             # 如果sid不存在于任何房间中
             # If sid doesn't exist in any room
@@ -186,7 +200,8 @@ class SMCPNamespace(BaseNamespace):
                 for participant_sid, _participant_eio_sid in participants:
                     participant_session = await self.get_session(participant_sid)
                     if participant_session.get("role") == "agent":
-                        raise ValueError("Agent already in room")
+                        logger.warning(f"Room {room!r} already has an agent; rejecting sid={sid}")
+                        raise RoomFullError()
             else:
                 logger.warning(f"Agent sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
                 return
@@ -211,7 +226,10 @@ class SMCPNamespace(BaseNamespace):
                         continue
                     participant_session = await self.get_session(participant_sid)
                     if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
-                        raise ValueError(f"Computer with name '{computer_name}' already exists in room '{room}'")
+                        logger.warning(
+                            f"Computer name {computer_name!r} already taken in room {room!r}; rejecting sid={sid}",
+                        )
+                        raise NameConflictError()
 
         # 名字注册闸门（角色无关）：注册表冲突必须在此刻暴露。若留到阶段 2 的 ``_register_name``，
         # socket 已经进入房间而回滚只覆盖会话 ⇒ 被拒客户端留在房里继续收 ``notify:*``（本单根因）。
@@ -328,32 +346,77 @@ class SMCPNamespace(BaseNamespace):
         # Call parent method to leave room
         await super().leave_room(sid, room)
 
-    async def on_server_join_office(self, sid: str, data: EnterOfficeReq) -> tuple[bool, str | None]:
+    async def on_server_join_office(
+        self, sid: str, data: EnterOfficeReq | None = None, *_extra: Any
+    ) -> ErrorPayload | None:
         """
         事件名：server:join_office 由全局变量 JOIN_OFFICE_EVENT 定义
         Computer或者Agent加入房间，为了突显smcp的办公特性，因此加入房间的动作命名为join_office
         Event name: server:join_office defined by global variable JOIN_OFFICE_EVENT
         Computer or Agent joins room, named join_office to highlight SMCP office characteristics
 
+        #214 ack 形态（协议 error-handling.md:177-205；`(bool, str | None)` 元组形态**已废除**）：
+
+        - **成功 ⇒ 空 ack**（本方法返回 ``None``，socketio 发零参 ACK）；
+        - **失败 ⇒ flat ``ErrorPayload``**：``400``（载荷畸形）/ ``403``（身份声明冲突）/
+          ``4101``（目标房已有 Agent）/ ``4105``（房内同名）/ ``4106``（Agent 已在其它房）/
+          ``500``（未预期内部异常，笼统文案、原文只进日志）。
+        - ``details`` 只含**与发起者自身相关**的上下文（目标房 / 自己声明的 role / 自己当前所在房）。
+
+        Ack shape per #214: success is an empty ack (`None`); failures are flat `ErrorPayload`.
+
+        **参数绑定也必须回 ack**（error-handling.md:102-106 明确覆盖「框架层参数提取器」这一时机）：
+        客户端不带载荷 emit（``socketio`` 把 ``None`` 折叠成零参包）或带多参 emit 时，绑定会在此之前
+        失败 ⇒ 异常逃出 handler ⇒ **根本不发 ACK** ⇒ 调用方挂到自身超时。故 ``data`` 具默认值、
+        多余位置参数由 ``*_extra`` 吸收，二者都落到 schema 校验 ⇒ 回 ``400``。
+        Binding failures (missing/extra payload args) must also ack — hence the default and ``*_extra``.
+
         Args:
             sid (str): 客户端ID 可能是 Computer或者Agent / Client ID, could be Computer or Agent
             data (EnterOfficeReq): 加入房间的数据 / Room join data
 
         Returns:
-            tuple[bool, Optional[str]]: 返回是否允许加入房间，以及可能的错误信息
-                                      / Returns whether joining is allowed and possible error message
+            Optional[ErrorPayload]: ``None`` = 成功；否则为 flat ErrorPayload
+                                   / None on success, otherwise a flat ErrorPayload
         """
-        role_info = TypeAdapter(EnterOfficeReq).validate_python(data)
+        try:
+            role_info = TypeAdapter(EnterOfficeReq).validate_python(data)
+        except ValidationError as exc:
+            # 协议 error-handling.md:102-106：具备 ack 通道的事件，载荷 schema 校验失败 **MUST** 回
+            # flat ErrorPayload(400)，**MUST NOT** 静默不 ack——「挂到客户端自身超时」与「立即收到
+            # 结构化错误」是两种客户端可感行为。本要求**覆盖校验的触发时机**（校验放在 handler 内亦然）。
+            # A schema failure MUST still ack (400); never leave the caller hanging to its own timeout.
+            logger.warning(f"server:join_office 载荷校验失败 sid={sid}: {exc}")
+            return build_bad_request_error()
         expected_role = role_info["role"]
+        office_id = role_info["office_id"]
+        if _extra:
+            # 多余位置参数 = 载荷形状非法（协议载荷是**单个** dict）⇒ 400。刻意不静默忽略：
+            # 静默会让「客户端多传了一个参数」变成一个看不见的兼容性问题。
+            # Extra positional args mean a malformed payload shape ⇒ 400 (never silently ignored).
+            logger.warning(f"server:join_office 多余位置参数 sid={sid}: {len(_extra)} 个")
+            return build_bad_request_error()
 
         session = await self.get_session(sid)
+        # 4106 的 details 需报「会话**当前**所在房」⇒ 必须在 enter_room 可能改动/收敛会话**之前**取。
+        # 4106's details need the session's *current* room, captured before enter_room can touch it.
+        previous_office = session.get("office_id")
         backup_session = copy.deepcopy(session)
 
         try:
-            # 检查角色是否匹配
-            # Check if role matches
+            # 检查角色是否匹配（身份声明冲突 ⇒ 403，**非**房间语义）；先于任何会话写入，故无需回滚
+            # Identity-declaration conflict ⇒ 403; runs before any session write, so no rollback needed.
             if session.get("role") and session["role"] != expected_role:
-                return False, f"Role mismatch, expected {expected_role}, but {session['role']} use this sid exists"
+                logger.warning(
+                    f"server:join_office 角色不符 sid={sid}: session={session['role']!r} request={expected_role!r}",
+                )
+                # 协议 events.md:610 的 403 还覆盖「同一 sid 声明的 **name** 与会话不符」，本 SDK
+                # **刻意不实现该分支**：改名后再入房是本仓的**合法流程**（CLI `socket join <office>
+                # <name>` 先改 comp.name 再 join；`test_rejected_rename_move_keeps_old_room` 正建立
+                # 在其上），实现它会把该流程判死。属对协议条文的**自觉偏离**，已在 #214 收尾说明中
+                # 列出；取值域类收紧归 #216。/ The name-mismatch half of events.md:610 is deliberately
+                # NOT implemented — renaming via a second join is a supported flow in this SDK.
+                return build_room_rejection_error(ErrorCode.FORBIDDEN)
 
             # 设置会话信息
             # Set session information
@@ -361,10 +424,10 @@ class SMCPNamespace(BaseNamespace):
             session["name"] = role_info["name"]
             await self.save_session(sid, session)
 
-            # 加入房间
-            # Join room
-            await self.enter_room(sid, role_info["office_id"])
-            return True, None
+            # 加入房间（成功 ⇒ 空 ack）
+            # Join room (success ⇒ empty ack)
+            await self.enter_room(sid, office_id)
+            return None
 
         except Exception as e:
             # 恢复本处理器写入的 role / name（**房间归属不回滚**）：``enter_room`` 失败时已按提交点
@@ -379,9 +442,27 @@ class SMCPNamespace(BaseNamespace):
                 else:
                     live_session.pop(field, None)
             await self.save_session(sid, live_session)
-            return False, f"Internal server error: {str(e)}"
 
-    async def on_server_leave_office(self, sid: str, data: LeaveOfficeReq) -> tuple[bool, str | None]:
+            if isinstance(e, RoomRejection):
+                # 业务拒绝：领域异常承载结构化 reason ⇒ 转 flat ErrorPayload（协议码 + 自身相关上下文）。
+                # 异常消息本身只含自身上下文（无对端 sid），details 由 builder 的白名单产出（#214）。
+                logger.warning(f"server:join_office 被拒 sid={sid} code={e.code}: {e}")
+                # 走**不抛**的助手：本分支在 except 子句内，二次抛出会顶替原异常逃出 handler ⇒ 不发 ACK
+                return build_room_rejection_ack(
+                    e,
+                    target_office_id=office_id,
+                    declared_role=expected_role,
+                    current_office_id=previous_office,
+                )
+
+            # 未知内部异常：笼统文案回 ack（不让客户端挂到超时），原文只进日志（协议 §通用错误码 500）。
+            # Unexpected internal error: generic text in the ack, the detail stays in the log.
+            logger.error(f"server:join_office 未预期异常 sid={sid}: {e}", exc_info=True)
+            return build_internal_error()
+
+    async def on_server_leave_office(
+        self, sid: str, data: LeaveOfficeReq | None = None, *_extra: Any
+    ) -> ErrorPayload | None:
         """
         事件名：server:leave_office 由全局变量 LEAVE_OFFICE_EVENT 定义
         Computer或者Agent离开房间，为了突显smcp的办公特性，因此离开房间的动作命名为leave_office
@@ -393,14 +474,34 @@ class SMCPNamespace(BaseNamespace):
         成员关系收敛一次。
         The room comes from the authoritative session only, never from the client payload.
 
+        #214 ack 形态：**成功与「无房幂等」都回空 ack**（``None``）；载荷 schema 校验失败回
+        ``400``；未预期内部异常回 ``500``。注意「载荷房号与会话不符」**不是**错误（协议：
+        MUST NOT 因此拒绝，只按会话执行），故它仍走成功路径。
+
+        **参数绑定也必须回 ack**（error-handling.md:102-106 覆盖「框架层参数提取器」时机）：
+        ``data`` 具默认值、多余位置参数由 ``*_extra`` 吸收，二者都落到 schema 校验 ⇒ ``400``；
+        否则异常逃出 handler ⇒ 不发 ACK ⇒ 调用方挂到自身超时。
+        Failure acks per #214: only `400` (schema) and `500` (internal) — a payload/session room
+        mismatch is explicitly NOT a rejection.
+
         Args:
             sid (str): 客户端ID 可能是 Computer或者Agent / Client ID, could be Computer or Agent
             data (LeaveOfficeReq): 离开房间的数据 / Room leave data
 
         Returns:
-            tuple[bool, Optional[str]]: 返回是否允许离开房间，以及可能的错误信息
-                                      / Returns whether leaving is allowed and possible error message
+            Optional[ErrorPayload]: ``None`` = 成功（含无房幂等）；否则为 flat ErrorPayload
+                                   / None on success (incl. idempotent no-room), else a flat ErrorPayload
         """
+        try:
+            leave_info = TypeAdapter(LeaveOfficeReq).validate_python(data)
+        except ValidationError as exc:
+            # 同 join：具备 ack 通道 ⇒ 校验失败 MUST 回 400，MUST NOT 静默不 ack（error-handling.md:102-106）。
+            logger.warning(f"server:leave_office 载荷校验失败 sid={sid}: {exc}")
+            return build_bad_request_error()
+        if _extra:
+            logger.warning(f"server:leave_office 多余位置参数 sid={sid}: {len(_extra)} 个")
+            return build_bad_request_error()
+
         try:
             session = await self.get_session(sid)
 
@@ -423,11 +524,11 @@ class SMCPNamespace(BaseNamespace):
                     if room == sid:
                         continue
                     await self.leave_room(sid, room)
-                return True, None
+                return None
 
-            claimed = data.get("office_id") if isinstance(data, dict) else None
+            claimed = leave_info.get("office_id")
             if claimed != office_id:
-                # 载荷与会话不一致：仅告警并按会话执行（不引入新的拒绝语义，避免与 rust 分叉）
+                # 载荷与会话不一致：仅告警并按会话执行（协议明令 MUST NOT 因此拒绝，避免与 rust 分叉）
                 # Payload disagrees with the session: warn and follow the session.
                 logger.warning(
                     f"leave_office: payload claims office {claimed!r} but session {sid} is in {office_id!r}; "
@@ -435,9 +536,11 @@ class SMCPNamespace(BaseNamespace):
                 )
 
             await self.leave_room(sid, office_id)
-            return True, None
+            return None
         except Exception as e:
-            return False, f"Internal server error: {str(e)}"
+            # 未知内部异常：笼统文案回 ack（不让客户端挂到超时），原文只进日志（#214 / §通用错误码 500）
+            logger.error(f"server:leave_office 未预期异常 sid={sid}: {e}", exc_info=True)
+            return build_internal_error()
 
     async def on_server_tool_call_cancel(self, sid: str, data: AgentCallData) -> None:
         """
@@ -821,50 +924,94 @@ class SMCPNamespace(BaseNamespace):
             skip_sid=sid,
         )
 
-    async def on_server_list_room(self, sid: str, data: ListRoomReq) -> ListRoomRet:
+    async def on_server_list_room(
+        self, sid: str, data: ListRoomReq | None = None, *_extra: Any
+    ) -> ListRoomRet | ErrorPayload:
         """
         列出指定房间内的所有会话信息。Agent可以通过此事件查询房间内的所有Computer和Agent。
         List all sessions in the specified room. Agent can query all Computers and Agents in the room via this event.
+
+        #214 ack 形态（协议 events.md §server:list_room ack 语义）：**成功**回 ``ListRoomRet``；
+        协议级错误以 flat ``ErrorPayload`` 投递——``400``（载荷畸形）/ ``4103``（会话尚未加入任何
+        房间）/ ``4104``（请求的 ``office_id`` ≠ 会话自身所在房）。**不再**静默不 ack（客户端挂到
+        自身超时）或返回空 ``sessions``（客户端误判「房间为空」）——那两种既有实现均已废除。
+
+        Ack shape per #214: `ListRoomRet` on success, flat `ErrorPayload` (400 / 4103 / 4104) on failure.
+
+        **参数绑定也必须回 ack**（error-handling.md:102-106 覆盖「框架层参数提取器」时机）：
+        ``data`` 具默认值、多余位置参数由 ``*_extra`` 吸收，二者都落到 schema 校验 ⇒ ``400``。
 
         Args:
             sid (str): 发起者ID，一般是Agent / Initiator ID, usually Agent
             data (ListRoomReq): 列出房间请求数据，包含office_id和req_id / List room request data with office_id and req_id
 
         Returns:
-            ListRoomRet: 房间内所有会话信息列表 / List of all session info in the room
+            ListRoomRet | ErrorPayload: 房间内所有会话信息列表，或 flat ErrorPayload
+                                       / List of all session info in the room, or a flat ErrorPayload
         """
         # 验证请求数据 / Validate request data
-        list_room_req = TypeAdapter(ListRoomReq).validate_python(data)
+        try:
+            list_room_req = TypeAdapter(ListRoomReq).validate_python(data)
+        except ValidationError as exc:
+            # 具备 ack 通道 ⇒ 校验失败 MUST 回 400，MUST NOT 静默不 ack（error-handling.md:102-106）
+            logger.warning(f"server:list_room 载荷校验失败 sid={sid}: {exc}")
+            return build_bad_request_error()
+        if _extra:
+            logger.warning(f"server:list_room 多余位置参数 sid={sid}: {len(_extra)} 个")
+            return build_bad_request_error()
         office_id = list_room_req["office_id"]
         req_id = list_room_req["req_id"]
 
-        # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission: ensure Agent is in the requested room
-        agent_session = await self.get_session(sid)
-        if agent_session is None:
-            # 发起者飞行中断连防御（同 _relay_client_call）：显式 raise 替代 None.get 的 AttributeError。
-            # In-flight disconnect guard (same as _relay_client_call): explicit raise over AttributeError.
-            raise SMCPNamespaceError("发起者会话不存在（可能已断连）：server:list_room / originator session gone")
-        agent_office_id = agent_session.get("office_id")
+        try:
+            # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission
+            agent_session = await self.get_session(sid)
+            if agent_session is None:
+                # **防御性死分支**：实测 socketio 的 ``get_session`` 对未知 sid 抛
+                # ``KeyError('Session not found')`` 而**不返回 None**，故线上"发起者已断连"走的是
+                # KeyError（由下方 catch-all 收编为 500；对已断连的 originator 而言 ack 没有读者，
+                # 协议 §飞行中断连 亦许可不回）。保留本分支只为避免 ``None.get`` 的 AttributeError。
+                # Defensive dead branch: the real "originator gone" path raises KeyError (socketio).
+                raise SMCPNamespaceError(
+                    "发起者会话不存在（可能已断连）：server:list_room / originator session gone",
+                )
+            agent_office_id = agent_session.get("office_id")
 
-        if agent_office_id != office_id:
-            raise SMCPNamespaceError(f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}")
+            if not agent_office_id:
+                # 无房 ⇒ 4103（会话自身无房可报，故无 code-specific details）
+                logger.warning(f"server:list_room 无房 sid={sid}, requested={office_id!r}")
+                return build_room_rejection_error(ErrorCode.NOT_IN_ROOM)
 
-        # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
-        all_sessions = await aget_all_sessions_in_office(office_id, self.server)
+            if agent_office_id != office_id:
+                # 显式点名他房 ⇒ 4104。**不泄露**目标房的存在性或成员信息——「房间存在但无权访问」与
+                # 「房间不存在」对外必须不可区分（error-handling.md §Cross Room Access 安全不变量）。
+                # 故 details 只回**被拒的目标房号**（发起者自己声明的值），不回该房的任何成员数据。
+                logger.warning(
+                    f"server:list_room 跨房越权 sid={sid}: session={agent_office_id!r} requested={office_id!r}",
+                )
+                return build_room_rejection_error(ErrorCode.CROSS_ROOM_ACCESS, target_office_id=office_id)
 
-        # 转换为SessionInfo格式 / Convert to SessionInfo format
-        sessions: list[SessionInfo] = []
-        for session in all_sessions:
-            if session.get("role") in ["computer", "agent"]:
-                session_info: SessionInfo = {
-                    "sid": session.get("sid", ""),
-                    "name": session.get("name", ""),
-                    "role": session["role"],
-                    "office_id": session.get("office_id", ""),
-                }
-                # a2c_version 为 NotRequired：仅在握手时记录到则带出 / NotRequired: include only if recorded at handshake
-                if session.get("a2c_version"):
-                    session_info["a2c_version"] = session["a2c_version"]
-                sessions.append(session_info)
+            # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
+            all_sessions = await aget_all_sessions_in_office(office_id, self.server)
 
-        return ListRoomRet(sessions=sessions, req_id=req_id)
+            # 转换为SessionInfo格式 / Convert to SessionInfo format
+            sessions: list[SessionInfo] = []
+            for session in all_sessions:
+                if session.get("role") in ["computer", "agent"]:
+                    session_info: SessionInfo = {
+                        "sid": session.get("sid", ""),
+                        "name": session.get("name", ""),
+                        "role": session["role"],
+                        "office_id": session.get("office_id", ""),
+                    }
+                    # a2c_version 为 NotRequired：仅在握手时记录到则带出 / NotRequired: only if recorded
+                    if session.get("a2c_version"):
+                        session_info["a2c_version"] = session["a2c_version"]
+                    sessions.append(session_info)
+
+            return ListRoomRet(sessions=sessions, req_id=req_id)
+        except Exception as e:
+            # 与 join / leave 对称的 catch-all：**有 ack 通道 ⇒ 失败必须产出 ack**。成功路径上的
+            # 意外异常（会话读取器、SessionInfo 组装）若逃出 handler，socketio 根本不发 ACK，
+            # 调用方就挂到自身超时——那正是本单要消灭的形态（error-handling.md:102-106）。
+            logger.error(f"server:list_room 未预期异常 sid={sid}: {e}", exc_info=True)
+            return build_internal_error()

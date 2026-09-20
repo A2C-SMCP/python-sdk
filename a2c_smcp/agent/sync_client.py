@@ -438,12 +438,16 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             return
         if generation != self._office_generation or self._desired_office != desired:
             return
-        ok, error_msg = parse_join_ack(result)
-        if ok:
+        verdict = parse_join_ack(result)
+        if verdict.ok:
             logger.info(f"已自动重新加入 Office: {office_id}")
         else:
             self._drop_desired_office()
-            logger.error(f"自动重新加入 Office 被拒绝: {office_id} - {error_msg}")
+            # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（#212 将对其做有界退避重试），
+            # 无码则是「未获裁决」（形状不认识 / 空响应）。Transient vs indeterminate, by code.
+            logger.error(
+                f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
+            )
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -774,6 +778,11 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         try:
             logger.debug(f"Getting computers in office {office_id}")
             response = self.call(LIST_ROOM_EVENT, req, namespace=self._namespace, timeout=timeout)
+
+            # flat ErrorPayload（#214：400 / 4103 无房 / 4104 跨房）→ 抛 SMCPProtocolError。
+            # 必须**先于** req_id 校验：ErrorPayload 无 req_id，会被误报成「响应 req_id 不匹配」。
+            # Must precede the req_id check: an ErrorPayload carries no req_id.
+            raise_for_error_payload(response)
 
             # 验证响应 / Validate response
             if response.get("req_id") != req["req_id"]:

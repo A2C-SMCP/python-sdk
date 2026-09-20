@@ -38,12 +38,13 @@ from a2c_smcp.smcp import (
     GetToolsReq,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
 
 async def _join_office(client: AsyncClient, role: Literal["computer", "agent"], office_id: str, name: str) -> None:
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
-    ok, err = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok and err is None
+    # v0.5.0（#214）：成功 = 空 ack（None）；失败 = flat ErrorPayload
+    assert_empty_ack(await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE))
 
 
 @pytest.mark.asyncio
@@ -118,12 +119,12 @@ async def test_leave_and_broadcast(socketio_server, basic_server_port: int):
     await _join_office(computer, role="computer", office_id=office_id, name="comp-B")
 
     # 通过 server:leave_office 离开
-    ok, err = await computer.call(
+    ack = await computer.call(
         LEAVE_OFFICE_EVENT,
         {"office_id": office_id},
         namespace=SMCP_NAMESPACE,
     )
-    assert ok and err is None
+    assert_empty_ack(ack)
 
     await asyncio.sleep(0.2)
     assert leave_events, "Agent 应收到 LEAVE_OFFICE_NOTIFICATION"
@@ -493,13 +494,12 @@ async def test_computer_duplicate_name_rejected(socketio_server, basic_server_po
     # 第二个 Computer 尝试加入同一房间，应该失败
     # Second Computer tries to join same room, should fail
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_id, "name": computer_name}
-    ok, err = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    ack = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
-    # 验证失败
-    # Verify failure
-    assert not ok, "第二个同名Computer应该加入失败 / Second Computer with same name should fail to join"
-    assert err is not None, "应该返回错误信息 / Should return error message"
-    assert "already exists" in err, f"错误信息应包含'already exists'，实际: {err} / Error should contain 'already exists'"
+    # 验证失败：v0.5.0 起以 flat ErrorPayload 承载，错误语义看**协议码**而非自由文本
+    # Verify failure: since v0.5.0 the rejection is a flat ErrorPayload — read the code, not free text
+    assert_rejected_ack(ack, 4105, action="server:join_office")
+    assert ack["message"] == "Name already taken in room", ack
 
     await computer1.disconnect()
     await computer2.disconnect()
@@ -538,12 +538,11 @@ async def test_computer_different_name_allowed(socketio_server, basic_server_por
     # 第二个 Computer 加入同一房间，应该成功
     # Second Computer joins same room, should succeed
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_id, "name": "comp-2"}
-    ok, err = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    ack = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
     # 验证成功
     # Verify success
-    assert ok, f"不同名Computer应该加入成功 / Different name Computer should succeed, error: {err}"
-    assert err is None, "不应该有错误信息 / Should not have error message"
+    assert_empty_ack(ack, action="不同名Computer应该加入成功 / Different name Computer should succeed, error")
 
     await computer1.disconnect()
     await computer2.disconnect()
@@ -574,12 +573,11 @@ async def test_computer_switch_room_with_same_name_allowed(socketio_server, basi
     # 切换到第二个房间（同名Computer）
     # Switch to second room (same name Computer)
     payload: EnterOfficeReq = {"role": "computer", "office_id": "office-room-2", "name": computer_name}
-    ok, err = await computer.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    ack = await computer.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
     # 验证成功
     # Verify success
-    assert ok, f"Computer切换房间应该成功 / Computer switching rooms should succeed, error: {err}"
-    assert err is None, "不应该有错误信息 / Should not have error message"
+    assert_empty_ack(ack, action="Computer切换房间应该成功 / Computer switching rooms should succeed, error")
 
 
 # ======================================================================
@@ -668,15 +666,20 @@ async def test_tool_call_wrong_role_rejected(socketio_server, basic_server_port:
 
 @pytest.mark.asyncio
 async def test_list_room_cross_office_rejected(socketio_server, basic_server_port: int):
-    """跨房间 server:list_room：Agent(office_A) 查询 office_B → SMCPNamespaceError，不泄露他房会话。"""
+    """跨房间 server:list_room：Agent(office_A) 查询 office_B → flat ErrorPayload(4104)，不泄露他房会话。
+
+    #214 前该路径 raise ⇒ 不回 ACK ⇒ 调用方挂到自身超时；协议明令不许「静默不 ack」。
+    """
     agent = AsyncClient()
     agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-D", "robot-neg-4")
 
-    with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
-        await socketio_server.on_server_list_room(
-            agent_sid,
-            {"agent": "robot-neg-4", "req_id": "neg-r4", "office_id": "office-neg-OTHER"},
-        )
+    ack = await socketio_server.on_server_list_room(
+        agent_sid,
+        {"agent": "robot-neg-4", "req_id": "neg-r4", "office_id": "office-neg-OTHER"},
+    )
+    assert_rejected_ack(ack, 4104, action="server:list_room")
+    assert ack["details"] == {"office_id": "office-neg-OTHER"}
+    assert "sessions" not in ack, "越权拒绝不得携带他房会话数据"
 
     await agent.disconnect()
 
@@ -795,8 +798,8 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
     )
     # 目标房闸门放行（office-B 里没有同名），名字注册表（裸名全局）才是冲突点
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "c213"}
-    ok, err = await subject.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok is False and err is not None, "跨 office 同名应被拒"
+    ack = await subject.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_rejected_ack(ack, 4105, action="server:join_office")  # 目标房同名（跨 office 同名由注册表闸门拦下）
 
     subject_sid = subject.get_sid(namespace=SMCP_NAMESPACE)
     assert subject_sid is not None
@@ -850,9 +853,9 @@ async def test_rejected_rename_move_keeps_old_room(socketio_server, basic_server
 
     # 改名换房：目标房已有同名（"taken-213"）⇒ 被拒。注册表闸门亦独立阻止（裸名已被占）。
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "taken-213"}
-    ok, err = await mover.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok is False and err is not None, "换房应被拒"
-    assert "already" in str(err), f"应为目标房/注册表的冲突文案，实际：{err!r}"
+    ack = await mover.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_rejected_ack(ack, 4105, action="server:join_office")  # 改名后撞目标房同名 ⇒ 4105
+    assert ack["message"] == "Name already taken in room", ack
 
     # 验收口径：校验先于副作用 ⇒ 旧房成员关系原封不动，对端也未收到 leave
     assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_a], "被拒的换房必须留在旧房"
@@ -893,3 +896,124 @@ async def test_get_config_cross_office_rejected(socketio_server, basic_server_po
 
     await agent.disconnect()
     await computer.disconnect()
+
+
+# ======================================================================
+# #214：ack 形态的**线上**回归（真 socketio 栈）
+#
+# 本节的用例全部经 `client.call(...)` 走真实 ACK 通道——直接调用 handler 的单元用例
+# **看不见**两类失效：(a) 异常逃出 handler ⇒ socketio 根本不发 ACK ⇒ 调用方挂到自身超时；
+# (b) 返回值形状不是协议约定（如回了元组/空 dict）。acceptance「不再出现挂到超时」只能在此层钉死。
+# Wire-level regressions: these assertions can only be made through a real ack channel.
+# ======================================================================
+
+
+@pytest.mark.asyncio
+async def test_join_office_ack_shapes_over_wire(socketio_server, basic_server_port: int):
+    """join 的三种线上回应：成功回 `None`；被拒回 flat ErrorPayload；**参数绑定失败也必须回 ack**。"""
+    client = AsyncClient()
+    await client.connect(
+        f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io"
+    )
+    try:
+        # 成功 → 空 ack（客户端 call() 折叠为 None）
+        ack = await client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "agent", "office_id": "office-wire-214", "name": "wire-agent"},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        assert ack is None, f"成功必须是空 ack，实得 {ack!r}"
+
+        # 角色不符（会话已声明 agent，本次声明 computer）→ 403 payload
+        rejected = await client.call(
+            JOIN_OFFICE_EVENT,
+            {"role": "computer", "office_id": "office-wire-214", "name": "wire-agent"},
+            namespace=SMCP_NAMESPACE,
+            timeout=5,
+        )
+        assert isinstance(rejected, dict) and rejected["code"] == 403, rejected
+
+        # 载荷缺失 / 畸形：**必须在 socketio 元组展开或参数绑定处就回 ack**，
+        # 绝不能因为异常逃出 handler 而让调用方挂到自身超时（error-handling.md:102-106）。
+        for label, payload in [("no-payload", None), ("wrong-type", "not-a-dict"), ("empty-dict", {})]:
+            try:
+                ack = (
+                    await client.call(JOIN_OFFICE_EVENT, namespace=SMCP_NAMESPACE, timeout=5)
+                    if payload is None
+                    else await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE, timeout=5)
+                )
+            except Exception as exc:  # 超时 ⇒ 静默不 ack ⇒ acceptance 不满足
+                raise AssertionError(f"[{label}] 畸形载荷不得挂到客户端超时：{exc!r}") from exc
+            assert isinstance(ack, dict) and ack["code"] == 400, f"[{label}] {ack!r}"
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_list_room_cross_office_ack_over_wire(socketio_server, basic_server_port: int):
+    """`server:list_room` 越权在线上的形态：立即回 4104，**不**挂到客户端超时、**不**返回空列表。
+
+    旧实现是 raise SMCPNamespaceError ⇒ 不发 ACK ⇒ 调用方吃满 timeout；本用例是那条验收
+    （「不再出现『挂到超时』或『返回空 sessions』」）的线上钉死。
+    """
+    agent = AsyncClient()
+    await agent.connect(
+        f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io"
+    )
+    try:
+        await _join_office(agent, role="agent", office_id="office-wire-214-a", name="wire-lister")
+
+        try:
+            ack = await agent.call(
+                LIST_ROOM_EVENT,
+                {"agent": "wire-lister", "req_id": "wire-r1", "office_id": "office-wire-214-b"},
+                namespace=SMCP_NAMESPACE,
+                timeout=5,
+            )
+        except Exception as exc:
+            raise AssertionError(f"越权查询不得挂到客户端超时：{exc!r}") from exc
+
+        assert isinstance(ack, dict), f"越权必须回 flat ErrorPayload，实得 {ack!r}"
+        assert ack["code"] == 4104, ack
+        assert "sessions" not in ack, "越权拒绝不得携带目标房成员信息"
+    finally:
+        await agent.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_leave_office_ack_shapes_over_wire(socketio_server, basic_server_port: int):
+    """leave 的线上形态：有房/无房都回空 ack；载荷畸形回 400（**不**静默不 ack）。
+
+    协议 §server:leave_office：无房退房是**幂等成功**（不走 4103）；载荷 schema 失败 ⇒ 400。
+    两者都必须在线上有回应——`call()` 一旦超时，就说明 handler 又走了「异常逃出 ⇒ 不发 ACK」。
+    """
+    client = AsyncClient()
+    await client.connect(
+        f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io"
+    )
+    try:
+        await _join_office(client, role="agent", office_id="office-wire-leave", name="wire-leaver")
+
+        # 有房退房 → 空 ack
+        assert_empty_ack(
+            await client.call(
+                LEAVE_OFFICE_EVENT, {"office_id": "office-wire-leave"}, namespace=SMCP_NAMESPACE, timeout=5
+            ),
+            action="server:leave_office",
+        )
+
+        # 无房再退 → 幂等成功（仍为空 ack，**不是** 4103）
+        assert_empty_ack(
+            await client.call(
+                LEAVE_OFFICE_EVENT, {"office_id": "office-wire-leave"}, namespace=SMCP_NAMESPACE, timeout=5
+            ),
+            action="server:leave_office(幂等)",
+        )
+
+        # 载荷畸形 → 400（且有 ack）
+        for label, payload in [("empty-dict", {}), ("null-room", {"office_id": None})]:
+            ack = await client.call(LEAVE_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE, timeout=5)
+            assert isinstance(ack, dict) and ack["code"] == 400, f"[{label}] {ack!r}"
+    finally:
+        await client.disconnect()

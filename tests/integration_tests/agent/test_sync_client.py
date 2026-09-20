@@ -34,6 +34,7 @@ from a2c_smcp.smcp import (
 )
 from a2c_smcp.utils.logger import logger
 from tests.integration_tests.mock_sync_smcp_server import create_sync_smcp_socketio
+from tests.room_acks import assert_empty_ack
 
 
 @pytest.fixture
@@ -113,8 +114,8 @@ def _join_office(client: Client, role: Literal["computer", "agent"], office_id: 
     English: Join office via server:join_office (sync).
     """
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
-    ok, err = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok  # 只检查成功状态，忽略返回消息
+    ack = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_empty_ack(ack)
 
 
 def test_agent_receives_enter_and_tools_sync(startup_and_shutdown_sync_smcp_server):
@@ -269,13 +270,13 @@ def test_agent_receives_update_config_sync(startup_and_shutdown_sync_smcp_server
         # 触发配置更新
         computer_sid = computer.namespaces[SMCP_NAMESPACE]
         logger.info(f"[DEBUG] Computer SID: {computer_sid}")
-        ok, err = computer.call(
+        ack = computer.call(
             "server:update_config",
             {"computer": computer_sid},
             namespace=SMCP_NAMESPACE,
             timeout=3,
         )
-        assert ok and err is None
+        assert_empty_ack(ack)
 
         # 等待断开信号
         disconnect_event.wait()

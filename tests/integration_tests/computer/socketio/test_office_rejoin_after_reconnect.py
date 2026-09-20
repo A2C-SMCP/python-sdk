@@ -61,7 +61,8 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
         self.join_record: list[tuple[str, dict]] = []
         # 每次 join 的服务端裁决（含被拒原因），供"真实服务端拒绝路径"用例断言
         # Per-join server verdict, so the real-rejection case can assert on the genuine ack.
-        self.join_results: list[tuple[bool, Any]] = []
+        # #214：成功 = None（空 ack）；失败 = flat ErrorPayload（顶层含 code）
+        self.join_results: list[Any] = []
         self.joined = asyncio.Event()
         # 自第 N 次（1-based）join 起一律拒绝，复现「旧会话尚未回收」的瞬态拒绝
         # Reject from the Nth (1-based) join onwards — reproduces the transient rejection window
@@ -83,20 +84,14 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
             payload = dict(data)
             self.join_record.append((sid, payload))
             self.join_results.append(
-                (
-                    False,
-                    f"Internal server error: Computer with name '{payload.get('name')}' "
-                    f"already exists in room '{payload.get('office_id')}'",
-                ),
+                {"code": 4105, "message": "Name already taken in room"},
             )
             self.joined.set()
             return self.join_results[-1]
         result = await super().on_server_join_office(sid, data)
         self.join_record.append((sid, dict(data)))
-        if isinstance(result, (list, tuple)) and len(result) >= 2:
-            self.join_results.append((bool(result[0]), result[1]))
-        else:
-            self.join_results.append((bool(result), None))
+        # v0.5.0（#214）：成功 = 空 ack（None）；失败 = flat ErrorPayload
+        self.join_results.append(result)
         self.joined.set()
         return result
 
@@ -226,9 +221,9 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
         await _wait_for_new_sid(client, first_sid)
         await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
 
-        ok, error = office_server.join_results[-1]
-        assert ok is False, "旧会话未回收时，真实服务端应拒绝同名重放"
-        assert "already exists in room" in str(error), f"应为服务端真实的同名冲突文案，实际：{error!r}"
+        ack = office_server.join_results[-1]
+        assert isinstance(ack, dict) and ack["code"] == 4105, "旧会话未回收时，真实服务端应拒绝同名重放"
+        assert ack["message"] == "Name already taken in room", f"应为协议规范文案（不再含对端 sid），实际：{ack!r}"
 
         # 状态必须清空（不得保留表面有效的旧值），且单次尝试不重试
         loop = asyncio.get_running_loop()

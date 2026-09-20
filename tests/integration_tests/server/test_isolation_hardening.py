@@ -7,11 +7,13 @@
         with ``-O`` (assert statements stripped at compile time).
 
 设计说明 / Design note:
-  本用例不依赖具体异常类型——只验证"设计无关的安全不变量"：在断言被剥离时，
-  跨房间访问 **不得** 静默放行并泄露另一房间的会话数据。
-  This case is exception-type agnostic. It only asserts the design-agnostic security
-  invariant: with assertions stripped, a cross-room request MUST NOT silently pass
-  and leak the other room's session data.
+  本用例不依赖具体**拒绝形态**（异常 / flat ErrorPayload 皆可）——只验证"设计无关的安全
+  不变量"：在断言被剥离时，跨房间访问 **不得** 泄露另一房间的会话数据。
+  判据刻意做成**形状无关**：只要会话读取器被调用过，即视为泄露面已被打开（"先取全房成员
+  再拒绝"同样不合格）；这样 v0.5.0 把拒绝形态由 raise 改为 ErrorPayload(4104) 时，
+  用例的判别力不随之削弱。
+  Exception-type and rejection-shape agnostic: the invariant is that a cross-room request must not
+  reach the session reader at all, so a "fetch-then-reject" implementation also fails.
 """
 
 from __future__ import annotations
@@ -41,7 +43,8 @@ _ASYNC_SCRIPT = textwrap.dedent(
             {"sid": "spy", "name": "spy", "role": "agent", "office_id": "office_B"},
             {"sid": "c_b", "name": "c_b", "role": "computer", "office_id": "office_B"},
         ]
-        ns_mod.aget_all_sessions_in_office = AsyncMock(return_value=leaked)
+        reader = AsyncMock(return_value=leaked)
+        ns_mod.aget_all_sessions_in_office = reader
         try:
             ret = await ns.on_server_list_room(
                 "a_sid", {"agent": "a_sid", "req_id": "r", "office_id": "office_B"}
@@ -49,7 +52,16 @@ _ASYNC_SCRIPT = textwrap.dedent(
         except Exception:
             print("REJECTED")
             return
-        # 未抛异常 = 隔离被剥离，office_B 数据被泄露
+        # v0.5.0（#214）：越权以 flat ErrorPayload(4104) 表达，**不是**异常。
+        # 判据与"实现形态"解耦：只要是结构化拒绝（顶层 code），就不算泄露。
+        if isinstance(ret, dict) and "code" in ret:
+            # 形状无关的强判据：**读取器根本不该被调用**——「先取全房成员再拒绝」同样算泄露面被打开
+            if reader.await_count:
+                print("LEAK:reader-called")
+            else:
+                print("REJECTED")
+            return
+        # 未拒绝 = 隔离被剥离，office_B 数据被泄露
         print("LEAK:" + ",".join(s["sid"] for s in ret.get("sessions", [])))
 
     asyncio.run(main())
@@ -71,7 +83,8 @@ _SYNC_SCRIPT = textwrap.dedent(
         {"sid": "spy", "name": "spy", "role": "agent", "office_id": "office_B"},
         {"sid": "c_b", "name": "c_b", "role": "computer", "office_id": "office_B"},
     ]
-    ns_mod.get_all_sessions_in_office = MagicMock(return_value=leaked)
+    reader = MagicMock(return_value=leaked)
+    ns_mod.get_all_sessions_in_office = reader
     try:
         ret = ns.on_server_list_room(
             "a_sid", {"agent": "a_sid", "req_id": "r", "office_id": "office_B"}
@@ -79,7 +92,12 @@ _SYNC_SCRIPT = textwrap.dedent(
     except Exception:
         print("REJECTED")
     else:
-        print("LEAK:" + ",".join(s["sid"] for s in ret.get("sessions", [])))
+        # v0.5.0（#214）：越权以 flat ErrorPayload(4104) 表达，**不是**异常
+        if isinstance(ret, dict) and "code" in ret:
+            # 形状无关的强判据：**读取器根本不该被调用**（见 async 脚本同名说明）
+            print("LEAK:reader-called" if reader.called else "REJECTED")
+        else:
+            print("LEAK:" + ",".join(s["sid"] for s in ret.get("sessions", [])))
     """
 )
 

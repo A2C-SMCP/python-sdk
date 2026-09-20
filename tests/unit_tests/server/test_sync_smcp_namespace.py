@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,6 +18,7 @@ from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
     LEAVE_OFFICE_NOTIFICATION,
 )
+from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
 
 class _DummyAuthProv:
@@ -136,14 +138,15 @@ def test_on_server_join_office_ok_and_rollback_on_error():
     server.manager.get_participants = MagicMock(return_value=[])
     ns.server = server
 
-    # 正常路径
-    ok, err = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
-    assert ok is True and err is None
+    # 正常路径：成功 = 空 ack（v0.5.0 起；此前为 (True, None) 元组）
+    ack = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
+    assert_empty_ack(ack)
 
-    # enter_room 抛错 -> 回滚
+    # enter_room 抛错 -> 回滚 + 回 500 笼统文案（原文只进日志）
     ns.enter_room = MagicMock(side_effect=RuntimeError("boom"))
-    ok2, err2 = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
-    assert ok2 is False and "Internal server error" in err2
+    ack2 = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
+    assert_rejected_ack(ack2, 500)
+    assert "boom" not in json.dumps(ack2)
 
 
 def test_on_server_leave_office_ok_and_error():
@@ -151,12 +154,13 @@ def test_on_server_leave_office_ok_and_error():
     # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
     ns.get_session = MagicMock(return_value={"role": "agent", "office_id": "o"})
     ns.leave_room = MagicMock()
-    ok, err = ns.on_server_leave_office("sid", {"office_id": "o"})
-    assert ok is True and err is None
+    ack = ns.on_server_leave_office("sid", {"office_id": "o"})
+    assert_empty_ack(ack, action="server:leave_office")
 
     ns.leave_room = MagicMock(side_effect=RuntimeError("x"))
-    ok2, err2 = ns.on_server_leave_office("sid", {"office_id": "o"})
-    assert ok2 is False and "Internal server error" in err2
+    ack2 = ns.on_server_leave_office("sid", {"office_id": "o"})
+    assert_rejected_ack(ack2, 500, action="server:leave_office")
+    assert "x" != ack2["message"] and "boom" not in json.dumps(ack2)
 
 
 def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
@@ -285,13 +289,15 @@ def test_on_server_list_room_permission_denied():
 
     ns.get_session = MagicMock(return_value=agent_session)
 
-    # 执行测试，应该抛出 SMCPNamespaceError（隔离校验在 -O 下亦生效）
-    # Execute test, should raise SMCPNamespaceError (isolation holds even under -O)
-    with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
-        ns.on_server_list_room(
-            agent_sid,
-            {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
-        )
+    # #214：越权不再"静默不 ack"（那会让客户端挂到自身超时），改回 flat ErrorPayload(4104)。
+    # 隔离不变量本身不变：**绝不**返回 office_B 的任何会话数据。
+    ack = ns.on_server_list_room(
+        agent_sid,
+        {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
+    )
+    assert_rejected_ack(ack, 4104, action="server:list_room")
+    assert ack["details"] == {"office_id": "office_B"}
+    assert "sessions" not in ack, "越权拒绝不得携带目标房成员信息"
 
 
 def test_on_server_list_room_filters_invalid_sessions(monkeypatch):
@@ -359,7 +365,7 @@ def test_enter_room_computer_duplicate_name_raises_error(ns):
 
     # 应该抛出 ValueError，提示重名
     # Should raise ValueError indicating duplicate name
-    with pytest.raises(ValueError, match="Computer with name 'comp1' already exists in room 'room1'"):
+    with pytest.raises(ValueError, match="Name already taken in room"):
         ns.enter_room(new_computer_sid, "room1")
 
 

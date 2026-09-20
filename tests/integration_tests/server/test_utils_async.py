@@ -18,15 +18,16 @@ from socketio import AsyncClient
 
 from a2c_smcp.server import aget_all_sessions_in_office, aget_computers_in_office
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
+from tests.room_acks import assert_empty_ack
 
 
 async def _join_office(client: AsyncClient, role: str, office_id: str, name: str) -> None:
-    ok, err = await client.call(
+    ack = await client.call(
         JOIN_OFFICE_EVENT,
         {"role": role, "office_id": office_id, "name": name},
         namespace=SMCP_NAMESPACE,
     )
-    assert ok and err is None
+    assert_empty_ack(ack)
 
 
 @pytest.mark.asyncio

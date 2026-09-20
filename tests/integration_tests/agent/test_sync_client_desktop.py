@@ -21,6 +21,7 @@ from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE, UPDATE_DESKTOP_EVENT
 from a2c_smcp.utils.logger import logger
 from tests.integration_tests.mock_sync_smcp_server import create_sync_smcp_socketio
+from tests.room_acks import assert_empty_ack
 
 TEST_PORT = 8010
 
@@ -56,10 +57,10 @@ def startup_and_shutdown_sync_smcp_server_desktop():
 
 def _join_office(client: Client, role: str, office_id: str, name: str) -> None:
     payload = {"role": role, "office_id": office_id, "name": name}
-    ok, err = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    ack = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     # 只检查成功状态，忽略返回消息（server:join_office 成功时第二位可为提示消息或 None，见 test_sync_client.py 约定）
     # Only assert success; the second tuple element may be an informational message or None.
-    assert ok, f"join_office failed: {err}"
+    assert_empty_ack(ack, action="join_office failed")
 
 
 def test_sync_agent_get_desktop_and_update_flow(startup_and_shutdown_sync_smcp_server_desktop):
@@ -83,8 +84,8 @@ def test_sync_agent_get_desktop_and_update_flow(startup_and_shutdown_sync_smcp_s
         comp.connect(f"http://localhost:{TEST_PORT}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
         _join_office(comp, role="computer", office_id=office_id, name="comp-desktop-01")
         # 触发一次桌面更新广播
-        ok, err = comp.call(UPDATE_DESKTOP_EVENT, {"computer": comp.namespaces[SMCP_NAMESPACE]}, namespace=SMCP_NAMESPACE)
-        assert ok and err is None
+        ack = comp.call(UPDATE_DESKTOP_EVENT, {"computer": comp.namespaces[SMCP_NAMESPACE]}, namespace=SMCP_NAMESPACE)
+        assert_empty_ack(ack)
         disconnect.wait()
         comp.disconnect()
 

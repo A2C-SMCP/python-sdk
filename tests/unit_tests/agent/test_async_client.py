@@ -18,6 +18,7 @@ from mcp.types import CallToolResult
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     SMCP_NAMESPACE,
@@ -400,6 +401,31 @@ async def test_get_computers_in_office_empty(mock_call: AsyncMock, client: Async
 
     # 验证返回空列表 / Verify empty list is returned
     assert len(computers) == 0
+
+
+@pytest.mark.asyncio
+@patch("socketio.AsyncClient.call", new_callable=AsyncMock)
+async def test_get_computers_in_office_error_payload_raises_protocol_error(
+    mock_call: AsyncMock, client: AsyncSMCPAgentClient
+) -> None:
+    """#214：`server:list_room` 的 flat ErrorPayload（此处 4104 越权）⇒ `SMCPProtocolError`。
+
+    必须**先于** `req_id` 校验：ErrorPayload 不带 `req_id`，若顺序反了会被误报成
+    「Invalid response with mismatched req_id」——把结构化拒绝伪装成协议违约，客户端再也读不到码。
+
+    A flat ErrorPayload from list_room must surface as SMCPProtocolError (with its code), not as a
+    misleading "mismatched req_id" ValueError.
+    """
+    mock_call.return_value = {
+        "code": 4104,
+        "message": "Cross-room access denied",
+        "details": {"office_id": "other_office"},
+    }
+
+    with pytest.raises(SMCPProtocolError) as exc_info:
+        await client.get_computers_in_office("test_office")
+
+    assert exc_info.value.code == 4104
 
 
 @pytest.mark.asyncio

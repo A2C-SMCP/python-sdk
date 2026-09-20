@@ -41,6 +41,7 @@ from a2c_smcp.smcp import (
     ErrorCode,
 )
 from a2c_smcp.testing import create_local_sync_server
+from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
 
 def _url(port: int) -> str:
@@ -112,7 +113,7 @@ def startup_and_shutdown_local_sync_server(sync_server_port: int) -> Generator[N
 
 
 def _join_office(client: Client | SimpleClient, role: str, office_id: str, name: str) -> None:
-    ok, err = (
+    ack = (
         client.call(
             JOIN_OFFICE_EVENT,
             {"role": role, "office_id": office_id, "name": name},
@@ -121,9 +122,9 @@ def _join_office(client: Client | SimpleClient, role: str, office_id: str, name:
         if isinstance(client, Client)
         else client.call(JOIN_OFFICE_EVENT, {"role": role, "office_id": office_id, "name": name})
     )
-    if not (ok and err is None):
-        print(f"加入房间失败: role={role}, office_id={office_id}, name={name}, ok={ok}, err={err}")
-    assert ok and err is None
+    if ack is not None:
+        print(f"加入房间失败: role={role}, office_id={office_id}, name={name}, ack={ack!r}")
+    assert_empty_ack(ack)
 
 
 def test_enter_and_broadcast_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
@@ -167,8 +168,8 @@ def test_leave_and_broadcast_sync(startup_and_shutdown_local_sync_server, sync_s
     computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     _join_office(computer, role="computer", office_id=office_id, name="comp-S2")
 
-    ok, err = computer.call(LEAVE_OFFICE_EVENT, {"office_id": office_id}, namespace=SMCP_NAMESPACE)
-    assert ok and err is None
+    ack = computer.call(LEAVE_OFFICE_EVENT, {"office_id": office_id}, namespace=SMCP_NAMESPACE)
+    assert_empty_ack(ack)
 
     time.sleep(0.2)
     assert leave_events, "Agent 应收到 LEAVE_OFFICE_NOTIFICATION"
@@ -505,11 +506,11 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
 
         # 第一个 Computer 成功加入
         # First Computer joins successfully
-        ok, err = computer1.call(
+        ack = computer1.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": office_id, "name": computer_name},
         )
-        assert ok and err is None, f"第一个Computer应该加入成功 / First Computer should join successfully, error: {err}"
+        assert_empty_ack(ack, action="第一个Computer应该加入成功 / First Computer should join successfully, error")
 
         # 连接第二个 Computer（同名）
         # Connect second Computer (same name)
@@ -517,16 +518,15 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
 
         # 第二个 Computer 尝试加入同一房间，应该失败
         # Second Computer tries to join same room, should fail
-        ok2, err2 = computer2.call(
+        ack2 = computer2.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": office_id, "name": computer_name},
         )
 
         # 验证失败
         # Verify failure
-        assert not ok2, "第二个同名Computer应该加入失败 / Second Computer with same name should fail to join"
-        assert err2 is not None, "应该返回错误信息 / Should return error message"
-        assert "already exists" in err2, f"错误信息应包含'already exists'，实际: {err2} / Error should contain 'already exists'"
+        assert_rejected_ack(ack2, 4105, action="server:join_office")
+        assert ack2["message"] == "Name already taken in room", ack2
 
     finally:
         computer1.disconnect()
@@ -549,11 +549,11 @@ def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server,
 
         # 第一个 Computer 加入
         # First Computer joins
-        ok, err = computer1.call(
+        ack = computer1.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": office_id, "name": "comp-sync-1"},
         )
-        assert ok and err is None, f"第一个Computer应该加入成功 / First Computer should join successfully, error: {err}"
+        assert_empty_ack(ack, action="第一个Computer应该加入成功 / First Computer should join successfully, error")
 
         # 连接第二个 Computer（不同名）
         # Connect second Computer (different name)
@@ -561,15 +561,14 @@ def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server,
 
         # 第二个 Computer 加入同一房间，应该成功
         # Second Computer joins same room, should succeed
-        ok2, err2 = computer2.call(
+        ack2 = computer2.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": office_id, "name": "comp-sync-2"},
         )
 
         # 验证成功
         # Verify success
-        assert ok2, f"不同名Computer应该加入成功 / Different name Computer should succeed, error: {err2}"
-        assert err2 is None, "不应该有错误信息 / Should not have error message"
+        assert_empty_ack(ack2, action="不同名Computer应该加入成功 / Different name Computer should succeed, error")
 
     finally:
         computer1.disconnect()
@@ -591,23 +590,22 @@ def test_computer_switch_room_with_same_name_allowed(startup_and_shutdown_local_
 
         # 加入第一个房间
         # Join first room
-        ok, err = computer.call(
+        ack = computer.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": "office-sync-room-1", "name": computer_name},
         )
-        assert ok and err is None, f"加入第一个房间应该成功 / Joining first room should succeed, error: {err}"
+        assert_empty_ack(ack, action="加入第一个房间应该成功 / Joining first room should succeed, error")
 
         # 切换到第二个房间（同名Computer）
         # Switch to second room (same name Computer)
-        ok2, err2 = computer.call(
+        ack2 = computer.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": "office-sync-room-2", "name": computer_name},
         )
 
         # 验证成功
         # Verify success
-        assert ok2, f"Computer切换房间应该成功 / Computer switching rooms should succeed, error: {err2}"
-        assert err2 is None, "不应该有错误信息 / Should not have error message"
+        assert_empty_ack(ack2, action="Computer切换房间应该成功 / Computer switching rooms should succeed, error")
 
     finally:
         computer.disconnect()
@@ -869,12 +867,12 @@ def test_rejected_cross_office_join_is_isolated_sync(
     _join_office(holder, role="computer", office_id=office_a, name="c213s")
     _join_office(control, role="computer", office_id=office_b, name="c213s-control")
 
-    ok, err = subject.call(
+    ack = subject.call(
         JOIN_OFFICE_EVENT,
         {"role": "computer", "office_id": office_b, "name": "c213s"},
         namespace=SMCP_NAMESPACE,
     )
-    assert not ok and err is not None, "跨 office 同名应被拒"
+    assert_rejected_ack(ack, 4105, action="server:join_office")  # 跨 office 同名由注册表闸门拦下
 
     # 服务端权威视图：被拒者不得出现在目标房成员列表里
     listed = control.call(
@@ -929,12 +927,12 @@ def test_rejected_rename_move_keeps_old_room_sync(
     _join_office(mover, role="computer", office_id=office_a, name="mover-213s")
     _join_office(blocker, role="computer", office_id=office_b, name="taken-213s")
 
-    ok, err = mover.call(
+    ack = mover.call(
         JOIN_OFFICE_EVENT,
         {"role": "computer", "office_id": office_b, "name": "taken-213s"},
         namespace=SMCP_NAMESPACE,
     )
-    assert not ok and err is not None, "换房应被拒"
+    assert_rejected_ack(ack, 4105, action="server:join_office")  # 改名后撞目标房同名 ⇒ 4105
     time.sleep(0.2)
     assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
 

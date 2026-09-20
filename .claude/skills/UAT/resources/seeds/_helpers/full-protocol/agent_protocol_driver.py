@@ -58,6 +58,19 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _room_ack_result(ack: object) -> dict:
+    """房间事件（join/leave）的 ack → ``_check_success`` 可消费的形状。
+
+    v0.5.0（#214）：**空 ack（``None``）= 成功**；flat ``ErrorPayload``（顶层含 ``code``）= 失败。
+    Convert a room-event ack into the shape `_check_success` expects.
+    """
+    if ack is None:
+        return {"ok": True}
+    if isinstance(ack, dict) and "code" in ack:
+        return {"ok": False, "code": ack.get("code"), "message": ack.get("message")}
+    return {"ok": False, "code": None, "message": f"unexpected ack shape: {ack!r}"}
+
+
 def _check_success(case_id: str, resp, extra_checks=None) -> None:
     """Verify a success response (no error code)."""
     ok = True
@@ -172,12 +185,11 @@ def run(args: argparse.Namespace) -> int:
         namespace=SMCP_NAMESPACE,
         timeout=10,
     )
-    if isinstance(join_resp, tuple):
-        join_data = join_resp[0] if join_resp else None
-    else:
-        join_data = join_resp
-    _check_success("F-01", join_data if isinstance(join_data, dict) else {"joined": bool(join_data)}, [
-        ("join accepted", lambda r: (bool(join_data), f"join_resp={join_resp}")),
+    # v0.5.0（#214）：成功 = **空 ack**（None）；失败 = flat ErrorPayload（顶层含 code）。
+    # 旧的两参元组形态已废除——留着它会把「成功」读成 None 再判成失败。
+    # Success is the empty ack (None); failures are flat ErrorPayloads.
+    _check_success("F-01", _room_ack_result(join_resp), [
+        ("join accepted", lambda r: (r.get("ok"), f"join_resp={join_resp!r}")),
     ])
 
     # ═══════════════════════════════════════════════════════════
@@ -381,8 +393,9 @@ def run(args: argparse.Namespace) -> int:
         LEAVE_OFFICE_EVENT,
         {"office_id": args.office_id, "agent": agent_name, "req_id": "F-11"},
     )
-    _check_success("F-11", leave_resp if isinstance(leave_resp, dict) else {"left": bool(leave_resp)}, [
-        ("leave accepted", lambda r: (bool(leave_resp), f"leave_resp={leave_resp}")),
+    # 同 F-01：成功 = 空 ack（None）。无房退房亦为幂等成功（不返回 4103）。
+    _check_success("F-11", _room_ack_result(leave_resp), [
+        ("leave accepted", lambda r: (r.get("ok"), f"leave_resp={leave_resp!r}")),
     ])
 
     # ═══════════════════════════════════════════════════════════

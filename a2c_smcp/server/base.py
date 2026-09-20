@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 
 from socketio import AsyncNamespace
 
+from a2c_smcp.exceptions import NameConflictError
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.types import SID
 from a2c_smcp.utils.logger import ContextLogger, get_logger
@@ -147,11 +148,21 @@ class BaseNamespace(AsyncNamespace):
             sid (SID): 客户端连接ID / Client connection ID
 
         Raises:
-            ValueError: 当name已被其他sid使用时 / When name is already used by another sid
+            NameConflictError: 当name已被其他sid使用时（``4105``；``ValueError`` 子类，兼容既有
+                ``except ValueError`` 契约）/ When the name is already used by another sid.
         """
         existing_sid = self._name_to_sid_map.get(name)
         if existing_sid is not None and existing_sid != sid:
-            raise ValueError(f"Name '{name}' already registered by sid '{existing_sid}' in namespace {self.namespace}")
+            # 冗长诊断（**含对端 sid**）只进日志：ack 载荷 MUST NOT 携带其它会话的内部标识
+            # （error-handling.md:149）。异常消息本身只含自身上下文 ⇒ 泄露**构造上**不可能，
+            # 而非"记得别把 str(e) 塞进 payload"（#214）。
+            # Verbose diagnostics (peer sid included) go to logs only; the exception message is
+            # self-relative by construction, so it can never leak into an ack payload (#214).
+            logger.warning(
+                f"名字冲突 / name conflict: name={name!r} held by sid={existing_sid!r}, "
+                f"requested by sid={sid!r}, namespace={self.namespace}",
+            )
+            raise NameConflictError()
 
     async def _register_name(self, name: str, sid: SID) -> None:
         """

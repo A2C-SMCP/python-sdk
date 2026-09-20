@@ -15,6 +15,7 @@ import pytest
 from mcp.types import CallToolResult
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
@@ -450,6 +451,26 @@ class TestSMCPAgentClient:
 
         with pytest.raises(ValueError, match="Invalid response with mismatched req_id"):
             client.get_computers_in_office(office_id)
+
+    @patch("socketio.Client.call")
+    def test_get_computers_in_office_error_payload_raises_protocol_error(
+        self, mock_call: MagicMock, client: SMCPAgentClient
+    ) -> None:
+        """#214：`server:list_room` 的 flat ErrorPayload（此处 4104 越权）⇒ `SMCPProtocolError`。
+
+        必须**先于** `req_id` 校验：ErrorPayload 不带 `req_id`，顺序反了会被误报成
+        「Invalid response with mismatched req_id」——结构化拒绝被伪装成协议违约。
+        """
+        mock_call.return_value = {
+            "code": 4104,
+            "message": "Cross-room access denied",
+            "details": {"office_id": "other_office"},
+        }
+
+        with pytest.raises(SMCPProtocolError) as exc_info:
+            client.get_computers_in_office("test_office")
+
+        assert exc_info.value.code == 4104
 
     @patch("socketio.Client.call")
     def test_get_computers_in_office_timeout(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:

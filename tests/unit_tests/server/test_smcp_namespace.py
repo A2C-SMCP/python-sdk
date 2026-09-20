@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -43,6 +44,7 @@ from a2c_smcp.smcp import (
     LeaveOfficeReq,
     is_protocol_error_payload,
 )
+from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
 
 class MockAuthProvider(AuthenticationProvider):
@@ -158,10 +160,9 @@ class TestSMCPNamespace:
 
         # 执行测试
         # Execute test
-        success, error = await smcp_namespace.on_server_join_office("test_sid", data)
+        ack = await smcp_namespace.on_server_join_office("test_sid", data)
 
-        assert success is True
-        assert error is None
+        assert_empty_ack(ack)
         assert session["role"] == "computer"
         assert session["name"] == "test_computer"
 
@@ -184,10 +185,10 @@ class TestSMCPNamespace:
 
         # 执行测试
         # Execute test
-        success, error = await smcp_namespace.on_server_join_office("test_sid", data)
+        ack = await smcp_namespace.on_server_join_office("test_sid", data)
 
-        assert success is False
-        assert "Role mismatch" in error
+        # 身份声明冲突 ⇒ 403，**非**房间语义（4014/4101/4104 均不适用）
+        assert_rejected_ack(ack, 403)
 
     @pytest.mark.asyncio
     async def test_leave_office(self, smcp_namespace):
@@ -202,10 +203,9 @@ class TestSMCPNamespace:
 
         # 执行测试
         # Execute test
-        success, error = await smcp_namespace.on_server_leave_office("test_sid", data)
+        ack = await smcp_namespace.on_server_leave_office("test_sid", data)
 
-        assert success is True
-        assert error is None
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_called_once_with("test_sid", "office_123")
 
     @pytest.mark.asyncio
@@ -390,13 +390,15 @@ class TestSMCPNamespace:
 
         smcp_namespace.get_session = AsyncMock(return_value=agent_session)
 
-        # 执行测试，应该抛出 SMCPNamespaceError（隔离校验在 -O 下亦生效）
-        # Execute test, should raise SMCPNamespaceError (isolation holds even under -O)
-        with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
-            await smcp_namespace.on_server_list_room(
-                agent_sid,
-                {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
-            )
+        # #214：越权不再"静默不 ack"（客户端会挂到自身超时），改回 flat ErrorPayload(4104)。
+        # 隔离不变量不变：**绝不**返回 office_B 的任何会话数据。
+        ack = await smcp_namespace.on_server_list_room(
+            agent_sid,
+            {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
+        )
+        assert_rejected_ack(ack, 4104, action="server:list_room")
+        assert ack["details"] == {"office_id": "office_B"}
+        assert "sessions" not in ack, "越权拒绝不得携带目标房成员信息"
 
     @pytest.mark.asyncio
     async def test_on_server_list_room_filters_invalid_sessions(self, smcp_namespace, mock_server, monkeypatch):
@@ -504,7 +506,7 @@ class TestDefaultAuthenticationProvider:
 
         # 应该抛出 ValueError，提示重名
         # Should raise ValueError indicating duplicate name
-        with pytest.raises(ValueError, match="Computer with name 'comp1' already exists in room 'room1'"):
+        with pytest.raises(ValueError, match="Name already taken in room"):
             await smcp_namespace.enter_room(new_computer_sid, "room1")
 
     @pytest.mark.asyncio
@@ -607,7 +609,7 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.leave_room = AsyncMock()
         smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
 
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(ValueError, match="Name already taken in room"):
             await smcp_namespace.enter_room("c-sid", "roomB")
 
         smcp_namespace.leave_room.assert_not_awaited()  # 原实现先退旧房 / old impl left the old room first
@@ -741,12 +743,14 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.save_session = AsyncMock(side_effect=lambda sid, sess, *a, **k: store.__setitem__(sid, sess))
         smcp_namespace.enter_room = AsyncMock(side_effect=RuntimeError("boom"))
 
-        ok, err = await smcp_namespace.on_server_join_office(
+        ack = await smcp_namespace.on_server_join_office(
             "c-sid",
             EnterOfficeReq(**{"role": "computer", "name": "n", "office_id": "roomB"}),
         )
 
-        assert ok is False and "Internal server error" in err
+        # 未知内部异常 ⇒ 500 笼统文案（原文只进日志），**不得**回 "Internal server error: <原文>"
+        assert_rejected_ack(ack, 500)
+        assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
         assert "role" not in final and "name" not in final, "backup 缺失的字段须删除而非赋 None"
 
@@ -801,7 +805,7 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.emit = AsyncMock()
         smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
 
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(ValueError, match="Name already taken in room"):
             await smcp_namespace.enter_room("a-sid", "roomB")
 
         mock_server.enter_room.assert_not_awaited()
@@ -827,12 +831,13 @@ class TestEnterRoomTransactionalCommit:
 
         smcp_namespace.enter_room = AsyncMock(side_effect=_enter_boom)
 
-        ok, err = await smcp_namespace.on_server_join_office(
+        ack = await smcp_namespace.on_server_join_office(
             "c-sid",
             EnterOfficeReq(**{"role": "computer", "name": "new-name", "office_id": "roomB"}),
         )
 
-        assert ok is False and "Internal server error" in err
+        assert_rejected_ack(ack, 500)
+        assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
         assert "office_id" not in final, "收敛结果不得被 backup 里的旧房号复活"
         assert final["role"] == "computer" and final["name"] == "old-name", "role/name 须回滚"
@@ -1408,23 +1413,27 @@ class TestServerBroadcastOfficeIsolation:
         """
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "roomA", "name": "a1"})
         smcp_namespace.leave_room = AsyncMock()
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
-        assert ok is True and err is None
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_awaited_once_with("a-sid", "roomA")
 
     @pytest.mark.asyncio
     async def test_leave_office_without_office_is_idempotent_noop(self, smcp_namespace):
         """未入房时退房是**幂等空操作**：既不得 raise，也绝不得回退到载荷里的房间号。
 
-        载荷可携带 ``office_id=None``（TypedDict 不做校验），一旦回退到它就会得到
-        ``room=None`` ⇒ 与 ``server:update_*`` 同类的全命名空间广播泄漏。
+        载荷携带 ``office_id=None``：v0.5.0（#214）起它在 **schema 闸门**即被拒（400），
+        故「回退到载荷里的 None 房间」⇒ ``room=None`` ⇒ 全命名空间广播泄漏这条注入路径，
+        现在连业务代码都到不了。本用例同时钉住「拒绝时不得产生任何副作用」。
         """
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
         # 真实未入房的 socket 只在自己的 sid 房间里 / an office-less socket sits only in its own sid room
         smcp_namespace.rooms = MagicMock(return_value=["a-sid"])
         smcp_namespace.leave_room = AsyncMock()
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
-        assert ok is True and err is None
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
+
+        # #214 起该载荷在 **schema 闸门**即被拒（400）——「回退到载荷里的 None 房间」这条注入路径
+        # 现在连业务代码都到不了，比仅靠业务层守卫更硬。业务层的兜底仍由下面那条**合法**载荷用例守住。
+        assert_rejected_ack(ack, 400, action="server:leave_office")
         smcp_namespace.leave_room.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1438,8 +1447,8 @@ class TestServerBroadcastOfficeIsolation:
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid"])
         smcp_namespace.leave_room = AsyncMock()
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
-        assert ok is True and err is None
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1453,8 +1462,8 @@ class TestServerBroadcastOfficeIsolation:
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])  # 含自身 sid 房间
         smcp_namespace.leave_room = AsyncMock()
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
-        assert ok is True and err is None
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
+        assert_empty_ack(ack, action="server:leave_office")
         smcp_namespace.leave_room.assert_awaited_once_with("a-sid", "roomA")
 
     @pytest.mark.asyncio
@@ -1467,23 +1476,29 @@ class TestServerBroadcastOfficeIsolation:
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA", "roomB"])
         smcp_namespace.leave_room = AsyncMock()
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomC"})
-        assert ok is True and err is None
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomC"})
+        assert_empty_ack(ack, action="server:leave_office")
         assert {c.args for c in smcp_namespace.leave_room.await_args_list} == {("a-sid", "roomA"), ("a-sid", "roomB")}
 
     @pytest.mark.asyncio
     async def test_leave_office_convergence_error_is_reported(self, smcp_namespace):
-        """收敛分支自身的失败出口：``leave_room`` 抛错 → ``(False, "Internal server error: ...")``。"""
+        """收敛分支自身的失败出口：``leave_room`` 抛错 → flat ErrorPayload(500)（笼统文案，原文只进日志）。"""
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])
         smcp_namespace.leave_room = AsyncMock(side_effect=RuntimeError("boom"))
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": None})
-        assert ok is False and "Internal server error" in err
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
+
+        # 未预期内部异常 ⇒ 500 笼统文案（原文只进日志），**不得**回自由文本给客户端
+        assert_rejected_ack(ack, 500, action="server:leave_office")
+        assert "boom" not in json.dumps(ack)
 
     @pytest.mark.asyncio
     async def test_leave_office_leave_room_error_is_reported(self, smcp_namespace):
-        """退房过程中抛错 → ``(False, "Internal server error: ...")``（与 sync 镜像对等）。"""
+        """退房过程中抛错 → flat ErrorPayload(500)（笼统文案，原文只进日志；与 sync 镜像对等）。"""
         smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "roomA"})
         smcp_namespace.leave_room = AsyncMock(side_effect=RuntimeError("boom"))
-        ok, err = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
-        assert ok is False and "Internal server error" in err
+        ack = await smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
+
+        # 未预期内部异常 ⇒ 500 笼统文案（原文只进日志）
+        assert_rejected_ack(ack, 500, action="server:leave_office")
+        assert "boom" not in json.dumps(ack)

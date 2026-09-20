@@ -18,6 +18,7 @@ import threading
 import time
 from collections.abc import Iterator
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from socketio import Server, WSGIApp
@@ -44,12 +45,19 @@ class _RecordingSyncNamespace(MockSyncSMCPNamespace):
         self.join_event = threading.Event()
         self.reject_from: int | None = None
 
-    def on_server_join_office(self, sid: str, data: Any) -> tuple[bool, str | None]:
+    def on_server_join_office(self, sid: str, data: Any) -> Any:  # #214：成功 = None；失败 = flat ErrorPayload
         if self.reject_from is not None and len(self.join_record) + 1 >= self.reject_from:
             payload = dict(data)
             self.join_record.append((sid, payload))
             self.join_event.set()
-            return False, "Internal server error: Agent already in room"
+            # v0.5.0（#214）：失败 = flat ErrorPayload（顶层含 code）。旧元组形态已废除——
+            # 留在旧契约会让替身与真实服务端分叉，且用例只覆盖「形状不认识」分支，
+            # 覆盖不到 #212 要消费的 4101 带码分支。
+            return {
+                "code": 4101,
+                "message": "Room already has an agent",
+                "details": {"office_id": payload.get("office_id")},
+            }
         result = super().on_server_join_office(sid, data)
         self.join_record.append((sid, dict(data)))
         self.join_event.set()
@@ -185,8 +193,19 @@ def test_sync_agent_manual_disconnect_drops_membership_intent(
 
 def test_sync_agent_rejected_rejoin_clears_desired_office(
     sync_office_server: tuple[_RecordingSyncNamespace, int],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """回房被拒 → 清空意图（单次尝试，不重试）。"""
+    """回房被拒 → 清空意图（单次尝试，不重试）。
+
+    **必须断言走的是「被拒」分支而非「异常/超时」分支**：两条分支都会清空 intent，只断言
+    ``_desired_office is None`` 时，替身一侧写坏会让用例改走异常分支而照样全绿（async 版实锤）。
+    故用日志把「客户端确实读到了协议码」钉死。/ Assert the rejection branch via the logged code.
+    """
+    from a2c_smcp.agent import sync_client as agent_sync_mod
+
+    fake_logger = MagicMock()
+    monkeypatch.setattr(agent_sync_mod, "logger", fake_logger)
+
     ns, port = sync_office_server
     ns.reject_from = 2
     agent = _make_agent()
@@ -210,6 +229,10 @@ def test_sync_agent_rejected_rejoin_clears_desired_office(
             lambda: agent._desired_office is None,
             "回房被拒后回房意图未清空 / desired office not cleared after a rejected replay",
         )
+        # 被拒分支确实被走到（而非异常/超时分支）：客户端读到了协议码 4101
+        logged = " ".join(str(call) for call in fake_logger.error.call_args_list)
+        assert "被拒绝" in logged and "4101" in logged, f"应走「被拒」分支并读到协议码，实得日志：{logged}"
+
         time.sleep(_QUIESCENCE)
         assert len(ns.join_record) == 2, "回房被拒后不得重试"
     finally:

@@ -61,15 +61,21 @@ poetry add a2c-smcp -E server           # Poetry
 `a2c_smcp.PROTOCOL_VERSION` 暴露，并在 Socket.IO 连接握手阶段以 URL query `a2c_version` 与 Server 协商。
 
 ```python
-from a2c_smcp import PROTOCOL_VERSION  # 当前: "0.2.0"
+from a2c_smcp import PROTOCOL_VERSION  # 当前: "0.5.0"
 ```
 
 **兼容矩阵 / Compatibility matrix**
 
 | SDK 版本 | `a2c_smcp.PROTOCOL_VERSION` | 兼容的协议 Server 版本 | 说明 |
 |---|---|---|---|
+| `0.5.x` | `0.5.0` | `0.5.x` | 房间管理事件失败 ack 转 flat `ErrorPayload`（`(bool, str)` 元组形态废除）；`4101`–`4106` 码表；**破坏性 wire 变更** |
+| `0.4.x` | `0.4.0` | `0.4.x` | v0.4.0 GA：`client:put_blob` 上行写入通道 |
+| `0.3.x` | `0.3.0` | `0.3.x` | v0.3.0 GA：BundleID 模型 / `ExposedToolMapping` / SKILL 段改 bundle_id |
 | `0.2.x` | `0.2.0` | `0.2.x` | v0.2.0 GA：URI 纯标识符化、`client:get_resources`、连接版本握手；DPE 已移出至 [dpe-protocol](https://github.com/A2C-SMCP/dpe-protocol) |
 | `0.1.x`（pre-GA rc） | 无握手常量 | — | 早期 rc，无版本握手协商；请升级到 `0.2.x` |
+
+> 矩阵为协议 [versioning.md](https://github.com/A2C-SMCP/a2c-smcp-protocol/blob/develop/docs/specification/versioning.md)
+> 要求的 **MUST** 交付物：因 v0.x 下 `MINOR` 严格匹配，上表的每一行都**只**与同 `MINOR` 的对端互联。
 
 **兼容性规则（协议 MUST）/ Compatibility rule (protocol MUST)**
 

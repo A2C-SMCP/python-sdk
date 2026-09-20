@@ -38,6 +38,7 @@ from a2c_smcp.smcp import (
     SMCPTool,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack
 
 pytestmark = pytest.mark.e2e
 
@@ -169,14 +170,14 @@ async def test_async_integration_computer_agent_server_basic_flow(
         await asyncio.sleep(0.2)
 
         t2 = time.time()
-        ok, err = await agent_client.call(
+        ack = await agent_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "name": "test-agent-async-1", "office_id": office_id},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
         print(f"[E2E] Agent join office took {time.time() - t2:.2f}s")
-        assert ok is True, f"Agent join office failed: {err}"
+        assert_empty_ack(ack, action="agent join office")
         await asyncio.sleep(0.3)
 
         # 2. Computer 启动并连接到 Server / Computer boots up and connects to Server

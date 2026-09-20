@@ -32,6 +32,7 @@ from a2c_smcp.smcp import (
     SMCPTool,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack
 
 
 class _EH(AsyncAgentEventHandler):
@@ -65,8 +66,8 @@ async def _join_office(client: AsyncClient, role: Literal["computer", "agent"], 
     English: Join office via server:join_office.
     """
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
-    ok, err = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok and err is None
+    ack = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_empty_ack(ack)
 
 
 @pytest.mark.asyncio

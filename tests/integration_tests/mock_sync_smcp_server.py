@@ -21,6 +21,7 @@ from a2c_smcp.smcp import (
     UPDATE_DESKTOP_NOTIFICATION,
     EnterOfficeNotification,
     EnterOfficeReq,
+    ErrorPayload,
     GetDeskTopReq,
     GetDeskTopRet,
     GetToolsReq,
@@ -61,8 +62,11 @@ class MockSyncSMCPNamespace(Namespace):
         if sid in self.sessions:
             del self.sessions[sid]
 
-    def on_server_join_office(self, sid: str, data: EnterOfficeReq) -> tuple[bool, str | None]:
-        """处理加入办公室请求"""
+    def on_server_join_office(self, sid: str, data: EnterOfficeReq | None = None, *_extra: Any) -> ErrorPayload | None:
+        """处理加入办公室请求（#214：与真实 handler 同签名；载荷缺失/畸形回 flat 400，不再 TypeError）"""
+        if not isinstance(data, dict) or "office_id" not in data or "role" not in data or "name" not in data:
+            logger.warning(f"join_office 载荷畸形 sid={sid}: {data!r}")
+            return {"code": 400, "message": "Invalid request payload"}
         logger.info(f"Computer/Agent {sid} 加入房间 {data['office_id']}")
 
         # 存储会话信息 / Store session info
@@ -88,7 +92,9 @@ class MockSyncSMCPNamespace(Namespace):
             skip_sid=sid,
             room=data["office_id"],
         )
-        return True, "加入成功"
+        # v0.5.0（#214）：成功 = **空 ack**（``None``）。旧的两参元组形态已废除——
+        # 留着它会让本替身与真实服务端在 ack 形状上分叉，用例看起来绿、线上却挂到超时。
+        return None
 
     def on_server_update_config(self, sid: str, data: dict) -> tuple[bool, str | None]:
         """处理更新配置请求"""
