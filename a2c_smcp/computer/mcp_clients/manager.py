@@ -19,7 +19,7 @@ from a2c_smcp.computer.mcp_clients.auth_error import (
     build_auth_error_result,
     classify_auth_error,
 )
-from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
+from a2c_smcp.computer.mcp_clients.base_client import STATES, MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.http_client import AuthSignal, HttpMCPClient
 from a2c_smcp.computer.mcp_clients.model import (
     A2C_TOOL_META,
@@ -264,6 +264,22 @@ class CachedToolList(NamedTuple):
     tools: list[Tool]
 
 
+def _client_session_usable(client: MCPClientProtocol) -> bool:
+    """客户端**传输层会话**是否处于连接态（缓存复用的前置条件之一，#222）。
+
+    ``base_client.list_tools`` 自带状态门（``state != connected ⇒ ConnectionError``）；把同一条判据前移到
+    缓存复用点，才能保持旧的 fail-closed 行为：**会话已死的 client 不得按旧观测继续供路由**，而应真读
+    一次（必失败）⇒ 计入 ``failed`` ⇒ 其路由被摘（与改动前逐字同效）。
+
+    依据：`_active_clients` 的移除点只有显式 stop / clear_oauth 两处，**非错误驱动** —— 会话死亡
+    （keep-alive 失败置 ``error``）后 client 仍在册，故「在册」不等于「可用」。
+
+    / Whether the client's transport session is connected — mirrors ``base_client.list_tools``'s own state
+    gate so a dead session is re-read (and thus fails) instead of being served from cache.
+    """
+    return getattr(client, "state", None) == STATES.connected
+
+
 class MCPServerManager:
     """
     MCP Server管理器
@@ -338,8 +354,14 @@ class MCPServerManager:
         # #222：per-bundle 上游工具列表观测缓存（见 CachedToolList）。**只缓存上游观测**，投影每轮由
         # 「缓存工具 × 当前配置」重算 ⇒ 结构变更（启动/更新/移除/停止提交）无需重读未失效的 bundle，
         # 批量启动的 list_tools 次数由 N(N+1)/2 收敛为 N。
-        # 写入点**只有一处**：经校验的提交点（重绑定为「本快照内可用的观测」）；撤回点同步剪除（无 await 原语）。
-        # Per-bundle upstream tool-list cache (#222): written only at the validated commit point.
+        # 写入**只有一处**：经校验的提交点（且只留**本快照**内的观测）；删除有三处，皆为无 await 的同步段
+        # ——撤回原语（`_withdraw_bundle_tool_routes`）、`_clear_all`、以及本轮失败时的即时删（见刷新主体）。
+        # ⚠️ **本缓存是 python 独有**：rust `refresh_tool_routes` 无对应物（其每个结构性提交点照旧全量重读）。
+        # 故「上游**静默**改工具（不发 tools/list_changed）」的**检出/通知时机**两端不同：rust 任一次结构刷新
+        # 即检出，python 只在该 bundle 自身重读或一次强制刷新时检出（Agent **拉取**内容两端一致——python 的
+        # 可见路径恒经强制刷新）。若将来要求双端同构，需给对方开镜像 issue 或在此声明差异。
+        # Per-bundle upstream tool-list cache (#222): written only at the validated commit point. Python-only —
+        # rust has no counterpart, so *notification timing* for silent upstream changes differs across SDKs.
         self._tool_list_cache: dict[BUNDLE_ID, CachedToolList] = {}
         # #185：per-bundle 活跃 client 世代计数（ABA 检测）——每次 _active_clients 插入/移除/替换 +1。
         # available_tools 发布前与 _arefresh_tool_mapping 提交前按「client 身份 + generation」二次校验，
@@ -1663,7 +1685,7 @@ class MCPServerManager:
                 failed: set[BUNDLE_ID] = set()
                 for bundle_id, client, generation, config in snapshot:
                     entry = resolved.get(bundle_id)
-                    if entry is None:
+                    if entry is None and _client_session_usable(client):
                         hit = cached.get(bundle_id)
                         if hit is not None and hit.client is client and hit.generation == generation:
                             entry = hit
@@ -1704,9 +1726,13 @@ class MCPServerManager:
                                 merged_projection[_exposed] = _fingerprint
                         self._exposed_tools = new_routes
                         self._tool_projection = merged_projection
-                        # #222：缓存**只在经校验的提交点**重绑定，且只保留本快照内的观测（离场/失败者随之剪除）。
-                        # 这条纪律是「撤回不复活」的另一半：在途轮的迟到写入会被下一次校验挡在门外。
-                        self._tool_list_cache = dict(resolved)
+                        # #222：缓存**只在经校验的提交点**重绑定，且只保留**本快照**（= 此刻活跃集）的观测。
+                        # ⚠️ 必须按活跃集**过滤**而不是直接 `dict(resolved)`：`resolved` 跨重试累积，若某轮
+                        # 被撤回 / `_clear_all` 打断后重试（快照变小），未过滤就会把**已离场** bundle 的条目写回
+                        # ——那既否证「撤回/清空是硬边界」这条不变量，又在 `_clear_all` 之后（世代表已空、新入册者
+                        # 世代从 1 重新起算）让世代守卫失效、只剩对象身份兜底。
+                        # 校验刚通过 ⇒ 活跃集 == 本快照键集，故此处等价于「只留快照内者」。
+                        self._tool_list_cache = {bid: entry for bid, entry in resolved.items() if bid in self._active_clients}
                         return changed
 
     def _build_exposed_tables(

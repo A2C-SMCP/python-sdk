@@ -352,6 +352,93 @@ async def test_second_refresh_waits_for_inflight_round(manager: MCPServerManager
 
 
 @pytest.mark.asyncio
+async def test_withdrawn_bundle_is_not_written_back_by_a_retried_round(manager: MCPServerManager) -> None:
+    """在途轮**被撤回打断后重试**时，提交不得把已离场 bundle 的观测写回缓存（隔离审查 🔴）。
+
+    ``resolved`` 跨重试累积；若提交处直接 `dict(resolved)`，则在「撤回 → 校验失配 → 快照变小 → 重试 → 提交」
+    这条链上会把**已撤回** bundle 的条目复活 ⇒ 否证「撤回/清空是硬边界」。
+    """
+    ids = await _start_all(manager, ["cache_srv_1", "cache_srv_2"])
+    victim, gated = _probe(manager, ids[0]), _probe(manager, ids[1])
+    victim_before = victim.calls
+
+    gate = asyncio.Event()
+    gated.gate = gate
+    gated.entered.clear()
+    refresh = asyncio.create_task(manager.arefresh_tools())
+    await asyncio.wait_for(gated.entered.wait(), timeout=5.0)  # victim 已读完入 resolved、gated 在途
+
+    # 复刻 clear_oauth 零 await 快速段：退役 client + bump 世代 + 确定性撤回
+    manager._active_clients.pop(ids[0])
+    manager._active_client_generations[ids[0]] = manager._active_client_generations.get(ids[0], 0) + 1
+    assert manager._withdraw_bundle_tool_routes(ids[0]) is True
+
+    gated.gate = None
+    gate.set()
+    await asyncio.wait_for(refresh, timeout=5.0)  # 本轮校验失配 ⇒ 重试 ⇒ 提交
+
+    assert ids[0] not in manager._tool_list_cache, "已离场 bundle 的观测不得被重试轮的提交写回"
+    assert ids[1] in manager._tool_list_cache, "仍在册者应留在缓存"
+    assert not [k for k in manager._exposed_tools if k.startswith(f"{ids[0]}__")], "撤回的路由不得复活"
+    assert victim.calls == victim_before + 1, "本轮只应真读一次（重试轮快照已不含它）"
+
+
+@pytest.mark.asyncio
+async def test_clear_all_during_inflight_round_keeps_cache_empty(manager: MCPServerManager) -> None:
+    """``_clear_all`` 打断在途轮后，重试的提交**不得**把观测写回（此时世代表已空、世代守卫失效）。"""
+    ids = await _start_all(manager, ["cache_srv_1", "cache_srv_2"])
+    gated = _probe(manager, ids[1])
+
+    gate = asyncio.Event()
+    gated.gate = gate
+    gated.entered.clear()
+    refresh = asyncio.create_task(manager.arefresh_tools())
+    await asyncio.wait_for(gated.entered.wait(), timeout=5.0)
+
+    manager._clear_all()  # 缓存清空 + 世代归零 + 活跃集清空
+
+    gated.gate = None
+    gate.set()
+    await asyncio.wait_for(refresh, timeout=5.0)
+
+    assert manager._tool_list_cache == {}, "清空后重试提交不得把观测写回（世代已归零 ⇒ 只剩身份兜底）"
+    assert manager._active_clients == {}
+
+
+@pytest.mark.asyncio
+async def test_dead_session_is_re_read_and_routes_withdrawn(manager: MCPServerManager) -> None:
+    """会话已死（``state != connected``）但**仍在册**的 client 不得命中缓存：须真读 ⇒ 失败 ⇒ 摘路由。
+
+    旧行为：结构变更轮会对它真发 ``list_tools``，命中 ``base_client`` 的状态门抛 ``ConnectionError`` ⇒
+    计入 ``failed`` ⇒ 路由被摘（fail-closed）。缓存若在此处命中，就把这条 fail-closed 静默吞掉。
+    """
+    ids = await _start_all(manager, ["cache_srv_1", "cache_srv_2"])
+    dying = _probe(manager, ids[0])
+    before = dying.calls
+
+    dying.state = STATES.error  # 会话死亡（keep-alive 失败置 error），client 仍在 _active_clients
+    dying.boom = ConnectionError("Not connected to server")  # 复刻 base_client.list_tools 的状态门
+
+    await manager.aadd_or_aupdate_server(_cfg("cache_srv_3"))  # 结构变更刷新（该路径有提交点 + 收尾两处刷新）
+
+    # 每个刷新点各真读一次（失败即删缓存 ⇒ 每个点都重读，与「失败不得被旧观测抹平」同源）
+    assert dying.calls >= before + 1, f"会话不可用 ⇒ 不得命中缓存（须真读并经失败摘路由），实际：{dying.calls - before}"
+    assert _exposed(ids[0]) not in manager._exposed_tools, "失败即摘路由：不得因缓存而失效"
+
+
+@pytest.mark.asyncio
+async def test_update_path_restart_reads_new_client_once(manager: MCPServerManager) -> None:
+    """更新（restart）路径有**两个**刷新点（新 client 的提交点 + 入口收尾），合计只应真读新 client 一次。"""
+    ids = await _start_all(manager, ["cache_srv_1"])
+
+    await manager.aadd_or_aupdate_server(_cfg(ids[0], tool_meta={_default_tool_name(ids[0]): ToolMeta(alias="upd")}))
+
+    fresh = _probe(manager, ids[0])  # restart ⇒ 新 client 对象
+    assert fresh.calls == 1, f"restart 后两条刷新点合计只应真读一次，实际：{fresh.calls}"
+    assert _exposed(ids[0], "upd") in manager._exposed_tools, "新声明须被投影吸收"
+
+
+@pytest.mark.asyncio
 async def test_clear_all_drops_cache(manager: MCPServerManager) -> None:
     """``_clear_all`` 必须连带清空缓存：它同时把**世代表**清空（世代归零）⇒ 若旧条目留下，
 
