@@ -29,9 +29,21 @@ class SMCPProtocolError(Exception):
       - ``client:get_skill[s]``：``4014`` 复用（SKILL ``name`` 合法但未命中）/ ``4016`` Invalid Name /
         ``4017`` Skill Resource Not Accessible（v0.2.1 ``details.reason``）
       - ``client:get_blob``：``4018 Blob Not Accessible``（v0.2.1 ``details.reason``）
+      - ``server:join_office``（#218）：入房被拒 —— ``400``（载荷畸形）/ ``403``（同连接改名，文案追加
+        会话身份提示）/ ``4101``（房内已有 Agent）/ ``4105``（同名）/ ``4106``（已在它房）。**未知码同样
+        抛出**（宁严勿宽：未来协议新增码时绝不静默放过）。
+
+    **``.code == -1`` 是契约（#218 写成）**：当服务端拒绝但**码不可解析**或 ack 形状不认识（「未获裁决」）
+    时，载荷**省略 ``code`` 键**（写 ``{"code": None}`` 会让 ``int(None)`` 抛 ``TypeError``）⇒
+    ``.code`` 取默认值 ``-1``，``.message`` 仍带服务端文案。调用方按 ``e.code`` 分流时须把 ``-1``
+    当作「未获裁决」处理。/ ``-1`` means "rejected but no parseable code"; the key is omitted on purpose.
 
     ``details`` 是诊断容器，Agent MUST NOT 透传给最终用户（防泄露）。
     ``details`` is a diagnostic container; the Agent MUST NOT propagate it to end users.
+
+    **入房路径刻意不走** :func:`raise_for_error_payload`：该 helper 以 ``code ∈ ErrorCode`` 白名单为
+    闸，会把未知码与码不可解析的拒绝静默放过 —— 正是 #218 要消灭的「入房被拒零感知」（见
+    ``utils/office.py`` 的 ``build_join_failure_payload``）。
     """
 
     def __init__(self, payload: ErrorPayload) -> None:

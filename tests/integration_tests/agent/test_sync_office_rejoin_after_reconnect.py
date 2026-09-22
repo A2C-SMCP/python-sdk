@@ -25,8 +25,11 @@ from socketio import Server, WSGIApp
 from werkzeug.serving import make_server
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import SMCP_NAMESPACE
+from a2c_smcp.testing import create_local_sync_server
+from a2c_smcp.utils import office as office_mod
 from tests.integration_tests.mock_sync_smcp_server import MockSyncSMCPNamespace
 
 _CONNECT_TIMEOUT = 10.0
@@ -201,10 +204,9 @@ def test_sync_agent_rejected_rejoin_clears_desired_office(
     ``_desired_office is None`` 时，替身一侧写坏会让用例改走异常分支而照样全绿（async 版实锤）。
     故用日志把「客户端确实读到了协议码」钉死。/ Assert the rejection branch via the logged code.
     """
-    from a2c_smcp.agent import sync_client as agent_sync_mod
-
+    # #218：拒绝日志由**共享产出者**（utils.office，两路径同文案）产出 ⇒ 打桩目标随之迁移。
     fake_logger = MagicMock()
-    monkeypatch.setattr(agent_sync_mod, "logger", fake_logger)
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
 
     ns, port = sync_office_server
     ns.reject_from = 2
@@ -237,3 +239,60 @@ def test_sync_agent_rejected_rejoin_clears_desired_office(
         assert len(ns.join_record) == 2, "回房被拒后不得重试"
     finally:
         agent.disconnect()
+
+
+# ── #218 C1：显式 join 等 ACK，被拒可感（真实服务端裁决，同步镜像）──────────────
+
+
+@pytest.fixture
+def real_sync_server(sync_server_port: int) -> Iterator[int]:
+    """**真实**同步 SMCP 服务端（``LocalSyncSMCPNamespace`` 继承正式实现，含 ``enter_room`` 闸门）。
+
+    本文件其余用例的替身命名空间重写了 ``on_server_join_office`` 而**不经过**房间闸门，故「被真实
+    服务端拒绝」这一格必须换用正式实现，否则测的是替身自己的分支。/
+    The other tests in this file use a stand-in namespace that bypasses the room gates; the
+    "rejected by the real server" case needs the production implementation.
+    """
+    sio, _ns, app = create_local_sync_server()
+    sio.eio.start_service_task = False
+    thread = _ServerThread(app, sync_server_port)
+    thread.start()
+    try:
+        yield sync_server_port
+    finally:
+        thread.stop()
+        thread.join(timeout=5)
+
+
+def test_sync_explicit_join_rejected_by_real_server_raises_with_code(
+    real_sync_server: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """首次入房被**真实服务端**拒绝（房内已有 Agent ⇒ 4101）⇒ 抛 ``SMCPProtocolError``。
+
+    同步侧该调用由「发射即返回」变为**阻塞调用**（最多 OFFICE_JOIN_TIMEOUT）；被拒可感与异步逐字
+    同构（同一效应表、同一日志产出者）。
+    """
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+    first = _make_agent()
+    second = _make_agent()
+    try:
+        first.connect_to_server(f"http://localhost:{real_sync_server}", socketio_path="/socket.io")
+        first.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert first._confirmed_office == (_OFFICE, _AGENT_NAME), "成功入房必须落账已确认成员关系"
+
+        second.connect_to_server(f"http://localhost:{real_sync_server}", socketio_path="/socket.io")
+        with pytest.raises(SMCPProtocolError) as ei:
+            second.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+        assert ei.value.code == 4101, f"应带真实协议码，实得 {ei.value!r}"
+        assert second._desired_office is None, "首次被拒（无已确认房可回退）⇒ 清空意图"
+        assert second._confirmed_office is None
+
+        logged = " ".join(str(call) for call in fake_logger.error.call_args_list)
+        assert "4101" in logged, f"显式路径的拒绝必须经共享产出者记录，实得：{logged}"
+    finally:
+        first.disconnect()
+        second.disconnect()

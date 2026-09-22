@@ -21,6 +21,7 @@ from socketio.exceptions import TimeoutError as SioTimeoutError
 from a2c_smcp.agent import _request_builders as _rb
 from a2c_smcp.agent._cancel import AsyncCancelWatcher, CancelSendGate, SyncCancelWatcher
 from a2c_smcp.agent.auth import AgentAuthProvider
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.types import AgentEventHandler, AsyncAgentEventHandler, CancelSignal
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
@@ -46,6 +47,13 @@ from a2c_smcp.smcp import (
     UpdateToolListNotification,
 )
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.office import (
+    OFFICE_JOIN_TIMEOUT,
+    build_join_failure_payload,
+    log_join_rejection,
+    parse_join_ack,
+    resolve_join_failure,
+)
 
 logger = get_logger("agent")
 
@@ -61,6 +69,13 @@ logger = get_logger("agent")
 #: / Ack-wait timeout types. socketio's ``TimeoutError`` is NOT a subclass of the builtin, so
 #: catching only the builtin makes the timeout arm unreachable in production.
 TOOL_CALL_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, SioTimeoutError)
+
+#: ``join_office`` / 自动回房等待 ACK 的超时异常类型 —— 与 ``TOOL_CALL_TIMEOUT_ERRORS`` 同族同因
+#: （socketio 的 ``TimeoutError`` 非 builtin 子类）。调用方若要区分「超时」与其它传输层失败，按本
+#: 元组捕获；**未连接**抛的是 ``socketio.exceptions.BadNamespaceError``（发送前，不在本元组内）。
+#:
+#: / Ack-wait timeout types for the office join paths (same socketio trap as tool calls).
+OFFICE_ACK_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, SioTimeoutError)
 
 
 class BaseAgentClient(ABC):
@@ -84,15 +99,33 @@ class BaseAgentClient(ABC):
         """
         self.auth_provider = auth_provider
         self.event_handler = event_handler
-        # ── #203 Office 成员关系：desired + generation（与 Computer 侧同构）─────────────────────
-        # ``_desired_office`` = 调用方最后一次声明的入房意图 ``(office_id, agent_name)``。Agent 侧的
-        # ``join_office`` 是**无 ack 的 emit**、且服务端房间成员关系随会话销毁，断线重连后必须由客户端
-        # 重放 ``server:join_office``；``agent_name`` 只存在于 join 调用实参，故这里必须记住它。
-        # The last declared membership intent; replayed after an auto-reconnect because room
-        # membership is session-scoped and ``agent_name`` only exists as a call argument.
+        # ── #203/#218 Office 成员关系：desired + confirmed + generation + session ──────────────
+        # ``_desired_office`` = 调用方最后一次声明的入房意图 ``(office_id, agent_name)``。房间成员关系
+        # 随会话销毁，断线重连后必须由客户端重放 ``server:join_office``；``agent_name`` 只存在于 join
+        # 调用实参，故这里必须记住它。**自 #218 起**显式 ``join_office`` 也等 ACK，故意图还会被失败
+        # 效应表改写（明确拒绝 ⇒ 回退到已确认房；未获裁决 ⇒ 双清空）。
+        # The last declared membership intent; replayed after an auto-reconnect and rewritten by the
+        # failure-effect matrix since #218.
         self._desired_office: tuple[str, str] | None = None
+        # ``_confirmed_office`` = **服务端已确认**的成员关系（镜像 Computer 的 ``_confirmed_office_id``）。
+        # **写入白名单只有两处**：显式 join 成功、回放成功；其余路径一律**只清不写**。必须与意图分离：
+        # 明确拒绝时要回退到「最近一次被确认过的房」，若取入口预写值，并发下会把「从未加入过的房间」
+        # 钉回状态（#213 判例）。
+        # The last server-confirmed membership — written only by an explicit-join success or a replay
+        # success; every other path clears it at most.
+        self._confirmed_office: tuple[str, str] | None = None
         self._office_generation = 0
+        # ``_office_session`` = **会话纪元**（#217 裁决 5）：``_office_generation`` 同时承担「操作抢占」
+        # （#213 要求成功**无视**它）与「会话作废」（成功必须**服从**它）两种语义，一个计数器无法兼顾。
+        # 故拆成两个：成功落账只受会话纪元约束；失败效应走 generation 守卫（断连必然推进它，故自动
+        # 涵盖会话作废）。只在会话边界（connect / disconnect / __disconnect_final）推进。
+        # Session epoch: success accounting obeys it (never the operation-supersession guard, #213) and
+        # it advances on every session boundary.
+        self._office_session = 0
         self._office_rejoin_task: asyncio.Task[None] | None = None
+        # office 操作互斥（与 Computer 侧同构）：显式 join / leave 与自动回房**共用**，保证 wire 顺序
+        # 与「最后声明的意图」一致，且一次死连接不会让互斥被占满（等待有界 10s）。
+        # Serializes explicit join/leave with the replay so the wire order matches the last declaration.
         self._office_op_lock = asyncio.Lock()
 
     def _bump_office_generation(self) -> int:
@@ -107,8 +140,34 @@ class BaseAgentClient(ABC):
         if task is not None and not task.done():
             task.cancel()
 
+    def _begin_office_session(self, *, drop_desired: bool) -> None:
+        """会话边界（connect / disconnect / __disconnect_final）：作废在途操作与随会话销毁的成员关系。
+
+        Session boundary: invalidate in-flight operations and all session-scoped membership state.
+
+        - **推进 generation**：作废在途 join / 回放（失败效应不再施加）；
+        - **推进会话纪元**：挡住「已随会话作废」的成功落账（#217 S11）；
+        - **清 `_confirmed_office`**：成员关系属于会话，断开即销毁——重连后要重新成为成员只能靠重放
+          成功时重新落账；
+        - ``drop_desired`` 为真时一并清意图（手工断开 / 服务端踢出 / 重连彻底放弃）。
+        """
+        self._bump_office_generation()
+        self._office_session += 1
+        self._confirmed_office = None
+        if drop_desired:
+            self._desired_office = None
+        self._cancel_office_rejoin()
+
     def _drop_desired_office(self) -> None:
-        """清空回房意图（显式退房 / 手工断开 / 服务端踢出 / 重连彻底放弃 / 回房失败）。"""
+        """清空回房意图（**只清意图**：显式退房的入口调用）。
+
+        刻意不清 ``_confirmed_office``：退房的清账必须排在 LEAVE **发出之后**（op-lock 之内），否则
+        「join 在途 + 并发 leave」会让在途 join 的成功落账把已确认房写成**刚退掉的房**。会话边界上的
+        清账走 :meth:`_begin_office_session`。
+
+        Clears the intent only; the confirmed half is cleared by ``leave_office`` *after* the LEAVE is
+        emitted (a pre-lock clear would resurrect a ghost room).
+        """
         self._bump_office_generation()
         self._cancel_office_rejoin()
         self._desired_office = None
@@ -482,22 +541,47 @@ class BaseAgentClient(ABC):
 
     async def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
         """
-        加入一个Office（Socket.IO中的Room）
-        Join an Office (Room in Socket.IO)
+        加入一个Office（Socket.IO中的Room），并**等待服务端裁决**。
+        Join an Office (Room in Socket.IO) and **wait for the server's verdict**.
 
-        Args:
-            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID
-                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID
-            agent_name (str): Agent名称，提供给前端展示用
-                            / Agent name, for frontend display
-            namespace (str | None): 命名空间 / Namespace
+        #218：本方法由「无 ack 的 ``emit``」改为 ``call`` —— 入房被拒必须**可感**：
+        服务端校验失败（房内已有 Agent ``4101`` / 同名 ``4105`` / 载荷畸形 ``400`` / 同连接改名 ``403``）
+        一律抛 :class:`~a2c_smcp.agent.errors.SMCPProtocolError`，调用方以 ``except ... as e: e.code``
+        机器分流。失败后的**本地状态去留**由 :func:`a2c_smcp.utils.office.resolve_join_failure`
+        单一权威决定（明确拒绝 ⇒ 意图回退到「已确认房」；未获裁决 / 传输层失败 ⇒ 双清空）。
+        Since #218 the join waits for the ack; a rejection raises ``SMCPProtocolError`` carrying the
+        protocol code, and the local membership state follows the shared failure-effect matrix.
+
+        #203：本方法同时声明 **desired 意图**——``(office_id, agent_name)`` 被记住，断线自动重连后
+        由客户端重放入房（room 成员关系属于会话）。
+        Also declares the desired membership intent, replayed after an auto-reconnect.
+
+        Raises:
+            SMCPProtocolError: 服务端**裁决为拒绝**时（``e.code`` 为协议码；形状不认识 / 码不可解析时
+                ``e.code == -1``，**仍抛**——绝不静默放过）。``403`` 的文案会追加会话身份提示。
+            Exception: **传输层失败**（超时 / 命名空间不可用）**原样传播**，不做包装。注意
+                ``socketio.exceptions.TimeoutError`` **不是** builtin ``TimeoutError`` 的子类
+                （MRO: ``TimeoutError → SocketIOError → Exception``），需按
+                :data:`OFFICE_ACK_TIMEOUT_ERRORS` 捕获；命名空间未连接时是
+                ``socketio.exceptions.BadNamespaceError``（**发送前**抛出 ⇒ 意图不保留，请先连接）。
 
         Note:
-            #203：本方法同时声明 **desired 意图**——``(office_id, agent_name)`` 被记住，断线自动重连后
-            由客户端重放入房（room 成员关系属于会话）。``leave_office`` / 手工断开 / 服务端踢出会清空它。
-            Also declares the desired membership intent, replayed after an auto-reconnect.
+            **有界等待**：本调用最多阻塞 ``OFFICE_JOIN_TIMEOUT``（10s，协议默认 60s 收紧，长于回房
+            等待的值已披露）；sync 侧还要叠加 op-lock 等待。调用方若在事件回调内调用本方法，回调线程
+            会被阻塞至多该时长（不会死锁：ACK 由独立的逐包线程投递）。
+
+        Note:
+            **取锁期间被抢占 ⇒ 本调用静默返回、不发包**（不抛异常，返回值与成功同形）。两种触发：
+            ① **更新的声明**抢先（并发 ``leave_office`` / 换房）——后到者负责自己的声明，wire 顺序
+            恒与最后声明一致；② **会话边界**抢先（``connect`` / ``disconnect`` / ``__disconnect_final``
+            钩子推进 generation）——传输中断且会自动重连时意图保留、由重放接手并重新裁决；手工断开 /
+            服务端踢出时意图已随之清空，**不会**再有重放（会话动作是更新的声明，按「最后声明为准」）。
+            调用方若需确认是否真的在房里，应依据服务端事实而非本调用的返回值。
         """
-        self._bump_office_generation()
+        generation = self._bump_office_generation()
+        # C6：会话纪元在**操作入口**捕获，在临界区内比对后落账（只写「受会话纪元约束」而不写比较点，
+        # 会被实现成「只在钩子里赋值」⇒ S11 的守护假绿）。
+        session = self._office_session
         self._cancel_office_rejoin()
         self._desired_office = (office_id, agent_name)
         # 与自动回房共用 office 操作锁（对称 Computer 侧）：回房在途时本 join 排队等候，避免
@@ -505,10 +589,43 @@ class BaseAgentClient(ABC):
         # 仍在房间里）。取消在途回房使等待是瞬时的，不会吃满回房超时。
         # Serialize with the replay so JOIN/LEAVE cannot be reordered on the wire.
         async with self._office_op_lock:
-            await self.emit(
-                JOIN_OFFICE_EVENT,
-                EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
-                namespace=namespace,
+            if generation != self._office_generation:
+                # 取锁期间被抢占（更新声明 / 会话边界）⇒ 不发包：否则 wire 顺序与最后声明错位
+                # （排队的 JOIN 迟于更新的 LEAVE 落地 ⇒ 客户端以为已退房、服务端仍在房）。D 预写保留，
+                # 由后到者或重放接手。
+                logger.info(f"join_office 被更新的操作抢占，跳过发包: {office_id}")
+                return
+            try:
+                result = await self.call(
+                    JOIN_OFFICE_EVENT,
+                    EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                    namespace=namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
+                )
+            except Exception:
+                # 传输层失败（超时 / 命名空间不可用）：**无法判定**服务端是否已生效 ⇒ 按表双清空（不臆断）。
+                # 仅当本次仍是最新意图时才落效应：断连钩子必然已推进 generation ⇒ 该行不生效 ⇒ 意图
+                # 按 #203 语义**保留**待重放（写成无条件清空会静默杀死用户意图）。
+                # An inconclusive outcome clears both — but only while this attempt is still current.
+                if generation == self._office_generation:
+                    effect = resolve_join_failure(None, confirmed=self._confirmed_office)
+                    self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                raise
+            verdict = parse_join_ack(result)
+            if verdict.ok:
+                # 成功落账**无视操作抢占**（#213：成功是关于服务端事实的陈述），但**受会话纪元约束**
+                # （否则手工断开后到达的成功会把已作废的房写成「已确认」⇒ 后续拒绝回退到幽灵房）。
+                if session == self._office_session:
+                    self._confirmed_office = (office_id, agent_name)
+                return
+            confirmed_before = self._confirmed_office
+            if generation == self._office_generation:
+                effect = resolve_join_failure(verdict, confirmed=confirmed_before)
+                self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+            # 同态口径 ②：与自动回房**同一产出者、同一文案**（日志是重放路径既有的可感通道）
+            log_join_rejection(office_id, verdict, confirmed_name=confirmed_before[1] if confirmed_before else None)
+            raise SMCPProtocolError(
+                build_join_failure_payload(verdict, confirmed_name=confirmed_before[1] if confirmed_before else None)
             )
 
     async def leave_office(self, office_id: str, namespace: str | None = None) -> None:
@@ -519,11 +636,20 @@ class BaseAgentClient(ABC):
         Args:
             office_id (str): 房间ID / Room ID
             namespace (str | None): 命名空间 / Namespace
+
+        Note:
+            **清账位置是承重条款**：``_confirmed_office`` 的作废排在 LEAVE **发出之后**（op-lock 之内）。
+            若按入口位置清，「join 在途 + 并发 leave」会让在途 join 的成功落账把已确认房写成**刚退掉的
+            房** ⇒ 后续任一次拒绝都把意图回退到那个幽灵房 ⇒ 下次重连自动回房到用户已明确退掉的房间。
+            发包失败也照样作废（``finally``）：请求可能已发出，旧「已确认」不再可信。
         """
         self._drop_desired_office()
         # 与自动回房共用 office 操作锁（同 join_office：避免 LEAVE 抢先于在途 JOIN 落地）
         async with self._office_op_lock:
-            await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+            try:
+                await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+            finally:
+                self._confirmed_office = None
 
     @abstractmethod
     def register_event_handlers(self) -> None:
@@ -557,21 +683,40 @@ class BaseAgentSyncClient(ABC):
         """
         self.auth_provider = auth_provider
         self.event_handler = event_handler
-        # ── #203 Office 成员关系：desired + generation（与异步侧、Computer 侧同构）────────────
+        # ── #203/#218 Office 成员关系：desired + confirmed + generation + session ─────────────
         # 同步侧差异：回房跑在独立 daemon 线程里（connect 钩子内联在读循环的分发线程上，``call`` 阻塞），
-        # 线程**不可取消**，故只用 generation 判据作废陈旧结果，状态变更用锁保护（短临界区、不跨网络等待）。
-        # Sync difference: the replay runs on a daemon thread (not cancellable), so staleness is
-        # handled purely by the generation guard, with a short lock around state mutations only.
+        # 线程**不可取消**，故只用 generation 双检作废陈旧结果。**但 handler 与用户主线程天然并发**
+        # （engineio 对 MESSAGE 包逐包新建线程派发），故除短临界区的状态锁外，自 #218 起补一把
+        # **office 操作锁**串行化 join/leave/回房（它**会**跨网络等待，与状态锁的分工见类头与
+        # ``sync_client`` 模块 docstring）。/ Sync difference: threads are not cancellable (generation
+        # double-check only) and handlers run concurrently with the user thread, hence the op-lock.
         self._desired_office: tuple[str, str] | None = None
+        # ``_confirmed_office``：白名单写入 = 显式 join 成功 / 回放成功；其余路径只清不写（同异步侧）。
+        self._confirmed_office: tuple[str, str] | None = None
         self._office_generation = 0
+        # 会话纪元（见异步侧说明）：成功落账只受它约束（#217 裁决 5）。
+        self._office_session = 0
         self._office_rejoin_thread: threading.Thread | None = None
+        # **锁次序单向**：``_office_op_lock`` → ``_office_state_lock``（禁止反向）。
+        # 操作锁跨网络等待（``call`` 最多 OFFICE_JOIN_TIMEOUT），状态锁只覆盖瞬时写。
+        # One-way lock order: op-lock → state-lock. The op-lock spans the bounded ack wait.
+        self._office_op_lock = threading.Lock()
         self._office_state_lock = threading.Lock()
+
+    def _bump_office_generation_locked(self) -> int:
+        """推进 generation（**须已持有** ``_office_state_lock``）。
+
+        非加锁版本的存在意义：``threading.Lock`` **不可重入**，把两次获取叠起来（如
+        「先 bump 再 drop」）会自死锁。每个临界区只获取一次锁，内部一律调本方法。
+        Non-reentrant lock: one acquisition per critical section, hence this inner helper.
+        """
+        self._office_generation += 1
+        return self._office_generation
 
     def _bump_office_generation(self) -> int:
         """推进 generation（作废在途自动回房）并返回新值 / advance the generation, invalidating in-flight replays."""
         with self._office_state_lock:
-            self._office_generation += 1
-            return self._office_generation
+            return self._bump_office_generation_locked()
 
     def _cancel_office_rejoin(self) -> None:
         """作废在途自动回房 / invalidate any in-flight replay.
@@ -581,12 +726,22 @@ class BaseAgentSyncClient(ABC):
         """
         self._office_rejoin_thread = None
 
-    def _drop_desired_office(self) -> None:
-        """清空回房意图（显式退房 / 手工断开 / 服务端踢出 / 重连彻底放弃 / 回房失败）。"""
-        self._bump_office_generation()
-        self._cancel_office_rejoin()
+    def _begin_office_session(self, *, drop_desired: bool) -> None:
+        """会话边界：作废在途操作 + 随会话销毁的成员关系（同步侧，**单次**获取状态锁）。"""
         with self._office_state_lock:
+            self._bump_office_generation_locked()
+            self._office_session += 1
+            self._confirmed_office = None
+            if drop_desired:
+                self._desired_office = None
+        self._cancel_office_rejoin()
+
+    def _drop_desired_office(self) -> None:
+        """清空回房意图（**只清意图**：显式退房的入口调用；清账位置的理由见异步侧同名方法）。"""
+        with self._office_state_lock:
+            self._bump_office_generation_locked()
             self._desired_office = None
+        self._cancel_office_rejoin()
 
     @abstractmethod
     def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
@@ -954,29 +1109,73 @@ class BaseAgentSyncClient(ABC):
 
     def join_office(self, office_id: str, agent_name: str, namespace: str | None = None) -> None:
         """
-        加入一个Office（Socket.IO中的Room）
-        Join an Office (Room in Socket.IO)
+        加入一个Office（Socket.IO中的Room），并**等待服务端裁决**（同步实现）。
+        Join an Office and **wait for the server's verdict** (sync implementation).
+
+        #218：语义与异步侧逐字同构（见 :meth:`BaseAgentClient.join_office` 的 Raises / Note）；本
+        实现为阻塞调用，失败效应与日志走同一套共享权威。**调用方可见差异**：sync 侧除 ACK 等待外还要
+        等 op-lock（在途 join / 回房持锁时）⇒ 最坏约 2× ``OFFICE_JOIN_TIMEOUT``（已披露）。
 
         Args:
-            office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID
-                            / Room ID, in A2C-smcp protocol, OfficeID is the Socket.IO RoomID
-            agent_name (str): Agent名称，提供给前端展示用
-                            / Agent name, for frontend display
+            office_id (str): 房间ID / Room ID
+            agent_name (str): Agent名称，提供给前端展示用 / Agent name, for frontend display
             namespace (str | None): 命名空间 / Namespace
 
+        Raises:
+            SMCPProtocolError: 服务端裁决为拒绝（``e.code`` 可分流；``403`` 追加身份提示）。
+            Exception: 传输层失败原样传播（超时按 :data:`OFFICE_ACK_TIMEOUT_ERRORS` 捕获；
+                未连接是 ``socketio.exceptions.BadNamespaceError``）。
+
         Note:
-            #203：同异步侧——本方法同时声明 **desired 意图**，断线自动重连后由客户端重放入房。
-            Also declares the desired membership intent, replayed after an auto-reconnect.
+            **取锁期间被抢占 ⇒ 静默返回、不发包**（不抛异常）：更新的声明抢先（并发 leave / 换房）或
+            会话边界抢先（断连钩子）都会走到这里——语义与异步侧逐字相同，见
+            :meth:`BaseAgentClient.join_office` 的 Note。
         """
-        self._bump_office_generation()
+        generation = self._bump_office_generation()
+        session = self._office_session
         self._cancel_office_rejoin()
         with self._office_state_lock:
             self._desired_office = (office_id, agent_name)
-        self.emit(
-            JOIN_OFFICE_EVENT,
-            EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
-            namespace=namespace,
-        )
+        with self._office_op_lock:
+            if generation != self._office_generation:
+                # 取锁期间被抢占（``threading.Lock`` 不公平，排队顺序 ≠ 声明顺序）⇒ 不发包，
+                # 否则排队的 JOIN 会迟于更新的 LEAVE 落地 ⇒ 客户端以为已退房、服务端仍在房。
+                logger.info(f"join_office 被更新的操作抢占，跳过发包: {office_id}")
+                return
+            try:
+                result = self.call(
+                    JOIN_OFFICE_EVENT,
+                    EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                    namespace=namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
+                )
+            except Exception:
+                # 守卫与效应必须在**同一次锁获取**内完成（隔离审查报出的竞态）：``threading.Lock``
+                # 不可重入且不公平，「先判后写」之间会被 GIL 抢占 —— 并发 `join(B)` 的**入口段**
+                # （bump generation + 写 desired）落在这条窗口里时，本陈旧效应会把它的意图清成 None
+                # ⇒ 该连接此后任何重连都不再回放 B（静默掉出房间）。/ The guard and the effect must
+                # share one acquisition; otherwise a concurrent join's entry write lands in between.
+                with self._office_state_lock:
+                    if generation == self._office_generation:
+                        effect = resolve_join_failure(None, confirmed=self._confirmed_office)
+                        self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                raise
+            verdict = parse_join_ack(result)
+            with self._office_state_lock:
+                if verdict.ok:
+                    # 成功落账无视操作抢占（#213）、受会话纪元约束（#217 S11）
+                    if session == self._office_session:
+                        self._confirmed_office = (office_id, agent_name)
+                    return
+                confirmed_before = self._confirmed_office
+                if generation == self._office_generation:
+                    effect = resolve_join_failure(verdict, confirmed=confirmed_before)
+                    self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+            # 日志/异常在状态锁之外产出（同态口径 ②：与自动回房同一产出者、同一文案）
+            log_join_rejection(office_id, verdict, confirmed_name=confirmed_before[1] if confirmed_before else None)
+            raise SMCPProtocolError(
+                build_join_failure_payload(verdict, confirmed_name=confirmed_before[1] if confirmed_before else None)
+            )
 
     def leave_office(self, office_id: str, namespace: str | None = None) -> None:
         """
@@ -986,9 +1185,18 @@ class BaseAgentSyncClient(ABC):
         Args:
             office_id (str): 房间ID / Room ID
             namespace (str | None): 命名空间 / Namespace
+
+        Note:
+            清账位置是承重条款（同异步侧）：``_confirmed_office`` 在 LEAVE **发出之后**作废，发包失败
+            也照样作废（``finally``）。
         """
         self._drop_desired_office()
-        self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+        with self._office_op_lock:
+            try:
+                self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+            finally:
+                with self._office_state_lock:
+                    self._confirmed_office = None
 
     @abstractmethod
     def register_event_handlers(self) -> None:

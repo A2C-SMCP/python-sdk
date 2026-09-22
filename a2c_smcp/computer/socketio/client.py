@@ -83,7 +83,7 @@ from a2c_smcp.utils.handshake import (
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
+from a2c_smcp.utils.office import OFFICE_JOIN_TIMEOUT, parse_join_ack
 
 logger = get_logger(__name__)
 
@@ -433,7 +433,7 @@ class SMCPComputerClient(AsyncClient):
                     JOIN_OFFICE_EVENT,
                     EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
                     namespace=self._namespace,
-                    timeout=OFFICE_REJOIN_TIMEOUT,
+                    timeout=OFFICE_JOIN_TIMEOUT,
                 )
             except Exception as e:
                 if generation != self._office_generation or self.office_id != office_id:

@@ -294,13 +294,53 @@ client.join_office("my_office", "my_agent")
 await async_client.join_office("my_office", "my_agent")
 ```
 
-> **身份在一条连接内不可变。** 协议规定：同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）。
-> 因此**同一条连接**上不能用不同的 `agent_name` 再次 `join_office`——服务端会拒绝（`403`）。
+> **本调用等待服务端裁决（自 #218 起）。** `server:join_office` 有 ack 通道（成功空 ack / 失败 flat
+> `ErrorPayload`），Agent 客户端现在**读取**该 ack：入房被拒会抛
+> `SMCPProtocolError`，`.code` 可机器分流（见下方「入房失败的处理」）。等待是**有界**的
+> （`OFFICE_JOIN_TIMEOUT` = 10 秒）；同步侧还要叠加 office 操作锁的等待（前方有在途 office 操作时，
+> 典型最坏约 2×10 秒，多个排队者时更长）——调用方在事件回调内调用会阻塞该回调线程。
 >
-> 注意 `server:join_office` 在协议里**有** ack 通道（成功空 ack / 失败 flat `ErrorPayload`），但本 SDK
-> 的 Agent 客户端是用**无 ack 的 `emit`** 发出该请求的（其自动回房路径才用 `call` 读 ack）⇒ **本端收不到
-> 这次拒绝的回执**。要换名请**重新建立连接**（新 sid）后再入房。换房（不同 `office_id`）不受影响，
-> 但 Agent **必须**先 `leave_office` 再入新房（见下文）。
+> **取锁期间被抢占 ⇒ 本调用静默返回、不发包**（返回形如成功，不抛）。触发者是更新的声明（并发
+> `leave_office` / 换房）或会话边界（断连/重连钩子）：前者由后到者负责，后者在「传输中断且会自动
+> 重连」时保留意图交给重放，在手工断开 / 服务端踢出时意图已清空、不会再有重放。需要确认是否真的在
+> 房里时，以服务端事实为准。
+>
+> **身份在一条连接内不可变。** 协议规定：同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）。
+> 因此**同一条连接**上不能用不同的 `agent_name` 再次 `join_office`——服务端会以 `403` 拒绝。
+> 只要本端仍记得已确认的会话身份，异常文案就会附带「本连接会话身份已固化为 `<name>`；改名须重新建立
+> 连接」提示；**先 `leave_office` 再改名不会**出现该提示（退房会作废本地身份记忆），此时按同一条规则
+> 处理：换名须**重新建立连接**（新 sid）后再入房。换房（不同 `office_id`）不受影响，但 Agent **必须**
+> 先 `leave_office` 再入新房（见下文）。
+
+### 入房失败的处理
+
+```python
+from a2c_smcp.agent.errors import SMCPProtocolError
+
+try:
+    await async_client.join_office("my_office", "my_agent")
+except SMCPProtocolError as e:
+    # e.code: 4101 房内已有 Agent / 4105 同名 / 4106 已在其它房 / 403 改名被拒 / 400 载荷畸形
+    #         -1 = 服务端拒绝但码不可解析（未获裁决）
+    print(f"入房被拒：{e.code} {e.error_message}")  # str(e) 形如 "[4101] Room already has an agent"
+```
+
+失败后的**本地状态**遵守一条统一规则（显式入房与自动回房同规则、同文案）：
+
+- **明确拒绝**：入房意图回退到「最近一次被服务端确认过的房间」——已经在一个房里换房被拒时，不会
+  连带丢掉原房的自动回房能力；
+- **未获裁决 / 传输层失败**（超时、连接已断）：意图与「已确认房」一并清空，**不臆断**服务端状态。
+
+> 上述效应**只在本次声明仍是最新时施加**：若同拍已被断连 / 重连的会话边界抢先（超时前连接已断，
+> 钩子推进了 generation），意图**保留**待重连重放——重放会用同一张表重新裁决，成功即恢复、被拒才清空。
+
+超时不是 builtin 异常：`socketio.exceptions.TimeoutError` **不是** `TimeoutError` 的子类，按
+`a2c_smcp.agent.base.OFFICE_ACK_TIMEOUT_ERRORS` 捕获；未连接就调用则抛
+`socketio.exceptions.BadNamespaceError`（发送前失败，**不保留**意图，请先连接）。
+
+**超时（`未获裁决`）后如何收敛**：服务端可能其实已把你加入房间。协议支持的恢复手段是**重发同一次
+入房**——同会话重复加入同一房间会被服务端幂等放行（成功 = 空 ack）；要换房则必须先 `leave_office`，
+否则会被 `4106` 拒绝。
 
 ### 离开房间
 

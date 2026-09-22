@@ -24,7 +24,7 @@ import pytest
 
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
-from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT
+from a2c_smcp.utils.office import OFFICE_JOIN_TIMEOUT
 
 _TRANSPORT_ERROR = "transport error"
 _CLIENT_DISCONNECT = "client disconnect"
@@ -145,7 +145,7 @@ async def test_connect_with_desired_office_schedules_replay() -> None:
     assert calls[0]["data"]["name"] == "test_computer"
     assert calls[0]["namespace"] == SMCP_NAMESPACE
     # 回房必须是**有界**等待：socketio 的 call() 在连接已断时不快速失败，会吃满默认 60s
-    assert calls[0]["timeout"] == OFFICE_REJOIN_TIMEOUT, "回房必须带 OFFICE_REJOIN_TIMEOUT 有界超时"
+    assert calls[0]["timeout"] == OFFICE_JOIN_TIMEOUT, "回房必须带 OFFICE_JOIN_TIMEOUT 有界超时"
     assert client.office_id == "officeA"
 
 

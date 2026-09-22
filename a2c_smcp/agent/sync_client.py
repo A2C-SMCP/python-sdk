@@ -67,7 +67,12 @@ from a2c_smcp.utils.handshake import (
 )
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 from a2c_smcp.utils.mime import is_text_mime
-from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
+from a2c_smcp.utils.office import (
+    OFFICE_JOIN_TIMEOUT,
+    log_join_rejection,
+    parse_join_ack,
+    resolve_join_failure,
+)
 
 logger = get_logger("agent")
 
@@ -80,15 +85,29 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
     注意：当前Client操作是非线程安全的，不可以在多线程环境下使用
     Note: Current Client operations are not thread-safe, cannot be used in multi-threaded environments
 
+    **线程模型（据实）/ Thread model, as it actually is**：engineio 对每个 MESSAGE 包**新建一个
+    daemon 线程**派发（``_trigger_event(..., run_async=True)`` ⇒ ``start_background_task``），
+    ``connect`` / ``disconnect`` 则是**内联**触发。故**事件处理器与用户主线程天然并发**——这正是
+    #218 给 office 操作补 ``_office_op_lock`` 的理由（此前 sync 侧无任何 wire 互斥，重放的
+    check-then-send 与显式 join 可交错 ⇒ 净效果「客户端以为退房、服务端仍在房」）。
+    Handlers run on per-packet threads and the lifecycle hooks are dispatched inline, so handlers
+    race the user thread by construction — hence the office op-lock added in #218.
+
     已备案的**跨线程例外**共两处（其余仍不线程安全）：
 
-    - **#203 自动回房**（``_rejoin_office``）：跑在独立 daemon 线程，只做"发出 join + 等 ACK"这一件事
-      ——由 generation 双检（发包前 / 应用结果前）保证陈旧结果不落状态。可接受的最坏后果是：若等待
-      期间连接被拆，该线程吃满 ``OFFICE_REJOIN_TIMEOUT``（10s）后退出（socketio ``call()`` 不会在
-      断链时快速失败）。
+    - **#203/#218 自动回房**（``_rejoin_office``）：跑在独立 daemon 线程，只做"发出 join + 等 ACK"
+      这一件事——generation **双检（取到 op-lock 后 / 应用结果前）**保证陈旧结果不落状态，且与显式
+      join/leave 共用 ``_office_op_lock`` 互斥。可接受的最坏后果：等待期间连接被拆时，该线程吃满
+      ``OFFICE_JOIN_TIMEOUT``（10s）后退出（socketio ``call()`` 不会在断链时快速失败）。
     - **#209 取消 watcher**（``_cancel.SyncCancelWatcher``）：仅在调用方传入 ``cancel`` 时启动，只做
       "轮询 ``is_set()`` + 发一次 ``server:tool_call_cancel``"，**不接触**本类任何可变状态，且在
       ``emit_tool_call`` 返回前被 join 收口（``threading.enumerate()`` 可断言无线程残留）。
+
+    **残余风险（已披露，非本类可控）**：python-socketio 自陈 ``call`` / ``emit`` **非线程安全**
+    （多线程同时 emit 会让多包消息乱序）⇒ ``_office_op_lock`` 只串行化**office 操作**，其它用户 RPC
+    与回房仍可能交错；跨线程调用本类的其它方法依旧不在支持范围内。
+    / Residual: socketio's own ``call``/``emit`` are not thread-safe; the op-lock serializes office
+    operations only.
 
     / Two sanctioned cross-thread exceptions: the #203 office replay and the #209 cancel watcher
     (started only when ``cancel`` is given; touches no mutable client state; joined before return).
@@ -424,11 +443,13 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         Runs on the read-loop dispatch thread, where a blocking ack wait would also stall the
         connect-completion signal.
 
+        会话边界（#217 裁决 5）：推进 generation 与会话纪元、作废随会话销毁的已确认成员关系；意图保留。
+        Begins a new office session: generation + session epoch advance, confirmed membership is dropped.
+
         守卫用 ``self._namespace in self.namespaces`` 而非 ``self.connected``（后者要等
         ``connect()`` 返回后才置位）。/ Guard on the registered namespace, not ``self.connected``.
         """
-        self._bump_office_generation()
-        self._cancel_office_rejoin()
+        self._begin_office_session(drop_desired=False)
         desired = self._desired_office
         if desired is None:
             return
@@ -446,16 +467,16 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         """namespace 断连钩子：按原因决定回房意图去留。**不得阻塞**（内联触发路径）。
 
         仅"传输中断且底层会自动重连"保留意图；手工断开 / 服务端踢出 / 未启用重连一律清空。
+        两种分支都走会话边界（清已确认房号：成员关系属于会话）。
         """
         if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
-            self._bump_office_generation()
-            self._cancel_office_rejoin()
+            self._begin_office_session(drop_desired=False)
             return
-        self._drop_desired_office()
+        self._begin_office_session(drop_desired=True)
 
     def _on_namespace_disconnect_final(self) -> None:
-        """重连彻底放弃 → 清空回房意图。"""
-        self._drop_desired_office()
+        """重连彻底放弃 → 会话边界 + 清空回房意图。"""
+        self._begin_office_session(drop_desired=True)
 
     def _rejoin_office(self, desired: tuple[str, str], generation: int) -> None:
         """
@@ -463,41 +484,57 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         Replay ``server:join_office`` on the fresh namespace and validate its ack.
 
-        同步侧无法取消线程，故以 generation **双检**（发包前 / 应用结果前）作废陈旧结果；被拒时清空
-        意图 + 错误日志（单次尝试，镜像 rust-sdk#204）。
-        Threads are not cancellable, so the generation is re-checked before sending and before
-        applying the verdict; a rejection clears the intent (single attempt, mirrors rust-sdk#204).
+        同步侧无法取消线程，故以 generation **双检**（**取到 op-lock 后**、应用结果前）作废陈旧结果
+        ——检查必须在锁内：线程不可取消，锁外检查会让陈旧线程在更新的 JOIN/LEAVE 之后仍把包发上线。
+        The staleness check runs *inside* the op-lock: threads are not cancellable, so a check made
+        outside could still emit the packet after a newer operation has landed.
+
+        失败效应与日志走与显式 ``join_office`` **同一张表、同一个产出者**（#217 同态口径）；**不再**
+        借 ``_drop_desired_office()`` 清状态（那次额外 generation bump 在补了 op-lock 后失去必要，
+        且会让两侧 generation 序列分叉）。单次尝试（镜像 rust-sdk#204）。
         """
-        if generation != self._office_generation or self._desired_office != desired:
-            return  # 已被更新的操作接管 / superseded
-        if self._namespace not in self.namespaces:
-            return  # 连接又断了：交给下一次 connect 钩子
-        office_id, agent_name = desired
-        try:
-            result = self.call(
-                JOIN_OFFICE_EVENT,
-                EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
-                namespace=self._namespace,
-                timeout=OFFICE_REJOIN_TIMEOUT,
-            )
-        except Exception as e:
+        session = self._office_session
+        with self._office_op_lock:
             if generation != self._office_generation or self._desired_office != desired:
+                return  # 已被更新的操作接管 / superseded
+            if self._namespace not in self.namespaces:
+                return  # 连接又断了：交给下一次 connect 钩子
+            office_id, agent_name = desired
+            try:
+                result = self.call(
+                    JOIN_OFFICE_EVENT,
+                    EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                    namespace=self._namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
+                )
+            except Exception as e:
+                # 陈旧性检查与效应施加必须在**同一次**状态锁获取内（隔离审查报出的竞态）：锁外比对会被
+                # GIL 抢占 —— 并发 `join(B)` 的入口段（bump generation + 写 desired）落在窗口里时，
+                # 本陈旧回放会把它的意图与已确认成员关系一并清成 None。/ Staleness check and effect
+                # application share one acquisition; a lock-free compare can be preempted in between.
+                with self._office_state_lock:
+                    if generation != self._office_generation or self._desired_office != desired:
+                        return
+                    effect = resolve_join_failure(None, confirmed=self._confirmed_office)
+                    self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
                 return
-            self._drop_desired_office()
-            logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
-            return
-        if generation != self._office_generation or self._desired_office != desired:
-            return
-        verdict = parse_join_ack(result)
-        if verdict.ok:
-            logger.info(f"已自动重新加入 Office: {office_id}")
-        else:
-            self._drop_desired_office()
+            verdict = parse_join_ack(result)
+            with self._office_state_lock:
+                if verdict.ok and session == self._office_session:
+                    # 成功是对服务端**事实**的陈述 ⇒ 无视操作抢占（#213），受会话纪元约束（S11）
+                    self._confirmed_office = desired
+                if generation != self._office_generation or self._desired_office != desired:
+                    return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
+                if verdict.ok:
+                    logger.info(f"已自动重新加入 Office: {office_id}")
+                    return
+                confirmed_before = self._confirmed_office
+                effect = resolve_join_failure(verdict, confirmed=confirmed_before)
+                self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
             # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（#212 将对其做有界退避重试），
             # 无码则是「未获裁决」（形状不认识 / 空响应）。Transient vs indeterminate, by code.
-            logger.error(
-                f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
-            )
+            log_join_rejection(office_id, verdict, confirmed_name=confirmed_before[1] if confirmed_before else None)
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """

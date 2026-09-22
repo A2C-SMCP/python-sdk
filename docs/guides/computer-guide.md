@@ -313,6 +313,9 @@ await client.connect(
   （未真正在房间时不发无效包）。
 - Agent 侧（`AsyncSMCPAgentClient` / `SMCPAgentClient`）同语义：`join_office(office_id, agent_name)`
   会记住该意图，自动重连后重放；`leave_office` / 手工断开清空。
+- **差异（自 #218 起）**：Agent 的**显式** `join_office` 也等 ACK（有界 10 秒，与回房同值），入房被拒
+  抛 `SMCPProtocolError`（`.code` 可分流）、失败后的意图去留与回房**同一张效应表**；Computer 的显式
+  `join_office` 仍走 socketio 默认超时并抛 `RuntimeError`（不带协议码）。
 
 ### 事件回调
 

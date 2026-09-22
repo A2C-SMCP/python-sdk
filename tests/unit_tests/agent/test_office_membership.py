@@ -13,16 +13,21 @@ sync implementations, since rust-sdk has no counterpart to compare against for t
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from socketio.exceptions import BadNamespaceError
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
-from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT
+from a2c_smcp.utils import office as office_mod
+from a2c_smcp.utils.office import OFFICE_JOIN_TIMEOUT
 
 _TRANSPORT_ERROR = "transport error"
 _CLIENT_DISCONNECT = "client disconnect"
@@ -133,7 +138,7 @@ async def test_async_connect_with_desired_schedules_replay() -> None:
     assert calls[0]["event"] == JOIN_OFFICE_EVENT
     assert calls[0]["data"] == {"office_id": _OFFICE, "role": "agent", "name": _AGENT_NAME}
     assert calls[0]["namespace"] == SMCP_NAMESPACE
-    assert calls[0]["timeout"] == OFFICE_REJOIN_TIMEOUT, "回房必须带 OFFICE_REJOIN_TIMEOUT 有界超时"
+    assert calls[0]["timeout"] == OFFICE_JOIN_TIMEOUT, "回房必须带 OFFICE_JOIN_TIMEOUT 有界超时"
     assert client._desired_office == (_OFFICE, _AGENT_NAME)
 
 
@@ -229,32 +234,48 @@ async def test_async_stale_replay_failure_does_not_clobber_new_intent() -> None:
 
 @pytest.mark.asyncio
 async def test_async_join_records_intent_and_leave_clears_it() -> None:
-    """显式 join 记录意图（供重连重放），leave 清空。"""
+    """显式 join 记录意图（供重连重放）+ 落账已确认成员关系；leave 清空两半。
+
+    #218：join 已由无 ack 的 emit 改为**等 ACK 的 call** ⇒ 夹具必须打桩 ``call``（打桩 ``emit``
+    会让真 ``call`` 吃满 OFFICE_JOIN_TIMEOUT 后超时）。
+    """
     client = _make_async_client()
-    emitted: list[tuple[str, Any]] = []
+    calls: list[tuple[str, Any]] = []
+
+    async def fake_call(event: str, data: Any = None, namespace: str | None = None, **kwargs: Any) -> Any:
+        calls.append((event, data))
+        return None  # 空 ack = 成功
 
     async def fake_emit(event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
-        emitted.append((event, data))
+        calls.append((event, data))
 
+    client.call = fake_call  # type: ignore[method-assign]
     client.emit = fake_emit  # type: ignore[method-assign]
 
     await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+    assert calls[-1][0] == JOIN_OFFICE_EVENT
+    assert calls[-1][1]["office_id"] == _OFFICE
     assert client._desired_office == (_OFFICE, _AGENT_NAME)
-    assert emitted[-1][1]["office_id"] == _OFFICE
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
 
     await client.leave_office(_OFFICE, namespace=SMCP_NAMESPACE)
     assert client._desired_office is None
+    assert client._confirmed_office is None, "退房后已确认成员关系随之作废"
 
 
 # ── sync：镜像覆盖 / sync mirror ─────────────────────────────────────────────
 
 
 def _sync_wait_thread(client: SMCPAgentClient, timeout: float = 5.0) -> None:
-    """等回房线程收尾（同步侧无 await 可锚定）/ join the replay thread (no awaitable to anchor on)."""
+    """等回房线程收尾（同步侧无 await 可锚定）/ join the replay thread (no awaitable to anchor on).
+
+    **先断言线程引用存在**：若实现意外把引用清空（如失败路径回退到 ``_drop_desired_office``），
+    本助手会静默不等待 ⇒ 后续断言在「线程尚未跑完」的状态下假绿。
+    """
     thread = client._office_rejoin_thread
-    if thread is not None:
-        thread.join(timeout=timeout)
-        assert not thread.is_alive(), "回房线程未在期限内收尾"
+    assert thread is not None, "回房线程未被记录：等待失去锚点（可能静默假绿）"
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), "回房线程未在期限内收尾"
 
 
 def test_sync_transport_error_retains_desired_office() -> None:
@@ -304,7 +325,7 @@ def test_sync_connect_with_desired_schedules_replay_in_thread() -> None:
     assert calls[0]["event"] == JOIN_OFFICE_EVENT
     assert calls[0]["data"] == {"office_id": _OFFICE, "role": "agent", "name": _AGENT_NAME}
     assert calls[0]["namespace"] == SMCP_NAMESPACE
-    assert calls[0]["timeout"] == OFFICE_REJOIN_TIMEOUT, "回房必须带 OFFICE_REJOIN_TIMEOUT 有界超时"
+    assert calls[0]["timeout"] == OFFICE_JOIN_TIMEOUT, "回房必须带 OFFICE_JOIN_TIMEOUT 有界超时"
     assert client._desired_office == (_OFFICE, _AGENT_NAME)
 
 
@@ -376,18 +397,678 @@ def test_sync_rejected_replay_not_retried() -> None:
 
 
 def test_sync_join_records_intent_and_leave_clears_it() -> None:
-    """显式 join/leave 记录/清空意图（同步侧）。"""
+    """显式 join/leave 记录/清空意图 + 已确认成员关系（同步侧，镜像异步）。"""
     client = _make_sync_client()
-    emitted: list[tuple[str, Any]] = []
+    calls: list[tuple[str, Any]] = []
+
+    def fake_call(event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
+        calls.append((event, data))
+        return None  # 空 ack = 成功
 
     def fake_emit(event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
-        emitted.append((event, data))
+        calls.append((event, data))
 
+    client.call = fake_call  # type: ignore[method-assign]
     client.emit = fake_emit  # type: ignore[method-assign]
 
     client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+    assert calls[-1][0] == JOIN_OFFICE_EVENT
+    assert calls[-1][1]["office_id"] == _OFFICE
     assert client._desired_office == (_OFFICE, _AGENT_NAME)
-    assert emitted[-1][1]["office_id"] == _OFFICE
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
 
     client.leave_office(_OFFICE, namespace=SMCP_NAMESPACE)
     assert client._desired_office is None
+    assert client._confirmed_office is None, "退房后已确认成员关系随之作废"
+
+
+# ── #218 C1：显式 join 等 ACK（async）/ explicit join waits for the ack ────────
+#
+# 效应表矩阵本身在 tests/unit_tests/utils/test_office.py 直接覆盖；本节覆盖**接线**：
+# 异常形态（可感 + `.code` 可分流）、状态归属（desired / confirmed 的去留）、
+# 会话纪元与抢占守卫、以及锁语义（取锁后被抢占 ⇒ 不发包）。
+
+
+def _rejecting_async_call(payload: dict[str, Any]) -> Any:
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return payload
+
+    return fake_call
+
+
+@pytest.mark.asyncio
+async def test_async_join_success_records_confirmed_office() -> None:
+    """成功（空 ack）⇒ 意图与**已确认**成员关系同时落账。"""
+    client = _make_async_client()
+    client.call = _rejecting_async_call(None)  # type: ignore[method-assign]
+
+    await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office == (_OFFICE, _AGENT_NAME)
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+
+@pytest.mark.asyncio
+async def test_async_rejected_switch_restores_confirmed_office() -> None:
+    """S1：房 A 已在房 → 显式 `join(B)` 被拒 ⇒ 回退到**已确认**的房 A（不清空）。
+
+    若一律清空，重连后将**静默掉出**仍然有效的房 A —— 这就是 `_confirmed_office` 的存在理由。
+    """
+    client = _make_async_client()
+    client._confirmed_office = (_OFFICE, _AGENT_NAME)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client.call = _rejecting_async_call({"code": 4106, "message": "Agent already in another room"})  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        await client.join_office("officeB", _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 4106
+    assert client._desired_office == (_OFFICE, _AGENT_NAME)
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+
+@pytest.mark.asyncio
+async def test_async_rejected_first_join_without_confirmed_clears() -> None:
+    """S9：从未成功入房（`confirmed is None`）⇒ 首次被拒即清空（首撞 `4101` = 永久冲突）。"""
+    client = _make_async_client()
+    client.call = _rejecting_async_call({"code": 4101, "message": "Room already has an agent"})  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 4101
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_unknown_code_still_raises() -> None:
+    """未知码（未来协议新增）**仍**可感：不得因码表白名单而静默放过。"""
+    client = _make_async_client()
+    client.call = _rejecting_async_call({"code": 4199, "message": "future code"})  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 4199
+
+
+@pytest.mark.asyncio
+async def test_async_unparsable_code_is_indeterminate_but_raises() -> None:
+    """码不可解析 ⇒ 「未获裁决」：`.code == -1`（省略 code 键）且**不** TypeError。"""
+    client = _make_async_client()
+    client._confirmed_office = (_OFFICE, _AGENT_NAME)
+    client.call = _rejecting_async_call({"code": "not-a-number", "message": "weird"})  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == -1
+    assert ei.value.error_message == "weird"
+    assert client._confirmed_office is None, "未获裁决 ⇒ 双清空（请求已发出，旧确认不再可信）"
+
+
+@pytest.mark.asyncio
+async def test_async_403_appends_identity_hint_and_rolls_back_both_halves() -> None:
+    """S3：同连接改名被拒（403）⇒ 名字半随房号半一起回滚 + 异常带身份提示。"""
+    client = _make_async_client()
+    client._confirmed_office = (_OFFICE, "alice")
+    client._desired_office = ("officeB", "bob")
+    client.call = _rejecting_async_call(  # type: ignore[method-assign]
+        {"code": 403, "message": "Role or name mismatch with existing session"}
+    )
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        await client.join_office("officeB", "bob", namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 403
+    assert "alice" in ei.value.error_message
+    assert "重新建立连接" in ei.value.error_message
+    assert client._desired_office == (_OFFICE, "alice"), "新名不得留存（否则重连前持续静默分叉）"
+    assert client._confirmed_office == (_OFFICE, "alice")
+
+
+@pytest.mark.asyncio
+async def test_async_rejection_logs_via_shared_producer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """显式路径的拒绝同样经**共享产出者**（同态口径 ②），否则 #219 的变异会留空档。"""
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+    client = _make_async_client()
+    client.call = _rejecting_async_call({"code": 4101, "message": "Room already has an agent"})  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError):
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    fake_logger.error.assert_called_once()
+    text = fake_logger.error.call_args[0][0]
+    assert "4101" in text and _OFFICE in text
+
+
+@pytest.mark.asyncio
+async def test_async_transport_failure_propagates_and_clears_both() -> None:
+    """S2：传输层失败（无裁决）⇒ 原样传播**原异常** + 双清空（不臆断服务端状态）。"""
+    client = _make_async_client()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_pre_send_failure_clears_intent() -> None:
+    """发送前失败（未连接 / 未注册 namespace）⇒ 同表双清空（请求根本没出去，不保留待重放意图）。"""
+    client = _make_async_client()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        raise BadNamespaceError("/smcp is not a connected namespace.")
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(BadNamespaceError):
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_transport_failure_after_disconnect_keeps_intent() -> None:
+    """S5：传输层失败**撞上断连钩子**（generation 已推进）⇒ 效应不施加、意图保留待重放。
+
+    这一行的守卫是承重条款：写成无条件清空会静默杀死 #203 建立的重放意图。
+    """
+    client = _make_async_client(reconnection=True)
+    _register_namespace(client)
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        client._on_namespace_disconnect(_TRANSPORT_ERROR)  # 断连钩子推进 generation
+        raise RuntimeError("/smcp is not a connected namespace.")
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        await client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office == (_OFFICE, _AGENT_NAME)
+    assert client._confirmed_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_superseded_join_skips_send() -> None:
+    """取锁窗口内被更新的声明抢占 ⇒ **不发包**（wire 顺序必须与最后声明一致）。"""
+    client = _make_async_client()
+    sent: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        sent.append(1)
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+    await client._office_op_lock.acquire()
+    task = asyncio.create_task(client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE))
+    await asyncio.sleep(0.05)  # 让 join 走到「等锁」处
+    client._bump_office_generation()  # 模拟并发 leave / 换房抢占
+    client._office_op_lock.release()
+    await task
+
+    assert sent == [], "被抢占的 join 不得把 JOIN 发上线"
+
+
+@pytest.mark.asyncio
+async def test_async_join_in_flight_then_leave_clears_both() -> None:
+    """S4：join 在途 + 立刻 leave ⇒ 双清空（依赖 leave 的清账排在锁后，否则留下幽灵房）。"""
+    client = _make_async_client()
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        await release.wait()
+        return None
+
+    async def fake_emit(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    join_task = asyncio.create_task(client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+
+    leave_task = asyncio.create_task(client.leave_office(_OFFICE, namespace=SMCP_NAMESPACE))
+    await asyncio.sleep(0.05)  # leave 入口已清 desired，正等 op-lock
+
+    release.set()
+    await join_task  # 在途 join 成功 ⇒ 落账 C
+    await leave_task  # 随后 LEAVE 发出 ⇒ 清 C（清账在锁内、LEAVE 之后）
+
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_leave_clears_confirmed_even_when_emit_fails() -> None:
+    """LEAVE 发包失败（namespace 已断）⇒ `confirmed` 仍须作废：请求可能已发出，旧确认不再可信。
+
+    若清账写在 emit **之后**且无 finally，异常路径会留下 `confirmed` ⇒ 后续任一次拒绝把意图回退到
+    用户刚退掉的房 ⇒ 下次重连自动回房到幽灵房。
+    """
+    client = _make_async_client()
+    client._confirmed_office = (_OFFICE, _AGENT_NAME)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+
+    async def fake_emit(*args: Any, **kwargs: Any) -> None:
+        raise BadNamespaceError("/smcp is not a connected namespace.")
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    with pytest.raises(BadNamespaceError):
+        await client.leave_office(_OFFICE, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_cancelled_join_keeps_declared_intent() -> None:
+    """S10：显式 join 被取消（`CancelledError`，非 `Exception`）⇒ 停在入口预写值（有意）。"""
+    client = _make_async_client()
+    in_flight = asyncio.Event()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        await asyncio.sleep(30)
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    task = asyncio.create_task(client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client._desired_office == (_OFFICE, _AGENT_NAME), "取消不改状态：预写意图保留（撤销须显式 leave）"
+    assert client._confirmed_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_stale_success_blocked_by_session_epoch() -> None:
+    """S11：手工断连（会话边界）与在途 join 的成功落账撞车 ⇒ 陈旧成功**不得**落账。"""
+    client = _make_async_client(reconnection=False)
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        await release.wait()
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    task = asyncio.create_task(client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+
+    client._on_namespace_disconnect(_CLIENT_DISCONNECT)  # 会话边界：推进 session/generation
+    release.set()
+    await task
+
+    assert client._confirmed_office is None, "已随会话作废的成功不得落账（会话纪元守卫）"
+    assert client._desired_office is None
+
+
+@pytest.mark.asyncio
+async def test_async_replay_success_records_confirmed_office() -> None:
+    """回放成功 ⇒ 写 `_confirmed_office`（白名单里的第二个写入者），供之后的拒绝回退使用。"""
+    client = _make_async_client()
+    _register_namespace(client)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client._office_generation = 3
+    client.call = _rejecting_async_call(None)  # type: ignore[method-assign]
+
+    await client._arejoin_office((_OFFICE, _AGENT_NAME), 3)
+
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+
+@pytest.mark.asyncio
+async def test_async_superseded_replay_success_still_records_confirmed() -> None:
+    """成功是关于服务端**事实**的陈述 ⇒ 被抢占的回放成功仍落账（#213），但不再改其它状态。
+
+    若按失败效应表的 `generation == current` 条件逐行套用，这里会**吞掉成功落账**，其反例正是
+    `_confirmed_office` 的存在理由。
+    """
+    client = _make_async_client()
+    _register_namespace(client)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client._office_generation = 1
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        await release.wait()
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    task = asyncio.create_task(client._arejoin_office((_OFFICE, _AGENT_NAME), 1))
+    await asyncio.wait_for(in_flight.wait(), timeout=5)
+
+    # 用户显式换房（抢占这次回放）
+    client._bump_office_generation()
+    client._desired_office = ("officeB", _AGENT_NAME)
+
+    release.set()
+    await task
+
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
+    assert client._desired_office == ("officeB", _AGENT_NAME)
+
+
+# ── #218 C1：sync 镜像 / sync mirror ─────────────────────────────────────────
+
+
+def test_sync_rejected_switch_restores_confirmed_office() -> None:
+    """S1（同步）：换房被拒 ⇒ 回退到已确认房（不清空）。"""
+    client = _make_sync_client(reconnection=False)
+    client._confirmed_office = (_OFFICE, _AGENT_NAME)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return {"code": 4106, "message": "Agent already in another room"}
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        client.join_office("officeB", _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 4106
+    assert client._desired_office == (_OFFICE, _AGENT_NAME)
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+
+def test_sync_rejected_first_join_clears_both() -> None:
+    """S9（同步）：从未成功入房 ⇒ 首次被拒即双清空。"""
+    client = _make_sync_client()
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return {"code": 4101, "message": "Room already has an agent"}
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 4101
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+def test_sync_403_appends_identity_hint_and_rolls_back_both_halves() -> None:
+    """S3（同步）：改名被拒 ⇒ 名字半随房号半回滚 + 异常带身份提示（双路径同文案）。"""
+    client = _make_sync_client(reconnection=False)
+    client._confirmed_office = (_OFFICE, "alice")
+    client._desired_office = ("officeB", "bob")
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return {"code": 403, "message": "Role or name mismatch with existing session"}
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        client.join_office("officeB", "bob", namespace=SMCP_NAMESPACE)
+
+    assert ei.value.code == 403
+    assert "alice" in ei.value.error_message
+    assert "重新建立连接" in ei.value.error_message
+    assert client._desired_office == (_OFFICE, "alice")
+    assert client._confirmed_office == (_OFFICE, "alice")
+
+
+def test_sync_transport_failure_propagates_and_clears_both() -> None:
+    """S2（同步）：传输层失败 ⇒ 原样传播 + 双清空。"""
+    client = _make_sync_client()
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+def test_sync_leave_clears_confirmed_even_when_emit_fails() -> None:
+    """LEAVE 发包失败 ⇒ `confirmed` 仍须作废（异常安全，与异步同构）。"""
+    client = _make_sync_client()
+    client._confirmed_office = (_OFFICE, _AGENT_NAME)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+
+    def fake_emit(*args: Any, **kwargs: Any) -> None:
+        raise BadNamespaceError("/smcp is not a connected namespace.")
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    with pytest.raises(BadNamespaceError):
+        client.leave_office(_OFFICE, namespace=SMCP_NAMESPACE)
+
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+def test_sync_join_in_flight_then_leave_clears_both() -> None:
+    """S4（同步）：join 在途 + 立刻 leave ⇒ 双清空（op-lock 保证 LEAVE 排在在途 JOIN 之后落地）。"""
+    client = _make_sync_client()
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        release.wait(timeout=5)
+        return None
+
+    def fake_emit(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    join_thread = threading.Thread(target=lambda: client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE))
+    join_thread.start()
+    assert in_flight.wait(timeout=5), "join 未跑到发包处"
+
+    leave_thread = threading.Thread(target=lambda: client.leave_office(_OFFICE, namespace=SMCP_NAMESPACE))
+    leave_thread.start()
+    time.sleep(0.05)  # leave 入口已清 desired、正等 op-lock
+
+    release.set()
+    join_thread.join(timeout=5)
+    leave_thread.join(timeout=5)
+    assert not join_thread.is_alive() and not leave_thread.is_alive()
+
+    assert client._desired_office is None
+    assert client._confirmed_office is None
+
+
+def test_sync_superseded_join_skips_send() -> None:
+    """取锁窗口内被抢占 ⇒ **不发包**（`threading.Lock` 不公平，锁内重查是必需的）。"""
+    client = _make_sync_client()
+    sent: list[int] = []
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        sent.append(1)
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+    client._office_op_lock.acquire()
+    thread = threading.Thread(target=lambda: client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE))
+    thread.start()
+    time.sleep(0.05)  # join 走到「等锁」处
+    client._bump_office_generation()
+    client._office_op_lock.release()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert sent == [], "被抢占的 join 不得把 JOIN 发上线"
+
+
+def test_sync_replay_success_records_confirmed_office() -> None:
+    """回放成功 ⇒ 写 `_confirmed_office`（同步侧）。"""
+    client = _make_sync_client()
+    _register_namespace(client)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client._office_generation = 3
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    client._rejoin_office((_OFFICE, _AGENT_NAME), 3)
+
+    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+
+def test_sync_replay_failure_does_not_bump_generation() -> None:
+    """回放失败**不**额外推进 generation —— 与异步侧逐字同构（旧实现的 `_drop_desired_office()` 会）。"""
+    client = _make_sync_client()
+    _register_namespace(client)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client._office_generation = 7
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return {"code": 4101, "message": "Room already has an agent"}
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    client._rejoin_office((_OFFICE, _AGENT_NAME), 7)
+
+    assert client._desired_office is None
+    assert client._office_generation == 7, "失败效应不得推进 generation（两侧同构）"
+
+
+class _ArmingLock:
+    """注入交错的 ``threading.Lock`` 替身：**armed 后**的首次获取前先执行注入动作。
+
+    用来在单线程测试里确定性地复现「另一线程的入口段刚好落在『判据已读、效应未写』窗口内」——
+    GIL 抢占窗口无法用 sleep 稳定复现，故改为在锁获取点注入。/ Deterministically injects a
+    competing operation's entry write at the lock-acquisition point (a GIL window cannot be raced
+    reliably with sleeps).
+    """
+
+    def __init__(self, real: threading.Lock, is_armed: Any, inject: Any) -> None:
+        self._real = real
+        self._is_armed = is_armed
+        self._inject = inject
+        self.fired = False
+
+    def __enter__(self) -> _ArmingLock:
+        if self._is_armed() and not self.fired:
+            self.fired = True  # 先行置位：注入动作自身也会获取本锁
+            self._inject()
+        self._real.acquire()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._real.release()
+
+
+def test_sync_transport_failure_effect_cannot_clobber_concurrent_join() -> None:
+    """陈旧失败效应不得清掉**并发 join(B)** 刚写下的意图：守卫与效应必须同一次锁获取。
+
+    交错（隔离审查报出）：U 的 `join(A)` 传输层失败 → 判据已读为「仍最新」→ 并发 V 的 `join(B)`
+    **入口段**（bump generation + 写 desired）落在这条窗口里 → 修复前 U 按陈旧判据双清空 ⇒ V 随后
+    成功入房、`_desired_office` 却永久为 None ⇒ 该连接此后任何重连都不再回放 B。
+    """
+    client = _make_sync_client()
+    armed = False
+
+    def raising_call(*args: Any, **kwargs: Any) -> Any:
+        nonlocal armed
+        armed = True  # 失败已发生：此后任意一次锁获取都可能撞上并发入口段
+        raise RuntimeError("boom")
+
+    def inject_concurrent_entry() -> None:
+        # 与真实实现同序：bump generation → 状态锁内写 desired
+        client._bump_office_generation()
+        with client._office_state_lock:
+            client._desired_office = ("officeB", _AGENT_NAME)
+
+    client.call = raising_call  # type: ignore[method-assign]
+    lock = _ArmingLock(threading.Lock(), lambda: armed, inject_concurrent_entry)
+    client._office_state_lock = lock  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError):
+        client.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+    assert lock.fired, "交错注入未生效 —— 夹具失效即假绿"
+    assert client._desired_office == ("officeB", _AGENT_NAME), "陈旧效应不得清掉更新操作的意图"
+
+
+def test_sync_replay_failure_effect_cannot_clobber_concurrent_join() -> None:
+    """回放线程的陈旧失败效应同样不得清掉并发 join 的意图与已确认成员关系（同窗口，另一调用点）。"""
+    client = _make_sync_client()
+    _register_namespace(client)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client._office_generation = 1
+    client._confirmed_office = (_OFFICE, "alice")
+    armed = False
+
+    def raising_call(*args: Any, **kwargs: Any) -> Any:
+        nonlocal armed
+        armed = True
+        raise RuntimeError("boom")
+
+    def inject_concurrent_entry() -> None:
+        client._bump_office_generation()
+        with client._office_state_lock:
+            client._desired_office = ("officeB", _AGENT_NAME)
+            client._confirmed_office = ("officeB", _AGENT_NAME)
+
+    client.call = raising_call  # type: ignore[method-assign]
+    lock = _ArmingLock(threading.Lock(), lambda: armed, inject_concurrent_entry)
+    client._office_state_lock = lock  # type: ignore[assignment]
+
+    client._rejoin_office((_OFFICE, _AGENT_NAME), 1)
+
+    assert lock.fired, "交错注入未生效 —— 夹具失效即假绿"
+    assert client._desired_office == ("officeB", _AGENT_NAME), "陈旧回放不得清掉新意图"
+    assert client._confirmed_office == ("officeB", _AGENT_NAME), "陈旧回放不得清掉新已确认房"
+
+
+def test_sync_stale_success_blocked_by_session_epoch() -> None:
+    """S11（同步）：会话边界与回放的成功落账撞车 ⇒ 陈旧成功不得落账。"""
+    client = _make_sync_client(reconnection=False)
+    _register_namespace(client)
+    client._desired_office = (_OFFICE, _AGENT_NAME)
+    client._office_generation = 1
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def fake_call(*args: Any, **kwargs: Any) -> Any:
+        in_flight.set()
+        release.wait(timeout=5)
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    thread = threading.Thread(target=lambda: client._rejoin_office((_OFFICE, _AGENT_NAME), 1))
+    thread.start()
+    assert in_flight.wait(timeout=5)
+
+    client._on_namespace_disconnect(_CLIENT_DISCONNECT)  # 会话边界：推进 session/generation
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert client._confirmed_office is None, "已随会话作废的成功不得落账"

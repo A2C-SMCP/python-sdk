@@ -14,6 +14,26 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Breaking Changes
 
+- **Agent 显式 `join_office` 改为等 ACK（#218）**：`AsyncSMCPAgentClient.join_office` /
+  `SMCPAgentClient.join_office` 由「无 ack 的 `emit`」改为 `call`，三类后果：
+  1. **可能抛**：服务端裁决为拒绝时抛既有 `SMCPProtocolError`（`.code` 可机器分流 `400/403/4101/4105/
+     4106`；码不可解析 / 形状不认识时 `.code == -1`，「未获裁决」）。此前入房被拒**完全静默**
+     ——包括同一连接改名被拒的 `403`（本地意图与服务端身份会静默分叉）。`403` 的异常文案追加
+     「本连接会话身份已固化为 `<name>`；改名须重新建立连接」。
+  2. **变阻塞调用**：ACK 等待由 `0` 变为**有界 10s**（新常量 `OFFICE_JOIN_TIMEOUT`；sync 侧还要叠加
+     office 操作锁 ⇒ 最坏约 20s）。超时按 `a2c_smcp.agent.base.OFFICE_ACK_TIMEOUT_ERRORS` 捕获
+     （socketio 的 `TimeoutError` **不是** builtin 子类）。
+  3. **失败后本地意图去留按统一表**（显式 join 与自动回房同规则、同文案）：明确拒绝 ⇒ 意图回退到
+     「已确认房」；未获裁决 / 传输层失败 ⇒ 双清空。效应只在**本次声明仍是最新**时施加（同拍已被
+     断连 / 重连的会话边界抢先 ⇒ 意图保留待重放）；未连接即调用（`BadNamespaceError`，发送前）按同一
+     规则 ⇒ **不保留**意图（此前会残留待重连重放）。
+  4. **取锁期间被抢占 ⇒ 静默返回、不发包**（返回形如成功）：并发 `leave_office` / 换房，或断连 / 重连
+     会话边界抢先时，本调用不再把 JOIN 发上线（wire 顺序恒与最后声明一致）。调用方需确认是否真的在房
+     时，请以服务端事实为准。
+  - 附带：新增 `_confirmed_office` / `_office_session` 状态，sync 侧新增 office 操作锁；拒绝日志由
+    `a2c_smcp.utils.office` 的共享产出者统一产出（两路径同文案，不含 SID / namespace）。
+- **`OFFICE_REJOIN_TIMEOUT` 硬切为 `OFFICE_JOIN_TIMEOUT`**（#218，不留别名）：Agent 两侧显式 join 与
+  自动回房共用该有界等待常量；Computer 显式 join **未**纳入（仍走 socketio 默认超时）。
 - **三个房间事件的失败 ack 改为 flat `ErrorPayload`**（#214，protocol#61）：
   `server:join_office` / `server:leave_office` 的**成功 = 空 ack**（`None`），失败 = 顶层含 `code` 的
   flat `ErrorPayload`；`server:list_room` 成功仍为 `ListRoomRet`，失败为 flat `ErrorPayload`。
@@ -27,6 +47,11 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 
+- **入房失败处理的单一权威 API**（#218，`a2c_smcp.utils`）：`resolve_join_failure`（失败效应表：
+  明确拒绝 ⇒ 意图回退到已确认房；未获裁决 / 传输层失败 ⇒ 双清空）、`join_failure_message` /
+  `build_join_failure_payload`（异常与日志**同一文案**；`403` 追加身份提示；未获裁决省略 `code` 键 ⇒
+  `SMCPProtocolError.code == -1`）、`log_join_rejection`（两路径共用的 ERROR 产出者）、
+  `OfficeMembership`（效应结果）。另新增 `a2c_smcp.agent.base.OFFICE_ACK_TIMEOUT_ERRORS`。
 - `ErrorCode` 新增 `400` / `403` / `500` / `4101`–`4106`（`4102 Room Not Found` 为预留码，
   builder **构造上拒绝**产出）。载荷构造收敛到 `build_bad_request_error` / `build_internal_error` /
   `build_room_rejection_error` 三个共享 builder（sync / async 逐字节一致）。

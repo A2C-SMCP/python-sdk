@@ -67,7 +67,12 @@ from a2c_smcp.utils.handshake import (
 )
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 from a2c_smcp.utils.mime import is_text_mime
-from a2c_smcp.utils.office import OFFICE_REJOIN_TIMEOUT, parse_join_ack
+from a2c_smcp.utils.office import (
+    OFFICE_JOIN_TIMEOUT,
+    log_join_rejection,
+    parse_join_ack,
+    resolve_join_failure,
+)
 
 logger = get_logger("agent")
 
@@ -420,8 +425,9 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         Namespace (re)connect hook: schedule the office replay while a desired membership remains.
 
-        Agent 侧的 ``join_office`` 是无 ack 的 emit，房间成员关系又随会话销毁（服务端
-        ``on_disconnect`` 会退房并清 ``session["office_id"]``），故重连后必须由客户端重放。
+        会话边界（#217 裁决 5）：推进 generation 与会话纪元、作废随会话销毁的已确认成员关系；意图
+        保留（待重放）。Agent 显式 ``join_office`` 自 #218 起也等 ACK，但房间成员关系仍随会话销毁
+        （服务端 ``on_disconnect`` 会退房并清 ``session["office_id"]``），故重连后必须由客户端重放。
         Room membership is session-scoped, so a reconnected namespace must replay the join.
 
         甩任务而非内联 await：本钩子被 ``_handle_connect`` 内联 await，其后才 ``_connect_event.set()``；
@@ -431,8 +437,7 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         守卫用 ``self._namespace in self.namespaces`` 而非 ``self.connected``（后者在 connect() 返回后
         才置位，早于本任务第一步）。/ Guard on the registered namespace, not ``self.connected``.
         """
-        self._bump_office_generation()
-        self._cancel_office_rejoin()
+        self._begin_office_session(drop_desired=False)
         desired = self._desired_office
         if desired is None:
             return
@@ -443,16 +448,19 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         仅"传输中断且底层会自动重连"保留意图；手工断开 / 服务端踢出 / 未启用重连一律清空。
         Retained only for a transport error that will be retried; every other reason clears it.
+
+        两种分支都走会话边界（推进 generation / 会话纪元 + 清已确认房号）：成员关系属于会话，断开即
+        销毁，重连后的新 SID 从未加入过该房——要重新成为成员必须靠回放成功时重新落账。
+        Both branches begin a new session: the confirmed membership is session-scoped.
         """
         if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
-            self._bump_office_generation()
-            self._cancel_office_rejoin()
+            self._begin_office_session(drop_desired=False)
             return
-        self._drop_desired_office()
+        self._begin_office_session(drop_desired=True)
 
     def _on_namespace_disconnect_final(self) -> None:
-        """重连彻底放弃 → 清空回房意图。**必须零 await**。"""
-        self._drop_desired_office()
+        """重连彻底放弃 → 会话边界 + 清空回房意图。**必须零 await**。"""
+        self._begin_office_session(drop_desired=True)
 
     async def _arejoin_office(self, desired: tuple[str, str], generation: int) -> None:
         """
@@ -460,12 +468,14 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         Replay ``server:join_office`` on the fresh namespace and validate its ack.
 
-        与显式 ``join_office``（无 ack 的 emit）不同，回房用 ``call`` 取得服务端裁决：被拒（如旧会话
-        尚未回收导致的一房一 Agent 拒绝）时清空意图 + 错误日志，状态不得撒谎。
-        Unlike the explicit emit-only join, the replay uses ``call`` to obtain the server's verdict.
+        与显式 ``join_office`` 共用同一张**失败效应表**与同一个**日志产出者**（#217 同态口径）：
+        明确拒绝 ⇒ 意图回退到已确认房；未获裁决 / 传输层失败 ⇒ 双清空。两路径起点不同（重放前断连已
+        清 ``_confirmed_office`` ⇒ 回退目标为 ``None``），但裁决与文案逐字一致。
+        Shares the failure-effect matrix and the log producer with the explicit join.
 
-        单次尝试（镜像 rust-sdk#204）；结果只在 generation 仍新鲜时落到状态上。
+        单次尝试（镜像 rust-sdk#204；有界退避重试归 #212）；结果只在 generation 仍新鲜时落到状态上。
         """
+        session = self._office_session
         async with self._office_op_lock:
             if generation != self._office_generation or self._desired_office != desired:
                 return  # 已被更新的操作接管 / superseded
@@ -477,25 +487,34 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
                     JOIN_OFFICE_EVENT,
                     EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
                     namespace=self._namespace,
-                    timeout=OFFICE_REJOIN_TIMEOUT,
+                    timeout=OFFICE_JOIN_TIMEOUT,
                 )
             except Exception as e:
                 if generation != self._office_generation or self._desired_office != desired:
                     return
-                self._desired_office = None
+                effect = resolve_join_failure(None, confirmed=self._confirmed_office)
+                self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
                 logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
                 return
-            if generation != self._office_generation or self._desired_office != desired:
-                return
             verdict = parse_join_ack(result)
+            if verdict.ok and session == self._office_session:
+                # 成功是对服务端**事实**的陈述 ⇒ 无视操作抢占（#213），但受会话纪元约束（S11：
+                # 手工断开与回放落账同拍时，陈旧的「已确认」不得复活）
+                self._confirmed_office = desired
+            if generation != self._office_generation or self._desired_office != desired:
+                return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
             if verdict.ok:
                 logger.info(f"已自动重新加入 Office: {office_id}")
             else:
-                self._desired_office = None
+                confirmed_before = self._confirmed_office
+                effect = resolve_join_failure(verdict, confirmed=confirmed_before)
+                self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
                 # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（#212 将对其做有界退避重试），
                 # 无码则是「未获裁决」（形状不认识 / 空响应）。Transient vs indeterminate, by code.
-                logger.error(
-                    f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
+                log_join_rejection(
+                    office_id,
+                    verdict,
+                    confirmed_name=confirmed_before[1] if confirmed_before else None,
                 )
 
     async def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:

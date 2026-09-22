@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-#203 自动重连后恢复 Office 成员关系（Agent 侧，异步，真实 wire）。
+#203 自动重连后恢复 Office 成员关系（Agent 侧，异步，真实 wire）；含 #218 显式 join 等 ACK。
 
-Agent 的 ``join_office`` 是**无 ack 的 emit**、且不保存任何本地成员状态；服务端房间成员关系随会话
-销毁（``server/namespace.py`` 断连时退房并清 ``session["office_id"]``）。因此传输层断线自动重连后，
-新 SID 不在房间里：Agent 发出的 ``client:*`` 会被服务端按 office 校验拒绝，也收不到任何 ``notify:*``
-广播。本文件验证：重连完成后客户端重放 ``server:join_office``，新 SID 重新成为该 Office 成员；
-无法恢复时清空回房意图，不保留"看似还在房间"的状态。
+服务端房间成员关系随会话销毁（``server/namespace.py`` 断连时退房并清 ``session["office_id"]``）。
+因此传输层断线自动重连后，新 SID 不在房间里：Agent 发出的 ``client:*`` 会被服务端按 office 校验
+拒绝，也收不到任何 ``notify:*`` 广播。本文件验证：重连完成后客户端重放 ``server:join_office``，
+新 SID 重新成为该 Office 成员；无法恢复时清空回房意图，不保留"看似还在房间"的状态。
 
-Real-wire coverage for #203 on the Agent side (async): the agent's ``join_office`` is a
-fire-and-forget emit with no local membership state, while room membership is session-scoped — so
-after an auto-reconnect the new SID is not in the room and the agent is silently unreachable. The
-client must replay ``server:join_office`` and, when it cannot, drop the intent instead of keeping
-a plausible-looking membership.
+**#218 追加**：显式 ``join_office`` 已由「无 ack 的 emit」改为等 ACK ⇒ 首次入房被**真实服务端**
+拒绝（房内已有 Agent）必须抛 ``SMCPProtocolError`` 且 ``.code`` 可机器分流。
+
+Real-wire coverage for #203 (replay) and #218 (explicit join waits for the ack) on the Agent side.
 
 断线模拟同 Computer 侧：服务端主动 CLOSE 会让 socketio ``will_reconnect=False``，只有传输层突然
 断开才走 ``TRANSPORT_ERROR`` → 自动重连。/ Drop simulation mirrors the Computer-side test.
@@ -30,8 +28,10 @@ from socketio import ASGIApp, AsyncServer
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.smcp import SMCP_NAMESPACE
 from a2c_smcp.testing import UvicornTestServer
+from a2c_smcp.utils import office as office_mod
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace
 
 _CONNECT_TIMEOUT = 10.0
@@ -175,10 +175,10 @@ async def test_agent_rejected_rejoin_clears_desired_office(
     ——本单实锤踩到过。故用日志把「客户端确实读到了协议码」钉死。
     Assert the rejection branch (not the exception path) was taken, via the logged protocol code.
     """
-    from a2c_smcp.agent import client as agent_client_mod
-
+    # #218：拒绝日志由**共享产出者**（utils.office，两路径同文案）产出 ⇒ 打桩目标随之迁移；
+    # 若仍打桩 agent.client 的模块 logger，断言会**静默失空**（调用列表为空反而看不出问题）。
     fake_logger = MagicMock()
-    monkeypatch.setattr(agent_client_mod, "logger", fake_logger)
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
 
     office_server.reject_from = 2
     agent = _make_agent()
@@ -209,6 +209,46 @@ async def test_agent_rejected_rejoin_clears_desired_office(
         assert len(office_server.join_record) == 2, "回房被拒后不得重试"
     finally:
         await agent.disconnect()
+
+
+# ── #218 C1：显式 join 等 ACK，被拒可感（真实服务端裁决）──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_explicit_join_rejected_by_real_server_raises_with_code(
+    office_server: _OfficeRecordingNamespace,  # 请求它是为了启动服务器（副作用），非断言对象
+    basic_server_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """首次入房被**真实服务端**拒绝 ⇒ 抛 ``SMCPProtocolError`` 且 ``.code`` 可机器分流。
+
+    裁决来自真实 ``enter_room`` 闸门（房内已有 Agent ⇒ 4101），**非**替身 ack：这是 #219 要求的
+    「经 SDK API + 真实服务端」场景。改前该拒绝对调用方完全不可感（不抛、不告警）。
+    """
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+    first = _make_agent()
+    second = _make_agent()
+    try:
+        await _connect(first, basic_server_port)
+        await first.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert first._confirmed_office == (_OFFICE, _AGENT_NAME), "成功入房必须落账已确认成员关系"
+
+        await _connect(second, basic_server_port)
+        with pytest.raises(SMCPProtocolError) as ei:
+            await second.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+        assert ei.value.code == 4101, f"应带真实协议码，实得 {ei.value!r}"
+        assert second._desired_office is None, "首次被拒（无已确认房可回退）⇒ 清空意图"
+        assert second._confirmed_office is None
+
+        # 同一产出者、同一文案：拒绝日志含协议码（与重放路径共用 utils.office 的产出者）
+        logged = " ".join(str(call) for call in fake_logger.error.call_args_list)
+        assert "4101" in logged, f"显式路径的拒绝必须经共享产出者记录，实得：{logged}"
+    finally:
+        await first.disconnect()
+        await second.disconnect()
 
 
 @pytest.mark.asyncio
