@@ -436,9 +436,13 @@ async def test_superseded_replay_success_still_records_confirmed() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_rejection_clears_office_id() -> None:
-    """回房被拒且 generation 仍新鲜（无人接管）→ 清空 office_id（状态不得撒谎）。"""
+    """回房被拒且 generation 仍新鲜（无人接管）→ **预算耗尽后**清空 office_id（状态不得撒谎）。
+
+    预算是退化值 ``0``：本用例钉的是 #203 既有的终态；重试分支本身由文末 `#212` 小节覆盖。
+    """
     client = _make_client(reconnection=True)
     _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.0
     client.office_id = "officeA"
     client._office_generation = 7
 
@@ -686,3 +690,249 @@ async def test_emit_update_guards_require_registered_namespace(method_name: str)
     await getattr(client, method_name)()
 
     assert emitted == [], f"{method_name} 在未实际入房时不得发包"
+
+
+# ── #212：重连回房的瞬态冲突有界退避 ──────────────────────────────────────────────
+#
+# 协议依据：error-handling.md:486（4101/4105 条件可选重试，仅限传输层重连后的恢复路径）、
+# room-model.md:216-218（回收窗口可达数十秒 ⇒ 默认预算须覆盖它）。**只有回放路径重试**：显式
+# join_office 不重试（语义归 #213/#214，见上文「显式 join 失败时的房号去留」小节）。
+# 预算一律取极小值（被 ``min(曲线, 剩余预算)`` 夹取 ⇒ 不牺牲确定性也无需真等 45s）。
+
+_ROOM_FULL = {"code": 4101, "message": "Room already has an agent"}
+
+#: 限时取锁超时（见 agent 侧同名常量说明）：必须严格小于退避窗口。
+PROBE_TIMEOUT = 0.5
+
+
+class _RecordingAsyncLock:
+    """记录 enter/exit 序列的 ``asyncio.Lock`` 替身 —— 证明**退避期间不持锁**（#217 补正 §三）。"""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self.events: list[str] = []
+
+    async def __aenter__(self) -> _RecordingAsyncLock:
+        self.events.append("enter")
+        await self._real.acquire()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self._real.release()
+        self.events.append("exit")
+
+
+async def _await_until(predicate: Any, *, timeout: float = 5.0) -> None:
+    """有界等待断言（``poe test`` 无 ``--timeout`` 护栏，无界忙等会拖住整个套件）。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            raise AssertionError(f"等待超时（{timeout}s）：夹具或实现未按预期推进")
+        await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_replay_self_heals_across_a_transient_conflict() -> None:
+    """回房撞旧会话（4101）→ 退避重试 → 服务端回收后成功 ⇒ 落账（Computer 侧抖动自愈）。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.3
+    client.office_id = "officeA"
+    client._office_generation = 1
+    attempts: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        return dict(_ROOM_FULL) if len(attempts) == 1 else None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    await client._arejoin_office("officeA", 1)
+
+    assert len(attempts) == 2, "瞬态冲突必须重试"
+    assert client.office_id == "officeA"
+    assert client._confirmed_office_id == "officeA", "重试成功后落账"
+
+
+@pytest.mark.asyncio
+async def test_replay_gives_up_when_budget_is_exhausted() -> None:
+    """预算耗尽 ⇒ 清空 desired + 已确认房号 + ERROR（文案带码，与状态清空同步）。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.25
+    client.office_id = "officeA"
+    client._confirmed_office_id = "officeA"
+    client._office_generation = 1
+    attempts: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        return dict(_ROOM_FULL)
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    await client._arejoin_office("officeA", 1)
+
+    assert len(attempts) >= 2, "预算内必须重试"
+    assert client.office_id is None
+    assert client._confirmed_office_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"code": 4106, "message": "Agent already in another room"},
+        {"code": 500, "message": "Internal server error"},
+        {"message": "boom"},
+    ],
+)
+async def test_replay_never_retries_non_transient_outcomes(payload: dict) -> None:
+    """一次即终：``4106``（非瞬态）/ ``500``（可晚于提交）/ 无码都不重试（预算充足 ⇒ 判据使然）。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 5.0
+    client.office_id = "officeA"
+    client._office_generation = 1
+    attempts: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        return dict(payload)
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    await client._arejoin_office("officeA", 1)
+
+    assert attempts == [1], "非瞬态码 / 无码一律一次即终"
+
+
+@pytest.mark.asyncio
+async def test_replay_releases_op_lock_between_attempts() -> None:
+    """退避在**锁外**：① enter/exit 逐次交替（结构）② 退避窗口内**限时**取到锁（行为，杀「sleep 在锁内」）。
+
+    只有 ① 不够：把 sleep 挪进同一次临界区时 enter/exit 对数不变 ⇒ 结构断言照样绿（隔离审查实证）。
+    ② 必须是**限时**取锁：asyncio.Lock 的 FIFO 会把释放后的首次获取优先交给等待中的探针 ⇒「取到后看
+    计数」同样杀不死该变异（实测）。限时取锁把「退避期间锁被持有」变成可观测事实。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 1.0  # 退避窗口 1.0s > 探针 0.5s 超时
+    client.office_id = "officeA"
+    client._office_generation = 1
+    attempts: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        return dict(_ROOM_FULL)
+
+    client.call = fake_call  # type: ignore[method-assign]
+    # 夹具自检（防「探针变盲」的假绿）：限时取锁只在「退避窗口 > 探针超时」时才有分辨力。
+    assert PROBE_TIMEOUT < client.office_rejoin_retry_budget, "探针超时须小于退避窗口，否则断言退化成恒真"
+    real_lock = client._office_op_lock  # 探针用**真锁**：两条断言各用各的仪器
+    lock = _RecordingAsyncLock(real_lock)
+    client._office_op_lock = lock  # type: ignore[assignment]
+
+    task = asyncio.create_task(client._arejoin_office("officeA", 1))
+    await _await_until(lambda: len(attempts) >= 1)
+
+    probe_took_lock_at: list[int] = []
+
+    async def probe() -> None:
+        await asyncio.wait_for(real_lock.acquire(), timeout=PROBE_TIMEOUT)  # 超时 ⇒ TimeoutError ⇒ 用例红
+        probe_took_lock_at.append(len(attempts))
+        real_lock.release()
+
+    await probe()
+    await task
+
+    assert probe_took_lock_at == [1], "探针须在**退避窗口内**取到锁（回放结束后才取到不算）"
+    assert len(attempts) >= 2, "预算内必须重试（否则本断言退化成单次路径）"
+    assert lock.events == ["enter", "exit"] * len(attempts), (
+        f"每次尝试须是独立的临界区；实得 {lock.events}（尝试 {len(attempts)} 次）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_declares_the_same_identity_across_attempts() -> None:
+    """同一次回放的 N 次尝试必须声明**同一身份**：退避窗口内就地改名不得让同一 sid 先后声明两个名字。
+
+    身份在一条连接内不可变（协议 events.md）：第二次尝试若重读 ``computer.name``，改名后会撞 ``403``，
+    把一次本可成功的恢复打成失败。/ Identity is immutable per session, so the request is built once.
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.3
+    client.office_id = "officeA"
+    client._office_generation = 1
+    seen: list[Any] = []
+
+    async def fake_call(event: Any, data: Any = None, **kwargs: Any) -> Any:
+        seen.append(data)
+        if len(seen) == 1:
+            client.computer.name = "renamed-mid-backoff"  # CLI 就地改名（interactive_impl）
+            return dict(_ROOM_FULL)
+        return None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    await client._arejoin_office("officeA", 1)
+
+    assert len(seen) == 2, "须发生一次重试（否则本断言退化成单次路径）"
+    assert seen[0]["name"] == seen[1]["name"] == "test_computer", "N 次尝试必须共用同一次身份声明"
+
+
+@pytest.mark.asyncio
+async def test_replay_superseded_during_backoff_sends_nothing_more() -> None:
+    """退避期间被更新的操作抢占（generation 前进）⇒ 中止：不再发包、不得改动新意图。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.4
+    client.office_id = "officeA"
+    client._office_generation = 1
+    attempts: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        return dict(_ROOM_FULL)
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    replay = asyncio.create_task(client._arejoin_office("officeA", 1))
+    await _await_until(lambda: len(attempts) >= 1)
+
+    client._office_generation += 1
+    client.office_id = "officeB"
+    await replay
+
+    assert attempts == [1], "被抢占后不得再发包"
+    assert client.office_id == "officeB", "陈旧回放不得改新房号"
+
+
+# ── #212 裁决 4：显式 join 的失败判据由「有没有码」收敛为「是否校验类」─────────────────
+
+
+@pytest.mark.asyncio
+async def test_post_commit_code_clears_desired_but_keeps_confirmed() -> None:
+    """``500`` 可发生在成员关系**已提交之后** ⇒ 不得回退到旧房（会宣称仍在房），落到本侧「非校验」支。
+
+    与本侧既有的「无码」分支同形：清 desired、**保留** ``_confirmed_office_id``（与 Agent 的「双清空」
+    刻意分叉，见 ``utils/office.py`` 的 scope note）。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    client._confirmed_office_id = "officeA"
+    client._office_generation = 7
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        return {"code": 500, "message": "Internal server error"}
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="加入房间失败"):
+        await client.join_office("officeB")
+
+    assert client.office_id is None, "500 不得回退到旧房（可能已随提交点作废）"
+    assert client._confirmed_office_id == "officeA", "本侧非校验支保留已确认记忆（与 Agent 刻意分叉）"

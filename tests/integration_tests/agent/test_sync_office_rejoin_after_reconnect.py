@@ -55,7 +55,7 @@ class _RecordingSyncNamespace(MockSyncSMCPNamespace):
             self.join_event.set()
             # v0.5.0（#214）：失败 = flat ErrorPayload（顶层含 code）。旧元组形态已废除——
             # 留在旧契约会让替身与真实服务端分叉，且用例只覆盖「形状不认识」分支，
-            # 覆盖不到 #212 要消费的 4101 带码分支。
+            # 覆盖不到 4101 的带码分支（#212 的退避重试正是消费这一支：瞬态冲突 ⇒ 重试）。
             return {
                 "code": 4101,
                 "message": "Room already has an agent",
@@ -198,7 +198,7 @@ def test_sync_agent_rejected_rejoin_clears_desired_office(
     sync_office_server: tuple[_RecordingSyncNamespace, int],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """回房被拒 → 清空意图（单次尝试，不重试）。
+    """回房持续被拒 → 退避重试到**预算耗尽**后清空意图（同步镜像 async 侧）。
 
     **必须断言走的是「被拒」分支而非「异常/超时」分支**：两条分支都会清空 intent，只断言
     ``_desired_office is None`` 时，替身一侧写坏会让用例改走异常分支而照样全绿（async 版实锤）。
@@ -211,6 +211,8 @@ def test_sync_agent_rejected_rejoin_clears_desired_office(
     ns, port = sync_office_server
     ns.reject_from = 2
     agent = _make_agent()
+    # #212：预算压到极小 ⇒ 几次重试后立即认输（默认 45s 会让本用例白跑满预算）。
+    agent.office_rejoin_retry_budget = 0.3
     try:
         agent.connect_to_server(f"http://localhost:{port}", socketio_path="/socket.io")
         first_sid = agent.namespaces[SMCP_NAMESPACE]
@@ -229,14 +231,61 @@ def test_sync_agent_rejected_rejoin_clears_desired_office(
 
         _wait_until(
             lambda: agent._desired_office is None,
-            "回房被拒后回房意图未清空 / desired office not cleared after a rejected replay",
+            "重试预算耗尽后回房意图未清空 / desired office not cleared after the budget ran out",
         )
         # 被拒分支确实被走到（而非异常/超时分支）：客户端读到了协议码 4101
         logged = " ".join(str(call) for call in fake_logger.error.call_args_list)
         assert "被拒绝" in logged and "4101" in logged, f"应走「被拒」分支并读到协议码，实得日志：{logged}"
 
-        time.sleep(_QUIESCENCE)
-        assert len(ns.join_record) == 2, "回房被拒后不得重试"
+        # #212：瞬态冲突（4101）在预算内必须重试（行为变更：此前一次即终）
+        assert len(ns.join_record) >= 3, "瞬态冲突必须重试（至少多打一次）"
+    finally:
+        agent.disconnect()
+
+
+def test_sync_agent_rejoin_self_heals_after_transient_conflict(
+    sync_office_server: tuple[_RecordingSyncNamespace, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**本单的目标形态**（同步镜像）：撞尚未回收的旧会话 → 退避重试 → 回收后自动回房成功、无 ERROR。
+
+    与 async 侧同样用**替身开关**造拒绝（真实回收窗口由 Computer 侧用例覆盖）；本用例证的是同步侧
+    的重试与落账。
+    """
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+    ns, port = sync_office_server
+    ns.reject_from = 2
+    agent = _make_agent()
+    agent.office_rejoin_retry_budget = 5.0
+    try:
+        agent.connect_to_server(f"http://localhost:{port}", socketio_path="/socket.io")
+        first_sid = agent.namespaces[SMCP_NAMESPACE]
+        agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert ns.join_event.wait(timeout=_CONNECT_TIMEOUT)
+
+        ns.join_event.clear()
+        ws = agent.eio.ws
+        assert ws is not None
+        ws.abort()
+        _wait_until(
+            lambda: agent.namespaces.get(SMCP_NAMESPACE) not in (None, first_sid),
+            "重连后命名空间未在期限内重建 / namespace not re-established after reconnect",
+        )
+        assert ns.join_event.wait(timeout=_CONNECT_TIMEOUT), "回房请求未被服务端收到"
+        # 前置断言用 `>=`：退避窗口内计数不再静止（同 async 侧）。
+        assert len(ns.join_record) >= 2, "前置：重放确已被拒一次"
+
+        ns.reject_from = None  # 服务端此刻已完成回收 ⇒ 下一次重试应成功
+        _wait_until(
+            lambda: agent._confirmed_office == (_OFFICE, _AGENT_NAME),
+            "重试未自愈 / the retry did not restore the office membership",
+        )
+
+        assert len(ns.join_record) >= 3, "自愈必须靠一次真实重放（而非替身放行）"
+        assert ns.join_record[-1][0] == agent.namespaces[SMCP_NAMESPACE], "重放须来自当前 SID"
+        fake_logger.error.assert_not_called()
     finally:
         agent.disconnect()
 

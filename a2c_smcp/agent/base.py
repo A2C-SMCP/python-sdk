@@ -49,6 +49,7 @@ from a2c_smcp.smcp import (
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.office import (
     OFFICE_JOIN_TIMEOUT,
+    OFFICE_REJOIN_RETRY_BUDGET,
     build_join_failure_payload,
     log_join_rejection,
     parse_join_ack,
@@ -127,6 +128,14 @@ class BaseAgentClient(ABC):
         # 与「最后声明的意图」一致，且一次死连接不会让互斥被占满（等待有界 10s）。
         # Serializes explicit join/leave with the replay so the wire order matches the last declaration.
         self._office_op_lock = asyncio.Lock()
+        # ── #212 重连回房的退避预算（公开可配置）─────────────────────────────────────────────
+        # 自动回房被 ``4101``/``4105``（瞬态冲突）拒绝时的**有界退避重试**预算（秒，墙钟）：默认
+        # ``OFFICE_REJOIN_RETRY_BUDGET``（45s = socket.io 默认最长回收窗口），退避 1→2→4→5…秒封顶。
+        # 预算耗尽才落失败效应与 ERROR 日志；**显式 ``join_office`` 不受影响**（不重试）。赋值即可按部署
+        # 调整（镜像 socketio 自身 ``reconnection_delay`` 的实例属性约定）；``<= 0`` 退化回单次尝试。
+        # Bounded backoff budget (seconds) for the replay's transient 4101/4105 rejections; assignable per
+        # instance, mirroring socketio's own ``reconnection_delay`` convention. <= 0 disables retrying.
+        self.office_rejoin_retry_budget: float = OFFICE_REJOIN_RETRY_BUDGET
 
     def _bump_office_generation(self) -> int:
         """推进 generation（作废在途自动回房）并返回新值 / advance the generation, invalidating in-flight replays."""
@@ -702,6 +711,9 @@ class BaseAgentSyncClient(ABC):
         # One-way lock order: op-lock → state-lock. The op-lock spans the bounded ack wait.
         self._office_op_lock = threading.Lock()
         self._office_state_lock = threading.Lock()
+        # #212 重连回房的退避预算（公开可配置，语义与异步侧逐字相同）：赋值即可按部署调整；<= 0 退化
+        # 回单次尝试。/ Same bounded-backoff budget as the async side; assignable, <= 0 disables retrying.
+        self.office_rejoin_retry_budget: float = OFFICE_REJOIN_RETRY_BUDGET
 
     def _bump_office_generation_locked(self) -> int:
         """推进 generation（**须已持有** ``_office_state_lock``）。

@@ -58,7 +58,7 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
             self.joined.set()
             # v0.5.0（#214）：失败 = flat ErrorPayload（顶层含 code）。旧元组形态已废除——
             # 留在旧契约会让替身与真实服务端分叉，且用例只覆盖「形状不认识」分支，
-            # 覆盖不到 #212 要消费的 4101 带码分支。
+            # 覆盖不到 4101 的带码分支（#212 的退避重试正是消费这一支：瞬态冲突 ⇒ 重试）。
             return {
                 "code": 4101,
                 "message": "Room already has an agent",
@@ -168,7 +168,7 @@ async def test_agent_rejected_rejoin_clears_desired_office(
     basic_server_port: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """回房被拒（如旧会话未回收导致的一房一 Agent 拒绝）→ 清空意图，不得保留假成员状态。
+    """回房持续被拒（旧会话一直未回收）→ 退避重试到**预算耗尽**后清空意图，不得保留假成员状态。
 
     **必须断言走的是「被拒」分支而非「异常/超时」分支**：两条分支都会清空 intent，只断言
     ``_desired_office is None`` 时，替身一侧写坏（如抛 NameError）会让用例改走异常分支而**照样全绿**
@@ -182,6 +182,9 @@ async def test_agent_rejected_rejoin_clears_desired_office(
 
     office_server.reject_from = 2
     agent = _make_agent()
+    # #212：预算压到极小（退避被 min(曲线, 剩余预算) 夹取）⇒ 几次重试后立即认输，不真等默认 45s。
+    # 若沿用默认预算，本用例要等满 45s 才等到「预算耗尽」的终态（`poe test` 无超时护栏，会白跑）。
+    agent.office_rejoin_retry_budget = 0.3
     try:
         await _connect(agent, basic_server_port)
         first_sid = agent.namespaces[SMCP_NAMESPACE]
@@ -195,18 +198,68 @@ async def test_agent_rejected_rejoin_clears_desired_office(
         await _wait_for_new_sid(agent, first_sid)
         await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
 
-        assert len(office_server.join_record) == 2
+        # `>=`（非 `==`）：预算小 ⇒ 首次重试可能在断言前就落地（#212 后计数不再静止）
+        assert len(office_server.join_record) >= 2
         await _wait_until(
             lambda: agent._desired_office is None,
-            "回房被拒后回房意图未清空 / desired office not cleared after a rejected replay",
+            "重试预算耗尽后回房意图未清空 / desired office not cleared after the budget ran out",
         )
         # 被拒分支确实被走到（而非异常/超时分支）：客户端读到了协议码 4101
         logged = " ".join(str(call) for call in fake_logger.error.call_args_list)
         assert "被拒绝" in logged and "4101" in logged, f"应走「被拒」分支并读到协议码，实得日志：{logged}"
+        # #212：瞬态冲突（4101）在预算内必须重试（行为变更：此前一次即终）
+        assert len(office_server.join_record) >= 3, "瞬态冲突必须重试（至少多打一次）"
+    finally:
+        await agent.disconnect()
 
-        # 单次尝试：被拒后不得重试
-        await asyncio.sleep(_QUIESCENCE)
-        assert len(office_server.join_record) == 2, "回房被拒后不得重试"
+
+@pytest.mark.asyncio
+async def test_agent_rejoin_self_heals_after_transient_conflict(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**本单的目标形态**：回房撞尚未回收的旧会话（4101）→ 退避重试 → 回收完成后自动回房成功。
+
+    重放被拒（**替身开关** ``reject_from`` 直返带码 ack，未过真实 ``enter_room`` 闸门）→ 客户端退避
+    1s 后重试 → 清掉开关模拟「服务端已完成回收」→ 本次重放真的走到真服务端 handler 并成功 ⇒
+    ``_confirmed_office`` 落账、**不落 ERROR**（抖动自愈，无需人工干预）。
+
+    真实的**回收窗口**（推迟 ``on_disconnect`` 让重放真的撞上同名闸门）由 Computer 侧
+    ``test_rejoin_self_heals_once_the_server_reclaims_the_session`` 覆盖；本用例证的是客户端侧的
+    重试与落账。
+    """
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+    office_server.reject_from = 2  # 第二次（重连后的重放）一律拒绝：模拟「旧会话尚未回收」
+    agent = _make_agent()
+    agent.office_rejoin_retry_budget = 5.0  # 预算充足：本用例要的是「重试后成功」，不是预算耗尽
+    try:
+        await _connect(agent, basic_server_port)
+        first_sid = agent.namespaces[SMCP_NAMESPACE]
+        await agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+
+        office_server.joined.clear()
+        ws = agent.eio.ws
+        assert ws is not None
+        await ws.close()
+        await _wait_for_new_sid(agent, first_sid)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+        # 前置断言用 `>=`：退避窗口（此处 5.0s 预算、首退避 1.0s）内计数不再静止，
+        # 用等值会把「重试已落地」误判成失败（CI 负载抖动即可触发）。
+        assert len(office_server.join_record) >= 2, "前置：重放确已被拒一次"
+
+        office_server.reject_from = None  # 服务端此刻已完成回收 ⇒ 下一次重试应成功
+        await _wait_until(
+            lambda: agent._confirmed_office == (_OFFICE, _AGENT_NAME),
+            "重试未自愈 / the retry did not restore the office membership",
+        )
+
+        assert len(office_server.join_record) >= 3, "自愈必须靠一次真实重放（而非替身放行）"
+        assert office_server.join_record[-1][0] == agent.namespaces[SMCP_NAMESPACE], "重放须来自当前 SID"
+        fake_logger.error.assert_not_called()
     finally:
         await agent.disconnect()
 

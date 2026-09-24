@@ -66,6 +66,28 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   **不再**返回空 `sessions`）；且**不调用**会话读取器 ⇒ 目标房成员信息不可能进响应。
 - 三个事件的 handler 都补齐 **catch-all**：未知内部异常一律回 `500` + 笼统文案（原文进日志），
   不再让异常逃出 handler 导致"根本不发 ACK、调用方挂到自身超时"。
+- **重连回房的瞬态冲突有界退避重试（#212）**：静默断线后服务端要等自身心跳超时才回收旧会话，而客户端
+  在秒级内就重连重放 ⇒ 必然撞上 `4101`（房内已有 Agent）/ `4105`（房内同名）。协议把二者定义为同一类
+  **瞬态冲突**，并只对「本端刚经历传输层重连」的恢复路径放行**有界**重试（`error-handling.md`
+  §建议的重试策略）。三条回放路径（Agent async / Agent sync / Computer）现在按 `1→2→4→5…` 秒退避
+  重试，**默认预算 45s** = socket.io 默认最长回收窗口（`ping_interval(25) + ping_timeout(20)`），
+  预算耗尽才落失败效应与错误日志（与显式入房**同一张效应表、同一句 ERROR 文案**，故 #219 的同态口径
+  不受影响）。静默断线族因此从「需人工重入」变为「无感自愈」。
+  - **可配置**：`AsyncSMCPAgentClient.office_rejoin_retry_budget` / `SMCPAgentClient.…` /
+    `SMCPComputerClient.…`（公开实例属性，默认取 `OFFICE_REJOIN_RETRY_BUDGET`；`<= 0` 退化回单次尝试）。
+    部署方调大了服务端 `ping_interval` / `ping_timeout` 时须相应调大——协议 `room-model.md` 的同名
+    SHOULD 级部署约束是客户端补偿能生效的前提。
+  - **只作用于回放路径**：显式 `join_office` **不重试**（首次入房撞上冲突即永久冲突）；`4106`（重连产生
+    的是新会话，不可能「已在其它房」）/ `500` / 未知码 / 无码 / 传输层失败一律不重试。
+    > **协议对齐说明（有意的一次解释扩张）**：协议把重试限定为「本端刚经历传输层重连」，而 Computer 侧
+    > 「宿主预置 `office_id` 再 `connect()`」的**首连**也走重放通道 ⇒ 也会重试。冷启动（进程被杀后
+    > 以同名重启）撞的正是**上一进程**尚未回收的僵尸会话，与协议给出的瞬态成因（「旧会话未回收」）同源，
+    > 故判为落在「重试判定由客户端依自身状态做出」的自治范围内；Agent 侧无此通道（其重启走显式
+    > `join_office`，不重试）。若协议要收紧该边界，两侧需同步收窄。
+  - **锁语义**：预算内**逐次取/放锁**（每次尝试各取一次 office 操作锁）⇒ 退避不会占满 office 操作
+    互斥；恢复耗时的上界 = 预算 + 一次有界 ACK 等待（末次尝试可在预算边界上发起）。
+  - 新增单一权威纯函数 `rejoin_retry_delay` 与常量 `OFFICE_REJOIN_RETRY_BASE_DELAY` /
+    `OFFICE_REJOIN_RETRY_MAX_DELAY` / `TRANSIENT_JOIN_CONFLICT_CODES`（`a2c_smcp.utils`）。
 
 ### Fixed
 
@@ -73,6 +95,14 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   上下文（目标房 / 自己声明的 role / 自己当前所在房），**MUST NOT** 携带任何对端会话标识（`sid` 等）。
   名字冲突的冗长诊断（含对端 sid）下沉到服务端日志。
 - 未预期内部异常回 `500` + 笼统文案，原文只进日志（此前把 `str(e)` 原样回给客户端）。
+- **入房失败的效应判据由「顶层有没有码」收敛为「是否校验类」（#212，`is_validation_rejection`）**：
+  `room-model.md` 明写「校验必须先于副作用」⇒ 只有 `400`/`403`/`4101`/`4105`/`4106` 才保证
+  「既有成员关系未被改变」，回退到「已确认房」才成立。`500` 是 handler catch-all，**可发生在成员关系
+  已提交之后**（入房广播抛错 ⇒ 服务端按提交点收敛为无房）——旧判据此时会让客户端宣称仍在旧房；未知码
+  同理 fail-safe。二者改按「未获裁决」处置（Agent 双清空；Computer 清 desired、保留
+  `_confirmed_office_id`，与它既有的「无码」支同形）。新增常量 `JOIN_VALIDATION_REJECTION_CODES`。
+  > 代价（已裁决接受）：`500` 若发生在**提交之前**，双清空会多丢一次恢复机会（旧房号不再回退）——
+  > 协议未覆盖此处，按「不臆断、不撒谎」取双清空。
 
 ## [0.4.0] - 2026-08-25
 

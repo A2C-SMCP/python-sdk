@@ -9,6 +9,7 @@
 """
 
 import threading
+import time
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -71,6 +72,7 @@ from a2c_smcp.utils.office import (
     OFFICE_JOIN_TIMEOUT,
     log_join_rejection,
     parse_join_ack,
+    rejoin_retry_delay,
     resolve_join_failure,
 )
 
@@ -480,9 +482,10 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
     def _rejoin_office(self, desired: tuple[str, str], generation: int) -> None:
         """
-        自动回房（daemon 线程）：重放 ``server:join_office`` 并校验 ACK。
+        自动回房（daemon 线程）：重放 ``server:join_office`` 并校验 ACK；瞬态冲突按预算做**有界退避重试**。
 
-        Replay ``server:join_office`` on the fresh namespace and validate its ack.
+        Replay ``server:join_office`` on the fresh namespace and validate its ack, retrying the transient
+        conflicts within a bounded backoff budget (#212).
 
         同步侧无法取消线程，故以 generation **双检**（**取到 op-lock 后**、应用结果前）作废陈旧结果
         ——检查必须在锁内：线程不可取消，锁外检查会让陈旧线程在更新的 JOIN/LEAVE 之后仍把包发上线。
@@ -491,50 +494,83 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         失败效应与日志走与显式 ``join_office`` **同一张表、同一个产出者**（#217 同态口径）；**不再**
         借 ``_drop_desired_office()`` 清状态（那次额外 generation bump 在补了 op-lock 后失去必要，
-        且会让两侧 generation 序列分叉）。单次尝试（镜像 rust-sdk#204）。
+        且会让两侧 generation 序列分叉）。
+
+        **重试语义与异步侧逐字同构**（只重试 ``4101``/``4105``、预算 ``office_rejoin_retry_budget``、
+        退避期间**放锁**：每次尝试各取一次 op-lock，#217 补正 §三）；差异只在落地形态——线程不可取消，
+        故每次尝试的陈旧性检查与效应施加仍在**同一次** ``_office_state_lock`` 获取内，退避 sleep 在**两把
+        锁之外**。被抢占的**孤儿线程**最多多睡一轮退避，醒来即在守卫处退出（不再发包、不改状态）。
+        Same retry semantics as the async side; each attempt re-checks staleness under the state lock and
+        the backoff sleeps outside both locks (an orphaned thread exits at the guard after its nap).
         """
         session = self._office_session
-        with self._office_op_lock:
-            if generation != self._office_generation or self._desired_office != desired:
-                return  # 已被更新的操作接管 / superseded
-            if self._namespace not in self.namespaces:
-                return  # 连接又断了：交给下一次 connect 钩子
-            office_id, agent_name = desired
-            try:
-                result = self.call(
-                    JOIN_OFFICE_EVENT,
-                    EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
-                    namespace=self._namespace,
-                    timeout=OFFICE_JOIN_TIMEOUT,
-                )
-            except Exception as e:
-                # 陈旧性检查与效应施加必须在**同一次**状态锁获取内（隔离审查报出的竞态）：锁外比对会被
-                # GIL 抢占 —— 并发 `join(B)` 的入口段（bump generation + 写 desired）落在窗口里时，
-                # 本陈旧回放会把它的意图与已确认成员关系一并清成 None。/ Staleness check and effect
-                # application share one acquisition; a lock-free compare can be preempted in between.
-                with self._office_state_lock:
-                    if generation != self._office_generation or self._desired_office != desired:
-                        return
-                    effect = resolve_join_failure(None, confirmed=self._confirmed_office)
-                    self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
-                logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
-                return
-            verdict = parse_join_ack(result)
-            with self._office_state_lock:
-                if verdict.ok and session == self._office_session:
-                    # 成功是对服务端**事实**的陈述 ⇒ 无视操作抢占（#213），受会话纪元约束（S11）
-                    self._confirmed_office = desired
+        deadline = time.monotonic() + max(0.0, self.office_rejoin_retry_budget)
+        attempt = 0
+        while True:
+            with self._office_op_lock:
                 if generation != self._office_generation or self._desired_office != desired:
-                    return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
-                if verdict.ok:
-                    logger.info(f"已自动重新加入 Office: {office_id}")
+                    return  # 已被更新的操作接管 / superseded
+                if self._namespace not in self.namespaces:
+                    return  # 连接又断了：交给下一次 connect 钩子
+                office_id, agent_name = desired
+                try:
+                    result = self.call(
+                        JOIN_OFFICE_EVENT,
+                        EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                        namespace=self._namespace,
+                        timeout=OFFICE_JOIN_TIMEOUT,
+                    )
+                except Exception as e:
+                    # 陈旧性检查与效应施加必须在**同一次**状态锁获取内（隔离审查报出的竞态）：锁外比对会被
+                    # GIL 抢占 —— 并发 `join(B)` 的入口段（bump generation + 写 desired）落在窗口里时，
+                    # 本陈旧回放会把它的意图与已确认成员关系一并清成 None。/ Staleness check and effect
+                    # application share one acquisition; a lock-free compare can be preempted in between.
+                    with self._office_state_lock:
+                        if generation != self._office_generation or self._desired_office != desired:
+                            return
+                        effect = resolve_join_failure(None, confirmed=self._confirmed_office)
+                        self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                    logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
                     return
-                confirmed_before = self._confirmed_office
-                effect = resolve_join_failure(verdict, confirmed=confirmed_before)
-                self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
-            # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（#212 将对其做有界退避重试），
-            # 无码则是「未获裁决」（形状不认识 / 空响应）。Transient vs indeterminate, by code.
-            log_join_rejection(office_id, verdict, confirmed_name=confirmed_before[1] if confirmed_before else None)
+                verdict = parse_join_ack(result)
+                with self._office_state_lock:
+                    if verdict.ok and session == self._office_session:
+                        # 成功是对服务端**事实**的陈述 ⇒ 无视操作抢占（#213），受会话纪元约束（S11）
+                        self._confirmed_office = desired
+                    if generation != self._office_generation or self._desired_office != desired:
+                        return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
+                    if verdict.ok:
+                        logger.info(f"已自动重新加入 Office: {office_id}")
+                        return
+                    confirmed_before = self._confirmed_office
+                    # 退避决策与效应施加同一次临界区（决策本身不碰状态，但「是否还有下一次」与
+                    # 「陈旧性」必须同一次判读，否则被抢占的重试会多发包一轮）
+                    delay = rejoin_retry_delay(verdict, attempt=attempt, remaining=deadline - time.monotonic())
+                    if delay is None:
+                        effect = resolve_join_failure(verdict, confirmed=confirmed_before)
+                        self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                if delay is None:
+                    # 日志仍在 op-lock 之内（与异步侧逐字同构、也与本方法原实现一致）：锁外发日志会在并发
+                    # join 落地之后仍报旧状态。/ Logging stays inside the op-lock, as in the async path.
+                    if attempt:
+                        # 与共享 ERROR 分开：ERROR 文案须与显式路径逐字相同（#219 同态口径），
+                        # 「重试过几次」是回放路径独有的上下文。/ Kept apart from the shared ERROR text.
+                        logger.warning(f"自动回房重试耗尽（共 {attempt + 1} 次尝试）: {office_id} - code={verdict.code}")
+                    # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（重试预算见
+                    # ``office_rejoin_retry_budget``），无码则是「未获裁决」（形状不认识 / 空响应）。
+                    log_join_rejection(
+                        office_id,
+                        verdict,
+                        confirmed_name=confirmed_before[1] if confirmed_before else None,
+                    )
+                    return
+                attempt += 1
+                logger.debug(
+                    f"自动回房遇到瞬态冲突，{delay:.1f}s 后重试（第 {attempt} 次尝试）: "
+                    f"{office_id} - code={verdict.code}"
+                )
+            # 退避必须在两把锁之外：预算内逐次取/放锁（#217 补正 §三）
+            time.sleep(delay)
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """

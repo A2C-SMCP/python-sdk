@@ -23,13 +23,20 @@ import pytest
 from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.utils import office as office_mod
 from a2c_smcp.utils.office import (
+    JOIN_VALIDATION_REJECTION_CODES,
     NO_RESPONSE_MESSAGE,
     OFFICE_JOIN_TIMEOUT,
+    OFFICE_REJOIN_RETRY_BASE_DELAY,
+    OFFICE_REJOIN_RETRY_BUDGET,
+    OFFICE_REJOIN_RETRY_MAX_DELAY,
+    TRANSIENT_JOIN_CONFLICT_CODES,
     JoinOfficeVerdict,
     build_join_failure_payload,
+    is_validation_rejection,
     join_failure_message,
     log_join_rejection,
     parse_join_ack,
+    rejoin_retry_delay,
     resolve_join_failure,
 )
 
@@ -281,3 +288,175 @@ class TestLogJoinRejection:
         text = fake_logger.error.call_args[0][0]
         assert "alice" in text
         assert "重新建立连接" in text
+
+
+# ── #212 重连回房的有界退避（瞬态冲突白名单 + 曲线 + 校验类判据）──────────────────────
+#
+# 协议依据：error-handling.md:486 重试表（4101/4105 条件可选）、room-model.md:216-218（回收窗口
+# 可达数十秒 ⇒ 任何有限短窗都覆盖不了）、room-model.md:157（校验必须先于副作用）。曲线与预算大小
+# 归 SDK 自治，故本节的期望值是 **SDK 决策**（用户拍板 45s / 1.2.4.5.5…），不是协议条款。
+
+
+class TestRejoinRetryConstants:
+    """退避预算与曲线常量 / backoff budget & curve (SDK 自治裁量)."""
+
+    def test_budget_covers_default_reclaim_window(self) -> None:
+        """默认预算须覆盖 socket.io 默认最长回收窗口 = ``ping_interval(25) + ping_timeout(20)``。
+
+        写死 45.0 而非只断言 ``>= 45``：这是**产品决策**（用户拍板），改小它等于让重试徒劳
+        （room-model.md:216-218 已论证「任何有限短窗都覆盖不了回收窗口」）。
+        """
+        assert OFFICE_REJOIN_RETRY_BUDGET == 45.0
+
+    def test_curve_is_bounded_and_within_budget(self) -> None:
+        """曲线 1 → 2 → 4 →（封顶）5 秒；封顶值必须远小于预算，否则预算只够一两次尝试。"""
+        assert OFFICE_REJOIN_RETRY_BASE_DELAY == 1.0
+        assert OFFICE_REJOIN_RETRY_MAX_DELAY == 5.0
+        assert OFFICE_REJOIN_RETRY_MAX_DELAY < OFFICE_REJOIN_RETRY_BUDGET
+
+
+class TestTransientJoinConflictCodes:
+    """瞬态冲突白名单 = 协议重试表里「条件可选」的那两码（error-handling.md:496）。"""
+
+    def test_only_room_full_and_name_conflict(self) -> None:
+        assert frozenset({4101, 4105}) == TRANSIENT_JOIN_CONFLICT_CODES
+
+    def test_already_in_room_is_not_transient(self) -> None:
+        """4106 不属瞬态冲突：重连产生的是**新会话**（无 ``office_id``），不可能「已在其它房」。
+
+        它只由客户端状态错误产生，须先显式退房（error-handling.md:498）——重试不改变结果。
+        """
+        assert 4106 not in TRANSIENT_JOIN_CONFLICT_CODES
+
+
+class TestIsValidationRejection:
+    """「校验先于副作用」判据 / the pre-commit (validation) rejection predicate.
+
+    #212 裁决 4：判据由「顶层有没有码」收敛为「码是否属**校验类**」——只有校验期返回的码才保证
+    「既有成员关系未被改变」，据此回退到「已确认房」才成立。``500`` 是 handler catch-all，可晚于
+    成员关系提交（入房广播抛错 ⇒ 服务端按提交点收敛为无房），此时回退会让客户端宣称仍在旧房。
+    """
+
+    @pytest.mark.parametrize("code", [400, 403, 4101, 4105, 4106])
+    def test_join_validation_codes_are_recognised(self, code: int) -> None:
+        assert is_validation_rejection(JoinOfficeVerdict(ok=False, code=code, message="x")) is True
+
+    @pytest.mark.parametrize("code", [500, 4102, 4103, 4104, 4199])
+    def test_post_commit_reserved_and_unknown_codes_are_excluded(self, code: int) -> None:
+        """``500`` 可晚于提交；``4102`` 是预留码、``4103``/``4104`` 只由 ``list_room`` 产出（join 产不出）；
+        未知码 fail-safe（与 ``parse_join_ack`` 的「宁严勿宽」同向）。"""
+        assert is_validation_rejection(JoinOfficeVerdict(ok=False, code=code, message="x")) is False
+
+    def test_indeterminate_and_transport_are_not_validation_rejections(self) -> None:
+        assert is_validation_rejection(JoinOfficeVerdict(ok=False, code=None, message=NO_RESPONSE_MESSAGE)) is False
+        assert is_validation_rejection(None) is False
+
+    def test_whitelist_matches_join_reachable_validation_codes(self) -> None:
+        """白名单是**维护耦合点**：它必须恰好是「join 的校验类码」集合。
+
+        服务端 ``server:join_office`` 可达码 = ``{400, 403, 4101, 4105, 4106, 500}``（``4102``-``4104``
+        只由别的事件产出）。未来 MINOR 新增校验类码时，本断言不会自动报警，但会落到「非校验 ⇒ 双清空」
+        这一 fail-safe 方向（牺牲恢复能力、不撒谎）——改动这里请同时更新本断言与 docstring。
+        """
+        assert frozenset({400, 403, 4101, 4105, 4106}) == JOIN_VALIDATION_REJECTION_CODES
+        assert TRANSIENT_JOIN_CONFLICT_CODES <= JOIN_VALIDATION_REJECTION_CODES
+
+
+class TestRejoinRetryDelay:
+    """退避曲线与预算夹取（纯函数，三条回放路径共用）/ shared backoff policy for all replay paths."""
+
+    @staticmethod
+    def _room_full() -> JoinOfficeVerdict:
+        return JoinOfficeVerdict(ok=False, code=4101, message="Room already has an agent")
+
+    def test_curve_doubles_then_caps(self) -> None:
+        assert [rejoin_retry_delay(self._room_full(), attempt=i, remaining=999.0) for i in range(5)] == [
+            1.0,
+            2.0,
+            4.0,
+            5.0,
+            5.0,
+        ]
+
+    def test_name_conflict_is_retryable_too(self) -> None:
+        """4101 与 4105 是同一类瞬态冲突的两种形态（重连撞旧会话：Agent 独占 / 同名）。"""
+        verdict = JoinOfficeVerdict(ok=False, code=4105, message="Name already taken in room")
+        assert rejoin_retry_delay(verdict, attempt=0, remaining=999.0) == 1.0
+
+    @pytest.mark.parametrize("code", [4106, 500, 4102, 4103, 4104, 4199])
+    def test_non_transient_codes_never_retry(self, code: int) -> None:
+        assert rejoin_retry_delay(JoinOfficeVerdict(ok=False, code=code, message="x"), attempt=0, remaining=999.0) is None
+
+    def test_indeterminate_and_transport_never_retry(self) -> None:
+        """形状不认识 / 码不可解析（无码）与传输层失败（无裁决）都不重试：协议只对 4101/4105 放行。"""
+        assert (
+            rejoin_retry_delay(
+                JoinOfficeVerdict(ok=False, code=None, message=NO_RESPONSE_MESSAGE), attempt=0, remaining=999.0
+            )
+            is None
+        )
+        assert rejoin_retry_delay(None, attempt=0, remaining=999.0) is None
+
+    @pytest.mark.parametrize("remaining", [0.0, -0.5])
+    def test_exhausted_budget_never_retries(self, remaining: float) -> None:
+        """预算耗尽（含非正预算的退化配置）⇒ 放弃并落失败效应。"""
+        assert rejoin_retry_delay(self._room_full(), attempt=0, remaining=remaining) is None
+
+    def test_delay_is_clamped_to_remaining_budget(self) -> None:
+        """末段退避不得越过预算：否则「预算 = 墙钟上界」不成立，测试也无法用小预算提速。"""
+        assert rejoin_retry_delay(self._room_full(), attempt=3, remaining=0.25) == 0.25
+
+    def test_huge_attempt_does_not_overflow(self) -> None:
+        """指数必须封顶：``2.0 ** 1024`` 在 Python 里**抛 OverflowError**（不是返回 inf）。
+
+        预算可被配置成任意大（部署方为覆盖超长回收窗口而调大）⇒ 尝试次数随之变多。若不封顶，异常会从
+        纯函数逃出：async 侧成为 detached task 的未取回异常、sync 侧让回房线程带栈退出（恰在预算耗尽前
+        最需要它的时候）。封顶后该值早已被 ``OFFICE_REJOIN_RETRY_MAX_DELAY`` 压低，无行为差异。
+        """
+        assert rejoin_retry_delay(self._room_full(), attempt=5000, remaining=1e9) == 5.0
+
+
+class TestResolveJoinFailurePostCommitCodes:
+    """判据收敛后的效应矩阵（#212 裁决 4）/ effect matrix for non-validation rejections.
+
+    与 ``TestResolveJoinFailureMatrix`` 分开成节，是为了让「这是**新增**的语义」在测试结构上可见：
+    原矩阵只按「有没有码」分两行，新判据把 ``500`` / 预留码 / 未知码从「回退」搬到「双清空」。
+    """
+
+    def test_internal_error_clears_both(self) -> None:
+        """500 可发生在成员关系**已提交之后** ⇒ 旧「已确认房」不再可信，双清空。"""
+        effect = resolve_join_failure(
+            JoinOfficeVerdict(ok=False, code=500, message="Internal server error"),
+            confirmed=("officeA", "alice"),
+        )
+
+        assert effect.desired is None
+        assert effect.confirmed is None
+
+    def test_unknown_code_clears_both(self) -> None:
+        """未知码 fail-safe：宁可丢掉恢复能力，也不宣称一个可能已不存在的成员关系。"""
+        effect = resolve_join_failure(
+            JoinOfficeVerdict(ok=False, code=4199, message="future code"),
+            confirmed=("officeA", "alice"),
+        )
+
+        assert effect.desired is None
+        assert effect.confirmed is None
+
+    @pytest.mark.parametrize("code", [4102, 4103, 4104])
+    def test_reserved_and_foreign_room_codes_clear_both(self, code: int) -> None:
+        """这三个码不由 ``join`` 产出（4102 预留、4103/4104 属 list_room）；万一收到即 fail-safe 双清空。"""
+        effect = resolve_join_failure(JoinOfficeVerdict(ok=False, code=code, message="x"), confirmed=("officeA", "alice"))
+
+        assert effect.desired is None
+        assert effect.confirmed is None
+
+    def test_bad_request_still_falls_back(self) -> None:
+        """400（载荷畸形）属**请求校验**，先于任何副作用 ⇒ 既有成员关系不变 ⇒ 仍回退。"""
+        effect = resolve_join_failure(
+            JoinOfficeVerdict(ok=False, code=400, message="Bad request"),
+            confirmed=("officeA", "alice"),
+        )
+
+        assert effect.desired == ("officeA", "alice")
+        assert effect.confirmed == ("officeA", "alice")

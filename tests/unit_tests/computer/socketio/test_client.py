@@ -481,8 +481,12 @@ async def test_join_office_rejection_without_message_still_restores_confirmed():
     这一**字符串比较**区分；文案一旦为空串/被改，语义就静默翻转（把拒绝当未裁决 ⇒ 错误清空房号）。
     本用例用「空 message + 有 code」把两种判据分开：只有看码的实现才回退到已确认房号。
 
-    The rejection test is "does a protocol code exist" — not a string sentinel; a payload with an
-    empty message but a code must still restore the last confirmed office.
+    **#212 起判据再收紧一步**：不仅要看码，还要看该码是否属**校验类**
+    （``is_validation_rejection``——``500``/未知码不回退）。本用例用 ``4101``（校验类）钉住「看码」
+    这一层；「非校验类码不回退」由 ``test_post_commit_code_clears_desired_but_keeps_confirmed`` 覆盖。
+
+    The rejection test is "does a *validation* protocol code exist" — not a string sentinel; a payload
+    with an empty message but a pre-commit code must still restore the last confirmed office.
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "test_computer"

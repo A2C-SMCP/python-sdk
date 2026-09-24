@@ -191,7 +191,7 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
     office_server: _OfficeRecordingNamespace,
     basic_server_port: int,
 ) -> None:
-    """**真实服务端**拒绝路径：旧会话未回收 → 同名冲突 → 清空状态且不重试。
+    """**真实服务端**拒绝路径：旧会话未回收 → 同名冲突 → 退避重试到**预算耗尽**后清空状态。
 
     与 ``reject_from`` 合成开关不同，本用例让服务端**推迟回收旧会话**（静默断线时服务端要等 ping
     超时才 ``on_disconnect``），使重放的 join 真实撞上 ``enter_room`` 的同名检查——覆盖生产主线上
@@ -201,6 +201,8 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
     replay hits ``enter_room``'s duplicate-name check and comes back with the real ack text.
     """
     client = _make_client()
+    # #212：预算压到极小 ⇒ 真实 4105 上重试几次后立即认输（默认 45s 会让本用例白跑满预算）。
+    client.office_rejoin_retry_budget = 0.3
     try:
         await client.connect(
             f"http://localhost:{basic_server_port}",
@@ -225,18 +227,75 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
         assert isinstance(ack, dict) and ack["code"] == 4105, "旧会话未回收时，真实服务端应拒绝同名重放"
         assert ack["message"] == "Name already taken in room", f"应为协议规范文案（不再含对端 sid），实际：{ack!r}"
 
-        # 状态必须清空（不得保留表面有效的旧值），且单次尝试不重试
+        # 状态必须清空（不得保留表面有效的旧值）——#212 起清空发生在**预算耗尽**之后
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CONNECT_TIMEOUT
         while client.office_id is not None:
             if loop.time() > deadline:
                 raise AssertionError("真实拒绝后 office_id 未清空 / office_id not cleared after a real rejection")
             await asyncio.sleep(_WAIT_INTERVAL)
-        await asyncio.sleep(_QUIESCENCE)
-        assert len(office_server.join_record) == 2, "被拒后不得重试"
+        # #212：真实 4105 是瞬态冲突 ⇒ 预算内必须重试（行为变更：此前一次即终）
+        assert len(office_server.join_record) >= 3, "瞬态冲突必须重试（至少多打一次）"
     finally:
         if office_server.stall_disconnect is not None:
             office_server.stall_disconnect.set()  # 放行旧会话回收，避免拖住 teardown
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_rejoin_self_heals_once_the_server_reclaims_the_session(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """**本单的目标形态**（真服务端闸门 + 真回收窗口）：退避重试撞上回收完成 ⇒ 自动回房、无需人工。
+
+    本用例是全库里**唯一**用真闸门 + 真回收窗口兑现该路径的一条：``stall_disconnect`` 推迟真实
+    ``on_disconnect`` ⇒ 重放真的撞上 ``enter_room`` 的同名检查；放行后旧会话真的被回收 ⇒ 重试真的入房。
+    Agent 侧两条自愈用例的「拒绝」出自替身开关，不构成真闸门证据。
+
+    与前一条用例同一装置，只是**放行**被推迟的 ``on_disconnect``：服务端回收旧会话后，下一次重试
+    真的入房成功 ⇒ ``office_id`` 保持、``_confirmed_office_id`` 落账、不落 ERROR。
+    """
+    client = _make_client()
+    client.office_rejoin_retry_budget = 5.0  # 预算充足：本用例要的是「重试后成功」，不是预算耗尽
+    try:
+        await client.connect(
+            f"http://localhost:{basic_server_port}",
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+        )
+        first_sid = client.namespaces[SMCP_NAMESPACE]
+        await client.join_office("rejoin-office")
+        assert client.office_id == "rejoin-office"
+
+        office_server.stall_disconnect = asyncio.Event()
+        office_server.joined.clear()
+        ws = client.eio.ws
+        assert ws is not None
+        await ws.close()
+
+        await _wait_for_new_sid(client, first_sid)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+        # 前置断言用 `>=`：退避窗口内计数不再静止（同 Agent 侧）。
+        assert len(office_server.join_record) >= 2, "前置：重放确已被真服务端拒一次"
+
+        # 服务端完成回收：放行被推迟的 on_disconnect ⇒ 房内不再有旧会话 ⇒ 下次重试应成功
+        office_server.stall_disconnect.set()
+        office_server.joined.clear()
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CONNECT_TIMEOUT
+        while client._confirmed_office_id != "rejoin-office":
+            if loop.time() > deadline:
+                raise AssertionError("重试未自愈 / the retry did not restore the office membership")
+            await asyncio.sleep(_WAIT_INTERVAL)
+
+        assert client.office_id == "rejoin-office", "自愈后 desired 保持"
+        assert len(office_server.join_record) >= 3, "自愈必须靠一次真实重放"
+        assert office_server.join_record[-1][0] == client.namespaces[SMCP_NAMESPACE], "重放须来自当前 SID"
+    finally:
+        if office_server.stall_disconnect is not None:
+            office_server.stall_disconnect.set()
         await client.disconnect()
 
 
@@ -251,6 +310,7 @@ async def test_rejected_rejoin_clears_office_state(
     """
     office_server.reject_from = 2  # 第二次（重连后）的 join 一律拒绝
     client = _make_client()
+    client.office_rejoin_retry_budget = 0.3  # #212：极小预算 ⇒ 重试几次后立即认输
     try:
         await client.connect(
             f"http://localhost:{basic_server_port}",
@@ -269,7 +329,7 @@ async def test_rejected_rejoin_clears_office_state(
         await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
 
         # 确实尝试过重放（被拒），且客户端状态回到"未加入"
-        assert len(office_server.join_record) == 2
+        assert len(office_server.join_record) >= 2  # `>=`：退避窗口内计数不再静止（#212）
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CONNECT_TIMEOUT
         while client.office_id is not None:
@@ -277,9 +337,8 @@ async def test_rejected_rejoin_clears_office_state(
                 raise AssertionError("回房被拒后 office_id 未清空 / office_id not cleared after a rejected replay")
             await asyncio.sleep(_WAIT_INTERVAL)
 
-        # 单次尝试：被拒后不得再重试（镜像 rust，#203 口径"单次尝试，失败即清空"）
-        await asyncio.sleep(_QUIESCENCE)
-        assert len(office_server.join_record) == 2, "回房被拒后不得重试 / no retry after a rejected replay"
+        # #212：瞬态冲突（4105）在预算内必须重试（行为变更：此前一次即终）
+        assert len(office_server.join_record) >= 3, "瞬态冲突必须重试（至少多打一次）"
     finally:
         await client.disconnect()
 

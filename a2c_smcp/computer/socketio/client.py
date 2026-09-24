@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import hashlib
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeAlias, cast
 
@@ -83,7 +84,13 @@ from a2c_smcp.utils.handshake import (
     extract_4008_payload,
 )
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.office import OFFICE_JOIN_TIMEOUT, parse_join_ack
+from a2c_smcp.utils.office import (
+    OFFICE_JOIN_TIMEOUT,
+    OFFICE_REJOIN_RETRY_BUDGET,
+    is_validation_rejection,
+    parse_join_ack,
+    rejoin_retry_delay,
+)
 
 logger = get_logger(__name__)
 
@@ -221,6 +228,13 @@ class SMCPComputerClient(AsyncClient):
         self._office_generation: int = 0
         self._office_rejoin_task: asyncio.Task[None] | None = None
         self._office_op_lock = asyncio.Lock()
+        # #212 自动回房的退避预算（公开可配置，默认 ``OFFICE_REJOIN_RETRY_BUDGET`` = 45s，覆盖 socket.io
+        # 默认最长回收窗口）：被 ``4101``/``4105``（瞬态冲突）拒绝时按 1→2→4→5…秒退避重试，预算耗尽才
+        # 清空 desired 并记错误。赋值即可按部署调整（镜像 socketio 自身 ``reconnection_delay`` 的实例
+        # 属性约定）；``<= 0`` 退化回单次尝试（测试与嵌入方的逃生舱）。
+        # Bounded backoff budget (seconds) for the replay's transient 4101/4105 rejections; assignable per
+        # instance. <= 0 disables retrying.
+        self.office_rejoin_retry_budget: float = OFFICE_REJOIN_RETRY_BUDGET
         # 引擎级（非协议）namespace 生命周期钩子。两个 handler 刻意写成**同步函数**：engineio 以
         # ``run_async=False`` 内联触发 'disconnect'（engineio/async_client.py:614），在其中 await 会把
         # 拆链与 ``eio.disconnect()`` 一起卡住——函数签名是"零 await"的结构性保证。
@@ -412,52 +426,82 @@ class SMCPComputerClient(AsyncClient):
 
     async def _arejoin_office(self, office_id: str, generation: int) -> None:
         """
-        自动回房：在新建立的 namespace 连接上重放 ``server:join_office``。
+        自动回房：在新建立的 namespace 连接上重放 ``server:join_office``；瞬态冲突按预算做**有界退避重试**。
 
-        Replay ``server:join_office`` on the freshly re-established namespace connection (#203).
+        Replay ``server:join_office`` on the freshly re-established namespace connection (#203), retrying
+        the transient conflicts within a bounded backoff budget (#212).
 
         结果只在 generation 仍新鲜时落到状态上：期间用户显式换房/退房（generation 前进）则整条结果
         作废——陈旧回房的失败**不得**清掉用户刚设好的房号。/ Results are applied only while the
         generation is still current, so a superseded replay can never clobber a newer office.
 
-        单次尝试：被拒即清空 desired + 错误日志（镜像 rust-sdk#204 语义，不做重试）。
-        Single attempt, mirroring rust-sdk#204: a rejection clears the desired office and logs.
+        **重试语义（#212）**：被 ``4101``/``4105`` 拒时按 :func:`a2c_smcp.utils.office.rejoin_retry_delay`
+        退避重试（预算 = ``office_rejoin_retry_budget``，默认 45s = socket.io 默认最长回收窗口），
+        **退避期间放锁**（每次尝试各取一次 op-lock）；预算耗尽才清空 desired + 错误日志。其余码
+        （``4106`` / ``500`` / 未知码 / 无码 / 传输层失败）**不重试**。上界 = 预算 + 一次
+        ``OFFICE_JOIN_TIMEOUT``（末次尝试在预算边界上发起，其 ACK 仍等到自己的有界超时）。
+        Retries only the transient 4101/4105, releasing the op-lock between attempts; the desired office is
+        cleared only when the budget is exhausted.
+
+        **身份在一条连接内不可变**：``EnterOfficeReq`` 在循环入口**一次性构造**，N 次尝试共用同一份声明
+        ——若每次重读 ``self.computer.name``，用户在退避窗口内改名（CLI 的 ``_rename_via_reconnect`` 会
+        就地改 ``comp.name``）会让同一条 sid 先后声明两个名字，撞 ``403``（身份不可变）而把一次本可
+        成功的恢复打成失败。/ The request is built once so every attempt declares the same identity.
         """
-        async with self._office_op_lock:
-            if generation != self._office_generation or self.office_id != office_id:
-                return  # 已被更新的操作接管 / superseded by a newer operation
-            if self._namespace not in self.namespaces:
-                return  # 连接又断了：交给下一次 connect 钩子 / the connection dropped again
-            try:
-                result = await self.call(
-                    JOIN_OFFICE_EVENT,
-                    EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
-                    namespace=self._namespace,
-                    timeout=OFFICE_JOIN_TIMEOUT,
-                )
-            except Exception as e:
+        request = EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name)
+        # 预算 = 墙钟上界（起点 = 回放起点）；``<= 0``（含负值配置）⇒ 不重试，退化回单次尝试。
+        deadline = time.monotonic() + max(0.0, self.office_rejoin_retry_budget)
+        attempt = 0
+        while True:
+            async with self._office_op_lock:
                 if generation != self._office_generation or self.office_id != office_id:
-                    return  # 结果已作废，不得用陈旧结果改状态
-                self.office_id = None
-                self._confirmed_office_id = None
-                logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
-                return
-            verdict = parse_join_ack(result)
-            if verdict.ok:
-                # 同 join_office：成功是对服务端事实的陈述，不受 supersession 守卫约束（#213）
-                self._confirmed_office_id = office_id
-            if generation != self._office_generation or self.office_id != office_id:
-                return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
-            if verdict.ok:
-                logger.info(f"已自动重新加入 Office: {office_id}")
-            else:
-                self.office_id = None
-                self._confirmed_office_id = None
-                # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（#212 将对其做有界退避重试），
-                # 无码则是「未获裁决」（形状不认识 / 空响应）。Transient vs indeterminate, by code.
-                logger.error(
-                    f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
+                    return  # 已被更新的操作接管 / superseded by a newer operation
+                if self._namespace not in self.namespaces:
+                    return  # 连接又断了：交给下一次 connect 钩子 / the connection dropped again
+                try:
+                    result = await self.call(
+                        JOIN_OFFICE_EVENT,
+                        request,
+                        namespace=self._namespace,
+                        timeout=OFFICE_JOIN_TIMEOUT,
+                    )
+                except Exception as e:
+                    if generation != self._office_generation or self.office_id != office_id:
+                        return  # 结果已作废，不得用陈旧结果改状态
+                    self.office_id = None
+                    self._confirmed_office_id = None
+                    logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
+                    return
+                verdict = parse_join_ack(result)
+                if verdict.ok:
+                    # 同 join_office：成功是对服务端事实的陈述，不受 supersession 守卫约束（#213）
+                    self._confirmed_office_id = office_id
+                if generation != self._office_generation or self.office_id != office_id:
+                    return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
+                if verdict.ok:
+                    logger.info(f"已自动重新加入 Office: {office_id}")
+                    return
+                delay = rejoin_retry_delay(verdict, attempt=attempt, remaining=deadline - time.monotonic())
+                if delay is None:
+                    self.office_id = None
+                    self._confirmed_office_id = None
+                    if attempt:
+                        logger.warning(
+                            f"自动回房重试耗尽（共 {attempt + 1} 次尝试）: {office_id} - code={verdict.code}"
+                        )
+                    # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（重试预算见
+                    # ``office_rejoin_retry_budget``），无码则是「未获裁决」（形状不认识 / 空响应）。
+                    logger.error(
+                        f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
+                    )
+                    return
+                attempt += 1
+                logger.debug(
+                    f"自动回房遇到瞬态冲突，{delay:.1f}s 后重试（第 {attempt} 次尝试）: "
+                    f"{office_id} - code={verdict.code}"
                 )
+            # 退避必须在锁外：预算内逐次取/放锁（#217 补正 §三）
+            await asyncio.sleep(delay)
 
     async def join_office(self, office_id: str) -> None:
         """
@@ -471,15 +515,18 @@ class SMCPComputerClient(AsyncClient):
         replay invalidated *before* the new id is written, so a superseded replay's failure path can
         never clear it.
 
-        #213 / #214：失败时的房号去留按**失败形态**分刀（服务端拒绝不改变既有成员关系 ⇒ 客户端也不得
-        清掉仍在的房间）：
-          - 服务端**明确拒绝**（v0.5.0 起 = flat ErrorPayload，**顶层带协议码**）⇒ 回退到
-            ``_confirmed_office_id``（最近一次被服务端确认的房号，通常是旧房；从未确认过则为 ``None``）；
-          - 传输层失败 / 无码响应（无法判定服务端是否已生效）⇒ 维持清空语义（不臆断）。
+        #213 / #214 / #212：失败时的房号去留按**失败形态**分刀（校验类拒绝不改变既有成员关系 ⇒ 客户端
+        也不得清掉仍在的房间）：
+          - 服务端**校验类拒绝**（``is_validation_rejection``：``400``/``403``/``4101``/``4105``/``4106``，
+            协议明写「校验必须先于副作用」）⇒ 回退到 ``_confirmed_office_id``（最近一次被服务端确认的
+            房号，通常是旧房；从未确认过则为 ``None``）；
+          - 传输层失败 / 非校验类码（``500`` 可晚于成员关系提交、未知码无法判定）/ 无码响应 ⇒ 维持清空
+            语义（不臆断服务端状态）。
         回退取的是**已确认**房号而非入口快照：入口预写的意图在并发下可能属于一次「裁决被丢弃」的
         在途 join，绝不代表真实成员关系。
-        #213: a rejection restores the last *server-confirmed* office — never the desired field, whose
-        value may be an unconfirmed pre-write from a superseded in-flight join.
+        #213/#212: only a *pre-commit* rejection restores the last server-confirmed office — never the
+        desired field (which may be an unconfirmed pre-write from a superseded in-flight join), and never
+        a code that can post-date the membership commit (``500``) or an unrecognised one.
 
         Args:
             office_id (str): 房间ID，在A2C-smcp协议中，OfficeID即为Socket.IO RoomID / Room ID, in A2C-smcp protocol,
@@ -531,17 +578,17 @@ class SMCPComputerClient(AsyncClient):
             raise
 
         if not verdict.ok:
-            # 服务端给出了裁决 ⇒ **明确拒绝**（#214 起以 flat ErrorPayload 承载协议码：顶层 `code` 非空
-            # 即「服务端明确判了」）。协议 room-model.md「加入时校验失败 ⇒ 拒绝加入」且拒绝**不改变既有
-            # 成员关系**（校验先于副作用），故此处回退到**已确认**房号，而不是清空——清空会让宿主以为
-            # 「不在任何房」，与真实成员关系相反（#213 的服务端修正后尤其如此：换房被拒时它仍在旧房）。
-            # 无码（形状不认识 / 未获裁决）不是拒绝裁决，维持清空语义（与上面传输层失败一致）。
-            # 判据从「文案哨兵」改为「码是否存在」：哨兵是字符串比较，一旦文案微调就会静默失配。#214
-            # An explicit verdict = rejection: the server does not change existing membership, so fall
-            # back to the last *confirmed* office instead of clearing. Judgment keyed on the presence of
-            # a protocol code (not a string sentinel, which silently misfires if the text changes).
+            # 服务端给出了裁决 ⇒ **拒绝**（#214 起以 flat ErrorPayload 承载协议码）。协议 room-model.md
+            # 「加入时**校验**失败 ⇒ 拒绝加入」且校验**先于副作用** ⇒ 校验类拒绝不改变既有成员关系，故此处
+            # 回退到**已确认**房号，而不是清空——清空会让宿主以为「不在任何房」，与真实成员关系相反
+            # （#213 的服务端修正后尤其如此：换房被拒时它仍在旧房）。
+            # 判据 (#212 裁决 4)：由「顶层有没有码」收敛为 **是否校验类**——``500`` 可发生在成员关系**已提交
+            # 之后**（入房广播抛错 ⇒ 服务端按提交点收敛为无房），回退会让宿主宣称仍在旧房；未知码同理
+            # fail-safe。非校验类走下面「无码」的同一支：清 desired、**保留**已确认房号（本侧既有分叉，
+            # 与 Agent 的「双清空」刻意不同，见 ``utils/office.py`` 的 scope note）。
+            # #212: the key is now *pre-commit*, not merely code presence — a 500 can post-date the commit.
             if self._office_generation == generation:
-                self.office_id = self._confirmed_office_id if verdict.code is not None else None
+                self.office_id = self._confirmed_office_id if is_validation_rejection(verdict) else None
             raise RuntimeError(f"加入房间失败 / Failed to join office: {verdict.message}")
 
         # 裁决为成功：记录服务端已确认的成员关系。**刻意不受 supersession 守卫约束**——成功是关于
