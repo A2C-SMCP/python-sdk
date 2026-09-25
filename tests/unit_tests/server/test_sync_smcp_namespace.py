@@ -105,7 +105,7 @@ def test_enter_room_updates_session_and_broadcast(ns):
     ns.emit.assert_called_once()
     args, kwargs = ns.emit.call_args
     assert args[0] == ENTER_OFFICE_NOTIFICATION
-    assert kwargs.get("room") == "roomZ"
+    assert kwargs.get("room") == "office:roomZ"
     assert kwargs.get("skip_sid") == "sid1"
 
 
@@ -175,7 +175,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     args1, kwargs1 = ns.emit.call_args
     assert args1[0] == CANCEL_TOOL_CALL_NOTIFICATION
     assert kwargs1.get("skip_sid") == "a1"
-    assert kwargs1.get("room") == "roomA"
+    assert kwargs1.get("room") == "office:roomA"
 
     # update_config 仅允许 computer
     ns.get_session = MagicMock(return_value={"role": "computer", "office_id": "roomR"})
@@ -183,7 +183,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     ns.on_server_update_config("c1", {"computer": "c1"})
     ns.emit.assert_called_once()
     _args2, kwargs2 = ns.emit.call_args
-    assert kwargs2.get("room") == "roomR"
+    assert kwargs2.get("room") == "office:roomR"
 
     # client tool_call：仅允许 agent，经 _relay_client_call 路由到目标 computer（#99）—— 目标 sess 须解析为 computer 且同 office
     # tool_call now routes via _relay_client_call (#99): target session must resolve to a computer in the same office
@@ -192,7 +192,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     )
     ns.call = MagicMock(return_value={"ok": True, "result": "success"})
     ns.get_sid_by_name = MagicMock(return_value="c1")
-    ret = ns.on_client_tool_call("a1", {"robot_id": "a1", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5})
+    ret = ns.on_client_tool_call("a1", {"agent": "a1", "req_id": "r2", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5})
     assert ret == {"ok": True, "result": "success"}
     ns.call.assert_called_once()
     args, kwargs = ns.call.call_args

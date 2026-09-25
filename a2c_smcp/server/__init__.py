@@ -21,10 +21,13 @@ from .sync_base import SyncBaseNamespace
 from .sync_namespace import SyncSMCPNamespace
 from .types import OFFICE_ID, SID, AgentSession, BaseSession, ComputerSession, Session
 from .utils import (
+    OFFICE_ROOM_PREFIX,
     aget_all_sessions_in_office,
     aget_computers_in_office,
     get_all_sessions_in_office,
     get_computers_in_office,
+    office_id_of_room,
+    office_room,
     require_office_id,
 )
 
@@ -61,4 +64,8 @@ __all__ = [
     "get_all_sessions_in_office",
     # 隔离不变量 / Isolation invariant
     "require_office_id",
+    # office 房名命名空间（#216）/ Office room-name namespace (#216)
+    "OFFICE_ROOM_PREFIX",
+    "office_room",
+    "office_id_of_room",
 ]

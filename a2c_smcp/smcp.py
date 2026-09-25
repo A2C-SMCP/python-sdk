@@ -980,6 +980,18 @@ def build_internal_error() -> ErrorPayload:
     return {"code": int(ErrorCode.INTERNAL_ERROR), "message": "Internal error"}
 
 
+def build_non_agent_client_call_error() -> ErrorPayload:
+    """非 Agent 会话发起 ``client:*`` 路由 → flat ``ErrorPayload(403)``（#216）。
+    Build the flat ``ErrorPayload(403)`` returned when a non-agent session issues a ``client:*`` call.
+
+    协议依据 / Protocol: events.md §Client 事件（``client:*`` 发起方为 Agent）+ error-handling.md
+    §通用错误码 403（业务层未授权操作）。存活调用方的拒绝 **MUST** 经 ack 可感，不得静默挂到超时
+    （#216 §四）。无 ``details``：发起者自身的 role 它自己知道，无需回显。
+    sync / async 命名空间共用本 builder，保证两实现逐字节一致。
+    """
+    return {"code": int(ErrorCode.FORBIDDEN), "message": "Only agents may issue client:* calls"}
+
+
 def build_room_rejection_error(
     code: int,
     *,

@@ -38,7 +38,7 @@ async def test_on_client_get_desktop_and_update_broadcast(monkeypatch: pytest.Mo
     # 转发到 client:get_desktop
     ns.call = AsyncMock(return_value={"desktops": ["window://m"], "req_id": "rid"})
 
-    req: GetDeskTopReq = {"computer": comp_name, "robot_id": agent_name, "req_id": "rid", "desktop_size": 1}
+    req: GetDeskTopReq = {"computer": comp_name, "agent": agent_name, "req_id": "rid", "desktop_size": 1}
     ret = await ns.on_client_get_desktop(agent_sid, req)
     assert ret["desktops"] == ["window://m"]
     ns.call.assert_awaited_with(GET_DESKTOP_EVENT, req, to=comp_sid, namespace=ns.namespace)

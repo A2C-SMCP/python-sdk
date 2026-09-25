@@ -376,6 +376,9 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         try:
             logger.debug(f"Getting tools from computer {computer}")
             response = self.call(GET_TOOLS_EVENT, req, namespace=self._namespace, timeout=timeout)
+            # 路由层 flat ErrorPayload（400 / 403 / 404 / 4103，#216）先于 req_id 校验解码，否则被误报为「req_id 不匹配」
+            # Decode routing-layer flat ErrorPayloads first, or they surface as a misleading req_id mismatch (#216)
+            raise_for_error_payload(response)
 
             # 验证响应
             # Validate response
@@ -402,11 +405,16 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         备注 / Notes:
             ``GetComputerConfigRet`` 无 ``req_id`` 字段、``on_get_config`` 也不 echo req_id，故**不做** req_id 校验；
-            ``on_get_config`` 无 flat ErrorPayload 路径，故**不需** raise_for_error_payload。与 async 无语义差异。
+            Computer 的 ``on_get_config`` 虽无 flat ErrorPayload 路径，但 Server 路由层会回 ``400`` / ``403`` /
+            ``404`` / ``4103``（#216）⇒ 仍须 raise_for_error_payload。与 async 无语义差异。
         """
         req = self.create_get_config_request(computer)
         logger.debug(f"Getting config from computer {computer}")
         response = self.call(GET_CONFIG_EVENT, req, namespace=self._namespace, timeout=timeout)
+        # 路由层 flat ErrorPayload（400 / 403 / 404 / 4103，#216）⇒ 抛 SMCPProtocolError；否则会被下方
+        # ``response.get("servers", {})`` 静默当成「零个 server」的成功（假成功）。
+        # Decode routing-layer ErrorPayloads, which would otherwise read as a config with zero servers (#216).
+        raise_for_error_payload(response)
         ret: GetComputerConfigRet = {"servers": response.get("servers", {})}
         if response.get("inputs") is not None:
             ret["inputs"] = response["inputs"]
@@ -662,6 +670,8 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         req = self.create_get_desktop_request(computer, size=size, window=window)
         logger.debug(f"Getting desktop from computer {computer}, size={size}, window={window}")
         response = self.call(GET_DESKTOP_EVENT, req, namespace=self._namespace, timeout=timeout)
+        # 路由层 flat ErrorPayload 先于 req_id 校验解码（#216）/ decode routing-layer ErrorPayloads first (#216)
+        raise_for_error_payload(response)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
         return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])

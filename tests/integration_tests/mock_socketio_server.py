@@ -74,10 +74,11 @@ class MockComputerServerNamespace(SMCPNamespace):
         self.client_operations_record[sid] = ("server_leave_office", data)
         return await super().on_server_leave_office(sid, data, *_extra)
 
-    async def on_server_update_config(self, sid: str, data):  # type: ignore[override]
+    async def on_server_update_config(self, sid: str, data=None, *_extra):  # type: ignore[override]
         # 记录更新配置事件 / record update config event
+        # #216：与真实 handler 同签名（``data=None, *_extra``），否则无载荷 / 多参在替身层先 TypeError，测不到真实丢弃分支
         self.client_operations_record[sid] = ("server_update_config", data)
-        return await super().on_server_update_config(sid, data)
+        return await super().on_server_update_config(sid, data, *_extra)
 
 
 class MockComputerServerSyncNamespace(SyncSMCPNamespace):

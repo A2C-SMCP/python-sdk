@@ -190,7 +190,7 @@ class TestEnterRoomTransactionalCommitSync:
     def test_target_room_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
         """换房撞目标房同 role 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房（#215 后跨 office 同名合法）。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["c-sid", "roomA"])
+        mock_server.rooms = MagicMock(return_value=["c-sid", "office:roomA"])
         session = {"role": "computer", "name": "dup", "office_id": "roomA", "sid": "c-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -211,7 +211,7 @@ class TestEnterRoomTransactionalCommitSync:
     def test_move_with_self_owned_name_succeeds(self, smcp_namespace, mock_server):
         """换房：旧房键属于**本 sid** ⇒ 放行，且键迁移到目标房（旧房键释放、无悬挂，#215）。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["c-sid", "roomA", "roomB"])
+        mock_server.rooms = MagicMock(return_value=["c-sid", "office:roomA", "office:roomB"])
         session = {"role": "computer", "name": "dup", "office_id": "roomA", "sid": "c-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -220,7 +220,7 @@ class TestEnterRoomTransactionalCommitSync:
 
         smcp_namespace.enter_room("c-sid", "roomB")
 
-        mock_server.leave_room.assert_called_once_with("c-sid", "roomA", namespace=SMCP_NAMESPACE)
+        mock_server.leave_room.assert_called_once_with("c-sid", "office:roomA", namespace=SMCP_NAMESPACE)
         assert session["office_id"] == "roomB"
         assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "dup"): "c-sid"}
         assert [c.args[0] for c in smcp_namespace.emit.call_args_list] == [
@@ -231,7 +231,7 @@ class TestEnterRoomTransactionalCommitSync:
     def test_phase2_failure_converges_membership_and_session(self, smcp_namespace, mock_server):
         """入房之后失败（末步广播抛错）⇒ 摘除房间 + 清会话 + 回收 name。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["solo", "roomB"])
+        mock_server.rooms = MagicMock(return_value=["solo", "office:roomB"])
         session = {"role": "computer", "name": "solo", "sid": "solo"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -240,14 +240,14 @@ class TestEnterRoomTransactionalCommitSync:
         with pytest.raises(RuntimeError, match="broadcast boom"):
             smcp_namespace.enter_room("solo", "roomB")
 
-        mock_server.leave_room.assert_called_once_with("solo", "roomB", namespace=SMCP_NAMESPACE)
+        mock_server.leave_room.assert_called_once_with("solo", "office:roomB", namespace=SMCP_NAMESPACE)
         assert "office_id" not in session
         assert smcp_namespace._name_to_sid_map == {}
 
     def test_phase2_success_is_untouched_by_convergence(self, smcp_namespace, mock_server):
         """**正对照**：同装置成功路径 ⇒ 成员关系 / 会话 / 注册 / 广播各就位。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["solo", "roomB"])
+        mock_server.rooms = MagicMock(return_value=["solo", "office:roomB"])
         session = {"role": "computer", "name": "solo", "sid": "solo"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -263,7 +263,7 @@ class TestEnterRoomTransactionalCommitSync:
     def test_leave_room_not_committed_keeps_old_room(self, smcp_namespace, mock_server):
         """换房时旧房离开**未提交**（广播前抛错）⇒ 一切原样，收敛不得触发。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["c-sid", "roomA"])
+        mock_server.rooms = MagicMock(return_value=["c-sid", "office:roomA"])
         session = {"role": "computer", "name": "n", "office_id": "roomA", "sid": "c-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -280,7 +280,7 @@ class TestEnterRoomTransactionalCommitSync:
     def test_leave_room_committed_converges_to_no_room(self, smcp_namespace, mock_server):
         """换房时旧房离开**已提交**后失败（入房通知抛错）⇒ 收敛为「无房」。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["c-sid", "roomB"])  # 已退旧房、已入新房
+        mock_server.rooms = MagicMock(return_value=["c-sid", "office:roomB"])  # 已退旧房、已入新房
         session = {"role": "computer", "name": "n", "office_id": "roomA", "sid": "c-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -296,7 +296,7 @@ class TestEnterRoomTransactionalCommitSync:
             smcp_namespace.enter_room("c-sid", "roomB")
 
         left = [c.args[:2] for c in mock_server.leave_room.call_args_list]
-        assert ("c-sid", "roomA") in left and ("c-sid", "roomB") in left
+        assert ("c-sid", "office:roomA") in left and ("c-sid", "office:roomB") in left
         assert "office_id" not in session
         assert smcp_namespace._name_to_sid_map == {}, "旧房键与目标房键均须回收"
 
@@ -333,7 +333,7 @@ class TestEnterRoomTransactionalCommitSync:
     def test_convergence_never_releases_another_sids_name(self, smcp_namespace, mock_server):
         """收敛回收 name 带**归属守卫**：并发下被他人抢走的 name 绝不能被本次失败注销。"""
         smcp_namespace.server = mock_server
-        mock_server.rooms = MagicMock(return_value=["solo", "roomB"])
+        mock_server.rooms = MagicMock(return_value=["solo", "office:roomB"])
         session = {"role": "computer", "name": "solo", "sid": "solo"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
@@ -608,7 +608,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         args, kwargs = smcp_namespace.emit.call_args
         assert args[0] == UPDATE_SKILLS_NOTIFICATION
         assert args[1] == {"computer": comp_name}
-        assert kwargs["room"] == "room1"
+        assert kwargs["room"] == "office:room1"
         assert kwargs["skip_sid"] == comp_sid
 
     def test_on_server_update_skills_rejects_non_computer(self, smcp_namespace, mock_server):
@@ -616,8 +616,8 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
         smcp_namespace.get_session = MagicMock(return_value=sess_agent)
         smcp_namespace.emit = MagicMock()
-        with pytest.raises(SMCPNamespaceError, match="Computer"):
-            smcp_namespace.on_server_update_skills("a-sid", {"computer": "c1"})
+        # #216：fire-and-forget 角色不符 ⇒ 告警后静默丢弃（不 raise）
+        assert smcp_namespace.on_server_update_skills("a-sid", {"computer": "c1"}) is None
         smcp_namespace.emit.assert_not_called()
 
     # ── v0.2.2 #46（sync 镜像）：旧路由收编 _relay_client_call + 飞行断连防御 ──
@@ -626,7 +626,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         """sync：``client:get_tools`` 收编后经 ``_relay_client_call`` 转发到正确事件 + Computer SID."""
         ns, agent_sid, comp_name, comp_sid = routed_ns
         ns.call.return_value = {"tools": [], "req_id": "r1"}
-        ret = ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        ret = ns.on_client_get_tools(agent_sid, {"agent": "a", "req_id": "r1", "computer": comp_name})
         ns.call.assert_called_once()
         assert ns.call.call_args[0][0] == GET_TOOLS_EVENT
         assert ns.call.call_args.kwargs["to"] == comp_sid
@@ -637,7 +637,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         ns, agent_sid, comp_name, _comp_sid = routed_ns
         err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "computer mcp not ready"}
         ns.call.return_value = err
-        ret = ns.on_client_get_tools(agent_sid, {"computer": comp_name})
+        ret = ns.on_client_get_tools(agent_sid, {"agent": "a", "req_id": "r1", "computer": comp_name})
         assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
 
     def test_get_desktop_flat_error_passthrough(self, routed_ns):
@@ -645,7 +645,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         ns, agent_sid, comp_name, _comp_sid = routed_ns
         err = {"code": int(ErrorCode.MCP_SERVER_NOT_FOUND), "message": "no desktop"}
         ns.call.return_value = err
-        ret = ns.on_client_get_desktop(agent_sid, {"computer": comp_name})
+        ret = ns.on_client_get_desktop(agent_sid, {"agent": "a", "req_id": "r1", "computer": comp_name})
         assert ret["code"] == int(ErrorCode.MCP_SERVER_NOT_FOUND)
 
     def test_relay_agent_session_none_raises_namespace_error(self, smcp_namespace, mock_server):
@@ -658,7 +658,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else None)
         smcp_namespace.call = MagicMock()
         with pytest.raises(SMCPNamespaceError, match="session gone"):
-            smcp_namespace.on_client_get_tools("gone-agent-sid", {"computer": comp_name})
+            smcp_namespace.on_client_get_tools("gone-agent-sid", {"agent": "a", "req_id": "r1", "computer": comp_name})
         smcp_namespace.call.assert_not_called()
 
 
@@ -834,8 +834,8 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.server = mock_server
         smcp_namespace.get_session = MagicMock(return_value={"role": "computer", "name": "c1"})
         smcp_namespace.emit = MagicMock()
-        with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
-            getattr(smcp_namespace, handler)("c-sid", {"computer": "c1"})
+        # #216：fire-and-forget 未入房 ⇒ 告警后静默丢弃（不 raise，协议 MUST NOT 为此新增 ack）
+        assert getattr(smcp_namespace, handler)("c-sid", {"computer": "c1"}) is None
         smcp_namespace.emit.assert_not_called()
 
     @pytest.mark.parametrize(("handler", "expected_event"), UPDATE_HANDLERS)
@@ -852,7 +852,7 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.emit.assert_called_once()
         args, kwargs = smcp_namespace.emit.call_args
         assert args[0] == expected_event
-        assert kwargs["room"] == "room1"
+        assert kwargs["room"] == "office:room1"
         assert kwargs["skip_sid"] == "c-sid"
 
     def test_leave_office_convergence_is_exhaustive_and_payload_independent(self, smcp_namespace):
@@ -862,7 +862,7 @@ class TestServerBroadcastOfficeIsolationSync:
         欠收敛写法都会在此暴露（这两类写法在其余场景下全绿）。
         """
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
-        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA", "roomB"])
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "office:roomA", "office:roomB"])
         smcp_namespace.leave_room = MagicMock()
         ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomC"})
         assert_empty_ack(ack, action="server:leave_office")
@@ -871,7 +871,7 @@ class TestServerBroadcastOfficeIsolationSync:
     def test_leave_office_convergence_error_is_reported(self, smcp_namespace):
         """收敛分支自身的失败出口：``leave_room`` 抛错 → flat ErrorPayload(500)（笼统文案，原文只进日志）。"""
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
-        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "office:roomA"])
         smcp_namespace.leave_room = MagicMock(side_effect=RuntimeError("boom"))
         ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomB"})
 
@@ -888,8 +888,8 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.server = mock_server
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
         smcp_namespace.emit = MagicMock()
-        with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
-            smcp_namespace.on_server_tool_call_cancel("a-sid", {"agent": "a1", "req_id": "r1"})
+        # #216：fire-and-forget 未入房 ⇒ 告警后静默丢弃（不 raise，协议 MUST NOT 为此新增 ack）
+        assert smcp_namespace.on_server_tool_call_cancel("a-sid", {"agent": "a1", "req_id": "r1"}) is None
         smcp_namespace.emit.assert_not_called()
 
     def test_tool_call_cancel_broadcasts_only_to_own_office(self, smcp_namespace, mock_server):
@@ -901,7 +901,7 @@ class TestServerBroadcastOfficeIsolationSync:
         smcp_namespace.emit.assert_called_once()
         args, kwargs = smcp_namespace.emit.call_args
         assert args[0] == CANCEL_TOOL_CALL_NOTIFICATION
-        assert kwargs["room"] == "room1"
+        assert kwargs["room"] == "office:room1"
         assert kwargs["skip_sid"] == "a-sid"
 
     # ── leave_office：广播目标只取服务端权威会话，绝不用客户端载荷 ──────────────
@@ -955,7 +955,7 @@ class TestServerBroadcastOfficeIsolationSync:
         收敛依据是服务端权威的 socketio 成员关系（非载荷），客户端无法借此向未加入的房间广播。
         """
         smcp_namespace.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
-        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "roomA"])  # 含自身 sid 房间
+        smcp_namespace.rooms = MagicMock(return_value=["a-sid", "office:roomA"])  # 含自身 sid 房间
         smcp_namespace.leave_room = MagicMock()
         ack = smcp_namespace.on_server_leave_office("a-sid", {"office_id": "roomA"})
         assert_empty_ack(ack, action="server:leave_office")

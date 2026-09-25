@@ -156,14 +156,14 @@ class TestNameKeySpaceAsync:
         assert isinstance(ret, dict) and ret["code"] == 404, ret
         ns.call.assert_not_awaited()
 
-    async def test_route_from_office_less_initiator_raises(self) -> None:
-        """无房发起者无从在房内解析 ⇒ 未入房拒绝（承载形态转 4103 属 #216）。"""
+    async def test_route_from_office_less_initiator_is_4103(self) -> None:
+        """无房发起者无从在房内解析 ⇒ flat 4103（#216 §四：经 ack 可感，不再 raise）。"""
         sessions: dict[str, dict[str, Any]] = {"ag": {"role": "agent", "name": "bot"}, "pc": {}}
         ns = _async_ns(sessions)
         await ns.on_server_join_office("pc", _join("computer", "pc", "office-a"))
 
-        with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
-            await ns.on_client_get_tools("ag", _get_tools("pc"))
+        ack = await ns.on_client_get_tools("ag", _get_tools("pc"))
+        assert isinstance(ack, dict) and ack["code"] == 4103, ack
         ns.call.assert_not_awaited()
 
     async def test_leave_office_clears_key(self) -> None:
@@ -333,13 +333,13 @@ class TestNameKeySpaceSync:
         assert isinstance(ret, dict) and ret["code"] == 404, ret
         ns.call.assert_not_called()
 
-    def test_route_from_office_less_initiator_raises(self) -> None:
+    def test_route_from_office_less_initiator_is_4103(self) -> None:
         sessions: dict[str, dict[str, Any]] = {"ag": {"role": "agent", "name": "bot"}, "pc": {}}
         ns = _sync_ns(sessions)
         ns.on_server_join_office("pc", _join("computer", "pc", "office-a"))
 
-        with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
-            ns.on_client_get_tools("ag", _get_tools("pc"))
+        ack = ns.on_client_get_tools("ag", _get_tools("pc"))
+        assert isinstance(ack, dict) and ack["code"] == 4103, ack
         ns.call.assert_not_called()
 
     def test_leave_office_clears_key(self) -> None:

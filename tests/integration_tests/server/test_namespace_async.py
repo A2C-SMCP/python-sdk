@@ -14,6 +14,7 @@ English: Integration tests for async SMCPNamespace in `a2c_smcp/server/namespace
 """
 
 import asyncio
+import json
 from typing import Literal
 
 import pytest
@@ -21,9 +22,11 @@ from mcp.types import CallToolResult, TextContent
 from socketio import AsyncClient
 
 from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.server.utils import office_room
 from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
     GET_CONFIG_EVENT,
+    GET_RESOURCES_EVENT,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
@@ -38,6 +41,8 @@ from a2c_smcp.smcp import (
     GetToolsReq,
     UpdateMCPConfigNotification,
     build_computer_not_found_error,
+    build_non_agent_client_call_error,
+    build_room_rejection_error,
 )
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
@@ -346,7 +351,8 @@ async def test_update_config_broadcast(socketio_server, basic_server_port: int):
     )
 
     await asyncio.sleep(0.2)
-    assert update_events and update_events[0]["computer"] == computer.get_sid(SMCP_NAMESPACE)
+    # #216：出向身份字段取发起者**会话**（events.md §房间广播类事件的目标来源 MUST）——载荷自称的 sid 不被转发
+    assert update_events == [{"computer": "comp-E"}], update_events
 
     await agent.disconnect()
     await computer.disconnect()
@@ -644,22 +650,24 @@ async def test_get_resources_cross_office_rejected(socketio_server, basic_server
 
 @pytest.mark.asyncio
 async def test_tool_call_wrong_role_rejected(socketio_server, basic_server_port: int):
-    """错角色 client:tool_call：由 Computer 发起工具调用 → SMCPNamespaceError。"""
+    """错角色 client:tool_call：由 Computer 发起工具调用 → 经 ack 立即回 flat 403（#216：不再 raise 致挂起）。"""
     computer = AsyncClient()
-    comp_sid = await _connect_join(computer, basic_server_port, "computer", "office-neg-C", "comp-neg-3")
+    await _connect_join(computer, basic_server_port, "computer", "office-neg-C", "comp-neg-3")
 
-    with pytest.raises(SMCPNamespaceError, match="目前仅支持Agent调用工具"):
-        await socketio_server.on_client_tool_call(
-            comp_sid,
-            {
-                "agent": "comp-neg-3",
-                "computer": "comp-neg-3",
-                "req_id": "neg-r3",
-                "tool_name": "t",
-                "params": {},
-                "timeout": 5,
-            },
-        )
+    ack = await computer.call(
+        TOOL_CALL_EVENT,
+        {
+            "agent": "comp-neg-3",
+            "computer": "comp-neg-3",
+            "req_id": "neg-r3",
+            "tool_name": "t",
+            "params": {},
+            "timeout": 5,
+        },
+        namespace=SMCP_NAMESPACE,
+        timeout=3,
+    )
+    assert ack == build_non_agent_client_call_error(), ack
 
     await computer.disconnect()
 
@@ -795,7 +803,7 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
     await _connect_join(twin, basic_server_port, "computer", office_a, "c213")
     control_sid = await _connect_join(control, basic_server_port, "computer", office_b, "c213-control")
     # 正对照：钩子确实记录了合法入房（证明下面「未入房」的断言不是钩子失灵）
-    assert (control_sid, office_b) in entered, "入房钩子应记录合法成员的加入"
+    assert (control_sid, office_room(office_b)) in entered, "入房钩子应记录合法成员的加入"
 
     await subject.connect(
         f"http://localhost:{basic_server_port}",
@@ -810,11 +818,11 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
     assert subject_sid is not None
 
     # 验收口径 ①：**从未**进入目标房（顺序保证：校验先于副作用）
-    assert (subject_sid, office_b) not in entered, "被拒的加入不得触碰目标房"
+    assert (subject_sid, office_room(office_b)) not in entered, "被拒的加入不得触碰目标房"
     # 验收口径 ②：终态一致——真实成员关系里不含目标房
     assert [r for r in socketio_server.rooms(subject_sid) if r != subject_sid] == [], "被拒客户端不得留在目标房"
     # 正对照：持有者的成员关系确实可被 rooms() 读出（证明上面的断言不是空转）
-    assert [r for r in socketio_server.rooms(holder_sid) if r != holder_sid] == [office_b]
+    assert [r for r in socketio_server.rooms(holder_sid) if r != holder_sid] == [office_room(office_b)]
 
     # 验收口径 ③：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
     await _connect_join(joiner, basic_server_port, "computer", office_b, "c213-joiner")
@@ -857,7 +865,7 @@ async def test_computer_switch_into_same_name_room_rejected_keeps_old_room(socke
 
     await asyncio.sleep(0.3)
     assert peer_leaves == [], f"被拒的换房不得先退旧房：{peer_leaves}"
-    assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_a]
+    assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_room(office_a)]
     assert await socketio_server.get_sid_by_name(office_a, "computer", "c215") == mover_sid
 
     for client in (peer, mover, holder):
@@ -905,7 +913,7 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
     assert "details" not in ack, f"403 无 code-specific details: {ack!r}"
 
     # 验收口径：校验先于副作用 ⇒ 旧房成员关系原封不动，对端也未收到 leave
-    assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_a], "被拒的换房必须留在旧房"
+    assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_room(office_a)], "被拒的换房必须留在旧房"
     assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
 
     # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
@@ -1064,3 +1072,123 @@ async def test_leave_office_ack_shapes_over_wire(socketio_server, basic_server_p
             assert isinstance(ack, dict) and ack["code"] == 400, f"[{label}] {ack!r}"
     finally:
         await client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# #216 取值域与边界校验加固 —— 真实 socketio 链路验收 / wire-level acceptance
+# ---------------------------------------------------------------------------
+
+# 验收口径：client:get_tools / get_resources / get_config / tool_call 在「无房」下由 call() **返回** dict
+_OFFICE_LESS_ROUTES = [
+    (GET_TOOLS_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r"}),
+    (GET_RESOURCES_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r", "mcp_server": "s"}),
+    (GET_CONFIG_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r"}),
+    (TOOL_CALL_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r", "tool_name": "t", "params": {}, "timeout": 5}),
+]
+
+
+async def _connect(client: AsyncClient, port: int) -> str:
+    await client.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    return client.get_sid(namespace=SMCP_NAMESPACE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("event", "payload"), _OFFICE_LESS_ROUTES, ids=[e for e, _ in _OFFICE_LESS_ROUTES])
+async def test_office_less_client_call_returns_4103_over_wire(socketio_server, basic_server_port: int, event, payload):
+    """#216 §四：未入房发起 client:* ⇒ call() 立即**返回** flat 4103（不再 raise 致 TimeoutError）。"""
+    agent = AsyncClient()
+    await _connect(agent, basic_server_port)
+    try:
+        ack = await agent.call(event, payload, namespace=SMCP_NAMESPACE, timeout=3)
+        assert ack == build_room_rejection_error(ErrorCode.NOT_IN_ROOM), ack
+    finally:
+        await agent.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cross_office_get_config_returns_404_over_wire(socketio_server, basic_server_port: int):
+    """#216 §四（跨房）：get_config 目标只在他房 ⇒ call() 返回 flat 404（与「不存在」逐字节相同）。"""
+    agent, computer = AsyncClient(), AsyncClient()
+    await _connect_join(agent, basic_server_port, "agent", "office-216-A", "robot-216")
+    await _connect_join(computer, basic_server_port, "computer", "office-216-B", "comp-216")
+    try:
+        ack = await agent.call(
+            GET_CONFIG_EVENT, {"computer": "comp-216", "agent": "robot-216", "req_id": "r"}, namespace=SMCP_NAMESPACE, timeout=3
+        )
+        assert ack == build_computer_not_found_error("comp-216"), ack
+    finally:
+        await agent.disconnect()
+        await computer.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [pytest.param((), id="no_payload"), pytest.param(({"agent": "ag", "req_id": "r"},), id="missing_computer"),
+     pytest.param(({"computer": "pc", "agent": "ag", "req_id": "r"}, "extra"), id="extra_positional")],
+)
+async def test_malformed_client_call_returns_400_over_wire(socketio_server, basic_server_port: int, args):
+    """#216 §一：client:* 载荷畸形（含绑定层：无载荷 / 多参）⇒ call() 立即返回 flat 400。"""
+    agent = AsyncClient()
+    await _connect_join(agent, basic_server_port, "agent", "office-216-bad", "robot-216-bad")
+    try:
+        data = args if len(args) != 1 else args[0]
+        ack = await agent.call(GET_TOOLS_EVENT, data if args else None, namespace=SMCP_NAMESPACE, timeout=3)
+        assert ack == {"code": 400, "message": "Invalid request payload"}, ack
+    finally:
+        await agent.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_office_id_equal_to_peer_sid_cannot_reach_private_room(socketio_server, basic_server_port: int):
+    """#216 §三 回归：以 ``office_id = <对端 SID>`` 入房并广播，对端（私有 SID 房主）**收不到**。
+
+    正对照：同样以该 office_id 入房的第三方 Agent **收得到**——证明广播真的发生了，只是没进对端私有房。
+    """
+    victim, attacker, observer = AsyncClient(), AsyncClient(), AsyncClient()
+    victim_got: list[dict] = []
+    observer_got: list[dict] = []
+
+    @victim.on("notify:update_config", namespace=SMCP_NAMESPACE)
+    async def _victim(data: dict) -> None:
+        victim_got.append(data)
+
+    @observer.on("notify:update_config", namespace=SMCP_NAMESPACE)
+    async def _observer(data: dict) -> None:
+        observer_got.append(data)
+
+    victim_sid = await _connect(victim, basic_server_port)
+    try:
+        await _connect_join(observer, basic_server_port, "agent", victim_sid, "observer-216")
+        await _connect_join(attacker, basic_server_port, "computer", victim_sid, "attacker-216")
+
+        await attacker.emit(UPDATE_CONFIG_EVENT, {"computer": "attacker-216"}, namespace=SMCP_NAMESPACE)
+        await asyncio.sleep(0.3)
+
+        assert observer_got == [{"computer": "attacker-216"}], observer_got
+        assert victim_got == [], f"office_id=对端SID 的广播泄漏进了对端私有房: {victim_got!r}"
+        assert set(socketio_server.rooms(victim_sid)) == {victim_sid}
+    finally:
+        await victim.disconnect()
+        await attacker.disconnect()
+        await observer.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_name_conflict_ack_never_leaks_peer_sid_over_wire(socketio_server, basic_server_port: int):
+    """#216 §二 验收：同名 join 被拒（4105）的 ack 不含对端真实 sid、不含 namespace（对端标识只进日志）。"""
+    holder, challenger = AsyncClient(), AsyncClient()
+    holder_sid = await _connect_join(holder, basic_server_port, "computer", "office-216-dup", "dup-216")
+    await _connect(challenger, basic_server_port)
+    try:
+        ack = await challenger.call(
+            JOIN_OFFICE_EVENT, {"role": "computer", "office_id": "office-216-dup", "name": "dup-216"}, namespace=SMCP_NAMESPACE
+        )
+        assert_rejected_ack(ack, 4105)
+        blob = json.dumps(ack, ensure_ascii=False)
+        assert holder_sid not in blob, blob
+        assert SMCP_NAMESPACE not in blob, blob
+        assert ack["details"] == {"office_id": "office-216-dup", "role": "computer"}, ack
+    finally:
+        await holder.disconnect()
+        await challenger.disconnect()

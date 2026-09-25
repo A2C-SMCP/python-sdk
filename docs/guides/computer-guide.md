@@ -329,7 +329,7 @@ await client.connect(
   `emit_refresh_desktop` / `emit_update_skills` 的发送判据是「**有入房意图**（`office_id` 非空）∧
   **服务端已确认在房**（`_confirmed_office_id` 非空）∧ namespace 在册」——与协议 `computer.md §2.2` 的
   「Computer SHOULD 在成功加入 Office 后才发送这四个事件」对齐（rust 侧同款 `has_confirmed_office()`）。
-  判据不成立时**不发包**（发了也会被服务端 `require_office_id` 丢弃，而这些事件是 fire-and-forget、无
+  判据不成立时**不发包**（发了也会被服务端按「未入房」丢弃，而这些事件是 fire-and-forget、无
   ack，客户端察觉不到），改为**记下这一类别**；等成员关系重新确立（自动回房成功或显式入房成功）后
   **逐条补发一次**。协议明确允许这种做法（「未加入 Office 时，本地变化可以被记录或合并，但不应产生跨房间
   可见通知」）。

@@ -182,7 +182,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     # Agent 拉取工具列表 / Agent get tools
     agent_ret_tools = agent_client.call(
         GET_TOOLS_EVENT,
-        {"computer": comp_name, "robot_id": agent_name, "req_id": "req-tools"},
+        {"computer": comp_name, "agent": agent_name, "req_id": "req-tools"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -192,7 +192,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     # Agent 拉取桌面 / Agent get desktop
     agent_ret_desktop = agent_client.call(
         GET_DESKTOP_EVENT,
-        {"computer": comp_name, "robot_id": agent_name, "req_id": "req-desk"},
+        {"computer": comp_name, "agent": agent_name, "req_id": "req-desk"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )

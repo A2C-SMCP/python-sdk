@@ -317,9 +317,9 @@ class SMCPComputerClient(AsyncClient):
         coalesced, but must not produce cross-room notifications.
 
         **已确认**半是承重的（#223）：回放在途窗口内 desired 被刻意保留（#203）、namespace 已重新在册，
-        但服务端新会话尚无 ``office_id`` ⇒ ``require_office_id`` 拒收——而这些事件是 fire-and-forget、
+        但服务端新会话尚无 ``office_id`` ⇒ 服务端按「未入房」丢弃——而这些事件是 fire-and-forget、
         协议明文禁止为其新增 ack（error-handling.md:99）⇒ 发送端**无感**，白发一批注定被丢的包只会在
-        服务端留下 ERROR 噪音。**意图**半同样不可省：``join_office`` 的非校验类拒绝会清 desired 而保留
+        服务端留下告警噪音。**意图**半同样不可省：``join_office`` 的非校验类拒绝会清 desired 而保留
         ``_confirmed_office_id``，该态下服务端会话通常已按提交点收敛为无房（``500`` 可晚于提交）⇒ 放行
         等于**新增**一批注定被丢的包。
         The confirmed half is load-bearing (the replay window), and so is the intent half (the 500

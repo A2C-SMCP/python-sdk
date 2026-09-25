@@ -11,6 +11,7 @@ English: Integration tests for SyncSMCPNamespace in `a2c_smcp/server/sync_namesp
 - 使用 werkzeug 在独立进程中运行 WSGI 服务器，彻底解决 GIL 阻塞问题。
 """
 
+import json
 import multiprocessing
 import socket
 import threading
@@ -30,6 +31,7 @@ from a2c_smcp.agent.sync_client import SMCPAgentClient
 from a2c_smcp.smcp import (
     ENTER_OFFICE_NOTIFICATION,
     GET_CONFIG_EVENT,
+    GET_RESOURCES_EVENT,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
@@ -40,6 +42,8 @@ from a2c_smcp.smcp import (
     UPDATE_CONFIG_EVENT,
     ErrorCode,
     build_computer_not_found_error,
+    build_non_agent_client_call_error,
+    build_room_rejection_error,
 )
 from a2c_smcp.testing import create_local_sync_server
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
@@ -235,7 +239,7 @@ def _run_agent_client_process(
         # 执行GET_TOOLS调用
         res = agent.call(
             GET_TOOLS_EVENT,
-            {"computer": computer_name, "robot_id": agent_id, "req_id": "req-sync-1"},
+            {"computer": computer_name, "agent": agent_id, "req_id": "req-sync-1"},
             namespace=SMCP_NAMESPACE,
             timeout=15,
         )
@@ -400,7 +404,7 @@ def test_tool_call_forward_sync(startup_and_shutdown_local_sync_server, sync_ser
         res = agent.call(
             TOOL_CALL_EVENT,
             {
-                "robot_id": "robot-S5",
+                "agent": "robot-S5",
                 "computer": "comp-S5",
                 "tool_name": "echo",
                 "params": {"text": "hi"},
@@ -460,7 +464,7 @@ def test_tool_call_target_disconnect_midflight_returns_404_sync(
         try:
             box["res"] = agent.call(
                 TOOL_CALL_EVENT,
-                {"robot_id": "robot-SD", "computer": "comp-SD", "tool_name": "slow", "params": {}, "req_id": "req-sd", "timeout": 30},
+                {"agent": "robot-SD", "computer": "comp-SD", "tool_name": "slow", "params": {}, "req_id": "req-sd", "timeout": 30},
                 namespace=SMCP_NAMESPACE,
                 timeout=40,
             )
@@ -691,26 +695,26 @@ def test_get_tools_cross_office_rejected_sync(startup_and_shutdown_local_sync_se
 
 
 def test_tool_call_wrong_role_rejected_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
-    """错角色 client:tool_call（同步）：Computer 发起工具调用 → 被拒绝（超时，无 ACK）。"""
+    """错角色 client:tool_call（同步）：Computer 发起工具调用 → 经 ack 立即回 flat 403（#216：不再超时无 ACK）。"""
     computer = Client()
     computer.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     try:
         _join_office(computer, role="computer", office_id="office-sync-neg-C", name="comp-sneg-2")
 
-        with pytest.raises(SioTimeoutError):
-            computer.call(
-                TOOL_CALL_EVENT,
-                {
-                    "agent": "comp-sneg-2",
-                    "computer": "comp-sneg-2",
-                    "req_id": "sneg-r2",
-                    "tool_name": "t",
-                    "params": {},
-                    "timeout": 5,
-                },
-                namespace=SMCP_NAMESPACE,
-                timeout=3,
-            )
+        ack = computer.call(
+            TOOL_CALL_EVENT,
+            {
+                "agent": "comp-sneg-2",
+                "computer": "comp-sneg-2",
+                "req_id": "sneg-r2",
+                "tool_name": "t",
+                "params": {},
+                "timeout": 5,
+            },
+            namespace=SMCP_NAMESPACE,
+            timeout=3,
+        )
+        assert ack == build_non_agent_client_call_error(), ack
     finally:
         computer.disconnect()
 
@@ -958,3 +962,118 @@ def test_rename_on_live_session_rejected_keeps_old_room_sync(
 
     for client in (peer, mover, latecomer):
         client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# #216 取值域与边界校验加固（同步）—— 真实 socketio 链路验收 / wire-level acceptance (sync)
+# ---------------------------------------------------------------------------
+
+_OFFICE_LESS_ROUTES_SYNC = [
+    (GET_TOOLS_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r"}),
+    (GET_RESOURCES_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r", "mcp_server": "s"}),
+    (GET_CONFIG_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r"}),
+    (TOOL_CALL_EVENT, {"computer": "pc", "agent": "ag", "req_id": "r", "tool_name": "t", "params": {}, "timeout": 5}),
+]
+
+
+def _connect_sync(client: Client, port: int) -> str:
+    client.connect(_url(port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    return client.get_sid(namespace=SMCP_NAMESPACE)
+
+
+def test_office_less_client_calls_return_4103_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
+    """#216 §四（同步）：未入房发起 client:* ⇒ call() 立即**返回** flat 4103（不再 SioTimeoutError）。"""
+    agent = Client()
+    _connect_sync(agent, sync_server_port)
+    try:
+        for event, payload in _OFFICE_LESS_ROUTES_SYNC:
+            ack = agent.call(event, payload, namespace=SMCP_NAMESPACE, timeout=3)
+            assert ack == build_room_rejection_error(ErrorCode.NOT_IN_ROOM), (event, ack)
+    finally:
+        agent.disconnect()
+
+
+def test_cross_office_get_config_returns_404_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
+    """#216 §四 跨房（同步）：get_config 目标只在他房 ⇒ call() 返回 flat 404。"""
+    agent, computer = Client(), Client()
+    _connect_sync(agent, sync_server_port)
+    _connect_sync(computer, sync_server_port)
+    try:
+        _join_office(agent, role="agent", office_id="office-s216-A", name="robot-s216")
+        _join_office(computer, role="computer", office_id="office-s216-B", name="comp-s216")
+        ack = agent.call(
+            GET_CONFIG_EVENT, {"computer": "comp-s216", "agent": "robot-s216", "req_id": "r"}, namespace=SMCP_NAMESPACE, timeout=3
+        )
+        assert ack == build_computer_not_found_error("comp-s216"), ack
+    finally:
+        agent.disconnect()
+        computer.disconnect()
+
+
+def test_malformed_client_calls_return_400_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
+    """#216 §一（同步）：client:* 载荷畸形（无载荷 / 缺字段 / 多参）⇒ call() 立即返回 flat 400。"""
+    agent = Client()
+    _connect_sync(agent, sync_server_port)
+    try:
+        _join_office(agent, role="agent", office_id="office-s216-bad", name="robot-s216-bad")
+        for data in (None, {"agent": "ag", "req_id": "r"}, ({"computer": "pc", "agent": "ag", "req_id": "r"}, "extra")):
+            ack = agent.call(GET_TOOLS_EVENT, data, namespace=SMCP_NAMESPACE, timeout=3)
+            assert ack == {"code": 400, "message": "Invalid request payload"}, (data, ack)
+    finally:
+        agent.disconnect()
+
+
+def test_office_id_equal_to_peer_sid_cannot_reach_private_room_sync(
+    startup_and_shutdown_local_sync_server, sync_server_port: int
+) -> None:
+    """#216 §三 回归（同步）：以 ``office_id = <对端 SID>`` 入房并广播，对端收不到；同房第三方正对照收得到。"""
+    victim, attacker, observer = Client(), Client(), Client()
+    victim_got: list[dict] = []
+    observer_got: list[dict] = []
+
+    @victim.on("notify:update_config", namespace=SMCP_NAMESPACE)
+    def _victim(data: dict) -> None:
+        victim_got.append(data)
+
+    @observer.on("notify:update_config", namespace=SMCP_NAMESPACE)
+    def _observer(data: dict) -> None:
+        observer_got.append(data)
+
+    victim_sid = _connect_sync(victim, sync_server_port)
+    _connect_sync(observer, sync_server_port)
+    _connect_sync(attacker, sync_server_port)
+    try:
+        _join_office(observer, role="agent", office_id=victim_sid, name="observer-s216")
+        _join_office(attacker, role="computer", office_id=victim_sid, name="attacker-s216")
+
+        attacker.emit(UPDATE_CONFIG_EVENT, {"computer": "attacker-s216"}, namespace=SMCP_NAMESPACE)
+        deadline = time.monotonic() + 3
+        while not observer_got and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.2)
+
+        assert observer_got == [{"computer": "attacker-s216"}], observer_got
+        assert victim_got == [], f"office_id=对端SID 的广播泄漏进了对端私有房: {victim_got!r}"
+    finally:
+        victim.disconnect()
+        attacker.disconnect()
+        observer.disconnect()
+
+
+def test_name_conflict_ack_never_leaks_peer_sid_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
+    """#216 §二 验收（同步）：同名 join 被拒（4105）的 ack 不含对端真实 sid、不含 namespace。"""
+    holder, challenger = Client(), Client()
+    holder_sid = _connect_sync(holder, sync_server_port)
+    _connect_sync(challenger, sync_server_port)
+    try:
+        _join_office(holder, role="computer", office_id="office-s216-dup", name="dup-s216")
+        ack = challenger.call(
+            JOIN_OFFICE_EVENT, {"role": "computer", "office_id": "office-s216-dup", "name": "dup-s216"}, namespace=SMCP_NAMESPACE
+        )
+        assert_rejected_ack(ack, 4105)
+        blob = json.dumps(ack, ensure_ascii=False)
+        assert holder_sid not in blob, blob
+        assert SMCP_NAMESPACE not in blob, blob
+    finally:
+        holder.disconnect()
+        challenger.disconnect()

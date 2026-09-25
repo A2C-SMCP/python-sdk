@@ -8,7 +8,7 @@
 * 描述: 同步版本基础Namespace抽象类 / Synchronous Base Namespace abstract class
 """
 
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs
 
 from socketio import Namespace
@@ -16,6 +16,7 @@ from socketio import Namespace
 from a2c_smcp.exceptions import NameConflictError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
+from a2c_smcp.server.utils import office_room
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
 logger = get_logger("server")
@@ -87,10 +88,10 @@ class SyncBaseNamespace(Namespace):
         # Clean up name mapping
         self._unregister_name(sid)
 
-        rooms = self.rooms(sid)
-        for room in rooms:
-            if room == sid:
-                continue
+        # 清理房间连接：离开哪些房、以何种标识交给 ``leave_room``，由 :meth:`_rooms_to_leave_on_disconnect` 决定
+        # （基类保持原语义；``SMCPNamespace`` 覆写为只处理 ``office:`` 房并交出原始 office_id，#216）。
+        # Which rooms to leave (and in which identifier space) is decided by the overridable hook.
+        for room in self._rooms_to_leave_on_disconnect(sid):
             self.leave_room(sid, room)
         logger.info(f"SocketIO Client {sid} disconnected from {self.namespace}")
 
@@ -153,6 +154,39 @@ class SyncBaseNamespace(Namespace):
         if key is not None and self._name_to_sid_map.get(key) == sid:
             del self._name_to_sid_map[key]
             logger.debug(f"Unregistered name {key!r} for sid '{sid}' in namespace {self.namespace}")
+
+    def _rooms_to_leave_on_disconnect(self, sid: SID) -> list[str]:
+        """断连时需要 ``leave_room`` 的房间（标识须与本类 ``leave_room`` 的入参语义一致）。
+        Rooms to ``leave_room`` on disconnect, in the identifier space this class's ``leave_room`` expects.
+
+        基类：除 socketio 自动建立的私有 sid 房外的全部房间（socketio 房名原样）。``SMCPNamespace`` 覆写为只取
+        ``office:`` 前缀房并还原为 office_id（其 ``leave_room`` 以 office_id 为参数，#216）——换算与 ``leave_room``
+        同在一个类里，避免基类假定子类的房名约定。
+        Base: every room except the private sid room (raw names). ``SMCPNamespace`` narrows it to office rooms.
+        """
+        return [room for room in self.rooms(sid) if room != sid]
+
+    def _get_session_or_none(self, sid: SID) -> dict[str, Any] | None:
+        """读会话；未知 sid（连接已移除）返回 ``None`` 而非抛 ``KeyError``（socketio 对未知 sid 抛 KeyError）。
+        Read a session, returning ``None`` instead of raising ``KeyError`` for an unknown sid.
+
+        供 fire-and-forget 事件使用：它们对「发起者已不在」只能静默丢弃（无 ack 通道），让 KeyError 逃出
+        handler 只会产生 traceback 噪音（#216）。
+        """
+        try:
+            return cast(dict[str, Any] | None, self.get_session(sid))
+        except KeyError:
+            return None
+
+    def _emit_to_office(self, event: str, data: Any, office_id: OFFICE_ID, skip_sid: SID | None = None) -> None:
+        """向 office 房广播（房名经 :func:`office_room` 换算为 ``office:{office_id}``，#216）。
+        Broadcast to an office room; the socketio room name is ``office:{office_id}`` (#216).
+
+        房间广播**只**经此发出：调用方只持有协议层的 ``office_id``，socketio 房名的换算在此单点完成，
+        不会有调用点漏加前缀而把广播投进同名的私有 sid 房。
+        The only room-broadcast path, so no call site can forget the prefix.
+        """
+        self.emit(event, data, room=office_room(office_id), skip_sid=skip_sid)
 
     def get_sid_by_name(self, office_id: OFFICE_ID, role: str, name: str) -> SID | None:
         """

@@ -8,10 +8,10 @@
 * 描述: Server端工具函数 / Server-side utility functions
 """
 
-from collections.abc import Mapping
-from typing import Any, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, TypeVar, cast
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from socketio import AsyncServer, Server
 
 from a2c_smcp.exceptions import RoomRejection, SMCPNamespaceError
@@ -20,6 +20,69 @@ from a2c_smcp.smcp import SMCP_NAMESPACE, ErrorPayload, build_internal_error, bu
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("server")
+
+_T = TypeVar("_T")
+
+# socketio 房名中 office 房的命名空间前缀（#216 / 协议 room-model.md §房间标识）。
+# socketio 为每个连接自动建一个以 sid 命名的私有房；若房名直接取客户端自选的 ``office_id``，取
+# ``office_id = <对端 SID>`` 即可进入对端私有房并向其投递广播。加前缀让两个命名空间**无条件不相交**
+# （零运行期成本，与 rust-sdk 同一前缀）。前缀只存在于 socketio 层：会话、ack、通知载荷里的
+# ``office_id`` 一律是原值。
+# Room-name prefix for office rooms, keeping them disjoint from socketio's per-sid private rooms.
+OFFICE_ROOM_PREFIX = "office:"
+
+
+def office_room(office_id: OFFICE_ID) -> str:
+    """``office_id`` → socketio 房名（``office:{office_id}``）/ socketio room name of an office."""
+    return f"{OFFICE_ROOM_PREFIX}{office_id}"
+
+
+def office_id_of_room(room: str) -> OFFICE_ID | None:
+    """socketio 房名 → ``office_id``；非 office 房（私有 sid 房 / 其它房）返回 ``None``。
+    Inverse of :func:`office_room`; ``None`` for rooms that are not office rooms.
+    """
+    if room.startswith(OFFICE_ROOM_PREFIX):
+        return room[len(OFFICE_ROOM_PREFIX) :]
+    return None
+
+
+def office_ids_of_rooms(rooms: Iterable[str]) -> list[OFFICE_ID]:
+    """从 ``rooms(sid)`` 中挑出 office 房并还原 ``office_id``（私有 sid 房等一律跳过）。
+    Office ids among a socket's rooms; the private sid room and foreign rooms are skipped.
+    """
+    return [office_id for office_id in map(office_id_of_room, rooms) if office_id is not None]
+
+
+def parse_payload(event: str, adapter: TypeAdapter[_T], data: Any, extra: tuple[Any, ...], sid: str) -> _T | None:
+    """``server:*`` / ``client:*`` 载荷的边界校验单点（#216 / 协议 security.md §数据验证要求）。
+    Single boundary validator for every inbound payload.
+
+    协议给出的 TypedDict **不构成校验**（``{"office_id": None}`` 会原样穿过），故每个事件入口都经此显式
+    校验。非法 ⇒ 记告警并返回 ``None``，由调用方按事件的承载形态处置：具备 ack 通道的事件回
+    ``build_bad_request_error()``（``400``），fire-and-forget 事件静默丢弃（协议 error-handling.md
+    §错误响应格式：MUST NOT 为此新增 ack）。
+
+    非法 = 任一：多余位置参数（协议载荷是**单个** dict；刻意不静默忽略）/ schema 校验失败（含无载荷
+    ``None``、非 dict、缺字段、类型错）。日志里的校验器文案可能内嵌输入值——只进日志，从不回显进 ack。
+
+    Returns ``None`` when the payload is invalid (extra positional args or a schema failure); the
+    caller answers ``400`` on ack-bearing events and drops fire-and-forget ones.
+
+    Args:
+        event: 事件名（仅用于日志）/ event name, for the log line
+        adapter: 载荷的 TypeAdapter / payload TypeAdapter
+        data: 原始载荷 / raw payload
+        extra: handler 以 ``*_extra`` 吸收的多余位置参数 / extra positional args
+        sid: 发起者 SID（仅用于日志）/ initiator SID, for the log line
+    """
+    if extra:
+        logger.warning(f"{event} 多余位置参数 sid={sid}: {len(extra)} 个 / extra positional args")
+        return None
+    try:
+        return adapter.validate_python(data)
+    except ValidationError as exc:
+        logger.warning(f"{event} 载荷校验失败 sid={sid} / payload validation failed: {exc}")
+        return None
 
 
 def default_session_name(role: str | None, sid: str) -> str:
@@ -87,6 +150,50 @@ def build_room_rejection_ack(
         return build_internal_error()
 
 
+def resolve_broadcast_origin(
+    event: str, session: Mapping[str, Any] | None, sid: str, required_role: str
+) -> tuple[OFFICE_ID, str] | None:
+    """fire-and-forget 广播类事件的发起者判定：返回 ``(广播目标 office_id, 发起者会话名)``，不满足则 ``None``（丢弃）。
+    Decide whether a fire-and-forget broadcast may proceed; returns ``(office_id, session_name)`` or ``None``.
+
+    协议依据 / Protocol:
+
+    - error-handling.md §错误响应格式 (a)：``server:tool_call_cancel`` 与 ``server:update_*`` 无 ack 通道，非法请求
+      **静默丢弃即合规**，MUST NOT 为此新增 ack（#216）。故「会话不存在 / 角色不符 / 未入房」一律告警后丢弃，
+      **不**抛异常：抛出不产生任何对端可感响应，只会让任一客户端能往服务端日志灌 traceback。
+    - events.md §房间广播类事件的目标来源：广播**目标**与出向 ``notify:*`` 的**身份字段**都 MUST 取自发起者
+      **会话**（绝不取载荷）⇒ 本函数把两者一并从会话给出；未入房时绝不以 ``room=None`` 降级为全命名空间广播。
+
+    Returns ``None`` (logged) when the session is gone, has the wrong role, or is not in any office —
+    never a namespace-wide ``room=None``. Both the target and the outbound identity come from the session.
+    """
+    if not session:
+        logger.warning(f"{event} 发起者会话不存在，丢弃 sid={sid} / originator session gone, dropped")
+        return None
+    if session.get("role") != required_role:
+        logger.warning(
+            f"{event} 仅 {required_role} 可发起，丢弃 sid={sid} role={session.get('role')!r} "
+            f"/ only {required_role} may emit this, dropped",
+        )
+        return None
+    office_id = session.get("office_id")
+    if not office_id:
+        logger.warning(f"{event} 发起者未加入任何房间，丢弃 sid={sid} / initiator not in any office, dropped")
+        return None
+    return cast(OFFICE_ID, office_id), cast(str, session.get("name", ""))
+
+
+def warn_on_claimed_identity_mismatch(event: str, sid: str, field: str, claimed: str, actual: str) -> None:
+    """载荷自称的身份与会话不符 ⇒ 只告警（events.md：SHOULD 告警后按会话执行，**MUST NOT** 拒绝）。
+    A claimed identity that disagrees with the session is logged only — never a rejection.
+    """
+    if claimed != actual:
+        logger.warning(
+            f"{event} 载荷 {field}={claimed!r} 与会话 {actual!r} 不符，按会话执行 sid={sid} "
+            f"/ payload {field} disagrees with the session; following the session",
+        )
+
+
 def require_office_id(session: Mapping[str, Any], sid: str) -> OFFICE_ID:
     """
     取会话的 ``office_id``，未入房则**显式 raise**（「向发起者所在房间广播」的隔离前置）。
@@ -143,7 +250,7 @@ async def aget_computers_in_office(office_id: OFFICE_ID, sio: AsyncServer) -> li
     # and Agent can only exist in a single room in SMCP_NAMESPACE. Therefore, office_id can be used directly to get rooms
     # 排除OFFICE_ID实际上就是排除Agent，进而获取到的是Computers
     # Excluding OFFICE_ID actually excludes Agent, thus getting Computers
-    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_id):
+    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_room(office_id)):
         if sid != office_id:  # 排除Agent自身 / Exclude Agent itself
             try:
                 session = await sio.get_session(sid, namespace=SMCP_NAMESPACE)
@@ -176,7 +283,7 @@ def get_computers_in_office(office_id: OFFICE_ID, sio: Server) -> list[ComputerS
     # and Agent can only exist in a single room in SMCP_NAMESPACE. Therefore, office_id can be used directly to get rooms
     # 排除OFFICE_ID实际上就是排除Agent，进而获取到的是Computers
     # Excluding OFFICE_ID actually excludes Agent, thus getting Computers
-    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_id):
+    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_room(office_id)):
         if sid != office_id:  # 排除Agent自身 / Exclude Agent itself
             try:
                 session = sio.get_session(sid, namespace=SMCP_NAMESPACE)
@@ -203,7 +310,7 @@ async def aget_all_sessions_in_office(office_id: OFFICE_ID, sio: AsyncServer) ->
         list[dict]: 所有会话列表 / All session list
     """
     sessions = []
-    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_id):
+    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_room(office_id)):
         try:
             session = await sio.get_session(sid, namespace=SMCP_NAMESPACE)
             if session:
@@ -228,7 +335,7 @@ def get_all_sessions_in_office(office_id: OFFICE_ID, sio: Server) -> list[dict]:
         list[dict]: 所有会话列表 / All session list
     """
     sessions = []
-    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_id):
+    for sid, _eio_sid in sio.manager.get_participants(SMCP_NAMESPACE, office_room(office_id)):
         try:
             session = sio.get_session(sid, namespace=SMCP_NAMESPACE)
             if session:

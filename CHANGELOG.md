@@ -46,12 +46,41 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   （协议 MUST NOT 施加全局唯一）。用户可感：**跨 office 同名**、**同名 Agent + Computer** 不再被 `4105`
   误拒；同房同 role 同名仍 `4105`。`client:*` 路由改为在**发起者所在房内**解析——目标只在他房 / 名字属于
   Agent 时立即回 flat `404`（与「不存在」逐字节相同，不泄露他房成员存在性），此前为抛异常致调用方挂满超时。
-  未入房发起者的路由拒绝仍为抛异常（flat `4103` 承载见 #216）。
+  未入房发起者的路由拒绝现为 flat `4103`（#216，见下条）。
   - Server 子类化 API 签名变更（不留兼容）：`get_sid_by_name(office_id, role, name)`、
     `_register_name(office_id, role, name, sid)`、`_ensure_name_registerable(office_id, role, name, sid)`；
     `_name_to_sid_map` 键改为 `(office_id, role, name)` 元组（`server.types.NAME_KEY`），新增反向索引
     `_sid_to_name_key`：`_unregister_name` 按 sid 注销、不再从可变会话字段反推（杜绝回滚后残留键致永久 4105），
     并内置归属守卫（只删本 sid 持有的键）。`enter_room` 的 Computer 房内同名扫描并入注册表闸门（判据单点）。
+- **边界校验加固 + office 房名命名空间分离**（#216，protocol#61 自查 A / B + `office_id` 取值域）：
+  - **`client:*` 路由的拒绝一律经 ack 可感**（此前多为抛异常 ⇒ 调用方挂满超时）：载荷畸形（缺字段 / 类型错 /
+    无载荷 / 多余位置参数）⇒ `400`；未入房 ⇒ `4103`；**非 Agent 发起任一 `client:*` ⇒ `403`**（此前只有
+    `tool_call` 校验角色，其余路由对 Computer 放行）；房内解析不到 ⇒ `404`。唯一保留的静默路径是「发起者会话
+    已不存在」。同步版 `client:tool_call` 的载荷改按 `ToolCallReq` 校验（与 async 一致；`timeout` 等字段必填）。
+  - **fire-and-forget 事件**（`server:tool_call_cancel` / `server:update_*` ×4）：载荷非法 / 角色不符 / 未入房时
+    改为**告警日志 + 静默丢弃**（协议：MUST NOT 为此新增 ack），不再抛 `SMCPNamespaceError`（此前会往服务端日志灌
+    traceback；线上行为不变——本就不广播、不回执）。`require_office_id` 保留导出，但本仓不再调用。
+  - **出向 `notify:*` 的身份字段改取发起者会话**（events.md §房间广播类事件的目标来源 MUST）：`notify:update_*` 的
+    `computer`、`notify:tool_call_cancel` 的 `agent` 不再原样转发载荷自称值（此前可用 `computer="peer"` 让房内 Agent
+    去刷新**另一台** Computer）；载荷与会话不符时只告警、**按会话执行**——`tool_call_cancel` 不再因 `agent` 名不符而丢弃
+    （协议 MUST NOT 拒绝）。
+  - `server:join_office` 的 `office_id=""` ⇒ `400`（此前入房成功却处处被当成「未入房」）。
+  - **socketio 房名改为 `office:{office_id}`**（`server.utils.office_room` / `office_id_of_room`），与 socketio
+    为每个连接自动建立的私有 sid 房**无条件不相交**——此前取 `office_id = <对端 SID>` 即可进入对端私有房并向其
+    投递广播。**线上载荷不变**（会话 / ack / 通知里的 `office_id` 仍是原值），但**自行 `emit(room=office_id)`、
+    直接读 `manager.rooms` 或 `get_participants(namespace, office_id)` 的 `SMCPNamespace` 子类须改用 `office_room()`**；
+    房间广播在基类统一经 `_emit_to_office` 发出；`rooms(sid)` 遍历只处理 `office:` 前缀房。
+  - handler 签名统一为 `(sid, data=None, *_extra)`（绑定失败也落到校验层）；边界校验单点 `server.utils.parse_payload`；
+    `_relay_client_call` 签名变为 `(sid, data, extra, event, req_adapter, ret_adapter, *, timeout_from_request=False)`。
+    `client:*` 校验通过后**原样转发**原始载荷（async `tool_call` 此前转发校验后的 dict——会剥掉额外键、做类型强转；
+    现与 sync 及其余路由一致）。
+  - 公开导出 `a2c_smcp.server.office_room` / `office_id_of_room` / `OFFICE_ROOM_PREFIX`。断连清理改经可覆写钩子
+    `_rooms_to_leave_on_disconnect(sid)`：`BaseNamespace` 保持原语义（离开除私有 sid 房外的全部房），`SMCPNamespace`
+    覆写为只处理 `office:` 房并交出原始 office_id。
+  - **Agent 侧**：`get_tools_from_computer` / `get_config_from_computer` / `get_desktop_from_computer`（sync + async）
+    解码路由层 flat ErrorPayload 并抛 `SMCPProtocolError`——此前 `get_config` 把 `404` / `4103` **静默当成「零个
+    server」的成功**，另两者报误导性的「req_id 不匹配」。
+  - 失败 reason 不含对端 `sid` / namespace（自 #214 起已成立，本单补真实链路验收）。
 - **`enter_room` / `_ensure_name_registerable` 的业务拒绝改抛领域异常**
   （`RoomFullError` / `NameConflictError` / `AlreadyInRoomError`，均为 `ValueError` 子类，携带 `code`）。
 
