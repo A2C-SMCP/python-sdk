@@ -37,6 +37,7 @@ from a2c_smcp.smcp import (
     GetComputerConfigReq,
     GetToolsReq,
     UpdateMCPConfigNotification,
+    build_computer_not_found_error,
 )
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
@@ -605,18 +606,18 @@ async def _connect_join(client: AsyncClient, port: int, role: Literal["computer"
 
 @pytest.mark.asyncio
 async def test_get_tools_cross_office_rejected(socketio_server, basic_server_port: int):
-    """跨房间 client:get_tools：Agent(office_A) 取 Computer(office_B) 工具 → SMCPNamespaceError。"""
+    """跨房间 client:get_tools：Agent(office_A) 取 Computer(office_B) 工具 → 统一 flat 404（#215：房内解析）。"""
     agent = AsyncClient()
     computer = AsyncClient()
     agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-A", "robot-neg-1")
     await _connect_join(computer, basic_server_port, "computer", "office-neg-B", "comp-neg-1")
 
-    # v0.2.2 #46 起，client:get_tools 收编进 _relay_client_call，跨房间错误文案统一为通用 "跨房间" 模板。
-    with pytest.raises(SMCPNamespaceError, match="跨房间"):
-        await socketio_server.on_client_get_tools(
-            agent_sid,
-            {"computer": "comp-neg-1", "agent": "robot-neg-1", "req_id": "neg-r1"},
-        )
+    # #215：名字解析限定在发起者所在房内 ⇒ 他房目标与「不存在」逐字节相同（不泄露他房成员存在性）
+    ret = await socketio_server.on_client_get_tools(
+        agent_sid,
+        {"computer": "comp-neg-1", "agent": "robot-neg-1", "req_id": "neg-r1"},
+    )
+    assert ret == build_computer_not_found_error("comp-neg-1")
 
     await agent.disconnect()
     await computer.disconnect()
@@ -624,19 +625,18 @@ async def test_get_tools_cross_office_rejected(socketio_server, basic_server_por
 
 @pytest.mark.asyncio
 async def test_get_resources_cross_office_rejected(socketio_server, basic_server_port: int):
-    """跨房间 client:get_resources（PR #29 来源场景）→ SMCPNamespaceError，不路由到 Computer。"""
+    """跨房间 client:get_resources（PR #29 来源场景）→ 统一 flat 404，不路由到 Computer（#215）。"""
     agent = AsyncClient()
     computer = AsyncClient()
     agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-A2", "robot-neg-2")
     await _connect_join(computer, basic_server_port, "computer", "office-neg-B2", "comp-neg-2")
 
-    # v0.2.1 #41 起，跨房间消息由 ``_relay_client_call`` 统一收敛，错误文案改为通用 "跨房间" 模板
-    # Since v0.2.1 #41, cross-office checks are centralized in ``_relay_client_call``
-    with pytest.raises(SMCPNamespaceError, match="跨房间"):
-        await socketio_server.on_client_get_resources(
-            agent_sid,
-            {"computer": "comp-neg-2", "agent": "robot-neg-2", "mcp_server": "any", "req_id": "neg-r2"},
-        )
+    # #215：房内解析，他房目标 ⇒ 与「不存在」相同的 flat 404
+    ret = await socketio_server.on_client_get_resources(
+        agent_sid,
+        {"computer": "comp-neg-2", "agent": "robot-neg-2", "mcp_server": "any", "req_id": "neg-r2"},
+    )
+    assert ret == build_computer_not_found_error("comp-neg-2")
 
     await agent.disconnect()
     await computer.disconnect()
@@ -749,8 +749,11 @@ async def test_get_config_success_same_office(socketio_server, basic_server_port
 
 
 @pytest.mark.asyncio
-async def test_rejected_cross_office_join_never_enters_room(socketio_server, basic_server_port: int, monkeypatch):
-    """#213：跨 office 同名被拒的客户端**从未**进入目标房——入房记录 + 成员关系 + 广播隔离三重断言。
+async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_server_port: int, monkeypatch):
+    """#213：房内同名被拒（4105）的客户端**从未**进入目标房——入房记录 + 成员关系 + 广播隔离三重断言。
+
+    #215 起跨 office 同名合法（键空间 ``(office_id, role, name)``），故冲突改在目标房内构造；另以
+    ``twin`` 正对照钉住「他房同名放行」。
 
     修复前：``enter_room`` 先真入房、后 ``_register_name`` 抛错，回滚只覆盖会话 ⇒ 被拒客户端留在
     目标房里持续收 ``notify:*``，而会话说它不在任何房。
@@ -769,10 +772,11 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
 
     monkeypatch.setattr(socketio_server.server, "enter_room", _recording_enter_room)
 
-    holder = AsyncClient()  # office-A 持有名字 "c213"
+    holder = AsyncClient()  # office-B 持有名字 "c213"
     subject = AsyncClient()  # 以同名进 office-B → 被拒
     control = AsyncClient()  # office-B 的合法成员（正对照）
     joiner = AsyncClient()  # 触发 office-B 的 notify:enter_office
+    twin = AsyncClient()  # 以同名进 office-A → 放行（#215 正对照）
 
     on_control: list[dict] = []
     on_subject: list[dict] = []
@@ -786,7 +790,9 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
         on_subject.append(data)
 
     office_a, office_b = "office-213-a", "office-213-b"
-    holder_sid = await _connect_join(holder, basic_server_port, "computer", office_a, "c213")
+    holder_sid = await _connect_join(holder, basic_server_port, "computer", office_b, "c213")
+    # #215 正对照：他房同名合法（_join_office 内断言空 ack）
+    await _connect_join(twin, basic_server_port, "computer", office_a, "c213")
     control_sid = await _connect_join(control, basic_server_port, "computer", office_b, "c213-control")
     # 正对照：钩子确实记录了合法入房（证明下面「未入房」的断言不是钩子失灵）
     assert (control_sid, office_b) in entered, "入房钩子应记录合法成员的加入"
@@ -796,10 +802,9 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
         namespaces=[SMCP_NAMESPACE],
         socketio_path="/socket.io",
     )
-    # 目标房闸门放行（office-B 里没有同名），名字注册表（裸名全局）才是冲突点
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "c213"}
     ack = await subject.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert_rejected_ack(ack, 4105, action="server:join_office")  # 目标房同名（跨 office 同名由注册表闸门拦下）
+    assert_rejected_ack(ack, 4105, action="server:join_office")  # 目标房内同 role 同名
 
     subject_sid = subject.get_sid(namespace=SMCP_NAMESPACE)
     assert subject_sid is not None
@@ -809,7 +814,7 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
     # 验收口径 ②：终态一致——真实成员关系里不含目标房
     assert [r for r in socketio_server.rooms(subject_sid) if r != subject_sid] == [], "被拒客户端不得留在目标房"
     # 正对照：持有者的成员关系确实可被 rooms() 读出（证明上面的断言不是空转）
-    assert [r for r in socketio_server.rooms(holder_sid) if r != holder_sid] == [office_a]
+    assert [r for r in socketio_server.rooms(holder_sid) if r != holder_sid] == [office_b]
 
     # 验收口径 ③：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
     await _connect_join(joiner, basic_server_port, "computer", office_b, "c213-joiner")
@@ -817,7 +822,45 @@ async def test_rejected_cross_office_join_never_enters_room(socketio_server, bas
     assert on_control, "正对照：office-B 合法成员应收到 notify:enter_office"
     assert on_subject == [], "被拒客户端不得收到目标房任何 notify:*"
 
-    for client in (holder, subject, control, joiner):
+    for client in (holder, subject, control, joiner, twin):
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_computer_switch_into_same_name_room_rejected_keeps_old_room(socketio_server, basic_server_port: int):
+    """#215 + #213：Computer 换房撞上目标房同 role 同名 ⇒ 4105，且**校验先于副作用** ⇒ 原房原封不动。
+
+    裸名注册表下该路径在线上不可构造（同名 Computer 无法同时存在于两房）；复合键落地后可构造，故在此补集成守护：
+    被拒的换房不得先退旧房（对端收不到 ``notify:leave_office``），旧房成员关系保持。
+    """
+    peer = AsyncClient()  # office-A 的对端（观察 leave 通知）
+    mover = AsyncClient()  # office-A 的 "c215"，换房到 office-B → 被拒
+    holder = AsyncClient()  # office-B 已持有 "c215"
+
+    peer_leaves: list[dict] = []
+
+    @peer.on(LEAVE_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_leave(data: dict):  # noqa: ANN202
+        peer_leaves.append(data)
+
+    office_a, office_b = "office-215-a", "office-215-b"
+    await _connect_join(peer, basic_server_port, "computer", office_a, "peer-215")
+    mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "c215")
+    await _connect_join(holder, basic_server_port, "computer", office_b, "c215")
+
+    ack = await mover.call(
+        JOIN_OFFICE_EVENT,
+        {"role": "computer", "office_id": office_b, "name": "c215"},
+        namespace=SMCP_NAMESPACE,
+    )
+    assert_rejected_ack(ack, 4105, action="server:join_office")
+
+    await asyncio.sleep(0.3)
+    assert peer_leaves == [], f"被拒的换房不得先退旧房：{peer_leaves}"
+    assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_a]
+    assert await socketio_server.get_sid_by_name(office_a, "computer", "c215") == mover_sid
+
+    for client in (peer, mover, holder):
         await client.disconnect()
 
 
@@ -885,18 +928,18 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
 
 @pytest.mark.asyncio
 async def test_get_config_cross_office_rejected(socketio_server, basic_server_port: int):
-    """跨房间 client:get_config：Agent(office_A) 取 Computer(office_B) 配置 → SMCPNamespaceError，不路由到 Computer（#94）。"""
+    """跨房间 client:get_config：Agent(office_A) 取 Computer(office_B) 配置 → 统一 flat 404，不路由到 Computer（#94/#215）。"""
     agent = AsyncClient()
     computer = AsyncClient()
     agent_sid = await _connect_join(agent, basic_server_port, "agent", "office-neg-cfgA", "robot-neg-cfg")
     await _connect_join(computer, basic_server_port, "computer", "office-neg-cfgB", "comp-neg-cfg")
 
-    # 与 get_tools/get_resources 同级：跨房间由 _relay_client_call 统一收敛为通用 "跨房间" 错误。
-    with pytest.raises(SMCPNamespaceError, match="跨房间"):
-        await socketio_server.on_client_get_config(
-            agent_sid,
-            {"computer": "comp-neg-cfg", "agent": "robot-neg-cfg", "req_id": "neg-cfg-1"},
-        )
+    # 与 get_tools/get_resources 同级：#215 房内解析 ⇒ 他房目标回与「不存在」相同的 flat 404
+    ret = await socketio_server.on_client_get_config(
+        agent_sid,
+        {"computer": "comp-neg-cfg", "agent": "robot-neg-cfg", "req_id": "neg-cfg-1"},
+    )
+    assert ret == build_computer_not_found_error("comp-neg-cfg")
 
     await agent.disconnect()
     await computer.disconnect()

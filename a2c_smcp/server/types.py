@@ -15,6 +15,10 @@ from typing_extensions import TypedDict
 # 类型别名定义 / Type aliases
 OFFICE_ID: TypeAlias = str
 SID: TypeAlias = str
+# 名字注册表键 ``(office_id, role, name)``（#215，协议 room-model.md §房内名字唯一性）：唯一性是**房内同 role**
+# 的，跨房同名 / 同名异 role 均允许。元组键天然无字符串拼接歧义。
+# Name-registry key ``(office_id, role, name)`` (#215): uniqueness is per room and per role.
+NAME_KEY: TypeAlias = tuple[OFFICE_ID, str, str]
 
 
 class BaseSession(TypedDict):

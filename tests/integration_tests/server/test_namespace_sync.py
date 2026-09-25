@@ -39,6 +39,7 @@ from a2c_smcp.smcp import (
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
     ErrorCode,
+    build_computer_not_found_error,
 )
 from a2c_smcp.testing import create_local_sync_server
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
@@ -660,7 +661,7 @@ def test_list_room_session_info_contains_a2c_version_sync(
 
 
 def test_get_tools_cross_office_rejected_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
-    """跨房间 client:get_tools（同步）：office 不一致 → 拒绝且不路由到 Computer。"""
+    """跨房间 client:get_tools（同步）：目标只在他房 → 立即 flat 404（#215 房内解析，与「不存在」相同），不路由到 Computer。"""
     agent = Client()
     computer = Client()
     computer_invoked = threading.Event()
@@ -676,13 +677,13 @@ def test_get_tools_cross_office_rejected_sync(startup_and_shutdown_local_sync_se
         _join_office(agent, role="agent", office_id="office-sync-neg-A", name="robot-sneg-1")
         _join_office(computer, role="computer", office_id="office-sync-neg-B", name="comp-sneg-1")
 
-        with pytest.raises(SioTimeoutError):
-            agent.call(
-                GET_TOOLS_EVENT,
-                {"computer": "comp-sneg-1", "agent": "robot-sneg-1", "req_id": "sneg-r1"},
-                namespace=SMCP_NAMESPACE,
-                timeout=3,
-            )
+        ret = agent.call(
+            GET_TOOLS_EVENT,
+            {"computer": "comp-sneg-1", "agent": "robot-sneg-1", "req_id": "sneg-r1"},
+            namespace=SMCP_NAMESPACE,
+            timeout=3,
+        )
+        assert ret == build_computer_not_found_error("comp-sneg-1"), ret
         assert not computer_invoked.is_set(), "跨房间请求不得路由到 Computer / cross-room request must not reach Computer"
     finally:
         agent.disconnect()
@@ -832,11 +833,13 @@ def test_get_config_success_sync(startup_and_shutdown_local_sync_server: Namespa
             computer_process.join(timeout=2)
 
 
-def test_rejected_cross_office_join_is_isolated_sync(
+def test_rejected_same_name_join_is_isolated_sync(
     startup_and_shutdown_local_sync_server,
     sync_server_port: int,
 ) -> None:
-    """#213 sync：跨 office 同名被拒的客户端不留在目标房（服务端权威 ``list_room`` + notify 隔离）。
+    """#213 sync：房内同名被拒（4105）的客户端不留在目标房（服务端权威 ``list_room`` + notify 隔离）。
+
+    #215 起跨 office 同名合法，故冲突改在目标房内构造；``twin`` 正对照钉住「他房同名放行」。
 
     同步服务端在**独立进程**中运行，测试侧读不到它的真实成员关系 ⇒ 用服务端权威的
     ``server:list_room`` 与 wire 上的 ``notify:*`` 断言终态。「**从未**入房」这一顺序保证由单元
@@ -847,6 +850,7 @@ def test_rejected_cross_office_join_is_isolated_sync(
     subject = Client()
     control = Client()
     joiner = Client()
+    twin = Client()
 
     on_control: list[dict] = []
     on_subject: list[dict] = []
@@ -860,11 +864,12 @@ def test_rejected_cross_office_join_is_isolated_sync(
         on_subject.append(data)
 
     office_a, office_b = "office-213-sync-a", "office-213-sync-b"
-    for client in (holder, subject, control, joiner):
+    for client in (holder, subject, control, joiner, twin):
         client.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
 
-    # 目标房闸门放行（office-B 内无同名），名字注册表（裸名全局）才是冲突点
-    _join_office(holder, role="computer", office_id=office_a, name="c213s")
+    _join_office(holder, role="computer", office_id=office_b, name="c213s")
+    # #215 正对照：他房同名合法（_join_office 内断言空 ack）
+    _join_office(twin, role="computer", office_id=office_a, name="c213s")
     _join_office(control, role="computer", office_id=office_b, name="c213s-control")
 
     ack = subject.call(
@@ -872,7 +877,7 @@ def test_rejected_cross_office_join_is_isolated_sync(
         {"role": "computer", "office_id": office_b, "name": "c213s"},
         namespace=SMCP_NAMESPACE,
     )
-    assert_rejected_ack(ack, 4105, action="server:join_office")  # 跨 office 同名由注册表闸门拦下
+    assert_rejected_ack(ack, 4105, action="server:join_office")  # 目标房内同 role 同名
 
     # 服务端权威视图：被拒者不得出现在目标房成员列表里
     listed = control.call(
@@ -880,8 +885,11 @@ def test_rejected_cross_office_join_is_isolated_sync(
         {"agent": control.get_sid(namespace=SMCP_NAMESPACE), "req_id": "req-213", "office_id": office_b},
         namespace=SMCP_NAMESPACE,
     )
+    subject_sid = subject.get_sid(namespace=SMCP_NAMESPACE)
+    listed_sids = [s["sid"] for s in listed["sessions"]]
     names = sorted(s["name"] for s in listed["sessions"])
-    assert names == ["c213s-control"], f"被拒客户端不得出现在目标房成员列表：{names}"
+    assert subject_sid not in listed_sids, f"被拒客户端不得出现在目标房成员列表：{listed['sessions']}"
+    assert names == ["c213s", "c213s-control"], f"目标房成员应为持有者 + 对照：{names}"
 
     # 验收口径：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
     _join_office(joiner, role="computer", office_id=office_b, name="c213s-joiner")
@@ -889,7 +897,7 @@ def test_rejected_cross_office_join_is_isolated_sync(
     assert on_control, "正对照：目标房合法成员应收到 notify:enter_office"
     assert on_subject == [], "被拒客户端不得收到目标房任何 notify:*"
 
-    for client in (holder, subject, control, joiner):
+    for client in (holder, subject, control, joiner, twin):
         client.disconnect()
 
 

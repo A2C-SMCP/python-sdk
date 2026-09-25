@@ -42,6 +42,7 @@ from a2c_smcp.smcp import (
     GetDeskTopReq,
     GetDeskTopRet,
     LeaveOfficeReq,
+    build_computer_not_found_error,
     is_protocol_error_payload,
 )
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
@@ -310,7 +311,7 @@ class TestSMCPNamespace:
         sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
 
         smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent))
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, agent_id: agent_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid, ("room1", "agent", agent_id): agent_sid}
         smcp_namespace.call = AsyncMock(return_value={"tools": [], "req_id": "r1"})
 
         # get_tools 成功
@@ -517,13 +518,12 @@ class TestDefaultAuthenticationProvider:
         new_computer_sid = "new_sid"
         new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
 
-        # Mock get_participants 返回房间内已有的参与者
-        # Mock get_participants to return existing participant
-        mock_server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
-
-        # Mock get_session：第一次返回新Computer的session，第二次返回已存在Computer的session
-        # Mock get_session: first call returns new Computer's session, second returns existing Computer's session
-        smcp_namespace.get_session = AsyncMock(side_effect=[new_session, existing_session])
+        # #215：房内同 role 同名的唯一判据是 ``(office_id, role, name)`` 注册表（已有 Computer 入房时写入）
+        # #215: the (office_id, role, name) registry is the single same-name gate
+        smcp_namespace._name_to_sid_map = {
+            (existing_session["office_id"], existing_session["role"], existing_session["name"]): existing_computer_sid,
+        }
+        smcp_namespace.get_session = AsyncMock(return_value=new_session)
         smcp_namespace.save_session = AsyncMock()
 
         # 应该抛出 ValueError，提示重名
@@ -616,10 +616,10 @@ class TestEnterRoomTransactionalCommit:
     """
 
     @pytest.mark.asyncio
-    async def test_cross_office_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
-        """跨 office 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房。
+    async def test_target_room_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
+        """换房撞目标房同 role 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房。
 
-        复现 #213 原始路径：目标房同名检查（只看房内）放行 ⇒ 注册表（裸名全局）才是冲突点。
+        #213 原始路径（跨 office 同名经裸名注册表被拒）在 #215 后已合法；「校验先于副作用」改由目标房内冲突守护。
         """
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["c-sid", "roomA"])
@@ -629,7 +629,8 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock()
         smcp_namespace.leave_room = AsyncMock()
-        smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
+        registry = {("roomA", "computer", "dup"): "c-sid", ("roomB", "computer", "dup"): "other-sid"}
+        smcp_namespace._name_to_sid_map = dict(registry)
 
         with pytest.raises(ValueError, match="Name already taken in room"):
             await smcp_namespace.enter_room("c-sid", "roomB")
@@ -638,13 +639,13 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.emit.assert_not_awaited()
         mock_server.enter_room.assert_not_awaited()  # 目标房从未进入 / never joined the target room
         assert session["office_id"] == "roomA"
-        assert smcp_namespace._name_to_sid_map == {"dup": "other-sid"}
+        assert smcp_namespace._name_to_sid_map == registry
 
     @pytest.mark.asyncio
     async def test_move_with_self_owned_name_succeeds(self, smcp_namespace, mock_server):
-        """换房且注册表里的 name 属于**本 sid** ⇒ 必须放行（``existing_sid == sid`` 豁免）。
+        """换房：旧房键属于**本 sid** ⇒ 放行，且键随之迁移到目标房（旧房键释放、无悬挂）。
 
-        防止闸门写成裸 ``if name in map: raise``——那会让每一次正常换房都被误拒。
+        #215 后键含 ``office_id``：旧房键与目标房键不同，换房不再依赖 ``existing_sid == sid`` 豁免。
         """
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["c-sid", "roomA", "roomB"])
@@ -653,13 +654,13 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock()
-        smcp_namespace._name_to_sid_map = {"dup": "c-sid"}
+        await smcp_namespace._register_name("roomA", "computer", "dup", "c-sid")  # 经注册入口，正/反向索引同步写入
 
         await smcp_namespace.enter_room("c-sid", "roomB")
 
         mock_server.leave_room.assert_awaited_once_with("c-sid", "roomA", namespace=SMCP_NAMESPACE)
         assert session["office_id"] == "roomB"
-        assert smcp_namespace._name_to_sid_map == {"dup": "c-sid"}
+        assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "dup"): "c-sid"}
         # 恰为「先退旧房、后入新房」两条通知 / exactly the leave-then-enter notifications
         assert [c.args[0] for c in smcp_namespace.emit.await_args_list] == [
             LEAVE_OFFICE_NOTIFICATION,
@@ -682,7 +683,7 @@ class TestEnterRoomTransactionalCommit:
 
         mock_server.leave_room.assert_awaited_once_with("solo", "roomB", namespace=SMCP_NAMESPACE)
         assert "office_id" not in session
-        assert "solo" not in smcp_namespace._name_to_sid_map
+        assert smcp_namespace._name_to_sid_map == {}
 
     @pytest.mark.asyncio
     async def test_phase2_success_is_untouched_by_convergence(self, smcp_namespace, mock_server):
@@ -698,7 +699,7 @@ class TestEnterRoomTransactionalCommit:
         await smcp_namespace.enter_room("solo", "roomB")
 
         assert session["office_id"] == "roomB"
-        assert smcp_namespace._name_to_sid_map["solo"] == "solo"
+        assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "solo"): "solo"}
         smcp_namespace.emit.assert_awaited_once()
         mock_server.leave_room.assert_not_awaited()  # 成功路径不得出现摘除 / no eviction on success
 
@@ -717,14 +718,14 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock(side_effect=RuntimeError("leave broadcast boom"))
-        smcp_namespace._name_to_sid_map = {"n": "c-sid"}
+        smcp_namespace._name_to_sid_map = {("roomA", "computer", "n"): "c-sid"}
 
         with pytest.raises(RuntimeError, match="leave broadcast boom"):
             await smcp_namespace.enter_room("c-sid", "roomB")
 
         assert session["office_id"] == "roomA"
         mock_server.leave_room.assert_not_awaited()
-        assert smcp_namespace._name_to_sid_map == {"n": "c-sid"}
+        assert smcp_namespace._name_to_sid_map == {("roomA", "computer", "n"): "c-sid"}
 
     @pytest.mark.asyncio
     async def test_leave_room_committed_converges_to_no_room(self, smcp_namespace, mock_server):
@@ -736,7 +737,7 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock()
-        smcp_namespace._name_to_sid_map = {"n": "c-sid"}
+        await smcp_namespace._register_name("roomA", "computer", "n", "c-sid")  # 经注册入口，正/反向索引同步写入
 
         def _emit_boom(event, *args, **kwargs):  # noqa: ANN001, ANN202
             if event == ENTER_OFFICE_NOTIFICATION:
@@ -751,7 +752,7 @@ class TestEnterRoomTransactionalCommit:
         mock_server.leave_room.assert_any_await("c-sid", "roomA", namespace=SMCP_NAMESPACE)
         mock_server.leave_room.assert_any_await("c-sid", "roomB", namespace=SMCP_NAMESPACE)
         assert "office_id" not in session
-        assert "n" not in smcp_namespace._name_to_sid_map
+        assert smcp_namespace._name_to_sid_map == {}, "旧房键与目标房键均须回收"
 
     @pytest.mark.asyncio
     async def test_join_office_rollback_removes_fields_absent_from_backup(self, smcp_namespace, mock_server):
@@ -805,7 +806,7 @@ class TestEnterRoomTransactionalCommit:
 
         def _emit_hijack_then_boom(event: str, *args: object, **kwargs: object) -> None:
             if event == ENTER_OFFICE_NOTIFICATION:
-                smcp_namespace._name_to_sid_map["solo"] = "intruder"  # 并发抢占
+                smcp_namespace._name_to_sid_map[("roomB", "computer", "solo")] = "intruder"  # 并发抢占
                 raise RuntimeError("broadcast boom")
 
         smcp_namespace.emit = AsyncMock(side_effect=_emit_hijack_then_boom)
@@ -813,11 +814,11 @@ class TestEnterRoomTransactionalCommit:
         with pytest.raises(RuntimeError, match="broadcast boom"):
             await smcp_namespace.enter_room("solo", "roomB")
 
-        assert smcp_namespace._name_to_sid_map == {"solo": "intruder"}, "不得替抢占者注销 name 映射"
+        assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "solo"): "intruder"}, "不得替抢占者注销 name 映射"
 
     @pytest.mark.asyncio
     async def test_agent_name_conflict_never_enters_room(self, smcp_namespace, mock_server):
-        """闸门**角色无关**：Agent 撞跨 office 同名同样不得进入房间。"""
+        """闸门对 Agent 同样生效：Agent 撞目标房同 role 同名（注册表闸门）不得进入房间。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["a-sid"])
         mock_server.manager.get_participants.return_value = []  # 目标房内无 agent
@@ -825,7 +826,7 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock()
-        smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
+        smcp_namespace._name_to_sid_map = {("roomB", "agent", "dup"): "other-sid"}
 
         with pytest.raises(ValueError, match="Name already taken in room"):
             await smcp_namespace.enter_room("a-sid", "roomB")
@@ -898,7 +899,8 @@ class TestV021ClientRoutesAndUpdateSkills:
 
     覆盖统一 ``_relay_client_call`` 助手的关键不变量：
       - Computer SID 解析（未注册 → flat ErrorPayload(404)，#92；非抛未捕获异常）
-      - office/role 隔离 **显式 raise SMCPNamespaceError**（非 assert，对齐 #31 `-O` 加固）
+      - 名字解析限定发起者所在房（#215）：他房 / 非 Computer 目标 → 与「不存在」相同的 flat 404；
+        注册表与会话不一致 → **显式 raise SMCPNamespaceError**（不变量守卫，#31）
       - flat ErrorPayload 透传（无嵌套 envelope，不二次 unwrap；与 agent 侧 predicate 一致）
     Covers the key invariants of the unified ``_relay_client_call`` helper.
     """
@@ -916,7 +918,7 @@ class TestV021ClientRoutesAndUpdateSkills:
         smcp_namespace.get_session = AsyncMock(
             side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent),
         )
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid, ("room1", "agent", "agent-1"): agent_sid}
         smcp_namespace.call = AsyncMock()
         return smcp_namespace, agent_sid, comp_name, comp_sid
 
@@ -1085,37 +1087,56 @@ class TestV021ClientRoutesAndUpdateSkills:
         smcp_namespace.call.assert_not_awaited()  # 未找到时不应转发 / no relay on not-found
 
     @pytest.mark.asyncio
-    async def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
-        """跨房间访问 → **显式 raise SMCPNamespaceError**（非 assert，对齐 #31 `-O` 加固）.
-        Cross-office access → explicit raise SMCPNamespaceError (not assert, per #31)."""
+    async def test_get_blob_cross_office_is_uniform_404(self, smcp_namespace, mock_server):
+        """跨房间访问 → 与「不存在」相同的 flat 404（#215：房内解析，不泄露他房成员存在性），不转发.
+        Cross-office target → the same flat 404 as an absent one (#215), never relayed."""
         smcp_namespace.server = mock_server
         comp_sid = "c-sid"
-        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", "c1"): comp_sid, ("room2", "agent", "agent-1"): "a-sid"}
         sess_comp_room1 = {"role": "computer", "office_id": "room1", "name": "c1"}
         sess_agent_room2 = {"role": "agent", "office_id": "room2", "name": "agent-1"}
         smcp_namespace.get_session = AsyncMock(
             side_effect=lambda sid: sess_comp_room1 if sid == comp_sid else sess_agent_room2,
         )
-        with pytest.raises(SMCPNamespaceError, match="跨房间"):
-            await smcp_namespace.on_client_get_blob(
-                "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "c1", "blob_handle": "h"},
-            )
+        smcp_namespace.call = AsyncMock()
+        ret = await smcp_namespace.on_client_get_blob(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "c1", "blob_handle": "h"},
+        )
+        assert ret == build_computer_not_found_error("c1")
+        smcp_namespace.call.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_get_skills_target_role_not_computer_raises(self, smcp_namespace, mock_server):
-        """目标 SID role != computer → **显式 raise SMCPNamespaceError**.
-        Target SID with ``role != "computer"`` → explicit SMCPNamespaceError."""
+    async def test_get_skills_target_name_of_agent_is_404(self, smcp_namespace, mock_server):
+        """目标名属于同房 **Agent** → 按 role=computer 解析不到 → flat 404（#215）.
+        Target name belongs to an Agent → not found under role=computer → flat 404 (#215)."""
         smcp_namespace.server = mock_server
-        wrong_sid = "wrong-sid"
-        smcp_namespace._name_to_sid_map = {"agent-2": wrong_sid}
-        sess_wrong = {"role": "agent", "office_id": "room1", "name": "agent-2"}
-        smcp_namespace.get_session = AsyncMock(return_value=sess_wrong)
-        with pytest.raises(SMCPNamespaceError, match="Computer"):
+        smcp_namespace._name_to_sid_map = {("room1", "agent", "agent-2"): "wrong-sid"}
+        smcp_namespace.get_session = AsyncMock(return_value={"role": "agent", "office_id": "room1", "name": "agent-1"})
+        smcp_namespace.call = AsyncMock()
+        ret = await smcp_namespace.on_client_get_skills(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "agent-2"},
+        )
+        assert ret == build_computer_not_found_error("agent-2")
+        smcp_namespace.call.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_registry_session_divergence_raises(self, smcp_namespace, mock_server):
+        """不变量守卫：注册表键指向的会话与键不符（人为破坏）→ **显式 raise SMCPNamespaceError**（#31），不转发.
+        Invariant guard: a registry entry whose session disagrees with its key → explicit raise (#31)."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {("room1", "computer", "c1"): "c-sid"}
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_corrupt = {"role": "agent", "office_id": "room1", "name": "c1"}
+        smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: sess_corrupt if sid == "c-sid" else sess_agent)
+        smcp_namespace.call = AsyncMock()
+        with pytest.raises(SMCPNamespaceError, match="不一致"):
             await smcp_namespace.on_client_get_skills(
                 "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "agent-2"},
+                {"agent": "agent-1", "req_id": "r", "computer": "c1"},
             )
+        smcp_namespace.call.assert_not_awaited()
 
     # ── 广播 / Broadcast ─────────────────────────────────────────────
 
@@ -1191,7 +1212,7 @@ class TestV021ClientRoutesAndUpdateSkills:
         smcp_namespace.server = mock_server
         comp_sid = "c-sid"
         comp_name = "c1"
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid}
         sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
         # Computer 会话存在；发起者（Agent）会话已断连 → None / Computer ok, originator gone
         smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: sess_comp if sid == comp_sid else None)
@@ -1233,7 +1254,7 @@ class TestInflightTargetDisconnectGuard:
         sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
         sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
         smcp_namespace.get_session = AsyncMock(side_effect=lambda sid: (sess_comp if sid == comp_sid else sess_agent))
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid, ("room1", "agent", "agent-1"): agent_sid}
         smcp_namespace.call = AsyncMock()
         return smcp_namespace, agent_sid, comp_name, comp_sid
 
@@ -1311,32 +1332,13 @@ class TestInflightTargetDisconnectGuard:
         assert comp_sid not in ns._inflight_disconnect_signals
 
     @pytest.mark.asyncio
-    async def test_cross_office_raises_with_no_dangling_signal(self, smcp_namespace, mock_server):
-        """跨房间仍先 raise SMCPNamespaceError，且**未登记任何信号**（证明登记发生在隔离校验之后）."""
-        smcp_namespace.server = mock_server
-        comp_sid = "c-sid"
-        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
-        sess_comp_room1 = {"role": "computer", "office_id": "room1", "name": "c1"}
-        sess_agent_room2 = {"role": "agent", "office_id": "room2", "name": "agent-1"}
-        smcp_namespace.get_session = AsyncMock(
-            side_effect=lambda sid: sess_comp_room1 if sid == comp_sid else sess_agent_room2,
-        )
-        smcp_namespace.call = AsyncMock()
-        with pytest.raises(SMCPNamespaceError, match="跨房间"):
-            await smcp_namespace.on_client_tool_call(
-                "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5},
-            )
-        assert comp_sid not in smcp_namespace._inflight_disconnect_signals
-        smcp_namespace.call.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_toctou_disconnect_before_registration_returns_404(self, guard_ns):
         """TOCTOU：解析 SID 后、登记前目标已断（``get_sid_by_name`` 复查转 None）→ 短路 404，不触发 ``self.call``."""
         ns, agent_sid, comp_name, comp_sid = guard_ns
-        seq = [comp_sid, None]  # 首次解析命中；登记后复查已失联 / first resolve hits, re-check finds it gone
+        # 解析命中 → 读会话后复查仍在 → 登记后复查已失联 / resolve hits, post-read check holds, post-registration check finds it gone
+        seq = [comp_sid, comp_sid, None]
 
-        async def fake_get_sid_by_name(_name):
+        async def fake_get_sid_by_name(_office_id, _role, _name):
             return seq.pop(0) if seq else None
 
         ns.get_sid_by_name = AsyncMock(side_effect=fake_get_sid_by_name)

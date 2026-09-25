@@ -147,6 +147,7 @@ class TestJoinOfficeAckShapeSync:
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-a"},
         }
         ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
+        ns._name_to_sid_map = {("room-a", "computer", "dup"): PEER_SID}  # #215：注册表是房内同名的唯一判据
 
         first = ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-a"})
         assert isinstance(first, dict) and first["code"] == 4105, first
@@ -189,6 +190,7 @@ class TestJoinOfficeAckShapeSync:
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
         }
         ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
+        ns._name_to_sid_map = {("room-a", "computer", "dup"): "sid-1", ("room-b", "computer", "dup"): PEER_SID}
 
         ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-b"})
 
@@ -201,7 +203,7 @@ class TestJoinOfficeAckShapeSync:
 
     def test_registry_conflict_is_4105_without_peer_sid(self) -> None:
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
-        ns._name_to_sid_map = {"taken": PEER_SID}
+        ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
 
         ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
 
@@ -237,7 +239,7 @@ class TestJoinOfficeAckShapeSync:
         monkeypatch.setattr(sync_base_mod, "logger", fake_logger)
 
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
-        ns._name_to_sid_map = {"taken": PEER_SID}
+        ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
 
         ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
 
@@ -459,13 +461,14 @@ class TestSyncAsyncPayloadParitySync:
                 {
                     "session": {"role": "computer", "name": "dup"},
                     PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
+                    "_registry": {("room-b", "computer", "dup"): PEER_SID},  # #215：房内同名由注册表判定
                 },
             ),
             (
                 "name-conflict-registry",
                 {"role": "computer", "name": "taken", "office_id": "room-b"},
                 [],
-                {"session": {"role": "computer", "name": "taken"}, "_registry": {"taken": PEER_SID}},
+                {"session": {"role": "computer", "name": "taken"}, "_registry": {("room-b", "computer", "taken"): PEER_SID}},
             ),
             ("malformed", {}, [], {"session": {}}),
         ]
@@ -488,6 +491,8 @@ class TestSyncAsyncPayloadParitySync:
             sync_ack = sync_ns.on_server_join_office("sid-1", payload)
             async_ack = await async_ns.on_server_join_office("sid-1", payload)
 
+            # 每行都是失败场景：夹具不成立会让两侧同为 None（成功）而「相等」——必须先钉住确是失败
+            assert isinstance(sync_ack, dict) and "code" in sync_ack, f"[{label}] 夹具未构造出失败: {sync_ack!r}"
             assert sync_ack == async_ack, f"[{label}] sync 与 async 载荷分叉: {sync_ack!r} != {async_ack!r}"
 
     async def test_list_room_failure_payloads_are_identical(self) -> None:

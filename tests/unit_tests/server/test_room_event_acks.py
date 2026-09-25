@@ -203,6 +203,7 @@ class TestJoinOfficeAckShape:
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-a"},
         }
         ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
+        ns._name_to_sid_map = {("room-a", "computer", "dup"): PEER_SID}  # #215：注册表是房内同名的唯一判据
 
         # 首次入房撞目标房同名 ⇒ 4105，name 回滚（会话身份从未落地）
         first = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-a"})
@@ -254,6 +255,8 @@ class TestJoinOfficeAckShape:
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
         }
         ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
+        # #215：注册表（键 (office_id, role, name)）是房内同名的唯一判据；#215 前该路径在线上不可构造
+        ns._name_to_sid_map = {("room-a", "computer", "dup"): "sid-1", ("room-b", "computer", "dup"): PEER_SID}
 
         ack = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-b"})
 
@@ -269,8 +272,8 @@ class TestJoinOfficeAckShape:
         """名字注册表冲突（**冲突消息内含对端 sid**）⇒ `4105`，且 ack **绝不**携带该 sid。"""
         sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "taken"}}
         ns = _namespace(sessions)
-        # 注册表里该名字已被**另一个** sid 占用（跨房裸名注册表，过渡态）
-        ns._name_to_sid_map = {"taken": PEER_SID}
+        # 注册表里目标房该 (role, name) 已被**另一个** sid 占用
+        ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
 
         ack = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
 
@@ -323,7 +326,7 @@ class TestJoinOfficeAckShape:
         monkeypatch.setattr(base_mod, "logger", fake_logger)
 
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
-        ns._name_to_sid_map = {"taken": PEER_SID}
+        ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
 
         ack = await ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
 
@@ -591,7 +594,7 @@ class TestEnterRoomDomainErrorTypes:
 
         sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "taken"}}
         ns = _namespace(sessions)
-        ns._name_to_sid_map = {"taken": PEER_SID}
+        ns._name_to_sid_map = {("room-a", "computer", "taken"): PEER_SID}
 
         with pytest.raises(NameConflictError) as exc_info:
             await ns.enter_room("sid-1", "room-a")
@@ -628,7 +631,7 @@ class TestRoomRejectionCodesAreStructurallyConfined:
         rows: list[tuple[str, Any]] = []
 
         # (标签, 请求载荷, 本会话, 对端会话, 参与者, 注册表)
-        join_rows: list[tuple[str, Any, dict[str, Any], dict[str, Any] | None, list[tuple[str, str]], dict[str, str]]] = [
+        join_rows: list[tuple[str, Any, dict[str, Any], dict[str, Any] | None, list[tuple[str, str]], dict[Any, str]]] = [
             ("载荷畸形", {}, {}, None, [], {}),
             ("角色不符", {"role": "computer", "name": "n", "office_id": "r"}, {"role": "agent"}, None, [], {}),
             (
@@ -654,7 +657,7 @@ class TestRoomRejectionCodesAreStructurallyConfined:
                 # 对端必须是**同房同名 computer**，否则同名检查根本不触发（本行曾因此静默变成"成功"）
                 {"role": "computer", "name": "dup", "office_id": "r"},
                 [(PEER_SID, "e")],
-                {},
+                {("r", "computer", "dup"): PEER_SID},  # #215：房内同名由注册表判定
             ),
             (
                 "注册表冲突",
@@ -662,7 +665,7 @@ class TestRoomRejectionCodesAreStructurallyConfined:
                 {"role": "computer", "name": "taken"},
                 None,
                 [],
-                {"taken": PEER_SID},
+                {("r", "computer", "taken"): PEER_SID},
             ),
         ]
         for label, payload, sess, peer, participants, registry in join_rows:

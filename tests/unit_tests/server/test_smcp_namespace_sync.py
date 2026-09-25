@@ -39,6 +39,7 @@ from a2c_smcp.smcp import (
     EnterOfficeReq,
     ErrorCode,
     LeaveOfficeReq,
+    build_computer_not_found_error,
     is_protocol_error_payload,
 )
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
@@ -186,8 +187,8 @@ class TestEnterRoomTransactionalCommitSync:
     成员关系必须与会话状态一致（被拒客户端**不得**留在房里收 ``notify:*``）。
     """
 
-    def test_cross_office_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
-        """跨 office 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房。"""
+    def test_target_room_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
+        """换房撞目标房同 role 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房（#215 后跨 office 同名合法）。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["c-sid", "roomA"])
         session = {"role": "computer", "name": "dup", "office_id": "roomA", "sid": "c-sid"}
@@ -195,7 +196,8 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.save_session = MagicMock()
         smcp_namespace.emit = MagicMock()
         smcp_namespace.leave_room = MagicMock()
-        smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
+        registry = {("roomA", "computer", "dup"): "c-sid", ("roomB", "computer", "dup"): "other-sid"}
+        smcp_namespace._name_to_sid_map = dict(registry)
 
         with pytest.raises(ValueError, match="Name already taken in room"):
             smcp_namespace.enter_room("c-sid", "roomB")
@@ -204,23 +206,23 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.emit.assert_not_called()
         mock_server.enter_room.assert_not_called()  # 目标房从未进入 / never joined the target room
         assert session["office_id"] == "roomA"
-        assert smcp_namespace._name_to_sid_map == {"dup": "other-sid"}
+        assert smcp_namespace._name_to_sid_map == registry
 
     def test_move_with_self_owned_name_succeeds(self, smcp_namespace, mock_server):
-        """换房且注册表里的 name 属于**本 sid** ⇒ 必须放行（``existing_sid == sid`` 豁免）。"""
+        """换房：旧房键属于**本 sid** ⇒ 放行，且键迁移到目标房（旧房键释放、无悬挂，#215）。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["c-sid", "roomA", "roomB"])
         session = {"role": "computer", "name": "dup", "office_id": "roomA", "sid": "c-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
         smcp_namespace.emit = MagicMock()
-        smcp_namespace._name_to_sid_map = {"dup": "c-sid"}
+        smcp_namespace._register_name("roomA", "computer", "dup", "c-sid")  # 经注册入口，正/反向索引同步写入
 
         smcp_namespace.enter_room("c-sid", "roomB")
 
         mock_server.leave_room.assert_called_once_with("c-sid", "roomA", namespace=SMCP_NAMESPACE)
         assert session["office_id"] == "roomB"
-        assert smcp_namespace._name_to_sid_map == {"dup": "c-sid"}
+        assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "dup"): "c-sid"}
         assert [c.args[0] for c in smcp_namespace.emit.call_args_list] == [
             LEAVE_OFFICE_NOTIFICATION,
             ENTER_OFFICE_NOTIFICATION,
@@ -240,7 +242,7 @@ class TestEnterRoomTransactionalCommitSync:
 
         mock_server.leave_room.assert_called_once_with("solo", "roomB", namespace=SMCP_NAMESPACE)
         assert "office_id" not in session
-        assert "solo" not in smcp_namespace._name_to_sid_map
+        assert smcp_namespace._name_to_sid_map == {}
 
     def test_phase2_success_is_untouched_by_convergence(self, smcp_namespace, mock_server):
         """**正对照**：同装置成功路径 ⇒ 成员关系 / 会话 / 注册 / 广播各就位。"""
@@ -254,7 +256,7 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.enter_room("solo", "roomB")
 
         assert session["office_id"] == "roomB"
-        assert smcp_namespace._name_to_sid_map["solo"] == "solo"
+        assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "solo"): "solo"}
         smcp_namespace.emit.assert_called_once()
         mock_server.leave_room.assert_not_called()  # 成功路径不得出现摘除 / no eviction on success
 
@@ -266,14 +268,14 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
         smcp_namespace.emit = MagicMock(side_effect=RuntimeError("leave broadcast boom"))
-        smcp_namespace._name_to_sid_map = {"n": "c-sid"}
+        smcp_namespace._name_to_sid_map = {("roomA", "computer", "n"): "c-sid"}
 
         with pytest.raises(RuntimeError, match="leave broadcast boom"):
             smcp_namespace.enter_room("c-sid", "roomB")
 
         assert session["office_id"] == "roomA"
         mock_server.leave_room.assert_not_called()
-        assert smcp_namespace._name_to_sid_map == {"n": "c-sid"}
+        assert smcp_namespace._name_to_sid_map == {("roomA", "computer", "n"): "c-sid"}
 
     def test_leave_room_committed_converges_to_no_room(self, smcp_namespace, mock_server):
         """换房时旧房离开**已提交**后失败（入房通知抛错）⇒ 收敛为「无房」。"""
@@ -282,7 +284,7 @@ class TestEnterRoomTransactionalCommitSync:
         session = {"role": "computer", "name": "n", "office_id": "roomA", "sid": "c-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
-        smcp_namespace._name_to_sid_map = {"n": "c-sid"}
+        smcp_namespace._register_name("roomA", "computer", "n", "c-sid")  # 经注册入口，正/反向索引同步写入
 
         def _emit_boom(event: str, *args: object, **kwargs: object) -> None:
             if event == ENTER_OFFICE_NOTIFICATION:
@@ -296,7 +298,7 @@ class TestEnterRoomTransactionalCommitSync:
         left = [c.args[:2] for c in mock_server.leave_room.call_args_list]
         assert ("c-sid", "roomA") in left and ("c-sid", "roomB") in left
         assert "office_id" not in session
-        assert "n" not in smcp_namespace._name_to_sid_map
+        assert smcp_namespace._name_to_sid_map == {}, "旧房键与目标房键均须回收"
 
     def test_join_office_rollback_removes_fields_absent_from_backup(self, smcp_namespace, mock_server):
         """backup 里**没有** role/name（全新连接首连即被拒）⇒ 回滚须删除字段，而非留下 ``None``。"""
@@ -338,7 +340,7 @@ class TestEnterRoomTransactionalCommitSync:
 
         def _emit_hijack_then_boom(event: str, *args: object, **kwargs: object) -> None:
             if event == ENTER_OFFICE_NOTIFICATION:
-                smcp_namespace._name_to_sid_map["solo"] = "intruder"  # 并发抢占
+                smcp_namespace._name_to_sid_map[("roomB", "computer", "solo")] = "intruder"  # 并发抢占
                 raise RuntimeError("broadcast boom")
 
         smcp_namespace.emit = MagicMock(side_effect=_emit_hijack_then_boom)
@@ -346,10 +348,10 @@ class TestEnterRoomTransactionalCommitSync:
         with pytest.raises(RuntimeError, match="broadcast boom"):
             smcp_namespace.enter_room("solo", "roomB")
 
-        assert smcp_namespace._name_to_sid_map == {"solo": "intruder"}, "不得替抢占者注销 name 映射"
+        assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "solo"): "intruder"}, "不得替抢占者注销 name 映射"
 
     def test_agent_name_conflict_never_enters_room(self, smcp_namespace, mock_server):
-        """闸门**角色无关**：Agent 撞跨 office 同名同样不得进入房间。"""
+        """闸门对 Agent 同样生效：Agent 撞目标房同 role 同名（注册表闸门）不得进入房间。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["a-sid"])
         mock_server.manager.get_participants.return_value = []
@@ -357,7 +359,7 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
         smcp_namespace.emit = MagicMock()
-        smcp_namespace._name_to_sid_map = {"dup": "other-sid"}
+        smcp_namespace._name_to_sid_map = {("roomB", "agent", "dup"): "other-sid"}
 
         with pytest.raises(ValueError, match="Name already taken in room"):
             smcp_namespace.enter_room("a-sid", "roomB")
@@ -432,7 +434,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
         sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
         smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid, ("room1", "agent", "agent-1"): agent_sid}
         smcp_namespace.call = MagicMock()
         return smcp_namespace, agent_sid, comp_name, comp_sid
 
@@ -563,22 +565,36 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         assert ret["details"]["computer_name"] == "absent"
         smcp_namespace.call.assert_not_called()  # 未找到时不应转发 / no relay on not-found
 
-    def test_get_blob_cross_office_raises_smcp_namespace_error(self, smcp_namespace, mock_server):
-        """跨房间 → 显式 raise SMCPNamespaceError（对齐 #31 `-O` 加固）.
-        Cross-office → explicit raise SMCPNamespaceError (per #31)."""
+    def test_get_blob_cross_office_is_uniform_404(self, smcp_namespace, mock_server):
+        """跨房间 → 与「不存在」相同的 flat 404（#215 房内解析，sync mirror），不转发.
+        Cross-office target → the same flat 404 as an absent one (#215), never relayed."""
         smcp_namespace.server = mock_server
         comp_sid = "c-sid"
-        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", "c1"): comp_sid, ("room2", "agent", "agent-1"): "a-sid"}
         sess_comp = {"role": "computer", "office_id": "room1", "name": "c1"}
         sess_agent = {"role": "agent", "office_id": "room2", "name": "agent-1"}
         smcp_namespace.get_session = MagicMock(
             side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent,
         )
-        with pytest.raises(SMCPNamespaceError, match="跨房间"):
-            smcp_namespace.on_client_get_blob(
-                "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "c1", "blob_handle": "h"},
-            )
+        smcp_namespace.call = MagicMock()
+        ret = smcp_namespace.on_client_get_blob(
+            "a-sid",
+            {"agent": "agent-1", "req_id": "r", "computer": "c1", "blob_handle": "h"},
+        )
+        assert ret == build_computer_not_found_error("c1")
+        smcp_namespace.call.assert_not_called()
+
+    def test_registry_session_divergence_raises(self, smcp_namespace, mock_server):
+        """不变量守卫：注册表键指向的会话与键不符（人为破坏）→ 显式 raise SMCPNamespaceError（#31；sync mirror）."""
+        smcp_namespace.server = mock_server
+        smcp_namespace._name_to_sid_map = {("room1", "computer", "c1"): "c-sid"}
+        sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
+        sess_corrupt = {"role": "agent", "office_id": "room1", "name": "c1"}
+        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_corrupt if sid == "c-sid" else sess_agent)
+        smcp_namespace.call = MagicMock()
+        with pytest.raises(SMCPNamespaceError, match="不一致"):
+            smcp_namespace.on_client_get_skills("a-sid", {"agent": "agent-1", "req_id": "r", "computer": "c1"})
+        smcp_namespace.call.assert_not_called()
 
     def test_on_server_update_skills_broadcasts(self, smcp_namespace, mock_server):
         smcp_namespace.server = mock_server
@@ -637,7 +653,7 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         smcp_namespace.server = mock_server
         comp_sid = "c-sid"
         comp_name = "c1"
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid}
         sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
         smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else None)
         smcp_namespace.call = MagicMock()
@@ -674,7 +690,7 @@ class TestInflightTargetDisconnectGuardSync:
         sess_agent = {"role": "agent", "office_id": "room1", "name": "agent-1"}
         sess_comp = {"role": "computer", "office_id": "room1", "name": comp_name}
         smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
-        smcp_namespace._name_to_sid_map = {comp_name: comp_sid, "agent-1": agent_sid}
+        smcp_namespace._name_to_sid_map = {("room1", "computer", comp_name): comp_sid, ("room1", "agent", "agent-1"): agent_sid}
         smcp_namespace.call = MagicMock()
         return smcp_namespace, agent_sid, comp_name, comp_sid
 
@@ -763,28 +779,11 @@ class TestInflightTargetDisconnectGuardSync:
             for w in workers:
                 w.join(timeout=2)
 
-    def test_cross_office_raises_with_no_dangling_signal(self, smcp_namespace, mock_server):
-        """跨房间仍先 raise SMCPNamespaceError，且未登记任何信号（登记在隔离校验之后；sync）."""
-        smcp_namespace.server = mock_server
-        comp_sid = "c-sid"
-        smcp_namespace._name_to_sid_map = {"c1": comp_sid, "agent-1": "a-sid"}
-        sess_comp = {"role": "computer", "office_id": "room1", "name": "c1"}
-        sess_agent = {"role": "agent", "office_id": "room2", "name": "agent-1"}
-        smcp_namespace.get_session = MagicMock(side_effect=lambda sid: sess_comp if sid == comp_sid else sess_agent)
-        smcp_namespace.call = MagicMock()
-        with pytest.raises(SMCPNamespaceError, match="跨房间"):
-            smcp_namespace.on_client_tool_call(
-                "a-sid",
-                {"agent": "agent-1", "req_id": "r", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5},
-            )
-        assert comp_sid not in smcp_namespace._inflight_disconnect_signals
-        smcp_namespace.call.assert_not_called()
-
     def test_toctou_disconnect_before_registration_returns_404(self, guard_ns):
         """TOCTOU：解析后、登记前目标已断（``get_sid_by_name`` 复查转 None）→ 短路 404，不触发 ``self.call``（sync）."""
         ns, agent_sid, comp_name, comp_sid = guard_ns
-        seq = [comp_sid, None]
-        ns.get_sid_by_name = MagicMock(side_effect=lambda _name: seq.pop(0) if seq else None)
+        seq = [comp_sid, comp_sid, None]  # 解析命中 → 读会话后复查仍在 → 登记后复查已失联
+        ns.get_sid_by_name = MagicMock(side_effect=lambda _office_id, _role, _name: seq.pop(0) if seq else None)
         ns.call = MagicMock(return_value={"ok": True})
         ret = ns.on_client_tool_call(agent_sid, self._tool_call_req(comp_name, timeout=5))
         assert ret["code"] == int(ErrorCode.NOT_FOUND)

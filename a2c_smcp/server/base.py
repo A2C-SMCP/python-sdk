@@ -15,7 +15,7 @@ from socketio import AsyncNamespace
 
 from a2c_smcp.exceptions import NameConflictError
 from a2c_smcp.server.auth import AuthenticationProvider
-from a2c_smcp.server.types import SID
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
 logger = get_logger("server")
@@ -38,9 +38,13 @@ class BaseNamespace(AsyncNamespace):
         """
         super().__init__(namespace=namespace)
         self.auth_provider = auth_provider
-        # name到sid的映射表，用于通过name查找session
-        # name-to-sid mapping table for finding session by name
-        self._name_to_sid_map: dict[str, SID] = {}
+        # (office_id, role, name) → sid 映射表（#215：键空间即协议的房内唯一性作用域）
+        # (office_id, role, name) → sid mapping (#215: the key space is the per-room uniqueness scope)
+        self._name_to_sid_map: dict[NAME_KEY, SID] = {}
+        # 反向索引 sid → 其持有的唯一键：注销按 sid 删，**不**依赖可变的会话字段反推（回滚会 pop 掉 role/name，
+        # 反推失败即留下永久 4105 的残留键）。一个 sid 至多持有一个键。
+        # Reverse index sid → its single key: unregister by sid, never by re-deriving from mutable session fields.
+        self._sid_to_name_key: dict[SID, NAME_KEY] = {}
 
     async def on_connect(self, sid: SID, environ: dict, auth: dict | None = None) -> bool:
         """
@@ -125,33 +129,32 @@ class BaseNamespace(AsyncNamespace):
         """
         return await super().trigger_event(event.replace(":", "_"), *args)
 
-    async def _ensure_name_registerable(self, name: str, sid: SID) -> None:
+    async def _ensure_name_registerable(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """
-        名字注册闸门：``name`` 被**其它** sid 占用时抛出（本 sid 持有视为可注册，幂等）。
-        Name-registration gate: raise when ``name`` is held by *another* sid.
+        名字注册闸门：键 ``(office_id, role, name)`` 被**其它** sid 占用时抛出（本 sid 持有视为可注册，幂等）。
+        Name-registration gate: raise when ``(office_id, role, name)`` is held by *another* sid.
 
-        #213：``enter_room`` 在**任何成员关系变更之前**调用本闸门。此前该冲突只在
-        ``_register_name`` 内被发现，而那时 socket 已经进入房间；异常回滚又只覆盖会话、不回滚房间
-        ⇒ 被拒客户端留在房里收 ``notify:*``（协议 room-model.md §Computer 加入规则 注记 3
-        「校验必须先于副作用」）。``_register_name`` 亦经本方法判定，判据**单点**、不会漂移。
+        #215：注册表键空间即协议的唯一性作用域——**房内同 role 同名唯一**（room-model.md §房内名字唯一性）；
+        跨房同名、同名异 role 均允许，SDK **MUST NOT** 施加全局名字空间唯一性。``office_id`` 须由调用方
+        **显式**给出目标房：Computer 换房的校验阶段，会话里仍是旧房。
+        #215: the key space *is* the protocol's uniqueness scope (per room, per role). The target
+        office is passed explicitly — during a Computer's room switch the session still names the old one.
 
-        注意：本闸门镜像的是**当前注册表的键空间**（裸 ``name``，无 office/role 作用域——过渡态），
-        **不是**协议的名字唯一性规则（协议口径为房内 ``(office_id, role, name)``，见 room-model.md
-        §房内名字唯一性）。注册表键空间收敛由 #215 落地；本方法是**冲突判据**的单点，但 #215 还需
-        一并处理同以裸名为键的 ``get_sid_by_name``（路由）与 ``_unregister_name``（注销）。
-        This gate mirrors the *current registry key space* (bare name, transitional), not the
-        protocol's per-room uniqueness rule; #215 lands the composite key — the single point for the
-        *conflict predicate*, alongside the bare-name ``get_sid_by_name`` / ``_unregister_name``.
+        #213：``enter_room`` 在**任何成员关系变更之前**调用本闸门（协议 注记 3「校验必须先于副作用」）；
+        ``_register_name`` 亦经本方法判定，判据**单点**、不会漂移。
+        #213: ``enter_room`` runs this gate before any membership change; ``_register_name`` reuses it.
 
         Args:
+            office_id (OFFICE_ID): 目标房 / Target office
+            role (str): 客户端角色 / Client role
             name (str): 客户端名称 / Client name
             sid (SID): 客户端连接ID / Client connection ID
 
         Raises:
-            NameConflictError: 当name已被其他sid使用时（``4105``；``ValueError`` 子类，兼容既有
-                ``except ValueError`` 契约）/ When the name is already used by another sid.
+            NameConflictError: 键已被其他 sid 使用时（``4105``；``ValueError`` 子类，兼容既有
+                ``except ValueError`` 契约）/ When the key is already held by another sid.
         """
-        existing_sid = self._name_to_sid_map.get(name)
+        existing_sid = self._name_to_sid_map.get((office_id, role, name))
         if existing_sid is not None and existing_sid != sid:
             # 冗长诊断（**含对端 sid**）只进日志：ack 载荷 MUST NOT 携带其它会话的内部标识
             # （error-handling.md:149）。异常消息本身只含自身上下文 ⇒ 泄露**构造上**不可能，
@@ -159,61 +162,73 @@ class BaseNamespace(AsyncNamespace):
             # Verbose diagnostics (peer sid included) go to logs only; the exception message is
             # self-relative by construction, so it can never leak into an ack payload (#214).
             logger.warning(
-                f"名字冲突 / name conflict: name={name!r} held by sid={existing_sid!r}, "
-                f"requested by sid={sid!r}, namespace={self.namespace}",
+                f"名字冲突 / name conflict: office={office_id!r} role={role!r} name={name!r} held by "
+                f"sid={existing_sid!r}, requested by sid={sid!r}, namespace={self.namespace}",
             )
             raise NameConflictError()
 
-    async def _register_name(self, name: str, sid: SID) -> None:
+    async def _register_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """
-        注册name到sid的映射，如果name已存在则抛出异常
-        Register name-to-sid mapping, raise exception if name already exists
+        注册 ``(office_id, role, name)`` → sid 映射，键已被其它 sid 持有则抛出异常
+        Register the ``(office_id, role, name)`` → sid mapping; raise if another sid holds the key
 
         Args:
+            office_id (OFFICE_ID): 房间ID / Office ID
+            role (str): 客户端角色 / Client role
             name (str): 客户端名称 / Client name
             sid (SID): 客户端连接ID / Client connection ID
 
         Raises:
-            ValueError: 当name已被其他sid使用时 / When name is already used by another sid
+            NameConflictError: 当键已被其他sid使用时 / When the key is already held by another sid
         """
-        await self._ensure_name_registerable(name, sid)
-        if name in self._name_to_sid_map:
+        await self._ensure_name_registerable(office_id, role, name, sid)
+        key = (office_id, role, name)
+        if key in self._name_to_sid_map:
             # 如果是同一个sid重新注册，允许（幂等操作）
             # Allow re-registration by the same sid (idempotent operation)
-            logger.debug(f"Name '{name}' re-registered by same sid '{sid}'")
+            logger.debug(f"Name {key!r} re-registered by same sid '{sid}'")
         else:
-            self._name_to_sid_map[name] = sid
-            logger.debug(f"Registered name '{name}' -> sid '{sid}' in namespace {self.namespace}")
+            # 一个 sid 至多持有一个键：先释放它此前持有的（正常路径已由 leave_room 释放，此处兜住收敛失败的残留）
+            # One key per sid: release any key it still holds (normally already released by leave_room).
+            await self._unregister_name(sid)
+            self._name_to_sid_map[key] = sid
+            self._sid_to_name_key[sid] = key
+            logger.debug(f"Registered name {key!r} -> sid '{sid}' in namespace {self.namespace}")
 
     async def _unregister_name(self, sid: SID) -> None:
         """
-        注销sid对应的name映射
-        Unregister name mapping for the given sid
+        注销sid当前持有的名字映射（按反向索引 ``sid → key`` 定位，**不**从会话字段反推）
+        Unregister the name mapping held by ``sid`` (located via the reverse index, not the session)
+
+        会话的 role/name 可能已被 ``on_server_join_office`` 的回滚 pop 掉（首次入房失败且收敛也失败时），
+        从会话反推会找不到键 ⇒ 残留键把该房同 role 同名永久拒为 ``4105``。反向索引与注册同源写入，杜绝分叉。
+        **归属守卫**：只删除确由本 sid 持有的键——绝不替其它 sid 注销（单点守卫，调用方无需各自再判）。
+        Session fields may have been rolled back; the reverse index is written together with the registry,
+        so it cannot diverge. Ownership guard: a key now held by another sid is never removed.
 
         Args:
             sid (SID): 客户端连接ID / Client connection ID
         """
-        # 通过session直接获取name，避免遍历映射表
-        # Get name directly from session to avoid iterating through the map
-        session = await self.get_session(sid)
-        name = session.get("name")
+        key = self._sid_to_name_key.pop(sid, None)
+        if key is not None and self._name_to_sid_map.get(key) == sid:
+            del self._name_to_sid_map[key]
+            logger.debug(f"Unregistered name {key!r} for sid '{sid}' in namespace {self.namespace}")
 
-        if name and name in self._name_to_sid_map:
-            del self._name_to_sid_map[name]
-            logger.debug(f"Unregistered name '{name}' for sid '{sid}' in namespace {self.namespace}")
-
-    async def get_sid_by_name(self, name: str) -> SID | None:
+    async def get_sid_by_name(self, office_id: OFFICE_ID, role: str, name: str) -> SID | None:
         """
-        通过name获取对应的sid
-        Get sid by name
+        在指定房内按 role + name 解析 sid（#215：路由名字解析 MUST 限定在会话所在房内，
+        MUST NOT 做全局裸名解析——room-model.md §跨房间访问防护）
+        Resolve a sid by role + name *inside* the given office (never a global bare-name lookup)
 
         Args:
+            office_id (OFFICE_ID): 房间ID（调用方所在房）/ Office ID (the caller's office)
+            role (str): 目标角色 / Target role
             name (str): 客户端名称 / Client name
 
         Returns:
             SID | None: 对应的sid，如果不存在则返回None / Corresponding sid, or None if not found
         """
-        return self._name_to_sid_map.get(name)
+        return self._name_to_sid_map.get((office_id, role, name))
 
     @staticmethod
     def _extract_headers(environ: dict) -> list:

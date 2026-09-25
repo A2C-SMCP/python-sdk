@@ -42,6 +42,16 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **`a2c_smcp.utils.parse_join_ack` 返回类型变更**（SDK 公开 API）：由 `tuple[bool, str]` 改为
   `JoinOfficeVerdict(ok, code, message)`，便于下游按 `code` 机器分流。**刻意不再兼容**旧元组形态——
   `MINOR` 严格匹配使跨版本对端物理上不可能互联，兼容分支只会掩盖未迁移的调用方。
+- **名字唯一性键空间收敛为 `(office_id, role, name)`**（#215，protocol#61 Q3）：唯一性改为**房内同 role**
+  （协议 MUST NOT 施加全局唯一）。用户可感：**跨 office 同名**、**同名 Agent + Computer** 不再被 `4105`
+  误拒；同房同 role 同名仍 `4105`。`client:*` 路由改为在**发起者所在房内**解析——目标只在他房 / 名字属于
+  Agent 时立即回 flat `404`（与「不存在」逐字节相同，不泄露他房成员存在性），此前为抛异常致调用方挂满超时。
+  未入房发起者的路由拒绝仍为抛异常（flat `4103` 承载见 #216）。
+  - Server 子类化 API 签名变更（不留兼容）：`get_sid_by_name(office_id, role, name)`、
+    `_register_name(office_id, role, name, sid)`、`_ensure_name_registerable(office_id, role, name, sid)`；
+    `_name_to_sid_map` 键改为 `(office_id, role, name)` 元组（`server.types.NAME_KEY`），新增反向索引
+    `_sid_to_name_key`：`_unregister_name` 按 sid 注销、不再从可变会话字段反推（杜绝回滚后残留键致永久 4105），
+    并内置归属守卫（只删本 sid 持有的键）。`enter_room` 的 Computer 房内同名扫描并入注册表闸门（判据单点）。
 - **`enter_room` / `_ensure_name_registerable` 的业务拒绝改抛领域异常**
   （`RoomFullError` / `NameConflictError` / `AlreadyInRoomError`，均为 `ValueError` 子类，携带 `code`）。
 

@@ -16,7 +16,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.exceptions import (
     AlreadyInRoomError,
-    NameConflictError,
     RoomFullError,
     RoomRejection,
     SMCPNamespaceError,
@@ -196,23 +195,10 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # The old room is left in phase 2 — all target-room gates must run first.
             past_room = session.get("office_id") or None
 
-            # 检查房间内是否已有同名的Computer
-            # Check if there's already a Computer with the same name in the room
-            computer_name = session.get("name")
-            if computer_name:
-                for participant_sid, _participant_eio_sid in self.server.manager.get_participants(SMCP_NAMESPACE, room):
-                    if participant_sid == sid:
-                        continue
-                    participant_session = self.get_session(participant_sid)
-                    if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
-                        logger.warning(
-                            f"Computer name {computer_name!r} already taken in room {room!r}; rejecting sid={sid}",
-                        )
-                        raise NameConflictError()
-
-        # 名字注册闸门（角色无关）：必须早于任何成员关系变更（本单根因：原先该冲突在入房后才暴露）
-        # Role-agnostic name-registration gate: must fire before any membership change.
-        self._ensure_name_registerable(session["name"], sid)
+        # 房内同 role 同名闸门（#215，键 ``(office_id, role, name)``；Agent / Computer 同一判据）：必须早于任何
+        # 成员关系变更（#213）；目标房显式传入（换房的 Computer 此刻会话里仍是旧房）。镜像 async 实现。
+        # Per-room, per-role name gate (#215) — must fire before any membership change (#213).
+        self._ensure_name_registerable(room, session["role"], session["name"], sid)
 
         # ── 阶段 2：生效（成员关系变更） / Phase 2: effects (membership changes) ──
         registered = False
@@ -227,7 +213,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
 
             # 注册name到sid的映射
             # Register name-to-sid mapping
-            self._register_name(session["name"], sid)
+            self._register_name(room, session["role"], session["name"], sid)
             registered = True
 
             # 根据角色发送不同的通知 / Send different notifications based on role
@@ -249,8 +235,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # Commit-point discrimination; see the async implementation for the full rationale.
             if past_room is None or session.get("office_id") != past_room:
                 try:
-                    # name 映射归属守卫：绝不替并发抢占者注销 / never unregister another sid's mapping
-                    if registered and self._name_to_sid_map.get(session.get("name")) == sid:
+                    # 按反向索引注销本次注册的键；``_unregister_name`` 自带归属守卫，绝不替并发抢占者注销
+                    # Unregisters via the reverse index; ``_unregister_name`` is ownership-guarded.
+                    if registered:
                         self._unregister_name(sid)
                     for stale_room in list(self.rooms(sid)):
                         if stale_room == sid:
@@ -571,34 +558,53 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         统一收敛 office/role 隔离校验、Computer SID 解析、flat ErrorPayload 透传。
         Unifies office/role isolation, Computer SID lookup, and flat-ErrorPayload pass-through.
 
-        Computer 名未命中 → 回 flat ``ErrorPayload(404)``（#92，error-handling.md §20 + §78），**不**抛
-        未捕获异常（同步 socketio 下抛异常会杀线程、不回 ack，致 Agent ``call`` 静默超时）。office/role
-        隔离失败仍 raise ``SMCPNamespaceError``（安全：跨房间不泄露 Computer 存在性，见 exceptions.py）。
-        Computer name miss → flat ``ErrorPayload(404)`` (no uncaught raise); isolation failures still raise.
+        Computer 名在**发起者所在房内**未命中（#215：他房同名 / 名字属于 Agent 同样落此分支，与「不存在」不可区分）
+        → 回 flat ``ErrorPayload(404)``（#92，error-handling.md §20 + §78），**不**抛未捕获异常（同步 socketio 下
+        抛异常会杀线程、不回 ack，致 Agent ``call`` 静默超时）。发起者会话缺失 / 未入房 / 注册表不变量破坏仍
+        raise ``SMCPNamespaceError``（未入房的 flat 4103 承载归 #216）。
+        In-office name miss → flat ``ErrorPayload(404)``; session-gone / office-less / invariant breaks still raise.
 
         ``timeout`` 仅 ``tool_call`` 透传 per-request 超时；其余 ``client:*`` 事件留 None → 走 socketio 默认。
         ``timeout`` is only passed through for ``tool_call``; other events leave it None (socketio default).
 
         协议依据 / Protocol: events.md 各 ``client:*`` 事件 + error-handling.md flat ErrorPayload.
         """
-        computer_name = data["computer"]
-        computer_sid = self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            return build_computer_not_found_error(computer_name)
-
-        session = self.get_session(computer_sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError(f"目前仅支持 Computer 响应 {event} / target SID is not a Computer")
-
         agent_session = self.get_session(sid)
         if agent_session is None:
             # 发起者（Agent）飞行中断连：会话已不存在。显式 raise 替代 None.get 的 AttributeError
-            # （对齐 #31）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            # （对齐 #31 隔离不变量显式 raise）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            # Originator (Agent) disconnected in-flight: session gone. Explicit raise instead of an
+            # AttributeError on None.get (aligns with #31). Protocol allows Server MAY silently not-ack.
             raise SMCPNamespaceError(f"发起者会话不存在（可能已断连）：{event} / originator session gone")
-        if session.get("office_id") != agent_session.get("office_id"):
-            raise SMCPNamespaceError(
-                f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
-            )
+        agent_office = agent_session.get("office_id")
+        if not agent_office:
+            # 无房发起者无从在房内解析目标（room-model.md §跨房间访问防护）。承载形态（flat 4103）归 #216。
+            # An office-less initiator cannot resolve anything in-room; the flat-4103 carrier belongs to #216.
+            raise SMCPNamespaceError(f"发起者未加入任何房间：{event} / initiator is not in any office")
+
+        # #215：名字解析**限定在发起者所在房内**、按 role=computer 查（MUST NOT 全局裸名解析）。解析不到统一回
+        # 404——与「该名字存在于其它房 / 属于同房 Agent」对外不可区分，杜绝探测他房成员存在性。
+        # #215: resolve inside the initiator's office only; a miss is a uniform 404 (no cross-room probing).
+        computer_name = data["computer"]
+        computer_sid = self.get_sid_by_name(agent_office, "computer", computer_name)
+        if not computer_sid:
+            return build_computer_not_found_error(computer_name)
+
+        try:
+            session = self.get_session(computer_sid)
+        except KeyError:
+            # socket 已被移除（断连收尾）；注销先于移除 ⇒ 下方复查必然判为「已离开」
+            # Socket already removed; unregistration precedes removal, so the re-check below sees it gone.
+            session = None
+        # 解析后目标已离房 / 断连（同步服务端多线程分发下可达：解析与读会话之间另一线程跑完 on_disconnect / 换房）
+        # ⇒ 与「不存在」同义回 404（同在途断连分支）。以注册表复查判定：注销恒先于清会话 office_id。
+        # Target left between resolution and session read (reachable under threaded sync dispatch) → 404.
+        if self.get_sid_by_name(agent_office, "computer", computer_name) != computer_sid:
+            return build_computer_not_found_error(computer_name)
+        # 不变量守卫：注册表仍指向该 sid、会话却与键矛盾 ⇒ 注册表损坏，显式 raise（#31：隔离不变量只 raise）。
+        # Invariant guard: registry still points at the sid but the session contradicts the key → raise (#31).
+        if not session or session.get("role") != "computer" or session.get("office_id") != agent_office:
+            raise SMCPNamespaceError(f"名字注册表与会话不一致：{event} / name registry diverged from session")
 
         # tool_call 透传 per-request timeout；其余 client:* 事件 timeout=None → 用 socketio 默认
         # （勿对默认事件传 timeout=None，socketio 下会变成永久等待而非默认 60s）。
@@ -607,7 +613,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         if timeout is not None:
             call_kwargs["timeout"] = timeout
 
-        client_response = self._call_with_disconnect_guard(event, data, computer_name, computer_sid, call_kwargs)
+        client_response = self._call_with_disconnect_guard(event, data, agent_office, computer_name, computer_sid, call_kwargs)
         if client_response is _DISCONNECTED:
             # 目标在途断连：Computer 中途消失 == 不存在，回 flat ErrorPayload(404)（与 #92/#99 同一 payload）。
             # Target disconnected mid-flight: a vanished Computer == not found → flat ErrorPayload(404).
@@ -620,6 +626,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         self,
         event: str,
         data: Any,
+        office_id: OFFICE_ID,
         computer_name: str,
         computer_sid: SID,
         call_kwargs: dict[str, Any],
@@ -645,7 +652,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # TOCTOU 复查：解析 SID 与登记之间目标可能已断连（信号永不会被 fire）。用 ``get_sid_by_name`` 复查
             # （``on_disconnect`` → base ``_unregister_name`` 清掉 name 映射）关闭该窗口。
             # TOCTOU re-check: target may have died between SID resolve and registration → short-circuit to 404.
-            if disconnect_ev.is_set() or self.get_sid_by_name(computer_name) is None:
+            if disconnect_ev.is_set() or self.get_sid_by_name(office_id, "computer", computer_name) is None:
                 return _DISCONNECTED
 
             # ``disconnect_ev`` 一事二用：完成路径由 ``_runner`` 在 finally 触发，断连路径由 ``on_disconnect`` 触发，

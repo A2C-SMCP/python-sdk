@@ -200,10 +200,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
 
     # client get_tools：校验在同一房间并转发
     ns.get_session = MagicMock(
-        side_effect=[
-            {"role": "computer", "office_id": "room1"},  # computer sess
-            {"role": "agent", "office_id": "room1"},  # agent sess
-        ],
+        side_effect=lambda sid: {"role": "computer", "office_id": "room1"} if sid == "c1" else {"role": "agent", "office_id": "room1"},
     )
     ns.call = MagicMock(
         return_value={
@@ -355,13 +352,13 @@ def test_enter_room_computer_duplicate_name_raises_error(ns):
     new_computer_sid = "new_sid"
     new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
 
-    # Mock get_participants 返回房间内已有的参与者
-    # Mock get_participants to return existing participant
-    ns.server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
-
-    # Mock get_session：第一次返回新Computer的session，第二次返回已存在Computer的session
-    # Mock get_session: first call returns new Computer's session, second returns existing Computer's session
-    ns.get_session.side_effect = [new_session, existing_session]
+    # #215：房内同 role 同名的唯一判据是 ``(office_id, role, name)`` 注册表（已有 Computer 入房时写入）
+    # #215: the (office_id, role, name) registry is the single same-name gate
+    ns._name_to_sid_map = {
+        (existing_session["office_id"], existing_session["role"], existing_session["name"]): existing_computer_sid,
+    }
+    ns.get_session.side_effect = None
+    ns.get_session.return_value = new_session
 
     # 应该抛出 ValueError，提示重名
     # Should raise ValueError indicating duplicate name
