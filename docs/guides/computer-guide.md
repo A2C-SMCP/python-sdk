@@ -312,6 +312,10 @@ await client.connect(
   ——冷启动自愈靠的就是它。CLI 的 `socket join` 走**显式** `join_office`，**不**重试。
 - **手工断开**（`client.disconnect()`）、服务端踢出、重连彻底放弃（重试次数用尽）均清空期望，
   下次 `connect()` 不会静默回旧房间。
+- **`leave_office` 无条件清本地意图（#223）**：先清 desired + 已确认房号、作废在途自动回房，再尽力通知
+  服务端；namespace 不在册（已断线）时**不发包**也**不抛**异常——那时服务端会话已随连接销毁，本就没有
+  可退的成员关系。此前是「先发包后清」，断线时直接抛 `BadNamespaceError` ⇒ 本地意图留着，重连后的自动
+  回房会把用户刚退掉的房又回一遍（CLI `socket leave` 在断线期间就撞在这上面）。
 - **瞬态冲突的有界退避重试（#212）**：静默断线后服务端要等自身心跳超时才回收旧会话（socket.io 默认
   `ping_interval(25) + ping_timeout(20)` ⇒ 最长 **45 秒**），这段时间的回房重放会被判 `4101` / `4105`。
   SDK 对这两码按 `1→2→4→5→5…` 秒退避重试，**默认预算 45 秒**，预算耗尽才清空状态 + 打错误日志 ⇒
@@ -321,16 +325,26 @@ await client.connect(
     部署方调大了服务端 `ping_interval` / `ping_timeout` 时须相应调大——协议的 SHOULD 级部署约束
     （回收窗口应与客户端可接受的恢复时延相称）是客户端补偿能生效的前提，调大到远超预算时重试必然徒劳。
   - `4106` / `500` / 未知码 / 无码 / 传输层失败**不重试**（重试不改变结果，或成员关系可能已变）。
-- 重连窗口内 `emit_update_*` 系列自动 no-op（namespace 不在册时不发无效包）。
-  > **已知边界**（见 #212 实现说明）：回房**在途**（含退避重试）时 namespace 已重新在册、但成员关系尚未
-  > 建立，而 `_in_office()` 只看「desired 非空 + namespace 在册」⇒ 它为真，于是这段时间的
-  > `notify:update_config` / `update_tool_list` / `update_skills` / `update_desktop`
-  > **会被服务端丢弃**（这些是 fire-and-forget 事件、无 ack ⇒ 客户端也收不到任何回执）。后果是房间里
-  > 的 Agent 可能拿不到这几次变更，直到下一次变更或入房重拉。
-  >
-  > 这个缺口**先于 #212 存在**（`_in_office()` 的判据本单未动），但本单把该窗口从「多数场景毫秒级」
-  > 拉长到「最长 = 重试预算 + 一次有界 ACK 等待」。修法（在途窗口内也让 emit 闭嘴，或回房成功后补发一次
-  > 当前状态）另单处理。
+- **断连 / 回放在途窗口内的状态上报（#223）**：`emit_update_config` / `emit_update_tool_list` /
+  `emit_refresh_desktop` / `emit_update_skills` 的发送判据是「**有入房意图**（`office_id` 非空）∧
+  **服务端已确认在房**（`_confirmed_office_id` 非空）∧ namespace 在册」——与协议 `computer.md §2.2` 的
+  「Computer SHOULD 在成功加入 Office 后才发送这四个事件」对齐（rust 侧同款 `has_confirmed_office()`）。
+  判据不成立时**不发包**（发了也会被服务端 `require_office_id` 丢弃，而这些事件是 fire-and-forget、无
+  ack，客户端察觉不到），改为**记下这一类别**；等成员关系重新确立（自动回房成功或显式入房成功）后
+  **逐条补发一次**。协议明确允许这种做法（「未加入 Office 时，本地变化可以被记录或合并，但不应产生跨房间
+  可见通知」）。
+  - 效果：**自本端感知断连起**，断连 / 退避重试窗口内改配置、改工具、改 SKILL、改桌面，房内 Agent 不会
+    漏——回房成功后它们各自收到一次对应的 `notify:update_*`（在此之前，工具面靠 `notify:enter_office`
+    自动重拉能自愈，config / skills / desktop 三类则要等到下一次变更）。
+  - 合并语义：同一类别在窗口内改多次只补发**一次**（按事件名去重）；补发失败（例如又断线）的类别留待
+    **下一次**成员关系确立时再补，退房不清空。
+  - 从未入房时不记录（房内没有旧状态可陈旧，入房时对面本就会重拉）；预算耗尽 / 已退房后 `office_id`
+    已清，同样不记录。
+  - **已知边界（无法消除）**：从物理掉线到本端察觉（`disconnect` 钩子触发）之间，判据仍为真 ⇒ 走直发
+    分支、包随垂死的传输一起丢，既不送达也不补发。要消除它必须给这四个事件加 ack，协议明确禁止；故上面
+    的保证只从「本端感知断连」起算。
+  - **已知边界（既存，非本单引入）**：Computer **进程重启**后用同名入房时，房内 Agent 只会被
+    `notify:enter_office` 触发重拉**工具**；config / skills / desktop 的旧视图要等到下一次变更才刷新。
 - Agent 侧（`AsyncSMCPAgentClient` / `SMCPAgentClient`）同语义：`join_office(office_id, agent_name)`
   会记住该意图，自动重连后重放（同样享受退避重试）；`leave_office` / 手工断开清空。
 - **差异（自 #218 起）**：Agent 的**显式** `join_office` 也等 ACK（有界 10 秒，与回房同值），入房被拒

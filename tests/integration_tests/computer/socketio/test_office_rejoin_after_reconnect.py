@@ -34,11 +34,11 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from socketio import ASGIApp, AsyncServer
+from socketio import ASGIApp, AsyncClient, AsyncServer
 
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
-from a2c_smcp.smcp import SMCP_NAMESPACE
+from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE, UPDATE_CONFIG_NOTIFICATION
 from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace
 
@@ -73,6 +73,10 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
         # When set, the server defers reaping the stale session (as it does on a silent drop until
         # its ping timeout), so the replay hits the real duplicate-name check.
         self.stall_disconnect: asyncio.Event | None = None
+        # #223：按到达顺序的**事件序日志**（``("join", sid)`` 成功重放 / ``("join-rejected", sid)`` /
+        # ``("update_config", sid)``）——用于断言「补发发生在成功重放**之后**」，比两个计数各自断言强。
+        # Arrival-ordered log so the flush can be tied to "after the successful replay".
+        self.event_log: list[tuple[str, str]] = []
 
     async def on_disconnect(self, sid: str) -> None:
         if self.stall_disconnect is not None:
@@ -86,14 +90,21 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
             self.join_results.append(
                 {"code": 4105, "message": "Name already taken in room"},
             )
+            self.event_log.append(("join-rejected", sid))
             self.joined.set()
             return self.join_results[-1]
         result = await super().on_server_join_office(sid, data)
         self.join_record.append((sid, dict(data)))
+        self.event_log.append(("join", sid))
         # v0.5.0（#214）：成功 = 空 ack（None）；失败 = flat ErrorPayload
         self.join_results.append(result)
         self.joined.set()
         return result
+
+    async def on_server_update_config(self, sid: str, data):  # type: ignore[override]
+        """#223：记录到达（含被服务端丢弃的那些）后交给真实 handler（房间广播/拒收都在父类里）。"""
+        self.event_log.append(("update_config", sid))
+        return await super().on_server_update_config(sid, data)
 
 
 @pytest.fixture
@@ -416,3 +427,102 @@ async def test_leave_office_then_reconnect_does_not_rejoin(
         assert client.office_id is None
     finally:
         await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_deferred_config_update_is_flushed_after_the_replay_succeeds(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """#223：回放在途窗口内 ``emit_update_config`` **不发包**；回房成功后**恰补发一次**，房内真收到广播。
+
+    协议依据（computer.md §2.2）：Computer SHOULD 在**成功加入 Office 后**才发送 ``server:update_*``；
+    未加入 Office 时「本地变化可以被记录或合并，但不应产生跨房间可见通知」。窗口内发包会被服务端
+    ``require_office_id`` 拒收——而这些事件是 fire-and-forget（协议禁止为其新增 ack）⇒ 发送端**无感**。
+
+    本用例在**真 wire** 上同时钉住两半：
+
+      ① 窗口内：服务端**零** ``server:update_config``、房内**零** ``notify:update_config``（不白发包）；
+      ② 回房成功后：**恰一包** + 房内 Agent **恰一条** ``notify:update_config``，且**发生在成功重放之后**
+         （事件序日志断言，防「早于 / 绕过回放」的坏实现同样满足计数）。
+
+    真闸门：``stall_disconnect`` 推迟真实 ``on_disconnect`` ⇒ 重放真的撞 ``enter_room`` 的同名检查。
+    """
+    office_id = "rejoin-office"
+    observer = AsyncClient()
+    client = _make_client()
+    client.office_rejoin_retry_budget = 5.0  # 预算充足：本用例要的是「重试后成功并补发」
+    received: list[dict] = []
+
+    @observer.on(UPDATE_CONFIG_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_notify(data: dict) -> None:
+        received.append(data)
+
+    try:
+        # 房内观察者（Agent 角色）：先入场，断线重连期间它一直留在房里
+        await observer.connect(
+            f"http://localhost:{basic_server_port}",
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+        )
+        await observer.call(
+            JOIN_OFFICE_EVENT,
+            {"office_id": office_id, "role": "agent", "name": "observer-agent"},
+            namespace=SMCP_NAMESPACE,
+        )
+
+        await client.connect(
+            f"http://localhost:{basic_server_port}",
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+        )
+        first_sid = client.namespaces[SMCP_NAMESPACE]
+        await client.join_office(office_id)
+        assert client._confirmed_office_id == office_id, "前置：已确认在房（可上报态）"
+
+        # 静默断线：服务端推迟回收旧会话 ⇒ 重放的 join 撞真同名检查并在预算内重试
+        office_server.stall_disconnect = asyncio.Event()
+        office_server.joined.clear()
+        office_server.event_log.clear()
+        ws = client.eio.ws
+        assert ws is not None
+        await ws.close()
+        await _wait_for_new_sid(client, first_sid)
+        await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
+        assert client._confirmed_office_id is None, "前置：回放在途 ⇒ 成员关系尚未确立"
+
+        # ① 窗口内变更：不得发包、不得广播（负例需要静默窗口）
+        await client.emit_update_config()
+        await asyncio.sleep(_QUIESCENCE)
+        assert not any(kind == "update_config" for kind, _ in office_server.event_log), (
+            f"窗口内不得发 server:update_config（发了也会被 require_office_id 丢弃）：{office_server.event_log}"
+        )
+        assert received == [], "窗口内房内不得收到 notify:update_config"
+
+        # 放行回收 ⇒ 下一次重试真的入房成功 ⇒ 补发
+        office_server.stall_disconnect.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CONNECT_TIMEOUT
+        while not received:
+            if loop.time() > deadline:
+                raise AssertionError(f"回房成功后未补发：{office_server.event_log}")
+            await asyncio.sleep(_WAIT_INTERVAL)
+
+        # ② 恰一包 + 恰一条，且都在**成功重放之后**
+        current_sid = client.namespaces[SMCP_NAMESPACE]
+        assert [kind for kind, _ in office_server.event_log].count("update_config") == 1, (
+            f"补发必须恰一次：{office_server.event_log}"
+        )
+        flush_at = office_server.event_log.index(("update_config", current_sid))
+        joined_at = max(
+            i for i, (kind, sid) in enumerate(office_server.event_log) if kind == "join" and sid == current_sid
+        )
+        assert flush_at > joined_at, "补发必须发生在成功重放之后（不得早于/绕过回放）"
+        assert len(received) == 1, f"房内 Agent 恰收到一条 notify:update_config：{received}"
+        assert received[0]["computer"] == "office-rejoin-computer"
+        assert client._confirmed_office_id == office_id, "自愈后成员关系落账"
+    finally:
+        if office_server.stall_disconnect is not None:
+            office_server.stall_disconnect.set()
+        await client.disconnect()
+        await observer.disconnect()

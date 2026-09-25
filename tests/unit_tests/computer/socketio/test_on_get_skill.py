@@ -264,8 +264,9 @@ class TestEmitUpdateSkills:
     async def test_emits_when_in_office(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         client = SMCPComputerClient(computer=_computer(tmp_path, name="comp-x"))
         client.office_id = "office-1"
-        # #203：emit 守卫 = "已入房**且** namespace 在册"（desired 在重连窗口内被保留，
-        # 此时 namespace 不在册，放行会抛 BadNamespaceError）
+        # #223：emit 判据 = "服务端**已确认**成员关系 **且** namespace 在册"（desired 在重连窗口内被保留、
+        # namespace 也可能已重新在册，但那时服务端新会话尚无 office_id ⇒ 发包会被 require_office_id 丢弃）
+        client._confirmed_office_id = "office-1"
         client.namespaces[SMCP_NAMESPACE] = "sid-x"
         called: dict[str, Any] = {}
 
@@ -289,4 +290,5 @@ class TestEmitUpdateSkills:
 
         monkeypatch.setattr(SMCPComputerClient, "emit", fake_emit)
         await client.emit_update_skills()
-        assert "event" not in called  # office_id 守卫：未入房间不发送
+        assert "event" not in called  # 上报判据：未入房间不发送
+        assert client._deferred_office_updates == set(), "无入房意图时不记待补发（#223）"

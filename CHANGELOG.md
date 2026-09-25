@@ -88,6 +88,25 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     互斥；恢复耗时的上界 = 预算 + 一次有界 ACK 等待（末次尝试可在预算边界上发起）。
   - 新增单一权威纯函数 `rejoin_retry_delay` 与常量 `OFFICE_REJOIN_RETRY_BASE_DELAY` /
     `OFFICE_REJOIN_RETRY_MAX_DELAY` / `TRANSIENT_JOIN_CONFLICT_CODES`（`a2c_smcp.utils`）。
+- **回放在途窗口的状态上报不再丢失（#223）**：`server:update_config` / `update_tool_list` /
+  `update_desktop` / `update_skills` 的发送判据由「desired 非空 ∧ namespace 在册」收敛为「有入房意图 ∧
+  **服务端已确认在房** ∧ namespace 在册」——与协议 `computer.md §2.2`「Computer SHOULD 在**成功加入
+  Office 后**才发送这四个事件」对齐（rust 侧早已是同款 `has_confirmed_office()` 判据）。判据不成立时不再
+  对服务端发注定被丢弃的包，而是把**事件名记入待补发集合**；成员关系重新确立（自动回房成功 / 显式入房
+  成功）后**逐条补发一次**（协议同节明许「未加入 Office 时，本地变化可以被记录或合并，但不应产生跨房间
+  可见通知」）。由此，**自本端感知断连起**，断连 / 退避重试窗口内改配置、改工具、改 SKILL、改桌面时，
+  房内 Agent 不再漏收——工具面本就有 `notify:enter_office` 自动重拉兜底，config / skills / desktop 三类
+  此前会一直漏到下一次变更（#212 把该窗口从毫秒级拉长到最长 ≈ 预算 + 一次有界 ACK 等待，放大了这一既存
+  缺口）。「物理掉线 → 本端察觉」之间的残留窗口属 fire-and-forget 固有不可知（消除它必须加 ack，协议
+  禁止），不在本保证范围内。
+  - 规则：同一类别在窗口内改多次**合并为一次**补发（按事件名去重，域恒为 4）；补发失败的条目留待**下一次**
+    成员关系确立时再补（逐条独立，一条失败不饿死其余类别）；从未入房 / 预算耗尽 / 已退房后不记录；退房
+    不清空待补发集合。
+  - 空转语义（写进 docstring）：条目移除 = 「已交给传输层」，**不是**「服务端已收到」——协议明文禁止给这
+    四个事件新增 ack 通道（`error-handling.md` §无 ack 通道的 fire-and-forget 事件），客户端永远无法确证
+    送达。
+  > **跨 SDK 对齐说明（有意的一次分叉）**：本单的**判据**半与 rust 对齐；**合并补发**半是 python 先行
+  > （rust 今天判据不成立即静默丢弃、无补发）⇒ 已开 rust 镜像单跟踪，由 rust 侧决定是否跟进。
 
 ### Fixed
 
@@ -103,6 +122,29 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `_confirmed_office_id`，与它既有的「无码」支同形）。新增常量 `JOIN_VALIDATION_REJECTION_CODES`。
   > 代价（已裁决接受）：`500` 若发生在**提交之前**，双清空会多丢一次恢复机会（旧房号不再回退）——
   > 协议未覆盖此处，按「不臆断、不撒谎」取双清空。
+- **`emit_update_*` 在「回放在途」窗口内误放行（#223）**：判据只看 desired ⇒ 窗口内照发，而服务端**新会话
+  尚无 `office_id`** ⇒ `require_office_id` 拒收；这四个事件是 fire-and-forget、无 ack ⇒ 客户端**无感**，
+  房内 Agent 静默漏掉这几类变更。详见上面 Added 条目的判据 + 合并补发。
+- **Computer 侧补上「会话纪元」守卫，堵住两条会把 `_confirmed_office_id` 写脏的路径（#223 隔离审查）**：
+  「成功落账」在同一会话内刻意不受操作抢占约束（#213），但成员关系**属于会话**——跨会话的一律不得落账。
+  两条实测可达的脏写：①**显式 `join_office`** 等 ACK 期间断连（断连钩子是内联同步触发的，ACK 就绪与钩子
+  清账可同拍）⇒ 那条「成功」属于已销毁的会话；②**退房**在等 office 操作锁期间通知失败（`emit` 抛）⇒
+  临界区之后的清理被整段跳过（现改为 `finally`，异常照旧透传）。两者都会留下「服务端会话无房、本地却
+  自称已确认在房」的幻影态，使上面的判据放行一批注定被丢弃的上报**且不记入待补发**（变更真丢）。
+  新增字段 `_office_session`（镜像 Agent 侧的 #217 裁决 5：`generation` 只管操作抢占，会话作废另立纪元——
+  用 `generation` 守卫落账会连「同一会话内被抢占的成功」一起否掉，#213 明令不得）。
+
+### Changed
+
+- **`SMCPComputerClient.update_config` 与 `emit_update_config` 收敛为同一实现（#223）**：`update_config`
+  此前**无守卫**（无条件发送），与其孪生 `emit_update_config` 行为分叉；现委托后者（同判据、同补发）。
+  宿主若曾在「未确认在房」时依赖它把包发上线，请改用其它通道——那个包本来也会被服务端丢弃。
+- **`SMCPComputerClient.leave_office` 不再因未连接而抛异常（#223）**：改为**先无条件清本地意图**
+  （清 desired + 已确认房号、作废在途自动回房），再在 namespace 在册时通知服务端；不在册时记 DEBUG 并
+  正常返回（服务端会话已随连接销毁，本就没有可退的成员关系）。此前「先发包后清」在断线时抛
+  `BadNamespaceError` ⇒ 清理语句执行不到 ⇒ 本地意图残留 ⇒ 重连后自动回房把用户刚退掉的房又回了一遍。
+  CLI `socket leave` 相应改为「desired 有值就必须真的退」（不再因「未连接 / 未在房」跳过），文案区分
+  「已离开房间」与「未连接：已清除本地入房意图，重连后不再自动回房」。
 
 ## [0.4.0] - 2026-08-25
 

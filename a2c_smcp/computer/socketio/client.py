@@ -226,6 +226,19 @@ class SMCPComputerClient(AsyncClient):
         # ``office_id`` because the entry pre-write can hold an unconfirmed intent (#213).
         self._confirmed_office_id: str | None = None
         self._office_generation: int = 0
+        # ``_office_session`` = **会话纪元**（#223；镜像 Agent 侧的 #217 裁决 5）：每条 socketio 会话
+        # （连接）一个世代，断连钩子与 ``__disconnect_final`` 推进它。它与 ``_office_generation`` 分工：
+        #   · generation ⇒ **操作抢占**（谁的最后声明生效：desired / 失败效应的去留）；
+        #   · session   ⇒ **会话作废**（陈旧的「成功落账」不得跨会话复活）。
+        # 一个计数器兼顾不了两件事：用 generation 守卫落账会连「同一会话内被抢占的成功」一起否掉，而
+        # #213 要求那种成功必须落账（回退目标须指向最近一次真实成员变更）。断连钩子是**内联同步**触发的
+        # （见下方 hooks 注释）⇒ 「ACK 已就绪、join 任务尚未恢复」与「钩子已清账」可以同拍发生，若落账不
+        # 分会话，就会在断连后把已随会话销毁的房写回 ``_confirmed_office_id`` ⇒ #223 的上报判据放行一批
+        # 注定被丢弃的包（且不记待补发）。
+        # ``_office_session`` = the session epoch (mirrors the Agent side's #217 ruling 5): it separates
+        # "operation supersession" (generation) from "session invalidation" (this counter), so a success
+        # belonging to a dead session can never resurrect the membership.
+        self._office_session: int = 0
         self._office_rejoin_task: asyncio.Task[None] | None = None
         self._office_op_lock = asyncio.Lock()
         # #212 自动回房的退避预算（公开可配置，默认 ``OFFICE_REJOIN_RETRY_BUDGET`` = 45s，覆盖 socket.io
@@ -235,6 +248,28 @@ class SMCPComputerClient(AsyncClient):
         # Bounded backoff budget (seconds) for the replay's transient 4101/4105 rejections; assignable per
         # instance. <= 0 disables retrying.
         self.office_rejoin_retry_budget: float = OFFICE_REJOIN_RETRY_BUDGET
+        # #223 待补发上报集合（存**事件名**，域恒为 4 个 ``server:update_*`` ⇒ 最多 4 个元素）：
+        # 有入房意图但服务端尚未确认成员关系（断线窗口 / 回放在途）时，上报发不出去——直接丢掉会让房内
+        # Agent 永久漏掉 config / skills / desktop 的变更（工具面靠 ``notify:enter_office`` 自动重拉自愈，
+        # 这三类不会）。协议允许「未加入 Office 时记录或合并本地变化」（computer.md §2.2）⇒ 先记下来，
+        # 等成员关系确立再补发（:meth:`_flush_deferred_office_updates`）。
+        # 四条不变量 / Four invariants:
+        #   (i) 单事件循环内读写，**无需加锁**：本客户端是 async-only，五个上报方法的所有调用点都在循环内
+        #       （唯一的跨线程入口——DropIn watcher 线程——经 ``loop.call_soon_threadsafe`` 回投）；
+        #       再加锁反而与不可重入的 ``_office_op_lock`` 形成锁序风险。
+        #   (ii) 重复补发对接收端良性（payload 只有 ``{computer}``，对端按通知重拉）。
+        #   (iii) 条目移除 = 「已交给传输层」，**不是**「服务端已收到」（engineio 未连接时静默返回；
+        #        协议又禁止给这些事件加 ack ⇒ 客户端永远无法确证送达）。退房**不**清空本集合。
+        #   (iv) **残留窗口**：从物理掉线到 ``_on_namespace_disconnect`` 触发之间，判据仍为真 ⇒ 走**直发**
+        #        分支（不记录）：包进写队列后随垂死的传输一起丢（或 engineio 直接静默返回）——既不送达也
+        #        不补发。这与「服务端已收包但因无 office_id 丢弃」同属 fire-and-forget 的固有不可知，是
+        #        本判据**无法**消除的边界（要消除必须加 ack，协议禁止）；故文档/CHANGELOG 不得承诺「窗口内
+        #        的变更一定不丢」，只能承诺「自本端感知断连起不丢」。
+        # Residual window: between the physical drop and the disconnect hook the guard still passes, so the
+        # direct path hands the packet to a dying transport — inherently unobservable without an ack.
+        # Pending ``server:update_*`` event names to re-announce once membership is (re)established;
+        # single-loop, lock-free, idempotent for receivers.
+        self._deferred_office_updates: set[str] = set()
         # 引擎级（非协议）namespace 生命周期钩子。两个 handler 刻意写成**同步函数**：engineio 以
         # ``run_async=False`` 内联触发 'disconnect'（engineio/async_client.py:614），在其中 await 会把
         # 拆链与 ``eio.disconnect()`` 一起卡住——函数签名是"零 await"的结构性保证。
@@ -254,16 +289,97 @@ class SMCPComputerClient(AsyncClient):
 
     def _in_office(self) -> bool:
         """
-        ``server:update_*`` 上报守卫：是否"已入房**且**连接可用"。
+        「有入房意图 ∧ 连接可用」——**CLI 的退房/改名判据**，不是上报判据。
 
-        Guard for the ``server:update_*`` emitters: in an office *and* on a live namespace.
+        "Has an office intent and a live namespace" — the CLI's leave/rename guard, *deliberately
+        not* the update-notification guard.
 
         #203：不能只看 ``office_id``——desired 在重连窗口内被刻意保留，此时 namespace 不在册，
         ``emit`` 会抛 ``BadNamespaceError``（破坏 ``Computer`` 侧记录的"未入房 → no-op"契约）。
         Since #203 the desired office survives a reconnect window, where the namespace is not
         registered and ``emit`` would raise ``BadNamespaceError``.
+
+        #223：本判据**不代表服务端已认可成员关系**——回放在途时 desired 在、namespace 已重新在册，而
+        服务端新会话尚无 ``office_id``。故 ``server:update_*`` 的上报判据另立
+        :meth:`_can_emit_office_update`（多要「已确认」半）；本判据继续服务 CLI：在途窗口里用户退房仍应
+        发出 ``server:leave_office`` 并清掉本地意图（否则重连后自动回房会把刚退的房又回一遍）。
+        Not a proxy for server-confirmed membership: the emitters have their own guard (#223), while
+        the CLI must still be able to leave mid-replay.
         """
         return self.office_id is not None and self._namespace in self.namespaces
+
+    def _can_emit_office_update(self) -> bool:
+        """
+        ``server:update_*`` 的上报判据：有入房意图 ∧ 服务端**已确认**成员关系 ∧ namespace 在册。
+
+        Protocol precondition (``computer.md`` §2.2): a Computer SHOULD emit these four events only
+        *after successfully joining an office*; while not in one, local changes may be recorded or
+        coalesced, but must not produce cross-room notifications.
+
+        **已确认**半是承重的（#223）：回放在途窗口内 desired 被刻意保留（#203）、namespace 已重新在册，
+        但服务端新会话尚无 ``office_id`` ⇒ ``require_office_id`` 拒收——而这些事件是 fire-and-forget、
+        协议明文禁止为其新增 ack（error-handling.md:99）⇒ 发送端**无感**，白发一批注定被丢的包只会在
+        服务端留下 ERROR 噪音。**意图**半同样不可省：``join_office`` 的非校验类拒绝会清 desired 而保留
+        ``_confirmed_office_id``，该态下服务端会话通常已按提交点收敛为无房（``500`` 可晚于提交）⇒ 放行
+        等于**新增**一批注定被丢的包。
+        The confirmed half is load-bearing (the replay window), and so is the intent half (the 500
+        path clears the intent while keeping the confirmed memory).
+
+        这不是隔离守卫：广播目标取自服务端会话状态（events.md:27），本判据只决定**发不发**。
+        Not an isolation guard — the broadcast target comes from the server session; this only decides
+        whether to send.
+        """
+        return (
+            self.office_id is not None
+            and self._confirmed_office_id is not None
+            and self._namespace in self.namespaces
+        )
+
+    async def _emit_or_defer_office_update(self, event: str) -> None:
+        """
+        上报 ``server:update_*``：可发则发；发不出但有入房意图 ⇒ 记入待补发，等成员关系确立后补发。
+
+        Emit when possible; otherwise record the category for a later flush. The protocol explicitly
+        allows recording/coalescing local changes while not in an office (``computer.md`` §2.2) —
+        dropping them outright would leave the room's Agents stale for config / skills / desktop
+        (the tool face self-heals through ``notify:enter_office``; these three do not).
+
+        「记」的条件是**有入房意图**：首次入房前不记（房内没有旧状态可陈旧，入房时对面本就会重拉），
+        预算耗尽 / 已退房后 desired 已清也不记。
+        """
+        if self._can_emit_office_update():
+            await self.emit(event, UpdateComputerConfigReq(computer=self.computer.name))
+            return
+        if self.office_id is not None:
+            self._deferred_office_updates.add(event)
+
+    async def _flush_deferred_office_updates(self) -> None:
+        """
+        成员关系**重新确立**（回放成功 / 显式入房成功）后，逐条补发窗口内记录的上报。
+
+        **绝不可在持有** ``_office_op_lock`` **时调用**：补发含 ``await emit``，占着 office 操作锁会拖住
+        用户的 leave/join（与 #222「状态锁不跨 RPC」同款纪律）⇒ 两个调用点都在成功路径的锁**之外**。
+        Must never be called while holding ``_office_op_lock``.
+
+        逐条独立：某条 emit 失败**不得**饿死其余类别（队首阻塞）；失败条目留在集合里，下一次成员关系确立
+        再补。``except Exception`` 是刻意的——调用方之一是**无人 await** 的回放任务（异常逃出去只会变成
+        「Task exception was never retrieved」），另一是 ``join_office``（补发不得给它新增异常面：其失败
+        路径抛 ``RuntimeError``，而传输层异常会被原样重抛）；``CancelledError`` 属 ``BaseException``，
+        照旧透传，停机收敛不被吞。
+        Per-entry isolation; failures stay pending for the next confirmation; only ``Exception`` is
+        caught so cancellation still propagates.
+        """
+        if not self._deferred_office_updates:
+            return
+        for event in sorted(self._deferred_office_updates):
+            if not self._can_emit_office_update():
+                return  # 成员关系又没了（断连 / 退房 / 新回放接管）⇒ 剩下的留待下次确立
+            try:
+                await self.emit(event, UpdateComputerConfigReq(computer=self.computer.name))
+            except Exception as e:  # 补发是尽力而为：失败只降级为「留待下次成员关系确立」
+                logger.error(f"回房后补发 {event} 失败，保留待下次成员关系确立: {e}")
+                continue
+            self._deferred_office_updates.discard(event)
 
     async def connect(
         self,
@@ -401,6 +517,10 @@ class SMCPComputerClient(AsyncClient):
           retried; every other reason clears the intent.
         """
         self._office_generation += 1
+        # #223：会话边界同时推进**会话纪元**——它才是「陈旧落账不得复活」的判据（见字段注释与
+        # ``join_office`` / ``_arejoin_office`` 的落账守卫）。generation 兼顾不了这一半：它同时被
+        # 用户操作推进，用它守卫会连「同一会话内被抢占的成功」一起否掉（#213 要求那种成功必须落账）。
+        self._office_session += 1
         self._cancel_office_rejoin()
         # 无论哪种原因，**已确认**房号都随本次会话作废：房间成员关系属于会话（见类头注释），断开即销毁，
         # 重连后的新 SID 从未加入过该房——要重新成为成员必须靠回房重放成功（那时才重新落账）。
@@ -420,6 +540,7 @@ class SMCPComputerClient(AsyncClient):
         "will not reconnect" signal; keeping the stale id past it would be a standing lie.
         """
         self._office_generation += 1
+        self._office_session += 1  # #223：会话纪元（同 _on_namespace_disconnect）
         self._cancel_office_rejoin()
         self.office_id = None
         self._confirmed_office_id = None
@@ -447,12 +568,21 @@ class SMCPComputerClient(AsyncClient):
         ——若每次重读 ``self.computer.name``，用户在退避窗口内改名（CLI 的 ``_rename_via_reconnect`` 会
         就地改 ``comp.name``）会让同一条 sid 先后声明两个名字，撞 ``403``（身份不可变）而把一次本可
         成功的恢复打成失败。/ The request is built once so every attempt declares the same identity.
+
+        #223：成功时用**显式标记**退出循环，把「待补发上报」的补发放在 ``async with`` **之外** —— 结构上
+        保证只有真正建立成员关系的那条路径会补发（其余五条 ``return`` 全部不经补发），且补发不占 office
+        操作锁。/ The success path exits through an explicit flag so the deferred flush stays outside the
+        critical section; every other branch returns without flushing.
         """
         request = EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name)
+        # #223：本轮回放所属的**会话**——成功落账前须复核（同 ``join_office``）。退避期间断连会推进
+        # 会话纪元，此时这条「成功」属于已销毁的会话。
+        session = self._office_session
         # 预算 = 墙钟上界（起点 = 回放起点）；``<= 0``（含负值配置）⇒ 不重试，退化回单次尝试。
         deadline = time.monotonic() + max(0.0, self.office_rejoin_retry_budget)
         attempt = 0
-        while True:
+        joined = False
+        while not joined:
             async with self._office_op_lock:
                 if generation != self._office_generation or self.office_id != office_id:
                     return  # 已被更新的操作接管 / superseded by a newer operation
@@ -474,13 +604,25 @@ class SMCPComputerClient(AsyncClient):
                     return
                 verdict = parse_join_ack(result)
                 if verdict.ok:
-                    # 同 join_office：成功是对服务端事实的陈述，不受 supersession 守卫约束（#213）
-                    self._confirmed_office_id = office_id
+                    # 同 join_office：成功是对服务端事实的陈述，**同一会话内**不受 supersession 守卫约束
+                    # （#213）；**跨会话**一律否掉（#223 的会话纪元守卫）。
+                    # 另有一条不变量（#223 隔离审查的落点，现已是**纵深防御**而非唯一防线）：本任务必须是
+                    # ``_office_rejoin_task``——每条抢占路径（join / leave / 断连钩子 / 新的 connect 钩子）都在
+                    # **同一同步段**里先 ``_cancel_office_rejoin()`` 再改状态 ⇒ 被抢占的回放在 ``await call``
+                    # 处即收到 ``CancelledError``（不属 ``Exception``，逃过下面的捕获），走不到本行；即便该
+                    # 不变量被破坏，会话纪元也会挡住「跨会话」那一半（回归锁见
+                    # ``test_leave_during_inflight_replay_leaves_no_phantom_confirmed`` 与
+                    # ``test_join_success_after_a_session_boundary_is_not_recorded``）。
+                    # Same-session supersession is ignored (server-side fact); cross-session is never
+                    # recorded. The "this task IS the tracked replay" invariant is defence in depth.
+                    if session == self._office_session:
+                        self._confirmed_office_id = office_id
                 if generation != self._office_generation or self.office_id != office_id:
                     return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
                 if verdict.ok:
                     logger.info(f"已自动重新加入 Office: {office_id}")
-                    return
+                    joined = True
+                    break  # 补发在锁外（见方法 docstring / #223）
                 delay = rejoin_retry_delay(verdict, attempt=attempt, remaining=deadline - time.monotonic())
                 if delay is None:
                     self.office_id = None
@@ -502,6 +644,8 @@ class SMCPComputerClient(AsyncClient):
                 )
             # 退避必须在锁外：预算内逐次取/放锁（#217 补正 §三）
             await asyncio.sleep(delay)
+        # 成员关系已确立：补发窗口期记录的上报（#223）。锁外调用，见 helper docstring。
+        await self._flush_deferred_office_updates()
 
     async def join_office(self, office_id: str) -> None:
         """
@@ -537,6 +681,9 @@ class SMCPComputerClient(AsyncClient):
         """
         generation = self._office_generation + 1
         self._office_generation = generation
+        # #223：本次 join 所属的**会话**——落账前必须复核（断连钩子是内联同步触发的，``await call`` 期间
+        # 会话作废而 ACK 仍可能就绪 ⇒ 那条「成功」属于已销毁的会话，落账会造出 #223 判据放行的幻影态）。
+        session = self._office_session
         self._cancel_office_rejoin()
         # 提前设置 office_id，避免服务器广播事件时 office_id 仍为 None 的时序竞争问题
         # Set office_id before sending request to avoid race condition when server broadcasts events
@@ -561,8 +708,10 @@ class SMCPComputerClient(AsyncClient):
             # 已知语义（有意，非副作用）：若 generation 的推进来自 **断连钩子**（传输中断且会自动重连），
             # 则这里**保留** office_id = 本次声明的房号——失败的是"这一次尝试"，不是"想要在这个房间"的
             # 意图；重连后回房会重新裁决，成功即恢复、被拒才清空（#203 口径 1）。调用方看到 RuntimeError
-            # 表示本次未落地，可自行重试；此时 office_id 非空**不代表**已在房间，判断"是否真在房间里"
-            # 请用 `_in_office()`。
+            # 表示本次未落地，可自行重试；此时 office_id 非空**不代表**已在房间。
+            # #223：判定「服务端是否已认可本会话在房」**只**看 ``_confirmed_office_id``——``_in_office()``
+            # 是「有意图 ∧ 在册」，回放在途时为真而服务端会话说无房，据此放行的 ``server:update_*`` 会被
+            # 丢弃（上报判据是 ``_can_emit_office_update``，多要「已确认」半）。
             # Deliberate: a disconnect-driven generation bump keeps the intent (the attempt failed,
             # not the wish to be in that room); the post-reconnect replay re-adjudicates it.
             #
@@ -591,13 +740,23 @@ class SMCPComputerClient(AsyncClient):
                 self.office_id = self._confirmed_office_id if is_validation_rejection(verdict) else None
             raise RuntimeError(f"加入房间失败 / Failed to join office: {verdict.message}")
 
-        # 裁决为成功：记录服务端已确认的成员关系。**刻意不受 supersession 守卫约束**——成功是关于
-        # 服务端**事实**的陈述：即便本次 join 已被后到操作抢占（desired 归后者），这次成员变更**真实
-        # 发生过**，不落账会让之后任何一次「被拒回退」指向更旧、且已失效的房号。
+        # 裁决为成功：记录服务端已确认的成员关系。**在同一会话内刻意不受 supersession 守卫约束**——
+        # 成功是关于服务端**事实**的陈述：即便本次 join 已被后到操作抢占（desired 归后者），这次成员变更
+        # **真实发生过**，不落账会让之后任何一次「被拒回退」指向更旧、且已失效的房号。
         # 次序安全：`call` 由 ``_office_op_lock`` 串行，且从锁释放到本行无 await ⇒ 后完成者胜，
         # 陈旧成功不会覆盖更新的真值。
-        # Recorded regardless of supersession: a success is a statement of server-side fact.
-        self._confirmed_office_id = office_id
+        # **但跨会话必须否掉**（#223）：成员关系属于会话，断连已在 ``await call`` 期间作废了它 ⇒ 这条
+        # 「成功」陈述的是一个**已不存在**的会话成员关系；落账会让 #223 的上报判据在「服务端无房」时放行
+        # 一批注定被丢弃的包（且不记待补发）。用**会话纪元**而非 generation 作判据——后者同时被用户操作
+        # 推进，用它守卫会连上面那种「同一会话内被抢占的成功」一起否掉（#213 明令不得）。
+        # Recorded regardless of *same-session* supersession, but never across a session boundary.
+        if session == self._office_session:
+            self._confirmed_office_id = office_id
+
+        # #223：成员关系已确立 ⇒ 补发窗口期记录的上报（此处已在 ``_office_op_lock`` 之外）。刻意**不加**
+        # generation 守卫：与上面的落账同理，成功是关于服务端事实的陈述（被抢占时补发进的是本端刚确认
+        # 的那个房，而房内 Agent 本就在等这批通知）。
+        await self._flush_deferred_office_updates()
 
     async def leave_office(self, office_id: str) -> None:
         """
@@ -606,49 +765,87 @@ class SMCPComputerClient(AsyncClient):
         #203：退房同时作废 desired 与在途自动回房——重连不得把用户刚退掉的房间再回一遍。
         Leaving also invalidates the desired intent and any in-flight replay.
 
+        #223：本地意图**无条件先清**，再尽力通知服务端。此前是「先 emit 后清」——namespace 不在册时
+        ``emit`` 抛 ``BadNamespaceError``，清理语句根本执行不到 ⇒ 用户（或 CLI ``socket leave``）刚退的
+        房仍在本地意图里，重连后自动回房把刚退的房又回了一遍。而那种状态下服务端会话本已随连接销毁
+        （没有可退的成员关系）⇒ 不发包即可，不再抛。
+        The local intent is cleared unconditionally *before* the best-effort notification: the previous
+        order skipped the clearing whenever the namespace was unregistered, which re-joined the room
+        the user had just left after a reconnect.
+
+        **退房是最后一句陈述**：临界区之后再清一次 ``_confirmed_office_id``。在途操作的成功落账可能晚于
+        上面的首次清账——显式 ``join_office`` 的落账在**锁外**（且它不是 ``_office_rejoin_task`` ⇒ 取消链
+        管不到它）：线序为 JOIN→LEAVE（服务端最后无房），若不在退房末尾再清，本地就会留下「已确认在房」
+        的幻影，使 #223 的上报判据放行一批注定被丢弃的包。回放那条路靠取消（``_cancel_office_rejoin``）
+        保证其锁内落账不生效，回归锁见
+        ``test_leave_during_inflight_replay_leaves_no_phantom_confirmed`` /
+        ``test_leave_while_explicit_join_awaits_ack_leaves_no_phantom_confirmed``。
+        A leave is the last word: the confirmed office is cleared again *after* the critical section,
+        because an in-flight explicit join records its success outside the lock and must not resurrect it.
+
         Args:
             office_id (str): 房间ID
         """
         self._office_generation += 1
         self._cancel_office_rejoin()
-        async with self._office_op_lock:
-            await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id))
         self.office_id = None
         # 已确认房号随之作废：退房后再被拒的 join 不得把旧房号回退回来（#213）
         self._confirmed_office_id = None
+        if self._namespace not in self.namespaces:
+            # 无连接 ⇒ 服务端会话已销毁，无成员关系可退；本地意图已清，重连不会再回房。
+            logger.debug(f"退房时 namespace 不在册，仅清本地意图（服务端会话已随连接销毁）: {office_id}")
+            return
+        try:
+            async with self._office_op_lock:
+                await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id))
+        finally:
+            # **退房是最后一句陈述**：锁内可能刚有在途操作的「成功落账」写回 ``_confirmed_office_id``
+            # （#213 的写点刻意不受 supersession 约束），而退房比它更新 ⇒ 必须在锁外再清一次。
+            # 必须放在 ``finally`` 里：等锁期间连接可能断掉（``emit`` 抛 ``BadNamespaceError``），
+            # 那不改变「退房」这一陈述的效力——异常照旧透传，只是清理不得被跳过。
+            # Nothing may outlive a leave: the clear is re-applied after the critical section **even if
+            # the notification itself failed** (the exception still propagates).
+            self._confirmed_office_id = None
 
     async def emit_update_config(self) -> None:
         """
         当前MCP配置更新时需要触发此事件向信令服务器推送，进而触发Agent端的配置更新
 
         不需要传递当前的配置参数，因为Agnet会通过其它接口进行刷新
+
+        #223：判据见 :meth:`_can_emit_office_update`（服务端**已确认**在房才发）；发不出但有入房意图时
+        记入待补发，成员关系确立后由 :meth:`_flush_deferred_office_updates` 补发。
         """
-        if self._in_office():
-            await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
+        await self._emit_or_defer_office_update(UPDATE_CONFIG_EVENT)
 
     async def update_config(self) -> None:
         """
-        当前MCP配置更新时需要触发此事件向信令服务器推送，进而触发Agent端的配置更新
+        :meth:`emit_update_config` 的孪生（同 payload、同判据、同补发）——保留公开名，实现委托过去。
 
-        不需要传递当前的配置参数，因为Agnet会通过其它接口进行刷新
+        #223：本方法此前**无守卫**（无条件发送），与 ``emit_update_config`` 的行为分叉；现收敛为委托，
+        不再有第二条"绕过守卫"的路。/ Alias of :meth:`emit_update_config`: it used to emit
+        unconditionally, diverging from the guarded twin; both now share one implementation.
         """
-        await self.emit(UPDATE_CONFIG_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
+        await self.emit_update_config()
 
     async def emit_update_tool_list(self) -> None:
         """
         工具列表变更时需要触发此事件向信令服务器推送，服务端会广播 notify:update_tool_list。
         When tool list changes, emit event to server; it will broadcast notify:update_tool_list.
+
+        #223：判据/补发同 :meth:`emit_update_config`（``server:update_*`` 四事件一族）。
         """
-        if self._in_office():
-            await self.emit(UPDATE_TOOL_LIST_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
+        await self._emit_or_defer_office_update(UPDATE_TOOL_LIST_EVENT)
 
     async def emit_refresh_desktop(self) -> None:
         """
         桌面刷新触发：当资源列表或资源内容变化时，通知信令服务器。服务端会广播 notify:update_desktop。
         Desktop refresh trigger: notify server when resources list/content changed; server will broadcast notify:update_desktop.
+
+        #223：判据/补发同 :meth:`emit_update_config`。桌面类是**最需要补发的一类**——Agent 只在收到
+        ``notify:update_desktop`` 时才重拉 ``client:get_desktop``（``notify:enter_office`` 只触发工具重拉）。
         """
-        if self._in_office():
-            await self.emit(UPDATE_DESKTOP_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
+        await self._emit_or_defer_office_update(UPDATE_DESKTOP_EVENT)
 
     async def emit_update_skills(self) -> None:
         """
@@ -657,8 +854,9 @@ class SMCPComputerClient(AsyncClient):
         When the SKILL set changes, emit server:update_skills; server broadcasts notify:update_skills.
 
         复用 UpdateComputerConfigReq（协议 events.md §server:update_skills 明确复用，不新建结构）；
-        office_id 守卫与 :meth:`emit_update_tool_list` 一致——未入房间不发送。
-        Reuses UpdateComputerConfigReq (protocol reuses it); office_id guard mirrors emit_update_tool_list.
+        判据/补发与 :meth:`emit_update_tool_list` 一致（#223）。
+        Reuses UpdateComputerConfigReq (protocol reuses it); guard and deferred flush mirror
+        emit_update_tool_list (#223).
 
         v0.2.1（S14，#67）：本方法是 :class:`~a2c_smcp.computer.skills.debouncer.SkillEventDebouncer` 的
         **低层 emit sink**——多源 SKILL 变更（mcp ``ResourceListChanged`` / user 源文件 watcher / CLI 操作）
@@ -666,8 +864,7 @@ class SMCPComputerClient(AsyncClient):
         This is the low-level emit sink for the Computer-owned ``SkillEventDebouncer``; event handlers must
         route through the debouncer (300ms coalescing) rather than calling this directly.
         """
-        if self._in_office():
-            await self.emit(UPDATE_SKILLS_EVENT, UpdateComputerConfigReq(computer=self.computer.name))
+        await self._emit_or_defer_office_update(UPDATE_SKILLS_EVENT)
 
     async def on_tool_call(self, data: ToolCallReq) -> dict:
         """

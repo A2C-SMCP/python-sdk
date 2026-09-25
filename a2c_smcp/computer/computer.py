@@ -939,7 +939,8 @@ class Computer(BaseComputer[PromptSession]):
         """
         去抖器结算末端：向信令服务器推送 ``server:update_skills`` / Debouncer settlement sink。
 
-        无 Socket.IO 客户端 / 未入房间 → no-op（emit 的 office_id 守卫在 client 侧）。该协程是
+        无 Socket.IO 客户端 → no-op；客户端侧按「已确认在房 ∧ 在册」判据决定发送或**记入待补发**（#223，
+        见 ``SMCPComputerClient._emit_or_defer_office_update``）。该协程是
         :class:`SkillEventDebouncer` 的 ``on_emit``，**不**应被事件处理器裸调（一律经去抖器 :meth:`mark_dirty`）。
         """
         client = self.socketio_client
@@ -2502,7 +2503,7 @@ class Computer(BaseComputer[PromptSession]):
             logger.debug("Socket.IO 客户端不存在或已释放，忽略能力撤销上报")
             return
         try:
-            # 直接通过事件常量发送（工具列表更新；office_id 守卫在 emit_update_tool_list 内）
+            # 直接通过事件常量发送（工具列表更新；发送/补发判据在 emit_update_tool_list 内，#223）
             await client.emit_update_tool_list()
         except Exception:
             logger.error("上报能力撤销（工具变更）失败", exc_info=True)

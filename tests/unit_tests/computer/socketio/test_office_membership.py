@@ -17,13 +17,23 @@ tightened emit guards.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+import a2c_smcp.computer.socketio.client as computer_client_mod
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
-from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
+from a2c_smcp.smcp import (
+    JOIN_OFFICE_EVENT,
+    LEAVE_OFFICE_EVENT,
+    SMCP_NAMESPACE,
+    UPDATE_CONFIG_EVENT,
+    UPDATE_DESKTOP_EVENT,
+    UPDATE_SKILLS_EVENT,
+    UPDATE_TOOL_LIST_EVENT,
+)
 from a2c_smcp.utils.office import OFFICE_JOIN_TIMEOUT
 
 _TRANSPORT_ERROR = "transport error"
@@ -674,6 +684,10 @@ async def test_switch_indeterminate_ack_clears_desired() -> None:
 async def test_emit_update_guards_require_registered_namespace(method_name: str) -> None:
     """office_id 有值但 namespace 不在册（重连窗口/已掉线）→ no-op，不得发无效包。
 
+    #223：emit 判据是**两半**——「已确认成员关系」∧「namespace 在册」（另见
+    ``test_update_emitters_do_not_send_when_namespace_unregistered_even_if_confirmed`` 对后者的
+    独立负例）。本用例只覆盖「不在册」这一半（此时 confirmed 恰也为空）。
+
     English: with a retained desired office but no registered namespace, the update emitters must
     stay no-ops instead of raising ``BadNamespaceError``.
     """
@@ -936,3 +950,620 @@ async def test_post_commit_code_clears_desired_but_keeps_confirmed() -> None:
 
     assert client.office_id is None, "500 不得回退到旧房（可能已随提交点作废）"
     assert client._confirmed_office_id == "officeA", "本侧非校验支保留已确认记忆（与 Agent 刻意分叉）"
+
+
+# ── #223：回放在途窗口内的 server:update_*（判据对齐 + 合并补发）────────────────────
+#
+# 协议依据（computer.md §2.2）：「Computer SHOULD 在**成功加入 Office 后**才发送 server:update_*。
+# 未加入 Office 时，本地变化**可以被记录或合并**，但不应产生跨房间可见通知。」
+# 回放在途窗口内 desired 仍在、namespace 已重新在册，但服务端新会话尚无 office_id ⇒ 服务端
+# require_office_id 拒收，而这些事件是 fire-and-forget（无 ack）⇒ 发送端无感。故判据改为
+# 「有入房意图 ∧ 服务端已确认成员关系 ∧ 在册」；窗口内变更记入待补发集合，成员关系确立
+# （回放成功 / 显式入房成功）后逐条补发。
+#
+# 该缺陷是**活性/质量缺陷，不是合规违规**（丢包本身合规，协议还禁止给这些事件加 ack）；客户端判据
+# 与协议前置不一致 + 变更未记录，才是要修的。客户端谓词也**不是隔离守卫**——广播目标由服务端会话
+# 决定（events.md:27），客户端只决定发不发。
+
+#: 四类上报（含无守卫的孪生 ``update_config``：同 payload、同判据、同补发）。
+_UPDATE_EMITTERS: list[tuple[str, str]] = [
+    ("emit_update_config", UPDATE_CONFIG_EVENT),
+    ("update_config", UPDATE_CONFIG_EVENT),
+    ("emit_update_tool_list", UPDATE_TOOL_LIST_EVENT),
+    ("emit_refresh_desktop", UPDATE_DESKTOP_EVENT),
+    ("emit_update_skills", UPDATE_SKILLS_EVENT),
+]
+
+
+def _record_emits(client: SMCPComputerClient) -> list[tuple[str, Any]]:
+    """把 ``emit`` 换成记录器（返回 ``[(event, data), ...]``），避免触碰真实 socketio 连接。"""
+    sent: list[tuple[str, Any]] = []
+
+    async def fake_emit(event: str, data: Any = None, *args: Any, **kwargs: Any) -> None:
+        sent.append((event, data))
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+    return sent
+
+
+def _confirm_office(client: SMCPComputerClient, office_id: str = "officeA") -> None:
+    """构造稳定态：有入房意图 ∧ 服务端已确认成员关系 ∧ namespace 在册。"""
+    client.office_id = office_id
+    client._confirmed_office_id = office_id
+    _mark_namespace_registered(client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name,event", _UPDATE_EMITTERS)
+async def test_update_emitters_send_only_when_confirmed_and_live(method_name: str, event: str) -> None:
+    """**正对照**：已确认成员关系 + 在册 ⇒ 恰发一条（防「一律不发」的过度收紧）。"""
+    client = _make_client(reconnection=True)
+    _confirm_office(client)
+    sent = _record_emits(client)
+
+    await getattr(client, method_name)()
+
+    assert sent == [(event, {"computer": "test_computer"})], f"{method_name} 在稳定态必须发包"
+    assert client._deferred_office_updates == set(), "稳定态直接发，不留待补发"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name,event", _UPDATE_EMITTERS)
+async def test_update_emitters_do_not_send_on_desired_only(method_name: str, event: str) -> None:
+    """只有 desired（服务端从未确认）⇒ 不发包 + 记入待补发 —— 回放在途窗口的主体判据。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    assert client._confirmed_office_id is None, "前置：服务端尚未确认成员关系"
+    sent = _record_emits(client)
+
+    await getattr(client, method_name)()
+
+    assert sent == [], f"{method_name} 在「未确认在房」时不得发包（会被服务端静默丢弃）"
+    assert event in client._deferred_office_updates, "窗口内的变更必须被记录，否则永久丢失"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name,event", _UPDATE_EMITTERS)
+async def test_update_emitters_do_not_send_when_namespace_unregistered_even_if_confirmed(
+    method_name: str, event: str
+) -> None:
+    """确认过但在册已失效（连接又断）⇒ 不发包（判据的「在册」半是承重的，独立负例）。"""
+    client = _make_client(reconnection=True)
+    client.office_id = "officeA"
+    client._confirmed_office_id = "officeA"
+    assert SMCP_NAMESPACE not in client.namespaces
+    sent = _record_emits(client)
+
+    await getattr(client, method_name)()
+
+    assert sent == [], f"{method_name} 在 namespace 不在册时不得发包"
+    assert event in client._deferred_office_updates
+
+
+@pytest.mark.asyncio
+async def test_no_emit_or_deferral_before_the_first_join() -> None:
+    """从未入房（既无意图也无确认）⇒ 不发包**也不记录**：房内无旧状态可陈旧（协议只允许记录，未要求）。"""
+    client = _make_client()
+    _mark_namespace_registered(client)
+    assert client.office_id is None
+    sent = _record_emits(client)
+
+    await client.emit_update_config()
+
+    assert sent == []
+    assert client._deferred_office_updates == set(), "无入房意图时不该攒待补发（首次入房后对面本就会重拉）"
+
+
+@pytest.mark.asyncio
+async def test_no_emit_when_confirmed_survives_without_intent() -> None:
+    """非校验类拒绝后的可达态（desired 已清、confirmed 保留）⇒ 不得发包（意图半不可省）。
+
+    本态由 ``join_office`` 的非校验支产生（``500`` 可晚于成员关系提交 ⇒ 服务端会话通常已无 office_id）。
+    放行会**新增**一批注定被丢的包 + 服务端 ERROR 噪音，故判据必须带意图半。
+    """
+    client = _make_client()
+    _mark_namespace_registered(client)
+    client.office_id = None
+    client._confirmed_office_id = "officeA"
+    sent = _record_emits(client)
+
+    await client.emit_update_config()
+
+    assert sent == [], "意图已清 ⇒ 不做任何上报（与今天行为一致，不得新增发包）"
+    assert client._deferred_office_updates == set()
+
+
+@pytest.mark.asyncio
+async def test_deferral_survives_without_a_live_namespace() -> None:
+    """断线窗口（已有意图、namespace 不在册）也要记录 —— 这是本缺陷最早、最广的窗口。"""
+    client = _make_client(reconnection=True)
+    client.office_id = "officeA"
+    assert SMCP_NAMESPACE not in client.namespaces
+    sent = _record_emits(client)
+
+    await client.emit_update_skills()
+
+    assert sent == []
+    assert client._deferred_office_updates == {UPDATE_SKILLS_EVENT}
+
+
+@pytest.mark.asyncio
+async def test_replay_confirmation_flushes_deferred_updates() -> None:
+    """回放（先被 4101 拒、退避后成功）那一刻逐条补发窗口内的变更 —— 本单的核心行为。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.3
+    client.office_id = "officeA"
+    client._office_generation = 1
+    sent = _record_emits(client)
+
+    await client.emit_update_skills()
+    await client.emit_update_config()
+    assert sent == [], "窗口内不得发包"
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT, UPDATE_SKILLS_EVENT}
+
+    attempts: list[int] = []
+
+    async def fake_call(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(1)
+        return dict(_ROOM_FULL) if len(attempts) == 1 else None
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    await client._arejoin_office("officeA", 1)
+
+    assert len(attempts) == 2, "前置：回放须先被拒再成功（考的是成功那一刻的补发）"
+    assert [event for event, _ in sent] == [UPDATE_CONFIG_EVENT, UPDATE_SKILLS_EVENT], (
+        "成员关系确立后按事件名序逐条补发"
+    )
+    assert all(data == {"computer": "test_computer"} for _, data in sent)
+    assert client._deferred_office_updates == set(), "补发成功后条目必须移除"
+
+
+@pytest.mark.asyncio
+async def test_explicit_join_confirmation_flushes_deferred_updates() -> None:
+    """显式入房成功同样补发，且补发发生在**落账之后**（emit 时已能读到新房号）。"""
+    client = _make_client()
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    await client.emit_update_config()
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}
+
+    seen: list[tuple[str, str | None]] = []
+
+    async def fake_emit(event: str, data: Any = None, *args: Any, **kwargs: Any) -> None:
+        seen.append((event, client._confirmed_office_id))
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    async def accept(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    client.call = accept  # type: ignore[method-assign]
+
+    await client.join_office("officeB")
+
+    assert seen == [(UPDATE_CONFIG_EVENT, "officeB")], "补发须在 confirmed 落账之后发生"
+    assert client._deferred_office_updates == set()
+
+
+@pytest.mark.asyncio
+async def test_flush_does_not_resend_after_success() -> None:
+    """补发成功后条目必须移除：重复补发会放大对面的重拉（虽然幂等，但没必要）。"""
+    client = _make_client()
+    _confirm_office(client)
+    client._deferred_office_updates.add(UPDATE_CONFIG_EVENT)
+    sent = _record_emits(client)
+
+    await client._flush_deferred_office_updates()
+    await client._flush_deferred_office_updates()
+
+    assert [event for event, _ in sent] == [UPDATE_CONFIG_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_flush_rechecks_the_predicate_before_each_entry() -> None:
+    """逐条复检判据：第一条发出后连接即断 ⇒ 后续条目不得再发（否则又是一批发给服务端被丢的包）。"""
+    client = _make_client(reconnection=True)
+    _confirm_office(client)
+    client._deferred_office_updates.update({UPDATE_CONFIG_EVENT, UPDATE_SKILLS_EVENT})
+    sent: list[str] = []
+
+    async def fake_emit(event: str, data: Any = None, *args: Any, **kwargs: Any) -> None:
+        sent.append(event)
+        client._on_namespace_disconnect(_TRANSPORT_ERROR)  # 首条后连接即断（成员关系随会话作废）
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    await client._flush_deferred_office_updates()
+
+    assert sent == [UPDATE_CONFIG_EVENT], "断连后不得继续补发"
+    assert client._deferred_office_updates == {UPDATE_SKILLS_EVENT}, "未发出的条目留待下次确立"
+
+
+@pytest.mark.asyncio
+async def test_replay_flush_runs_outside_the_op_lock() -> None:
+    """补发在 office 操作锁**之外**（补发含 await emit，不得占着锁 —— #222 的「状态锁不跨 RPC」同款）。
+
+    探针必须是**限时取锁**：补发此刻正阻塞在 ``emit`` 里，若实现把它挪进临界区或长屏障，这里会超时。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_rejoin_retry_budget = 0.0  # 单次尝试：窗口里没有退避噪声
+    client.office_id = "officeA"
+    client._office_generation = 1
+    await client.emit_update_config()  # 窗口内变更 ⇒ 记入待补发（谓词假，不发包）
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_emit(event: str, data: Any = None, *args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await release.wait()
+
+    client.emit = blocking_emit  # type: ignore[method-assign]
+
+    async def succeed(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    client.call = succeed  # type: ignore[method-assign]
+    real_lock = client._office_op_lock
+    lock = _RecordingAsyncLock(real_lock)
+    client._office_op_lock = lock  # type: ignore[assignment]
+
+    replay = asyncio.create_task(client._arejoin_office("officeA", 1))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)  # 补发已在飞（阻塞在 emit 内）
+        await asyncio.wait_for(real_lock.acquire(), timeout=PROBE_TIMEOUT)  # 超时 ⇒ 补发占了锁 ⇒ 红
+        real_lock.release()
+    finally:
+        release.set()
+        await replay
+
+    assert lock.events == ["enter", "exit"], f"回放只取一次锁，且补发全程在锁外；实得 {lock.events}"
+
+
+@pytest.mark.asyncio
+async def test_flush_retains_the_failed_entry_and_continues_the_others(caplog: pytest.LogCaptureFixture) -> None:
+    """一条失败不得饿死其余类别（队首阻塞），失败条目保留待下次；ERROR 只由补发方产出。"""
+    client = _make_client()
+    _confirm_office(client)
+    client._deferred_office_updates.update({UPDATE_CONFIG_EVENT, UPDATE_SKILLS_EVENT})
+    sent: list[str] = []
+
+    async def fake_emit(event: str, data: Any = None, *args: Any, **kwargs: Any) -> None:
+        if event == UPDATE_CONFIG_EVENT:
+            raise RuntimeError("transport broke")
+        sent.append(event)
+
+    client.emit = fake_emit  # type: ignore[method-assign]
+
+    computer_client_mod.logger.addHandler(caplog.handler)
+    caplog.set_level(logging.ERROR)
+    try:
+        await client._flush_deferred_office_updates()  # 不得抛出
+    finally:
+        computer_client_mod.logger.removeHandler(caplog.handler)
+
+    assert sent == [UPDATE_SKILLS_EVENT], "config 失败后仍须尝试 skills"
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}
+    assert any(r.levelno == logging.ERROR for r in caplog.records), "失败须有 ERROR 记录（唯一产出者在这里）"
+
+
+@pytest.mark.asyncio
+async def test_flush_failure_does_not_escape_the_replay_task() -> None:
+    """补发异常不得逃出回放任务（该任务无人 await ⇒ 会变成没人取回的 Task 异常）。"""
+    client = _make_client(reconnection=True)
+    _confirm_office(client)
+    client._office_generation = 1
+    client.office_rejoin_retry_budget = 0.0
+    client._deferred_office_updates.add(UPDATE_CONFIG_EVENT)
+
+    async def explode(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("transport broke")
+
+    client.emit = explode  # type: ignore[method-assign]
+
+    async def succeed(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    client.call = succeed  # type: ignore[method-assign]
+
+    await client._arejoin_office("officeA", 1)  # 不得抛出
+
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}, "未送达的条目保留"
+
+
+@pytest.mark.asyncio
+async def test_flush_does_not_swallow_cancellation() -> None:
+    """取消必须照旧透传（补发只捕 ``Exception``）：停机收敛不得被吞掉。"""
+    client = _make_client()
+    _confirm_office(client)
+    client._deferred_office_updates.add(UPDATE_CONFIG_EVENT)
+    entered = asyncio.Event()
+
+    async def blocking_emit(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    client.emit = blocking_emit  # type: ignore[method-assign]
+
+    task = asyncio.create_task(client._flush_deferred_office_updates())
+    await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}, "取消（未送达）的条目保留"
+
+
+@pytest.mark.asyncio
+async def test_deferred_set_is_not_cleared_by_leave() -> None:
+    """退房不清待补发：下一次入房补发对对面无害且有益（新房的 Agent 也不会主动重拉 skills/desktop）。"""
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    await client.emit_update_skills()
+    assert client._deferred_office_updates == {UPDATE_SKILLS_EVENT}
+
+    sent = _record_emits(client)
+    await client.leave_office("officeA")
+
+    assert [event for event, _ in sent] == [LEAVE_OFFICE_EVENT]
+    assert client.office_id is None
+    assert client._deferred_office_updates == {UPDATE_SKILLS_EVENT}, "退房不清（集合域恒为 4 个事件名，不会膨胀）"
+
+
+@pytest.mark.asyncio
+async def test_leave_office_without_a_live_namespace_clears_intent_and_does_not_raise() -> None:
+    """#223：断线（namespace 不在册）时退房 ⇒ 不得抛 ``BadNamespaceError``，且本地意图**必须**被清掉。
+
+    此前是「先 emit 后清」：``emit`` 抛异常 ⇒ 清理语句根本执行不到 ⇒ 用户（或 CLI ``socket leave``）在
+    断线期间退的房仍在本地意图里，重连后自动回房把刚退的房又回了一遍。无连接时服务端会话已随连接销毁
+    （没有可退的成员关系），故不发包即可。
+    """
+    client = _make_client(reconnection=True)
+    client.office_id = "officeA"
+    client._confirmed_office_id = "officeA"
+    client._office_generation = 3
+    stale_replay = asyncio.create_task(asyncio.sleep(60))
+    client._office_rejoin_task = stale_replay
+    sent = _record_emits(client)
+    assert SMCP_NAMESPACE not in client.namespaces
+
+    await client.leave_office("officeA")  # 不得抛
+
+    assert sent == [], "无连接时不发包（服务端会话已随连接销毁）"
+    assert client.office_id is None, "本地意图必须清掉（否则重连后又会被自动拉回）"
+    assert client._confirmed_office_id is None
+    assert client._office_rejoin_task is None, "在途回房必须被作废"
+    assert client._office_generation == 4, "退房推进世代（作废在途操作的结果）"
+
+    stale_replay.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stale_replay
+
+
+@pytest.mark.asyncio
+async def test_leave_office_during_inflight_replay_still_notifies_server() -> None:
+    """在途窗口内退房 ⇒ 仍须发 ``server:leave_office``（CLI 的 ``socket leave`` 就活在这个窗口里）。
+
+    窗口内 namespace **已在册**（否则 CLI 走的是「未连接」分支），故「不在册才跳过」的短路不会误伤它。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    assert client._confirmed_office_id is None, "前置：回放在途 ⇒ 服务端尚未确认"
+    sent = _record_emits(client)
+
+    await client.leave_office("officeA")
+
+    assert [event for event, _ in sent] == [LEAVE_OFFICE_EVENT], "在途窗口退房必须通知服务端"
+    assert client.office_id is None
+
+
+# ── #223 隔离审查：幻影「已确认房」的两个可达路径（回归锁）─────────────────────────────
+#
+# 背景：``_confirmed_office_id`` 的成功落账**刻意不受 supersession 守卫约束**（#213：成功是关于服务端
+# 事实的陈述）。该豁免成立的**前提**是「本任务必是 ``_office_rejoin_task``」——每条抢占路径都在同一同步段
+# 里先 ``_cancel_office_rejoin()`` 再改状态，被抢占的回放在 ``await call`` 处即收到 ``CancelledError``
+# （BaseException，逃过成功/失败两个 ``except``），走不到落账行。
+#   · 回放路径：靠上面的**取消**成立（下面第一条用例锁住它）；
+#   · 显式 join 路径：**没有**可取消的任务（join 不是你……不是 ``_office_rejoin_task``）⇒ 它的落账会落在
+#     退房清账**之后** ⇒ 必须由 ``leave_office``「退房是最后一句陈述」的**临界区后再清一次**兜住
+#     （下面第二条用例锁住它）。
+# 幻影态的后果正是 #223 的缺陷形态：服务端会话已无房，而本地 ``_can_emit_office_update()`` 为真 ⇒
+# 上报白发一批（被 ``require_office_id`` 丢弃）且**不记入待补发** ⇒ 变更真实丢失。
+
+
+@pytest.mark.asyncio
+async def test_leave_during_inflight_replay_leaves_no_phantom_confirmed() -> None:
+    """退房抢占「已持锁、正等 ACK」的**自动回房** ⇒ 落定后 ``confirmed`` 必须为 None（取消使然）。
+
+    生产形态：回放任务登记在 ``_office_rejoin_task`` 上（``_on_namespace_connect`` 的唯一赋值点），
+    故 ``leave_office`` 的 ``_cancel_office_rejoin()`` 能真正取消它 ⇒ 陈旧成功写不进去。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    client._confirmed_office_id = "officeA"
+    client._office_generation = 1
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_call(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return None  # 服务端 ACCEPT（空 ack）——若未被取消，成功落账会把 officeA 写回
+
+    client.call = blocking_call  # type: ignore[method-assign]
+    replay = asyncio.create_task(client._arejoin_office("officeA", 1))
+    client._office_rejoin_task = replay  # 生产形态：connect 钩子登记在途回放
+    await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
+
+    sent = _record_emits(client)
+    leave = asyncio.create_task(client.leave_office("officeA"))
+    await asyncio.sleep(0)  # 让退房走到「等锁」（此刻回放仍持锁等 ACK）
+    assert client.office_id is None, "前置：退房已清本地意图"
+    release.set()
+    await asyncio.gather(replay, leave, return_exceptions=True)
+
+    assert [event for event, _ in sent] == [LEAVE_OFFICE_EVENT]
+    # **机制断言**（终态断言会失明：临界区后那次再清同样兜得住这条路径）——被抢占的回放必须真的被取消，
+    # 即 `:579` 那条「不受 supersession 约束的成功落账」所依赖的前提不变量。
+    assert replay.cancelled(), "退房必须取消在途回放（否则陈旧成功会写回已退掉的房）"
+    assert client._confirmed_office_id is None, (
+        "退房是最后一句陈述：被抢占的在途回放不得把已退掉的房写回已确认房号（否则 #223 判据会放行注定被丢的上报）"
+    )
+    assert not client._can_emit_office_update()
+
+
+@pytest.mark.asyncio
+async def test_leave_while_explicit_join_awaits_ack_leaves_no_phantom_confirmed() -> None:
+    """退房抢占「等 ACK 中的**显式** join」⇒ 落定后 ``confirmed`` 必须为 None（临界区后再清一次使然）。
+
+    显式 ``join_office`` 的落账在**锁外**（且它不是 ``_office_rejoin_task`` ⇒ 取消链管不到它）：退房只等
+    锁，等它释放锁后它才落账 ⇒ 线序是 JOIN→LEAVE（服务端最后为**无房**）而本地会留下「已确认在房」的
+    幻影。修法是 ``leave_office`` 在临界区之后再清一次——退房比任何在途操作都更新。
+    """
+    client = _make_client()
+    _mark_namespace_registered(client)
+    client._office_generation = 1
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_call(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return None  # 服务端 ACCEPT（空 ack）
+
+    client.call = blocking_call  # type: ignore[method-assign]
+    sent = _record_emits(client)
+    join = asyncio.create_task(client.join_office("officeA"))
+    await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
+
+    leave = asyncio.create_task(client.leave_office("officeA"))
+    await asyncio.sleep(0)  # 让退房走到「等锁」（此刻 join 仍持锁等 ACK）
+    assert client.office_id is None, "前置：退房已清本地意图（join 尚未落账）"
+    release.set()
+    await asyncio.gather(join, leave, return_exceptions=True)
+
+    assert [event for event, _ in sent] == [LEAVE_OFFICE_EVENT]
+    assert client._confirmed_office_id is None, "在途 join 的成功落账不得复活已退掉的房"
+    assert not client._can_emit_office_update()
+
+
+@pytest.mark.asyncio
+async def test_join_success_after_a_session_boundary_is_not_recorded() -> None:
+    """#223：显式 ``join_office`` 的 ACK 在**会话作废之后**才落账 ⇒ 不得写回 ``_confirmed_office_id``。
+
+    断连钩子是**内联同步**触发的（engineio 特性，见 client 的 hooks 注释）⇒「ACK 已就绪、join 任务尚未
+    恢复」与「钩子已清账」可以同拍发生。成员关系属于会话 ⇒ 那条「成功」陈述的是一个**已销毁**的会话，
+    落账会造出幻影态：服务端会话无房，而 #223 的上报判据为真 ⇒ 发包被丢弃且不记待补发（变更永久丢失）。
+    判据必须是**会话纪元**：``generation`` 兼顾不了——它同时被用户操作推进，用它守卫会连「同一会话内被
+    抢占的成功」（#213 明令必须落账）一起否掉。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client._office_generation = 1
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_call(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return None  # 服务端 ACCEPT（空 ack）
+
+    client.call = blocking_call  # type: ignore[method-assign]
+    join = asyncio.create_task(client.join_office("officeA"))
+    await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
+
+    client._on_namespace_disconnect(_TRANSPORT_ERROR)  # 会话作废（传输中断、会自动重连 ⇒ desired 保留）
+    assert client._confirmed_office_id is None, "前置：钩子已按「成员关系属于会话」清账"
+
+    release.set()
+    await asyncio.gather(join, return_exceptions=True)
+
+    assert client._confirmed_office_id is None, "跨会话的成功不得落账（否则上报判据会放行注定被丢的包）"
+    assert not client._can_emit_office_update(), "判据不得在「服务端无房」时为真"
+    sent = _record_emits(client)
+    await client.emit_update_config()
+    assert sent == [], "幻影态下不得发包"
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}, (
+        "窗口内的变更必须被记录（回房成功后补发）——这正是本单要保住的语义"
+    )
+
+
+@pytest.mark.asyncio
+async def test_leave_tail_clear_runs_even_when_the_notification_fails() -> None:
+    """退房通知失败（等锁期间断线 ⇒ ``emit`` 抛）时，「退房是最后一句陈述」的清理**不得被跳过**。
+
+    尾清若放在 ``async with`` 之后的裸语句里，异常会把它整段跳过 ⇒ 在途 join 的落账留存 ⇒ 幻影态
+    （同 ``test_leave_while_explicit_join_awaits_ack_leaves_no_phantom_confirmed``）。异常照旧透传，不吞。
+    """
+    client = _make_client()
+    _mark_namespace_registered(client)
+    client._office_generation = 1
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_call(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return None
+
+    client.call = blocking_call  # type: ignore[method-assign]
+    join = asyncio.create_task(client.join_office("officeA"))
+    await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
+
+    async def failing_emit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("namespace is not a connected namespace.")
+
+    client.emit = failing_emit  # type: ignore[method-assign]
+    leave = asyncio.create_task(client.leave_office("officeA"))
+    await asyncio.sleep(0)  # 让退房走到「等锁」
+    assert client.office_id is None, "前置：退房已清本地意图"
+    release.set()  # join 在锁外落账（若尾清被跳过就留存）
+    results = await asyncio.gather(join, leave, return_exceptions=True)
+
+    assert isinstance(results[1], RuntimeError), f"退房通知失败必须透传（不得吞）：{results!r}"
+    assert client._confirmed_office_id is None, "通知失败不得让「退房是最后一句陈述」失守"
+    assert not client._can_emit_office_update()
+
+
+@pytest.mark.asyncio
+async def test_replay_success_after_a_session_boundary_is_not_recorded() -> None:
+    """**纵深防御用例（人为破坏不变量）**：回放的成功落账同样受**会话纪元**约束。
+
+    生产上本状态**不可达**：``_arejoin_office`` 的唯一创建点（``_on_namespace_connect``）必然把任务登记到
+    ``_office_rejoin_task``，而每条抢占路径都在同一同步段里先取消它 ⇒ 被抢占的回放在 ``await call`` 处即收
+    到 ``CancelledError``（见 ``test_leave_during_inflight_replay_leaves_no_phantom_confirmed``）。本用例
+    **刻意不登记**该任务（绕过取消链）以钉住守卫本身——否则落账处那句「即便该不变量被破坏，会话纪元也会挡住
+    跨会话那一半」只是散文（隔离审查实测：删掉该守卫时 0 个用例变红）。它不声称该状态可达，只声称守卫有效。
+    """
+    client = _make_client(reconnection=True)
+    _mark_namespace_registered(client)
+    client.office_id = "officeA"
+    client._office_generation = 1
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_call(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return None  # 服务端 ACCEPT（空 ack）
+
+    client.call = blocking_call  # type: ignore[method-assign]
+    replay = asyncio.create_task(client._arejoin_office("officeA", 1))
+    # 刻意**不**写 client._office_rejoin_task —— 人为破坏「在途回放必被登记」的不变量
+    await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
+
+    client._on_namespace_disconnect(_TRANSPORT_ERROR)  # 会话作废并推进纪元
+    release.set()
+    await asyncio.gather(replay, return_exceptions=True)
+
+    assert client._confirmed_office_id is None, "跨会话的成功落账必须被会话纪元否掉（纵深防御）"
+    assert not client._can_emit_office_update()

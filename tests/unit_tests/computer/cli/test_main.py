@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 import a2c_smcp.computer.cli.main as cli_main
 from a2c_smcp.computer.cli.main import _interactive_loop
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.smcp import LEAVE_OFFICE_EVENT
 
 
 class DummyInteractive:
@@ -1527,32 +1528,29 @@ async def test_rename_keeps_new_connection_when_join_is_denied(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_socket_leave_uses_real_membership_not_desired(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``socket leave`` 以**真实成员关系**（``_in_office()``）为准，而非 desired ``office_id``。
+async def test_socket_leave_clears_intent_even_when_not_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``socket leave`` 在「有意图但不可达」（未连接 / 回放在途）时**仍须退房**：本地意图必须被清掉。
+
+    #223 回归点：此前以 ``_client_in_office``（意图 ∧ 在册）为门 ⇒ 不可达时**不调** ``leave_office``
+    ⇒ 本地 ``office_id`` 留着 ⇒ 重连后的自动回房把用户刚退掉的房又回了一遍。现在判据只剩**文案**职责，
+    客户端 ``leave_office`` 无条件清本地意图、仅在 namespace 在册时才真发 ``server:leave_office``。
 
     .. important::
        **真实断线窗口不经过本分支**——实测（真 ASGI 服务端 + 真客户端，掐 WebSocket）断开后
-       socketio 同时清空 ``namespaces`` **与** ``connected``，故窗口内先命中命令入口的「未连接」守卫，
-       ``_client_in_office`` 根本不被求值。本用例的 ``connected=True`` + 命名空间空是**合成**状态，
-       :meth:`_client_in_office` 在此的作用是**防御 socketio 的 connected/namespaces 不一致**
-       （如手工改状态、或未来上游把两者解耦），不是「修复重连窗口」。
-       真实窗口的行为由下一条用例（``connected=False``）覆盖。
+       socketio 同时清空 ``namespaces`` **与** ``connected``，故窗口内先命中命令入口的「未连接」守卫。
+       本用例的 ``connected=True`` + 命名空间空是**合成**状态，覆盖 ``_client_in_office`` 的防御语义。
+       真实窗口由下一条用例（``connected=False``）覆盖。
 
-    判据若只看 desired，会对一个并不在册的命名空间发 ``leave_office``（对真实客户端即
-    ``BadNamespaceError``）。本用例用**真实**客户端——桩对象没有 ``_in_office``，走不到这条语义。
+    本用例用**真实**客户端（桩对象没有 ``_in_office``，走不到这条语义）。
     """
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
 
-    left: list[str] = []
+    sent: list[str] = []
 
-    async def _spy_leave(self: Any, office_id: str) -> None:
-        left.append(office_id)
+    async def _spy_emit(self: Any, event: str, data: Any = None, *a: Any, **kw: Any) -> None:
+        sent.append(event)
 
-    async def _noop(self: Any, *a: Any, **kw: Any) -> None:
-        return None
-
-    monkeypatch.setattr(SMCPComputerClient, "leave_office", _spy_leave)
-    monkeypatch.setattr(SMCPComputerClient, "emit_update_config", _noop)
+    monkeypatch.setattr(SMCPComputerClient, "emit", _spy_emit)
 
     comp = Computer(name="leave_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     client = SMCPComputerClient(computer=comp)
@@ -1572,33 +1570,39 @@ async def test_socket_leave_uses_real_membership_not_desired(monkeypatch: pytest
 
     await _interactive_loop(comp, init_client=client)
 
-    assert left == [], f"未真在房里时不得发 leave_office，实得 {left!r}"
-    assert any("未加入房间" in line for line in printed), f"应如实提示未在房间：{printed!r}"
+    assert LEAVE_OFFICE_EVENT not in sent, f"不可达时不得发包（服务端会话已随连接销毁），实得 {sent!r}"
+    assert client.office_id is None, "本地意图必须被清掉（否则重连后又会被自动拉回）"
+    assert any("已清除本地入房意图" in line for line in printed), f"应如实提示只清了本地意图：{printed!r}"
 
-    # 正对照：命名空间在册（真在房）时确实会退房——防止上面断言被「永远不发 leave」的坏实现同样满足
+    # 正对照：命名空间在册（可上报）⇒ 真发 server:leave_office + 文案「已离开房间」
+    # （防止上面断言被「永远只清本地」的坏实现同样满足）
     client.office_id = "office-old"
     client.namespaces[client.namespace] = "eio-sid"
     assert client._in_office(), "前置：正对照须满足 `_in_office()`"
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["socket leave", "exit"]))
     await _interactive_loop(comp, init_client=client)
-    assert left == ["office-old"], f"在房时应真的退房，实得 {left!r}"
+    assert LEAVE_OFFICE_EVENT in sent, f"可上报时必须真的退房，实得 {sent!r}"
+    assert client.office_id is None
+    assert any("已离开房间" in line for line in printed), f"在房时文案应为「已离开房间」：{printed!r}"
 
 
 @pytest.mark.asyncio
-async def test_socket_leave_in_real_disconnect_window_reports_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """**真实**断线窗口（``connected=False`` + desired 保留）下 ``socket leave`` 提示「未连接」且不发 leave。
+async def test_socket_leave_in_real_disconnect_window_clears_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**真实**断线窗口（``connected=False`` + desired 保留）下 ``socket leave`` 必须清掉本地意图。
 
-    「未连接」在此是**实情**（传输已断），优于对未在册的命名空间发请求；这也标定了上一条用例的
-    ``_client_in_office`` 分支在真实窗口内不被求值。
+    #223：此前该分支只打印「未连接」并**跳过**退房 ⇒ 本地 ``office_id`` 留着 ⇒ 重连后自动回房把用户
+    刚退掉的房又回了一遍。现在提示语改为「已清除本地入房意图，重连后不再自动回房」，且不发包（无连接
+    可用，服务端会话已随连接销毁 ⇒ 没有可退的成员关系；发包与否由客户端 ``leave_office`` 决定，
+    单测 ``test_office_membership.py`` 覆盖）。
     """
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
 
-    left: list[str] = []
+    sent: list[str] = []
 
-    async def _spy_leave(self: Any, office_id: str) -> None:
-        left.append(office_id)
+    async def _spy_emit(self: Any, event: str, data: Any = None, *a: Any, **kw: Any) -> None:
+        sent.append(event)
 
-    monkeypatch.setattr(SMCPComputerClient, "leave_office", _spy_leave)
+    monkeypatch.setattr(SMCPComputerClient, "emit", _spy_emit)
 
     comp = Computer(name="leave_c2", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     client = SMCPComputerClient(computer=comp)
@@ -1615,8 +1619,9 @@ async def test_socket_leave_in_real_disconnect_window_reports_not_connected(monk
 
     await _interactive_loop(comp, init_client=client)
 
-    assert left == [], f"断线窗口内不得发 leave_office，实得 {left!r}"
-    assert any("未连接 / Not connected" in line for line in printed), f"应提示未连接：{printed!r}"
+    assert LEAVE_OFFICE_EVENT not in sent, f"断线时不得发包，实得 {sent!r}"
+    assert client.office_id is None, "本地意图必须清掉（否则重连后自动回房把刚退的房又回一遍）"
+    assert any("已清除本地入房意图" in line for line in printed), f"应如实提示：{printed!r}"
 
 
 @pytest.mark.asyncio

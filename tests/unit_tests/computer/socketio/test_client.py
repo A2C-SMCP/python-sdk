@@ -29,10 +29,10 @@ async def test_emit_disallows_notify_and_client_events():
 
 
 @pytest.mark.asyncio
-async def test_emit_update_config_only_when_in_office(monkeypatch):
+async def test_emit_update_config_only_when_confirmed_and_live(monkeypatch):
     """
-    中文：仅当已加入房间（有 office_id）时触发 UPDATE_MCP_CONFIG_EVENT；未加入时不触发
-    English: Fire UPDATE_MCP_CONFIG_EVENT only when office_id set; otherwise do nothing
+    中文：仅当**服务端已确认**在房（``_confirmed_office_id``）且 namespace 在册时触发 UPDATE_MCP_CONFIG_EVENT
+    English: Fire UPDATE_MCP_CONFIG_EVENT only with a server-confirmed office on a live namespace
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "sid-123"
@@ -44,19 +44,42 @@ async def test_emit_update_config_only_when_in_office(monkeypatch):
 
     # 注入必要上下文（无需真实连接）/ Inject minimal context (no real connection)
     client.namespaces[SMCP_NAMESPACE] = "sid-123"
-
-    # 场景1：未加入房间，不应发送
     monkeypatch.setattr(SMCPComputerClient, "emit", fake_emit, raising=False)
+
+    # 场景1：从未入房（无意图）⇒ 不发，且不记待补发
     client.office_id = None
     await SMCPComputerClient.emit_update_config(client)
     assert not sent
+    assert client._deferred_office_updates == set()
 
-    # 场景2：已加入房间，应发送 UPDATE_MCP_CONFIG_EVENT
+    # 场景2：服务端已确认且 namespace 在册 ⇒ 正常发送
     client.office_id = "office-1"
+    client._confirmed_office_id = "office-1"
     await SMCPComputerClient.emit_update_config(client)
     assert len(sent) == 1
     assert sent[0][0] == UPDATE_CONFIG_EVENT
     assert sent[0][1] == {"computer": "sid-123"}
+
+
+@pytest.mark.asyncio
+async def test_emit_update_config_defers_when_office_not_confirmed(monkeypatch):
+    """#223：desired 有值但服务端**尚未确认**（回放在途窗口）⇒ 不发包（发了也会被服务端丢弃），
+    改记入待补发集合，等成员关系确立后补发。"""
+    client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "sid-123"
+    client.namespaces[SMCP_NAMESPACE] = "sid-123"
+    client.office_id = "office-1"
+    assert client._confirmed_office_id is None, "前置：服务端尚未确认成员关系"
+    sent = []
+
+    async def fake_emit(self, event, data=None, namespace=None, callback=None):
+        sent.append((event, data, namespace))
+
+    monkeypatch.setattr(SMCPComputerClient, "emit", fake_emit, raising=False)
+    await SMCPComputerClient.emit_update_config(client)
+
+    assert not sent, "未确认在房时不得发包"
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}, "窗口内的变更必须被记录"
 
 
 @pytest.mark.asyncio

@@ -136,11 +136,17 @@ class ConnectionArgs(TypedDict):
 
 
 def _client_in_office(client: Any) -> bool:
-    """客户端是否**真实**在房间里——优先用客户端自己的判据，桩对象回退到 ``office_id``。
+    """客户端是否「可上报 / 可退房」——有入房意图 **且** namespace 在册。优先用客户端自己的判据，
+    桩对象回退到 ``office_id``。
 
-    ``office_id`` 是 *desired*：重连窗口内它被刻意保留（#203），此时 namespace 并未在册、并不真在
-    房里。客户端已把正确判据固化在 ``SmcpComputerClient._in_office()``（其文档明确要求据此判断），
-    CLI 沿用同一判据以免在断线窗口里对一个并不在的房间发 leave。
+    ``office_id`` 是 *desired*：重连窗口内它被刻意保留（#203），此时 namespace 并未在册。客户端把该
+    判据固化在 ``SmcpComputerClient._in_office()``（意图 ∧ 在册；它**不代表**服务端已确认成员关系——
+    #223 起上报判据另立 ``_can_emit_office_update``，本判据继续服务 CLI）。
+
+    #223：**退房不再以本判据为门**——desired 有值就必须真的调 ``leave_office``（由客户端清本地意图并
+    在在册时通知服务端），否则用户在被判「未连接 / 未在房」时退的房会在重连后被自动回房拉回来。故本
+    判据在 ``socket leave`` 里只剩**文案**职责（「已离开房间」vs「已清除本地入房意图」），改名路径
+    「1/4」仍用它决定要不要通知旧房。
     """
     probe = getattr(client, "_in_office", None)
     if callable(probe):
@@ -690,17 +696,25 @@ async def interactive_loop(
                             if joined:
                                 console.print("[green]已加入房间 / Joined office[/green]")
                 elif sub == "leave":
-                    if not smcp_client or not getattr(smcp_client, "connected", False):
+                    if not smcp_client:
                         console.print("[yellow]未连接 / Not connected[/yellow]")
-                    elif not _client_in_office(smcp_client):
-                        # 判据与改名路径的「1/4」统一为 `_client_in_office`（#203 重连窗口内 desired
-                        # 被刻意保留，此时并不真在房里；沿用 desired 会对未在册的 namespace 发
-                        # ``leave_office`` ⇒ 抛 BadNamespaceError ⇒ 只打印笼统「执行失败」，且用户
-                        # 以为退成了、重连后又被自动拉回旧房）。
+                    elif smcp_client.office_id is None:
                         console.print("[yellow]未加入房间 / Not in any office[/yellow]")
                     else:
+                        # #223：desired 有值就必须**真的**退——不能因为「未连接 / 未确认在房」就跳过。
+                        # 客户端 ``leave_office`` 负责清本地意图（并作废在途回房），仅在 namespace 在册时
+                        # 顺带通知服务端；跳过则本地意图留着，重连后的自动回房会把用户刚退掉的房又回一遍。
+                        # 判据 ``_client_in_office`` 只决定文案（真发出去了 vs 仅清了本地意图），且必须在
+                        # 调用**之前**求值——``leave_office`` 会清掉本地意图，调用后再问只会得到 False。
+                        reachable = _client_in_office(smcp_client)
                         await smcp_client.leave_office(smcp_client.office_id)
-                        console.print("[green]已离开房间 / Left office[/green]")
+                        if reachable:
+                            console.print("[green]已离开房间 / Left office[/green]")
+                        else:
+                            console.print(
+                                "[yellow]未连接：已清除本地入房意图，重连后不再自动回房 / "
+                                "Not connected; local office intent cleared[/yellow]"
+                            )
                 else:
                     console.print("[yellow]未知的 socket 子命令 / Unknown subcommand[/yellow]")
 
