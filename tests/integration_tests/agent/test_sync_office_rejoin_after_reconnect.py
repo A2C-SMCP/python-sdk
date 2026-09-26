@@ -345,3 +345,36 @@ def test_sync_explicit_join_rejected_by_real_server_raises_with_code(
     finally:
         first.disconnect()
         second.disconnect()
+
+
+def test_sync_explicit_and_replay_rejections_are_byte_identical_on_real_server(
+    real_sync_server: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#219（同步镜像）：显式 join 与重放被真实闸门以同一理由（4101）拒绝 ⇒ ERROR 文本逐字相同。
+
+    重放在同一 sid 上直接调用（同异步侧）：被拒 sid 在服务端无房间残留，与重连后的新 sid 同构。
+    """
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+    first = _make_agent()
+    second = _make_agent()
+    second.office_rejoin_retry_budget = 0.0  # 单次尝试：本用例比的是文案，不是退避
+    try:
+        first.connect_to_server(f"http://localhost:{real_sync_server}", socketio_path="/socket.io")
+        first.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        second.connect_to_server(f"http://localhost:{real_sync_server}", socketio_path="/socket.io")
+        with pytest.raises(SMCPProtocolError) as ei:
+            second.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert ei.value.code == 4101
+
+        second._desired_office = (_OFFICE, _AGENT_NAME)
+        second._rejoin_office((_OFFICE, _AGENT_NAME), second._office_generation)
+
+        texts = [call.args[0] for call in fake_logger.error.call_args_list]
+        assert len(texts) == 2, f"两条路径须各产出一条共享 ERROR，实得：{texts}"
+        assert texts[0] == texts[1] and "4101" in texts[0], f"首次被拒与重放被拒的可感结果须同态：{texts}"
+    finally:
+        first.disconnect()
+        second.disconnect()

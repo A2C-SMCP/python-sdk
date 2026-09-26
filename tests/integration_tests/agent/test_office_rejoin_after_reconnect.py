@@ -305,6 +305,42 @@ async def test_explicit_join_rejected_by_real_server_raises_with_code(
 
 
 @pytest.mark.asyncio
+async def test_explicit_and_replay_rejections_are_byte_identical_on_real_server(
+    office_server: _OfficeRecordingNamespace,  # 请求它是为了启动服务器（副作用），非断言对象
+    basic_server_port: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#219：同一连接先经显式 join、再经重放，被**真实闸门**以同一理由（4101）拒绝 ⇒ ERROR 文本逐字相同。
+
+    重放在同一 sid 上直接调用（不经断连→钩子→调度链，该链由本文件其余用例覆盖）：服务端校验先于副作用 ⇒
+    被拒 sid 在服务端无房间残留，与重连后的新 sid 同构。
+    """
+    fake_logger = MagicMock()
+    monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+    first = _make_agent()
+    second = _make_agent()
+    second.office_rejoin_retry_budget = 0.0  # 单次尝试：本用例比的是文案，不是退避
+    try:
+        await _connect(first, basic_server_port)
+        await first.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        await _connect(second, basic_server_port)
+        with pytest.raises(SMCPProtocolError) as ei:
+            await second.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert ei.value.code == 4101
+
+        second._desired_office = (_OFFICE, _AGENT_NAME)
+        await second._arejoin_office((_OFFICE, _AGENT_NAME), second._office_generation)
+
+        texts = [call.args[0] for call in fake_logger.error.call_args_list]
+        assert len(texts) == 2, f"两条路径须各产出一条共享 ERROR，实得：{texts}"
+        assert texts[0] == texts[1] and "4101" in texts[0], f"首次被拒与重放被拒的可感结果须同态：{texts}"
+    finally:
+        await first.disconnect()
+        await second.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_agent_manual_disconnect_drops_membership_intent(
     office_server: _OfficeRecordingNamespace,
     basic_server_port: int,
