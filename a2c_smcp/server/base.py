@@ -15,6 +15,7 @@ from socketio import AsyncNamespace
 
 from a2c_smcp.exceptions import NameConflictError
 from a2c_smcp.server.auth import AuthenticationProvider
+from a2c_smcp.server.name_registry import release_name, reserve_name
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
 from a2c_smcp.server.utils import office_room
 from a2c_smcp.utils.logger import ContextLogger, get_logger
@@ -100,15 +101,18 @@ class BaseNamespace(AsyncNamespace):
         """
         logger.info(f"SocketIO Client {sid} disconnecting from {self.namespace}...")
 
-        # 清理name映射
-        # Clean up name mapping
-        await self._unregister_name(sid)
-
         # 清理房间连接：离开哪些房、以何种标识交给 ``leave_room``，由 :meth:`_rooms_to_leave_on_disconnect` 决定
         # （基类保持原语义；``SMCPNamespace`` 覆写为只处理 ``office:`` 房并交出原始 office_id，#216）。
         # Which rooms to leave (and in which identifier space) is decided by the overridable hook.
         for room in self._rooms_to_leave_on_disconnect(sid):
             await self.leave_room(sid, room)
+
+        # 残留注销**排在退房广播之后**（S3，与 sync 同序）：先注销会让同名新连接在旧 leave 广播发出前完成入房并
+        # 广播 enter。常态下键已由 leave_room 注销；残留（注册晚于退房快照）须补一次 leave 宣告。
+        # Residual cleanup after the leave broadcasts (S3, same order as sync); a residual key gets its leave.
+        residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+        if residual is not None:
+            await self._announce_residual_leave(sid, residual)
 
         logger.info(f"SocketIO Client {sid} disconnected from {self.namespace}")
 
@@ -166,8 +170,13 @@ class BaseNamespace(AsyncNamespace):
 
     async def _register_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """
-        注册 ``(office_id, role, name)`` → sid 映射，键已被其它 sid 持有则抛出异常
-        Register the ``(office_id, role, name)`` → sid mapping; raise if another sid holds the key
+        **原子**注册 ``(office_id, role, name)`` → sid：存活 / Agent 席位 / 同名校验与写入在一次同步调用内完成。
+        Atomically register the ``(office_id, role, name)`` → sid mapping.
+
+        原子性是**结构保证**：核心 :func:`~a2c_smcp.server.name_registry.reserve_name` 是同步函数（零挂起点），
+        不会被断连收尾或并发 join 穿插——此前的原子性只是「各 await 碰巧不挂起」（换成 pubsub manager 即失效）。
+        与 sync 端同一核心（sync 在注册表锁内调用），判据单点、不漂移（v0.5.0 审查 🔴7/S1）。
+        Atomicity is structural: the core is a synchronous function shared with the sync namespace.
 
         Args:
             office_id (OFFICE_ID): 房间ID / Office ID
@@ -176,23 +185,20 @@ class BaseNamespace(AsyncNamespace):
             sid (SID): 客户端连接ID / Client connection ID
 
         Raises:
+            SessionGoneError: sid 已进入断连收尾。
+            RoomFullError: ``4101``（目标房已有另一 Agent）。
             NameConflictError: 当键已被其他sid使用时 / When the key is already held by another sid
         """
-        await self._ensure_name_registerable(office_id, role, name, sid)
-        key = (office_id, role, name)
-        if key in self._name_to_sid_map:
-            # 如果是同一个sid重新注册，允许（幂等操作）
-            # Allow re-registration by the same sid (idempotent operation)
-            logger.debug(f"Name {key!r} re-registered by same sid '{sid}'")
-        else:
-            # 一个 sid 至多持有一个键：先释放它此前持有的（正常路径已由 leave_room 释放，此处兜住收敛失败的残留）
-            # One key per sid: release any key it still holds (normally already released by leave_room).
-            await self._unregister_name(sid)
-            self._name_to_sid_map[key] = sid
-            self._sid_to_name_key[sid] = key
-            logger.debug(f"Registered name {key!r} -> sid '{sid}' in namespace {self.namespace}")
+        reserve_name(
+            self._name_to_sid_map,
+            self._sid_to_name_key,
+            (office_id, role, name),
+            sid,
+            connected=bool(self.server.manager.is_connected(sid, self.namespace)),
+        )
+        logger.debug(f"Registered name {(office_id, role, name)!r} -> sid '{sid}' in namespace {self.namespace}")
 
-    async def _unregister_name(self, sid: SID) -> None:
+    async def _unregister_name(self, sid: SID, office_id: OFFICE_ID | None = None) -> None:
         """
         注销sid当前持有的名字映射（按反向索引 ``sid → key`` 定位，**不**从会话字段反推）
         Unregister the name mapping held by ``sid`` (located via the reverse index, not the session)
@@ -200,16 +206,26 @@ class BaseNamespace(AsyncNamespace):
         会话的 role/name 可能已被 ``on_server_join_office`` 的回滚 pop 掉（首次入房失败且收敛也失败时），
         从会话反推会找不到键 ⇒ 残留键把该房同 role 同名永久拒为 ``4105``。反向索引与注册同源写入，杜绝分叉。
         **归属守卫**：只删除确由本 sid 持有的键——绝不替其它 sid 注销（单点守卫，调用方无需各自再判）。
+        ``office_id`` 非空时只注销该房的键（``leave_room`` 用）。
         Session fields may have been rolled back; the reverse index is written together with the registry,
         so it cannot diverge. Ownership guard: a key now held by another sid is never removed.
 
         Args:
             sid (SID): 客户端连接ID / Client connection ID
+            office_id (OFFICE_ID | None): 仅注销该房的键 / only release a key of this office
         """
-        key = self._sid_to_name_key.pop(sid, None)
-        if key is not None and self._name_to_sid_map.get(key) == sid:
-            del self._name_to_sid_map[key]
+        key = release_name(self._name_to_sid_map, self._sid_to_name_key, sid, office_id)
+        if key is not None:
             logger.debug(f"Unregistered name {key!r} for sid '{sid}' in namespace {self.namespace}")
+
+    def _holds_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> bool:
+        """``(office_id, role, name)`` 此刻是否仍由 ``sid`` 持有。/ Whether ``sid`` still holds the key."""
+        return self._name_to_sid_map.get((office_id, role, name)) == sid
+
+    async def _announce_residual_leave(self, sid: SID, key: NAME_KEY) -> None:
+        """断连残留键的补发退房宣告钩子（基类无协议知识 ⇒ no-op；``SMCPNamespace`` 覆写）。
+        Hook to announce a leave for a residual key found at disconnect (no-op in the base class).
+        """
 
     def _rooms_to_leave_on_disconnect(self, sid: SID) -> list[str]:
         """断连时需要 ``leave_room`` 的房间（标识须与本类 ``leave_room`` 的入参语义一致）。

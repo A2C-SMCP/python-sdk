@@ -8,12 +8,14 @@
 * 描述: 同步版本基础Namespace抽象类 / Synchronous Base Namespace abstract class
 """
 
+import threading
 from typing import Any, cast
 from urllib.parse import parse_qs
 
 from socketio import Namespace
 
 from a2c_smcp.exceptions import NameConflictError
+from a2c_smcp.server.name_registry import release_name, reserve_name
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
 from a2c_smcp.server.utils import office_room
@@ -42,6 +44,12 @@ class SyncBaseNamespace(Namespace):
         # 反推失败即留下永久 4105 的残留键）。一个 sid 至多持有一个键。
         # Reverse index sid → its single key: unregister by sid, never by re-deriving from mutable session fields.
         self._sid_to_name_key: dict[SID, NAME_KEY] = {}
+        # 注册表锁（v0.5.0 审查 🔴7/S1）：同步服务端每个事件一个线程（``async_handlers=True``），断连收尾跑在
+        # engine.io 线程上——「校验 + 写入」与「注销」必须互斥，否则 ① 断连清理先跑完、join 后写入 ⇒ 注册表
+        # 残留指向死 sid 的键（同名重连永久 4105）；② 两个同名 join 都通过校验 ⇒ 房内双同名。可重入：注销
+        # 可能在持锁路径内被再次调用。锁内**只**做纯字典操作（不 emit、不读写会话），无锁序问题。
+        # Registry lock: check-and-set and unregister must be mutually exclusive across handler threads.
+        self._registry_lock = threading.RLock()
 
     def on_connect(self, sid: SID, environ: dict, auth: dict | None = None) -> bool:
         """
@@ -84,15 +92,20 @@ class SyncBaseNamespace(Namespace):
         """
         logger.info(f"SocketIO Client {sid} disconnecting from {self.namespace}...")
 
-        # 清理name映射
-        # Clean up name mapping
-        self._unregister_name(sid)
-
         # 清理房间连接：离开哪些房、以何种标识交给 ``leave_room``，由 :meth:`_rooms_to_leave_on_disconnect` 决定
         # （基类保持原语义；``SMCPNamespace`` 覆写为只处理 ``office:`` 房并交出原始 office_id，#216）。
         # Which rooms to leave (and in which identifier space) is decided by the overridable hook.
         for room in self._rooms_to_leave_on_disconnect(sid):
             self.leave_room(sid, room)
+
+        # 残留注销**排在退房广播之后**（S3）：先注销会让同名新连接在旧 leave 广播发出前完成入房并广播 enter，
+        # 对端收到「enter(X) → leave(X)」而丢掉新的 X。常态下键已由 leave_room 注销，此处只兜住「注册落在
+        # 退房快照之后」的残留（并发 join 的线程窗口）——残留键对应的在场宣告须补一次 leave。
+        # Residual cleanup runs after the leave broadcasts (S3); a residual key still gets its leave announced.
+        with self._registry_lock:
+            residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+        if residual is not None:
+            self._announce_residual_leave(sid, residual)
         logger.info(f"SocketIO Client {sid} disconnected from {self.namespace}")
 
     def trigger_event(self, event: str, *args: Any) -> Any:
@@ -125,35 +138,49 @@ class SyncBaseNamespace(Namespace):
 
     def _register_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """
-        注册 ``(office_id, role, name)`` → sid 映射，键已被其它 sid 持有则抛出异常（同步）
-        Register the ``(office_id, role, name)`` → sid mapping (sync)
+        **原子**注册 ``(office_id, role, name)`` → sid（同步）：注册表锁内一次完成存活 / Agent 席位 / 同名校验与写入。
+        Atomically register the ``(office_id, role, name)`` → sid mapping under the registry lock (sync).
+
+        存活判据 ``manager.is_connected``：断连收尾一开始（``pre_disconnect``）即为假，早于断连 handler——故
+        「注册先于断连」时由断连的残留注销清掉，「注册晚于断连开始」时在此被拒，两种交错都不留死 sid 的键（🔴7）。
+        ``is_connected`` turns False before the disconnect handler runs, so no interleaving leaves a dead key.
 
         Raises:
+            SessionGoneError: sid 已进入断连收尾。
+            RoomFullError: ``4101``（目标房已有另一 Agent）。
             NameConflictError: 当键已被其他sid使用时 / When the key is already held by another sid
         """
-        self._ensure_name_registerable(office_id, role, name, sid)
-        key = (office_id, role, name)
-        if key in self._name_to_sid_map:
-            # 如果是同一个sid重新注册，允许（幂等操作）
-            # Allow re-registration by the same sid (idempotent operation)
-            logger.debug(f"Name {key!r} re-registered by same sid '{sid}'")
-        else:
-            # 一个 sid 至多持有一个键：先释放它此前持有的（正常路径已由 leave_room 释放，此处兜住收敛失败的残留）
-            # One key per sid: release any key it still holds (normally already released by leave_room).
-            self._unregister_name(sid)
-            self._name_to_sid_map[key] = sid
-            self._sid_to_name_key[sid] = key
-            logger.debug(f"Registered name {key!r} -> sid '{sid}' in namespace {self.namespace}")
+        with self._registry_lock:
+            reserve_name(
+                self._name_to_sid_map,
+                self._sid_to_name_key,
+                (office_id, role, name),
+                sid,
+                connected=bool(self.server.manager.is_connected(sid, self.namespace)),
+            )
+        logger.debug(f"Registered name {(office_id, role, name)!r} -> sid '{sid}' in namespace {self.namespace}")
 
-    def _unregister_name(self, sid: SID) -> None:
+    def _unregister_name(self, sid: SID, office_id: OFFICE_ID | None = None) -> None:
         """
         注销sid当前持有的名字映射（同步镜像：按反向索引 ``sid → key`` 定位、不从会话字段反推；归属守卫只删本 sid 持有的键）
         Unregister the mapping held by ``sid`` (sync; via the reverse index, ownership-guarded)
+
+        ``office_id`` 非空时只注销该房的键（``leave_room`` 用）。/ With ``office_id``, only that office's key.
         """
-        key = self._sid_to_name_key.pop(sid, None)
-        if key is not None and self._name_to_sid_map.get(key) == sid:
-            del self._name_to_sid_map[key]
+        with self._registry_lock:
+            key = release_name(self._name_to_sid_map, self._sid_to_name_key, sid, office_id)
+        if key is not None:
             logger.debug(f"Unregistered name {key!r} for sid '{sid}' in namespace {self.namespace}")
+
+    def _holds_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> bool:
+        """``(office_id, role, name)`` 此刻是否仍由 ``sid`` 持有（锁内读取）。/ Whether ``sid`` still holds the key."""
+        with self._registry_lock:
+            return self._name_to_sid_map.get((office_id, role, name)) == sid
+
+    def _announce_residual_leave(self, sid: SID, key: NAME_KEY) -> None:
+        """断连残留键的补发退房宣告钩子（基类无协议知识 ⇒ no-op；``SyncSMCPNamespace`` 覆写）。
+        Hook to announce a leave for a residual key found at disconnect (no-op in the base class).
+        """
 
     def _rooms_to_leave_on_disconnect(self, sid: SID) -> list[str]:
         """断连时需要 ``leave_room`` 的房间（标识须与本类 ``leave_room`` 的入参语义一致）。

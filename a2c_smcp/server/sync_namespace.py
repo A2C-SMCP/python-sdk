@@ -20,9 +20,10 @@ from a2c_smcp.exceptions import (
     RoomRejection,
     SMCPNamespaceError,
 )
+from a2c_smcp.server.name_registry import SessionGoneError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.sync_base import SyncBaseNamespace
-from a2c_smcp.server.types import OFFICE_ID, SID
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
 from a2c_smcp.server.utils import (
     build_room_rejection_ack,
     default_session_name,
@@ -101,6 +102,13 @@ logger = get_logger("server")
 _DISCONNECTED: object = object()
 
 
+def _leave_notification(office_id: OFFICE_ID, role: str | None, name: str) -> LeaveOfficeNotification:
+    """按角色构造 ``notify:leave_office`` 载荷（``computer`` / ``agent`` 字段取名字而非 sid）。"""
+    if role == "computer":
+        return LeaveOfficeNotification(office_id=office_id, computer=name)
+    return LeaveOfficeNotification(office_id=office_id, agent=name)
+
+
 class SyncSMCPNamespace(SyncBaseNamespace):
     """
     同步SMCP命名空间，处理SMCP相关事件（同步）
@@ -160,6 +168,19 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         Only office rooms, as raw office ids (this class's ``leave_room`` takes an office id, #216).
         """
         return office_ids_of_rooms(self.rooms(sid))
+
+    def _announce_residual_leave(self, sid: SID, key: NAME_KEY) -> None:
+        """断连时发现的残留键（注册落在退房快照之后）补发 ``notify:leave_office``——对端可能已收到其 enter。
+        A residual key at disconnect may already have been announced; announce its leave.
+        """
+        office_id, role, name = key
+        self._emit_to_office(LEAVE_OFFICE_NOTIFICATION, _leave_notification(office_id, role, name), office_id, skip_sid=sid)
+
+    def _target_still_resolves(self, office_id: OFFICE_ID, computer_name: str, computer_sid: SID) -> bool:
+        """房内名字此刻是否**仍解析到同一 sid**（relay 复查与在途断连守卫的唯一判据，S4）。
+        Whether the in-room name still resolves to the *same* sid (single criterion for both re-checks).
+        """
+        return self.get_sid_by_name(office_id, "computer", computer_name) == computer_sid
 
     def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
@@ -228,19 +249,27 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             session["office_id"] = room
             self.save_session(sid, session)
 
-            # 注册name到sid的映射
-            # Register name-to-sid mapping
-            self._register_name(room, session["role"], session["name"], sid)
+            # 注册name到sid的映射：**原子**「存活 + Agent 席位 + 同名」校验并写入（🔴7/S1）。阶段 1 的闸门只是
+            # 廉价预检；并发 join / 断连收尾落在预检与此处之间时，以此处为准（被拒 ⇒ 下方失败收敛摘房）。
+            # Register name-to-sid mapping: the authoritative atomic check-and-set (phase 1 is only a pre-check).
+            role, name = session["role"], session["name"]
+            self._register_name(room, role, name, sid)
             registered = True
 
             # 根据角色发送不同的通知 / Send different notifications based on role
             notification_data: EnterOfficeNotification = {"office_id": room}
-            if session.get("role") == "computer":
-                notification_data["computer"] = session.get("name")
+            if role == "computer":
+                notification_data["computer"] = name
             else:
-                notification_data["agent"] = session.get("name")
+                notification_data["agent"] = name
 
             self._emit_to_office(ENTER_OFFICE_NOTIFICATION, notification_data, room, skip_sid=sid)
+            # 宣告后复查（线程窗口）：注册与本次 enter 广播之间，断连收尾 / 并发退房可能已注销该键并**先**发出
+            # leave ⇒ 对端最终看到「leave → enter」的幻影成员。键已不归本 sid ⇒ 补发一次 leave 收敛对端视图
+            # （可能与已发出的 leave 重复——重复 leave 对端幂等，缺失则永久幻影）。
+            # Post-announce re-check: if the key was released meanwhile, re-announce the leave (duplicates are harmless).
+            if not self._holds_name(room, role, name, sid):
+                self._emit_to_office(LEAVE_OFFICE_NOTIFICATION, _leave_notification(room, role, name), room, skip_sid=sid)
         except Exception:
             # 失败收敛 —— 按**提交点**分刀：旧房离开未提交（会话 office_id 仍 == past_room）⇒ 一切原样，
             # 不收敛（否则会把客户端从合法所属的旧房无声摘除）；否则摘成「无房」并与会话同步。
@@ -276,17 +305,12 @@ class SyncSMCPNamespace(SyncBaseNamespace):
 
         # 构建离开通知，使用name而不是sid
         # Build leave notification using name instead of sid
-        client_name = session.get("name", "")
-        notification = (
-            LeaveOfficeNotification(office_id=room, computer=client_name)
-            if session.get("role") == "computer"
-            else LeaveOfficeNotification(office_id=room, agent=client_name)
-        )
+        notification = _leave_notification(room, session.get("role"), session.get("name", ""))
         self._emit_to_office(LEAVE_OFFICE_NOTIFICATION, notification, room, skip_sid=sid)
 
-        # 注销name映射
-        # Unregister name mapping
-        self._unregister_name(sid)
+        # 注销name映射：只注销**本房**的键（并发线程可能已为同 sid 登记了别的房，不得顺手删掉）
+        # Unregister only this office's key.
+        self._unregister_name(sid, room)
 
         if "office_id" in session:
             del session["office_id"]
@@ -361,6 +385,11 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # 收敛（可能已删除 office_id），整体覆盖 backup 会把旧房号复活、使会话与真实成员关系分叉。
             # 缺失字段须**删除**而非赋 None（后者会污染后续 role 判定）。镜像 async 实现（#213）。
             # Roll back only the fields written here; room ownership belongs to enter_room (#213).
+            if isinstance(e, SessionGoneError):
+                # 发起者已进入断连收尾（🔴7）：会话即将销毁、ack 无人接收 ⇒ 不回滚、不打错误栈
+                # The originator is disconnecting: nothing to roll back, nobody to ack.
+                logger.info(f"server:join_office 发起者已断连，放弃入房 sid={sid}")
+                return build_internal_error()
             live_session = self.get_session(sid)
             for field in ("role", "name"):
                 if field in backup_session:
@@ -597,20 +626,27 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         if not computer_sid:
             return build_computer_not_found_error(computer_name)
 
-        try:
-            session = self.get_session(computer_sid)
-        except KeyError:
-            # socket 已被移除（断连收尾）；注销先于移除 ⇒ 下方复查必然判为「已离开」
-            # Socket already removed; unregistration precedes removal, so the re-check below sees it gone.
-            session = None
+        # 会话字段**先快照、后复查**（S2）：会话是活对象，并发退房先注销、后删 ``office_id``——快照早于复查 ⇒
+        # 快照若已陈旧，复查必然判「已离开」；反过来（先复查后读）会读到半途被删的字段而误报注册表损坏。
+        # Snapshot the live session's fields *before* the registry re-check (leave unregisters, then clears office_id).
+        session = self._get_session_or_none(computer_sid)
+        target_role = session.get("role") if session else None
+        target_office = session.get("office_id") if session else None
         # 解析后目标已离房 / 断连（同步服务端多线程分发下可达：解析与读会话之间另一线程跑完 on_disconnect / 换房）
-        # ⇒ 与「不存在」同义回 404（同在途断连分支）。以注册表复查判定：注销恒先于清会话 office_id。
+        # ⇒ 与「不存在」同义回 404（同在途断连分支）。判据与在途断连守卫共用 :meth:`_target_still_resolves`（S4）。
         # Target left between resolution and session read (reachable under threaded sync dispatch) → 404.
-        if self.get_sid_by_name(agent_office, "computer", computer_name) != computer_sid:
+        if not self._target_still_resolves(agent_office, computer_name, computer_sid):
+            return build_computer_not_found_error(computer_name)
+        if session is None:
+            # 注册表仍指向一个会话已不存在的 sid：死 sid 残留。自愈注销（归属守卫只删它自己的键）并回 404，
+            # 不 raise——raise 会让 Agent 收不到 ack、干等满超时（S2）。
+            # Registry points at a vanished session: self-heal the residue and answer 404 instead of raising.
+            logger.warning(f"{event} 目标 sid={computer_sid} 会话已不存在，注销残留名字并回 404")
+            self._unregister_name(computer_sid)
             return build_computer_not_found_error(computer_name)
         # 不变量守卫：注册表仍指向该 sid、会话却与键矛盾 ⇒ 注册表损坏，显式 raise（#31：隔离不变量只 raise）。
         # Invariant guard: registry still points at the sid but the session contradicts the key → raise (#31).
-        if not session or session.get("role") != "computer" or session.get("office_id") != agent_office:
+        if target_role != "computer" or target_office != agent_office:
             raise SMCPNamespaceError(f"名字注册表与会话不一致：{event} / name registry diverged from session")
 
         # tool_call 透传 per-request timeout；其余 client:* 事件 timeout=None → 用 socketio 默认
@@ -659,7 +695,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # TOCTOU 复查：解析 SID 与登记之间目标可能已断连（信号永不会被 fire）。用 ``get_sid_by_name`` 复查
             # （``on_disconnect`` → base ``_unregister_name`` 清掉 name 映射）关闭该窗口。
             # TOCTOU re-check: target may have died between SID resolve and registration → short-circuit to 404.
-            if disconnect_ev.is_set() or self.get_sid_by_name(office_id, "computer", computer_name) is None:
+            # 判据与 relay 复查同一（``!= sid``，S4）：只判 ``is None`` 会漏掉「旧 sid 断连、同名新 sid 已注册」——
+            # 信号登记在旧 sid 上且其 fire 已发生过 ⇒ 调用挂到满超时而非 404。
+            if disconnect_ev.is_set() or not self._target_still_resolves(office_id, computer_name, computer_sid):
                 return _DISCONNECTED
 
             # ``disconnect_ev`` 一事二用：完成路径由 ``_runner`` 在 finally 触发，断连路径由 ``on_disconnect`` 触发，
