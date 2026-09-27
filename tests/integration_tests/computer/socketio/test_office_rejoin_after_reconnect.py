@@ -77,6 +77,15 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
         # ``("update_config", sid)``）——用于断言「补发发生在成功重放**之后**」，比两个计数各自断言强。
         # Arrival-ordered log so the flush can be tied to "after the successful replay".
         self.event_log: list[tuple[str, str]] = []
+        self.refuse_connect = False
+        self.refused_connects = 0
+
+    async def on_connect(self, sid: str, environ: dict, auth: dict | None = None) -> bool:  # type: ignore[override]
+        # v0.5.0 审查 🔴5：置位期间拒绝一切新连接 ⇒ 客户端停留在「自动重连窗口」（逐次尝试失败、循环在跑）
+        if self.refuse_connect:
+            self.refused_connects += 1
+            raise ConnectionRefusedError("refused (holding the client in its reconnect window)")
+        return await super().on_connect(sid, environ, auth)
 
     async def on_disconnect(self, sid: str) -> None:
         if self.stall_disconnect is not None:
@@ -393,6 +402,52 @@ async def test_manual_disconnect_drops_membership_intent(
         assert len(office_server.join_record) == 1, "手工断开后的连接不得自动回房"
         assert client.office_id is None
     finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_manual_disconnect_during_reconnect_window_stops_reconnect_and_never_rejoins(
+    office_server: _OfficeRecordingNamespace,
+    basic_server_port: int,
+) -> None:
+    """v0.5.0 审查 🔴5（真实 wire）：**重连窗口内**手工 ``disconnect()`` ⇒ 重连中止、之后永不回旧房。
+
+    上游 ``disconnect()`` 在窗口内是空操作（namespaces 已清空、eio 已断开；不置中止位、不触发钩子）⇒ 缺修复时
+    意图与重连都活着：服务端一恢复接纳，客户端就以新 SID 自动回房。本用例用「服务端拒绝一切新连接」把客户端钉在
+    窗口里，断开后**放开**拒绝并静默等待——服务端**不得**再看到任何 join（而非只断言客户端字段，后者会假绿）。
+    """
+    client = _make_client()
+    try:
+        await client.connect(
+            f"http://localhost:{basic_server_port}",
+            socketio_path="/socket.io",
+            namespaces=[SMCP_NAMESPACE],
+        )
+        await client.join_office("rejoin-office")
+        assert len(office_server.join_record) == 1
+
+        office_server.refuse_connect = True
+        ws = client.eio.ws
+        assert ws is not None
+        await ws.close()  # 传输中断 ⇒ 自动重连；服务端拒绝 ⇒ 停留在重连窗口
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CONNECT_TIMEOUT
+        while office_server.refused_connects < 1:
+            if loop.time() > deadline:
+                raise AssertionError("夹具失效：客户端未进入重连窗口")
+            await asyncio.sleep(_WAIT_INTERVAL)
+        assert not client.connected
+        assert client.office_id == "rejoin-office", "前置：窗口内 desired 保留（#203）"
+
+        await asyncio.wait_for(client.disconnect(), timeout=_CONNECT_TIMEOUT)
+        assert client.office_id is None, "手工断开必须清空入房意图"
+
+        office_server.refuse_connect = False  # 服务端恢复接纳：缺修复时客户端会在此后自动重连并回房
+        await asyncio.sleep(1.0)  # > reconnection_delay_max(0.3) 的数倍
+        assert len(office_server.join_record) == 1, f"断开后不得自动回房：{office_server.join_record!r}"
+        assert not client.connected, "断开后不得被自动重连"
+    finally:
+        office_server.refuse_connect = False
         await client.disconnect()
 
 

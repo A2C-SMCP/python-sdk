@@ -75,6 +75,11 @@ from a2c_smcp.utils.office import (
     rejoin_retry_delay,
     resolve_join_failure,
 )
+from a2c_smcp.utils.reconnect import (
+    adisconnect_aborting_reconnect,
+    forget_finished_reconnect_task,
+    translate_reconnect_attempt_error,
+)
 
 logger = get_logger("agent")
 
@@ -144,7 +149,10 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         # 调用 AsyncClient 的 emit 方法
         # Call AsyncClient's emit method
-        await AsyncClient.emit(self, event, data, namespace, callback)
+        # v0.5.0 审查 Y5：未显式传入 ⇒ 实例命名空间（与 Computer 侧一致）。上游 ``namespace or '/'`` 会把
+        # ``None`` 落到根命名空间 ⇒ 文档标准写法 ``join_office(office, name)`` 抛 ``BadNamespaceError``。
+        # Fall back to the instance namespace (upstream would route ``None`` to ``/``).
+        await AsyncClient.emit(self, event, data, namespace or self._namespace, callback)
 
     async def call(self, event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
         """
@@ -166,10 +174,48 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
 
         # 调用 AsyncClient 的 call 方法
         # Call AsyncClient's call method
-        return await AsyncClient.call(self, event, data, namespace, timeout)
+        # v0.5.0 审查 Y5：同 emit —— 未显式传入 ⇒ 实例命名空间 / fall back to the instance namespace
+        return await AsyncClient.call(self, event, data, namespace or self._namespace, timeout)
 
     # 事件合法性校验复用 BaseAgentClient.validate_emit_event
     # Reuse BaseAgentClient.validate_emit_event for event validation
+
+    async def connect(self, *args: Any, **kwargs: Any) -> None:
+        """
+        覆盖上游 ``connect``：重连循环内的握手失败规整（v0.5.0 审查 Y10）。
+
+        上游重连循环以本方法做每次尝试，且**只吞** ``ConnectionError`` / ``ValueError``。4008 在这里本是
+        ``ConnectionError`` ⇒ 被吞掉后**无限重试**（``reconnection_attempts`` 缺省 0 = 不限），违反 versioning.md
+        §4「不得静默重试」。故重连循环内识别到 4008 即中止重连（下一拍触发 ``__disconnect_final`` ⇒ 既有钩子
+        清入房意图），ERROR 日志可感。首连 / 宿主手工连接的行为不变（4008 仍由 :meth:`connect_to_server`
+        还原为 ``ProtocolVersionError``）。
+        Inside socketio's reconnect loop a 4008 aborts reconnection instead of retrying forever.
+        """
+        # 残留的「已结束重连任务」会让本次连接之后的掉线永不自动重连（见 forget_finished_reconnect_task）
+        forget_finished_reconnect_task(self)
+        try:
+            await AsyncClient.connect(self, *args, **kwargs)
+        except HANDSHAKE_CONNECT_ERRORS as e:
+            loop_error = translate_reconnect_attempt_error(self, e, logger)
+            if loop_error is None or loop_error is e:
+                raise
+            raise loop_error from e
+
+    async def disconnect(self) -> None:
+        """
+        断开连接，并**中止**进行中的自动重连（v0.5.0 审查 🔴5）。
+
+        上游 ``disconnect()`` 在重连窗口内是**空操作**（namespaces 已清空、eio 已断开；不置中止位、不触发钩子）
+        ⇒ 意图不清、重连不停，稍后自动回到旧房。故宿主在重连窗口内断开时，先走会话边界并清意图（手工断开是
+        最后的声明），再中止重连并等其收敛；若在途那次尝试恰好成功，再真正断开。其余情形（已连接 / 上游在
+        重连任务内部的自清理 / 空闲）原样走上游。
+        Disconnect, aborting an in-progress auto-reconnect (upstream ``disconnect()`` is a no-op there).
+        """
+        await adisconnect_aborting_reconnect(
+            self,
+            lambda: AsyncClient.disconnect(self),
+            lambda: self._begin_office_session(drop_desired=True),
+        )
 
     async def connect_to_server(
         self,

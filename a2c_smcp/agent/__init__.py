@@ -14,7 +14,7 @@ Provides Agent-side SMCP protocol client implementation, including both synchron
 """
 
 from a2c_smcp.agent.auth import DEFAULT_AUTH_FIELD_NAME, AgentAuthProvider, DefaultAgentAuthProvider
-from a2c_smcp.agent.base import BaseAgentClient
+from a2c_smcp.agent.base import OFFICE_ACK_TIMEOUT_ERRORS, TOOL_CALL_TIMEOUT_ERRORS, BaseAgentClient
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.agent.sync_client import SMCPAgentClient
@@ -48,6 +48,9 @@ __all__ = [
     "AsyncSMCPAgentClient",
     # 协议错误 / Protocol errors
     "SMCPProtocolError",
+    # ack 等待超时异常元组（socketio 的 TimeoutError 非 builtin 子类，按元组捕获）/ Ack-wait timeout tuples
+    "OFFICE_ACK_TIMEOUT_ERRORS",
+    "TOOL_CALL_TIMEOUT_ERRORS",
     # 类型定义 / Type definitions
     "AgentConfig",
     "AgentEventHandler",

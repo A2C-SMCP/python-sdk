@@ -1144,6 +1144,29 @@ class FakeSMCPClient:
 
 
 @pytest.mark.asyncio
+async def test_socket_connect_tears_down_a_reconnecting_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """v0.5.0 审查 🔴6：旧客户端「未连接」≠「已死」——自动重连窗口内它 ``connected=False`` 而重连任务在跑。
+
+    ``socket connect`` 若只看 ``connected`` 就新建客户端、不拆旧的，旧客户端稍后重连成功会以当前 ``comp.name``
+    回到旧房，成为 CLI 看不见、也管不到的幽灵 Computer。新建之前必须先 ``disconnect()`` 旧客户端（真实客户端
+    的 ``disconnect()`` 会中止在途重连并清意图，见 ``tests/unit_tests/utils/test_reconnect.py``）。
+    """
+    monkeypatch.setattr(cli_main, "SMCPComputerClient", FakeSMCPClient)
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["socket connect http://localhost:7010", "exit"]))
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
+    comp = Computer(name="ghost_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+    reconnecting = FakeSMCPClient(computer=comp)
+    reconnecting.office_id = "office-old"  # 重连窗口：desired 保留、connected=False
+    assert reconnecting.connected is False
+
+    await _interactive_loop(comp, init_client=reconnecting)
+
+    new_client = FakeSMCPClient.last  # type: ignore[attr-defined]
+    assert new_client is not reconnecting, "前置：确实新建了连接"
+    assert reconnecting.disconnects == 1, "新建连接前必须拆掉处于重连窗口的旧客户端（否则留下幽灵 Computer）"
+
+
+@pytest.mark.asyncio
 async def test_socket_and_notify_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli_main, "SMCPComputerClient", FakeSMCPClient)
 
@@ -1550,7 +1573,12 @@ async def test_socket_leave_clears_intent_even_when_not_reachable(monkeypatch: p
     async def _spy_emit(self: Any, event: str, data: Any = None, *a: Any, **kw: Any) -> None:
         sent.append(event)
 
+    async def _spy_call(self: Any, event: str, data: Any = None, *a: Any, **kw: Any) -> Any:
+        sent.append(event)  # v0.5.0 审查 Y4：leave 走 call（等 ack）；空 ack = 成功
+        return None
+
     monkeypatch.setattr(SMCPComputerClient, "emit", _spy_emit)
+    monkeypatch.setattr(SMCPComputerClient, "call", _spy_call)
 
     comp = Computer(name="leave_c", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
     client = SMCPComputerClient(computer=comp)

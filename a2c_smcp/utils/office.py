@@ -68,12 +68,12 @@ logger = get_logger("utils.office")
 OFFICE_JOIN_TIMEOUT = 10
 """入房等 ACK 的有界上界（秒）/ Bounded ack wait for ``server:join_office``, in seconds.
 
-**Agent 两侧**（显式 ``join_office`` 与自动回房）与 **Computer 自动回房**共用本值——一次死连接不会把
-office 操作互斥占满 socketio 默认的 60s。代价：慢网络下显式 join 的超时阈值由 60s（默认）收紧到 10s
-（#217 裁决 4，已披露）。**Computer 显式 join 未纳入**（仍走 socketio 默认超时）。
+**两端全部 office 操作**（Agent 两侧与 Computer 的显式 ``join_office`` / ``leave_office`` 与自动回房）
+共用本值——一次死连接不会把 office 操作互斥占满 socketio 默认的 60s（断线时 socketio 丢弃 ack 回调，
+``call`` 只能等满超时；持锁等满 60s 会把重连回房与退房一并卡住）。代价：慢网络下显式 join 的超时阈值
+由 60s（默认）收紧到 10s（#217 裁决 4，已披露；v0.5.0 审查起 Computer 显式 join 与两端 leave 同样纳入）。
 #212 的退避重试**逐次**套用本值，故恢复耗时的上界 = :data:`OFFICE_REJOIN_RETRY_BUDGET` + 本值。
-All replay paths share this bound; the Computer's explicit join is deliberately out of scope and still
-uses the socketio default.
+Every office operation on both sides (explicit join/leave and the replay) shares this bound.
 """
 
 OFFICE_REJOIN_RETRY_BUDGET: float = 45.0
@@ -202,6 +202,19 @@ def parse_join_ack(result: Any) -> JoinOfficeVerdict:
             code = None
         return JoinOfficeVerdict(ok=False, code=code, message=str(result.get("message", "")))
     return JoinOfficeVerdict(ok=False, code=None, message=NO_RESPONSE_MESSAGE)
+
+
+def parse_leave_ack(result: Any) -> JoinOfficeVerdict:
+    """
+    解析 ``server:leave_office`` 的 ACK（v0.5.0 审查 Y4）/ Parse a ``server:leave_office`` ack.
+
+    协议 error-handling.md:179 把 ``join_office`` 与 ``leave_office`` 放在**同一条**契约下（成功回空 ack，
+    失败回 flat ``ErrorPayload``；无房时退房属幂等成功），故判定规则与 :func:`parse_join_ack` **逐字相同**
+    ——这里委托给它而不是复制一份，避免两条路径的形状判据日后漂移。独立命名只为调用点语义清晰。
+    Same wire contract as ``join_office`` (protocol error-handling.md:179), hence a delegation rather
+    than a copy; the distinct name only keeps call sites readable.
+    """
+    return parse_join_ack(result)
 
 
 def is_validation_rejection(verdict: JoinOfficeVerdict | None) -> bool:

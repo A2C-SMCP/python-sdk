@@ -11,6 +11,7 @@
 import asyncio
 import functools
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, cast
@@ -53,6 +54,7 @@ from a2c_smcp.utils.office import (
     build_join_failure_payload,
     log_join_rejection,
     parse_join_ack,
+    parse_leave_ack,
     resolve_join_failure,
 )
 
@@ -77,6 +79,82 @@ TOOL_CALL_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, SioTi
 #:
 #: / Ack-wait timeout types for the office join paths (same socketio trap as tool calls).
 OFFICE_ACK_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, SioTimeoutError)
+
+
+def _raise_for_leave_rejection(result: Any) -> None:
+    """``server:leave_office`` 被拒 ⇒ 抛 :class:`SMCPProtocolError`（两侧共用；v0.5.0 审查 Y4）。
+
+    本地意图与已确认房号在调用前**已无条件清空**（#223 口径：退房是最后一句陈述）——裁决只决定是否抛，
+    不回滚任何本地状态。载荷与 join 同一构造器（未获裁决省略 ``code`` ⇒ ``.code == -1``）。
+    / Raise on a rejected leave; local state was already cleared unconditionally.
+    """
+    verdict = parse_leave_ack(result)
+    if not verdict.ok:
+        raise SMCPProtocolError(build_join_failure_payload(verdict))
+
+
+class _FifoLock:
+    """先到先得的互斥锁（票号 + ``threading.Condition``）/ A first-come-first-served mutex.
+
+    与 ``threading.Lock`` 同形（``acquire`` / ``release`` / 上下文管理器 / ``locked``），**不可重入**。
+    只提供阻塞式 ``acquire()``：office 操作锁的全部用法都是无超时的 ``with``。
+    等待被异常打断（如 ``KeyboardInterrupt``）的票号记为作废并被跳过——否则后续排队者永远等不到它。
+    Same shape as ``threading.Lock`` (non-reentrant, blocking only); abandoned tickets are skipped.
+    """
+
+    __slots__ = ("_abandoned", "_cond", "_next_ticket", "_serving")
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._next_ticket = 0
+        self._serving = 0
+        self._abandoned: set[int] = set()
+
+    def _skip_abandoned(self) -> None:
+        while self._serving in self._abandoned:
+            self._abandoned.discard(self._serving)
+            self._serving += 1
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        """同 ``threading.Lock.acquire``：超时 / 非阻塞未取到 ⇒ 票号作废并返回 ``False``。"""
+        deadline = None if (blocking and timeout < 0) else time.monotonic() + (timeout if blocking else 0)
+        with self._cond:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            try:
+                while ticket != self._serving:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        self._abandon(ticket)
+                        return False
+                    self._cond.wait(remaining)
+            except BaseException:
+                self._abandon(ticket)
+                raise
+        return True
+
+    def _abandon(self, ticket: int) -> None:
+        self._abandoned.add(ticket)
+        self._skip_abandoned()
+        self._cond.notify_all()
+
+    def release(self) -> None:
+        with self._cond:
+            if self._serving >= self._next_ticket:
+                raise RuntimeError("release unlocked _FifoLock")
+            self._serving += 1
+            self._skip_abandoned()
+            self._cond.notify_all()
+
+    def locked(self) -> bool:
+        with self._cond:
+            return self._serving != self._next_ticket
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.release()
 
 
 class BaseAgentClient(ABC):
@@ -387,9 +465,18 @@ class BaseAgentClient(ABC):
         / Broadcast ``server:tool_call_cancel`` (fire-and-forget, no ack); shared by the #209 cancel
         entry and the self-timeout fallback.
         """
-        agent_config = self.auth_provider.get_agent_config()
-        cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req_id)
-        await self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=namespace)
+        # v0.5.0 审查 🔴3：best-effort **在此处**收口（而非各调用点各自包一层）——自身超时兜底臂在
+        # ``except TOOL_CALL_TIMEOUT_ERRORS`` 子句**内**调用本方法，子句内抛出的异常不会被同级
+        # ``except Exception`` 接住 ⇒ 断链后等满超时，``emit`` 抛 ``BadNamespaceError`` 直接逃出
+        # ``emit_tool_call``（「永不抛」契约破裂，``meta.a2c_timeout`` 一并丢失）。watcher 与超时臂共用本根。
+        # ``except Exception`` 天然不吞 ``CancelledError``（BaseException 分支）。
+        # Best-effort at the single root: the timeout arm calls this *inside* an except clause.
+        try:
+            agent_config = self.auth_provider.get_agent_config()
+            cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req_id)
+            await self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=namespace)
+        except Exception as e:  # noqa: BLE001 - 取消广播 best-effort，失败不得影响原调用
+            logger.warning(f"发送取消广播失败（不影响原调用）/ cancel broadcast failed (original call unaffected): {e}")
 
     def _start_cancel_watcher(
         self,
@@ -651,14 +738,26 @@ class BaseAgentClient(ABC):
             若按入口位置清，「join 在途 + 并发 leave」会让在途 join 的成功落账把已确认房写成**刚退掉的
             房** ⇒ 后续任一次拒绝都把意图回退到那个幽灵房 ⇒ 下次重连自动回房到用户已明确退掉的房间。
             发包失败也照样作废（``finally``）：请求可能已发出，旧「已确认」不再可信。
+
+        Raises:
+            SMCPProtocolError: 服务端拒绝退房（flat ErrorPayload；v0.5.0 审查 Y4 起等 ack）。本地意图与已确认房号
+                在此之前**已**清空——裁决只决定是否抛，不回滚本地状态。
+            Exception: 传输层失败原样传播（超时按 :data:`OFFICE_ACK_TIMEOUT_ERRORS` 捕获）。
         """
         self._drop_desired_office()
         # 与自动回房共用 office 操作锁（同 join_office：避免 LEAVE 抢先于在途 JOIN 落地）
         async with self._office_op_lock:
             try:
-                await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+                # v0.5.0 审查 Y4：``server:leave_office`` **有 ack**（协议 events.md:173）⇒ 等裁决。
+                result = await self.call(
+                    LEAVE_OFFICE_EVENT,
+                    LeaveOfficeReq(office_id=office_id),
+                    namespace=namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
+                )
             finally:
                 self._confirmed_office = None
+        _raise_for_leave_rejection(result)
 
     @abstractmethod
     def register_event_handlers(self) -> None:
@@ -709,7 +808,10 @@ class BaseAgentSyncClient(ABC):
         # **锁次序单向**：``_office_op_lock`` → ``_office_state_lock``（禁止反向）。
         # 操作锁跨网络等待（``call`` 最多 OFFICE_JOIN_TIMEOUT），状态锁只覆盖瞬时写。
         # One-way lock order: op-lock → state-lock. The op-lock spans the bounded ack wait.
-        self._office_op_lock = threading.Lock()
+        # v0.5.0 审查 Y6：操作锁必须**先到先得**——``threading.Lock`` 不公平，排队的 ``leave(A)`` 可能被后发的
+        # ``join(B)`` 抢先 ⇒ wire 上 JOIN(B) → LEAVE（服务端按会话退掉 B）⇒ desired=B 却不在房、且无人重放。
+        # 异步侧 ``asyncio.Lock`` 按序唤醒，无此问题。/ FIFO op-lock: threading.Lock is not fair.
+        self._office_op_lock = _FifoLock()
         self._office_state_lock = threading.Lock()
         # #212 重连回房的退避预算（公开可配置，语义与异步侧逐字相同）：赋值即可按部署调整；<= 0 退化
         # 回单次尝试。/ Same bounded-backoff budget as the async side; assignable, <= 0 disables retrying.
@@ -961,9 +1063,13 @@ class BaseAgentSyncClient(ABC):
         / Broadcast ``server:tool_call_cancel`` (fire-and-forget, no ack); shared by the #209 cancel
         entry and the self-timeout fallback.
         """
-        agent_config = self.auth_provider.get_agent_config()
-        cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req_id)
-        self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=namespace)
+        # v0.5.0 审查 🔴3：best-effort 在此单一根收口（理由见异步侧同名方法）。
+        try:
+            agent_config = self.auth_provider.get_agent_config()
+            cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req_id)
+            self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=namespace)
+        except Exception as e:  # noqa: BLE001 - 取消广播 best-effort，失败不得影响原调用
+            logger.warning(f"发送取消广播失败（不影响原调用）/ cancel broadcast failed (original call unaffected): {e}")
 
     def _start_cancel_watcher(
         self,
@@ -1143,11 +1249,16 @@ class BaseAgentSyncClient(ABC):
             会话边界抢先（断连钩子）都会走到这里——语义与异步侧逐字相同，见
             :meth:`BaseAgentClient.join_office` 的 Note。
         """
-        generation = self._bump_office_generation()
-        session = self._office_session
-        self._cancel_office_rejoin()
+        # v0.5.0 审查 🔴4：入口段（推进 generation + 捕获会话纪元 + 写意图）必须在**同一次**状态锁获取内完成，
+        # 与异步侧的「零 await 原子段」同构。拆成两次获取时，断连钩子（``_begin_office_session``）可落在两次
+        # 之间：drop 分支把意图清成 None 后又被这里写回（已清空的意图被**复活**，下次连接静默回房）；保留分支
+        # 则推进了 generation ⇒ 本调用静默不发包却留下意图。
+        # One acquisition for the whole entry segment, mirroring the async side's await-free segment.
         with self._office_state_lock:
+            generation = self._bump_office_generation_locked()
+            session = self._office_session
             self._desired_office = (office_id, agent_name)
+        self._cancel_office_rejoin()
         with self._office_op_lock:
             if generation != self._office_generation:
                 # 取锁期间被抢占（``threading.Lock`` 不公平，排队顺序 ≠ 声明顺序）⇒ 不发包，
@@ -1201,14 +1312,25 @@ class BaseAgentSyncClient(ABC):
         Note:
             清账位置是承重条款（同异步侧）：``_confirmed_office`` 在 LEAVE **发出之后**作废，发包失败
             也照样作废（``finally``）。
+
+        Raises:
+            SMCPProtocolError: 服务端拒绝退房（同异步侧；本地状态已清空，不回滚）。
+            Exception: 传输层失败原样传播。
         """
         self._drop_desired_office()
         with self._office_op_lock:
             try:
-                self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id), namespace=namespace)
+                # v0.5.0 审查 Y4：等 leave 裁决（同异步侧）
+                result = self.call(
+                    LEAVE_OFFICE_EVENT,
+                    LeaveOfficeReq(office_id=office_id),
+                    namespace=namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
+                )
             finally:
                 with self._office_state_lock:
                     self._confirmed_office = None
+        _raise_for_leave_rejection(result)
 
     @abstractmethod
     def register_event_handlers(self) -> None:

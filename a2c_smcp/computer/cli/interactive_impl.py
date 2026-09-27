@@ -663,6 +663,19 @@ async def interactive_loop(
                             console.print(f"[red]参数解析失败 / Parse error: {e}[/red]")
                             continue
 
+                        if smcp_client is not None:
+                            # v0.5.0 审查 🔴6：旧客户端「未连接」≠「已死」——它可能正处在自动重连窗口里（``connected``
+                            # 为 False 而重连任务在跑）。不先拆掉就新建，旧客户端会在稍后重连成功时以**当前**
+                            # ``comp.name`` 回到旧房，成为 CLI 看不见、也管不到的幽灵 Computer。``disconnect()``
+                            # 会中止在途重连并清意图（见 ``SMCPComputerClient.disconnect``）；失败不阻止新建连接。
+                            # Tear the previous client down first: "not connected" may mean "reconnecting".
+                            try:
+                                await smcp_client.disconnect()
+                            except Exception as e:  # noqa: BLE001 - 旧连接无论如何都要弃用
+                                console.print(f"[yellow]⚠ 旧连接拆除失败（继续新建）/ old client teardown failed: {e}[/yellow]")
+                            smcp_client = None
+                            connection = None
+                            attempted_name = None
                         smcp_client = smcp_client_cls(computer=comp)
                         await smcp_client.connect(url_val, auth=auth, headers=headers)
                         # 记录连接参数供改名重连重放；新连接 ⇒ 身份声明状态清零（新 sid = 新会话）。

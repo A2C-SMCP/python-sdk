@@ -89,7 +89,13 @@ from a2c_smcp.utils.office import (
     OFFICE_REJOIN_RETRY_BUDGET,
     is_validation_rejection,
     parse_join_ack,
+    parse_leave_ack,
     rejoin_retry_delay,
+)
+from a2c_smcp.utils.reconnect import (
+    adisconnect_aborting_reconnect,
+    forget_finished_reconnect_task,
+    translate_reconnect_attempt_error,
 )
 
 logger = get_logger(__name__)
@@ -430,9 +436,20 @@ class SMCPComputerClient(AsyncClient):
         # 协议 §1 polling-first MUST 护栏（统一接线，详见 handshake.apply_polling_first_guard）
         kwargs["transports"] = apply_polling_first_guard(kwargs.get("transports"), logger)
         logger.info(f"Connecting to SMCP server at {url} (a2c_version={PROTOCOL_VERSION})")
+        # 残留的「已结束重连任务」会让本次连接之后的掉线永不自动重连（见 forget_finished_reconnect_task）
+        forget_finished_reconnect_task(self)
         try:
             await super().connect(handshake_url, *args, **kwargs)
         except HANDSHAKE_CONNECT_ERRORS as e:
+            # v0.5.0 审查 Y10：本次调用来自上游重连循环时，该循环**只吞** ConnectionError / ValueError——抛
+            # ProtocolVersionError（或裸 RuntimeError）会让重连任务带异常死亡、``__disconnect_final`` 永不触发
+            # ⇒ 入房意图永久残留。4008 ⇒ 中止重连（下一拍触发 ``__disconnect_final`` 清意图）；其它 ⇒ 规整后交还。
+            # Inside socketio's reconnect loop only ConnectionError/ValueError are swallowed.
+            loop_error = translate_reconnect_attempt_error(self, e, logger)
+            if loop_error is e:
+                raise
+            if loop_error is not None:
+                raise loop_error from e
             payload = extract_4008_payload(e)
             if payload is None:
                 # 非协议版本错误：保持原异常 / not a version error: preserve the original exception
@@ -441,6 +458,27 @@ class SMCPComputerClient(AsyncClient):
             # Protocol §4 MUST: proactively disconnect before raising (anti reconnect-loop)
             await self.disconnect()
             raise build_protocol_version_error(payload) from e
+
+    async def disconnect(self) -> None:
+        """
+        断开连接，并**中止**进行中的自动重连（v0.5.0 审查 🔴5）。
+
+        Disconnect, aborting an in-progress auto-reconnect.
+
+        上游 ``AsyncClient.disconnect()`` 在重连窗口内是**空操作**：namespaces 已清空、eio 已断开，它既不发包、
+        也不置 ``_reconnect_abort``、也不触发断连钩子（此刻本就不是 connected）⇒ 意图不清、重连不停，约 1 秒后
+        自动回到旧房（CLI 改名路径因此留下「以新名回到旧房」的幽灵 Computer）。故本覆写在**宿主于重连窗口内
+        断开**时：
+
+        1. **先**清入房意图（与 ``__disconnect_final`` 同一份会话边界：推进 generation / 会话纪元、作废在途回房、
+           清 desired 与已确认房号）——手工断开是「最后的声明」，重连哪怕在中止前抢先成功，连接钩子也看不到
+           意图、不会回房；
+        2. 中止重连并等其收敛；若在途那次尝试恰好成功，再真正断开。
+
+        其余情形（已连接 / 上游在重连任务内部的自清理 / 空闲）原样走上游，见
+        :func:`a2c_smcp.utils.reconnect.adisconnect_aborting_reconnect`。
+        """
+        await adisconnect_aborting_reconnect(self, super().disconnect, self._on_namespace_disconnect_final)
 
     async def emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
         """
@@ -692,10 +730,13 @@ class SMCPComputerClient(AsyncClient):
         try:
             # 使用 call 方法等待服务器返回结果 / Use call method to wait for server response
             async with self._office_op_lock:
+                # v0.5.0 审查 Y8：有界 ACK 等待（与回房同值）——断线时 socketio 丢弃 ack 回调，默认 60s 会让
+                # 本锁被占满 60s，把重连回房与退房一并卡住。/ Bounded ack wait, same as the replay.
                 result = await self.call(
                     JOIN_OFFICE_EVENT,
                     EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
                     namespace=self._namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
                 )
 
             # 检查返回结果 / Check return result
@@ -785,6 +826,11 @@ class SMCPComputerClient(AsyncClient):
 
         Args:
             office_id (str): 房间ID
+
+        Raises:
+            RuntimeError: 服务端拒绝退房（flat ErrorPayload，如 ``400`` / ``500``；v0.5.0 审查 Y4）。本地意图与
+                已确认房号在此之前**已**清空。/ The server rejected the leave; local state is already cleared.
+            Exception: 传输层失败（ACK 超时 / 等锁期间断线）原样透传。
         """
         self._office_generation += 1
         self._cancel_office_rejoin()
@@ -797,15 +843,29 @@ class SMCPComputerClient(AsyncClient):
             return
         try:
             async with self._office_op_lock:
-                await self.emit(LEAVE_OFFICE_EVENT, LeaveOfficeReq(office_id=office_id))
+                # v0.5.0 审查 Y4：``server:leave_office`` **有 ack**（协议 events.md:173：成功空 / 失败 flat
+                # ErrorPayload）——等裁决而非 fire-and-forget，否则服务端拒绝（``400`` / ``500``）调用方零感知，
+                # 且紧随其后的 join 可能被服务端先于 LEAVE 处理（``4106``）。本地意图已在上面无条件清空，
+                # 裁决只决定「是否抛」，不回滚任何本地状态。
+                # Wait for the leave verdict; the local intent is already cleared regardless of the outcome.
+                result = await self.call(
+                    LEAVE_OFFICE_EVENT,
+                    LeaveOfficeReq(office_id=office_id),
+                    namespace=self._namespace,
+                    timeout=OFFICE_JOIN_TIMEOUT,
+                )
         finally:
             # **退房是最后一句陈述**：锁内可能刚有在途操作的「成功落账」写回 ``_confirmed_office_id``
             # （#213 的写点刻意不受 supersession 约束），而退房比它更新 ⇒ 必须在锁外再清一次。
-            # 必须放在 ``finally`` 里：等锁期间连接可能断掉（``emit`` 抛 ``BadNamespaceError``），
+            # 必须放在 ``finally`` 里：等锁期间连接可能断掉（``call`` 抛 ``BadNamespaceError`` / 超时），
             # 那不改变「退房」这一陈述的效力——异常照旧透传，只是清理不得被跳过。
             # Nothing may outlive a leave: the clear is re-applied after the critical section **even if
             # the notification itself failed** (the exception still propagates).
             self._confirmed_office_id = None
+        verdict = parse_leave_ack(result)
+        if not verdict.ok:
+            # 与显式 join 被拒同一异常族（RuntimeError）/ Same exception family as a rejected explicit join.
+            raise RuntimeError(f"离开房间失败 / Failed to leave office: {verdict.message}")
 
     async def emit_update_config(self) -> None:
         """

@@ -976,13 +976,26 @@ _UPDATE_EMITTERS: list[tuple[str, str]] = [
 
 
 def _record_emits(client: SMCPComputerClient) -> list[tuple[str, Any]]:
-    """把 ``emit`` 换成记录器（返回 ``[(event, data), ...]``），避免触碰真实 socketio 连接。"""
+    """把 ``emit`` 换成记录器（返回 ``[(event, data), ...]``），避免触碰真实 socketio 连接。
+
+    v0.5.0 审查 Y4 起 ``server:leave_office`` 走 ``call``（等 ack）⇒ 同时截获 ``call(LEAVE)`` 记入同一列表并回
+    空 ack（成功）；其余 ``call`` 原样委托给截获前的实现（用例先装的阻塞 ``call`` 不受影响）。
+    """
     sent: list[tuple[str, Any]] = []
 
     async def fake_emit(event: str, data: Any = None, *args: Any, **kwargs: Any) -> None:
         sent.append((event, data))
 
+    prev_call = client.call
+
+    async def fake_call(event: str, data: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if event == LEAVE_OFFICE_EVENT:
+            sent.append((event, data))
+            return None
+        return await prev_call(event, data, *args, **kwargs)
+
     client.emit = fake_emit  # type: ignore[method-assign]
+    client.call = fake_call  # type: ignore[method-assign]
     return sent
 
 
@@ -1499,7 +1512,7 @@ async def test_join_success_after_a_session_boundary_is_not_recorded() -> None:
 
 @pytest.mark.asyncio
 async def test_leave_tail_clear_runs_even_when_the_notification_fails() -> None:
-    """退房通知失败（等锁期间断线 ⇒ ``emit`` 抛）时，「退房是最后一句陈述」的清理**不得被跳过**。
+    """退房通知失败（等锁期间断线 ⇒ ``call`` 抛）时，「退房是最后一句陈述」的清理**不得被跳过**。
 
     尾清若放在 ``async with`` 之后的裸语句里，异常会把它整段跳过 ⇒ 在途 join 的落账留存 ⇒ 幻影态
     （同 ``test_leave_while_explicit_join_awaits_ack_leaves_no_phantom_confirmed``）。异常照旧透传，不吞。
@@ -1519,10 +1532,12 @@ async def test_leave_tail_clear_runs_even_when_the_notification_fails() -> None:
     join = asyncio.create_task(client.join_office("officeA"))
     await asyncio.wait_for(entered.wait(), timeout=PROBE_TIMEOUT)
 
-    async def failing_emit(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("namespace is not a connected namespace.")
+    async def failing_leave_call(event: str, data: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if event == LEAVE_OFFICE_EVENT:
+            raise RuntimeError("namespace is not a connected namespace.")
+        return await blocking_call(event, data, *args, **kwargs)
 
-    client.emit = failing_emit  # type: ignore[method-assign]
+    client.call = failing_leave_call  # type: ignore[method-assign]
     leave = asyncio.create_task(client.leave_office("officeA"))
     await asyncio.sleep(0)  # 让退房走到「等锁」
     assert client.office_id is None, "前置：退房已清本地意图"
