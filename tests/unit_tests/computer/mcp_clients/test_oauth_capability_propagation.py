@@ -293,6 +293,8 @@ class TestClearOAuthRaceSafety:
                 BUNDLE_A,
                 rejected_client,  # type: ignore[arg-type] — 测试假 client 非完整协议面
                 clear_epoch=captured_epoch,
+                config=manager._servers_config.get(BUNDLE_A)
+                or StreamableHttpServerConfig(name=BUNDLE_A, server_parameters={"url": f"https://mcp.example.com/{BUNDLE_A}"}),
             )
         assert _is_oauth_required_error(exc.value)
         assert BUNDLE_A not in manager._active_clients
@@ -308,6 +310,7 @@ class TestClearOAuthRaceSafety:
             BUNDLE_A,
             _GatedClient([_tool("tool_a")]),  # type: ignore[arg-type] — 测试假 client 非完整协议面
             clear_epoch=fresh_epoch,
+            config=manager._servers_config[BUNDLE_A],
         )
         assert BUNDLE_A in manager._active_clients
 

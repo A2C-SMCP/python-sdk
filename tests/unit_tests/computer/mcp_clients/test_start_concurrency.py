@@ -658,7 +658,7 @@ async def test_commit_rejects_client_for_removed_bundle(harness: Harness) -> Non
 
     late_client = ControlledMCPClient(harness.control, _cfg(bid), None)
     with pytest.raises(OAuthError):
-        await manager._commit_active_client(bid, late_client, clear_epoch=None)
+        await manager._commit_active_client(bid, late_client, clear_epoch=None, config=_cfg(bid))
 
     assert bid not in manager._active_clients, "已移除的 bundle 不得被复活"
     late_client.adisconnect.assert_awaited()  # 被拒的 client 必须 best-effort 退役（否则连接泄漏）

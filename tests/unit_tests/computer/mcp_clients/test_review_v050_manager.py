@@ -256,18 +256,53 @@ async def test_ainitialize_after_close_still_stops_and_restarts(manager: MCPServ
 
 @pytest.mark.asyncio
 async def test_commit_does_not_overwrite_existing_active_client(manager: MCPServerManager, harness: Harness) -> None:
-    """Y2：先到者胜；后到者被退役（不泄漏），对调用方即「已启动」——不抛。"""
+    """Y2：两方都用**当前声明** ⇒ 先到者胜；后到者被退役（不泄漏），对调用方即「已启动」——不抛。"""
     [bundle_id] = await _start_all(manager, ["alpha"])
     winner = _probe(manager, bundle_id)
     generation = manager._active_client_generations[bundle_id]
-    latecomer = ToolListProbe(_cfg("alpha"), [_tool("alpha_tool")])
+    current = manager._servers_config[bundle_id]
+    latecomer = ToolListProbe(current, [_tool("alpha_tool")])
 
-    await manager._commit_active_client(bundle_id, latecomer)  # type: ignore[arg-type]
+    await manager._commit_active_client(bundle_id, latecomer, config=current)  # type: ignore[arg-type]
 
     assert manager._active_clients[bundle_id] is winner
     assert manager._active_client_generations[bundle_id] == generation, "被拒的提交不得推进世代"
     latecomer.adisconnect.assert_awaited_once()
     winner.adisconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_commit_rejects_newcomer_built_from_superseded_config(manager: MCPServerManager) -> None:
+    """Y2 复审：新来者按**已被替换**的声明构造（detached OAuth 任务读的是任务启动时的 config，期间 restart
+    已换声明）⇒ 拒它。先到者胜会让「声明是新的、进程是旧的」静默成立。"""
+    [bundle_id] = await _start_all(manager, ["alpha"])
+    holder = _probe(manager, bundle_id)
+    stale = manager._servers_config[bundle_id]
+    manager._servers_config[bundle_id] = _cfg("alpha")  # 替换对象 = 新声明（写点全是替换，见 _commit_active_client）
+    stale_client = ToolListProbe(stale, [_tool("alpha_tool")])
+
+    await manager._commit_active_client(bundle_id, stale_client, config=stale)  # type: ignore[arg-type]
+
+    assert manager._active_clients[bundle_id] is holder
+    stale_client.adisconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_replaces_existing_client_built_from_superseded_config(manager: MCPServerManager) -> None:
+    """Y2 复审：旧 OAuth 提交恰落在 restart 的 stop 与写配置之间 ⇒ 活跃者持旧声明；restart 用新声明的 client
+    提交时须**退役旧者、装新者**（否则先到者胜把旧进程钉死在新声明下）。"""
+    [bundle_id] = await _start_all(manager, ["alpha"])
+    stale_holder = _probe(manager, bundle_id)
+    generation = manager._active_client_generations[bundle_id]
+    fresh_config = _cfg("alpha")
+    manager._servers_config[bundle_id] = fresh_config
+    fresh_client = ToolListProbe(fresh_config, [_tool("alpha_tool")])
+
+    await manager._commit_active_client(bundle_id, fresh_client, config=fresh_config)  # type: ignore[arg-type]
+
+    assert manager._active_clients[bundle_id] is fresh_client
+    assert manager._active_client_generations[bundle_id] == generation + 1, "换 client 必须推进世代（缓存失效）"
+    stale_holder.adisconnect.assert_awaited_once()
 
 
 # ────────────────────── Y9：失败轮不丢工作 / 不丢通知 ──────────────────────

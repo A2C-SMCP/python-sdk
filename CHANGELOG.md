@@ -255,14 +255,16 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 公开的 `astop_client` / `aremove_server` / `astop_all` 纳入启动门的生命周期票据（不占并发上限、计入
     `drain()`）：`aclose` 不再在子进程未停下时返回，`aremove_server` 与 `aclose` 并发不再抛 `KeyError`。
     **关闸后调用改抛 `McpStartGateClosed`**（对齐 rust `mcp_lifecycle_gate`）。
-  - `_commit_active_client` 已有活跃 client 时先到者保留、后到者断开退役（此前 OAuth 后台连接可覆盖并泄漏）。
+  - `_commit_active_client` 的冲突裁决按**声明身份**：用已被替换的声明构造的 client 一律让位（新来者被拒 /
+    旧活跃者被退役），两方都是当前声明时先到者保留、后到者断开退役（此前 OAuth 后台连接可覆盖并泄漏，且可能让
+    旧配置的进程顶替 restart 后的新声明）。
   - 资源 / 工具刷新一轮失败后不再丢弃本轮工作与期间到达的通知。
 
 ### Fixed（v0.5.0 跨节点审查）
 
 - **重连窗口内 `disconnect()` 无效（Computer + Agent async/sync）**：socketio 的 `disconnect()` 在自动重连
   窗口内是空操作 ⇒ 意图不清、重连不停，约 1 秒后自动回到旧房。三个客户端覆写 `disconnect()`：先清意图，
-  再中止重连并等待重连任务结束（`a2c_smcp.utils.reconnect`）。CLI `socket connect` / 改名重连因此不再留下
+  再中止重连并等待重连任务结束（`a2c_smcp.utils.reconnect`；等待上界 10s，到点记 WARNING 返回，中止位保持置位）。CLI `socket connect` / 改名重连因此不再留下
   CLI 管不到的「幽灵 Computer」。
 - **自动重连撞上 `4008`**：Computer 侧 `ProtocolVersionError` 逃出重连任务（任务死掉、意图永久残留）；Agent
   侧被当作普通连接错误**无限重试**。现两端一律停止重连、记 ERROR、经既有钩子清空意图。
@@ -273,7 +275,11 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **Server 名字注册表原子化**：sync 服务端每个事件一个线程，入房注册与断连清理交错会留下指向死 sid 的条目
   ⇒ 同名重连永久 `4105`。注册改为一步完成「sid 存活校验 + `4101` / `4105` 判定 + 写入」（sync 加
   `RLock`，async 无 await 段），并发同名 join 只会一个成功；断连改为先广播 leave 再注销；relay 与断连守卫
-  统一以「仍解析到同一 sid」复查，目标会话已不存在时回 `404` 并自愈，不再让 Agent 干等超时。
+  统一以「仍解析到同一 sid」复查，目标会话已不存在时回 `404` 并自愈，不再让 Agent 干等超时。断连清理包在
+  `try/finally` 里：leave 广播抛错（pubsub publish 失败等）也照常注销名字、唤醒在途调用。
+  > **已知边界**：原子注册位于 `enter_room` 生效阶段（入房之后），并发竞争的输家（`4101` / `4105`）会短暂进入
+  > 目标房后收敛为无房；换房的 Computer 此时已退掉旧房。前移会让 relay 在「注册表已指向、会话尚无 `office_id`」
+  > 的窗口里误报注册表损坏（#213），故刻意保留。
 
 ## [0.4.0] - 2026-08-25
 

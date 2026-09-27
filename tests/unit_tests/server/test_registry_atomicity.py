@@ -298,6 +298,30 @@ class TestDisconnectOrdering:
         events = [c.args[0] for c in ns.emit.call_args_list]
         assert events == [ENTER_OFFICE_NOTIFICATION, LEAVE_OFFICE_NOTIFICATION], events
 
+    async def test_failed_leave_broadcast_still_releases_name_and_wakes_inflight(self, kind: str) -> None:
+        """复审 🔴：S3 把注销挪到 leave 广播之后——广播抛错（pubsub publish 失败等）若跳过注销，死 sid 永久占名
+        ⇒ 同名重连恒 4105（🔴7 换了触发条件）；在途 relay 的断连信号也不得因此漏发。"""
+        sessions: dict[str, dict[str, Any]] = {"pc": {}, "pc-2": {}}
+        ns = _ns(kind, sessions)
+        await _run(ns.on_server_join_office("pc", _join("computer", "pc", "office-a")))
+        ns.server.rooms.return_value = ["office:office-a"]
+        inflight = ns._register_inflight_signal("pc")
+
+        def _emit(event: str, *args: Any, **kwargs: Any) -> None:
+            if event == LEAVE_OFFICE_NOTIFICATION:
+                raise ConnectionError("pubsub down")
+
+        ns.emit.side_effect = _emit
+
+        with pytest.raises(ConnectionError):
+            await _run(_disconnect_now(ns, "pc"))
+
+        assert ns._name_to_sid_map == {}, "广播失败也必须注销（否则死 sid 永久占名）"
+        assert inflight.is_set(), "清理中途抛错也必须唤醒在途调用"
+        ns.emit.side_effect = None
+        ns.server.rooms.return_value = []
+        assert await _run(ns.on_server_join_office("pc-2", _join("computer", "pc", "office-a"))) is None
+
 
 @pytest.mark.parametrize("kind", KINDS)
 class TestRelayRechecks:

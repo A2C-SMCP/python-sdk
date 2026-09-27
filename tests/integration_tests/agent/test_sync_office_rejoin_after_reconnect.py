@@ -47,6 +47,15 @@ class _RecordingSyncNamespace(MockSyncSMCPNamespace):
         self.join_record: list[tuple[str, dict]] = []
         self.join_event = threading.Event()
         self.reject_from: int | None = None
+        self.refuse_connect = False
+        self.refused_connects = 0
+
+    def on_connect(self, sid: str, environ: dict, auth: dict | None = None) -> bool:
+        # v0.5.0 审查 🔴5：置位期间拒绝一切新连接 ⇒ 客户端停留在「自动重连窗口」（逐次尝试失败、重连线程在跑）
+        if self.refuse_connect:
+            self.refused_connects += 1
+            raise ConnectionRefusedError("refused (holding the client in its reconnect window)")
+        return super().on_connect(sid, environ, auth)
 
     def on_server_join_office(self, sid: str, data: Any = None, *_extra: Any) -> Any:  # #214：成功 = None；失败 = flat ErrorPayload
         if self.reject_from is not None and len(self.join_record) + 1 >= self.reject_from:
@@ -192,6 +201,42 @@ def test_sync_agent_manual_disconnect_drops_membership_intent(
         time.sleep(_QUIESCENCE)
         assert len(ns.join_record) == 1, "手工断开后的连接不得自动回房"
     finally:
+        agent.disconnect()
+
+
+def test_sync_agent_disconnect_during_reconnect_window_stops_reconnect_and_never_rejoins(
+    sync_office_server: tuple[_RecordingSyncNamespace, int],
+) -> None:
+    """v0.5.0 审查 🔴5（真实 wire，sync 镜像 Computer 侧同名用例）：重连窗口内 ``disconnect()`` ⇒ 重连线程
+    结束、之后永不回旧房。断言落在**服务端**的 join 记录上（只断言客户端字段会假绿）。"""
+    ns, port = sync_office_server
+    agent = _make_agent()
+    try:
+        agent.connect_to_server(f"http://localhost:{port}", socketio_path="/socket.io")
+        agent.join_office(_OFFICE, _AGENT_NAME)
+        assert ns.join_event.wait(timeout=_CONNECT_TIMEOUT)
+        assert len(ns.join_record) == 1
+
+        ns.refuse_connect = True
+        ws = agent.eio.ws
+        assert ws is not None
+        ws.abort()  # 硬掐 TCP ⇒ TRANSPORT_ERROR ⇒ 自动重连；服务端拒绝 ⇒ 停留在重连窗口
+        _wait_until(lambda: ns.refused_connects >= 1, "夹具失效：客户端未进入重连窗口")
+        assert not agent.connected
+        assert agent._desired_office == (_OFFICE, _AGENT_NAME), "前置：窗口内 desired 保留（#203）"
+        reconnect_thread = agent._reconnect_task
+        assert reconnect_thread is not None and reconnect_thread.is_alive()
+
+        agent.disconnect()
+        assert agent._desired_office is None, "手工断开必须清空入房意图"
+        assert not reconnect_thread.is_alive(), "disconnect() 必须中止在途自动重连（机制断言）"
+
+        ns.refuse_connect = False  # 服务端恢复接纳：缺修复时客户端会在此后自动重连并回房
+        time.sleep(1.0)  # > reconnection_delay_max(0.3) 的数倍
+        assert len(ns.join_record) == 1, f"断开后不得自动回房：{ns.join_record!r}"
+        assert not agent.connected, "断开后不得被自动重连"
+    finally:
+        ns.refuse_connect = False
         agent.disconnect()
 
 

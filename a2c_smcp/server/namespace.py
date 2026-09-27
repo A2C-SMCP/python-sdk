@@ -139,8 +139,11 @@ class SMCPNamespace(BaseNamespace):
         call registering in the window re-checks ``get_sid_by_name`` → None → short-circuits to 404 instead of
         missing the fire. Already-registered signals still wake (super never touches the signal registry).
         """
-        await super().on_disconnect(sid)
-        self._fire_inflight_disconnect_signals(sid)
+        try:
+            await super().on_disconnect(sid)
+        finally:
+            # 清理中途抛错也必须唤醒在途调用：否则以该 sid 为目标的 relay 只能挂到超时。
+            self._fire_inflight_disconnect_signals(sid)
 
     async def _announce_residual_leave(self, sid: SID, key: NAME_KEY) -> None:
         """断连时发现的残留键补发 ``notify:leave_office``（与 sync 同构）。/ Announce a residual key's leave."""

@@ -35,8 +35,9 @@ def reserve_name(
     （把它写成同步函数正是为了让 async 的原子性成为**结构保证**而非碰巧）。
     Atomic check-and-set; the caller provides atomicity (a lock on sync, zero suspension points on async).
 
-    Agent 席位判据取注册表（不扫 socketio 成员）：Agent 的「在房」恒经注册落账、退房恒先注销，
-    故「房内存在另一 Agent 键」与「房内已有 Agent」等价，且与写入同处一个原子步内（S1）。
+    Agent 席位判据取注册表（不扫 socketio 成员）：Agent 的「在房」恒经注册落账，退房 / 断连的注销在
+    ``finally`` 里无条件执行（断连时排在 leave 广播**之后**，S3），故「房内存在另一 Agent 键」与「房内已有
+    Agent」等价（断连收尾窗口内旧键仍在 ⇒ 按占用处理，与 4105 同口径），且与写入同处一个原子步内（S1）。
     The agent-slot check reads the registry so it shares the atomic step with the write (S1).
 
     Raises:

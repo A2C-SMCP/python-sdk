@@ -6,6 +6,7 @@
 import asyncio
 import contextlib
 import json
+import weakref
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, NoReturn, cast
@@ -340,6 +341,9 @@ class MCPServerManager:
         self._materializer: MaterializeFunc | None = materializer
         # 活动客户端 {bundle_id: client}
         self._active_clients: dict[BUNDLE_ID, MCPClientProtocol] = {}
+        # 已提交 client 构造所用的 config（按对象身份，弱引用 ⇒ client 被丢弃即自动消失，移除点无需同步维护）。
+        # 仅供 :meth:`_commit_active_client` 的冲突裁决判「哪一方用的是当前声明」（v0.5.0 审查 Y2 复审）。
+        self._committed_client_configs: weakref.WeakKeyDictionary[MCPClientProtocol, MCPServerConfig] = weakref.WeakKeyDictionary()
         # #184: 已接受的启动意图（不因 OAuth 未授权或连接失败而丢失）
         # Accepted activation intents; not lost on OAuth or connect failure.
         self._activation_intents: set[BUNDLE_ID] = set()
@@ -963,7 +967,7 @@ class MCPServerManager:
                 # 连接失败：保留 activation intent，仅更新 connection 状态（#184 语义）
                 self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
                 raise
-            await self._commit_active_client(bundle_id, client, clear_epoch)
+            await self._commit_active_client(bundle_id, client, clear_epoch, config=config)
             return
 
         if coordinator is not None and _has_static_authorization_header(config):
@@ -986,7 +990,7 @@ class MCPServerManager:
                 self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
                 raise
             if signal is None:
-                await self._commit_active_client(bundle_id, client, clear_epoch)  # 匿名连通
+                await self._commit_active_client(bundle_id, client, clear_epoch, config=config)  # 匿名连通
                 return
             # #181 static-only（Rust #180）：配置了静态 Authorization header 的 server
             # 永远走静态认证——401 即静态凭据被拒（4006 分类面），**绝不回退 OAuth**。
@@ -1043,7 +1047,7 @@ class MCPServerManager:
                     self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
                     raise
                 if signal is None:
-                    await self._commit_active_client(bundle_id, client, clear_epoch)
+                    await self._commit_active_client(bundle_id, client, clear_epoch, config=config)
                     return
                 if signal.status_code == 401:
                     # 恢复的凭据已被服务端拒绝 → 清槽（generation bump + store 清空 +
@@ -1070,7 +1074,14 @@ class MCPServerManager:
         self._connection_states[bundle_id] = MCPServerConnectionState.AUTHORIZATION_REQUIRED
         _raise_oauth_required()
 
-    async def _commit_active_client(self, bundle_id: BUNDLE_ID, client: MCPClientProtocol, clear_epoch: int | None = None) -> None:
+    async def _commit_active_client(
+        self,
+        bundle_id: BUNDLE_ID,
+        client: MCPClientProtocol,
+        clear_epoch: int | None = None,
+        *,
+        config: MCPServerConfig,
+    ) -> None:
         """登记活跃 client —— **本方法自取 ``_lock``**（#208）+ 刷新 ExposedToolMapping。
 
         #208：提交点由「调用方持锁」改为「自带锁」，使整个启动事务可以在**锁外**跑慢路径
@@ -1089,6 +1100,11 @@ class MCPServerManager:
         :meth:`_aoauth_connect` 若已越过 coordinator 身份检查并停在锁上，会为**已移除**的 bundle
         写回 ``_active_clients``——「移除后复活」。该路径**不走** per-bundle 锁（交互式 flow 可阻塞
         分钟级，持锁会卡死 ``remove``/``restart``），故必须在此以状态守卫 fail-closed 兜住。
+
+        ``config`` = 构造 ``client`` 所用的声明（必填）。冲突裁决（v0.5.0 审查 Y2）按**声明身份**而非到达顺序：
+        ``_servers_config`` 的写点全是替换对象 ⇒ 身份比较即「是否当前声明」。①新来者的声明已被替换 ⇒ 拒它
+        （detached OAuth 任务在任务启动时读的 config，期间 restart 已换声明）；②已有活跃 client 且其声明已被
+        替换 ⇒ 退役旧者、装新者（OAuth 提交恰落在 restart 的 stop 与写配置之间）；③两者都用当前声明 ⇒ 先到者胜。
         """
         async with self._lock:
             if clear_epoch is not None and self._oauth_clear_epochs.get(bundle_id, 0) != clear_epoch:
@@ -1104,15 +1120,25 @@ class MCPServerManager:
                 # 配置已被移除 / 已换代（aremove_server / _clear_all）——不得复活。
                 await self._reject_commit(bundle_id, client, "bundle removed")
                 _raise_oauth_required()
+            current = self._servers_config[bundle_id]
+            if config is not current:
+                # ① 新来者按**已被替换**的声明构造（同一 bundle 的更新 / restart 已写入新声明）：提交它会让
+                #    「声明是新的、进程是旧的」静默成立。新声明的持有者负责启动，此处只退役、不抛。
+                await self._reject_commit(bundle_id, client, "config superseded")
+                return
             existing = self._active_clients.get(bundle_id)
             if existing is not None and existing is not client:
-                # v0.5.0 审查 Y2：同一 bundle 已有**另一个**活跃 client（先到者胜）。可达形态：detached 的
-                # _aoauth_connect 不走 per-bundle 锁，与并发 start / restart 的「凭据已授权」分支各自连上后
-                # 先后提交。无条件覆盖会让先到者的 transport + keep-alive 任务无人持有 ⇒ 泄漏（且违反
-                # no-double-open）。故退役**后到者**；bundle 已由先到者连上，对调用方即「已启动」——不抛。
-                await self._reject_commit(bundle_id, client, "another active client already committed")
-                return
+                # v0.5.0 审查 Y2：同一 bundle 已有**另一个**活跃 client。可达形态：detached 的 _aoauth_connect
+                # 不走 per-bundle 锁，与并发 start / restart 的「凭据已授权」分支各自连上后先后提交。无条件覆盖
+                # 会让旧者的 transport + keep-alive 任务无人持有 ⇒ 泄漏（且违反 no-double-open）。
+                if self._committed_client_configs.get(existing) is current:
+                    # ③ 旧者同样是当前声明 ⇒ 先到者胜；bundle 对调用方即「已启动」——不抛。
+                    await self._reject_commit(bundle_id, client, "another active client already committed")
+                    return
+                # ② 旧者的声明已被替换（或来源不明）⇒ 退役旧者，装新者（世代随下方提交 bump ⇒ 缓存失效）。
+                await self._reject_commit(bundle_id, existing, "superseded by a client built from the current config")
             self._active_clients[bundle_id] = client
+            self._committed_client_configs[client] = config
             _bump_active_client_generation(self._active_client_generations, bundle_id)
             self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
         # ExposedToolMapping 刷新不再抛跨 server 重名（bundle_id 前缀天然唯一），无需回滚。
@@ -1375,7 +1401,7 @@ class MCPServerManager:
                 return
             try:
                 # #208：_commit_active_client **自取**状态锁（外层不得再包——asyncio.Lock 不可重入）
-                await self._commit_active_client(bundle_id, client, clear_epoch)
+                await self._commit_active_client(bundle_id, client, clear_epoch, config=config)
             except OAuthError as commit_exc:
                 if not _is_oauth_required_error(commit_exc):
                     # 非 OAuthRequired 的意外错误（当前 commit 链只抛 OAuthRequired，本分支

@@ -104,15 +104,21 @@ class BaseNamespace(AsyncNamespace):
         # 清理房间连接：离开哪些房、以何种标识交给 ``leave_room``，由 :meth:`_rooms_to_leave_on_disconnect` 决定
         # （基类保持原语义；``SMCPNamespace`` 覆写为只处理 ``office:`` 房并交出原始 office_id，#216）。
         # Which rooms to leave (and in which identifier space) is decided by the overridable hook.
-        for room in self._rooms_to_leave_on_disconnect(sid):
-            await self.leave_room(sid, room)
-
-        # 残留注销**排在退房广播之后**（S3，与 sync 同序）：先注销会让同名新连接在旧 leave 广播发出前完成入房并
-        # 广播 enter。常态下键已由 leave_room 注销；残留（注册晚于退房快照）须补一次 leave 宣告。
-        # Residual cleanup after the leave broadcasts (S3, same order as sync); a residual key gets its leave.
-        residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
-        if residual is not None:
-            await self._announce_residual_leave(sid, residual)
+        try:
+            for room in self._rooms_to_leave_on_disconnect(sid):
+                await self.leave_room(sid, room)
+        finally:
+            # 残留注销**排在退房广播之后**（S3，与 sync 同序）：先注销会让同名新连接在旧 leave 广播发出前完成入房并
+            # 广播 enter。常态下键已由 leave_room 注销；残留（注册晚于退房快照）须补一次 leave 宣告。
+            # ⚠️ 必须在 ``finally`` 里：退房广播抛错（pubsub publish 失败等）时跳过注销 = 死 sid 永久占名 ⇒ 同名重连
+            # 恒 ``4105``（🔴7 的失败形态，只是换了触发条件）。宣告失败只记日志，不得顶替原异常。
+            # Residual cleanup after the leave broadcasts (S3); in ``finally`` so a failed broadcast cannot leak a key.
+            residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+            if residual is not None:
+                try:
+                    await self._announce_residual_leave(sid, residual)
+                except Exception:
+                    logger.exception(f"残留键 leave 宣告失败（键已注销）/ residual leave announce failed: {residual}")
 
         logger.info(f"SocketIO Client {sid} disconnected from {self.namespace}")
 
@@ -177,6 +183,10 @@ class BaseNamespace(AsyncNamespace):
         不会被断连收尾或并发 join 穿插——此前的原子性只是「各 await 碰巧不挂起」（换成 pubsub manager 即失效）。
         与 sync 端同一核心（sync 在注册表锁内调用），判据单点、不漂移（v0.5.0 审查 🔴7/S1）。
         Atomicity is structural: the core is a synchronous function shared with the sync namespace.
+
+        **已知边界（刻意保留，与 sync 同）**：本原子步位于 ``enter_room`` 生效阶段、第一个副作用之后；并发竞争
+        的输家会短暂进入目标房（换房的 Computer 已退旧房）后收敛为无房。前移会打开 relay 误报注册表损坏的
+        窗口（#213），故不前移。/ Known boundary: a race loser is briefly in the room before convergence.
 
         Args:
             office_id (OFFICE_ID): 房间ID / Office ID

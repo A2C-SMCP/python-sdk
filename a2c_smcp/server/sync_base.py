@@ -95,17 +95,22 @@ class SyncBaseNamespace(Namespace):
         # 清理房间连接：离开哪些房、以何种标识交给 ``leave_room``，由 :meth:`_rooms_to_leave_on_disconnect` 决定
         # （基类保持原语义；``SMCPNamespace`` 覆写为只处理 ``office:`` 房并交出原始 office_id，#216）。
         # Which rooms to leave (and in which identifier space) is decided by the overridable hook.
-        for room in self._rooms_to_leave_on_disconnect(sid):
-            self.leave_room(sid, room)
-
-        # 残留注销**排在退房广播之后**（S3）：先注销会让同名新连接在旧 leave 广播发出前完成入房并广播 enter，
-        # 对端收到「enter(X) → leave(X)」而丢掉新的 X。常态下键已由 leave_room 注销，此处只兜住「注册落在
-        # 退房快照之后」的残留（并发 join 的线程窗口）——残留键对应的在场宣告须补一次 leave。
-        # Residual cleanup runs after the leave broadcasts (S3); a residual key still gets its leave announced.
-        with self._registry_lock:
-            residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
-        if residual is not None:
-            self._announce_residual_leave(sid, residual)
+        try:
+            for room in self._rooms_to_leave_on_disconnect(sid):
+                self.leave_room(sid, room)
+        finally:
+            # 残留注销**排在退房广播之后**（S3）：先注销会让同名新连接在旧 leave 广播发出前完成入房并广播 enter，
+            # 对端收到「enter(X) → leave(X)」而丢掉新的 X。常态下键已由 leave_room 注销，此处只兜住「注册落在
+            # 退房快照之后」的残留（并发 join 的线程窗口）——残留键对应的在场宣告须补一次 leave。
+            # ⚠️ 必须在 ``finally`` 里（与 async 同构）：退房广播抛错时跳过注销 = 死 sid 永久占名 ⇒ 同名重连恒 ``4105``。
+            # Residual cleanup runs after the leave broadcasts (S3); in ``finally`` so a failed broadcast cannot leak a key.
+            with self._registry_lock:
+                residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+            if residual is not None:
+                try:
+                    self._announce_residual_leave(sid, residual)
+                except Exception:
+                    logger.exception(f"残留键 leave 宣告失败（键已注销）/ residual leave announce failed: {residual}")
         logger.info(f"SocketIO Client {sid} disconnected from {self.namespace}")
 
     def trigger_event(self, event: str, *args: Any) -> Any:
@@ -144,6 +149,13 @@ class SyncBaseNamespace(Namespace):
         存活判据 ``manager.is_connected``：断连收尾一开始（``pre_disconnect``）即为假，早于断连 handler——故
         「注册先于断连」时由断连的残留注销清掉，「注册晚于断连开始」时在此被拒，两种交错都不留死 sid 的键（🔴7）。
         ``is_connected`` turns False before the disconnect handler runs, so no interleaving leaves a dead key.
+
+        **已知边界（刻意保留）**：本原子步位于 ``enter_room`` 的生效阶段（``super().enter_room`` 与写会话
+        ``office_id`` **之后**），不前移到第一个副作用之前——前移会打开「注册表已指向该 sid、会话尚无
+        ``office_id``」的窗口，relay 在其中误报注册表损坏（#213 已论证）。代价：**并发竞争的输家**（4101 / 4105）
+        会短暂进入目标 socketio 房、换房的 Computer 已先退掉旧房，随后按提交点收敛为无房。仅限竞争输家；
+        阶段 1 的预检仍挡住一切非并发的冲突。
+        Known boundary: a concurrent-race loser is briefly in the room before convergence (kept deliberately).
 
         Raises:
             SessionGoneError: sid 已进入断连收尾。

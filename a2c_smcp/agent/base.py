@@ -1261,8 +1261,8 @@ class BaseAgentSyncClient(ABC):
         self._cancel_office_rejoin()
         with self._office_op_lock:
             if generation != self._office_generation:
-                # 取锁期间被抢占（``threading.Lock`` 不公平，排队顺序 ≠ 声明顺序）⇒ 不发包，
-                # 否则排队的 JOIN 会迟于更新的 LEAVE 落地 ⇒ 客户端以为已退房、服务端仍在房。
+                # 取锁期间被抢占（操作锁已是 FIFO，Y6；此处守住的是**会话边界**或排在前面的 leave / 换房
+                # 推进了 generation）⇒ 不发包，否则排队的 JOIN 会迟于更新的声明落地 ⇒ 客户端以为已退房、服务端仍在房。
                 logger.info(f"join_office 被更新的操作抢占，跳过发包: {office_id}")
                 return
             try:

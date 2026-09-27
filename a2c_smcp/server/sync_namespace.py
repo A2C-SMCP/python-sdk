@@ -137,8 +137,11 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         不触碰信号 registry，故 fire 置于其后对已登记信号零损失；``_fire`` 持 ``_inflight_lock`` 而 ``super()`` 不持锁，无死锁。
         Super-then-fire (mirrors async) closes the TOCTOU window; already-registered signals still wake.
         """
-        super().on_disconnect(sid)
-        self._fire_inflight_disconnect_signals(sid)
+        try:
+            super().on_disconnect(sid)
+        finally:
+            # 清理中途抛错也必须唤醒在途调用（与 async 同构）：否则以该 sid 为目标的 relay 只能挂到超时。
+            self._fire_inflight_disconnect_signals(sid)
 
     def _fire_inflight_disconnect_signals(self, sid: SID) -> None:
         """唤醒以 ``sid`` 为目标的全部在途断连信号（幂等）。Wake all in-flight signals targeting ``sid`` (idempotent)."""

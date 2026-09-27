@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
@@ -44,6 +45,14 @@ from a2c_smcp.utils.handshake import extract_4008_payload
 #: 每轮重新置位即可跨过这条竞态（置位是幂等的）。
 #: Re-set the abort flag on every poll: the reconnect loop clears it on entry.
 _ABORT_POLL_INTERVAL = 0.05
+
+#: 中止后等待重连任务收敛的**上界**（秒，与入房 ACK 的 ``OFFICE_JOIN_TIMEOUT`` 同值）。在途那次尝试可能卡在上游
+#: eio 握手 / namespace 等待（慢网络、黑洞地址），无界等待会把 CLI 交互循环一并卡死。到点即记 WARNING 返回：
+#: 入房意图已先清、中止位仍置位 ⇒ 循环在下一拍中止；那次尝试即便随后成功，连接钩子也不会回房。
+#: Upper bound for the abort wait; on expiry we warn and return (intent already cleared, abort flag still set).
+_ABORT_WAIT_TIMEOUT = 10.0
+
+_logger = logging.getLogger(__name__)
 
 
 def _reconnect_task_alive(client: Any) -> bool:
@@ -96,6 +105,13 @@ def _set_abort(client: Any) -> None:
         abort.set()
 
 
+def _warn_abort_wait_expired() -> None:
+    _logger.warning(
+        f"中止自动重连后 {_ABORT_WAIT_TIMEOUT:.0f}s 内在途尝试仍未结束：不再等待（入房意图已清，中止位保持置位）"
+        f" / reconnect abort wait expired; returning with the abort flag still set",
+    )
+
+
 def _user_disconnect_in_reconnect_window(client: Any) -> bool:
     """「宿主在重连窗口内断开」——**唯一**需要补全语义的情形。
 
@@ -128,7 +144,12 @@ async def adisconnect_aborting_reconnect(
     if _user_disconnect_in_reconnect_window(client):
         on_abort()
         task = client._reconnect_task
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _ABORT_WAIT_TIMEOUT
         while not task.done():
+            if loop.time() >= deadline:
+                _warn_abort_wait_expired()
+                break
             _set_abort(client)
             await asyncio.wait({task}, timeout=_ABORT_POLL_INTERVAL)
     await disconnect()
@@ -139,7 +160,11 @@ def disconnect_aborting_reconnect(client: Any, disconnect: Callable[[], None], o
     if _user_disconnect_in_reconnect_window(client):
         on_abort()
         task: threading.Thread = client._reconnect_task
+        deadline = time.monotonic() + _ABORT_WAIT_TIMEOUT
         while task.is_alive():
+            if time.monotonic() >= deadline:
+                _warn_abort_wait_expired()
+                break
             _set_abort(client)
             task.join(_ABORT_POLL_INTERVAL)
     disconnect()

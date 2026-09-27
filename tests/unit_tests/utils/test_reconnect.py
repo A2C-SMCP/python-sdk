@@ -254,3 +254,162 @@ async def test_finished_reconnect_task_is_forgotten_on_next_connect_entry() -> N
     forget_finished_reconnect_task(client)
     assert client._reconnect_task is alive, "在途任务不得被丢弃"
     alive.cancel()
+
+
+# ── 🔴5 复审：中止期间在途尝试恰好成功 / 中止等待有上界 ─────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("factory", [_make_computer, _make_async_agent], ids=["computer", "async-agent"])
+async def test_async_inflight_attempt_succeeding_during_abort_still_ends_disconnected(
+    factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """中止位只在两次尝试之间检查——在途那次可能恰好成功。要求：意图**先于**成功被清（连接钩子不会回房），
+    且收敛后仍真正断开（上游 ``disconnect`` 在任务结束**之后**被调用）。"""
+    order: list[str] = []
+    calls = 0
+
+    async def connect(self: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SioConnError("server unreachable")
+        while not self._reconnect_abort.is_set():  # 在途尝试：直到宿主已发起中止才「成功」
+            await asyncio.sleep(0.005)
+        order.append(f"attempt-succeeded(intent={_async_intent(self)!r})")
+
+    real_disconnect = AsyncClient.disconnect
+
+    async def spy_disconnect(self: Any) -> None:
+        order.append(f"upstream-disconnect(task_done={self._reconnect_task is None or self._reconnect_task.done()})")
+        await real_disconnect(self)
+
+    monkeypatch.setattr(AsyncClient, "connect", connect)
+    monkeypatch.setattr(AsyncClient, "disconnect", spy_disconnect)
+    client = factory()
+    _prime_connection_args(client)
+    client._reconnect_task = asyncio.ensure_future(client._handle_reconnect())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _DEADLINE
+    while calls < 2:
+        assert loop.time() < deadline, "夹具失效：未进入第二次尝试"
+        await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(client.disconnect(), timeout=_DEADLINE)
+
+    assert order == ["attempt-succeeded(intent=None)", "upstream-disconnect(task_done=True)"], order
+
+
+def test_sync_inflight_attempt_succeeding_during_abort_still_ends_disconnected(monkeypatch: pytest.MonkeyPatch) -> None:
+    order: list[str] = []
+    calls = 0
+
+    def connect(self: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SioConnError("server unreachable")
+        while not self._reconnect_abort.is_set():
+            time.sleep(0.005)
+        order.append(f"attempt-succeeded(intent={self._desired_office!r})")
+
+    real_disconnect = Client.disconnect
+
+    def spy_disconnect(self: Any) -> None:
+        task = self._reconnect_task
+        order.append(f"upstream-disconnect(task_done={task is None or not task.is_alive()})")
+        real_disconnect(self)
+
+    monkeypatch.setattr(Client, "connect", connect)
+    monkeypatch.setattr(Client, "disconnect", spy_disconnect)
+    client = _make_sync_agent()
+    _prime_connection_args(client)
+    task = threading.Thread(target=client._handle_reconnect, daemon=True)
+    client._reconnect_task = task
+    task.start()
+    deadline = time.monotonic() + _DEADLINE
+    while calls < 2:
+        assert time.monotonic() < deadline, "夹具失效：未进入第二次尝试"
+        time.sleep(0.005)
+
+    client.disconnect()
+
+    assert order == ["attempt-succeeded(intent=None)", "upstream-disconnect(task_done=True)"], order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("factory", [_make_computer, _make_async_agent], ids=["computer", "async-agent"])
+async def test_async_abort_wait_is_bounded(factory: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """在途尝试卡死（黑洞地址 / 慢握手）时，中止等待有上界：到点返回，意图已清、中止位仍置位。"""
+    import a2c_smcp.utils.reconnect as reconnect_mod
+
+    monkeypatch.setattr(reconnect_mod, "_ABORT_WAIT_TIMEOUT", 0.2)
+    calls = 0
+    hang = asyncio.Event()
+
+    async def connect(self: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SioConnError("server unreachable")
+        await hang.wait()  # 永不返回（直到测试收尾放行）
+        raise SioConnError("released")
+
+    monkeypatch.setattr(AsyncClient, "connect", connect)
+    client = factory()
+    _prime_connection_args(client)
+    task = asyncio.ensure_future(client._handle_reconnect())
+    client._reconnect_task = task
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _DEADLINE
+    while calls < 2:
+        assert loop.time() < deadline, "夹具失效：未进入第二次尝试"
+        await asyncio.sleep(0.005)
+    try:
+        started = loop.time()
+        await asyncio.wait_for(client.disconnect(), timeout=_DEADLINE)
+        assert loop.time() - started < 1.0, "中止等待必须有上界"
+        assert _async_intent(client) is None
+        assert client._reconnect_abort.is_set(), "到点返回后中止位须保持置位（循环下一拍中止）"
+    finally:
+        hang.set()
+        await asyncio.wait_for(asyncio.wait({task}), timeout=_DEADLINE)
+    assert calls == 2, "放行后循环看到中止位即停，不得再尝试"
+
+
+def test_sync_abort_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import a2c_smcp.utils.reconnect as reconnect_mod
+
+    monkeypatch.setattr(reconnect_mod, "_ABORT_WAIT_TIMEOUT", 0.2)
+    calls = 0
+    hang = threading.Event()
+
+    def connect(self: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SioConnError("server unreachable")
+        hang.wait()
+        raise SioConnError("released")
+
+    monkeypatch.setattr(Client, "connect", connect)
+    client = _make_sync_agent()
+    _prime_connection_args(client)
+    task = threading.Thread(target=client._handle_reconnect, daemon=True)
+    client._reconnect_task = task
+    task.start()
+    deadline = time.monotonic() + _DEADLINE
+    while calls < 2:
+        assert time.monotonic() < deadline, "夹具失效：未进入第二次尝试"
+        time.sleep(0.005)
+    try:
+        started = time.monotonic()
+        client.disconnect()
+        assert time.monotonic() - started < 1.0, "中止等待必须有上界"
+        assert client._desired_office is None
+        assert client._reconnect_abort.is_set()
+    finally:
+        hang.set()
+        task.join(_DEADLINE)
+    assert not task.is_alive()
+    assert calls == 2
