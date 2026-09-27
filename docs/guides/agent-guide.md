@@ -335,7 +335,7 @@ except SMCPProtocolError as e:
 > 钩子推进了 generation），意图**保留**待重连重放——重放会用同一张表重新裁决，成功即恢复、被拒才清空。
 
 超时不是 builtin 异常：`socketio.exceptions.TimeoutError` **不是** `TimeoutError` 的子类，按
-`a2c_smcp.agent.base.OFFICE_ACK_TIMEOUT_ERRORS` 捕获；未连接就调用则抛
+`a2c_smcp.agent.OFFICE_ACK_TIMEOUT_ERRORS` 捕获（亦可从 `a2c_smcp.agent.base` 导入）；未连接就调用则抛
 `socketio.exceptions.BadNamespaceError`（发送前失败，**不保留**意图，请先连接）。
 
 **超时（`未获裁决`）后如何收敛**：服务端可能其实已把你加入房间。协议支持的恢复手段是**重发同一次
@@ -372,6 +372,17 @@ client.leave_office("my_office")
 # 异步
 await async_client.leave_office("my_office")
 ```
+
+`leave_office` **等服务端 ACK**（协议 `server:leave_office` 有 ack：成功 = 空、失败 = flat `ErrorPayload`），
+有界 10 秒（`OFFICE_JOIN_TIMEOUT`）。本地入房意图与已确认房号**先于发包**清掉，无论结果如何；服务端拒绝
+（`400` / `500`）抛 `SMCPProtocolError`，超时按 `OFFICE_ACK_TIMEOUT_ERRORS` 捕获。换房请等 `leave_office`
+返回后再 `join_office`——只发不等时，紧随其后的 join 可能在服务端先落地而被判 `4106`。
+
+`join_office` / `leave_office` 的 `namespace` 参数可省略，缺省为客户端构造时的命名空间（默认 `/smcp`）。
+
+**断开连接**：`disconnect()` 在自动重连窗口内同样生效——清空入房意图并**中止**重连（此前 socketio 的
+`disconnect()` 在该窗口内什么都不做，重连成功后会自动回到旧房）。自动重连撞上 `4008`（协议版本不兼容）
+时，客户端停止重连、记 ERROR 并清空意图，不再无限重试。
 
 ## 错误处理
 

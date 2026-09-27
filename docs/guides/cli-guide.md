@@ -22,7 +22,13 @@ a2c-computer run
 
 # 常用参数
 a2c-computer run --auto-connect true --auto-reconnect true
+
+# 限制 MCP Server 并发启动数（单个启动 / start all / 治理恢复共用同一上限）
+a2c-computer run --concurrency 4
 ```
+
+`--concurrency N`：MCP 最大并发启动数，属宿主运行时策略、不落盘。不传 = 保持串行启动的既有行为；`0` 按 `1`
+处理。该上限在启动前安装，运行期不可更改。
 
 启动后进入交互模式（提示符 `a2c>`），输入 `help` 查看可用命令。
 

@@ -27,6 +27,7 @@ from .office import (
     join_failure_message,
     log_join_rejection,
     parse_join_ack,
+    parse_leave_ack,
     rejoin_retry_delay,
     resolve_join_failure,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "join_failure_message",
     "log_join_rejection",
     "parse_join_ack",
+    "parse_leave_ack",
     "rejoin_retry_delay",
     "resolve_join_failure",
     "resolve_xdg_first",
