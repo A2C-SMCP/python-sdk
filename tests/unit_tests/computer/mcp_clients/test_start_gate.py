@@ -305,3 +305,71 @@ async def test_cancelled_waiter_does_not_consume_or_leak_a_permit() -> None:
     assert gate.in_flight == 1
     successor.result().release()
     assert gate.in_flight == 0
+
+
+# ────────────────────── 生命周期票据（v0.5.0 跨节点审查 🔴2）──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_lifecycle_ticket() -> None:
+    """停止 / 移除持有的票据必须被 ``drain()`` 等到（否则 aclose 在子进程停下前返回）。"""
+    gate = McpStartGate(max=1)
+    ticket = gate.enter_lifecycle()
+
+    drained = asyncio.create_task(gate.drain())
+    await _tick()
+    assert not drained.done(), "在途票据未归还前 drain 不得返回"
+
+    ticket.release()
+    await _tick()
+    assert drained.done()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_ticket_never_consumes_or_hands_off_a_permit() -> None:
+    """票据不受上限约束、不占许可；归还时也不得把名额交接给排队的启动者。"""
+    gate = McpStartGate(max=1)
+    holder = await gate.acquire()
+    ticket = gate.enter_lifecycle()  # 已满也同步发放
+    assert gate.in_flight == 1
+
+    queued = asyncio.create_task(gate.acquire())
+    await _tick()
+    ticket.release()
+    await _tick()
+    assert not queued.done(), "票据归还不是许可归还，不得唤醒排队的启动者"
+
+    holder.release()
+    await _tick()
+    assert queued.done()
+    queued.result().release()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_ticket_rejected_after_close_and_release_is_idempotent() -> None:
+    gate = McpStartGate()
+    async with gate.enter_lifecycle() as ticket:
+        pass
+    ticket.release()  # 幂等：不得二次递减
+    await asyncio.wait_for(gate.drain(), timeout=0.5)
+    # 二次递减会让计数变负 ⇒ 下一张票据在途时 drain 误判已收敛
+    pending = gate.enter_lifecycle()
+    drained = asyncio.create_task(gate.drain())
+    await _tick()
+    assert not drained.done()
+    pending.release()
+    await _tick()
+    assert drained.done()
+
+    gate.close()
+    with pytest.raises(McpStartGateClosed):
+        gate.enter_lifecycle()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_ticket_does_not_lock_configure() -> None:
+    """票据不是启动事务：不锁死构造期的 ``configure``。"""
+    gate = McpStartGate()
+    gate.enter_lifecycle().release()
+    gate.configure(max_concurrency=2)
+    assert gate.max == 2

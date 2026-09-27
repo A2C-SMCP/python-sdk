@@ -705,21 +705,38 @@ class Computer(BaseComputer[PromptSession]):
         PR #199 的阴性对照）。
 
         刷新失败（RPC / 连接错误）视为**本轮不可判定**：记 ERROR、不推进、不冒泡 —— 不确定即不推进，
-        宁可漏报一次也不虚增能力版本。
+        宁可漏报一次也不虚增能力版本。失败轮在途期间若到达过新通知，照常补跑一轮（v0.5.0 审查 Y9）。
         """
         assert self.mcp_manager is not None  # 由 _schedule_tool_projection_refresh 前置守卫
         manager = self.mcp_manager  # 捕获引用：结算期间 shutdown 可能已把属性置 None
         while True:
             try:
-                changed = await manager.arefresh_tools()
+                await self._arefresh_tools_and_bump(manager)
             except Exception as e:
                 logger.error(f"工具投影刷新失败，本轮不推进能力轴: {e}", exc_info=True)
-                return
-            if changed:
-                self._bump_capability_revision()
+                # 审查 Y9：失败轮不得吞掉「本轮在途期间」到达的通知——有新通知就补跑（它们要求的是一次
+                # 失败之后的真读）；没有则结束，持续失败 + 无新通知时不自旋。
+                if not self._tool_refresh_dirty:
+                    return
+                self._tool_refresh_dirty = False
+                continue
             if not self._tool_refresh_dirty:
                 return
             self._tool_refresh_dirty = False  # 在途期间到达过通知 → 补跑一轮
+
+    async def _arefresh_tools_and_bump(self, manager: MCPServerManager) -> None:
+        """强制刷新工具投影，投影**真实变化**即推进 capability 轴——**唯一**消费 ``arefresh_tools()`` 返回值的出口。
+
+        v0.5.0 跨节点审查 🔴1：manager 的变化判据是「新投影 vs 上次**提交**的投影」，任何一次强制刷新提交了新投影，
+        该变化就**只**体现在这一次的返回值里——丢掉它，后续刷新比对得 False，revision 永久少推进一次。
+        故 ``client:get_tools`` 服务前的刷新（#127）与 ``tools/list_changed`` 后台刷新（#197）必须共用本出口，
+        不得再直接 ``await manager.arefresh_tools()`` 而忽略返回值。
+
+        / Single consumer of ``arefresh_tools()``'s change flag: a forced refresh that commits a new projection
+        reports the change exactly once, so every caller must route through here or the revision is lost.
+        """
+        if await manager.arefresh_tools():
+            self._bump_capability_revision()
 
     def _schedule_resource_refresh(
         self,
@@ -758,7 +775,9 @@ class Computer(BaseComputer[PromptSession]):
         """后台消费资源刷新（#210）：一轮内先 window 后 skill；结算后若又被标脏则补跑一轮。
 
         失败策略 / Failure policy: 本轮任一步抛异常即记 ERROR 并**结束整轮**（不冒泡到接收循环）—— 与
-        #197 的 ``_arefresh_tool_projection`` 同姿态（不确定即不做，宁可漏一轮也不在半途状态上继续）。
+        #197 的 ``_arefresh_tool_projection`` 同姿态（不确定即不做，不在半途状态上继续）。v0.5.0 审查 Y9：
+        本轮的动作位**还回**脏位（否则失败轮的工作永久丢失）；本轮在途期间若有新通知则补跑一轮，否则留待
+        下一次通知连带重做——持续失败且无新通知时不自旋。
 
         锁不变量 / Lock invariant: 资源路径**刻意**只走 manager 的不取锁 API（``list_windows`` /
         ``list_skill_resources`` / ``read_resource`` 仅做 ``_active_clients`` 快照），而工具路径走
@@ -782,7 +801,16 @@ class Computer(BaseComputer[PromptSession]):
                     await self._on_resource_list_changed_skills()  # ② 集合比对后再决定
             except Exception as e:
                 logger.error(f"资源刷新失败，本轮跳过: {e}", exc_info=True)
-                return
+                # 审查 Y9：脏位在尝试**之前**已清，失败轮的工作若不还回去就永久丢失（下一次通知只会带来它
+                # 自己的那一位）。先记下「本轮在途期间有无新通知」，再把本轮的位 OR 回去：有新通知 → 补跑
+                # （连同本轮工作一并重试）；无 → 结束，留待下一次通知触发，持续失败时不自旋。
+                arrived = self._windows_list_dirty or self._skills_content_dirty or self._skills_list_dirty
+                self._windows_list_dirty |= windows_list
+                self._skills_content_dirty |= skills_content
+                self._skills_list_dirty |= skills_list
+                if not arrived:
+                    return
+                continue
             if not (self._windows_list_dirty or self._skills_content_dirty or self._skills_list_dirty):
                 return
 
@@ -1743,7 +1771,9 @@ class Computer(BaseComputer[PromptSession]):
         # _tool_mapping 已陈旧——available_tools() 迭代该映射键，**新增**工具不在其中永远漏掉。本方法运行于
         # socketio on_get_tools 安全上下文（非 MCP 接收循环），可安全 await 刷新（内联刷新会话级死锁见 #127）。
         # #127: refresh the tool mapping before serving get_tools; runtime tool additions are otherwise missed.
-        await self.mcp_manager.arefresh_tools()
+        # 🔴1（v0.5.0 审查）：经唯一出口刷新——本次提交若改变了投影，revision 在此推进（否则紧随其后的
+        # list_changed 后台刷新比对得 False，这次变化就永久漏记）。
+        await self._arefresh_tools_and_bump(self.mcp_manager)
         # 从 Manager 获取全部工具，携带各自归属 bundle_id（#152 D1）。
         tools = [(bundle_id, t) async for bundle_id, t in self.mcp_manager.available_tools()]
 
@@ -2463,7 +2493,8 @@ class Computer(BaseComputer[PromptSession]):
 
         ① :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）时 +1；
            幂等重复 clear 不递增。
-        ② 运行期**工具投影真实变化**（MCP ``tools/list_changed``，#197）时 +1 —— 判据为含 schema 的
+        ② 运行期**工具投影真实变化**（MCP ``tools/list_changed``，#197；或 ``client:get_tools`` 服务前的强制刷新
+           恰好提交了新投影，v0.5.0 审查 🔴1——两者共用 :meth:`_arefresh_tools_and_bump`）时 +1 —— 判据为含 schema 的
            全字段投影比对（``manager.arefresh_tools()`` 的返回值）；重复通知而投影未变**不**推进。
            config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
         """

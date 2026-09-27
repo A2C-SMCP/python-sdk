@@ -21,6 +21,11 @@ MCP 启动并发门（#208），逐语义对齐 rust-sdk ``crates/smcp-computer/
   被唤醒者不复查容量 ⇒ 无惊群、严格 FIFO（同 tokio ``Semaphore`` 语义）。
 - **未配置 = 不限流但仍计数**（``max is None``，对应 rust ``Semaphore::MAX_PERMITS`` +
   ``AtomicUsize``）：使 ``drain()`` 与「关闸令排队者即刻失败」在串行路径上同样成立。
+- **生命周期票据**（:meth:`McpStartGate.enter_lifecycle`，v0.5.0 跨节点审查 🔴2）：停止 / 移除这类
+  **非启动**的生命周期事务同样必须被 ``drain()`` 等到——否则 ``aclose`` 会在一个「client 已出册、
+  ``adisconnect`` 仍在途」的停止事务之前返回（子进程未停），``_clear_all`` 之后恢复执行的移除还会
+  撞上已清空的配置表。票据**不受上限约束**（停止不该排在启动后面等许可）、**不参与许可交接**，
+  只计入收敛；关闸后拒绝发放。对应 rust：stop / unmount 持 ``mcp_lifecycle_gate.read()``，shutdown 取写锁。
 """
 
 from __future__ import annotations
@@ -71,6 +76,35 @@ class StartPermit:
         self.release()
 
 
+class LifecycleTicket:
+    """一次**非启动**生命周期事务（停止 / 移除）的收敛票据。由 :meth:`McpStartGate.enter_lifecycle` 返回。
+
+    与 :class:`StartPermit` 的区别：不占并发上限、释放时**不**把名额交接给排队的启动者——只让
+    :meth:`McpStartGate.drain` 看得见它。释放幂等；推荐 ``async with gate.enter_lifecycle():``。
+
+    / Drain-visible ticket for a non-start lifecycle transaction; never counts against the cap.
+    """
+
+    __slots__ = ("_gate", "_released")
+
+    def __init__(self, gate: McpStartGate) -> None:
+        self._gate = gate
+        self._released = False
+
+    def release(self) -> None:
+        """归还票据（幂等）。/ Release the ticket; idempotent."""
+        if self._released:
+            return
+        self._released = True
+        self._gate._release_lifecycle()
+
+    async def __aenter__(self) -> LifecycleTicket:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self.release()
+
+
 class McpStartGate:
     """Computer 级 MCP 启动并发门。/ Computer-level bounded-concurrency gate for MCP starts.
 
@@ -86,7 +120,9 @@ class McpStartGate:
         self._waiters: deque[asyncio.Future[None]] = deque()
         self._closed = False
         self._started = False
-        # _idle 置位 ⇔ in_flight == 0（drain 的等待条件，见 _release）
+        # 在途**非启动**生命周期事务数（停止 / 移除，🔴2）：只计入 drain，不占上限
+        self._lifecycle_in_flight = 0
+        # _idle 置位 ⇔ in_flight == 0 且无在途生命周期票据（drain 的等待条件，见 _release / _release_lifecycle）
         self._idle = asyncio.Event()
         self._idle.set()
         if max is not None:
@@ -158,6 +194,26 @@ class McpStartGate:
             raise
         return StartPermit(self)
 
+    def enter_lifecycle(self) -> LifecycleTicket:
+        """登记一次**非启动**生命周期事务（停止 / 移除），使 :meth:`drain` 能等到它收敛（🔴2）。
+
+        关闸 → 立即抛 :class:`McpStartGateClosed`（shutdown / 换代进行中，本事务会被其拆除覆盖）；否则**同步**
+        发放（无排队、不受上限约束、不锁死 :meth:`configure`——它不是启动事务）。
+
+        / Register a non-start lifecycle transaction so ``drain()`` waits for it; raises when closed.
+        """
+        if self._closed:
+            raise McpStartGateClosed(GATE_CLOSED_MESSAGE)
+        self._lifecycle_in_flight += 1
+        self._idle.clear()
+        return LifecycleTicket(self)
+
+    def _release_lifecycle(self) -> None:
+        """归还生命周期票据（不做许可交接）；全部收敛时置 idle。/ Release a lifecycle ticket."""
+        self._lifecycle_in_flight -= 1
+        if self._in_flight == 0 and self._lifecycle_in_flight == 0:
+            self._idle.set()
+
     def _detach_waiter(self, waiter: asyncio.Future[None]) -> bool:
         """把等待者从队列摘除（取消路径）。返回是否真的摘到了。/ Detach a waiter; True if found."""
         try:
@@ -177,7 +233,7 @@ class McpStartGate:
             self._in_flight += 1
             waiter.set_result(None)
             return
-        if self._in_flight == 0:
+        if self._in_flight == 0 and self._lifecycle_in_flight == 0:
             self._idle.set()
 
     # ────────────────────── 关闭与收敛 / Close & drain ──────────────────────
@@ -200,13 +256,13 @@ class McpStartGate:
                 waiter.set_exception(McpStartGateClosed(GATE_CLOSED_MESSAGE))
 
     async def drain(self) -> None:
-        """等待在途启动事务收敛（``in_flight == 0``）。
+        """等待在途启动事务**与**在途生命周期票据收敛（``in_flight == 0`` 且无在途票据，🔴2）。
 
         **调用方不得持任何锁**：在途事务可能正等待状态锁，持锁等待 = 自死锁。
         （rust 以 ``mcp_lifecycle_gate.write()`` 达成同效。）
 
         / Wait until in-flight starts converge. The caller must hold no lock.
         """
-        while self._in_flight > 0:
+        while self._in_flight > 0 or self._lifecycle_in_flight > 0:
             await self._idle.wait()
             self._idle.clear()

@@ -321,8 +321,9 @@ class TestRefreshSemanticsPreserved:
     async def test_round_abort_is_contained_and_later_notification_still_runs(self, tmp_path: Path) -> None:
         """轮中止分支（``except Exception``）：记 ERROR 后**结束整轮**、不冒泡，且后续通知仍能开新一轮。
 
-        该分支是本轮新增代码里唯一的兜底路径：它会把**已消费的脏位**一并丢弃（轮首已清），故必须钉住
-        「不挂死、不冒泡、下一轮照跑」——否则一次偶发异常就静默停掉该 Computer 的全部资源刷新。
+        该分支是本轮新增代码里唯一的兜底路径，必须钉住「不挂死、不冒泡、下一轮照跑」——否则一次偶发异常
+        就静默停掉该 Computer 的全部资源刷新。（v0.5.0 审查 Y9 起失败轮的工作会还回脏位、由下一次通知
+        连带重做，见 ``test_review_v050_manager.py``。）
         """
         computer = await _booted_computer(tmp_path)
         calls: list[int] = []

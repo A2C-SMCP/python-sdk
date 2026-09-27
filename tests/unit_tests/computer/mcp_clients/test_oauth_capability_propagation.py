@@ -23,6 +23,7 @@ import pytest
 from mcp.types import Tool
 
 from a2c_smcp.computer.mcp_clients.manager import (
+    CachedToolList,
     MCPServerManager,
     _is_oauth_required_error,
 )
@@ -100,10 +101,11 @@ def _seed_active_bundle(
     client: _GatedClient,
     tool_names: list[str],
 ) -> None:
-    """直接播种活跃 bundle：config + client + activation + 世代 + 路由 + 连接状态（不经网络）。
+    """直接播种活跃 bundle：config + client + activation + 世代 + 路由 + 已提交观测 + 连接状态（不经网络）。
 
     config 一并播种——available_tools / _arefresh_tool_mapping 的构建段均读
-    ``_servers_config``，缺 config 会 KeyError。
+    ``_servers_config``，缺 config 会 KeyError。已提交观测（``_tool_list_cache``）同拍播种：
+    available_tools 只服务已提交的投影（v0.5.0 审查 Y1），路由与观测恒同源。
     """
     manager._servers_config[bundle_id] = StreamableHttpServerConfig(
         name=bundle_id,
@@ -114,6 +116,11 @@ def _seed_active_bundle(
     manager._active_client_generations[bundle_id] = manager._active_client_generations.get(bundle_id, 0) + 1
     for name in tool_names:
         manager._exposed_tools[f"{bundle_id}__{name}"] = (bundle_id, name)
+    manager._tool_list_cache[bundle_id] = CachedToolList(
+        client,  # type: ignore[arg-type]
+        manager._active_client_generations[bundle_id],
+        list(client._tools),
+    )
     manager._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
 
 
@@ -243,33 +250,28 @@ class TestClearOAuthRaceSafety:
     @pytest.mark.asyncio
     async def test_pull_racing_clear_returns_no_stale_tools(self) -> None:
         """Agent 拉取 vs clear 竞态：发布前二次校验过滤已撤回候选——拉取结果不含被清除
-        bundle 的过期工具（Rust list_available_tools_with_bundle_id 发布前重验证同构）。"""
+        bundle 的过期工具（Rust list_available_tools_with_bundle_id 发布前重验证同构）。
+
+        v0.5.0 审查 Y1 起 available_tools 不再发 RPC，拉取内唯一的挂起点是**产出之间**（消费方在两次
+        ``__anext__`` 之间可 await 任意事）：快照已含 B 的候选证据时 clear(B)，余下产出须被校验滤掉。"""
         manager = MCPServerManager(auto_connect=False)
-        gate = asyncio.Event()
-        client_a = _GatedClient([_tool("tool_a")], gate=gate)
+        client_a = _GatedClient([_tool("tool_a")])
         client_b = _GatedClient([_tool("tool_b")])
         _seed_active_bundle(manager, BUNDLE_A, client_a, ["tool_a"])
         _seed_active_bundle(manager, BUNDLE_B, client_b, ["tool_b"])
-        _seed_coordinator(manager, BUNDLE_A)
+        _seed_coordinator(manager, BUNDLE_B)
 
-        async def _drain() -> list[tuple[str, Tool]]:
-            return [(bid, tool) async for bid, tool in manager.available_tools()]
+        pull = manager.available_tools()
+        first_bid, _first = await pull.__anext__()  # 快照已取完（含 A、B 两个候选）
+        assert first_bid == BUNDLE_A
 
-        pull_task = asyncio.create_task(_drain())
-        # 等拉取完成快照并阻塞于 A 的 list_tools（此时快照已含 A 的候选证据）
-        for _ in range(50):
-            if client_a.list_calls >= 1:
-                break
-            await asyncio.sleep(0.01)
-        assert client_a.list_calls == 1
-
-        changed = await manager.clear_oauth(BUNDLE_A)
+        changed = await manager.clear_oauth(BUNDLE_B)
         assert changed is True
 
-        gate.set()
-        results = await pull_task
-        # A 已撤回：候选被发布前校验过滤；B 不受波及
-        assert [bid for bid, _ in results] == [BUNDLE_B]
+        rest = [bid async for bid, _ in pull]
+        # B 已撤回：候选被发布前校验过滤；A 不受波及。整次拉取零 RPC（服务已提交投影）
+        assert rest == []
+        assert client_a.list_calls == 0 and client_b.list_calls == 0
 
     @pytest.mark.asyncio
     async def test_clear_epoch_rejects_inflight_start_commit(self) -> None:

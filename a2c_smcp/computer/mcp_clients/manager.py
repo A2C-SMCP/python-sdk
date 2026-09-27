@@ -274,7 +274,8 @@ def _client_session_usable(client: MCPClientProtocol) -> bool:
     调用点纪律：必须挂在**真读与否**的判据上、**每轮**判（见 :meth:`_arefresh_tool_mapping` 的复用判据行）
     —— 只挂在「缓存命中分支」上会漏掉 `resolved` 跨重试携带的观测。
 
-    依据：`_active_clients` 的移除点只有显式 stop / clear_oauth 两处，**非错误驱动** —— 会话死亡
+    依据：`_active_clients` 的移除点只有显式 stop（``_astop_client_locked``，含 remove / restart / stop all
+    经由它）/ clear_oauth / ``_clear_all``（aclose / ainitialize 的整表清空）三处，**非错误驱动** —— 会话死亡
     （keep-alive 失败置 ``error``）后 client 仍在册，故「在册」不等于「可用」。
 
     / Whether the client's transport session is connected — mirrors ``base_client.list_tools``'s own state
@@ -483,7 +484,9 @@ class MCPServerManager:
         #    ⚠️ 不得在 ``self._lock`` 内调用：``_astop_all`` **自取**状态锁（asyncio.Lock 不可重入 ⇒ 自死锁）
         await self._astop_all()
         self._clear_all()
-        # 3. 新一代：换门 + 换 bundle 锁表（drain 已保证无在途持锁者，故换表安全）
+        # 3. 新一代：换门 + 换 bundle 锁表。换表安全的前提 = 此刻**无任何** bundle 锁持有者：启动事务持门许可、
+        #    公开的停止 / 移除持生命周期票据（🔴2），二者都被第 1 步的 drain 等到；其余持锁者只有本方法自己的
+        #    `_astop_all`（已返回）。新增任何取 bundle 锁的公开入口都必须持许可或票据，否则此前提失效。
         self._start_gate = McpStartGate(max=self._start_gate.max)
         self._bundle_locks = {}
         # 4. 纯登记（no-double-open，加载期 first-wins）：按配置顺序 per-bundle_id 保留**首个**，
@@ -639,18 +642,27 @@ class MCPServerManager:
 
         #208：整个移除在**该 bundle 的生命周期锁**内进行 ⇒ 与同 bundle 的在途启动事务串行化，
         不存在「移除后启动事务提交回来把 client 复活」的窗口。
+
+        v0.5.0 审查 🔴2：持生命周期票据（对齐 rust unmount 持 ``mcp_lifecycle_gate.read()``）——否则
+        ``aclose`` 看不到本事务：它在 ``_clear_all`` 之后恢复执行时 ``del _servers_config[...]`` 抛 ``KeyError``，
+        且 ``aclose`` 会先于其 ``adisconnect`` 返回。
+
+        Raises:
+            KeyError: ``bundle_id`` 未注册。
+            McpStartGateClosed: 门已关（shutdown / ainitialize 换代中）。
         """
-        async with self._bundle_lock(bundle_id):
-            if bundle_id in self._active_clients:
-                await self._astop_client_locked(bundle_id)
-            # #179：退役 OAuth 运行时态（coordinator/flow/connect task）——配置移除后
-            # 再以同 bundle_id 挂回不同 transport 时不得沿用陈旧 coordinator。
-            async with self._lock:
-                self._retire_oauth_bundle(bundle_id)
-                del self._servers_config[bundle_id]
-                self._servers_config_raw.pop(bundle_id, None)
-            # 结构变更刷新（reuse_cached=True）：被移除者已随 client 退役离开快照，其余 bundle 的上游未变。
-            await self._arefresh_tool_mapping(reuse_cached=True)
+        async with self._start_gate.enter_lifecycle():
+            async with self._bundle_lock(bundle_id):
+                if bundle_id in self._active_clients:
+                    await self._astop_client_locked(bundle_id)
+                # #179：退役 OAuth 运行时态（coordinator/flow/connect task）——配置移除后
+                # 再以同 bundle_id 挂回不同 transport 时不得沿用陈旧 coordinator。
+                async with self._lock:
+                    self._retire_oauth_bundle(bundle_id)
+                    del self._servers_config[bundle_id]
+                    self._servers_config_raw.pop(bundle_id, None)
+                # 结构变更刷新（reuse_cached=True）：被移除者已随 client 退役离开快照，其余 bundle 的上游未变。
+                await self._arefresh_tool_mapping(reuse_cached=True)
 
     async def _arestart_server(self, bundle_id: BUNDLE_ID, config: MCPServerConfig) -> None:
         """重启服务器客户端（按 bundle_id）。``config`` = 调用方提供的新 raw/rendered 声明（update-in-place 入参）。
@@ -1092,6 +1104,14 @@ class MCPServerManager:
                 # 配置已被移除 / 已换代（aremove_server / _clear_all）——不得复活。
                 await self._reject_commit(bundle_id, client, "bundle removed")
                 _raise_oauth_required()
+            existing = self._active_clients.get(bundle_id)
+            if existing is not None and existing is not client:
+                # v0.5.0 审查 Y2：同一 bundle 已有**另一个**活跃 client（先到者胜）。可达形态：detached 的
+                # _aoauth_connect 不走 per-bundle 锁，与并发 start / restart 的「凭据已授权」分支各自连上后
+                # 先后提交。无条件覆盖会让先到者的 transport + keep-alive 任务无人持有 ⇒ 泄漏（且违反
+                # no-double-open）。故退役**后到者**；bundle 已由先到者连上，对调用方即「已启动」——不抛。
+                await self._reject_commit(bundle_id, client, "another active client already committed")
+                return
             self._active_clients[bundle_id] = client
             _bump_active_client_generation(self._active_client_generations, bundle_id)
             self._connection_states[bundle_id] = MCPServerConnectionState.CONNECTED
@@ -1436,9 +1456,17 @@ class MCPServerManager:
 
         #208：整个停止在**该 bundle 的生命周期锁**内 ⇒ 与同 bundle 在途启动事务串行化——
         「启动尚未 commit 时 stop」不会出现「stop 返回后 client 才被提交」的复活窗口。
+
+        v0.5.0 审查 🔴2：持门的**生命周期票据**（对齐 rust stop 持 ``mcp_lifecycle_gate.read()``）——
+        ``_astop_client_locked`` 先把 client 出册、再锁外 ``adisconnect``，出册后 ``aclose`` 的
+        ``_astop_all`` 快照已看不到它；只有让 ``drain()`` 等到本事务，``aclose`` 才不会在子进程停下之前返回。
+
+        Raises:
+            McpStartGateClosed: 门已关（shutdown / ainitialize 换代中）——其拆除本就会停掉全部 client。
         """
-        async with self._bundle_lock(bundle_id):
-            await self._astop_client_locked(bundle_id)
+        async with self._start_gate.enter_lifecycle():
+            async with self._bundle_lock(bundle_id):
+                await self._astop_client_locked(bundle_id)
 
     async def _astop_client(self, bundle_id: BUNDLE_ID) -> None:
         """经 per-bundle 锁的停止（公开/锁外调用点用）。/ Stop via the per-bundle lock."""
@@ -1496,9 +1524,16 @@ class MCPServerManager:
 
         #208：本入口**不再**包状态锁（``_astop_all`` 逐项自取 bundle 锁 → 状态锁；外层持状态锁
         即锁序倒置）。停止的原子性由 per-bundle 锁逐项保证。
+
+        v0.5.0 审查 🔴2：持生命周期票据（理由同 :meth:`astop_client`）。``aclose`` / ``ainitialize`` 在关闸
+        **之后**仍须能停，故它们直接调私有 :meth:`_astop_all`，不经本入口。
+
+        Raises:
+            McpStartGateClosed: 门已关（shutdown / ainitialize 换代中）。
         """
         logger.debug(f"Manager Stop all async task: {asyncio.current_task()}")
-        await self._astop_all()
+        async with self._start_gate.enter_lifecycle():
+            await self._astop_all()
 
     def _clear_all(self) -> None:
         """清空所有连接与映射 / Clear all state。
@@ -1561,7 +1596,8 @@ class MCPServerManager:
 
         #208 收敛顺序（**不可换**，写错 = 进程泄漏）：
         1. ``gate.close()``：不再接纳新启动，**排队者即刻失败**（在途不中断）；
-        2. ``await gate.drain()``：等在途启动事务收敛（**不持任何锁**——在途事务可能正等状态锁）；
+        2. ``await gate.drain()``：等在途启动事务**与**在途停止 / 移除事务（生命周期票据，🔴2）收敛
+           （**不持任何锁**——在途事务可能正等状态锁）；
         3. 结算 detached OAuth connect 任务（不占门计数，drain 收敛不到）；
         4. ``_astop_all()``：此时快照完整（无「尚未提交的启动」）；
         5. ``_clear_all()``：与 4 之间**不得有 await**（``_clear_all`` 不 disconnect）。
@@ -1581,8 +1617,9 @@ class MCPServerManager:
             logger.warning(
                 "aclose 的收敛前导被取消：继续走完 stop/clear（取消信号由最外层入口还原）",
             )
-        # 4. 停止所有客户端（此时快照完整）
-        await self.astop_all()
+        # 4. 停止所有客户端（此时快照完整）。直调私有 `_astop_all`：公开 `astop_all` 持生命周期票据，
+        #    而门在第 1 步已关（🔴2）。
+        await self._astop_all()
 
         # 5. 清空所有状态存储（与上一步之间不得有 await）
         self._clear_all()
@@ -2252,35 +2289,42 @@ class MCPServerManager:
         ``aexecute_tool`` 经 ExposedToolMapping 解析回原始名调用上游。与 ``list_windows`` / ``list_resources``
         返回 ``(bundle_id, X)`` 的既定约定一致。
 
-        #185：快照 → **锁外** RPC（每 bundle 至多一次 tools/list）→ 发布前锁外二次校验
-        （零 await 同步段 → asyncio 原子）——「路由值未变 + client 身份未变 + 世代未变」三项全真才产出，
-        任一失配（:meth:`clear_oauth` 快速段已撤回该 bundle）→ 丢弃该候选。与 Rust
+        **服务已提交的投影（v0.5.0 跨节点审查 Y1）**：工具定义取自 :meth:`_arefresh_tool_mapping` 在**同一个**
+        经校验提交点写入的上游观测缓存 ``_tool_list_cache``——路由表与缓存同拍重绑定，二者恒对应同一次观测。
+        本方法**不再发任何 tools/list**：此前「路由取自刷新时那次读、schema 取自此处第二次读」，两次读之间
+        上游一变，Agent 看到的工具（增删 / schema）就与刚提交的投影分叉，且该变化不会推进
+        ``capability_revision``；单个 bundle 的第二次读失败还会让整个 ``client:get_tools`` 失败。
+        「上游可能变了」的语义由调用方先行强制刷新承担（``Computer.aget_available_tools``，#127）。
+        缓存缺条目 / 条目的 client 或世代与当前不符的 bundle 直接跳过（它此刻不在已提交投影里，或刚被换代）。
+
+        #185：快照 → 发布前二次校验（零 await 同步段 → asyncio 原子）——「路由值未变 + client 身份未变 +
+        世代未变」三项全真才产出，任一失配（:meth:`clear_oauth` 快速段已撤回该 bundle）→ 丢弃该候选。与 Rust
         ``list_available_tools_with_bundle_id`` 发布前重验证同构：clear 要么先于本拉取完成
         （候选被过滤），要么后于本拉取（capability 广播触发 Agent 重拉）——Agent **永不**在
         clear 完成后拿到含已撤回 bundle 的过期工具列表。
         """
-        # ① 快照（锁内一次性取：路由 + client 身份 + 世代 + config；此后全部 RPC 在锁外——
-        #    clear 快速段绝不因本拉取的 tools/list RPC 而阻塞）
+        # ① 快照（锁内一次性取：路由 + client 身份 + 世代 + config + 已提交观测）
         snapshots: list[tuple[EXPOSED_TOOL_NAME, BUNDLE_ID, TOOL_NAME, MCPClientProtocol, int, MCPServerConfig]] = []
+        servers_cached_tools: dict[BUNDLE_ID, list[Tool]] = {}
         async with self._lock:
             for exposed_name, (bundle_id, original_tool_name) in self._exposed_tools.items():
                 client = self._active_clients.get(bundle_id)
                 if client is None:
                     continue
+                generation = self._active_client_generations.get(bundle_id, 0)
+                entry = self._tool_list_cache.get(bundle_id)
+                # 观测须与**当前** client / 世代同源（缓存复用判据的同一条），否则该路由不是这份观测提交的
+                if entry is None or entry.client is not client or entry.generation != generation:
+                    continue
+                servers_cached_tools[bundle_id] = entry.tools
                 snapshots.append((
                     exposed_name,
                     bundle_id,
                     original_tool_name,
                     client,
-                    self._active_client_generations.get(bundle_id, 0),
+                    generation,
                     self._servers_config[bundle_id],
                 ))
-        # ② 锁外 RPC：每 bundle_id 仅拉一次 tools/list（跨该 server 的多个 routed tool 复用，
-        #    同 #91 per-server 缓存约定；异常照旧向调用方传播，与历史行为一致）
-        servers_cached_tools: dict[BUNDLE_ID, list[Tool]] = {}
-        for _exposed_name, bundle_id, _original_tool_name, client, _generation, _config in snapshots:
-            if bundle_id not in servers_cached_tools:
-                servers_cached_tools[bundle_id] = await client.list_tools()
         # ③ 组装候选（改名副本 + A2C meta；携发布校验所需的路由/身份/世代证据）
         candidates: list[tuple[EXPOSED_TOOL_NAME, BUNDLE_ID, TOOL_NAME, MCPClientProtocol, int, Tool]] = []
         # 畸形声明诊断：每 server 每次 tools/list 刷新至多一次（#151 R1' 防刷屏先例，协议 config-diagnostics 按 server 聚合）。
