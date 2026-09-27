@@ -48,7 +48,7 @@ class _RecordingSyncNamespace(MockSyncSMCPNamespace):
         self.join_event = threading.Event()
         self.reject_from: int | None = None
 
-    def on_server_join_office(self, sid: str, data: Any) -> Any:  # #214：成功 = None；失败 = flat ErrorPayload
+    def on_server_join_office(self, sid: str, data: Any = None, *_extra: Any) -> Any:  # #214：成功 = None；失败 = flat ErrorPayload
         if self.reject_from is not None and len(self.join_record) + 1 >= self.reject_from:
             payload = dict(data)
             self.join_record.append((sid, payload))
@@ -61,7 +61,7 @@ class _RecordingSyncNamespace(MockSyncSMCPNamespace):
                 "message": "Room already has an agent",
                 "details": {"office_id": payload.get("office_id")},
             }
-        result = super().on_server_join_office(sid, data)
+        result = super().on_server_join_office(sid, data, *_extra)
         self.join_record.append((sid, dict(data)))
         self.join_event.set()
         return result
@@ -87,7 +87,8 @@ def sync_office_server(sync_server_port: int) -> Iterator[tuple[_RecordingSyncNa
         cors_allowed_origins="*",
         ping_timeout=10,
         ping_interval=10,
-        async_handlers=False,
+        # 与生产装配一致（每事件一线程）：串行分发会遮住断连收尾 vs 入房的线程竞态（v0.5.0 审查 S5）
+        async_handlers=True,
     )
     sio.eio.start_service_task = False
     ns = _RecordingSyncNamespace()
@@ -297,10 +298,10 @@ def test_sync_agent_rejoin_self_heals_after_transient_conflict(
 def real_sync_server(sync_server_port: int) -> Iterator[int]:
     """**真实**同步 SMCP 服务端（``LocalSyncSMCPNamespace`` 继承正式实现，含 ``enter_room`` 闸门）。
 
-    本文件其余用例的替身命名空间重写了 ``on_server_join_office`` 而**不经过**房间闸门，故「被真实
-    服务端拒绝」这一格必须换用正式实现，否则测的是替身自己的分支。/
-    The other tests in this file use a stand-in namespace that bypasses the room gates; the
-    "rejected by the real server" case needs the production implementation.
+    本文件其余用例的替身命名空间可按开关**伪造**拒绝（``reject_from``），故「被真实服务端拒绝」这一格
+    换用未加任何开关的正式装配，确保拒绝来自真实闸门而非替身分支。/
+    The other tests can forge rejections via a stand-in switch; this case uses the untouched
+    production assembly so the rejection provably comes from the real gate.
     """
     sio, _ns, app = create_local_sync_server()
     sio.eio.start_service_task = False
