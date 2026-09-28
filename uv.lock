@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "a2c-smcp"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -18,6 +18,7 @@ dependencies = [
     { name = "msgpack" },
     { name = "pydantic" },
     { name = "python-socketio" },
+    { name = "pyyaml" },
     { name = "transitions" },
     { name = "tzlocal" },
     { name = "vrl-python" },
@@ -73,6 +74,7 @@ requires-dist = [
     { name = "prompt-toolkit", marker = "extra == 'cli'", specifier = ">=3.0.52,<4.0.0" },
     { name = "pydantic", specifier = ">=2.11.7,<3.0.0" },
     { name = "python-socketio", specifier = ">=5.13.0,<6.0.0" },
+    { name = "pyyaml", specifier = ">=6.0,<7.0" },
     { name = "rich", marker = "extra == 'cli'", specifier = ">=14.1.0,<15.0.0" },
     { name = "transitions", specifier = ">=0.9.3,<0.10.0" },
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.17.4,<1.0.0" },

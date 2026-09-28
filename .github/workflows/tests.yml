@@ -19,6 +19,18 @@ permissions:
   contents: read
 
 jobs:
+  wheel-install:
+    name: Check isolated wheel installation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v7
+      - name: Check base SDK and CLI without development dependencies
+        run: python tests/packaging/check_wheel_install.py
+
   test:
     name: Run unit/integration tests
     runs-on: ubuntu-latest
