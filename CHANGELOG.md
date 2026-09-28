@@ -7,6 +7,13 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 > 注：v0.3.1 / v0.3.2 发版时未单独切段（Bugfix / OAuth 收敛类），本段累积至 [0.3.0]。
 
+## [0.4.1] - 2026-09-28
+
+### Fixed
+- **Computer CLI 启动缺少 `yaml` 模块**（#224）：将 PyYAML 声明为核心运行时依赖，确保安装
+  `a2c-smcp[cli]` 后可正常导入 Computer、解析 Skills YAML 元数据及执行 `a2c-computer --help`。
+  新增独立 wheel 安装 CI 检查，避免开发依赖间接安装 PyYAML 掩盖缺失声明。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。
