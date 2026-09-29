@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.utils.window_uri import is_window_uri
 
 
@@ -33,6 +34,13 @@ class _DummyClient:
 
     async def emit_refresh_desktop(self) -> None:
         self.refresh_called += 1
+
+
+async def _settle_resource_refresh(comp: Computer) -> None:
+    """#210：资源刷新改由后台任务执行 —— 断言效果前必须结算（未调度则直接返回）。"""
+    task = comp._resource_refresh_task
+    if task is not None:
+        await task
 
 
 @pytest.mark.asyncio
@@ -56,6 +64,7 @@ async def test_on_manager_change_tool_list_changed_triggers_emit(monkeypatch: py
 @pytest.mark.asyncio
 async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     comp = Computer(name="test", auto_connect=False, auto_reconnect=False)
+    comp.mcp_manager = MCPServerManager(auto_connect=False)  # #210: ready manager, without starting file watchers
     # 绑定伪客户端
     client = _DummyClient()
     comp.socketio_client = client
@@ -68,6 +77,7 @@ async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest
 
     monkeypatch.setattr(comp, "_acollect_window_uris", raise_collect)
     await comp._on_manager_change(SimpleNamespace(root=ResourceListChangedNotification()))  # type: ignore
+    await _settle_resource_refresh(comp)  # #210：断言前必须结算在途后台任务
     assert client.refresh_called == 0
 
     # 2) 集合发生变化 -> 触发刷新
@@ -77,6 +87,8 @@ async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest
     monkeypatch.setattr(comp, "_acollect_window_uris", changed_collect)
     comp._windows_cache = set()  # 原为空
     await comp._on_manager_change(SimpleNamespace(root=ResourceListChangedNotification()))  # type: ignore
+    # 每步之间必须结算：否则下一步手改 _windows_cache 时本轮可能仍在途，比对将拿到被改后的缓存（顺序耦合）
+    await _settle_resource_refresh(comp)
     assert client.refresh_called == 1
 
     # 3) 集合未变化 -> 不触发刷新
@@ -87,6 +99,7 @@ async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest
 
     monkeypatch.setattr(comp, "_acollect_window_uris", same_collect)
     await comp._on_manager_change(SimpleNamespace(root=ResourceListChangedNotification()))  # type: ignore
+    await _settle_resource_refresh(comp)
     assert client.refresh_called == 1  # 未增加
 
 
