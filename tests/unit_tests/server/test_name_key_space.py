@@ -9,7 +9,8 @@
           - architecture.md §映射生命周期（注册 / 查询 / 注销）
 
         核心契约 / Core contract：
-          - 跨房同名（同 role）**允许**；同房同名但不同 role **允许**；同房同 role 同名 ⇒ ``4105``；
+          - 跨房同名（同 role）**允许**；同房同名但不同 role **允许**；同房同 role 同名 ⇒ ``4101``
+            （#230：「每 role 一席」先拦，``4105`` 已为预留码）；
           - ``client:*`` 路由在**发起者所在房内**解析；解析不到统一回 flat ``404``，与「该名字存在于
             其它房」**不可区分**（否则可探测他房成员存在性）；
           - 退房 / 断连按键空间清除映射，无悬挂项；注销绝不替其它 sid 删除映射。
@@ -103,15 +104,16 @@ class TestNameKeySpaceAsync:
         assert await ns.on_server_join_office("ag", _join("agent", "twin", "office-a")) is None
         assert await ns.on_server_join_office("pc", _join("computer", "twin", computer_office)) is None
 
-    async def test_same_role_same_name_same_office_is_4105(self) -> None:
-        """房内同 role 同名 ⇒ 4105（经真实先后 join，不靠 participants 桩）；被拒者不入房、不改注册表。"""
+    async def test_same_role_same_name_same_office_is_4101(self) -> None:
+        """房内同 role 同名 ⇒ 4101（protocol#66 场景 #2，不得回 4105；经真实先后 join）；被拒者不入房、不改注册表。"""
         sessions: dict[str, dict[str, Any]] = {"c-1": {}, "c-2": {}}
         ns = _async_ns(sessions)
 
         assert await ns.on_server_join_office("c-1", _join("computer", "pc", "office-a")) is None
         ack = await ns.on_server_join_office("c-2", _join("computer", "pc", "office-a"))
 
-        assert isinstance(ack, dict) and ack["code"] == 4105, ack
+        assert ack == {"code": 4101, "message": "Room already has a computer",
+                       "details": {"office_id": "office-a", "role": "computer"}}, ack
         assert await ns.get_sid_by_name("office-a", "computer", "pc") == "c-1"
         assert "office_id" not in sessions["c-2"]
         assert ns.server.enter_room.await_count == 1
@@ -213,7 +215,7 @@ class TestNameKeySpaceAsync:
     async def test_unregister_does_not_depend_on_mutable_session_fields(self) -> None:
         """会话的 role/name 被回滚 pop 掉（``on_server_join_office`` 的字段级回滚）后，断连仍须清除其持有的键。
 
-        注销若从会话字段反推键，此时反推失败 ⇒ 残留键把该房同 role 同名**永久**拒为 4105（仅重启可恢复）。
+        注销若从会话字段反推键，此时反推失败 ⇒ 残留键**永久**指向死 sid（仅重启可恢复）。
         反向索引 ``sid → key`` 与注册同源写入，注销不读会话。
         """
         sessions: dict[str, dict[str, Any]] = {"pc": {}, "pc-2": {}}
@@ -285,14 +287,15 @@ class TestNameKeySpaceSync:
         assert ns.on_server_join_office("ag", _join("agent", "twin", "office-a")) is None
         assert ns.on_server_join_office("pc", _join("computer", "twin", computer_office)) is None
 
-    def test_same_role_same_name_same_office_is_4105(self) -> None:
+    def test_same_role_same_name_same_office_is_4101(self) -> None:
         sessions: dict[str, dict[str, Any]] = {"c-1": {}, "c-2": {}}
         ns = _sync_ns(sessions)
 
         assert ns.on_server_join_office("c-1", _join("computer", "pc", "office-a")) is None
         ack = ns.on_server_join_office("c-2", _join("computer", "pc", "office-a"))
 
-        assert isinstance(ack, dict) and ack["code"] == 4105, ack
+        assert ack == {"code": 4101, "message": "Room already has a computer",
+                       "details": {"office_id": "office-a", "role": "computer"}}, ack
         assert ns.get_sid_by_name("office-a", "computer", "pc") == "c-1"
         assert "office_id" not in sessions["c-2"]
         assert ns.server.enter_room.call_count == 1
@@ -387,7 +390,7 @@ class TestNameKeySpaceSync:
     def test_unregister_does_not_depend_on_mutable_session_fields(self) -> None:
         """会话的 role/name 被回滚 pop 掉（``on_server_join_office`` 的字段级回滚）后，断连仍须清除其持有的键。
 
-        注销若从会话字段反推键，此时反推失败 ⇒ 残留键把该房同 role 同名**永久**拒为 4105（仅重启可恢复）。
+        注销若从会话字段反推键，此时反推失败 ⇒ 残留键**永久**指向死 sid（仅重启可恢复）。
         反向索引 ``sid → key`` 与注册同源写入，注销不读会话。
         """
         sessions: dict[str, dict[str, Any]] = {"pc": {}, "pc-2": {}}

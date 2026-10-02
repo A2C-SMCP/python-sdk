@@ -39,10 +39,10 @@ _OFFICE = "officeA"
 _NAME = "agent-1"
 _DESIRED = (_OFFICE, _NAME)
 
-#: 双路径均可产出的拒绝形态（``4101`` 为合规主向量；``4105`` 在 #215 后 = 同房同 role 同名）
+#: 双路径均可产出的拒绝形态（``4101`` 为合规主向量；``4105`` 自 protocol#66 起为预留码 = 对端违规形态，不重试）
 VECTORS = [
-    pytest.param({"code": 4101, "message": "Room already has an agent"}, id="4101"),
-    pytest.param({"code": 4105, "message": "Name already taken in room"}, id="4105"),
+    pytest.param({"code": 4101, "message": "Room already has an agent", "details": {"role": "agent"}}, id="4101"),
+    pytest.param({"code": 4105, "message": "Name already taken in room"}, id="4105-reserved"),
     pytest.param({"code": "4101", "message": "Room already has an agent"}, id="stringified-code"),
     pytest.param({"code": 4101}, id="no-message"),
     pytest.param({"code": 500, "message": "Internal server error"}, id="500"),
@@ -205,7 +205,7 @@ def test_perceivable_output_is_byte_identical(monkeypatch: pytest.MonkeyPatch, a
 
     增量价值（相对 A/B 组）= **显式异常形态** + 未打桩的真实产出者文案，不是独立的第三道防线。
 
-    ``after-retries``：重放在预算内真实退避重试后才耗尽（仅 4101/4105 会重试）——重试不得改动共享文案。
+    ``after-retries``：重放在预算内真实退避重试后才耗尽（仅 4101 会重试）——重试不得改动共享文案。
     """
     sink = _Sink()
     monkeypatch.setattr(office_mod, "logger", sink)
@@ -214,7 +214,7 @@ def test_perceivable_output_is_byte_identical(monkeypatch: pytest.MonkeyPatch, a
     for path in PATHS:
         attempts: list[int] = []
         exc, _client = _drive(path, ack, budget=replay_budget, attempts=attempts)
-        if path.endswith("replay") and replay_budget and verdict.code in (4101, 4105):
+        if path.endswith("replay") and replay_budget and verdict.code == 4101:
             assert len(attempts) >= 2, f"{path}: 夹具须真实重试过，否则 after-retries 格退化为单次（实得 {attempts}）"
         assert len(sink.errors) == 1, f"{path} 须恰一条共享 ERROR，实得 {sink.errors}"
         texts[path] = sink.errors.pop()

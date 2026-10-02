@@ -113,10 +113,10 @@ class RoomRejection(ValueError):
     房间管理事件的**业务拒绝**（协议 flat ``ErrorPayload`` 的结构化载体）。
     A room-management business rejection carrying the protocol error code.
 
-    适用 / Scope：``server:join_office`` 的三个业务闸门——目标房已有 Agent（``4101``）、
-    房内已有同 role 同名会话（``4105``）、Agent 已在其它房（``4106``）。由
-    ``SMCPNamespace.enter_room`` / ``BaseNamespace._ensure_name_registerable`` 抛出，由
-    ``on_server_join_office`` 捕获并**按 code 转换为 flat ErrorPayload**（#214）。
+    适用 / Scope：``server:join_office`` 的两个业务闸门——目标房该 role 的席位已被其它会话占据（``4101``，
+    「每 role 一席」，#230）、Agent 已在其它房（``4106``）。由 ``SMCPNamespace.enter_room`` /
+    ``BaseNamespace._claim_seat`` 抛出，由 ``on_server_join_office`` 捕获并**按 code 转换为 flat
+    ErrorPayload**（#214）。``4105`` 已转为协议预留码（protocol#66），不再有对应的领域异常。
 
     **为什么继承 ``ValueError``**：这些闸门历来抛 ``ValueError``（``except ValueError`` /
     ``pytest.raises(ValueError)`` 是既有契约）。换型只增加**信息量**（带上协议码），不改变
@@ -135,21 +135,18 @@ class RoomRejection(ValueError):
 
 
 class RoomFullError(RoomRejection):
-    """目标房已有 Agent（``4101``）——一房一 Agent 规则。"""
+    """目标房该 role 的席位已被其它会话占据（``4101``）——「每 role 一席」规则（protocol#66，#230）。
+
+    一房至多 1 Agent、至多 1 Computer；同 role 的第二个会话**无论是否同名**都以本异常拒绝（同名不再单列
+    ``4105``）。``role`` 为**发起者自己声明**的 role（即被占的席位），不泄露对端信息。
+    The seat of the initiator's own role is taken (``4101``, "one seat per role"); same-name or not.
+    """
 
     code: ClassVar[int] = ErrorCode.ROOM_FULL
 
-    def __init__(self) -> None:
-        super().__init__("Room already has an agent")
-
-
-class NameConflictError(RoomRejection):
-    """房内已有同 role 同名会话（``4105``）——``name`` 是 ``client:*`` 的路由地址，房内必须唯一。"""
-
-    code: ClassVar[int] = ErrorCode.NAME_CONFLICT
-
-    def __init__(self) -> None:
-        super().__init__("Name already taken in room")
+    def __init__(self, role: str) -> None:
+        self.role = role
+        super().__init__(f"Room already has {'an agent' if role == 'agent' else 'a computer'}")
 
 
 class AlreadyInRoomError(RoomRejection):

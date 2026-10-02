@@ -388,37 +388,48 @@ class TestSMCPAgentClient:
             client.validate_office_data(data)
 
     @patch("socketio.Client.call")
-    def test_get_computers_in_office_success(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
-        """测试成功获取房间内的Computer列表 / Test successfully get computers list in office"""
+    def test_get_computer_in_office_returns_the_single_computer(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """#230：返回房内唯一的 Computer（过滤掉 Agent 会话）/ the office's single computer"""
         office_id = "test_office"
-        req_id = f"list_computers_test_agent_{office_id}"
-
-        # 模拟响应包含多个会话，包括computer和agent角色
-        # Mock response with multiple sessions including computer and agent roles
-        mock_response = {
-            "req_id": req_id,
+        mock_call.return_value = {
+            "req_id": f"list_computers_test_agent_{office_id}",
             "sessions": [
-                {"sid": "comp1", "role": "computer", "computer_id": "computer-1"},
-                {"sid": "comp2", "role": "computer", "computer_id": "computer-2"},
-                {"sid": "agent1", "role": "agent", "agent_id": "agent-1"},
+                {"sid": "comp1", "role": "computer", "name": "computer-1"},
+                {"sid": "agent1", "role": "agent", "name": "agent-1"},
             ],
         }
-        mock_call.return_value = mock_response
 
-        computers = client.get_computers_in_office(office_id)
-
-        # 验证只返回computer角色的会话 / Verify only computer role sessions are returned
-        assert len(computers) == 2
-        assert all(c["role"] == "computer" for c in computers)
-        assert computers[0]["computer_id"] == "computer-1"
-        assert computers[1]["computer_id"] == "computer-2"
-
-        # 验证调用参数 / Verify call arguments
+        assert client.get_computer_in_office(office_id) == {"sid": "comp1", "role": "computer", "name": "computer-1"}
         mock_call.assert_called_once()
 
     @patch("socketio.Client.call")
-    def test_get_computers_in_office_empty(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
-        """测试房间内没有Computer时返回空列表 / Test return empty list when no computers in office"""
+    def test_get_computer_in_office_more_than_one_is_protocol_violation(
+        self, mock_call: MagicMock, client: SMCPAgentClient
+    ) -> None:
+        """多于一台 Computer ⇒ 服务端协议违规 ⇒ 显式报错，不挑其中一台（镜像 async）。"""
+        office_id = "test_office"
+        mock_call.return_value = {
+            "req_id": f"list_computers_test_agent_{office_id}",
+            "sessions": [{"sid": "c1", "role": "computer"}, {"sid": "c2", "role": "computer"}],
+        }
+
+        with pytest.raises(ValueError, match="Protocol violation"):
+            client.get_computer_in_office(office_id)
+
+    def test_get_computers_in_office_is_deprecated_shim(self, client: SMCPAgentClient) -> None:
+        """旧复数 API 已废弃（#230）：发 DeprecationWarning，委托单数 API 并包装为 ``[c]`` / ``[]``。"""
+        single = MagicMock(side_effect=[{"sid": "c1", "role": "computer"}, None])
+        client.get_computer_in_office = single  # type: ignore[method-assign]
+
+        with pytest.warns(DeprecationWarning, match="get_computer_in_office"):
+            assert client.get_computers_in_office("o", timeout=3) == [{"sid": "c1", "role": "computer"}]
+        with pytest.warns(DeprecationWarning):
+            assert client.get_computers_in_office("o") == []
+        assert single.call_args_list[0].args == ("o",) and single.call_args_list[0].kwargs == {"timeout": 3}
+
+    @patch("socketio.Client.call")
+    def test_get_computer_in_office_empty(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+        """测试房间内没有Computer时返回 None / Test return None when no computer in office"""
         office_id = "test_office"
         req_id = f"list_computers_test_agent_{office_id}"
 
@@ -432,13 +443,11 @@ class TestSMCPAgentClient:
         }
         mock_call.return_value = mock_response
 
-        computers = client.get_computers_in_office(office_id)
-
-        # 验证返回空列表 / Verify empty list is returned
-        assert len(computers) == 0
+        # 房内暂无 Computer ⇒ None / no computer in the office ⇒ None
+        assert client.get_computer_in_office(office_id) is None
 
     @patch("socketio.Client.call")
-    def test_get_computers_in_office_invalid_response(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+    def test_get_computer_in_office_invalid_response(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
         """测试响应req_id不匹配时抛出异常 / Test raise exception when response req_id mismatches"""
         office_id = "test_office"
 
@@ -451,10 +460,10 @@ class TestSMCPAgentClient:
         mock_call.return_value = mock_response
 
         with pytest.raises(ValueError, match="Invalid response with mismatched req_id"):
-            client.get_computers_in_office(office_id)
+            client.get_computer_in_office(office_id)
 
     @patch("socketio.Client.call")
-    def test_get_computers_in_office_error_payload_raises_protocol_error(
+    def test_get_computer_in_office_error_payload_raises_protocol_error(
         self, mock_call: MagicMock, client: SMCPAgentClient
     ) -> None:
         """#214：`server:list_room` 的 flat ErrorPayload（此处 4104 越权）⇒ `SMCPProtocolError`。
@@ -469,15 +478,15 @@ class TestSMCPAgentClient:
         }
 
         with pytest.raises(SMCPProtocolError) as exc_info:
-            client.get_computers_in_office("test_office")
+            client.get_computer_in_office("test_office")
 
         assert exc_info.value.code == 4104
 
     @patch("socketio.Client.call")
-    def test_get_computers_in_office_timeout(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
+    def test_get_computer_in_office_timeout(self, mock_call: MagicMock, client: SMCPAgentClient) -> None:
         """测试请求超时时抛出异常 / Test raise exception on timeout"""
         office_id = "test_office"
         mock_call.side_effect = TimeoutError("Request timeout")
 
         with pytest.raises(TimeoutError):
-            client.get_computers_in_office(office_id, timeout=1)
+            client.get_computer_in_office(office_id, timeout=1)

@@ -1086,7 +1086,7 @@ def test_sync_stale_success_blocked_by_session_epoch() -> None:
 
 # ── #212：重连回房的瞬态冲突有界退避（async + sync）─────────────────────────────────
 #
-# 协议依据：error-handling.md:486 —— 4101/4105「仅当本端刚经历传输层重连」时可做**有界**退避重试；
+# 协议依据：error-handling.md 重试表 —— 4101「仅当本端刚经历传输层重连」时可做**有界**退避重试（4105 自 protocol#66 起为预留码，不重试）；
 # room-model.md:216-218 —— 服务端回收窗口可达数十秒，任何有限短窗都覆盖不了它（故默认预算 45s）。
 # **只有回放路径重试**：显式 join_office 的语义在 #218 已定（不重试），其用例见上文「#218 C1」小节。
 #
@@ -1136,7 +1136,7 @@ class _RecordingLock:
 
 
 _ROOM_FULL = {"code": 4101, "message": "Room already has an agent"}
-_NAME_TAKEN = {"code": 4105, "message": "Name already taken in room"}
+_RESERVED_4105 = {"code": 4105, "message": "Name already taken in room"}  # 预留码：对端违规，不重试（#230）
 
 #: 异步探针的**限时取锁**超时：必须严格小于被测用例的退避窗口（`office_rejoin_retry_budget`），
 #: 否则「退避期间锁被持有」不再可观测 —— 用例会退化成恒真（各用例内另有 `assert` 自检）。
@@ -1195,7 +1195,7 @@ async def test_async_replay_gives_up_when_budget_is_exhausted(monkeypatch: pytes
 
     async def fake_call(*args: Any, **kwargs: Any) -> Any:
         attempts.append(1)
-        return dict(_NAME_TAKEN)
+        return dict(_ROOM_FULL)
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -1205,7 +1205,7 @@ async def test_async_replay_gives_up_when_budget_is_exhausted(monkeypatch: pytes
     assert client._desired_office is None, "预算耗尽 ⇒ 落失败效应（回放侧 confirmed 为空 ⇒ 双清空）"
     fake_logger.error.assert_called_once()
     text = fake_logger.error.call_args[0][0]
-    assert "4105" in text and _OFFICE in text, "共享 ERROR 文案不得因重试而改变"
+    assert "4101" in text and _OFFICE in text, "共享 ERROR 文案不得因重试而改变"
 
 
 @pytest.mark.asyncio
@@ -1234,6 +1234,7 @@ async def test_async_replay_marks_exhausted_retries_in_own_warning(monkeypatch: 
     "payload",
     [
         {"code": 4106, "message": "Agent already in another room"},
+        _RESERVED_4105,
         {"code": 500, "message": "Internal server error"},
         {"code": "not-a-number", "message": "weird"},
         {"message": "boom"},
@@ -1241,9 +1242,9 @@ async def test_async_replay_marks_exhausted_retries_in_own_warning(monkeypatch: 
 )
 @pytest.mark.asyncio
 async def test_async_replay_never_retries_non_transient_outcomes(payload: dict) -> None:
-    """一次即终：``4106``（非瞬态）/ ``500``（可晚于提交）/ 码不可解析 / 无码，都不重试。
+    """一次即终：``4106``（非瞬态）/ ``4105``（预留码，对端违规）/ ``500``（可晚于提交）/ 码不可解析 / 无码，都不重试。
 
-    与 `test_async_replay_retries_name_conflict_too` 构成正反对照：``4101`` 与 ``4105`` 才重试。
+    与 `test_async_replay_self_heals_across_a_transient_conflict` 构成正反对照：只有 ``4101`` 才重试。
     """
     client = _make_async_client()
     _register_namespace(client)
@@ -1261,28 +1262,6 @@ async def test_async_replay_never_retries_non_transient_outcomes(payload: dict) 
     await client._arejoin_office((_OFFICE, _AGENT_NAME), 1)
 
     assert attempts == [1], "非瞬态码 / 无码一律一次即终"
-
-
-@pytest.mark.asyncio
-async def test_async_replay_retries_name_conflict_too() -> None:
-    """``4105`` 与 ``4101`` 同属瞬态冲突（协议把二者并列为同一类），同样重试。"""
-    client = _make_async_client()
-    _register_namespace(client)
-    client.office_rejoin_retry_budget = 0.3
-    client._desired_office = (_OFFICE, _AGENT_NAME)
-    client._office_generation = 1
-    attempts: list[int] = []
-
-    async def fake_call(*args: Any, **kwargs: Any) -> Any:
-        attempts.append(1)
-        return dict(_NAME_TAKEN) if len(attempts) == 1 else None
-
-    client.call = fake_call  # type: ignore[method-assign]
-
-    await client._arejoin_office((_OFFICE, _AGENT_NAME), 1)
-
-    assert len(attempts) == 2
-    assert client._confirmed_office == (_OFFICE, _AGENT_NAME)
 
 
 @pytest.mark.asyncio
@@ -1431,7 +1410,7 @@ def test_sync_replay_gives_up_when_budget_is_exhausted(monkeypatch: pytest.Monke
 
     def fake_call(*args: Any, **kwargs: Any) -> Any:
         attempts.append(1)
-        return dict(_NAME_TAKEN)
+        return dict(_ROOM_FULL)
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -1452,6 +1431,7 @@ def test_sync_replay_gives_up_when_budget_is_exhausted(monkeypatch: pytest.Monke
     "payload",
     [
         {"code": 4106, "message": "Agent already in another room"},
+        _RESERVED_4105,
         {"code": 500, "message": "Internal server error"},
         {"message": "boom"},
     ],

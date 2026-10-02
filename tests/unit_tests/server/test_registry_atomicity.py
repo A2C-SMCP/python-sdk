@@ -3,9 +3,10 @@
 * 文件名: test_registry_atomicity
 * 描述: v0.5.0 跨节点审查 🔴7 / S1-S4 —— 名字注册表的原子性与断连收尾的交错（async + sync 双路径）。
 
-        - 🔴7：断连收尾先跑完、join 后注册 ⇒ 注册表残留死 sid 的键 ⇒ 同名重连永久 4105。
-          修法：注册在锁内（sync）/ 零挂起点（async）原子校验 ``manager.is_connected``。
-        - S1：同名 / 同房第二个 Agent 的「先查后写」无锁 ⇒ 双同名 / 双 Agent。
+        - 🔴7：断连收尾先跑完、join 后注册 ⇒ 残留死 sid 的键 / 席位 ⇒ 重连永久被拒。
+          修法：注册 / 占席在锁内（sync）/ 零挂起点（async）原子校验 ``manager.is_connected``。
+        - S1 → #230：同 role 第二个会话的「先查后写」⇒ 双席。现由阶段 1 的原子占席（``_claim_seat``）承担，
+          并发输家在动任何成员关系**之前**即被 4101 拒绝（协议「席位检查与占席 MUST 原子」+「校验先于副作用」）。
         - S2：relay 复查与会话字段读取的先后 ⇒ 并发退房误报注册表损坏（raise ⇒ Agent 干等超时）；
           死 sid 残留 ⇒ 404 + 自愈。
         - S3：断连先注销再广播 leave ⇒ 同名新连接的 enter 可能先于旧 leave。
@@ -28,7 +29,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from a2c_smcp.exceptions import NameConflictError, RoomFullError
+from a2c_smcp.exceptions import RoomFullError
 from a2c_smcp.server import AuthenticationProvider, SMCPNamespace, SyncAuthenticationProvider, SyncSMCPNamespace
 from a2c_smcp.smcp import ENTER_OFFICE_NOTIFICATION, LEAVE_OFFICE_NOTIFICATION, build_computer_not_found_error
 
@@ -109,6 +110,26 @@ def _run_inline(kind: str, maybe_coro: Any) -> None:
         raise box["e"]
 
 
+def _call_inline(kind: str, fn: Any, *args: Any) -> Any:
+    """在钩子里**完整**跑完另一条路径并取回其返回值（sync 直接调用；async 在新事件循环线程里跑完）。"""
+    if kind == "sync":
+        return fn(*args)
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["ret"] = asyncio.run(fn(*args))
+        except BaseException as e:  # noqa: BLE001
+            box["e"] = e
+
+    t = threading.Thread(target=_target)
+    t.start()
+    t.join()
+    if "e" in box:
+        raise box["e"]
+    return box.get("ret")
+
+
 @pytest.mark.parametrize("kind", KINDS)
 class TestDeadSidNeverHoldsName:
     """🔴7：断连收尾落在「入房」与「注册」之间，注册表不得残留死 sid。"""
@@ -130,8 +151,9 @@ class TestDeadSidNeverHoldsName:
 
         assert ns._name_to_sid_map == {}, f"死 sid 不得占名：{ns._name_to_sid_map}"
         assert ns._sid_to_name_key == {}
+        assert ns._seat_to_sid == {} and ns._sid_to_seats == {}, f"死 sid 不得占席：{ns._seat_to_sid}"
         assert not _emitted(ns, ENTER_OFFICE_NOTIFICATION), "被拒的死 sid 不得宣告入房"
-        # 同名新连接必须能入房（修复前：永久 4105）
+        # 同名新连接必须能入房（修复前：永久被拒）
         ns.save_session.side_effect = save
         assert await _run(ns.on_server_join_office("pc-2", _join("computer", "pc", "office-a"))) is None
 
@@ -144,39 +166,157 @@ class TestDeadSidNeverHoldsName:
 
         assert isinstance(ack, dict) and ack["code"] == 500, ack
         assert ns._name_to_sid_map == {}
+        assert ns._seat_to_sid == {}, "已开始断连的 sid 不得占席"
         assert "office_id" not in sessions["pc"], "被拒注册须按失败收敛摘房"
+        ns.server.enter_room.assert_not_called()  # 占席即被拒 ⇒ 连 socketio 房都没进
 
 
 @pytest.mark.parametrize("kind", KINDS)
-class TestAtomicReservation:
-    """S1：Agent 席位 / 同名的「校验 + 写入」原子化（注册表判据，与写入同一步）。"""
+class TestAtomicSeatClaim:
+    """#230（protocol#66 注记 3/4）：席位检查与占席原子、且先于任何副作用——并发输家不碰任何成员关系。"""
 
-    async def test_second_agent_joining_in_the_gate_window_is_4101(self, kind: str) -> None:
-        sessions: dict[str, dict[str, Any]] = {"ag-1": {}, "ag-2": {}}
+    @pytest.mark.parametrize("role", ["agent", "computer"])
+    async def test_rival_joining_in_the_effect_window_is_4101_and_untouched(self, kind: str, role: str) -> None:
+        """首个会话已过阶段 1（已占席）、尚在阶段 2 —— 同 role 的第二个会话在此窗口完整入房 ⇒ 后者 4101，前者成功。"""
+        sessions: dict[str, dict[str, Any]] = {"s-1": {}, "s-2": {}}
         ns = _ns(kind, sessions)
         save = ns.save_session.side_effect
-        injected = {"done": False}
+        rival: dict[str, Any] = {}
 
         def _save(sid: str, sess: dict[str, Any]) -> None:
             save(sid, sess)
-            if sid == "ag-1" and sess.get("office_id") == "office-a" and not injected["done"]:
-                injected["done"] = True
-                # ag-1 已过阶段 1 闸门、尚未注册 —— ag-2 的完整入房落在这个窗口里
-                _run_inline(kind, ns.on_server_join_office("ag-2", _join("agent", "bot-2", "office-a")))
+            if sid == "s-1" and sess.get("office_id") == "office-a" and "ack" not in rival:
+                rival["ack"] = None  # 占位，防重入
+                rival["ack"] = _call_inline(kind, ns.on_server_join_office, "s-2", _join(role, "other", "office-a"))
 
         ns.save_session.side_effect = _save
 
-        ack = await _run(ns.on_server_join_office("ag-1", _join("agent", "bot-1", "office-a")))
+        ack = await _run(ns.on_server_join_office("s-1", _join(role, "first", "office-a")))
 
-        assert isinstance(ack, dict) and ack["code"] == 4101, ack
-        agents = [k for k in ns._name_to_sid_map if k[1] == "agent"]
-        assert agents == [("office-a", "agent", "bot-2")], agents
-        assert "office_id" not in sessions["ag-1"]
+        assert ack is None, ack
+        assert rival["ack"] == {"code": 4101, "message": f"Room already has {'an agent' if role == 'agent' else 'a computer'}",
+                                "details": {"office_id": "office-a", "role": role}}, rival
+        assert ns._seat_to_sid == {("office-a", role): "s-1"}
+        assert "office_id" not in sessions["s-2"]
+        entered = [c.args[0] for c in ns.server.enter_room.call_args_list]
+        assert entered == ["s-1"], f"输家在占席处即被拒，绝不进 socketio 房：{entered}"
 
-    def test_threaded_same_name_registration_has_exactly_one_winner(self, kind: str) -> None:
-        if kind == "async":
-            pytest.skip("async 原子性由零挂起点保证（结构性），线程竞速只对 sync 有意义")
-        sids = [f"pc-{i}" for i in range(8)]
+    async def test_switching_computer_losing_the_race_keeps_its_old_room(self, kind: str) -> None:
+        """并发版场景 #4：C2 在 R2、与 C1 竞争空房 R1 而落败 ⇒ C2 仍在 R2，R2 **未**收到 notify:leave_office。"""
+        sessions: dict[str, dict[str, Any]] = {"c1": {}, "c2": {}}
+        ns = _ns(kind, sessions)
+        assert await _run(ns.on_server_join_office("c2", _join("computer", "c2", "office-b"))) is None
+        ns.emit.reset_mock()
+        save = ns.save_session.side_effect
+        rival: dict[str, Any] = {}
+
+        def _save(sid: str, sess: dict[str, Any]) -> None:
+            save(sid, sess)
+            if sid == "c1" and sess.get("office_id") == "office-a" and "ack" not in rival:
+                rival["ack"] = None
+                rival["ack"] = _call_inline(kind, ns.on_server_join_office, "c2", _join("computer", "c2", "office-a"))
+
+        ns.save_session.side_effect = _save
+
+        assert await _run(ns.on_server_join_office("c1", _join("computer", "c1", "office-a"))) is None
+
+        assert isinstance(rival["ack"], dict) and rival["ack"]["code"] == 4101, rival
+        assert sessions["c2"].get("office_id") == "office-b", "输家必须仍在原房"
+        assert ns._seat_to_sid == {("office-a", "computer"): "c1", ("office-b", "computer"): "c2"}
+        assert not _emitted(ns, LEAVE_OFFICE_NOTIFICATION), "校验先于副作用：原房不得收到 leave"
+
+    async def test_failed_enter_frees_the_seat_only_after_the_name(self, kind: str) -> None:
+        """审查 🟡1：入房失败回滚必须**先**注销名字、摘房，**最后**才释放席位（与 leave_room / 断连同序）。
+
+        反序时（sync 两次独立取锁之间可达）：席位已空、名字键仍挂在失败方名下 ⇒ 同名新来者占到席位后在
+        ``_register_name`` 撞上残留键 ⇒ RegistryInvariantError ⇒ 合法新来者收到 500（且不在重试集合内）。
+        钩子在「席位被释放」的那一刻插入同名 rival 的完整入房：正确顺序下 rival 必得空 ack。
+        """
+        sessions: dict[str, dict[str, Any]] = {"x": {}, "y": {}}
+        ns = _ns(kind, sessions)
+
+        def _emit(event: str, *args: Any, **kwargs: Any) -> None:
+            if event == ENTER_OFFICE_NOTIFICATION and kwargs.get("skip_sid") == "x":
+                raise ConnectionError("enter broadcast failed")  # x 已注册名字后失败
+
+        ns.emit.side_effect = _emit
+        real_release = ns._release_seats
+        rival: dict[str, Any] = {}
+
+        def _release(sid: str, office_id: Any = None) -> Any:
+            out = real_release(sid, office_id)
+            if sid == "x" and "ack" not in rival:
+                rival["ack"] = None
+                if inspect.isawaitable(out):
+                    # async：先完成真实释放，再在新线程里跑 rival（与 sync 的「两次取锁之间」同构）
+                    async def _then() -> None:
+                        await out
+                        rival["ack"] = _call_inline(kind, ns.on_server_join_office, "y", _join("computer", "PC", "office-a"))
+
+                    return _then()
+                rival["ack"] = _call_inline(kind, ns.on_server_join_office, "y", _join("computer", "PC", "office-a"))
+            return out
+
+        ns._release_seats = _release
+
+        ack = await _run(ns.on_server_join_office("x", _join("computer", "PC", "office-a")))
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+        assert rival["ack"] is None, f"席位释放时失败方的名字必须已注销，同名新来者应成功：{rival['ack']!r}"
+        assert ns._seat_to_sid == {("office-a", "computer"): "y"}
+        assert ns._name_to_sid_map == {("office-a", "computer", "PC"): "y"}
+
+    async def test_roomless_after_convergence_holds_no_seat(self, kind: str) -> None:
+        """审查 🟡2：换房途中旧房 leave 已删会话 office_id、却在提交（save）时抛错 ⇒ 收敛为无房，**旧房席位也须释放**。
+
+        否则无房的 sid 永久占着旧房 Computer 席位 ⇒ 旧房恒 4101（直到它断连）。「无房 ⇒ 不持任何席位」须是结构性保证。
+        """
+        sessions: dict[str, dict[str, Any]] = {"c": {}}
+        ns = _ns(kind, sessions)
+        assert await _run(ns.on_server_join_office("c", _join("computer", "c", "office-a"))) is None
+        save = ns.save_session.side_effect
+        boom = {"armed": True}
+
+        def _save(sid: str, sess: dict[str, Any]) -> None:
+            if boom["armed"] and sid == "c" and "office_id" not in sess:
+                boom["armed"] = False  # 只在 leave_room(旧房) 的提交处抛一次
+                raise ConnectionError("session store down")
+            save(sid, sess)
+
+        ns.save_session.side_effect = _save
+
+        ack = await _run(ns.on_server_join_office("c", _join("computer", "c", "office-b")))
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+        assert "office_id" not in sessions["c"]
+        assert ns._seat_to_sid == {} and ns._sid_to_seats == {}, f"无房会话不得持有任何席位：{ns._seat_to_sid}"
+
+    async def test_uncommitted_old_room_leave_keeps_old_seat_frees_target(self, kind: str) -> None:
+        """正对照（提交点分刀）：旧房 leave 在**提交前**失败（广播抛错）⇒ 仍在旧房 ⇒ 旧房席位保留、仅目标席位释放。"""
+        sessions: dict[str, dict[str, Any]] = {"c": {}}
+        ns = _ns(kind, sessions)
+        assert await _run(ns.on_server_join_office("c", _join("computer", "c", "office-a"))) is None
+
+        def _emit(event: str, *args: Any, **kwargs: Any) -> None:
+            if event == LEAVE_OFFICE_NOTIFICATION:
+                raise ConnectionError("leave broadcast failed")
+
+        ns.emit.side_effect = _emit
+
+        ack = await _run(ns.on_server_join_office("c", _join("computer", "c", "office-b")))
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+        assert sessions["c"].get("office_id") == "office-a"
+        assert ns._seat_to_sid == {("office-a", "computer"): "c"}, ns._seat_to_sid
+
+
+class TestThreadedSeatClaim:
+    """sync 专属：真实线程竞速下「检查 + 占席」恰一个赢家（async 的原子性由零挂起点结构性保证，无需线程竞速）。"""
+
+    @pytest.mark.parametrize("role", ["agent", "computer"])
+    def test_threaded_seat_claim_has_exactly_one_winner(self, role: str) -> None:
+        kind = "sync"
+        sids = [f"s-{i}" for i in range(8)]
         ns = _ns(kind, {sid: {} for sid in sids})
 
         class _SlowDict(dict):  # 放大「读到空位 → 写入」之间的窗口，让无锁实现必然交错
@@ -185,51 +325,14 @@ class TestAtomicReservation:
                 time.sleep(0.005)
                 return value
 
-        ns._name_to_sid_map = _SlowDict()
+        ns._seat_to_sid = _SlowDict()
         outcomes: dict[str, str] = {}
         barrier = threading.Barrier(len(sids))
 
         def _worker(sid: str) -> None:
             barrier.wait()
             try:
-                ns._register_name("office-a", "computer", "pc", sid)
-                outcomes[sid] = "ok"
-            except NameConflictError:
-                outcomes[sid] = "4105"
-
-        threads = [threading.Thread(target=_worker, args=(sid,)) for sid in sids]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        winners = [sid for sid, o in outcomes.items() if o == "ok"]
-        assert len(winners) == 1, f"同名注册必须恰有一个赢家：{outcomes}"
-        assert dict(ns._name_to_sid_map) == {("office-a", "computer", "pc"): winners[0]}
-        # 反向索引只记赢家（败者不得留下指向该键的残留）
-        assert ns._sid_to_name_key == {winners[0]: ("office-a", "computer", "pc")}
-
-    def test_threaded_agent_slot_has_exactly_one_winner(self, kind: str) -> None:
-        if kind == "async":
-            pytest.skip("同上")
-        sids = [f"ag-{i}" for i in range(8)]
-        ns = _ns(kind, {sid: {} for sid in sids})
-        outcomes: dict[str, str] = {}
-        barrier = threading.Barrier(len(sids))
-        real_items = dict.items
-
-        class _SlowDict(dict):
-            def items(self) -> Any:  # type: ignore[override]
-                snapshot = list(real_items(self))
-                time.sleep(0.005)
-                return snapshot
-
-        ns._name_to_sid_map = _SlowDict()
-
-        def _worker(sid: str) -> None:
-            barrier.wait()
-            try:
-                ns._register_name("office-a", "agent", sid, sid)
+                ns._claim_seat("office-a", role, sid)
                 outcomes[sid] = "ok"
             except RoomFullError:
                 outcomes[sid] = "4101"
@@ -240,7 +343,11 @@ class TestAtomicReservation:
         for t in threads:
             t.join()
 
-        assert sum(o == "ok" for o in outcomes.values()) == 1, f"一房一 Agent：{outcomes}"
+        winners = [sid for sid, o in outcomes.items() if o == "ok"]
+        assert len(winners) == 1, f"每 role 一席必须恰有一个赢家：{outcomes}"
+        assert dict(ns._seat_to_sid) == {("office-a", role): winners[0]}
+        # 反向索引只记赢家（败者不得留下指向该席位的残留）
+        assert ns._sid_to_seats == {winners[0]: {("office-a", role)}}
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -300,7 +407,7 @@ class TestDisconnectOrdering:
 
     async def test_failed_leave_broadcast_still_releases_name_and_wakes_inflight(self, kind: str) -> None:
         """复审 🔴：S3 把注销挪到 leave 广播之后——广播抛错（pubsub publish 失败等）若跳过注销，死 sid 永久占名
-        ⇒ 同名重连恒 4105（🔴7 换了触发条件）；在途 relay 的断连信号也不得因此漏发。"""
+        ⇒ 重连恒被拒（🔴7 换了触发条件）；在途 relay 的断连信号也不得因此漏发。"""
         sessions: dict[str, dict[str, Any]] = {"pc": {}, "pc-2": {}}
         ns = _ns(kind, sessions)
         await _run(ns.on_server_join_office("pc", _join("computer", "pc", "office-a")))
@@ -317,6 +424,7 @@ class TestDisconnectOrdering:
             await _run(_disconnect_now(ns, "pc"))
 
         assert ns._name_to_sid_map == {}, "广播失败也必须注销（否则死 sid 永久占名）"
+        assert ns._seat_to_sid == {}, "广播失败也必须释放席位（否则该房该 role 永久 4101）"
         assert inflight.is_set(), "清理中途抛错也必须唤醒在途调用"
         ns.emit.side_effect = None
         ns.server.rooms.return_value = []
@@ -342,6 +450,7 @@ class TestRelayRechecks:
 
         assert ret == build_computer_not_found_error("pc"), ret
         assert ("office-a", "computer", "pc") not in ns._name_to_sid_map, "死 sid 残留须自愈注销"
+        assert ("office-a", "computer") not in ns._seat_to_sid, "死 sid 的席位同样须自愈释放"
 
     async def test_leave_landing_on_the_recheck_is_404_not_raise(self, kind: str) -> None:
         ns, sessions = await self._setup(kind)

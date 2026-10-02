@@ -132,9 +132,9 @@ class TestClientRouteRejections:
     @pytest.mark.parametrize(("handler", "payload"), CLIENT_ROUTES, ids=ROUTE_IDS)
     async def test_non_agent_initiator_gets_403(self, make_ns: Any, handler: str, payload: dict) -> None:
         """已入房的 Computer 发 client:*（协议：client:* 发起方为 Agent）⇒ flat 403，且不转发。"""
-        sessions: dict[str, dict[str, Any]] = {"other": {}, "pc": {}}
+        # 「每 role 一席」（#230）下房内只能有这一台 Computer；路由目标 ``pc`` 不在房也无妨——角色判定先于目标解析
+        sessions: dict[str, dict[str, Any]] = {"other": {}}
         ns = make_ns(sessions)
-        assert await _run(ns.on_server_join_office("pc", _join("computer", "pc", "office-a"))) is None
         assert await _run(ns.on_server_join_office("other", _join("computer", "other", "office-a"))) is None
 
         ack = await _run(getattr(ns, handler)("other", payload))
@@ -378,11 +378,12 @@ class TestOfficeRoomNamespace:
         rooms = [c.kwargs.get("room") for c in ns.emit.call_args_list]
         assert rooms == ["office:office-a"], rooms
 
-    async def test_agent_occupancy_scan_uses_prefixed_room(self, make_ns: Any) -> None:
+    async def test_seat_is_keyed_by_raw_office_id(self, make_ns: Any) -> None:
+        """#230 起 Agent 占用不再扫 socketio 房成员，改由席位表判定：席位键用**原始** office_id（前缀只存在于 socketio 层）。"""
         ns = make_ns({"ag": {}})
         assert await _run(ns.on_server_join_office("ag", _join("agent", "ag", "office-a"))) is None
-        scanned = [c.args[1] for c in ns.server.manager.get_participants.call_args_list]
-        assert scanned and all(r == "office:office-a" for r in scanned), scanned
+        assert ns._seat_to_sid == {("office-a", "agent"): "ag"}
+        assert _rooms_calls(ns.server.enter_room) == ["office:office-a"]
 
     async def test_leave_leaves_prefixed_room_and_broadcasts_there(self, make_ns: Any) -> None:
         ns = make_ns({"pc": {}})

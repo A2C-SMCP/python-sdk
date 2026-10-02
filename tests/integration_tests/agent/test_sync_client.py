@@ -313,10 +313,10 @@ def test_validate_emit_event_blocks_invalid():
         agent.call("agent:do_something", {})
 
 
-def test_get_computers_in_office_sync(startup_and_shutdown_sync_smcp_server):
+def test_get_computer_in_office_sync(startup_and_shutdown_sync_smcp_server):
     """
-    中文：验证同步Agent可以获取房间内所有Computer的信息。
-    English: Verify sync Agent can get all computers info in the office.
+    中文：#230「每 role 一席」——同步 Agent 取到房内唯一的 Computer；第二台 Computer 入房被 4101 拒绝。
+    English: the sync Agent gets the office's single computer; a second computer is rejected (4101).
     """
     port = startup_and_shutdown_sync_smcp_server
     handler = _EH()
@@ -324,7 +324,6 @@ def test_get_computers_in_office_sync(startup_and_shutdown_sync_smcp_server):
     auth = DefaultAgentAuthProvider(agent_id="robot-sync-4", office_id=office_id)
     agent = SMCPAgentClient(auth_provider=auth, event_handler=handler)
 
-    # Agent连接并加入办公室 / Agent connects and joins office
     agent.connect_to_server(
         f"http://localhost:{port}",
         namespace=SMCP_NAMESPACE,
@@ -332,7 +331,7 @@ def test_get_computers_in_office_sync(startup_and_shutdown_sync_smcp_server):
     )
     agent.join_office(office_id=office_id, agent_name="robot-sync-4", namespace=SMCP_NAMESPACE)
 
-    # 使用线程启动两个Computer客户端 / Start two Computer clients in threads
+    # 使用线程启动 Computer 客户端 / Start the Computer client in a thread
     def run_computer_client(computer_name: str) -> None:
         logger.info(f"Starting Computer Client: {computer_name}")
         computer = Client()
@@ -349,52 +348,37 @@ def test_get_computers_in_office_sync(startup_and_shutdown_sync_smcp_server):
 
     disconnect_event = threading.Event()
     computer_thread1 = threading.Thread(target=run_computer_client, args=("comp-sync-04-1",))
-    computer_thread2 = threading.Thread(target=run_computer_client, args=("comp-sync-04-2",))
     computer_thread1.start()
-    computer_thread2.start()
-
-    # 等待所有客户端加入完成 / Wait for all clients to join
     time.sleep(1.0)
 
-    # 调用get_computers_in_office获取Computer列表 / Call get_computers_in_office to get computers list
-    computers = agent.get_computers_in_office(office_id)
+    # 第二台 Computer ⇒ 4101 {role: computer}
+    second = Client()
+    second.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    ack = second.call(
+        JOIN_OFFICE_EVENT, {"role": "computer", "office_id": office_id, "name": "comp-sync-04-2"}, namespace=SMCP_NAMESPACE
+    )
+    assert isinstance(ack, dict) and ack["code"] == 4101 and ack["details"]["role"] == "computer", ack
+    second.disconnect()
 
-    # 验证返回的Computer数量 / Verify number of computers returned
-    assert len(computers) == 2, f"Expected 2 computers, got {len(computers)}"
+    computer = agent.get_computer_in_office(office_id)
+    assert computer is not None and computer["role"] == "computer" and computer["name"] == "comp-sync-04-1", computer
 
-    # 验证所有返回的会话都是computer角色 / Verify all returned sessions are computer role
-    assert all(c["role"] == "computer" for c in computers), "All sessions should be computer role"
-
-    # 验证Computer名称 / Verify computer names
-    computer_names = {c["name"] for c in computers}
-    assert "comp-sync-04-1" in computer_names, "comp-sync-04-1 should be in the list"
-    assert "comp-sync-04-2" in computer_names, "comp-sync-04-2 should be in the list"
-
-    # 从每个Computer获取工具列表 / Get tools list from each computer
-    for computer in computers:
-        computer_sid = computer["sid"]
-        logger.info(f"Getting tools from computer: {computer['name']} (sid: {computer_sid})")
-
-        # 调用get_tools_from_computer获取工具列表 / Call get_tools_from_computer to get tools list
-        tools_ret = agent.get_tools_from_computer(computer_sid)
-
-        # 验证返回结果 / Verify the result
-        assert tools_ret is not None, f"Failed to get tools from computer {computer['name']}"
-        assert tools_ret.get("tools"), "GetToolsRet should have 'tools' attribute"
-        assert tools_ret.get("req_id"), "GetToolsRet should have 'req_id' attribute"
-        logger.info(f"Successfully got {len(tools_ret['tools'])} tools from computer {computer['name']}")
+    # 从唯一的 Computer 获取工具列表 / Get tools from the single computer
+    tools_ret = agent.get_tools_from_computer(computer["sid"])
+    assert tools_ret is not None, f"Failed to get tools from computer {computer['name']}"
+    assert tools_ret.get("tools"), "GetToolsRet should have 'tools' attribute"
+    assert tools_ret.get("req_id"), "GetToolsRet should have 'req_id' attribute"
 
     # 清理 / Cleanup
     disconnect_event.set()
     computer_thread1.join()
-    computer_thread2.join()
     agent.disconnect()
 
 
-def test_get_computers_in_office_empty_sync(startup_and_shutdown_sync_smcp_server):
+def test_get_computer_in_office_empty_sync(startup_and_shutdown_sync_smcp_server):
     """
-    中文：验证当房间内没有Computer时，同步Agent返回空列表。
-    English: Verify sync Agent returns empty list when no computers in office.
+    中文：房间内没有 Computer 时，同步 Agent 返回 None。
+    English: the sync Agent returns None when no computer is in the office.
     """
     port = startup_and_shutdown_sync_smcp_server
     handler = _EH()
@@ -402,24 +386,16 @@ def test_get_computers_in_office_empty_sync(startup_and_shutdown_sync_smcp_serve
     auth = DefaultAgentAuthProvider(agent_id="robot-sync-5", office_id=office_id)
     agent = SMCPAgentClient(auth_provider=auth, event_handler=handler)
 
-    # Agent连接并加入办公室 / Agent connects and joins office
     agent.connect_to_server(
         f"http://localhost:{port}",
         namespace=SMCP_NAMESPACE,
         socketio_path="/socket.io",
     )
     agent.join_office(office_id=office_id, agent_name="robot-sync-5", namespace=SMCP_NAMESPACE)
-
-    # 等待连接完成 / Wait for connection to complete
     time.sleep(0.5)
 
-    # 调用get_computers_in_office，应该返回空列表 / Call get_computers_in_office, should return empty list
-    computers = agent.get_computers_in_office(office_id)
+    assert agent.get_computer_in_office(office_id) is None
 
-    # 验证返回空列表 / Verify empty list is returned
-    assert len(computers) == 0, f"Expected 0 computers, got {len(computers)}"
-
-    # 清理 / Cleanup
     agent.disconnect()
 
 

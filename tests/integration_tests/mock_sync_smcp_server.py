@@ -10,7 +10,7 @@ English: Synchronous SMCP server Mock implementation for sync client integration
 
 v0.5.0 审查 S5：本替身**继承正式** :class:`SyncSMCPNamespace`（对照 async 侧的 ``MockComputerServerNamespace``），
 房间管理（``server:join_office`` / ``server:leave_office`` / ``server:list_room`` / ``server:update_*``）全部走正式
-实现——``office:`` 房名前缀、通知里的**名字**（而非 sid）、4101/4105/4106/403 的拒绝形态都与线上一致。此前的裸
+实现——``office:`` 房名前缀、通知里的**名字**（而非 sid）、4101/4106/403 的拒绝形态都与线上一致。此前的裸
 ``Namespace`` 替身自写这些 handler（无 leave、无前缀、通知填 sid、无任何校验），sync Agent 的集成测试因此测不到
 v0.5.0 的拒绝形态。
 

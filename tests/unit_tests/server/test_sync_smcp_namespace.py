@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import RoomFullError, SMCPNamespaceError
 from a2c_smcp.server.sync_namespace import SyncSMCPNamespace
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
@@ -47,21 +47,10 @@ def test_enter_room_agent_rules(ns):
     with pytest.raises(ValueError):
         ns.enter_room("sidA", "B")
 
-    # agent 不在任何房间，房间已有 agent -> 抛错
+    # agent 不在任何房间，房间已有 agent（#230：席位表是唯一判据）-> 4101
     ns.get_session.return_value = {"role": "agent"}
-    ns.server.manager.get_participants.return_value = ["sidX"]
-    # 该参与者为 agent
-
-    def _get_sess_for_participant(sid):
-        if sid == "sidX":
-            return {"role": "agent"}
-        return {}
-
-    ns.get_session.side_effect = [
-        {"role": "agent"},  # self session
-        {"role": "agent"},  # participant session
-    ]
-    with pytest.raises(ValueError):
+    ns._seat_to_sid[("room1", "agent")] = "sidX"
+    with pytest.raises(RoomFullError):
         ns.enter_room("sidB", "room1")
 
     # agent 已在同一房间 -> 返回且不重复 emit
@@ -352,55 +341,29 @@ def test_enter_room_computer_duplicate_name_raises_error(ns):
     new_computer_sid = "new_sid"
     new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
 
-    # #215：房内同 role 同名的唯一判据是 ``(office_id, role, name)`` 注册表（已有 Computer 入房时写入）
-    # #215: the (office_id, role, name) registry is the single same-name gate
-    ns._name_to_sid_map = {
-        (existing_session["office_id"], existing_session["role"], existing_session["name"]): existing_computer_sid,
-    }
+    # #230：同 role 第二个会话无论同名与否都先撞席位（4101，不再是 4105）
+    ns._seat_to_sid[(existing_session["office_id"], "computer")] = existing_computer_sid
     ns.get_session.side_effect = None
     ns.get_session.return_value = new_session
 
-    # 应该抛出 ValueError，提示重名
-    # Should raise ValueError indicating duplicate name
-    with pytest.raises(ValueError, match="Name already taken in room"):
+    with pytest.raises(RoomFullError, match="Room already has a computer"):
         ns.enter_room(new_computer_sid, "room1")
 
 
-def test_enter_room_computer_different_name_succeeds(ns, monkeypatch):
+def test_enter_room_second_computer_with_different_name_is_room_full(ns):
     """
-    测试Computer不同名可以成功加入：房间内已有Computer，但名字不同，应该成功
-    Test Computer with different name can join: room has Computer but different name, should succeed
+    #230「每 role 一席」：房内已有 Computer 时，**不同名**的第二台同样被拒（4101），不替换、不驱逐（同步）
     """
-    from a2c_smcp.server.sync_base import SyncBaseNamespace
+    ns._seat_to_sid[("room1", "computer")] = "existing_sid"
+    ns.get_session.side_effect = None
+    ns.get_session.return_value = {"role": "computer", "name": "comp2", "sid": "new_sid"}
 
-    # 房间内已有一个名为 "comp1" 的 Computer
-    # Room already has a Computer named "comp1"
-    existing_computer_sid = "existing_sid"
-    existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
+    with pytest.raises(RoomFullError):
+        ns.enter_room("new_sid", "room1")
 
-    # 新的 Computer 叫 "comp2"，名字不同
-    # New Computer named "comp2", different name
-    new_computer_sid = "new_sid"
-    new_session = {"role": "computer", "name": "comp2", "sid": new_computer_sid}
-
-    # Mock get_participants 返回房间内已有的参与者
-    ns.server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
-
-    # Mock get_session
-    ns.get_session.side_effect = [new_session, existing_session, new_session]
-    ns._register_name = MagicMock()
-
-    # Mock 父类的 enter_room 方法
-    # Mock parent class enter_room method
-    monkeypatch.setattr(SyncBaseNamespace, "enter_room", MagicMock())
-
-    # 应该成功加入，不抛出异常
-    # Should succeed without raising exception
-    ns.enter_room(new_computer_sid, "room1")
-
-    # 验证 save_session 被调用
-    # Verify save_session was called
-    assert ns.save_session.called
+    ns.server.enter_room.assert_not_called()
+    ns.emit.assert_not_called()
+    assert ns._seat_to_sid == {("room1", "computer"): "existing_sid"}, "不替换旧 Computer"
 
 
 def test_enter_room_computer_same_sid_allowed(ns, monkeypatch):

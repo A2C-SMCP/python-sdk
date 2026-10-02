@@ -44,6 +44,12 @@ def _namespace(
     return ns
 
 
+def _seat(ns: Any, office_id: str, role: str, sid: str) -> None:
+    """预置席位（#230，镜像 async 版）。Seed an occupied seat."""
+    ns._seat_to_sid[(office_id, role)] = sid
+    ns._sid_to_seats.setdefault(sid, set()).add((office_id, role))
+
+
 def _assert_no_leak(payload: dict[str, Any]) -> None:
     """失败 ack 的 message / details MUST NOT 含其它会话的内部标识。"""
     blob = json.dumps(payload, ensure_ascii=False, default=str)
@@ -146,11 +152,11 @@ class TestJoinOfficeAckShapeSync:
             "sid-1": {"role": "computer"},
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-a"},
         }
-        ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
-        ns._name_to_sid_map = {("room-a", "computer", "dup"): PEER_SID}  # #215：注册表是房内同名的唯一判据
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "computer", PEER_SID)  # #230：目标房的 Computer 席位已被对端占据
 
         first = ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-a"})
-        assert isinstance(first, dict) and first["code"] == 4105, first
+        assert isinstance(first, dict) and first["code"] == 4101, first
         assert "name" not in sessions["sid-1"], f"被拒后会话不得残留 name: {sessions['sid-1']!r}"
 
         second = ns.on_server_join_office("sid-1", {"role": "computer", "name": "other", "office_id": "room-b"})
@@ -162,12 +168,16 @@ class TestJoinOfficeAckShapeSync:
             "sid-1": {"role": "agent"},
             PEER_SID: {"role": "agent", "name": PEER_NAME, "office_id": "room-a"},
         }
-        ns = _namespace(sessions, participants=[(PEER_SID, "eio-peer")])
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "agent", PEER_SID)
 
         ack = ns.on_server_join_office("sid-1", {"role": "agent", "name": "a1", "office_id": "room-a"})
 
-        assert isinstance(ack, dict) and ack["code"] == 4101, ack
-        assert ack["details"] == {"office_id": "room-a"}, ack
+        assert ack == {
+            "code": 4101,
+            "message": "Room already has an agent",
+            "details": {"office_id": "room-a", "role": "agent"},
+        }, ack
         _assert_no_leak(ack)
 
     def test_agent_switch_is_4106_with_current_room(self) -> None:
@@ -183,33 +193,51 @@ class TestJoinOfficeAckShapeSync:
         assert sessions["sid-1"]["office_id"] == "room-old"
         _assert_no_leak(ack)
 
-    def test_computer_same_name_in_target_room_is_4105(self) -> None:
-        """目标房已有同 role 同名会话 ⇒ `4105`（同步镜像；含 #213「校验先于副作用」断言）。"""
+    def test_computer_switch_into_occupied_room_is_4101(self) -> None:
+        """目标房已有（同名的）另一台 Computer ⇒ `4101 {role: computer}`，不得回 `4105`（同步镜像；含「校验先于副作用」）。"""
         sessions: dict[str, dict[str, Any]] = {
             "sid-1": {"role": "computer", "name": "dup", "office_id": "room-a"},
             PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
         }
-        ns = _namespace(sessions, participants=[("sid-1", "eio-self"), (PEER_SID, "eio-peer")])
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "computer", "sid-1")
+        _seat(ns, "room-b", "computer", PEER_SID)
         ns._name_to_sid_map = {("room-a", "computer", "dup"): "sid-1", ("room-b", "computer", "dup"): PEER_SID}
 
         ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-b"})
 
-        assert isinstance(ack, dict) and ack["code"] == 4105, ack
-        assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
+        assert ack == {
+            "code": 4101,
+            "message": "Room already has a computer",
+            "details": {"office_id": "room-b", "role": "computer"},
+        }, ack
         _assert_no_leak(ack)
         ns.server.leave_room.assert_not_called()
         ns.server.enter_room.assert_not_called()
         assert sessions["sid-1"]["office_id"] == "room-a"
+        assert ns._seat_to_sid == {("room-a", "computer"): "sid-1", ("room-b", "computer"): PEER_SID}
 
-    def test_registry_conflict_is_4105_without_peer_sid(self) -> None:
+    def test_seat_conflict_is_4101_without_peer_sid(self) -> None:
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
+        _seat(ns, "room-b", "computer", PEER_SID)
+
+        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
+
+        assert isinstance(ack, dict) and ack["code"] == 4101, ack
+        assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
+        _assert_no_leak(ack)  # 回归守卫：旧实现把 "sid '<peer>'" 自由文本塞进 error_msg
+
+    def test_name_key_held_by_another_sid_with_free_seat_is_500_never_4105(self) -> None:
+        """注册表与席位表矛盾 ⇒ `500` 并回滚席位（同步镜像）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "taken"}}
+        ns = _namespace(sessions)
         ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
 
         ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
 
-        assert isinstance(ack, dict) and ack["code"] == 4105, ack
-        assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
-        _assert_no_leak(ack)  # 回归守卫：旧实现把 "sid '<peer>'" 自由文本塞进 error_msg
+        assert ack == {"code": 500, "message": "Internal error"}, ack
+        assert ns._seat_to_sid == {} and ns._sid_to_seats == {}
+        assert "office_id" not in sessions["sid-1"]
 
     def test_missing_payload_still_acks(self) -> None:
         """**参数绑定失败也必须回 ack**（同步镜像）：零参包 ⇒ 400。"""
@@ -232,14 +260,14 @@ class TestJoinOfficeAckShapeSync:
         assert "office_id" not in sessions["sid-1"], "多参必须在**产生副作用之前**被拒"
 
     def test_registry_conflict_diagnostic_goes_to_log_not_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """名字冲突诊断（含对端 sid）进日志、不进 ack（同步镜像；双向断言的理由见 async 版）。"""
+        """席位冲突诊断（含对端 sid）进日志、不进 ack（同步镜像；双向断言的理由见 async 版）。"""
         from a2c_smcp.server import sync_base as sync_base_mod
 
         fake_logger = MagicMock()
         monkeypatch.setattr(sync_base_mod, "logger", fake_logger)
 
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
-        ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
+        _seat(ns, "room-b", "computer", PEER_SID)
 
         ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
 
@@ -407,7 +435,7 @@ class TestListRoomAckShapeSync:
 class TestSyncAsyncPayloadParitySync:
     """双实现**线上载荷对拍**：同一场景下 sync 与 async 必须产出逐字段一致的 ErrorPayload。
 
-    只测各自终端形态抓不到「sync 传错上下文」——例如 4106 误把目标房当成当前房、4105 的 role
+    只测各自终端形态抓不到「sync 传错上下文」——例如 4106 误把目标房当成当前房、4101 的 role
     取成对端 role：两条断言在各自文件里都可能"看起来对"，只有对拍才暴露分歧。
     Parity check across the two implementations: the same scenario must produce identical payloads.
     """
@@ -445,7 +473,7 @@ class TestSyncAsyncPayloadParitySync:
             (
                 "room-full",
                 {"role": "agent", "name": "a1", "office_id": "room-a"},
-                [(PEER_SID, "e")],
+                [("room-a", "agent")],
                 {"session": {"role": "agent"}, PEER_SID: {"role": "agent", "name": "p", "office_id": "room-a"}},
             ),
             (
@@ -455,17 +483,17 @@ class TestSyncAsyncPayloadParitySync:
                 {"session": {"role": "agent", "office_id": "room-old"}},
             ),
             (
-                "name-conflict-room",
+                "computer-seat-taken-same-name",
                 {"role": "computer", "name": "dup", "office_id": "room-b"},
-                [("sid-1", "e"), (PEER_SID, "e2")],
+                [("room-b", "computer")],
                 {
                     "session": {"role": "computer", "name": "dup"},
                     PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
-                    "_registry": {("room-b", "computer", "dup"): PEER_SID},  # #215：房内同名由注册表判定
+                    "_registry": {("room-b", "computer", "dup"): PEER_SID},
                 },
             ),
             (
-                "name-conflict-registry",
+                "registry-contradiction",
                 {"role": "computer", "name": "taken", "office_id": "room-b"},
                 [],
                 {"session": {"role": "computer", "name": "taken"}, "_registry": {("room-b", "computer", "taken"): PEER_SID}},
@@ -473,7 +501,8 @@ class TestSyncAsyncPayloadParitySync:
             ("malformed", {}, [], {"session": {}}),
         ]
 
-        for label, payload, participants, spec in scenarios:
+        # 第三列：对端（PEER_SID）预先占着的席位 / seats held by the peer
+        for label, payload, peer_seats, spec in scenarios:
             sync_sessions: dict[str, dict[str, Any]] = {}
             for key, value in spec.items():
                 if key == "_registry":
@@ -481,12 +510,13 @@ class TestSyncAsyncPayloadParitySync:
                 sync_sessions["sid-1" if key == "session" else key] = dict(value)  # type: ignore[arg-type]
             async_sessions: dict[str, dict[str, Any]] = {k: dict(v) for k, v in sync_sessions.items()}
 
-            sync_ns = _namespace(sync_sessions, participants=participants)
-            if "_registry" in spec:
-                sync_ns._name_to_sid_map = dict(spec["_registry"])
-            async_ns = self._build_async(async_sessions, participants)
-            if "_registry" in spec:
-                async_ns._name_to_sid_map = dict(spec["_registry"])
+            sync_ns = _namespace(sync_sessions)
+            async_ns = self._build_async(async_sessions, [])
+            for each in (sync_ns, async_ns):
+                for office_id, role in peer_seats:
+                    _seat(each, office_id, role, PEER_SID)
+                if "_registry" in spec:
+                    each._name_to_sid_map = dict(spec["_registry"])
 
             sync_ack = sync_ns.on_server_join_office("sid-1", payload)
             async_ack = await async_ns.on_server_join_office("sid-1", payload)

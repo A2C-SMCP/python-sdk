@@ -19,6 +19,11 @@ SID: TypeAlias = str
 # 的，跨房同名 / 同名异 role 均允许。元组键天然无字符串拼接歧义。
 # Name-registry key ``(office_id, role, name)`` (#215): uniqueness is per room and per role.
 NAME_KEY: TypeAlias = tuple[OFFICE_ID, str, str]
+# 席位键 ``(office_id, role)``（#230，协议 room-model.md §成员类型「每 role 一席」）：房内每个 role 至多一个会话。
+# 席位是**准入**的权威判据（4101），名字注册表只承担路由解析；同 role 的第二个会话无论同名与否都先撞席位。
+# Seat key ``(office_id, role)`` (#230, "one seat per role"): the admission authority (4101); the name
+# registry above only serves routing.
+SEAT_KEY: TypeAlias = tuple[OFFICE_ID, str]
 
 
 class BaseSession(TypedDict):

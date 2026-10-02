@@ -265,22 +265,28 @@ desktop = await async_client.get_desktop_from_computer(
 )
 ```
 
-### 获取房间内 Computer 列表
+### 获取房间内的 Computer
+
+v0.5.0 起房间是「**每 role 一席**」（protocol#66）：一房至多 1 Agent、至多 1 Computer，即一个 Agent
+同一时刻至多连一台 Computer。房内**唯一**的 Computer 用 `get_computer_in_office` 获取：
 
 ```python
 from a2c_smcp.smcp import SessionInfo
 
 # 同步
-computers: list[SessionInfo] = client.get_computers_in_office(
-    "my_office",
-    timeout=20
-)
-for c in computers:
-    print(f"Computer: {c['name']} (sid: {c['sid']})")
+computer: SessionInfo | None = client.get_computer_in_office("my_office", timeout=20)
+if computer is not None:
+    print(f"Computer: {computer['name']} (sid: {computer['sid']})")
 
 # 异步
-computers = await async_client.get_computers_in_office("my_office", timeout=20)
+computer = await async_client.get_computer_in_office("my_office", timeout=20)
 ```
+
+- 房内暂无 Computer ⇒ `None`；服务端列出多于一台 ⇒ 视为服务端协议违规，抛 `ValueError`（不替你挑一台）。
+- **换绑 Computer** 不引入新事件：旧 Computer 离房（`notify:leave_office`）→ 新 Computer 入房
+  （`notify:enter_office`）。收到 leave 清理旧 Computer 的工具 / Desktop / SKILL 缓存，收到 enter 重新拉取。
+- `get_computers_in_office`（返回列表）**已废弃**：仍可用（委托 `get_computer_in_office`，返回 `[c]` / `[]`），
+  调用即发 `DeprecationWarning`，将在后续版本移除。
 
 ## 房间管理
 
@@ -320,7 +326,8 @@ from a2c_smcp.agent.errors import SMCPProtocolError
 try:
     await async_client.join_office("my_office", "my_agent")
 except SMCPProtocolError as e:
-    # e.code: 4101 房内已有 Agent / 4105 同名 / 4106 已在其它房 / 403 改名被拒 / 400 载荷畸形
+    # e.code: 4101 房内已有 Agent（本 role 席位已占）/ 4106 已在其它房 / 403 改名被拒 / 400 载荷畸形
+    #         按 e.code 分流即可：Agent 自己发起的入房，被占席位恒为 agent（入房异常不携带服务端 details）
     #         -1 = 服务端拒绝但码不可解析（未获裁决）
     print(f"入房被拒：{e.code} {e.error_message}")  # str(e) 形如 "[4101] Room already has an agent"
 ```
@@ -345,8 +352,9 @@ except SMCPProtocolError as e:
 ### 自动回房：瞬态冲突的有界退避重试（#212）
 
 传输层断线自动重连后，SDK 会重放同一份入房意图（`_desired_office`）。若服务端**尚未回收**本客户端的
-旧会话（静默断线时它要等自身心跳超时，socket.io 默认最长 **45 秒**），重放会被判 `4101`（房内已有
-Agent）/ `4105`（房内同名）——协议把二者定义为同一类**瞬态冲突**，只允许在**重连恢复路径**上有界重试。
+旧会话（静默断线时它要等自身心跳超时，socket.io 默认最长 **45 秒**），重放会被判 `4101`（旧会话仍占着
+本 role 的席位）——协议把这种成因定义为**瞬态冲突**，只允许在**重连恢复路径**上有界重试。`4105` 自
+protocol#66 起是**预留码**（服务端不得产出），收到即按对端协议违规记录、**不重试**。
 
 - 默认按 `1→2→4→5→5…` 秒退避重试，**预算 45 秒**（= socket.io 默认最长回收窗口）；预算耗尽才落失败
   效应与错误日志 ⇒ 网络抖动通常**无感自愈**，无需手工重入。
@@ -354,13 +362,13 @@ Agent）/ `4105`（房内同名）——协议把二者定义为同一类**瞬�
   的公开实例属性；`<= 0` 关掉重试，退化为单次尝试）。部署方调大了服务端 `ping_interval` /
   `ping_timeout` 时须相应调大——协议的 SHOULD 级部署约束（回收窗口应与客户端可接受的恢复时延相称）
   是补偿能生效的前提。
-- **只给回放路径**：显式 `join_office` 不重试（首次入房撞上冲突即永久冲突）；`4106` / `500` / 未知码 /
+- **只给回放路径**：显式 `join_office` 不重试（首次入房撞上冲突即永久冲突）；`4105` / `4106` / `500` / 未知码 /
   无码 / 传输层失败也不重试。退避期间 office 操作锁是空闲的（每次尝试各取一次），恢复耗时上界 =
   预算 + 一次有界 ACK 等待。
 - **重启不在重试范围之内**：退避重试只作用于**回放路径**（前提是一次「传输中断后意图被保留」的会话）。
-  进程被杀后重启是**新进程**，走的是**显式** `join_office`：若沿用同名、撞上上一进程尚未回收的
-  `4105`，会**直接抛** `SMCPProtocolError`（不重试）。此时要么等旧会话被回收后由调用方自己重试，要么
-  换名——改名须**重新建立连接**（新 sid）。Computer 侧有对等通道（预置 `office_id` 再 `connect()` 即走
+  进程被杀后重启是**新进程**，走的是**显式** `join_office`：撞上上一进程尚未回收的旧会话（仍占着席位）
+  ⇒ `4101`，会**直接抛** `SMCPProtocolError`（不重试）。此时只能等旧会话被回收后由调用方自己重试——
+  **改名无效**（席位与名字无关）。Computer 侧有对等通道（预置 `office_id` 再 `connect()` 即走
   重放路径，见 computer-guide），Agent 侧没有。
 
 ### 离开房间

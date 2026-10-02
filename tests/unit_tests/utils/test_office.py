@@ -63,11 +63,29 @@ class TestParseJoinAckVerdicts:
     def test_error_payload_with_details_still_parses(self) -> None:
         """`details` 的存在不影响判定（协议 details 为诊断容器）。"""
         verdict = parse_join_ack(
-            {"code": 4105, "message": "Name already taken in room", "details": {"office_id": "o", "role": "computer"}}
+            {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "o", "role": "computer"}}
         )
 
         assert verdict.ok is False
-        assert verdict.code == 4105
+        assert verdict.code == 4101
+
+    @pytest.mark.parametrize("code", [4102, 4105])
+    def test_reserved_code_is_logged_as_violation_and_still_rejected(self, code: int, monkeypatch: pytest.MonkeyPatch) -> None:
+        """预留码（4102 / 4105，protocol#66）⇒ 对端协议违规：留告警，照常判拒绝（不臆断成功）。
+
+        双向断言：预留码必告警；正常拒绝码（4101）**不**告警——否则「告警」可能只是对一切拒绝都打。
+        """
+        from a2c_smcp.utils import office as office_mod
+
+        fake_logger = MagicMock()
+        monkeypatch.setattr(office_mod, "logger", fake_logger)
+
+        verdict = parse_join_ack({"code": code, "message": "x"})
+
+        assert verdict.ok is False and verdict.code == code
+        assert fake_logger.warning.call_count == 1 and "预留码" in str(fake_logger.warning.call_args)
+        parse_join_ack({"code": 4101, "message": "Room already has an agent", "details": {"role": "agent"}})
+        assert fake_logger.warning.call_count == 1, "非预留码不得告警"
 
     def test_error_payload_without_message_is_still_code_carried(self) -> None:
         """缺 `message` 时仍以码为准（宁可拒绝，不可误判成功）。"""
@@ -219,9 +237,9 @@ class TestJoinFailureMessage:
 
     def test_non_403_never_appends_hint(self) -> None:
         """身份提示**只**对 403 追加（其余码追加会破坏双路径同文案）。"""
-        verdict = JoinOfficeVerdict(ok=False, code=4105, message="Name already taken in room")
+        verdict = JoinOfficeVerdict(ok=False, code=4101, message="Room already has a computer")
 
-        assert join_failure_message(verdict, confirmed_name="alice") == "Name already taken in room"
+        assert join_failure_message(verdict, confirmed_name="alice") == "Room already has a computer"
 
 
 class TestBuildJoinFailurePayload:
@@ -292,7 +310,7 @@ class TestLogJoinRejection:
 
 # ── #212 重连回房的有界退避（瞬态冲突白名单 + 曲线 + 校验类判据）──────────────────────
 #
-# 协议依据：error-handling.md:486 重试表（4101/4105 条件可选）、room-model.md:216-218（回收窗口
+# 协议依据：error-handling.md 重试表（4101 条件可选；4105 自 protocol#66 起为预留码）、room-model.md:216-218（回收窗口
 # 可达数十秒 ⇒ 任何有限短窗都覆盖不了）、room-model.md:157（校验必须先于副作用）。曲线与预算大小
 # 归 SDK 自治，故本节的期望值是 **SDK 决策**（用户拍板 45s / 1.2.4.5.5…），不是协议条款。
 
@@ -316,10 +334,10 @@ class TestRejoinRetryConstants:
 
 
 class TestTransientJoinConflictCodes:
-    """瞬态冲突白名单 = 协议重试表里「条件可选」的那两码（error-handling.md:496）。"""
+    """瞬态冲突白名单 = 协议重试表里「条件可选」的码（#230：「每 role 一席」后仅 4101）。"""
 
-    def test_only_room_full_and_name_conflict(self) -> None:
-        assert frozenset({4101, 4105}) == TRANSIENT_JOIN_CONFLICT_CODES
+    def test_only_room_full(self) -> None:
+        assert frozenset({4101}) == TRANSIENT_JOIN_CONFLICT_CODES
 
     def test_already_in_room_is_not_transient(self) -> None:
         """4106 不属瞬态冲突：重连产生的是**新会话**（无 ``office_id``），不可能「已在其它房」。
@@ -337,13 +355,13 @@ class TestIsValidationRejection:
     成员关系提交（入房广播抛错 ⇒ 服务端按提交点收敛为无房），此时回退会让客户端宣称仍在旧房。
     """
 
-    @pytest.mark.parametrize("code", [400, 403, 4101, 4105, 4106])
+    @pytest.mark.parametrize("code", [400, 403, 4101, 4106])
     def test_join_validation_codes_are_recognised(self, code: int) -> None:
         assert is_validation_rejection(JoinOfficeVerdict(ok=False, code=code, message="x")) is True
 
-    @pytest.mark.parametrize("code", [500, 4102, 4103, 4104, 4199])
+    @pytest.mark.parametrize("code", [500, 4102, 4103, 4104, 4105, 4199])
     def test_post_commit_reserved_and_unknown_codes_are_excluded(self, code: int) -> None:
-        """``500`` 可晚于提交；``4102`` 是预留码、``4103``/``4104`` 只由 ``list_room`` 产出（join 产不出）；
+        """``500`` 可晚于提交；``4102`` / ``4105`` 是预留码、``4103``/``4104`` 只由 ``list_room`` 产出（join 产不出）；
         未知码 fail-safe（与 ``parse_join_ack`` 的「宁严勿宽」同向）。"""
         assert is_validation_rejection(JoinOfficeVerdict(ok=False, code=code, message="x")) is False
 
@@ -354,11 +372,11 @@ class TestIsValidationRejection:
     def test_whitelist_matches_join_reachable_validation_codes(self) -> None:
         """白名单是**维护耦合点**：它必须恰好是「join 的校验类码」集合。
 
-        服务端 ``server:join_office`` 可达码 = ``{400, 403, 4101, 4105, 4106, 500}``（``4102``-``4104``
-        只由别的事件产出）。未来 MINOR 新增校验类码时，本断言不会自动报警，但会落到「非校验 ⇒ 双清空」
+        服务端 ``server:join_office`` 可达码 = ``{400, 403, 4101, 4106, 500}``（``4103``/``4104`` 只由别的事件
+        产出；``4102`` / ``4105`` 为预留码）。未来 MINOR 新增校验类码时，本断言不会自动报警，但会落到「非校验 ⇒ 双清空」
         这一 fail-safe 方向（牺牲恢复能力、不撒谎）——改动这里请同时更新本断言与 docstring。
         """
-        assert frozenset({400, 403, 4101, 4105, 4106}) == JOIN_VALIDATION_REJECTION_CODES
+        assert frozenset({400, 403, 4101, 4106}) == JOIN_VALIDATION_REJECTION_CODES
         assert TRANSIENT_JOIN_CONFLICT_CODES <= JOIN_VALIDATION_REJECTION_CODES
 
 
@@ -378,17 +396,17 @@ class TestRejoinRetryDelay:
             5.0,
         ]
 
-    def test_name_conflict_is_retryable_too(self) -> None:
-        """4101 与 4105 是同一类瞬态冲突的两种形态（重连撞旧会话：Agent 独占 / 同名）。"""
-        verdict = JoinOfficeVerdict(ok=False, code=4105, message="Name already taken in room")
+    def test_computer_seat_conflict_is_retryable(self) -> None:
+        """4101 不分席位：Computer 重连撞上自己尚未回收的旧会话同样是 4101 {role: computer}，同样重试。"""
+        verdict = JoinOfficeVerdict(ok=False, code=4101, message="Room already has a computer")
         assert rejoin_retry_delay(verdict, attempt=0, remaining=999.0) == 1.0
 
-    @pytest.mark.parametrize("code", [4106, 500, 4102, 4103, 4104, 4199])
+    @pytest.mark.parametrize("code", [4105, 4106, 500, 4102, 4103, 4104, 4199])
     def test_non_transient_codes_never_retry(self, code: int) -> None:
         assert rejoin_retry_delay(JoinOfficeVerdict(ok=False, code=code, message="x"), attempt=0, remaining=999.0) is None
 
     def test_indeterminate_and_transport_never_retry(self) -> None:
-        """形状不认识 / 码不可解析（无码）与传输层失败（无裁决）都不重试：协议只对 4101/4105 放行。"""
+        """形状不认识 / 码不可解析（无码）与传输层失败（无裁决）都不重试：协议只对 4101 放行。"""
         assert (
             rejoin_retry_delay(
                 JoinOfficeVerdict(ok=False, code=None, message=NO_RESPONSE_MESSAGE), attempt=0, remaining=999.0

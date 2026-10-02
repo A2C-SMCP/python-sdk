@@ -530,18 +530,19 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
 
         # 验证失败
         # Verify failure
-        assert_rejected_ack(ack2, 4105, action="server:join_office")
-        assert ack2["message"] == "Name already taken in room", ack2
+        # #230：同 role 第二个会话无论同名与否都先撞席位 ⇒ 4101（不再是 4105）
+        assert ack2 == {"code": 4101, "message": "Room already has a computer",
+                        "details": {"office_id": office_id, "role": "computer"}}, ack2
 
     finally:
         computer1.disconnect()
         computer2.disconnect()
 
 
-def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server, sync_server_port: int):
+def test_computer_different_name_also_rejected(startup_and_shutdown_local_sync_server, sync_server_port: int):
     """
-    中文：测试不同名Computer可以加入：房间内已有Computer，但名字不同，应该成功
-    English: Test different name Computer can join: room has Computer but different name, should succeed
+    中文：#230「每 role 一席」——房间内已有 Computer 时，不同名的第二台同样被拒（4101）
+    English: one seat per role — a second Computer with a different name is rejected too (4101)
     """
     computer1 = SimpleClient()
     computer2 = SimpleClient()
@@ -564,16 +565,14 @@ def test_computer_different_name_allowed(startup_and_shutdown_local_sync_server,
         # Connect second Computer (different name)
         computer2.connect(_url(sync_server_port), namespace=SMCP_NAMESPACE)
 
-        # 第二个 Computer 加入同一房间，应该成功
-        # Second Computer joins same room, should succeed
+        # 第二个 Computer 加入同一房间 ⇒ 4101 / Second Computer ⇒ 4101
         ack2 = computer2.call(
             JOIN_OFFICE_EVENT,
             {"role": "computer", "office_id": office_id, "name": "comp-sync-2"},
         )
 
-        # 验证成功
-        # Verify success
-        assert_empty_ack(ack2, action="不同名Computer应该加入成功 / Different name Computer should succeed, error")
+        assert_rejected_ack(ack2, 4101, action="server:join_office")
+        assert ack2["details"] == {"office_id": office_id, "role": "computer"}, ack2
 
     finally:
         computer1.disconnect()
@@ -841,9 +840,11 @@ def test_rejected_same_name_join_is_isolated_sync(
     startup_and_shutdown_local_sync_server,
     sync_server_port: int,
 ) -> None:
-    """#213 sync：房内同名被拒（4105）的客户端不留在目标房（服务端权威 ``list_room`` + notify 隔离）。
+    """#213 + #230 sync：撞目标房 Computer 席位（同名者占着）被拒（4101）的客户端不留在目标房（服务端权威
+    ``list_room`` + notify 隔离）。
 
-    #215 起跨 office 同名合法，故冲突改在目标房内构造；``twin`` 正对照钉住「他房同名放行」。
+    #215 起跨 office 同名合法；``twin`` 正对照钉住「他房同名放行」。#230 后 office-B 只容一台 Computer：
+    对照改为 Agent，后续广播由「holder 退房 → joiner 入房」触发。
 
     同步服务端在**独立进程**中运行，测试侧读不到它的真实成员关系 ⇒ 用服务端权威的
     ``server:list_room`` 与 wire 上的 ``notify:*`` 断言终态。「**从未**入房」这一顺序保证由单元
@@ -874,14 +875,14 @@ def test_rejected_same_name_join_is_isolated_sync(
     _join_office(holder, role="computer", office_id=office_b, name="c213s")
     # #215 正对照：他房同名合法（_join_office 内断言空 ack）
     _join_office(twin, role="computer", office_id=office_a, name="c213s")
-    _join_office(control, role="computer", office_id=office_b, name="c213s-control")
+    _join_office(control, role="agent", office_id=office_b, name="c213s-control")
 
     ack = subject.call(
         JOIN_OFFICE_EVENT,
         {"role": "computer", "office_id": office_b, "name": "c213s"},
         namespace=SMCP_NAMESPACE,
     )
-    assert_rejected_ack(ack, 4105, action="server:join_office")  # 目标房内同 role 同名
+    assert_rejected_ack(ack, 4101, action="server:join_office")  # 目标房 Computer 席位已占（同名亦然）
 
     # 服务端权威视图：被拒者不得出现在目标房成员列表里
     listed = control.call(
@@ -896,6 +897,7 @@ def test_rejected_same_name_join_is_isolated_sync(
     assert names == ["c213s", "c213s-control"], f"目标房成员应为持有者 + 对照：{names}"
 
     # 验收口径：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
+    assert_empty_ack(holder.call(LEAVE_OFFICE_EVENT, {"office_id": office_b}, namespace=SMCP_NAMESPACE))
     _join_office(joiner, role="computer", office_id=office_b, name="c213s-joiner")
     time.sleep(0.3)
     assert on_control, "正对照：目标房合法成员应收到 notify:enter_office"
@@ -913,10 +915,10 @@ def test_rename_on_live_session_rejected_keeps_old_room_sync(
 
     协议 events.md:610 / faq.md:162：改身份须换新连接。这是「**已在旧房** + 换房被拒」路径的集成
     守护（#213 原口径不变：修复前该路径先退旧房再报错，客户端落成「无房」却仍以为在旧房）。
+    #230 后 office-A 只容一台 Computer：对端改为 Agent，「仍是活成员」改由对端退房再重入触发的广播证明。
     """
     peer = Client()
     mover = Client()
-    latecomer = Client()
 
     on_peer_leave: list[dict] = []
     on_mover_enter: list[dict] = []
@@ -930,10 +932,10 @@ def test_rename_on_live_session_rejected_keeps_old_room_sync(
         on_mover_enter.append(data)
 
     office_a, office_b = "office-221-mv-sync-a", "office-221-mv-sync-b"
-    for client in (peer, mover, latecomer):
+    for client in (peer, mover):
         client.connect(_url(sync_server_port), namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
 
-    _join_office(peer, role="computer", office_id=office_a, name="peer-221s")
+    _join_office(peer, role="agent", office_id=office_a, name="peer-221s")
     _join_office(mover, role="computer", office_id=office_a, name="mover-221s")
 
     ack = mover.call(
@@ -955,12 +957,13 @@ def test_rename_on_live_session_rejected_keeps_old_room_sync(
     names = sorted(s["name"] for s in listed["sessions"])
     assert names == ["mover-221s", "peer-221s"], f"换房被拒后旧房成员应原封不动（含旧名）：{names}"
 
-    # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
-    _join_office(latecomer, role="computer", office_id=office_a, name="late-221s")
+    # 仍是活成员：对端退房再重入时它照常收到旧房的 notify:enter_office（正对照）
+    assert_empty_ack(peer.call(LEAVE_OFFICE_EVENT, {"office_id": office_a}, namespace=SMCP_NAMESPACE))
+    _join_office(peer, role="agent", office_id=office_a, name="peer-221s")
     time.sleep(0.3)
-    assert on_mover_enter, "旧房仍应把新成员入房广播给 mover"
+    assert on_mover_enter, "旧房仍应把成员入房广播给 mover"
 
-    for client in (peer, mover, latecomer):
+    for client in (peer, mover):
         client.disconnect()
 
 
@@ -1061,7 +1064,7 @@ def test_office_id_equal_to_peer_sid_cannot_reach_private_room_sync(
 
 
 def test_name_conflict_ack_never_leaks_peer_sid_sync(startup_and_shutdown_local_sync_server, sync_server_port: int) -> None:
-    """#216 §二 验收（同步）：同名 join 被拒（4105）的 ack 不含对端真实 sid、不含 namespace。"""
+    """#216 §二 验收（同步）：同名 join 被拒（#230 起为 4101）的 ack 不含对端真实 sid、不含 namespace。"""
     holder, challenger = Client(), Client()
     holder_sid = _connect_sync(holder, sync_server_port)
     _connect_sync(challenger, sync_server_port)
@@ -1070,7 +1073,7 @@ def test_name_conflict_ack_never_leaks_peer_sid_sync(startup_and_shutdown_local_
         ack = challenger.call(
             JOIN_OFFICE_EVENT, {"role": "computer", "office_id": "office-s216-dup", "name": "dup-s216"}, namespace=SMCP_NAMESPACE
         )
-        assert_rejected_ack(ack, 4105)
+        assert_rejected_ack(ack, 4101)
         blob = json.dumps(ack, ensure_ascii=False)
         assert holder_sid not in blob, blob
         assert SMCP_NAMESPACE not in blob, blob

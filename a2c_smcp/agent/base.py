@@ -43,6 +43,7 @@ from a2c_smcp.smcp import (
     LeaveOfficeNotification,
     LeaveOfficeReq,
     PutBlobReq,
+    SessionInfo,
     ToolCallReq,
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
@@ -91,6 +92,22 @@ def _raise_for_leave_rejection(result: Any) -> None:
     verdict = parse_leave_ack(result)
     if not verdict.ok:
         raise SMCPProtocolError(build_join_failure_payload(verdict))
+
+
+def _the_computer_in_office(sessions: list[SessionInfo], office_id: str) -> SessionInfo | None:
+    """从 ``server:list_room`` 的会话列表取出房内**唯一**的 Computer（async / sync 两侧共用，#230）。
+
+    「每 role 一席」（protocol#66）下房内至多一台 Computer，0.5 MINOR 握手保证对端遵守 ⇒ 多于一台即服务端违规，
+    显式报错而**不**挑其中一台（替调用方猜哪台正是该规则要消灭的歧义）。
+    / The single Computer of the office; more than one is a server protocol violation (raise, never pick).
+
+    Raises:
+        ValueError: 列表中 Computer 多于一台。
+    """
+    computers = [s for s in sessions if s.get("role") == "computer"]
+    if len(computers) > 1:
+        raise ValueError(f"Protocol violation: office {office_id!r} lists {len(computers)} computers (at most 1 allowed)")
+    return computers[0] if computers else None
 
 
 class _FifoLock:
@@ -207,11 +224,11 @@ class BaseAgentClient(ABC):
         # Serializes explicit join/leave with the replay so the wire order matches the last declaration.
         self._office_op_lock = asyncio.Lock()
         # ── #212 重连回房的退避预算（公开可配置）─────────────────────────────────────────────
-        # 自动回房被 ``4101``/``4105``（瞬态冲突）拒绝时的**有界退避重试**预算（秒，墙钟）：默认
+        # 自动回房被 ``4101``（瞬态冲突）拒绝时的**有界退避重试**预算（秒，墙钟）：默认
         # ``OFFICE_REJOIN_RETRY_BUDGET``（45s = socket.io 默认最长回收窗口），退避 1→2→4→5…秒封顶。
         # 预算耗尽才落失败效应与 ERROR 日志；**显式 ``join_office`` 不受影响**（不重试）。赋值即可按部署
         # 调整（镜像 socketio 自身 ``reconnection_delay`` 的实例属性约定）；``<= 0`` 退化回单次尝试。
-        # Bounded backoff budget (seconds) for the replay's transient 4101/4105 rejections; assignable per
+        # Bounded backoff budget (seconds) for the replay's transient 4101 rejections; assignable per
         # instance, mirroring socketio's own ``reconnection_delay`` convention. <= 0 disables retrying.
         self.office_rejoin_retry_budget: float = OFFICE_REJOIN_RETRY_BUDGET
 
@@ -641,7 +658,7 @@ class BaseAgentClient(ABC):
         Join an Office (Room in Socket.IO) and **wait for the server's verdict**.
 
         #218：本方法由「无 ack 的 ``emit``」改为 ``call`` —— 入房被拒必须**可感**：
-        服务端校验失败（房内已有 Agent ``4101`` / 同名 ``4105`` / 载荷畸形 ``400`` / 同连接改名 ``403``）
+        服务端校验失败（房内已有 Agent ``4101`` / 载荷畸形 ``400`` / 同连接改名 ``403``）
         一律抛 :class:`~a2c_smcp.agent.errors.SMCPProtocolError`，调用方以 ``except ... as e: e.code``
         机器分流。失败后的**本地状态去留**由 :func:`a2c_smcp.utils.office.resolve_join_failure`
         单一权威决定（明确拒绝 ⇒ 意图回退到「已确认房」；未获裁决 / 传输层失败 ⇒ 双清空）。

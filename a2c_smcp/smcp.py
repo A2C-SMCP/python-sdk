@@ -503,11 +503,13 @@ class ErrorCode(IntEnum):
     # 协议依据 / Protocol: error-handling.md §连接与房间管理错误码 / §房间管理错误响应
     # 由具备 ack 通道的三个房间事件产出（server:join_office / server:leave_office /
     # server:list_room），一律以 flat ErrorPayload 承载（protocol#61）。
-    ROOM_FULL = 4101  # join 时目标房已有 Agent
+    ROOM_FULL = 4101  # join 时目标房**该 role 的席位**已被其它会话占据（每 role 一席，protocol#66）
     ROOM_NOT_FOUND = 4102  # **预留码**：协议当前任何路径都不产生，SDK **MUST NOT** 主动返回
     NOT_IN_ROOM = 4103  # 会话无 office_id 时发起需要房间上下文的操作
     CROSS_ROOM_ACCESS = 4104  # 调用方**显式指定**了非自己所在房的操作（如 list_room 查他房）
-    NAME_CONFLICT = 4105  # 房内已有同 role 同名会话（name 是 client:* 的路由地址）
+    # **预留码**（protocol#66）：仅在 0.5.0-dev 草案表示过「房内同 role 同名」；「每 role 一席」后同 role 的
+    # 第二个会话无论同名与否都先撞 4101，本码再无可达路径。SDK **MUST NOT** 返回；收到时按协议违规记录并放弃。
+    NAME_CONFLICT = 4105
     ALREADY_IN_ROOM = 4106  # **Agent** 已在其它房又请求入新房（Computer 自动换房，不产生本码）
 
 
@@ -601,11 +603,11 @@ class ErrorPayload(TypedDict, total=False):
       - 4019: details.reason (invalid_upload/invalid_declaration/range/too_large/busy/forbidden/integrity/io_error)
     v0.5.0 起，连接与房间管理码（400 / 403 / 500 / 4101–4106）同样只用 ``details``：
     From v0.5.0, the room-management codes likewise use ``details`` only:
-      - 4101: details.office_id（被拒的目标房）
+      - 4101: details.office_id（被拒的目标房）/ details.role（被占的席位 = **发起者自己声明**的 role）
       - 4102: 预留码，无触发
       - 4103: 无 code-specific 字段
       - 4104: details.office_id（被拒的目标房）
-      - 4105: details.office_id（被拒的目标房）/ details.role（**发起者自己声明**的 role）
+      - 4105: 预留码，无触发（protocol#66）
       - 4106: details.office_id（会话**当前**所在房）
     400 / 403 / 500 无 code-specific 字段。**``details`` 只含与发起者自身相关的上下文**，
     **MUST NOT** 携带任何对端会话标识（sid 等）——见 error-handling.md:149 / :328。
@@ -939,18 +941,24 @@ def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
 #     被拒的目标房），**MUST NOT** 携带任何对端会话标识（sid 等）——见 :149 / :328。
 # =====================================================================
 
-# 房间管理「业务拒绝」的 code → 协议标准文案（4101/4103-4106 逐字对齐 error-handling.md 与
+# 房间管理「业务拒绝」的 code → 协议标准文案（4103/4104/4106 逐字对齐 error-handling.md 与
 # room-model.md 的响应示例；**403 例外**——协议未给该码的示例文案，本仓自拟，须同时覆盖 role 与
-# name 两半，见 #221）。
-# code → canonical message; 4101/4103-4106 verbatim from the protocol examples, 403 is SDK-authored
+# name 两半，见 #221）。4101 的文案随被占席位而变，见 :data:`_ROOM_FULL_MESSAGES`。
+# code → canonical message; 4103/4104/4106 verbatim from the protocol examples, 403 is SDK-authored
 # (the protocol ships no 403 example) and must cover both the role and name halves of the rule.
 _ROOM_REJECTION_MESSAGES: dict[int, str] = {
     int(ErrorCode.FORBIDDEN): "Role or name mismatch with existing session",
-    int(ErrorCode.ROOM_FULL): "Room already has an agent",
     int(ErrorCode.NOT_IN_ROOM): "Not in any room",
     int(ErrorCode.CROSS_ROOM_ACCESS): "Cross-room access denied",
-    int(ErrorCode.NAME_CONFLICT): "Name already taken in room",
     int(ErrorCode.ALREADY_IN_ROOM): "Agent already in another room",
+}
+
+# 4101「本 role 席位已占」按被占席位（= 发起者声明的 role）取文案，逐字对齐 room-model.md 加入伪代码与
+# error-handling.md §Room Full 的示例（protocol#66）。``details.role`` 才是机器判据，文案只供人读。
+# 4101 message per occupied seat, verbatim from the protocol examples; ``details.role`` is the machine field.
+_ROOM_FULL_MESSAGES: dict[str, str] = {
+    "agent": "Room already has an agent",
+    "computer": "Room already has a computer",
 }
 
 
@@ -1022,43 +1030,44 @@ def build_room_rejection_error(
 
     Args:
         code: 房间管理错误码（:class:`ErrorCode` 取值之一）。
-        target_office_id: **被拒的目标房**（``4101`` / ``4104`` / ``4105`` 用）——发起者自己声明的目标。
-        declared_role: 发起者**自己声明**的 role（``4105`` 用）——不是冲突方的 role。
+        target_office_id: **被拒的目标房**（``4101`` / ``4104`` 用）——发起者自己声明的目标。
+        declared_role: 发起者**自己声明**的 role（``4101`` 用，即被占的席位；**必填**）——不是冲突方的 role。
         current_office_id: 会话**当前**所在房（``4106`` 用）——不是被拒的目标房。
 
     Returns:
         flat ``ErrorPayload``；``code`` 无 code-specific ``details`` 时不带 ``details`` 键。
 
     Raises:
-        ValueError: ``code`` 为预留码 ``4102``（协议 **MUST NOT** 主动返回），或不属于房间管理错误码。
-            把「不可产出」做成结构性保证，而不是靠调用方自觉。
+        ValueError: ``code`` 为预留码 ``4102`` / ``4105``（协议 **MUST NOT** 主动返回），不属于房间管理错误码，
+            或 ``4101`` 未给出合法的 ``declared_role``。把「不可产出」做成结构性保证，而不是靠调用方自觉。
     """
     # 归一为 int：``ErrorCode`` 是 ``IntEnum``，但载荷一律以裸整数出线（与
     # ``build_computer_not_found_error`` 一致，避免 dict 里出现 enum 对象的 repr）。
     # Normalize to a plain int so the payload is byte-identical across the sync/async mirrors.
     code = int(code)
-    if code == int(ErrorCode.ROOM_NOT_FOUND):
+    if code in (int(ErrorCode.ROOM_NOT_FOUND), int(ErrorCode.NAME_CONFLICT)):
         raise ValueError(
-            "4102 Room Not Found 是预留码：协议当前任何路径都不产生它，SDK MUST NOT 主动返回 "
-            "/ 4102 is reserved: no protocol path produces it and SDKs MUST NOT return it",
+            f"{code} 是预留码：协议当前任何路径都不产生它，SDK MUST NOT 主动返回 "
+            f"/ {code} is reserved: no protocol path produces it and SDKs MUST NOT return it",
         )
+    if code == int(ErrorCode.ROOM_FULL):
+        # 4101 的 ``details.role`` 是区分「哪个席位被占」的唯一机器字段（protocol#66）⇒ 缺失即构造错误，
+        # 不静默产出一个对端无法分流的 4101。/ ``details.role`` is the only machine field of 4101 — required.
+        seat_message = _ROOM_FULL_MESSAGES.get(declared_role or "")
+        if seat_message is None:
+            raise ValueError(f"4101 须给出被占席位的 role（agent / computer）/ 4101 requires a seat role: {declared_role!r}")
+        full_details: dict[str, Any] = {} if target_office_id is None else {"office_id": target_office_id}
+        full_details["role"] = declared_role
+        return {"code": code, "message": seat_message, "details": full_details}
     try:
         message = _ROOM_REJECTION_MESSAGES[code]
     except KeyError:
         raise ValueError(f"非房间管理错误码 / not a room-management error code: {code!r}") from None
 
     payload: ErrorPayload = {"code": code, "message": message}
-    if code in (int(ErrorCode.ROOM_FULL), int(ErrorCode.CROSS_ROOM_ACCESS)):
+    if code == int(ErrorCode.CROSS_ROOM_ACCESS):
         if target_office_id is not None:
             payload["details"] = {"office_id": target_office_id}
-    elif code == int(ErrorCode.NAME_CONFLICT):
-        details: dict[str, Any] = {}
-        if target_office_id is not None:
-            details["office_id"] = target_office_id
-        if declared_role is not None:
-            details["role"] = declared_role
-        if details:
-            payload["details"] = details
     elif code == int(ErrorCode.ALREADY_IN_ROOM):
         if current_office_id is not None:
             payload["details"] = {"office_id": current_office_id}

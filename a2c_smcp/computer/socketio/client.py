@@ -248,10 +248,10 @@ class SMCPComputerClient(AsyncClient):
         self._office_rejoin_task: asyncio.Task[None] | None = None
         self._office_op_lock = asyncio.Lock()
         # #212 自动回房的退避预算（公开可配置，默认 ``OFFICE_REJOIN_RETRY_BUDGET`` = 45s，覆盖 socket.io
-        # 默认最长回收窗口）：被 ``4101``/``4105``（瞬态冲突）拒绝时按 1→2→4→5…秒退避重试，预算耗尽才
+        # 默认最长回收窗口）：被 ``4101``（瞬态冲突）拒绝时按 1→2→4→5…秒退避重试，预算耗尽才
         # 清空 desired 并记错误。赋值即可按部署调整（镜像 socketio 自身 ``reconnection_delay`` 的实例
         # 属性约定）；``<= 0`` 退化回单次尝试（测试与嵌入方的逃生舱）。
-        # Bounded backoff budget (seconds) for the replay's transient 4101/4105 rejections; assignable per
+        # Bounded backoff budget (seconds) for the replay's transient 4101 rejections; assignable per
         # instance. <= 0 disables retrying.
         self.office_rejoin_retry_budget: float = OFFICE_REJOIN_RETRY_BUDGET
         # #223 待补发上报集合（存**事件名**，域恒为 4 个 ``server:update_*`` ⇒ 最多 4 个元素）：
@@ -594,12 +594,12 @@ class SMCPComputerClient(AsyncClient):
         作废——陈旧回房的失败**不得**清掉用户刚设好的房号。/ Results are applied only while the
         generation is still current, so a superseded replay can never clobber a newer office.
 
-        **重试语义（#212）**：被 ``4101``/``4105`` 拒时按 :func:`a2c_smcp.utils.office.rejoin_retry_delay`
+        **重试语义（#212）**：被 ``4101`` 拒时按 :func:`a2c_smcp.utils.office.rejoin_retry_delay`
         退避重试（预算 = ``office_rejoin_retry_budget``，默认 45s = socket.io 默认最长回收窗口），
         **退避期间放锁**（每次尝试各取一次 op-lock）；预算耗尽才清空 desired + 错误日志。其余码
         （``4106`` / ``500`` / 未知码 / 无码 / 传输层失败）**不重试**。上界 = 预算 + 一次
         ``OFFICE_JOIN_TIMEOUT``（末次尝试在预算边界上发起，其 ACK 仍等到自己的有界超时）。
-        Retries only the transient 4101/4105, releasing the op-lock between attempts; the desired office is
+        Retries only the transient 4101, releasing the op-lock between attempts; the desired office is
         cleared only when the budget is exhausted.
 
         **身份在一条连接内不可变**：``EnterOfficeReq`` 在循环入口**一次性构造**，N 次尝试共用同一份声明
@@ -669,7 +669,7 @@ class SMCPComputerClient(AsyncClient):
                         logger.warning(
                             f"自动回房重试耗尽（共 {attempt + 1} 次尝试）: {office_id} - code={verdict.code}"
                         )
-                    # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（重试预算见
+                    # 带协议码：4101 是重连撞旧会话（旧会话仍占席位）的**瞬态**冲突（重试预算见
                     # ``office_rejoin_retry_budget``），无码则是「未获裁决」（形状不认识 / 空响应）。
                     logger.error(
                         f"自动重新加入 Office 被拒绝: {office_id} - code={verdict.code} {verdict.message}",
@@ -699,7 +699,7 @@ class SMCPComputerClient(AsyncClient):
 
         #213 / #214 / #212：失败时的房号去留按**失败形态**分刀（校验类拒绝不改变既有成员关系 ⇒ 客户端
         也不得清掉仍在的房间）：
-          - 服务端**校验类拒绝**（``is_validation_rejection``：``400``/``403``/``4101``/``4105``/``4106``，
+          - 服务端**校验类拒绝**（``is_validation_rejection``：``400``/``403``/``4101``/``4106``，
             协议明写「校验必须先于副作用」）⇒ 回退到 ``_confirmed_office_id``（最近一次被服务端确认的
             房号，通常是旧房；从未确认过则为 ``None``）；
           - 传输层失败 / 非校验类码（``500`` 可晚于成员关系提交、未知码无法判定）/ 无码响应 ⇒ 维持清空

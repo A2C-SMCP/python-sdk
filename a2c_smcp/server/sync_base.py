@@ -14,10 +14,9 @@ from urllib.parse import parse_qs
 
 from socketio import Namespace
 
-from a2c_smcp.exceptions import NameConflictError
-from a2c_smcp.server.name_registry import release_name, reserve_name
+from a2c_smcp.server.name_registry import claim_seat, release_name, release_seats, reserve_name
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
-from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID
 from a2c_smcp.server.utils import office_room
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
@@ -41,13 +40,17 @@ class SyncBaseNamespace(Namespace):
         # (office_id, role, name) → sid mapping (#215: the key space is the per-room uniqueness scope)
         self._name_to_sid_map: dict[NAME_KEY, SID] = {}
         # 反向索引 sid → 其持有的唯一键：注销按 sid 删，**不**依赖可变的会话字段反推（回滚会 pop 掉 role/name，
-        # 反推失败即留下永久 4105 的残留键）。一个 sid 至多持有一个键。
+        # 反推失败即留下永久占用的残留键）。一个 sid 至多持有一个键。
         # Reverse index sid → its single key: unregister by sid, never by re-deriving from mutable session fields.
         self._sid_to_name_key: dict[SID, NAME_KEY] = {}
-        # 注册表锁（v0.5.0 审查 🔴7/S1）：同步服务端每个事件一个线程（``async_handlers=True``），断连收尾跑在
-        # engine.io 线程上——「校验 + 写入」与「注销」必须互斥，否则 ① 断连清理先跑完、join 后写入 ⇒ 注册表
-        # 残留指向死 sid 的键（同名重连永久 4105）；② 两个同名 join 都通过校验 ⇒ 房内双同名。可重入：注销
-        # 可能在持锁路径内被再次调用。锁内**只**做纯字典操作（不 emit、不读写会话），无锁序问题。
+        # 席位表 (office_id, role) → sid（#230「每 role 一席」，准入权威）+ 反向索引（与 async 同构）。
+        # Seat table (#230, admission authority) + reverse index, mirroring async.
+        self._seat_to_sid: dict[SEAT_KEY, SID] = {}
+        self._sid_to_seats: dict[SID, set[SEAT_KEY]] = {}
+        # 注册表锁（v0.5.0 审查 🔴7/S1；#230 起同时守护席位表）：同步服务端每个事件一个线程（``async_handlers=True``），
+        # 断连收尾跑在 engine.io 线程上——「检查 + 占席 / 写入」与「释放 / 注销」必须互斥，否则 ① 断连清理先跑完、
+        # join 后写入 ⇒ 残留指向死 sid 的席位（该房该 role 永久 4101）；② 两个并发 join 都通过检查 ⇒ 同 role 双席。
+        # 可重入：注销可能在持锁路径内被再次调用。锁内**只**做纯字典操作（不 emit、不读写会话），无锁序问题。
         # Registry lock: check-and-set and unregister must be mutually exclusive across handler threads.
         self._registry_lock = threading.RLock()
 
@@ -102,10 +105,12 @@ class SyncBaseNamespace(Namespace):
             # 残留注销**排在退房广播之后**（S3）：先注销会让同名新连接在旧 leave 广播发出前完成入房并广播 enter，
             # 对端收到「enter(X) → leave(X)」而丢掉新的 X。常态下键已由 leave_room 注销，此处只兜住「注册落在
             # 退房快照之后」的残留（并发 join 的线程窗口）——残留键对应的在场宣告须补一次 leave。
-            # ⚠️ 必须在 ``finally`` 里（与 async 同构）：退房广播抛错时跳过注销 = 死 sid 永久占名 ⇒ 同名重连恒 ``4105``。
+            # ⚠️ 必须在 ``finally`` 里（与 async 同构）：退房广播抛错时跳过注销 = 死 sid 永久占席 ⇒ 该房该 role 恒 ``4101``。
+            # 席位在同一把锁内、名字之后释放（与 async 同序），连「已占席未入房」的席位一并收回。
             # Residual cleanup runs after the leave broadcasts (S3); in ``finally`` so a failed broadcast cannot leak a key.
             with self._registry_lock:
                 residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+                release_seats(self._seat_to_sid, self._sid_to_seats, sid)
             if residual is not None:
                 try:
                     self._announce_residual_leave(sid, residual)
@@ -120,47 +125,61 @@ class SyncBaseNamespace(Namespace):
         """
         return super().trigger_event(event.replace(":", "_"), *args)
 
-    def _ensure_name_registerable(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
+    def _claim_seat(self, office_id: OFFICE_ID, role: str, sid: SID) -> bool:
         """
-        名字注册闸门：键 ``(office_id, role, name)`` 被**其它** sid 占用时抛出（本 sid 持有视为可注册，幂等）。
+        准入闸门：注册表锁内**原子**「席位检查 + 占席」``(office_id, role)``（#230，同步镜像 async ``_claim_seat``）。
+        Admission gate: atomically check and claim the seat under the registry lock (sync mirror).
 
-        同步镜像 async ``BaseNamespace._ensure_name_registerable``：键空间即协议的房内唯一性作用域（#215），
-        ``office_id`` 须显式给出目标房；``enter_room`` 在任何成员关系变更之前调用（#213），判据单点。
-        Sync mirror of the async gate (#215 composite key; #213 validate-before-effects).
+        ``enter_room`` 在任何成员关系变更之前调用（协议 注记 4）；``office_id`` 须显式给出目标房。
+
+        Returns:
+            bool: 本次是否**新**占席；调用方失败时只回滚自己新占的席位。
 
         Raises:
-            NameConflictError: ``4105``；``ValueError`` 子类，兼容既有 ``except ValueError`` 契约。
+            SessionGoneError: sid 已进入断连收尾。
+            RoomFullError: ``4101``，该席位已被其它会话占据（同名与否无关）。
         """
-        existing_sid = self._name_to_sid_map.get((office_id, role, name))
-        if existing_sid is not None and existing_sid != sid:
-            # 冗长诊断（含对端 sid）只进日志；异常消息只含自身上下文 ⇒ 泄露构造上不可能（#214）。
-            # Verbose diagnostics (peer sid included) go to logs only (#214).
-            logger.warning(
-                f"名字冲突 / name conflict: office={office_id!r} role={role!r} name={name!r} held by "
-                f"sid={existing_sid!r}, requested by sid={sid!r}, namespace={self.namespace}",
+        with self._registry_lock:
+            holder = self._seat_to_sid.get((office_id, role))
+            if holder is not None and holder != sid:
+                # 冗长诊断（含对端 sid）只进日志；异常消息只含自身上下文 ⇒ 泄露构造上不可能（#214）。
+                logger.warning(
+                    f"席位已占 / seat taken: office={office_id!r} role={role!r} held by sid={holder!r}, "
+                    f"requested by sid={sid!r}, namespace={self.namespace}",
+                )
+            return claim_seat(
+                self._seat_to_sid,
+                self._sid_to_seats,
+                (office_id, role),
+                sid,
+                connected=bool(self.server.manager.is_connected(sid, self.namespace)),
             )
-            raise NameConflictError()
+
+    def _release_seats(self, sid: SID, office_id: OFFICE_ID | None = None) -> None:
+        """释放 sid 的席位（锁内；``office_id`` 非空时只放该房的；归属守卫）。Release seats under the lock."""
+        with self._registry_lock:
+            released = release_seats(self._seat_to_sid, self._sid_to_seats, sid, office_id)
+        if released:
+            logger.debug(f"Released seats {released!r} for sid '{sid}' in namespace {self.namespace}")
 
     def _register_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """
-        **原子**注册 ``(office_id, role, name)`` → sid（同步）：注册表锁内一次完成存活 / Agent 席位 / 同名校验与写入。
+        **原子**注册 ``(office_id, role, name)`` → sid（同步，路由解析用）：注册表锁内一次完成存活校验与写入。
         Atomically register the ``(office_id, role, name)`` → sid mapping under the registry lock (sync).
 
         存活判据 ``manager.is_connected``：断连收尾一开始（``pre_disconnect``）即为假，早于断连 handler——故
         「注册先于断连」时由断连的残留注销清掉，「注册晚于断连开始」时在此被拒，两种交错都不留死 sid 的键（🔴7）。
         ``is_connected`` turns False before the disconnect handler runs, so no interleaving leaves a dead key.
 
-        **已知边界（刻意保留）**：本原子步位于 ``enter_room`` 的生效阶段（``super().enter_room`` 与写会话
-        ``office_id`` **之后**），不前移到第一个副作用之前——前移会打开「注册表已指向该 sid、会话尚无
-        ``office_id``」的窗口，relay 在其中误报注册表损坏（#213 已论证）。代价：**并发竞争的输家**（4101 / 4105）
-        会短暂进入目标 socketio 房、换房的 Computer 已先退掉旧房，随后按提交点收敛为无房。仅限竞争输家；
-        阶段 1 的预检仍挡住一切非并发的冲突。
-        Known boundary: a concurrent-race loser is briefly in the room before convergence (kept deliberately).
+        本原子步位于 ``enter_room`` 的生效阶段（``super().enter_room`` 与写会话 ``office_id`` **之后**），不前移——
+        前移会打开「注册表已指向该 sid、会话尚无 ``office_id``」的窗口，relay 在其中误报注册表损坏（#213 已论证）。
+        **准入不在此判**（#230）：席位已由 :meth:`_claim_seat` 在阶段 1 占下，并发竞争的输家在动任何成员关系之前
+        即被 ``4101`` 拒绝（此前「输家短暂入房、换房者已退旧房」的已知边界随之消失）。
+        Admission happened in phase 1 (:meth:`_claim_seat`); a race loser never touches any membership.
 
         Raises:
             SessionGoneError: sid 已进入断连收尾。
-            RoomFullError: ``4101``（目标房已有另一 Agent）。
-            NameConflictError: 当键已被其他sid使用时 / When the key is already held by another sid
+            RegistryInvariantError: 键被其它 sid 持有（席位表与注册表矛盾，不变量破坏 ⇒ 500）。
         """
         with self._registry_lock:
             reserve_name(

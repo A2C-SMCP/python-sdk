@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from socketio.exceptions import TimeoutError as SioTimeoutError
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import RoomFullError, SMCPNamespaceError
 from a2c_smcp.server import (
     AuthenticationProvider,
     DefaultAuthenticationProvider,
@@ -249,14 +249,11 @@ class TestSMCPNamespace:
         with pytest.raises(ValueError):
             await smcp_namespace.enter_room("sid1", "roomB")
 
-        # 2) agent 未在任何房间，但房间内已有 agent
+        # 2) agent 未在任何房间，但房间内已有 agent（#230：席位表是唯一判据）
         session2 = {"role": "agent"}
         smcp_namespace.get_session = AsyncMock(return_value=session2)
-        # 房间已有一个 agent 参与者
-        mock_server.manager.get_participants.return_value = ["sidAgent"]
-
-        smcp_namespace.get_session = AsyncMock(side_effect=[session2, {"role": "agent"}])
-        with pytest.raises(ValueError):
+        smcp_namespace._seat_to_sid[("roomA", "agent")] = "sidAgent"
+        with pytest.raises(RoomFullError):
             await smcp_namespace.enter_room("sid2", "roomA")
 
         # 3) agent 已在同一房间 -> 返回（不抛错）
@@ -518,59 +515,34 @@ class TestDefaultAuthenticationProvider:
         new_computer_sid = "new_sid"
         new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
 
-        # #215：房内同 role 同名的唯一判据是 ``(office_id, role, name)`` 注册表（已有 Computer 入房时写入）
-        # #215: the (office_id, role, name) registry is the single same-name gate
-        smcp_namespace._name_to_sid_map = {
-            (existing_session["office_id"], existing_session["role"], existing_session["name"]): existing_computer_sid,
-        }
+        # #230：同 role 第二个会话无论同名与否都先撞席位（4101，不再是 4105）
+        # #230: the second session of a role hits the seat first, same name or not
+        smcp_namespace._seat_to_sid[(existing_session["office_id"], "computer")] = existing_computer_sid
         smcp_namespace.get_session = AsyncMock(return_value=new_session)
         smcp_namespace.save_session = AsyncMock()
 
-        # 应该抛出 ValueError，提示重名
-        # Should raise ValueError indicating duplicate name
-        with pytest.raises(ValueError, match="Name already taken in room"):
+        with pytest.raises(RoomFullError, match="Room already has a computer"):
             await smcp_namespace.enter_room(new_computer_sid, "room1")
 
     @pytest.mark.asyncio
-    async def test_enter_room_computer_different_name_succeeds(self, smcp_namespace, mock_server, monkeypatch):
+    async def test_enter_room_second_computer_with_different_name_is_room_full(self, smcp_namespace, mock_server):
         """
-        测试Computer不同名可以成功加入：房间内已有Computer，但名字不同，应该成功
-        Test Computer with different name can join: room has Computer but different name, should succeed
+        #230「每 role 一席」：房内已有 Computer 时，**不同名**的第二台同样被拒（4101），不替换、不驱逐
+        Second computer with a different name is rejected too (4101) — no replacement, no eviction
         """
-        from a2c_smcp.server.base import BaseNamespace
-
         smcp_namespace.server = mock_server
-
-        # 房间内已有一个名为 "comp1" 的 Computer
-        # Room already has a Computer named "comp1"
-        existing_computer_sid = "existing_sid"
-        existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
-
-        # 新的 Computer 叫 "comp2"，名字不同
-        # New Computer named "comp2", different name
-        new_computer_sid = "new_sid"
-        new_session = {"role": "computer", "name": "comp2", "sid": new_computer_sid}
-
-        # Mock get_participants 返回房间内已有的参与者
-        mock_server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
-
-        # Mock get_session
-        smcp_namespace.get_session = AsyncMock(side_effect=[new_session, existing_session, new_session])
+        smcp_namespace._seat_to_sid[("room1", "computer")] = "existing_sid"
+        new_session = {"role": "computer", "name": "comp2", "sid": "new_sid"}
+        smcp_namespace.get_session = AsyncMock(return_value=new_session)
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock()
-        smcp_namespace._register_name = AsyncMock()
 
-        # Mock 父类的 enter_room 方法
-        # Mock parent class enter_room method
-        monkeypatch.setattr(BaseNamespace, "enter_room", AsyncMock())
+        with pytest.raises(RoomFullError):
+            await smcp_namespace.enter_room("new_sid", "room1")
 
-        # 应该成功加入，不抛出异常
-        # Should succeed without raising exception
-        await smcp_namespace.enter_room(new_computer_sid, "room1")
-
-        # 验证 save_session 被调用
-        # Verify save_session was called
-        assert smcp_namespace.save_session.called
+        mock_server.enter_room.assert_not_awaited()
+        smcp_namespace.emit.assert_not_awaited()
+        assert smcp_namespace._seat_to_sid == {("room1", "computer"): "existing_sid"}, "不替换旧 Computer"
 
     @pytest.mark.asyncio
     async def test_enter_room_computer_same_sid_allowed(self, smcp_namespace, mock_server, monkeypatch):
@@ -617,7 +589,7 @@ class TestEnterRoomTransactionalCommit:
 
     @pytest.mark.asyncio
     async def test_target_room_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
-        """换房撞目标房同 role 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房。
+        """换房撞目标房席位（同名的另一台 Computer，#230 ⇒ 4101）被拒：旧房未动、目标房未进、无广播、会话仍是旧房。
 
         #213 原始路径（跨 office 同名经裸名注册表被拒）在 #215 后已合法；「校验先于副作用」改由目标房内冲突守护。
         """
@@ -631,8 +603,10 @@ class TestEnterRoomTransactionalCommit:
         smcp_namespace.leave_room = AsyncMock()
         registry = {("roomA", "computer", "dup"): "c-sid", ("roomB", "computer", "dup"): "other-sid"}
         smcp_namespace._name_to_sid_map = dict(registry)
+        seats = {("roomA", "computer"): "c-sid", ("roomB", "computer"): "other-sid"}
+        smcp_namespace._seat_to_sid = dict(seats)
 
-        with pytest.raises(ValueError, match="Name already taken in room"):
+        with pytest.raises(RoomFullError):
             await smcp_namespace.enter_room("c-sid", "roomB")
 
         smcp_namespace.leave_room.assert_not_awaited()  # 原实现先退旧房 / old impl left the old room first
@@ -640,6 +614,7 @@ class TestEnterRoomTransactionalCommit:
         mock_server.enter_room.assert_not_awaited()  # 目标房从未进入 / never joined the target room
         assert session["office_id"] == "roomA"
         assert smcp_namespace._name_to_sid_map == registry
+        assert smcp_namespace._seat_to_sid == seats, "被拒不得改动任何席位"
 
     @pytest.mark.asyncio
     async def test_move_with_self_owned_name_succeeds(self, smcp_namespace, mock_server):
@@ -818,17 +793,17 @@ class TestEnterRoomTransactionalCommit:
 
     @pytest.mark.asyncio
     async def test_agent_name_conflict_never_enters_room(self, smcp_namespace, mock_server):
-        """闸门对 Agent 同样生效：Agent 撞目标房同 role 同名（注册表闸门）不得进入房间。"""
+        """闸门对 Agent 同样生效：Agent 撞目标房的 Agent 席位（同名者占着，#230 ⇒ 4101）不得进入房间。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["a-sid"])
-        mock_server.manager.get_participants.return_value = []  # 目标房内无 agent
         session = {"role": "agent", "name": "dup", "sid": "a-sid"}
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
         smcp_namespace.emit = AsyncMock()
         smcp_namespace._name_to_sid_map = {("roomB", "agent", "dup"): "other-sid"}
+        smcp_namespace._seat_to_sid = {("roomB", "agent"): "other-sid"}
 
-        with pytest.raises(ValueError, match="Name already taken in room"):
+        with pytest.raises(RoomFullError, match="Room already has an agent"):
             await smcp_namespace.enter_room("a-sid", "roomB")
 
         mock_server.enter_room.assert_not_awaited()

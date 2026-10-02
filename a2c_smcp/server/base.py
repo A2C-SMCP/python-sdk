@@ -13,10 +13,9 @@ from urllib.parse import parse_qs
 
 from socketio import AsyncNamespace
 
-from a2c_smcp.exceptions import NameConflictError
 from a2c_smcp.server.auth import AuthenticationProvider
-from a2c_smcp.server.name_registry import release_name, reserve_name
-from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
+from a2c_smcp.server.name_registry import claim_seat, release_name, release_seats, reserve_name
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID
 from a2c_smcp.server.utils import office_room
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
@@ -44,9 +43,14 @@ class BaseNamespace(AsyncNamespace):
         # (office_id, role, name) → sid mapping (#215: the key space is the per-room uniqueness scope)
         self._name_to_sid_map: dict[NAME_KEY, SID] = {}
         # 反向索引 sid → 其持有的唯一键：注销按 sid 删，**不**依赖可变的会话字段反推（回滚会 pop 掉 role/name，
-        # 反推失败即留下永久 4105 的残留键）。一个 sid 至多持有一个键。
+        # 反推失败即留下永久占用的残留键）。一个 sid 至多持有一个键。
         # Reverse index sid → its single key: unregister by sid, never by re-deriving from mutable session fields.
         self._sid_to_name_key: dict[SID, NAME_KEY] = {}
+        # 席位表 (office_id, role) → sid（#230「每 role 一席」，准入权威）+ 反向索引 sid → 其持有的席位。
+        # 入房在阶段 1（任何副作用之前）原子占席；Computer 换房途中一个 sid 可暂时持有新旧两房的席位。
+        # Seat table (#230, admission authority) + reverse index; claimed atomically before any side effect.
+        self._seat_to_sid: dict[SEAT_KEY, SID] = {}
+        self._sid_to_seats: dict[SID, set[SEAT_KEY]] = {}
 
     async def on_connect(self, sid: SID, environ: dict, auth: dict | None = None) -> bool:
         """
@@ -110,10 +114,14 @@ class BaseNamespace(AsyncNamespace):
         finally:
             # 残留注销**排在退房广播之后**（S3，与 sync 同序）：先注销会让同名新连接在旧 leave 广播发出前完成入房并
             # 广播 enter。常态下键已由 leave_room 注销；残留（注册晚于退房快照）须补一次 leave 宣告。
-            # ⚠️ 必须在 ``finally`` 里：退房广播抛错（pubsub publish 失败等）时跳过注销 = 死 sid 永久占名 ⇒ 同名重连
-            # 恒 ``4105``（🔴7 的失败形态，只是换了触发条件）。宣告失败只记日志，不得顶替原异常。
+            # ⚠️ 必须在 ``finally`` 里：退房广播抛错（pubsub publish 失败等）时跳过注销 = 死 sid 永久占席 ⇒ 该房该 role
+            # 恒 ``4101``（🔴7 的失败形态，只是换了触发条件）。宣告失败只记日志，不得顶替原异常。
+            # 席位排在名字之后释放（与 ``leave_room`` 同序）：先放席位会让新会话占席后撞上尚未注销的旧名字键。
+            # 同步、零挂起点地连做 ⇒ 包括「占了席位但尚未入房」（阶段 1 与阶段 2 之间断连）的席位也一并收回。
             # Residual cleanup after the leave broadcasts (S3); in ``finally`` so a failed broadcast cannot leak a key.
+            # Seats go after the name (same order as leave_room), including a seat claimed but not yet entered.
             residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+            release_seats(self._seat_to_sid, self._sid_to_seats, sid)
             if residual is not None:
                 try:
                     await self._announce_residual_leave(sid, residual)
@@ -136,57 +144,65 @@ class BaseNamespace(AsyncNamespace):
         """
         return await super().trigger_event(event.replace(":", "_"), *args)
 
-    async def _ensure_name_registerable(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
+    async def _claim_seat(self, office_id: OFFICE_ID, role: str, sid: SID) -> bool:
         """
-        名字注册闸门：键 ``(office_id, role, name)`` 被**其它** sid 占用时抛出（本 sid 持有视为可注册，幂等）。
-        Name-registration gate: raise when ``(office_id, role, name)`` is held by *another* sid.
+        准入闸门：**原子**「席位检查 + 占席」``(office_id, role)``（#230，protocol#66「每 role 一席」）。
+        Admission gate: atomically check and claim the ``(office_id, role)`` seat.
 
-        #215：注册表键空间即协议的唯一性作用域——**房内同 role 同名唯一**（room-model.md §房内名字唯一性）；
-        跨房同名、同名异 role 均允许，SDK **MUST NOT** 施加全局名字空间唯一性。``office_id`` 须由调用方
-        **显式**给出目标房：Computer 换房的校验阶段，会话里仍是旧房。
-        #215: the key space *is* the protocol's uniqueness scope (per room, per role). The target
-        office is passed explicitly — during a Computer's room switch the session still names the old one.
-
-        #213：``enter_room`` 在**任何成员关系变更之前**调用本闸门（协议 注记 3「校验必须先于副作用」）；
-        ``_register_name`` 亦经本方法判定，判据**单点**、不会漂移。
-        #213: ``enter_room`` runs this gate before any membership change; ``_register_name`` reuses it.
+        ``enter_room`` 在**任何成员关系变更之前**调用（协议 注记 4「校验必须先于副作用」）——包括 Computer
+        换房时的「退旧房」：目标房席位被占 ⇒ ``4101``，旧房原封不动、不发任何 ``notify:*``。原子性是**结构保证**：
+        核心 :func:`~a2c_smcp.server.name_registry.claim_seat` 是同步函数（零挂起点），并发加入同一空房恰一者成功。
+        ``office_id`` 须由调用方**显式**给出目标房：Computer 换房的校验阶段，会话里仍是旧房。
+        Runs before any membership change; the synchronous core makes the check-and-claim atomic.
 
         Args:
             office_id (OFFICE_ID): 目标房 / Target office
-            role (str): 客户端角色 / Client role
-            name (str): 客户端名称 / Client name
+            role (str): 发起者声明的角色（即申请的席位）/ Declared role (the seat being claimed)
             sid (SID): 客户端连接ID / Client connection ID
 
+        Returns:
+            bool: 本次是否**新**占席（``False`` = 已持有）；调用方失败时只回滚自己新占的席位。
+
         Raises:
-            NameConflictError: 键已被其他 sid 使用时（``4105``；``ValueError`` 子类，兼容既有
-                ``except ValueError`` 契约）/ When the key is already held by another sid.
+            SessionGoneError: sid 已进入断连收尾。
+            RoomFullError: ``4101``，该席位已被其它会话占据（同名与否无关）。
         """
-        existing_sid = self._name_to_sid_map.get((office_id, role, name))
-        if existing_sid is not None and existing_sid != sid:
-            # 冗长诊断（**含对端 sid**）只进日志：ack 载荷 MUST NOT 携带其它会话的内部标识
-            # （error-handling.md:149）。异常消息本身只含自身上下文 ⇒ 泄露**构造上**不可能，
-            # 而非"记得别把 str(e) 塞进 payload"（#214）。
-            # Verbose diagnostics (peer sid included) go to logs only; the exception message is
-            # self-relative by construction, so it can never leak into an ack payload (#214).
+        holder = self._seat_to_sid.get((office_id, role))
+        if holder is not None and holder != sid:
+            # 冗长诊断（**含对端 sid**）只进日志：ack 载荷 MUST NOT 携带其它会话的内部标识（#214）。
+            # Verbose diagnostics (peer sid included) go to logs only (#214).
             logger.warning(
-                f"名字冲突 / name conflict: office={office_id!r} role={role!r} name={name!r} held by "
-                f"sid={existing_sid!r}, requested by sid={sid!r}, namespace={self.namespace}",
+                f"席位已占 / seat taken: office={office_id!r} role={role!r} held by sid={holder!r}, "
+                f"requested by sid={sid!r}, namespace={self.namespace}",
             )
-            raise NameConflictError()
+        return claim_seat(
+            self._seat_to_sid,
+            self._sid_to_seats,
+            (office_id, role),
+            sid,
+            connected=bool(self.server.manager.is_connected(sid, self.namespace)),
+        )
+
+    async def _release_seats(self, sid: SID, office_id: OFFICE_ID | None = None) -> None:
+        """释放 sid 的席位（``office_id`` 非空时只放该房的；归属守卫：绝不替其它 sid 释放）。
+        Release ``sid``'s seats (only that office's when given; ownership-guarded).
+        """
+        released = release_seats(self._seat_to_sid, self._sid_to_seats, sid, office_id)
+        if released:
+            logger.debug(f"Released seats {released!r} for sid '{sid}' in namespace {self.namespace}")
 
     async def _register_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """
-        **原子**注册 ``(office_id, role, name)`` → sid：存活 / Agent 席位 / 同名校验与写入在一次同步调用内完成。
-        Atomically register the ``(office_id, role, name)`` → sid mapping.
+        **原子**注册 ``(office_id, role, name)`` → sid（路由解析用）：存活校验与写入在一次同步调用内完成。
+        Atomically register the ``(office_id, role, name)`` → sid mapping (routing).
 
         原子性是**结构保证**：核心 :func:`~a2c_smcp.server.name_registry.reserve_name` 是同步函数（零挂起点），
-        不会被断连收尾或并发 join 穿插——此前的原子性只是「各 await 碰巧不挂起」（换成 pubsub manager 即失效）。
-        与 sync 端同一核心（sync 在注册表锁内调用），判据单点、不漂移（v0.5.0 审查 🔴7/S1）。
+        不会被断连收尾或并发 join 穿插。与 sync 端同一核心（sync 在注册表锁内调用），判据单点（v0.5.0 审查 🔴7/S1）。
         Atomicity is structural: the core is a synchronous function shared with the sync namespace.
 
-        **已知边界（刻意保留，与 sync 同）**：本原子步位于 ``enter_room`` 生效阶段、第一个副作用之后；并发竞争
-        的输家会短暂进入目标房（换房的 Computer 已退旧房）后收敛为无房。前移会打开 relay 误报注册表损坏的
-        窗口（#213），故不前移。/ Known boundary: a race loser is briefly in the room before convergence.
+        **准入不在此判**（#230）：席位已由 :meth:`_claim_seat` 在阶段 1 占下，并发竞争的输家在动任何成员关系之前
+        即被拒。名字注册仍留在生效阶段（写会话 ``office_id`` 之后）：前移会打开 relay 误报注册表损坏的窗口（#213）。
+        Admission happened in phase 1 (:meth:`_claim_seat`); registration stays post-session-write (#213).
 
         Args:
             office_id (OFFICE_ID): 房间ID / Office ID
@@ -196,8 +212,7 @@ class BaseNamespace(AsyncNamespace):
 
         Raises:
             SessionGoneError: sid 已进入断连收尾。
-            RoomFullError: ``4101``（目标房已有另一 Agent）。
-            NameConflictError: 当键已被其他sid使用时 / When the key is already held by another sid
+            RegistryInvariantError: 键被其它 sid 持有（席位表与注册表矛盾，不变量破坏 ⇒ 500）。
         """
         reserve_name(
             self._name_to_sid_map,
@@ -214,7 +229,7 @@ class BaseNamespace(AsyncNamespace):
         Unregister the name mapping held by ``sid`` (located via the reverse index, not the session)
 
         会话的 role/name 可能已被 ``on_server_join_office`` 的回滚 pop 掉（首次入房失败且收敛也失败时），
-        从会话反推会找不到键 ⇒ 残留键把该房同 role 同名永久拒为 ``4105``。反向索引与注册同源写入，杜绝分叉。
+        从会话反推会找不到键 ⇒ 残留键永久指向该 sid。反向索引与注册同源写入，杜绝分叉。
         **归属守卫**：只删除确由本 sid 持有的键——绝不替其它 sid 注销（单点守卫，调用方无需各自再判）。
         ``office_id`` 非空时只注销该房的键（``leave_room`` 用）。
         Session fields may have been rolled back; the reverse index is written together with the registry,

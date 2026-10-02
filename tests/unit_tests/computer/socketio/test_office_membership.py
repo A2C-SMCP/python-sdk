@@ -248,7 +248,7 @@ async def test_stale_replay_rejection_does_not_clobber_newer_office() -> None:
     async def fake_call(*args: Any, **kwargs: Any):
         in_flight.set()
         await release.wait()
-        return {"code": 4105, "message": "Name already taken in room"}
+        return {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "officeB", "role": "computer"}}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -457,7 +457,7 @@ async def test_replay_rejection_clears_office_id() -> None:
     client._office_generation = 7
 
     async def fake_call(*args: Any, **kwargs: Any):
-        return {"code": 4105, "message": "Name already taken in room"}
+        return {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "officeB", "role": "computer"}}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -503,7 +503,7 @@ async def test_rejected_switch_restores_previous_office() -> None:
         return None
 
     async def reject(*args: Any, **kwargs: Any) -> Any:
-        return {"code": 4105, "message": "Name already taken in room"}
+        return {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "officeB", "role": "computer"}}
 
     client.call = accept  # type: ignore[method-assign]
     await client.join_office("officeA")
@@ -554,7 +554,7 @@ async def test_rejected_fresh_join_keeps_no_office() -> None:
     assert client.office_id is None
 
     async def fake_call(*args: Any, **kwargs: Any) -> Any:
-        return {"code": 4105, "message": "Name already taken in room"}
+        return {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "officeB", "role": "computer"}}
 
     client.call = fake_call  # type: ignore[method-assign]
 
@@ -708,12 +708,12 @@ async def test_emit_update_guards_require_registered_namespace(method_name: str)
 
 # ── #212：重连回房的瞬态冲突有界退避 ──────────────────────────────────────────────
 #
-# 协议依据：error-handling.md:486（4101/4105 条件可选重试，仅限传输层重连后的恢复路径）、
+# 协议依据：error-handling.md 重试表（4101 条件可选重试，仅限传输层重连后的恢复路径；4105 自 protocol#66 起为预留码）、
 # room-model.md:216-218（回收窗口可达数十秒 ⇒ 默认预算须覆盖它）。**只有回放路径重试**：显式
 # join_office 不重试（语义归 #213/#214，见上文「显式 join 失败时的房号去留」小节）。
 # 预算一律取极小值（被 ``min(曲线, 剩余预算)`` 夹取 ⇒ 不牺牲确定性也无需真等 45s）。
 
-_ROOM_FULL = {"code": 4101, "message": "Room already has an agent"}
+_ROOM_FULL = {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "officeA", "role": "computer"}}
 
 #: 限时取锁超时（见 agent 侧同名常量说明）：必须严格小于退避窗口。
 PROBE_TIMEOUT = 0.5

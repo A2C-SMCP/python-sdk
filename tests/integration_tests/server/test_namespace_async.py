@@ -368,7 +368,6 @@ async def test_list_room_success(socketio_server, basic_server_port: int):
 
     agent = AsyncClient()
     computer1 = AsyncClient()
-    computer2 = AsyncClient()
 
     # 连接所有客户端 / Connect all clients
     await agent.connect(
@@ -381,17 +380,11 @@ async def test_list_room_success(socketio_server, basic_server_port: int):
         namespaces=[SMCP_NAMESPACE],
         socketio_path="/socket.io",
     )
-    await computer2.connect(
-        f"http://localhost:{basic_server_port}",
-        namespaces=[SMCP_NAMESPACE],
-        socketio_path="/socket.io",
-    )
 
-    # 让所有客户端加入同一房间 / All clients join the same room
+    # 让所有客户端加入同一房间（#230：每 role 一席 ⇒ 1 Agent + 1 Computer）/ All clients join the same room
     office_id = "office-list-room-1"
     await _join_office(agent, role="agent", office_id=office_id, name="robot-list")
     await _join_office(computer1, role="computer", office_id=office_id, name="comp-list-1")
-    await _join_office(computer2, role="computer", office_id=office_id, name="comp-list-2")
 
     # 等待所有客户端加入 / Wait for all clients to join
     await asyncio.sleep(0.2)
@@ -408,19 +401,18 @@ async def test_list_room_success(socketio_server, basic_server_port: int):
     assert result is not None
     assert result["req_id"] == "list_req_1"
     assert "sessions" in result
-    assert len(result["sessions"]) == 3  # 1 agent + 2 computers
+    assert len(result["sessions"]) == 2  # 1 agent + 1 computer
 
     # 验证会话信息 / Verify session info
     sessions = result["sessions"]
     roles = [s["role"] for s in sessions]
     assert roles.count("agent") == 1
-    assert roles.count("computer") == 2
+    assert roles.count("computer") == 1
     assert all(s["office_id"] == office_id for s in sessions)
 
     # 断开连接 / Disconnect
     await agent.disconnect()
     await computer1.disconnect()
-    await computer2.disconnect()
 
 
 @pytest.mark.asyncio
@@ -505,18 +497,20 @@ async def test_computer_duplicate_name_rejected(socketio_server, basic_server_po
 
     # 验证失败：v0.5.0 起以 flat ErrorPayload 承载，错误语义看**协议码**而非自由文本
     # Verify failure: since v0.5.0 the rejection is a flat ErrorPayload — read the code, not free text
-    assert_rejected_ack(ack, 4105, action="server:join_office")
-    assert ack["message"] == "Name already taken in room", ack
+    # #230：同 role 第二个会话无论同名与否都先撞席位 ⇒ 4101（不再是 4105）
+    assert_rejected_ack(ack, 4101, action="server:join_office")
+    assert ack == {"code": 4101, "message": "Room already has a computer",
+                   "details": {"office_id": office_id, "role": "computer"}}, ack
 
     await computer1.disconnect()
     await computer2.disconnect()
 
 
 @pytest.mark.asyncio
-async def test_computer_different_name_allowed(socketio_server, basic_server_port: int):
+async def test_computer_different_name_also_rejected(socketio_server, basic_server_port: int):
     """
-    中文：测试不同名Computer可以加入：房间内已有Computer，但名字不同，应该成功
-    English: Test different name Computer can join: room has Computer but different name, should succeed
+    中文：#230「每 role 一席」——房间内已有 Computer 时，不同名的第二台同样被拒（4101），不替换旧 Computer
+    English: one seat per role — a second Computer with a different name is rejected too (4101)
     """
     computer1 = AsyncClient()
     computer2 = AsyncClient()
@@ -542,14 +536,15 @@ async def test_computer_different_name_allowed(socketio_server, basic_server_por
         socketio_path="/socket.io",
     )
 
-    # 第二个 Computer 加入同一房间，应该成功
-    # Second Computer joins same room, should succeed
+    # 第二个 Computer 加入同一房间 ⇒ 4101
+    # Second Computer joins the same room ⇒ 4101
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_id, "name": "comp-2"}
     ack = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
-    # 验证成功
-    # Verify success
-    assert_empty_ack(ack, action="不同名Computer应该加入成功 / Different name Computer should succeed, error")
+    assert_rejected_ack(ack, 4101, action="server:join_office")
+    assert ack["details"] == {"office_id": office_id, "role": "computer"}, ack
+    # 不替换：原 Computer 仍持有该房席位与名字
+    assert await socketio_server.get_sid_by_name(office_id, "computer", "comp-1") == computer1.get_sid(namespace=SMCP_NAMESPACE)
 
     await computer1.disconnect()
     await computer2.disconnect()
@@ -758,10 +753,12 @@ async def test_get_config_success_same_office(socketio_server, basic_server_port
 
 @pytest.mark.asyncio
 async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_server_port: int, monkeypatch):
-    """#213：房内同名被拒（4105）的客户端**从未**进入目标房——入房记录 + 成员关系 + 广播隔离三重断言。
+    """#213 + #230：撞目标房 Computer 席位（同名者占着）被拒（4101）的客户端**从未**进入目标房——
+    入房记录 + 成员关系 + 广播隔离三重断言。
 
-    #215 起跨 office 同名合法（键空间 ``(office_id, role, name)``），故冲突改在目标房内构造；另以
-    ``twin`` 正对照钉住「他房同名放行」。
+    #215 起跨 office 同名合法（键空间 ``(office_id, role, name)``），另以 ``twin`` 正对照钉住「他房同名放行」。
+    #230「每 role 一席」后 office-B 只容一台 Computer：合法观察者改为 Agent（``control``），触发后续广播的方式改为
+    「holder 退房 → joiner 入房」。
 
     修复前：``enter_room`` 先真入房、后 ``_register_name`` 抛错，回滚只覆盖会话 ⇒ 被拒客户端留在
     目标房里持续收 ``notify:*``，而会话说它不在任何房。
@@ -780,10 +777,10 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
 
     monkeypatch.setattr(socketio_server.server, "enter_room", _recording_enter_room)
 
-    holder = AsyncClient()  # office-B 持有名字 "c213"
+    holder = AsyncClient()  # office-B 的 Computer "c213"（占着席位）
     subject = AsyncClient()  # 以同名进 office-B → 被拒
-    control = AsyncClient()  # office-B 的合法成员（正对照）
-    joiner = AsyncClient()  # 触发 office-B 的 notify:enter_office
+    control = AsyncClient()  # office-B 的合法 Agent 成员（正对照）
+    joiner = AsyncClient()  # holder 退房后入 office-B，触发 notify:enter_office
     twin = AsyncClient()  # 以同名进 office-A → 放行（#215 正对照）
 
     on_control: list[dict] = []
@@ -801,7 +798,7 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
     holder_sid = await _connect_join(holder, basic_server_port, "computer", office_b, "c213")
     # #215 正对照：他房同名合法（_join_office 内断言空 ack）
     await _connect_join(twin, basic_server_port, "computer", office_a, "c213")
-    control_sid = await _connect_join(control, basic_server_port, "computer", office_b, "c213-control")
+    control_sid = await _connect_join(control, basic_server_port, "agent", office_b, "c213-control")
     # 正对照：钩子确实记录了合法入房（证明下面「未入房」的断言不是钩子失灵）
     assert (control_sid, office_room(office_b)) in entered, "入房钩子应记录合法成员的加入"
 
@@ -812,7 +809,7 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
     )
     payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "c213"}
     ack = await subject.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert_rejected_ack(ack, 4105, action="server:join_office")  # 目标房内同 role 同名
+    assert_rejected_ack(ack, 4101, action="server:join_office")  # 目标房 Computer 席位已占（同名亦然）
 
     subject_sid = subject.get_sid(namespace=SMCP_NAMESPACE)
     assert subject_sid is not None
@@ -825,6 +822,7 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
     assert [r for r in socketio_server.rooms(holder_sid) if r != holder_sid] == [office_room(office_b)]
 
     # 验收口径 ③：被拒客户端收不到该房任何 notify:*；正对照：合法成员收得到
+    assert_empty_ack(await holder.call(LEAVE_OFFICE_EVENT, {"office_id": office_b}, namespace=SMCP_NAMESPACE))
     await _connect_join(joiner, basic_server_port, "computer", office_b, "c213-joiner")
     await asyncio.sleep(0.3)
     assert on_control, "正对照：office-B 合法成员应收到 notify:enter_office"
@@ -836,12 +834,11 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
 
 @pytest.mark.asyncio
 async def test_computer_switch_into_same_name_room_rejected_keeps_old_room(socketio_server, basic_server_port: int):
-    """#215 + #213：Computer 换房撞上目标房同 role 同名 ⇒ 4105，且**校验先于副作用** ⇒ 原房原封不动。
+    """#215 + #213 + #230：Computer 换房撞上目标房（同名者占着的）Computer 席位 ⇒ 4101，且**校验先于副作用** ⇒ 原房原封不动。
 
-    裸名注册表下该路径在线上不可构造（同名 Computer 无法同时存在于两房）；复合键落地后可构造，故在此补集成守护：
-    被拒的换房不得先退旧房（对端收不到 ``notify:leave_office``），旧房成员关系保持。
+    被拒的换房不得先退旧房（对端收不到 ``notify:leave_office``），旧房成员关系保持（protocol#66 场景 #4/#6）。
     """
-    peer = AsyncClient()  # office-A 的对端（观察 leave 通知）
+    peer = AsyncClient()  # office-A 的 Agent 对端（观察 leave 通知）
     mover = AsyncClient()  # office-A 的 "c215"，换房到 office-B → 被拒
     holder = AsyncClient()  # office-B 已持有 "c215"
 
@@ -852,7 +849,7 @@ async def test_computer_switch_into_same_name_room_rejected_keeps_old_room(socke
         peer_leaves.append(data)
 
     office_a, office_b = "office-215-a", "office-215-b"
-    await _connect_join(peer, basic_server_port, "computer", office_a, "peer-215")
+    await _connect_join(peer, basic_server_port, "agent", office_a, "peer-215")
     mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "c215")
     await _connect_join(holder, basic_server_port, "computer", office_b, "c215")
 
@@ -861,7 +858,7 @@ async def test_computer_switch_into_same_name_room_rejected_keeps_old_room(socke
         {"role": "computer", "office_id": office_b, "name": "c215"},
         namespace=SMCP_NAMESPACE,
     )
-    assert_rejected_ack(ack, 4105, action="server:join_office")
+    assert_rejected_ack(ack, 4101, action="server:join_office")
 
     await asyncio.sleep(0.3)
     assert peer_leaves == [], f"被拒的换房不得先退旧房：{peer_leaves}"
@@ -883,12 +880,12 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
 
     与 #213 的关系：这是「**已在旧房** + 换房被拒」这一路径的集成守护——修复前该路径先退旧房再报错，
     客户端落成「无房」却仍以为在旧房。现在拒因是 403（身份声明冲突，先于任何房间副作用），
-    「旧房原封不动」的验收口径不变。房内同名（4105）在换房路径上的「校验先于副作用」由单测
-    ``test_computer_same_name_in_target_room_is_4105`` 覆盖（裸名注册表下该路径在线上不可构造）。
+    「旧房原封不动」的验收口径不变。席位冲突（4101）在换房路径上的「校验先于副作用」由
+    ``test_computer_switch_into_same_name_room_rejected_keeps_old_room`` 覆盖。
+    #230 后 office-A 只容一台 Computer：对端改为 Agent，「mover 仍是活成员」改由对端退房再重入触发的广播证明。
     """
-    peer = AsyncClient()  # office-A 的对端（观察 leave 通知）
+    peer = AsyncClient()  # office-A 的 Agent 对端（观察 leave 通知）
     mover = AsyncClient()  # office-A 成员，改名换房到 office-B → 被拒
-    latecomer = AsyncClient()  # 之后加入 office-A，用于证明 mover 仍是活成员
 
     on_peer_leave: list[dict] = []
     on_mover_enter: list[dict] = []
@@ -902,7 +899,7 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
         on_mover_enter.append(data)
 
     office_a, office_b = "office-221-mv-a", "office-221-mv-b"
-    peer_sid = await _connect_join(peer, basic_server_port, "computer", office_a, "peer-221")
+    peer_sid = await _connect_join(peer, basic_server_port, "agent", office_a, "peer-221")
     mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "mover-221")
 
     # 改名（并换房）：声明与会话不同的 name ⇒ 身份声明冲突 403
@@ -916,10 +913,11 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
     assert [r for r in socketio_server.rooms(mover_sid) if r != mover_sid] == [office_room(office_a)], "被拒的换房必须留在旧房"
     assert on_peer_leave == [], "换房被拒不得让旧房对端看到 notify:leave_office"
 
-    # 仍是活成员：新成员入房时它照常收到旧房的 notify:enter_office（正对照）
-    await _connect_join(latecomer, basic_server_port, "computer", office_a, "late-221")
+    # 仍是活成员：对端退房再重入时它照常收到旧房的 notify:enter_office（正对照）
+    assert_empty_ack(await peer.call(LEAVE_OFFICE_EVENT, {"office_id": office_a}, namespace=SMCP_NAMESPACE))
+    await _join_office(peer, role="agent", office_id=office_a, name="peer-221")
     await asyncio.sleep(0.3)
-    assert on_mover_enter, "旧房仍应把新成员入房广播给 mover"
+    assert on_mover_enter, "旧房仍应把成员入房广播给 mover"
 
     # 身份未落地：旧房成员列表里它仍叫 mover-221
     listed = await peer.call(
@@ -928,9 +926,9 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
         namespace=SMCP_NAMESPACE,
     )
     names = sorted(s["name"] for s in listed["sessions"])
-    assert names == ["late-221", "mover-221", "peer-221"], f"改名不得在旧房落地：{names}"
+    assert names == ["mover-221", "peer-221"], f"改名不得在旧房落地：{names}"
 
-    for client in (peer, mover, latecomer):
+    for client in (peer, mover):
         await client.disconnect()
 
 
@@ -1176,7 +1174,7 @@ async def test_office_id_equal_to_peer_sid_cannot_reach_private_room(socketio_se
 
 @pytest.mark.asyncio
 async def test_name_conflict_ack_never_leaks_peer_sid_over_wire(socketio_server, basic_server_port: int):
-    """#216 §二 验收：同名 join 被拒（4105）的 ack 不含对端真实 sid、不含 namespace（对端标识只进日志）。"""
+    """#216 §二 验收：同名 join 被拒（#230 起为 4101）的 ack 不含对端真实 sid、不含 namespace（对端标识只进日志）。"""
     holder, challenger = AsyncClient(), AsyncClient()
     holder_sid = await _connect_join(holder, basic_server_port, "computer", "office-216-dup", "dup-216")
     await _connect(challenger, basic_server_port)
@@ -1184,7 +1182,7 @@ async def test_name_conflict_ack_never_leaks_peer_sid_over_wire(socketio_server,
         ack = await challenger.call(
             JOIN_OFFICE_EVENT, {"role": "computer", "office_id": "office-216-dup", "name": "dup-216"}, namespace=SMCP_NAMESPACE
         )
-        assert_rejected_ack(ack, 4105)
+        assert_rejected_ack(ack, 4101)
         blob = json.dumps(ack, ensure_ascii=False)
         assert holder_sid not in blob, blob
         assert SMCP_NAMESPACE not in blob, blob

@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from socketio.exceptions import TimeoutError as SioTimeoutError
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import RoomFullError, SMCPNamespaceError
 from a2c_smcp.server import (
     DefaultSyncAuthenticationProvider,
     SyncAuthenticationProvider,
@@ -188,7 +188,7 @@ class TestEnterRoomTransactionalCommitSync:
     """
 
     def test_target_room_name_conflict_touches_nothing(self, smcp_namespace, mock_server):
-        """换房撞目标房同 role 同名被拒：旧房未动、目标房未进、无广播、会话仍是旧房（#215 后跨 office 同名合法）。"""
+        """换房撞目标房席位（同名的另一台 Computer，#230 ⇒ 4101）被拒：旧房未动、目标房未进、无广播、会话仍是旧房。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["c-sid", "office:roomA"])
         session = {"role": "computer", "name": "dup", "office_id": "roomA", "sid": "c-sid"}
@@ -198,8 +198,10 @@ class TestEnterRoomTransactionalCommitSync:
         smcp_namespace.leave_room = MagicMock()
         registry = {("roomA", "computer", "dup"): "c-sid", ("roomB", "computer", "dup"): "other-sid"}
         smcp_namespace._name_to_sid_map = dict(registry)
+        seats = {("roomA", "computer"): "c-sid", ("roomB", "computer"): "other-sid"}
+        smcp_namespace._seat_to_sid = dict(seats)
 
-        with pytest.raises(ValueError, match="Name already taken in room"):
+        with pytest.raises(RoomFullError):
             smcp_namespace.enter_room("c-sid", "roomB")
 
         smcp_namespace.leave_room.assert_not_called()  # 原实现先退旧房 / old impl left the old room first
@@ -207,6 +209,7 @@ class TestEnterRoomTransactionalCommitSync:
         mock_server.enter_room.assert_not_called()  # 目标房从未进入 / never joined the target room
         assert session["office_id"] == "roomA"
         assert smcp_namespace._name_to_sid_map == registry
+        assert smcp_namespace._seat_to_sid == seats, "被拒不得改动任何席位"
 
     def test_move_with_self_owned_name_succeeds(self, smcp_namespace, mock_server):
         """换房：旧房键属于**本 sid** ⇒ 放行，且键迁移到目标房（旧房键释放、无悬挂，#215）。"""
@@ -351,17 +354,17 @@ class TestEnterRoomTransactionalCommitSync:
         assert smcp_namespace._name_to_sid_map == {("roomB", "computer", "solo"): "intruder"}, "不得替抢占者注销 name 映射"
 
     def test_agent_name_conflict_never_enters_room(self, smcp_namespace, mock_server):
-        """闸门对 Agent 同样生效：Agent 撞目标房同 role 同名（注册表闸门）不得进入房间。"""
+        """闸门对 Agent 同样生效：Agent 撞目标房的 Agent 席位（#230 ⇒ 4101）不得进入房间。"""
         smcp_namespace.server = mock_server
         mock_server.rooms = MagicMock(return_value=["a-sid"])
-        mock_server.manager.get_participants.return_value = []
         session = {"role": "agent", "name": "dup", "sid": "a-sid"}
         smcp_namespace.get_session = MagicMock(return_value=session)
         smcp_namespace.save_session = MagicMock()
         smcp_namespace.emit = MagicMock()
         smcp_namespace._name_to_sid_map = {("roomB", "agent", "dup"): "other-sid"}
+        smcp_namespace._seat_to_sid = {("roomB", "agent"): "other-sid"}
 
-        with pytest.raises(ValueError, match="Name already taken in room"):
+        with pytest.raises(RoomFullError, match="Room already has an agent"):
             smcp_namespace.enter_room("a-sid", "roomB")
 
         mock_server.enter_room.assert_not_called()

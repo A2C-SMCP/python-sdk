@@ -71,7 +71,7 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
         # 置位后：服务端**推迟回收旧会话**（模拟静默断线——真实服务端要等 ping 超时才会 on_disconnect），
         # 让重放的 join 撞上真实的同名冲突检查。
         # When set, the server defers reaping the stale session (as it does on a silent drop until
-        # its ping timeout), so the replay hits the real duplicate-name check.
+        # its ping timeout), so the replay hits the real seat check (4101, #230).
         self.stall_disconnect: asyncio.Event | None = None
         # #223：按到达顺序的**事件序日志**（``("join", sid)`` 成功重放 / ``("join-rejected", sid)`` /
         # ``("update_config", sid)``）——用于断言「补发发生在成功重放**之后**」，比两个计数各自断言强。
@@ -97,7 +97,7 @@ class _OfficeRecordingNamespace(MockComputerServerNamespace):
             payload = dict(data)
             self.join_record.append((sid, payload))
             self.join_results.append(
-                {"code": 4105, "message": "Name already taken in room"},
+                {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "rejoin-office", "role": "computer"}},
             )
             self.event_log.append(("join-rejected", sid))
             self.joined.set()
@@ -218,10 +218,10 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
     真实的 ack 文案与清空行为。
 
     English: the genuine server-side rejection path — the stale session is not yet reaped, so the
-    replay hits ``enter_room``'s duplicate-name check and comes back with the real ack text.
+    replay hits ``enter_room``'s seat check (4101, #230) and comes back with the real ack text.
     """
     client = _make_client()
-    # #212：预算压到极小 ⇒ 真实 4105 上重试几次后立即认输（默认 45s 会让本用例白跑满预算）。
+    # #212：预算压到极小 ⇒ 真实 4101 上重试几次后立即认输（默认 45s 会让本用例白跑满预算）。
     client.office_rejoin_retry_budget = 0.3
     try:
         await client.connect(
@@ -244,8 +244,10 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
         await asyncio.wait_for(office_server.joined.wait(), timeout=_CONNECT_TIMEOUT)
 
         ack = office_server.join_results[-1]
-        assert isinstance(ack, dict) and ack["code"] == 4105, "旧会话未回收时，真实服务端应拒绝同名重放"
-        assert ack["message"] == "Name already taken in room", f"应为协议规范文案（不再含对端 sid），实际：{ack!r}"
+        # #230：旧会话仍占着 Computer 席位 ⇒ 4101 {role: computer}（不再是 4105）
+        assert isinstance(ack, dict) and ack["code"] == 4101, "旧会话未回收时，真实服务端应拒绝重放"
+        assert ack == {"code": 4101, "message": "Room already has a computer",
+                       "details": {"office_id": "rejoin-office", "role": "computer"}}, f"应为协议规范载荷（不含对端 sid），实际：{ack!r}"
 
         # 状态必须清空（不得保留表面有效的旧值）——#212 起清空发生在**预算耗尽**之后
         loop = asyncio.get_running_loop()
@@ -254,7 +256,7 @@ async def test_rejoin_rejected_by_real_server_clears_office_state(
             if loop.time() > deadline:
                 raise AssertionError("真实拒绝后 office_id 未清空 / office_id not cleared after a real rejection")
             await asyncio.sleep(_WAIT_INTERVAL)
-        # #212：真实 4105 是瞬态冲突 ⇒ 预算内必须重试（行为变更：此前一次即终）
+        # #212：真实 4101 是瞬态冲突 ⇒ 预算内必须重试（行为变更：此前一次即终）
         assert len(office_server.join_record) >= 3, "瞬态冲突必须重试（至少多打一次）"
     finally:
         if office_server.stall_disconnect is not None:
@@ -357,7 +359,7 @@ async def test_rejected_rejoin_clears_office_state(
                 raise AssertionError("回房被拒后 office_id 未清空 / office_id not cleared after a rejected replay")
             await asyncio.sleep(_WAIT_INTERVAL)
 
-        # #212：瞬态冲突（4105）在预算内必须重试（行为变更：此前一次即终）
+        # #212：瞬态冲突（4101）在预算内必须重试（行为变更：此前一次即终）
         assert len(office_server.join_record) >= 3, "瞬态冲突必须重试（至少多打一次）"
     finally:
         await client.disconnect()

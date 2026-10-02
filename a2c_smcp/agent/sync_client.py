@@ -10,6 +10,7 @@
 
 import threading
 import time
+import warnings
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -20,7 +21,7 @@ from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent import _blob_sideband as _sb
 from a2c_smcp.agent._cancel import CancelSendGate
 from a2c_smcp.agent.auth import AgentAuthProvider
-from a2c_smcp.agent.base import TOOL_CALL_TIMEOUT_ERRORS, BaseAgentSyncClient
+from a2c_smcp.agent.base import TOOL_CALL_TIMEOUT_ERRORS, BaseAgentSyncClient, _the_computer_in_office
 from a2c_smcp.agent.errors import SMCPProtocolError, raise_for_error_payload
 from a2c_smcp.agent.types import AgentEventHandler, CancelSignal
 from a2c_smcp.smcp import (
@@ -546,7 +547,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         借 ``_drop_desired_office()`` 清状态（那次额外 generation bump 在补了 op-lock 后失去必要，
         且会让两侧 generation 序列分叉）。
 
-        **重试语义与异步侧逐字同构**（只重试 ``4101``/``4105``、预算 ``office_rejoin_retry_budget``、
+        **重试语义与异步侧逐字同构**（只重试 ``4101``、预算 ``office_rejoin_retry_budget``、
         退避期间**放锁**：每次尝试各取一次 op-lock，#217 补正 §三）；差异只在落地形态——线程不可取消，
         故每次尝试的陈旧性检查与效应施加仍在**同一次** ``_office_state_lock`` 获取内，退避 sleep 在**两把
         锁之外**。被抢占的**孤儿线程**最多多睡一轮退避，醒来即在守卫处退出（不再发包、不改状态）。
@@ -606,7 +607,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
                         # 与共享 ERROR 分开：ERROR 文案须与显式路径逐字相同（#219 同态口径），
                         # 「重试过几次」是回放路径独有的上下文。/ Kept apart from the shared ERROR text.
                         logger.warning(f"自动回房重试耗尽（共 {attempt + 1} 次尝试）: {office_id} - code={verdict.code}")
-                    # 带协议码：4101/4105 是重连撞旧会话的**瞬态**冲突（重试预算见
+                    # 带协议码：4101 是重连撞旧会话（旧会话仍占席位）的**瞬态**冲突（重试预算见
                     # ``office_rejoin_retry_budget``），无码则是「未获裁决」（形状不认识 / 空响应）。
                     log_join_rejection(
                         office_id,
@@ -931,17 +932,23 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         except Exception as e:
             logger.error(f"Error handling skills updated notification: {e}", exc_info=True)
 
-    def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
+    def get_computer_in_office(self, office_id: str, timeout: int = 20) -> SessionInfo | None:
         """
-        获取指定房间内的所有Computer信息
-        Get all computers info in the specified office
+        获取指定房间内**唯一**的 Computer 信息（#230：「每 role 一席」，房内至多一台 Computer）
+        Get the single computer in the specified office (#230: one seat per role)
+
+        换绑 Computer 由 ``notify:leave_office``（旧）→ ``notify:enter_office``（新）表达，无需遍历房内多台 Computer。
 
         Args:
             office_id (str): 房间ID / Office ID
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
-            list[SessionInfo]: Computer信息列表 / List of computer info
+            SessionInfo | None: 房内的 Computer；房内暂无 Computer 时为 ``None`` / The computer, or ``None``
+
+        Raises:
+            SMCPProtocolError: 服务端以 flat ErrorPayload 拒绝（``400`` / ``4103`` / ``4104``）。
+            ValueError: 响应 ``req_id`` 不匹配，或房内列出多于一台 Computer（服务端协议违规）。
         """
         agent_config = self.auth_provider.get_agent_config()
         req = ListRoomReq(
@@ -963,11 +970,32 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             if response.get("req_id") != req["req_id"]:
                 raise ValueError("Invalid response with mismatched req_id")
 
-            # 过滤出Computer角色的会话 / Filter sessions with computer role
-            all_sessions = response.get("sessions", [])
-            computers = [s for s in all_sessions if s.get("role") == "computer"]
-            return computers
+            # 房内唯一的 Computer（多于一台 ⇒ 服务端协议违规，抛错）/ The office's single Computer
+            return _the_computer_in_office(response.get("sessions", []), office_id)
 
         except Exception as e:
-            logger.error(f"Failed to get computers in office {office_id}: {e}", exc_info=True)
+            logger.error(f"Failed to get computer in office {office_id}: {e}", exc_info=True)
             raise
+
+    def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
+        """
+        **已废弃**（#230）：改用 :meth:`get_computer_in_office`。房内至多一台 Computer，列表长度恒 ``<= 1``。
+        **Deprecated** (#230): use :meth:`get_computer_in_office`; the list has at most one element.
+
+        保留为过渡：委托 :meth:`get_computer_in_office` 并包装成列表，调用即发 ``DeprecationWarning``，将在后续版本移除。
+        Kept as a shim delegating to :meth:`get_computer_in_office`; scheduled for removal.
+
+        Args:
+            office_id (str): 房间ID / Office ID
+            timeout (int): 超时时间 / Timeout duration
+
+        Returns:
+            list[SessionInfo]: ``[computer]`` 或 ``[]`` / ``[computer]`` or ``[]``
+        """
+        warnings.warn(
+            "get_computers_in_office() is deprecated since 0.5.0 (one computer per office); use get_computer_in_office()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        computer = self.get_computer_in_office(office_id, timeout=timeout)
+        return [computer] if computer is not None else []

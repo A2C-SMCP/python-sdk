@@ -30,7 +30,7 @@ class SMCPProtocolError(Exception):
         ``4017`` Skill Resource Not Accessible（v0.2.1 ``details.reason``）
       - ``client:get_blob``：``4018 Blob Not Accessible``（v0.2.1 ``details.reason``）
       - ``server:join_office``（#218）：入房被拒 —— ``400``（载荷畸形）/ ``403``（同连接改名，文案追加
-        会话身份提示）/ ``4101``（房内已有 Agent）/ ``4105``（同名）/ ``4106``（已在它房）。**未知码同样
+        会话身份提示）/ ``4101``（房内本 role 席位已占，``details.role``）/ ``4106``（已在它房）。**未知码同样
         抛出**（宁严勿宽：未来协议新增码时绝不静默放过）。
 
     **``.code == -1`` 是契约（#218 写成）**：当服务端拒绝但**码不可解析**或 ack 形状不认识（「未获裁决」）

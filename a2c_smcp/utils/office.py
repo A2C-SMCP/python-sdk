@@ -42,12 +42,12 @@ Office 入房 ACK 判定与失败效应（单一权威）/ Office join-ack verdi
 
 #212 语境 / #212 context：
     **静默断线**（拔网线 / 代理被 kill / NAT 超时）下服务端要等自身心跳超时才回收旧会话，客户端却在
-    秒级内重连并重放 ``server:join_office`` ⇒ 必然撞上 ``4101``/``4105``（协议 error-handling.md
-    §建议的重试策略）。故**回放路径**对这两码做**有界退避重试**（:func:`rejoin_retry_delay` +
+    秒级内重连并重放 ``server:join_office`` ⇒ 必然撞上 ``4101``（旧会话仍占着本 role 的席位，协议
+    error-handling.md §建议的重试策略）。故**回放路径**对该码做**有界退避重试**（:func:`rejoin_retry_delay` +
     :data:`OFFICE_REJOIN_RETRY_BUDGET`）；预算耗尽才落失败效应。**只作用于回放路径**——显式
     ``join_office`` 不重试（首次入房撞上冲突即永久冲突）。同批把效应表判据由「顶层有没有码」收敛为
     :func:`is_validation_rejection`：只有**校验先于副作用**的码才能回退到「已确认房」。
-    Bounded backoff for the transient 4101/4105 conflicts, on the replay paths only; the effect matrix
+    Bounded backoff for the transient 4101 conflict, on the replay paths only; the effect matrix
     now keys on pre-commit (validation) rejections rather than on mere code presence.
 
 **不得**用 :func:`a2c_smcp.smcp.build_room_rejection_error` 构造这里的异常载荷：那是**服务端**载荷
@@ -81,7 +81,7 @@ OFFICE_REJOIN_RETRY_BUDGET: float = 45.0
 
 默认取满 socket.io 的**最长默认会话回收窗口** ``ping_interval(25) + ping_timeout(20) = 45s``：静默断线后
 服务端要等自身心跳超时才回收旧会话，而客户端在秒级内就重连重放 ⇒ 这段时间的重放必然撞上
-``4101``/``4105``。协议（`room-model.md` §静默断线与会话回收）对回收窗口只给出 **SHOULD 级部署约束**
+``4101``。协议（`room-model.md` §静默断线与会话回收）对回收窗口只给出 **SHOULD 级部署约束**
 且明确「任何有限短窗都覆盖不了回收窗口」，故默认值按常见默认取满；部署方调大了 ping 参数时，由使用方
 覆盖客户端的公开属性 ``office_rejoin_retry_budget``（Agent 两侧与 Computer 各一个实例属性，默认取本值）。
 
@@ -101,12 +101,14 @@ OFFICE_REJOIN_RETRY_MAX_DELAY: float = 5.0
 的恢复延迟上限。另：末段退避会被 ``min(..., 剩余预算)`` 夹取，故曲线末段可能短于本值。
 """
 
-TRANSIENT_JOIN_CONFLICT_CODES: frozenset[int] = frozenset({ErrorCode.ROOM_FULL, ErrorCode.NAME_CONFLICT})
-"""**瞬态冲突**白名单（``4101`` / ``4105``）——唯一可重试的两码 / the only retryable join rejections.
+TRANSIENT_JOIN_CONFLICT_CODES: frozenset[int] = frozenset({ErrorCode.ROOM_FULL})
+"""**瞬态冲突**白名单（``4101``）——唯一可重试的码 / the only retryable join rejection.
 
-协议 `error-handling.md` §建议的重试策略 把二者列为**同一类瞬态冲突的两种形态**（目标房已有 Agent /
-房内同 role 同名）：静默断线后服务端尚未回收旧会话时，重放必然撞上它们；`4106` **不属**此类（重连产生的
-是新会话，无 ``office_id``，不可能「已在其它房」），不可重试。
+协议 `error-handling.md` §Room Full 把 ``4101`` 的成因分为永久（另一真实同 role 会话占席）与瞬态（静默断线后
+服务端尚未回收本端旧会话，旧会话仍占着席位）两类，服务端无法区分；回放路径即「刚经历传输层重连」的前提，
+故只在回放路径重试。``4105`` 自 protocol#66 起是**预留码**（「每 role 一席」后同名先撞 ``4101``）——收到即
+协议违规，**放弃不重试**（见 :func:`parse_join_ack` 的告警）。``4106`` **不属**此类（重连产生的是新会话，无
+``office_id``，不可能「已在其它房」），不可重试。
 """
 
 JOIN_VALIDATION_REJECTION_CODES: frozenset[int] = frozenset(
@@ -114,22 +116,24 @@ JOIN_VALIDATION_REJECTION_CODES: frozenset[int] = frozenset(
         ErrorCode.BAD_REQUEST,
         ErrorCode.FORBIDDEN,
         ErrorCode.ROOM_FULL,
-        ErrorCode.NAME_CONFLICT,
         ErrorCode.ALREADY_IN_ROOM,
     }
 )
 """**校验类**拒绝白名单——保证「既有成员关系未被改变」的码 / pre-commit (validation) rejections.
 
-`room-model.md` 的加入伪代码明写「**校验必须先于副作用**」，故加入校验能返回的码（``4101`` / ``4105`` /
-``4106``）与请求校验码（``400`` / ``403``）都**不改变既有成员关系** ⇒ 客户端可以回退到「已确认房」
+`room-model.md` 的加入伪代码明写「**校验必须先于副作用**」，故加入校验能返回的码（``4101`` / ``4106``）与
+请求校验码（``400`` / ``403``）都**不改变既有成员关系** ⇒ 客户端可以回退到「已确认房」
 （见 :func:`resolve_join_failure`）。
 
 **刻意排除**：``500``（handler catch-all，可发生在成员关系**已提交之后**——入房广播抛错时服务端按提交点
-收敛为「无房」，此时回退会让客户端宣称仍在旧房）、``4102``（预留码）/ ``4103`` / ``4104``（只由
+收敛为「无房」，此时回退会让客户端宣称仍在旧房）、``4102`` / ``4105``（预留码，收到即协议违规）/ ``4103`` / ``4104``（只由
 ``server:list_room`` 产出，join 物理上产不出）、以及**未知码**（fail-safe：宁丢恢复能力，不撒谎）。
 本集合是**维护耦合点**：它必须恰好等于「``server:join_office`` 的校验类可达码」，见
 ``tests/unit_tests/utils/test_office.py::TestIsValidationRejection``。
 """
+
+_RESERVED_ROOM_CODES: frozenset[int] = frozenset({ErrorCode.ROOM_NOT_FOUND, ErrorCode.NAME_CONFLICT})
+"""房间管理**预留码**（``4102`` / ``4105``）：协议 MUST NOT 产出，收到即对端违规 / reserved room codes."""
 
 NO_RESPONSE_MESSAGE = "服务器未返回结果 / No response from server"
 """**无法判定**（既非空 ack、也非可识别的 flat ErrorPayload）时的兜底文案。
@@ -155,9 +159,9 @@ class JoinOfficeVerdict:
     ==================  ========  ============  ==========================================
 
     ``code`` 是**唯一**可用于机器分流的字段：重连回房只对
-    :data:`TRANSIENT_JOIN_CONFLICT_CODES`（``4101`` / ``4105``）做有界退避重试（:func:`rejoin_retry_delay`），
+    :data:`TRANSIENT_JOIN_CONFLICT_CODES`（``4101``）做有界退避重试（:func:`rejoin_retry_delay`），
     其余码一律放弃并如实报错；失败效应则按 :func:`is_validation_rejection` 二分。
-    ``code`` is the only machine-actionable field — only 4101/4105 are retried (see
+    ``code`` is the only machine-actionable field — only 4101 is retried (see
     :func:`rejoin_retry_delay`), and :func:`is_validation_rejection` splits the failure effects.
     """
 
@@ -200,6 +204,10 @@ def parse_join_ack(result: Any) -> JoinOfficeVerdict:
         except (TypeError, ValueError):
             # 码不可解析（如字符串化失败）⇒ 仍判拒绝、只是无码可分流（宁严勿宽）
             code = None
+        if code in _RESERVED_ROOM_CODES:
+            # 预留码（4102 / 4105，protocol#66）：协议 MUST NOT 产出 ⇒ 对端违规。照常判拒绝（非校验类、不重试），
+            # 只多留一条可检索的违规记录。/ A reserved code is a peer protocol violation: logged, then rejected.
+            logger.warning(f"server:join_office 收到预留码 {code}（对端协议违规，放弃）/ reserved code from peer: {result!r}")
         return JoinOfficeVerdict(ok=False, code=code, message=str(result.get("message", "")))
     return JoinOfficeVerdict(ok=False, code=None, message=NO_RESPONSE_MESSAGE)
 
@@ -308,8 +316,8 @@ def rejoin_retry_delay(verdict: JoinOfficeVerdict | None, *, attempt: int, remai
     Return the seconds to wait before the next replay attempt, or ``None`` to stop retrying and apply the
     failure effect.
 
-    **只对** :data:`TRANSIENT_JOIN_CONFLICT_CODES`（``4101`` / ``4105``）返回非 ``None``：协议
-    `error-handling.md` §建议的重试策略 只对这两码放行「有界退避重试」，且**仅限传输层重连后的恢复
+    **只对** :data:`TRANSIENT_JOIN_CONFLICT_CODES`（``4101``）返回非 ``None``：协议
+    `error-handling.md` §建议的重试策略 只对该码放行「有界退避重试」，且**仅限传输层重连后的恢复
     路径**——本函数由回放路径调用，故调用点本身就是该前提（显式 ``join_office`` 不调用它）。
     曲线 ``base * 2**attempt``、封顶 :data:`OFFICE_REJOIN_RETRY_MAX_DELAY`、并以 ``remaining``（墙钟
     剩余预算）夹取，使「预算 = 恢复耗时的上界」成立且极小预算可确定性测试。

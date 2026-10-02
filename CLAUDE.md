@@ -111,6 +111,13 @@ Socket.IO 事件遵循以下前缀：
 - **DPE 已整体移除**: A2C-SMCP 控制面不再涉及 `client:get_dpe` / `dpe://` 解析；DPE 迁出至独立
   [dpe-protocol](https://github.com/A2C-SMCP/dpe-protocol) 仓库。修改时勿重新引入 DPE 事件/类型。
 
+### v0.5.0 房间模型：每 role 一席 (#230 / protocol#66)
+
+一房 ≤1 Agent、≤1 Computer。准入由服务端**席位表** `(office_id, role) → sid` 在 `enter_room` 阶段 1
+（任何副作用之前）原子判定，被占 ⇒ `4101 {office_id, role}`；名字注册表 `(office_id, role, name)` 只管路由。
+`4105` 为**预留码**（不得产出、不得重试），勿重新引入同名专用拒绝路径。Agent 侧用 `get_computer_in_office`
+（单数）；`get_computers_in_office` 已废弃。
+
 ### 连接面鉴权字段契约 (#112 / AS-38，Epic TFRM-153)
 
 **连接面鉴权统一走 Socket.IO CONNECT `auth` dict，凭据字段名 = `token`**（A2C-SMCP auth-agnostic，

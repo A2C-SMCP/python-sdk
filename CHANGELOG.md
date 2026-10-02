@@ -14,9 +14,38 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Breaking Changes
 
+- **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer
+  ⇒ 一个 Agent 同一时刻至多连一台 Computer。无新事件、无能力字段（随 0.5 MINOR 握手生效）。
+  - **第二台 Computer 入房被拒 `4101`**（此前允许任意多台）：不替换、不驱逐已在房的 Computer；同名与否都一样。
+    换绑 = 旧 Computer `leave_office` → 新 Computer `join_office`（Agent 观察到 `notify:leave_office` →
+    `notify:enter_office`）。
+  - **`4101` 泛化为「本 role 席位已占」**，ack 载荷字节级对齐协议示例：
+    `{"code":4101,"message":"Room already has an agent"|"Room already has a computer","details":{"office_id":…,"role":…}}`
+    （服务端载荷中 `details.role` = 发起者自己声明的 role，即被占席位；客户端入房异常只带 `code` / `message`，
+    按 `code` 分流）。`build_room_rejection_error(4101, …)` 要求
+    `declared_role` 必填；`RoomFullError` 构造改为 `RoomFullError(role)`。
+  - **`4105` 收回为预留码**：服务端不再产出（同 role 同名先撞席位 ⇒ `4101`），`build_room_rejection_error`
+    构造上拒绝 `4105`（与 `4102` 同款）；**`NameConflictError` 删除**（未发布即收回，不留别名）。客户端收到
+    `4102` / `4105` ⇒ 记协议违规告警、按非校验类拒绝处理、**不重试**。
+  - **重连回房的瞬态重试集合由 `{4101, 4105}` 收敛为 `{4101}`**（`TRANSIENT_JOIN_CONFLICT_CODES`；
+    `JOIN_VALIDATION_REJECTION_CODES` 同步去掉 `4105`）。
+  - **服务端准入改由席位表原子判定**：新增 `_seat_to_sid: (office_id, role) → sid`（`server.types.SEAT_KEY`）
+    与反向索引 `_sid_to_seats`。`enter_room` 在**任何副作用之前**（含 Computer 换房的「自动离开旧房」）原子
+    「检查 + 占席」（async 零挂起点 / sync 注册表锁内）⇒ 并发加入空房恰一者成功，输家在动旧房之前即被拒
+    （此前「竞争输家短暂入房、换房者已先退旧房」的已知边界随之消失）；失败即回滚新占席位，退房 / 断连 /
+    relay 自愈时释放。名字注册表只承担路由解析：键被他人持有 ⇒ `RegistryInvariantError`（`500`），不伪装成协议码。
+    Server 子类化 API：`_ensure_name_registerable` 删除，改为 `_claim_seat(office_id, role, sid)` /
+    `_release_seats(sid, office_id=None)`；Agent 占用判定不再扫描 socketio 房成员。
+  - **幂等重入统一**：会话已在目标房再次 join（Agent / Computer 同）⇒ 空 ack、不重复广播 `notify:enter_office`。
+  - **Agent API**：新增 `get_computer_in_office(office_id) -> SessionInfo | None`（async / sync）；房内列出多于
+    一台 Computer ⇒ 判服务端协议违规抛 `ValueError`（不挑其中一台）。**`get_computers_in_office` 已废弃**：
+    仍可用（委托新方法，返回 `[c]` / `[]`）并发 `DeprecationWarning`，将在后续版本移除——**使用方请迁移到
+    `get_computer_in_office`**。rust-sdk 侧同步新增同名单数方法（rust-sdk#232）。
+  - 一致性：新增 `tests/integration_tests/server/test_single_computer_room_conformance.py`，对 async / sync 两种
+    服务端线上覆盖 room-model §一致性测试场景全部 9 条。
 - **Agent 显式 `join_office` 改为等 ACK（#218）**：`AsyncSMCPAgentClient.join_office` /
   `SMCPAgentClient.join_office` 由「无 ack 的 `emit`」改为 `call`，三类后果：
-  1. **可能抛**：服务端裁决为拒绝时抛既有 `SMCPProtocolError`（`.code` 可机器分流 `400/403/4101/4105/
+  1. **可能抛**：服务端裁决为拒绝时抛既有 `SMCPProtocolError`（`.code` 可机器分流 `400/403/4101/
      4106`；码不可解析 / 形状不认识时 `.code == -1`，「未获裁决」）。此前入房被拒**完全静默**
      ——包括同一连接改名被拒的 `403`（本地意图与服务端身份会静默分叉）。`403` 的异常文案追加
      「本连接会话身份已固化为 `<name>`；改名须重新建立连接」。
@@ -43,15 +72,15 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `JoinOfficeVerdict(ok, code, message)`，便于下游按 `code` 机器分流。**刻意不再兼容**旧元组形态——
   `MINOR` 严格匹配使跨版本对端物理上不可能互联，兼容分支只会掩盖未迁移的调用方。
 - **名字唯一性键空间收敛为 `(office_id, role, name)`**（#215，protocol#61 Q3）：唯一性改为**房内同 role**
-  （协议 MUST NOT 施加全局唯一）。用户可感：**跨 office 同名**、**同名 Agent + Computer** 不再被 `4105`
-  误拒；同房同 role 同名仍 `4105`。`client:*` 路由改为在**发起者所在房内**解析——目标只在他房 / 名字属于
+  （协议 MUST NOT 施加全局唯一）。用户可感：**跨 office 同名**、**同名 Agent + Computer** 不再被误拒；
+  同房同 role 同名由「每 role 一席」先拦为 `4101`（#230，见上条）。`client:*` 路由改为在**发起者所在房内**解析——目标只在他房 / 名字属于
   Agent 时立即回 flat `404`（与「不存在」逐字节相同，不泄露他房成员存在性），此前为抛异常致调用方挂满超时。
   未入房发起者的路由拒绝现为 flat `4103`（#216，见下条）。
   - Server 子类化 API 签名变更（不留兼容）：`get_sid_by_name(office_id, role, name)`、
-    `_register_name(office_id, role, name, sid)`、`_ensure_name_registerable(office_id, role, name, sid)`；
+    `_register_name(office_id, role, name, sid)`（`_ensure_name_registerable` 已由 #230 删除，见上条）；
     `_name_to_sid_map` 键改为 `(office_id, role, name)` 元组（`server.types.NAME_KEY`），新增反向索引
-    `_sid_to_name_key`：`_unregister_name` 按 sid 注销、不再从可变会话字段反推（杜绝回滚后残留键致永久 4105），
-    并内置归属守卫（只删本 sid 持有的键）。`enter_room` 的 Computer 房内同名扫描并入注册表闸门（判据单点）。
+    `_sid_to_name_key`：`_unregister_name` 按 sid 注销、不再从可变会话字段反推（杜绝回滚后残留键永久占用），
+    并内置归属守卫（只删本 sid 持有的键）。
 - **边界校验加固 + office 房名命名空间分离**（#216，protocol#61 自查 A / B + `office_id` 取值域）：
   - **`client:*` 路由的拒绝一律经 ack 可感**（此前多为抛异常 ⇒ 调用方挂满超时）：载荷畸形（缺字段 / 类型错 /
     无载荷 / 多余位置参数）⇒ `400`；未入房 ⇒ `4103`；**非 Agent 发起任一 `client:*` ⇒ `403`**（此前只有
@@ -114,8 +143,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - 三个事件的 handler 都补齐 **catch-all**：未知内部异常一律回 `500` + 笼统文案（原文进日志），
   不再让异常逃出 handler 导致"根本不发 ACK、调用方挂到自身超时"。
 - **重连回房的瞬态冲突有界退避重试（#212）**：静默断线后服务端要等自身心跳超时才回收旧会话，而客户端
-  在秒级内就重连重放 ⇒ 必然撞上 `4101`（房内已有 Agent）/ `4105`（房内同名）。协议把二者定义为同一类
-  **瞬态冲突**，并只对「本端刚经历传输层重连」的恢复路径放行**有界**重试（`error-handling.md`
+  在秒级内就重连重放 ⇒ 必然撞上 `4101`（旧会话仍占着本 role 的席位；#230 起 `4105` 为预留码、不再重试）。
+  协议把这种成因定义为**瞬态冲突**，并只对「本端刚经历传输层重连」的恢复路径放行**有界**重试（`error-handling.md`
   §建议的重试策略）。三条回放路径（Agent async / Agent sync / Computer）现在按 `1→2→4→5…` 秒退避
   重试，**默认预算 45s** = socket.io 默认最长回收窗口（`ping_interval(25) + ping_timeout(20)`），
   预算耗尽才落失败效应与错误日志（与显式入房**同一张效应表、同一句 ERROR 文案**，故 #219 的同态口径
@@ -203,7 +232,7 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   名字冲突的冗长诊断（含对端 sid）下沉到服务端日志。
 - 未预期内部异常回 `500` + 笼统文案，原文只进日志（此前把 `str(e)` 原样回给客户端）。
 - **入房失败的效应判据由「顶层有没有码」收敛为「是否校验类」（#212，`is_validation_rejection`）**：
-  `room-model.md` 明写「校验必须先于副作用」⇒ 只有 `400`/`403`/`4101`/`4105`/`4106` 才保证
+  `room-model.md` 明写「校验必须先于副作用」⇒ 只有 `400`/`403`/`4101`/`4106` 才保证
   「既有成员关系未被改变」，回退到「已确认房」才成立。`500` 是 handler catch-all，**可发生在成员关系
   已提交之后**（入房广播抛错 ⇒ 服务端按提交点收敛为无房）——旧判据此时会让客户端宣称仍在旧房；未知码
   同理 fail-safe。二者改按「未获裁决」处置（Agent 双清空；Computer 清 desired、保留
@@ -273,13 +302,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **sync Agent `join_office` 入口分两次取锁**：与断连钩子交错时可能静默不发包却残留意图，或复活已清空的意图；
   现单次取锁，与 async 同构。
 - **Server 名字注册表原子化**：sync 服务端每个事件一个线程，入房注册与断连清理交错会留下指向死 sid 的条目
-  ⇒ 同名重连永久 `4105`。注册改为一步完成「sid 存活校验 + `4101` / `4105` 判定 + 写入」（sync 加
+  ⇒ 同名重连永久被拒。注册改为一步完成「sid 存活校验 + 判定 + 写入」（sync 加
   `RLock`，async 无 await 段），并发同名 join 只会一个成功；断连改为先广播 leave 再注销；relay 与断连守卫
   统一以「仍解析到同一 sid」复查，目标会话已不存在时回 `404` 并自愈，不再让 Agent 干等超时。断连清理包在
   `try/finally` 里：leave 广播抛错（pubsub publish 失败等）也照常注销名字、唤醒在途调用。
-  > **已知边界**：原子注册位于 `enter_room` 生效阶段（入房之后），并发竞争的输家（`4101` / `4105`）会短暂进入
-  > 目标房后收敛为无房；换房的 Computer 此时已退掉旧房。前移会让 relay 在「注册表已指向、会话尚无 `office_id`」
-  > 的窗口里误报注册表损坏（#213），故刻意保留。
+  > 原「并发竞争的输家短暂进入目标房、换房的 Computer 已先退旧房」的已知边界已由 #230 的阶段 1 原子占席消除
+  > （见 Breaking Changes）；名字注册本身仍留在生效阶段（前移会让 relay 误报注册表损坏，#213）。
 
 ### Fixed（#224 打包依赖 —— 干净安装可用性）
 

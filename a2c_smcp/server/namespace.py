@@ -17,7 +17,6 @@ from pydantic import TypeAdapter
 
 from a2c_smcp.exceptions import (
     AlreadyInRoomError,
-    RoomFullError,
     RoomRejection,
     SMCPNamespaceError,
 )
@@ -189,8 +188,11 @@ class SMCPNamespace(BaseNamespace):
 
         #213 两阶段结构（协议 room-model.md §Computer 加入规则 注记 3「校验必须先于副作用」）：
 
-        - **阶段 1 校验**（零成员关系副作用）：角色约束、目标房同名检查、名字注册闸门；
+        - **阶段 1 校验**（零成员关系副作用）：角色约束（Agent ``4106``）、幂等重入、**原子占席**（``4101``，#230）；
         - **阶段 2 生效**：退旧房 → 入新房 → 写会话 → 注册 name → 广播 ``notify:enter_office``。
+
+        #230「每 role 一席」：席位检查与占席在阶段 1 **原子**完成（:meth:`_claim_seat`，零挂起点）——并发加入同一
+        空房恰一者成功；输家在动任何成员关系之前即被拒（换房的 Computer 不会先退旧房再被拒）。
 
         不变量：本方法抛错后 socketio 的真实成员关系与会话状态**一致**——被拒客户端绝不留在目标房里
         （否则它会持续收到该房的 ``notify:*``，而会话说它不在任何房）。阶段 2 的任何抛错都会按
@@ -217,52 +219,30 @@ class SMCPNamespace(BaseNamespace):
             session["name"] = default_session_name(session.get("role"), sid)
 
         # ── 阶段 1：校验（零成员关系副作用） / Phase 1: validation (no membership side effect) ──
-        past_room: OFFICE_ID | None = None
-        if session["role"] == "agent":
-            # 如果sid已经存在于某个房间中，并且房间号不是当前房间号
-            # If sid already exists in a room and the room number is not the current room
-            if session.get("office_id") and session.get("office_id") != room:
-                logger.warning(
-                    f"Agent sid: {sid} already in room: {session.get('office_id')}, can't join room: {room}",
-                )
-                # 领域异常承载协议码（4106）：handler 据此回 flat ErrorPayload（#214）。
-                # 异常消息只含自身上下文（无 sid）⇒ 不可能泄露进 ack 载荷。
-                raise AlreadyInRoomError()
+        role = session["role"]
+        current_room = session.get("office_id") or None
+        if current_room == room:
+            # 幂等重入（protocol#66：Agent / Computer 通用）：空 ack，**MUST NOT** 重复广播 ``notify:enter_office``。
+            # 先于席位检查也成立：本会话在房 ⇒ 它就是该席位的持有者（自会话守卫）。
+            # Idempotent re-entry: empty ack, no duplicate enter broadcast.
+            logger.warning(f"{role} sid: {sid} already in room: {room}. 正在重复加入房间")
+            return
+        if role == "agent" and current_room is not None:
+            # Agent 换房 MUST 显式两步（先 leave）。领域异常承载协议码（4106）：handler 据此回 flat ErrorPayload
+            # （#214）；异常消息只含自身上下文（无 sid）⇒ 不可能泄露进 ack 载荷。
+            logger.warning(f"Agent sid: {sid} already in room: {current_room}, can't join room: {room}")
+            raise AlreadyInRoomError()
+        # Computer 可以切换房间，但**退房动作推迟到阶段 2**：目标房闸门必须先查完。
+        # 若先退旧房再查目标房，一旦目标房席位被占，该 Computer 已离开原房且对端已收到
+        # ``notify:leave_office``，落成「无房」中间态却无任何补救语义（协议 注记 4）。
+        # The old room is left in phase 2 — all target-room gates must run first.
+        past_room: OFFICE_ID | None = current_room
 
-            # 如果sid不存在于任何房间中
-            # If sid doesn't exist in any room
-            elif not session.get("office_id"):
-                # 获取房间内所有参与者
-                # Get all participants in the room
-                participants = self.server.manager.get_participants(SMCP_NAMESPACE, office_room(room))
-
-                # 检查房间内是否已有Agent
-                # Check if there's already an Agent in the room
-                for participant_sid, _participant_eio_sid in participants:
-                    participant_session = await self.get_session(participant_sid)
-                    if participant_session.get("role") == "agent":
-                        logger.warning(f"Room {room!r} already has an agent; rejecting sid={sid}")
-                        raise RoomFullError()
-            else:
-                logger.warning(f"Agent sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
-                return
-        else:
-            if session.get("office_id") == room:
-                logger.warning(f"Computer sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间")
-                return
-
-            # Computer 可以切换房间，但**退房动作推迟到阶段 2**：目标房闸门必须先查完。
-            # 若先退旧房再查目标房，一旦目标房同名被拒，该 Computer 已离开原房且对端已收到
-            # ``notify:leave_office``，落成「无房」中间态却无任何补救语义（协议 注记 3）。
-            # The old room is left in phase 2 — all target-room gates must run first.
-            past_room = session.get("office_id") or None
-
-        # 房内同 role 同名闸门（#215：键 ``(office_id, role, name)`` 即协议唯一性作用域，Agent / Computer 同一判据；
-        # 跨房同名、同名异 role 放行）。必须早于任何成员关系变更：若留到阶段 2 的 ``_register_name``，socket 已进入
-        # 房间而回滚只覆盖会话 ⇒ 被拒客户端留在房里继续收 ``notify:*``（#213）。目标房**显式**传入——换房的
-        # Computer 此刻会话里仍是旧房。
-        # Per-room, per-role name gate (#215) — must fire before any membership change (#213).
-        await self._ensure_name_registerable(room, session["role"], session["name"], sid)
+        # 「每 role 一席」准入（#230）：**原子**检查并占下 ``(room, role)`` 席位，同名与否无关（``4105`` 已是预留码）。
+        # 必须早于任何成员关系变更（#213）；目标房**显式**传入——换房的 Computer 此刻会话里仍是旧房。
+        # 自此至阶段 2 结束，任何失败都必须释放本次新占的席位（见下方 except）。
+        # Atomic seat claim (#230) before any membership change; released on any later failure.
+        claimed_seat = await self._claim_seat(room, role, sid)
 
         # ── 阶段 2：生效（成员关系变更） / Phase 2: effects (membership changes) ──
         registered = False
@@ -281,10 +261,10 @@ class SMCPNamespace(BaseNamespace):
             session["office_id"] = room
             await self.save_session(sid, session)
 
-            # 注册name到sid的映射：**原子**「存活 + Agent 席位 + 同名」校验并写入（🔴7/S1，与 sync 同一核心）。
-            # 阶段 1 的闸门只是廉价预检；被拒 ⇒ 下方失败收敛摘房。
-            # Register name-to-sid mapping: the authoritative atomic check-and-set (phase 1 is only a pre-check).
-            role, name = session["role"], session["name"]
+            # 注册name到sid的映射（路由解析用）：**原子**「存活」校验并写入（🔴7/S1，与 sync 同一核心）。
+            # 准入已由阶段 1 的占席决定；断连收尾已开始 ⇒ 被拒 ⇒ 下方失败收敛摘房。
+            # Register the routing name (admission was decided by the phase-1 seat claim).
+            name = session["name"]
             await self._register_name(room, role, name, sid)
             registered = True
 
@@ -328,12 +308,22 @@ class SMCPNamespace(BaseNamespace):
                     if "office_id" in session:
                         del session["office_id"]
                         await self.save_session(sid, session)
+                    # 席位**最后**释放（#230 审查 🟡1/🟡2，与 leave_room / 断连同序）：名字已注销、已摘出 socketio 房后
+                    # 才放席位 ⇒ 新来者占到席位时不会撞上残留名字键、也收不到本会话的广播。已收敛为「无房」⇒ 释放
+                    # **全部**席位（含换房途中旧房 leave 已删 office_id、却未及释放的旧房席位）：无房 ⇒ 不持任何席位。
+                    # 收敛失败（下方 except）则保留席位——与「会话 / 成员关系可能仍在房」一致，由退房 / 断连回收。
+                    # Seats go last, and all of them: a room-less session holds no seat.
+                    await self._release_seats(sid)
                 except Exception as conv_err:
                     # 收敛不得掩盖原始异常，故只记日志后重抛原始异常。**已知边界**（best-effort）：收敛自身
                     # 失败（socketio 退房 / save 抛错）时该 sid 可能仍留在目标房且会话仍带 office_id——
                     # 两者一致但未清零。此处刻意**不做二次收敛**（重试同一失败路径无收益、可能成环），
                     # 也不上抛（会把「入房失败」误报为别的故障）。
                     logger.error(f"enter_room 失败收敛未完成 sid={sid} room={room}: {conv_err}", exc_info=True)
+            elif claimed_seat:
+                # 旧房离开**未提交** ⇒ 仍是旧房成员（旧房席位照旧归它），只回滚本次新占的目标房席位（归属守卫）。
+                # Old-room leave not committed: still a member there; roll back only the target seat.
+                await self._release_seats(sid, room)
             raise
 
     async def leave_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
@@ -365,6 +355,13 @@ class SMCPNamespace(BaseNamespace):
             del session["office_id"]
         await self.save_session(sid, session)
 
+        # 释放本房席位（#230）：排在名字注销之后（新占席者不会撞上残留名字键），且在会话 ``office_id`` 删除**持久化之后**
+        # ——提前释放会让该房在本会话仍在时放进第二个同 role 会话。注意上面的 ``del`` 改的是实时会话 dict：save 抛错时
+        # 会话已显示无房、席位却未放；该残留由调用方的失败收敛（``enter_room`` 收敛为无房时释放全部席位）或断连回收。
+        # Release this office's seat after the name and after the session save; a failed save is cleaned up by the
+        # caller's convergence (enter_room releases every seat once room-less) or by disconnect.
+        await self._release_seats(sid, room)
+
         # 调用父类方法离开房间（socketio 房名带 ``office:`` 前缀，#216）
         # Call parent method to leave room (prefixed socketio room name, #216)
         await super().leave_room(sid, office_room(room))
@@ -383,7 +380,7 @@ class SMCPNamespace(BaseNamespace):
         - **成功 ⇒ 空 ack**（本方法返回 ``None``，socketio 发零参 ACK）；
         - **失败 ⇒ flat ``ErrorPayload``**：``400``（载荷畸形）/ ``403``（身份声明冲突——本会话声明的
           ``role`` **或** ``name`` 与既有会话不符；改身份须新连接，见 §Server 处理规则）/
-          ``4101``（目标房已有 Agent）/ ``4105``（房内同名）/ ``4106``（Agent 已在其它房）/
+          ``4101``（目标房本 role 席位已占，``details.role``，#230）/ ``4106``（Agent 已在其它房）/
           ``500``（未预期内部异常，笼统文案、原文只进日志）。
         - ``details`` 只含**与发起者自身相关**的上下文（目标房 / 自己声明的 role / 自己当前所在房）。
 
@@ -830,6 +827,7 @@ class SMCPNamespace(BaseNamespace):
             # Registry points at a vanished session: self-heal and answer 404 instead of raising.
             logger.warning(f"{event} 目标 sid={computer_sid} 会话已不存在，注销残留名字并回 404")
             await self._unregister_name(computer_sid)
+            await self._release_seats(computer_sid)  # 死 sid 的席位同样收回（#230）/ its seats too
             return build_computer_not_found_error(computer_name)
         # 不变量守卫：注册表仍指向该 sid、会话却与键矛盾 ⇒ 注册表损坏，显式 raise（#31：隔离不变量只 raise）。
         # Invariant guard: registry still points at the sid but the session contradicts the key → raise (#31).

@@ -323,17 +323,21 @@ async def test_join_office_success():
 
 
 @pytest.mark.asyncio
-async def test_join_office_duplicate_name_raises_error():
+async def test_join_office_seat_taken_raises_error():
     """
-    测试加入房间失败（重名）：服务器回 flat ErrorPayload(4105)，应抛出 RuntimeError。
+    测试加入房间失败（目标房已有 Computer，#230 每 role 一席）：服务器回 flat ErrorPayload(4101)，应抛出 RuntimeError。
 
-    Test join office fails (duplicate name): the server returns a flat ErrorPayload(4105).
+    Test join office fails (the office already has a computer): the server returns a flat ErrorPayload(4101).
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "duplicate_name"
 
     client.call = AsyncMock(
-        return_value={"code": 4105, "message": "Name already taken in room", "details": {"office_id": "office_123"}}
+        return_value={
+            "code": 4101,
+            "message": "Room already has a computer",
+            "details": {"office_id": "office_123", "role": "computer"},
+        }
     )
 
     with pytest.raises(RuntimeError, match="加入房间失败"):
