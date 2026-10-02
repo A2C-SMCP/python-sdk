@@ -18,6 +18,12 @@ dependencies = [
     "aiohttp >=3.12.15,<4.0.0",
     "msgpack >=1.1.0,<2.0.0",
     "watchdog (>=6.0.0,<7.0.0)",
+    # #224：SKILL frontmatter 解析（computer/skills/staging.py `import yaml`）是**运行期硬需求**。
+    #   该 import 自 v0.2.1（21e6016）引入起从未声明为依赖——dev/CI 因 poethepoet 传递带入 pyyaml
+    #   而恒能 import，mypy 又被下方 override 显式豁免，于是坏包一路发到 v0.4.0，使用者干净安装
+    #   跑 `a2c-computer --help` 导入即崩。SKILL 是协议核心通道（非可选能力），故落 core 而非 extra。
+    #   回归守卫：tests/unit_tests/test_packaging_dependencies.py
+    "pyyaml (>=6.0.2,<7.0.0)",
 ]
 
 [project.scripts]
@@ -68,7 +74,10 @@ test = [
     "requests >=2.32.5,<3.0.0",
     "websocket-client >=1.8.0,<2.0.0",
     "pytest-timeout >=2.4.0,<3.0.0",
-    "pytest-rerunfailures >=16.0,<17.0"
+    "pytest-rerunfailures >=16.0,<17.0",
+    # #224：依赖覆盖守卫（test_packaging_dependencies.py）用 Requirement/marker 求值判定
+    #   「干净 pip 安装可达面」。按 #187 依赖卫生约定显式声明，不骑 pytest/hatchling 的传递依赖。
+    "packaging >=24.0,<26.0"
 ]
 build = [
     "bump-my-version>=1.2.4",
@@ -127,6 +136,10 @@ module = [
     "pexpect.*",
     "msgpack",
     "msgpack.*",
+    # yaml：PyYAML **不发类型存根**（需另装 types-PyYAML），故豁免类型检查——这与下方 `keyring` 同因。
+    #   ⚠️ 切勿把本条目理解成「yaml 可以不安装」：#224 正是把这两件事混为一谈——21e6016（v0.2.1 SKILL
+    #   子系统）加了这两行 override 却没把 pyyaml 写进 [project] dependencies，让 mypy 对「未安装」主动
+    #   沉默，坏包由此逃逸到 v0.4.0。依赖声明在 [project] dependencies，守卫在 test_packaging_dependencies.py。
     "yaml",
     "yaml.*",
     "keyring",

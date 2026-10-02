@@ -1,10 +1,12 @@
 # 文件名: tests.yml / File name: tests.yml
 # 作者: JQQ / Author: JQQ
 # 创建日期: 2025/09/26 / Created: 2025/09/26
-# 最后修改日期: 2025/11/20 / Last Modified: 2025/11/20
+# 最后修改日期: 2026/09/29 / Last Modified: 2026/09/29
 # 版权: 2023 JQQ. All rights reserved. / Copyright: 2023 JQQ. All rights reserved.
 # 依赖: GitHub Actions, Python 3.11, uv, poethepoet / Deps: GitHub Actions, Python 3.11, uv, poethepoet
-# 描述: 普通测试工作流，安装依赖后运行 `poe test` / Description: Regular test workflow that installs deps then runs `poe test`
+# 描述: 普通测试工作流，安装依赖后运行 `poe test`；另含干净安装冒烟 job（#224）
+#       Description: Regular test workflow that installs deps then runs `poe test`;
+#       plus a clean-install smoke job (#224).
 
 name: Tests
 
@@ -75,3 +77,48 @@ jobs:
       #   with:
       #     name: coverage-report
       #     path: coverage* || .coverage* || htmlcov
+
+  # ── 干净安装冒烟 / Clean-install smoke (#224) ──────────────────────────────
+  # 上面那个 test job 装的是 `uv sync --group dev --group test --extra cli`，其中 dev 组的 poethepoet
+  # **传递依赖 pyyaml**。于是「源码 import 了未声明的包」在这个环境里永远当不成问题 —— 这正是 #224
+  # 从 v0.2.1 一路逃逸到 v0.4.0 的通道（使用者在干净 pipx 环境跑 `a2c-computer --help` 直接
+  # ModuleNotFoundError）。注意它只装了 cli extra：`keyring` 等其它 extra 的成员在 CI 里**并不存在**，
+  # 故单元守卫不能靠「已安装」判定声明合规（见 test_packaging_dependencies.py 的判据说明）。
+  #
+  # 本 job 只装**发布件自己声明的依赖**（core + 指定 extra），复现真实用户的安装面。
+  # 与 tests/unit_tests/test_packaging_dependencies.py 互补：单元守卫管「源码 import 未声明」，
+  # 本 job 管制品级缺陷（入口点 / 包数据 / 元数据等）。
+  #
+  # The test job above runs `uv sync --group dev --group test --extra cli`, and dev's poethepoet pulls
+  # pyyaml transitively — so an undeclared import can never fail there. That is exactly how #224
+  # reached v0.4.0. Note it installs only the cli extra: members of other extras (keyring) are absent
+  # in CI, so a unit guard must not judge declaration compliance by "is it installed".
+  # This job installs only what the artifact itself declares, reproducing a real user's env.
+  clean-install-smoke:
+    name: Clean-install smoke (declared deps only)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Python 3.11
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build wheel
+        run: uv build
+
+      # 装 [cli] 而非纯 core：文档指引 Computer 使用者装 `a2c-smcp[cli]`，
+      # 且 #224 报告者正是注入了 prompt-toolkit/rich/typer 后用 CLI —— 这是最接近真实用户的安装面。
+      # 冒烟脚本与 publish.yml **单点复用**（两处逐字复制会静默漂移，使上传前那道闸门失效）。
+      # Install [cli] rather than bare core (the documented Computer install, and the surface #224's
+      # reporter ended up with). The smoke script is shared with publish.yml so the two gates cannot
+      # drift apart.
+      - name: Clean-install smoke test
+        run: scripts/clean_install_smoke.sh "$PWD"/dist/*.whl cli

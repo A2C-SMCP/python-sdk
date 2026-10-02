@@ -281,6 +281,37 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   > 目标房后收敛为无房；换房的 Computer 此时已退掉旧房。前移会让 relay 在「注册表已指向、会话尚无 `office_id`」
   > 的窗口里误报注册表损坏（#213），故刻意保留。
 
+### Fixed（#224 打包依赖 —— 干净安装可用性）
+
+- **`pyyaml` 未声明为运行时依赖，干净安装下 Computer CLI 导入即崩**（#224）：`pip install a2c-smcp`
+  后执行 `a2c-computer --help` 在导入阶段抛 `ModuleNotFoundError: No module named 'yaml'`
+  （`computer/skills/staging.py` 的模块级 `import yaml`），Computer CLI 完全不可用。
+  - **根因**：该 `import` 自 v0.2.1（commit `21e6016`，SKILL 子系统）引入起就是**运行期硬需求**，
+    但 `pyyaml` 从未写进 `[project] dependencies`。同一提交只给 mypy 加了 `yaml` / `yaml.*` 的
+    `ignore_missing_imports` —— 把「库无类型存根」误当成「库可不安装」，让静态检查对「未安装」主动沉默。
+    dev / CI 环境因 `poethepoet`（dev 组）传递依赖 pyyaml 而**恒能 import**，故本地与 CI 从不复现；
+    坏包形状自 v0.2.1 起未变，一路发布至 v0.4.0 才由使用者在干净 pipx 环境暴露。
+  - **修复**：`pyyaml (>=6.0.2,<7.0.0)` 落入 **`[project] dependencies`（core，非 extra）**——SKILL 是
+    协议核心通道（非可选能力），`parse_skill_frontmatter` 由 `Computer.boot_up()` 的**库路径**调用，
+    与 CLI 无关，塞进 `cli` extra 只能修一半。对称的 rust-sdk 同样把 `serde_yaml_ng` 声明在
+    `crates/smcp-computer` 的依赖里。
+    > 未走「自写极简 frontmatter 解析器」路线：frontmatter 非扁平结构，`tags`（`list[str]`）/
+    > `allowed-tools`（`list`）/ `metadata`（`dict`）均需覆盖，且偏离协议「YAML frontmatter」措辞。
+  - **回归守卫**：新增 `tests/unit_tests/test_packaging_dependencies.py`——断言源码中每个第三方顶层
+    import 都有一条**声明路径**（先按 import 名直配声明面，未中再按发行包映射回落，以兼容
+    `yaml → pyyaml` 这类改名；只用后者会把「已声明但当前环境未装」的可选依赖如 `keyring` 误判违规）。
+    含正对照（防「扫不到东西」的假绿）、marker 求值不变量（PEP 508 marker 必须以 `extra=""` 求值，
+    否则会顺着 `mcp → starlette → "pyyaml ; extra == 'full'"` 误判可达，对本 bug 假绿），
+    以及 `pyyaml` 必须落 **core** 的单点回归锁（通用守卫不区分 core / extra，无法阻止它被挪进 extra）。
+    另有一条「已声明但当前环境未装」的回归锁：CI 的 `uv sync --group dev --group test --extra cli`
+    只装 cli extra，`keyring` 等其它 extra 成员**并不在场**，故判据必须是「声明面直配」而非
+    「已在环境中安装」——否则守卫会在 CI 恒红并把维护者引向错误的修法。上述每条断言均以变异验证
+    （逐个反向改动后确认其真的会红）。
+  - **CI 纵深**：`tests.yml` 新增 `clean-install-smoke` job（空 venv 只装制品声明的依赖后跑
+    `a2c-computer --help` + 断言导入来源为制品而非仓库源码）；`publish.yml` 在**上传制品前**调用同款冒烟
+    ——此前 publish job 只 `uv build`（隔离环境里连包本体都不安装），制品从未被验证过，
+    正是「坏包直达 PyPI」的通道。两处共用 `scripts/clean_install_smoke.sh` 单一来源，防止漂移。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

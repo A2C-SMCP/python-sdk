@@ -1,7 +1,7 @@
 # 文件名: publish.yml / File name: publish.yml
 # 作者: JQQ / Author: JQQ
 # 创建日期: 2025/09/26 / Created: 2025/09/26
-# 最后修改日期: 2025/11/20 / Last Modified: 2025/11/20
+# 最后修改日期: 2026/09/29 / Last Modified: 2026/09/29
 # 版权: 2023 JQQ. All rights reserved. / Copyright: 2023 JQQ. All rights reserved.
 # 依赖: GitHub Actions, Python 3.11, uv, pypa/gh-action-pypi-publish / Deps: GitHub Actions, Python 3.11, uv, pypa/gh-action-pypi-publish
 # 描述:
@@ -66,6 +66,15 @@ jobs:
       - name: Build sdist and wheel
         run: |
           uv build
+
+      # #224：上传制品**前**的干净安装冒烟 —— 此前本 job 只 `uv build`（隔离环境里连包本体都不安装），
+      # 制品从未被验证过，「坏包直达 PyPI」的通道正是这里。v0.4.0 的 `import yaml` 未声明依赖
+      # 即由此逃逸；本步骤把它挡在上传之前。脚本与 tests.yml **单点复用**。
+      # #224: clean-install smoke BEFORE uploading artifacts. This job previously only ran
+      # `uv build` (which does not even install the package), so a broken artifact reached PyPI
+      # unverified — exactly how v0.4.0 shipped with an undeclared `import yaml`. Shared script.
+      - name: Clean-install smoke test
+        run: scripts/clean_install_smoke.sh "$GITHUB_WORKSPACE"/dist/*.whl cli
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v5
