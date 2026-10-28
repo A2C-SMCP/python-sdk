@@ -76,7 +76,9 @@ _OS_PREAD: Callable[[int, int, int], bytes] | None = getattr(os, "pread", None)
 
 # Windows 最终路径复核失败告警限频 / Rate-limited warning for Windows final-path failures.
 _WIN_FINAL_PATH_WARN_INTERVAL_SECONDS: float = 300.0
-_win_final_path_warn_last: float = 0.0
+# 哨兵必须与 time.monotonic() 同源（自开机计时）；0.0 会在 uptime<300s 的宿主吞掉首次告警。
+# Sentinel must share the time.monotonic() epoch; 0.0 suppresses the first warning on fresh hosts.
+_win_final_path_warn_last: float = float("-inf")
 
 # Win32 错误码：文件 / 路径在打开后被删除 / Win32 errors: file/path deleted after open.
 _WIN_ERROR_FILE_NOT_FOUND: int = 2
@@ -243,6 +245,11 @@ def build_protected_paths(
         **re-stat** 为准。workdir 级配置（``<cwd>/.tfrobot`` 的 settings / mcp.json）、
         SKILL Home、blob 缓存根、flag settings / mcp 由接线层经 ``extra_paths`` 注入；
         默认集覆盖 SDK 全局位置：config / state / keyring / policy managed 目录。
+
+        目录形态的保护只做**路径前缀**；硬链接身份兜底只覆盖以**文件**形式进入 ``protected.paths``
+        的项。调用方若需要目录内文件的硬链接防御（如 ``.tfrobot`` 的 settings.json /
+        settings.local.json / mcp.json / inputs），MUST 把这些具体文件与目录一并注入
+        ``extra_paths``——仅注入目录不会获得 file-id 兜底。
     """
     pf: PathPlatform = native_platform() if platform is None else platform
     environ: Mapping[str, str] = os.environ if env is None else env
@@ -647,7 +654,8 @@ def _matches_protected_file_identity(
 
     先查构建期快照 ``file_ids``，再对 ``protected.paths`` 中当前为 regular file 的项
     **re-stat**（覆盖 ``os.replace`` 原子重写后 inode 变化——settings / input-values 是高频
-    重写对象）。目录项会 stat 失败或非 regular，自动跳过。
+    重写对象）。目录项本身是 regular file 判定为否，自动跳过；因此**目录内文件的硬链接**
+    需要调用方把该文件也作为候选注入（见 :func:`build_protected_paths` Note）。
     """
     identity = (fst.st_dev, fst.st_ino)
     if identity in protected.file_ids:

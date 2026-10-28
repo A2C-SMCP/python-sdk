@@ -17,6 +17,7 @@ import hashlib
 import importlib
 import os
 import threading
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -653,6 +654,37 @@ class TestFstatErrorMapping:
             resolve_for_pull(payload, roots, protected=ProtectedPaths())
 
 
+class _FakeCtypesFunc:
+    """可设置 argtypes / restype 的 fake ctypes 函数 / Fake ctypes function with argtypes."""
+
+    def __init__(self, impl: Any) -> None:
+        self._impl = impl
+        self.argtypes: list[Any] = []
+        self.restype: Any = None
+
+    def __call__(self, *args: Any) -> Any:
+        return self._impl(*args)
+
+
+def _install_windows_ctypes(monkeypatch: pytest.MonkeyPatch, func: Any) -> None:
+    """安装 fake ctypes/wintypes/msvcrt 并把 os.name 切到 nt / Install fake Windows ctypes stack."""
+    class _FakeBuffer:
+        def __init__(self, size: int) -> None:
+            self.size = size
+            self.value = ""
+
+    fake_ctypes = types.SimpleNamespace(
+        WinDLL=lambda name, use_last_error=False: types.SimpleNamespace(GetFinalPathNameByHandleW=func),
+        create_unicode_buffer=_FakeBuffer,
+        get_last_error=lambda: 5,
+    )
+    fake_wintypes = types.SimpleNamespace(HANDLE=lambda x: x, LPWSTR=object, DWORD=int)
+    fake_msvcrt = types.SimpleNamespace(get_osfhandle=lambda fd: 1234)
+    fake_modules = {"ctypes": fake_ctypes, "ctypes.wintypes": fake_wintypes, "msvcrt": fake_msvcrt}
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(importlib, "import_module", lambda name: fake_modules[name])
+
+
 class TestWindowsFinalPath:
     """Windows ``GetFinalPathNameByHandleW`` 分支（helper 可 mock，任意 OS 可测）."""
 
@@ -696,20 +728,64 @@ class TestWindowsFinalPath:
 
         fake_get = _FakeGetFinalPath()
         kernel32 = types.SimpleNamespace(GetFinalPathNameByHandleW=fake_get)
+        seen_win_dll: list[tuple[str, bool]] = []
+        seen_fds: list[int] = []
+
+        def fake_windll(name: str, use_last_error: bool = False) -> Any:
+            seen_win_dll.append((name, use_last_error))
+            return kernel32
+
+        def fake_get_osfhandle(fd: int) -> int:
+            seen_fds.append(fd)
+            return 1234
+
         fake_ctypes = types.SimpleNamespace(
-            WinDLL=lambda name, use_last_error=False: kernel32,
+            WinDLL=fake_windll,
             create_unicode_buffer=_FakeBuffer,
             get_last_error=lambda: 5,
         )
         fake_wintypes = types.SimpleNamespace(HANDLE=lambda x: x, LPWSTR=object, DWORD=int)
-        fake_msvcrt = types.SimpleNamespace(get_osfhandle=lambda fd: 1234)
+        fake_msvcrt = types.SimpleNamespace(get_osfhandle=fake_get_osfhandle)
         fake_modules = {"ctypes": fake_ctypes, "ctypes.wintypes": fake_wintypes, "msvcrt": fake_msvcrt}
         monkeypatch.setattr(importlib, "import_module", lambda name: fake_modules[name])
 
         assert _windows_final_path(7) == "\\\\?\\C:\\Users\\u\\a.txt"
+        assert seen_win_dll == [("kernel32", True)]
+        assert seen_fds == [7]
         assert fake_get.calls == [(1234, 32768, 0), (1234, 40001, 0)]
         assert fake_get.argtypes == [fake_wintypes.HANDLE, fake_wintypes.LPWSTR, fake_wintypes.DWORD, fake_wintypes.DWORD]
         assert fake_get.restype is fake_wintypes.DWORD
+
+    def test_ctypes_body_retry_zero_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """重试后第二次返回 0 → OSError（不只首调检查）."""
+        calls: list[int] = []
+
+        def impl(handle: int, buf: Any, size: int, flags: int) -> int:
+            calls.append(size)
+            if len(calls) == 1:
+                return 40000
+            return 0
+
+        _install_windows_ctypes(monkeypatch, _FakeCtypesFunc(impl))
+        with pytest.raises(OSError) as exc_info:
+            _windows_final_path(7)
+        assert exc_info.value.errno == 5
+        assert calls == [32768, 40001]
+
+    def test_ctypes_body_exactly_size_retries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """首调恰返回 size（n>=size 边界）→ 必须重试."""
+        calls: list[int] = []
+
+        def impl(handle: int, buf: Any, size: int, flags: int) -> int:
+            calls.append(size)
+            if len(calls) == 1:
+                return size  # 边界：恰等于 buffer 长度
+            buf.value = "\\\\?\\C:\\x"
+            return len(buf.value)
+
+        _install_windows_ctypes(monkeypatch, _FakeCtypesFunc(impl))
+        assert _windows_final_path(7) == "\\\\?\\C:\\x"
+        assert calls == [32768, 32769]
 
     def test_ctypes_body_raises_on_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """ctypes 体：API 返回 0 → OSError(win32 error)."""
@@ -728,9 +804,10 @@ class TestWindowsFinalPath:
             _windows_final_path(1)
         assert exc_info.value.errno == 5
 
-    def test_deleted_win32_error_is_forbidden(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("win_error", [2, 3])
+    def test_deleted_win32_error_is_forbidden(self, monkeypatch: pytest.MonkeyPatch, win_error: int) -> None:
         def deleted(fd: int) -> str:
-            raise OSError(2, "file not found")
+            raise OSError(win_error, "file or path not found")
 
         monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver._windows_final_path", deleted)
         with pytest.raises(PathResolveError) as exc_info:
@@ -755,7 +832,12 @@ class TestWindowsFinalPath:
         assert _reason(exc_info) == "forbidden"
 
     def test_windows_failure_warns_rate_limited(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver._win_final_path_warn_last", 0.0)
+        """默认哨兵为 -inf：uptime<300s 的宿主首次也告警；同刻抑制、>300s 再次告警."""
+        import a2c_smcp.computer.blob.path_resolver as path_resolver_module
+
+        assert path_resolver_module._win_final_path_warn_last == float("-inf")
+        now = [100.0]
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
         warnings: list[str] = []
 
         def fake_warning(message: str, *args: object) -> None:
@@ -764,11 +846,19 @@ class TestWindowsFinalPath:
         def boom(fd: int) -> str:
             raise OSError(5, "boom")
 
-        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver.logger.warning", fake_warning)
-        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver._windows_final_path", boom)
-        assert _fd_final_path(0, "windows") is None
+        monkeypatch.setattr(path_resolver_module.logger, "warning", fake_warning)
+        monkeypatch.setattr(path_resolver_module, "_windows_final_path", boom)
+
+        # 首次（模拟 uptime=100s）必须告警 / first call at uptime 100s must warn
         assert _fd_final_path(0, "windows") is None
         assert len(warnings) == 1
+        # 同刻再次失败：限频抑制 / same instant: suppressed
+        assert _fd_final_path(0, "windows") is None
+        assert len(warnings) == 1
+        # 超过 300s 后再次告警 / after >300s: warn again
+        now[0] += 301.0
+        assert _fd_final_path(0, "windows") is None
+        assert len(warnings) == 2
         assert "final-path recheck failed" in warnings[0]
 
 
