@@ -62,6 +62,16 @@ from a2c_smcp.computer.blob import (
     ToolspoolBlobStore,
     default_thresholds,
 )
+from a2c_smcp.computer.blob.path_resolver import (
+    ProtectedPaths,
+    ReadRoot,
+    ResolvedPath,
+    PathPullResult,
+    build_protected_paths,
+    build_read_roots,
+    resolve_for_pull,
+    resolve_path,
+)
 from a2c_smcp.computer.desktop.organize import organize_desktop
 from a2c_smcp.computer.inputs.render import ConfigRender, collect_referenced_input_ids, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
@@ -107,7 +117,8 @@ from a2c_smcp.computer.settings.recovery import (
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.schema import FIELD_READ_ROOTS, SettingsScope
+from a2c_smcp.computer.settings.scope import TFROBOT_DIRNAME
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
     SkillEventDebouncer,
@@ -353,6 +364,8 @@ class Computer(BaseComputer[PromptSession]):
         # v0.4.0 #196：client:put_blob 上行会话 store + landingRoot（lazy；见 landing_root / blob_upload_store）
         self._blob_upload_store: BlobUploadStore | None = None
         self._landing_root: Path | None = None
+        # v0.5.0 #236 / protocol#65：client:resolve_path 授权读根（lazy；已配置时缓存，见 read_roots）
+        self._read_roots: list[ReadRoot] | None = None
         self._blob_upload_lock = threading.Lock()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
@@ -444,6 +457,121 @@ class Computer(BaseComputer[PromptSession]):
                     return candidate  # 未配置：不缓存（与 landing_root 热启用语义对齐）
                 self._blob_upload_store = candidate
             return self._blob_upload_store
+
+    # ------------------------
+    # 按路径读取 / Read-by-path (v0.5.0 #236 / protocol#65)
+    # ------------------------
+    @property
+    def read_roots(self) -> list[ReadRoot]:
+        """``client:resolve_path`` 的授权读根（settings 键 ``readRoots``，config-first）。
+
+        Authorized read roots for ``client:resolve_path`` (settings key ``readRoots``).
+
+        协议依据 / Protocol: ``security.md`` §读取通道安全；``blob-transfer.md`` §生产者三：按路径读取.
+        **默认空 = 不可读（fail-closed）**；仅受信 scope 可设（project 供给已在
+        :data:`~a2c_smcp.computer.settings.schema.TRUSTED_SCOPE_ONLY_FIELDS` 被整字段剔除），
+        跨 scope 按数组语义**拼接去重**（授权只增不减）。
+
+        与 :attr:`landing_root` 同款热启用语义：**已配置时进程内缓存**（运行期改值需重启 Computer），
+        未配置时每次重查，允许事后补配置即时生效。非法的单项（``build_read_roots`` 静默丢弃）
+        与 realpath 失败的根在此记 WARNING 诊断——逐项配置诊断另经 settings 校验错误通道呈现。
+        Cached once configured; unset re-queries (hot-enable friendly). Invalid / realpath-failed
+        roots are logged here; per-item config diagnostics surface via the settings error channel.
+        """
+        if self._read_roots:
+            return self._read_roots
+        raw = self._resolve_declared_settings().settings.get(FIELD_READ_ROOTS)
+        if not isinstance(raw, list) or not raw:
+            return []  # 未配置：不缓存（与 landing_root 热启用语义对齐）/ unset: not cached
+        compiled = build_read_roots([item for item in raw if isinstance(item, str)])
+        for root in compiled:
+            if root.real is None:
+                logger.warning(
+                    f"readRoots 根 {root.configured!r} 的 realpath 解析失败，仅保留配置形态 / "
+                    f"realpath failed for read root {root.configured!r}; configured form kept only",
+                )
+        if len(compiled) < len(raw):
+            logger.warning(
+                f"readRoots 有 {len(raw) - len(compiled)} 项无法编译为规范路径（非法项已忽略）/ "
+                f"{len(raw) - len(compiled)} readRoots item(s) dropped as invalid",
+            )
+        self._read_roots = compiled
+        return compiled
+
+    def protected_paths(self) -> ProtectedPaths:
+        """固定拒绝集：即便位于 ``readRoots`` 内也拒绝的 SDK 自管位置（每次现算）。
+
+        Fixed rejection set: SDK-managed locations refused even inside ``readRoots``.
+
+        协议依据 / Protocol: ``blob-transfer.md`` §固定拒绝集；``security.md`` §读取通道安全（零凭证传播）.
+        默认集（SDK config / state 目录，覆盖 settings / ``computer-id`` / input 值缓存）由
+        :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 计算；本方法只注入
+        **接线层已知的额外位置**——flag settings 文件、工作目录治理目录（``.tfrobot``：settings /
+        mcp.json / inputs）、SKILL Home、blob 缓存根。``landing_root`` 单独传入以获得 ``.part`` 规则。
+
+        每次现算（不缓存）：``landing_root`` 热启用、``.tfrobot`` 随 cwd 变化、文件身份
+        (``dev``/``ino``) 需反映当前文件系统状态.
+        Recomputed per call: landing root may be hot-enabled, and file identities must be current.
+        """
+        extra: list[str] = [str(self._blob_cache_root), str(self.skill_home)]
+        if self._flag_settings_path is not None:
+            extra.append(str(self._flag_settings_path))
+        # project/local 治理目录随 cwd 走（#116 单 cwd 锚点）；与 resolve_settings 同源回退.
+        cwd = self._resolve_cwd() or Path(os.getcwd())
+        extra.append(str(cwd / TFROBOT_DIRNAME))
+        landing = self.landing_root
+        return build_protected_paths(
+            extra_paths=extra,
+            landing_root=str(landing) if landing is not None else None,
+            env=self._resolve_env(),
+        )
+
+    def resolve_read_path(self, path: str) -> ResolvedPath:
+        """按协议九步管线解析一个本地路径并**现铸** ``blob_handle``（v0.5.0 #236）。
+
+        Run the protocol's nine-step pipeline and mint a ``blob_handle``.
+
+        协议依据 / Protocol: ``blob-transfer.md`` §Computer 处理流程；``error-handling.md`` §4020.
+        顺序 MUST：``normalize_path``（``..`` 词法先消解）→ ``readRoots`` 空 / 词法围栏（不访问文件
+        系统）→ 非严格 realpath 围栏 → 固定拒绝集 → ``lstat`` 类型预检 → 非阻塞打开 + ``fstat`` →
+        同一句柄 stat / sha256 → 铸造句柄。**越界判定先于存在性探测**，故 ``readRoots`` 之外的路径
+        一律 ``forbidden``、不泄露存在性。
+
+        Args:
+            path: Agent 给出的 Computer 本地绝对路径（原生或 canonical ``/C:/...`` 形态）.
+
+        Returns:
+            ResolvedPath: ``canonical_path`` / ``blob_handle`` / ``mime_type`` / ``total_size`` /
+                ``sha256`` / ``mtime``（epoch ms）.
+
+        Raises:
+            PathResolveError: ``reason`` ∈ ``invalid_path`` / ``forbidden`` / ``not_found`` /
+                ``not_a_file``（接线层映射为 ``4020`` 扁平 ErrorPayload）.
+        """
+        return resolve_path(path, self.read_roots, protected=self.protected_paths())
+
+    def pull_path_blob(self, handle_payload: Mapping[str, Any]) -> PathPullResult:
+        """``client:get_blob`` 解析 ``kind=path`` 句柄：按**当前**授权与文件系统状态复核。
+
+        Revalidate a ``kind=path`` handle at pull time against the *current* authorization.
+
+        协议依据 / Protocol: ``blob-transfer.md`` §Computer 处理流程（拉取期复核）；§生产者三.
+        重跑围栏 / 固定拒绝集 / 权限校验并按**当前** ``readRoots`` 判定：越界或撤权 →
+        ``BlobHandleForbiddenError``；删除 / 非普通文件 / stat 键不符（已改写）→
+        ``BlobHandleGoneError``；句柄结构非法 → ``BlobHandleInvalidError``（接线层统一映射 ``4018``）。
+        ``sha256`` / ``total_size`` 取句柄内值、**不重算**；字节从**复核时的同一打开句柄**读取。
+
+        ⚠️ 返回值持有已打开的文件句柄——调用方 **MUST** 在 ``finally`` 中 :meth:`PathPullResult.close`，
+        否则 fd 泄漏（GC 兜底不足以应对高频拉取）。
+        The returned object owns an open handle; callers MUST ``close()`` it in ``finally``.
+
+        Args:
+            handle_payload: ``decode_blob_handle`` 得到的 ``kind=path`` 载荷.
+
+        Returns:
+            PathPullResult: 复核通过的元数据 + :meth:`~PathPullResult.slice` 惰性读取能力.
+        """
+        return resolve_for_pull(handle_payload, self.read_roots, protected=self.protected_paths())
 
     def mint_toolspool_handle(self, payload: bytes, mime: str) -> str:
         """铸造 ``kind=toolspool`` 不透明句柄并写盘 / Mint an opaque ``kind=toolspool`` handle.

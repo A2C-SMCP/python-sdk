@@ -7,7 +7,7 @@ import asyncio
 import base64
 import hashlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypeAlias, cast
 
 from mcp.types import CallToolResult, Resource
@@ -21,6 +21,12 @@ from a2c_smcp.computer.blob import (
     decode_blob_handle,
     encode_skill_handle,
 )
+
+# ``HANDLE_KIND_PATH`` 目前由 path core（#236 流 1）定义在 ``blob/handle.py``，尚未经 ``blob/__init__``
+# 再导出；直接按模块路径导入，待 70 加导出后可改回包级导入（行为等价）。
+# HANDLE_KIND_PATH lives in blob/handle.py and is not yet re-exported by the package.
+from a2c_smcp.computer.blob.handle import HANDLE_KIND_PATH
+from a2c_smcp.computer.blob.path_resolver import PathResolveError
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import GetSkillRet as GetSkillRetModel
@@ -38,6 +44,7 @@ from a2c_smcp.smcp import (
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -68,6 +75,8 @@ from a2c_smcp.smcp import (
     PutBlobReq,
     PutBlobRet,
     ResourceAnnotations,
+    ResolvePathReq,
+    ResolvePathRet,
     ToolCallReq,
     UpdateComputerConfigReq,
 )
@@ -208,6 +217,8 @@ class SMCPComputerClient(AsyncClient):
         self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
         self.on(GET_RESOURCES_EVENT, self.on_get_resources, namespace=self._namespace)
         self.on(GET_BLOB_EVENT, self.on_get_blob, namespace=self._namespace)
+        # v0.5.0 按路径读取（protocol#65）：blob_handle 的第三个生产者 / read-by-path (#236)
+        self.on(RESOLVE_PATH_EVENT, self.on_resolve_path, namespace=self._namespace)
         # v0.4.0 上行写入通道 / upload write channel (#196)
         self.on(PUT_BLOB_EVENT, self.on_put_blob, namespace=self._namespace)
         # v0.2.1 SKILL 通道发现 / 渐进式披露 / SKILL channel discovery & progressive disclosure (#66)
@@ -1239,6 +1250,33 @@ class SMCPComputerClient(AsyncClient):
         # eliminating dual-maintenance of equivalent sync/async handler bodies (PR #52 fix-review).
         return _process_get_blob(data, self.computer)
 
+    async def on_resolve_path(self, data: ResolvePathReq) -> ResolvePathRet | ErrorPayload:
+        """
+        按路径读取 / Read by path（``client:resolve_path``，v0.5.0 #236 / protocol#65）.
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md §client:resolve_path；
+        blob-transfer.md §生产者三：按路径读取；security.md §读取通道安全。
+
+        语义 / Semantics：Agent 给出 Computer 本地路径 → ``normalize_path`` → ``readRoots`` 围栏 →
+        非严格 realpath 围栏 → 固定拒绝集 → 类型预检 → 非阻塞打开 → 同一句柄 stat/sha256 →
+        **现铸** ``blob_handle``。字节仍由 ``client:get_blob`` 拉取（本事件不传字节）。
+        授权边界 = settings ``readRoots``（**默认空 = 不可读**）；越界判定先于存在性探测，
+        ``readRoots`` 之外的路径一律 ``forbidden``、不泄露存在性。
+
+        错误语义（flat ErrorPayload，经 Socket.IO ack 第一参回传，无嵌套 envelope）/
+        Errors (flat ErrorPayload, no nested envelope): ``4020`` ``details.reason`` ∈
+        ``invalid_path`` / ``forbidden`` / ``not_found`` / ``not_a_file``（开放枚举）。
+
+        Args:
+            data (ResolvePathReq): ``computer`` / ``path`` / ``req_id``。
+
+        Returns:
+            ResolvePathRet | ErrorPayload: 成功为规范路径 + 元数据 + 现铸句柄，失败为 flat 4020。
+        """
+        # 与 on_get_blob 同款抽取：模块级纯同步核心（_process_resolve_path），同步 wire 测试复用。
+        # Same extraction as on_get_blob: module-level sync core shared with sync wire tests.
+        return _process_resolve_path(data, self.computer)
+
     async def on_put_blob(self, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
         """
         上行写入单块处理 / Upload-write chunk handling（``client:put_blob``，v0.4.0 #196）.
@@ -1410,6 +1448,126 @@ def _blob_error(*, reason: str) -> ErrorPayload:
     )
 
 
+def _path_error(*, reason: str) -> ErrorPayload:
+    """构造 ``4020 Path Not Accessible`` flat ErrorPayload，``reason`` 经 ``details`` 下沉。
+    Build ``4020`` flat ErrorPayload with ``reason`` under ``details`` (error-handling.md §4020).
+    """
+    return ErrorPayload(
+        code=int(ErrorCode.PATH_NOT_ACCESSIBLE),
+        message="Path not accessible",
+        details={"reason": reason},
+    )
+
+
+def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePathRet | ErrorPayload:
+    """``client:resolve_path`` 的纯同步核心逻辑（v0.5.0 #236 / protocol#65）。
+
+    Pure synchronous core for ``client:resolve_path``.
+
+    抽取模式与 :func:`_process_get_blob` 一致：同步 ``socketio.Client`` wire 测试 mock 与 async
+    :meth:`SMCPComputerClient.on_resolve_path` 复用同一份实现。完整协议 / 安全 / 错误语义文档保留在
+    async wrapper 上。
+
+    Args:
+        data: ``ResolvePathReq`` payload（``computer`` / ``path`` / ``req_id``）。
+        computer: 持有 ``name`` / ``read_roots`` / ``resolve_read_path`` 的 ``Computer`` 实例。
+
+    Returns:
+        ``ResolvePathRet``（成功）或 ``ErrorPayload``（``4020`` 四 reason）。
+
+    Raises:
+        SMCPNamespaceError: ``computer.name`` 与 ``data["computer"]`` 不匹配（防御纵深，理论不可达）。
+    """
+    if computer.name != data["computer"]:
+        raise SMCPNamespaceError("计算机标识不匹配")
+
+    # fail-closed 显式守卫（协议第 2 步）：``readRoots`` 为空一律 forbidden，且**不触碰文件系统**。
+    # 与 path core 的管线重复一层是刻意的防御纵深——授权缺省值必须在接线层也成立，不能只依赖下游。
+    # Explicit fail-closed guard (protocol step 2): empty readRoots is forbidden before any FS access.
+    if not computer.read_roots:
+        logger.warning("client:resolve_path 拒绝：readRoots 未配置（默认不可读）/ no readRoots configured")
+        return _path_error(reason="forbidden")
+
+    try:
+        resolved = computer.resolve_read_path(data["path"])
+    except PathResolveError as exc:
+        logger.warning(f"client:resolve_path 拒绝：reason={exc.reason} path={data['path']!r}")
+        return _path_error(reason=exc.reason)
+
+    return ResolvePathRet(
+        canonical_path=resolved.canonical_path,
+        blob_handle=resolved.blob_handle,
+        mime_type=resolved.mime_type,
+        total_size=resolved.total_size,
+        sha256=resolved.sha256,
+        mtime=resolved.mtime,
+        req_id=data["req_id"],
+    )
+
+
+def _process_path_get_blob(data: GetBlobReq, computer: Computer, payload: Mapping[str, Any]) -> GetBlobRet | ErrorPayload:
+    """``client:get_blob`` 的 ``kind=path`` 分支：拉取期复核 + 切片（v0.5.0 #236 / protocol#65）。
+
+    Pull-time branch for ``kind=path`` handles: revalidate against the *current* ``readRoots``
+    and filesystem state, then slice from the **same opened handle**.
+
+    协议依据 / Protocol: blob-transfer.md §Computer 处理流程（拉取期复核）；§生产者三.
+    错误映射（``4018`` 枚举不变）/ Error mapping (4018 enum unchanged)：
+      - 越界 / 撤权 / 命中固定拒绝集 / 其余打开错误 → ``BlobHandleForbiddenError`` → ``forbidden``
+      - 删除 / 非普通文件 / stat 键不符（已改写）→ ``BlobHandleGoneError`` → ``gone``
+      - 句柄结构非法 → ``BlobHandleInvalidError`` → ``invalid_handle``
+      - ``chunk_offset`` 越界 → ``range``
+
+    ⚠️ ``PathPullResult`` 持有已打开句柄：本函数在 ``finally`` 中 ``close()``（幂等），
+    覆盖 range 早退与正常返回两条路径——GC 兜底不足以应对高频拉取。
+
+    Args:
+        data: ``GetBlobReq`` payload.
+        computer: 持有 ``pull_path_blob`` / ``blob_thresholds`` 的 ``Computer``.
+        payload: ``decode_blob_handle`` 得到的 ``kind=path`` 载荷（**不**被信任）。
+
+    Returns:
+        ``GetBlobRet``（成功）或 ``ErrorPayload``（``4018``）。
+    """
+    chunk_offset = data.get("chunk_offset", 0)
+    max_chunk_bytes = computer.blob_thresholds.clamp_chunk(data.get("max_chunk_bytes"))
+
+    # 复核在 try 之外：失败时尚未打开句柄（或已由 path core 内部释放），无需 close。
+    # Revalidation happens before the try: on failure no handle is owned by us.
+    try:
+        pull = computer.pull_path_blob(payload)
+    except BlobHandleError as exc:
+        reason = getattr(exc, "reason", "forbidden")
+        logger.warning(f"client:get_blob path handle rejected: {reason}: {exc}")
+        return _blob_error(reason=reason)
+
+    try:
+        if not isinstance(chunk_offset, int) or chunk_offset < 0 or chunk_offset > pull.total_size:
+            logger.warning(
+                f"client:get_blob range out of bounds (path): offset={chunk_offset}, total_size={pull.total_size}",
+            )
+            return _blob_error(reason="range")
+        remaining = pull.total_size - chunk_offset
+        slice_len = min(max_chunk_bytes, remaining)
+        chunk = pull.slice(chunk_offset, slice_len)
+        # eof 用 len(chunk) 形式（与 _process_get_blob 一致；对短读健壮）
+        # eof uses len(chunk) like the generic path (short-read robust).
+        eof = chunk_offset + len(chunk) == pull.total_size
+        ret: GetBlobRet = {
+            "blob_handle": data["blob_handle"],
+            "mime_type": pull.mime_type,
+            "total_size": pull.total_size,
+            "sha256": pull.sha256,
+            "chunk_offset": chunk_offset,
+            "eof": eof,
+            "blob": base64.b64encode(chunk).decode("ascii"),
+            "req_id": data["req_id"],
+        }
+        return ret
+    finally:
+        pull.close()
+
+
 def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | ErrorPayload:
     """通用二进制拉取的纯同步核心逻辑 / Pure synchronous core logic for ``client:get_blob``.
 
@@ -1450,6 +1608,14 @@ def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | Erro
     except BlobHandleInvalidError as e:
         logger.warning(f"client:get_blob invalid handle: {e}")
         return _blob_error(reason="invalid_handle")
+
+    # v0.5.0 #236 / protocol#65：``kind=path`` 走拉取期复核特判——**不进**通用 resolver 表。
+    # 理由：``ResolvedBlob`` 无 close 语义，range 失败等早退路径会漏掉已打开句柄（fd 泄漏）；
+    # path 分支需要 try/finally 显式 close（``PathPullResult`` 自持打开句柄）。
+    # kind=path is special-cased (not in the resolver table): the pull result owns an open
+    # handle, so it MUST be closed in a finally block.
+    if kind == HANDLE_KIND_PATH:
+        return _process_path_get_blob(data, computer, payload)
 
     resolver = computer.blob_resolvers.get(kind)
     if resolver is None:

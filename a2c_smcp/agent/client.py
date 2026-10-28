@@ -37,6 +37,7 @@ from a2c_smcp.smcp import (
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -54,6 +55,7 @@ from a2c_smcp.smcp import (
     GetToolsRet,
     LeaveOfficeNotification,
     ListRoomReq,
+    ResolvePathRet,
     SessionInfo,
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
@@ -861,6 +863,40 @@ class AsyncSMCPAgentClient(AsyncClient, BaseAgentClient):
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for blob")
         return GetBlobRet(**response)
+
+    async def resolve_path(self, computer: str, path: str, *, timeout: int = 30) -> ResolvePathRet:
+        """异步按路径读取（v0.5.0 #236 / protocol#65）：规范化 + ``readRoots`` 校验 + stat.
+
+        Resolve a Computer-local path: normalize → ``readRoots`` fence → stat, minting a
+        ``blob_handle`` for ``client:get_blob``.
+
+        协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取.
+        授权边界 = Computer 端 settings ``readRoots``（默认空 = 不可读，fail-closed）；越界判定先于
+        存在性探测，因此 ``readRoots`` 之外的路径一律 ``4020 forbidden``、不泄露存在性。
+
+        失败 / Failures：``4020``（``invalid_path`` / ``forbidden`` / ``not_found`` /
+        ``not_a_file``）经 :func:`raise_for_error_payload` 抛 :class:`SMCPProtocolError`；resolve
+        成功后拉取期（``get_blob``）的撤权 / 删除走 ``4018``（``forbidden`` / ``gone``）。
+
+        持久引用 / Durable reference：保存 ``computer_id`` + ``canonical_path``（**不是** ``blob_handle``），
+        每次读取重新 resolve；仅需变更检测时比对 ``sha256``，不必拉字节.
+
+        Args:
+            computer: 目标 Computer 名.
+            path: Computer 本地绝对路径（原生或 canonical ``/C:/...`` 形态）.
+            timeout: ack 超时（秒）.
+
+        Returns:
+            ResolvePathRet: ``canonical_path`` / ``blob_handle`` / ``mime_type`` / ``total_size`` /
+                ``sha256`` / ``mtime``（epoch ms）/ ``req_id``.
+        """
+        req = self.create_resolve_path_request(computer, path)
+        logger.debug(f"Resolving path on computer {computer}")
+        response = await self.call(RESOLVE_PATH_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for resolve_path")
+        return ResolvePathRet(**response)
 
     def _make_blob_call(self) -> Any:
         """构造 :func:`drain_blob` 的 ``call`` 适配器（绑定本 client 的 socketio 与 namespace）.
