@@ -28,6 +28,7 @@ import stat
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from a2c_smcp.computer.blob.handle import (
@@ -39,6 +40,7 @@ from a2c_smcp.computer.blob.handle import (
 from a2c_smcp.computer.inputs.value_store import resolve_value_store_path
 from a2c_smcp.computer.settings.scope import user_settings_path
 from a2c_smcp.utils.mime import guess_mime
+from a2c_smcp.utils.path import resolve_xdg_first
 from a2c_smcp.utils.path_norm import (
     InvalidPathError,
     PathPlatform,
@@ -249,6 +251,27 @@ def build_protected_paths(
         candidates.append(str(state_dir))
     except (OSError, ValueError) as e:  # pragma: no cover - 防御性
         logger.warning("拒绝集: 无法解析 state dir / cannot resolve state dir: %s", e)
+
+    try:
+        # keyring 文件后端（Linux 无 Secret Service 时的兜底）默认落 XDG data；零凭证传播。
+        # keyring file backend fallback stores plaintext credentials under XDG data.
+        keyring_dir = resolve_xdg_first(
+            environ,
+            "XDG_DATA_HOME",
+            "python_keyring",
+            fallback=Path.home() / ".local" / "share" / "python_keyring",
+        )
+        candidates.extend([str(keyring_dir), str(keyring_dir / "keyring_pass.cfg")])
+        # GNOME keyring 文件目录（可选但同类凭据面）/ GNOME keyring files (same credential surface).
+        gnome_keyrings = resolve_xdg_first(
+            environ,
+            "XDG_DATA_HOME",
+            "keyrings",
+            fallback=Path.home() / ".local" / "share" / "keyrings",
+        )
+        candidates.append(str(gnome_keyrings))
+    except (OSError, ValueError) as e:  # pragma: no cover - 防御性
+        logger.warning("拒绝集: 无法解析 keyring 目录 / cannot resolve keyring dirs: %s", e)
 
     candidates.extend(str(p) for p in extra_paths)
 

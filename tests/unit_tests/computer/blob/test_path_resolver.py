@@ -271,6 +271,25 @@ class TestFixedRejectionSet:
             resolve_path(str(other), _root(root), protected=protected)
         assert _reason(exc_info) == "forbidden"
 
+    def test_keyring_file_backend_forbidden(self, tmp_path: Path) -> None:
+        """keyring 文件后端（python_keyring / GNOME keyrings）默认在 XDG data 下，必须拒绝."""
+        root = tmp_path / "root"
+        keyring_file = _write(root / "xdg-data" / "python_keyring" / "keyring_pass.cfg", b"secret")
+        gnome_file = _write(root / "xdg-data" / "keyrings" / "login.keyring", b"secret")
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+            "XDG_DATA_HOME": str(root / "xdg-data"),
+        }
+        protected = build_protected_paths(env=env)
+
+        for target in (keyring_file, gnome_file):
+            canonical = os.path.realpath(target)
+            assert _is_protected(canonical, protected, "posix")
+            with pytest.raises(PathResolveError) as exc_info:
+                resolve_path(str(target), _root(root), protected=protected)
+            assert _reason(exc_info) == "forbidden"
+
     def test_part_only_inside_landing_root_forbidden(self, tmp_path: Path) -> None:
         root = tmp_path / "root"
         landing = root / "landing"
