@@ -68,6 +68,27 @@ class TestSMCPProtocolErrorV021:
         assert ei.value.details == {}
         assert ei.value.reason is None
 
+    @pytest.mark.parametrize(
+        ("code", "bad_details"),
+        [
+            pytest.param(int(ErrorCode.SKILL_NAME_INVALID), "bad", id="4016-string"),
+            pytest.param(int(ErrorCode.SKILL_NAME_INVALID), ["x"], id="4016-list"),
+            pytest.param(int(ErrorCode.BLOB_WRITE_FAILED), 42, id="4019-int"),
+        ],
+    )
+    def test_non_mapping_details_degrade_to_empty(self, code: int, bad_details: Any) -> None:
+        """#234：非 mapping 的 details **宽松归一为空映射**，不得抛 ``ValueError``（与 rust 同策略）。
+
+        回归形态：``dict("bad")`` 抛 ``ValueError``，宿主拿到的就不是 ``SMCPProtocolError``——
+        一次可感的协议拒绝被升级成非协议异常。此缺陷在 4014–4020 全通道同构，不限于 join。
+        """
+        with pytest.raises(SMCPProtocolError) as ei:
+            raise_for_error_payload({"code": code, "message": "x", "details": bad_details})
+
+        assert ei.value.code == code
+        assert ei.value.details == {}
+        assert ei.value.reason is None
+
 
 # ── async client get_skills / get_skill / get_blob ─────────────────
 

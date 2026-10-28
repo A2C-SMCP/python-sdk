@@ -13,6 +13,7 @@ A2C-SMCP protocol errors are returned as a **flat ErrorPayload** in the Socket.I
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, cast
 
 from a2c_smcp.smcp import ErrorPayload, is_protocol_error_payload
@@ -38,8 +39,10 @@ class SMCPProtocolError(Exception):
     ``.code`` 取默认值 ``-1``，``.message`` 仍带服务端文案。调用方按 ``e.code`` 分流时须把 ``-1``
     当作「未获裁决」处理。/ ``-1`` means "rejected but no parseable code"; the key is omitted on purpose.
 
-    ``details`` 是诊断容器，Agent MUST NOT 透传给最终用户（防泄露）。
-    ``details`` is a diagnostic container; the Agent MUST NOT propagate it to end users.
+    ``details`` 是诊断容器，Agent MUST NOT 透传给最终用户（防泄露）。非 mapping 的 ``details``
+    **宽松归一为空映射**（#234）——对端违规不应把可感的协议拒绝升级成 ``ValueError``；与 rust
+    ``SmcpProtocolError::from_value`` 的 ``as_object + unwrap_or_default`` 对齐。
+    ``details`` is a diagnostic container; non-mapping values degrade to ``{}`` (matches rust).
 
     **入房路径刻意不走** :func:`raise_for_error_payload`：该 helper 以 ``code ∈ ErrorCode`` 白名单为
     闸，会把未知码与码不可解析的拒绝静默放过 —— 正是 #218 要消灭的「入房被拒零感知」（见
@@ -55,7 +58,13 @@ class SMCPProtocolError(Exception):
         self.capability: str | None = payload.get("capability")
         # 4016 / 4017 / 4018 details 容器（v0.2.1 起 code-specific 字段下沉到 details）
         # details container for 4016 / 4017 / 4018 (since v0.2.1 code-specific fields live under details)
-        self.details: dict[str, Any] = dict(payload.get("details") or {})
+        #
+        # #234：**宽松归一**——非 mapping 的 details 一律当空映射。协议违规（对端给了字符串/数组）
+        # 不得把一次可感的拒绝升级成 ``ValueError``（``dict("bad")`` 会抛），否则宿主拿到的就不是
+        # ``SMCPProtocolError`` 了。与 rust ``SmcpProtocolError::from_value`` 的
+        # ``as_object + unwrap_or_default`` 同策略。/ Non-mapping details degrade to {} (matches rust).
+        raw_details = payload.get("details")
+        self.details: dict[str, Any] = dict(raw_details) if isinstance(raw_details, Mapping) else {}
         # 4017 / 4018 共用 ``details.reason`` 开放枚举（解析方 MUST 容忍未知值兜底）
         # ``details.reason`` open enum shared by 4017 / 4018; parsers MUST default to fail-safe on unknown
         self.reason: str | None = self.details.get("reason")
