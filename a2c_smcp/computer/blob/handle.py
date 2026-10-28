@@ -34,7 +34,7 @@
 from __future__ import annotations
 
 import base64
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 import msgpack
 
@@ -81,8 +81,8 @@ class PathHandlePayload(TypedDict):
     mtime: int
     sha256: str
     mime: str
-    dev: int
-    ino: int
+    dev: NotRequired[int]
+    ino: NotRequired[int]
 
 
 # ── 异常体系 / Error taxonomy ────────────────────────────────────────────
