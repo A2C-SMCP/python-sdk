@@ -24,6 +24,7 @@ from prompt_toolkit.completion import Completer
 from pydantic import TypeAdapter
 
 from a2c_smcp.computer.cli.banner import render_banner
+from a2c_smcp.computer.cli.commands import identity as identity_cmd
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
@@ -836,6 +837,11 @@ async def interactive_loop(
             elif cmd == "settings" and len(parts) >= 2:
                 # v0.2.1 settings 意图层增删改查（show/get/set/edit，§4.5，S16 #69）。
                 await settings_cmd.repl_dispatch(comp, parts, session=session)
+
+            elif cmd == "identity" and len(parts) >= 2:
+                # v0.5.0（protocol#64）：`identity reset`——复用 SDK reset_identity（已连接时拒绝）。
+                # Reuses the SDK API so a live connection / office intent is refused in-process.
+                await identity_cmd.repl_dispatch(comp, parts)
 
             else:
                 console.print("[yellow]未知命令 / Unknown command[/yellow]")

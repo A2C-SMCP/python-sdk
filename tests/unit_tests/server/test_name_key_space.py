@@ -68,7 +68,11 @@ def _sync_ns(sessions: dict[str, dict[str, Any]]) -> SyncSMCPNamespace:
 
 
 def _join(role: str, name: str, office: str) -> dict[str, str]:
-    return {"role": role, "name": name, "office_id": office}
+    payload = {"role": role, "name": name, "office_id": office}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键。
+    if role == "computer":
+        payload["computer_id"] = "11111111-1111-4111-8111-111111111111"
+    return payload
 
 
 def _get_tools(computer: str) -> dict[str, str]:

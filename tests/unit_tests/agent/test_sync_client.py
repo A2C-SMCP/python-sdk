@@ -221,6 +221,8 @@ class TestSMCPAgentClient:
         data: EnterOfficeNotification = {
             "office_id": "test_office",
             "computer": "test_computer",
+            # v0.5.0 / protocol#64：Computer 成员的通知带 computer_id，Agent 原样透传给事件处理器
+            "computer_id": "abcdef01-2345-4678-8abc-def012345678",
         }
 
         with patch.object(client, "get_tools_from_computer") as mock_get_tools:
@@ -384,7 +386,7 @@ class TestSMCPAgentClient:
             "computer": "",
         }
 
-        with pytest.raises(AssertionError, match="无效的计算机ID"):
+        with pytest.raises(AssertionError, match="无效的计算机名称"):
             client.validate_office_data(data)
 
     @patch("socketio.Client.call")
@@ -490,3 +492,13 @@ class TestSMCPAgentClient:
 
         with pytest.raises(TimeoutError):
             client.get_computer_in_office(office_id, timeout=1)
+
+    def test_join_office_payload_never_carries_computer_id(self, client: SMCPAgentClient) -> None:
+        """v0.5.0（protocol#64）：Agent 入房 MUST NOT 携带 ``computer_id``（同步镜像）。"""
+        with patch.object(client, "call") as mock_call:
+            mock_call.return_value = None  # 空 ack = 成功
+            client.join_office("office-1", "agent-1")
+
+        payload = mock_call.call_args.args[1]
+        assert payload["role"] == "agent"
+        assert "computer_id" not in payload, f"Agent 载荷不得出现 computer_id: {payload!r}"

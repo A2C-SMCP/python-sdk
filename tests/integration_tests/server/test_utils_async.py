@@ -22,11 +22,11 @@ from tests.room_acks import assert_empty_ack
 
 
 async def _join_office(client: AsyncClient, role: str, office_id: str, name: str) -> None:
-    ack = await client.call(
-        JOIN_OFFICE_EVENT,
-        {"role": role, "office_id": office_id, "name": name},
-        namespace=SMCP_NAMESPACE,
-    )
+    payload: dict = {"role": role, "office_id": office_id, "name": name}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
+    ack = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     assert_empty_ack(ack)
 
 

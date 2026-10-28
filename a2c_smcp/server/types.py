@@ -8,7 +8,7 @@
 * 描述: Server端类型定义 / Server-side type definitions
 """
 
-from typing import Literal, TypeAlias
+from typing import Literal, NamedTuple, TypeAlias
 
 from typing_extensions import TypedDict
 
@@ -24,6 +24,20 @@ NAME_KEY: TypeAlias = tuple[OFFICE_ID, str, str]
 # Seat key ``(office_id, role)`` (#230, "one seat per role"): the admission authority (4101); the name
 # registry above only serves routing.
 SEAT_KEY: TypeAlias = tuple[OFFICE_ID, str]
+
+
+class IdentityRecord(NamedTuple):
+    """同一 sid 的身份声明**单一三元组**（v0.5.0 / protocol#64）。
+
+    ``role`` / ``name`` / ``computer_id`` 必须作为一个整体比对与记录：拆成三个独立字段再逐项拼接，
+    会在「记录到一半」或「部分字段被其它路径改写」时产生自相矛盾的身份。``computer_id`` 仅 Computer
+    有值（Agent 恒为 ``None``，与「Agent MUST NOT 携带该键」同构）。
+    The single identity triple per sid (protocol#64); Agent's computer_id is always None.
+    """
+
+    role: str
+    name: str
+    computer_id: str | None
 
 
 class BaseSession(TypedDict):

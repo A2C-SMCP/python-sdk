@@ -24,6 +24,7 @@ from a2c_smcp.computer.blob import (
 )
 from a2c_smcp.computer.blob.path_resolver import PathResolveError
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.identity import load_or_create_computer_id, reset_computer_id
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import GetSkillRet as GetSkillRetModel
 from a2c_smcp.computer.skills import SkillNameError, SkillSandboxError, parse_skill_name
@@ -207,6 +208,15 @@ class SMCPComputerClient(AsyncClient):
         self.computer = computer
         # 实例级握手配置 / Per-instance handshake config
         self._namespace = namespace
+        # v0.5.0（protocol#64）：Computer 稳定身份（``computer_id``）的**进程内缓存**。持久化状态的
+        # 物化时机是首次 :meth:`connect`（不在 ``__init__`` / import 时产生任何身份配置副作用）。
+        # 跨重连复用同一值；``reset_identity()`` 只在新连接前可改。
+        # Cached stable identity; materialized on first connect (never in __init__/import).
+        self._computer_id: str | None = None
+        # 身份物化 / 重置的互斥锁（fix-review 🟡2）：check → await → 赋值必须整体原子——
+        # 否则 reset 与在途物化交错时，stale 物化结果会覆盖新身份（内存旧 / 磁盘新，新身份需重启才生效）。
+        # Serializes materialization vs reset; prevents a stale load from clobbering a fresh reset.
+        self._identity_lock = asyncio.Lock()
         # 将客户端以 weakref 方式绑定回 Computer，避免循环强引用
         self.computer.socketio_client = self
         self.on(TOOL_CALL_EVENT, self.on_tool_call, namespace=self._namespace)
@@ -322,6 +332,71 @@ class SMCPComputerClient(AsyncClient):
         the CLI must still be able to leave mid-replay.
         """
         return self.office_id is not None and self._namespace in self.namespaces
+
+    def _identity_env(self) -> Mapping[str, str] | None:
+        """
+        身份持久化使用**本 Computer 实例**的 env（``None`` = ambient ``os.environ``）。
+
+        与 settings / mcp.json 同一 XDG 锚点：同进程两台注入不同 env 的 Computer 必须各自读写自己的
+        身份文件，否则会共享同一个 ``computer-id``（SDK 自造克隆）。
+        ``None``（未注入）与**非 Mapping**（异常替身）区分处理：后者显式告警后退化 ambient，绝不静默。
+        The identity store follows this instance's env; a non-Mapping value is warned about (never
+        silently treated the same as an explicit ``None``).
+        """
+        env = getattr(self.computer, "env", None)
+        if env is None:
+            return None
+        if not isinstance(env, Mapping):
+            logger.warning(
+                f"Computer.env 不是 Mapping（{type(env).__name__}），身份持久化退化为 ambient os.environ",
+            )
+            return None
+        return env
+
+    async def _amaterialize_computer_id(self) -> str:
+        """
+        取本连接的稳定身份；未物化时经**线程池**加载 / 生成（single-flight，绝不阻塞事件循环）。
+
+        调用方须在**取 ``_office_op_lock`` 之前** await 本方法：首启竞态最坏重试 1s，占着 office
+        操作锁读盘会拖住退房 / 换房与回放（与 #222「锁不跨 I/O」同一纪律）。
+        与 :meth:`reset_identity` 共用 ``_identity_lock``：check → await → 赋值整体互斥，
+        reset 不会与在途物化交错（否则 stale 物化结果会覆盖新身份，内存旧 / 磁盘新）。
+        Single-flight and mutually exclusive with reset_identity; disk I/O runs in a worker thread.
+        """
+        async with self._identity_lock:
+            if self._computer_id is None:
+                self._computer_id = await asyncio.to_thread(
+                    load_or_create_computer_id,
+                    env=self._identity_env(),
+                )
+            return self._computer_id
+
+    async def reset_identity(self) -> str:
+        """
+        重置本机 Computer 稳定身份（protocol#64「换了一台新电脑」）：生成新 UUID 并原子落盘。
+
+        **已连接（含有入房意图 / 回放在途）时拒绝**：Server 对同一 sid 的身份记录不因 leave 清除，
+        同一连接内改值只会撞 ``403``；新值必须经**新连接**生效（``disconnect`` 后重新 ``connect``）。
+        Refused while connected or holding an office intent: the server records the identity per
+        sid and only a new connection may present the new value (otherwise 403).
+
+        Returns:
+            str: 新的小写规范 UUID。
+
+        Raises:
+            RuntimeError: 已连接或有入房意图。调用方应先 ``disconnect()`` / ``leave_office()``。
+            ComputerIdentityError: 持久化文件不可写。
+        """
+        if self.connected or self.office_id is not None or self._confirmed_office_id is not None:
+            raise RuntimeError(
+                "已连接（或存在入房意图）时不能重置 Computer 身份：请先断开连接，再重置并以新连接入房"
+                " / Cannot reset identity while connected or holding an office intent: disconnect first",
+            )
+        async with self._identity_lock:
+            new_id = await asyncio.to_thread(reset_computer_id, env=self._identity_env())
+            self._computer_id = new_id
+        logger.info(f"Computer identity reset; new computer_id={new_id}")
+        return new_id
 
     def _can_emit_office_update(self) -> bool:
         """
@@ -440,6 +515,11 @@ class SMCPComputerClient(AsyncClient):
                     "/ 'auth_provider' must be a callable (zero-arg async per the AuthProvider contract)",
                 )
             kwargs["auth"] = auth_provider
+        # v0.5.0（protocol#64）：首次 connect 物化持久化身份（缺失即原子生成；跨重连 / 重启复用）。
+        # 损坏或不可读写 ⇒ 异常直接上抛（CLI 非零退出），**绝不**以进程内临时值降级——那会让宿主的
+        # 持久引用无信号地全部失效（协议 room-model.md §Computer 身份「持久化失败」）。
+        # Materialize the persisted identity on first connect; corruption aborts instead of degrading.
+        await self._amaterialize_computer_id()
         handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
         kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
         # 协议 §1 polling-first MUST 护栏（统一接线，详见 handshake.apply_polling_first_guard）
@@ -621,7 +701,13 @@ class SMCPComputerClient(AsyncClient):
         操作锁。/ The success path exits through an explicit flag so the deferred flush stays outside the
         critical section; every other branch returns without flushing.
         """
-        request = EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name)
+        request = EnterOfficeReq(
+            office_id=office_id,
+            role="computer",
+            name=self.computer.name,
+            # fix-review 🟡5：物化（磁盘 I/O）在循环入口、锁外 await 完成；循环内只复用不可变 request。
+            computer_id=await self._amaterialize_computer_id(),
+        )
         # #223：本轮回放所属的**会话**——成功落账前须复核（同 ``join_office``）。退避期间断连会推进
         # 会话纪元，此时这条「成功」属于已销毁的会话。
         session = self._office_session
@@ -732,6 +818,17 @@ class SMCPComputerClient(AsyncClient):
         # 会话作废而 ACK 仍可能就绪 ⇒ 那条「成功」属于已销毁的会话，落账会造出 #223 判据放行的幻影态）。
         session = self._office_session
         self._cancel_office_rejoin()
+        # fix-review 🟡5：身份物化是磁盘 I/O（首启竞态最坏重试 1s），必须在**取 office 操作锁之前**
+        # 经线程池完成——锁内不跨 I/O（同 #222 纪律），也不阻塞事件循环。
+        # Materialize before acquiring the office lock; disk I/O runs in a worker thread.
+        computer_id = await self._amaterialize_computer_id()
+        if generation != self._office_generation:
+            # fix-review 🟡1：物化期间的断连 / 退房 / 新声明会推进 generation。此时无条件写
+            # ``office_id`` 会把「已断开却残留 desired」反转回来（下次 connect 自动回旧房，违反 #203）
+            # ⇒ 本 join 已被抢占：不写 desired、不发包，直接让位给更新的声明。
+            # Superseded while materializing: no desired write, no wire send.
+            logger.info(f"join_office 在身份物化期间被抢占，放弃本次入房: {office_id}")
+            return
         # 提前设置 office_id，避免服务器广播事件时 office_id 仍为 None 的时序竞争问题
         # Set office_id before sending request to avoid race condition when server broadcasts events
         self.office_id = office_id
@@ -743,7 +840,12 @@ class SMCPComputerClient(AsyncClient):
                 # 本锁被占满 60s，把重连回房与退房一并卡住。/ Bounded ack wait, same as the replay.
                 result = await self.call(
                     JOIN_OFFICE_EVENT,
-                    EnterOfficeReq(office_id=office_id, role="computer", name=self.computer.name),
+                    EnterOfficeReq(
+                        office_id=office_id,
+                        role="computer",
+                        name=self.computer.name,
+                        computer_id=computer_id,
+                    ),
                     namespace=self._namespace,
                     timeout=OFFICE_JOIN_TIMEOUT,
                 )

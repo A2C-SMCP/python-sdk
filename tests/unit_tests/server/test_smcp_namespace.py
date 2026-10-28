@@ -22,6 +22,7 @@ from a2c_smcp.server import (
     SMCPNamespace,
 )
 from a2c_smcp.server.base import BaseNamespace
+from a2c_smcp.server.types import IdentityRecord
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
@@ -158,6 +159,7 @@ class TestSMCPNamespace:
             "role": "computer",
             "name": "test_computer",
             "office_id": "office_123",
+            "computer_id": "11111111-1111-4111-8111-111111111111",
         })
 
         # 执行测试
@@ -176,6 +178,8 @@ class TestSMCPNamespace:
         session = {"role": "agent"}
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
+        # protocol#64：判据是身份记录三元组（首次 join 通过时写入），夹具须先种记录
+        smcp_namespace._sid_identity["test_sid"] = IdentityRecord(role="agent", name="test_computer", computer_id=None)
 
         # 测试数据
         # Test data
@@ -183,6 +187,7 @@ class TestSMCPNamespace:
             "role": "computer",
             "name": "test_computer",
             "office_id": "office_123",
+            "computer_id": "11111111-1111-4111-8111-111111111111",
         })
 
         # 执行测试
@@ -202,11 +207,17 @@ class TestSMCPNamespace:
         session = {"role": "computer", "name": "old_name"}
         smcp_namespace.get_session = AsyncMock(return_value=session)
         smcp_namespace.save_session = AsyncMock()
+        smcp_namespace._sid_identity["test_sid"] = IdentityRecord(
+            role="computer",
+            name="old_name",
+            computer_id="11111111-1111-4111-8111-111111111111",
+        )
 
         data = EnterOfficeReq(**{
             "role": "computer",
             "name": "test_computer",
             "office_id": "office_123",
+            "computer_id": "11111111-1111-4111-8111-111111111111",
         })
 
         ack = await smcp_namespace.on_server_join_office("test_sid", data)
@@ -731,10 +742,11 @@ class TestEnterRoomTransactionalCommit:
         assert smcp_namespace._name_to_sid_map == {}, "旧房键与目标房键均须回收"
 
     @pytest.mark.asyncio
-    async def test_join_office_rollback_removes_fields_absent_from_backup(self, smcp_namespace, mock_server):
-        """backup 里**没有** role/name（全新连接首连即被拒）⇒ 回滚须删除字段，而非留下 ``None``。
+    async def test_join_office_failure_keeps_identity_fields(self, smcp_namespace, mock_server):
+        """500 失败后身份声明**不回滚**（protocol#64，用户 2026-10-27 拍板）。
 
-        赋 ``None`` 会让 ``session["role"] != "agent"`` 之类的判定走偏（None 既不等于也不不等于）。
+        记录点在 400/403 之后、4106/4101 之前，随连接存续；`role` / `name` / `computer_id` 一并保留，
+        且不得写成 ``None``（会污染后续 role 判据）。
         """
         smcp_namespace.server = mock_server
         store: dict[str, dict] = {"c-sid": {"sid": "c-sid"}}
@@ -744,14 +756,27 @@ class TestEnterRoomTransactionalCommit:
 
         ack = await smcp_namespace.on_server_join_office(
             "c-sid",
-            EnterOfficeReq(**{"role": "computer", "name": "n", "office_id": "roomB"}),
+            EnterOfficeReq(
+                **{
+                    "role": "computer",
+                    "name": "n",
+                    "office_id": "roomB",
+                    "computer_id": "11111111-1111-4111-8111-111111111111",
+                },
+            ),
         )
 
         # 未知内部异常 ⇒ 500 笼统文案（原文只进日志），**不得**回 "Internal server error: <原文>"
         assert_rejected_ack(ack, 500)
         assert "boom" not in json.dumps(ack)
         final = store["c-sid"]
-        assert "role" not in final and "name" not in final, "backup 缺失的字段须删除而非赋 None"
+        assert final["role"] == "computer" and final["name"] == "n", "500 后身份声明须保留（不回滚）"
+        assert final["computer_id"] == "11111111-1111-4111-8111-111111111111"
+        assert smcp_namespace._sid_identity["c-sid"] == (
+            "computer",
+            "n",
+            "11111111-1111-4111-8111-111111111111",
+        )
 
     @pytest.mark.asyncio
     async def test_convergence_failure_does_not_mask_original_error(self, smcp_namespace, mock_server):
@@ -836,7 +861,14 @@ class TestEnterRoomTransactionalCommit:
 
         ack = await smcp_namespace.on_server_join_office(
             "c-sid",
-            EnterOfficeReq(**{"role": "computer", "name": "c1", "office_id": "roomB"}),
+            EnterOfficeReq(
+                **{
+                    "role": "computer",
+                    "name": "c1",
+                    "office_id": "roomB",
+                    "computer_id": "11111111-1111-4111-8111-111111111111",
+                },
+            ),
         )
 
         assert_rejected_ack(ack, 500)
@@ -846,11 +878,11 @@ class TestEnterRoomTransactionalCommit:
         assert final["role"] == "computer" and final["name"] == "c1", "role/name 须保持声明值"
 
     @pytest.mark.asyncio
-    async def test_join_office_rejection_drops_identity_written_on_fresh_session(self, smcp_namespace, mock_server):
-        """失败回滚对**本次新写入**的 ``role`` / ``name`` 是**删除**（而非写 None）。
+    async def test_join_office_rejection_keeps_identity_on_fresh_session(self, smcp_namespace, mock_server):
+        """失败后本次声明的身份**保留**（protocol#64：4101/4106/500 均不回滚）。
 
-        会话此前未声明身份 ⇒ 失败后必须回到「无身份」，否则 ``session["role"] = None`` 会污染后续
-        的 role 判据（``is not None`` 判据的正对照）。
+        与 #213 的旧「字段级回滚」相反：身份记录与拒绝正交，随后同一连接改声明 ⇒ 403。字段值必须
+        是声明值而非 ``None``（``None`` 会污染后续 role 判据）。
         """
         smcp_namespace.server = mock_server
         store: dict[str, dict] = {"c-sid": {"sid": "c-sid"}}
@@ -860,12 +892,20 @@ class TestEnterRoomTransactionalCommit:
 
         ack = await smcp_namespace.on_server_join_office(
             "c-sid",
-            EnterOfficeReq(**{"role": "computer", "name": "c1", "office_id": "roomB"}),
+            EnterOfficeReq(
+                **{
+                    "role": "computer",
+                    "name": "c1",
+                    "office_id": "roomB",
+                    "computer_id": "11111111-1111-4111-8111-111111111111",
+                },
+            ),
         )
 
         assert_rejected_ack(ack, 500)
-        assert "role" not in store["c-sid"], f"新写入的 role 须被删除而非置 None: {store['c-sid']!r}"
-        assert "name" not in store["c-sid"], f"新写入的 name 须被删除而非置 None: {store['c-sid']!r}"
+        assert store["c-sid"]["role"] == "computer", f"声明的 role 须保留: {store['c-sid']!r}"
+        assert store["c-sid"]["name"] == "c1", f"声明的 name 须保留: {store['c-sid']!r}"
+        assert smcp_namespace._sid_identity["c-sid"] == ("computer", "c1", "11111111-1111-4111-8111-111111111111")
 
 
 class TestV021ClientRoutesAndUpdateSkills:

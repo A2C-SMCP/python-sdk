@@ -121,3 +121,70 @@ def test_hardlink_to_state_value_store_is_forbidden(
         computer.resolve_read_path(str(link))
 
     assert exc.value.reason == "forbidden"
+
+
+def _home_only_computer(tmp_path: Path, home: Path) -> Computer:
+    """仅注入 ``HOME``（XDG 全未设置）的 Computer —— protocol#64 身份路径跟随注入 HOME。"""
+    return Computer(
+        name="home-only",
+        blob_cache_root=tmp_path / "cache",
+        project_root=tmp_path / "cwd",
+        skill_home=tmp_path / "skills",
+        env={"HOME": str(home)},
+    )
+
+
+def test_injected_home_identity_is_in_rejection_set_and_forbidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """🔴 fix-review：注入 HOME（XDG 未设）时，``computer-id`` 的**实际使用位置**必须在拒绝集。
+
+    ``readRoots`` 覆盖该 home 也不得读出稳定身份（目录前缀 + 文件身份双保险）。
+    """
+    from a2c_smcp.computer.identity import identity_store_path
+
+    home = tmp_path / "srv-home"
+    computer = _home_only_computer(tmp_path, home)
+    env = {"HOME": str(home)}
+    identity = identity_store_path(env)
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text("abcdef01-2345-4678-8abc-def012345678\n", encoding="utf-8")
+
+    _grant(computer, monkeypatch, str(home))
+
+    protected = computer.protected_paths().paths
+    assert normalize_path(str(identity)) in protected, "身份文件必须在拒绝集内"
+    assert normalize_path(str(identity.parent)) in protected, "身份目录必须在拒绝集内（前缀保护）"
+
+    with pytest.raises(PathResolveError) as exc:
+        computer.resolve_read_path(str(identity))
+    assert exc.value.reason == "forbidden"
+
+
+def test_hardlink_to_injected_home_identity_is_forbidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同款硬链接变体：路径前缀失效 ⇒ 靠身份文件在拒绝集里的 file_id 兜底。"""
+    from a2c_smcp.computer.identity import identity_store_path
+
+    home = tmp_path / "srv-home"
+    computer = _home_only_computer(tmp_path, home)
+    identity = identity_store_path({"HOME": str(home)})
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text("abcdef01-2345-4678-8abc-def012345678\n", encoding="utf-8")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    link = root / "innocent.txt"
+    try:
+        os.link(identity, link)
+    except OSError:  # pragma: no cover - 文件系统不支持硬链接（跨设备等）
+        pytest.skip("hardlink unsupported on this filesystem")
+
+    _grant(computer, monkeypatch, str(root))
+
+    with pytest.raises(PathResolveError) as exc:
+        computer.resolve_read_path(str(link))
+    assert exc.value.reason == "forbidden"

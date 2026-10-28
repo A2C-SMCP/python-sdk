@@ -17,6 +17,7 @@ Over-the-wire conformance for the 9 room-model scenarios of protocol#66, against
 from __future__ import annotations
 
 import asyncio
+import itertools
 import multiprocessing
 import socket
 from collections.abc import AsyncGenerator
@@ -33,9 +34,13 @@ from a2c_smcp.smcp import (
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    LIST_ROOM_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
+    ErrorCode,
+    build_bad_request_error,
     build_computer_not_found_error,
+    build_room_rejection_error,
 )
 from a2c_smcp.testing import UvicornTestServer, create_local_sync_server
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
@@ -90,10 +95,17 @@ async def server_url(request: pytest.FixtureRequest) -> AsyncGenerator[str, None
 
 
 class _Peer:
-    """一个线上会话 + 它收到的成员通知（按到达顺序）。"""
+    """一个线上会话 + 它收到的成员通知（按到达顺序）。
+
+    v0.5.0（protocol#64）：每个 Computer 会话默认携带一个**唯一且合法**的 ``computer_id``
+    （规范 UUID、非 nil/max）；同一 peer 的重复 join / 换房沿用同值（身份在连接内不可变）。
+    """
+    #: 进程内 Computer 身份计数器（构造合法 UUID v4 文本；不使用 nil/max）
+    _computer_seq = itertools.count(1)
 
     def __init__(self) -> None:
         self.client = AsyncClient()
+        self.computer_id = f"00000000-0000-4000-8000-{next(self._computer_seq):012d}"
         self.notices: list[tuple[str, dict[str, Any]]] = []
 
         @self.client.on(ENTER_OFFICE_NOTIFICATION, namespace=SMCP_NAMESPACE)
@@ -104,10 +116,15 @@ class _Peer:
         async def _on_leave(data: dict[str, Any]) -> None:
             self.notices.append(("leave", data))
 
-    async def join(self, role: str, name: str, office_id: str) -> Any:
-        return await self.client.call(
-            JOIN_OFFICE_EVENT, {"role": role, "name": name, "office_id": office_id}, namespace=SMCP_NAMESPACE, timeout=10
-        )
+    async def join(self, role: str, name: str, office_id: str, computer_id: str | None = None) -> Any:
+        payload: dict[str, Any] = {"role": role, "name": name, "office_id": office_id}
+        if role == "computer":
+            payload["computer_id"] = computer_id if computer_id is not None else self.computer_id
+        return await self.client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE, timeout=10)
+
+    async def join_raw(self, payload: dict[str, Any]) -> Any:
+        """原样发送（用于构造 400 场景：缺失 / 非法 / Agent 携带 computer_id）。"""
+        return await self.client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE, timeout=10)
 
     async def leave(self, office_id: str) -> Any:
         return await self.client.call(LEAVE_OFFICE_EVENT, {"office_id": office_id}, namespace=SMCP_NAMESPACE, timeout=10)
@@ -187,7 +204,9 @@ async def test_3_idempotent_rejoin_does_not_rebroadcast(peers: Any) -> None:
     assert await c1.join("computer", "C1", "R1") is None
 
     await _quiet()
-    assert a.notices == [("enter", {"office_id": "R1", "computer": "C1"})], a.notices
+    assert a.notices == [
+        ("enter", {"office_id": "R1", "computer": "C1", "computer_id": c1.computer_id}),
+    ], a.notices
 
 
 async def test_4_rejected_switch_keeps_old_room_untouched(peers: Any) -> None:
@@ -234,8 +253,8 @@ async def test_5_rebind_is_leave_then_enter_and_routes_to_new_computer(peers: An
 
     await _await_notices(a, 2)
     assert a.notices == [
-        ("leave", {"office_id": "R1", "computer": "C1"}),
-        ("enter", {"office_id": "R1", "computer": "C2"}),
+        ("leave", {"office_id": "R1", "computer": "C1", "computer_id": c1.computer_id}),
+        ("enter", {"office_id": "R1", "computer": "C2", "computer_id": c2.computer_id}),
     ], a.notices
 
     def _call(computer: str) -> dict[str, Any]:
@@ -304,8 +323,253 @@ async def test_9_positive_auto_switch_broadcasts_both_rooms(peers: Any) -> None:
 
     await _await_notices(a, 1)
     await _await_notices(watcher_r2, 1)
-    assert a.notices == [("leave", {"office_id": "R1", "computer": "C1"})], a.notices
-    assert watcher_r2.notices == [("enter", {"office_id": "R2", "computer": "C1"})], watcher_r2.notices
+    assert a.notices == [
+        ("leave", {"office_id": "R1", "computer": "C1", "computer_id": c1.computer_id}),
+    ], a.notices
+    assert watcher_r2.notices == [
+        ("enter", {"office_id": "R2", "computer": "C1", "computer_id": c1.computer_id}),
+    ], watcher_r2.notices
     # 旧房席位已释放：另一台 Computer 可进 R1
     c2 = await peers()
     assert await c2.join("computer", "C2", "R1") is None
+
+
+# ===========================================================================
+# v0.5.0（protocol#64）：``computer_id`` 场景 #10–#21
+# ===========================================================================
+#: 两个合法且不同的 ``computer_id``（记法同协议：X / Y）。刻意含 a-f：``X.upper()`` 才能构造大小写差异。
+X = "abcdef01-2345-4678-8abc-def012345678"
+Y = "abcdef02-2345-4678-8abc-def012345679"
+
+
+def _bad_request() -> dict[str, Any]:
+    return build_bad_request_error()
+
+
+def _forbidden() -> dict[str, Any]:
+    return build_room_rejection_error(ErrorCode.FORBIDDEN)
+
+
+async def _list_room(peer: _Peer, office_id: str, agent: str = "A") -> dict[str, Any]:
+    """以 ``peer``（房内 Agent）身份拉 ``server:list_room``。"""
+    return await peer.client.call(
+        LIST_ROOM_EVENT,
+        {"agent": agent, "req_id": "lr", "office_id": office_id},
+        namespace=SMCP_NAMESPACE,
+        timeout=10,
+    )
+
+
+def _session_by_name(room: dict[str, Any], name: str) -> dict[str, Any]:
+    for session in room["sessions"]:
+        if session.get("name") == name:
+            return session
+    raise AssertionError(f"{name!r} 不在 SessionInfo 列表中: {room!r}")
+
+
+async def test_10_computer_id_missing_or_malformed_is_400(peers: Any) -> None:
+    """#10：缺失 / 大写 / 无连字符 / 非 UUID / nil / max ⇒ 400；规范形态但版本位非 4/7 ⇒ 接受。
+
+    400 先于任何副作用：用一个房内 watcher 证明失败请求不产生 enter 广播，随后同一 peer 以合法值
+    入房成功（席位仍空 ⇒ 失败请求确实没入过房）。
+    """
+    watcher, c = await peers(), await peers()
+    assert await watcher.join("agent", "W", "R1") is None
+
+    bad_values: list[Any] = [
+        "<missing>",
+        X.upper(),
+        X.replace("-", ""),
+        "not-a-uuid",
+        "00000000-0000-0000-0000-000000000000",  # nil
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",  # max
+        # protocol#64 / PR #74：整串 + 恰 36 字符；空白与换行一律 400
+        X + "\n",
+        " " + X,
+        X + " ",
+    ]
+    for bad in bad_values:
+        payload: dict[str, Any] = {"role": "computer", "name": "C1", "office_id": "R1"}
+        if bad != "<missing>":
+            payload["computer_id"] = bad
+        assert await c.join_raw(payload) == _bad_request(), f"computer_id={bad!r} 应回 400"
+
+    await _quiet()
+    assert watcher.notices == [], f"400 不得产生任何广播: {watcher.notices!r}"
+
+    # 正向：规范形态但版本位非 4/7（opaque 接收）必须接受
+    accepted = "12345678-1234-9234-8234-123456789abc"
+    assert await c.join("computer", "C1", "R1", computer_id=accepted) is None
+    await _await_notices(watcher, 1)
+    assert watcher.notices == [("enter", {"office_id": "R1", "computer": "C1", "computer_id": accepted})]
+
+
+async def test_11_agent_carrying_computer_id_is_400(peers: Any) -> None:
+    """#11：Agent 携带 ``computer_id``（任意值，含 ``null``）⇒ 400；A 未入房。
+
+    R1 按场景保持为空（Agent 席位唯一 ⇒ 无法同时放观察者）。「未入房」用**正对照**证明：
+    去掉该键后同一会话可正常入房——若前两次 400 已产生副作用，这里会撞 4101。
+    """
+    a = await peers()
+
+    assert await a.join_raw({"role": "agent", "name": "A", "office_id": "R1", "computer_id": X}) == _bad_request()
+    # ``null``：TypedDict 的 ``NotRequired[str]`` 在校验阶段即拒绝 ⇒ 400
+    assert await a.join_raw({"role": "agent", "name": "A", "office_id": "R1", "computer_id": None}) == _bad_request()
+
+    # A 未入房：不携带该键即可正常入房（若已入房会撞 4101 / 4106）
+    assert await a.join("agent", "A", "R1") is None
+
+
+async def test_12_echo_in_notice_and_session_info(peers: Any) -> None:
+    """#12：A 在 R1；C1 以 X 入房 ⇒ enter 带 X；SessionInfo 中 C1 有 X，A **无** ``computer_id`` 键。"""
+    a, c = await peers(), await peers()
+    assert await a.join("agent", "A", "R1") is None
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a, 1)
+    assert a.notices == [("enter", {"office_id": "R1", "computer": "C1", "computer_id": X})], a.notices
+
+    room = await _list_room(a, "R1")
+    c1_info = _session_by_name(room, "C1")
+    a_info = _session_by_name(room, "A")
+    assert c1_info["computer_id"] == X, c1_info
+    assert "computer_id" not in a_info, f"Agent 的 SessionInfo MUST 省略该键: {a_info!r}"
+
+
+async def test_13_same_sid_changing_computer_id_is_403(peers: Any) -> None:
+    """#13：C1 在 R1（X）；同一会话以 Y 再次 join ⇒ 403；仍在 R1、记录仍为 X、无广播。"""
+    a, c = await peers(), await peers()
+    assert await a.join("agent", "A", "R1") is None
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a, 1)
+    a.notices.clear()
+
+    assert await c.join("computer", "C1", "R1", computer_id=Y) == _forbidden()
+
+    await _quiet()
+    assert a.notices == [], f"403 不得产生广播: {a.notices!r}"
+    room = await _list_room(a, "R1")
+    assert _session_by_name(room, "C1")["computer_id"] == X, "记录不得被改声明覆盖"
+
+
+async def test_14_cloned_computer_id_in_another_room_is_accepted(peers: Any) -> None:
+    """#14：C1 在 R1（X）；另一会话 C2 以同一 X join R2（克隆）⇒ 空 ack（协议不做冲突检测）。"""
+    c1, c2 = await peers(), await peers()
+    assert await c1.join("computer", "C1", "R1", computer_id=X) is None
+    assert await c2.join("computer", "C2", "R2", computer_id=X) is None
+
+
+async def test_15_leave_and_disconnect_notices_carry_computer_id(peers: Any) -> None:
+    """#15：C1 显式 leave / 断连 ⇒ A 收到带 X 的 ``notify:leave_office``。"""
+    a, c = await peers(), await peers()
+    assert await a.join("agent", "A", "R1") is None
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a, 1)
+    a.notices.clear()
+
+    assert await c.leave("R1") is None
+    await _await_notices(a, 1)
+    assert a.notices == [("leave", {"office_id": "R1", "computer": "C1", "computer_id": X})], a.notices
+
+    # 断连路径：重新入房后直接断开
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a, 2)
+    a.notices.clear()
+    await c.client.disconnect()
+    await _await_notices(a, 1)
+    assert a.notices == [("leave", {"office_id": "R1", "computer": "C1", "computer_id": X})], a.notices
+
+
+async def test_16_auto_switch_notices_carry_computer_id(peers: Any) -> None:
+    """#16：C1 从 R1 自动换房到 R2 ⇒ R1 收到 leave(X)，R2 收到 enter(X)。"""
+    a_r1, a_r2, c = await peers(), await peers(), await peers()
+    assert await a_r1.join("agent", "A1", "R1") is None
+    assert await a_r2.join("agent", "A2", "R2") is None
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a_r1, 1)
+    a_r1.notices.clear()
+
+    assert await c.join("computer", "C1", "R2", computer_id=X) is None
+
+    await _await_notices(a_r1, 1)
+    await _await_notices(a_r2, 1)
+    assert a_r1.notices == [("leave", {"office_id": "R1", "computer": "C1", "computer_id": X})], a_r1.notices
+    assert a_r2.notices == [("enter", {"office_id": "R2", "computer": "C1", "computer_id": X})], a_r2.notices
+
+
+async def test_17_same_identity_rejoin_is_idempotent(peers: Any) -> None:
+    """#17：C1 在 R1（X）；同一会话以 X 再次 join ⇒ 空 ack，无广播（#13 的正对照）。"""
+    a, c = await peers(), await peers()
+    assert await a.join("agent", "A", "R1") is None
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a, 1)
+    a.notices.clear()
+
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _quiet()
+    assert a.notices == [], a.notices
+
+
+async def test_18_record_survives_leave_so_new_id_is_403(peers: Any) -> None:
+    """#18：C1 在 R1（X）；leave 后同一会话以 Y join ⇒ 403；记录不因 leave 清除。"""
+    a, c = await peers(), await peers()
+    assert await a.join("agent", "A", "R1") is None
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    await _await_notices(a, 1)
+    a.notices.clear()
+
+    assert await c.leave("R1") is None
+    await _await_notices(a, 1)
+    a.notices.clear()
+
+    assert await c.join("computer", "C1", "R1", computer_id=Y) == _forbidden()
+    room = await _list_room(a, "R1")
+    assert all(session.get("name") != "C1" for session in room["sessions"]), f"C1 不得在房: {room!r}"
+
+    # 记录仍为 X：同一会话以 X 入房即可（正对照）
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+
+
+async def test_19_changing_id_while_switching_room_is_403_not_4101(peers: Any) -> None:
+    """#19：C1 在 R1（X）、C2 在 R2；C1 以 Y join R2 ⇒ 403（**非** 4101）；C1 仍在 R1、R1 无 leave。"""
+    a_r1, c1, c2 = await peers(), await peers(), await peers()
+    assert await a_r1.join("agent", "A1", "R1") is None
+    assert await c1.join("computer", "C1", "R1", computer_id=X) is None
+    assert await c2.join("computer", "C2", "R2", computer_id=Y) is None
+    await _await_notices(a_r1, 1)
+    a_r1.notices.clear()
+
+    ack = await c1.join("computer", "C1", "R2", computer_id=Y)
+    assert ack == _forbidden(), f"身份校验必须先于席位（403 而非 4101）: {ack!r}"
+
+    await _quiet()
+    assert a_r1.notices == [], f"C1 仍在 R1，不得收到 leave: {a_r1.notices!r}"
+    room = await _list_room(a_r1, "R1")
+    assert _session_by_name(room, "C1")["computer_id"] == X
+
+
+async def test_20_agent_switching_room_with_computer_id_is_400_not_4106(peers: Any) -> None:
+    """#20：A 在 R1；A join R2 并携带 ``computer_id`` ⇒ 400（**非** 4106）；A 仍在 R1。"""
+    a, watcher = await peers(), await peers()
+    assert await a.join("agent", "A", "R1") is None
+    assert await watcher.join("agent", "W", "R2") is None
+    watcher.notices.clear()
+
+    ack = await a.join_raw({"role": "agent", "name": "A", "office_id": "R2", "computer_id": X})
+    assert ack == _bad_request(), f"取值校验必须先于房间语义（400 而非 4106）: {ack!r}"
+
+    await _quiet()
+    assert watcher.notices == [], watcher.notices
+    room = await _list_room(a, "R1")
+    assert _session_by_name(room, "A")["name"] == "A"
+
+
+async def test_21_agent_enter_notice_omits_computer_id(peers: Any) -> None:
+    """#21：C1 在 R1（X）；A 入房 ⇒ C1 收到的 enter(agent) **无** ``computer_id`` 键（不得为 null）。"""
+    c, a = await peers(), await peers()
+    assert await c.join("computer", "C1", "R1", computer_id=X) is None
+    assert await a.join("agent", "A", "R1") is None
+
+    await _await_notices(c, 1)
+    assert c.notices == [("enter", {"office_id": "R1", "agent": "A"})], c.notices
+    payload = c.notices[0][1]
+    assert "computer_id" not in payload, f"Agent 通知 MUST 省略该键（不得为 null）: {payload!r}"

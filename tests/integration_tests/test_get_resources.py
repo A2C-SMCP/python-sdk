@@ -266,11 +266,11 @@ def sync_smcp_server(sync_server_port: int) -> Generator[int, Any, None]:
 
 
 def _sync_join(client: Client, role: Literal["computer", "agent"], office_id: str, name: str) -> None:
-    ack = client.call(
-        JOIN_OFFICE_EVENT,
-        {"role": role, "office_id": office_id, "name": name},
-        namespace=SMCP_NAMESPACE,
-    )
+    payload: dict = {"role": role, "office_id": office_id, "name": name}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
+    ack = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     assert_empty_ack(ack)
 
 

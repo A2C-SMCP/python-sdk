@@ -117,7 +117,7 @@ def test_leave_room_broadcast_and_clear_session(monkeypatch):
     assert "office_id" not in sess  # 已清理
 
 
-def test_on_server_join_office_ok_and_rollback_on_error():
+def test_on_server_join_office_ok_and_error_ack():
     ns = SyncSMCPNamespace(_DummyAuthProv())
     ns.get_session = MagicMock(return_value={})
     ns.save_session = MagicMock()
@@ -127,13 +127,21 @@ def test_on_server_join_office_ok_and_rollback_on_error():
     server.manager.get_participants = MagicMock(return_value=[])
     ns.server = server
 
+    payload = {
+        "role": "computer",
+        "name": "n",
+        "office_id": "o",
+        # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id
+        "computer_id": "11111111-1111-4111-8111-111111111111",
+    }
+
     # 正常路径：成功 = 空 ack（v0.5.0 起；此前为 (True, None) 元组）
-    ack = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
+    ack = ns.on_server_join_office("sid", payload)
     assert_empty_ack(ack)
 
-    # enter_room 抛错 -> 回滚 + 回 500 笼统文案（原文只进日志）
+    # enter_room 抛错 -> 回 500 笼统文案（原文只进日志）；身份声明**不回滚**（protocol#64）
     ns.enter_room = MagicMock(side_effect=RuntimeError("boom"))
-    ack2 = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
+    ack2 = ns.on_server_join_office("sid", payload)
     assert_rejected_ack(ack2, 500)
     assert "boom" not in json.dumps(ack2)
 

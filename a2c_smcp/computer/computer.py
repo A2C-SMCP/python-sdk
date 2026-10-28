@@ -36,6 +36,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
@@ -73,6 +74,7 @@ from a2c_smcp.computer.blob.path_resolver import (
     resolve_path,
 )
 from a2c_smcp.computer.desktop.organize import organize_desktop
+from a2c_smcp.computer.identity import identity_store_path
 from a2c_smcp.computer.inputs.render import ConfigRender, collect_referenced_input_ids, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
@@ -587,6 +589,13 @@ class Computer(BaseComputer[PromptSession]):
     def _build_protected_paths(self, resolved: "ResolvedSettings") -> ProtectedPaths:
         """由已解析 settings 构造拒绝集（``landing_root`` 取自同一份视图，避免二次解析）。"""
         extra: list[str] = [str(self._blob_cache_root), str(self.skill_home)]
+        # #235 / protocol#64（blob-transfer.md §固定拒绝集）：``computer-id`` 的**实际使用位置**必须在拒绝集。
+        # 默认集按 ambient config dir 构造；注入 env（尤其仅 HOME、XDG 未设）时实际路径可能完全不同 ⇒
+        # 目录（路径前缀）+ 文件（硬链接文件身份）双保险。每次现算，随实例 env 变化。
+        # The identity's actual location is injected explicitly; the default set only covers the
+        # ambient config dir, which diverges when env is injected (HOME-only, XDG unset).
+        identity_path = identity_store_path(self._resolve_env())
+        extra.extend([str(identity_path.parent), str(identity_path)])
         if self._flag_settings_path is not None:
             extra.append(str(self._flag_settings_path))
         if self._mcp_flag_config is not None:
@@ -744,9 +753,20 @@ class Computer(BaseComputer[PromptSession]):
 
     # ── #134 per-instance env/cwd 注入接缝（对齐 rust-sdk#121） ──────────────
 
+    @property
+    def env(self) -> Mapping[str, str] | None:
+        """per-instance env 注入（``None`` = ambient ``os.environ``），**只读视图**。
+
+        v0.5.0（protocol#64）：Computer 身份持久化必须跟随**本实例**的 env（与 settings / mcp.json
+        同一 XDG 锚点），否则同进程两台注入不同 env 的 Computer 会共读同一身份文件（SDK 自造克隆）。
+        返回 ``MappingProxyType`` 只读副本：调用方不得就地改写实例注入的 env。
+        Read-only view over the injected env; callers must not mutate it in place.
+        """
+        return MappingProxyType(self._env) if self._env is not None else None
+
     def _resolve_env(self) -> Mapping[str, str] | None:
-        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。"""
-        return self._env
+        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。委托公开只读视图。"""
+        return self.env
 
     def _resolve_cwd(self) -> Path | None:
         """注入 project_root（``None`` = 延迟回退 ``os.getcwd()``，保 CLI 向后兼容）。"""

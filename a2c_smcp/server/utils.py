@@ -15,8 +15,16 @@ from pydantic import TypeAdapter, ValidationError
 from socketio import AsyncServer, Server
 
 from a2c_smcp.exceptions import RoomRejection, SMCPNamespaceError
-from a2c_smcp.server.types import OFFICE_ID, ComputerSession
-from a2c_smcp.smcp import SMCP_NAMESPACE, ErrorPayload, build_internal_error, build_room_rejection_error
+from a2c_smcp.server.types import OFFICE_ID, SID, ComputerSession, IdentityRecord
+from a2c_smcp.smcp import (
+    SMCP_NAMESPACE,
+    EnterOfficeNotification,
+    ErrorPayload,
+    LeaveOfficeNotification,
+    SessionInfo,
+    build_internal_error,
+    build_room_rejection_error,
+)
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("server")
@@ -98,6 +106,82 @@ def default_session_name(role: str | None, sid: str) -> str:
     make a repeat empty-name join look like an identity change the client cannot recover from.
     """
     return f"{role or 'unknown'}_{sid[:6]}"
+
+
+def build_enter_notification(
+    office_id: OFFICE_ID,
+    role: str | None,
+    name: str,
+    computer_id: str | None,
+) -> EnterOfficeNotification:
+    """构造 ``notify:enter_office`` 载荷（sync / async 共用，protocol#64）。
+
+    Computer 成员带 ``computer_id``；Agent 成员**省略**该键（不得为 ``null``）。Computer 缺
+    ``computer_id`` 时也不伪造：直接省略（仅测试直接调 ``enter_room`` 的旧路径可能出现）。
+    Shared enter-notification builder; Agent members omit the key entirely.
+    """
+    payload: EnterOfficeNotification = {"office_id": office_id}
+    if role == "computer":
+        payload["computer"] = name
+        if computer_id:
+            payload["computer_id"] = computer_id
+    else:
+        payload["agent"] = name
+    return payload
+
+
+def build_leave_notification(
+    office_id: OFFICE_ID,
+    role: str | None,
+    name: str,
+    computer_id: str | None = None,
+) -> LeaveOfficeNotification:
+    """构造 ``notify:leave_office`` 载荷（sync / async 共用，protocol#64）。
+
+    ``computer`` / ``agent`` 字段取名字而非 sid；Computer 带 ``computer_id``，Agent 省略该键。
+    Shared leave-notification builder; the name is the routing address, never the sid.
+    """
+    if role == "computer":
+        payload = LeaveOfficeNotification(office_id=office_id, computer=name)
+        if computer_id:
+            payload["computer_id"] = computer_id
+        return payload
+    return LeaveOfficeNotification(office_id=office_id, agent=name)
+
+
+def project_session_info(
+    session: Mapping[str, Any],
+    identities: Mapping[SID, IdentityRecord],
+) -> SessionInfo | None:
+    """把内部会话投影为协议 ``SessionInfo``（sync / async 共用，protocol#64）。
+
+    - ``a2c_version`` / ``computer_id`` 均为 NotRequired：有则带出；
+    - ``role="computer"`` 时 ``computer_id`` MUST 存在（会话字段优先，身份记录兜底——覆盖「会话尚未
+      持久化」的窄窗口）；``role="agent"`` 时 MUST 省略该键（不得为 ``null``）；
+    - 非 ``computer`` / ``agent`` 的会话返回 ``None``（调用方跳过）。
+
+    Shared SessionInfo projection: Computer carries ``computer_id`` (session first, identity record
+    as fallback); Agent never carries the key.
+    """
+    role = session.get("role")
+    if role not in ("computer", "agent"):
+        return None
+    info: SessionInfo = {
+        "sid": session.get("sid", ""),
+        "name": session.get("name", ""),
+        "role": role,
+        "office_id": session.get("office_id", ""),
+    }
+    if session.get("a2c_version"):
+        info["a2c_version"] = session["a2c_version"]
+    if role == "computer":
+        computer_id = session.get("computer_id")
+        if not computer_id:
+            record = identities.get(cast(SID, session.get("sid", "")))
+            computer_id = record.computer_id if record is not None else None
+        if computer_id:
+            info["computer_id"] = computer_id
+    return info
 
 
 def build_room_rejection_ack(

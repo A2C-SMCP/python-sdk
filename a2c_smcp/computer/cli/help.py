@@ -28,6 +28,7 @@ NAMESPACES: dict[str, str] = {
     "socket": "Socket.IO connection control",
     "notify": "Send notifications to Agent",
     "settings": "settings.json intent layer (show / get / set / edit)",
+    "identity": "Computer stable identity (reset)",
     "utility": "status / tools / mcp / desktop / render / tc / history",
 }
 
@@ -72,6 +73,9 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("socket leave", "离开房间 / leave office"),
     ],
     "notify": [("notify update", "触发配置更新通知 / emit config updated notification")],
+    "identity": [
+        ("identity reset", "重置 Computer 稳定身份（需新连接生效）/ reset stable identity (needs a new connection)"),
+    ],
     "settings": [
         ("settings show [--scope user|project|local|flag|policy|merged]", "展示某 scope（默认 merged）/ show a scope (default merged)"),
         ("settings get <key> [--scope ...]", "读取单字段 / read a field"),

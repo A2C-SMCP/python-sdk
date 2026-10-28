@@ -60,7 +60,9 @@ PROJECT_SETTINGS_FILENAME = "settings.json"
 LOCAL_SETTINGS_FILENAME = "settings.local.json"
 USER_SETTINGS_FILENAME = "settings.json"
 
-_A2C_CONFIG_SUBDIR = "a2c"
+#: SDK 在用户配置目录下的子目录名（settings / mcp.json / ``computer-id`` 共用）。
+#: Public so the identity store can converge on the same constant (no duplicate literal).
+A2C_CONFIG_SUBDIR = "a2c"
 
 
 def resolve_user_config_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -76,8 +78,8 @@ def resolve_user_config_dir(env: Mapping[str, str] | None = None) -> Path:
     return resolve_xdg_first(
         environ,
         XDG_CONFIG_HOME_ENV,
-        _A2C_CONFIG_SUBDIR,
-        fallback=Path.home() / ".config" / _A2C_CONFIG_SUBDIR,
+        A2C_CONFIG_SUBDIR,
+        fallback=Path.home() / ".config" / A2C_CONFIG_SUBDIR,
     )
 
 
