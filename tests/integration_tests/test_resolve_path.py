@@ -20,7 +20,8 @@ End-to-end integration tests for ``client:resolve_path`` + ``kind=path`` pulls.
   - 越界（存在 / 不存在）→ ``forbidden``（**不泄露存在性**）
   - 授权内不存在 → ``not_found``；目录 → ``not_a_file``
   - resolve 后删除 → ``4018 gone``；改写（尺寸变化）→ ``4018 gone``
-  - 撤权（settings 改写 + ``refresh_read_roots``）→ ``4018 forbidden``
+  - 撤权（**外部改 settings**，不调任何失效入口）→ ``4018 forbidden``（授权每请求现读、无缓存）
+  - root 符号链接**换指向** → 旧句柄 ``4018 forbidden``、新 resolve 落到新目标（realpath 现算）
   - ``project`` scope 提供 ``readRoots`` → 整字段不生效（仍 ``forbidden``）
 """
 

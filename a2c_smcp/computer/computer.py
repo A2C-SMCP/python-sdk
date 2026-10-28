@@ -165,6 +165,19 @@ class _RawServerEntry:
     marketplace: str | None
 
 
+def _absolute_flag_path(path: Path | str | None) -> Path | None:
+    """flag 层文件路径 → 绝对路径（展开 ``~``、相对路径按**构造期** cwd 解析、跟随符号链接）。
+
+    Normalize a flag-layer path to absolute at construction time (expanduser + resolve).
+
+    ``resolve()`` 默认非严格：文件尚不存在也返回绝对路径（构造期允许「稍后创建」）。
+    单独抽成函数便于单测钉住「相对路径也进拒绝集」。
+    """
+    if path is None:
+        return None
+    return Path(path).expanduser().resolve()
+
+
 @dataclass(frozen=True, slots=True)
 class PathAccessPolicy:
     """一次请求的读取授权快照：读根 + 固定拒绝集（v0.5.0 #236 / protocol#65）。
@@ -272,9 +285,15 @@ class Computer(BaseComputer[PromptSession]):
         # 它在 CLI 下恒空不是缺陷，而是「CLI 不是嵌入式宿主」的正确表现。
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
         # flag 层 mcp.json 路径（`--mcp-config`）：与 `_mcp_servers` 同为当次 boot 的声明式输入（§2.5-5）。
-        self._mcp_flag_config: Path | None = mcp_flag_config
+        # **构造期归一到绝对路径**（🔴1）：审批门 origin / 固定拒绝集 / 文件读取三处必须看到同一绝对
+        # 路径。相对路径或 ``~`` 直接进拒绝集会被 ``normalize_path`` 判 invalid 后**静默丢弃**，
+        # 该文件的凭据内容仍可被 ``resolve`` + ``get_blob`` 读出（``./mcp.json`` + readRoots 含 cwd
+        # 即真实场景）。归一点选在构造器：CLI 与嵌入式宿主共用同一入口。
+        # Normalize at construction so the approval gate, the rejection set and file reads all see
+        # one absolute path; otherwise a relative/`~` flag path is silently dropped from the set.
+        self._mcp_flag_config: Path | None = _absolute_flag_path(mcp_flag_config)
         # flag 层 settings.json 路径（`--settings`）：与 `_mcp_flag_config` 同为 flag scope 文件对（#167 子问题 3）。
-        self._flag_settings_path: Path | None = flag_settings_path
+        self._flag_settings_path: Path | None = _absolute_flag_path(flag_settings_path)
         # #134（对齐 rust-sdk#121）：per-instance env/project_root 注入接缝。None = 进程 ambient（backward compat）。
         # 嵌入式宿主注入使 settings 解析轴（XDG / project cwd）与 ledger（skill_home）同锚点，消除归属混源。
         self._env: Mapping[str, str] | None = env
@@ -557,8 +576,16 @@ class Computer(BaseComputer[PromptSession]):
         # project/local 治理目录随 cwd 走（#116 单 cwd 锚点）；与 resolve_settings 同源回退.
         cwd = self._resolve_cwd() or Path(os.getcwd())
         extra.append(str(cwd / TFROBOT_DIRNAME))
-        raw_landing = resolved.settings.get(FIELD_LANDING_ROOT)
-        landing = raw_landing if isinstance(raw_landing, str) and raw_landing else None
+        # ``.part`` 规则必须对准**实际写入根**：``blob_upload_store`` 用的是 :attr:`landing_root`
+        # （已配置时进程内缓存）。若这里改读「最新 settings」，运行期改值后保护罩与写入根错位——
+        # 旧 root 下的 ``.part`` 反而不再被拒（🟡4）。已缓存 → 用缓存值；未缓存 → 用同一份
+        # ``resolved`` 视图（存储将来也读最新值，二者一致且不额外解析）。
+        # Align the `.part` rule with the *actual* write root used by blob_upload_store.
+        if self._landing_root is not None:
+            landing: str | None = str(self._landing_root)
+        else:
+            raw_landing = resolved.settings.get(FIELD_LANDING_ROOT)
+            landing = raw_landing if isinstance(raw_landing, str) and raw_landing else None
         return build_protected_paths(
             extra_paths=extra,
             landing_root=landing,
@@ -584,10 +611,15 @@ class Computer(BaseComputer[PromptSession]):
         cache.
         """
         resolved = self._resolve_declared_settings()
-        return PathAccessPolicy(
-            roots=self._compile_read_roots(resolved),
-            protected=self._build_protected_paths(resolved),
-        )
+        roots = self._compile_read_roots(resolved)
+        if not roots:
+            # 未授权：短路掉拒绝集构造——它会 ``ensure_skill_home()``（mkdir）并 stat 约 8 条路径，
+            # 与「空 readRoots 时不触碰文件系统」的语义冲突（🟡7）。空拒绝集对调用方无差别：
+            # 空 roots 在 path core 第 2 步即 forbidden，绝不会走到拒绝集判定。
+            # Short-circuit: an empty rejection set is equivalent here because empty roots already
+            # mean `forbidden` at path core step 2 — and building it would mkdir skill home + stat.
+            return PathAccessPolicy(roots=[], protected=ProtectedPaths())
+        return PathAccessPolicy(roots=roots, protected=self._build_protected_paths(resolved))
 
     def resolve_read_path(self, path: str, *, policy: PathAccessPolicy | None = None) -> ResolvedPath:
         """按协议九步管线解析一个本地路径并**现铸** ``blob_handle``（v0.5.0 #236）。

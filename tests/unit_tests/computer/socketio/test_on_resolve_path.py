@@ -36,13 +36,13 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.blob import BlobHandleForbiddenError, BlobHandleGoneError
-from a2c_smcp.computer.blob.path_resolver import PathResolveError, ResolvedPath
+from a2c_smcp.computer.blob.path_resolver import PathResolveError, ProtectedPaths, ResolvedPath
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.settings.scope import ResolvedSettings
 from a2c_smcp.computer.socketio import client as computer_sio
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.exceptions import SMCPNamespaceError
-from a2c_smcp.utils.path_norm import normalize_path
+from a2c_smcp.utils.path_norm import normalize_path, realpath_nonstrict
 
 
 @pytest.fixture()
@@ -112,7 +112,7 @@ class TestResolvePathHandler:
     """``on_resolve_path`` 接线 / handler wiring."""
 
     @pytest.mark.asyncio
-    async def test_empty_read_roots_is_forbidden_without_touching_fs(
+    async def test_empty_read_roots_is_forbidden_without_touching_target(
         self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """``readRoots`` 未配置 → ``4020 forbidden``；resolve 不得被调用（fail-closed 先于一切）.
@@ -126,7 +126,7 @@ class TestResolvePathHandler:
         ret = await client.on_resolve_path(_resolve_req())  # type: ignore[arg-type]
 
         assert ret == {"code": 4020, "message": "Path not accessible", "details": {"reason": "forbidden"}}
-        assert called == [], "readRoots 为空时 MUST NOT 触碰文件系统 / must not touch the filesystem"
+        assert called == [], "readRoots 为空时 MUST NOT 触碰目标路径（不 lstat/open）"
 
     @pytest.mark.asyncio
     async def test_success_maps_all_fields(
@@ -401,5 +401,141 @@ class TestReadAuthorizationSource:
         monkeypatch.setattr(computer, "path_access_policy", boom)
 
         ret = await client.on_get_blob(_blob_req())  # type: ignore[arg-type]
+
+        assert ret["code"] == 500  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# 第二轮审查回归锁 / second fix-review round
+# ---------------------------------------------------------------------------
+class TestReviewRoundTwoLocks:
+    """拒绝集路径归一、切片异常 ack、写入根对齐、realpath 新鲜度（隔离审查第二轮）."""
+
+    @pytest.mark.parametrize("attr", ["mcp_flag_config", "flag_settings_path"])
+    def test_relative_flag_paths_absolutized_and_kept_in_rejection_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attr: str
+    ) -> None:
+        """🔴1：``--mcp-config ./mcp.json`` / ``--settings ./x.json`` 相对路径必须仍进拒绝集.
+
+        构造期归一到绝对路径；否则 ``normalize_path`` 判 invalid 后**静默丢弃**，
+        该文件（可含 server 字面量 env/凭据）仍可被 resolve + get_blob 读出。
+        """
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "flag.json").write_text("{}", encoding="utf-8")
+
+        computer = Computer(name="comp-test", blob_cache_root=tmp_path / "cache", **{attr: Path("./flag.json")})
+        _grant(computer, monkeypatch)
+
+        expected = normalize_path(str(Path("./flag.json").expanduser().resolve()))
+        assert expected in computer.protected_paths().paths
+        assert getattr(computer, f"_{attr}").is_absolute(), "flag 路径必须在构造期已是绝对路径"
+
+    def test_read_roots_realpath_refreshed_when_root_symlink_retargeted(
+        self, tmp_path: Path, computer: Computer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴2/🟡5：settings 文本**不变**、root 软链换指向 → ``ReadRoot.real`` 必须随之改变.
+
+        旧缓存实现（以 raw 列表为键）在此用例下仍返回旧 real ⇒ 旧目标继续可读。
+        """
+        old = tmp_path / "old"
+        new = tmp_path / "new"
+        old.mkdir()
+        new.mkdir()
+        link = tmp_path / "root"
+        link.symlink_to(old, target_is_directory=True)
+
+        monkeypatch.setattr(
+            computer,
+            "_resolve_declared_settings",
+            lambda: ResolvedSettings(settings={"readRoots": [str(link)]}, errors=[], per_scope_layers={}),
+        )
+
+        first = computer.read_roots[0]
+        assert first.real == normalize_path(realpath_nonstrict(str(old)))
+
+        link.unlink()
+        link.symlink_to(new, target_is_directory=True)
+
+        second = computer.read_roots[0]
+        assert second.configured == first.configured, "配置形态不变"
+        assert second.real == normalize_path(realpath_nonstrict(str(new))), "realpath 必须每请求现算"
+
+    def test_protected_paths_uses_actual_write_root(
+        self, tmp_path: Path, computer: Computer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡4：``.part`` 规则对准**实际写入根**（``_landing_root`` 缓存），而非最新 settings.
+
+        否则运行期改 ``landingRoot`` 后保护罩与写入根错位，旧 root 下的 ``.part`` 不再被拒。
+        """
+        computer._landing_root = Path("/old/landing")  # 模拟 blob_upload_store 已缓存的写入根
+        monkeypatch.setattr(
+            computer,
+            "_resolve_declared_settings",
+            lambda: ResolvedSettings(settings={"landingRoot": "/new/landing"}, errors=[], per_scope_layers={}),
+        )
+
+        assert computer.protected_paths().landing_root == normalize_path("/old/landing")
+
+    def test_path_access_policy_short_circuits_rejection_set_when_unauthorized(
+        self, computer: Computer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡7：空 ``readRoots`` 时短路拒绝集构造（否则 skill home mkdir + ~8 条 stat）.
+
+        正对照：有授权时拒绝集**必须**被构造，避免「短路」退化成永不构造。
+        """
+        _grant(computer, monkeypatch)
+
+        def _must_not_run(resolved: Any) -> Any:
+            raise AssertionError("空 readRoots 时不得构造拒绝集")
+
+        monkeypatch.setattr(computer, "_build_protected_paths", _must_not_run)
+
+        policy = computer.path_access_policy()
+        assert policy.roots == []
+        assert policy.protected.paths == ()
+
+        # 正对照 / positive control
+        _grant(computer, monkeypatch, "/srv/docs")
+        calls: list[Any] = []
+        monkeypatch.setattr(
+            computer,
+            "_build_protected_paths",
+            lambda resolved: calls.append(resolved) or ProtectedPaths(),
+        )
+        computer.path_access_policy()
+        assert calls, "有授权时拒绝集必须被构造"
+
+    @pytest.mark.asyncio
+    async def test_slice_oserror_returns_flat_500_and_still_closes(
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡2：``pull.slice`` 抛 OSError（NFS/FUSE ESTALE 等）→ flat 500 ack，句柄仍关闭."""
+        fake = _FakePull(b"abc")
+        _grant(computer, monkeypatch, "/srv/docs")
+        _patch_path_handle(monkeypatch)
+        monkeypatch.setattr(computer, "pull_path_blob", lambda payload, **kw: fake)
+
+        def boom(offset: int, length: int) -> bytes:
+            raise OSError("ESTALE")
+
+        fake.slice = boom  # type: ignore[method-assign]
+
+        ret = await client.on_get_blob(_blob_req())  # type: ignore[arg-type]
+
+        assert ret == {"code": 500, "message": "Internal error"}
+        assert fake.close_calls == 1, "异常路径也必须 close（fd 泄漏守卫）"
+
+    @pytest.mark.asyncio
+    async def test_missing_path_key_still_acks_500(
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡3：载荷缺 ``path`` 且内部抛错 → 仍回 500（``except`` 内二次 KeyError 会顶替原异常）."""
+
+        def boom() -> Any:
+            raise OSError("settings unreadable")
+
+        monkeypatch.setattr(computer, "path_access_policy", boom)
+
+        ret = await client.on_resolve_path({"agent": "a", "req_id": "r", "computer": "comp-test"})  # type: ignore[arg-type]
 
         assert ret["code"] == 500  # type: ignore[index]

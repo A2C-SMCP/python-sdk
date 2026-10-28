@@ -75,6 +75,7 @@ from a2c_smcp.smcp import (
     ResourceAnnotations,
     ToolCallReq,
     UpdateComputerConfigReq,
+    build_internal_error,
 )
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
@@ -1490,10 +1491,10 @@ def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePa
 
     Args:
         data: ``ResolvePathReq`` payload（``computer`` / ``path`` / ``req_id``）。
-        computer: 持有 ``name`` / ``read_roots`` / ``resolve_read_path`` 的 ``Computer`` 实例。
+        computer: 持有 ``name`` / ``path_access_policy`` / ``resolve_read_path`` 的 ``Computer`` 实例。
 
     Returns:
-        ``ResolvePathRet``（成功）或 ``ErrorPayload``（``4020`` 四 reason）。
+        ``ResolvePathRet``（成功）或 ``ErrorPayload``（``4020`` 四 reason / ``500``）。
 
     Raises:
         SMCPNamespaceError: ``computer.name`` 与 ``data["computer"]`` 不匹配（防御纵深，理论不可达）。
@@ -1501,18 +1502,25 @@ def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePa
     if computer.name != data["computer"]:
         raise SMCPNamespaceError("计算机标识不匹配")
 
-    # 一次解析得出本请求的授权快照（读根 + 拒绝集）；守卫与管线共用同一份视图（🟡5）。
+    # 在 try 之前取局部变量：``except`` 内的日志不得再索引 payload——缺失字段的二次 KeyError
+    # 会顶替原异常逃出 handler，连 500 ack 都发不出（🟡3）。
+    # Capture the path before the try: indexing it inside `except` could raise a second KeyError
+    # and replace the original exception, leaving the caller without any ack.
+    path = data.get("path")
+
+    # 一次解析得出本请求的授权快照（读根 + 拒绝集）；守卫与管线共用同一份视图。
     # One settings parse per request; the guard and the pipeline share the snapshot.
     #
-    # 未预期异常兜底（🟡4）：``read_roots`` / ``protected_paths`` 可能抛 OSError（如 skill home
+    # 未预期异常兜底：``path_access_policy`` / ``resolve_read_path`` 可能抛 OSError（如 skill home
     # 创建失败、settings 目录不可读）。异常逃出 handler ⇒ **不发 ack** ⇒ Agent 挂到自身超时；
     # 「凡有 ack 通道 ⇒ 失败必须产出 ack」是硬约束，故映射为 flat 500（文案笼统、原文只进日志）。
-    # Any unexpected exception must still produce an ack: map it to a generic flat 500.
+    # Any unexpected exception must still produce an ack: map it to the generic flat 500.
     # ``SMCPNamespaceError``（隔离不变量）在 try 之外抛出，绝不被吞。
     try:
         policy = computer.path_access_policy()
 
-        # fail-closed 显式守卫（**防御纵深**）：``readRoots`` 为空一律 forbidden，且**不触碰文件系统**。
+        # fail-closed 显式守卫（**防御纵深**）：``readRoots`` 为空一律 forbidden，且**不触碰目标路径**
+        # （不 lstat / 不 open；授权视图本身仍需读 settings 文件，这是判定的前提）。
         # 规范判据在 path core 第 2 步（``_run_pipeline``，流 1 已有单测）；此处再查一层是刻意的——
         # 授权缺省值必须在接线层也成立，不能只依赖下游实现，也不让任何下游回归静默打开读取面。
         # Defense in depth: the normative check is path core step 2 (covered by stream 1's tests);
@@ -1521,13 +1529,16 @@ def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePa
             logger.warning("client:resolve_path 拒绝：readRoots 未配置（默认不可读）/ no readRoots configured")
             return _path_error(reason="forbidden")
 
+        # 取值用 ``data["path"]``（``ResolvePathReq`` 为 total=True，Server 已校验）；缺失时
+        # KeyError 落入下面的 ``except Exception`` → 仍有 500 ack（🟡3）。
+        # Index here (total=True, Server-validated); a missing key lands in `except Exception` → 500 ack.
         resolved = computer.resolve_read_path(data["path"], policy=policy)
     except PathResolveError as exc:
-        logger.warning(f"client:resolve_path 拒绝：reason={exc.reason} path={data['path']!r}")
+        logger.warning(f"client:resolve_path 拒绝：reason={exc.reason} path={path!r}")
         return _path_error(reason=exc.reason)
     except Exception:
-        logger.exception(f"client:resolve_path 未预期异常 path={data['path']!r}")
-        return ErrorPayload(code=int(ErrorCode.INTERNAL_ERROR), message="Internal error")
+        logger.exception(f"client:resolve_path 未预期异常 path={path!r}")
+        return build_internal_error()
 
     return ResolvePathRet(
         canonical_path=resolved.canonical_path,
@@ -1613,7 +1624,7 @@ def _process_path_get_blob(data: GetBlobReq, computer: Computer, payload: Mappin
         # 未预期异常必须仍产出 ack（否则 Agent 挂到自身超时）；文案笼统、原文只进日志。
         # Any unexpected error still produces an ack (flat 500); the traceback stays in logs.
         logger.exception("client:get_blob path 分支未预期异常 / unexpected error in path branch")
-        return ErrorPayload(code=int(ErrorCode.INTERNAL_ERROR), message="Internal error")
+        return build_internal_error()
 
     try:
         if not isinstance(chunk_offset, int) or chunk_offset < 0 or chunk_offset > pull.total_size:
@@ -1633,6 +1644,12 @@ def _process_path_get_blob(data: GetBlobReq, computer: Computer, payload: Mappin
             chunk=chunk,
             req_id=data["req_id"],
         )
+    except Exception:
+        # 🟡2：``pull.slice`` 走真实文件读（NFS/FUSE 可抛 ESTALE / EIO）。异常穿过 ``finally``
+        # 逃出 handler ⇒ 不发 ack ⇒ Agent 挂到超时；此处仍必须产出 ack。``finally`` 保持 close。
+        # Slice does real file I/O (NFS/FUSE can raise ESTALE/EIO); still answer with a flat 500.
+        logger.exception("client:get_blob path 切片未预期异常 / unexpected error while slicing")
+        return build_internal_error()
     finally:
         pull.close()
 
