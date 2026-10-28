@@ -28,6 +28,7 @@ from a2c_smcp.testing import (
     run_http_server,
 )
 
+
 @pytest.fixture(autouse=True)
 def isolate_a2c_identity_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """v0.5.0（protocol#64）：隔离 Computer 身份持久化目录（``$XDG_CONFIG_HOME/a2c``）。

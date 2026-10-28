@@ -241,10 +241,12 @@ async def test_event_handlers_enter_leave_update(client: AsyncSMCPAgentClient, h
         return {"tools": [{"name": "t-x"}], "req_id": "r"}
 
     with patch.object(client, "get_tools_from_computer", new=AsyncMock(side_effect=_mock_get_tools)):
-        # enter
-        enter: EnterOfficeNotification = {"office_id": "test_office", "computer": "c1"}
+        # enter（v0.5.0 / protocol#64：Computer 成员的通知带 computer_id，Agent 须原样透传给宿主）
+        cid = "abcdef01-2345-4678-8abc-def012345678"
+        enter: EnterOfficeNotification = {"office_id": "test_office", "computer": "c1", "computer_id": cid}
         await client._on_computer_enter_office(enter)
         assert handler.enter_office_calls and handler.tools_received_calls
+        assert handler.enter_office_calls[-1]["computer_id"] == cid, "Agent 必须把 computer_id 透传给事件处理器"
 
         # leave
         leave: LeaveOfficeNotification = {"office_id": "test_office", "computer": "c1"}
@@ -352,17 +354,19 @@ async def test_get_computer_in_office_returns_the_single_computer(mock_call: Asy
     English: Returns the office's single computer (agent sessions filtered out).
     """
     office_id = "test_office"
+    computer_id = "abcdef01-2345-4678-8abc-def012345678"
     mock_call.return_value = {
         "req_id": f"list_computers_test_agent_{office_id}",
         "sessions": [
-            {"sid": "comp1", "role": "computer", "name": "computer-1"},
+            {"sid": "comp1", "role": "computer", "name": "computer-1", "computer_id": computer_id},
             {"sid": "agent1", "role": "agent", "name": "agent-1"},
         ],
     }
 
     computer = await client.get_computer_in_office(office_id)
 
-    assert computer == {"sid": "comp1", "role": "computer", "name": "computer-1"}
+    # 协议#64：SessionInfo 的 computer_id 原样交给宿主（持久引用的机器身份）
+    assert computer == {"sid": "comp1", "role": "computer", "name": "computer-1", "computer_id": computer_id}
     mock_call.assert_awaited_once()
 
 

@@ -345,7 +345,7 @@ def test_validate_office_data_missing_computer():
         "agent": None,
     }
 
-    with pytest.raises(AssertionError, match="无效的计算机ID"):
+    with pytest.raises(AssertionError, match="无效的计算机名称"):
         client.validate_office_data(invalid_data)
 
 

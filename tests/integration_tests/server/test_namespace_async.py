@@ -46,9 +46,14 @@ from a2c_smcp.smcp import (
 )
 from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
+#: v0.5.0（protocol#64）：同一文件内的 Computer 入房共用固定身份（同一 sid 的身份在连接内不可变）。
+_COMPUTER_ID = "abcdef01-2345-4678-8abc-def012345678"
+
 
 async def _join_office(client: AsyncClient, role: Literal["computer", "agent"], office_id: str, name: str) -> None:
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
+    if role == "computer":
+        payload["computer_id"] = _COMPUTER_ID
     # v0.5.0（#214）：成功 = 空 ack（None）；失败 = flat ErrorPayload
     assert_empty_ack(await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE))
 
@@ -492,7 +497,7 @@ async def test_computer_duplicate_name_rejected(socketio_server, basic_server_po
 
     # 第二个 Computer 尝试加入同一房间，应该失败
     # Second Computer tries to join same room, should fail
-    payload: EnterOfficeReq = {"role": "computer", "office_id": office_id, "name": computer_name}
+    payload: EnterOfficeReq = {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_id, "name": computer_name}
     ack = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
     # 验证失败：v0.5.0 起以 flat ErrorPayload 承载，错误语义看**协议码**而非自由文本
@@ -538,7 +543,7 @@ async def test_computer_different_name_also_rejected(socketio_server, basic_serv
 
     # 第二个 Computer 加入同一房间 ⇒ 4101
     # Second Computer joins the same room ⇒ 4101
-    payload: EnterOfficeReq = {"role": "computer", "office_id": office_id, "name": "comp-2"}
+    payload: EnterOfficeReq = {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_id, "name": "comp-2"}
     ack = await computer2.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
     assert_rejected_ack(ack, 4101, action="server:join_office")
@@ -574,7 +579,7 @@ async def test_computer_switch_room_with_same_name_allowed(socketio_server, basi
 
     # 切换到第二个房间（同名Computer）
     # Switch to second room (same name Computer)
-    payload: EnterOfficeReq = {"role": "computer", "office_id": "office-room-2", "name": computer_name}
+    payload: EnterOfficeReq = {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": "office-room-2", "name": computer_name}
     ack = await computer.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
 
     # 验证成功
@@ -807,7 +812,7 @@ async def test_rejected_same_name_join_never_enters_room(socketio_server, basic_
         namespaces=[SMCP_NAMESPACE],
         socketio_path="/socket.io",
     )
-    payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "c213"}
+    payload: EnterOfficeReq = {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_b, "name": "c213"}
     ack = await subject.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     assert_rejected_ack(ack, 4101, action="server:join_office")  # 目标房 Computer 席位已占（同名亦然）
 
@@ -855,7 +860,7 @@ async def test_computer_switch_into_same_name_room_rejected_keeps_old_room(socke
 
     ack = await mover.call(
         JOIN_OFFICE_EVENT,
-        {"role": "computer", "office_id": office_b, "name": "c215"},
+        {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_b, "name": "c215"},
         namespace=SMCP_NAMESPACE,
     )
     assert_rejected_ack(ack, 4101, action="server:join_office")
@@ -903,7 +908,7 @@ async def test_rename_on_live_session_rejected_keeps_old_room(socketio_server, b
     mover_sid = await _connect_join(mover, basic_server_port, "computer", office_a, "mover-221")
 
     # 改名（并换房）：声明与会话不同的 name ⇒ 身份声明冲突 403
-    payload: EnterOfficeReq = {"role": "computer", "office_id": office_b, "name": "renamed-221"}
+    payload: EnterOfficeReq = {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_b, "name": "renamed-221"}
     ack = await mover.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     assert_rejected_ack(ack, 403, action="server:join_office")
     assert ack["message"] == "Role or name mismatch with existing session", ack
@@ -981,7 +986,7 @@ async def test_join_office_ack_shapes_over_wire(socketio_server, basic_server_po
         # 角色不符（会话已声明 agent，本次声明 computer）→ 403 payload
         rejected = await client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": "office-wire-214", "name": "wire-agent"},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": "office-wire-214", "name": "wire-agent"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -1180,7 +1185,14 @@ async def test_name_conflict_ack_never_leaks_peer_sid_over_wire(socketio_server,
     await _connect(challenger, basic_server_port)
     try:
         ack = await challenger.call(
-            JOIN_OFFICE_EVENT, {"role": "computer", "office_id": "office-216-dup", "name": "dup-216"}, namespace=SMCP_NAMESPACE
+            JOIN_OFFICE_EVENT,
+            {
+                "role": "computer",
+                "computer_id": _COMPUTER_ID,
+                "office_id": "office-216-dup",
+                "name": "dup-216",
+            },
+            namespace=SMCP_NAMESPACE,
         )
         assert_rejected_ack(ack, 4101)
         blob = json.dumps(ack, ensure_ascii=False)

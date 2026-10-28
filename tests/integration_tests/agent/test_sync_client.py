@@ -114,6 +114,9 @@ def _join_office(client: Client, role: Literal["computer", "agent"], office_id: 
     English: Join office via server:join_office (sync).
     """
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
     ack = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     assert_empty_ack(ack)
 
@@ -355,7 +358,14 @@ def test_get_computer_in_office_sync(startup_and_shutdown_sync_smcp_server):
     second = Client()
     second.connect(f"http://localhost:{port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     ack = second.call(
-        JOIN_OFFICE_EVENT, {"role": "computer", "office_id": office_id, "name": "comp-sync-04-2"}, namespace=SMCP_NAMESPACE
+        JOIN_OFFICE_EVENT,
+        {
+            "role": "computer",
+            "office_id": office_id,
+            "name": "comp-sync-04-2",
+            "computer_id": "abcdef02-2345-4678-8abc-def012345679",
+        },
+        namespace=SMCP_NAMESPACE,
     )
     assert isinstance(ack, dict) and ack["code"] == 4101 and ack["details"]["role"] == "computer", ack
     second.disconnect()
@@ -439,6 +449,8 @@ def test_sync_agent_on_computer_enter_office_with_mock(startup_and_shutdown_sync
                 "office_id": office_id,
                 "role": "computer",
                 "name": computer_id,
+                # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id
+                "computer_id": "abcdef01-2345-4678-8abc-def012345678",
             }
             logger.info("Sending ENTER_OFFICE_EVENT...")
             computer_client.call(JOIN_OFFICE_EVENT, enter_payload, namespace=SMCP_NAMESPACE)

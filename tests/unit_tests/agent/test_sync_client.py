@@ -221,6 +221,8 @@ class TestSMCPAgentClient:
         data: EnterOfficeNotification = {
             "office_id": "test_office",
             "computer": "test_computer",
+            # v0.5.0 / protocol#64：Computer 成员的通知带 computer_id，Agent 原样透传给事件处理器
+            "computer_id": "abcdef01-2345-4678-8abc-def012345678",
         }
 
         with patch.object(client, "get_tools_from_computer") as mock_get_tools:

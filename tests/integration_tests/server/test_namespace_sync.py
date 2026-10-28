@@ -117,15 +117,18 @@ def startup_and_shutdown_local_sync_server(sync_server_port: int) -> Generator[N
             server_process.join(timeout=1)
 
 
+#: v0.5.0（protocol#64）：同一文件内的 Computer 入房共用固定身份（同一 sid 的身份在连接内不可变）。
+_COMPUTER_ID = "abcdef01-2345-4678-8abc-def012345678"
+
+
 def _join_office(client: Client | SimpleClient, role: str, office_id: str, name: str) -> None:
+    payload: dict = {"role": role, "office_id": office_id, "name": name}
+    if role == "computer":
+        payload["computer_id"] = _COMPUTER_ID
     ack = (
-        client.call(
-            JOIN_OFFICE_EVENT,
-            {"role": role, "office_id": office_id, "name": name},
-            namespace=SMCP_NAMESPACE,
-        )
+        client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
         if isinstance(client, Client)
-        else client.call(JOIN_OFFICE_EVENT, {"role": role, "office_id": office_id, "name": name})
+        else client.call(JOIN_OFFICE_EVENT, payload)
     )
     if ack is not None:
         print(f"加入房间失败: role={role}, office_id={office_id}, name={name}, ack={ack!r}")
@@ -513,7 +516,7 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
         # First Computer joins successfully
         ack = computer1.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": office_id, "name": computer_name},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_id, "name": computer_name},
         )
         assert_empty_ack(ack, action="第一个Computer应该加入成功 / First Computer should join successfully, error")
 
@@ -525,7 +528,7 @@ def test_computer_duplicate_name_rejected(startup_and_shutdown_local_sync_server
         # Second Computer tries to join same room, should fail
         ack2 = computer2.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": office_id, "name": computer_name},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_id, "name": computer_name},
         )
 
         # 验证失败
@@ -557,7 +560,7 @@ def test_computer_different_name_also_rejected(startup_and_shutdown_local_sync_s
         # First Computer joins
         ack = computer1.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": office_id, "name": "comp-sync-1"},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_id, "name": "comp-sync-1"},
         )
         assert_empty_ack(ack, action="第一个Computer应该加入成功 / First Computer should join successfully, error")
 
@@ -568,7 +571,7 @@ def test_computer_different_name_also_rejected(startup_and_shutdown_local_sync_s
         # 第二个 Computer 加入同一房间 ⇒ 4101 / Second Computer ⇒ 4101
         ack2 = computer2.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": office_id, "name": "comp-sync-2"},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_id, "name": "comp-sync-2"},
         )
 
         assert_rejected_ack(ack2, 4101, action="server:join_office")
@@ -596,7 +599,7 @@ def test_computer_switch_room_with_same_name_allowed(startup_and_shutdown_local_
         # Join first room
         ack = computer.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": "office-sync-room-1", "name": computer_name},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": "office-sync-room-1", "name": computer_name},
         )
         assert_empty_ack(ack, action="加入第一个房间应该成功 / Joining first room should succeed, error")
 
@@ -604,7 +607,7 @@ def test_computer_switch_room_with_same_name_allowed(startup_and_shutdown_local_
         # Switch to second room (same name Computer)
         ack2 = computer.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "office_id": "office-sync-room-2", "name": computer_name},
+            {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": "office-sync-room-2", "name": computer_name},
         )
 
         # 验证成功
@@ -879,7 +882,7 @@ def test_rejected_same_name_join_is_isolated_sync(
 
     ack = subject.call(
         JOIN_OFFICE_EVENT,
-        {"role": "computer", "office_id": office_b, "name": "c213s"},
+        {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_b, "name": "c213s"},
         namespace=SMCP_NAMESPACE,
     )
     assert_rejected_ack(ack, 4101, action="server:join_office")  # 目标房 Computer 席位已占（同名亦然）
@@ -940,7 +943,7 @@ def test_rename_on_live_session_rejected_keeps_old_room_sync(
 
     ack = mover.call(
         JOIN_OFFICE_EVENT,
-        {"role": "computer", "office_id": office_b, "name": "renamed-221s"},
+        {"role": "computer", "computer_id": _COMPUTER_ID, "office_id": office_b, "name": "renamed-221s"},
         namespace=SMCP_NAMESPACE,
     )
     assert_rejected_ack(ack, 403, action="server:join_office")
@@ -1071,7 +1074,14 @@ def test_name_conflict_ack_never_leaks_peer_sid_sync(startup_and_shutdown_local_
     try:
         _join_office(holder, role="computer", office_id="office-s216-dup", name="dup-s216")
         ack = challenger.call(
-            JOIN_OFFICE_EVENT, {"role": "computer", "office_id": "office-s216-dup", "name": "dup-s216"}, namespace=SMCP_NAMESPACE
+            JOIN_OFFICE_EVENT,
+            {
+                "role": "computer",
+                "computer_id": _COMPUTER_ID,
+                "office_id": "office-s216-dup",
+                "name": "dup-s216",
+            },
+            namespace=SMCP_NAMESPACE,
         )
         assert_rejected_ack(ack, 4101)
         blob = json.dumps(ack, ensure_ascii=False)

@@ -67,6 +67,9 @@ async def _join_office(client: AsyncClient, role: Literal["computer", "agent"], 
     English: Join office via server:join_office.
     """
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
     ack = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
     assert_empty_ack(ack)
 
@@ -355,7 +358,14 @@ async def test_get_computer_in_office(socketio_server, basic_server_port: int):
     # 第二台 Computer ⇒ 4101 {role: computer}
     await computer2.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     ack = await computer2.call(
-        JOIN_OFFICE_EVENT, {"role": "computer", "office_id": office_id, "name": "comp-04-2"}, namespace=SMCP_NAMESPACE
+        JOIN_OFFICE_EVENT,
+        {
+            "role": "computer",
+            "office_id": office_id,
+            "name": "comp-04-2",
+            "computer_id": "abcdef02-2345-4678-8abc-def012345679",
+        },
+        namespace=SMCP_NAMESPACE,
     )
     assert isinstance(ack, dict) and ack["code"] == 4101 and ack["details"]["role"] == "computer", ack
 
