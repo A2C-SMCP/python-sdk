@@ -13,6 +13,7 @@ Computer 侧 ``computer_id`` 生产者（``SMCPComputerClient``）单测 —— 
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -38,6 +39,14 @@ class TestMaterialization:
         client = _make_client()
         assert client._computer_id is None
         assert not identity_store_path().exists(), "connect 之前不得落盘身份文件"
+
+    def test_pure_mcp_host_construction_creates_no_identity(self, tmp_path: Path) -> None:
+        """纯 MCP 宿主（只构造 Computer、不连 Socket.IO）不得创建身份配置。"""
+        from a2c_smcp.computer.computer import Computer
+
+        Computer(name="pure-mcp-host", blob_cache_root=tmp_path)
+
+        assert not identity_store_path().exists(), "Computer 构造不得物化身份（时机 = 首次 connect）"
 
     @pytest.mark.asyncio
     async def test_connect_materializes_and_persists(self, monkeypatch: pytest.MonkeyPatch) -> None:
