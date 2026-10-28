@@ -7,6 +7,7 @@ Computer 侧通用二进制传输 / Generic binary transfer on the Computer side
 
 模块组成 / Module composition:
   - handle.py     blob_handle 编解码（单层 msgpack + base64url，无 MAC）
+  - path_resolver.py  protocol#65 按路径读取：readRoots 围栏 + 九步 resolve + path 句柄复核
   - toolspool.py  tool_call 二进制溢写的内容寻址暂存（``.blobspool/<cid>``）
   - resolver.py   BlobResolver Protocol + 内置 ToolspoolBlobResolver / SkillBlobResolver（kind=skill 重跑沙箱）
   - thresholds.py inline budget / too_large cap / chunk max / upload 会话阈值 默认值 + 环境变量覆盖
@@ -30,6 +31,17 @@ from a2c_smcp.computer.blob.handle import (
     encode_path_handle,
     encode_skill_handle,
     encode_toolspool_handle,
+)
+from a2c_smcp.computer.blob.path_resolver import (
+    PathPullResult,
+    PathResolveError,
+    ProtectedPaths,
+    ReadRoot,
+    ResolvedPath,
+    build_protected_paths,
+    build_read_roots,
+    resolve_for_pull,
+    resolve_path,
 )
 from a2c_smcp.computer.blob.resolver import (
     BlobResolver,
@@ -60,16 +72,25 @@ __all__ = [
     "BlobTooLargeError",
     "BlobUploadStore",
     "PathHandlePayload",
+    "PathPullResult",
+    "PathResolveError",
+    "ProtectedPaths",
+    "ReadRoot",
     "ResolvedBlob",
+    "ResolvedPath",
     "SkillBlobResolver",
     "SkillHandlePayload",
     "ToolspoolBlobResolver",
     "ToolspoolBlobStore",
     "ToolspoolHandlePayload",
+    "build_protected_paths",
+    "build_read_roots",
     "decode_blob_handle",
     "default_thresholds",
     "encode_path_handle",
     "encode_skill_handle",
     "encode_toolspool_handle",
+    "resolve_for_pull",
+    "resolve_path",
     "sanitize_name_hint",
 ]

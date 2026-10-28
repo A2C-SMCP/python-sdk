@@ -16,6 +16,7 @@ import hashlib
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -31,6 +32,9 @@ from a2c_smcp.computer.blob.path_resolver import (
     PathResolveError,
     ProtectedPaths,
     ReadRoot,
+    _is_protected,
+    _within_any,
+    _within_any_real,
     build_protected_paths,
     build_read_roots,
     resolve_for_pull,
@@ -52,6 +56,20 @@ def _write(path: Path, content: bytes = _CONTENT) -> Path:
 
 def _reason(exc: pytest.ExceptionInfo[PathResolveError]) -> str:
     return exc.value.reason
+
+
+def _manual_path_payload(path: Path) -> dict[str, Any]:
+    """按当前文件状态手工铸造 path 句柄 payload（供拉取期拒绝集 / 竞争测试）."""
+    st = path.stat()
+    return {
+        "canonical_path": os.path.realpath(path),
+        "total_size": st.st_size,
+        "mtime": st.st_mtime_ns // 1_000_000,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "mime": "text/plain",
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+    }
 
 
 class TestBuildReadRoots:
@@ -238,6 +256,40 @@ class TestFixedRejectionSet:
                 resolve_path(str(target), _root(root), protected=protected)
             assert _reason(exc_info) == "forbidden"
 
+    def test_state_dir_any_file_forbidden(self, tmp_path: Path) -> None:
+        """状态目录整目录保护：非 input-values.json 的文件也 forbidden."""
+        root = tmp_path / "root"
+        state_dir = root / "xdg-state" / "a2c"
+        other = _write(state_dir / "other-state.bin", b"state")
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+        }
+        protected = build_protected_paths(env=env)
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(other), _root(root), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+
+    def test_keyring_file_backend_forbidden(self, tmp_path: Path) -> None:
+        """keyring 文件后端（python_keyring / GNOME keyrings）默认在 XDG data 下，必须拒绝."""
+        root = tmp_path / "root"
+        keyring_file = _write(root / "xdg-data" / "python_keyring" / "keyring_pass.cfg", b"secret")
+        gnome_file = _write(root / "xdg-data" / "keyrings" / "login.keyring", b"secret")
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+            "XDG_DATA_HOME": str(root / "xdg-data"),
+        }
+        protected = build_protected_paths(env=env)
+
+        for target in (keyring_file, gnome_file):
+            canonical = os.path.realpath(target)
+            assert _is_protected(canonical, protected, "posix")
+            with pytest.raises(PathResolveError) as exc_info:
+                resolve_path(str(target), _root(root), protected=protected)
+            assert _reason(exc_info) == "forbidden"
+
     def test_part_only_inside_landing_root_forbidden(self, tmp_path: Path) -> None:
         root = tmp_path / "root"
         landing = root / "landing"
@@ -283,6 +335,145 @@ class TestFixedRejectionSet:
             assert _reason(exc_info) == "forbidden"
         finally:
             locked.chmod(0o755)
+
+
+class TestWindowsRejectionSetCasefold:
+    """Windows 文件系统大小写不敏感：拒绝集 casefold，readRoots 围栏仍区分大小写."""
+
+    def test_skillenv_case_insensitive_on_windows(self) -> None:
+        assert _is_protected("/C:/root/.SKILLENV", ProtectedPaths(), "windows")
+        assert not _is_protected("/C:/root/.SKILLENV", ProtectedPaths(), "posix")
+
+    def test_protected_prefix_case_insensitive_on_windows(self) -> None:
+        protected = ProtectedPaths(paths=("/C:/secret",))
+        assert _is_protected("/C:/SECRET/file.txt", protected, "windows")
+        assert not _is_protected("/C:/SECRET/file.txt", protected, "posix")
+
+    def test_landing_part_case_insensitive_on_windows(self) -> None:
+        protected = ProtectedPaths(landing_root="/C:/landing")
+        assert _is_protected("/C:/LANDING/x.PART", protected, "windows")
+        assert not _is_protected("/C:/LANDING/x.PART", protected, "posix")
+
+    def test_read_roots_fence_stays_case_sensitive(self) -> None:
+        """readRoots 围栏仍按协议区分大小写（casefold 只用于拒绝集）."""
+        roots = [ReadRoot(configured="/C:/Data", real="/C:/Data")]
+        assert _within_any("/C:/Data/f.txt", roots)
+        assert not _within_any("/C:/data/f.txt", roots)
+        assert _within_any_real("/C:/Data/f.txt", roots)
+        assert not _within_any_real("/C:/data/f.txt", roots)
+
+
+class TestRaceAndFinalPathGuards:
+    def test_identity_changed_between_lstat_and_open_forbidden(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        roots = _root(root)  # 先构建根，避免受 lstat 补丁影响 / build roots before patching
+        canonical_native = os.path.realpath(file)
+
+        original_lstat = os.lstat
+
+        def fake_lstat(path: str) -> os.stat_result:
+            st = original_lstat(path)
+            if path == canonical_native:
+                # st_ino 为 stat_result 的第 2 个字段 / st_ino is the 2nd field
+                return os.stat_result(
+                    (
+                        st.st_mode,
+                        st.st_ino + 1,
+                        st.st_dev,
+                        st.st_nlink,
+                        st.st_uid,
+                        st.st_gid,
+                        st.st_size,
+                        st.st_atime,
+                        st.st_mtime,
+                        st.st_ctime,
+                    ),
+                )
+            return st
+
+        monkeypatch.setattr(os, "lstat", fake_lstat)
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(file), roots, protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+        assert "identity" in str(exc_info.value)  # 断言命中身份比对分支 / assert the identity branch
+
+    def test_final_path_outside_forbidden(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        outside = os.path.realpath(tmp_path / "outside.txt")
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._fd_final_path",
+            lambda fd, platform: outside,
+        )
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(file), _root(root), protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+        assert "outside readRoots" in str(exc_info.value)  # 命中最终路径围栏 / final-path fence
+
+    def test_final_path_protected_forbidden(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        secret = _write(root / "secret.txt")
+        protected = ProtectedPaths(paths=(os.path.realpath(secret),))
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._fd_final_path",
+            lambda fd, platform: os.path.realpath(secret),
+        )
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(file), _root(root), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+        assert "rejection set" in str(exc_info.value)  # 命中最终路径拒绝集 / final-path rejection
+
+    def test_final_path_none_allows(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._fd_final_path",
+            lambda fd, platform: None,
+        )
+        result = resolve_path(str(file), _root(root), protected=ProtectedPaths())
+        assert result.total_size == len(_CONTENT)
+
+    def test_pull_final_path_outside_forbidden(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        roots = _root(root)
+        minted = resolve_path(str(file), roots, protected=ProtectedPaths())
+        _, payload = decode_blob_handle(minted.blob_handle)
+        outside = os.path.realpath(tmp_path / "outside.txt")
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._fd_final_path",
+            lambda fd, platform: outside,
+        )
+        with pytest.raises(BlobHandleForbiddenError) as exc_info:
+            resolve_for_pull(payload, roots, protected=ProtectedPaths())
+        assert "outside readRoots" in str(exc_info.value)
 
 
 class TestResolveForPull:
@@ -353,6 +544,60 @@ class TestResolveForPull:
         file.mkdir()
         with pytest.raises(BlobHandleGoneError):
             resolve_for_pull(payload, roots)
+
+    def test_pull_skillenv_forbidden(self, tmp_path: Path) -> None:
+        """拉取期固定拒绝集：手工句柄指向 .skillenv → 4018 forbidden."""
+        root = tmp_path / "root"
+        root.mkdir()
+        target = _write(root / "sub" / ".skillenv")
+        with pytest.raises(BlobHandleForbiddenError):
+            resolve_for_pull(_manual_path_payload(target), _root(root), protected=ProtectedPaths())
+
+    def test_pull_protected_config_file_forbidden(self, tmp_path: Path) -> None:
+        """拉取期固定拒绝集：手工句柄指向 SDK settings → 4018 forbidden."""
+        root = tmp_path / "root"
+        settings = _write(root / "xdg-config" / "a2c" / "settings.json")
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+        }
+        protected = build_protected_paths(env=env)
+        with pytest.raises(BlobHandleForbiddenError):
+            resolve_for_pull(_manual_path_payload(settings), _root(root), protected=protected)
+
+    def test_pull_identity_mismatch_same_size_same_mtime_gone(self, tmp_path: Path) -> None:
+        """句柄 dev/ino 身份比对：同尺寸 + 回填 mtime 的硬链接替换仍判 gone."""
+        root = tmp_path / "root"
+        root.mkdir()
+        original = _write(root / "a.txt", b"AAAA")
+        roots = _root(root)
+        minted = resolve_path(str(original), roots, protected=ProtectedPaths())
+        _, payload = decode_blob_handle(minted.blob_handle)
+
+        replacement = _write(root / "b.txt", b"BBBB")
+        st = original.stat()
+        os.utime(replacement, ns=(st.st_atime_ns, st.st_mtime_ns))
+        original.unlink()
+        os.link(replacement, original)
+
+        with pytest.raises(BlobHandleGoneError):
+            resolve_for_pull(payload, roots, protected=ProtectedPaths())
+
+    def test_component_prefix_not_bare_string(self, tmp_path: Path) -> None:
+        """围栏按路径分量：/x/data 不包含 /x/database."""
+        data = tmp_path / "data"
+        data.mkdir()
+        database = tmp_path / "database"
+        database.mkdir()
+        file = _write(database / "f.txt")
+        roots = _root(data)
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(file), roots, protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+
+        with pytest.raises(BlobHandleForbiddenError):
+            resolve_for_pull(_manual_path_payload(file), roots, protected=ProtectedPaths())
 
     def test_invalid_payloads_rejected(self, tmp_path: Path) -> None:
         _, payload, _, roots = self._mint(tmp_path)

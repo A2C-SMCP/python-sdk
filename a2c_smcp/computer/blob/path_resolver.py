@@ -37,8 +37,8 @@ from a2c_smcp.computer.blob.handle import (
     BlobHandleInvalidError,
     encode_path_handle,
 )
-from a2c_smcp.computer.inputs.value_store import VALUE_STORE_FILENAME, XDG_STATE_HOME_ENV
-from a2c_smcp.computer.settings.scope import USER_SETTINGS_FILENAME, resolve_user_config_dir
+from a2c_smcp.computer.inputs.value_store import resolve_value_store_path
+from a2c_smcp.computer.settings.scope import user_settings_path
 from a2c_smcp.utils.mime import guess_mime
 from a2c_smcp.utils.path import resolve_xdg_first
 from a2c_smcp.utils.path_norm import (
@@ -60,9 +60,6 @@ _BlobSlicer = Callable[[int, int], bytes]
 
 # sha256 读取块大小 / Hash read chunk size.
 _HASH_CHUNK_BYTES: int = 1024 * 1024
-
-# XDG 子目录（config / state 同名）/ XDG subdir (same name for config and state).
-_A2C_SUBDIR = "a2c"
 
 # Computer 身份文件名（#235 落点；本模块只做拒绝集，不依赖其实现）/ computer-id filename.
 _COMPUTER_ID_FILENAME = "computer-id"
@@ -224,32 +221,57 @@ def build_protected_paths(
     默认集覆盖 ``$XDG_CONFIG_HOME/a2c``（或 ``~/.config/a2c``）与
     ``$XDG_STATE_HOME/a2c``（或 ``~/.local/state/a2c``）——settings / ``computer-id`` /
     input 值缓存均在这些目录下。``extra_paths`` 由 config+wire 流注入（flag settings 等）。
+
+    Note:
+        ``resolve_path`` / ``resolve_for_pull`` 的 ``protected=None`` 只是防御性兜底
+        （每次请求重建）；接线层 SHOULD 预构建一次并复用，热路径不依赖本默认集。
     """
     pf: PathPlatform = native_platform() if platform is None else platform
     environ: Mapping[str, str] = os.environ if env is None else env
 
+    # 单一权威：config / state 目录解析复用 settings / inputs 的既有函数，避免复制 fallback 漂移。
+    # Single authority: reuse the settings / inputs resolvers instead of duplicating fallbacks.
     candidates: list[str] = []
     try:
-        config_dir = Path(resolve_user_config_dir(environ))
+        settings_file = user_settings_path(environ)
+        config_dir = settings_file.parent
         candidates.extend(
             [
                 str(config_dir),
-                str(config_dir / USER_SETTINGS_FILENAME),
+                str(settings_file),
                 str(config_dir / _COMPUTER_ID_FILENAME),
             ],
         )
     except (OSError, ValueError) as e:  # pragma: no cover - 防御性：env 异常形态
         logger.warning("拒绝集: 无法解析 user config dir / cannot resolve user config dir: %s", e)
     try:
-        state_dir = resolve_xdg_first(
-            environ,
-            XDG_STATE_HOME_ENV,
-            _A2C_SUBDIR,
-            fallback=Path.home() / ".local" / "state" / _A2C_SUBDIR,
-        )
-        candidates.append(str(state_dir / VALUE_STORE_FILENAME))
+        # 整目录入拒绝集（settings / computer-id / 凭据等均在其下），不只保护 input-values.json。
+        # Protect the whole state dir, not just input-values.json.
+        state_dir = resolve_value_store_path(environ).parent
+        candidates.append(str(state_dir))
     except (OSError, ValueError) as e:  # pragma: no cover - 防御性
         logger.warning("拒绝集: 无法解析 state dir / cannot resolve state dir: %s", e)
+
+    try:
+        # keyring 文件后端（Linux 无 Secret Service 时的兜底）默认落 XDG data；零凭证传播。
+        # keyring file backend fallback stores plaintext credentials under XDG data.
+        keyring_dir = resolve_xdg_first(
+            environ,
+            "XDG_DATA_HOME",
+            "python_keyring",
+            fallback=Path.home() / ".local" / "share" / "python_keyring",
+        )
+        candidates.extend([str(keyring_dir), str(keyring_dir / "keyring_pass.cfg")])
+        # GNOME keyring 文件目录（可选但同类凭据面）/ GNOME keyring files (same credential surface).
+        gnome_keyrings = resolve_xdg_first(
+            environ,
+            "XDG_DATA_HOME",
+            "keyrings",
+            fallback=Path.home() / ".local" / "share" / "keyrings",
+        )
+        candidates.append(str(gnome_keyrings))
+    except (OSError, ValueError) as e:  # pragma: no cover - 防御性
+        logger.warning("拒绝集: 无法解析 keyring 目录 / cannot resolve keyring dirs: %s", e)
 
     candidates.extend(str(p) for p in extra_paths)
 
@@ -456,7 +478,7 @@ def _run_pipeline(
         raise PathResolveError("forbidden", f"canonical path is outside readRoots: {canonical!r}")
 
     # 6) 固定拒绝集
-    if _is_protected(canonical, protected):
+    if _is_protected(canonical, protected, platform):
         raise PathResolveError("forbidden", f"path is in the fixed rejection set: {canonical!r}")
 
     # 7) 类型预检（打开之前）
@@ -480,9 +502,17 @@ def _run_pipeline(
         raise PathResolveError(_open_error_reason(e, native), f"open failed: {e}") from e
 
     try:
-        fst = os.fstat(fd)
+        try:
+            fst = os.fstat(fd)
+        except OSError as e:
+            raise PathResolveError("forbidden", f"fstat failed: {e}") from e
         if not stat.S_ISREG(fst.st_mode):
             raise PathResolveError("not_a_file", f"opened fd is not a regular file: {canonical!r}")
+        # 身份比对（跨平台）：lstat 与 open 之间文件被替换（含 Windows 无 O_NOFOLLOW 的链接替换）
+        # → forbidden。Windows 无 /proc / F_GETPATH，此项是最终路径复核的替代保障。
+        # Identity check (cross-platform): the file was replaced between lstat and open.
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            raise PathResolveError("forbidden", "file identity changed between lstat and open")
         if (fst.st_dev, fst.st_ino) in protected.file_ids:
             raise PathResolveError("forbidden", "file identity is in the fixed rejection set (hard link)")
         final_path = _fd_final_path(fd, platform)
@@ -490,7 +520,7 @@ def _run_pipeline(
             # 最终路径复核：重跑第 5–6 步（防御 resolve 后的链接 / 路径替换）
             if not _within_any_real(final_path, roots):
                 raise PathResolveError("forbidden", f"opened file final path is outside readRoots: {final_path!r}")
-            if _is_protected(final_path, protected):
+            if _is_protected(final_path, protected, platform):
                 raise PathResolveError("forbidden", f"opened file final path is in the rejection set: {final_path!r}")
     except BaseException:
         _close_quietly(fd)
@@ -543,17 +573,27 @@ def _raise_pull_error(exc: PathResolveError) -> None:
     raise BlobHandleGoneError(str(exc)) from exc
 
 
-def _is_within(path: str, root: str) -> bool:
-    """按**路径分量**判定 ``path`` 是否在 ``root`` 内（非裸字符串前缀）."""
-    if path == root:
+def _is_within(path: str, root: str, *, case_insensitive: bool = False) -> bool:
+    """按**路径分量**判定 ``path`` 是否在 ``root`` 内（非裸字符串前缀）.
+
+    与 :func:`a2c_smcp.utils.path.is_within` 语义一致（Path 对象版）；本函数服务
+    ``canonical_path`` 字符串形态（含 Windows ``/C:/`` 根与可选 casefold），两处勿各自漂移。
+    ``case_insensitive`` 仅由固定拒绝集在 Windows 上使用；readRoots 围栏按协议保持区分大小写。
+    """
+    if case_insensitive:
+        path_cmp = path.casefold()
+        root_cmp = root.casefold()
+    else:
+        path_cmp, root_cmp = path, root
+    if path_cmp == root_cmp:
         return True
-    if root.endswith("/"):
-        return path.startswith(root)
-    return path.startswith(root + "/")
+    if root_cmp.endswith("/"):
+        return path_cmp.startswith(root_cmp)
+    return path_cmp.startswith(root_cmp + "/")
 
 
 def _within_any(path: str, roots: Sequence[ReadRoot]) -> bool:
-    """词法围栏：配置形态或 realpath 形态任一命中即通过."""
+    """词法围栏：配置形态或 realpath 形态任一命中即通过（协议：区分大小写）."""
     for root in roots:
         if _is_within(path, root.configured):
             return True
@@ -567,14 +607,24 @@ def _within_any_real(path: str, roots: Sequence[ReadRoot]) -> bool:
     return any(root.real is not None and _is_within(path, root.real) for root in roots)
 
 
-def _is_protected(canonical_path: str, protected: ProtectedPaths) -> bool:
-    """固定拒绝集判定（含 ``.skillenv`` / landing ``.part``）."""
-    if any(_is_within(canonical_path, entry) for entry in protected.paths):
+def _is_protected(canonical_path: str, protected: ProtectedPaths, platform: PathPlatform) -> bool:
+    """固定拒绝集判定（含 ``.skillenv`` / landing ``.part``）.
+
+    Windows 上文件名大小写不敏感：拒绝集按 casefold 比较，防止 ``.SKILLENV`` 绕过；
+    readRoots 围栏不走此分支（协议要求按码点区分大小写）。
+    """
+    case_insensitive = platform == "windows"
+    if any(_is_within(canonical_path, entry, case_insensitive=case_insensitive) for entry in protected.paths):
         return True
     name = canonical_path.rsplit("/", 1)[-1]
-    if name == ".skillenv":
+    compare_name = name.casefold() if case_insensitive else name
+    if compare_name == ".skillenv":
         return True
-    if protected.landing_root is not None and _is_within(canonical_path, protected.landing_root) and name.endswith(".part"):
+    if (
+        protected.landing_root is not None
+        and _is_within(canonical_path, protected.landing_root, case_insensitive=case_insensitive)
+        and compare_name.endswith(".part")
+    ):
         return True
     return False
 
