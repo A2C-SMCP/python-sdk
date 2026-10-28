@@ -7,7 +7,7 @@ import asyncio
 import base64
 import hashlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypeAlias, cast
 
 from mcp.types import CallToolResult, Resource
@@ -16,11 +16,13 @@ from socketio import AsyncClient
 
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.computer.blob import (
+    HANDLE_KIND_PATH,
     BlobHandleError,
     BlobHandleInvalidError,
     decode_blob_handle,
     encode_skill_handle,
 )
+from a2c_smcp.computer.blob.path_resolver import PathResolveError
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.model import GetSkillRet as GetSkillRetModel
@@ -38,6 +40,7 @@ from a2c_smcp.smcp import (
     JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_EVENT,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -67,9 +70,13 @@ from a2c_smcp.smcp import (
     MCPServerInput,
     PutBlobReq,
     PutBlobRet,
+    ResolvePathReq,
+    ResolvePathRet,
     ResourceAnnotations,
     ToolCallReq,
     UpdateComputerConfigReq,
+    build_bad_request_error,
+    build_internal_error,
 )
 from a2c_smcp.smcp import (
     MCPServerConfig as SMCPServerConfigDict,
@@ -208,6 +215,8 @@ class SMCPComputerClient(AsyncClient):
         self.on(GET_DESKTOP_EVENT, self.on_get_desktop, namespace=self._namespace)
         self.on(GET_RESOURCES_EVENT, self.on_get_resources, namespace=self._namespace)
         self.on(GET_BLOB_EVENT, self.on_get_blob, namespace=self._namespace)
+        # v0.5.0 按路径读取（protocol#65）：blob_handle 的第三个生产者 / read-by-path (#236)
+        self.on(RESOLVE_PATH_EVENT, self.on_resolve_path, namespace=self._namespace)
         # v0.4.0 上行写入通道 / upload write channel (#196)
         self.on(PUT_BLOB_EVENT, self.on_put_blob, namespace=self._namespace)
         # v0.2.1 SKILL 通道发现 / 渐进式披露 / SKILL channel discovery & progressive disclosure (#66)
@@ -1237,7 +1246,58 @@ class SMCPComputerClient(AsyncClient):
         # 复用同一份实现，避免"两份同源 handler 逻辑双份维护"的脆弱点（PR #52 fix-review）.
         # Core logic extracted to module-level ``_process_get_blob``, shared with sync wire mock,
         # eliminating dual-maintenance of equivalent sync/async handler bodies (PR #52 fix-review).
+        #
+        # 🟡5（隔离审查）：``kind=path`` 每块都要 settings 解析 + realpath / lstat / open，全是同步
+        # I/O，放事件循环上会与心跳/其它 ack 抢时间片 → 仅该分支 offload 到 worker 线程。
+        # 其余 kind 保持原有在循环内执行（其 resolver 的并发语义未变，避免顺带改变 skill/toolspool
+        # 的行为）。解码是纯计算，额外一次只为分流，成本可忽略。
+        # Only the path branch is offloaded: it does per-chunk settings parsing + realpath/lstat/open.
+        # Other kinds keep their existing in-loop execution so their resolver semantics are unchanged.
+        try:
+            kind, _payload = decode_blob_handle(data["blob_handle"])
+        except BlobHandleInvalidError:
+            # 交给同步核心统一产出 4018 invalid_handle（保持错误路径单一实现）
+            return _process_get_blob(data, self.computer)
+        if kind == HANDLE_KIND_PATH:
+            return await asyncio.to_thread(_process_get_blob, data, self.computer)
         return _process_get_blob(data, self.computer)
+
+    async def on_resolve_path(self, data: ResolvePathReq) -> ResolvePathRet | ErrorPayload:
+        """
+        按路径读取 / Read by path（``client:resolve_path``，v0.5.0 #236 / protocol#65）.
+
+        协议依据 / Protocol: a2c-smcp-protocol events.md §client:resolve_path；
+        blob-transfer.md §生产者三：按路径读取；security.md §读取通道安全。
+
+        语义 / Semantics：Agent 给出 Computer 本地路径 → ``normalize_path`` → ``readRoots`` 围栏 →
+        非严格 realpath 围栏 → 固定拒绝集 → 类型预检 → 非阻塞打开 → 同一句柄 stat/sha256 →
+        **现铸** ``blob_handle``。字节仍由 ``client:get_blob`` 拉取（本事件不传字节）。
+        授权边界 = settings ``readRoots``（**默认空 = 不可读**）；越界判定先于存在性探测，
+        ``readRoots`` 之外的路径一律 ``forbidden``、不泄露存在性。
+
+        错误语义（flat ErrorPayload，经 Socket.IO ack 第一参回传，无嵌套 envelope）/
+        Errors (flat ErrorPayload, no nested envelope): ``4020`` ``details.reason`` ∈
+        ``invalid_path`` / ``forbidden`` / ``not_found`` / ``not_a_file``（开放枚举）。
+
+        Args:
+            data (ResolvePathReq): ``computer`` / ``path`` / ``req_id``。
+
+        Returns:
+            ResolvePathRet | ErrorPayload: 成功为规范路径 + 元数据 + 现铸句柄，失败为 flat 4020。
+        """
+        # 与 on_get_blob 同款抽取：模块级纯同步核心（_process_resolve_path），同步 wire 测试复用。
+        # Same extraction as on_get_blob: module-level sync core shared with sync wire tests.
+        #
+        # ⚠️ **MUST 离开事件循环**（隔离审查裁决）：path core 在铸造期对**全量文件**算 sha256
+        # （协议无大小上限），数 GB 文件上是秒级同步 I/O。直接在 async handler 里跑会阻塞
+        # socket.io 事件循环——心跳发不出（连接被判死）、同连接上的 ``client:tool_call`` 等 ack
+        # 全部排队超时。故 offload 到 worker 线程；``get_blob`` 的 path 分支只做 stat/单块 slice
+        # （有界、受 ``chunk_max_bytes`` 约束）故仍同步执行。
+        # MUST leave the event loop: mint-time sha256 is computed over the *whole* file (the
+        # protocol sets no size cap). Running it inline would stall the socket.io loop — missed
+        # heartbeats and timed-out tool calls on the same connection. Pull-path work is bounded
+        # by chunk_max_bytes, so it stays synchronous.
+        return await asyncio.to_thread(_process_resolve_path, data, self.computer)
 
     async def on_put_blob(self, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
         """
@@ -1410,6 +1470,209 @@ def _blob_error(*, reason: str) -> ErrorPayload:
     )
 
 
+def _path_error(*, reason: str) -> ErrorPayload:
+    """构造 ``4020 Path Not Accessible`` flat ErrorPayload，``reason`` 经 ``details`` 下沉。
+    Build ``4020`` flat ErrorPayload with ``reason`` under ``details`` (error-handling.md §4020).
+    """
+    return ErrorPayload(
+        code=int(ErrorCode.PATH_NOT_ACCESSIBLE),
+        message="Path not accessible",
+        details={"reason": reason},
+    )
+
+
+def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePathRet | ErrorPayload:
+    """``client:resolve_path`` 的纯同步核心逻辑（v0.5.0 #236 / protocol#65）。
+
+    Pure synchronous core for ``client:resolve_path``.
+
+    抽取模式与 :func:`_process_get_blob` 一致：同步 ``socketio.Client`` wire 测试 mock 与 async
+    :meth:`SMCPComputerClient.on_resolve_path` 复用同一份实现。完整协议 / 安全 / 错误语义文档保留在
+    async wrapper 上。
+
+    Args:
+        data: ``ResolvePathReq`` payload（``computer`` / ``path`` / ``req_id``）。
+        computer: 持有 ``name`` / ``path_access_policy`` / ``resolve_read_path`` 的 ``Computer`` 实例。
+
+    Returns:
+        ``ResolvePathRet``（成功）或 ``ErrorPayload``（``4020`` 四 reason / ``500``）。
+
+    Raises:
+        SMCPNamespaceError: ``computer.name`` 与 ``data["computer"]`` 不匹配（防御纵深，理论不可达）。
+    """
+    if computer.name != data["computer"]:
+        raise SMCPNamespaceError("计算机标识不匹配")
+
+    # 在 try 之前取局部变量：``except`` 内的日志不得再索引 payload——缺失字段的二次 KeyError
+    # 会顶替原异常逃出 handler，连 500 ack 都发不出（🟡3）。
+    # Capture the path before the try: indexing it inside `except` could raise a second KeyError
+    # and replace the original exception, leaving the caller without any ack.
+    path = data.get("path")
+
+    # 一次解析得出本请求的授权快照（读根 + 拒绝集）；守卫与管线共用同一份视图。
+    # One settings parse per request; the guard and the pipeline share the snapshot.
+    #
+    # 未预期异常兜底：``path_access_policy`` / ``resolve_read_path`` 可能抛 OSError（如 skill home
+    # 创建失败、settings 目录不可读）。异常逃出 handler ⇒ **不发 ack** ⇒ Agent 挂到自身超时；
+    # 「凡有 ack 通道 ⇒ 失败必须产出 ack」是硬约束，故映射为 flat 500（文案笼统、原文只进日志）。
+    # Any unexpected exception must still produce an ack: map it to the generic flat 500.
+    # ``SMCPNamespaceError``（隔离不变量）在 try 之外抛出，绝不被吞。
+    try:
+        policy = computer.path_access_policy()
+
+        # fail-closed 显式守卫（**防御纵深**）：``readRoots`` 为空一律 forbidden，且**不触碰目标路径**
+        # （不 lstat / 不 open；授权视图本身仍需读 settings 文件，这是判定的前提）。
+        # 规范判据在 path core 第 2 步（``_run_pipeline``，流 1 已有单测）；此处再查一层是刻意的——
+        # 授权缺省值必须在接线层也成立，不能只依赖下游实现，也不让任何下游回归静默打开读取面。
+        # Defense in depth: the normative check is path core step 2 (covered by stream 1's tests);
+        # repeating it here keeps fail-closed true at the wiring layer even if path core regresses.
+        if not policy.roots:
+            logger.warning("client:resolve_path 拒绝：readRoots 未配置（默认不可读）/ no readRoots configured")
+            return _path_error(reason="forbidden")
+
+        # 取值用 ``data["path"]``（``ResolvePathReq`` 为 total=True，Server 已校验）；缺失时
+        # KeyError 落入下面的 ``except Exception`` → 仍有 500 ack（🟡3）。
+        # Index here (total=True, Server-validated); a missing key lands in `except Exception` → 500 ack.
+        resolved = computer.resolve_read_path(data["path"], policy=policy)
+    except PathResolveError as exc:
+        logger.warning(f"client:resolve_path 拒绝：reason={exc.reason} path={path!r}")
+        return _path_error(reason=exc.reason)
+    except Exception:
+        logger.exception(f"client:resolve_path 未预期异常 path={path!r}")
+        return build_internal_error()
+
+    return ResolvePathRet(
+        canonical_path=resolved.canonical_path,
+        blob_handle=resolved.blob_handle,
+        mime_type=resolved.mime_type,
+        total_size=resolved.total_size,
+        sha256=resolved.sha256,
+        mtime=resolved.mtime,
+        req_id=data["req_id"],
+    )
+
+
+def _clamp_chunk_or_none(computer: Computer, requested: Any) -> int | None:
+    """clamp 客户建议的单块大小；**类型非法**（线上可达）返回 ``None`` 而非抛异常（🟡2）。
+
+    Server 的 ``parse_payload`` 是 lax 校验（``"1024"`` 会被强制为 int 通过），但 relay 转发的是
+    **原始 payload**——Computer 会收到字符串。``clamp_chunk`` 内 ``requested <= 0`` 对 str 抛
+    ``TypeError``；若发生在受保护块之外会逃出 handler ⇒ 不发 ack ⇒ Agent 挂到自身超时。
+    Return None for a malformed value so the handler can answer with a flat 400 instead.
+    """
+    try:
+        return computer.blob_thresholds.clamp_chunk(requested)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_chunk_ret(
+    *,
+    blob_handle: str,
+    mime_type: str,
+    total_size: int,
+    sha256: str,
+    chunk_offset: int,
+    chunk: bytes,
+    req_id: str,
+) -> GetBlobRet:
+    """组装单块 ``GetBlobRet`` —— 所有 kind 共用，线上形状的**单一真相源**（🟡6）。
+
+    Build one chunk ``GetBlobRet``; the single source of truth for the wire shape across kinds.
+
+    ``eof`` 用 ``len(chunk)`` 形式（``chunk_offset + len(chunk) == total_size``）：对 OS 短读
+    健壮，与历史 ``_process_get_blob`` 语义一致。
+    """
+    ret: GetBlobRet = {
+        "blob_handle": blob_handle,
+        "mime_type": mime_type,
+        "total_size": total_size,
+        "sha256": sha256,
+        "chunk_offset": chunk_offset,
+        "eof": chunk_offset + len(chunk) == total_size,
+        "blob": base64.b64encode(chunk).decode("ascii"),
+        "req_id": req_id,
+    }
+    return ret
+
+
+def _process_path_get_blob(data: GetBlobReq, computer: Computer, payload: Mapping[str, Any]) -> GetBlobRet | ErrorPayload:
+    """``client:get_blob`` 的 ``kind=path`` 分支：拉取期复核 + 切片（v0.5.0 #236 / protocol#65）。
+
+    Pull-time branch for ``kind=path`` handles: revalidate against the *current* ``readRoots``
+    and filesystem state, then slice from the **same opened handle**.
+
+    协议依据 / Protocol: blob-transfer.md §Computer 处理流程（拉取期复核）；§生产者三.
+    错误映射（``4018`` 枚举不变）/ Error mapping (4018 enum unchanged)：
+      - 越界 / 撤权 / 命中固定拒绝集 / 其余打开错误 → ``BlobHandleForbiddenError`` → ``forbidden``
+      - 删除 / 非普通文件 / stat 键不符（已改写）→ ``BlobHandleGoneError`` → ``gone``
+      - 句柄结构非法 → ``BlobHandleInvalidError`` → ``invalid_handle``
+      - ``chunk_offset`` 越界 → ``range``
+
+    ⚠️ ``PathPullResult`` 持有已打开句柄：本函数在 ``finally`` 中 ``close()``（幂等），
+    覆盖 range 早退与正常返回两条路径——GC 兜底不足以应对高频拉取。
+
+    Args:
+        data: ``GetBlobReq`` payload.
+        computer: 持有 ``pull_path_blob`` / ``blob_thresholds`` 的 ``Computer``.
+        payload: ``decode_blob_handle`` 得到的 ``kind=path`` 载荷（**不**被信任）。
+
+    Returns:
+        ``GetBlobRet``（成功）或 ``ErrorPayload``（``4018``）。
+    """
+    chunk_offset = data.get("chunk_offset", 0)
+    clamped = _clamp_chunk_or_none(computer, data.get("max_chunk_bytes"))
+    if clamped is None:
+        logger.warning(f"client:get_blob 非法 max_chunk_bytes={data.get('max_chunk_bytes')!r}（path 分支）")
+        return build_bad_request_error()
+    max_chunk_bytes = clamped
+
+    # 复核在 try 之外：失败时尚未打开句柄（或已由 path core 内部释放），无需 close。
+    # Revalidation happens before the try: on failure no handle is owned by us.
+    #
+    # 每请求**一次** settings 解析（🟡5）：快照同时供复核与拒绝集使用。
+    # One settings parse per request (snapshot shared by revalidation and rejection set).
+    try:
+        policy = computer.path_access_policy()
+        pull = computer.pull_path_blob(payload, policy=policy)
+    except BlobHandleError as exc:
+        reason = getattr(exc, "reason", "forbidden")
+        logger.warning(f"client:get_blob path handle rejected: {reason}: {exc}")
+        return _blob_error(reason=reason)
+    except Exception:
+        # 未预期异常必须仍产出 ack（否则 Agent 挂到自身超时）；文案笼统、原文只进日志。
+        # Any unexpected error still produces an ack (flat 500); the traceback stays in logs.
+        logger.exception("client:get_blob path 分支未预期异常 / unexpected error in path branch")
+        return build_internal_error()
+
+    try:
+        if not isinstance(chunk_offset, int) or chunk_offset < 0 or chunk_offset > pull.total_size:
+            logger.warning(
+                f"client:get_blob range out of bounds (path): offset={chunk_offset}, total_size={pull.total_size}",
+            )
+            return _blob_error(reason="range")
+        remaining = pull.total_size - chunk_offset
+        slice_len = min(max_chunk_bytes, remaining)
+        chunk = pull.slice(chunk_offset, slice_len)
+        return _build_chunk_ret(
+            blob_handle=data["blob_handle"],
+            mime_type=pull.mime_type,
+            total_size=pull.total_size,
+            sha256=pull.sha256,
+            chunk_offset=chunk_offset,
+            chunk=chunk,
+            req_id=data["req_id"],
+        )
+    except Exception:
+        # 🟡2：``pull.slice`` 走真实文件读（NFS/FUSE 可抛 ESTALE / EIO）。异常穿过 ``finally``
+        # 逃出 handler ⇒ 不发 ack ⇒ Agent 挂到超时；此处仍必须产出 ack。``finally`` 保持 close。
+        # Slice does real file I/O (NFS/FUSE can raise ESTALE/EIO); still answer with a flat 500.
+        logger.exception("client:get_blob path 切片未预期异常 / unexpected error while slicing")
+        return build_internal_error()
+    finally:
+        pull.close()
+
+
 def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | ErrorPayload:
     """通用二进制拉取的纯同步核心逻辑 / Pure synchronous core logic for ``client:get_blob``.
 
@@ -1442,7 +1705,11 @@ def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | Erro
     handle = data["blob_handle"]
     chunk_offset = data.get("chunk_offset", 0)
     max_chunk_bytes_req = data.get("max_chunk_bytes")
-    max_chunk_bytes = computer.blob_thresholds.clamp_chunk(max_chunk_bytes_req)
+    clamped = _clamp_chunk_or_none(computer, max_chunk_bytes_req)
+    if clamped is None:
+        logger.warning(f"client:get_blob 非法 max_chunk_bytes={max_chunk_bytes_req!r}")
+        return build_bad_request_error()
+    max_chunk_bytes = clamped
 
     # 1) 解码句柄 → kind 派发 / Decode handle → kind dispatch
     try:
@@ -1450,6 +1717,14 @@ def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | Erro
     except BlobHandleInvalidError as e:
         logger.warning(f"client:get_blob invalid handle: {e}")
         return _blob_error(reason="invalid_handle")
+
+    # v0.5.0 #236 / protocol#65：``kind=path`` 走拉取期复核特判——**不进**通用 resolver 表。
+    # 理由：``ResolvedBlob`` 无 close 语义，range 失败等早退路径会漏掉已打开句柄（fd 泄漏）；
+    # path 分支需要 try/finally 显式 close（``PathPullResult`` 自持打开句柄）。
+    # kind=path is special-cased (not in the resolver table): the pull result owns an open
+    # handle, so it MUST be closed in a finally block.
+    if kind == HANDLE_KIND_PATH:
+        return _process_path_get_blob(data, computer, payload)
 
     resolver = computer.blob_resolvers.get(kind)
     if resolver is None:
@@ -1477,20 +1752,16 @@ def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | Erro
     remaining = resolved.total_size - chunk_offset
     slice_len = min(max_chunk_bytes, remaining)
     chunk = resolved.slice(chunk_offset, slice_len)
-    # eof 公式保留 len(chunk) 形式：与原 ``end == total_size`` 等价，对 OS 短读健壮.
-    # Preserve len(chunk) form: equivalent to original ``end == total_size``, robust to short-reads.
-    eof = chunk_offset + len(chunk) == resolved.total_size
-    ret: GetBlobRet = {
-        "blob_handle": handle,
-        "mime_type": resolved.mime,
-        "total_size": resolved.total_size,
-        "sha256": resolved.sha256,
-        "chunk_offset": chunk_offset,
-        "eof": eof,
-        "blob": base64.b64encode(chunk).decode("ascii"),
-        "req_id": data["req_id"],
-    }
-    return ret
+    # 与 path 分支共用 ``_build_chunk_ret``（线上形状单一真相源，🟡6）.
+    return _build_chunk_ret(
+        blob_handle=handle,
+        mime_type=resolved.mime,
+        total_size=resolved.total_size,
+        sha256=resolved.sha256,
+        chunk_offset=chunk_offset,
+        chunk=chunk,
+        req_id=data["req_id"],
+    )
 
 
 def _process_put_blob(data: PutBlobReq, computer: Computer) -> PutBlobRet | ErrorPayload:

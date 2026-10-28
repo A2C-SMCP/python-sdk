@@ -1747,6 +1747,7 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_SKILLS_EVENT,
         GET_TOOLS_EVENT,
         PUT_BLOB_EVENT,
+        RESOLVE_PATH_EVENT,
         SMCP_NAMESPACE,
         TOOL_CALL_EVENT,
     )
@@ -1825,6 +1826,7 @@ def test_cli_namespace_flag_propagates_to_client_handler_registration(
         GET_RESOURCES_EVENT,
         GET_BLOB_EVENT,
         PUT_BLOB_EVENT,  # v0.4.0 #196：上行写入通道
+        RESOLVE_PATH_EVENT,  # v0.5.0 #236 / protocol#65：按路径读取
         GET_SKILLS_EVENT,
         GET_SKILL_EVENT,
         CANCEL_TOOL_CALL_NOTIFICATION,  # #96：notify:tool_call_cancel 接收处理器

@@ -34,6 +34,12 @@ GET_BLOB_EVENT = "client:get_blob"
 # v0.4.0 新增：上行写入通道（Agent → Computer 分块落盘）/ v0.4.0 added: upload write channel
 # 协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3（上行）/ §7（landing 沙箱）
 PUT_BLOB_EVENT = "client:put_blob"
+# v0.5.0 新增：按路径读取（blob_handle 的第三个生产者，protocol#65）
+# v0.5.0 added: read-by-path (the third blob_handle producer, protocol#65)
+# 协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取
+# 授权边界 = settings ``readRoots``（默认空 = 不可读）；字节仍经 ``client:get_blob`` 拉取。
+# Authorization boundary = settings ``readRoots`` (empty default = unreadable); bytes still flow via get_blob.
+RESOLVE_PATH_EVENT = "client:resolve_path"
 # 服务端事件 由server:开头的事件服务端执行
 JOIN_OFFICE_EVENT = "server:join_office"
 LEAVE_OFFICE_EVENT = "server:leave_office"
@@ -488,6 +494,14 @@ class ErrorCode(IntEnum):
     # busy / forbidden / integrity / io_error（开放枚举）
     BLOB_WRITE_FAILED = 4019
 
+    # v0.5.0 新增：按路径读取铸造期 / v0.5.0 added: read-by-path mint stage (protocol#65)
+    # 协议依据 / Protocol: error-handling.md §Path Not Accessible（4020）
+    # 与 4018 的分界：4020 属**铸造期**（resolve 失败、不铸句柄）；resolve 成功后拉取期的
+    # 撤权 / 删除仍走 4018（forbidden / gone），**4018 枚举不变**。
+    # Boundary: 4020 is mint-time (no handle minted); pull-time revoke/removal stays on 4018.
+    # details.reason ∈ {invalid_path, forbidden, not_found, not_a_file}（开放枚举 / open enum）。
+    PATH_NOT_ACCESSIBLE = 4020
+
     # v0.5.0 新增：通用请求错误 / v0.5.0 added: generic request errors
     # 协议依据 / Protocol: error-handling.md §通用错误码
     # 三者此前缺位于本枚举，而房间事件的失败通道需要它们作为**结构化**取值（#214）：
@@ -833,6 +847,46 @@ class GetBlobRet(TypedDict, total=False):
     chunk_offset: int  # 本块起始字节偏移
     eof: bool  # ⟺ chunk_offset + 本块字节数 == total_size
     blob: str  # base64，本块字节
+    req_id: str
+
+
+class ResolvePathReq(AgentCallData, total=True):
+    """
+    按路径读取请求（``client:resolve_path``，v0.5.0 protocol#65）。
+    Read-by-path request (``client:resolve_path``, v0.5.0 protocol#65).
+
+    协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq。
+
+    Agent 给出 Computer **本地绝对路径**（原生形态或 ``canonical_path`` 形态 ``/C:/...``），
+    Computer 在 settings ``readRoots`` 授权内规范化 + stat，返回规范路径与元数据并**现铸**
+    ``blob_handle``；字节仍经 ``client:get_blob`` 拉取。**Agent MUST NOT** 自行构造句柄。
+    The Agent gives a **local absolute path**; the Computer normalizes + stats it inside the
+    settings-authorized ``readRoots``, returning metadata and minting an opaque handle.
+    """
+
+    computer: str
+    path: str  # 本地绝对路径：原生形态或 canonical_path 形态 / native or canonical form
+
+
+class ResolvePathRet(TypedDict, total=True):
+    """
+    按路径读取响应（v0.5.0 protocol#65）。
+    Read-by-path response (v0.5.0 protocol#65).
+
+    协议依据 / Protocol: data-structures.md §ResolvePathRet；blob-transfer.md §生产者三。
+
+    持久引用 = ``computer_id`` + ``canonical_path``，**不是** ``blob_handle``——每次读取重新
+    resolve 现铸句柄。只需变更检测时比对 ``sha256``，不必拉字节。
+    Durable reference = ``computer_id`` + ``canonical_path``, never the handle. Compare
+    ``sha256`` for change detection without pulling bytes.
+    """
+
+    canonical_path: str  # realpath 后经 normalize_path；可直接回用作 path / reusable as path
+    blob_handle: str  # 现铸不透明句柄，转 client:get_blob 拉取字节 / minted opaque handle
+    mime_type: str  # 确定性推断（同 SKILL §6.4 (1)）/ deterministic inference
+    total_size: int  # 文件字节数 / file size in bytes
+    sha256: str  # 全量 sha256 十六进制（小写）/ full sha256 hex (lowercase)
+    mtime: int  # Unix epoch 毫秒（向负无穷取整；仅作提示）/ epoch ms, floor; advisory only
     req_id: str
 
 

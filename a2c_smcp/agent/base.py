@@ -43,6 +43,7 @@ from a2c_smcp.smcp import (
     LeaveOfficeNotification,
     LeaveOfficeReq,
     PutBlobReq,
+    ResolvePathReq,
     SessionInfo,
     ToolCallReq,
     UpdateMCPConfigNotification,
@@ -409,6 +410,15 @@ class BaseAgentClient(ABC):
             chunk_offset,
             max_chunk_bytes,
         )
+
+    def create_resolve_path_request(self, computer: str, path: str) -> ResolvePathReq:
+        """创建按路径读取请求对象（v0.5.0 #236 / protocol#65）/ Create resolve-path request object.
+
+        协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq.
+        ``path`` 为 Computer 本地绝对路径（原生或 canonical 形态）；
+        持久引用应保存返回的 ``canonical_path``（+ ``computer_id``），而非 ``blob_handle``.
+        """
+        return _rb.build_resolve_path_request(self.auth_provider.get_agent_config(), computer, path)
 
     def create_put_blob_request(
         self,
@@ -1007,6 +1017,15 @@ class BaseAgentSyncClient(ABC):
             chunk_offset,
             max_chunk_bytes,
         )
+
+    def create_resolve_path_request(self, computer: str, path: str) -> ResolvePathReq:
+        """创建按路径读取请求对象（v0.5.0 #236 / protocol#65）/ Create resolve-path request object.
+
+        协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq.
+        ``path`` 为 Computer 本地绝对路径（原生或 canonical 形态）；
+        持久引用应保存返回的 ``canonical_path``（+ ``computer_id``），而非 ``blob_handle``.
+        """
+        return _rb.build_resolve_path_request(self.auth_provider.get_agent_config(), computer, path)
 
     def create_put_blob_request(
         self,

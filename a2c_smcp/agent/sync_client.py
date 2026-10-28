@@ -37,6 +37,7 @@ from a2c_smcp.smcp import (
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
@@ -54,6 +55,7 @@ from a2c_smcp.smcp import (
     GetToolsRet,
     LeaveOfficeNotification,
     ListRoomReq,
+    ResolvePathRet,
     SessionInfo,
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
@@ -838,6 +840,21 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for blob")
         return GetBlobRet(**response)
+
+    def resolve_path(self, computer: str, path: str, *, timeout: int = 30) -> ResolvePathRet:
+        """同步按路径读取（sync mirror of async ``resolve_path``；v0.5.0 #236 / protocol#65）.
+
+        协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取.
+        失败面与 async 版完全一致（``4020`` 四 reason 抛 :class:`SMCPProtocolError`）；完整语义文档见
+        :meth:`a2c_smcp.agent.client.AsyncSMCPAgentClient.resolve_path`.
+        """
+        req = self.create_resolve_path_request(computer, path)
+        logger.debug(f"Resolving path on computer {computer}")
+        response = self.call(RESOLVE_PATH_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for resolve_path")
+        return cast(ResolvePathRet, response)
 
     def _make_blob_call(self) -> Any:
         """构造 :func:`drain_blob_sync` 的 ``call`` 适配器（sync mirror of async ``_make_blob_call``）."""
