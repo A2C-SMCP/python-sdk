@@ -25,6 +25,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids
+from a2c_smcp.computer.cli.commands import identity as identity_cmd
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
@@ -442,6 +443,9 @@ skill_app = typer.Typer(help="Skills cross-source query (list / info)")
 # MCP server 挂载延到下次 REPL boot 经批准框落地（§4.6）。settings 直读写物化意图层。
 plugin_app = typer.Typer(help="Plugins — skill+mcp bundles (install / enable / list ...)")
 settings_app = typer.Typer(help="settings.json intent layer (show / get / set / edit)")
+# identity（v0.5.0 / protocol#64）：Computer 稳定身份的重置入口。独立 CLI 只做原子文件替换 +
+# 重启提示（进程内无法判定运行中的 Computer 是否已连接；REPL 的 `identity reset` 才做已连接拒绝）。
+identity_app = typer.Typer(help="Computer identity (reset)")
 
 
 @marketplace_app.command("add")
@@ -698,10 +702,17 @@ def _settings_edit(
     raise typer.Exit(code)
 
 
+@identity_app.command("reset")
+def _identity_reset() -> None:
+    """重置本机 Computer 稳定身份（需重启运行中的 Computer）/ Reset the stable Computer identity."""
+    raise typer.Exit(identity_cmd.reset_identity_cli())
+
+
 app.add_typer(marketplace_app, name="marketplace")
 app.add_typer(skill_app, name="skill")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(settings_app, name="settings")
+app.add_typer(identity_app, name="identity")
 
 
 # 为 console_scripts 兼容提供入口
