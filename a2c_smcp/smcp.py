@@ -927,7 +927,8 @@ def normalize_details(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     / Any non-mapping ``details`` (including absent) becomes ``{}``, matching rust
     ``SmcpProtocolError::from_value`` (``as_object`` + ``unwrap_or_default``). The returned dict is a
-    shallow copy, so mutating the source payload afterwards cannot change the caller's view.
+    **top-level-only** (shallow) copy, so mutating the source payload afterwards cannot change the
+    caller's view at the top level (nested mutable values stay shared — standard keys are scalars).
 
     Args:
         payload (Mapping[str, Any]): flat ``ErrorPayload``（或任何含 ``details`` 键的映射）。

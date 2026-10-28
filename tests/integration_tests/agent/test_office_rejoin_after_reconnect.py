@@ -295,8 +295,10 @@ async def test_explicit_join_rejected_by_real_server_raises_with_code(
         assert ei.value.code == 4101, f"应带真实协议码，实得 {ei.value!r}"
         # #234：真实 ack 的 details 必须原样到达宿主（协议标准 key：被拒目标房 + 发起者自己声明的 role）
         assert ei.value.details == {"office_id": _OFFICE, "role": "agent"}, f"4101 须透出 details，实得 {ei.value.details!r}"
-        # 安全不变量：details 是诊断容器，**不得**经异常文案透出（Exception.__str__ 只含 code + message）
-        assert "office_id" not in str(ei.value), f"details 不得进入异常文案，实得 {str(ei.value)!r}"
+        # 安全不变量：details 是诊断容器，**不得**经异常文案透出（Exception.__str__ 只含 code + message）。
+        # 键名与值分别断言——只禁键名会漏掉「值被拼进文案」的泄露形态。
+        assert "office_id" not in str(ei.value), f"details 键名不得进入异常文案，实得 {str(ei.value)!r}"
+        assert _OFFICE not in str(ei.value), f"details 值不得进入异常文案，实得 {str(ei.value)!r}"
         assert second._desired_office is None, "首次被拒（无已确认房可回退）⇒ 清空意图"
         assert second._confirmed_office is None
 

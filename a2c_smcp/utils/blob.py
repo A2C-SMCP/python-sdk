@@ -483,9 +483,11 @@ def _raise_for_blob_error(payload: Mapping[str, Any]) -> None:
         return
     if code == int(ErrorCode.BLOB_NOT_ACCESSIBLE):
         # #234：details 归一走 smcp.normalize_details（非 mapping 退化空映射），避免对端给出
-        # 字符串/数组时 `.get()` 抛 AttributeError 顶替 BlobTransferError。
+        # 字符串/数组时 `.get()` 抛 AttributeError 顶替 BlobTransferError；reason 同 rust
+        # ``as_str().unwrap_or(default)``：非字符串（None / 数字）一律取默认，不做 ``str()`` 强转。
         details = normalize_details(payload)
-        reason = str(details.get("reason", "invalid_handle"))
+        raw_reason = details.get("reason")
+        reason = raw_reason if isinstance(raw_reason, str) else "invalid_handle"
         raise BlobTransferError(reason=reason, message=str(payload.get("message", "Blob not accessible")))
     # 其它协议错误码：直接以原始 code 透传（不再 swallow 成 success）
     # Other protocol error codes: surface them verbatim (do not silently swallow)
@@ -601,9 +603,11 @@ def _raise_for_put_blob_error(payload: Mapping[str, Any]) -> None:
     if code is None:
         return
     if code == int(ErrorCode.BLOB_WRITE_FAILED):
-        # #234：同 4018 —— 非 mapping details 不得把 BlobUploadError 顶替成 AttributeError。
+        # #234：同 4018 —— 非 mapping details 不得把 BlobUploadError 顶替成 AttributeError；
+        # reason 非字符串同样取默认（与 rust as_str 对齐）。
         details = normalize_details(payload)
-        reason = str(details.get("reason", "invalid_upload"))
+        raw_reason = details.get("reason")
+        reason = raw_reason if isinstance(raw_reason, str) else "invalid_upload"
         raise BlobUploadError(reason=reason, message=str(payload.get("message", "Blob write failed")))
     raise BlobUploadError(
         reason=f"protocol_error_{code}",

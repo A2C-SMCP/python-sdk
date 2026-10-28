@@ -226,6 +226,28 @@ class TestSerialErrorMatrix:
         assert exc_info.value.reason == "invalid_handle"
         assert len(call.calls) == 1, "非 mapping details 不应触发重试（与其它不可重试 reason 同类）"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_reason", [None, 42])
+    async def test_4018_non_string_reason_degrades_to_default(self, bad_reason: Any) -> None:
+        """#234：``reason`` 非字符串 ⇒ 默认 reason（同 rust ``as_str().unwrap_or(...)``），**不**做 ``str()`` 强转。
+
+        否则 ``{"reason": null}`` 会变成 "None"、``42`` 变成 "42"——既非开放枚举也非默认值。
+        """
+        call = _AsyncMockCall(
+            [
+                {
+                    "code": int(ErrorCode.BLOB_NOT_ACCESSIBLE),
+                    "message": "Blob not accessible",
+                    "details": {"reason": bad_reason},
+                }
+            ]
+        )
+        with pytest.raises(BlobTransferError) as exc_info:
+            await drain_blob(call, "c", "h")
+
+        assert exc_info.value.reason == "invalid_handle"
+        assert len(call.calls) == 1
+
 
 # ── 并行模式 / Parallel mode ─────────────────────────────────────────────
 

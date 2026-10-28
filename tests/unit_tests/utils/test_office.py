@@ -393,7 +393,10 @@ class TestLogJoinRejection:
         log_join_rejection("officeA", verdict)
 
         text = fake_logger.error.call_args[0][0]
-        assert "details=" in text and "officeB" in text and "'role': 'agent'" in text
+        # 不耦合 dict.__repr__：分别断言「日志带 details 段」与两个标准 key 的存在
+        assert "details=" in text
+        assert "office_id" in text and "officeB" in text
+        assert "role" in text and "agent" in text
 
     def test_log_appends_403_hint_via_message_authority(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """403 提示与异常文案同源（同一文案权威），不得各写各的。"""

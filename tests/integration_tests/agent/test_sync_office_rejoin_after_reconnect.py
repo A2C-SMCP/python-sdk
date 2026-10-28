@@ -385,8 +385,9 @@ def test_sync_explicit_join_rejected_by_real_server_raises_with_code(
         assert ei.value.code == 4101, f"应带真实协议码，实得 {ei.value!r}"
         # #234（同步镜像）：真实 ack 的 details 必须原样到达宿主
         assert ei.value.details == {"office_id": _OFFICE, "role": "agent"}, f"4101 须透出 details，实得 {ei.value.details!r}"
-        # 安全不变量：details 不得经异常文案透出（同异步侧）
-        assert "office_id" not in str(ei.value), f"details 不得进入异常文案，实得 {str(ei.value)!r}"
+        # 安全不变量：details 不得经异常文案透出（同异步侧；键名与值分别断言）
+        assert "office_id" not in str(ei.value), f"details 键名不得进入异常文案，实得 {str(ei.value)!r}"
+        assert _OFFICE not in str(ei.value), f"details 值不得进入异常文案，实得 {str(ei.value)!r}"
         assert second._desired_office is None, "首次被拒（无已确认房可回退）⇒ 清空意图"
         assert second._confirmed_office is None
 
