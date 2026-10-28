@@ -124,6 +124,22 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 
+- **按路径读取 `client:resolve_path` + `readRoots` 授权（#236，protocol#65）**：新增事件
+  `client:resolve_path`（`ResolvePathReq` / `ResolvePathRet`）与错误码 `4020 Path Not Accessible`
+  （`details.reason ∈ {invalid_path, forbidden, not_found, not_a_file}`，开放枚举；resolve 成功后
+  拉取期的撤权 / 删除仍走 `4018 forbidden` / `gone`，**`4018` 枚举不变**）。
+  - **授权边界 = settings `readRoots`**（默认空 = 不可读，fail-closed）：仅受信 scope 可设，
+    `project` scope 提供该键**整字段拒绝**；跨 scope 按数组语义拼接去重；逐项须为绝对路径且通过
+    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。
+  - **授权每请求现读、无进程内缓存**：拉取期 `get_blob` 按**当前** `readRoots` 与**当前文件系统状态**
+    重施围栏（覆盖 resolve 后的撤权、root 符号链接换指向）；正确性不依赖宿主调用任何失效入口。
+  - **固定拒绝集**（即便在 `readRoots` 内也拒绝）：`.skillenv`、SDK 配置/状态/凭据目录
+    （含 `--settings` / `--mcp-config` / `.tfrobot` / SKILL Home / blob 缓存根 / keyring 文件后端）、
+    未定稿 `.part`。
+  - `resolve`（对全量字节算 sha256）与 `get_blob` 的 path 分支均 offload 到 worker 线程，
+    避免阻塞 socket.io 事件循环；path 句柄在 `finally` 中关闭（fd 泄漏守卫）。
+  - Agent 侧：`SMCPAgentClient.resolve_path` / `AsyncSMCPAgentClient.resolve_path`；Server 侧走统一
+    `_relay_client_call` 路由（与其它 `client:*` 一致）。
 - **入房失败处理的单一权威 API**（#218，`a2c_smcp.utils`）：`resolve_join_failure`（失败效应表：
   明确拒绝 ⇒ 意图回退到已确认房；未获裁决 / 传输层失败 ⇒ 双清空）、`join_failure_message` /
   `build_join_failure_payload`（异常与日志**同一文案**；`403` 追加身份提示；未获裁决省略 `code` 键 ⇒

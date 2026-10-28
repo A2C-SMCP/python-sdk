@@ -49,6 +49,7 @@ from a2c_smcp.smcp import (
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -82,6 +83,8 @@ from a2c_smcp.smcp import (
     ListRoomRet,
     PutBlobReq,
     PutBlobRet,
+    ResolvePathReq,
+    ResolvePathRet,
     SessionInfo,
     ToolCallReq,
     UpdateComputerConfigReq,
@@ -965,6 +968,25 @@ class SMCPNamespace(BaseNamespace):
         return cast(
             "GetBlobRet | ErrorPayload",
             await self._relay_client_call(sid, data, _extra, GET_BLOB_EVENT, TypeAdapter(GetBlobReq), TypeAdapter(GetBlobRet)),
+        )
+
+    async def on_client_resolve_path(self, sid: str, data: ResolvePathReq | None = None, *_extra: Any) -> ResolvePathRet | ErrorPayload:
+        """透明转发 ``client:resolve_path`` 至目标 Computer / Relay ``client:resolve_path``.
+
+        协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取.
+        Server 只看路由（``computer``）与 flat ``ErrorPayload`` 透传；``4020`` 的四种
+        ``details.reason`` 由 Computer 铸造，原样回传（与其它 ``client:*`` 同路由）。
+
+        Args:
+            sid: 发起者 SID（Agent）/ Initiator SID (Agent).
+            data: 请求载荷（computer / path / req_id）.
+
+        Returns:
+            ResolvePathRet | ErrorPayload: 成功为解析结果，失败为 flat ``4020``（透传）.
+        """
+        return cast(
+            "ResolvePathRet | ErrorPayload",
+            await self._relay_client_call(sid, data, _extra, RESOLVE_PATH_EVENT, TypeAdapter(ResolvePathReq), TypeAdapter(ResolvePathRet)),
         )
 
     async def on_client_put_blob(self, sid: str, data: PutBlobReq | None = None, *_extra: Any) -> PutBlobRet | ErrorPayload:

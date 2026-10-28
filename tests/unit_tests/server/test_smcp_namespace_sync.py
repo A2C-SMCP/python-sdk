@@ -32,6 +32,7 @@ from a2c_smcp.smcp import (
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
@@ -673,6 +674,38 @@ class TestV021ClientRoutesAndUpdateSkillsSync:
         assert ns.call.call_args[0][0] == GET_TOOLS_EVENT
         assert ns.call.call_args.kwargs["to"] == comp_sid
         assert ret["tools"] == []
+
+    def test_resolve_path_relays_via_unified_helper(self, routed_ns):
+        """sync：``client:resolve_path`` 经 ``_relay_client_call`` 转发到正确事件 + Computer SID（#236 sync mirror）."""
+        ns, agent_sid, comp_name, comp_sid = routed_ns
+        ok = {
+            "canonical_path": "/srv/docs/a.txt",
+            "blob_handle": "opaque",
+            "mime_type": "text/plain",
+            "total_size": 11,
+            "sha256": "a" * 64,
+            "mtime": 1_700_000_000_123,
+            "req_id": "r1",
+        }
+        ns.call.return_value = ok
+        ret = ns.on_client_resolve_path(
+            agent_sid, {"agent": "a", "req_id": "r1", "computer": comp_name, "path": "/srv/docs/a.txt"}
+        )
+        ns.call.assert_called_once()
+        assert ns.call.call_args[0][0] == RESOLVE_PATH_EVENT
+        assert ns.call.call_args.kwargs["to"] == comp_sid
+        assert ret["canonical_path"] == "/srv/docs/a.txt"
+
+    def test_resolve_path_flat_error_passthrough(self, routed_ns):
+        """sync：``4020`` flat ErrorPayload 原样透传（与 async 同构）."""
+        ns, agent_sid, comp_name, _comp_sid = routed_ns
+        err = {"code": 4020, "message": "Path not accessible", "details": {"reason": "forbidden"}}
+        ns.call.return_value = err
+        ret = ns.on_client_resolve_path(
+            agent_sid, {"agent": "a", "req_id": "r1", "computer": comp_name, "path": "/etc/shadow"}
+        )
+        assert ret["code"] == 4020
+        assert ret["details"] == {"reason": "forbidden"}
 
     def test_get_tools_flat_error_passthrough(self, routed_ns):
         """sync：v0.2.2 旧路由非豁免——``client:get_tools`` 的 flat ErrorPayload 原样透传，不强转 GetToolsRet."""

@@ -48,6 +48,7 @@ from a2c_smcp.smcp import (
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_EVENT,
@@ -81,6 +82,8 @@ from a2c_smcp.smcp import (
     ListRoomRet,
     PutBlobReq,
     PutBlobRet,
+    ResolvePathReq,
+    ResolvePathRet,
     SessionInfo,
     ToolCallReq,
     UpdateComputerConfigReq,
@@ -789,6 +792,18 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         return cast(
             "GetBlobRet | ErrorPayload",
             self._relay_client_call(sid, data, _extra, GET_BLOB_EVENT, TypeAdapter(GetBlobReq), TypeAdapter(GetBlobRet)),
+        )
+
+    def on_client_resolve_path(self, sid: str, data: ResolvePathReq | None = None, *_extra: Any) -> ResolvePathRet | ErrorPayload:
+        """同步：透明转发 ``client:resolve_path`` / Sync relay of ``client:resolve_path``.
+
+        协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取.
+        Server 不解释路径、不铸造句柄，flat ``4020`` 原样回传（与 async 一致）.
+        Server never interprets paths or mints handles; flat 4020 is relayed verbatim.
+        """
+        return cast(
+            "ResolvePathRet | ErrorPayload",
+            self._relay_client_call(sid, data, _extra, RESOLVE_PATH_EVENT, TypeAdapter(ResolvePathReq), TypeAdapter(ResolvePathRet)),
         )
 
     def on_client_put_blob(self, sid: str, data: PutBlobReq | None = None, *_extra: Any) -> PutBlobRet | ErrorPayload:
