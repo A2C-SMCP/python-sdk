@@ -136,6 +136,11 @@ class EnterOfficeReq(TypedDict):
     role: Literal["computer", "agent"]
     name: str
     office_id: str
+    # v0.5.0（protocol#64）：Computer 稳定唯一身份。``role="computer"`` 时 MUST 携带；``role="agent"`` 时
+    # MUST NOT 出现该键（含 ``null``）。形态为小写规范 UUID（8-4-4-4-12），接收方视为不透明。
+    # v0.5.0 (protocol#64): stable Computer identity. MUST for role="computer"; MUST NOT appear
+    # (not even as null) for role="agent"; received as an opaque canonical lowercase UUID.
+    computer_id: NotRequired[str]
 
 
 class LeaveOfficeReq(TypedDict):
@@ -347,6 +352,9 @@ class LeaveOfficeNotification(TypedDict, total=False):
 
     office_id: str
     computer: str | None
+    # v0.5.0（protocol#64）：成员为 Computer 时回显其 ``computer_id``；Agent 时 MUST 省略该键（不得为 null）。
+    # v0.5.0 (protocol#64): echoed for Computer members; omitted entirely for Agents.
+    computer_id: str
     agent: str | None
 
 
@@ -355,6 +363,9 @@ class EnterOfficeNotification(TypedDict, total=False):
 
     office_id: str
     computer: str | None  # Computer Name
+    # v0.5.0（protocol#64）：成员为 Computer 时回显其 ``computer_id``；Agent 时 MUST 省略该键（不得为 null）。
+    # v0.5.0 (protocol#64): echoed for Computer members; omitted entirely for Agents.
+    computer_id: str
     agent: str | None  # Agent Name
 
 
@@ -420,6 +431,9 @@ class SessionInfo(TypedDict, total=False):
     # v0.2 新增：协议版本号，由 Server 在 HTTP 握手阶段从 URL query 写入；仅用于展示与诊断，不参与二次校验
     # v0.2 added: protocol version, written by Server from URL query during HTTP handshake; for display/diagnostics only
     a2c_version: NotRequired[str]
+    # v0.5.0（protocol#64）：``role="computer"`` 时 MUST 存在；Agent 的 SessionInfo MUST 省略该键。
+    # v0.5.0 (protocol#64): MUST exist for role="computer"; MUST be omitted for Agents.
+    computer_id: NotRequired[str]
 
 
 class ListRoomRet(TypedDict):
