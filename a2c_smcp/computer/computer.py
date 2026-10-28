@@ -572,6 +572,16 @@ class Computer(BaseComputer[PromptSession]):
 
         授权边界每次请求现读（见 :attr:`read_roots`）；本方法把「一次请求 = 一次解析」固化，
         避免 resolve 守卫与管线各解析一遍、以及每个 get_blob 块解析两遍。
+
+        ⚠️ 成本 / Cost（follow-up 观察项，非缺陷）：每个 ``get_blob`` 块触发**一次**完整 settings
+        解析（user/project/local/flag/policy 各一文件 + policy 环境探测；Windows 上注册表查询更贵）
+        加上每个 read root 一次 realpath。大文件多块拉取时这是 O(chunks) 次小文件读。
+        **不得**用「进程内长期缓存」优化——拉取期必须反映当前授权与文件系统状态（撤权 / root
+        换指向即时生效）。后续若成为热点，只能加**带 mtime 键**（settings 文件 mtime + 每个 root
+        的 realpath）的短命缓存，且 mtime/realpath 仍需每请求重算。
+        One full settings parse per chunk is intentional (authorization and realpath must be current).
+        Any future optimization MUST key on settings-file mtimes + fresh realpaths, never a long-lived
+        cache.
         """
         resolved = self._resolve_declared_settings()
         return PathAccessPolicy(
