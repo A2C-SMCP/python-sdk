@@ -189,7 +189,21 @@ def encode_path_handle(
     协议要求句柄编码 ``canonical_path`` + **计算前** stat 键 + ``sha256``；``dev`` / ``ino``
     为文件身份（平台不提供时省略）。句柄仍不透明、无状态——解析方 MUST 重跑授权校验。
     """
-    raise NotImplementedError("path core skeleton — implemented in the next commit")
+    if (dev is None) != (ino is None):
+        raise ValueError("dev and ino must be provided together or omitted together")
+    payload: dict[str, Any] = {
+        "v": HANDLE_VERSION,
+        "kind": HANDLE_KIND_PATH,
+        "canonical_path": canonical_path,
+        "total_size": total_size,
+        "mtime": mtime,
+        "sha256": sha256,
+        "mime": mime,
+    }
+    if dev is not None and ino is not None:
+        payload["dev"] = dev
+        payload["ino"] = ino
+    return _encode(payload)
 
 
 def decode_blob_handle(handle: str) -> tuple[Literal["skill", "toolspool", "path"], dict[str, Any]]:
