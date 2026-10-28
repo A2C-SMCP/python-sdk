@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import stat
+import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -38,6 +39,12 @@ from a2c_smcp.computer.blob.handle import (
     encode_path_handle,
 )
 from a2c_smcp.computer.inputs.value_store import resolve_value_store_path
+from a2c_smcp.computer.settings.policy import (
+    LINUX_MANAGED_DIR,
+    MACOS_MANAGED_DIR,
+    MACOS_PLIST_PATH,
+    WINDOWS_MANAGED_DIR,
+)
 from a2c_smcp.computer.settings.scope import user_settings_path
 from a2c_smcp.utils.mime import guess_mime
 from a2c_smcp.utils.path import resolve_xdg_first
@@ -66,6 +73,14 @@ _COMPUTER_ID_FILENAME = "computer-id"
 
 # ``os.pread`` 仅 POSIX 提供；Windows 回退到 lseek + read.
 _OS_PREAD: Callable[[int, int, int], bytes] | None = getattr(os, "pread", None)
+
+# Windows 最终路径复核失败告警限频 / Rate-limited warning for Windows final-path failures.
+_WIN_FINAL_PATH_WARN_INTERVAL_SECONDS: float = 300.0
+_win_final_path_warn_last: float = 0.0
+
+# Win32 错误码：文件 / 路径在打开后被删除 / Win32 errors: file/path deleted after open.
+_WIN_ERROR_FILE_NOT_FOUND: int = 2
+_WIN_ERROR_PATH_NOT_FOUND: int = 3
 
 
 class PathResolveError(Exception):
@@ -223,10 +238,11 @@ def build_protected_paths(
     input 值缓存均在这些目录下。``extra_paths`` 由 config+wire 流注入（flag settings 等）。
 
     Note:
-        ``resolve_path`` / ``resolve_for_pull`` 的 ``protected=None`` 只是防御性兜底
-        （每次请求重建）；接线层 SHOULD 预构建一次并复用，热路径不依赖本默认集。
-        workdir 级配置（``<cwd>/.tfrobot`` 的 settings / mcp.json）由接线层经
-        ``extra_paths`` 注入；默认集只覆盖 SDK 全局位置（config / state / keyring）。
+        ``protected`` 应由接线层**每次请求重建**（settings 可能被原子重写）；``file_ids``
+        只是构建期快照，安全判定以打开句柄时对 ``protected.paths`` 中 regular file 的
+        **re-stat** 为准。workdir 级配置（``<cwd>/.tfrobot`` 的 settings / mcp.json）、
+        SKILL Home、blob 缓存根、flag settings / mcp 由接线层经 ``extra_paths`` 注入；
+        默认集覆盖 SDK 全局位置：config / state / keyring / policy managed 目录。
     """
     pf: PathPlatform = native_platform() if platform is None else platform
     environ: Mapping[str, str] = os.environ if env is None else env
@@ -275,6 +291,13 @@ def build_protected_paths(
     except (OSError, ValueError) as e:  # pragma: no cover - 防御性
         logger.warning("拒绝集: 无法解析 keyring 目录 / cannot resolve keyring dirs: %s", e)
 
+    # policy scope 的企业下发位置（可含 env / 凭据）；按宿主平台取有效形态，缺失也无害。
+    # Policy-scope managed locations (may carry enterprise env/credentials); host-valid forms only.
+    if pf == "windows":
+        candidates.append(str(WINDOWS_MANAGED_DIR))
+    else:
+        candidates.extend([str(MACOS_MANAGED_DIR), str(MACOS_PLIST_PATH), str(LINUX_MANAGED_DIR)])
+
     candidates.extend(str(p) for p in extra_paths)
 
     protected: set[str] = set()
@@ -296,10 +319,10 @@ def build_protected_paths(
         if real is not None:
             protected.add(real)
         # 硬链接 SHOULD：记录实际文件的 (dev, ino)。目录不展开（前缀判定已覆盖）。
-        # file_ids 是**构建期快照**：只覆盖构建时已存在的受保护文件；之后新建的文件
-        # 仍受目录前缀保护，但指向它的硬链接要等下一次构建才具备身份兜底（协议 SHOULD 的既存限制）。
-        # file_ids is a build-time snapshot; later-created files are covered by the dir prefix,
-        # but hard links to them need a rebuild for identity defense (existing SHOULD limitation).
+        # file_ids 是**构建期快照**，仅作兜底；安全判定以 _matches_protected_file_identity
+        # 在打开句柄时对受保护文件 re-stat 为准（覆盖 os.replace 原子重写后的 inode 变化）。
+        # file_ids is a build-time snapshot fallback; the authoritative check re-stats protected
+        # files at open time (covers inode changes from atomic rewrites).
         try:
             st = os.stat(to_native_path(real or configured, pf))
         except OSError:
@@ -521,7 +544,7 @@ def _run_pipeline(
         # swaps remain covered by the final-path recheck where available.
         if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
             raise PathResolveError("forbidden", "file identity changed between lstat and open")
-        if (fst.st_dev, fst.st_ino) in protected.file_ids:
+        if _matches_protected_file_identity(fst, protected, platform):
             raise PathResolveError("forbidden", "file identity is in the fixed rejection set (hard link)")
         final_path = _fd_final_path(fd, platform)
         if final_path is not None:
@@ -615,6 +638,30 @@ def _within_any_real(path: str, roots: Sequence[ReadRoot]) -> bool:
     return any(root.real is not None and _is_within(path, root.real) for root in roots)
 
 
+def _matches_protected_file_identity(
+    fst: os.stat_result,
+    protected: ProtectedPaths,
+    platform: PathPlatform,
+) -> bool:
+    """打开句柄身份是否命中受保护文件 / Whether the opened fd identity is a protected file.
+
+    先查构建期快照 ``file_ids``，再对 ``protected.paths`` 中当前为 regular file 的项
+    **re-stat**（覆盖 ``os.replace`` 原子重写后 inode 变化——settings / input-values 是高频
+    重写对象）。目录项会 stat 失败或非 regular，自动跳过。
+    """
+    identity = (fst.st_dev, fst.st_ino)
+    if identity in protected.file_ids:
+        return True
+    for entry in protected.paths:
+        try:
+            st = os.stat(to_native_path(entry, platform))
+        except (OSError, InvalidPathError, ValueError):
+            continue
+        if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == identity:
+            return True
+    return False
+
+
 def _is_protected(canonical_path: str, protected: ProtectedPaths, platform: PathPlatform) -> bool:
     """固定拒绝集判定（含 ``.skillenv`` / landing ``.part``）.
 
@@ -703,18 +750,43 @@ def _fd_final_path(fd: int, platform: PathPlatform) -> str | None:
     取不到时返回 ``None``（SHOULD 级检查，不阻断；此时只剩身份比对兜底，属已知限制）；
     取到但无法规范化 / 已删除 → ``forbidden``。
     """
-    try:
-        target = _windows_final_path(fd) if platform == "windows" else _posix_final_path(fd)
-    except (OSError, ImportError, AttributeError, UnicodeError):
-        return None
+    if platform == "windows":
+        try:
+            target = _windows_final_path(fd)
+        except OSError as e:
+            win_error = getattr(e, "winerror", None) or e.errno
+            if win_error in (_WIN_ERROR_FILE_NOT_FOUND, _WIN_ERROR_PATH_NOT_FOUND):
+                raise PathResolveError("forbidden", "file was deleted after open") from e
+            _warn_windows_final_path_failure(e)
+            return None
+        except (ImportError, AttributeError, UnicodeError) as e:
+            _warn_windows_final_path_failure(e)
+            return None
+    else:
+        try:
+            target = _posix_final_path(fd)
+        except (OSError, ImportError, AttributeError, UnicodeError):
+            return None
     if target is None:
         return None
-    if target.endswith(" (deleted)"):
+    # POSIX readlink 用 " (deleted)" 标记已删除；Windows 不以名称后缀表达，改用 Win32 错误码。
+    # POSIX marks unlinked files with " (deleted)"; Windows uses Win32 error codes instead.
+    if platform == "posix" and target.endswith(" (deleted)"):
         raise PathResolveError("forbidden", "file was deleted after open")
     try:
         return normalize_path(target, platform)
     except (InvalidPathError, ValueError) as e:
         raise PathResolveError("forbidden", f"final path cannot be normalized: {e}") from e
+
+
+def _warn_windows_final_path_failure(exc: BaseException) -> None:
+    """Windows 最终路径复核失败告警（限频）/ Rate-limited warning for Windows final-path failures."""
+    global _win_final_path_warn_last
+    now = time.monotonic()
+    if now - _win_final_path_warn_last < _WIN_FINAL_PATH_WARN_INTERVAL_SECONDS:
+        return
+    _win_final_path_warn_last = now
+    logger.warning("Windows 最终路径复核失败，回退身份比对 / final-path recheck failed: %s", exc)
 
 
 def _posix_final_path(fd: int) -> str | None:
