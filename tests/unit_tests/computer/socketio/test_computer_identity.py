@@ -287,7 +287,7 @@ class TestIdentityRaces:
         client._on_namespace_disconnect("client disconnect")
         gate.set()
 
-        assert await task is None, "被抢占的 join 应静默让位"
+        await task  # 被抢占时静默让位（成功路径同样返回 None，故不以返回值断言）
         client.call.assert_not_awaited()
         assert client.office_id is None, "不得把 desired 写回已断开的连接"
 
@@ -300,6 +300,7 @@ class TestIdentityRaces:
         client = _make_client()
         client._computer_id = None
         gate = threading.Event()
+        reset_entered = threading.Event()
         stale = "abcdef01-2345-4678-8abc-def012345678"
         fresh = "abcdef02-2345-4678-8abc-def012345679"
 
@@ -308,6 +309,7 @@ class TestIdentityRaces:
             return stale
 
         def _reset(*, env: object = None) -> str:
+            reset_entered.set()  # 进入「文件操作」的确定性探针
             return fresh
 
         monkeypatch.setattr(computer_client_mod, "load_or_create_computer_id", _slow_load)
@@ -321,9 +323,13 @@ class TestIdentityRaces:
         assert client._identity_lock.locked()
 
         reset = asyncio.create_task(client.reset_identity())
-        await asyncio.sleep(0)  # 让 reset 进入锁等待
+        # 关键探针：物化持锁期间 reset 必须被挡在文件操作之外（无 `_identity_lock` 时此处会提前置位）
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+        assert not reset_entered.is_set(), "有锁时 reset 不得在物化完成前进入文件操作"
         gate.set()
 
         assert await materialize == stale
         assert await reset == fresh
+        assert reset_entered.is_set()
         assert client._computer_id == fresh, "内存必须是 reset 后的新身份"
