@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -61,13 +62,58 @@ class TestParseJoinAckVerdicts:
         assert verdict.message == "Room already has an agent"
 
     def test_error_payload_with_details_still_parses(self) -> None:
-        """`details` 的存在不影响判定（协议 details 为诊断容器）。"""
+        """`details` 原样带出（#234）：4101 的标准 key 是 ``office_id`` / ``role``。"""
         verdict = parse_join_ack(
             {"code": 4101, "message": "Room already has a computer", "details": {"office_id": "o", "role": "computer"}}
         )
 
         assert verdict.ok is False
         assert verdict.code == 4101
+        assert verdict.details == {"office_id": "o", "role": "computer"}
+
+    def test_4106_details_carry_current_office(self) -> None:
+        """4106 的 ``details.office_id`` 是会话**当前**所在房（协议 error-handling.md §4106）。"""
+        verdict = parse_join_ack(
+            {"code": 4106, "message": "Agent already in another room", "details": {"office_id": "office-a"}}
+        )
+
+        assert verdict.ok is False
+        assert verdict.code == 4106
+        assert verdict.details == {"office_id": "office-a"}
+
+    def test_missing_details_is_none(self) -> None:
+        """无 ``details`` 的拒绝 ⇒ ``None``（与「有 details 但为空」区分，载荷侧据此决定是否写键）。"""
+        assert parse_join_ack({"code": 4106, "message": "x"}).details is None
+
+    @pytest.mark.parametrize("bad_details", [["office_id"], "office-a", 42, {"office_id"}])
+    def test_non_mapping_details_is_ignored(self, bad_details: Any) -> None:
+        """非 mapping 的 ``details`` ⇒ 当不存在处理，**不抛**（``SMCPProtocolError`` 的 ``dict(...)`` 会炸）。"""
+        verdict = parse_join_ack({"code": 4101, "message": "x", "details": bad_details})
+
+        assert verdict.ok is False
+        assert verdict.code == 4101
+        assert verdict.details is None
+
+    def test_details_is_snapshotted(self) -> None:
+        """解析即快照：调用方事后改 ack 不改变已作出的裁决。"""
+        ack: dict[str, Any] = {"code": 4101, "message": "x", "details": {"office_id": "o"}}
+        verdict = parse_join_ack(ack)
+
+        ack["details"]["office_id"] = "mutated"
+
+        assert verdict.details == {"office_id": "o"}
+
+    def test_mapping_proxy_details_is_accepted_and_copied(self) -> None:
+        """非 dict 的 ``Mapping``（如 ``MappingProxyType``）同样被接受并复制顶层（#234 变异锁）。
+
+        若判据从 ``Mapping`` 收窄成 ``dict``，本用例变红；若去掉 ``dict(...)`` 复制，快照断言变红。
+        """
+        source = {"office_id": "o"}
+        verdict = parse_join_ack({"code": 4101, "message": "x", "details": MappingProxyType(source)})
+        source["office_id"] = "mutated"
+
+        assert verdict.details == {"office_id": "o"}
+        assert type(verdict.details) is dict, "必须归一为普通 dict（可被调用方安全持有）"
 
     @pytest.mark.parametrize("code", [4102, 4105])
     def test_reserved_code_is_logged_as_violation_and_still_rejected(self, code: int, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,6 +321,46 @@ class TestBuildJoinFailurePayload:
         assert error.code == -1
         assert error.error_message == "weird"
 
+    @pytest.mark.parametrize(
+        ("code", "details"),
+        [
+            pytest.param(4101, {"office_id": "office-b", "role": "agent"}, id="4101-room-full"),
+            pytest.param(4106, {"office_id": "office-a"}, id="4106-already-in-room"),
+            pytest.param(4199, {"future": True}, id="unknown-code-passthrough"),
+        ],
+    )
+    def test_details_are_passed_through(self, code: int, details: dict[str, Any]) -> None:
+        """details **不按码特判**原样透传：4101/4106 与未来码走同一条路（#234）。"""
+        payload = build_join_failure_payload(JoinOfficeVerdict(ok=False, code=code, message="boom", details=details))
+
+        assert SMCPProtocolError(payload).details == details
+
+    def test_missing_details_omits_key(self) -> None:
+        """无 details ⇒ 载荷**不含**该键（宿主读到的仍是 ``{}``，与 #218 起的行为一致）。"""
+        payload = build_join_failure_payload(JoinOfficeVerdict(ok=False, code=4101, message="boom"))
+
+        assert "details" not in payload
+        assert SMCPProtocolError(payload).details == {}
+
+    def test_empty_details_mapping_is_preserved(self) -> None:
+        """服务端显式给了空 mapping ⇒ 原样保留（与「没给」区分，防止日后改成真值判断而静默漂移）。"""
+        payload = build_join_failure_payload(JoinOfficeVerdict(ok=False, code=4101, message="boom", details={}))
+
+        assert payload["details"] == {}
+
+    def test_non_mapping_details_never_reaches_the_payload(self) -> None:
+        """端到端不变式：非 mapping details 在解析侧即被丢弃 ⇒ 裁决无 details、载荷不写该键。
+
+        回滚 #234 后 ``verdict.details`` 不存在（AttributeError）⇒ 本用例必红，是真回归锁
+        （旧版只断言 ``.details == {}``，回滚后照样绿，属空转）。
+        """
+        verdict = parse_join_ack({"code": 4101, "message": "x", "details": ["office_id"]})
+        payload = build_join_failure_payload(verdict)
+
+        assert verdict.details is None
+        assert "details" not in payload
+        assert SMCPProtocolError(payload).details == {}
+
 
 class TestLogJoinRejection:
     """共享日志产出者（同态口径 ②）/ the shared rejection-log producer."""
@@ -294,6 +380,23 @@ class TestLogJoinRejection:
         assert "Room already has an agent" in text
         assert "sid" not in text.lower()
         assert "namespace" not in text.lower()
+        assert "details=" not in text, "无 details 时不得写空容器（与「没给」区分）"
+
+    def test_log_carries_details_when_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#234：重放路径没有异常通道，诊断容器只能经共享日志带出（两路径仍同一文案）。"""
+        fake_logger = MagicMock()
+        monkeypatch.setattr(office_mod, "logger", fake_logger)
+        verdict = JoinOfficeVerdict(
+            ok=False, code=4101, message="Room already has an agent", details={"office_id": "officeB", "role": "agent"}
+        )
+
+        log_join_rejection("officeA", verdict)
+
+        text = fake_logger.error.call_args[0][0]
+        # 不耦合 dict.__repr__：分别断言「日志带 details 段」与两个标准 key 的存在
+        assert "details=" in text
+        assert "office_id" in text and "officeB" in text
+        assert "role" in text and "agent" in text
 
     def test_log_appends_403_hint_via_message_authority(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """403 提示与异常文案同源（同一文案权威），不得各写各的。"""
