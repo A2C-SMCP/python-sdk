@@ -12,9 +12,12 @@ path core 九步管线 / 拉取期复核测试 / Path core pipeline & pull-time 
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import importlib
 import os
 import threading
+import types
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,7 @@ from a2c_smcp.computer.blob.path_resolver import (
     ReadRoot,
     _fd_final_path,
     _is_protected,
+    _windows_final_path,
     _within_any,
     _within_any_real,
     build_protected_paths,
@@ -41,6 +45,8 @@ from a2c_smcp.computer.blob.path_resolver import (
     resolve_for_pull,
     resolve_path,
 )
+from a2c_smcp.computer.inputs.value_store import ValueStore
+from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, WINDOWS_MANAGED_DIR
 
 _CONTENT = b"hello path blob\n"
 
@@ -57,6 +63,22 @@ def _write(path: Path, content: bytes = _CONTENT) -> Path:
 
 def _reason(exc: pytest.ExceptionInfo[PathResolveError]) -> str:
     return exc.value.reason
+
+
+_HARDLINK_UNSUPPORTED_ERRNOS = {
+    errno.EOPNOTSUPP,
+    errno.EPERM,
+    errno.EACCES,
+    errno.EXDEV,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+}
+
+
+def _skip_if_hardlink_unsupported(exc: OSError) -> None:
+    """仅对「平台 / 文件系统不支持硬链接」的 errno 跳过；其余真实错误照常失败."""
+    if exc.errno not in _HARDLINK_UNSUPPORTED_ERRNOS:
+        raise exc
+    pytest.skip(f"hard links are not supported: {exc}")
 
 
 def _manual_path_payload(path: Path) -> dict[str, Any]:
@@ -279,8 +301,8 @@ class TestFixedRejectionSet:
         alias = root / "innocent.txt"
         try:
             os.link(value_store, alias)
-        except OSError:
-            pytest.skip("hard links are not supported on this platform/filesystem")
+        except OSError as exc:
+            _skip_if_hardlink_unsupported(exc)
 
         env = {
             "XDG_CONFIG_HOME": str(root / "xdg-config"),
@@ -291,6 +313,33 @@ class TestFixedRejectionSet:
             resolve_path(str(alias), _root(root), protected=protected)
         assert _reason(exc_info) == "forbidden"
         assert "hard link" in str(exc_info.value)  # 命中 file_ids 身份兜底 / file-id branch
+
+    def test_hardlink_to_atomically_rewritten_value_store_forbidden(self, tmp_path: Path) -> None:
+        """file_ids 快照失效场景：ValueStore 原子重写后，打开时 re-stat 必须拦住硬链接."""
+        root = tmp_path / "root"
+        value_store = _write(root / "xdg-state" / "a2c" / "input-values.json", b'{"k": "v"}')
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+        }
+        protected = build_protected_paths(env=env)  # 快照 inode A
+        old_ino = value_store.stat().st_ino
+
+        ValueStore(env=env).set("k", "v2")  # 原子重写 → inode B
+        new_st = value_store.stat()
+        assert new_st.st_ino != old_ino, "atomic rewrite should change the inode"
+        assert (new_st.st_dev, new_st.st_ino) not in protected.file_ids  # 快照已失效
+
+        alias = root / "innocent.txt"
+        try:
+            os.link(value_store, alias)
+        except OSError as exc:
+            _skip_if_hardlink_unsupported(exc)
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(alias), _root(root), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+        assert "hard link" in str(exc_info.value)
 
     def test_keyring_file_backend_forbidden(self, tmp_path: Path) -> None:
         """keyring 文件后端（python_keyring / GNOME keyrings）默认在 XDG data 下，必须拒绝."""
@@ -310,6 +359,24 @@ class TestFixedRejectionSet:
             with pytest.raises(PathResolveError) as exc_info:
                 resolve_path(str(target), _root(root), protected=protected)
             assert _reason(exc_info) == "forbidden"
+
+    def test_policy_managed_dir_forbidden_even_with_root_slash(self, tmp_path: Path) -> None:
+        """readRoots=/ 时 policy managed 目录（managed-mcp.json 等）仍 forbidden."""
+        env = {
+            "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+            "XDG_STATE_HOME": str(tmp_path / "xdg-state"),
+        }
+        protected = build_protected_paths(env=env)
+        if os.name == "nt":
+            target = str(WINDOWS_MANAGED_DIR / "managed-mcp.json")
+            roots = build_read_roots(["C:\\"])
+        else:
+            target = str(LINUX_MANAGED_DIR / "managed-mcp.json")
+            roots = build_read_roots(["/"])
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(target, roots, protected=protected)
+        assert _reason(exc_info) == "forbidden"
 
     def test_part_only_inside_landing_root_forbidden(self, tmp_path: Path) -> None:
         root = tmp_path / "root"
@@ -332,8 +399,8 @@ class TestFixedRejectionSet:
         alias = root / "alias.txt"
         try:
             os.link(protected_file, alias)
-        except OSError:
-            pytest.skip("hard links are not supported on this platform/filesystem")
+        except OSError as exc:
+            _skip_if_hardlink_unsupported(exc)
 
         protected = build_protected_paths(extra_paths=[str(protected_file)])
         with pytest.raises(PathResolveError) as exc_info:
@@ -526,7 +593,8 @@ class TestStep6WithoutFinalPath:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         root = tmp_path / "root"
-        settings = _write(root / "xdg-config" / "a2c" / "settings.json")
+        # 故意用 file_ids 之外的目录内文件：确保是第 6 步目录前缀拦下，而非硬链接身份分支。
+        other = _write(root / "xdg-config" / "a2c" / "other.txt")
         env = {
             "XDG_CONFIG_HOME": str(root / "xdg-config"),
             "XDG_STATE_HOME": str(root / "xdg-state"),
@@ -538,11 +606,11 @@ class TestStep6WithoutFinalPath:
             lambda fd, platform: None,
         )
         with pytest.raises(PathResolveError) as exc_info:
-            resolve_path(str(settings), roots, protected=protected)
+            resolve_path(str(other), roots, protected=protected)
         assert _reason(exc_info) == "forbidden"
 
         with pytest.raises(BlobHandleForbiddenError):
-            resolve_for_pull(_manual_path_payload(settings), roots, protected=protected)
+            resolve_for_pull(_manual_path_payload(other), roots, protected=protected)
 
 
 class TestFstatErrorMapping:
@@ -603,6 +671,105 @@ class TestWindowsFinalPath:
         with pytest.raises(PathResolveError) as exc_info:
             _fd_final_path(0, "windows")
         assert _reason(exc_info) == "forbidden"
+
+    def test_ctypes_body_retries_with_required_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ctypes 体：get_osfhandle / flags=0 / n>=size 重试 / 第二次写 buffer."""
+        monkeypatch.setattr(os, "name", "nt")
+
+        class _FakeBuffer:
+            def __init__(self, size: int) -> None:
+                self.size = size
+                self.value = ""
+
+        class _FakeGetFinalPath:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, int, int]] = []
+                self.argtypes: list[Any] = []
+                self.restype: Any = None
+
+            def __call__(self, handle: int, buf: _FakeBuffer, size: int, flags: int) -> int:
+                self.calls.append((handle, size, flags))
+                if len(self.calls) == 1:
+                    return 40000  # 需求长度 > 初始 buffer，触发重试
+                buf.value = "\\\\?\\C:\\Users\\u\\a.txt"
+                return len(buf.value)
+
+        fake_get = _FakeGetFinalPath()
+        kernel32 = types.SimpleNamespace(GetFinalPathNameByHandleW=fake_get)
+        fake_ctypes = types.SimpleNamespace(
+            WinDLL=lambda name, use_last_error=False: kernel32,
+            create_unicode_buffer=_FakeBuffer,
+            get_last_error=lambda: 5,
+        )
+        fake_wintypes = types.SimpleNamespace(HANDLE=lambda x: x, LPWSTR=object, DWORD=int)
+        fake_msvcrt = types.SimpleNamespace(get_osfhandle=lambda fd: 1234)
+        fake_modules = {"ctypes": fake_ctypes, "ctypes.wintypes": fake_wintypes, "msvcrt": fake_msvcrt}
+        monkeypatch.setattr(importlib, "import_module", lambda name: fake_modules[name])
+
+        assert _windows_final_path(7) == "\\\\?\\C:\\Users\\u\\a.txt"
+        assert fake_get.calls == [(1234, 32768, 0), (1234, 40001, 0)]
+        assert fake_get.argtypes == [fake_wintypes.HANDLE, fake_wintypes.LPWSTR, fake_wintypes.DWORD, fake_wintypes.DWORD]
+        assert fake_get.restype is fake_wintypes.DWORD
+
+    def test_ctypes_body_raises_on_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ctypes 体：API 返回 0 → OSError(win32 error)."""
+        monkeypatch.setattr(os, "name", "nt")
+        fake_ctypes = types.SimpleNamespace(
+            WinDLL=lambda name, use_last_error=False: types.SimpleNamespace(GetFinalPathNameByHandleW=lambda h, b, s, f: 0),
+            create_unicode_buffer=lambda size: types.SimpleNamespace(value=""),
+            get_last_error=lambda: 5,
+        )
+        fake_wintypes = types.SimpleNamespace(HANDLE=lambda x: x, LPWSTR=object, DWORD=int)
+        fake_msvcrt = types.SimpleNamespace(get_osfhandle=lambda fd: 1)
+        fake_modules = {"ctypes": fake_ctypes, "ctypes.wintypes": fake_wintypes, "msvcrt": fake_msvcrt}
+        monkeypatch.setattr(importlib, "import_module", lambda name: fake_modules[name])
+
+        with pytest.raises(OSError) as exc_info:
+            _windows_final_path(1)
+        assert exc_info.value.errno == 5
+
+    def test_deleted_win32_error_is_forbidden(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def deleted(fd: int) -> str:
+            raise OSError(2, "file not found")
+
+        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver._windows_final_path", deleted)
+        with pytest.raises(PathResolveError) as exc_info:
+            _fd_final_path(0, "windows")
+        assert _reason(exc_info) == "forbidden"
+
+    def test_deleted_suffix_is_not_special_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """合法文件名以 " (deleted)" 结尾时，Windows 分支不得误拒."""
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._windows_final_path",
+            lambda fd: "\\\\?\\C:\\tmp\\x (deleted)",
+        )
+        assert _fd_final_path(0, "windows") == "/C:/tmp/x (deleted)"
+
+    def test_deleted_suffix_is_forbidden_on_posix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._posix_final_path",
+            lambda fd: "/tmp/x (deleted)",
+        )
+        with pytest.raises(PathResolveError) as exc_info:
+            _fd_final_path(0, "posix")
+        assert _reason(exc_info) == "forbidden"
+
+    def test_windows_failure_warns_rate_limited(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver._win_final_path_warn_last", 0.0)
+        warnings: list[str] = []
+
+        def fake_warning(message: str, *args: object) -> None:
+            warnings.append(message % args)
+
+        def boom(fd: int) -> str:
+            raise OSError(5, "boom")
+
+        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver.logger.warning", fake_warning)
+        monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver._windows_final_path", boom)
+        assert _fd_final_path(0, "windows") is None
+        assert _fd_final_path(0, "windows") is None
+        assert len(warnings) == 1
+        assert "final-path recheck failed" in warnings[0]
 
 
 class TestResolveForPull:
@@ -709,8 +876,8 @@ class TestResolveForPull:
         original.unlink()
         try:
             os.link(replacement, original)
-        except OSError:
-            pytest.skip("hard links are not supported on this platform/filesystem")
+        except OSError as exc:
+            _skip_if_hardlink_unsupported(exc)
 
         with pytest.raises(BlobHandleGoneError):
             resolve_for_pull(payload, roots, protected=ProtectedPaths())
