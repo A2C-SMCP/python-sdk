@@ -17,14 +17,17 @@ Computer 侧通用二进制传输 / Generic binary transfer on the Computer side
 """
 
 from a2c_smcp.computer.blob.handle import (
+    HANDLE_KIND_PATH,
     BlobHandleError,
     BlobHandleForbiddenError,
     BlobHandleGoneError,
     BlobHandleInvalidError,
     BlobTooLargeError,
+    PathHandlePayload,
     SkillHandlePayload,
     ToolspoolHandlePayload,
     decode_blob_handle,
+    encode_path_handle,
     encode_skill_handle,
     encode_toolspool_handle,
 )
@@ -47,6 +50,7 @@ from a2c_smcp.computer.blob.upload import (
 )
 
 __all__ = [
+    "HANDLE_KIND_PATH",
     "BlobHandleError",
     "BlobHandleForbiddenError",
     "BlobHandleGoneError",
@@ -55,6 +59,7 @@ __all__ = [
     "BlobThresholds",
     "BlobTooLargeError",
     "BlobUploadStore",
+    "PathHandlePayload",
     "ResolvedBlob",
     "SkillBlobResolver",
     "SkillHandlePayload",
@@ -63,6 +68,7 @@ __all__ = [
     "ToolspoolHandlePayload",
     "decode_blob_handle",
     "default_thresholds",
+    "encode_path_handle",
     "encode_skill_handle",
     "encode_toolspool_handle",
     "sanitize_name_hint",

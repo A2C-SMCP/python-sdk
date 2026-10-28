@@ -156,19 +156,30 @@ def _normalize_windows(path: str) -> str:
     return f"/{drive}:/" + "/".join(segments)
 
 
+def _is_ascii_letter(ch: str) -> bool:
+    """``[A-Za-z]``（``str.isalpha`` 会接受非 ASCII 字母）/ ASCII ``[A-Za-z]`` only."""
+    return "a" <= ch <= "z" or "A" <= ch <= "Z"
+
+
 def _is_canonical_windows_drive(path: str) -> bool:
     """``/X:`` 或 ``/X:/...`` / ``/X:`` or ``/X:/...``."""
-    return len(path) >= 3 and path[0] == "/" and path[1].isalpha() and path[2] == ":" and (len(path) == 3 or path[3] == "/")
+    return (
+        len(path) >= 3
+        and path[0] == "/"
+        and _is_ascii_letter(path[1])
+        and path[2] == ":"
+        and (len(path) == 3 or path[3] == "/")
+    )
 
 
 def _is_canonical_windows_path(path: str) -> bool:
     """``/X:/`` 或 ``/X:/...``（canonical 形态）/ Canonical ``/X:/`` form."""
-    return len(path) >= 4 and path[0] == "/" and path[1].isalpha() and path[2] == ":" and path[3] == "/"
+    return len(path) >= 4 and path[0] == "/" and _is_ascii_letter(path[1]) and path[2] == ":" and path[3] == "/"
 
 
 def _is_windows_drive_path(path: str) -> bool:
     """``X:/...`` / ``X:/...``."""
-    return len(path) >= 3 and path[0].isalpha() and path[1] == ":" and path[2] == "/"
+    return len(path) >= 3 and _is_ascii_letter(path[0]) and path[1] == ":" and path[2] == "/"
 
 
 def _check_windows_component(segment: str) -> None:

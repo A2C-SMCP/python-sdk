@@ -50,6 +50,13 @@ def test_conformance_vector(vector: dict[str, Any]) -> None:
         assert normalize_path(vector["input"], vector["platform"]) == vector["expected"]
 
 
+def test_windows_drive_must_be_ascii_letter() -> None:
+    """协议 ``[A-Za-z]``；``str.isalpha`` 的非 ASCII 字母不算盘符."""
+    for bad in ("é:\\x", "中:/x", "Ω:/x"):
+        with pytest.raises(InvalidPathError):
+            normalize_path(bad, "windows")
+
+
 class TestNativePath:
     """``canonical_path`` ↔ 宿主原生路径转换 / Canonical ↔ native path conversion."""
 
