@@ -225,6 +225,8 @@ def build_protected_paths(
     Note:
         ``resolve_path`` / ``resolve_for_pull`` 的 ``protected=None`` 只是防御性兜底
         （每次请求重建）；接线层 SHOULD 预构建一次并复用，热路径不依赖本默认集。
+        workdir 级配置（``<cwd>/.tfrobot`` 的 settings / mcp.json）由接线层经
+        ``extra_paths`` 注入；默认集只覆盖 SDK 全局位置（config / state / keyring）。
     """
     pf: PathPlatform = native_platform() if platform is None else platform
     environ: Mapping[str, str] = os.environ if env is None else env
@@ -245,10 +247,10 @@ def build_protected_paths(
     except (OSError, ValueError) as e:  # pragma: no cover - 防御性：env 异常形态
         logger.warning("拒绝集: 无法解析 user config dir / cannot resolve user config dir: %s", e)
     try:
-        # 整目录入拒绝集（settings / computer-id / 凭据等均在其下），不只保护 input-values.json。
-        # Protect the whole state dir, not just input-values.json.
-        state_dir = resolve_value_store_path(environ).parent
-        candidates.append(str(state_dir))
+        # 目录 + 具体文件都要：目录作前缀保护，文件用于硬链接身份兜底（file_ids）。
+        # Both the dir (prefix) and the file (hard-link identity) are needed.
+        value_store = resolve_value_store_path(environ)
+        candidates.extend([str(value_store.parent), str(value_store)])
     except (OSError, ValueError) as e:  # pragma: no cover - 防御性
         logger.warning("拒绝集: 无法解析 state dir / cannot resolve state dir: %s", e)
 
@@ -294,6 +296,10 @@ def build_protected_paths(
         if real is not None:
             protected.add(real)
         # 硬链接 SHOULD：记录实际文件的 (dev, ino)。目录不展开（前缀判定已覆盖）。
+        # file_ids 是**构建期快照**：只覆盖构建时已存在的受保护文件；之后新建的文件
+        # 仍受目录前缀保护，但指向它的硬链接要等下一次构建才具备身份兜底（协议 SHOULD 的既存限制）。
+        # file_ids is a build-time snapshot; later-created files are covered by the dir prefix,
+        # but hard links to them need a rebuild for identity defense (existing SHOULD limitation).
         try:
             st = os.stat(to_native_path(real or configured, pf))
         except OSError:
@@ -508,9 +514,11 @@ def _run_pipeline(
             raise PathResolveError("forbidden", f"fstat failed: {e}") from e
         if not stat.S_ISREG(fst.st_mode):
             raise PathResolveError("not_a_file", f"opened fd is not a regular file: {canonical!r}")
-        # 身份比对（跨平台）：lstat 与 open 之间文件被替换（含 Windows 无 O_NOFOLLOW 的链接替换）
-        # → forbidden。Windows 无 /proc / F_GETPATH，此项是最终路径复核的替代保障。
-        # Identity check (cross-platform): the file was replaced between lstat and open.
+        # 身份比对（跨平台）：证明 lstat 的文件 == open 的文件（覆盖最终分量替换）。
+        # 中间目录替换 / Windows 8.3 别名仍由最终路径复核兜底：POSIX /proc|F_GETPATH，
+        # Windows GetFinalPathNameByHandle；两者都取不到时属已知限制，身份比对不是等价替代。
+        # Identity check proves lstat file == opened file (final component); intermediate-directory
+        # swaps remain covered by the final-path recheck where available.
         if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
             raise PathResolveError("forbidden", "file identity changed between lstat and open")
         if (fst.st_dev, fst.st_ino) in protected.file_ids:
@@ -689,23 +697,15 @@ def _open_error_reason(exc: OSError, native: str) -> ResolveReason:
 
 
 def _fd_final_path(fd: int, platform: PathPlatform) -> str | None:
-    """取已打开句柄的最终路径（Linux ``/proc/self/fd`` / macOS ``F_GETPATH``）.
+    """取已打开句柄的最终路径（POSIX ``/proc/self/fd`` / ``F_GETPATH``；Windows
+    ``GetFinalPathNameByHandleW``）.
 
-    取不到时返回 ``None``（SHOULD 级检查，不阻断）；取到但无法规范化 / 已删除 → ``forbidden``。
+    取不到时返回 ``None``（SHOULD 级检查，不阻断；此时只剩身份比对兜底，属已知限制）；
+    取到但无法规范化 / 已删除 → ``forbidden``。
     """
-    target: str | None = None
     try:
-        if os.name == "posix":
-            try:
-                target = os.readlink(f"/proc/self/fd/{fd}")
-            except OSError:
-                import fcntl
-
-                f_getpath = getattr(fcntl, "F_GETPATH", None)
-                if f_getpath is not None:
-                    buf = fcntl.fcntl(fd, f_getpath, b"\x00" * 1024)
-                    target = os.fsdecode(buf.split(b"\x00", 1)[0])
-    except (OSError, UnicodeError):
+        target = _windows_final_path(fd) if platform == "windows" else _posix_final_path(fd)
+    except (OSError, ImportError, AttributeError, UnicodeError):
         return None
     if target is None:
         return None
@@ -715,3 +715,52 @@ def _fd_final_path(fd: int, platform: PathPlatform) -> str | None:
         return normalize_path(target, platform)
     except (InvalidPathError, ValueError) as e:
         raise PathResolveError("forbidden", f"final path cannot be normalized: {e}") from e
+
+
+def _posix_final_path(fd: int) -> str | None:
+    """Linux ``/proc/self/fd`` → macOS ``F_GETPATH``；都不可用返回 ``None``."""
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        pass
+    import fcntl
+
+    f_getpath = getattr(fcntl, "F_GETPATH", None)
+    if f_getpath is None:
+        return None
+    buf = fcntl.fcntl(fd, f_getpath, b"\x00" * 1024)
+    return os.fsdecode(buf.split(b"\x00", 1)[0])
+
+
+def _windows_final_path(fd: int) -> str | None:
+    """Windows ``GetFinalPathNameByHandleW``（协议点名的最终路径来源）.
+
+    返回 ``\\\\?\\...`` 形态，由 :func:`normalize_path` 剥前缀；UNC 解析结果无法归一 →
+    ``invalid_path`` → 第 8 步 ``forbidden``。
+    """
+    if os.name != "nt":
+        # 测试可在任意 OS 上 monkeypatch 本函数模拟 Windows 分支 / Tests may mock this helper.
+        raise OSError("GetFinalPathNameByHandleW is Windows-only")
+    import importlib
+
+    ctypes_mod: Any = importlib.import_module("ctypes")
+    wintypes: Any = importlib.import_module("ctypes.wintypes")
+    msvcrt: Any = importlib.import_module("msvcrt")
+    kernel32: Any = ctypes_mod.WinDLL("kernel32", use_last_error=True)
+    func: Any = kernel32.GetFinalPathNameByHandleW
+    func.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    func.restype = wintypes.DWORD
+
+    handle = msvcrt.get_osfhandle(fd)
+    size = 32768
+    buf = ctypes_mod.create_unicode_buffer(size)
+    n = func(wintypes.HANDLE(handle), buf, size, 0)
+    if n == 0:
+        raise OSError(ctypes_mod.get_last_error(), "GetFinalPathNameByHandleW failed")
+    if n >= size:
+        size = n + 1
+        buf = ctypes_mod.create_unicode_buffer(size)
+        n = func(wintypes.HANDLE(handle), buf, size, 0)
+        if n == 0:
+            raise OSError(ctypes_mod.get_last_error(), "GetFinalPathNameByHandleW failed")
+    return str(buf.value)

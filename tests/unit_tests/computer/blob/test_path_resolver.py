@@ -32,6 +32,7 @@ from a2c_smcp.computer.blob.path_resolver import (
     PathResolveError,
     ProtectedPaths,
     ReadRoot,
+    _fd_final_path,
     _is_protected,
     _within_any,
     _within_any_real,
@@ -271,6 +272,26 @@ class TestFixedRejectionSet:
             resolve_path(str(other), _root(root), protected=protected)
         assert _reason(exc_info) == "forbidden"
 
+    def test_hardlink_to_value_store_forbidden(self, tmp_path: Path) -> None:
+        """默认集保留 value store 文件身份：硬链接到 readRoots 内仍 forbidden."""
+        root = tmp_path / "root"
+        value_store = _write(root / "xdg-state" / "a2c" / "input-values.json", b'{"k": "v"}')
+        alias = root / "innocent.txt"
+        try:
+            os.link(value_store, alias)
+        except OSError:
+            pytest.skip("hard links are not supported on this platform/filesystem")
+
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+        }
+        protected = build_protected_paths(env=env)
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(alias), _root(root), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+        assert "hard link" in str(exc_info.value)  # 命中 file_ids 身份兜底 / file-id branch
+
     def test_keyring_file_backend_forbidden(self, tmp_path: Path) -> None:
         """keyring 文件后端（python_keyring / GNOME keyrings）默认在 XDG data 下，必须拒绝."""
         root = tmp_path / "root"
@@ -476,6 +497,114 @@ class TestRaceAndFinalPathGuards:
         assert "outside readRoots" in str(exc_info.value)
 
 
+class TestStep6WithoutFinalPath:
+    """第 6 步拒绝集是 Windows / 无 /proc 容器上的唯一防线；最终路径复核不可用时仍须拒绝."""
+
+    def test_skillenv_forbidden_when_final_path_unavailable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        target = _write(root / "sub" / ".skillenv")
+        roots = _root(root)
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._fd_final_path",
+            lambda fd, platform: None,
+        )
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(target), roots, protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+
+        with pytest.raises(BlobHandleForbiddenError):
+            resolve_for_pull(_manual_path_payload(target), roots, protected=ProtectedPaths())
+
+    def test_protected_dir_forbidden_when_final_path_unavailable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        settings = _write(root / "xdg-config" / "a2c" / "settings.json")
+        env = {
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+        }
+        protected = build_protected_paths(env=env)
+        roots = _root(root)
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._fd_final_path",
+            lambda fd, platform: None,
+        )
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(settings), roots, protected=protected)
+        assert _reason(exc_info) == "forbidden"
+
+        with pytest.raises(BlobHandleForbiddenError):
+            resolve_for_pull(_manual_path_payload(settings), roots, protected=protected)
+
+
+class TestFstatErrorMapping:
+    def test_fstat_oserror_mint_forbidden(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        roots = _root(root)
+
+        def boom(fd: int) -> os.stat_result:
+            raise OSError("fstat failed")
+
+        monkeypatch.setattr(os, "fstat", boom)
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(file), roots, protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+        assert "fstat failed" in str(exc_info.value)
+
+    def test_fstat_oserror_pull_forbidden(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        file = _write(root / "a.txt")
+        roots = _root(root)
+        minted = resolve_path(str(file), roots, protected=ProtectedPaths())
+        _, payload = decode_blob_handle(minted.blob_handle)
+
+        def boom(fd: int) -> os.stat_result:
+            raise OSError("fstat failed")
+
+        monkeypatch.setattr(os, "fstat", boom)
+        with pytest.raises(BlobHandleForbiddenError):
+            resolve_for_pull(payload, roots, protected=ProtectedPaths())
+
+
+class TestWindowsFinalPath:
+    """Windows ``GetFinalPathNameByHandleW`` 分支（helper 可 mock，任意 OS 可测）."""
+
+    def test_verbatim_prefix_is_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._windows_final_path",
+            lambda fd: "\\\\?\\C:\\Users\\u\\a.txt",
+        )
+        assert _fd_final_path(0, "windows") == "/C:/Users/u/a.txt"
+
+    def test_unc_is_forbidden(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "a2c_smcp.computer.blob.path_resolver._windows_final_path",
+            lambda fd: "\\\\?\\UNC\\server\\share\\a.txt",
+        )
+        with pytest.raises(PathResolveError) as exc_info:
+            _fd_final_path(0, "windows")
+        assert _reason(exc_info) == "forbidden"
+
+
 class TestResolveForPull:
     def _mint(self, tmp_path: Path) -> tuple[str, dict[str, object], Path, list[ReadRoot]]:
         file = _write(tmp_path / "a.txt")
@@ -578,10 +707,23 @@ class TestResolveForPull:
         st = original.stat()
         os.utime(replacement, ns=(st.st_atime_ns, st.st_mtime_ns))
         original.unlink()
-        os.link(replacement, original)
+        try:
+            os.link(replacement, original)
+        except OSError:
+            pytest.skip("hard links are not supported on this platform/filesystem")
 
         with pytest.raises(BlobHandleGoneError):
             resolve_for_pull(payload, roots, protected=ProtectedPaths())
+
+    def test_pull_without_file_identity_allowed(self, tmp_path: Path) -> None:
+        """句柄缺 dev/ino（平台不提供）时按 size + mtime 校验，仍可切片."""
+        _, payload, _, roots = self._mint(tmp_path)
+        stripped = {key: value for key, value in payload.items() if key not in ("dev", "ino")}
+        pull = resolve_for_pull(stripped, roots, protected=ProtectedPaths())
+        try:
+            assert pull.slice(0, len(_CONTENT)) == _CONTENT
+        finally:
+            pull.close()
 
     def test_component_prefix_not_bare_string(self, tmp_path: Path) -> None:
         """围栏按路径分量：/x/data 不包含 /x/database."""
