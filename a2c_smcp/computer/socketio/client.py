@@ -1271,7 +1271,17 @@ class SMCPComputerClient(AsyncClient):
         """
         # 与 on_get_blob 同款抽取：模块级纯同步核心（_process_resolve_path），同步 wire 测试复用。
         # Same extraction as on_get_blob: module-level sync core shared with sync wire tests.
-        return _process_resolve_path(data, self.computer)
+        #
+        # ⚠️ **MUST 离开事件循环**（隔离审查裁决）：path core 在铸造期对**全量文件**算 sha256
+        # （协议无大小上限），数 GB 文件上是秒级同步 I/O。直接在 async handler 里跑会阻塞
+        # socket.io 事件循环——心跳发不出（连接被判死）、同连接上的 ``client:tool_call`` 等 ack
+        # 全部排队超时。故 offload 到 worker 线程；``get_blob`` 的 path 分支只做 stat/单块 slice
+        # （有界、受 ``chunk_max_bytes`` 约束）故仍同步执行。
+        # MUST leave the event loop: mint-time sha256 is computed over the *whole* file (the
+        # protocol sets no size cap). Running it inline would stall the socket.io loop — missed
+        # heartbeats and timed-out tool calls on the same connection. Pull-path work is bounded
+        # by chunk_max_bytes, so it stays synchronous.
+        return await asyncio.to_thread(_process_resolve_path, data, self.computer)
 
     async def on_put_blob(self, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
         """
@@ -1477,9 +1487,11 @@ def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePa
     if computer.name != data["computer"]:
         raise SMCPNamespaceError("计算机标识不匹配")
 
-    # fail-closed 显式守卫（协议第 2 步）：``readRoots`` 为空一律 forbidden，且**不触碰文件系统**。
-    # 与 path core 的管线重复一层是刻意的防御纵深——授权缺省值必须在接线层也成立，不能只依赖下游。
-    # Explicit fail-closed guard (protocol step 2): empty readRoots is forbidden before any FS access.
+    # fail-closed 显式守卫（**防御纵深**）：``readRoots`` 为空一律 forbidden，且**不触碰文件系统**。
+    # 规范判据在 path core 第 2 步（``_run_pipeline``，流 1 已有单测）；此处再查一层是刻意的——
+    # 授权缺省值必须在接线层也成立，不能只依赖下游实现，也不让任何下游回归静默打开读取面。
+    # Defense in depth: the normative check is path core step 2 (covered by stream 1's tests);
+    # repeating it here keeps fail-closed true at the wiring layer even if path core regresses.
     if not computer.read_roots:
         logger.warning("client:resolve_path 拒绝：readRoots 未配置（默认不可读）/ no readRoots configured")
         return _path_error(reason="forbidden")

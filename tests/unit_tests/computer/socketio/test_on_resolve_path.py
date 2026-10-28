@@ -17,6 +17,7 @@ blob-transfer.md §生产者三：按路径读取（拉取期复核）。
 覆盖 / Coverage:
   - ``readRoots`` 未配置 → ``4020 forbidden``，且**不**调用 resolve（fail-closed 先于一切）
   - 成功路径字段映射（canonical_path / blob_handle / mime / size / sha / mtime / req_id）
+  - **resolve 在线程池执行**（全量 sha256 不得阻塞 socket.io 事件循环）
   - ``PathResolveError`` 四 reason → ``4020`` flat ``details.reason``
   - 句柄 kind=path → 拉取期复核 + 切片（单块 / 分块 / max_chunk 下界）
   - range 越界 → ``4018 range``，句柄仍被 close
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +142,33 @@ class TestResolvePathHandler:
             "mtime": 1_700_000_000_123,
             "req_id": "r-1",
         }
+
+    @pytest.mark.asyncio
+    async def test_resolve_runs_off_the_event_loop(
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``resolve`` 必须在线程池执行——全量 sha256 数 GB 文件会阻塞事件循环（心跳/工具调用超时）.
+
+        断言方式：在 ``resolve_read_path`` 内记录当前线程 id，与事件循环线程比对。若有人把
+        ``await asyncio.to_thread(...)`` 改回直接调用，本用例即失败（锁住该决定）。
+        Asserts `resolve_read_path` runs on a worker thread, not the event-loop thread.
+        """
+        _grant(computer, monkeypatch, "/srv/docs")
+        loop_thread = threading.get_ident()
+        seen: dict[str, int] = {}
+
+        def fake_resolve(path: str) -> ResolvedPath:
+            seen["thread"] = threading.get_ident()
+            return _resolved()
+
+        monkeypatch.setattr(computer, "resolve_read_path", fake_resolve)
+
+        await client.on_resolve_path(_resolve_req())  # type: ignore[arg-type]
+
+        assert "thread" in seen, "resolve_read_path 未被调用 / not called"
+        assert seen["thread"] != loop_thread, (
+            "resolve 必须在事件循环之外的线程执行（asyncio.to_thread），否则全量 sha256 会阻塞事件循环"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("reason", ["invalid_path", "forbidden", "not_found", "not_a_file"])
