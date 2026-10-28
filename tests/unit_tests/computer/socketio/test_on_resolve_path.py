@@ -35,8 +35,8 @@ import pytest
 
 from a2c_smcp.computer.blob import BlobHandleForbiddenError, BlobHandleGoneError
 from a2c_smcp.computer.blob.path_resolver import PathResolveError, ResolvedPath
-from a2c_smcp.computer.settings.scope import ResolvedSettings
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.settings.scope import ResolvedSettings
 from a2c_smcp.computer.socketio import client as computer_sio
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.exceptions import SMCPNamespaceError
