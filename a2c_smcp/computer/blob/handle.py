@@ -9,9 +9,11 @@
 
     blob_handle = base64url( msgpack({
         "v": 1,
-        "kind": "skill" | "toolspool",
+        "kind": "skill" | "toolspool" | "path",
         # kind=skill:     {"name": <A2CSkillRef.name>, "rel_path": <POSIX rel>}
         # kind=toolspool: {"cid": <sha256 hex>, "mime": <mime>}
+        # kind=path:      {"canonical_path": <canonical>, "total_size": int, "mtime": int-ms,
+        #                  "sha256": <hex>, "mime": <mime>, "dev"?: int, "ino"?: int}
     }) )
 
 为何无 MAC / Why no MAC:
@@ -42,6 +44,7 @@ HANDLE_VERSION: int = 1
 # kind 取值集合（开放枚举，未来非破坏新增）/ kind enum (open set; non-breaking additions allowed)
 HANDLE_KIND_SKILL: Literal["skill"] = "skill"
 HANDLE_KIND_TOOLSPOOL: Literal["toolspool"] = "toolspool"
+HANDLE_KIND_PATH: Literal["path"] = "path"
 
 
 class SkillHandlePayload(TypedDict):
@@ -63,6 +66,23 @@ class ToolspoolHandlePayload(TypedDict):
 
     cid: str
     mime: str
+
+
+class PathHandlePayload(TypedDict):
+    """``kind="path"`` 句柄 payload（v0.5.0 protocol#65，SDK 内部 kind）.
+
+    Handler 内容**不**被信任：``get_blob`` 解析时按**当前** ``readRoots`` 重跑围栏 /
+    固定拒绝集 / 权限校验，并比对打开句柄的 stat 键。
+    ``dev`` / ``ino`` 平台不提供时省略（协议：文件身份可选）。
+    """
+
+    canonical_path: str
+    total_size: int
+    mtime: int
+    sha256: str
+    mime: str
+    dev: int
+    ino: int
 
 
 # ── 异常体系 / Error taxonomy ────────────────────────────────────────────
@@ -154,7 +174,25 @@ def encode_toolspool_handle(cid: str, mime: str) -> str:
     return _encode(payload)
 
 
-def decode_blob_handle(handle: str) -> tuple[Literal["skill", "toolspool"], dict[str, Any]]:
+def encode_path_handle(
+    canonical_path: str,
+    *,
+    total_size: int,
+    mtime: int,
+    sha256: str,
+    mime: str,
+    dev: int | None = None,
+    ino: int | None = None,
+) -> str:
+    """铸造 ``kind=path`` 不透明句柄 / Mint an opaque ``kind="path"`` handle.
+
+    协议要求句柄编码 ``canonical_path`` + **计算前** stat 键 + ``sha256``；``dev`` / ``ino``
+    为文件身份（平台不提供时省略）。句柄仍不透明、无状态——解析方 MUST 重跑授权校验。
+    """
+    raise NotImplementedError("path core skeleton — implemented in the next commit")
+
+
+def decode_blob_handle(handle: str) -> tuple[Literal["skill", "toolspool", "path"], dict[str, Any]]:
     """解码 ``blob_handle`` → ``(kind, payload_dict)``。
 
     解码失败的所有路径（非 ASCII / 非 base64url / 非 msgpack / 缺字段 / ``v`` 未知 /
@@ -190,6 +228,37 @@ def decode_blob_handle(handle: str) -> tuple[Literal["skill", "toolspool"], dict
         if not isinstance(cid, str) or not isinstance(mime, str):
             raise BlobHandleInvalidError("toolspool handle missing cid / mime")
         return HANDLE_KIND_TOOLSPOOL, {"cid": cid, "mime": mime}
+    if kind == HANDLE_KIND_PATH:
+        canonical_path = payload.get("canonical_path")
+        total_size = payload.get("total_size")
+        mtime = payload.get("mtime")
+        sha256 = payload.get("sha256")
+        mime = payload.get("mime")
+        if not isinstance(canonical_path, str) or not canonical_path:
+            raise BlobHandleInvalidError("path handle missing canonical_path")
+        if not isinstance(total_size, int) or isinstance(total_size, bool) or total_size < 0:
+            raise BlobHandleInvalidError("path handle invalid total_size")
+        if not isinstance(mtime, int) or isinstance(mtime, bool):
+            raise BlobHandleInvalidError("path handle invalid mtime")
+        if not isinstance(sha256, str) or not sha256:
+            raise BlobHandleInvalidError("path handle missing sha256")
+        if not isinstance(mime, str) or not mime:
+            raise BlobHandleInvalidError("path handle missing mime")
+        decoded: dict[str, Any] = {
+            "canonical_path": canonical_path,
+            "total_size": total_size,
+            "mtime": mtime,
+            "sha256": sha256,
+            "mime": mime,
+        }
+        dev = payload.get("dev")
+        ino = payload.get("ino")
+        if dev is not None or ino is not None:
+            if not isinstance(dev, int) or isinstance(dev, bool) or not isinstance(ino, int) or isinstance(ino, bool):
+                raise BlobHandleInvalidError("path handle invalid file identity")
+            decoded["dev"] = dev
+            decoded["ino"] = ino
+        return HANDLE_KIND_PATH, decoded
     raise BlobHandleInvalidError(f"unknown handle kind: {kind!r}")
 
 
