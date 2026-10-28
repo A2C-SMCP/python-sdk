@@ -27,6 +27,9 @@ from a2c_smcp.smcp import (
 )
 from tests.room_acks import assert_empty_ack
 
+#: v0.5.0（protocol#64）：mock Computer 的稳定入房身份（规范小写 UUID，同一次连接/回放复用同值）。
+_E2E_COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
+
 pytestmark = pytest.mark.e2e
 
 
@@ -114,7 +117,7 @@ async def test_async_agent_connect_and_join_office(async_socketio_server, async_
         # Computer 加入办公室 / Computer joins office
         ack = await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-async-1", "office_id": "office-async-1"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-async-1", "office_id": "office-async-1"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -176,7 +179,7 @@ async def test_async_agent_tool_call(async_socketio_server, async_server_port: i
         # Computer 加入办公室 / Computer joins office
         await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-async-2", "office_id": "office-async-2"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-async-2", "office_id": "office-async-2"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -249,7 +252,7 @@ async def test_async_agent_get_tools_and_desktop(async_socketio_server, async_se
         # Computer 加入办公室 / Computer joins office
         await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-async-3", "office_id": "office-async-3"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-async-3", "office_id": "office-async-3"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -313,7 +316,7 @@ async def test_async_agent_computer_leave_notification(async_socketio_server, as
         # Computer 加入办公室 / Computer joins office
         await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-async-4", "office_id": "office-async-4"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-async-4", "office_id": "office-async-4"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -378,7 +381,7 @@ async def test_async_agent_multiple_tool_calls(async_socketio_server, async_serv
         # Computer 加入办公室 / Computer joins office
         await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-async-5", "office_id": "office-async-5"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-async-5", "office_id": "office-async-5"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -447,7 +450,7 @@ async def test_async_agent_list_room(async_socketio_server, async_server_port: i
         # Computer 加入办公室 / Computer joins office
         await async_mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "computer-list-test", "office_id": office_id},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "computer-list-test", "office_id": office_id},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
