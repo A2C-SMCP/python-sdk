@@ -74,6 +74,7 @@ from a2c_smcp.computer.blob.path_resolver import (
     resolve_path,
 )
 from a2c_smcp.computer.desktop.organize import organize_desktop
+from a2c_smcp.computer.identity import identity_store_path
 from a2c_smcp.computer.inputs.render import ConfigRender, collect_referenced_input_ids, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
@@ -588,6 +589,13 @@ class Computer(BaseComputer[PromptSession]):
     def _build_protected_paths(self, resolved: "ResolvedSettings") -> ProtectedPaths:
         """由已解析 settings 构造拒绝集（``landing_root`` 取自同一份视图，避免二次解析）。"""
         extra: list[str] = [str(self._blob_cache_root), str(self.skill_home)]
+        # #235 / protocol#64（blob-transfer.md §固定拒绝集）：``computer-id`` 的**实际使用位置**必须在拒绝集。
+        # 默认集按 ambient config dir 构造；注入 env（尤其仅 HOME、XDG 未设）时实际路径可能完全不同 ⇒
+        # 目录（路径前缀）+ 文件（硬链接文件身份）双保险。每次现算，随实例 env 变化。
+        # The identity's actual location is injected explicitly; the default set only covers the
+        # ambient config dir, which diverges when env is injected (HOME-only, XDG unset).
+        identity_path = identity_store_path(self._resolve_env())
+        extra.extend([str(identity_path.parent), str(identity_path)])
         if self._flag_settings_path is not None:
             extra.append(str(self._flag_settings_path))
         if self._mcp_flag_config is not None:

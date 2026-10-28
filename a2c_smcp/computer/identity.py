@@ -32,11 +32,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
+from a2c_smcp.computer.settings.scope import A2C_CONFIG_SUBDIR
 from a2c_smcp.utils.computer_id import is_canonical_computer_id
 from a2c_smcp.utils.path import resolve_xdg_first
 
-#: 配置子目录（与 settings / mcp.json 的 ``<config>/a2c`` 同名）。/ SDK config subdirectory.
-IDENTITY_DIR_NAME: Final[str] = "a2c"
 #: 身份文件名（位于用户配置目录 ``<config>/a2c/`` 下）。/ Identity file name under the shared config dir.
 IDENTITY_FILE_NAME: Final[str] = "computer-id"
 #: 目录权限：仅属主可访问。/ Directory mode: owner-only.
@@ -83,8 +82,8 @@ def identity_store_path(env: Mapping[str, str] | None = None) -> Path:
     This function is side-effect free — materialization belongs to the first ``connect``.
     """
     environ: Mapping[str, str] = os.environ if env is None else env
-    fallback = _env_home(environ) / ".config" / IDENTITY_DIR_NAME
-    return resolve_xdg_first(environ, "XDG_CONFIG_HOME", IDENTITY_DIR_NAME, fallback=fallback) / IDENTITY_FILE_NAME
+    fallback = _env_home(environ) / ".config" / A2C_CONFIG_SUBDIR
+    return resolve_xdg_first(environ, "XDG_CONFIG_HOME", A2C_CONFIG_SUBDIR, fallback=fallback) / IDENTITY_FILE_NAME
 
 
 def load_or_create_computer_id(

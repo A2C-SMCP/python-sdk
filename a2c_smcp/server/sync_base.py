@@ -127,9 +127,9 @@ class SyncBaseNamespace(Namespace):
                 release_seats(self._seat_to_sid, self._sid_to_seats, sid)
             if residual is not None:
                 try:
-                    # 身份记录**先于**注销可用：残留 leave 的 ``computer_id`` 只能从这里取（会话可能已清理）。
-                    # The identity record must still be readable here — it carries computer_id for the
-                    # residual leave after the session may already be gone.
+                    # 残留 leave 的 ``computer_id`` 已由上方**同一锁段**从身份记录取出并作为参数传入；
+                    # 会话可能已清理，宣告侧不再读记录（fix-review 🟡6/🟡4）。
+                    # The record was read in the locked cleanup section above and passed in explicitly.
                     self._announce_residual_leave(
                         sid,
                         residual,

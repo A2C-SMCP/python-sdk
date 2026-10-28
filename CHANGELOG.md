@@ -222,6 +222,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   新 SID 后客户端自动重放 `server:join_office`（desired + generation 模型，镜像 rust-sdk#204）。手工断开 /
   服务端踢出 / 重连彻底放弃清空回房意图；新增 `a2c_smcp/utils/office.py`（入房 ACK 判定与有界超时的单一
   权威）。
+- **Computer 稳定唯一身份 `computer_id`（#235，protocol#64）**：Computer 首次连接生成随机 UUID v4，持久化到
+  `<config>/a2c/computer-id`（`$XDG_CONFIG_HOME` 优先，否则注入 env 的 `HOME/.config`；文件 0600、新建目录
+  0700；并发首启原子；损坏 / 不可读写 ⇒ fail-fast，不静默临时值），跨重连 / 重启复用。
+  - **wire**：`EnterOfficeReq.computer_id`（`role="computer"` MUST 携带、Agent MUST NOT 出现该键）；
+    `notify:enter_office` / `notify:leave_office` 与 `server:list_room` 的 `SessionInfo` 对 Computer 回显，
+    Agent 省略该键（不得为 `null`）。形态：小写规范 UUID，整串且恰 36 字符，拒绝 nil / max。
+  - **Server**：`400`（缺失 / 非法 / Agent 携带）、`403`（同一 sid 改值）；身份三元组 `(role, name,
+    computer_id)` 在首次校验通过时原子记录，`4101`/`4106`/`500` 与 `leave_office` 均不回滚。
+  - **重置**：SDK `SMCPComputerClient.reset_identity()`（已连接 / 有入房意图时拒绝）、REPL `identity reset`、
+    独立 CLI `a2c-computer identity reset`（原子替换 + 重启提示）；新值只经新连接生效。
+  - 新增包级导出 `ComputerIdentityError`（持久化不可读写 / 损坏 ⇒ 明确报错终止启动，CLI 非零退出）。
+  - **破坏性**：v0.5.0 起 Computer 入房不携带 `computer_id` 将被 `400` 拒绝。
 
 ### Fixed
 

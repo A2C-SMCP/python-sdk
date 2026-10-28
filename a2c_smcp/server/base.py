@@ -138,9 +138,9 @@ class BaseNamespace(AsyncNamespace):
             release_seats(self._seat_to_sid, self._sid_to_seats, sid)
             if residual is not None:
                 try:
-                    # 身份记录**先于**注销可用：残留 leave 的 ``computer_id`` 只能从这里取（会话可能已清理）；
-                    # 读取与名字注销紧邻，值随参数传入宣告（fix-review 🟡6）。
-                    # The identity record still exists here; pass its computer_id into the announcement.
+                    # 残留 leave 的 ``computer_id`` 已由调用方在清理段（与名字注销相邻）从身份记录取出并
+                    # 作为参数传入；会话可能已清理，宣告侧不再读记录（fix-review 🟡6/🟡4）。
+                    # The caller captured computer_id alongside the cleanup; the hook receives it.
                     await self._announce_residual_leave(
                         sid,
                         residual,
