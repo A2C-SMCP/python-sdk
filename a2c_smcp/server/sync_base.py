@@ -14,7 +14,14 @@ from urllib.parse import parse_qs
 
 from socketio import Namespace
 
-from a2c_smcp.server.name_registry import claim_seat, record_identity, release_name, release_seats, reserve_name
+from a2c_smcp.server.name_registry import (
+    IdentityClaim,
+    claim_seat,
+    record_identity,
+    release_name,
+    release_seats,
+    reserve_name,
+)
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID, IdentityRecord
 from a2c_smcp.server.utils import office_room
@@ -114,13 +121,20 @@ class SyncBaseNamespace(Namespace):
             # Residual cleanup runs after the leave broadcasts (S3); in ``finally`` so a failed broadcast cannot leak a key.
             with self._registry_lock:
                 residual = release_name(self._name_to_sid_map, self._sid_to_name_key, sid)
+                # 身份记录与名字注销**同锁段**读取（fix-review 🟡6）：join 分支的失败收尾可能 pop
+                # 记录，锁外读会拿到 None 而丢掉残留 leave 的 computer_id。
+                record = self._sid_identity.get(sid)
                 release_seats(self._seat_to_sid, self._sid_to_seats, sid)
             if residual is not None:
                 try:
                     # 身份记录**先于**注销可用：残留 leave 的 ``computer_id`` 只能从这里取（会话可能已清理）。
                     # The identity record must still be readable here — it carries computer_id for the
                     # residual leave after the session may already be gone.
-                    self._announce_residual_leave(sid, residual)
+                    self._announce_residual_leave(
+                        sid,
+                        residual,
+                        record.computer_id if record is not None else None,
+                    )
                 except Exception:
                     logger.exception(f"残留键 leave 宣告失败（键已注销）/ residual leave announce failed: {residual}")
             # 身份记录随连接销毁（与席位 / 名字同属连接态）。放在残留宣告**之后**：宣告需要它。
@@ -173,11 +187,11 @@ class SyncBaseNamespace(Namespace):
         if released:
             logger.debug(f"Released seats {released!r} for sid '{sid}' in namespace {self.namespace}")
 
-    def _claim_identity(self, sid: SID, role: str, name: str, computer_id: str | None) -> bool:
+    def _claim_identity(self, sid: SID, role: str, name: str, computer_id: str | None) -> IdentityClaim:
         """**原子**「身份声明一致性校验 + 首次记录」（protocol#64；注册表锁内，镜像 async ``_claim_identity``）。
 
         Returns:
-            bool: ``False`` = 与既有记录不符 ⇒ 调用方回 ``403``。
+            IdentityClaim: ``MISMATCH`` ⇒ 调用方回 ``403``；``INSERTED`` / ``MATCHED`` 区分是否本次新插入。
         """
         with self._registry_lock:
             return record_identity(
@@ -232,8 +246,10 @@ class SyncBaseNamespace(Namespace):
         with self._registry_lock:
             return self._name_to_sid_map.get((office_id, role, name)) == sid
 
-    def _announce_residual_leave(self, sid: SID, key: NAME_KEY) -> None:
+    def _announce_residual_leave(self, sid: SID, key: NAME_KEY, computer_id: str | None) -> None:
         """断连残留键的补发退房宣告钩子（基类无协议知识 ⇒ no-op；``SyncSMCPNamespace`` 覆写）。
+
+        ``computer_id`` 由调用方在注册表锁段内从身份记录取出后传入（fix-review 🟡6）。
         Hook to announce a leave for a residual key found at disconnect (no-op in the base class).
         """
 

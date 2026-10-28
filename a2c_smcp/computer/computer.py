@@ -36,6 +36,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
@@ -746,17 +747,18 @@ class Computer(BaseComputer[PromptSession]):
 
     @property
     def env(self) -> Mapping[str, str] | None:
-        """per-instance env 注入（``None`` = ambient ``os.environ``）。
+        """per-instance env 注入（``None`` = ambient ``os.environ``），**只读视图**。
 
         v0.5.0（protocol#64）：Computer 身份持久化必须跟随**本实例**的 env（与 settings / mcp.json
         同一 XDG 锚点），否则同进程两台注入不同 env 的 Computer 会共读同一身份文件（SDK 自造克隆）。
-        The stable identity must follow this instance's env, like settings/mcp.json do.
+        返回 ``MappingProxyType`` 只读副本：调用方不得就地改写实例注入的 env。
+        Read-only view over the injected env; callers must not mutate it in place.
         """
-        return self._env
+        return MappingProxyType(self._env) if self._env is not None else None
 
     def _resolve_env(self) -> Mapping[str, str] | None:
-        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。"""
-        return self._env
+        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。委托公开只读视图。"""
+        return self.env
 
     def _resolve_cwd(self) -> Path | None:
         """注入 project_root（``None`` = 延迟回退 ``os.getcwd()``，保 CLI 向后兼容）。"""

@@ -14,7 +14,7 @@ and aligned with rust-sdk — see a2c-smcp-protocol Discussion #71).
 - 位置：``$XDG_CONFIG_HOME/a2c/computer-id``（``XDG_CONFIG_HOME`` **仅绝对路径**生效），
   否则 ``~/.config/a2c/computer-id``；
 - 内容：UTF-8 单行、小写规范 UUID + 结尾换行；
-- 权限：目录 ``0700`` / 文件 ``0600``（显式 chmod，``mkdir`` 自身受 umask 影响）；
+- 权限：**本次新建**的目录 ``0700``（既存配置目录不改权限）/ 文件 ``0600``；
 - 首启：``O_CREAT|O_EXCL`` 原子创建，多进程并发首启共用同一值；
 - 空 / 半写（并发创建者尚未写完）：短重试 **≤1s**；
 - 损坏（重试耗尽仍非合法形态）或不可读写：**fail-fast**，绝不静默改用临时值、绝不自动覆写。
@@ -32,9 +32,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
-from a2c_smcp.computer.settings.scope import resolve_user_config_dir
 from a2c_smcp.utils.computer_id import is_canonical_computer_id
+from a2c_smcp.utils.path import resolve_xdg_first
 
+#: 配置子目录（与 settings / mcp.json 的 ``<config>/a2c`` 同名）。/ SDK config subdirectory.
+IDENTITY_DIR_NAME: Final[str] = "a2c"
 #: 身份文件名（位于用户配置目录 ``<config>/a2c/`` 下）。/ Identity file name under the shared config dir.
 IDENTITY_FILE_NAME: Final[str] = "computer-id"
 #: 目录权限：仅属主可访问。/ Directory mode: owner-only.
@@ -56,19 +58,33 @@ class ComputerIdentityError(RuntimeError):
     """
 
 
+def _env_home(env: Mapping[str, str]) -> Path:
+    """从注入 env 派生 HOME（``HOME`` → ``USERPROFILE`` → ambient ``Path.home()``）。
+
+    身份路径必须跟随**实例** env：嵌入式宿主同进程注入两台不同 HOME 的 Computer 时，XDG 未设置
+    也要落到各自的家目录，不能共用 ambient 家目录（SDK 自造克隆）。
+    Derive HOME from the injected env so per-instance isolation also covers the XDG-unset case.
+    """
+    raw = env.get("HOME") or env.get("USERPROFILE") or ""
+    return Path(raw).expanduser() if raw else Path.home()
+
+
 def identity_store_path(env: Mapping[str, str] | None = None) -> Path:
     """
-    解析身份文件路径：``<用户配置目录>/a2c/computer-id``。
+    解析身份文件路径：``<config>/a2c/computer-id``。
 
-    用户配置目录经 :func:`a2c_smcp.computer.settings.scope.resolve_user_config_dir` 解析——与
-    mcp.json / settings.json 共用同一 XDG 规则（``$XDG_CONFIG_HOME`` 仅绝对路径、值会 ``strip()``、
-    结果 ``expanduser().resolve()``）。**单一权威**：两处各写一份会在 XDG 带空白 / 相对值时让身份
-    文件与配置目录分叉（reset「成功」却改不到实际生效的那份）。
-    Resolve via the shared user-config resolver so the identity file can never diverge from the
-    mcp.json/settings.json home when XDG is whitespace-padded or relative.
+    规则与 settings / mcp.json 同源（``resolve_xdg_first``：``$XDG_CONFIG_HOME`` 仅绝对路径、值会
+    ``strip()``、结果 ``expanduser().resolve()``），**唯一差异**：XDG 未设置时 fallback 从**注入 env
+    的 HOME/USERPROFILE** 派生（settings 用 ambient ``Path.home()``）——身份必须跟实例走，否则同进程
+    两台注入不同 HOME 的 Computer 会共读同一身份文件。
+    Same XDG rules as settings/mcp.json via ``resolve_xdg_first``; the only intentional difference is
+    that the fallback HOME comes from the injected env (settings uses ambient ``Path.home()``), so
+    per-instance identity isolation also holds when XDG is unset.
     This function is side-effect free — materialization belongs to the first ``connect``.
     """
-    return resolve_user_config_dir(env) / IDENTITY_FILE_NAME
+    environ: Mapping[str, str] = os.environ if env is None else env
+    fallback = _env_home(environ) / ".config" / IDENTITY_DIR_NAME
+    return resolve_xdg_first(environ, "XDG_CONFIG_HOME", IDENTITY_DIR_NAME, fallback=fallback) / IDENTITY_FILE_NAME
 
 
 def load_or_create_computer_id(

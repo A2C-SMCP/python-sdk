@@ -9,8 +9,23 @@
         / Pure seat-table and name-registry primitives shared by both namespaces
 """
 
+from enum import Enum
+
 from a2c_smcp.exceptions import RoomFullError
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID, IdentityRecord
+
+
+class IdentityClaim(Enum):
+    """``record_identity`` 的结果：本次是**新插入**、与既有记录一致、还是冲突。
+
+    「只 pop 自己插入的」需要这个三态（fix-review 🟡6）：后续 join 匹配到既有记录后若因断连收尾
+    失败，不能把该记录删掉——它是残留 leave 宣告的 ``computer_id`` 载体。
+    Three-state claim result so a later (matching) join never pops a record it did not insert.
+    """
+
+    INSERTED = "inserted"
+    MATCHED = "matched"
+    MISMATCH = "mismatch"
 
 
 class SessionGoneError(RuntimeError):
@@ -103,7 +118,7 @@ def record_identity(
     identities: dict[SID, IdentityRecord],
     sid: SID,
     identity: IdentityRecord,
-) -> bool:
+) -> IdentityClaim:
     """**原子**「身份一致性校验 + 首次记录」（v0.5.0 / protocol#64，房间模型 §Computer 身份）。
 
     协议要求：同一 sid 的「一致性校验 + 记录」MUST 原子；首次通过校验即记录（``400`` / ``403`` 之后、
@@ -117,13 +132,14 @@ def record_identity(
     The caller provides atomicity (registry lock on sync, zero suspension points on async).
 
     Returns:
-        bool: ``True`` = 与本 sid 既有记录一致（或本次首次记录）；``False`` = 声明与记录不同 ⇒ ``403``。
+        IdentityClaim: ``INSERTED`` = 本次首次记录；``MATCHED`` = 与既有记录一致；
+        ``MISMATCH`` = 声明与记录不同 ⇒ ``403``。
     """
     existing = identities.get(sid)
     if existing is None:
         identities[sid] = identity
-        return True
-    return existing == identity
+        return IdentityClaim.INSERTED
+    return IdentityClaim.MATCHED if existing == identity else IdentityClaim.MISMATCH
 
 
 def reserve_name(

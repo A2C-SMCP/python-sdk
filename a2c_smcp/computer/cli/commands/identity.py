@@ -68,8 +68,9 @@ async def repl_dispatch(comp: Computer, parts: list[str]) -> None:
     client = comp.socketio_client
     try:
         # 复用同一个 SDK API（同进程可判定 connected / 入房意图）；无 client = 必然未连接 ⇒ 纯文件重置。
-        # Reuse the same SDK API when a client exists; otherwise the process cannot be connected.
-        new_id = await client.reset_identity() if client is not None else reset_computer_id()
+        # 无 client 时也必须跟随**本实例**的 env（fix-review 🟡5），不能用 ambient。
+        # Reuse the SDK API when a client exists; the file fallback still follows this instance's env.
+        new_id = await client.reset_identity() if client is not None else reset_computer_id(env=getattr(comp, "env", None))
     except RuntimeError as e:
         # RuntimeError：已连接拒绝；ComputerIdentityError（其子类）：文件不可写 / 目录异常
         console.print(f"[red]❌ 重置失败 / reset failed: {e}[/red]")

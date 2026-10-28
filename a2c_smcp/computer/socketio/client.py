@@ -213,6 +213,10 @@ class SMCPComputerClient(AsyncClient):
         # 跨重连复用同一值；``reset_identity()`` 只在新连接前可改。
         # Cached stable identity; materialized on first connect (never in __init__/import).
         self._computer_id: str | None = None
+        # 身份物化 / 重置的互斥锁（fix-review 🟡2）：check → await → 赋值必须整体原子——
+        # 否则 reset 与在途物化交错时，stale 物化结果会覆盖新身份（内存旧 / 磁盘新，新身份需重启才生效）。
+        # Serializes materialization vs reset; prevents a stale load from clobbering a fresh reset.
+        self._identity_lock = asyncio.Lock()
         # 将客户端以 weakref 方式绑定回 Computer，避免循环强引用
         self.computer.socketio_client = self
         self.on(TOOL_CALL_EVENT, self.on_tool_call, namespace=self._namespace)
@@ -334,27 +338,38 @@ class SMCPComputerClient(AsyncClient):
         身份持久化使用**本 Computer 实例**的 env（``None`` = ambient ``os.environ``）。
 
         与 settings / mcp.json 同一 XDG 锚点：同进程两台注入不同 env 的 Computer 必须各自读写自己的
-        身份文件，否则会共享同一个 ``computer-id``（SDK 自造克隆）。非 Mapping（测试里的 MagicMock
-        computer）退化为 ambient。
-        The identity store follows this instance's env, like settings/mcp.json do.
+        身份文件，否则会共享同一个 ``computer-id``（SDK 自造克隆）。
+        ``None``（未注入）与**非 Mapping**（异常替身）区分处理：后者显式告警后退化 ambient，绝不静默。
+        The identity store follows this instance's env; a non-Mapping value is warned about (never
+        silently treated the same as an explicit ``None``).
         """
         env = getattr(self.computer, "env", None)
-        return env if isinstance(env, Mapping) else None
+        if env is None:
+            return None
+        if not isinstance(env, Mapping):
+            logger.warning(
+                f"Computer.env 不是 Mapping（{type(env).__name__}），身份持久化退化为 ambient os.environ",
+            )
+            return None
+        return env
 
     async def _amaterialize_computer_id(self) -> str:
         """
-        取本连接的稳定身份；未物化时经**线程池**加载 / 生成（幂等，绝不阻塞事件循环）。
+        取本连接的稳定身份；未物化时经**线程池**加载 / 生成（single-flight，绝不阻塞事件循环）。
 
         调用方须在**取 ``_office_op_lock`` 之前** await 本方法：首启竞态最坏重试 1s，占着 office
         操作锁读盘会拖住退房 / 换房与回放（与 #222「锁不跨 I/O」同一纪律）。
-        Must be awaited *before* acquiring ``_office_op_lock``; disk I/O runs in a worker thread.
+        与 :meth:`reset_identity` 共用 ``_identity_lock``：check → await → 赋值整体互斥，
+        reset 不会与在途物化交错（否则 stale 物化结果会覆盖新身份，内存旧 / 磁盘新）。
+        Single-flight and mutually exclusive with reset_identity; disk I/O runs in a worker thread.
         """
-        if self._computer_id is None:
-            self._computer_id = await asyncio.to_thread(
-                load_or_create_computer_id,
-                env=self._identity_env(),
-            )
-        return self._computer_id
+        async with self._identity_lock:
+            if self._computer_id is None:
+                self._computer_id = await asyncio.to_thread(
+                    load_or_create_computer_id,
+                    env=self._identity_env(),
+                )
+            return self._computer_id
 
     async def reset_identity(self) -> str:
         """
@@ -377,8 +392,9 @@ class SMCPComputerClient(AsyncClient):
                 "已连接（或存在入房意图）时不能重置 Computer 身份：请先断开连接，再重置并以新连接入房"
                 " / Cannot reset identity while connected or holding an office intent: disconnect first",
             )
-        new_id = await asyncio.to_thread(reset_computer_id, env=self._identity_env())
-        self._computer_id = new_id
+        async with self._identity_lock:
+            new_id = await asyncio.to_thread(reset_computer_id, env=self._identity_env())
+            self._computer_id = new_id
         logger.info(f"Computer identity reset; new computer_id={new_id}")
         return new_id
 
@@ -806,6 +822,13 @@ class SMCPComputerClient(AsyncClient):
         # 经线程池完成——锁内不跨 I/O（同 #222 纪律），也不阻塞事件循环。
         # Materialize before acquiring the office lock; disk I/O runs in a worker thread.
         computer_id = await self._amaterialize_computer_id()
+        if generation != self._office_generation:
+            # fix-review 🟡1：物化期间的断连 / 退房 / 新声明会推进 generation。此时无条件写
+            # ``office_id`` 会把「已断开却残留 desired」反转回来（下次 connect 自动回旧房，违反 #203）
+            # ⇒ 本 join 已被抢占：不写 desired、不发包，直接让位给更新的声明。
+            # Superseded while materializing: no desired write, no wire send.
+            logger.info(f"join_office 在身份物化期间被抢占，放弃本次入房: {office_id}")
+            return
         # 提前设置 office_id，避免服务器广播事件时 office_id 仍为 None 的时序竞争问题
         # Set office_id before sending request to avoid race condition when server broadcasts events
         self.office_id = office_id

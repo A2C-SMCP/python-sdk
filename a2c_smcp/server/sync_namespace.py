@@ -18,7 +18,7 @@ from a2c_smcp.exceptions import (
     RoomRejection,
     SMCPNamespaceError,
 )
-from a2c_smcp.server.name_registry import SessionGoneError
+from a2c_smcp.server.name_registry import IdentityClaim, SessionGoneError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.sync_base import SyncBaseNamespace
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
@@ -168,15 +168,13 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         return office_ids_of_rooms(self.rooms(sid))
 
-    def _announce_residual_leave(self, sid: SID, key: NAME_KEY) -> None:
+    def _announce_residual_leave(self, sid: SID, key: NAME_KEY, computer_id: str | None) -> None:
         """断连时发现的残留键（注册落在退房快照之后）补发 ``notify:leave_office``——对端可能已收到其 enter。
-        A residual key at disconnect may already have been announced; announce its leave.
+
+        ``computer_id`` 由调用方在注册表锁段内连同 ``release_name`` 一并取出后传入（fix-review 🟡6）。
+        The caller passes the computer_id captured in the same locked cleanup section.
         """
         office_id, role, name = key
-        # 身份记录是会话清理后仍可读的 computer_id 载体（在残留宣告之后才注销，protocol#64）。
-        # The identity record is the only carrier still readable after session cleanup.
-        record = self._sid_identity.get(sid)
-        computer_id = record.computer_id if record is not None else None
         self._emit_to_office(
             LEAVE_OFFICE_NOTIFICATION,
             build_leave_notification(office_id, role, name, computer_id),
@@ -376,6 +374,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         session = self.get_session(sid)
         # 4106 的 details 需报「会话**当前**所在房」⇒ 必须在 enter_room 可能改动/收敛会话之前取。
         previous_office = session.get("office_id")
+        # 身份记录三态：只有 INSERTED（本次新插入）才允许在失败收尾时 pop（fix-review 🟡6）。
+        claim: IdentityClaim | None = None
 
         try:
             # 身份声明一致性 + **首次记录**（protocol#64；与 #221 的 role/name 同一规则）。记录点是
@@ -383,7 +383,8 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # 校验与记录在注册表锁内的同一同步核心完成 ⇒ 并发声明不同身份时至多一者被记录。镜像 async。
             # Atomic compare-and-record of the identity triple; the record survives later rejections.
             expected_name = declared_name or default_session_name(expected_role, sid)
-            if not self._claim_identity(sid, expected_role, expected_name, computer_id):
+            claim = self._claim_identity(sid, expected_role, expected_name, computer_id)
+            if claim is IdentityClaim.MISMATCH:
                 logger.warning(
                     f"server:join_office 身份声明不符 sid={sid}: request="
                     f"({expected_role!r}, {declared_name!r}, {computer_id!r})",
@@ -408,9 +409,11 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             if isinstance(e, SessionGoneError):
                 # 发起者已进入断连收尾：身份记录随连接销毁（断连清理可能早于本次写入 ⇒ 显式收尾）。
                 # fix-review 🟡10：与 ``sync_base.on_disconnect`` 一样在注册表锁内 pop——并发的断连清理
-                # 与本分支会同时改写同一 dict。
-                with self._registry_lock:
-                    self._sid_identity.pop(sid, None)
+                # 与本分支会同时改写同一 dict。🟡6：只有本次**新插入**的记录才回收；匹配到既有记录时
+                # 绝不 pop（它是断连清理/残留 leave 宣告的 computer_id 载体）。
+                if claim is IdentityClaim.INSERTED:
+                    with self._registry_lock:
+                        self._sid_identity.pop(sid, None)
                 logger.info(f"server:join_office 发起者已断连，放弃入房 sid={sid}")
                 return build_internal_error()
 
