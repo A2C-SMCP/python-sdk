@@ -159,14 +159,19 @@ async def test_resolve_then_chunked_pull_roundtrip(tmp_path: Path, socketio_serv
 
         chunks: list[bytes] = []
         offset = 0
-        while True:
+        # 有界循环（🟢9）：eof 永不成立时也不挂死，且结尾断言确实见到 eof
+        # Bounded loop: a missing eof fails the assertion instead of hanging the test.
+        saw_eof = False
+        for _ in range(len(payload) + 2):
             got = await agent.get_blob(COMPUTER, ret["blob_handle"], chunk_offset=offset, max_chunk_bytes=4)
             assert got["sha256"] == ret["sha256"]  # 与 resolve 期一致
             chunks.append(base64.b64decode(got["blob"]))
             if got["eof"]:
+                saw_eof = True
                 break
             offset += len(chunks[-1])
 
+        assert saw_eof, "分块读取必须在有界次数内见到 eof（eof 回归时不得挂死）"
         assert b"".join(chunks) == payload
 
         # canonical_path 可直接回用作 path（协议 MUST）/ canonical_path round-trips as path
@@ -264,25 +269,24 @@ async def test_rewrite_after_resolve_makes_pull_gone(tmp_path: Path, socketio_se
 
 
 @pytest.mark.asyncio
-async def test_revoke_after_resolve_makes_pull_forbidden(
+async def test_revoke_after_resolve_denies_pull_and_new_resolve(
     tmp_path: Path, socketio_server: None, server_port: int
 ) -> None:
-    """撤权（``readRoots`` 改写 + 宿主使缓存失效）→ 拉取期 ``4018 forbidden``.
+    """撤权后：旧句柄拉取 ``4018 forbidden``，新 resolve ``4020 forbidden``.
 
-    缓存语义：``read_roots`` 已配置时进程内缓存（与 ``landingRoot`` 同款，运行期改值需重启）；
-    宿主支持热更新时 MUST 调 ``Computer.refresh_read_roots()``——本用例即模拟该路径。
+    ``read_roots`` **每请求现读、无缓存**（授权边界必须反映当前 settings）；不依赖任何
+    宿主失效调用——见 :func:`test_external_settings_rewrite_revokes_without_refresh`。
     """
     root = tmp_path / "root"
     (root / "other").mkdir(parents=True)
     target = root / "revoked.txt"
     target.write_bytes(b"revocable")
 
-    async with _stack(tmp_path, server_port, read_roots=[str(root)]) as (computer, agent):
+    async with _stack(tmp_path, server_port, read_roots=[str(root)]) as (_computer, agent):
         ret = await agent.resolve_path(COMPUTER, str(target))
 
-        # 撤权：settings 改为不含该文件的根 + 使缓存失效
+        # 撤权：settings 改为不含该文件的根（另一个进程写文件，不触碰 Computer 状态）
         _write_user_settings(tmp_path / "cfg", {"readRoots": [str(root / "other")]})
-        computer.refresh_read_roots()
 
         with pytest.raises(SMCPProtocolError) as exc:
             await agent.get_blob(COMPUTER, ret["blob_handle"])
@@ -298,10 +302,11 @@ async def test_revoke_after_resolve_makes_pull_forbidden(
 async def test_external_settings_rewrite_revokes_without_refresh(
     tmp_path: Path, socketio_server: None, server_port: int
 ) -> None:
-    """**外部进程**改写 settings（不调用 ``refresh_read_roots``）→ 下一次 ``get_blob`` 即 ``4018 forbidden``.
+    """**外部进程**改写 settings、**不调用任何失效入口** → 下一次 ``get_blob`` 即 ``4018 forbidden``.
 
     协议 MUST：拉取期按**当前** ``readRoots`` 复核，撤权不得依赖宿主显式通知——
     ``a2c-computer settings set`` 由另一个进程写文件时，运行中的 Computer 不会被回调。
+    实现上 ``read_roots`` 每请求现读（无缓存），本用例是「正确性不依赖 refresh」的回归锁。
     """
     root = tmp_path / "root"
     (root / "other").mkdir(parents=True)
@@ -333,3 +338,39 @@ async def test_project_scope_read_roots_is_ignored(tmp_path: Path, socketio_serv
         with pytest.raises(SMCPProtocolError) as exc:
             await agent.resolve_path(COMPUTER, str(target))
         _assert_protocol_error(exc, 4020, "forbidden")
+
+
+@pytest.mark.asyncio
+async def test_root_symlink_retarget_denies_old_handle(
+    tmp_path: Path, socketio_server: None, server_port: int
+) -> None:
+    """root 符号链接**换指向**后：旧句柄 ``4018 forbidden``、新 resolve 按新目标判定（🔴2 回归锁）.
+
+    ``read_roots`` 不缓存，每个 root 的 realpath 形态每请求现算。缓存实现（以 raw 列表为键）
+    会把换指向前的旧 realpath 无限期用作围栏依据 ⇒ 旧目标继续可读。本用例即钉住该回归。
+    """
+    real_old = tmp_path / "real_old"
+    real_new = tmp_path / "real_new"
+    real_old.mkdir()
+    real_new.mkdir()
+    (real_old / "f.txt").write_bytes(b"old-content")
+    (real_new / "f.txt").write_bytes(b"new-content")
+    root_link = tmp_path / "root_link"
+    root_link.symlink_to(real_old, target_is_directory=True)
+
+    async with _stack(tmp_path, server_port, read_roots=[str(root_link)]) as (_computer, agent):
+        ret = await agent.resolve_path(COMPUTER, str(root_link / "f.txt"))
+        assert ret["sha256"] == hashlib.sha256(b"old-content").hexdigest()
+
+        # 换指向（配置文本不变，仅文件系统状态变化）
+        root_link.unlink()
+        root_link.symlink_to(real_new, target_is_directory=True)
+
+        with pytest.raises(SMCPProtocolError) as exc:
+            await agent.get_blob(COMPUTER, ret["blob_handle"])
+        _assert_protocol_error(exc, 4018, "forbidden")
+
+        # 新 resolve 按**当前** realpath 解析到新目标
+        newer = await agent.resolve_path(COMPUTER, str(root_link / "f.txt"))
+        assert newer["sha256"] == hashlib.sha256(b"new-content").hexdigest()
+        assert newer["canonical_path"] != ret["canonical_path"]

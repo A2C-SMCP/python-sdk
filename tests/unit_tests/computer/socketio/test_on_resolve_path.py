@@ -42,6 +42,7 @@ from a2c_smcp.computer.settings.scope import ResolvedSettings
 from a2c_smcp.computer.socketio import client as computer_sio
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.utils.path_norm import normalize_path
 
 
 @pytest.fixture()
@@ -114,9 +115,13 @@ class TestResolvePathHandler:
     async def test_empty_read_roots_is_forbidden_without_touching_fs(
         self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``readRoots`` 未配置 → ``4020 forbidden``；resolve 不得被调用（fail-closed 先于一切）."""
+        """``readRoots`` 未配置 → ``4020 forbidden``；resolve 不得被调用（fail-closed 先于一切）.
+
+        🟡7：显式注入空授权视图，**不**依赖宿主真实 ``~/.config/a2c/settings.json`` 为空。
+        """
+        _grant(computer, monkeypatch)  # 零读根
         called: list[str] = []
-        monkeypatch.setattr(computer, "resolve_read_path", lambda path: called.append(path) or _resolved())
+        monkeypatch.setattr(computer, "resolve_read_path", lambda path, **kw: called.append(path) or _resolved())
 
         ret = await client.on_resolve_path(_resolve_req())  # type: ignore[arg-type]
 
@@ -129,7 +134,7 @@ class TestResolvePathHandler:
     ) -> None:
         """成功路径：``ResolvedPath`` 六字段 + ``req_id`` 原样映射进 ``ResolvePathRet``."""
         _grant(computer, monkeypatch, "/srv/docs")
-        monkeypatch.setattr(computer, "resolve_read_path", lambda path: _resolved())
+        monkeypatch.setattr(computer, "resolve_read_path", lambda path, **kw: _resolved())
 
         ret = await client.on_resolve_path(_resolve_req())  # type: ignore[arg-type]
 
@@ -157,7 +162,7 @@ class TestResolvePathHandler:
         loop_thread = threading.get_ident()
         seen: dict[str, int] = {}
 
-        def fake_resolve(path: str) -> ResolvedPath:
+        def fake_resolve(path: str, **kw: Any) -> ResolvedPath:
             seen["thread"] = threading.get_ident()
             return _resolved()
 
@@ -178,7 +183,7 @@ class TestResolvePathHandler:
         """四种铸造期失败 → ``4020`` flat ErrorPayload，``reason`` 下沉 ``details``（开放枚举）."""
         _grant(computer, monkeypatch, "/srv/docs")
 
-        def _raise(path: str) -> ResolvedPath:
+        def _raise(path: str, **kw: Any) -> ResolvedPath:
             raise PathResolveError(reason)  # type: ignore[arg-type]
 
         monkeypatch.setattr(computer, "resolve_read_path", _raise)
@@ -227,8 +232,9 @@ class TestPathGetBlobBranch:
     ) -> None:
         """单块：元数据取句柄内值（不重算），``eof`` 由 len(chunk) 判定，句柄 close 恰好一次."""
         fake = _FakePull(b"hello world")
+        _grant(computer, monkeypatch, "/srv/docs")
         _patch_path_handle(monkeypatch)
-        monkeypatch.setattr(computer, "pull_path_blob", lambda payload: fake)
+        monkeypatch.setattr(computer, "pull_path_blob", lambda payload, **kw: fake)
 
         ret = await client.on_get_blob(_blob_req())  # type: ignore[arg-type]
 
@@ -246,8 +252,9 @@ class TestPathGetBlobBranch:
     ) -> None:
         """分块：``max_chunk_bytes`` 生效、非末块 ``eof=False``，每块各自 close."""
         fake = _FakePull(b"0123456789")
+        _grant(computer, monkeypatch, "/srv/docs")
         _patch_path_handle(monkeypatch)
-        monkeypatch.setattr(computer, "pull_path_blob", lambda payload: fake)
+        monkeypatch.setattr(computer, "pull_path_blob", lambda payload, **kw: fake)
 
         first = await client.on_get_blob(_blob_req(offset=0, max_chunk=4))  # type: ignore[arg-type]
         second = await client.on_get_blob(_blob_req(offset=4, max_chunk=4))  # type: ignore[arg-type]
@@ -264,8 +271,9 @@ class TestPathGetBlobBranch:
     ) -> None:
         """``chunk_offset`` 越界 → ``4018 range``；**早退路径也必须 close**（fd 泄漏守卫）."""
         fake = _FakePull(b"abc")
+        _grant(computer, monkeypatch, "/srv/docs")
         _patch_path_handle(monkeypatch)
-        monkeypatch.setattr(computer, "pull_path_blob", lambda payload: fake)
+        monkeypatch.setattr(computer, "pull_path_blob", lambda payload, **kw: fake)
 
         ret = await client.on_get_blob(_blob_req(offset=99))  # type: ignore[arg-type]
 
@@ -289,9 +297,10 @@ class TestPathGetBlobBranch:
         expected_reason: str,
     ) -> None:
         """拉取期复核失败 → ``4018``（撤权 forbidden / 删除 gone），``4018`` 枚举不变."""
+        _grant(computer, monkeypatch, "/srv/docs")
         _patch_path_handle(monkeypatch)
 
-        def _raise(payload: Any) -> Any:
+        def _raise(payload: Any, **kw: Any) -> Any:
             raise error
 
         monkeypatch.setattr(computer, "pull_path_blob", _raise)
@@ -300,3 +309,97 @@ class TestPathGetBlobBranch:
 
         assert ret["code"] == 4018  # type: ignore[index]
         assert ret["details"] == {"reason": expected_reason}  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# 授权视图与拒绝集来源 / authorization view & rejection set provenance
+# ---------------------------------------------------------------------------
+class TestReadAuthorizationSource:
+    """``read_roots`` / ``protected_paths`` 的来源与新鲜度（隔离审查 🔴1/🔴2/🟡4）."""
+
+    def test_read_roots_reread_on_every_call(self, computer: Computer, monkeypatch: pytest.MonkeyPatch) -> None:
+        """🔴2：授权**每请求现读**——settings 变则 roots 立刻变（无缓存可陈旧）.
+
+        同时锁住 realpath 新鲜度：缓存实现会让 root 符号链接换指向后旧目标继续可读。
+        """
+        settings: dict[str, Any] = {"readRoots": ["/srv/a"]}
+        monkeypatch.setattr(
+            computer,
+            "_resolve_declared_settings",
+            lambda: ResolvedSettings(settings=dict(settings), errors=[], per_scope_layers={}),
+        )
+
+        assert [r.configured for r in computer.read_roots] == ["/srv/a"]
+
+        settings["readRoots"] = ["/srv/b"]
+
+        assert [r.configured for r in computer.read_roots] == ["/srv/b"], "settings 变化必须立刻反映（不得缓存）"
+
+    def test_protected_paths_includes_mcp_config_flag_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴1：``--mcp-config`` 文件（flag 层 mcp.json，可含 server 字面量 env/凭据）必须在拒绝集内."""
+        mcp_cfg = tmp_path / "flag-mcp.json"
+        mcp_cfg.write_text("{}", encoding="utf-8")
+        computer = Computer(name="comp-test", blob_cache_root=tmp_path / "cache", mcp_flag_config=mcp_cfg)
+        _grant(computer, monkeypatch, "/srv/docs")
+
+        protected = computer.protected_paths()
+
+        assert normalize_path(str(mcp_cfg)) in protected.paths
+
+    def test_protected_paths_covers_flag_settings_and_tfrobot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """flag settings 与工作目录治理目录（``.tfrobot``）同样在拒绝集内（回归锁）."""
+        flag_settings = tmp_path / "flag-settings.json"
+        flag_settings.write_text("{}", encoding="utf-8")
+        project_root = tmp_path / "cwd"
+        project_root.mkdir()
+        computer = Computer(
+            name="comp-test",
+            blob_cache_root=tmp_path / "cache",
+            flag_settings_path=flag_settings,
+            project_root=project_root,
+        )
+        _grant(computer, monkeypatch, "/srv/docs")
+
+        protected = computer.protected_paths()
+
+        assert normalize_path(str(flag_settings)) in protected.paths
+        assert normalize_path(str(project_root / ".tfrobot")) in protected.paths
+
+    @pytest.mark.asyncio
+    async def test_unexpected_settings_error_returns_flat_500(
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡4：``read_roots``/``protected_paths`` 抛未预期异常（如 OSError）→ flat ``500``（**必须 ack**）.
+
+        异常逃出 async handler 会导致**不发 ack**、Agent 挂到自身超时；协议要求有 ack 通道即必须 ack。
+        """
+
+        def boom() -> Any:
+            raise OSError("settings dir unreadable")
+
+        monkeypatch.setattr(computer, "path_access_policy", boom)
+
+        ret = await client.on_resolve_path(_resolve_req())  # type: ignore[arg-type]
+
+        assert ret["code"] == 500  # type: ignore[index]
+        assert ret["message"] == "Internal error"  # type: ignore[index]
+
+    @pytest.mark.asyncio
+    async def test_path_pull_unexpected_error_returns_flat_500(
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡4（get_blob path 分支同款）：未预期异常 → flat ``500``，不挂死 Agent."""
+        _patch_path_handle(monkeypatch)
+
+        def boom() -> Any:
+            raise OSError("settings dir unreadable")
+
+        monkeypatch.setattr(computer, "path_access_policy", boom)
+
+        ret = await client.on_get_blob(_blob_req())  # type: ignore[arg-type]
+
+        assert ret["code"] == 500  # type: ignore[index]

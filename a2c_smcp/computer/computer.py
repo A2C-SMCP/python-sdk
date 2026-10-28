@@ -117,7 +117,7 @@ from a2c_smcp.computer.settings.recovery import (
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
-from a2c_smcp.computer.settings.schema import FIELD_READ_ROOTS, SettingsScope
+from a2c_smcp.computer.settings.schema import FIELD_LANDING_ROOT, FIELD_READ_ROOTS, SettingsScope
 from a2c_smcp.computer.settings.scope import TFROBOT_DIRNAME
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
@@ -163,6 +163,22 @@ class _RawServerEntry:
     config: MCPServerConfig
     plugin: str | None
     marketplace: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PathAccessPolicy:
+    """一次请求的读取授权快照：读根 + 固定拒绝集（v0.5.0 #236 / protocol#65）。
+
+    A per-request snapshot of read authorization: read roots + the fixed rejection set.
+
+    ``Computer.path_access_policy()`` 由**一次** settings 解析同时得出两者，resolve 与
+    pull 共用同一快照——避免同请求内 settings 被解析多遍、也避免两次解析之间的不一致
+    （如解析途中另一进程改配置）。
+    Derived from a single settings parse so resolve/pull never disagree within one request.
+    """
+
+    roots: list[ReadRoot]
+    protected: ProtectedPaths
 
 
 class Computer(BaseComputer[PromptSession]):
@@ -364,9 +380,10 @@ class Computer(BaseComputer[PromptSession]):
         # v0.4.0 #196：client:put_blob 上行会话 store + landingRoot（lazy；见 landing_root / blob_upload_store）
         self._blob_upload_store: BlobUploadStore | None = None
         self._landing_root: Path | None = None
-        # v0.5.0 #236 / protocol#65：client:resolve_path 授权读根（编译缓存键 = raw 列表；见 read_roots）
-        self._read_roots: list[ReadRoot] | None = None
-        self._read_roots_key: tuple[str, ...] | None = None
+        # v0.5.0 #236 / protocol#65：client:resolve_path 的授权读根**不缓存**（见 read_roots —
+        # settings 与 root realpath 都必须每请求现算；缓存会让换指向后的旧目标被放行）。
+        # Read roots are intentionally not cached: both settings and each root's realpath must be
+        # current per request, otherwise a retargeted root symlink keeps the old target readable.
         self._blob_upload_lock = threading.Lock()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
@@ -464,7 +481,7 @@ class Computer(BaseComputer[PromptSession]):
     # ------------------------
     @property
     def read_roots(self) -> list[ReadRoot]:
-        """``client:resolve_path`` 的授权读根（settings 键 ``readRoots``，config-first）。
+        """``client:resolve_path`` 的授权读根（settings 键 ``readRoots``）。
 
         Authorized read roots for ``client:resolve_path`` (settings key ``readRoots``).
 
@@ -473,30 +490,26 @@ class Computer(BaseComputer[PromptSession]):
         :data:`~a2c_smcp.computer.settings.schema.TRUSTED_SCOPE_ONLY_FIELDS` 被整字段剔除），
         跨 scope 按数组语义**拼接去重**（授权只增不减）。
 
-        **授权边界每次请求现读（协议 MUST）**：拉取期 ``get_blob`` 必须按**当前** ``readRoots``
-        复核（覆盖 resolve 后的撤权），且撤权不得依赖宿主记得调用失效入口——``a2c-computer
-        settings set`` 由另一进程改文件时，运行中的 Computer 不会被通知。因此本属性每次调用都
-        重新解析 settings；仅当 **raw 列表未变**时复用已编译的 :class:`ReadRoot`（避免重复
-        realpath），raw 变化即重建。成本 = 每请求多读 2–4 个小 JSON。
+        **无缓存，每次请求重建（授权边界 MUST 反映当前状态）**：
+        - settings 可能被**另一进程**改写（``a2c-computer settings set``），运行期 Computer 收不到通知；
+        - 每个 root 的 realpath 形态必须反映**当前文件系统状态**——缓存编号会把「root 符号链接
+          换指向」后的旧目标无限期放行（拉取期按旧 real 围栏通过）。
+        成本 = 每请求读 2–4 个小 JSON + 每个 root 一次 realpath；root 通常 1–3 个，可忽略。
+        No cache: both the settings *and* each root's realpath must be current at every request
+        (another process may rewrite settings; a root symlink may be retargeted). Cost is a few
+        small reads + one realpath per root.
 
-        Authorization MUST be re-read on every request: a revocation performed by another
-        process must take effect immediately. Only the *compiled* form is reused while the raw
-        list is unchanged (avoids repeated realpath); any raw change recompiles.
-
-        非法的单项（``build_read_roots`` 静默丢弃）与 realpath 失败的根在**重建时**记 WARNING；
+        非法的单项（``build_read_roots`` 静默丢弃）与 realpath 失败的根在此记 WARNING；
         逐项配置诊断另经 settings 校验错误通道呈现。
         """
-        raw = self._resolve_declared_settings().settings.get(FIELD_READ_ROOTS)
+        return self._compile_read_roots(self._resolve_declared_settings())
+
+    def _compile_read_roots(self, resolved: "ResolvedSettings") -> list[ReadRoot]:
+        """把已解析 settings 的 ``readRoots`` 编译为双形态根（含诊断日志）。"""
+        raw = resolved.settings.get(FIELD_READ_ROOTS)
         if not isinstance(raw, list) or not raw:
-            # 未授权 / 撤权到底：清空编译缓存，后续授权恢复时必须重建.
-            # Unset or fully revoked: drop the compiled cache so re-grant recompiles.
-            self._read_roots = None
-            self._read_roots_key = None
             return []
         items = [item for item in raw if isinstance(item, str)]
-        key = tuple(items)
-        if self._read_roots is not None and self._read_roots_key == key:
-            return self._read_roots
         compiled = build_read_roots(items)
         for root in compiled:
             if root.real is None:
@@ -509,21 +522,7 @@ class Computer(BaseComputer[PromptSession]):
                 f"readRoots 有 {len(raw) - len(compiled)} 项无法编译为规范路径（非法项已忽略）/ "
                 f"{len(raw) - len(compiled)} readRoots item(s) dropped as invalid",
             )
-        self._read_roots = compiled
-        self._read_roots_key = key
         return compiled
-
-    def refresh_read_roots(self) -> None:
-        """显式清除 :attr:`read_roots` 的编译缓存（可选优化入口，**正确性不依赖它**）。
-
-        Explicitly drop the compiled ``read_roots`` cache (an optional hint, **not** load-bearing).
-
-        授权边界的**正确性**由「每次请求现读 raw」保证（见 :attr:`read_roots`）；本方法只是让
-        宿主在已知配置变化时跳过下一次比较。撤权由另一进程改文件时无需调用本方法。
-        Correctness comes from re-reading raw on every request; this only skips one comparison.
-        """
-        self._read_roots = None
-        self._read_roots_key = None
 
     def protected_paths(self) -> ProtectedPaths:
         """固定拒绝集：即便位于 ``readRoots`` 内也拒绝的 SDK 自管位置（每次现算）。
@@ -533,27 +532,54 @@ class Computer(BaseComputer[PromptSession]):
         协议依据 / Protocol: ``blob-transfer.md`` §固定拒绝集；``security.md`` §读取通道安全（零凭证传播）.
         默认集（SDK config / state 目录，覆盖 settings / ``computer-id`` / input 值缓存）由
         :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 计算；本方法只注入
-        **接线层已知的额外位置**——flag settings 文件、工作目录治理目录（``.tfrobot``：settings /
-        mcp.json / inputs）、SKILL Home、blob 缓存根。``landing_root`` 单独传入以获得 ``.part`` 规则。
+        **接线层已知的额外位置**：
+          - ``--settings``（flag 层 settings.json）
+          - ``--mcp-config``（flag 层 mcp.json——**可含 server 字面量 env / 凭据**，用户 readRoots
+            覆盖其目录时必须仍拒绝；隔离审查 🔴1）
+          - 工作目录治理目录 ``.tfrobot``（settings / mcp.json / inputs）
+          - SKILL Home、blob 缓存根
+        ``landing_root`` 单独传入以获得 ``.part`` 规则。
 
         每次现算（不缓存）：``landing_root`` 热启用、``.tfrobot`` 随 cwd 变化、文件身份
         (``dev``/``ino``) 需反映当前文件系统状态.
         Recomputed per call: landing root may be hot-enabled, and file identities must be current.
         """
+        return self._build_protected_paths(self._resolve_declared_settings())
+
+    def _build_protected_paths(self, resolved: "ResolvedSettings") -> ProtectedPaths:
+        """由已解析 settings 构造拒绝集（``landing_root`` 取自同一份视图，避免二次解析）。"""
         extra: list[str] = [str(self._blob_cache_root), str(self.skill_home)]
         if self._flag_settings_path is not None:
             extra.append(str(self._flag_settings_path))
+        if self._mcp_flag_config is not None:
+            # flag 层 mcp.json：可含 server 字面量 env / 凭据（🔴1）
+            extra.append(str(self._mcp_flag_config))
         # project/local 治理目录随 cwd 走（#116 单 cwd 锚点）；与 resolve_settings 同源回退.
         cwd = self._resolve_cwd() or Path(os.getcwd())
         extra.append(str(cwd / TFROBOT_DIRNAME))
-        landing = self.landing_root
+        raw_landing = resolved.settings.get(FIELD_LANDING_ROOT)
+        landing = raw_landing if isinstance(raw_landing, str) and raw_landing else None
         return build_protected_paths(
             extra_paths=extra,
-            landing_root=str(landing) if landing is not None else None,
+            landing_root=landing,
             env=self._resolve_env(),
         )
 
-    def resolve_read_path(self, path: str) -> ResolvedPath:
+    def path_access_policy(self) -> "PathAccessPolicy":
+        """一次 settings 解析同时得出 (读根, 固定拒绝集)，供 resolve / pull 共用。
+
+        Parse settings **once** and derive both the read roots and the rejection set.
+
+        授权边界每次请求现读（见 :attr:`read_roots`）；本方法把「一次请求 = 一次解析」固化，
+        避免 resolve 守卫与管线各解析一遍、以及每个 get_blob 块解析两遍。
+        """
+        resolved = self._resolve_declared_settings()
+        return PathAccessPolicy(
+            roots=self._compile_read_roots(resolved),
+            protected=self._build_protected_paths(resolved),
+        )
+
+    def resolve_read_path(self, path: str, *, policy: PathAccessPolicy | None = None) -> ResolvedPath:
         """按协议九步管线解析一个本地路径并**现铸** ``blob_handle``（v0.5.0 #236）。
 
         Run the protocol's nine-step pipeline and mint a ``blob_handle``.
@@ -566,6 +592,8 @@ class Computer(BaseComputer[PromptSession]):
 
         Args:
             path: Agent 给出的 Computer 本地绝对路径（原生或 canonical ``/C:/...`` 形态）.
+            policy: 本请求的授权快照（``None`` = 现算一次）；接线层应传入，确保与调用方
+                的「空 readRoots 守卫」用**同一份**授权视图.
 
         Returns:
             ResolvedPath: ``canonical_path`` / ``blob_handle`` / ``mime_type`` / ``total_size`` /
@@ -575,9 +603,10 @@ class Computer(BaseComputer[PromptSession]):
             PathResolveError: ``reason`` ∈ ``invalid_path`` / ``forbidden`` / ``not_found`` /
                 ``not_a_file``（接线层映射为 ``4020`` 扁平 ErrorPayload）.
         """
-        return resolve_path(path, self.read_roots, protected=self.protected_paths())
+        snapshot = policy or self.path_access_policy()
+        return resolve_path(path, snapshot.roots, protected=snapshot.protected)
 
-    def pull_path_blob(self, handle_payload: Mapping[str, Any]) -> PathPullResult:
+    def pull_path_blob(self, handle_payload: Mapping[str, Any], *, policy: PathAccessPolicy | None = None) -> PathPullResult:
         """``client:get_blob`` 解析 ``kind=path`` 句柄：按**当前**授权与文件系统状态复核。
 
         Revalidate a ``kind=path`` handle at pull time against the *current* authorization.
@@ -594,11 +623,13 @@ class Computer(BaseComputer[PromptSession]):
 
         Args:
             handle_payload: ``decode_blob_handle`` 得到的 ``kind=path`` 载荷.
+            policy: 本请求的授权快照（``None`` = 现算一次；接线层传一次，避免每块重复解析）.
 
         Returns:
             PathPullResult: 复核通过的元数据 + :meth:`~PathPullResult.slice` 惰性读取能力.
         """
-        return resolve_for_pull(handle_payload, self.read_roots, protected=self.protected_paths())
+        snapshot = policy or self.path_access_policy()
+        return resolve_for_pull(handle_payload, snapshot.roots, protected=snapshot.protected)
 
     def mint_toolspool_handle(self, payload: bytes, mime: str) -> str:
         """铸造 ``kind=toolspool`` 不透明句柄并写盘 / Mint an opaque ``kind=toolspool`` handle.
