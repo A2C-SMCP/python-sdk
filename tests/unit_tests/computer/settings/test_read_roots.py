@@ -25,25 +25,44 @@ from a2c_smcp.computer.settings.schema import (
     validate_settings,
 )
 from a2c_smcp.computer.settings.scope import merge_layers
+from a2c_smcp.utils.path_norm import native_platform
 
 
 # ---------------------------------------------------------------------------
 # 字段级校验 / field-level validation
 # ---------------------------------------------------------------------------
 def test_read_roots_keeps_absolute_items() -> None:
-    """合法绝对路径（POSIX / Windows 盘符 / canonical 形态）全部保留且不记错."""
-    raw = {
-        FIELD_READ_ROOTS: [
-            "/home/u/docs",
-            "/var/lib/data/",
-            "C:\\Users\\u\\docs",
-            "C:/Users/u/other",
-            "/C:/Users/u/canonical",
-        ]
-    }
-    cleaned, errors = validate_settings(raw, SettingsScope.USER)
+    """合法绝对路径（**宿主平台**形态 + canonical ``/C:/...``）全部保留且不记错.
+
+    形态预判与运行期同源：用 ``normalize_path(宿主平台)``，故 Windows 原生路径在 POSIX 宿主上
+    属 ``invalid_path``（运行期同样不可用），不应保留。
+    """
+    if native_platform() == "posix":
+        items = ["/home/u/docs", "/var/lib/data/", "/C:/Users/u/canonical"]
+    else:
+        items = ["C:\\Users\\u\\docs", "C:/Users/u/other", "/C:/Users/u/canonical"]
+    cleaned, errors = validate_settings({FIELD_READ_ROOTS: items}, SettingsScope.USER)
     assert errors == []
-    assert cleaned[FIELD_READ_ROOTS] == raw[FIELD_READ_ROOTS]
+    assert cleaned[FIELD_READ_ROOTS] == items
+
+
+def test_read_roots_rejects_absolute_but_invalid_shape() -> None:
+    """绝对路径但**形态非法**（含 U+0000）→ 配置期即丢弃并记 ``invalid path`` 诊断（不留给运行期）."""
+    cleaned, errors = validate_settings({FIELD_READ_ROOTS: ["/srv/ok", "/srv/\x00bad"]}, SettingsScope.USER)
+
+    assert cleaned[FIELD_READ_ROOTS] == ["/srv/ok"]
+    assert len(errors) == 1
+    assert errors[0].field == f"{FIELD_READ_ROOTS}[1]"
+    assert "invalid path" in errors[0].reason
+
+
+def test_read_roots_rejects_foreign_platform_form() -> None:
+    """非宿主平台形态（POSIX 上的 ``C:\\...`` / Windows 上的 ``/home/...``）→ 过滤 + 诊断."""
+    foreign = "C:\\Users\\u\\docs" if native_platform() == "posix" else "/home/u/docs"
+    cleaned, errors = validate_settings({FIELD_READ_ROOTS: [foreign]}, SettingsScope.USER)
+
+    assert cleaned[FIELD_READ_ROOTS] == []
+    assert len(errors) == 1
 
 
 def test_read_roots_filters_invalid_items_individually() -> None:

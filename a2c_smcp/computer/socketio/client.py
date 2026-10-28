@@ -74,9 +74,9 @@ from a2c_smcp.smcp import (
     MCPServerInput,
     PutBlobReq,
     PutBlobRet,
-    ResourceAnnotations,
     ResolvePathReq,
     ResolvePathRet,
+    ResourceAnnotations,
     ToolCallReq,
     UpdateComputerConfigReq,
 )

@@ -854,7 +854,7 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         raise_for_error_payload(response)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for resolve_path")
-        return ResolvePathRet(**response)
+        return cast(ResolvePathRet, response)
 
     def _make_blob_call(self) -> Any:
         """构造 :func:`drain_blob_sync` 的 ``call`` 适配器（sync mirror of async ``_make_blob_call``）."""

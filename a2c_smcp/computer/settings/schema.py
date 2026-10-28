@@ -43,6 +43,7 @@ from enum import StrEnum
 from typing import Any, NotRequired, TypedDict
 
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.path_norm import InvalidPathError, native_platform, normalize_path
 
 logger = get_logger(__name__)
 
@@ -434,8 +435,9 @@ def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[An
     非法项**逐条过滤**并记诊断（不整字段判废——其余授权根仍然生效）；空数组 = 不可读
     （fail-closed，语义由 resolve 管线保证）。**不做** ``~`` 展开：协议 ``normalize_path``
     明确不展开 ``~``，含 ``~`` 的项在运行期按 ``invalid_path`` 处理，故此处不视为绝对路径。
-    双形态（配置 / realpath）与围栏编译在运行期由
-    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` 完成。
+    绝对路径项再经 :func:`~a2c_smcp.utils.path_norm.normalize_path`（宿主平台）预判形态，
+    ``invalid_path`` 在**配置期**即记诊断。双形态（配置 / realpath）在运行期由
+    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` 编译。
     Per-item filtering (one bad root never voids the others); empty = unreadable (fail-closed).
     No ``~`` expansion: the protocol's ``normalize_path`` does not expand it either.
     """
@@ -443,12 +445,22 @@ def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[An
         return _DROP, [_err(scope, key, f"expected array, got {type(value).__name__}")]
     cleaned: list[str] = []
     errors: list[SettingsValidationError] = []
+    platform = native_platform()
     for idx, item in enumerate(value):
+        field = f"{key}[{idx}]"
         if not isinstance(item, str):
-            errors.append(_err(scope, f"{key}[{idx}]", f"expected string, got {type(item).__name__}"))
+            errors.append(_err(scope, field, f"expected string, got {type(item).__name__}"))
             continue
         if not _is_absolute_path(item):
-            errors.append(_err(scope, f"{key}[{idx}]", "must be an absolute path"))
+            errors.append(_err(scope, field, "must be an absolute path"))
+            continue
+        # 形态与运行期同源：用协议 ``normalize_path``（宿主平台）预判 ``invalid_path``，
+        # 配置期即给出诊断，避免「写得进、读不了」。
+        # Same predicate as runtime: pre-validate with the protocol's normalize_path.
+        try:
+            normalize_path(item, platform)
+        except InvalidPathError as exc:
+            errors.append(_err(scope, field, f"invalid path: {exc}"))
             continue
         cleaned.append(item)
     return cleaned, errors

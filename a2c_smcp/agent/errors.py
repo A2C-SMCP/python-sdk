@@ -29,6 +29,9 @@ class SMCPProtocolError(Exception):
       - ``client:get_skill[s]``：``4014`` 复用（SKILL ``name`` 合法但未命中）/ ``4016`` Invalid Name /
         ``4017`` Skill Resource Not Accessible（v0.2.1 ``details.reason``）
       - ``client:get_blob``：``4018 Blob Not Accessible``（v0.2.1 ``details.reason``）
+      - ``client:resolve_path``（v0.5.0 #236 / protocol#65）：``4020 Path Not Accessible``
+        （``details.reason`` ∈ ``invalid_path`` / ``forbidden`` / ``not_found`` / ``not_a_file``，铸造期；
+        resolve 成功后拉取期的撤权 / 删除仍走 ``4018 forbidden`` / ``gone``）
       - ``server:join_office``（#218）：入房被拒 —— ``400``（载荷畸形）/ ``403``（同连接改名，文案追加
         会话身份提示）/ ``4101``（房内本 role 席位已占，``details.role``）/ ``4106``（已在它房）。**未知码同样
         抛出**（宁严勿宽：未来协议新增码时绝不静默放过）。

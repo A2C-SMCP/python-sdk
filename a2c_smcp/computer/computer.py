@@ -63,10 +63,10 @@ from a2c_smcp.computer.blob import (
     default_thresholds,
 )
 from a2c_smcp.computer.blob.path_resolver import (
+    PathPullResult,
     ProtectedPaths,
     ReadRoot,
     ResolvedPath,
-    PathPullResult,
     build_protected_paths,
     build_read_roots,
     resolve_for_pull,
@@ -497,6 +497,19 @@ class Computer(BaseComputer[PromptSession]):
             )
         self._read_roots = compiled
         return compiled
+
+    def refresh_read_roots(self) -> None:
+        """清除 :attr:`read_roots` 的进程内缓存（settings 变更后由宿主调用）。
+
+        Invalidate the in-process ``read_roots`` cache (host calls it after settings changes).
+
+        协议要求拉取期按**当前** ``readRoots`` 重施围栏（覆盖 resolve 后的撤权）；缓存使
+        「运行期改配置」默认需重启生效，宿主若支持热更新设置，MUST 在写回后调用本方法，
+        下一次 resolve / ``get_blob`` 即按新授权判定。
+        The protocol requires pull-time evaluation against the *current* readRoots; hosts that
+        hot-reload settings MUST call this so revocation takes effect immediately.
+        """
+        self._read_roots = None
 
     def protected_paths(self) -> ProtectedPaths:
         """固定拒绝集：即便位于 ``readRoots`` 内也拒绝的 SDK 自管位置（每次现算）。
