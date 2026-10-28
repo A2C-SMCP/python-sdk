@@ -16,16 +16,12 @@ from socketio import AsyncClient
 
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.computer.blob import (
+    HANDLE_KIND_PATH,
     BlobHandleError,
     BlobHandleInvalidError,
     decode_blob_handle,
     encode_skill_handle,
 )
-
-# ``HANDLE_KIND_PATH`` 目前由 path core（#236 流 1）定义在 ``blob/handle.py``，尚未经 ``blob/__init__``
-# 再导出；直接按模块路径导入，待 70 加导出后可改回包级导入（行为等价）。
-# HANDLE_KIND_PATH lives in blob/handle.py and is not yet re-exported by the package.
-from a2c_smcp.computer.blob.handle import HANDLE_KIND_PATH
 from a2c_smcp.computer.blob.path_resolver import PathResolveError
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.base_client import MCPCapabilityNotSupportedError, MCPServerNotFoundError

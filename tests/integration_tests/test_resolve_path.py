@@ -295,6 +295,31 @@ async def test_revoke_after_resolve_makes_pull_forbidden(
 
 
 @pytest.mark.asyncio
+async def test_external_settings_rewrite_revokes_without_refresh(
+    tmp_path: Path, socketio_server: None, server_port: int
+) -> None:
+    """**外部进程**改写 settings（不调用 ``refresh_read_roots``）→ 下一次 ``get_blob`` 即 ``4018 forbidden``.
+
+    协议 MUST：拉取期按**当前** ``readRoots`` 复核，撤权不得依赖宿主显式通知——
+    ``a2c-computer settings set`` 由另一个进程写文件时，运行中的 Computer 不会被回调。
+    """
+    root = tmp_path / "root"
+    (root / "other").mkdir(parents=True)
+    target = root / "external-revoked.txt"
+    target.write_bytes(b"revocable")
+
+    async with _stack(tmp_path, server_port, read_roots=[str(root)]) as (_computer, agent):
+        ret = await agent.resolve_path(COMPUTER, str(target))
+
+        # 外部改写配置文件；不触碰任何 Computer 实例状态
+        _write_user_settings(tmp_path / "cfg", {"readRoots": [str(root / "other")]})
+
+        with pytest.raises(SMCPProtocolError) as exc:
+            await agent.get_blob(COMPUTER, ret["blob_handle"])
+        _assert_protocol_error(exc, 4018, "forbidden")
+
+
+@pytest.mark.asyncio
 async def test_project_scope_read_roots_is_ignored(tmp_path: Path, socketio_server: None, server_port: int) -> None:
     """``project`` scope（入 git）提供 ``readRoots`` → **整字段不生效**，仍不可读."""
     root = tmp_path / "root"

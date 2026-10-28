@@ -364,8 +364,9 @@ class Computer(BaseComputer[PromptSession]):
         # v0.4.0 #196：client:put_blob 上行会话 store + landingRoot（lazy；见 landing_root / blob_upload_store）
         self._blob_upload_store: BlobUploadStore | None = None
         self._landing_root: Path | None = None
-        # v0.5.0 #236 / protocol#65：client:resolve_path 授权读根（lazy；已配置时缓存，见 read_roots）
+        # v0.5.0 #236 / protocol#65：client:resolve_path 授权读根（编译缓存键 = raw 列表；见 read_roots）
         self._read_roots: list[ReadRoot] | None = None
+        self._read_roots_key: tuple[str, ...] | None = None
         self._blob_upload_lock = threading.Lock()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
@@ -472,18 +473,31 @@ class Computer(BaseComputer[PromptSession]):
         :data:`~a2c_smcp.computer.settings.schema.TRUSTED_SCOPE_ONLY_FIELDS` 被整字段剔除），
         跨 scope 按数组语义**拼接去重**（授权只增不减）。
 
-        与 :attr:`landing_root` 同款热启用语义：**已配置时进程内缓存**（运行期改值需重启 Computer），
-        未配置时每次重查，允许事后补配置即时生效。非法的单项（``build_read_roots`` 静默丢弃）
-        与 realpath 失败的根在此记 WARNING 诊断——逐项配置诊断另经 settings 校验错误通道呈现。
-        Cached once configured; unset re-queries (hot-enable friendly). Invalid / realpath-failed
-        roots are logged here; per-item config diagnostics surface via the settings error channel.
+        **授权边界每次请求现读（协议 MUST）**：拉取期 ``get_blob`` 必须按**当前** ``readRoots``
+        复核（覆盖 resolve 后的撤权），且撤权不得依赖宿主记得调用失效入口——``a2c-computer
+        settings set`` 由另一进程改文件时，运行中的 Computer 不会被通知。因此本属性每次调用都
+        重新解析 settings；仅当 **raw 列表未变**时复用已编译的 :class:`ReadRoot`（避免重复
+        realpath），raw 变化即重建。成本 = 每请求多读 2–4 个小 JSON。
+
+        Authorization MUST be re-read on every request: a revocation performed by another
+        process must take effect immediately. Only the *compiled* form is reused while the raw
+        list is unchanged (avoids repeated realpath); any raw change recompiles.
+
+        非法的单项（``build_read_roots`` 静默丢弃）与 realpath 失败的根在**重建时**记 WARNING；
+        逐项配置诊断另经 settings 校验错误通道呈现。
         """
-        if self._read_roots:
-            return self._read_roots
         raw = self._resolve_declared_settings().settings.get(FIELD_READ_ROOTS)
         if not isinstance(raw, list) or not raw:
-            return []  # 未配置：不缓存（与 landing_root 热启用语义对齐）/ unset: not cached
-        compiled = build_read_roots([item for item in raw if isinstance(item, str)])
+            # 未授权 / 撤权到底：清空编译缓存，后续授权恢复时必须重建.
+            # Unset or fully revoked: drop the compiled cache so re-grant recompiles.
+            self._read_roots = None
+            self._read_roots_key = None
+            return []
+        items = [item for item in raw if isinstance(item, str)]
+        key = tuple(items)
+        if self._read_roots is not None and self._read_roots_key == key:
+            return self._read_roots
+        compiled = build_read_roots(items)
         for root in compiled:
             if root.real is None:
                 logger.warning(
@@ -496,20 +510,20 @@ class Computer(BaseComputer[PromptSession]):
                 f"{len(raw) - len(compiled)} readRoots item(s) dropped as invalid",
             )
         self._read_roots = compiled
+        self._read_roots_key = key
         return compiled
 
     def refresh_read_roots(self) -> None:
-        """清除 :attr:`read_roots` 的进程内缓存（settings 变更后由宿主调用）。
+        """显式清除 :attr:`read_roots` 的编译缓存（可选优化入口，**正确性不依赖它**）。
 
-        Invalidate the in-process ``read_roots`` cache (host calls it after settings changes).
+        Explicitly drop the compiled ``read_roots`` cache (an optional hint, **not** load-bearing).
 
-        协议要求拉取期按**当前** ``readRoots`` 重施围栏（覆盖 resolve 后的撤权）；缓存使
-        「运行期改配置」默认需重启生效，宿主若支持热更新设置，MUST 在写回后调用本方法，
-        下一次 resolve / ``get_blob`` 即按新授权判定。
-        The protocol requires pull-time evaluation against the *current* readRoots; hosts that
-        hot-reload settings MUST call this so revocation takes effect immediately.
+        授权边界的**正确性**由「每次请求现读 raw」保证（见 :attr:`read_roots`）；本方法只是让
+        宿主在已知配置变化时跳过下一次比较。撤权由另一进程改文件时无需调用本方法。
+        Correctness comes from re-reading raw on every request; this only skips one comparison.
         """
         self._read_roots = None
+        self._read_roots_key = None
 
     def protected_paths(self) -> ProtectedPaths:
         """固定拒绝集：即便位于 ``readRoots`` 内也拒绝的 SDK 自管位置（每次现算）。
