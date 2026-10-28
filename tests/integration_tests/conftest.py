@@ -10,7 +10,8 @@ English: Global fixtures for integration tests, providing Socket.IO test server 
 """
 
 import socket
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
+from pathlib import Path
 
 import pytest
 from socketio import ASGIApp
@@ -18,6 +19,20 @@ from socketio import ASGIApp
 from a2c_smcp.smcp import SMCP_NAMESPACE
 from a2c_smcp.testing import UvicornTestServer
 from tests.integration_tests.mock_socketio_server import MockComputerServerNamespace, create_computer_test_socketio
+
+
+@pytest.fixture(autouse=True)
+def isolate_a2c_identity_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """v0.5.0（protocol#64）：隔离 Computer 身份持久化目录（``$XDG_CONFIG_HOME/a2c``）。
+
+    缺了它，集成测试里任何真实 ``SMCPComputerClient`` 都会读写开发者本机的
+    ``~/.config/a2c/computer-id``——测试之间共享身份、并污染真实配置。
+    Isolate the persisted Computer identity so integration tests never touch the real config.
+    """
+    xdg_home = tmp_path / "xdg-config"
+    xdg_home.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    yield xdg_home
 
 
 @pytest.fixture

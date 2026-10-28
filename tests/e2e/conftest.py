@@ -28,6 +28,20 @@ from a2c_smcp.testing import (
     run_http_server,
 )
 
+@pytest.fixture(autouse=True)
+def isolate_a2c_identity_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """v0.5.0（protocol#64）：隔离 Computer 身份持久化目录（``$XDG_CONFIG_HOME/a2c``）。
+
+    e2e 起真实进程（pexpect / 子进程），子进程继承本进程环境 ⇒ 在此设置即可让它们写入临时目录，
+    不碰开发者本机的 ``~/.config/a2c/computer-id``。
+    Isolate the persisted Computer identity; spawned e2e processes inherit this env var.
+    """
+    xdg_home = tmp_path / "xdg-config"
+    xdg_home.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    yield xdg_home
+
+
 # ============================================================================
 # 中文: 服务端装配与 runner 已下沉至 a2c_smcp.testing（#187），此处仅 re-export 供本目录测试引用
 # English: Assembly + runners now live in a2c_smcp.testing (#187); re-exported here for local tests

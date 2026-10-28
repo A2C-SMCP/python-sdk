@@ -14,8 +14,8 @@ from urllib.parse import parse_qs
 from socketio import AsyncNamespace
 
 from a2c_smcp.server.auth import AuthenticationProvider
-from a2c_smcp.server.name_registry import claim_seat, release_name, release_seats, reserve_name
-from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID
+from a2c_smcp.server.name_registry import claim_seat, record_identity, release_name, release_seats, reserve_name
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID, IdentityRecord
 from a2c_smcp.server.utils import office_room
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 
@@ -51,6 +51,12 @@ class BaseNamespace(AsyncNamespace):
         # Seat table (#230, admission authority) + reverse index; claimed atomically before any side effect.
         self._seat_to_sid: dict[SEAT_KEY, SID] = {}
         self._sid_to_seats: dict[SID, set[SEAT_KEY]] = {}
+        # 身份记录 sid → (role, name, computer_id)（v0.5.0 / protocol#64）：**单一三元组**，首次通过身份
+        # 校验即记录（400/403 之后、4106/4101 之前），随连接存续（leave 不清除、拒绝不回滚），断连收尾
+        # 时与注册表一同清理。它同时是「残留 leave 宣告」在会话清理后仍可读的 computer_id 载体。
+        # Identity triple per sid (protocol#64): recorded on first pass, kept for the connection's
+        # lifetime, and readable for residual leave announcements after session cleanup.
+        self._sid_identity: dict[SID, IdentityRecord] = {}
 
     async def on_connect(self, sid: SID, environ: dict, auth: dict | None = None) -> bool:
         """
@@ -124,9 +130,15 @@ class BaseNamespace(AsyncNamespace):
             release_seats(self._seat_to_sid, self._sid_to_seats, sid)
             if residual is not None:
                 try:
+                    # 身份记录**先于**注销可用：残留 leave 的 ``computer_id`` 只能从这里取（会话可能已清理）。
+                    # The identity record must still be readable here — it carries computer_id for the
+                    # residual leave after the session may already be gone.
                     await self._announce_residual_leave(sid, residual)
                 except Exception:
                     logger.exception(f"残留键 leave 宣告失败（键已注销）/ residual leave announce failed: {residual}")
+            # 身份记录随连接销毁（与席位 / 名字同属连接态）。放在残留宣告**之后**：宣告需要它。
+            # The identity record dies with the connection, after the residual announcement.
+            self._sid_identity.pop(sid, None)
 
         logger.info(f"SocketIO Client {sid} disconnected from {self.namespace}")
 
@@ -190,6 +202,22 @@ class BaseNamespace(AsyncNamespace):
         released = release_seats(self._seat_to_sid, self._sid_to_seats, sid, office_id)
         if released:
             logger.debug(f"Released seats {released!r} for sid '{sid}' in namespace {self.namespace}")
+
+    async def _claim_identity(self, sid: SID, role: str, name: str, computer_id: str | None) -> bool:
+        """**原子**「身份声明一致性校验 + 首次记录」（protocol#64；与 sync 端同一同步核心）。
+
+        在 ``400`` 校验之后、``4106`` / ``4101`` 之前调用（协议 room-model.md §Computer 身份）。原子性是
+        结构保证：核心 :func:`~a2c_smcp.server.name_registry.record_identity` 无 await、不取锁。
+        Atomic compare-and-record; structural atomicity via the synchronous core.
+
+        Returns:
+            bool: ``False`` = 与既有记录不符 ⇒ 调用方回 ``403``。
+        """
+        return record_identity(
+            self._sid_identity,
+            sid,
+            IdentityRecord(role=role, name=name, computer_id=computer_id),
+        )
 
     async def _register_name(self, office_id: OFFICE_ID, role: str, name: str, sid: SID) -> None:
         """

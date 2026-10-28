@@ -74,7 +74,11 @@ async def _run(value: Any) -> Any:
 
 
 def _join(role: str, name: str, office: str) -> dict[str, str]:
-    return {"role": role, "name": name, "office_id": office}
+    payload = {"role": role, "name": name, "office_id": office}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键。
+    if role == "computer":
+        payload["computer_id"] = "11111111-1111-4111-8111-111111111111"
+    return payload
 
 
 def _get_tools(computer: str) -> dict[str, str]:
@@ -385,7 +389,14 @@ class TestDisconnectOrdering:
         await _run(_disconnect_now(ns, "pc"))
 
         assert ns._name_to_sid_map == {}
-        assert _emitted(ns, LEAVE_OFFICE_NOTIFICATION) == [{"office_id": "office-a", "computer": "pc"}]
+        # protocol#64：残留 leave 的 computer_id 取自身份记录（会话清理后仍可读）
+        assert _emitted(ns, LEAVE_OFFICE_NOTIFICATION) == [
+            {
+                "office_id": "office-a",
+                "computer": "pc",
+                "computer_id": "11111111-1111-4111-8111-111111111111",
+            },
+        ]
 
     async def test_key_released_during_enter_broadcast_is_compensated(self, kind: str) -> None:
         sessions: dict[str, dict[str, Any]] = {"pc": {}}

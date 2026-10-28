@@ -19,11 +19,23 @@ from unittest.mock import MagicMock
 import pytest
 
 from a2c_smcp.server import SMCPNamespace, SyncAuthenticationProvider, SyncSMCPNamespace
+from a2c_smcp.server.types import IdentityRecord
 from a2c_smcp.smcp import SMCP_NAMESPACE
 
 PEER_SID = "PEER-SID-SENTINEL-9f3a"
 PEER_NAME = "peer-name-sentinel"
 NAMESPACE_NAME = SMCP_NAMESPACE
+
+# v0.5.0（protocol#64）：Computer 入房 MUST 携带合法 computer_id；Agent MUST NOT 出现该键。
+_COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _join(role: str, name: str, office: str) -> dict[str, Any]:
+    """构造协议合规的 ``server:join_office`` 载荷（Computer 自动带 ``computer_id``）。"""
+    payload: dict[str, Any] = {"role": role, "name": name, "office_id": office}
+    if role == "computer":
+        payload["computer_id"] = _COMPUTER_ID
+    return payload
 
 
 def _namespace(
@@ -64,7 +76,7 @@ class TestJoinOfficeAckShapeSync:
         sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
         ns = _namespace(sessions)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
 
         assert ack is None, f"成功必须是空 ack（None），实得 {ack!r}"
         assert sessions["sid-1"]["office_id"] == "room-a"
@@ -85,8 +97,10 @@ class TestJoinOfficeAckShapeSync:
 
     def test_role_mismatch_is_403(self) -> None:
         ns = _namespace({"sid-1": {"role": "agent"}})
+        # protocol#64：判据是身份记录三元组（首次 join 通过时写入），不是会话字段。
+        ns._sid_identity["sid-1"] = IdentityRecord(role="agent", name="c1", computer_id=None)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
 
         assert isinstance(ack, dict) and ack["code"] == 403, ack
         assert "details" not in ack, ack
@@ -96,8 +110,9 @@ class TestJoinOfficeAckShapeSync:
         """同一 sid 声明与会话不同的 name ⇒ `403`（#221；同步镜像）。"""
         sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "old-name"}}
         ns = _namespace(sessions)
+        ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="old-name", computer_id=_COMPUTER_ID)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "new-name", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "new-name", "room-a"))
 
         assert isinstance(ack, dict) and ack["code"] == 403, ack
         assert "details" not in ack, ack
@@ -112,8 +127,9 @@ class TestJoinOfficeAckShapeSync:
         """
         sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "real-name"}}
         ns = _namespace(sessions)
+        ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="real-name", computer_id=_COMPUTER_ID)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "", "room-a"))
 
         assert isinstance(ack, dict) and ack["code"] == 403, ack
 
@@ -126,42 +142,45 @@ class TestJoinOfficeAckShapeSync:
         sessions: dict[str, dict[str, Any]] = {"sid-abc123": {}}
         ns = _namespace(sessions)
 
-        first = ns.on_server_join_office("sid-abc123", {"role": "computer", "name": "", "office_id": "room-a"})
+        first = ns.on_server_join_office("sid-abc123", _join("computer", "", "room-a"))
         assert first is None, f"首次空名入房应放行，实得 {first!r}"
         assert sessions["sid-abc123"]["name"] == "computer_sid-ab", sessions["sid-abc123"]
 
-        second = ns.on_server_join_office("sid-abc123", {"role": "computer", "name": "", "office_id": "room-a"})
+        second = ns.on_server_join_office("sid-abc123", _join("computer", "", "room-a"))
         assert second is None, f"重复空名入房应幂等放行，实得 {second!r}"
 
-        other = ns.on_server_join_office("sid-abc123", {"role": "computer", "name": "alice", "office_id": "room-a"})
+        other = ns.on_server_join_office("sid-abc123", _join("computer", "alice", "room-a"))
         assert isinstance(other, dict) and other["code"] == 403, other
 
     def test_same_name_rejoin_is_allowed(self) -> None:
         """同名单连（重复 join / 换房）⇒ 放行（同步镜像）。"""
-        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "c1", "office_id": "room-a"}}
+        sessions: dict[str, dict[str, Any]] = {"sid-1": _join("computer", "c1", "room-a")}
         ns = _namespace(sessions)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-b"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-b"))
 
         assert ack is None, f"同名（换房）应放行，实得 {ack!r}"
         assert sessions["sid-1"]["office_id"] == "room-b"
 
-    def test_name_may_change_after_failed_join_rolled_it_back(self) -> None:
-        """上次入房失败（name 已回滚）后换名重入 ⇒ 放行（同步镜像）。"""
+    def test_identity_record_survives_failed_join_so_rename_is_403(self) -> None:
+        """上次入房被 4101 拒绝后身份记录**不回滚**；同一连接换名重入 ⇒ 403（同步镜像）。
+
+        protocol#64：记录点在 400/403 之后、4106/4101 之前，随连接存续——#213 旧回滚语义的反向断言。
+        """
         sessions: dict[str, dict[str, Any]] = {
             "sid-1": {"role": "computer"},
-            PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-a"},
+            PEER_SID: _join("computer", "dup", "room-a"),
         }
         ns = _namespace(sessions)
         _seat(ns, "room-a", "computer", PEER_SID)  # #230：目标房的 Computer 席位已被对端占据
 
-        first = ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-a"})
+        first = ns.on_server_join_office("sid-1", _join("computer", "dup", "room-a"))
         assert isinstance(first, dict) and first["code"] == 4101, first
-        assert "name" not in sessions["sid-1"], f"被拒后会话不得残留 name: {sessions['sid-1']!r}"
+        assert sessions["sid-1"]["name"] == "dup", f"被拒后身份声明应保留: {sessions['sid-1']!r}"
+        assert ns._sid_identity["sid-1"] == ("computer", "dup", _COMPUTER_ID)
 
-        second = ns.on_server_join_office("sid-1", {"role": "computer", "name": "other", "office_id": "room-b"})
-        assert second is None, f"身份未落地时应允许任意 name，实得 {second!r}"
-        assert sessions["sid-1"]["name"] == "other"
+        second = ns.on_server_join_office("sid-1", _join("computer", "other", "room-b"))
+        assert isinstance(second, dict) and second["code"] == 403, f"改名应被 403，实得 {second!r}"
 
     def test_room_full_is_4101_with_rejected_target_room(self) -> None:
         sessions: dict[str, dict[str, Any]] = {
@@ -196,15 +215,15 @@ class TestJoinOfficeAckShapeSync:
     def test_computer_switch_into_occupied_room_is_4101(self) -> None:
         """目标房已有（同名的）另一台 Computer ⇒ `4101 {role: computer}`，不得回 `4105`（同步镜像；含「校验先于副作用」）。"""
         sessions: dict[str, dict[str, Any]] = {
-            "sid-1": {"role": "computer", "name": "dup", "office_id": "room-a"},
-            PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
+            "sid-1": _join("computer", "dup", "room-a"),
+            PEER_SID: _join("computer", "dup", "room-b"),
         }
         ns = _namespace(sessions)
         _seat(ns, "room-a", "computer", "sid-1")
         _seat(ns, "room-b", "computer", PEER_SID)
         ns._name_to_sid_map = {("room-a", "computer", "dup"): "sid-1", ("room-b", "computer", "dup"): PEER_SID}
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "dup", "office_id": "room-b"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "dup", "room-b"))
 
         assert ack == {
             "code": 4101,
@@ -221,7 +240,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
         _seat(ns, "room-b", "computer", PEER_SID)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "taken", "room-b"))
 
         assert isinstance(ack, dict) and ack["code"] == 4101, ack
         assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
@@ -233,7 +252,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace(sessions)
         ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "taken", "room-b"))
 
         assert ack == {"code": 500, "message": "Internal error"}, ack
         assert ns._seat_to_sid == {} and ns._sid_to_seats == {}
@@ -253,7 +272,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace(sessions)
 
         ack = ns.on_server_join_office(
-            "sid-1", {"role": "computer", "name": "c1", "office_id": "room-a"}, "unexpected"
+            "sid-1", _join("computer", "c1", "room-a"), "unexpected"
         )
 
         assert isinstance(ack, dict) and ack["code"] == 400, ack
@@ -269,7 +288,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
         _seat(ns, "room-b", "computer", PEER_SID)
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "taken", "office_id": "room-b"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "taken", "room-b"))
 
         logged = " ".join(str(call) for call in fake_logger.warning.call_args_list)
         assert PEER_SID in logged, "诊断（含对端 sid）必须留在服务端日志里"
@@ -282,7 +301,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace({"sid-1": {}})
         ns.enter_room = MagicMock(side_effect=RoomRejection())
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
 
         assert isinstance(ack, dict) and ack["code"] == 500, ack
 
@@ -296,7 +315,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace({"sid-1": {}})
         ns.enter_room = MagicMock(side_effect=NoneCodeRejection())
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
 
         assert isinstance(ack, dict) and ack["code"] == 500, ack
 
@@ -304,7 +323,7 @@ class TestJoinOfficeAckShapeSync:
         ns = _namespace({"sid-1": {}})
         ns.enter_room = MagicMock(side_effect=RuntimeError("boom-internal-detail"))
 
-        ack = ns.on_server_join_office("sid-1", {"role": "computer", "name": "c1", "office_id": "room-a"})
+        ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
 
         assert isinstance(ack, dict) and ack["code"] == 500, ack
         assert "Internal server error" not in ack["message"], ack
@@ -460,15 +479,16 @@ class TestSyncAsyncPayloadParitySync:
         scenarios: list[tuple[str, dict[str, Any], list[tuple[str, str]], dict[str, Any]]] = [
             (
                 "role-mismatch",
-                {"role": "computer", "name": "c1", "office_id": "room-a"},
+                _join("computer", "c1", "room-a"),
                 [],
-                {"session": {"role": "agent"}},
+                # protocol#64：身份判据是记录三元组；夹具须先种记录（否则首次声明会放行）
+                {"session": {"role": "agent"}, "_identity": ("agent", "c1", None)},
             ),
             (
                 "name-mismatch",
-                {"role": "computer", "name": "new-name", "office_id": "room-a"},
+                _join("computer", "new-name", "room-a"),
                 [],
-                {"session": {"role": "computer", "name": "old-name"}},
+                {"session": {"role": "computer", "name": "old-name"}, "_identity": ("computer", "old-name", _COMPUTER_ID)},
             ),
             (
                 "room-full",
@@ -484,17 +504,17 @@ class TestSyncAsyncPayloadParitySync:
             ),
             (
                 "computer-seat-taken-same-name",
-                {"role": "computer", "name": "dup", "office_id": "room-b"},
+                _join("computer", "dup", "room-b"),
                 [("room-b", "computer")],
                 {
                     "session": {"role": "computer", "name": "dup"},
-                    PEER_SID: {"role": "computer", "name": "dup", "office_id": "room-b"},
+                    PEER_SID: _join("computer", "dup", "room-b"),
                     "_registry": {("room-b", "computer", "dup"): PEER_SID},
                 },
             ),
             (
                 "registry-contradiction",
-                {"role": "computer", "name": "taken", "office_id": "room-b"},
+                _join("computer", "taken", "room-b"),
                 [],
                 {"session": {"role": "computer", "name": "taken"}, "_registry": {("room-b", "computer", "taken"): PEER_SID}},
             ),
@@ -505,14 +525,17 @@ class TestSyncAsyncPayloadParitySync:
         for label, payload, peer_seats, spec in scenarios:
             sync_sessions: dict[str, dict[str, Any]] = {}
             for key, value in spec.items():
-                if key == "_registry":
+                if key in ("_registry", "_identity"):
                     continue
                 sync_sessions["sid-1" if key == "session" else key] = dict(value)  # type: ignore[arg-type]
             async_sessions: dict[str, dict[str, Any]] = {k: dict(v) for k, v in sync_sessions.items()}
 
             sync_ns = _namespace(sync_sessions)
             async_ns = self._build_async(async_sessions, [])
+            identity = spec.get("_identity")
             for each in (sync_ns, async_ns):
+                if identity is not None:
+                    each._sid_identity["sid-1"] = IdentityRecord(*identity)  # type: ignore[arg-type]
                 for office_id, role in peer_seats:
                     _seat(each, office_id, role, PEER_SID)
                 if "_registry" in spec:

@@ -384,7 +384,7 @@ class TestSMCPAgentClient:
             "computer": "",
         }
 
-        with pytest.raises(AssertionError, match="无效的计算机ID"):
+        with pytest.raises(AssertionError, match="无效的计算机名称"):
             client.validate_office_data(data)
 
     @patch("socketio.Client.call")

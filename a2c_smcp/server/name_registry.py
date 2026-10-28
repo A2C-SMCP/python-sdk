@@ -10,7 +10,7 @@
 """
 
 from a2c_smcp.exceptions import RoomFullError
-from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SEAT_KEY, SID, IdentityRecord
 
 
 class SessionGoneError(RuntimeError):
@@ -97,6 +97,33 @@ def release_seats(
     if not held:
         del seats_by_sid[sid]
     return released
+
+
+def record_identity(
+    identities: dict[SID, IdentityRecord],
+    sid: SID,
+    identity: IdentityRecord,
+) -> bool:
+    """**原子**「身份一致性校验 + 首次记录」（v0.5.0 / protocol#64，房间模型 §Computer 身份）。
+
+    协议要求：同一 sid 的「一致性校验 + 记录」MUST 原子；首次通过校验即记录（``400`` / ``403`` 之后、
+    ``4106`` / ``4101`` 之前），此后同一 sid 携带不同 ``role`` / ``name`` / ``computer_id`` ⇒ ``403``。
+    记录**随连接存续**：``leave_office`` 不清除，``4101`` / ``4106`` / ``500`` 拒绝也不回滚。
+
+    与 :func:`claim_seat` 同一原子性模型：**无 await、不取锁**；sync 端在注册表锁内调用，async 端依赖
+    零挂起点（本函数刻意写成同步函数，使原子性成为结构保证）。
+
+    Atomic compare-and-record of the identity triple; the record persists for the connection's lifetime.
+    The caller provides atomicity (registry lock on sync, zero suspension points on async).
+
+    Returns:
+        bool: ``True`` = 与本 sid 既有记录一致（或本次首次记录）；``False`` = 声明与记录不同 ⇒ ``403``。
+    """
+    existing = identities.get(sid)
+    if existing is None:
+        identities[sid] = identity
+        return True
+    return existing == identity
 
 
 def reserve_name(

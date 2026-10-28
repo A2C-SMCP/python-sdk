@@ -74,7 +74,11 @@ def make_ns(request: pytest.FixtureRequest) -> Callable[..., Any]:
 
 
 def _join(role: str, name: str, office: str) -> dict[str, str]:
-    return {"role": role, "name": name, "office_id": office}
+    payload = {"role": role, "name": name, "office_id": office}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键。
+    if role == "computer":
+        payload["computer_id"] = "11111111-1111-4111-8111-111111111111"
+    return payload
 
 
 _BASE = {"agent": "ag", "req_id": "r", "computer": "pc"}

@@ -527,21 +527,25 @@ class BaseAgentClient(ABC):
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
-        验证办公室数据并返回计算机ID
-        Validate office data and return computer ID
+        验证办公室数据并返回 **Computer 名称**（``computer`` 字段是房内路由地址，**不是**身份）。
+
+        v0.5.0（protocol#64）起，机器身份是独立字段 ``computer_id``（持久 UUID）；``computer`` 仍是
+        用户可自取、仅房内唯一的展示名 / 路由地址。两者不得混称。
+        Validate office data and return the Computer **name** (``computer`` is the routing/display
+        name, not the machine identity — since v0.5.0 the identity is the separate ``computer_id``).
 
         Args:
             data: 办公室通知数据 / Office notification data
 
         Returns:
-            str: 计算机ID / Computer ID
+            str: Computer 名称 / Computer name
 
         Raises:
             AssertionError: 当数据无效时 / When data is invalid
         """
         agent_config = self.auth_provider.get_agent_config()
         assert data["office_id"] == agent_config["office_id"], "无效的办公室ID / Invalid office ID"
-        assert data.get("computer"), "无效的计算机ID / Invalid computer ID"
+        assert data.get("computer"), "无效的计算机名称 / Invalid computer name"
         return cast(str, data["computer"])
 
     async def handle_computer_enter_office(self, data: EnterOfficeNotification) -> None:
@@ -1120,21 +1124,25 @@ class BaseAgentSyncClient(ABC):
 
     def validate_office_data(self, data: EnterOfficeNotification | LeaveOfficeNotification) -> str:
         """
-        验证办公室数据并返回计算机ID
-        Validate office data and return computer ID
+        验证办公室数据并返回 **Computer 名称**（``computer`` 字段是房内路由地址，**不是**身份）。
+
+        v0.5.0（protocol#64）起，机器身份是独立字段 ``computer_id``（持久 UUID）；``computer`` 仍是
+        用户可自取、仅房内唯一的展示名 / 路由地址。两者不得混称。
+        Validate office data and return the Computer **name** (``computer`` is the routing/display
+        name, not the machine identity — since v0.5.0 the identity is the separate ``computer_id``).
 
         Args:
             data: 办公室通知数据 / Office notification data
 
         Returns:
-            str: 计算机ID / Computer ID
+            str: Computer 名称 / Computer name
 
         Raises:
             AssertionError: 当数据无效时 / When data is invalid
         """
         agent_config = self.auth_provider.get_agent_config()
         assert data["office_id"] == agent_config["office_id"], "无效的办公室ID / Invalid office ID"
-        assert data.get("computer"), "无效的计算机ID / Invalid computer ID"
+        assert data.get("computer"), "无效的计算机名称 / Invalid computer name"
         return cast(str, data["computer"])
 
     def handle_computer_enter_office(self, data: EnterOfficeNotification) -> None:
