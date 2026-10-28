@@ -67,3 +67,11 @@ replace = '__version__: str = "{new_version}"'
 filename = "pyproject.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
+
+# uv.lock：根包 a2c-smcp 的版本行随 bump 在同一 commit 内更新，避免手动同步与移动 tag。
+# 用包名锚定，避免误改依赖包中可能出现的同版本字符串；`(?m)` 为多行标志。
+[[tool.bumpversion.files]]
+filename = "uv.lock"
+regex = true
+search = '(?m)^name = "a2c-smcp"\nversion = "{current_version}"'
+replace = 'name = "a2c-smcp"\nversion = "{new_version}"'
