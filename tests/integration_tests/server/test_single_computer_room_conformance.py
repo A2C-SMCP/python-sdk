@@ -383,6 +383,10 @@ async def test_10_computer_id_missing_or_malformed_is_400(peers: Any) -> None:
         "not-a-uuid",
         "00000000-0000-0000-0000-000000000000",  # nil
         "ffffffff-ffff-ffff-ffff-ffffffffffff",  # max
+        # protocol#64 / PR #74：整串 + 恰 36 字符；空白与换行一律 400
+        X + "\n",
+        " " + X,
+        X + " ",
     ]
     for bad in bad_values:
         payload: dict[str, Any] = {"role": "computer", "name": "C1", "office_id": "R1"}

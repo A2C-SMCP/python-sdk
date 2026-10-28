@@ -34,19 +34,56 @@ def _make_client() -> SMCPComputerClient:
 class TestMaterialization:
     """物化时机与失败语义。"""
 
-    def test_no_identity_before_connect(self) -> None:
-        """构造客户端 / import 都不得产生身份配置副作用。"""
+    def test_no_identity_before_connect(self, isolate_a2c_identity_config: Path) -> None:
+        """构造客户端 / import 都不得产生身份配置副作用（整棵 XDG 树为空，不只是身份文件）。"""
         client = _make_client()
         assert client._computer_id is None
-        assert not identity_store_path().exists(), "connect 之前不得落盘身份文件"
+        assert list(isolate_a2c_identity_config.rglob("*")) == [], "connect 之前不得产生任何身份配置副作用"
 
-    def test_pure_mcp_host_construction_creates_no_identity(self, tmp_path: Path) -> None:
-        """纯 MCP 宿主（只构造 Computer、不连 Socket.IO）不得创建身份配置。"""
+    def test_pure_mcp_host_construction_creates_no_identity(
+        self,
+        tmp_path: Path,
+        isolate_a2c_identity_config: Path,
+    ) -> None:
+        """纯 MCP 宿主（只构造 Computer、不连 Socket.IO）不得创建身份配置（整棵 XDG 树为空）。"""
         from a2c_smcp.computer.computer import Computer
 
         Computer(name="pure-mcp-host", blob_cache_root=tmp_path)
 
-        assert not identity_store_path().exists(), "Computer 构造不得物化身份（时机 = 首次 connect）"
+        assert list(isolate_a2c_identity_config.rglob("*")) == [], "Computer 构造不得物化身份（时机 = 首次 connect）"
+
+    @pytest.mark.asyncio
+    async def test_dual_instance_env_identity_isolation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fix-review 🔴1：两台注入不同 env 的 Computer ⇒ 各自独立的身份文件（不得共读 ambient）。
+
+        与 ``test_computer_env_injection.py`` 的 A/B 双实例范式同构：环境锚点必须跟实例走。
+        """
+        from a2c_smcp.computer.computer import Computer
+
+        env_a = {"XDG_CONFIG_HOME": str(tmp_path / "xdg-a"), "HOME": str(tmp_path / "home-a")}
+        env_b = {"XDG_CONFIG_HOME": str(tmp_path / "xdg-b"), "HOME": str(tmp_path / "home-b")}
+        comp_a = Computer(name="A", env=env_a, blob_cache_root=tmp_path / "blob-a")
+        comp_b = Computer(name="B", env=env_b, blob_cache_root=tmp_path / "blob-b")
+        client_a = SMCPComputerClient(computer=comp_a)
+        client_b = SMCPComputerClient(computer=comp_b)
+        monkeypatch.setattr(AsyncClient, "connect", AsyncMock())
+
+        await client_a.connect("http://localhost:1")
+        await client_b.connect("http://localhost:1")
+
+        assert client_a._computer_id != client_b._computer_id
+        assert identity_store_path(env_a).read_text(encoding="utf-8") == f"{client_a._computer_id}\n"
+        assert identity_store_path(env_b).read_text(encoding="utf-8") == f"{client_b._computer_id}\n"
+        assert identity_store_path(env_a) != identity_store_path(env_b)
+
+        # 重置也跟随实例 env：只改 A 的文件，B 不受影响
+        new_a = await client_a.reset_identity()
+        assert identity_store_path(env_a).read_text(encoding="utf-8") == f"{new_a}\n"
+        assert identity_store_path(env_b).read_text(encoding="utf-8") == f"{client_b._computer_id}\n"
 
     @pytest.mark.asyncio
     async def test_connect_materializes_and_persists(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,7 +146,7 @@ class TestJoinRequests:
 
     @pytest.mark.asyncio
     async def test_lazy_identity_for_embedded_join_without_connect(self) -> None:
-        """嵌入方绕过 connect 直接 join ⇒ _ensure_computer_id 兜底并落盘（幂等）。"""
+        """嵌入方绕过 connect 直接 join ⇒ _amaterialize_computer_id 兜底并落盘（幂等）。"""
         client = _make_client()
         client.call = AsyncMock(return_value=None)  # type: ignore[method-assign]
 

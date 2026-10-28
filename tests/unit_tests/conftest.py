@@ -8,7 +8,7 @@
 单元测试全局夹具 / Global unit-test fixtures.
 
 v0.5.0（protocol#64）：Computer 稳定身份持久化在 ``$XDG_CONFIG_HOME/a2c/computer-id``（未设置则为
-``~/.config/a2c``）。任何触发 ``SMCPComputerClient.connect`` / ``_ensure_computer_id`` 的测试都必须
+``~/.config/a2c``）。任何触发 ``SMCPComputerClient.connect`` / ``_amaterialize_computer_id`` 的测试都必须
 隔离该目录，否则会读写开发者真实身份文件、并在本机首次运行后留下跨测试共享状态。
 Since v0.5.0 the Computer identity is persisted under ``$XDG_CONFIG_HOME``; isolate it per test.
 """

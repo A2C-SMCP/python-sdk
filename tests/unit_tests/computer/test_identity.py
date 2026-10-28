@@ -41,18 +41,29 @@ class TestPathResolution:
 
     def test_absolute_xdg_config_home_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        assert identity_store_path() == tmp_path / "a2c" / "computer-id"
+        # 与 mcp.json / settings.json 共用 resolve_user_config_dir ⇒ 结果已 expanduser().resolve()
+        assert identity_store_path() == (tmp_path / "a2c" / "computer-id").resolve()
 
     def test_relative_xdg_config_home_is_ignored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # XDG 规范：相对路径的 XDG_CONFIG_HOME 视为未设置 / relative values are ignored per XDG
         monkeypatch.setenv("XDG_CONFIG_HOME", "relative/config")
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert identity_store_path() == tmp_path / ".config" / "a2c" / "computer-id"
+        assert identity_store_path() == (tmp_path / ".config" / "a2c" / "computer-id").resolve()
 
     def test_missing_xdg_falls_back_to_dot_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert identity_store_path() == tmp_path / ".config" / "a2c" / "computer-id"
+        assert identity_store_path() == (tmp_path / ".config" / "a2c" / "computer-id").resolve()
+
+    def test_whitespace_padded_xdg_is_stripped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """fix-review 阻塞项：XDG 带空白时必须与配置子系统解析到同一目录（不得分叉）。"""
+        monkeypatch.setenv("XDG_CONFIG_HOME", f"  {tmp_path}  ")
+        assert identity_store_path() == (tmp_path / "a2c" / "computer-id").resolve()
+
+    def test_whitespace_only_xdg_falls_back(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("XDG_CONFIG_HOME", "   ")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert identity_store_path() == (tmp_path / ".config" / "a2c" / "computer-id").resolve()
 
 
 class TestPersistence:
@@ -74,6 +85,17 @@ class TestPersistence:
 
         assert stat.S_IMODE(os.stat(path.parent).st_mode) == IDENTITY_DIR_MODE
         assert stat.S_IMODE(os.stat(path).st_mode) == IDENTITY_FILE_MODE
+
+    def test_existing_directory_permissions_are_not_changed(self, tmp_path: Path) -> None:
+        """fix-review 🟡2：既存配置目录（mcp.json / settings.json 的家）权限不得被收紧到 0700。"""
+        directory = tmp_path / "a2c"
+        directory.mkdir()
+        os.chmod(directory, 0o750)
+
+        load_or_create_computer_id(directory / "computer-id")
+
+        assert stat.S_IMODE(os.stat(directory).st_mode) == 0o750, "既存目录权限必须原样保留"
+        assert stat.S_IMODE(os.stat(directory / "computer-id").st_mode) == IDENTITY_FILE_MODE
 
     def test_reuse_across_calls_and_process_restart(self, tmp_path: Path) -> None:
         path = _identity_file(tmp_path)
@@ -111,6 +133,15 @@ class TestCorruptionAndConcurrency:
             load_or_create_computer_id(path)
         # 绝不自动覆写：损坏内容原样保留 / never overwrite a corrupt identity silently
         assert path.read_text(encoding="utf-8") == "not-a-uuid\n"
+
+    def test_trailing_newline_in_value_is_corrupt(self, tmp_path: Path) -> None:
+        """fix-review 阻塞项：``<uuid>\\n\\n`` 不得被当成合法（整串 + 恰 36 字符）。"""
+        path = _identity_file(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("abcdef01-2345-4678-8abc-def012345678\n\n", encoding="utf-8")
+
+        with pytest.raises(ComputerIdentityError, match="非法"):
+            load_or_create_computer_id(path)
 
     def test_nil_and_uppercase_are_corrupt(self, tmp_path: Path) -> None:
         path = _identity_file(tmp_path)
