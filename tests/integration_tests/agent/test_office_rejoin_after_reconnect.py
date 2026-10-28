@@ -293,6 +293,8 @@ async def test_explicit_join_rejected_by_real_server_raises_with_code(
             await second.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
 
         assert ei.value.code == 4101, f"应带真实协议码，实得 {ei.value!r}"
+        # #234：真实 ack 的 details 必须原样到达宿主（协议标准 key：被拒目标房 + 发起者自己声明的 role）
+        assert ei.value.details == {"office_id": _OFFICE, "role": "agent"}, f"4101 须透出 details，实得 {ei.value.details!r}"
         assert second._desired_office is None, "首次被拒（无已确认房可回退）⇒ 清空意图"
         assert second._confirmed_office is None
 
@@ -302,6 +304,32 @@ async def test_explicit_join_rejected_by_real_server_raises_with_code(
     finally:
         await first.disconnect()
         await second.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_explicit_switch_room_rejected_by_real_server_carries_current_office(
+    office_server: _OfficeRecordingNamespace,  # 请求它是为了启动服务器（副作用），非断言对象
+    basic_server_port: int,
+) -> None:
+    """换房被**真实闸门**拒绝（4106）⇒ ``details.office_id`` 是**当前**房，不是目标房（#234）。
+
+    协议 error-handling.md §4106：Agent 换房须先显式退房；``details.office_id`` 报会话**当前**所在房。
+    宿主（TFRS 换房流程）据此决定先退哪个房。
+    """
+    agent = _make_agent()
+    new_office = f"{_OFFICE}-target"
+    try:
+        await _connect(agent, basic_server_port)
+        await agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert agent._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+        with pytest.raises(SMCPProtocolError) as ei:
+            await agent.join_office(new_office, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+        assert ei.value.code == 4106, f"应带真实协议码，实得 {ei.value!r}"
+        assert ei.value.details == {"office_id": _OFFICE}, f"4106 须报当前房而非目标房，实得 {ei.value.details!r}"
+    finally:
+        await agent.disconnect()
 
 
 @pytest.mark.asyncio

@@ -383,6 +383,8 @@ def test_sync_explicit_join_rejected_by_real_server_raises_with_code(
             second.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
 
         assert ei.value.code == 4101, f"应带真实协议码，实得 {ei.value!r}"
+        # #234（同步镜像）：真实 ack 的 details 必须原样到达宿主
+        assert ei.value.details == {"office_id": _OFFICE, "role": "agent"}, f"4101 须透出 details，实得 {ei.value.details!r}"
         assert second._desired_office is None, "首次被拒（无已确认房可回退）⇒ 清空意图"
         assert second._confirmed_office is None
 
@@ -391,6 +393,26 @@ def test_sync_explicit_join_rejected_by_real_server_raises_with_code(
     finally:
         first.disconnect()
         second.disconnect()
+
+
+def test_sync_explicit_switch_room_rejected_by_real_server_carries_current_office(
+    real_sync_server: int,
+) -> None:
+    """同步镜像（#234）：换房被真实闸门以 4106 拒绝 ⇒ ``details.office_id`` 是当前房而非目标房。"""
+    agent = _make_agent()
+    new_office = f"{_OFFICE}-target"
+    try:
+        agent.connect_to_server(f"http://localhost:{real_sync_server}", socketio_path="/socket.io")
+        agent.join_office(_OFFICE, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+        assert agent._confirmed_office == (_OFFICE, _AGENT_NAME)
+
+        with pytest.raises(SMCPProtocolError) as ei:
+            agent.join_office(new_office, _AGENT_NAME, namespace=SMCP_NAMESPACE)
+
+        assert ei.value.code == 4106, f"应带真实协议码，实得 {ei.value!r}"
+        assert ei.value.details == {"office_id": _OFFICE}, f"4106 须报当前房而非目标房，实得 {ei.value.details!r}"
+    finally:
+        agent.disconnect()
 
 
 def test_sync_explicit_and_replay_rejections_are_byte_identical_on_real_server(
