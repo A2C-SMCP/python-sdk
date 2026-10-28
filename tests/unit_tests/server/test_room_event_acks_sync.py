@@ -569,3 +569,45 @@ class TestSyncAsyncPayloadParitySync:
             ).on_server_leave_office("sid-1", payload)
 
             assert sync_ack == async_ack, f"[{label}] sync 与 async 载荷分叉: {sync_ack!r} != {async_ack!r}"
+
+
+def test_same_sid_concurrent_different_declarations_record_at_most_one() -> None:
+    """protocol#64（同步镜像）：注册表锁内「一致性校验 + 首次记录」原子 —— 并发不同声明至多一者被记录。"""
+    import threading
+
+    from a2c_smcp.smcp import ErrorCode, build_room_rejection_error
+
+    sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+    ns = _namespace(sessions)
+    barrier = threading.Barrier(2)
+
+    def _get(sid: str) -> dict[str, Any]:
+        barrier.wait(timeout=5)  # 强制两个线程都先通过取会话再竞争记录
+        return sessions[sid]
+
+    ns.get_session = MagicMock(side_effect=_get)
+    ns.save_session = MagicMock(side_effect=lambda sid, sess: sessions.__setitem__(sid, sess))
+    ns.enter_room = MagicMock()
+    x = "abcdef01-2345-4678-8abc-def012345678"
+    y = "abcdef02-2345-4678-8abc-def012345679"
+    acks: list[Any] = [None, None]
+
+    def _run(index: int, computer_id: str) -> None:
+        acks[index] = ns.on_server_join_office(
+            "sid-1",
+            {"role": "computer", "name": "c1", "office_id": "room-a", "computer_id": computer_id},
+        )
+
+    threads = [threading.Thread(target=_run, args=(0, x)), threading.Thread(target=_run, args=(1, y))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(acks, key=lambda ack: ack is None) == [
+        build_room_rejection_error(ErrorCode.FORBIDDEN),
+        None,
+    ], acks
+    recorded = ns._sid_identity["sid-1"]
+    assert recorded[2] in (x, y)
+    assert recorded == ("computer", "c1", recorded[2])

@@ -845,3 +845,44 @@ class TestRoomRejectionCodesAreStructurallyConfined:
             if "4102" in line
         ]
         assert not offenders, f"预留码 4102 不得出现在服务端源码：{offenders}"
+
+
+@pytest.mark.asyncio
+async def test_same_sid_concurrent_different_declarations_record_at_most_one() -> None:
+    """protocol#64：「一致性校验 + 首次记录」对同一 sid **原子** —— 并发不同声明时至多一者被记录。
+
+    用 ``await asyncio.sleep(0)`` 的 get_session 强制两个 handler 在取会话处交错，再验证只有一个
+    声明落地（另一个 ⇒ 403）。没有原子核心时两者都会把自己写进记录。
+    """
+    import asyncio
+
+    from a2c_smcp.smcp import ErrorCode, build_room_rejection_error
+
+    sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+    ns = _namespace(sessions)
+
+    async def _get(sid: str) -> dict[str, Any]:
+        await asyncio.sleep(0)  # 强制交错：两个 handler 都先通过取会话
+        return sessions[sid]
+
+    ns.get_session = AsyncMock(side_effect=_get)
+    ns.save_session = AsyncMock(side_effect=lambda sid, sess: sessions.__setitem__(sid, sess))
+    ns.enter_room = AsyncMock()
+    x = "abcdef01-2345-4678-8abc-def012345678"
+    y = "abcdef02-2345-4678-8abc-def012345679"
+
+    def _payload(computer_id: str) -> dict[str, Any]:
+        return {"role": "computer", "name": "c1", "office_id": "room-a", "computer_id": computer_id}
+
+    acks = await asyncio.gather(
+        ns.on_server_join_office("sid-1", _payload(x)),
+        ns.on_server_join_office("sid-1", _payload(y)),
+    )
+
+    assert sorted(acks, key=lambda ack: ack is None) == [
+        build_room_rejection_error(ErrorCode.FORBIDDEN),
+        None,
+    ], acks
+    recorded = ns._sid_identity["sid-1"]
+    assert recorded[2] in (x, y)
+    assert recorded == ("computer", "c1", recorded[2])

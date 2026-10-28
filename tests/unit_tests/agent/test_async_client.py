@@ -481,3 +481,15 @@ async def test_get_computer_in_office_timeout(mock_call: AsyncMock, client: Asyn
 
     with pytest.raises(TimeoutError):
         await client.get_computer_in_office(office_id, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_join_office_payload_never_carries_computer_id(client: AsyncSMCPAgentClient) -> None:
+    """v0.5.0（protocol#64）：Agent 入房 MUST NOT 携带 ``computer_id``（该键只属于 Computer）。"""
+    with patch.object(client, "call", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = None  # 空 ack = 成功
+        await client.join_office("office-1", "agent-1")
+
+    payload = mock_call.await_args.args[1]
+    assert payload["role"] == "agent"
+    assert "computer_id" not in payload, f"Agent 载荷不得出现 computer_id: {payload!r}"

@@ -492,3 +492,13 @@ class TestSMCPAgentClient:
 
         with pytest.raises(TimeoutError):
             client.get_computer_in_office(office_id, timeout=1)
+
+    def test_join_office_payload_never_carries_computer_id(self, client: SMCPAgentClient) -> None:
+        """v0.5.0（protocol#64）：Agent 入房 MUST NOT 携带 ``computer_id``（同步镜像）。"""
+        with patch.object(client, "call") as mock_call:
+            mock_call.return_value = None  # 空 ack = 成功
+            client.join_office("office-1", "agent-1")
+
+        payload = mock_call.call_args.args[1]
+        assert payload["role"] == "agent"
+        assert "computer_id" not in payload, f"Agent 载荷不得出现 computer_id: {payload!r}"
