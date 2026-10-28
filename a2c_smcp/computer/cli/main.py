@@ -39,6 +39,7 @@ from a2c_smcp.computer.cli.utils import (
     resolve_import_target,
 )
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.identity import ComputerIdentityError
 from a2c_smcp.computer.inputs.resolver import InputResolver
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput as MCPServerInputModel,
@@ -347,7 +348,14 @@ def _run_impl(
                 effective_namespace = namespace or SMCP_NAMESPACE
                 init_client = SMCPComputerClient(computer=comp, namespace=effective_namespace)
                 # 通过 CLI 指定命名空间，确保连接时建立对应 namespace 会话
-                await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
+                try:
+                    await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
+                except ComputerIdentityError as e:
+                    # protocol#64：身份持久化损坏 / 不可读写 ⇒ 明确报错并以非零码终止，绝不静默用临时值
+                    # （否则宿主的持久引用会无信号地全部失效）。
+                    # Corrupt/unreadable identity aborts startup with a clear message and non-zero exit.
+                    console.print(f"[red]❌ Computer 身份不可用 / Computer identity unavailable: {e}[/red]")
+                    raise typer.Exit(1) from e
                 # 记录连接参数：``socket join`` 改名须换新连接（协议 events.md:610），该路径要重放这四个值
                 init_connection = {
                     "url": url,
