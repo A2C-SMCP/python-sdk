@@ -98,6 +98,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
 )
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
+    MCP_CONFIG_FILENAME,
     McpApprovalStatus,
     McpWriteScope,
     McpWriteTargetError,
@@ -118,7 +119,7 @@ from a2c_smcp.computer.settings.recovery import (
     recover_marketplace_skills,
 )
 from a2c_smcp.computer.settings.schema import FIELD_LANDING_ROOT, FIELD_READ_ROOTS, SettingsScope
-from a2c_smcp.computer.settings.scope import TFROBOT_DIRNAME
+from a2c_smcp.computer.settings.scope import LOCAL_SETTINGS_FILENAME, PROJECT_SETTINGS_FILENAME, TFROBOT_DIRNAME
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
     SkillEventDebouncer,
@@ -572,7 +573,8 @@ class Computer(BaseComputer[PromptSession]):
           - ``--settings``（flag 层 settings.json）
           - ``--mcp-config``（flag 层 mcp.json——**可含 server 字面量 env / 凭据**，用户 readRoots
             覆盖其目录时必须仍拒绝；隔离审查 🔴1）
-          - 工作目录治理目录 ``.tfrobot``（settings / mcp.json / inputs）
+          - 工作目录治理目录 ``.tfrobot`` **及其中的具体文件**（``settings.json`` /
+            ``settings.local.json`` / ``mcp.json``，存在即加——硬链接防护靠文件身份，见实现注释）
           - SKILL Home、blob 缓存根
         ``landing_root`` 单独传入以获得 ``.part`` 规则。
 
@@ -592,7 +594,18 @@ class Computer(BaseComputer[PromptSession]):
             extra.append(str(self._mcp_flag_config))
         # project/local 治理目录随 cwd 走（#116 单 cwd 锚点）；与 resolve_settings 同源回退.
         cwd = self._resolve_cwd() or Path(os.getcwd())
-        extra.append(str(cwd / TFROBOT_DIRNAME))
+        governance_dir = cwd / TFROBOT_DIRNAME
+        extra.append(str(governance_dir))
+        # 具体文件一并注入（隔离审查 🟡5）：硬链接到 ``.tfrobot/mcp.json`` 时**路径前缀失效**
+        # （链接在 readRoot 内、目标路径不同），只有**文件身份**（``dev``/``ino``）能挡；而目录
+        # 条目的 inode 与被链文件不同 ⇒ 只注入目录挡不住。存在即加（不存在时路径前缀仍是唯一
+        # 防线，且每次现算，文件一创建即被覆盖）。
+        # Inject the concrete files too: for a hard link only file identity (dev/ino) can block it,
+        # and the directory's own inode differs from the linked file's.
+        for governance_name in (PROJECT_SETTINGS_FILENAME, LOCAL_SETTINGS_FILENAME, MCP_CONFIG_FILENAME):
+            candidate = governance_dir / governance_name
+            if candidate.exists():
+                extra.append(str(candidate))
         # ``.part`` 规则必须对准**实际写入根**：``blob_upload_store`` 用的是 :attr:`landing_root`
         # （已配置时进程内缓存）。若这里改读「最新 settings」，运行期改值后保护罩与写入根错位——
         # 旧 root 下的 ``.part`` 反而不再被拒（🟡4）。已缓存 → 用缓存值；未缓存 → 用同一份
