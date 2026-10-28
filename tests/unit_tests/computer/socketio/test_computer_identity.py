@@ -13,12 +13,15 @@ Computer 侧 ``computer_id`` 生产者（``SMCPComputerClient``）单测 —— 
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from socketio import AsyncClient
 
+import a2c_smcp.computer.socketio.client as computer_client_mod
 from a2c_smcp.computer.identity import ComputerIdentityError, identity_store_path, load_or_create_computer_id
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import SMCP_NAMESPACE
@@ -191,3 +194,136 @@ class TestResetIdentity:
         assert new != old and is_canonical_computer_id(new)
         assert client._computer_id == new
         assert load_or_create_computer_id() == new
+
+
+class TestEnvAnchoring:
+    """fix-review 🟡3/🟡4/🟡8：env 全路径锚点、只读视图与包级导出。"""
+
+    def test_only_home_differs_yields_distinct_store_paths(self, tmp_path: Path) -> None:
+        """XDG 未设置时，身份路径必须跟随**注入 env** 的 HOME，而不是 ambient。"""
+        env_a = {"HOME": str(tmp_path / "home-a")}
+        env_b = {"HOME": str(tmp_path / "home-b")}
+
+        path_a = identity_store_path(env_a)
+        path_b = identity_store_path(env_b)
+
+        assert path_a != path_b
+        assert path_a == (tmp_path / "home-a" / ".config" / "a2c" / "computer-id").resolve()
+        assert path_b == (tmp_path / "home-b" / ".config" / "a2c" / "computer-id").resolve()
+
+    @pytest.mark.asyncio
+    async def test_dual_instance_home_only_identity_isolation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """两台仅 HOME 不同的 Computer ⇒ 两条不同身份文件（XDG 未设置路径）。"""
+        from a2c_smcp.computer.computer import Computer
+
+        env_a = {"HOME": str(tmp_path / "home-a")}
+        env_b = {"HOME": str(tmp_path / "home-b")}
+        client_a = SMCPComputerClient(
+            computer=Computer(name="A", env=env_a, blob_cache_root=tmp_path / "blob-a"),
+        )
+        client_b = SMCPComputerClient(
+            computer=Computer(name="B", env=env_b, blob_cache_root=tmp_path / "blob-b"),
+        )
+        monkeypatch.setattr(AsyncClient, "connect", AsyncMock())
+
+        await client_a.connect("http://localhost:1")
+        await client_b.connect("http://localhost:1")
+
+        assert client_a._computer_id != client_b._computer_id
+        assert identity_store_path(env_a).read_text(encoding="utf-8") == f"{client_a._computer_id}\n"
+        assert identity_store_path(env_b).read_text(encoding="utf-8") == f"{client_b._computer_id}\n"
+
+    def test_computer_env_is_read_only(self, tmp_path: Path) -> None:
+        """fix-review 🟡4：公开 env 是只读视图；`_resolve_env` 委托同一视图。"""
+        from a2c_smcp.computer.computer import Computer
+
+        env = {"XDG_CONFIG_HOME": str(tmp_path)}
+        comp = Computer(name="readonly-env", env=env, blob_cache_root=tmp_path)
+
+        assert comp.env is not None and comp.env["XDG_CONFIG_HOME"] == str(tmp_path)
+        with pytest.raises(TypeError):
+            comp.env["XDG_CONFIG_HOME"] = "/tmp/evil"  # type: ignore[index]
+        assert comp._resolve_env() is not None and comp._resolve_env()["XDG_CONFIG_HOME"] == str(tmp_path)
+        assert comp._env == env, "实例持有的原映射不被改写"
+
+    def test_computer_identity_error_is_exported(self) -> None:
+        """fix-review 🟡8：宿主必须捕获的 ComputerIdentityError 进包级 __all__。"""
+        from a2c_smcp.computer import ComputerIdentityError as exported
+        from a2c_smcp.computer import __all__ as computer_all
+        from a2c_smcp.computer.identity import ComputerIdentityError
+
+        assert "ComputerIdentityError" in computer_all
+        assert exported is ComputerIdentityError
+
+
+class TestIdentityRaces:
+    """fix-review 🔴1/🔴2 的竞态回归锁。"""
+
+    @pytest.mark.asyncio
+    async def test_join_superseded_during_materialization_keeps_no_desired(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """物化期间断连 ⇒ join 不得写回 office_id（否则「已断开却残留 desired」回旧房，#203）。"""
+        client = _make_client()
+        client._computer_id = None
+        gate = threading.Event()
+
+        def _slow_load(*, env: object = None) -> str:
+            assert gate.wait(timeout=5), "测试未释放物化闸门"
+            return "abcdef01-2345-4678-8abc-def012345678"
+
+        monkeypatch.setattr(computer_client_mod, "load_or_create_computer_id", _slow_load)
+        client.call = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        task = asyncio.create_task(client.join_office("R1"))
+        for _ in range(500):
+            if client._identity_lock.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert client._identity_lock.locked(), "测试未能进入物化窗口"
+
+        # 物化期间用户断开：generation 前进、desired 清空
+        client._on_namespace_disconnect("client disconnect")
+        gate.set()
+
+        assert await task is None, "被抢占的 join 应静默让位"
+        client.call.assert_not_awaited()
+        assert client.office_id is None, "不得把 desired 写回已断开的连接"
+
+    @pytest.mark.asyncio
+    async def test_reset_during_materialization_is_not_clobbered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """reset 与在途物化互斥：stale 物化结果不得覆盖新身份（内存旧 / 磁盘新）。"""
+        client = _make_client()
+        client._computer_id = None
+        gate = threading.Event()
+        stale = "abcdef01-2345-4678-8abc-def012345678"
+        fresh = "abcdef02-2345-4678-8abc-def012345679"
+
+        def _slow_load(*, env: object = None) -> str:
+            assert gate.wait(timeout=5), "测试未释放物化闸门"
+            return stale
+
+        def _reset(*, env: object = None) -> str:
+            return fresh
+
+        monkeypatch.setattr(computer_client_mod, "load_or_create_computer_id", _slow_load)
+        monkeypatch.setattr(computer_client_mod, "reset_computer_id", _reset)
+
+        materialize = asyncio.create_task(client._amaterialize_computer_id())
+        for _ in range(500):
+            if client._identity_lock.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert client._identity_lock.locked()
+
+        reset = asyncio.create_task(client.reset_identity())
+        await asyncio.sleep(0)  # 让 reset 进入锁等待
+        gate.set()
+
+        assert await materialize == stale
+        assert await reset == fresh
+        assert client._computer_id == fresh, "内存必须是 reset 后的新身份"

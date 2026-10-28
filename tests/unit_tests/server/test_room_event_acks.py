@@ -886,3 +886,39 @@ async def test_same_sid_concurrent_different_declarations_record_at_most_one() -
     recorded = ns._sid_identity["sid-1"]
     assert recorded[2] in (x, y)
     assert recorded == ("computer", "c1", recorded[2])
+
+
+def test_record_identity_three_states() -> None:
+    """fix-review 🟡6：INSERTED / MATCHED / MISMATCH 三态（只 pop 自己插入的记录）。"""
+    from a2c_smcp.server.name_registry import IdentityClaim, record_identity
+
+    records: dict[str, IdentityRecord] = {}
+    identity = IdentityRecord(role="computer", name="c1", computer_id=_COMPUTER_ID)
+
+    assert record_identity(records, "sid-1", identity) is IdentityClaim.INSERTED
+    assert record_identity(records, "sid-1", identity) is IdentityClaim.MATCHED
+    assert (
+        record_identity(records, "sid-1", IdentityRecord(role="computer", name="c2", computer_id=_COMPUTER_ID))
+        is IdentityClaim.MISMATCH
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_gone_pops_only_self_inserted_identity() -> None:
+    """fix-review 🟡6：断连收尾只回收**本次新插入**的记录；匹配到既有记录时绝不 pop。"""
+    from a2c_smcp.server.name_registry import SessionGoneError
+
+    # MATCHED（既有记录）：保留——它是残留 leave 宣告的 computer_id 载体
+    ns = _namespace({"sid-1": {}})
+    ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="c1", computer_id=_COMPUTER_ID)
+    ns.enter_room = AsyncMock(side_effect=SessionGoneError("gone"))
+    ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+    assert isinstance(ack, dict) and ack["code"] == 500, ack
+    assert "sid-1" in ns._sid_identity, "匹配到既有记录时不得 pop（残留 leave 需要它）"
+
+    # INSERTED（本次新插入）：由失败分支回收（正对照）
+    ns2 = _namespace({"sid-2": {}})
+    ns2.enter_room = AsyncMock(side_effect=SessionGoneError("gone"))
+    ack2 = await ns2.on_server_join_office("sid-2", _join("computer", "c1", "room-a"))
+    assert isinstance(ack2, dict) and ack2["code"] == 500, ack2
+    assert "sid-2" not in ns2._sid_identity

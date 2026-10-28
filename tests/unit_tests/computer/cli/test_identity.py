@@ -119,3 +119,15 @@ class TestRepl:
 
         assert client.calls == 0
         assert "usage" in capsys.readouterr().out.lower()
+
+
+@pytest.mark.asyncio
+async def test_without_client_uses_instance_env(tmp_path: Path) -> None:
+    """fix-review 🟡5：无 client 的文件重置也必须跟随本实例 env（不能用 ambient）。"""
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "xdg-instance")}
+    comp = SimpleNamespace(socketio_client=None, env=env)
+
+    await identity_cmd.repl_dispatch(comp, ["identity", "reset"])
+
+    assert identity_store_path(env).exists()
+    assert identity_store_path(env).read_text(encoding="utf-8").strip()

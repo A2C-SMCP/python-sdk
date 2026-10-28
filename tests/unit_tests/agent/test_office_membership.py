@@ -139,8 +139,6 @@ async def test_async_connect_with_desired_schedules_replay() -> None:
     assert len(calls) == 1
     assert calls[0]["event"] == JOIN_OFFICE_EVENT
     assert calls[0]["data"] == {"office_id": _OFFICE, "role": "agent", "name": _AGENT_NAME}
-    # fix-review 🟡7：显式钉住「Agent 回放不携带 computer_id」（protocol#64 的 wire 形状）
-    assert "computer_id" not in calls[0]["data"]
     assert calls[0]["namespace"] == SMCP_NAMESPACE
     assert calls[0]["timeout"] == OFFICE_JOIN_TIMEOUT, "回房必须带 OFFICE_JOIN_TIMEOUT 有界超时"
     assert client._desired_office == (_OFFICE, _AGENT_NAME)
@@ -333,8 +331,6 @@ def test_sync_connect_with_desired_schedules_replay_in_thread() -> None:
     assert len(calls) == 1
     assert calls[0]["event"] == JOIN_OFFICE_EVENT
     assert calls[0]["data"] == {"office_id": _OFFICE, "role": "agent", "name": _AGENT_NAME}
-    # fix-review 🟡7：显式钉住「Agent 回放不携带 computer_id」（protocol#64 的 wire 形状）
-    assert "computer_id" not in calls[0]["data"]
     assert calls[0]["namespace"] == SMCP_NAMESPACE
     assert calls[0]["timeout"] == OFFICE_JOIN_TIMEOUT, "回房必须带 OFFICE_JOIN_TIMEOUT 有界超时"
     assert client._desired_office == (_OFFICE, _AGENT_NAME)

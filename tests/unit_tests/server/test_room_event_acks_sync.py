@@ -611,3 +611,21 @@ def test_same_sid_concurrent_different_declarations_record_at_most_one() -> None
     recorded = ns._sid_identity["sid-1"]
     assert recorded[2] in (x, y)
     assert recorded == ("computer", "c1", recorded[2])
+
+
+def test_session_gone_pops_only_self_inserted_identity() -> None:
+    """fix-review 🟡6（同步镜像）：断连收尾只回收本次新插入的记录。"""
+    from a2c_smcp.server.name_registry import SessionGoneError
+
+    ns = _namespace({"sid-1": {}})
+    ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="c1", computer_id=_COMPUTER_ID)
+    ns.enter_room = MagicMock(side_effect=SessionGoneError("gone"))
+    ack = ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+    assert isinstance(ack, dict) and ack["code"] == 500, ack
+    assert "sid-1" in ns._sid_identity, "匹配到既有记录时不得 pop（残留 leave 需要它）"
+
+    ns2 = _namespace({"sid-2": {}})
+    ns2.enter_room = MagicMock(side_effect=SessionGoneError("gone"))
+    ack2 = ns2.on_server_join_office("sid-2", _join("computer", "c1", "room-a"))
+    assert isinstance(ack2, dict) and ack2["code"] == 500, ack2
+    assert "sid-2" not in ns2._sid_identity
