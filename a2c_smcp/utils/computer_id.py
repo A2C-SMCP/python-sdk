@@ -24,8 +24,11 @@ import re
 from typing import Final
 
 #: 规范 UUID 文本形态（小写、带连字符、8-4-4-4-12）。/ Canonical lowercase hyphenated UUID text.
+#: **不带** ``^…$`` 锚点、由 :meth:`re.Pattern.fullmatch` 匹配：Python 的 ``$`` 会匹配结尾换行，
+#: 带 ``$`` 的 ``match`` 会把 ``<uuid>\\n``（37 字符）误判为合法。
+#: No ``^…$`` anchors; use ``fullmatch`` — Python's ``$`` also matches before a trailing newline.
 CANONICAL_UUID_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
 )
 
 #: nil UUID：形态合法但协议明令拒绝。/ Nil UUID: canonical but explicitly rejected by the protocol.
@@ -48,6 +51,11 @@ def is_canonical_computer_id(value: object) -> bool:
     """
     if not isinstance(value, str):
         return False
-    if not CANONICAL_UUID_PATTERN.match(value):
+    # 协议澄清（protocol#64 / PR #74）：整串匹配且**长度恰为 36**——前导/尾随空白或换行一律 400。
+    # 正则之外显式限长，避免任何锚点语义差异（如 Python ``$`` 匹配结尾换行）漏进来。
+    # Whole-string match AND exactly 36 chars; never rely on anchor semantics alone.
+    if len(value) != 36:
+        return False
+    if CANONICAL_UUID_PATTERN.fullmatch(value) is None:
         return False
     return value not in (NIL_UUID, MAX_UUID)

@@ -484,6 +484,16 @@ class Computer(BaseComputer[PromptSession]):
 
     # ── #134 per-instance env/cwd 注入接缝（对齐 rust-sdk#121） ──────────────
 
+    @property
+    def env(self) -> Mapping[str, str] | None:
+        """per-instance env 注入（``None`` = ambient ``os.environ``）。
+
+        v0.5.0（protocol#64）：Computer 身份持久化必须跟随**本实例**的 env（与 settings / mcp.json
+        同一 XDG 锚点），否则同进程两台注入不同 env 的 Computer 会共读同一身份文件（SDK 自造克隆）。
+        The stable identity must follow this instance's env, like settings/mcp.json do.
+        """
+        return self._env
+
     def _resolve_env(self) -> Mapping[str, str] | None:
         """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。"""
         return self._env

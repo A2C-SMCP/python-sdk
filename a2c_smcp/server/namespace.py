@@ -25,11 +25,14 @@ from a2c_smcp.server.name_registry import SessionGoneError
 from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
 from a2c_smcp.server.utils import (
     aget_all_sessions_in_office,
+    build_enter_notification,
+    build_leave_notification,
     build_room_rejection_ack,
     default_session_name,
     office_ids_of_rooms,
     office_room,
     parse_payload,
+    project_session_info,
     resolve_broadcast_origin,
     warn_on_claimed_identity_mismatch,
 )
@@ -57,7 +60,6 @@ from a2c_smcp.smcp import (
     UPDATE_TOOL_LIST_EVENT,
     UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
-    EnterOfficeNotification,
     EnterOfficeReq,
     ErrorCode,
     ErrorPayload,
@@ -75,7 +77,6 @@ from a2c_smcp.smcp import (
     GetSkillsRet,
     GetToolsReq,
     GetToolsRet,
-    LeaveOfficeNotification,
     LeaveOfficeReq,
     ListRoomReq,
     ListRoomRet,
@@ -95,25 +96,6 @@ from a2c_smcp.utils.computer_id import is_canonical_computer_id
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("server")
-
-
-def _leave_notification(
-    office_id: OFFICE_ID,
-    role: str | None,
-    name: str,
-    computer_id: str | None = None,
-) -> LeaveOfficeNotification:
-    """按角色构造 ``notify:leave_office`` 载荷（``computer`` / ``agent`` 字段取名字而非 sid）。
-
-    v0.5.0（protocol#64）：Computer 成员带 ``computer_id``；Agent 成员**省略**该键（不得为 ``null``）。
-    For Computer members include ``computer_id``; Agents omit the key entirely.
-    """
-    if role == "computer":
-        payload = LeaveOfficeNotification(office_id=office_id, computer=name)
-        if computer_id:
-            payload["computer_id"] = computer_id
-        return payload
-    return LeaveOfficeNotification(office_id=office_id, agent=name)
 
 
 class SMCPNamespace(BaseNamespace):
@@ -168,7 +150,7 @@ class SMCPNamespace(BaseNamespace):
         computer_id = record.computer_id if record is not None else None
         await self._emit_to_office(
             LEAVE_OFFICE_NOTIFICATION,
-            _leave_notification(office_id, role, name, computer_id),
+            build_leave_notification(office_id, role, name, computer_id),
             office_id,
             skip_sid=sid,
         )
@@ -292,18 +274,9 @@ class SMCPNamespace(BaseNamespace):
             await self._register_name(room, role, name, sid)
             registered = True
 
-            # 根据角色发送不同的通知 / Send different notifications based on role
-            notification_data: EnterOfficeNotification = {"office_id": room}
-            if role == "computer":
-                notification_data["computer"] = name
-                # v0.5.0（protocol#64）：回显身份记录里的 computer_id（会话由 handler 写入；直接调用
-                # enter_room 的旧路径可能没有 ⇒ 不伪造、不省略为 null）。
-                # Echo the recorded computer_id; never fabricate one and never emit null.
-                session_computer_id = session.get("computer_id")
-                if session_computer_id:
-                    notification_data["computer_id"] = session_computer_id
-            else:
-                notification_data["agent"] = name
+            # 根据角色发送不同的通知（builder 与 sync 共用，protocol#64）
+            # Role-specific notification via the shared builder.
+            notification_data = build_enter_notification(room, role, name, session.get("computer_id"))
 
             # 广播加入新房间的消息至房间内其它人
             # Broadcast join message to others in the room
@@ -314,7 +287,7 @@ class SMCPNamespace(BaseNamespace):
             if not self._holds_name(room, role, name, sid):
                 await self._emit_to_office(
                     LEAVE_OFFICE_NOTIFICATION,
-                    _leave_notification(room, role, name, session.get("computer_id")),
+                    build_leave_notification(room, role, name, session.get("computer_id")),
                     room,
                     skip_sid=sid,
                 )
@@ -378,7 +351,7 @@ class SMCPNamespace(BaseNamespace):
         # Build leave notification; Computer carries computer_id from the identity record (authority).
         record = self._sid_identity.get(sid)
         computer_id = record.computer_id if record is not None else session.get("computer_id")
-        notification = _leave_notification(room, session.get("role"), session.get("name", ""), computer_id)
+        notification = build_leave_notification(room, session.get("role"), session.get("name", ""), computer_id)
 
         # 广播离开消息
         # Broadcast leave message
@@ -1097,29 +1070,12 @@ class SMCPNamespace(BaseNamespace):
             # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
             all_sessions = await aget_all_sessions_in_office(office_id, self.server)
 
-            # 转换为SessionInfo格式 / Convert to SessionInfo format
+            # 转换为 SessionInfo 格式（投影与 sync 共用，protocol#64）
+            # Project sessions via the shared helper.
             sessions: list[SessionInfo] = []
             for session in all_sessions:
-                if session.get("role") in ["computer", "agent"]:
-                    session_info: SessionInfo = {
-                        "sid": session.get("sid", ""),
-                        "name": session.get("name", ""),
-                        "role": session["role"],
-                        "office_id": session.get("office_id", ""),
-                    }
-                    # a2c_version 为 NotRequired：仅在握手时记录到则带出 / NotRequired: only if recorded
-                    if session.get("a2c_version"):
-                        session_info["a2c_version"] = session["a2c_version"]
-                    # v0.5.0（protocol#64）：Computer 的 SessionInfo MUST 带 computer_id；Agent MUST 省略该键。
-                    # 会话字段来自身份记录投影；记录兜底覆盖「会话尚未持久化」的窄窗口。
-                    # Computer SessionInfo carries computer_id; Agents omit the key entirely.
-                    if session["role"] == "computer":
-                        computer_id = session.get("computer_id")
-                        if not computer_id:
-                            record = self._sid_identity.get(session.get("sid", ""))
-                            computer_id = record.computer_id if record is not None else None
-                        if computer_id:
-                            session_info["computer_id"] = computer_id
+                session_info = project_session_info(session, self._sid_identity)
+                if session_info is not None:
                     sessions.append(session_info)
 
             return ListRoomRet(sessions=sessions, req_id=req_id)

@@ -32,11 +32,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
+from a2c_smcp.computer.settings.scope import resolve_user_config_dir
 from a2c_smcp.utils.computer_id import is_canonical_computer_id
 
-#: 目录名（XDG 配置根下的 SDK 子目录）。/ SDK subdirectory under the XDG config root.
-IDENTITY_DIR_NAME: Final[str] = "a2c"
-#: 身份文件名。/ Identity file name.
+#: 身份文件名（位于用户配置目录 ``<config>/a2c/`` 下）。/ Identity file name under the shared config dir.
 IDENTITY_FILE_NAME: Final[str] = "computer-id"
 #: 目录权限：仅属主可访问。/ Directory mode: owner-only.
 IDENTITY_DIR_MODE: Final[int] = 0o700
@@ -59,24 +58,17 @@ class ComputerIdentityError(RuntimeError):
 
 def identity_store_path(env: Mapping[str, str] | None = None) -> Path:
     """
-    解析身份文件路径：``$XDG_CONFIG_HOME/a2c/computer-id``（仅绝对路径），否则 ``~/.config/a2c/computer-id``。
+    解析身份文件路径：``<用户配置目录>/a2c/computer-id``。
 
-    XDG Base Directory 规范：``XDG_CONFIG_HOME`` 为相对路径时视为未设置。本函数**只解析**，
-    不创建任何目录（物化时机由调用方决定：Computer 在首次 ``connect`` 时才落盘）。
-    Resolve the identity path; a relative ``XDG_CONFIG_HOME`` is ignored per the XDG spec.
+    用户配置目录经 :func:`a2c_smcp.computer.settings.scope.resolve_user_config_dir` 解析——与
+    mcp.json / settings.json 共用同一 XDG 规则（``$XDG_CONFIG_HOME`` 仅绝对路径、值会 ``strip()``、
+    结果 ``expanduser().resolve()``）。**单一权威**：两处各写一份会在 XDG 带空白 / 相对值时让身份
+    文件与配置目录分叉（reset「成功」却改不到实际生效的那份）。
+    Resolve via the shared user-config resolver so the identity file can never diverge from the
+    mcp.json/settings.json home when XDG is whitespace-padded or relative.
     This function is side-effect free — materialization belongs to the first ``connect``.
     """
-    environ: Mapping[str, str] = os.environ if env is None else env
-    xdg_home = environ.get("XDG_CONFIG_HOME")
-    if xdg_home:
-        candidate = Path(xdg_home).expanduser()
-        if candidate.is_absolute():
-            base = candidate
-        else:
-            base = Path.home() / ".config"
-    else:
-        base = Path.home() / ".config"
-    return base / IDENTITY_DIR_NAME / IDENTITY_FILE_NAME
+    return resolve_user_config_dir(env) / IDENTITY_FILE_NAME
 
 
 def load_or_create_computer_id(
@@ -186,12 +178,27 @@ def reset_computer_id(
 
 
 def _ensure_private_dir(directory: Path) -> None:
-    """创建目录并**显式** chmod 0700（``mkdir`` 的 mode 会被 umask 削）。/ mkdir + explicit chmod 0700."""
+    """
+    确保目录存在；**仅本次新建**时显式 chmod 0700（``mkdir`` 的 mode 会被 umask 削）。
+
+    既存目录**不改权限**：该目录同时是 mcp.json / settings.json 的家（``<config>/a2c``），
+    身份子系统无权收紧用户既有配置目录的权限（与 ``skills/home.py`` 的「既存目录权限不改」同则）。
+    Only a directory created here is chmod-ed; an existing config home keeps its permissions.
+    """
+    created = False
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, IDENTITY_DIR_MODE)
+        directory.mkdir(parents=True, exist_ok=False)
+        created = True
+    except FileExistsError:
+        if not directory.is_dir():
+            raise ComputerIdentityError(f"身份目录路径已被非目录占用（{directory}）") from None
     except OSError as e:
-        raise ComputerIdentityError(f"无法创建 / 加固身份目录（{directory}）: {e}") from e
+        raise ComputerIdentityError(f"无法创建身份目录（{directory}）: {e}") from e
+    if created:
+        try:
+            os.chmod(directory, IDENTITY_DIR_MODE)
+        except OSError as e:
+            raise ComputerIdentityError(f"无法收紧身份目录权限（{directory}）: {e}") from e
 
 
 def _try_create(target: Path) -> str | None:

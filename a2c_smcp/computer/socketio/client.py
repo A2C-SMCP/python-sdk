@@ -7,7 +7,7 @@ import asyncio
 import base64
 import hashlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypeAlias, cast
 
 from mcp.types import CallToolResult, Resource
@@ -320,16 +320,31 @@ class SMCPComputerClient(AsyncClient):
         """
         return self.office_id is not None and self._namespace in self.namespaces
 
-    def _ensure_computer_id(self) -> str:
+    def _identity_env(self) -> Mapping[str, str] | None:
         """
-        取本连接的稳定身份；未物化时**就地**加载 / 生成（幂等）。
+        身份持久化使用**本 Computer 实例**的 env（``None`` = ambient ``os.environ``）。
 
-        生产路径上 :meth:`connect` 已先行物化（首次连接），本方法只是为「直接调用 ``join_office`` /
-        回放」的嵌入方与测试兜底；持久化语义与 :func:`load_or_create_computer_id` 完全一致。
-        Returns the stable identity, materializing it if a caller skipped ``connect`` (idempotent).
+        与 settings / mcp.json 同一 XDG 锚点：同进程两台注入不同 env 的 Computer 必须各自读写自己的
+        身份文件，否则会共享同一个 ``computer-id``（SDK 自造克隆）。非 Mapping（测试里的 MagicMock
+        computer）退化为 ambient。
+        The identity store follows this instance's env, like settings/mcp.json do.
+        """
+        env = getattr(self.computer, "env", None)
+        return env if isinstance(env, Mapping) else None
+
+    async def _amaterialize_computer_id(self) -> str:
+        """
+        取本连接的稳定身份；未物化时经**线程池**加载 / 生成（幂等，绝不阻塞事件循环）。
+
+        调用方须在**取 ``_office_op_lock`` 之前** await 本方法：首启竞态最坏重试 1s，占着 office
+        操作锁读盘会拖住退房 / 换房与回放（与 #222「锁不跨 I/O」同一纪律）。
+        Must be awaited *before* acquiring ``_office_op_lock``; disk I/O runs in a worker thread.
         """
         if self._computer_id is None:
-            self._computer_id = load_or_create_computer_id()
+            self._computer_id = await asyncio.to_thread(
+                load_or_create_computer_id,
+                env=self._identity_env(),
+            )
         return self._computer_id
 
     async def reset_identity(self) -> str:
@@ -353,7 +368,7 @@ class SMCPComputerClient(AsyncClient):
                 "已连接（或存在入房意图）时不能重置 Computer 身份：请先断开连接，再重置并以新连接入房"
                 " / Cannot reset identity while connected or holding an office intent: disconnect first",
             )
-        new_id = await asyncio.to_thread(reset_computer_id)
+        new_id = await asyncio.to_thread(reset_computer_id, env=self._identity_env())
         self._computer_id = new_id
         logger.info(f"Computer identity reset; new computer_id={new_id}")
         return new_id
@@ -479,8 +494,7 @@ class SMCPComputerClient(AsyncClient):
         # 损坏或不可读写 ⇒ 异常直接上抛（CLI 非零退出），**绝不**以进程内临时值降级——那会让宿主的
         # 持久引用无信号地全部失效（协议 room-model.md §Computer 身份「持久化失败」）。
         # Materialize the persisted identity on first connect; corruption aborts instead of degrading.
-        if self._computer_id is None:
-            self._computer_id = await asyncio.to_thread(load_or_create_computer_id)
+        await self._amaterialize_computer_id()
         handshake_url = build_handshake_url(url, PROTOCOL_VERSION)
         kwargs.setdefault("transports", DEFAULT_HANDSHAKE_TRANSPORTS)
         # 协议 §1 polling-first MUST 护栏（统一接线，详见 handshake.apply_polling_first_guard）
@@ -666,7 +680,8 @@ class SMCPComputerClient(AsyncClient):
             office_id=office_id,
             role="computer",
             name=self.computer.name,
-            computer_id=self._ensure_computer_id(),
+            # fix-review 🟡5：物化（磁盘 I/O）在循环入口、锁外 await 完成；循环内只复用不可变 request。
+            computer_id=await self._amaterialize_computer_id(),
         )
         # #223：本轮回放所属的**会话**——成功落账前须复核（同 ``join_office``）。退避期间断连会推进
         # 会话纪元，此时这条「成功」属于已销毁的会话。
@@ -778,6 +793,10 @@ class SMCPComputerClient(AsyncClient):
         # 会话作废而 ACK 仍可能就绪 ⇒ 那条「成功」属于已销毁的会话，落账会造出 #223 判据放行的幻影态）。
         session = self._office_session
         self._cancel_office_rejoin()
+        # fix-review 🟡5：身份物化是磁盘 I/O（首启竞态最坏重试 1s），必须在**取 office 操作锁之前**
+        # 经线程池完成——锁内不跨 I/O（同 #222 纪律），也不阻塞事件循环。
+        # Materialize before acquiring the office lock; disk I/O runs in a worker thread.
+        computer_id = await self._amaterialize_computer_id()
         # 提前设置 office_id，避免服务器广播事件时 office_id 仍为 None 的时序竞争问题
         # Set office_id before sending request to avoid race condition when server broadcasts events
         self.office_id = office_id
@@ -793,7 +812,7 @@ class SMCPComputerClient(AsyncClient):
                         office_id=office_id,
                         role="computer",
                         name=self.computer.name,
-                        computer_id=self._ensure_computer_id(),
+                        computer_id=computer_id,
                     ),
                     namespace=self._namespace,
                     timeout=OFFICE_JOIN_TIMEOUT,
