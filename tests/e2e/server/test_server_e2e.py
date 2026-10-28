@@ -53,9 +53,13 @@ def _wait_until(cond, timeout: float = 2.0, step: float = 0.01) -> bool:
 
 def _join_office(client, role: str, name: str, office_id: str) -> None:
     """中文: 加入房间 / English: Join office"""
+    payload = {"role": role, "name": name, "office_id": office_id}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "11111111-1111-4111-8111-111111111111"
     ack = client.call(
         JOIN_OFFICE_EVENT,
-        {"role": role, "name": name, "office_id": office_id},
+        payload,
         namespace=SMCP_NAMESPACE,
         timeout=5,
     )

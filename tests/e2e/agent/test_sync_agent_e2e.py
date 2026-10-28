@@ -27,6 +27,9 @@ from a2c_smcp.smcp import (
 )
 from tests.room_acks import assert_empty_ack
 
+#: v0.5.0（protocol#64）：mock Computer 的稳定入房身份（规范小写 UUID，同一次连接/回放复用同值）。
+_E2E_COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
+
 pytestmark = pytest.mark.e2e
 
 
@@ -122,7 +125,7 @@ def test_sync_agent_connect_and_join_office(server_endpoint: str, mock_computer_
         # Computer 加入办公室 / Computer joins office
         ack = mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-1", "office_id": "office-sync-1"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-1", "office_id": "office-sync-1"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -183,7 +186,7 @@ def test_sync_agent_tool_call(server_endpoint: str, mock_computer_client):
         # Computer 加入办公室 / Computer joins office
         mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-2", "office_id": "office-sync-2"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-2", "office_id": "office-sync-2"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -255,7 +258,7 @@ def test_sync_agent_get_tools_and_desktop(server_endpoint: str, mock_computer_cl
         # Computer 加入办公室 / Computer joins office
         mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-3", "office_id": "office-sync-3"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-3", "office_id": "office-sync-3"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -318,7 +321,7 @@ def test_sync_agent_computer_leave_notification(server_endpoint: str, mock_compu
         # Computer 加入办公室 / Computer joins office
         mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-4", "office_id": "office-sync-4"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-4", "office_id": "office-sync-4"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -393,7 +396,7 @@ def test_sync_agent_sio_param_with_real_connection(server_endpoint: str, mock_co
         # Computer 加入办公室 / Computer joins office
         ack = mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-sio", "office_id": "office-sio-test"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-sio", "office_id": "office-sio-test"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -469,7 +472,7 @@ def test_sync_agent_sio_param_in_leave_event(server_endpoint: str, mock_computer
         # Computer 加入办公室 / Computer joins office
         mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "test-computer-leave", "office_id": "office-leave-test"},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "test-computer-leave", "office_id": "office-leave-test"},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
@@ -542,7 +545,7 @@ def test_sync_agent_list_room(server_endpoint: str, mock_computer_client):
         # Computer 加入办公室 / Computer joins office
         mock_computer_client.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "computer-list-sync-test", "office_id": office_id},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "computer-list-sync-test", "office_id": office_id},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )

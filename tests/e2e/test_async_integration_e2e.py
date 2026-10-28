@@ -49,6 +49,9 @@ from a2c_smcp.smcp import (
 )
 from tests.room_acks import assert_empty_ack
 
+#: v0.5.0（protocol#64）：mock Computer 的稳定入房身份（规范小写 UUID，同一次连接/回放复用同值）。
+_E2E_COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
+
 pytestmark = pytest.mark.e2e
 
 
@@ -721,7 +724,7 @@ async def test_async_integration_cancel_signal_set_never_rewrites_terminal_state
         )
         await spectator.call(
             JOIN_OFFICE_EVENT,
-            {"role": "computer", "name": "spectator", "office_id": office_id},
+            {"role": "computer", "computer_id": _E2E_COMPUTER_ID, "name": "spectator", "office_id": office_id},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
