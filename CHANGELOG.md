@@ -21,8 +21,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `notify:enter_office`）。
   - **`4101` 泛化为「本 role 席位已占」**，ack 载荷字节级对齐协议示例：
     `{"code":4101,"message":"Room already has an agent"|"Room already has a computer","details":{"office_id":…,"role":…}}`
-    （服务端载荷中 `details.role` = 发起者自己声明的 role，即被占席位；客户端入房异常只带 `code` / `message`，
-    按 `code` 分流）。`build_room_rejection_error(4101, …)` 要求
+    （服务端载荷中 `details.role` = 发起者自己声明的 role，即被占席位；客户端 `SMCPProtocolError`
+    同时带出 `details`——`4101` `{office_id, role}`、`4106` `{office_id}`，按 `code` + `details` 分流，
+    见 #234）。`build_room_rejection_error(4101, …)` 要求
     `declared_role` 必填；`RoomFullError` 构造改为 `RoomFullError(role)`。
   - **`4105` 收回为预留码**：服务端不再产出（同 role 同名先撞席位 ⇒ `4101`），`build_room_rejection_error`
     构造上拒绝 `4105`（与 `4102` 同款）；**`NameConflictError` 删除**（未发布即收回，不留别名）。客户端收到
@@ -339,6 +340,20 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `a2c-computer --help` + 断言导入来源为制品而非仓库源码）；`publish.yml` 在**上传制品前**调用同款冒烟
     ——此前 publish job 只 `uv build`（隔离环境里连包本体都不安装），制品从未被验证过，
     正是「坏包直达 PyPI」的通道。两处共用 `scripts/clean_install_smoke.sh` 单一来源，防止漂移。
+
+### Fixed（#234 入房/退房失败详情）
+
+- **Agent 入房/退房被拒时丢弃协议 `details`**（#234）：`4101` 的 `details.office_id` / `details.role`、
+  `4106` 的 `details.office_id`（会话**当前**所在房）此前恒为空——宿主无法从 `SMCPProtocolError` 得知
+  当前房号与席位角色，与 rust-sdk 行为不对称。现 `JoinOfficeVerdict` 携带 `details`，显式 `join_office` /
+  `leave_office`（async / sync）与自动回房共用同一裁决与日志产出者：
+  - `SMCPProtocolError.details` 原样带出 ack 的 `details`（其余码同样透传，不按码特判；无 `details` 仍为 `{}`）；
+  - **非 mapping 的 `details` 一律归一为空映射**（新增单一权威 `smcp.normalize_details`，`4014`–`4020`
+    全族共用，含 `get_resources` / `get_skill[s]` / `get_blob` / `put_blob`）——对端违规不再把可感的协议
+    拒绝升级成 `ValueError` / `AttributeError`，与 rust `SmcpProtocolError::from_value`
+    （`as_object` + `unwrap_or_default`）对齐；
+  - `details.reason` 仅接受字符串，非字符串视同未提供（与 rust `as_str` 对齐）；
+  - 重放路径没有异常通道，拒绝日志（`log_join_rejection`）现同时携带 `details`。
 
 ## [0.4.0] - 2026-08-25
 

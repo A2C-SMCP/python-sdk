@@ -178,9 +178,28 @@ async def test_async_leave_rejection_raises_and_still_clears_local_state() -> No
         await client.leave_office(_OFFICE)
 
     assert ei.value.code == 500
+    assert ei.value.details == {}, "无 details 的拒绝仍需为空容器（#234）"
     assert [event for event, _ in calls] == [LEAVE_OFFICE_EVENT], "leave 必须走 call（等 ack），不再 fire-and-forget"
     assert calls[0][1] == 10, "leave 的 ack 等待须有界（OFFICE_JOIN_TIMEOUT）"
     assert client._desired_office is None and client._confirmed_office is None, "退房被拒也不回滚本地清账（#223）"
+
+
+@pytest.mark.asyncio
+async def test_async_leave_rejection_carries_details() -> None:
+    """#234：leave 与 join 共用同一构造器 ⇒ 被拒退房的 ``details`` 同样到达宿主（防两路径分叉）。"""
+    client = AsyncSMCPAgentClient(auth_provider=_auth())
+    client._desired_office = client._confirmed_office = (_OFFICE, _NAME)
+
+    async def fake_call(event: str, data: Any = None, namespace: Any = None, timeout: Any = 60) -> Any:
+        return {"code": 500, "message": "Internal error", "details": {"office_id": _OFFICE}}
+
+    client.call = fake_call  # type: ignore[method-assign]
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        await client.leave_office(_OFFICE)
+
+    assert ei.value.code == 500
+    assert ei.value.details == {"office_id": _OFFICE}
 
 
 @pytest.mark.asyncio
@@ -201,8 +220,24 @@ def test_sync_leave_rejection_raises_and_still_clears_local_state() -> None:
         client.leave_office(_OFFICE)
 
     assert ei.value.code == 500
+    assert ei.value.details == {}, "无 details 的拒绝仍需为空容器（#234）"
     assert client.call.call_args.args[0] == LEAVE_OFFICE_EVENT
     assert client._desired_office is None and client._confirmed_office is None
+
+
+def test_sync_leave_rejection_carries_details() -> None:
+    """同步镜像（#234）：被拒退房的 details 到达宿主。"""
+    client = SMCPAgentClient(auth_provider=_auth())
+    client._desired_office = client._confirmed_office = (_OFFICE, _NAME)
+    client.call = MagicMock(  # type: ignore[method-assign]
+        return_value={"code": 500, "message": "Internal error", "details": {"office_id": _OFFICE}}
+    )
+
+    with pytest.raises(SMCPProtocolError) as ei:
+        client.leave_office(_OFFICE)
+
+    assert ei.value.code == 500
+    assert ei.value.details == {"office_id": _OFFICE}
 
 
 # ── Y6 sync office 操作锁先到先得 ───────────────────────────────────────────────

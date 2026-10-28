@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from a2c_smcp.smcp import ErrorPayload, is_protocol_error_payload
+from a2c_smcp.smcp import ErrorPayload, is_protocol_error_payload, normalize_details
 
 
 class SMCPProtocolError(Exception):
@@ -38,8 +38,10 @@ class SMCPProtocolError(Exception):
     ``.code`` 取默认值 ``-1``，``.message`` 仍带服务端文案。调用方按 ``e.code`` 分流时须把 ``-1``
     当作「未获裁决」处理。/ ``-1`` means "rejected but no parseable code"; the key is omitted on purpose.
 
-    ``details`` 是诊断容器，Agent MUST NOT 透传给最终用户（防泄露）。
-    ``details`` is a diagnostic container; the Agent MUST NOT propagate it to end users.
+    ``details`` 是诊断容器，Agent MUST NOT 透传给最终用户（防泄露）。非 mapping 的 ``details``
+    **宽松归一为空映射**（#234）——对端违规不应把可感的协议拒绝升级成 ``ValueError``；与 rust
+    ``SmcpProtocolError::from_value`` 的 ``as_object + unwrap_or_default`` 对齐。
+    ``details`` is a diagnostic container; non-mapping values degrade to ``{}`` (matches rust).
 
     **入房路径刻意不走** :func:`raise_for_error_payload`：该 helper 以 ``code ∈ ErrorCode`` 白名单为
     闸，会把未知码与码不可解析的拒绝静默放过 —— 正是 #218 要消灭的「入房被拒零感知」（见
@@ -55,10 +57,19 @@ class SMCPProtocolError(Exception):
         self.capability: str | None = payload.get("capability")
         # 4016 / 4017 / 4018 details 容器（v0.2.1 起 code-specific 字段下沉到 details）
         # details container for 4016 / 4017 / 4018 (since v0.2.1 code-specific fields live under details)
-        self.details: dict[str, Any] = dict(payload.get("details") or {})
-        # 4017 / 4018 共用 ``details.reason`` 开放枚举（解析方 MUST 容忍未知值兜底）
-        # ``details.reason`` open enum shared by 4017 / 4018; parsers MUST default to fail-safe on unknown
-        self.reason: str | None = self.details.get("reason")
+        #
+        # #234：容器归一走 ``smcp.normalize_details``（单一权威，与 blob 的 4018/4019 共用）——
+        # 非 mapping 的 details 一律当空映射。协议违规（对端给了字符串/数组）不得把一次可感的拒绝
+        # 升级成 ``ValueError``（``dict("bad")`` 会抛），否则宿主拿到的就不是 ``SMCPProtocolError``。
+        # 与 rust ``SmcpProtocolError::from_value`` 的 ``as_object + unwrap_or_default`` 同策略。
+        # Container normalization is delegated to the single authority in ``smcp`` (shared with blob).
+        self.details: dict[str, Any] = normalize_details(payload)
+        # 4017 / 4018 共用 ``details.reason`` 开放枚举（解析方 MUST 容忍未知值兜底）。
+        # #234：**值**也要归一——非字符串视同未提供（与 rust ``and_then(Value::as_str)`` 对齐）；
+        # 原值仍留在 ``details`` 里供诊断，只是 ``.reason`` 不作机器分流。
+        # ``details.reason`` open enum; non-string values are exposed as ``None`` (matches rust as_str).
+        raw_reason = self.details.get("reason")
+        self.reason: str | None = raw_reason if isinstance(raw_reason, str) else None
         super().__init__(f"[{self.code}] {self.error_message}")
 
 

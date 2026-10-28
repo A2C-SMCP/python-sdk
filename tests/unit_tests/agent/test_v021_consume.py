@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,6 +68,56 @@ class TestSMCPProtocolErrorV021:
         # details 容器为空（4014 无 details）/ details container empty for 4014
         assert ei.value.details == {}
         assert ei.value.reason is None
+
+    @pytest.mark.parametrize(
+        ("code", "bad_details"),
+        [
+            pytest.param(int(ErrorCode.SKILL_NAME_INVALID), "bad", id="4016-string"),
+            pytest.param(int(ErrorCode.SKILL_NAME_INVALID), ["x"], id="4016-list"),
+            pytest.param(int(ErrorCode.BLOB_WRITE_FAILED), 42, id="4019-int"),
+        ],
+    )
+    def test_non_mapping_details_degrade_to_empty(self, code: int, bad_details: Any) -> None:
+        """#234：非 mapping 的 details **宽松归一为空映射**，不得抛 ``ValueError``（与 rust 同策略）。
+
+        回归形态：``dict("bad")`` 抛 ``ValueError``，宿主拿到的就不是 ``SMCPProtocolError``——
+        一次可感的协议拒绝被升级成非协议异常。此缺陷在 4014–4020 全通道同构，不限于 join。
+        """
+        with pytest.raises(SMCPProtocolError) as ei:
+            raise_for_error_payload({"code": code, "message": "x", "details": bad_details})
+
+        assert ei.value.code == code
+        assert ei.value.details == {}
+        assert ei.value.reason is None
+
+    def test_non_string_reason_is_not_exposed(self) -> None:
+        """#234：``details.reason`` 非字符串 ⇒ ``.reason is None``（与 rust ``as_str`` 对齐）。
+
+        原值仍留在 ``details`` 里供诊断，只是**不**参与机器分流——否则宿主会把整数当枚举用。
+        """
+        with pytest.raises(SMCPProtocolError) as ei:
+            raise_for_error_payload(
+                {"code": int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE), "message": "x", "details": {"reason": 42}}
+            )
+
+        assert ei.value.reason is None
+        assert ei.value.details == {"reason": 42}
+
+    def test_mapping_proxy_details_is_accepted_and_copied(self) -> None:
+        """#234：非 dict 的 ``Mapping``（``MappingProxyType``）被接受并复制（变异锁：收窄成 dict 即红）。"""
+        source = {"name": "x"}
+        with pytest.raises(SMCPProtocolError) as ei:
+            raise_for_error_payload(
+                {
+                    "code": int(ErrorCode.SKILL_NAME_INVALID),
+                    "message": "x",
+                    "details": MappingProxyType(source),
+                }
+            )
+        source["name"] = "mutated"
+
+        assert ei.value.details == {"name": "x"}
+        assert type(ei.value.details) is dict
 
 
 # ── async client get_skills / get_skill / get_blob ─────────────────
