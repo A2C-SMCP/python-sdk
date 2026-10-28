@@ -57,6 +57,7 @@ Do NOT reuse the server-side rejection builder here: it rejects unknown codes by
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -163,11 +164,21 @@ class JoinOfficeVerdict:
     其余码一律放弃并如实报错；失败效应则按 :func:`is_validation_rejection` 二分。
     ``code`` is the only machine-actionable field — only 4101 is retried (see
     :func:`rejoin_retry_delay`), and :func:`is_validation_rejection` splits the failure effects.
+
+    ``details`` 是协议规定的诊断容器（#234）：``4101`` → ``{office_id, role}``、``4106`` →
+    ``{office_id}``（当前房），其余码原样带出。**只接受 mapping**；非 mapping 视同未提供
+    （``None``）—— 协议违规不应把一次可感的拒绝升级成崩溃。
+    解析时**复制顶层映射**（浅拷贝）：调用方事后改动 ack 的顶层键不影响裁决；嵌套可变值仍与 ack
+    共享（协议标准 key 均为标量，无需深拷贝）。该 ``dict`` 字段使本 dataclass **不可哈希**——勿用作
+    set 成员 / dict 键 / ``lru_cache`` 键。
+    ``details`` is carried verbatim (mapping only, top level copied); non-mappings are treated as
+    absent. The ``dict`` field makes this dataclass unhashable.
     """
 
     ok: bool
     code: int | None
     message: str
+    details: dict[str, Any] | None = None
 
 
 def parse_join_ack(result: Any) -> JoinOfficeVerdict:
@@ -178,7 +189,7 @@ def parse_join_ack(result: Any) -> JoinOfficeVerdict:
 
     判定规则 / Verdict rules（协议 error-handling.md:177-205）:
       - ``None``（空 ack——socketio 把**零参** ACK 折叠为 ``None``）→ **成功**；
-      - ``dict`` 且顶层含 ``code`` → **显式拒绝**，带出协议码；
+      - ``dict`` 且顶层含 ``code`` → **显式拒绝**，带出协议码与 ``details``（mapping 才接受）；
       - 其余一切形状 → **无法判定**（``ok=False`` 且无码）。
 
     **刻意不再兼容 ``(bool, str | None)`` 元组**：v0.x 下 MINOR 严格匹配（versioning.md），跨版本
@@ -204,11 +215,18 @@ def parse_join_ack(result: Any) -> JoinOfficeVerdict:
         except (TypeError, ValueError):
             # 码不可解析（如字符串化失败）⇒ 仍判拒绝、只是无码可分流（宁严勿宽）
             code = None
+        # #234：details 原样带出（协议 4101/4106 标准 key）。**只收 mapping**：只有对象才能承载
+        # 标准 key，非 mapping 视同未提供（语义闸）。构造器侧的归一（smcp.normalize_details）属
+        # 纵深防御——`raise_for_error_payload` 不经过本闸，两条路径各自收口、互不依赖。
+        # Only mappings can carry the standard keys; non-mappings count as absent. The constructor-side
+        # normalization is defence in depth (raise_for_error_payload never passes through this gate).
+        raw_details = result.get("details")
+        details = dict(raw_details) if isinstance(raw_details, Mapping) else None
         if code in _RESERVED_ROOM_CODES:
             # 预留码（4102 / 4105，protocol#66）：协议 MUST NOT 产出 ⇒ 对端违规。照常判拒绝（非校验类、不重试），
             # 只多留一条可检索的违规记录。/ A reserved code is a peer protocol violation: logged, then rejected.
             logger.warning(f"server:join_office 收到预留码 {code}（对端协议违规，放弃）/ reserved code from peer: {result!r}")
-        return JoinOfficeVerdict(ok=False, code=code, message=str(result.get("message", "")))
+        return JoinOfficeVerdict(ok=False, code=code, message=str(result.get("message", "")), details=details)
     return JoinOfficeVerdict(ok=False, code=None, message=NO_RESPONSE_MESSAGE)
 
 
@@ -383,8 +401,15 @@ def build_join_failure_payload(
     """
     构造抛 ``SMCPProtocolError`` 用的 flat ``ErrorPayload`` / Build the flat ErrorPayload to raise.
 
-    归一化为 ``{"code", "message"}``（有意取舍：本条路径的调用方处置只需 ``code``，故丢掉 ``details``
-    以免诊断容器被透传）。**未获裁决必须省略 ``code`` 键**——写 ``{"code": None}`` 会让
+    保留 ``message`` / ``code`` / ``details`` 三键（#234）：``details`` **不按码特判**、原样透传
+    （解析侧已保证只可能是 mapping 或 ``None``；``None`` ⇒ 省略该键）。协议对 ``details`` 的约束是
+    「Agent MUST NOT 透传给**最终用户**」——那是宿主的使用纪律，不是要求 SDK 对宿主隐瞒。rust-sdk 的
+    房间路径同样**只接受 mapping**（``protocol_error.rs`` 的 ``SmcpProtocolError::from_value``：
+    ``as_object`` + ``unwrap_or_default``，非对象归一为空），与本次策略一致；勿与 blob 路径的
+    ``error_payload_from_value``（任意 JSON 值原样保留）混淆。
+    Details are carried verbatim (mapping only; omitted when absent), matching rust's room path.
+
+    **未获裁决必须省略 ``code`` 键**——写 ``{"code": None}`` 会让
     ``int(payload.get("code", -1))`` 抛 ``TypeError``；省略才得 ``.code == -1``（SDK 既有代码行为，
     自 #218 起写成**契约**）。
 
@@ -402,6 +427,8 @@ def build_join_failure_payload(
     payload: ErrorPayload = {"message": join_failure_message(verdict, confirmed_name=confirmed_name)}
     if verdict.code is not None:
         payload["code"] = verdict.code
+    if verdict.details is not None:
+        payload["details"] = dict(verdict.details)
     return payload
 
 
@@ -410,8 +437,10 @@ def log_join_rejection(office_id: str, verdict: JoinOfficeVerdict, *, confirmed_
     入房被拒的 ERROR 日志产出者（两路径共用）/ The shared ERROR-log producer for join rejections.
 
     #217 同态口径 ②：显式路径与自动回房路径必须**同一个产出者、同一份文案**——日志是重放路径
-    既有的可感通道（无人等 ACK，没有调用方可返回）。文案含 ``code`` + ``message``，**不含** SID /
-    namespace（对端会话标识不得外泄）。/ One producer, one wording, no peer session identifiers.
+    既有的可感通道（无人等 ACK，没有调用方可返回）。文案含 ``code`` + ``message`` + ``details``
+    （#234：重放路径没有异常通道，诊断容器只能从这里出去；协议 standard key 只含发起者自身上下文），
+    **不含** SID / namespace（对端会话标识不得外泄）。/ One producer, one wording, no peer session
+    identifiers; ``details`` is included because replay has no exception channel.
 
     **产出条件在调用方**（有意的不对称，供 #219 断言）：显式路径的裁决一定会走到本函数（调用方在等，
     文案另有异常通道）；重放路径仅在结果**未被抢占**时记录（陈旧结果整条丢弃，包括日志）。
@@ -421,7 +450,8 @@ def log_join_rejection(office_id: str, verdict: JoinOfficeVerdict, *, confirmed_
         verdict: 服务端裁决。
         confirmed_name (str | None): 已确认的会话身份名（``403`` 提示用）。
     """
+    details = f" details={verdict.details}" if verdict.details is not None else ""
     logger.error(
         f"加入 Office 被拒绝: {office_id} - code={verdict.code} "
-        f"{join_failure_message(verdict, confirmed_name=confirmed_name)}",
+        f"{join_failure_message(verdict, confirmed_name=confirmed_name)}{details}",
     )
