@@ -34,7 +34,8 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.blob import BlobHandleForbiddenError, BlobHandleGoneError
-from a2c_smcp.computer.blob.path_resolver import PathResolveError, ReadRoot, ResolvedPath
+from a2c_smcp.computer.blob.path_resolver import PathResolveError, ResolvedPath
+from a2c_smcp.computer.settings.scope import ResolvedSettings
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.socketio import client as computer_sio
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
@@ -56,9 +57,18 @@ def _resolve_req(path: str = "/srv/docs/a.txt", *, computer_name: str = "comp-te
     return {"agent": "agent-1", "req_id": "r-1", "computer": computer_name, "path": path}
 
 
-def _grant(computer: Computer, *roots: str) -> None:
-    """直接注入编译后的读根（跳过 settings 解析，聚焦接线）。"""
-    computer._read_roots = [ReadRoot(configured=r, real=r) for r in roots]
+def _grant(computer: Computer, monkeypatch: pytest.MonkeyPatch, *roots: str) -> None:
+    """注入 settings 视图（``readRoots`` = ``roots``），走真实的 ``read_roots`` 编译路径.
+
+    不直接写 ``_read_roots`` 缓存：``read_roots`` 每次现读 settings（撤权即时生效），
+    只覆写私有缓存会被判定为「raw 已变」并重新解析真实用户配置，导致测试依赖宿主环境。
+    Patch the settings view instead of the private cache so the real compile path runs.
+    """
+    monkeypatch.setattr(
+        computer,
+        "_resolve_declared_settings",
+        lambda: ResolvedSettings(settings={"readRoots": list(roots)}, errors=[], per_scope_layers={}),
+    )
 
 
 def _resolved(**overrides: Any) -> ResolvedPath:
@@ -116,7 +126,7 @@ class TestResolvePathHandler:
         self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """成功路径：``ResolvedPath`` 六字段 + ``req_id`` 原样映射进 ``ResolvePathRet``."""
-        _grant(computer, "/srv/docs")
+        _grant(computer, monkeypatch, "/srv/docs")
         monkeypatch.setattr(computer, "resolve_read_path", lambda path: _resolved())
 
         ret = await client.on_resolve_path(_resolve_req())  # type: ignore[arg-type]
@@ -137,7 +147,7 @@ class TestResolvePathHandler:
         self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch, reason: str
     ) -> None:
         """四种铸造期失败 → ``4020`` flat ErrorPayload，``reason`` 下沉 ``details``（开放枚举）."""
-        _grant(computer, "/srv/docs")
+        _grant(computer, monkeypatch, "/srv/docs")
 
         def _raise(path: str) -> ResolvedPath:
             raise PathResolveError(reason)  # type: ignore[arg-type]
@@ -152,10 +162,10 @@ class TestResolvePathHandler:
 
     @pytest.mark.asyncio
     async def test_computer_name_mismatch_raises(
-        self, computer: Computer, client: SMCPComputerClient
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """隔离不变量：``computer`` 名不匹配 → 抛 ``SMCPNamespaceError``（不伪装成 ErrorPayload）."""
-        _grant(computer, "/srv/docs")
+        _grant(computer, monkeypatch, "/srv/docs")
         with pytest.raises(SMCPNamespaceError):
             await client.on_resolve_path(_resolve_req(computer_name="other"))  # type: ignore[arg-type]
 
