@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -88,6 +89,35 @@ class TestSMCPProtocolErrorV021:
         assert ei.value.code == code
         assert ei.value.details == {}
         assert ei.value.reason is None
+
+    def test_non_string_reason_is_not_exposed(self) -> None:
+        """#234：``details.reason`` 非字符串 ⇒ ``.reason is None``（与 rust ``as_str`` 对齐）。
+
+        原值仍留在 ``details`` 里供诊断，只是**不**参与机器分流——否则宿主会把整数当枚举用。
+        """
+        with pytest.raises(SMCPProtocolError) as ei:
+            raise_for_error_payload(
+                {"code": int(ErrorCode.SKILL_RESOURCE_NOT_ACCESSIBLE), "message": "x", "details": {"reason": 42}}
+            )
+
+        assert ei.value.reason is None
+        assert ei.value.details == {"reason": 42}
+
+    def test_mapping_proxy_details_is_accepted_and_copied(self) -> None:
+        """#234：非 dict 的 ``Mapping``（``MappingProxyType``）被接受并复制（变异锁：收窄成 dict 即红）。"""
+        source = {"name": "x"}
+        with pytest.raises(SMCPProtocolError) as ei:
+            raise_for_error_payload(
+                {
+                    "code": int(ErrorCode.SKILL_NAME_INVALID),
+                    "message": "x",
+                    "details": MappingProxyType(source),
+                }
+            )
+        source["name"] = "mutated"
+
+        assert ei.value.details == {"name": "x"}
+        assert type(ei.value.details) is dict
 
 
 # ── async client get_skills / get_skill / get_blob ─────────────────

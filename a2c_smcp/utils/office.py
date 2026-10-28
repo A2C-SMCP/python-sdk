@@ -215,9 +215,11 @@ def parse_join_ack(result: Any) -> JoinOfficeVerdict:
         except (TypeError, ValueError):
             # 码不可解析（如字符串化失败）⇒ 仍判拒绝、只是无码可分流（宁严勿宽）
             code = None
-        # #234：details 原样带出（协议 4101/4106 标准 key）。**只收 mapping**并快照——非 mapping 是
-        # 对端违规，当未提供处理即可；若把它透到 SMCPProtocolError，其 dict(...) 会抛，把一次可感的
-        # 拒绝升级成崩溃。/ Only mappings are accepted (and copied); malformed details are ignored.
+        # #234：details 原样带出（协议 4101/4106 标准 key）。**只收 mapping**：只有对象才能承载
+        # 标准 key，非 mapping 视同未提供（语义闸）。构造器侧的归一（smcp.normalize_details）属
+        # 纵深防御——`raise_for_error_payload` 不经过本闸，两条路径各自收口、互不依赖。
+        # Only mappings can carry the standard keys; non-mappings count as absent. The constructor-side
+        # normalization is defence in depth (raise_for_error_payload never passes through this gate).
         raw_details = result.get("details")
         details = dict(raw_details) if isinstance(raw_details, Mapping) else None
         if code in _RESERVED_ROOM_CODES:
@@ -435,8 +437,10 @@ def log_join_rejection(office_id: str, verdict: JoinOfficeVerdict, *, confirmed_
     入房被拒的 ERROR 日志产出者（两路径共用）/ The shared ERROR-log producer for join rejections.
 
     #217 同态口径 ②：显式路径与自动回房路径必须**同一个产出者、同一份文案**——日志是重放路径
-    既有的可感通道（无人等 ACK，没有调用方可返回）。文案含 ``code`` + ``message``，**不含** SID /
-    namespace（对端会话标识不得外泄）。/ One producer, one wording, no peer session identifiers.
+    既有的可感通道（无人等 ACK，没有调用方可返回）。文案含 ``code`` + ``message`` + ``details``
+    （#234：重放路径没有异常通道，诊断容器只能从这里出去；协议 standard key 只含发起者自身上下文），
+    **不含** SID / namespace（对端会话标识不得外泄）。/ One producer, one wording, no peer session
+    identifiers; ``details`` is included because replay has no exception channel.
 
     **产出条件在调用方**（有意的不对称，供 #219 断言）：显式路径的裁决一定会走到本函数（调用方在等，
     文案另有异常通道）；重放路径仅在结果**未被抢占**时记录（陈旧结果整条丢弃，包括日志）。
@@ -446,7 +450,8 @@ def log_join_rejection(office_id: str, verdict: JoinOfficeVerdict, *, confirmed_
         verdict: 服务端裁决。
         confirmed_name (str | None): 已确认的会话身份名（``403`` 提示用）。
     """
+    details = f" details={verdict.details}" if verdict.details is not None else ""
     logger.error(
         f"加入 Office 被拒绝: {office_id} - code={verdict.code} "
-        f"{join_failure_message(verdict, confirmed_name=confirmed_name)}",
+        f"{join_failure_message(verdict, confirmed_name=confirmed_name)}{details}",
     )

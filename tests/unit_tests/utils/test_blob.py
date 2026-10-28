@@ -209,6 +209,23 @@ class TestSerialErrorMatrix:
             await drain_blob(call, "c", "h")
         assert exc_info.value.reason == "range"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_details", ["bad", 42, ["reason"]])
+    async def test_4018_non_mapping_details_degrades_to_default_reason(self, bad_details: Any) -> None:
+        """#234：非 mapping ``details`` 归一为空映射 ⇒ 默认 reason，不得抛 ``AttributeError``。
+
+        回归形态：``details.get(...)`` 对字符串/数组/标量直接抛，顶替掉 ``BlobTransferError``，
+        宿主拿到的就不是可分类的 blob 异常了。
+        """
+        call = _AsyncMockCall(
+            [{"code": int(ErrorCode.BLOB_NOT_ACCESSIBLE), "message": "Blob not accessible", "details": bad_details}]
+        )
+        with pytest.raises(BlobTransferError) as exc_info:
+            await drain_blob(call, "c", "h")
+
+        assert exc_info.value.reason == "invalid_handle"
+        assert len(call.calls) == 1, "非 mapping details 不应触发重试（与其它不可重试 reason 同类）"
+
 
 # ── 并行模式 / Parallel mode ─────────────────────────────────────────────
 

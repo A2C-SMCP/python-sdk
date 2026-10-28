@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -101,6 +102,18 @@ class TestParseJoinAckVerdicts:
         ack["details"]["office_id"] = "mutated"
 
         assert verdict.details == {"office_id": "o"}
+
+    def test_mapping_proxy_details_is_accepted_and_copied(self) -> None:
+        """非 dict 的 ``Mapping``（如 ``MappingProxyType``）同样被接受并复制顶层（#234 变异锁）。
+
+        若判据从 ``Mapping`` 收窄成 ``dict``，本用例变红；若去掉 ``dict(...)`` 复制，快照断言变红。
+        """
+        source = {"office_id": "o"}
+        verdict = parse_join_ack({"code": 4101, "message": "x", "details": MappingProxyType(source)})
+        source["office_id"] = "mutated"
+
+        assert verdict.details == {"office_id": "o"}
+        assert type(verdict.details) is dict, "必须归一为普通 dict（可被调用方安全持有）"
 
     @pytest.mark.parametrize("code", [4102, 4105])
     def test_reserved_code_is_logged_as_violation_and_still_rejected(self, code: int, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -335,13 +348,18 @@ class TestBuildJoinFailurePayload:
 
         assert payload["details"] == {}
 
-    def test_non_mapping_details_never_reaches_the_exception(self) -> None:
-        """端到端：非 mapping details 在解析侧被丢弃，构造异常时不崩、``.details == {}``。"""
-        verdict = parse_join_ack({"code": 4101, "message": "x", "details": ["office_id"]})
-        error = SMCPProtocolError(build_join_failure_payload(verdict))
+    def test_non_mapping_details_never_reaches_the_payload(self) -> None:
+        """端到端不变式：非 mapping details 在解析侧即被丢弃 ⇒ 裁决无 details、载荷不写该键。
 
-        assert error.code == 4101
-        assert error.details == {}
+        回滚 #234 后 ``verdict.details`` 不存在（AttributeError）⇒ 本用例必红，是真回归锁
+        （旧版只断言 ``.details == {}``，回滚后照样绿，属空转）。
+        """
+        verdict = parse_join_ack({"code": 4101, "message": "x", "details": ["office_id"]})
+        payload = build_join_failure_payload(verdict)
+
+        assert verdict.details is None
+        assert "details" not in payload
+        assert SMCPProtocolError(payload).details == {}
 
 
 class TestLogJoinRejection:
@@ -362,6 +380,20 @@ class TestLogJoinRejection:
         assert "Room already has an agent" in text
         assert "sid" not in text.lower()
         assert "namespace" not in text.lower()
+        assert "details=" not in text, "无 details 时不得写空容器（与「没给」区分）"
+
+    def test_log_carries_details_when_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#234：重放路径没有异常通道，诊断容器只能经共享日志带出（两路径仍同一文案）。"""
+        fake_logger = MagicMock()
+        monkeypatch.setattr(office_mod, "logger", fake_logger)
+        verdict = JoinOfficeVerdict(
+            ok=False, code=4101, message="Room already has an agent", details={"office_id": "officeB", "role": "agent"}
+        )
+
+        log_join_rejection("officeA", verdict)
+
+        text = fake_logger.error.call_args[0][0]
+        assert "details=" in text and "officeB" in text and "'role': 'agent'" in text
 
     def test_log_appends_403_hint_via_message_authority(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """403 提示与异常文案同源（同一文案权威），不得各写各的。"""

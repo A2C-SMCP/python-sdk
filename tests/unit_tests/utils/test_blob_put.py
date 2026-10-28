@@ -168,6 +168,14 @@ class TestErrorMapping:
             asyncio.run(pump_blob(call, "c1", b"data"))
         assert excinfo.value.reason == "protocol_error_4008"
 
+    @pytest.mark.parametrize("bad_details", ["bad", 42, ["reason"]])
+    def test_non_mapping_details_degrades_to_default_reason(self, bad_details: Any) -> None:
+        """#234：4019 的 ``details`` 非 mapping ⇒ 归一为空映射、取默认 reason，不得抛 ``AttributeError``。"""
+        call = _RecordingCall(acks=[{"code": 4019, "message": "Blob write failed", "details": bad_details}])
+        with pytest.raises(BlobUploadError) as excinfo:
+            asyncio.run(pump_blob(call, "c1", b"data"))
+        assert excinfo.value.reason == "invalid_upload"
+
     def test_final_echo_mismatch(self) -> None:
         data = b"data-bytes!"
         call = _RecordingCall(acks=[

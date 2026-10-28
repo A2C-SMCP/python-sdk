@@ -48,7 +48,7 @@ from typing import Any
 import socketio.exceptions
 
 from a2c_smcp import PROTOCOL_VERSION
-from a2c_smcp.smcp import ErrorCode
+from a2c_smcp.smcp import ErrorCode, normalize_details
 
 # ── 公开类型 / Public types ──────────────────────────────────────────────
 
@@ -482,7 +482,9 @@ def _raise_for_blob_error(payload: Mapping[str, Any]) -> None:
     if code is None:
         return
     if code == int(ErrorCode.BLOB_NOT_ACCESSIBLE):
-        details = payload.get("details") or {}
+        # #234：details 归一走 smcp.normalize_details（非 mapping 退化空映射），避免对端给出
+        # 字符串/数组时 `.get()` 抛 AttributeError 顶替 BlobTransferError。
+        details = normalize_details(payload)
         reason = str(details.get("reason", "invalid_handle"))
         raise BlobTransferError(reason=reason, message=str(payload.get("message", "Blob not accessible")))
     # 其它协议错误码：直接以原始 code 透传（不再 swallow 成 success）
@@ -599,7 +601,8 @@ def _raise_for_put_blob_error(payload: Mapping[str, Any]) -> None:
     if code is None:
         return
     if code == int(ErrorCode.BLOB_WRITE_FAILED):
-        details = payload.get("details") or {}
+        # #234：同 4018 —— 非 mapping details 不得把 BlobUploadError 顶替成 AttributeError。
+        details = normalize_details(payload)
         reason = str(details.get("reason", "invalid_upload"))
         raise BlobUploadError(reason=reason, message=str(payload.get("message", "Blob write failed")))
     raise BlobUploadError(

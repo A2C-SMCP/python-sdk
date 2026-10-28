@@ -4,6 +4,7 @@
 # @Author  : JQQ
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
+from collections.abc import Mapping
 from enum import IntEnum
 from typing import Annotated, Any, Literal, NotRequired, TypeAlias
 
@@ -912,6 +913,30 @@ def is_protocol_error_payload(data: object) -> bool:
     if isinstance(data, dict) and "content" in data:
         return False
     return isinstance(data, dict) and data.get("code") in _ERROR_CODE_VALUES
+
+
+def normalize_details(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    归一 flat ``ErrorPayload`` 的 ``details`` 诊断容器（**单一权威**，`#234`）。
+    Normalize the ``details`` diagnostic container of a flat ``ErrorPayload`` (single authority).
+
+    协议把 ``details`` 定义为**对象**（standard key 的承载容器，error-handling.md §details 字段约束）。
+    对端给出字符串 / 数组 / 标量属协议违规；调用方各自写 ``details.get(...)`` 会直接 ``AttributeError``
+    （既不诚实也不可分流）。本函数把任何**非 mapping** 值（含缺失 / ``None``）一律归一为空 dict，
+    调用方拿到的必然是可直接 ``.get()`` 的 mapping。
+
+    / Any non-mapping ``details`` (including absent) becomes ``{}``, matching rust
+    ``SmcpProtocolError::from_value`` (``as_object`` + ``unwrap_or_default``). The returned dict is a
+    shallow copy, so mutating the source payload afterwards cannot change the caller's view.
+
+    Args:
+        payload (Mapping[str, Any]): flat ``ErrorPayload``（或任何含 ``details`` 键的映射）。
+
+    Returns:
+        dict[str, Any]: 总是 mapping；非 mapping 值为空 dict。
+    """
+    raw = payload.get("details")
+    return dict(raw) if isinstance(raw, Mapping) else {}
 
 
 def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
