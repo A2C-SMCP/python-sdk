@@ -165,17 +165,29 @@ class _RawServerEntry:
     marketplace: str | None
 
 
-def _absolute_flag_path(path: Path | str | None) -> Path | None:
-    """flag 层文件路径 → 绝对路径（展开 ``~``、相对路径按**构造期** cwd 解析、跟随符号链接）。
+def _absolute_path(path: Path | str | None) -> Path | None:
+    """构造期路径 → 绝对路径（展开 ``~``、相对路径按**构造期** cwd 解析、跟随符号链接）。
 
-    Normalize a flag-layer path to absolute at construction time (expanduser + resolve).
+    Normalize a constructor-supplied path to absolute (expanduser + resolve at construction).
 
     ``resolve()`` 默认非严格：文件尚不存在也返回绝对路径（构造期允许「稍后创建」）。
-    单独抽成函数便于单测钉住「相对路径也进拒绝集」。
+
+    ``expanduser()`` 在 ``~nosuchuser`` 形态下抛 ``RuntimeError``（本机无该用户），
+    ``resolve()`` 可抛 ``OSError``：这类输入**不得**把「flag/settings 缺文件可容错」变成构造器
+    裸 traceback（🟡3）。失败时降级为 :meth:`Path.absolute`（仍绝对、不丢拒绝集条目）并记 WARNING。
+    ``expanduser`` can raise RuntimeError for unknown users; degrade to ``absolute()`` instead of
+    crashing the constructor — the path stays absolute so the rejection set keeps its entry.
     """
     if path is None:
         return None
-    return Path(path).expanduser().resolve()
+    raw = Path(path)
+    try:
+        return raw.expanduser().resolve()
+    except (RuntimeError, OSError, ValueError) as exc:
+        logger.warning(
+            f"路径归一失败，降级为 absolute（保持绝对形态）/ path normalization fell back to absolute: {raw!r}: {exc}",
+        )
+        return raw.absolute()
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,10 +220,10 @@ class Computer(BaseComputer[PromptSession]):
         blob_resolvers: dict[str, BlobResolver] | None = None,
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
-        mcp_flag_config: Path | None = None,
-        flag_settings_path: Path | None = None,
+        mcp_flag_config: Path | str | None = None,
+        flag_settings_path: Path | str | None = None,
         env: Mapping[str, str] | None = None,
-        project_root: Path | None = None,
+        project_root: Path | str | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -291,13 +303,18 @@ class Computer(BaseComputer[PromptSession]):
         # 即真实场景）。归一点选在构造器：CLI 与嵌入式宿主共用同一入口。
         # Normalize at construction so the approval gate, the rejection set and file reads all see
         # one absolute path; otherwise a relative/`~` flag path is silently dropped from the set.
-        self._mcp_flag_config: Path | None = _absolute_flag_path(mcp_flag_config)
+        self._mcp_flag_config: Path | None = _absolute_path(mcp_flag_config)
         # flag 层 settings.json 路径（`--settings`）：与 `_mcp_flag_config` 同为 flag scope 文件对（#167 子问题 3）。
-        self._flag_settings_path: Path | None = _absolute_flag_path(flag_settings_path)
+        self._flag_settings_path: Path | None = _absolute_path(flag_settings_path)
         # #134（对齐 rust-sdk#121）：per-instance env/project_root 注入接缝。None = 进程 ambient（backward compat）。
         # 嵌入式宿主注入使 settings 解析轴（XDG / project cwd）与 ledger（skill_home）同锚点，消除归属混源。
         self._env: Mapping[str, str] | None = env
-        self._project_root: Path | None = project_root
+        # project_root 也必须归一（🔴1 同类）：嵌入式宿主传相对 ``Path("proj")`` 时，
+        # ``cwd/.tfrobot`` 会变成相对路径 → 进拒绝集时被 ``normalize_path`` 判 invalid 后静默丢弃，
+        # ``.tfrobot/mcp.json``（可含 server 字面量 env/凭据）仍可被 resolve + get_blob 读出。
+        # Normalize project_root too: a relative anchor would make `<cwd>/.tfrobot` a relative
+        # protected path that normalize_path silently drops.
+        self._project_root: Path | None = _absolute_path(project_root)
         # #149：运行期活跃集的**声明面 raw 投影**缓存（bundle_id → raw-with-bundle 未渲染 config）。get_config wire
         # 从此取 body（占位符字面保留、绝不外泄已解析 secret）；SET 仍以 manager 运行期权威为准（见 active_server_configs）。
         # #149: raw (un-rendered) projection of the runtime-active set, keyed by bundle_id — the body source for the
@@ -614,7 +631,9 @@ class Computer(BaseComputer[PromptSession]):
         roots = self._compile_read_roots(resolved)
         if not roots:
             # 未授权：短路掉拒绝集构造——它会 ``ensure_skill_home()``（mkdir）并 stat 约 8 条路径，
-            # 与「空 readRoots 时不触碰文件系统」的语义冲突（🟡7）。空拒绝集对调用方无差别：
+            # 与「空 readRoots 时不触碰**目标路径**（不 lstat/open）」的语义冲突（🟡7）——注意
+            # 授权视图本身必然读 settings 文件，这是判定的前提，不在此列。
+            # 空拒绝集对调用方无差别：
             # 空 roots 在 path core 第 2 步即 forbidden，绝不会走到拒绝集判定。
             # Short-circuit: an empty rejection set is equivalent here because empty roots already
             # mean `forbidden` at path core step 2 — and building it would mkdir skill home + stat.

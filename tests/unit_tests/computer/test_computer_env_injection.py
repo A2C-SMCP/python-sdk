@@ -123,12 +123,17 @@ def test_constructor_accepts_env_and_project_root():
 
 
 def test_constructor_stores_env_and_project_root():
-    """显式注入的 env 和 project_root 被正确存储。"""
+    """显式注入的 env 和 project_root 被正确存储。
+
+    #236：``project_root`` 在构造期归一到绝对路径（相对锚点会让 ``.tfrobot`` 进不了固定拒绝集），
+    故按**值**比较而非 identity（``Path("/fake/project").resolve() == Path("/fake/project")``）。
+    """
     env = {"XDG_CONFIG_HOME": "/fake/xdg", "HOME": "/fake/home"}
     root = Path("/fake/project")
     c = Computer(name="test", env=env, project_root=root)
     assert c._env is env
-    assert c._project_root is root
+    assert c._project_root == root
+    assert c._project_root.is_absolute()
 
 
 # ── AC2: env 注入贯通 settings 解析 / env reaches settings resolution ────

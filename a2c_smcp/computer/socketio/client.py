@@ -75,6 +75,7 @@ from a2c_smcp.smcp import (
     ResourceAnnotations,
     ToolCallReq,
     UpdateComputerConfigReq,
+    build_bad_request_error,
     build_internal_error,
 )
 from a2c_smcp.smcp import (
@@ -1551,6 +1552,20 @@ def _process_resolve_path(data: ResolvePathReq, computer: Computer) -> ResolvePa
     )
 
 
+def _clamp_chunk_or_none(computer: Computer, requested: Any) -> int | None:
+    """clamp 客户建议的单块大小；**类型非法**（线上可达）返回 ``None`` 而非抛异常（🟡2）。
+
+    Server 的 ``parse_payload`` 是 lax 校验（``"1024"`` 会被强制为 int 通过），但 relay 转发的是
+    **原始 payload**——Computer 会收到字符串。``clamp_chunk`` 内 ``requested <= 0`` 对 str 抛
+    ``TypeError``；若发生在受保护块之外会逃出 handler ⇒ 不发 ack ⇒ Agent 挂到自身超时。
+    Return None for a malformed value so the handler can answer with a flat 400 instead.
+    """
+    try:
+        return computer.blob_thresholds.clamp_chunk(requested)
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_chunk_ret(
     *,
     blob_handle: str,
@@ -1606,7 +1621,11 @@ def _process_path_get_blob(data: GetBlobReq, computer: Computer, payload: Mappin
         ``GetBlobRet``（成功）或 ``ErrorPayload``（``4018``）。
     """
     chunk_offset = data.get("chunk_offset", 0)
-    max_chunk_bytes = computer.blob_thresholds.clamp_chunk(data.get("max_chunk_bytes"))
+    clamped = _clamp_chunk_or_none(computer, data.get("max_chunk_bytes"))
+    if clamped is None:
+        logger.warning(f"client:get_blob 非法 max_chunk_bytes={data.get('max_chunk_bytes')!r}（path 分支）")
+        return build_bad_request_error()
+    max_chunk_bytes = clamped
 
     # 复核在 try 之外：失败时尚未打开句柄（或已由 path core 内部释放），无需 close。
     # Revalidation happens before the try: on failure no handle is owned by us.
@@ -1686,7 +1705,11 @@ def _process_get_blob(data: GetBlobReq, computer: Computer) -> GetBlobRet | Erro
     handle = data["blob_handle"]
     chunk_offset = data.get("chunk_offset", 0)
     max_chunk_bytes_req = data.get("max_chunk_bytes")
-    max_chunk_bytes = computer.blob_thresholds.clamp_chunk(max_chunk_bytes_req)
+    clamped = _clamp_chunk_or_none(computer, max_chunk_bytes_req)
+    if clamped is None:
+        logger.warning(f"client:get_blob 非法 max_chunk_bytes={max_chunk_bytes_req!r}")
+        return build_bad_request_error()
+    max_chunk_bytes = clamped
 
     # 1) 解码句柄 → kind 派发 / Decode handle → kind dispatch
     try:

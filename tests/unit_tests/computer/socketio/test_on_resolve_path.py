@@ -35,7 +35,7 @@ from typing import Any
 
 import pytest
 
-from a2c_smcp.computer.blob import BlobHandleForbiddenError, BlobHandleGoneError
+from a2c_smcp.computer.blob import BlobHandleForbiddenError, BlobHandleGoneError, encode_toolspool_handle
 from a2c_smcp.computer.blob.path_resolver import PathResolveError, ProtectedPaths, ResolvedPath
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.settings.scope import ResolvedSettings
@@ -539,3 +539,70 @@ class TestReviewRoundTwoLocks:
         ret = await client.on_resolve_path({"agent": "a", "req_id": "r", "computer": "comp-test"})  # type: ignore[arg-type]
 
         assert ret["code"] == 500  # type: ignore[index]
+
+
+class TestReviewRoundThreeLocks:
+    """构造期路径归一 / 非法 max_chunk_bytes ack（隔离审查第三轮）."""
+
+    def test_relative_project_root_keeps_tfrobot_in_rejection_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴1：嵌入式宿主传相对 ``project_root`` 时，``.tfrobot`` 仍必须进拒绝集.
+
+        未归一时 ``cwd/.tfrobot`` 是相对路径 → ``normalize_path`` 判 invalid 后静默丢弃，
+        ``.tfrobot/mcp.json``（可含 env/凭据）仍可被 resolve + get_blob 读出。
+        """
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "proj" / ".tfrobot").mkdir(parents=True)
+
+        computer = Computer(name="comp-test", blob_cache_root=tmp_path / "cache", project_root=Path("proj"))
+        _grant(computer, monkeypatch)
+
+        expected = normalize_path(str((tmp_path / "proj" / ".tfrobot").resolve()))
+        assert expected in computer.protected_paths().paths
+
+    def test_unknown_user_tilde_path_does_not_raise(self, tmp_path: Path) -> None:
+        """🟡3：``~nosuchuser`` 形态的 flag 路径不得让构造器抛 ``RuntimeError``（降级为 absolute）."""
+        computer = Computer(
+            name="comp-test",
+            blob_cache_root=tmp_path / "cache",
+            flag_settings_path=Path("~nosuchuser_xyz_236/settings.json"),
+        )
+
+        assert computer._flag_settings_path is not None
+        assert computer._flag_settings_path.is_absolute()
+
+    def test_flag_path_accepts_str(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """🟡5：公开构造入参接受 ``str``（嵌入式宿主形态），并归一到绝对路径."""
+        monkeypatch.chdir(tmp_path)
+
+        computer = Computer(name="comp-test", blob_cache_root=tmp_path / "cache", mcp_flag_config="./flag.json")
+
+        assert computer._mcp_flag_config == (tmp_path / "flag.json").resolve()
+
+    @pytest.mark.asyncio
+    async def test_malformed_max_chunk_bytes_on_path_branch_acks_400(
+        self, computer: Computer, client: SMCPComputerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🟡2：``max_chunk_bytes: "1024"``（Server lax 校验放行、relay 转原始 payload）→ flat 400 ack."""
+        _grant(computer, monkeypatch, "/srv/docs")
+        _patch_path_handle(monkeypatch)
+        monkeypatch.setattr(computer, "pull_path_blob", lambda payload, **kw: _FakePull(b"abc"))
+
+        ret = await client.on_get_blob(_blob_req(max_chunk="1024"))  # type: ignore[arg-type]
+
+        assert ret["code"] == 400  # type: ignore[index]
+
+    @pytest.mark.asyncio
+    async def test_malformed_max_chunk_bytes_on_generic_branch_acks_400(
+        self, computer: Computer, client: SMCPComputerClient
+    ) -> None:
+        """🟡2（generic 分支同款）：toolspool 句柄 + ``max_chunk_bytes: "1024"`` → flat 400 ack."""
+        cid = computer.toolspool_store.put(b"payload", "text/plain")
+        handle = encode_toolspool_handle(cid=cid, mime="text/plain")
+        req = _blob_req(max_chunk="1024")
+        req["blob_handle"] = handle
+
+        ret = await client.on_get_blob(req)  # type: ignore[arg-type]
+
+        assert ret["code"] == 400  # type: ignore[index]
