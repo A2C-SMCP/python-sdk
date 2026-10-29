@@ -25,9 +25,7 @@ import os
 import sys
 from collections.abc import Iterable, Mapping
 from enum import Enum
-from typing import Any, cast
-
-from prompt_toolkit import PromptSession
+from typing import TYPE_CHECKING, Any, cast
 
 from a2c_smcp.computer.inputs.base import BaseInputResolver
 from a2c_smcp.computer.inputs.cli_io import ainput_pick, ainput_prompt, arun_command
@@ -43,6 +41,14 @@ from a2c_smcp.computer.mcp_clients.model import (
 )
 from a2c_smcp.utils.env_segment import env_var_name
 from a2c_smcp.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from prompt_toolkit import PromptSession
+else:
+    # 运行时占位（#226）：纯 core 安装不要求 cli extra。`PromptSession` 只用于
+    # `BaseInputResolver[...]` 基类与注解求值；真正的 prompt_toolkit 由 cli_io 惰性导入。
+    # Runtime placeholder (#226): a bare-core install must not require the cli extra.
+    PromptSession = Any
 
 logger = get_logger("computer")
 

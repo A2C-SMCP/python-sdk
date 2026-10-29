@@ -94,8 +94,13 @@ def _assert_ok(result: subprocess.CompletedProcess[str]) -> None:
 
 
 def test_core_import_does_not_load_cli_deps() -> None:
-    """中文: `import a2c_smcp.computer` 不得把 rich / prompt_toolkit 拉进 sys.modules（惰性），
-    且 console 正向可用（有 cli extra 时行为不变）。"""
+    """中文: `import a2c_smcp.computer` 不得在导入期构造 Console、也不得拉入 prompt_toolkit；
+    console 仍正向可用（有 cli extra 时行为不变）。
+
+    rich 例外：已安装时第三方 `httpx._main`（经 `mcp.shared.session`）会顺手导入 `rich.console`，
+    这不属本包；因此这里断言「本包未构造 Console 实例」而非「rich 不在 sys.modules」。
+    「完全没有 rich 也能导入」由另一个阻断用例证明。
+    """
     if importlib.util.find_spec("rich") is None or importlib.util.find_spec("prompt_toolkit") is None:
         import pytest
 
@@ -106,13 +111,16 @@ def test_core_import_does_not_load_cli_deps() -> None:
         import a2c_smcp.computer
 
         _assert_source()
-        assert "rich" not in sys.modules, "rich was imported eagerly by a2c_smcp.computer"
         assert "prompt_toolkit" not in sys.modules, "prompt_toolkit was imported eagerly by a2c_smcp.computer"
 
         from a2c_smcp.computer.utils import console as console_util
 
+        # rich 可能被第三方 httpx 顺手导入；关键是**本包**未在导入期构造 Console。
+        assert console_util._console is None, "Console must not be constructed at import time"
+        assert console_util._console_err is None, "Console(err) must not be constructed at import time"
         assert console_util.console is not None, "console must stay usable when the extra is installed"
         assert console_util.console is console_util.console, "console identity must be stable"
+        assert console_util._console is not None
         print(_MARKER)
         """
     )
@@ -129,12 +137,12 @@ def test_core_import_succeeds_without_cli_extra() -> None:
         import a2c_smcp.computer
 
         _assert_source()
-        assert "rich" not in sys.modules
-        assert "prompt_toolkit" not in sys.modules
 
         from a2c_smcp.computer.utils import console as console_util
 
-        console_util.set_no_color(True)  # 必须不触发 rich 导入
+        # 阻断块把 rich 置 None，故只能用「本包未构造实例」证明惰性。
+        assert console_util._console is None
+        console_util.set_no_color(True)  # 必须不触发 rich 导入（否则此处抛 ImportError）
         print(_MARKER)
         """,
         block_cli_deps=True,

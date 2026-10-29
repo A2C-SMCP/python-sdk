@@ -3,40 +3,53 @@
 # 作者: JQQ / Author: JQQ
 # 创建日期: 2026/09/29 / Created: 2026/09/29
 # 描述: 干净安装冒烟——把**构建出的 wheel** 装进空 venv（只装制品自己声明的依赖），
-#       验证 `a2c-computer --help` 可跑、且包能被导入。用于 tests.yml 与 publish.yml **单点复用**
+#       验证制品在两种安装面上都可用。用于 tests.yml 与 publish.yml **单点复用**
 #       （两处逐字复制会静默漂移，使「上传前」那道闸门失效——#224 的逃逸通道）。
 #       Description: Clean-install smoke — install the BUILT WHEEL into an empty venv (declared deps
-#       only), then verify `a2c-computer --help` runs and the package imports. Shared by tests.yml and
-#       publish.yml so the two gates cannot drift apart.
+#       only) and verify the artifact on two install surfaces. Shared by tests.yml and publish.yml so
+#       the two gates cannot drift apart.
 #
 # 用法 / Usage:
-#   scripts/clean_install_smoke.sh <wheel-path> [extras] [venv-dir]
+#   scripts/clean_install_smoke.sh <wheel-path> [cli|none] [venv-dir]
 #     wheel-path  wheel 文件路径（只允许一个，多个即报错——见下）
-#     extras      额外依赖名，逗号分隔，默认 cli
+#     mode        cli（默认）= 文档安装面：装 cli extra 并跑 `a2c-computer --help`；
+#                 none = 纯 core 导入契约（#226）：不装任何 extra，只验证 import 与惰性错误
 #     venv-dir    临时 venv 路径，默认 /tmp/a2c-smoke
-#
-#   ⚠️ 不提供「不装 extra」模式：本脚本固定运行 `a2c-computer --help`，而该入口点需要 cli extra
-#      （typer / prompt_toolkit / rich），故纯 core 安装下必然红——那是**另一个**缺陷
-#      （`import a2c_smcp.computer` 硬依赖 cli extra 的成员），不属本闸门的判据。
-#   ⚠️ There is deliberately no "no extras" mode: this script always runs `a2c-computer --help`,
-#      whose entry point needs the cli extra. Bare-core installs therefore always fail — that is a
-#      separate defect, not what this gate is about.
 #
 # 背景 / Why: #224 —— `pyyaml` 从未声明为依赖，但 dev/CI 的 `uv sync --group dev` 里
 #   `poethepoet` 传递带入 pyyaml，于是「源码 import 未声明的包」在 CI **永远复现不了**。
 #   本脚本构造真实用户的安装面（只有制品声明的依赖），把这类坏包挡在合入/上传之前。
+#
+# #226 / Mode `none`: 纯 core 安装下 `import a2c_smcp.computer` 必须成功，且交互路径
+#   （console / ainput_prompt）抛携带 `pip install "a2c-smcp[cli]"` 的 ImportError。
+#   `a2c-computer` 入口本身需要 typer（cli extra），故 none 模式不跑它。
 set -euo pipefail
 
-WHEEL_PATH="${1:?用法: clean_install_smoke.sh <wheel-path> [extras] [venv-dir]}"
+WHEEL_PATH="${1:?用法: clean_install_smoke.sh <wheel-path> [cli|none] [venv-dir]}"
 # 注意用 ${2-cli} 而非 ${2:-cli}：后者对**空串**也取默认值，会让下面的空值校验变成死条件
 # （传 "" 时静默装 [cli]，与「显式拒绝」的语义不符）。${2-cli} 仅在未传参时取默认。
-EXTRAS="${2-cli}"
+MODE="${2-cli}"
 VENV_DIR="${3:-/tmp/a2c-smoke}"
 
-if [[ -z "${EXTRAS}" || "${EXTRAS}" == "none" ]]; then
-  echo "::error::extras 不得为空或 none —— 本脚本固定跑 \`a2c-computer --help\`，纯 core 安装必然失败（见文件头说明）" >&2
+if [[ -z "${MODE}" ]]; then
+  echo "::error::模式不得为空——传 cli 或 none" >&2
   exit 1
 fi
+
+case "${MODE}" in
+  cli)
+    TARGET="${WHEEL_PATH}[cli]"
+    RUN_CLI=1
+    ;;
+  none)
+    TARGET="${WHEEL_PATH}"
+    RUN_CLI=0
+    ;;
+  *)
+    echo "::error::不支持的模式 '${MODE}'——只接受 cli 或 none" >&2
+    exit 1
+    ;;
+esac
 
 # rm -rf 的目标必须是个安全的自定义目录：挡掉空值、根目录与显然会被误伤的路径。
 # Guard the rm -rf target: reject empty / root / the cwd itself.
@@ -66,11 +79,9 @@ if [[ "${WHEEL_COUNT}" != "1" ]]; then
   exit 1
 fi
 
-TARGET="${WHEEL_PATH}[${EXTRAS}]"
-
 rm -rf "${VENV_DIR}"
 uv venv "${VENV_DIR}"
-echo "Smoke-testing ${TARGET}"
+echo "Smoke-testing ${TARGET} (mode=${MODE})"
 uv pip install --python "${VENV_DIR}/bin/python" "${TARGET}"
 
 # ⚠️ 必须在**中性 cwd** 下跑：`python -c` 会把 cwd 放进 sys.path[0]，若在仓库根跑，导入到的是
@@ -79,10 +90,15 @@ uv pip install --python "${VENV_DIR}/bin/python" "${TARGET}"
 #    would import the source tree instead of the artifact — the smoke would pass even for a broken
 #    wheel. The __file__ assertion below pins this down.
 cd /tmp
-"${VENV_DIR}/bin/a2c-computer" --help > /dev/null
-echo "a2c-computer --help OK"
 
-"${VENV_DIR}/bin/python" - "${VENV_DIR}" <<'PY'
+if [[ "${RUN_CLI}" == "1" ]]; then
+  "${VENV_DIR}/bin/a2c-computer" --help > /dev/null
+  echo "a2c-computer --help OK"
+fi
+
+"${VENV_DIR}/bin/python" - "${VENV_DIR}" "${MODE}" <<'PY'
+import asyncio
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -94,9 +110,40 @@ import a2c_smcp.computer
 # Ownership check (not substring matching): symlinks (macOS /tmp → /private/tmp) and relative paths
 # make substring comparison produce false alarms.
 venv_dir = Path(sys.argv[1]).resolve()
+mode = sys.argv[2]
 for mod in (a2c_smcp, a2c_smcp.computer):
     path = Path(mod.__file__ or "").resolve()
     assert path.is_relative_to(venv_dir), f"smoke 导入的是 {path}，不是被测制品 {venv_dir} / not the artifact"
     print(f"  {mod.__name__} -> {path}")
-print("artifact import OK")
+
+from a2c_smcp.computer.inputs.cli_io import ainput_prompt
+from a2c_smcp.computer.utils import console as console_util
+
+
+def _expect_actionable(label: str, call) -> None:
+    try:
+        call()
+    except ImportError as exc:
+        text = str(exc)
+        assert 'a2c-smcp[cli]' in text, f"{label}: hint missing from {text!r}"
+        assert isinstance(exc.__cause__, ModuleNotFoundError), f"{label}: cause is {exc.__cause__!r}"
+    else:
+        raise AssertionError(f"{label}: expected an actionable ImportError")
+
+
+if mode == "none":
+    # 夹具自检：纯 core 安装面必须真的没有 cli 依赖，否则下面的「惰性」断言是假绿。
+    # Fixture self-check: the bare-core surface must really lack the cli deps.
+    for name in ("rich", "prompt_toolkit"):
+        assert importlib.util.find_spec(name) is None, f"fixture self-check failed: {name} is installed in mode=none"
+    assert console_util._console is None, "console must not be constructed by importing a2c_smcp.computer"
+    console_util.set_no_color(True)  # 不得触发 rich 导入
+    _expect_actionable("console", lambda: console_util.console)
+    _expect_actionable("ainput_prompt", lambda: asyncio.run(ainput_prompt("value: ")))
+    print("core import contract OK (mode=none)")
+else:
+    # 正向对照：装 cli extra 时 console 必须真实可用（防 __getattr__ 过度惰性）。
+    assert console_util.console is not None
+    assert console_util.console is console_util.console, "console identity must be stable"
+    print("artifact import OK (mode=cli)")
 PY
