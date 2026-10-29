@@ -235,6 +235,36 @@ class TestResolvePath:
         result = resolve_path(str(root / "link" / ".." / "a.txt"), _root(root))
         assert result.canonical_path == os.path.realpath(root / "a.txt")
 
+    def test_missing_component_does_not_stop_symlink_resolution(self, tmp_path: Path) -> None:
+        """缺失分量不终止解析：其后的链接仍须展开，越界由 realpath 围栏拦截.
+
+        协议 ``conformance-tests.md`` §4.5（protocol#65 订正）：``root/link → missing/../sub/evil/id``、
+        ``root/sub/evil → /outside``（``/outside/id`` 存在）、``root/missing`` 不存在 ⇒
+        ``canonical_path`` 应为 ``/outside/id`` → ``forbidden``；在缺失分量处原样拼接会得到
+        ``root/sub/evil/id`` 而放行即为不合规。
+        """
+        root = tmp_path / "root"
+        (root / "sub").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        _write(outside / "id")
+        (root / "sub" / "evil").symlink_to(outside)
+        (root / "link").symlink_to("missing/../sub/evil/id")
+        assert not (root / "missing").exists()
+
+        # 夹具自检：第 4 步语义 MUST 等价 os.path.realpath(strict=False)，正确结果须为界外的 /outside/id
+        assert os.path.realpath(root / "link") == os.path.realpath(outside / "id")
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(root / "link"), _root(root))
+        assert _reason(exc_info) == "forbidden"
+        # 命中 realpath 围栏（第 5 步），而非 lstat / 打开等后续分支
+        assert "canonical path is outside readRoots" in str(exc_info.value)
+
+        # 正对照：把 outside 也纳入 readRoots，同一夹具必须解析成功且 canonical_path 恰为 /outside/id；
+        # 仅断言「越界 → forbidden」无法区分「解析到另一个界外路径」或「围栏恒拒绝」造成的假绿。
+        allowed = resolve_path(str(root / "link"), _root(root, outside))
+        assert allowed.canonical_path == os.path.realpath(outside / "id")
+
     def test_root_configured_via_symlink(self, tmp_path: Path) -> None:
         real_root = tmp_path / "real-root"
         real_root.mkdir()
@@ -410,6 +440,7 @@ class TestFixedRejectionSet:
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
     def test_unsearchable_parent_forbidden(self, tmp_path: Path) -> None:
+        """父目录不可搜索 → 第 7 步 ``lstat`` 权限类错误归 ``forbidden``（protocol#65 订正）."""
         root = tmp_path / "root"
         locked = root / "locked"
         locked.mkdir(parents=True)
@@ -422,6 +453,8 @@ class TestFixedRejectionSet:
             with pytest.raises(PathResolveError) as exc_info:
                 resolve_path(str(file), _root(root), protected=ProtectedPaths())
             assert _reason(exc_info) == "forbidden"
+            # 钉住第 7 步分支：第 4 步 realpath 吞掉 EACCES，错误须由类型预检 lstat 抛出
+            assert "lstat failed" in str(exc_info.value)
         finally:
             locked.chmod(0o755)
 
