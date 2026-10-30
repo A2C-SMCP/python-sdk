@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import stat
+import sys
 import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
@@ -616,7 +617,7 @@ def _is_within(path: str, root: str, *, case_insensitive: bool = False) -> bool:
 
     与 :func:`a2c_smcp.utils.path.is_within` 语义一致（Path 对象版）；本函数服务
     ``canonical_path`` 字符串形态（含 Windows ``/C:/`` 根与可选 casefold），两处勿各自漂移。
-    ``case_insensitive`` 仅由固定拒绝集在 Windows 上使用；readRoots 围栏按协议保持区分大小写。
+    ``case_insensitive`` 仅由固定拒绝集在 Windows / macOS 上使用；readRoots 围栏按协议保持区分大小写。
     """
     if case_insensitive:
         path_cmp = path.casefold()
@@ -670,13 +671,30 @@ def _matches_protected_file_identity(
     return False
 
 
+def _rejection_case_insensitive(platform: PathPlatform, *, host_platform: str | None = None) -> bool:
+    """固定拒绝集是否按 ``casefold`` 比较 / Whether the rejection set folds case.
+
+    协议 §固定拒绝集（protocol#76）：**Windows 与 macOS** 上名称判定（``.skillenv`` /
+    ``.part``）与目录判定 **MUST** 大小写不敏感；其他平台 **MAY**——本实现按码点，
+    避免把 Linux 上真实存在的 ``.SKILLENV`` 误判为受保护。
+
+    ``platform`` 只表达路径形态（macOS 仍是 ``posix``），故 macOS 由宿主 OS 判定；
+    ``host_platform`` 仅供测试注入，生产缺省取 :data:`sys.platform`。
+    readRoots 围栏不调用本函数（协议要求按码点区分大小写）。
+    已知边界：WSL DrvFs / Cygwin/MSYS 等大小写不敏感但 ``sys.platform`` 不在上述集合的挂载
+    仍按码点（协议 MAY）；覆盖需卷能力探测，另行评估。
+    """
+    host = sys.platform if host_platform is None else host_platform
+    return platform == "windows" or host in ("win32", "darwin")
+
+
 def _is_protected(canonical_path: str, protected: ProtectedPaths, platform: PathPlatform) -> bool:
     """固定拒绝集判定（含 ``.skillenv`` / landing ``.part``）.
 
-    Windows 上文件名大小写不敏感：拒绝集按 casefold 比较，防止 ``.SKILLENV`` 绕过；
-    readRoots 围栏不走此分支（协议要求按码点区分大小写）。
+    折叠规则见 :func:`_rejection_case_insensitive`（protocol#76：Windows / macOS MUST、
+    其他平台 MAY→按码点）；step 6 与 step 8 final-path 复核共用本函数。
     """
-    case_insensitive = platform == "windows"
+    case_insensitive = _rejection_case_insensitive(platform)
     if any(_is_within(canonical_path, entry, case_insensitive=case_insensitive) for entry in protected.paths):
         return True
     name = canonical_path.rsplit("/", 1)[-1]
