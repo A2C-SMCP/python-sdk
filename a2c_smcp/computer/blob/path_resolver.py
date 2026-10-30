@@ -681,6 +681,8 @@ def _rejection_case_insensitive(platform: PathPlatform, *, host_platform: str | 
     ``platform`` 只表达路径形态（macOS 仍是 ``posix``），故 macOS 由宿主 OS 判定；
     ``host_platform`` 仅供测试注入，生产缺省取 :data:`sys.platform`。
     readRoots 围栏不调用本函数（协议要求按码点区分大小写）。
+    已知边界：WSL DrvFs / Cygwin/MSYS 等大小写不敏感但 ``sys.platform`` 不在上述集合的挂载
+    仍按码点（协议 MAY）；覆盖需卷能力探测，另行评估。
     """
     host = sys.platform if host_platform is None else host_platform
     return platform == "windows" or host in ("win32", "darwin")

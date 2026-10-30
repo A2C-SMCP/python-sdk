@@ -387,13 +387,15 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 - **固定拒绝集在 macOS 上未按大小写不敏感匹配**（#245，protocol#76）：协议要求 Windows 与 macOS 上
   拒绝集的名称判定（`.skillenv` / `.part`）与目录判定 MUST 使用 Unicode casefold（其他平台 MAY）。
-  `_is_protected` 此前仅在 `platform == "windows"` 时折叠，而 macOS 的路径形态是 `posix`，因此
-  `root/.SKILLENV` 在默认大小写不敏感卷上可打开 `.skillenv`，仅靠协议中为 SHOULD 的第 8 步
-  final-path 复核兜底。现新增单一宿主映射 `_rejection_case_insensitive`（Windows 或宿主
-  `sys.platform` 为 `win32` / `darwin`），`.skillenv` 名称、`.part` 名称与 protected 目录前缀
-  （如 `.tfrobot`）三处一并折叠；Linux 及其他平台保持码点（协议 MAY，避免误拒真实存在的
-  `.SKILLENV`）。readRoots 词法 / realpath 围栏语义不变（协议要求区分大小写）。rust 侧目录
-  折叠缺口见 rust-sdk#256。
+  `_is_protected` 此前仅在 `platform == "windows"` 时折叠，而 macOS 的路径形态是 `posix`：`.skillenv`
+  与 protected 目录名的大小写变体只在第 8 步 final-path 复核（协议 SHOULD，且依赖 `/proc` 或
+  `F_GETPATH` 可用）时才被兜住；**`.part` 名称与 landing 目录的大小写变体没有任何兜底，实测可被读取**。
+  现新增单一宿主映射 `_rejection_case_insensitive`（Windows 或宿主 `sys.platform` 为 `win32` /
+  `darwin`），`.skillenv` 名称、`.part` 名称与 protected 目录前缀（如 `.tfrobot`）三处一并折叠，
+  step 6 / step 8 / 拉取期重跑结构上一致；Linux 及其他平台保持码点（协议 MAY，避免误拒真实存在的
+  `.SKILLENV`）。**已知边界**：大小写不敏感但平台串不在上述集合的挂载（如 WSL DrvFs `/mnt/c`、
+  Cygwin/MSYS）仍按码点——协议 MAY 不违规，覆盖需卷能力探测，另行评估。readRoots 词法 / realpath
+  围栏语义不变（协议要求区分大小写）。rust 侧目录折叠缺口见 rust-sdk#256。
 
 ## [0.4.0] - 2026-08-25
 
