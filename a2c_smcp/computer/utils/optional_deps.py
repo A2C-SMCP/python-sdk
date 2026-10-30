@@ -42,8 +42,11 @@ def require_cli_dependency(module: str) -> ModuleType:
     try:
         return importlib.import_module(module)
     except ModuleNotFoundError as exc:
-        # 只捕获 ModuleNotFoundError：若模块本身在、但内部依赖装坏，应原样暴露真因，
-        # 不伪装成「没装 extra」。
-        # Only ModuleNotFoundError: a broken install must surface its real cause, not be rewritten
-        # into "the extra is missing".
+        # 只有「缺的正是请求的模块或其父包」才套 extra 处方；若是传递依赖缺失
+        # （如 prompt_toolkit 在、wcwidth 不在），说明装坏了，原样抛让真因可见。
+        # Only rewrite when the missing name is the requested module (or a parent package).
+        # A missing transitive dependency means a broken install: surface the real cause untouched.
+        missing = exc.name or ""
+        if missing != module and not module.startswith(f"{missing}."):
+            raise
         raise ImportError(f"{CLI_EXTRA_HINT} (missing: {module})") from exc

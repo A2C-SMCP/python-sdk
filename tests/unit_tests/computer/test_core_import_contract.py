@@ -118,6 +118,7 @@ def test_core_import_does_not_load_cli_deps() -> None:
         # rich 可能被第三方 httpx 顺手导入；关键是**本包**未在导入期构造 Console。
         assert console_util._console is None, "Console must not be constructed at import time"
         assert console_util._console_err is None, "Console(err) must not be constructed at import time"
+        assert console_util.console_available() is True
         assert console_util.console is not None, "console must stay usable when the extra is installed"
         assert console_util.console is console_util.console, "console identity must be stable"
         assert console_util._console is not None
@@ -142,6 +143,15 @@ def test_core_import_succeeds_without_cli_extra() -> None:
 
         # 阻断块把 rich 置 None，故只能用「本包未构造实例」证明惰性。
         assert console_util._console is None
+        assert console_util.console_available() is False, "console_available() must not raise and must report False"
+        assert "console" in dir(console_util), "__dir__ must expose lazy names"
+        assert "console_err" in dir(console_util)
+        try:
+            hasattr(console_util, "console")
+        except ImportError:
+            pass  # 文档化行为：PEP 562 的异常不会被 hasattr 吞掉，缺 extra 时应引导用 console_available()
+        else:
+            raise SystemExit("hasattr(console_util, 'console') must raise ImportError without rich")
         console_util.set_no_color(True)  # 必须不触发 rich 导入（否则此处抛 ImportError）
         print(_MARKER)
         """,

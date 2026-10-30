@@ -137,13 +137,38 @@ if mode == "none":
     for name in ("rich", "prompt_toolkit"):
         assert importlib.util.find_spec(name) is None, f"fixture self-check failed: {name} is installed in mode=none"
     assert console_util._console is None, "console must not be constructed by importing a2c_smcp.computer"
+    assert console_util.console_available() is False
+    assert "console" in dir(console_util) and "console_err" in dir(console_util)
+    try:
+        hasattr(console_util, "console")
+    except ImportError:
+        pass
+    else:
+        raise AssertionError("hasattr must raise ImportError in mode=none")
     console_util.set_no_color(True)  # 不得触发 rich 导入
     _expect_actionable("console", lambda: console_util.console)
     _expect_actionable("ainput_prompt", lambda: asyncio.run(ainput_prompt("value: ")))
     print("core import contract OK (mode=none)")
 else:
+    import prompt_toolkit
+
+    from a2c_smcp.computer.inputs import cli_io
+    from a2c_smcp.computer.utils.optional_deps import require_cli_dependency
+
     # 正向对照：装 cli extra 时 console 必须真实可用（防 __getattr__ 过度惰性）。
+    assert console_util.console_available() is True
     assert console_util.console is not None
     assert console_util.console is console_util.console, "console identity must be stable"
+
+    # shim 正对照：掏空 PromptSession shim 时此处必红。
+    assert require_cli_dependency("prompt_toolkit").PromptSession is prompt_toolkit.PromptSession
+    assert isinstance(cli_io.PromptSession(), prompt_toolkit.PromptSession)
+
+    class _FakeSession:
+        async def prompt_async(self, message):
+            return "1"
+
+    # 真跑一次 pick：覆盖 rich.table 渲染 + 注入 session 分支。
+    assert asyncio.run(cli_io.ainput_pick("pick", ["a", "b"], session=_FakeSession())) == "b"
     print("artifact import OK (mode=cli)")
 PY

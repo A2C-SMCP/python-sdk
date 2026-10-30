@@ -4,6 +4,9 @@
 - 支持在运行时切换 no_color 以适配非 TTY/IDE 控制台。
 - rich 仅在本模块首次被访问 `console` / `console_err` 时导入：未安装 ``a2c-smcp[cli]`` 时
   import 本模块不报错，访问时抛携带安装提示的 ImportError（#187 惰性契约）。
+- 注意：缺 extra 时 `hasattr(module, "console")` / `getattr(module, "console", None)` 会**抛**
+  ImportError（PEP 562 的 `__getattr__` 异常不会被这两个内建吞掉）——需要「可选 UI」降级时
+  请先调用 :func:`console_available`。
 
 Global Console helpers (lazy import, #226). ``rich`` is imported only when ``console`` /
 ``console_err`` is first accessed; importing this module never requires the ``[cli]`` extra,
@@ -12,6 +15,7 @@ and a missing extra raises an actionable ImportError at access time (#187 contra
 
 from __future__ import annotations
 
+import importlib.util
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +73,31 @@ def __getattr__(name: str) -> Any:
                 _console_err = _create_console(stderr=True)
             return _console_err
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def console_available() -> bool:
+    """中文: 判断 rich 是否可导入（**不执行导入**）。
+
+    纯 core 安装下 ``hasattr(console_util, "console")`` / ``getattr(console_util, "console", None)``
+    会抛 ImportError（PEP 562 语义：``hasattr`` 只吞 AttributeError）。需要「可选 UI」降级时，
+    请先调用本谓词，不要用 ``getattr(..., default)`` 探测。
+
+    English: Whether ``rich`` is importable, without importing it. Under a bare-core install,
+    ``hasattr`` / ``getattr(module, "console", default)`` raise ImportError instead of returning a
+    default (PEP 562); use this predicate for optional-UI fallbacks.
+
+    Returns:
+        bool: rich 是否可导入 / whether rich is importable.
+    """
+    try:
+        return importlib.util.find_spec("rich") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def __dir__() -> list[str]:
+    """中文: 暴露惰性属性名（``console`` / ``console_err``），供 ``dir()`` 与 IDE 补全。"""
+    return sorted({*globals(), "console", "console_err"})
 
 
 def set_no_color(flag: bool) -> None:
