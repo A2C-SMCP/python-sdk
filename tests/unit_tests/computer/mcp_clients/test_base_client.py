@@ -5,6 +5,7 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 import asyncio
+import contextlib
 import logging
 from asyncio import Queue
 from contextlib import AsyncExitStack
@@ -629,3 +630,320 @@ async def test_teardown_error_is_logged_as_warning_not_error():
     teardown = [r for r in records if "teardown error" in r.getMessage()]
     assert teardown, "拆除异常必须留下日志记录（否则本断言空过）"
     assert [r.levelname for r in teardown] == ["WARNING"] * len(teardown), [r.levelname for r in teardown]
+
+
+# ------------------------------
+# #247 传输失败后的状态机收敛与半断开 teardown 幂等
+# #247 state-machine convergence after transport failure + half-broken teardown idempotency
+# ------------------------------
+
+
+async def _wait_for_state(client: BaseMCPClient, expected: STATES, timeout: float = 2.0) -> None:
+    """有界等待状态机到达 expected（避免对事件循环调度顺序做时序假设）。"""
+
+    async def _poll() -> None:
+        while client.state != expected:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_keepalive_exit_converges_and_disconnect_is_idempotent() -> None:
+    """#247：keep-alive 宿主任务被 anyio 取消（非 _close_task 发起）后，状态机须收敛到 error。
+
+    复现真实形态：取消被 ``except CancelledError`` 吞掉，``finally`` 的 ``aclose()`` 抛
+    ``ExceptionGroup`` 并清空会话；状态机不得滞留 connected，且半断开（error）状态下
+    ``adisconnect`` 不抛。
+    """
+    client = await _connected_client()
+    assert client.state == STATES.connected
+    assert client._async_session is not None
+    client._aexit_stack = _ExplodingExitStack()  # type: ignore[assignment]
+    task = client._session_keep_alive_task
+    assert task is not None
+
+    task.cancel()  # 模拟 anyio 取消宿主任务（不经 _close_task ⇒ _close_event 未置位）
+    await _wait_for_state(client, STATES.error, timeout=2.0)
+
+    assert client._async_session is None
+    assert client._async_session_closed_event.is_set()
+    # 前置形态断言（非红/绿判据）：任务确以 ExceptionGroup 结束，证明夹具复现了拆除异常形态
+    with pytest.raises(ExceptionGroup):
+        await task
+
+    # 半断开 → 断开：不得抛 MachineError
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    assert client.state == STATES.disconnected
+
+
+@pytest.mark.asyncio
+async def test_disconnect_with_dead_session_does_not_reconnect() -> None:
+    """#247 根因②：``acan_disconnect`` 不得再经惰性 ``async_session`` 触发 ``aconnect``。"""
+    client = await _connected_client()
+    client._async_session = None  # 半断开：状态 connected 但会话已清空（传输死亡后的形态）
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    assert client.state == STATES.disconnected
+
+
+@pytest.mark.asyncio
+async def test_keepalive_done_callback_guards() -> None:
+    """#247：收敛回调的守卫矩阵——非「本代任务 + 非优雅关闭 + connected + 已就绪」一律不收敛。"""
+    sentinel = asyncio.create_task(asyncio.sleep(0))
+    await sentinel
+
+    # ① 已被新连接替换（identity 不符）
+    c1 = await _connected_client()
+    c1._on_keep_alive_task_done(sentinel)
+    assert c1._converge_task is None
+    assert c1.state == STATES.connected
+
+    # ② 优雅关闭（_close_event 已置位）
+    c2 = await _connected_client()
+    c2._close_event.set()
+    c2._session_keep_alive_task = sentinel
+    c2._session_ready = True
+    c2._on_keep_alive_task_done(sentinel)
+    assert c2._converge_task is None
+    assert c2.state == STATES.connected
+
+    # ③ 状态非 connected
+    c3 = await _connected_client()
+    await c3.adisconnect()
+    c3._session_keep_alive_task = sentinel
+    c3._session_ready = True
+    c3._on_keep_alive_task_done(sentinel)
+    assert c3._converge_task is None
+    assert c3.state == STATES.disconnected
+
+    # ④ connect 阶段（initialize 未完成）
+    c4 = await _connected_client()
+    c4._session_ready = False
+    c4._session_keep_alive_task = sentinel
+    c4._on_keep_alive_task_done(sentinel)
+    assert c4._converge_task is None
+    assert c4.state == STATES.connected
+
+    # 清理仍在本代任务上等待关闭信号的 client（避免悬挂任务）
+    c1._close_event.set()
+    c4._close_event.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_convergence_runs_in_clean_transitions_context(monkeypatch) -> None:  # noqa: PT019
+    """#247：收敛事件必须以干净 transitions 上下文运行（不得继承 aconnect 的 current_context）。
+
+    继承会让 ``process_context`` 走 nested 分支：收敛事件自身不可取消、却能取消其它在途
+    transition——生产上表现为 shutdown 与死亡并发时行为依赖调度顺序。
+    """
+    client = await _connected_client()
+    assert client._session_ready is True
+    seen: list[object] = []
+    original = client.aerror
+
+    async def _probe(*args, **kwargs):  # noqa: ANN002, ANN003
+        seen.append(base_client_mod.A2CAsyncMachine.current_context.get())
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(client, "aerror", _probe)
+    client._aexit_stack = _ExplodingExitStack()  # type: ignore[assignment]
+    task = client._session_keep_alive_task
+    assert task is not None
+
+    task.cancel()
+    await _wait_for_state(client, STATES.error, timeout=2.0)
+    assert seen == [None], f"收敛上下文必须干净，实测 {seen!r}"
+
+
+@pytest.mark.asyncio
+async def test_convergence_does_not_tear_down_reconnected_session() -> None:
+    """#247 TOCTOU：收敛任务执行前新连接已接管 ⇒ 不得把新会话打成 error。"""
+    client = await _connected_client()
+    old = asyncio.create_task(asyncio.sleep(0))
+    await old
+
+    await asyncio.wait_for(client._aconverge_unexpected_exit(old), timeout=1.0)
+    assert client.state == STATES.connected
+
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_graceful_teardown_is_not_treated_as_unexpected_exit() -> None:
+    """#247 负对照：``_close_task`` 发起的优雅拆除即使 ``aclose()`` 抛异常，也不得收敛为 error。"""
+    client = await _connected_client()
+    client._aexit_stack = _ExplodingExitStack()  # type: ignore[assignment]
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    await asyncio.sleep(0.05)
+    assert client.state == STATES.disconnected
+
+
+class _GatedInitSession:
+    """initialize() 由测试显式放行/失败的假会话（#247 connect 窗口用例）。"""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fail = fail
+
+    async def initialize(self) -> InitializeResult:
+        self.started.set()
+        await self.release.wait()
+        if self.fail:
+            raise RuntimeError("initialize failed")
+        return InitializeResult(
+            protocolVersion="2025-06-18",
+            capabilities=ServerCapabilities(),
+            serverInfo=Implementation(name="gated", version="1.0.0"),
+        )
+
+
+class _GatedInitClient(BaseMCPClient):
+    """返回可被测试卡住/失败的 ``initialize()`` 会话。"""
+
+    def __init__(self, params: BaseModel, *, fail_initialize: bool = False) -> None:
+        super().__init__(params)  # type: ignore[arg-type]
+        self.session = _GatedInitSession(fail=fail_initialize)
+
+    async def _create_async_session(self) -> ClientSession:  # type: ignore[override]
+        return self.session  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+async def test_keepalive_death_during_initialize_fails_connect_and_converges() -> None:
+    """#247 🔴：initialize() 窗口内 keep-alive 死亡 ⇒ aconnect 必须失败且状态收敛 error。
+
+    旧实现：``self.async_session`` 惰性属性在 ``_async_session`` 被 finally 清空后触发
+    ``aconnect`` from ``connected`` → ``MachineError``，且会话已死却被当作连接成功。
+    """
+    client = _GatedInitClient(DummyParams())
+    connect_task = asyncio.create_task(client.aconnect())
+    await asyncio.wait_for(client.session.started.wait(), timeout=2.0)
+
+    keep_alive = client._session_keep_alive_task
+    assert keep_alive is not None
+    keep_alive.cancel()  # 模拟 anyio 取消宿主任务
+    with contextlib.suppress(BaseException):
+        await asyncio.wait_for(asyncio.shield(keep_alive), timeout=2.0)
+
+    client.session.release.set()
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(connect_task, timeout=2.0)
+
+    await _wait_for_state(client, STATES.error, timeout=2.0)
+    assert client._async_session is None
+    assert client._async_session_closed_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_initialize_failure_tears_down_session_and_converges() -> None:
+    """#247 🟡：``initialize()`` 失败必须回收 keep-alive/会话，并以 error 收口（不泄漏）。"""
+    client = _GatedInitClient(DummyParams(), fail_initialize=True)
+    connect_task = asyncio.create_task(client.aconnect())
+    await asyncio.wait_for(client.session.started.wait(), timeout=2.0)
+    keep_alive = client._session_keep_alive_task
+    assert keep_alive is not None
+
+    client.session.release.set()
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(connect_task, timeout=2.0)
+
+    await _wait_for_state(client, STATES.error, timeout=2.0)
+    assert keep_alive.done(), "initialize() 失败后 keep-alive 任务必须被回收"
+    assert client._async_session is None
+    assert client._async_session_closed_event.is_set()
+
+
+class _FailingCreateClient(BaseMCPClient):
+    """``_create_async_session`` 直接失败（模拟 stdio 命令不存在 / 传输在创建期被取消）。"""
+
+    async def _create_async_session(self) -> ClientSession:  # type: ignore[override]
+        raise FileNotFoundError("mcp command not found")
+
+
+class _GatedCreateClient(BaseMCPClient):
+    """``_create_async_session`` 由测试显式放行（模拟 stdio spawn / sse 建连进行中）。"""
+
+    def __init__(self, params: BaseModel) -> None:
+        super().__init__(params)  # type: ignore[arg-type]
+        self.create_started = asyncio.Event()
+        self.create_release = asyncio.Event()
+
+    async def _create_async_session(self) -> ClientSession:  # type: ignore[override]
+        self.create_started.set()
+        await self.create_release.wait()
+        return FakeClientSession()  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+async def test_session_creation_failure_fails_connect_fast() -> None:
+    """#247 🔴：会话创建失败不得让 aconnect 永久等待 success 事件（stdio/sse 无 bounded connect）。"""
+    client = _FailingCreateClient(DummyParams())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(client.aconnect(), timeout=2.0)
+    assert loop.time() - started < 1.0, "创建失败必须快速失败，不得挂到外层 timeout"
+    await _wait_for_state(client, STATES.error, timeout=2.0)
+    assert client._async_session is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_session_acquisition_tears_down_keepalive() -> None:
+    """#247 🟡：connect 在会话获取阶段被取消 ⇒ keep-alive/会话必须收口，不得成为孤儿。"""
+    client = _GatedCreateClient(DummyParams())
+    connect_task = asyncio.create_task(client.aconnect())
+    await asyncio.wait_for(client.create_started.wait(), timeout=2.0)
+    keep_alive = client._session_keep_alive_task
+    assert keep_alive is not None
+
+    connect_task.cancel()
+    client.create_release.set()  # 放行创建，使收口在有界时间内可完成
+    with contextlib.suppress(BaseException):
+        await asyncio.wait_for(connect_task, timeout=2.0)
+
+    await _wait_for_state(client, STATES.error, timeout=2.0)
+    assert keep_alive.done(), "取消后 keep-alive 任务必须被回收"
+    assert client._async_session is None
+    assert client._async_session_closed_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_from_error_without_keepalive_task_is_fast() -> None:
+    """#247：从未连接过的 error client（无 keep-alive 任务）断开不得空等 ``_TEARDOWN_TIMEOUT``。"""
+    client = InitializeResultTestClient(DummyParams())
+    await client.aerror()
+    assert client.state == STATES.error
+    assert client._session_keep_alive_task is None
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    elapsed = loop.time() - started
+    assert client.state == STATES.disconnected
+    assert elapsed < 1.0, f"无任务的 error client 断开应即时返回，实测 {elapsed:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_from_error_with_live_keepalive_task() -> None:
+    """#247：error 态下 keep-alive 任务仍存活时，``adisconnect`` 必须真正等待其收尾。"""
+    client = await _connected_client()
+    keep_alive = client._session_keep_alive_task
+    assert keep_alive is not None
+    original_close_task = client._close_task
+
+    async def _signal_only() -> None:
+        client._close_event.set()
+
+    client._close_task = _signal_only  # type: ignore[method-assign]
+    await client.aerror()  # 置 error 但不等待 keep-alive（模拟错误路径的早退形态）
+    client._close_task = original_close_task  # type: ignore[method-assign]
+    assert client.state == STATES.error
+    # 前置依赖基类不变量：aerror 的回调链在 set_state 前零 await ⇒ 任务此刻必然仍存活。
+    assert not keep_alive.done(), "前置：任务在 adisconnect 入口仍应存活"
+
+    await asyncio.wait_for(client.adisconnect(), timeout=2.0)
+    assert client.state == STATES.disconnected
+    assert client._async_session is None
+    assert client._async_session_closed_event.is_set()
