@@ -21,8 +21,9 @@ SDK 把 ``tools/call`` 的 401/403 抛进传输任务组、拆连接致 ``sessio
 ``super().call_tool()`` 并抛 ``UpstreamAuthError``。分类→构造（``UpstreamAuthError`` → 4006/4007）由
 ``test_auth_error.py`` / ``test_manager_auth_error.py`` 覆盖。
 
-> 真实传输端到端（含 mcp SSE 握手）由手工 / 专项 invocation 验证（见 ``http_client.py`` _AuthWatchingClient 的
-> 限界注释 + 协议 #35 第四景 follow-up）；本文件是 CI 稳定的机制回归守卫。
+> 真实传输端到端（含 mcp 握手）现由
+> ``tests/integration_tests/computer/mcp_clients/test_http_auth_error.py``（进程内 uvicorn + ASGI gate，
+> 三景 + hangs=false time-box，#231）覆盖；本文件仍是 CI 稳定的机制级回归守卫。
 """
 
 from __future__ import annotations
