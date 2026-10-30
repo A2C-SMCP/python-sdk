@@ -383,6 +383,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - `details.reason` 仅接受字符串，非字符串视同未提供（与 rust `as_str` 对齐）；
   - 重放路径没有异常通道，拒绝日志（`log_join_rejection`）现同时携带 `details`。
 
+### Fixed（#245 macOS 拒绝集大小写）
+
+- **固定拒绝集在 macOS 上未按大小写不敏感匹配**（#245，protocol#76）：协议要求 Windows 与 macOS 上
+  拒绝集的名称判定（`.skillenv` / `.part`）与目录判定 MUST 使用 Unicode casefold（其他平台 MAY）。
+  `_is_protected` 此前仅在 `platform == "windows"` 时折叠，而 macOS 的路径形态是 `posix`，因此
+  `root/.SKILLENV` 在默认大小写不敏感卷上可打开 `.skillenv`，仅靠协议中为 SHOULD 的第 8 步
+  final-path 复核兜底。现新增单一宿主映射 `_rejection_case_insensitive`（Windows 或宿主
+  `sys.platform` 为 `win32` / `darwin`），`.skillenv` 名称、`.part` 名称与 protected 目录前缀
+  （如 `.tfrobot`）三处一并折叠；Linux 及其他平台保持码点（协议 MAY，避免误拒真实存在的
+  `.SKILLENV`）。readRoots 词法 / realpath 围栏语义不变（协议要求区分大小写）。rust 侧目录
+  折叠缺口见 rust-sdk#256。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。
