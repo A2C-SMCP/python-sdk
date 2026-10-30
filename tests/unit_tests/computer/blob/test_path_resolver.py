@@ -16,6 +16,7 @@ import errno
 import hashlib
 import importlib
 import os
+import sys
 import threading
 import time
 import types
@@ -24,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from a2c_smcp.computer.blob import path_resolver as path_resolver_module
 from a2c_smcp.computer.blob.handle import (
     HANDLE_KIND_PATH,
     BlobHandleForbiddenError,
@@ -64,6 +66,14 @@ def _write(path: Path, content: bytes = _CONTENT) -> Path:
 
 def _reason(exc: pytest.ExceptionInfo[PathResolveError]) -> str:
     return exc.value.reason
+
+
+def _simulate_host(monkeypatch: pytest.MonkeyPatch, *, macos: bool) -> None:
+    """模拟宿主 OS 的拒绝集折叠判定（真实宿主映射由映射纯函数用例覆盖）."""
+    monkeypatch.setattr(
+        "a2c_smcp.computer.blob.path_resolver._rejection_case_insensitive",
+        lambda platform, *, host_platform=None: platform == "windows" or macos,
+    )
 
 
 _HARDLINK_UNSUPPORTED_ERRNOS = {
@@ -424,6 +434,120 @@ class TestFixedRejectionSet:
         result = resolve_path(str(outside_part), _root(root), protected=protected)
         assert result.total_size == len(b"not landing")
 
+    def test_case_variant_skillenv_forbidden_on_macos_host(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """§4.5（protocol#76）：macOS 上 ``root/.SKILLENV`` 打开的就是 ``.skillenv`` → forbidden."""
+        root = tmp_path / "root"
+        root.mkdir()
+        _write(root / ".skillenv")
+        _simulate_host(monkeypatch, macos=True)
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(root / ".SKILLENV"), _root(root), protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+        # 命中第 6 步拒绝集；第 8 步 final-path 消息为 "opened file final path is in the rejection set"
+        assert "fixed rejection set" in str(exc_info.value)
+
+    def test_case_variant_protected_dir_forbidden_on_macos_host(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """目录形态拒绝集（`.tfrobot`）在 macOS/Windows 上同样折叠命中（protocol#76，rust-sdk#256 对拍项）."""
+        root = tmp_path / "root"
+        config_dir = root / ".tfrobot"
+        _write(config_dir / "settings.json", b"{}")
+        allowed = _write(root / "other" / "settings.json", b"{}")
+        protected = build_protected_paths(extra_paths=[str(config_dir)])
+        _simulate_host(monkeypatch, macos=True)
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(root / ".TFROBOT" / "settings.json"), _root(root), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+        assert "fixed rejection set" in str(exc_info.value)
+
+        # 正对照：同样文件名的非受保护目录不受折叠影响
+        result = resolve_path(str(allowed), _root(root), protected=protected)
+        assert result.total_size == len(b"{}")
+
+    def test_case_variant_landing_part_forbidden_on_macos_host(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """macOS 上 landing 目录与 ``.PART`` 名称均折叠；landing 之外的 ``.PART`` 仍放行."""
+        root = tmp_path / "root"
+        landing = root / "landing"
+        _write(landing / "upload.PART", b"partial")
+        outside_part = _write(root / "other" / "x.PART", b"not landing")
+        protected = build_protected_paths(landing_root=str(landing))
+        _simulate_host(monkeypatch, macos=True)
+
+        # 目录大小写变体（LANDING）同样须命中 landing root 折叠判定
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(root / "LANDING" / "upload.PART"), _root(root), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+        assert "fixed rejection set" in str(exc_info.value)
+
+        # 正对照：landing root 之外的大小写变体不因折叠而误拒
+        result = resolve_path(str(outside_part), _root(root), protected=protected)
+        assert result.total_size == len(b"not landing")
+
+    def test_case_variant_skillenv_pull_forbidden_on_macos_host(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """拉取期重跑第 6 步：句柄内 canonical_path 的大小写变体同样 4018 forbidden."""
+        root = tmp_path / "root"
+        root.mkdir()
+        _write(root / ".skillenv")
+        _simulate_host(monkeypatch, macos=True)
+        payload = _manual_path_payload(root / ".skillenv")
+        payload["canonical_path"] = str(root / ".SKILLENV")
+
+        with pytest.raises(BlobHandleForbiddenError) as exc_info:
+            resolve_for_pull(payload, _root(root), protected=ProtectedPaths())
+        assert "fixed rejection set" in str(exc_info.value)
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS default case-insensitive volume")
+    def test_case_variant_skillenv_forbidden_on_real_macos_fs(self, tmp_path: Path) -> None:
+        """真实 macOS FS：``.SKILLENV`` 别名可读 ``.skillenv`` 时仍必须 forbidden（按宿主 OS 强制折叠）."""
+        root = tmp_path / "root"
+        root.mkdir()
+        secret = _write(root / ".skillenv", b"secret")
+        alias = root / ".SKILLENV"
+        if alias.exists():
+            # 夹具自检：大小写不敏感卷上别名确实指向同一文件（大小写敏感卷不跳过，折叠仍按宿主强制）
+            assert os.path.samefile(alias, secret)
+            assert alias.read_bytes() == secret.read_bytes()
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(alias), _root(root), protected=ProtectedPaths())
+        assert _reason(exc_info) == "forbidden"
+        assert "fixed rejection set" in str(exc_info.value)
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux case-sensitive semantics")
+    def test_case_variant_skillenv_not_folded_on_linux(self, tmp_path: Path) -> None:
+        """Linux 保持码点：``.SKILLENV`` 不是 ``.skillenv`` 的别名 → 铸造期 not_found / 拉取期 gone."""
+        root = tmp_path / "root"
+        root.mkdir()
+        _write(root / ".skillenv")
+        if (root / ".SKILLENV").exists():
+            pytest.skip("tmp mount is case-insensitive; cannot assert Linux codepoint semantics")
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(root / ".SKILLENV"), _root(root), protected=ProtectedPaths())
+        assert _reason(exc_info) == "not_found"
+
+        payload = _manual_path_payload(root / ".skillenv")
+        payload["canonical_path"] = str(root / ".SKILLENV")
+        with pytest.raises(BlobHandleGoneError):
+            resolve_for_pull(payload, _root(root), protected=ProtectedPaths())
+
     def test_hardlink_to_protected_file_forbidden(self, tmp_path: Path) -> None:
         root = tmp_path / "root"
         protected_file = _write(root / "config" / "settings.json")
@@ -459,22 +583,49 @@ class TestFixedRejectionSet:
             locked.chmod(0o755)
 
 
-class TestWindowsRejectionSetCasefold:
-    """Windows 文件系统大小写不敏感：拒绝集 casefold，readRoots 围栏仍区分大小写."""
+class TestRejectionSetCasefold:
+    """Windows + macOS 拒绝集大小写不敏感（protocol#76）；readRoots 围栏仍区分大小写."""
 
-    def test_skillenv_case_insensitive_on_windows(self) -> None:
+    @pytest.mark.parametrize(
+        ("platform", "host_platform", "expected"),
+        [
+            ("windows", "linux", True),
+            ("posix", "win32", True),
+            ("posix", "darwin", True),
+            ("posix", "linux", False),
+        ],
+    )
+    def test_rejection_case_insensitive_mapping(self, platform: str, host_platform: str, expected: bool) -> None:
+        """协议 §固定拒绝集：Windows / macOS MUST 折叠；其他平台 MAY（本实现按码点）."""
+        assert path_resolver_module._rejection_case_insensitive(platform, host_platform=host_platform) is expected
+
+    def test_skillenv_case_insensitive_on_windows_and_macos(self, monkeypatch: pytest.MonkeyPatch) -> None:
         assert _is_protected("/C:/root/.SKILLENV", ProtectedPaths(), "windows")
-        assert not _is_protected("/C:/root/.SKILLENV", ProtectedPaths(), "posix")
+        _simulate_host(monkeypatch, macos=True)
+        assert _is_protected("/root/.SKILLENV", ProtectedPaths(), "posix")
+        _simulate_host(monkeypatch, macos=False)
+        assert not _is_protected("/root/.SKILLENV", ProtectedPaths(), "posix")
 
-    def test_protected_prefix_case_insensitive_on_windows(self) -> None:
-        protected = ProtectedPaths(paths=("/C:/secret",))
-        assert _is_protected("/C:/SECRET/file.txt", protected, "windows")
-        assert not _is_protected("/C:/SECRET/file.txt", protected, "posix")
+    def test_protected_prefix_case_insensitive_on_windows_and_macos(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """目录形态拒绝集（如 `.tfrobot`）也折叠——不只 `.skillenv` 文件名（rust-sdk#256 对拍项）."""
+        assert _is_protected(
+            "/C:/root/.TFROBOT/settings.json",
+            ProtectedPaths(paths=("/C:/root/.tfrobot",)),
+            "windows",
+        )
+        protected = ProtectedPaths(paths=("/root/.tfrobot",))
+        _simulate_host(monkeypatch, macos=True)
+        assert _is_protected("/root/.TFROBOT/settings.json", protected, "posix")
+        _simulate_host(monkeypatch, macos=False)
+        assert not _is_protected("/root/.TFROBOT/settings.json", protected, "posix")
 
-    def test_landing_part_case_insensitive_on_windows(self) -> None:
-        protected = ProtectedPaths(landing_root="/C:/landing")
-        assert _is_protected("/C:/LANDING/x.PART", protected, "windows")
-        assert not _is_protected("/C:/LANDING/x.PART", protected, "posix")
+    def test_landing_part_case_insensitive_on_windows_and_macos(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert _is_protected("/C:/LANDING/x.PART", ProtectedPaths(landing_root="/C:/landing"), "windows")
+        protected = ProtectedPaths(landing_root="/landing")
+        _simulate_host(monkeypatch, macos=True)
+        assert _is_protected("/LANDING/x.PART", protected, "posix")
+        _simulate_host(monkeypatch, macos=False)
+        assert not _is_protected("/LANDING/x.PART", protected, "posix")
 
     def test_read_roots_fence_stays_case_sensitive(self) -> None:
         """readRoots 围栏仍按协议区分大小写（casefold 只用于拒绝集）."""
