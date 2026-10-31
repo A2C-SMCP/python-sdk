@@ -48,6 +48,12 @@ _TEARDOWN_TIMEOUT = 10.0
 # Bounded wait for in-flight transitions before giving up on convergence (#247).
 _CONVERGE_INFLIGHT_TIMEOUT = 10.0
 
+# #247：connect 握手（initialize）总时长上界。mcp ClientSession 无读超时；stdio spawn 成功但
+# initialize 死锁 / SSE 不回响应时，keep-alive 任务**仍存活**，只靠「任务死亡」竞速永远不返回。
+# 与 manager bounded connect 的 30s 上界对齐；超时 → 取消 init + _afail_connect + ConnectionError。
+# Overall connect-handshake deadline (aligns with manager's bounded-connect 30s).
+_CONNECT_HANDSHAKE_TIMEOUT = 30.0
+
 # 泛型参数，用于约束 MCP Server 参数类型
 # Generic parameter for constraining MCP Server parameter types
 ParamsT = TypeVar("ParamsT", bound=BaseModel)
@@ -399,8 +405,10 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 logger.debug(f"Keep-alive task ended after state left connected; teardown error: {exc!r}")
             return
         # 5. connect 阶段（initialize() 未完成）→ 由 on_enter_connected 的失败检查收口（_afail_connect），
-        #    此处不抢跑，避免把「连接中失败」提前写成 error 而与 connect 结果竞争。
+        #    此处不抢跑，避免把「连接中失败」提前写成 error 而与 connect 结果竞争；保留异常线索。
         if not self._session_ready:
+            if exc is not None:
+                logger.debug(f"Keep-alive task ended during connect handshake: {exc!r}")
             return
         logger.warning(
             f"Session keep-alive task ended unexpectedly; converging client to error state. "
@@ -492,6 +500,10 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         English: bounded teardown + forced convergence for connect-phase failures; never swallows
         the original exception (the caller re-raises immediately).
         """
+        if self._session_keep_alive_task is not task:
+            # #247：迟到的旧代 connect 失败收口——不得拆/清新代（同实例重连边界；生产每次新建 client）。
+            logger.debug("Stale connect failure ignored; current generation already replaced")
+            return
         logger.warning(
             f"MCP connect failed ({reason}); tearing down and converging to error. server params: {truncate(self.params)}",
         )
@@ -502,11 +514,14 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         finally:
             # #247：握手期失败可能已写入部分初始化态——清掉，避免 error 态携带陈旧 capabilities
             # （list_windows 会据此走能力分支 → 惰性 aconnect → MachineError 被吞成周期日志）。
-            self._initialize_result = None
-            self._subscribed_window_uris.clear()
+            # 代际守卫：仅本代可清（旧代收口迟到不得清新代）。
+            if self._session_keep_alive_task is task:
+                self._initialize_result = None
+                self._subscribed_window_uris.clear()
             self._spawn_convergence(task, after_intentional_teardown=True)
-            # #247：拆除被取消/短路时仍 best-effort 回收子进程（detached 收敛任务不保证能运行）。
-            if task is not None and not task.done():
+            # #247：拆除被取消/短路时仍 best-effort 回收子进程（detached 收敛任务不保证能运行；
+            # 仅本代存活任务——不得强杀新代子进程）。
+            if self._session_keep_alive_task is task and not task.done():
                 await self._aforce_kill()
 
     # region 状态转换回调函数基类实现
@@ -571,18 +586,33 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         init_task = asyncio.create_task(session.initialize())
         try:
             try:
-                await asyncio.wait({init_task, task}, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    {init_task, task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_CONNECT_HANDSHAKE_TIMEOUT,
+                )
             finally:
                 if not init_task.done():
                     init_task.cancel()
                     with suppress(asyncio.CancelledError, Exception):
                         await init_task
+                elif not init_task.cancelled():
+                    # 领取已完成的异常，避免 "Task exception was never retrieved"（任务同时完成分支）
+                    with suppress(BaseException):
+                        init_task.exception()
         except BaseException:
             await self._afail_connect(task, "connect cancelled during initialize()")
             raise
+        if not done:
+            # #247：握手 deadline 超时（keep-alive 仍存活但 initialize 死锁/无响应）——不能只靠
+            # 「任务死亡」竞速，否则 stdio/sse 的 StartPermit 会永久拖死 gate.drain()/shutdown。
+            await self._afail_connect(task, "initialize() handshake timed out")
+            raise ConnectionError("MCP initialize() handshake timed out")
         if task.done():
+            # 同时完成时 init_task 的异常已在 finally 领取；本失败携带 keep-alive 的拆除异常为因。
+            cause = None if task.cancelled() else task.exception()
             await self._afail_connect(task, "transport died during initialize()")
-            raise ConnectionError("MCP transport failed during initialize()")
+            raise ConnectionError("MCP transport failed during initialize()") from cause
         # 初始化client_session
         # 存储初始化返回结果，供后续使用
         # Store InitializeResult for later use
