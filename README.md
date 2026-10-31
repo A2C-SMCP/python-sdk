@@ -54,6 +54,11 @@ pip install "a2c-smcp[server]"          # pip
 poetry add a2c-smcp -E server           # Poetry
 ```
 
+> **纯 core 安装的导入契约（#226）**：`pip install a2c-smcp`（不装任何 extra）即可
+> `import a2c_smcp.computer` 并使用 `Computer` 的库能力（连接、工具调度、资源等）；只有真正需要
+> 交互式终端输入 / 控制台渲染时才会抛携带 `pip install "a2c-smcp[cli]"` 的 `ImportError`。
+> `a2c-computer` 命令行入口本身需要 `[cli]`。
+
 
 ## 协议兼容性 (SDK ↔ A2C-SMCP Protocol)
 

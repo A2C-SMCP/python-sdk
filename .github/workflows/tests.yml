@@ -114,11 +114,12 @@ jobs:
       - name: Build wheel
         run: uv build
 
-      # 装 [cli] 而非纯 core：文档指引 Computer 使用者装 `a2c-smcp[cli]`，
-      # 且 #224 报告者正是注入了 prompt-toolkit/rich/typer 后用 CLI —— 这是最接近真实用户的安装面。
-      # 冒烟脚本与 publish.yml **单点复用**（两处逐字复制会静默漂移，使上传前那道闸门失效）。
-      # Install [cli] rather than bare core (the documented Computer install, and the surface #224's
-      # reporter ended up with). The smoke script is shared with publish.yml so the two gates cannot
-      # drift apart.
-      - name: Clean-install smoke test
-        run: scripts/clean_install_smoke.sh "$PWD"/dist/*.whl cli
+      # 两道安装面（脚本与 publish.yml **单点复用**，防两处逐字复制静默漂移）：
+      #   cli  = 文档指引的真实用户面（#224 报告者即装 cli extra 后用 CLI）
+      #   none = 纯 core 导入契约（#226）：import a2c_smcp.computer 必须成功、交互路径抛可行动错误
+      # Two install surfaces, shared with publish.yml so the gates cannot drift apart:
+      # cli = documented user surface (#224 reporter), none = bare-core import contract (#226).
+      - name: Clean-install smoke test (cli)
+        run: scripts/clean_install_smoke.sh "$PWD"/dist/*.whl cli /tmp/a2c-smoke-cli
+      - name: Clean-install smoke test (no extras)
+        run: scripts/clean_install_smoke.sh "$PWD"/dist/*.whl none /tmp/a2c-smoke-core

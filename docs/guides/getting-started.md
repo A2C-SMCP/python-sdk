@@ -24,6 +24,9 @@ poetry add a2c-smcp --allow-prereleases
 pip install "a2c-smcp[cli]"
 ```
 
+> 库用法（自己构造 `Computer`）不需要 `[cli]`：纯 core 安装可直接 `import a2c_smcp.computer`；
+> 仅在真正需要交互式终端输入 / 控制台渲染时才提示安装该 extra（`ImportError` 带安装命令）。
+
 ## 核心概念
 
 A2C-SMCP 有三个核心角色：

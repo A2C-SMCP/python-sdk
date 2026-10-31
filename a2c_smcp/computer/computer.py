@@ -49,7 +49,6 @@ from mcp.types import (
     TextContent,
     ToolListChangedNotification,
 )
-from prompt_toolkit import PromptSession
 from pydantic import BaseModel, TypeAdapter
 
 from a2c_smcp.computer.base import BaseComputer
@@ -152,8 +151,17 @@ _SKILL_URI_PREFIX = "skill://"
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
+    from prompt_toolkit import PromptSession
+
     from a2c_smcp.computer.settings.scope import ResolvedSettings
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
+else:
+    # 运行时占位（#226）：纯 core 安装不要求 cli extra。`PromptSession` 只用于类基类
+    # `BaseComputer[...]` 与注解求值；真正的 prompt_toolkit 由交互路径惰性导入。
+    # Runtime placeholder (#226): a bare-core install must not require the cli extra. The name is
+    # only needed for the `BaseComputer[...]` base expression / annotations; the real
+    # prompt_toolkit is imported lazily by the interactive paths.
+    PromptSession = Any
 
 
 @dataclass(frozen=True)

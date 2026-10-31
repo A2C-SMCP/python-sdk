@@ -397,6 +397,20 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   Cygwin/MSYS）仍按码点——协议 MAY 不违规，覆盖需卷能力探测，另行评估。readRoots 词法 / realpath
   围栏语义不变（协议要求区分大小写）。rust 侧目录折叠缺口见 rust-sdk#256。
 
+### Fixed（#226 纯 core 导入契约）
+
+- **纯 core 安装（不装 `[cli]` extra）下 `import a2c_smcp.computer` 崩溃**（#226）：`rich` / `prompt_toolkit`
+  此前在 `computer.py`、`inputs/resolver.py`、`inputs/cli_io.py`、`utils/console.py` 被模块级硬引用，
+  与 #187 的 extra 惰性契约相悖。现改为惰性导入：
+  - `import a2c_smcp.computer` 不再要求 cli extra（类基类 / 注解用 `TYPE_CHECKING` + 运行时占位求值）；
+  - `utils/console.py` 的 `console` / `console_err` 改为首次访问时创建（PEP 562），保留 #160 的
+    实例身份与 `set_no_color` 就地 mutate 契约；`set_no_color` 本身不触发导入；
+  - `utils/console` 新增 `console_available()` 谓词与 `__dir__`：缺 extra 时 `hasattr` /
+    `getattr(..., default)` 会抛 `ImportError`（PEP 562 语义），可选 UI 降级须先查该谓词；
+  - 交互式输入 / 控制台渲染在依赖缺失时抛携带 `pip install "a2c-smcp[cli]"` 的 `ImportError`；
+  - 新增子进程回归锁（阻断 rich / prompt_toolkit）与 `clean_install_smoke.sh none` 制品级闸门（CI 双跑）。
+  - 注：`a2c-computer` 命令行入口本身仍需要 `a2c-smcp[cli]`（typer）。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。
