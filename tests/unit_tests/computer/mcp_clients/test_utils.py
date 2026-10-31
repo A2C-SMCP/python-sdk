@@ -12,11 +12,12 @@ Test client_factory factory method to ensure correct client instantiation for ea
 import pytest
 from polyfactory.factories.pydantic_factory import ModelFactory
 
+from a2c_smcp.computer.mcp_clients import base_client as base_client_mod
 from a2c_smcp.computer.mcp_clients.http_client import HttpMCPClient
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig
 from a2c_smcp.computer.mcp_clients.sse_client import SseMCPClient
 from a2c_smcp.computer.mcp_clients.stdio_client import StdioMCPClient
-from a2c_smcp.computer.mcp_clients.utils import client_factory
+from a2c_smcp.computer.mcp_clients.utils import STDIO_CONNECT_HANDSHAKE_TIMEOUT, client_factory
 
 
 class StdioServerConfigFactory(ModelFactory[StdioServerConfig]):
@@ -62,6 +63,20 @@ def test_client_factory_type(config_factory, expected_type):
     config = config_factory.build()
     client = client_factory(config)
     assert isinstance(client, expected_type)
+
+
+def test_client_factory_handshake_timeout_policy():
+    """#247：deadline 按传输类型配置（stdio 冷启动 120s；非 OAuth 30s；交互式 OAuth 无上界）。"""
+    stdio_client = client_factory(StdioServerConfigFactory.build())
+    assert stdio_client._connect_handshake_timeout == STDIO_CONNECT_HANDSHAKE_TIMEOUT
+
+    expected_default = base_client_mod._CONNECT_HANDSHAKE_TIMEOUT
+    assert client_factory(SseServerConfigFactory.build())._connect_handshake_timeout == expected_default
+    assert client_factory(StreamableHttpServerConfigFactory.build())._connect_handshake_timeout == expected_default
+
+    # coordinator-attached = 交互式 OAuth：不设 SDK 上界（由 flow TTL 10 分钟 + 取消链约束）
+    oauth_client = client_factory(StreamableHttpServerConfigFactory.build(), oauth_coordinator=object())
+    assert oauth_client._connect_handshake_timeout is None
 
 
 def test_client_factory_invalid_type():

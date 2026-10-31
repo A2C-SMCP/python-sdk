@@ -46,9 +46,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.routing import Mount
-from transitions import MachineError
 
 from a2c_smcp.computer.mcp_clients.auth_error import META_ERROR_CODE_KEY, META_MCP_SERVER_KEY
+from a2c_smcp.computer.mcp_clients.base_client import STATES, BaseMCPClient
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import StreamableHttpServerConfig
 from a2c_smcp.smcp import ErrorCode
@@ -71,6 +71,8 @@ _SERVER_DOWN_TIMEOUT = 15.0
 _SERVER_FORCE_DOWN_TIMEOUT = 5.0
 # base_client 内部 _TEARDOWN_TIMEOUT=10s，最坏两段共 20s；外层取 20s 不掩盖内部超时上界。
 _CLOSE_TIMEOUT = 20.0
+# #247：401/403 → anyio 取消 keep-alive → 收敛任务是异步链；有界等待其完成（正常 <1s）。
+_CONVERGE_TIMEOUT = 5.0
 
 
 def _jsonrpc_method(body: bytes) -> str | None:
@@ -251,31 +253,29 @@ async def gated_auth_server(request: pytest.FixtureRequest, basic_server_port: i
 async def _bounded_teardown(manager: MCPServerManager, client: Any) -> None:
     """有界拆除 manager，并回收 keep-alive 任务异常（防止 "Task exception was never retrieved" 噪声）。
 
-    只容忍已知的 ``MachineError``，其真实因果链（实测）：401/403 令 mcp 传输任务组失败 → anyio **取消宿主
-    keep-alive 任务** → ``base_client._keep_alive_task`` 的 ``except asyncio.CancelledError`` 吞掉取消 →
-    其 ``finally`` 中 ``_aexit_stack.aclose()`` 抛 ``ExceptionGroup`` 并置 ``_async_session=None`` /
-    ``_async_session_closed_event``——状态机**从未转移**，仍停在 ``connected``。随后 ``adisconnect`` 的条件
-    回调经 ``async_session`` 惰性属性走 ``aconnect``，抛
-    ``MachineError("Can't trigger event aconnect from state connected!")``，``aclose`` 的 ``_clear_all()``
-    因此被跳过。
-
-    ⚠️ 这是**任何传输层失败**都可能触发的生产既有缺陷（非 #231 范围；需另建 follow-up Issue），本用例只记录
-    不修生产代码。其它清理异常（尤其 time-box 超时）与措辞不符的 MachineError 照旧上抛。
+    #247 起**严格**：不再容忍 ``MachineError``。传输死亡后状态机必须已收敛，``adisconnect`` 在半断开
+    （error）状态可用，``aclose()`` 不得抛异常、``_clear_all()`` 不得被跳过。任何清理异常（含 time-box
+    超时）照旧上抛。
     """
     try:
         await asyncio.wait_for(manager.aclose(), timeout=_CLOSE_TIMEOUT)
-    except MachineError as exc:
-        message = str(exc)
-        if "aconnect" not in message or "state connected" not in message:
-            raise AssertionError(f"unexpected MachineError during teardown: {exc}") from exc
     finally:
         keep_alive = getattr(client, "_session_keep_alive_task", None) if client is not None else None
         if keep_alive is not None:
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(asyncio.shield(keep_alive), timeout=1.0)
-    # 容忍态边界：上述已知缺陷只允许跳过 _clear_all，client 必须已被 aclose 出册。
     if manager._active_clients:
         raise AssertionError(f"manager.aclose() left active clients: {list(manager._active_clients)}")
+
+
+async def _wait_until(predicate: Any, timeout: float) -> None:
+    """有界轮询（401 信号 → anyio 取消 → 收敛任务是异步链，不能对调度顺序做假设）。"""
+
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
 
 
 @pytest.mark.asyncio
@@ -330,6 +330,77 @@ async def test_upstream_auth_error_over_real_streamable_http(gated_auth_server: 
     assert result.meta[META_ERROR_CODE_KEY] == int(scenario.expected_error_code)
     assert result.meta[META_MCP_SERVER_KEY] == _BUNDLE_ID
     assert result.meta[META_MCP_SERVER_KEY] != config.name
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_converges_state_machine(
+    gated_auth_server: _GatedServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#247：传输失败后状态机收敛 error（teardown 前）；半断开 shutdown 不抛、可重复。"""
+    config = StreamableHttpServerConfig(
+        name=_DISPLAY_NAME,
+        bundle_id=_BUNDLE_ID,
+        server_parameters=StreamableHttpParameters(
+            url=gated_auth_server.url,
+            timeout=timedelta(seconds=20),
+        ),
+        oauth=None,
+    )
+
+    # 机制锚（#247 复审 🟡3）：只有 done-callback 的收敛路径会调 _spawn_convergence；
+    # 仅断言 state==error 还可能被 keep-alive 自身的 except-Exception aerror() 兜底满足。
+    spawned: list[asyncio.Task] = []
+    original_spawn = BaseMCPClient._spawn_convergence
+
+    def _spy_spawn(self, task: Any, *, after_intentional_teardown: bool = False) -> None:
+        spawned.append(task)
+        original_spawn(self, task, after_intentional_teardown=after_intentional_teardown)
+
+    monkeypatch.setattr(BaseMCPClient, "_spawn_convergence", _spy_spawn)
+
+    manager = MCPServerManager(auto_connect=False)
+    client: Any = None
+    primary_error: BaseException | None = None
+    try:
+        await manager.ainitialize([config])
+        await asyncio.wait_for(manager.astart_client(_BUNDLE_ID), timeout=_START_TIMEOUT)
+        # 前置非空断言（防空过）：确实处于「已连接 + 有会话」而非直接就是坏状态
+        client = manager._active_clients[_BUNDLE_ID]
+        assert client.state == STATES.connected
+        assert client._async_session is not None
+
+        result = await asyncio.wait_for(
+            manager.aexecute_tool(f"{_BUNDLE_ID}__{_TOOL_NAME}", {}),
+            timeout=_CALL_TIMEOUT,
+        )
+        assert result.isError is True
+
+        # teardown 之前：只有「意外终止收敛」能产生 error（adisconnect 尚未被调用）——
+        # 机制断言，排除「adisconnect 恰好也到同一终态」的假绿。
+        await _wait_until(lambda: client.state == STATES.error, timeout=_CONVERGE_TIMEOUT)
+        assert spawned, "收敛必须经 done-callback 的 _spawn_convergence 路径（非 keep-alive 自身兜底）"
+        assert client._async_session is None
+        assert client._async_session_closed_event.is_set()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            await _bounded_teardown(manager, client)
+            # 重复 shutdown：第二次必须同样有界、不抛（幂等）
+            await asyncio.wait_for(manager.aclose(), timeout=_CLOSE_TIMEOUT)
+        except BaseException:
+            if primary_error is None:
+                raise
+
+    # 终态与停机完整性：error → disconnected 只能经新增的 error 源；_clear_all 未被跳过。
+    assert client is not None
+    assert client.state == STATES.disconnected
+    assert not manager._servers_config
+    assert not manager._active_clients
+    assert not manager._connection_states
+    assert not manager._exposed_tools
+    assert not manager._tool_list_cache
 
 
 # 尾注 / Tail note：协议向量第 4 景「手写 SSE 客户端：tools/call 返 401」python N/A——python-sdk 无手写 SSE
