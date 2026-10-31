@@ -54,6 +54,11 @@ _CONVERGE_INFLIGHT_TIMEOUT = 10.0
 # Overall connect-handshake deadline (aligns with manager's bounded-connect 30s).
 _CONNECT_HANDSHAKE_TIMEOUT = 30.0
 
+# #247：取消 initialize 后的有界回收等待。initialize 若忽略取消（mcp 传输层不响应），不得让
+# 拆除挂死；超时后放弃该 detached 任务（随 loop 关闭回收）并告警。
+# Bounded grace for reaping the cancelled initialize task; abandon if it ignores cancellation.
+_INIT_CANCEL_GRACE = 2.0
+
 # 泛型参数，用于约束 MCP Server 参数类型
 # Generic parameter for constraining MCP Server parameter types
 ParamsT = TypeVar("ParamsT", bound=BaseModel)
@@ -220,6 +225,10 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         # #247：会话创建失败原因。keep-alive 的 except-Exception 已消费原异常（任务以正常结束收场），
         # 故须单独留存，供 connect 失败时作为 ConnectionError 的 __cause__（stdio 命令不存在等诊断）。
         self._create_session_error: BaseException | None = None
+        # #247：connect 握手（initialize）总时长上界；由 client_factory 按传输类型设定（stdio 冷启动
+        # 120s / 非 OAuth HTTP·SSE 30s / coordinator-attached 交互式 OAuth 为 None）。
+        # Per-transport connect-handshake deadline; None = no SDK-level bound.
+        self._connect_handshake_timeout: float | None = _CONNECT_HANDSHAKE_TIMEOUT
 
         # 初始化异步状态机
         self.machine = A2CAsyncMachine(
@@ -266,6 +275,16 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         Read-only access for InitializeResult (may be None if not initialized or already cleaned)
         """
         return self._initialize_result
+
+    def set_connect_handshake_timeout(self, timeout: float | None) -> None:
+        """配置 connect 握手（initialize）总时长上界；None 表示不设 SDK 层上界。
+
+        中文: 由 ``client_factory`` 按传输类型设定——stdio（npx/uvx 首次冷启动可 >30s）120s；
+        非 OAuth HTTP / SSE 30s（与 manager bounded connect 对齐）；coordinator-attached 交互式
+        OAuth 为 None（用户浏览器授权可达分钟级，由 flow TTL 10 分钟 + 取消链约束）。
+        English: per-transport handshake deadline; None = no SDK-level bound (interactive OAuth).
+        """
+        self._connect_handshake_timeout = timeout
 
     @abstractmethod
     async def _create_async_session(self) -> ClientSession:
@@ -589,13 +608,20 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 done, _ = await asyncio.wait(
                     {init_task, task},
                     return_when=asyncio.FIRST_COMPLETED,
-                    timeout=_CONNECT_HANDSHAKE_TIMEOUT,
+                    timeout=self._connect_handshake_timeout,
                 )
             finally:
                 if not init_task.done():
                     init_task.cancel()
-                    with suppress(asyncio.CancelledError, Exception):
-                        await init_task
+                    # #247：有界等待取消生效；**不得**吞掉调用方自身的取消（asyncio.wait 会把外层
+                    # CancelledError 原样上抛，交由外层 except 收口）。initialize 若忽略取消，
+                    # 等待 _INIT_CANCEL_GRACE 后放弃（detached 任务随 loop 关闭回收）。
+                    cancel_done, _ = await asyncio.wait({init_task}, timeout=_INIT_CANCEL_GRACE)
+                    if init_task in cancel_done and not init_task.cancelled():
+                        with suppress(BaseException):
+                            init_task.exception()
+                    elif init_task not in cancel_done:
+                        logger.warning("MCP initialize() ignored cancellation; abandoning the task")
                 elif not init_task.cancelled():
                     # 领取已完成的异常，避免 "Task exception was never retrieved"（任务同时完成分支）
                     with suppress(BaseException):

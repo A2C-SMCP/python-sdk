@@ -34,6 +34,12 @@ class STATES(StrEnum):
 
 TRANSITIONS: list[AsyncTransitionConfigDict]
 
+# 模块级超时策略（#247；client_factory 读取握手 deadline）
+_TEARDOWN_TIMEOUT: float
+_CONNECT_HANDSHAKE_TIMEOUT: float
+_CONVERGE_INFLIGHT_TIMEOUT: float
+_INIT_CANCEL_GRACE: float
+
 class A2CAsyncMachine(AsyncMachine): ...
 
 class MCPCapabilityNotSupportedError(Exception): ...
@@ -56,6 +62,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
     _session_ready: bool
     _converge_task: asyncio.Task | None
     _create_session_error: BaseException | None
+    _connect_handshake_timeout: float | None
     _subscribed_window_uris: set[str]
     _child_pids: set[int]
     state: STATES
@@ -73,6 +80,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
     async def _create_async_session(self) -> ClientSession: ...
     @property
     def initialize_result(self) -> InitializeResult | None: ...
+    def set_connect_handshake_timeout(self, timeout: float | None) -> None: ...
     async def aconnect(self, *args: Any, **kwargs: Any) -> None: ...
     async def aprepare_connect(self, event: EventData) -> None: ...
     async def acan_connect(self, event: EventData) -> bool: ...
