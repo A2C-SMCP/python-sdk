@@ -31,7 +31,17 @@ from typing import Any
 from a2c_smcp.computer.cli.commands import flag_value, format_settings_errors, resolved_settings_with_errors
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.policy import resolve_policy_settings
-from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError, validate_settings
+from a2c_smcp.computer.settings.raw import (
+    SettingsFileCorruptError,
+    read_raw_object,
+)
+from a2c_smcp.computer.settings.schema import (
+    POLICY_ONLY_FIELDS,
+    TRUSTED_SCOPE_ONLY_FIELDS,
+    SettingsScope,
+    SettingsValidationError,
+    validate_settings,
+)
 from a2c_smcp.computer.settings.scope import (
     apply_write,
     load_settings_file,
@@ -162,6 +172,39 @@ def settings_get(
     return EXIT_OK
 
 
+def _warn_inert_fields(doc: Mapping[str, Any], enum: SettingsScope) -> None:
+    """
+    写后诊断：文件里存在**读面会被过滤掉**的键（#246 / A+，§5.6）/ Warn about fields that will be ignored。
+
+    保留用户数据 ≠ 让它生效：project scope 的受信字段（审批门 enable 判据 / ``landingRoot`` / ``readRoots``）
+    与任何可写 scope 的 policy-only 字段都会被 :func:`validate_settings` 过滤。写路径不再删除它们，因此必须
+    明确告知「这些键在，但不生效」，否则用户看到 "✓ set" 会误以为已经配置成功。
+
+    扫描**整份写后文档**而非只看本次写入的键：project settings 里长期存在一个 ``readRoots`` 时，用户改任何
+    别的键都该被提醒「你那条 readRoots 是失效的」——这正是要补的配置诊断。
+    Scans the whole written document, not just the key being set: a pre-existing inert field must be
+    surfaced on any write, otherwise the user never learns it is dead config.
+
+    **每次写只告警一次**（把命中的键合并成一行），走 stderr 避免污染 ``--json`` 的机读 stdout。
+    At most one warning line per write; stderr only, so ``--json`` stdout stays machine-readable.
+    """
+    project_only = sorted(k for k in doc if enum is SettingsScope.PROJECT and k in TRUSTED_SCOPE_ONLY_FIELDS)
+    policy_only = sorted(k for k in doc if k in POLICY_ONLY_FIELDS)
+    if not project_only and not policy_only:
+        return
+    parts: list[str] = []
+    if project_only:
+        parts.append(
+            f"{', '.join(map(repr, project_only))} (personal/trusted decision in git-tracked project settings; "
+            "move it to settings.local.json or the user scope)"
+        )
+    if policy_only:
+        parts.append(f"{', '.join(map(repr, policy_only))} (policy-only; settable only from the managed policy source)")
+    console_err.print(
+        f"[yellow]! present in the {enum.value} settings but will NOT take effect: {'; '.join(parts)}[/yellow]"
+    )
+
+
 def settings_set(
     home: Path,
     env: Mapping[str, str] | None,
@@ -175,6 +218,12 @@ def settings_set(
 
     值解析：JSON 优先（``true`` / ``["a","b"]`` / ``{...}``），失败回退字面字符串。写经 ``apply_write``——
     对象递归深合并、**数组整体替换**、``null`` 删键（§5.4）。
+
+    **raw 保真 RMW**（#246）：读**原始 JSON**（:func:`read_raw_object`，不经校验过滤视图）→ 只改目标键 →
+    写回。被校验器过滤的字段（project 的 ``readRoots`` / ``landingRoot`` / ``enabledMcpjsonServers`` /
+    ``enableAllProjectMcpServers``、policy-only 字段、非法 ``permissions`` 条目、未知键）**原样保留**，
+    与 §5.6「单字段写、不整体重写文件」一致。目标文件 corrupt / 根非对象 → fail-closed（退出码 1，原文件不动）。
+    Raw-fidelity RMW: read the raw object, touch only the target key. Corrupt targets fail closed.
     """
     if scope not in _WRITABLE:
         return _err(f"scope {scope!r} is read-only (writable: {'|'.join(sorted(_WRITABLE))})", json_output=json_output)
@@ -188,11 +237,15 @@ def settings_set(
     except (json.JSONDecodeError, ValueError):
         parsed = value  # 回退字面字符串 / fall back to a literal string
 
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, enum)
-        updated = apply_write(existing, {key: parsed})
-        atomic_write_json(path, updated)
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            updated = apply_write(existing, {key: parsed})
+            atomic_write_json(path, updated)
+    except SettingsFileCorruptError as e:
+        return _err(str(e), json_output=json_output)
 
+    _warn_inert_fields(updated, enum)
     if json_output:
         console.print_json(data={"scope": scope, "key": key, "value": parsed})
         return EXIT_OK

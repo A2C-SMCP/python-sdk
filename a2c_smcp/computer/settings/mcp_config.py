@@ -56,6 +56,11 @@ from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
+from a2c_smcp.computer.settings.raw import (
+    SettingsFileCorruptError,
+    list_field_or_empty,
+    read_raw_object,
+)
 from a2c_smcp.computer.settings.schema import (
     FIELD_ALLOWED_MCP_SERVERS,
     FIELD_DENIED_MCP_SERVERS,
@@ -68,7 +73,6 @@ from a2c_smcp.computer.settings.schema import (
 )
 from a2c_smcp.computer.settings.scope import (
     apply_write,
-    load_settings_file,
     resolve_user_config_dir,
     workdir_local_settings_path,
     workdir_settings_dir,
@@ -519,18 +523,24 @@ def _append_local_mcp_array(field_name: str, name: str) -> None:
     """
     把 ``name`` 追加进 local ``settings.local.json`` 的某 MCP 数组字段（持锁原子 RMW + dedup）/ Append to a local array。
 
-    复用 store 原语：:func:`file_lock`（旁车 ``.lock``）+ :func:`load_settings_file`（容错）+ :func:`apply_write`
-    （数组**整体替换**写语义，§5.4）+ :func:`atomic_write_json`（``header=None``——人编意图层无写保护头/version）。
-    锁内读-改-写杜绝并发丢更新。
+    复用 store 原语：:func:`file_lock`（旁车 ``.lock``）+ :func:`read_raw_object`（**raw 保真**，不经校验过滤视图）
+    + :func:`apply_write`（数组**整体替换**写语义，§5.4）+ :func:`atomic_write_json`（``header=None``——人编意图层
+    无写保护头/version）。锁内读-改-写杜绝并发更新丢失。
+
+    **#246**：只改该数组键，其余字段（含 policy-only 越权字段、非法 ``permissions`` 条目、未知键）与数组内的
+    **非字符串条目**逐字保留。目标文件 corrupt / 该键非数组 → 抛 :class:`McpConfigCorruptError`，原文件不动。
     """
     path = _local_settings_write_path()
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
-        current = [v for v in existing.get(field_name, []) if isinstance(v, str)]
-        if name not in current:
-            current.append(name)
-        updated = apply_write(existing, {field_name: current})
-        atomic_write_json(path, updated)
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            current = list_field_or_empty(existing, field_name, path=path)
+            if name not in current:
+                current.append(name)
+            updated = apply_write(existing, {field_name: current})
+            atomic_write_json(path, updated)
+    except SettingsFileCorruptError as e:
+        raise McpConfigCorruptError(str(e)) from e
 
 
 def approve_mcp_server(name: str) -> None:
@@ -544,12 +554,19 @@ def deny_mcp_server(name: str) -> None:
 
 
 def approve_all_project_mcp() -> None:
-    """批准框 ``[a]ll``：``enableAllProjectMcpServers=true`` 写 local scope（§9.2）/ Approve-all: set the bool (local)。"""
+    """
+    批准框 ``[a]ll``：``enableAllProjectMcpServers=true`` 写 local scope（§9.2）/ Approve-all: set the bool (local)。
+
+    **#246 raw 保真**：只写该标量键，其余字段逐字保留；目标文件 corrupt → :class:`McpConfigCorruptError`。
+    """
     path = _local_settings_write_path()
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
-        updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})
-        atomic_write_json(path, updated)
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})
+            atomic_write_json(path, updated)
+    except SettingsFileCorruptError as e:
+        raise McpConfigCorruptError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -661,13 +678,22 @@ def mcp_write_path(
 
 def _write_servers_map(path: Path, servers: dict[str, Any], inputs: list[Any]) -> None:
     """
-    原子重写单个 ``mcp.json`` 的规整视图 ``{servers, inputs}`` / Atomically rewrite one mcp.json's normalized view。
+    原子写单个 ``mcp.json`` 的 ``servers`` / ``inputs`` 两键，**其余顶层键原样保留**（#246 raw 保真）
+    Atomically write the ``servers`` / ``inputs`` keys of one mcp.json, preserving every other top-level key.
 
-    经 :func:`load_mcp_config_file` 规整（未知顶层 key 如 ``$schema`` 不保留——``mcp.json`` 的 SDK 权威形状
-    即 ``{servers, inputs}``）；``atomic_write_json`` 无 ``header``（``mcp.json`` 是人编意图层，无写保护头/version，
-    照批准写助手姿态）。**调用方须已持 :func:`file_lock`**。
+    过去整文件重写成 ``{servers, inputs}``，会静默丢弃 IDE 补全用的 ``$schema`` 等未知顶层键；现在读回**原始
+    JSON 对象**、只覆写这两个键再写回。``atomic_write_json`` 无 ``header``（``mcp.json`` 是人编意图层，无写保护头/
+    version，照批准写助手姿态）。**调用方须已持 :func:`file_lock`**。
+
+    :raises McpConfigCorruptError: 目标文件在读写之间变成 corrupt / 根非对象（防御性；调用方通常已先行拦截）。
     """
-    atomic_write_json(path, {"servers": servers, "inputs": inputs})
+    try:
+        doc: dict[str, Any] = read_raw_object(path) or {}
+    except SettingsFileCorruptError as e:
+        raise McpConfigCorruptError(str(e)) from e
+    doc["servers"] = servers
+    doc["inputs"] = inputs
+    atomic_write_json(path, doc)
 
 
 def upsert_mcp_server(
@@ -706,8 +732,8 @@ def upsert_mcp_server(
       :class:`McpConfigCorruptError`，**绝不覆盖**（否则销毁既有内容，见该异常文档）。
     - **内容未变 = no-op**：目标 scope 现存定义与 ``body`` 逐字相等 → 不落盘、``changed=False``（对齐 rust 仅
       真变才 bump revision）。
-    - **规整副作用**：落盘经 :func:`load_mcp_config_file` 规整为 ``{servers, inputs}``——目标文件的**未知顶层
-      key**（如 IDE 补全用的 ``$schema``）在改写时**不保留**（``mcp.json`` 的 SDK 权威形状即 ``{servers, inputs}``）。
+    - **raw 保真（#246）**：落盘只覆写 ``servers`` / ``inputs`` 两个顶层键，目标文件的**其余顶层键**
+      （如 IDE 补全用的 ``$schema``）**原样保留**（见 :func:`_write_servers_map`）。
 
     :param name: server 身份（``mcp.json`` map key）/ the server identity (mcp.json map key).
     :param body: **未渲染** server 定义体（不含 map key；``name`` 由 key 承载）/ the un-rendered server body.

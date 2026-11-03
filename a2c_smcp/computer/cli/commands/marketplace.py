@@ -29,8 +29,13 @@ from rich.table import Table
 
 from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
-from a2c_smcp.computer.cli.utils import console
+from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import uninstall_plugin
+from a2c_smcp.computer.settings.raw import (
+    SettingsFileCorruptError,
+    list_field_or_empty,
+    read_raw_object,
+)
 from a2c_smcp.computer.settings.reconciler import prune_marketplaces
 from a2c_smcp.computer.settings.schema import (
     FIELD_TRUSTED_MARKETPLACES,
@@ -116,22 +121,33 @@ def _load_trusted(env: Mapping[str, str] | None) -> set[str]:
 
 
 def _record_trust(name: str, env: Mapping[str, str] | None) -> None:
-    """把 marketplace ``name`` 追加进 user ``settings.json`` 的 ``trustedMarketplaces``（持锁原子 RMW + dedup）。"""
+    """
+    把 marketplace ``name`` 追加进 user ``settings.json`` 的 ``trustedMarketplaces``（持锁原子 RMW + dedup）。
+
+    **#246 raw 保真**：读**原始 JSON**（:func:`read_raw_object`，不经校验过滤视图），只改该数组键——
+    其余字段（含 policy-only 越权字段、非法 ``permissions`` 条目、未知键）与**数组内的非字符串条目**逐字保留
+    （过去 ``if isinstance(n, str)`` 会顺带丢弃它们）。目标文件 corrupt / 该键非数组 → 抛
+    :class:`SettingsFileCorruptError`，原文件逐字节不动。
+    """
     path = user_settings_path(env)
     with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.USER)
-        current = [n for n in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(n, str)]
+        existing = read_raw_object(path) or {}
+        current = list_field_or_empty(existing, FIELD_TRUSTED_MARKETPLACES, path=path)
         if name not in current:
             current.append(name)
         atomic_write_json(path, apply_write(existing, {FIELD_TRUSTED_MARKETPLACES: current}))
 
 
 def _revoke_trust(name: str, env: Mapping[str, str] | None) -> None:
-    """从 user ``settings.json`` 的 ``trustedMarketplaces`` 移除 marketplace ``name``（remove 时调，避免只增不减）。"""
+    """
+    从 user ``settings.json`` 的 ``trustedMarketplaces`` 移除 marketplace ``name``（remove 时调，避免只增不减）。
+
+    **#246 raw 保真**：同 :func:`_record_trust`——只删目标元素，其余字段与非字符串条目保留。
+    """
     path = user_settings_path(env)
     with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.USER)
-        current = [n for n in existing.get(FIELD_TRUSTED_MARKETPLACES, []) if isinstance(n, str) and n != name]
+        existing = read_raw_object(path) or {}
+        current = [n for n in list_field_or_empty(existing, FIELD_TRUSTED_MARKETPLACES, path=path) if n != name]
         atomic_write_json(path, apply_write(existing, {FIELD_TRUSTED_MARKETPLACES: current}))
 
 
@@ -176,7 +192,11 @@ async def marketplace_add(
             return _err(f"untrusted marketplace {mp_name!r} ({url}); pass --trust to confirm non-interactively", json_output=json_output)
         if mp_name not in _load_trusted(env) and not await confirm(url):
             return _err("aborted by user (untrusted)", json_output=json_output)
-    _record_trust(mp_name, env)
+    try:
+        _record_trust(mp_name, env)
+    except SettingsFileCorruptError as e:
+        # fail-closed：trust 是后续 clone+注册的前置条件；写不进去就不继续（#246）。
+        return _err(str(e), json_output=json_output)
 
     if no_clone:
         # 仅注册意图（不推荐，§4.2 debug 用）：记 known_marketplaces 但不 clone/stage。
@@ -311,7 +331,12 @@ async def marketplace_remove(
                 uninstalled.append(pid)
 
     pruned = prune_marketplaces([name], registry, home, env=env)
-    _revoke_trust(name, env)  # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）
+    # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。此时移除**已完成**，revoke 只是清理残留，
+    # 故 fail-closed 的写失败降级为 WARN（不吞、不覆盖、不回滚已完成的开除动作）——#246。
+    try:
+        _revoke_trust(name, env)
+    except SettingsFileCorruptError as e:
+        console_err.print(f"[yellow]! removed {name!r} but failed to revoke its trust entry: {e}[/yellow]")
     if json_output:
         console.print_json(data={"removed": name, "pruned": pruned, "uninstalledPlugins": uninstalled, "keptPlugins": keep_plugins})
         return EXIT_OK

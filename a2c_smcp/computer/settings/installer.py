@@ -66,6 +66,12 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
+from a2c_smcp.computer.settings.raw import (
+    SettingsFileCorruptError,
+    list_field_or_empty,
+    mapping_field_or_empty,
+    read_raw_object,
+)
 from a2c_smcp.computer.settings.reconciler import (
     NonPluginBundleIds,
     ledger_mcp_deps_of,
@@ -196,21 +202,31 @@ def _write_enabled_plugin(plugin_id: str, value: bool | None, scope: str, projec
 
     ``value=None`` = 删除该条目（enable 失败回滚恢复 absent / uninstall 清条目，v0.3.0 §2.4）；条目本不存在 → no-op。
 
-    复用 store 原语自组织：:func:`file_lock`（旁车 ``.lock``，建父目录）+ :func:`load_settings_file`（容错）+
-    :func:`apply_write`（递归进 ``enabledPlugins`` 仅改该 key、不毁兄弟；:data:`DELETE` 删 key）+
+    复用 store 原语自组织：:func:`file_lock`（旁车 ``.lock``，建父目录）+ :func:`read_raw_object`（**raw 保真**，
+    不经校验过滤视图）+ :func:`apply_write`（递归进 ``enabledPlugins`` 仅改该 key、不毁兄弟；:data:`DELETE` 删 key）+
     :func:`atomic_write_json`（``header=None``——settings.json 是人编意图层，无写保护头 / version 字段，区别于物化文件）。
+
+    **#246**：读取 raw 原始 JSON，使 project 的 ``readRoots`` / ``landingRoot`` / ``enabledMcpjsonServers``、
+    policy-only 字段、非法 ``permissions`` 条目等被校验器过滤的字段不再被整文件回写抹掉。目标文件 corrupt /
+    ``enabledPlugins`` 非对象 → fail-closed（抛 :class:`PluginInstallError`，原文件逐字节不动）。
+    Raw-fidelity RMW; corrupt target or non-object ``enabledPlugins`` fails closed.
     """
-    path, scope_enum = _settings_path_for_scope(scope, project_path, env)
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, scope_enum)
-        if value is None:
-            enabled = existing.get("enabledPlugins")
-            if not isinstance(enabled, Mapping) or plugin_id not in enabled:
-                return  # 无条目可删（apply_write 对缺失父键会原样写入哨兵，须在此短路）
-            updated = apply_write(existing, {"enabledPlugins": {plugin_id: DELETE}})
-        else:
-            updated = apply_write(existing, {"enabledPlugins": {plugin_id: value}})
-        atomic_write_json(path, updated)
+    path, _scope_enum = _settings_path_for_scope(scope, project_path, env)
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            # 形状检查**两条分支都要过**：upsert 分支若跳过，apply_write 会把非映射值当「类型切换」整体替换，
+            # 等同静默修复（丢掉用户写的畸形内容）——同样违反 raw 保真。
+            enabled = mapping_field_or_empty(existing, "enabledPlugins", path=path)
+            if value is None:
+                if plugin_id not in enabled:
+                    return  # 无条目可删（apply_write 对缺失父键会原样写入哨兵，须在此短路）
+                updated = apply_write(existing, {"enabledPlugins": {plugin_id: DELETE}})
+            else:
+                updated = apply_write(existing, {"enabledPlugins": {plugin_id: value}})
+            atomic_write_json(path, updated)
+    except SettingsFileCorruptError as e:
+        raise PluginInstallError(str(e)) from e
 
 
 def _clear_enabled_entries_visible_layers(plugin_id: str, project_paths: set[str], env: Mapping[str, str] | None) -> None:
@@ -244,19 +260,24 @@ def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str
     安装是全局一次的事实（协议 v0.3.0 §2.1/§2.4「plugin_installation」）→ 意图固定落 **user** settings.json
     （#123 决策：不随 ``--scope`` 泄漏进可提交的 project 文件）；读取侧由 :func:`resolve_settings` merged
     并集承担（project/local 声明亦被认可，支持声明式复现）。数组写回整体替换（§5.4 写语义），保序去重。
+
+    **#246**：raw 保真 RMW——只改 ``installedPlugins``，其余字段（含 policy-only 越权字段 / 未知键）逐字保留。
+    目标文件 corrupt / ``installedPlugins`` 非数组 → fail-closed（抛 :class:`PluginInstallError`，原文件不动）。
     """
     path = user_settings_path(env)
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.USER)
-        current = existing.get("installedPlugins")
-        entries: list[str] = list(current) if isinstance(current, list) else []
-        was_present = plugin_id in entries
-        if present and not was_present:
-            entries.append(plugin_id)
-        elif not present and was_present:
-            entries = [e for e in entries if e != plugin_id]
-        atomic_write_json(path, apply_write(existing, {"installedPlugins": entries}))
-        return was_present
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            entries: list[Any] = list_field_or_empty(existing, "installedPlugins", path=path)
+            was_present = plugin_id in entries
+            if present and not was_present:
+                entries.append(plugin_id)
+            elif not present and was_present:
+                entries = [e for e in entries if e != plugin_id]
+            atomic_write_json(path, apply_write(existing, {"installedPlugins": entries}))
+            return was_present
+    except SettingsFileCorruptError as e:
+        raise PluginInstallError(str(e)) from e
 
 
 def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str) -> list[str]:
@@ -853,10 +874,24 @@ def migrate_legacy_installs(home: Path, *, env: Mapping[str, str] | None = None)
     :return: 本次迁入 ``installedPlugins`` 的 pid 列表（已迁移 no-op → 空）。
     """
     path = user_settings_path(env)
+    try:
+        return _migrate_installs_locked(path, home, env)
+    except SettingsFileCorruptError as e:
+        raise PluginInstallError(str(e)) from e
+
+
+def _migrate_installs_locked(path: Path, home: Path, env: Mapping[str, str] | None) -> list[str]:
+    """
+    :func:`migrate_legacy_installs` 的锁内主体（拆出以保持 raw 错误翻译集中在调用处）
+    The locked body of :func:`migrate_legacy_installs`, split out so raw-error translation stays at the call site.
+
+    **#246**：标记键判据读 **raw**（``"installedPlugins" in existing``）——过去读校验视图，类型错的标记键会被
+    过滤掉 ⇒ 被误判「未迁移」而重复迁入。写回同样只改目标键，其余字段（含 policy-only 越权字段 / 未知键）保留。
+    """
     with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.USER)
+        existing = read_raw_object(path) or {}
         if "installedPlugins" in existing:
-            return []  # 已迁移（标记键在）→ 严格 no-op
+            return []  # 已迁移（标记键在，哪怕类型错）→ 严格 no-op
 
         # ``drop_legacy=False`` 是**必须**的（#153）：v0.2.x 账本记录一律是旧格式（``bundledMcpServers``），
         # 默认读法会把它们整条丢弃 ⇒ 带 MCP server 的 plugin 连 pid 一起消失 ⇒ 意图无从回填 ⇒ 升级后
