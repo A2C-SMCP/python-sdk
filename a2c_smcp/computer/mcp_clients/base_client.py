@@ -261,12 +261,54 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         """
         异步会话对象
 
+        中文: 惰性建连**只允许从 ``initialized`` 发起**（#252）。其余状态（``connected`` 半断开 /
+        ``error`` / ``disconnected``）直接抛可读的 ``ConnectionError``——旧实现在这些状态下调
+        ``aconnect()``，只会撞 transitions 的内部错误 ``MachineError("Can't trigger event aconnect
+        from state …")``，既无诊断价值，也正是 #247 的原始根因形态。
+        English: Lazy connect is only allowed from `initialized`; other states raise a readable
+        ConnectionError instead of transitions' internal MachineError (#247 root-cause shape).
+
         Returns:
             ClientSession: MCP 官方异步会话，用于触发 MCP Server 指令
         """
         if self._async_session is None:
+            if self.state != STATES.initialized:
+                raise ConnectionError(
+                    f"MCP client has no active session in state {self.state!r}; "
+                    "lazy connect is only allowed from 'initialized'"
+                )
             await self.aconnect()
+            # ``acan_connect`` 可被子类否决 / 连接在握手期被拆除——aconnect 返回不等于拿到会话。
+            # `acan_connect` may veto, or the session may be torn down mid-handshake.
+            if self._async_session is None:
+                raise ConnectionError(
+                    f"MCP client still has no active session after connecting (state={self.state!r})"
+                )
         return cast(ClientSession, self._async_session)
+
+    @property
+    def is_session_usable(self) -> bool:
+        """本 client 当前是否**真的**可用——manager 提交与缓存复用的唯一判据（#252）。
+
+        中文: ``state == connected`` **不足以**证明可用：
+          - transitions 在进入 ``on_enter_connected`` **之前**就把状态置为 ``connected``（握手窗口内
+            状态恒为 connected）；
+          - 传输在 ``initialize()`` 返回后立即死亡时，keep-alive 的 ``finally`` 已清空 ``_async_session``，
+            而收敛任务必须**等在途的 aconnect 结束**才能把状态推到 ``error``（否则 transitions 会把
+            aerror 重新抛出，见 ``_aconverge_unexpected_exit``）。
+        故「aconnect 正常返回」时完全可能是 `connected + 无会话 + keep-alive 已死`——必须同时要求
+        有会话、且 keep-alive 任务存在且未结束。
+        English: `state == connected` alone is not proof of usability (the state is set before the
+        handshake, and teardown clears the session before convergence can move the machine); require
+        a live session and a live keep-alive task too.
+        """
+        task = self._session_keep_alive_task
+        return (
+            self.state == STATES.connected
+            and self._async_session is not None
+            and task is not None
+            and not task.done()
+        )
 
     @property
     def initialize_result(self) -> InitializeResult | None:
@@ -296,7 +338,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         """
         raise NotImplementedError
 
-    async def _keep_alive_task(self) -> None:
+    async def _keep_alive_task(self, close_event: asyncio.Event) -> None:
         """
         async_session 保活，进而保证其它连接可以正常使用它。
 
@@ -311,10 +353,15 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         2. 将需要持续保证的上下文压栈 self._aexit_stack
         3. 通过 asyncio.Event().wait() 来保证上下文的持续，同时通过响应 self._session_keep_alive_task.done() 来完成上下文的关闭
         4. 得到关闭信号后，对 self._aexit_stack 里的上下文进行关闭
+
+        #252：``close_event`` 由**创建方**（``on_enter_connected``）为本代新建并显式传入，
+        本任务既不清除也不触碰任何一代的共享信号——旧实现「任务体内 ``clear()`` 共享事件」
+        会让晚启动的旧代任务抹掉新代已置位的关闭信号。
+        / The close signal is created per generation by the caller and passed in; this task never
+        clears or touches another generation's signal (the old in-task `clear()` could erase a
+        newer generation's already-set signal).
         """
         logger.debug(f"Session keep-alive task: {asyncio.current_task().get_name()}")
-        # 每个 keep-alive 任务实例使用干净的关闭信号 / fresh close signal per task instance
-        self._close_event.clear()
         try:
             # 创建异步会话，同时完成上下文的压栈
             self._async_session = await self._create_async_session()
@@ -327,13 +374,14 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 # CancelledError 抢占下跳过 mcp 的子进程强杀，导致 stdio 子进程残留、os.waitpid 永久阻塞。
                 # Wait for the graceful close signal; do NOT rely on task.cancel (it would let the
                 # finally-block aclose() be pre-empted by CancelledError, skipping mcp's child force-kill).
-                await self._close_event.wait()
+                await close_event.wait()
             except asyncio.CancelledError:
                 # 向后兼容：仍容忍历史 cancel 路径 / back-compat: still tolerate the legacy cancel path
                 # #247：关闭信号未置位 ⇒ 取消来自**传输任务组（anyio）失败**而非优雅关闭。这是
                 # 「会话已死、状态机待收敛」的首条可诊断线索，故记 WARNING；优雅关闭仍为 DEBUG。
+                # #252：必须读本代的 ``close_event``——读 ``self._close_event`` 会拿到别代的信号。
                 # Not a graceful close → most likely anyio cancelled us after a transport failure.
-                if self._close_event.is_set():
+                if close_event.is_set():
                     logger.debug(f"Session keep-alive task cancelled: {asyncio.current_task().get_name()}")
                 else:
                     logger.warning(
@@ -564,7 +612,11 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         # 当作「连接后失败」收敛（否则会把连接中失败的 client 以 error 状态提交给 manager）。
         # The state is already `connected` before this callback; do not converge until initialize() completes.
         self._session_ready = False
-        self._session_keep_alive_task = asyncio.create_task(self._keep_alive_task())
+        # #252：**换代即换关闭信号对象**（单点清理，任务体内不再 clear）。新建与建任务之间无 await
+        # ⇒ 二者天然同代；任何一代都不可能再抹掉别代已置位的信号。
+        # A fresh close signal per generation, created in the same synchronous block as the task.
+        self._close_event = asyncio.Event()
+        self._session_keep_alive_task = asyncio.create_task(self._keep_alive_task(self._close_event))
         task = self._session_keep_alive_task
         # #247：任务意外终止（anyio 取消 / 传输死亡）时由 done callback 把状态机收敛到 error，
         # 避免 "connected + _async_session=None" 的半断开形态外泄到 adisconnect/shutdown。
@@ -1026,6 +1078,40 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             # 子进程已强杀，补发 closed 事件，避免 on_enter_disconnected 的 closed 等待挂死
             # Child already force-killed; ensure closed-event is set so disconnect doesn't hang.
             self._async_session_closed_event.set()
+
+    async def adiscard(self) -> None:
+        """显式回收一个**从未提交**给 manager 的 client 的会话 / 传输 / 子进程上下文（#252）。
+
+        中文: 与 :meth:`adisconnect` 的分工——``adiscard`` **刻意不经状态机**：弃置对象的终态对任何
+        人（含状态回调的宿主）都没有意义，而半断开（connected + 无会话）或连接中调 ``adisconnect``
+        会撞 ``MachineError`` 或与在途 transition 竞速。``_close_task`` 幂等、有界、自带强杀兜底，
+        且对「从未建过 keep-alive 任务」的 client 立即返回。
+        非抛出（``CancelledError`` 由 ``_close_task`` 内部按既有语义处理）：调用点都在 ``finally`` 里，
+        绝不能顶替正在传播的主异常。
+        English: Best-effort, non-raising reclamation for a client that was never committed to a
+        manager; deliberately state-machine-free (a discarded client's terminal state is meaningless,
+        and `adisconnect` from a half-broken / connecting client raises or races in-flight transitions).
+        """
+        # ⚠️ 必须连 ``BaseExceptionGroup`` 一起拦：anyio 的拆除期聚合可能包含 ``CancelledError``，
+        # 此时抛的是 ``BaseExceptionGroup``（``except Exception`` 不拦）。放它逃逸会**顶替 finally
+        # 中正在传播的主异常**——上游据此分类的重定向 stop / 超时会被换成裸 group，``_aspawn_client``
+        # 的分类臂失配（不写 ERROR），``clear_oauth`` 的 ``suppress`` 也拦不住。本方法的契约是
+        # 「除 CancelledError 外不抛」。
+        # Must also swallow BaseExceptionGroup (anyio teardown may aggregate CancelledError): letting it
+        # escape would replace the primary exception in flight and break upstream classification.
+        try:
+            try:
+                await self._close_task()
+            except (Exception, BaseExceptionGroup):
+                logger.warning("Discarding an uncommitted MCP client failed during teardown", exc_info=True)
+        finally:
+            # ``_close_task`` 在「任务已结束 / 从未创建」时早退，不覆盖「子进程已在、任务没起来」的窄路径；
+            # 强杀是 best-effort 且无子进程时 no-op。/ Covers "child spawned but task never ran".
+            await self._aforce_kill()
+            # 弃置对象不会再被强杀：清空 PID 集，防止同一对象将来被复用时按陈旧 PID 误杀（PID 复用）。
+            # The discarded client is never force-killed again — drop the PID set so a future PID reuse
+            # can never make it kill an unrelated process.
+            self._child_pids.clear()
 
     async def _aforce_kill(self) -> None:
         """兑底强杀本 client 启动的子进程树（仅 stdio 传输有子进程；其它传输为 no-op）。

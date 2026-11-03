@@ -257,6 +257,12 @@ MCPServerInput = MCPServerPromptStringInput | MCPServerPickStringInput | MCPServ
 class MCPClientProtocol(Protocol):
     state: "STATES"
 
+    #: #252：**真实可用性**判据（``state == connected`` ∧ 有会话 ∧ keep-alive 存活）。
+    #: 仅看 ``state`` 抓不住「握手窗口内状态已是 connected」与「传输已死但收敛未完成」两种形态。
+    #: True liveness predicate — `state == connected` alone is not proof of usability.
+    @property
+    def is_session_usable(self) -> bool: ...
+
     async def aconnect(self) -> None:
         """连接MCP Server"""
         ...

@@ -34,6 +34,11 @@ class _RecordingClient:
         self.disconnect_called = False
         self.list_tools = AsyncMock(return_value=[])
 
+    @property
+    def is_session_usable(self) -> bool:
+        """#252：manager 的可用性判据（假 client 以 state 为准）。"""
+        return self.state == "connected"
+
     async def aconnect(self) -> None:
         self.state = "connected"
 

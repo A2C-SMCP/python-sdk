@@ -64,6 +64,11 @@ class ToolListProbe:
         self._redirect_event: asyncio.Event | None = None
 
     @property
+    def is_session_usable(self) -> bool:
+        """#252：manager 的可用性判据（假 client 以 state 为准；``dying`` 用例靠改 state 生效）。"""
+        return self.state == STATES.connected
+
+    @property
     def calls(self) -> int:
         return int(self.list_tools.await_count)
 
