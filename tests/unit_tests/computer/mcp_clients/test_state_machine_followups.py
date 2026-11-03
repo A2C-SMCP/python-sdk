@@ -457,11 +457,16 @@ async def test_aoauth_connect_commit_rejection_keeps_healthy_status(monkeypatch:
 
 @pytest.mark.asyncio
 async def test_ensure_oauth_coordinator_wraps_bounded_connect_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`OAuthFlow.launch` 是宿主的 typed facade 入口（#179）：bootstrap 的裸超时/连接失败必须转 OAuthError。"""
+    """`OAuthFlow.launch` 是宿主的 typed facade 入口（#179）：bootstrap 的裸超时/连接失败必须转 OAuthError。
+
+    安全断言（`oauth_types.OAuthError` 约定）：``message`` 必须是**静态文案**，绝不携带 provider
+    响应 / token / authorization URL / code / state；原异常只能经 ``__cause__`` 保留。
+    """
     manager = _manager()
+    sensitive = "https://as.example/token?code=SECRET-CODE&state=SECRET-STATE&client_secret=SECRET-KEY"
 
     async def _boom(bundle_id: str) -> None:
-        raise TimeoutError("connect neither succeeded nor received an auth challenge")
+        raise TimeoutError(sensitive)
 
     monkeypatch.setattr(manager, "_astart_client_auto", _boom)
 
@@ -469,7 +474,10 @@ async def test_ensure_oauth_coordinator_wraps_bounded_connect_failures(monkeypat
         await manager._ensure_oauth_coordinator("oauth_srv")
 
     assert exc.value.code == OAuthErrorCode.Protocol
+    assert "SECRET" not in exc.value.message, "OAuthError.message 必须为静态文案（不得携带 provider 侧敏感文本）"
+    assert "as.example" not in exc.value.message, "不得把 authorization URL 带进 message"
     assert isinstance(exc.value.__cause__, TimeoutError), "原始异常必须保留为 __cause__（诊断不丢）"
+    assert "SECRET" in str(exc.value.__cause__), "前置：敏感文本确实只走 __cause__"
 
 
 @pytest.mark.asyncio

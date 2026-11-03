@@ -279,9 +279,11 @@ def _client_session_usable(client: MCPClientProtocol | None) -> bool:
     经由它）/ clear_oauth / ``_clear_all``（aclose / ainitialize 的整表清空）三处，**非错误驱动** —— 会话死亡
     （keep-alive 失败置 ``error``）后 client 仍在册，故「在册」不等于「可用」。
 
-    #252 起兼任 :meth:`MCPServerManager._commit_active_client` 的前置判据（提交前「client 必须仍处
-    connected」）——故签名放宽为 ``| None``：未注册的 bundle 一律判为不可用。
-    / Since #252 this is also the commit precondition; ``None`` (no client) is never usable.
+    #252 起兼任 :meth:`MCPServerManager._commit_active_client` 的前置判据（提交前的**存活判据**：
+    `state == connected` ∧ 有会话 ∧ keep-alive 存活）——故签名放宽为 ``| None``：未注册的 bundle
+    一律判为不可用。⚠️ 判据含义已从「状态」升级为「真实可用」，勿再退回只看 ``state``。
+    / Since #252 this is also the commit **liveness** precondition (connected + live session + live
+    keep-alive); ``None`` (no client) is never usable. Do not regress to a state-only check.
     """
     if client is None:
         return False
@@ -1160,7 +1162,8 @@ class MCPServerManager:
                 if current_task is not None and current_task.cancelling():
                     raise asyncio.CancelledError
                 raise ConnectionError(
-                    f"client for bundle_id={bundle_id!r} is not connected at commit time (state={client_state!r})"
+                    f"client for bundle_id={bundle_id!r} is not usable at commit time "
+                    f"(state={client_state!r}: session or keep-alive not alive)"
                 )
             existing = self._active_clients.get(bundle_id)
             if existing is not None and existing is not client:
@@ -1576,10 +1579,13 @@ class MCPServerManager:
             # #252：``_bounded_connect`` 现在会真实上抛超时 / 连接失败（旧实现谎报成功）——
             # ``OAuthFlow.launch`` 是宿主的 typed facade 入口（#179 契约：一律 ``OAuthError``），
             # 不得透出裸内建异常。
-            # `launch` is the host's typed facade; never surface bare builtin exceptions.
+            # ⚠️ 安全约定（``oauth_types.OAuthError``）：``message`` 必须是**静态文案**——绝不携带
+            # provider 响应 / token / authorization URL / code / state / error_description。mcp / httpx
+            # 的异常文本常含这些，故原异常**只经 ``from exc`` 挂 __cause__**（诊断不丢），不进 message。
+            # SECURITY: the message must stay static; the original exception only travels as __cause__.
             raise OAuthError(
                 OAuthErrorCode.Protocol,
-                f"OAuth bootstrap connect failed for bundle_id={bundle_id!r}: {exc}",
+                f"OAuth bootstrap connect failed for bundle_id={bundle_id!r}",
             ) from exc
         coordinator = self._oauth_coordinators.get(bundle_id)
         if coordinator is None:
