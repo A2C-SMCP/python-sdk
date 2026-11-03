@@ -893,6 +893,10 @@ def _migrate_installs_locked(path: Path, home: Path, env: Mapping[str, str] | No
         if "installedPlugins" in existing:
             return []  # 已迁移（标记键在，哪怕类型错）→ 严格 no-op
 
+        # 容器形状守卫：整字段非对象时 fail-closed——否则 apply_write 会按「类型切换」整体替换，
+        # 等于把用户写的畸形内容静默换掉（独立审查 🔴3）。
+        enabled_raw = mapping_field_or_empty(existing, "enabledPlugins", path=path)
+
         # ``drop_legacy=False`` 是**必须**的（#153）：v0.2.x 账本记录一律是旧格式（``bundledMcpServers``），
         # 默认读法会把它们整条丢弃 ⇒ 带 MCP server 的 plugin 连 pid 一起消失 ⇒ 意图无从回填 ⇒ 升级后
         # plugin 静默全丢。此处**只读 key**（pid），不碰旧格式的字段值，故安全；账本记录本身随后由
@@ -903,7 +907,10 @@ def _migrate_installs_locked(path: Path, home: Path, env: Mapping[str, str] | No
         merged_view: Mapping[str, Any] = merged_enabled if isinstance(merged_enabled, Mapping) else {}
 
         updates: dict[str, Any] = {"installedPlugins": ledger_pids}
-        enabled_updates = {pid: True for pid in ledger_pids if pid not in merged_view}
+        # **只补缺失**：``merged_view`` 是校验过滤后的视图，畸形值（如 ``"yes"``）会被过滤掉而被误判「无条目」；
+        # 故再用 raw 容器兜一层——该 pid 只要在**原始** ``enabledPlugins`` 里存在（哪怕值畸形）就不覆盖它。
+        # 对齐 rust ``set_enabled_true_if_absent`` 的 ``entry().or_insert(true)``（独立审查 🔴3）。
+        enabled_updates = {pid: True for pid in ledger_pids if pid not in merged_view and pid not in enabled_raw}
         if enabled_updates:
             updates["enabledPlugins"] = enabled_updates
         atomic_write_json(path, apply_write(existing, updates))

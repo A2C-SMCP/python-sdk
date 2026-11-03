@@ -39,6 +39,7 @@ from typing import Any
 
 __all__ = [
     "SettingsFileCorruptError",
+    "bool_field_or_none",
     "list_field_or_empty",
     "mapping_field_or_empty",
     "read_raw_object",
@@ -70,7 +71,12 @@ def read_raw_object(path: Path) -> dict[str, Any] | None:
 
     - 文件缺失 → ``None``（调用方按 ``{}`` 起手）/ missing → ``None``.
     - 空文件 / 纯空白 → ``{}``（无数据可丢）/ empty or whitespace-only → ``{}``.
-    - IO 不可读 / JSON 解析失败 / 根非对象 → :class:`SettingsFileCorruptError`.
+    - IO 不可读 / **非 UTF-8 编码** / JSON 解析失败 / 根非对象 → :class:`SettingsFileCorruptError`.
+
+    .. note::
+       ``UnicodeDecodeError`` 是 ``ValueError`` 子类而**不是** ``OSError``——漏捕会让裸解码异常穿透全部 9 条
+       写路径的错误翻译层（issue #246 独立审查 🔴1）。非 UTF-8 的 settings.json 真实存在（Windows 记事本
+       「Unicode」存盘即 UTF-16LE），必须与 IO 错误同等归入 fail-closed。
 
     :param path: 目标文件 / the target file.
     :raises SettingsFileCorruptError: 无法安全改写 / the file cannot be rewritten safely.
@@ -80,8 +86,10 @@ def read_raw_object(path: Path) -> dict[str, Any] | None:
         if not p.exists():
             return None
         text = p.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise SettingsFileCorruptError(p, f"unreadable ({exc}); fix the file permissions or remove it") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SettingsFileCorruptError(
+            p, f"unreadable ({exc}); fix the file permissions or re-save it as UTF-8"
+        ) from exc
     if not text.strip():
         return {}
     try:
@@ -134,3 +142,22 @@ def mapping_field_or_empty(obj: Mapping[str, Any], key: str, *, path: Path) -> d
     if not isinstance(value, Mapping):
         raise _malformed(path, key, "an object", value)
     return dict(value)
+
+
+def bool_field_or_none(obj: Mapping[str, Any], key: str, *, path: Path) -> bool | None:
+    """
+    取顶层**布尔**字段；键缺失 → ``None``；存在但非布尔（**含显式 ``null``**）→ 抛错 / Top-level boolean field。
+
+    用于「无条件写 ``true``」一类的写助手：目标键若是 ``"yes"`` / ``null`` / ``[]``，直接写会把用户的畸形值
+    静默换成合法值（= 静默修复），与 raw 保真契约为敌——故先过本守卫（issue #246 独立审查 🔴2）。
+    Guards the "unconditionally set true" writers: silently replacing a malformed value would defeat
+    raw fidelity, so a non-boolean target fails closed instead.
+
+    :raises SettingsFileCorruptError: 键存在但形状不符 / present but of the wrong shape.
+    """
+    value = obj.get(key)
+    if key not in obj:
+        return None
+    if not isinstance(value, bool):
+        raise _malformed(path, key, "a boolean", value)
+    return value

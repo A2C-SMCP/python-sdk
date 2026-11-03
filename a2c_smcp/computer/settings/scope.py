@@ -211,7 +211,10 @@ def load_settings_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any]
         return {}, []
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # ``UnicodeDecodeError`` 是 ``ValueError`` 子类而非 ``OSError``：原样漏捕会让非 UTF-8 的 settings.json
+        # （如 Windows 记事本存成 UTF-16LE）在启动解析处直接崩溃，而不是按文档契约「容错 + 记错、留盘」。
+        # #246 独立审查 🔴1 同族问题（写侧已在 ``settings/raw.py`` 归入 fail-closed）。
         logger.warning("Settings file %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
         return {}, [SettingsValidationError(scope=scope, field="<file>", reason=f"unreadable or corrupt JSON: {exc}", source_path=str(p))]
     return validate_settings(raw, scope, source_path=str(p))

@@ -44,11 +44,13 @@ from a2c_smcp.computer.settings.mcp_config import (
     approve_all_project_mcp,
     approve_mcp_server,
     deny_mcp_server,
+    load_mcp_config_file,
     remove_mcp_server,
     upsert_mcp_server,
 )
-from a2c_smcp.computer.settings.raw import SettingsFileCorruptError
-from a2c_smcp.computer.settings.scope import resolve_settings, user_settings_path
+from a2c_smcp.computer.settings.raw import SettingsFileCorruptError, read_raw_object
+from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.scope import load_settings_file, resolve_settings, user_settings_path
 
 
 # ── 辅助 / helpers ───────────────────────────────────────────────────────────
@@ -549,3 +551,141 @@ def test_settings_set_is_content_idempotent(tmp_path: Path, monkeypatch: pytest.
     settings_cmd.settings_set(tmp_path, env, "theme", "dark", scope="project", json_output=True)
 
     assert _read_json(path) == first
+
+
+# ── 独立审查回归（#246 审查 3🔴 + 覆盖空洞）─────────────────────────────────
+# 非 UTF-8 字节（Windows 记事本「Unicode」存盘即 UTF-16LE 带 BOM）。解码失败抛
+# UnicodeDecodeError（ValueError 子类，**非** OSError）——漏捕会让裸解码异常穿透全部错误翻译层。
+_NON_UTF8 = b"\xff\xfe{\x00}\x00"
+
+
+def test_read_raw_object_fail_closed_on_non_utf8(tmp_path: Path) -> None:
+    """🔴1：非 UTF-8 文件必须归入 `SettingsFileCorruptError`，不是裸 `UnicodeDecodeError`。"""
+    path = tmp_path / "settings.json"
+    path.write_bytes(_NON_UTF8)
+
+    with pytest.raises(SettingsFileCorruptError) as ei:
+        read_raw_object(path)
+    assert "unchanged" in str(ei.value).lower()
+
+
+def test_settings_set_fail_closed_on_non_utf8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🔴1：`settings_set` 走 `_err` 退出码 1，而非把 `UnicodeDecodeError` 泄漏成 traceback。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_NON_UTF8)
+
+    assert settings_cmd.settings_set(tmp_path, env, "theme", "dark", scope="project", json_output=True) == 1
+    assert path.read_bytes() == _NON_UTF8
+
+
+def test_write_enabled_plugin_fail_closed_on_non_utf8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🔴1：installer 层把非 UTF-8 翻译成 `PluginInstallError`（而非逃出 `UnicodeDecodeError`）。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_NON_UTF8)
+
+    with pytest.raises(PluginInstallError):
+        _write_enabled_plugin("acme@mp", True, "project", str(wd), env)
+    assert path.read_bytes() == _NON_UTF8
+
+
+def test_read_side_loaders_tolerate_non_utf8(tmp_path: Path) -> None:
+    """读面容错契约同样覆盖非 UTF-8：不崩溃，返回空视图 + 一条错误、文件留盘。"""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_bytes(_NON_UTF8)
+    data, errors = load_settings_file(settings_path, SettingsScope.USER)
+    assert data == {}
+    assert errors and errors[0].field == "<file>"
+
+    mcp_path = tmp_path / "mcp.json"
+    mcp_path.write_bytes(_NON_UTF8)
+    mcp_data, mcp_errors = load_mcp_config_file(mcp_path, SettingsScope.USER)
+    assert mcp_data == {"servers": {}, "inputs": []}
+    assert mcp_errors
+    assert settings_path.read_bytes() == _NON_UTF8 and mcp_path.read_bytes() == _NON_UTF8
+
+
+@pytest.mark.parametrize("value", ["yes", None, [], {}, 1])
+def test_approve_all_project_mcp_fail_closed_on_malformed_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """🔴2：「无条件写 true」的写助手同样要过形状守卫，不得把畸形值静默换成 `true`。"""
+    monkeypatch.chdir(tmp_path)
+    path = _local_settings(tmp_path)
+    _write_json(path, {"enableAllProjectMcpServers": value, "keep": 1})
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(McpConfigCorruptError):
+        approve_all_project_mcp()
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_approve_all_project_mcp_allows_absent_and_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """正对照：键缺失、或既存合法 `false` 时都应写成功。"""
+    monkeypatch.chdir(tmp_path)
+    path = _local_settings(tmp_path)
+    _write_json(path, {"enableAllProjectMcpServers": False, "keep": 1})
+
+    approve_all_project_mcp()
+
+    assert _read_json(path) == {"enableAllProjectMcpServers": True, "keep": 1}
+
+
+def _seed_ledger(home: Path, pid: str) -> None:
+    """造一份最小 installed_plugins 账本（migrate 的 pid 来源）。"""
+    _write_json(home / "installed_plugins.json", {"version": 1, "plugins": {pid: [{"scope": "user", "installPath": "/tmp/x"}]}})
+
+
+@pytest.mark.parametrize("value", ["garbage", None, [], ["a@mp"]])
+def test_migrate_fail_closed_on_malformed_enabled_container(tmp_path: Path, value: object) -> None:
+    """🔴3：`enabledPlugins` 整字段非对象 → fail-closed，不得被 `apply_write` 整体替换成新对象。"""
+    env = _env(tmp_path)
+    home = tmp_path / "skill-home"
+    home.mkdir()
+    _seed_ledger(home, "a@mp")
+    path = _user_settings(env)
+    _write_json(path, {"enabledPlugins": value})
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(PluginInstallError):
+        migrate_legacy_installs(home, env=env)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_migrate_does_not_overwrite_malformed_existing_entry(tmp_path: Path) -> None:
+    """🔴3：该 pid 在**原始** `enabledPlugins` 里已存在（值畸形、被校验视图过滤）→ 不覆盖它。
+
+    过去的判据只看校验后的 merged 视图 ⇒ 畸形值被过滤 ⇒ 误判「无条目」⇒ 回填 `true` 把用户原值冲掉。
+    """
+    env = _env(tmp_path)
+    home = tmp_path / "skill-home"
+    home.mkdir()
+    _seed_ledger(home, "a@mp")
+    path = _user_settings(env)
+    _write_json(path, {"enabledPlugins": {"a@mp": "yes"}})
+
+    assert migrate_legacy_installs(home, env=env) == ["a@mp"]
+
+    doc = _read_json(path)
+    assert doc["installedPlugins"] == ["a@mp"]  # 迁移本体照做
+    assert doc["enabledPlugins"] == {"a@mp": "yes"}  # 原值逐字保留，不回填 true
+
+
+def test_inert_field_warning_silent_when_nothing_inert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """WARN 负对照：无失效键（含 `$schema` 等未知键）时**不得**告警，否则会训练用户忽略它。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    _write_json(path, {"theme": "light", "$schema": "https://example/schema.json", "disabledMcpjsonServers": ["x"]})
+    capsys.readouterr()
+
+    assert settings_cmd.settings_set(tmp_path, env, "theme", "dark", scope="project", json_output=True) == 0
+
+    assert capsys.readouterr().err == ""

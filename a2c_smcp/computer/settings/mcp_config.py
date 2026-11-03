@@ -58,6 +58,7 @@ from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
 from a2c_smcp.computer.settings.raw import (
     SettingsFileCorruptError,
+    bool_field_or_none,
     list_field_or_empty,
     read_raw_object,
 )
@@ -210,7 +211,9 @@ def load_mcp_config_file(path: Path, scope: SettingsScope) -> tuple[dict[str, An
         return dict(empty), []
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # 同 :func:`~a2c_smcp.computer.settings.scope.load_settings_file`：``UnicodeDecodeError`` 不是
+        # ``OSError`` 子类，漏捕会让非 UTF-8 的 mcp.json 在解析处崩溃而非「容错 + 记错、留盘」。
         logger.warning("MCP config %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
         return dict(empty), [_err(scope, "<file>", f"unreadable or corrupt JSON: {exc}", src)]
     if not isinstance(raw, dict):
@@ -558,11 +561,15 @@ def approve_all_project_mcp() -> None:
     批准框 ``[a]ll``：``enableAllProjectMcpServers=true`` 写 local scope（§9.2）/ Approve-all: set the bool (local)。
 
     **#246 raw 保真**：只写该标量键，其余字段逐字保留；目标文件 corrupt → :class:`McpConfigCorruptError`。
+
+    **目标键形状守卫**：既存 ``enableAllProjectMcpServers`` 若非布尔（含显式 ``null``）→ 拒绝写入。它是
+    「无条件写 true」的写助手，不守卫就会把用户的畸形值静默换成合法值——与 raw 保真契约相反（独立审查 🔴2）。
     """
     path = _local_settings_write_path()
     try:
         with file_lock(path):
             existing = read_raw_object(path) or {}
+            bool_field_or_none(existing, FIELD_ENABLE_ALL_PROJECT_MCP, path=path)  # 形状守卫，值恒被覆盖
             updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})
             atomic_write_json(path, updated)
     except SettingsFileCorruptError as e:
