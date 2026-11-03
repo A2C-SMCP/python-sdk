@@ -505,3 +505,34 @@ async def test_aoauth_connect_cancel_during_commit_refresh_keeps_owned_client(
 
     assert manager._active_clients.get(bundle_id) is owned, "已登记的 client 不得被 finally 摘除"
     assert owned.adiscard.await_count == 0, "归属 manager 的 client 绝不能被 adiscard"
+
+
+@pytest.mark.asyncio
+async def test_commit_restores_swallowed_cancellation_instead_of_connection_error() -> None:
+    """#252 × #211：连接被取消打断时，提交守卫必须**还原取消**，不得伪装成 ConnectionError。
+
+    中文: transitions 的 ``process_context`` 按设计吞掉 ``CancelledError`` ⇒ ``aconnect()`` 照常返回，
+    留下的正是「connected + 无会话」。若守卫抛 ``ConnectionError``，``astart_*`` / ``boot_up`` 的
+    ``@restores_cancellation`` 与宿主 ``wait_for`` 都会把「取消」看成「连接失败」。
+    """
+    manager = _manager()
+    config = _cfg("alpha")
+    manager._servers_config["alpha"] = config
+    half_broken = _FakeHttpClient(session_alive=False, keepalive_alive=False)
+
+    async def _run() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await asyncio.sleep(0)  # 取消在此投递，由本层吞掉（模拟 transitions 的吞点）
+        except asyncio.CancelledError:
+            pass
+        await manager._commit_active_client("alpha", half_broken, config=config)  # type: ignore[arg-type]
+
+    task = asyncio.create_task(_run())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "alpha" not in manager._active_clients, "半断开 client 仍不得登记"
+    assert half_broken.adisconnect.await_count == 1

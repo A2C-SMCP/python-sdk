@@ -1150,6 +1150,15 @@ class MCPServerManager:
                 # 健康 client（detached OAuth 提交与并发 start 的交叉形态）。
                 if not _client_session_usable(self._active_clients.get(bundle_id)):
                     self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                # #252 × #211：连接若是被**取消**打断（transitions 的 ``process_context`` 按设计吞掉
+                # ``CancelledError`` ⇒ aconnect 照常返回，留下的正是半断开形态），必须把取消还给调用方，
+                # 不得把它伪装成传输故障的 ``ConnectionError``——否则 ``astart_*`` / ``boot_up`` 的
+                # ``@restores_cancellation`` 与宿主 ``wait_for`` 都会把「取消」看成「连接失败」。
+                # If the connect was aborted by cancellation (transitions intentionally swallows it),
+                # restore the cancellation instead of masquerading it as a transport fault.
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise asyncio.CancelledError
                 raise ConnectionError(
                     f"client for bundle_id={bundle_id!r} is not connected at commit time (state={client_state!r})"
                 )
