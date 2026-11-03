@@ -238,19 +238,60 @@ def _clear_enabled_entries_visible_layers(plugin_id: str, project_paths: set[str
     project/local 写调用前**先查 settings 文件存在**：:func:`~a2c_smcp.computer.settings.store.file_lock`
     会 ``mkdir(parents=True)`` 建父目录 + 建 ``.lock``，而 :func:`_write_enabled_plugin` 的 no-op 短路在锁后——
     无守卫会在无 ``.tfrobot/`` 的 cwd 制造垃圾目录。managed/policy 只读层不触碰；清失败 WARN 不阻断（best-effort）。
+
+    **user 层也在 best-effort 之内**（#246 独立审查 🔴B）：本函数在 uninstall **已删树/注销 skill/摘 server/删账本
+    之后**才被调用，user 层若抛 :class:`PluginInstallError` 会把整个卸载打断在半途，留下 project/local 残留。
+    故三层同姿态——失败只 WARN。真正的「目标键畸形」已由 :func:`_precheck_settings_writes` 在任何破坏性动作
+    **之前**拦下，这里只是纵深防御。
     """
-    _write_enabled_plugin(plugin_id, None, "user", None, env)
     targets = {str(Path(p)) for p in project_paths if p}
     targets.add(str(Path.cwd()))
-    for pp in sorted(targets):
+    layers: list[tuple[str, str | None, Path]] = [("user", None, user_settings_path(env))]
+    for project_path in sorted(targets):
         for s in ("project", "local"):
-            try:
-                path, _scope = _settings_path_for_scope(s, pp, env)
-                if not path.exists():  # 存在性守卫：不为清理凭空建 .tfrobot/ + .lock
-                    continue
-                _write_enabled_plugin(plugin_id, None, s, pp, env)
-            except PluginInstallError as e:  # best-effort：清条目失败不阻断
-                logger.warning("failed to clear enabledPlugins[%s] in %s scope at %s: %s", plugin_id, s, pp, e)
+            layers.append((s, project_path, _settings_path_for_scope(s, project_path, env)[0]))
+    for scope_name, anchor_path, layer_path in layers:
+        try:
+            if scope_name != "user" and not layer_path.exists():  # 存在性守卫：不为清理凭空建 .tfrobot/ + .lock
+                continue
+            _write_enabled_plugin(plugin_id, None, scope_name, anchor_path, env)
+        except PluginInstallError as e:  # best-effort：清条目失败不阻断
+            logger.warning(
+                "failed to clear enabledPlugins[%s] in %s scope%s: %s",
+                plugin_id,
+                scope_name,
+                f" at {anchor_path}" if anchor_path else "",
+                e,
+            )
+
+
+def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | None) -> None:
+    """
+    uninstall 的**破坏性动作之前**预检所有待写 settings 文件的目板键形状（#246 独立审查 🟡1）
+    Validate every settings file that uninstall will write **before** the irreversible steps.
+
+    为什么必须前置：uninstall 的顺序是「删树 → 注销 skill → 摘 server → 删账本 → 写意图」。若意图写在**最后**
+    才因目标键畸形 fail-closed，此时安装已被不可逆删除，而重试又会因账本已空走 no-op——**永远清不干净**。
+    故在任何删除之前把 `installedPlugins`（数组）/ `enabledPlugins`（对象）的形状验一遍：畸形即
+    :class:`PluginInstallError` 且**零副作用**。
+
+    :raises PluginInstallError: 任一待写文件的目板键畸形 / corrupt / 根非对象。
+    """
+    checks: list[tuple[Path, str]] = [(user_settings_path(env), "user")]
+    targets = {str(Path(p)) for p in project_paths if p}
+    targets.add(str(Path.cwd()))
+    for project_path in sorted(targets):
+        for s in ("project", "local"):
+            layer_path, _layer_scope = _settings_path_for_scope(s, project_path, env)
+            if layer_path.exists():  # 与清理同款存在性守卫：不存在的层不会被写
+                checks.append((layer_path, s))
+    try:
+        for check_path, _check_scope in checks:
+            existing = read_raw_object(check_path) or {}
+            mapping_field_or_empty(existing, "enabledPlugins", path=check_path)
+            list_field_or_empty(existing, "installedPlugins", path=check_path)
+    except SettingsFileCorruptError as e:
+        raise PluginInstallError(str(e)) from e
 
 
 def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str] | None) -> bool:
@@ -595,6 +636,13 @@ async def uninstall_plugin(
         deps,
         other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id, retained_records=retained),
         user_declared=non_plugin_bundle_ids(),
+    )
+
+    # ①.5 破坏性动作之前预检待写 settings 的目标键形状（#246 审查 🟡1）：畸形 → 零副作用 fail-closed，
+    #      否则会在「已删树」之后才抛错，而重试因账本已空走 no-op → 永远清不干净。
+    _precheck_settings_writes(
+        {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p},
+        env,
     )
 
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）

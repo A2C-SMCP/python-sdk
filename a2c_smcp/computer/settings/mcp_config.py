@@ -60,6 +60,7 @@ from a2c_smcp.computer.settings.raw import (
     SettingsFileCorruptError,
     bool_field_or_none,
     list_field_or_empty,
+    mapping_field_or_empty,
     read_raw_object,
 )
 from a2c_smcp.computer.settings.schema import (
@@ -696,6 +697,10 @@ def _write_servers_map(path: Path, servers: dict[str, Any], inputs: list[Any]) -
     """
     try:
         doc: dict[str, Any] = read_raw_object(path) or {}
+        # 目标键形状守卫（与 settings 轴同口径）：缺失或已是正确形状才允许覆写；`null` / 错类型 → fail-closed，
+        # 不得当成「空值」直接覆盖掉用户写的畸形内容（#246 独立审查 🟡2）。
+        mapping_field_or_empty(doc, "servers", path=path)
+        list_field_or_empty(doc, "inputs", path=path)
     except SettingsFileCorruptError as e:
         raise McpConfigCorruptError(str(e)) from e
     doc["servers"] = servers

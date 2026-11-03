@@ -30,7 +30,7 @@ from rich.table import Table
 from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
-from a2c_smcp.computer.settings.installer import uninstall_plugin
+from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
 from a2c_smcp.computer.settings.raw import (
     SettingsFileCorruptError,
     list_field_or_empty,
@@ -317,6 +317,7 @@ async def marketplace_remove(
         return _err("aborted by user", json_output=json_output)
 
     uninstalled: list[str] = []
+    failed: list[str] = []
     if not keep_plugins:
         installed = load_installed_plugins(home, env).get("plugins") or {}
         victims = [pid for pid in installed if pid.endswith(f"@{name}")]
@@ -325,10 +326,16 @@ async def marketplace_remove(
         # ``remove_cb is None`` ⇒ 判据结果实际未被消费）走 durable scopes。
         non_plugin_cb = mcp_cbs.non_plugin_bundle_ids if mcp_cbs is not None else files_only_non_plugin_bundle_ids(env)
         for pid in victims:
-            if await uninstall_plugin(
-                pid, registry, home, non_plugin_bundle_ids=non_plugin_cb, env=env, remove_server=remove_cb,
-            ):
-                uninstalled.append(pid)
+            # 按 victim 捕获（#246 审查 🔴A）：settings fail-closed 后 uninstall 可抛 `PluginInstallError`，
+            # 不捕获会在卸掉部分 plugin 后整条命令崩掉、其余 victim 一个都不处理。
+            try:
+                if await uninstall_plugin(
+                    pid, registry, home, non_plugin_bundle_ids=non_plugin_cb, env=env, remove_server=remove_cb,
+                ):
+                    uninstalled.append(pid)
+            except PluginInstallError as e:
+                failed.append(pid)
+                console_err.print(f"[yellow]! failed to uninstall {pid!r}: {e}[/yellow]")
 
     pruned = prune_marketplaces([name], registry, home, env=env)
     # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。此时移除**已完成**，revoke 只是清理残留，
@@ -337,6 +344,12 @@ async def marketplace_remove(
         _revoke_trust(name, env)
     except SettingsFileCorruptError as e:
         console_err.print(f"[yellow]! removed {name!r} but failed to revoke its trust entry: {e}[/yellow]")
+    if failed:
+        # 部分失败必须可感（退出码 1）：脚本无法从 stderr 的 WARN 判断成败。
+        return _err(
+            f"removed {name!r} but failed to uninstall {len(failed)} plugin(s): {', '.join(failed)}",
+            json_output=json_output,
+        )
     if json_output:
         console.print_json(data={"removed": name, "pruned": pruned, "uninstalledPlugins": uninstalled, "keptPlugins": keep_plugins})
         return EXIT_OK

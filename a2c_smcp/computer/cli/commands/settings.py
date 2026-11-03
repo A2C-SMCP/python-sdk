@@ -36,6 +36,7 @@ from a2c_smcp.computer.settings.raw import (
     read_raw_object,
 )
 from a2c_smcp.computer.settings.schema import (
+    FIELD_READ_ROOTS,
     POLICY_ONLY_FIELDS,
     TRUSTED_SCOPE_ONLY_FIELDS,
     SettingsScope,
@@ -237,9 +238,32 @@ def settings_set(
     except (json.JSONDecodeError, ValueError):
         parsed = value  # 回退字面字符串 / fall back to a literal string
 
+    # project scope 的 ``readRoots`` **不接收新值**（对齐 rust #253 `drop_project_read_roots`）：
+    # 该键在 project scope 永不生效（读面 MUST 拒绝），写进 git-tracked 文件只会制造伪配置。
+    # 注意与 A+ 的分工——**已有**的旧键不删除（不销毁用户数据），但**不写入**本次的新值。
+    if enum is SettingsScope.PROJECT and key == FIELD_READ_ROOTS:
+        reason = (
+            "readRoots does not take effect in the project scope (personal/trusted decision; project "
+            "settings.json is git-tracked) — set it in settings.local.json or the user scope"
+        )
+        console_err.print(f"[yellow]! {key!r} was NOT written to the project settings: {reason}[/yellow]")
+        if json_output:
+            console.print_json(data={"scope": scope, "key": key, "ignored": True, "reason": reason})
+            return EXIT_OK
+        console.print(f"[yellow]✓ ignored {key} in {scope} scope (not written)[/yellow]")
+        return EXIT_OK
+
     try:
         with file_lock(path):
             existing = read_raw_object(path) or {}
+            # 对象容器守卫（对齐 rust `ensure_object_container`）：本次要写对象、而盘上该键是非对象时
+            # fail-closed——否则 `apply_write` 按「类型切换」整体替换，静默丢弃用户写的畸形值。
+            if isinstance(parsed, Mapping) and key in existing and not isinstance(existing[key], Mapping):
+                return _err(
+                    f"{key!r} is a {type(existing[key]).__name__} in {path}, not an object; "
+                    "refusing to replace it — fix or remove it first (the file was NOT modified)",
+                    json_output=json_output,
+                )
             updated = apply_write(existing, {key: parsed})
             atomic_write_json(path, updated)
     except SettingsFileCorruptError as e:

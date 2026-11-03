@@ -34,9 +34,11 @@ from a2c_smcp.computer.cli.commands import marketplace as marketplace_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.settings.installer import (
     PluginInstallError,
+    _clear_enabled_entries_visible_layers,
     _write_enabled_plugin,
     _write_installed_plugin,
     migrate_legacy_installs,
+    uninstall_plugin,
 )
 from a2c_smcp.computer.settings.mcp_config import (
     McpConfigCorruptError,
@@ -689,3 +691,219 @@ def test_inert_field_warning_silent_when_nothing_inert(
     assert settings_cmd.settings_set(tmp_path, env, "theme", "dark", scope="project", json_output=True) == 0
 
     assert capsys.readouterr().err == ""
+
+
+# ── 第二轮独立审查：🔴A / 🔴B / 🟡1 / 🟡2 / 🟡6 / 🟡11 ─────────────────────
+def test_settings_set_object_over_non_object_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🟡6（对齐 rust `ensure_object_container`）：本次写对象、盘上该键是非对象 → 退出码 1，原文件不动。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    _write_json(path, {"permissions": "invalid-not-an-object", "keep": 1})
+    before = path.read_text(encoding="utf-8")
+
+    code = settings_cmd.settings_set(
+        tmp_path, env, "permissions", '{"additionalDirectories": ["/x"]}', scope="project", json_output=True
+    )
+    assert code == 1
+    assert path.read_text(encoding="utf-8") == before  # 畸形值不被静默替换
+
+
+def test_settings_set_object_over_object_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🟡6 正对照：盘上该键本就是对象 → 正常写入（深合并）。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    _write_json(path, {"permissions": {"additionalDirectories": ["/old"]}, "keep": 1})
+
+    code = settings_cmd.settings_set(
+        tmp_path, env, "permissions", '{"additionalDirectories": ["/new"]}', scope="project", json_output=True
+    )
+    assert code == 0
+    assert _read_json(path) == {"permissions": {"additionalDirectories": ["/new"]}, "keep": 1}
+
+
+def test_settings_set_project_read_roots_is_ignored_not_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🟡11（对齐 rust）：project 的 `readRoots` **不接收新值**、**不删旧键**、退出码 0、`--json` 带 `ignored`。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    _write_json(path, {"readRoots": ["/old"], "theme": "light"})
+    before = path.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    assert settings_cmd.settings_set(tmp_path, env, "readRoots", '["/new"]', scope="project", json_output=True) == 0
+
+    assert path.read_text(encoding="utf-8") == before  # 新值不写、旧值不删
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ignored"] is True
+    assert payload["key"] == "readRoots"
+    assert payload["reason"]
+
+
+def test_settings_set_project_read_roots_absent_stays_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🟡11 另一面：盘上没有该键时也不得凭空写入。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    _write_json(path, {"theme": "light"})
+    before = path.read_text(encoding="utf-8")
+
+    assert settings_cmd.settings_set(tmp_path, env, "readRoots", '["/new"]', scope="project", json_output=True) == 0
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_upsert_mcp_server_rejects_null_servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🟡2：`servers: null` 不是「空配置」—— 形状守卫必须 fail-closed 而不是直接覆盖。
+
+    注意 `load_mcp_config_file` 对 ``servers: null`` **不**报错（当缺失处理），所以这道守卫是唯一的拦截点。
+    """
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = wd / ".tfrobot" / "mcp.json"
+    _write_json(path, {"servers": None, "inputs": None, "keep": 1})
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(McpConfigCorruptError):
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.PROJECT, env=env, cwd=wd)
+    assert path.read_text(encoding="utf-8") == before
+
+
+class _StubRegistry:
+    """uninstall/disable 在触发预检前不需要真实 registry（先于任何 skill 注销）。"""
+
+    def unregister(self, name: str) -> None:  # pragma: no cover - 预检失败时不可达
+        raise AssertionError(f"unregister({name!r}) must not be reached")
+
+
+def _seed_plugin(home: Path, pid: str, install_dir: Path) -> None:
+    _write_json(
+        home / "installed_plugins.json",
+        {"version": 1, "plugins": {pid: [{"scope": "user", "installPath": str(install_dir)}]}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_uninstall_precheck_fails_closed_before_destructive_steps(tmp_path: Path) -> None:
+    """🟡1：目标键畸形必须在**删树/删账本之前** fail-closed，否则重试因账本已空永远清不干净。"""
+    env = _env(tmp_path)
+    home = tmp_path / "skill-home"
+    installed_tree = tmp_path / "installed-tree"
+    installed_tree.mkdir()
+    _seed_plugin(home, "a@mp", installed_tree)
+    _write_json(_user_settings(env), {"installedPlugins": "oops"})  # 畸形 → 预检失败
+
+    with pytest.raises(PluginInstallError):
+        await uninstall_plugin("a@mp", _StubRegistry(), home, non_plugin_bundle_ids=set, env=env)
+
+    assert installed_tree.exists(), "预检失败不得删安装树"
+    assert "a@mp" in _read_json(home / "installed_plugins.json")["plugins"], "预检失败不得删账本"
+
+
+@pytest.mark.asyncio
+async def test_clear_enabled_user_layer_failure_is_best_effort(tmp_path: Path) -> None:
+    """🔴B：user 层清理失败只 WARN，不得打断已完成的卸载（三层同姿态）。"""
+    env = _env(tmp_path)
+    path = _user_settings(env)
+    _write_json(path, {"enabledPlugins": "not-a-map"})
+
+    _clear_enabled_entries_visible_layers("a@mp", set(), env)  # 不抛
+
+    assert path.read_text(encoding="utf-8") == '{"enabledPlugins": "not-a-map"}'
+
+
+def test_plugin_uninstall_translates_plugin_install_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🔴A：`plugin_uninstall` 必须把 `PluginInstallError` 翻成退出码 1，而不是逃成 traceback。"""
+    import asyncio
+
+    from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+
+    async def _boom(*_a: object, **_kw: object) -> bool:
+        raise PluginInstallError("boom: settings corrupt")
+
+    monkeypatch.setattr(plugin_cmd, "uninstall_plugin", _boom)
+    capsys.readouterr()
+    code = asyncio.run(
+        plugin_cmd.plugin_uninstall(_StubRegistry(), tmp_path, _env(tmp_path), "a@mp", non_plugin_bundle_ids=set, json_output=True)  # type: ignore[arg-type]
+    )
+    assert code == 1
+    assert "boom" in capsys.readouterr().out
+
+
+def test_plugin_disable_translates_plugin_install_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🔴A：`plugin_disable` 同上。"""
+    import asyncio
+
+    from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+
+    monkeypatch.setattr(
+        plugin_cmd,
+        "_installed_records",
+        lambda *_a, **_kw: [{"scope": "user"}],
+    )
+
+    async def _boom(*_a: object, **_kw: object) -> None:
+        raise PluginInstallError("boom: settings corrupt")
+
+    monkeypatch.setattr(plugin_cmd, "disable_plugin", _boom)
+    capsys.readouterr()
+    code = asyncio.run(
+        plugin_cmd.plugin_disable(  # type: ignore[arg-type]
+            _StubRegistry(), tmp_path, _env(tmp_path), "a@mp", non_plugin_bundle_ids=set, json_output=True
+        )
+    )
+    assert code == 1
+    assert "boom" in capsys.readouterr().out
+
+
+def test_marketplace_remove_fails_per_victim_and_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🔴A：`marketplace_remove` 按 victim 捕获——一个失败不得让其余 victim 一个都不处理，且须可感（退出码 1）。"""
+    import asyncio
+
+    env = _env(tmp_path)
+    home = tmp_path / "skill-home"
+    _write_json(
+        home / "known_marketplaces.json",
+        {"version": 1, "marketplaces": {"mp": {"source": {"type": "git", "url": "u"}, "installLocation": ""}}},
+    )
+    _write_json(
+        home / "installed_plugins.json",
+        {
+            "version": 1,
+            "plugins": {
+                "a@mp": [{"scope": "user", "installPath": "/tmp/a"}],
+                "b@mp": [{"scope": "user", "installPath": "/tmp/b"}],
+            },
+        },
+    )
+    seen: list[str] = []
+
+    async def _uninstall(pid: str, *_a: object, **_kw: object) -> bool:
+        seen.append(pid)
+        if pid == "a@mp":
+            raise PluginInstallError("boom: settings corrupt")
+        return True
+
+    monkeypatch.setattr(marketplace_cmd, "uninstall_plugin", _uninstall)
+    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: 0)
+    capsys.readouterr()
+
+    code = asyncio.run(
+        marketplace_cmd.marketplace_remove(
+            _StubRegistry(), home, env, "mp", json_output=True  # type: ignore[arg-type]
+        )
+    )
+    assert seen == ["a@mp", "b@mp"], "单个 victim 失败不得中断其余"
+    assert code == 1, "部分失败必须可感（退出码 1）"

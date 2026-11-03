@@ -312,16 +312,24 @@ async def plugin_uninstall(
     remove_server: RemoveServer | None = None,
     json_output: bool = False,
 ) -> int:
-    """卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据**回收 bundled server + 删账本）/ Uninstall a plugin。"""
-    ok = await uninstall_plugin(
-        plugin_id,
-        registry,
-        home,
-        non_plugin_bundle_ids=non_plugin_bundle_ids,
-        env=env,
-        keep_servers=keep_servers,
-        remove_server=remove_server,
-    )
+    """
+    卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据**回收 bundled server + 删账本）/ Uninstall a plugin。
+
+    :class:`PluginInstallError` → ``_err`` 退出码 1（#246 审查 🔴A）：settings raw 写入 fail-closed 后本命令可抛
+    （目标键畸形 / 文件 corrupt），不翻译就会以未捕获异常逃成 traceback。
+    """
+    try:
+        ok = await uninstall_plugin(
+            plugin_id,
+            registry,
+            home,
+            non_plugin_bundle_ids=non_plugin_bundle_ids,
+            env=env,
+            keep_servers=keep_servers,
+            remove_server=remove_server,
+        )
+    except PluginInstallError as e:
+        return _err(str(e), json_output=json_output)
     if not ok:
         return _err(f"plugin {plugin_id!r} not installed (no-op)", json_output=json_output)
     if json_output:
@@ -387,16 +395,21 @@ async def plugin_disable(
     """禁用单个 plugin = 整 plugin 下线（停摘 bundled server + 隐藏 skills；物化层保留可一键复原）/ Disable a plugin。
 
     **scope 契约**：同 :func:`plugin_enable`，从 ledger 逐 scope 读。
+
+    :class:`PluginInstallError` → ``_err`` 退出码 1（#246 审查 🔴A，同 :func:`plugin_uninstall`）。
     """
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed (no-op)", json_output=json_output)
-    for rec in records:
-        await disable_plugin(
-            plugin_id, registry, home,
-            non_plugin_bundle_ids=non_plugin_bundle_ids,
-            scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env, remove_server=remove_server,
-        )
+    try:
+        for rec in records:
+            await disable_plugin(
+                plugin_id, registry, home,
+                non_plugin_bundle_ids=non_plugin_bundle_ids,
+                scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env, remove_server=remove_server,
+            )
+    except PluginInstallError as e:
+        return _err(str(e), json_output=json_output)
     if json_output:
         console.print_json(data={"disabled": plugin_id, "scopes": [r.get("scope") for r in records]})
         return EXIT_OK
