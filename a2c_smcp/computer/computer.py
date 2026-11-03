@@ -354,6 +354,9 @@ class Computer(BaseComputer[PromptSession]):
         self._windows_list_dirty: bool = False
         self._skills_list_dirty: bool = False
         self._skills_content_dirty: bool = False
+        # #227 / #210（0.4.2 回补）：停机 / boot 失败后禁止再调度资源刷新；重开由 boot_up / 懒挂载显式触发。
+        # Closed gate for the resource-refresh worker; reopened by boot_up or a lazy mount.
+        self._resource_refresh_closed: bool = False
         # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
         # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
         self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
@@ -784,6 +787,27 @@ class Computer(BaseComputer[PromptSession]):
 
     @restores_cancellation
     async def boot_up(self, *, session: PromptSession | None = None) -> None:
+        """启动计算机；boot 失败 / 取消时回收资源刷新与已启动的 client（#227 / #211）。
+
+        外层统一负责生命周期回收：先作废旧一代资源刷新（禁止晚到通知复活任务），再重建去抖器；
+        ``_boot_up`` 抛错（含取消）时关闭资源刷新、watcher、去抖器并 aclose manager，保 retry-safe。
+        """
+        await self._close_resource_refresh()
+        await self._skill_debouncer.aclose()
+        self._open_resource_refresh()
+        try:
+            await self._boot_up(session=session)
+        except BaseException:
+            await self._close_resource_refresh()
+            if self._skill_watcher is not None:
+                self._skill_watcher.stop()
+                self._skill_watcher = None
+            await self._skill_debouncer.aclose()
+            if self.mcp_manager is not None:
+                await self.mcp_manager.aclose()
+            raise
+
+    async def _boot_up(self, *, session: PromptSession | None = None) -> None:
         """
         启动计算机，初始化 MCP 服务器管理器。
         Boot up the computer and initialize the MCP server manager.
@@ -1026,6 +1050,26 @@ class Computer(BaseComputer[PromptSession]):
         if await manager.arefresh_tools():
             self._bump_capability_revision()
 
+    def _open_resource_refresh(self) -> None:
+        """重开通知生命周期（boot / 停机后懒挂载）——重建已被 ``shutdown`` 关闭的去抖器 / Reopen worker lifecycle."""
+        if self._resource_refresh_closed:
+            self._skill_debouncer = SkillEventDebouncer(
+                self._emit_update_skills_now,
+                invalidate=self._invalidate_user_skills,
+            )
+            self._resource_refresh_closed = False
+
+    async def _close_resource_refresh(self) -> None:
+        """禁止新投递并回收在途资源刷新；可重复调用 / Reject late events and await cancellation."""
+        self._resource_refresh_closed = True
+        self._windows_list_dirty = self._skills_list_dirty = self._skills_content_dirty = False
+        task = self._resource_refresh_task
+        self._resource_refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     def _schedule_resource_refresh(
         self,
         *,
@@ -1049,7 +1093,7 @@ class Computer(BaseComputer[PromptSession]):
         多轮 RPC）；``skills_content`` 在补跑轮里**吃掉** ``skills_list``（无条件重物化 ⊇ 集合路径的效果，
         唯一代价是 ``_skills_cache`` 本轮不提交 → 下一次集合通知多跑一轮重物化，自愈）。
         """
-        if self.mcp_manager is None:
+        if self._resource_refresh_closed or self.mcp_manager is None:
             logger.debug("MCP 管理器不存在（未 boot/已停机），忽略资源刷新调度")
             return
         self._windows_list_dirty |= windows_list
@@ -1537,6 +1581,8 @@ class Computer(BaseComputer[PromptSession]):
         ``_add_or_update`` 原地更新语义一致）。
         """
         if self.mcp_manager is None:
+            # #227：停机后的懒挂载重开通知生命周期（去抖器已被 shutdown 关闭）。
+            self._open_resource_refresh()
             self.mcp_manager = self._new_manager()
         bid = resolve_bundle_id(raw_cfg)
         # 先登记 raw（auto-connect start 的 materializer 需按 bundle_id 查 scope），manager add 失败则**恢复旧条目**
@@ -1936,6 +1982,7 @@ class Computer(BaseComputer[PromptSession]):
         ``asyncio.timeout`` 因协程「正常返回」而不抛 ``TimeoutError``，嵌入宿主拿不到超时信号。装饰器在
         收尾处按**计数快照**还原本次调用期间被吞的取消。详见 :mod:`a2c_smcp.utils.cancellation`。
         """
+        await self._close_resource_refresh()
         if self._skill_watcher is not None:
             self._skill_watcher.stop()
             self._skill_watcher = None
