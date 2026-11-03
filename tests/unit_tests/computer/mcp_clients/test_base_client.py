@@ -648,6 +648,24 @@ async def _wait_for_state(client: BaseMCPClient, expected: STATES, timeout: floa
     await asyncio.wait_for(_poll(), timeout=timeout)
 
 
+async def _wait_for_convergence(client: BaseMCPClient, timeout: float = 1.0) -> None:
+    """有界等待收敛任务**真正执行完毕**（``_aconverge_unexpected_exit`` 收尾时清空强引用）。
+
+    中文: ``_afail_connect`` 的收敛是 detached 的——它必须等 ``aconnect`` 退出 transitions 的
+    ``process_context`` 才能安全发起 ``aerror``（自等地发起会被 transitions 重新抛出）。故
+    「aconnect 已抛错」不等于「状态已收敛」，用本 helper 把调度窗口显式有界化，避免对事件循环
+    调度顺序做时序假设。
+    English: convergence is a detached task that must wait for `aconnect` to leave the transitions
+    context; "aconnect raised" != "state converged". Bounded-wait instead of assuming scheduling order.
+    """
+
+    async def _poll() -> None:
+        while client._converge_task is not None:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
 @pytest.mark.asyncio
 async def test_unexpected_keepalive_exit_converges_and_disconnect_is_idempotent() -> None:
     """#247：keep-alive 宿主任务被 anyio 取消（非 _close_task 发起）后，状态机须收敛到 error。
@@ -1075,7 +1093,9 @@ async def test_initialize_handshake_deadline_fails_connect_fast() -> None:
     with pytest.raises(ConnectionError):
         await asyncio.wait_for(client.aconnect(), timeout=2.0)
     assert loop.time() - started < 1.0, "握手 deadline 必须快速生效"
-    assert client.state == STATES.error
+    # #252：收敛是 detached 的（须等 aconnect 退出 transitions 上下文），不能对调度顺序做假设。
+    await _wait_for_state(client, STATES.error, timeout=1.0)
+    await _wait_for_convergence(client, timeout=1.0)
     assert client._async_session is None
     assert client._session_keep_alive_task is not None
     assert client._session_keep_alive_task.done()
@@ -1109,7 +1129,9 @@ async def test_short_handshake_deadline_rejects_slow_initialize() -> None:
     client.session.release.set()
     with pytest.raises(ConnectionError):
         await asyncio.wait_for(connect_task, timeout=2.0)
-    assert client.state == STATES.error
+    # #252：同 test_initialize_handshake_deadline_fails_connect_fast——收敛 detached，有界等待。
+    await _wait_for_state(client, STATES.error, timeout=1.0)
+    await _wait_for_convergence(client, timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -1131,7 +1153,8 @@ async def test_handshake_deadline_abandons_init_that_ignores_cancel(monkeypatch)
     with contextlib.suppress(BaseException):
         # 有界等待：清理若未先取消，这里的“第二次取消”会被吞，测试不得挂死
         await asyncio.wait_for(asyncio.shield(init_task), timeout=1.0)
-    assert client.state == STATES.error
+    # #252：同款 detached 收敛——有界等待后再断言 state（不得依赖调度碰运气）。
+    await _wait_for_state(client, STATES.error, timeout=1.0)
     assert client._async_session is None
 
 
@@ -1295,3 +1318,101 @@ async def test_disconnect_from_error_with_live_keepalive_task() -> None:
     assert client.state == STATES.disconnected
     assert client._async_session is None
     assert client._async_session_closed_event.is_set()
+
+
+# ────────────────────── #252：状态机 follow-up（client 侧） ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_signal_is_generation_scoped() -> None:
+    """#252 ③：换代即换关闭信号对象——旧代信号既不被复用，也不被新一代启动清除。
+
+    中文: 旧实现把关闭信号按 client 共享，清除点在新任务的**任务体内**（``_close_event.clear()``）
+    ⇒ 旧代 teardown 与新代启动擦肩时，晚到的 clear 会抹掉新代已置位的信号。本用例钉住
+    「新一代持有自己的对象、旧代状态原封不动」这一不变量。
+    回滚后：``old.is_set()`` 被抹为 False，且 ``client._close_event is old`` ⇒ 两条断言皆红。
+    """
+    client = InitializeResultTestClient(DummyParams())
+    old = client._close_event
+    old.set()  # 旧代已收到优雅关闭信号
+
+    await client.aconnect()
+    try:
+        assert old.is_set(), "旧代的关闭信号不得被新一代启动清除"
+        assert client._close_event is not old, "新一代必须持有自己的关闭信号对象（单点换代，无 clear）"
+        assert not client._close_event.is_set(), "新代信号必须是干净的"
+    finally:
+        await asyncio.wait_for(client.adisconnect(), timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_async_session_lazy_connect_only_from_initialized() -> None:
+    """#252 ④：``async_session`` 仅在 ``initialized`` 惰性建连；其余状态抛可读 ``ConnectionError``。
+
+    回滚后：``connected`` / ``error`` / ``disconnected`` 都会走 ``aconnect()``，抛 transitions 内部
+    ``MachineError("Can't trigger event aconnect from state …")`` ⇒ ``pytest.raises(ConnectionError)`` 红。
+    """
+    client = InitializeResultTestClient(DummyParams())
+
+    # 正对照：initialized 下仍可惰性建连（既有契约不变）
+    session = await client.async_session
+    assert session is not None
+    assert client.state == STATES.connected
+
+    # 半断开（connected + 无会话）：不得再走 aconnect
+    client._async_session = None
+    with pytest.raises(ConnectionError) as half_broken:
+        await client.async_session
+    assert "connected" in str(half_broken.value)
+    assert client.state == STATES.connected, "惰性建连被拒不得改变状态机"
+
+    # 断开后
+    client._async_session = session
+    await asyncio.wait_for(client.adisconnect(), timeout=5.0)
+    assert client.state == STATES.disconnected
+    with pytest.raises(ConnectionError) as after_disconnect:
+        await client.async_session
+    assert "disconnected" in str(after_disconnect.value)
+
+    # error 态
+    failing = _FailingCreateClient(DummyParams())
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(failing.aconnect(), timeout=2.0)
+    await _wait_for_state(failing, STATES.error, timeout=2.0)
+    with pytest.raises(ConnectionError) as errored:
+        await failing.async_session
+    assert "error" in str(errored.value)
+
+
+@pytest.mark.asyncio
+async def test_adiscard_reclaims_uncommitted_client() -> None:
+    """#252 ②：``adiscard()`` 回收从未提交给 manager 的 client 的会话/传输上下文，且不经状态机。"""
+    client = InitializeResultTestClient(DummyParams())
+    await client.aconnect()
+    client._subscribed_window_uris.add("window://test")
+    task = client._session_keep_alive_task
+    assert task is not None and client._async_session is not None
+
+    await asyncio.wait_for(client.adiscard(), timeout=5.0)
+
+    assert task.done(), "keep-alive 任务必须被回收"
+    assert client._async_session is None, "会话引用必须被清理"
+    assert client.initialize_result is None
+    assert client._subscribed_window_uris == set()
+    assert client.state == STATES.connected, "adiscard 刻意不经状态机（终态对弃置对象无意义）"
+
+    # 幂等：重复调用不抛、不改变结论
+    await asyncio.wait_for(client.adiscard(), timeout=5.0)
+    assert client._async_session is None
+
+
+@pytest.mark.asyncio
+async def test_adiscard_is_noop_for_never_connected_client() -> None:
+    """#252 ②：从未建过 keep-alive 任务的 client 上 ``adiscard()`` 立即返回、绝不建连。"""
+    client = InitializeResultTestClient(DummyParams())
+
+    await asyncio.wait_for(client.adiscard(), timeout=1.0)
+
+    assert client.state == STATES.initialized
+    assert client._async_session is None
+    assert client._session_keep_alive_task is None

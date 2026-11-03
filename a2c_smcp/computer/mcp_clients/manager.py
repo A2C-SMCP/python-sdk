@@ -265,7 +265,7 @@ class CachedToolList(NamedTuple):
     tools: list[Tool]
 
 
-def _client_session_usable(client: MCPClientProtocol) -> bool:
+def _client_session_usable(client: MCPClientProtocol | None) -> bool:
     """客户端**传输层会话**是否处于连接态（缓存复用的前置条件之一，#222）。
 
     ``base_client.list_tools`` 自带状态门（``state != connected ⇒ ConnectionError``）；把同一条判据前移到
@@ -279,8 +279,9 @@ def _client_session_usable(client: MCPClientProtocol) -> bool:
     经由它）/ clear_oauth / ``_clear_all``（aclose / ainitialize 的整表清空）三处，**非错误驱动** —— 会话死亡
     （keep-alive 失败置 ``error``）后 client 仍在册，故「在册」不等于「可用」。
 
-    / Whether the client's transport session is connected — mirrors ``base_client.list_tools``'s own state
-    gate so a dead session is re-read (and thus fails) instead of being served from cache.
+    #252 起兼任 :meth:`MCPServerManager._commit_active_client` 的前置判据（提交前「client 必须仍处
+    connected」）——故签名放宽为 ``| None``：未注册的 bundle 一律判为不可用。
+    / Since #252 this is also the commit precondition; ``None`` (no client) is never usable.
     """
     return getattr(client, "state", None) == STATES.connected
 
@@ -1126,6 +1127,24 @@ class MCPServerManager:
                 #    「声明是新的、进程是旧的」静默成立。新声明的持有者负责启动，此处只退役、不抛。
                 await self._reject_commit(bundle_id, client, "config superseded")
                 return
+            if not _client_session_usable(client):
+                # #252：aconnect() **可以在 keep-alive 已死、收敛任务尚未执行时正常返回**（见
+                # ``base_client._aconverge_unexpected_exit`` 的 in-flight transition 注释）——旧实现
+                # 无条件登记，于是 error client 成为 active，此后 ``astart_client`` 的幂等早退还会
+                # 谎报「已启动」。**必须上抛**：静默返回同样等于谎报 Ok。
+                # The client can return from aconnect() already converged to `error`; never register it,
+                # and never report success silently (that is the same "false Ok" failure mode).
+                client_state = getattr(client, "state", None)
+                await self._reject_commit(
+                    bundle_id, client, f"client not connected at commit time (state={client_state!r})"
+                )
+                # 状态面**只在本 bundle 没有可用活跃 client 时**才降级为 ERROR——否则会覆盖并发提交的
+                # 健康 client（detached OAuth 提交与并发 start 的交叉形态）。
+                if not _client_session_usable(self._active_clients.get(bundle_id)):
+                    self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                raise ConnectionError(
+                    f"client for bundle_id={bundle_id!r} is not connected at commit time (state={client_state!r})"
+                )
             existing = self._active_clients.get(bundle_id)
             if existing is not None and existing is not client:
                 # v0.5.0 审查 Y2：同一 bundle 已有**另一个**活跃 client。可达形态：detached 的 _aoauth_connect
@@ -1177,15 +1196,23 @@ class MCPServerManager:
         challenge 拒绝（mcp auth 仅在 401 时跑全流程）⇒ 合成 401 信号。403
         （insufficient_scope 等）作为 final response 正常透过 → 信号通道可得。
 
-        返回 challenge 信号（client 未登记、随 GC 弃置，**不得** ``adisconnect``
-        未连上的 client——会递归 aconnect）；连通返回 None。
+        返回 challenge 信号（client 未登记，由 :meth:`BaseMCPClient.adiscard` **显式回收**其
+        会话/传输上下文——#252；**不得** ``adisconnect`` 未连上的 client，会递归 aconnect）；
+        连通返回 None（此时 client 归调用方提交）。
 
         #179 隔离审查 🔴3：try/finally 保证本协程以**任何方式**退出（含被外层取消）
         时内层任务全部回收——``asyncio.wait`` 不级联取消 pending 内层任务（asyncio
         语义，已最小复现证实），孤儿 aconnect 会以 #133 挂起模式永久泄漏 httpx 会话。
 
+        #252：**没有产出可提交的 client 就必须回收**。旧实现只回收内层竞速任务，challenge 与
+        connect **同帧完成**时 client 已 ``connected`` 且 keep-alive 任务正持有 ``ClientSession``
+        与 httpx 传输——直接丢弃即孤儿。同批修正两条「谎报成功」的死分支：
+        ``asyncio.wait`` 超时**返回空 done 而不抛异常**（旧代码的 ``except TimeoutError`` 永不触发，
+        空集落到 ``return None``）；``connect_task`` 被取消也曾落到 ``return None``。
+
         Raises:
-            TimeoutError: 30s 内既未连通也未收到 challenge。
+            TimeoutError: 30s 内既未连通也未收到 challenge（**不是**外层取消——取消原样传播）。
+            ConnectionError: connect 任务被取消 / 竞速结束时既无成功也无信号。
             BaseException: 非 challenge 的 connect 失败原样上抛。
         """
         if coordinator is not None:
@@ -1202,17 +1229,23 @@ class MCPServerManager:
         inner = [connect_task, challenge_wait, redirect_stop_wait] + (
             [aborted_wait] if aborted_wait is not None else []
         )
+        # #252：``keep_client`` = 本次竞速产出了可提交的 client（只有连通才为 True）；``cleanup_ok`` =
+        # 内层任务已结算完毕。两者不同时成立 ⇒ 弃置并显式回收（含清理期被取消的形态）。
+        keep_client = False
+        cleanup_ok = False
         try:
-            try:
-                done, _pending = await asyncio.wait(
-                    set(inner),
-                    timeout=_CONNECT_TIMEOUT,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except TimeoutError:
+            done, _pending = await asyncio.wait(
+                set(inner),
+                timeout=_CONNECT_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # #252：``asyncio.wait`` 超时**返回空 done 而不抛异常**——旧实现的 ``except TimeoutError``
+                # 永不触发，空集落到末尾 ``return None`` 把 30s 挂死上报成「连接成功」。外层取消在
+                # ``await`` 处直接抛 ``CancelledError``，不会走到这里。
                 raise TimeoutError(
                     f"connect neither succeeded nor received an auth challenge within {_CONNECT_TIMEOUT}s"
-                ) from None
+                )
 
             if challenge_wait in done:
                 signal = client.take_connect_challenge()
@@ -1226,17 +1259,34 @@ class MCPServerManager:
                 # provider 全流程死亡 = 401 challenge 拒绝了恢复的凭据（无注册 flow 的
                 # redirect_handler 抛 authorizationRequired）→ 合成 401 信号供调用方清槽
                 return AuthSignal(401, None)
-            # connect 先完成：成功 → None；失败 → 原异常上抛（未登记 client，随弃置）
-            if connect_task in done and not connect_task.cancelled():
+            # connect 先完成：成功 → None；失败 → 原异常上抛（未登记 client，由 finally 弃置回收）
+            if connect_task in done:
+                if connect_task.cancelled():
+                    # #252：connect 任务被取消 ≠ 连接成功（旧实现落到 ``return None``）。
+                    # 外层取消在 ``await asyncio.wait`` 处已抛 CancelledError，能走到这里只可能是
+                    # connect 自身被取消——按失败处理，绝不谎报成功。
+                    raise ConnectionError("connect was cancelled before completing")
                 exc = connect_task.exception()
                 if exc is not None:
                     raise exc
-            return None
+                keep_client = True
+                return None
+            # 防御：其余竞速任务已在上面 return，走到这里说明既无成功也无信号。
+            raise ConnectionError("connect finished without a usable client")
         finally:
-            for t in inner:
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(*inner, return_exceptions=True)
+            try:
+                # #179 隔离审查 🔴3：外层取消不级联内层任务——finally 统一回收，防孤儿 aconnect 挂起泄漏。
+                for t in inner:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*inner, return_exceptions=True)
+                cleanup_ok = True
+            finally:
+                # #252：凡没有产出可提交 client 的退出（challenge / redirect / abort / 超时 /
+                # connect 异常 / 清理期被取消）都显式回收会话与传输上下文。
+                # ⚠️ 放在内层 finally：``gather`` 被取消时也要弃置，绝不能让 client 带着活会话逃逸。
+                if not (keep_client and cleanup_ok):
+                    await client.adiscard()
 
     def _oauth_spec(self, config: MCPServerConfig) -> tuple[str, OAuthOptions] | None:
         """Streamable HTTP → ``(server_url, effective options)``；非 streamable → None（无 OAuth 通道）。
@@ -1352,6 +1402,9 @@ class MCPServerManager:
         aborted_wait = asyncio.create_task(coordinator.flow_aborted_event().wait())
         redirect_stop_wait = asyncio.create_task(client.connect_redirect_event().wait())
         inner = [connect_task, aborted_wait, redirect_stop_wait]
+        # #252：只有成功提交才算把 client 交出去；其余一切退出（abort / redirect / connect 异常 /
+        # 提交被拒 / 外层取消）都必须显式回收其会话与传输上下文。
+        committed = False
         try:
             done, _pending = await asyncio.wait(
                 set(inner),
@@ -1402,6 +1455,20 @@ class MCPServerManager:
             try:
                 # #208：_commit_active_client **自取**状态锁（外层不得再包——asyncio.Lock 不可重入）
                 await self._commit_active_client(bundle_id, client, clear_epoch, config=config)
+                committed = True
+            except ConnectionError as commit_exc:
+                # #252：半断开 client 被提交守卫拒绝（``state != connected``）。与 aborted / connect-
+                # exception 同款收敛：比对 + fail_launch + 状态写同锁内同步段。**不得**上抛——本任务
+                # 是 detached 的 fire-and-forget，异常会变成未回收任务异常。
+                # A dead client rejected by the commit guard: converge exactly like the aborted /
+                # connect-exception arms (never let a detached task carry an unretrieved exception).
+                async with self._lock:
+                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
+                        coordinator.fail_launch(OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG))
+                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                logger.warning(
+                    f"oauth connect task for bundle_id={bundle_id!r} rejected at commit: {commit_exc}",
+                )
             except OAuthError as commit_exc:
                 if not _is_oauth_required_error(commit_exc):
                     # 非 OAuthRequired 的意外错误（当前 commit 链只抛 OAuthRequired，本分支
@@ -1420,12 +1487,18 @@ class MCPServerManager:
                     "credentials cleared concurrently (clear epoch mismatch)",
                 )
         finally:
-            # #179 隔离审查 🔴3：外层取消（clear_oauth / _clear_all cancel 本任务）不级联
-            # 内层任务——finally 统一回收，防孤儿 aconnect 挂起泄漏 + 跨 flow 污染。
-            for t in inner:
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(*inner, return_exceptions=True)
+            try:
+                # #179 隔离审查 🔴3：外层取消（clear_oauth / _clear_all cancel 本任务）不级联
+                # 内层任务——finally 统一回收，防孤儿 aconnect 挂起泄漏 + 跨 flow 污染。
+                for t in inner:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*inner, return_exceptions=True)
+            finally:
+                # #252：未提交者一律显式回收（含清理期被取消的形态）。已提交的 client 归 manager，
+                # 由 stop / remove / clear_oauth / aclose 的正规拆除路径处置，此处绝不插手。
+                if not committed:
+                    await client.adiscard()
 
     async def _ensure_oauth_coordinator(self, bundle_id: BUNDLE_ID) -> OAuthCoordinator:
         """OAuthFlow.launch 入口：coordinator 存在即返回；否则跑一次 bounded connect 触发

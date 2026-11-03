@@ -56,6 +56,8 @@ class _GatedClient:
         self._disconnect_error = disconnect_error
         self.list_calls = 0
         self.disconnected = False
+        # #252：``_commit_active_client`` 现在以 ``state == connected`` 作为提交前置条件。
+        self.state = "connected"
 
     async def list_tools(self) -> list[Tool]:
         self.list_calls += 1
@@ -336,10 +338,16 @@ class TestClearOAuthRaceSafety:
         manager._activation_intents.add(BUNDLE_A)
 
         class _InstantClient:
+            # #252：提交前置条件要求 ``state == connected``；未提交者由 ``adiscard`` 回收。
+            state = "connected"
+
             async def aconnect(self) -> None:
                 return None
 
             async def adisconnect(self) -> None:
+                return None
+
+            async def adiscard(self) -> None:
                 return None
 
         def factory(
@@ -387,10 +395,16 @@ class TestClearOAuthRaceSafety:
         )
 
         class _InstantClient:
+            # #252：提交前置条件要求 ``state == connected``；未提交者由 ``adiscard`` 回收。
+            state = "connected"
+
             async def aconnect(self) -> None:
                 return None
 
             async def adisconnect(self) -> None:
+                return None
+
+            async def adiscard(self) -> None:
                 return None
 
         monkeypatch.setattr(
