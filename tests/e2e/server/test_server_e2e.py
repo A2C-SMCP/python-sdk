@@ -53,26 +53,30 @@ def _wait_until(cond, timeout: float = 2.0, step: float = 0.01) -> bool:
 
 def _join_office(client, role: str, name: str, office_id: str) -> None:
     """中文: 加入房间 / English: Join office"""
-    ok, err = client.call(
+    payload = {"role": role, "name": name, "office_id": office_id}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "11111111-1111-4111-8111-111111111111"
+    ack = client.call(
         JOIN_OFFICE_EVENT,
-        {"role": role, "name": name, "office_id": office_id},
+        payload,
         namespace=SMCP_NAMESPACE,
         timeout=5,
     )
-    if not (ok and err is None):
-        raise RuntimeError(f"加入房间失败 / Failed to join office: ok={ok}, err={err}")
+    if ack is not None:
+        raise RuntimeError(f"加入房间失败 / Failed to join office: {ack!r}")
 
 
 def _leave_office(client, office_id: str) -> None:
     """中文: 离开房间 / English: Leave office"""
-    ok, err = client.call(
+    ack = client.call(
         LEAVE_OFFICE_EVENT,
         {"office_id": office_id},
         namespace=SMCP_NAMESPACE,
         timeout=5,
     )
-    if not (ok and err is None):
-        raise RuntimeError(f"离开房间失败 / Failed to leave office: ok={ok}, err={err}")
+    if ack is not None:
+        raise RuntimeError(f"离开房间失败 / Failed to leave office: {ack!r}")
 
 
 def test_server_end_to_end_flow(agent_client, computer_client):
@@ -182,7 +186,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     # Agent 拉取工具列表 / Agent get tools
     agent_ret_tools = agent_client.call(
         GET_TOOLS_EVENT,
-        {"computer": comp_name, "robot_id": agent_name, "req_id": "req-tools"},
+        {"computer": comp_name, "agent": agent_name, "req_id": "req-tools"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )
@@ -192,7 +196,7 @@ def test_server_end_to_end_flow(agent_client, computer_client):
     # Agent 拉取桌面 / Agent get desktop
     agent_ret_desktop = agent_client.call(
         GET_DESKTOP_EVENT,
-        {"computer": comp_name, "robot_id": agent_name, "req_id": "req-desk"},
+        {"computer": comp_name, "agent": agent_name, "req_id": "req-desk"},
         namespace=SMCP_NAMESPACE,
         timeout=2,
     )

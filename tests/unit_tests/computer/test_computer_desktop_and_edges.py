@@ -20,7 +20,6 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.computer import Computer
-from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.utils.window_uri import is_window_uri
 
 
@@ -38,8 +37,10 @@ class _DummyClient:
 
 async def _settle_resource_refresh(comp: Computer) -> None:
     """#210：资源刷新改由后台任务执行 —— 断言效果前必须结算（未调度则直接返回）。"""
-    task = comp._resource_refresh_task
-    if task is not None:
+    while True:
+        task = getattr(comp, "_resource_refresh_task", None)
+        if task is None or task.done():
+            return
         await task
 
 
@@ -64,7 +65,7 @@ async def test_on_manager_change_tool_list_changed_triggers_emit(monkeypatch: py
 @pytest.mark.asyncio
 async def test_on_manager_change_resource_list_changed_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     comp = Computer(name="test", auto_connect=False, auto_reconnect=False)
-    comp.mcp_manager = MCPServerManager(auto_connect=False)  # #210: ready manager, without starting file watchers
+    await comp.boot_up()  # #210：刷新经后台任务调度，需 manager 就绪（否则调度被前置守卫挡下 → 断言恒真）
     # 绑定伪客户端
     client = _DummyClient()
     comp.socketio_client = client

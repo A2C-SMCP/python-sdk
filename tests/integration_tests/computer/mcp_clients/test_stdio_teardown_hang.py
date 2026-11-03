@@ -25,6 +25,7 @@ import sys
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 
+import anyio
 import pytest
 from mcp import StdioServerParameters
 
@@ -146,3 +147,81 @@ async def test_close_task_force_kills_wedged_child(monkeypatch: pytest.MonkeyPat
         stuck_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await stuck_task
+
+
+# ------------------------------
+# #211：拆除异常不得让断开卡死
+# ------------------------------
+
+
+class _ExplodingTeardownCtx(AbstractAsyncContextManager):
+    """压入 keep-alive exit stack 的上下文：``__aexit__`` 抛 #211 的真实拆除异常形态。
+
+    mcp stdio 的 ``stdout_reader`` 在拆除窗口向已关闭的读流 ``send`` → anyio task group 聚合为
+    ``ExceptionGroup(BrokenResourceError)``。放在栈顶（最后入栈）即最先被 aclose 触达。
+    """
+
+    async def __aenter__(self) -> _ExplodingTeardownCtx:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [anyio.BrokenResourceError()])
+
+
+class _BlockingTeardownCtx(AbstractAsyncContextManager):
+    """压入 keep-alive exit stack 的上下文：``__aexit__`` 阻塞到放行，用于把「拆除进行中」变成可观测态。
+
+    用来钉死信号语义：**拆除未结束前 ``_async_session_closed_event`` 不得置位** —— 否则等待方会在会话
+    仍开着时被放行（等价于把 ``set()`` 提到 ``aclose()`` 之前的错误修法）。
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __aenter__(self) -> _BlockingTeardownCtx:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.entered.set()
+        await self.release.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only stdio child semantics")
+async def test_disconnect_converges_when_teardown_raises() -> None:
+    """#211：拆除上下文抛异常时，断开仍须收敛，且信号 / 状态清理 / 子进程回收都不缺席。"""
+    client = StdioMCPClient(_params())
+    await client.aconnect()
+    await client._create_session_success_event.wait()
+
+    # 前置非空断言（防空过）/ preconditions must be non-vacuous
+    assert client.initialize_result is not None
+    client._subscribed_window_uris.add("window://seed.example/main")
+    captured = set(client._child_pids)
+    assert captured, "应捕获到本 client 启动的 stdio 子进程 PID"
+
+    exploding = _ExplodingTeardownCtx()
+    blocking = _BlockingTeardownCtx()
+    await client._aexit_stack.enter_async_context(exploding)  # 先入 → 后出
+    await client._aexit_stack.enter_async_context(blocking)  # 后入 → 先出（阻塞点）
+
+    task = asyncio.create_task(client.adisconnect())
+    await asyncio.wait_for(blocking.entered.wait(), timeout=5)
+
+    # 拆除进行中：信号必须仍未置位 / signal must stay unset while teardown is in flight
+    assert not client._async_session_closed_event.is_set(), "拆除未结束前不得放行等待方"
+
+    blocking.release.set()
+    # 缺陷形态：拆除异常跳过 finally 后半段 → 信号缺席 → 只能在 wait_for 超时处「正常返回」
+    await asyncio.wait_for(task, timeout=5)
+
+    assert client._async_session_closed_event.is_set(), "aclose() 抛异常时关闭信号仍须照常置位"
+    assert client._async_session is None
+    assert client.initialize_result is None
+    assert client._subscribed_window_uris == set()
+    # 拆除真的跑完（信号在 aclose 之后置位）：子进程应已回收
+    for _ in range(30):
+        if all(not _pid_alive(pid) for pid in captured):
+            break
+        await asyncio.sleep(0.1)
+    assert all(not _pid_alive(pid) for pid in captured), f"stdio 子进程未回收 / child still alive: {captured}"

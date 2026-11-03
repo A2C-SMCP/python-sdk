@@ -265,22 +265,28 @@ desktop = await async_client.get_desktop_from_computer(
 )
 ```
 
-### 获取房间内 Computer 列表
+### 获取房间内的 Computer
+
+v0.5.0 起房间是「**每 role 一席**」（protocol#66）：一房至多 1 Agent、至多 1 Computer，即一个 Agent
+同一时刻至多连一台 Computer。房内**唯一**的 Computer 用 `get_computer_in_office` 获取：
 
 ```python
 from a2c_smcp.smcp import SessionInfo
 
 # 同步
-computers: list[SessionInfo] = client.get_computers_in_office(
-    "my_office",
-    timeout=20
-)
-for c in computers:
-    print(f"Computer: {c['name']} (sid: {c['sid']})")
+computer: SessionInfo | None = client.get_computer_in_office("my_office", timeout=20)
+if computer is not None:
+    print(f"Computer: {computer['name']} (sid: {computer['sid']})")
 
 # 异步
-computers = await async_client.get_computers_in_office("my_office", timeout=20)
+computer = await async_client.get_computer_in_office("my_office", timeout=20)
 ```
+
+- 房内暂无 Computer ⇒ `None`；服务端列出多于一台 ⇒ 视为服务端协议违规，抛 `ValueError`（不替你挑一台）。
+- **换绑 Computer** 不引入新事件：旧 Computer 离房（`notify:leave_office`）→ 新 Computer 入房
+  （`notify:enter_office`）。收到 leave 清理旧 Computer 的工具 / Desktop / SKILL 缓存，收到 enter 重新拉取。
+- `get_computers_in_office`（返回列表）**已废弃**：仍可用（委托 `get_computer_in_office`，返回 `[c]` / `[]`），
+  调用即发 `DeprecationWarning`，将在后续版本移除。
 
 ## 房间管理
 
@@ -294,6 +300,77 @@ client.join_office("my_office", "my_agent")
 await async_client.join_office("my_office", "my_agent")
 ```
 
+> **本调用等待服务端裁决（自 #218 起）。** `server:join_office` 有 ack 通道（成功空 ack / 失败 flat
+> `ErrorPayload`），Agent 客户端现在**读取**该 ack：入房被拒会抛
+> `SMCPProtocolError`，`.code` 可机器分流（见下方「入房失败的处理」）。等待是**有界**的
+> （`OFFICE_JOIN_TIMEOUT` = 10 秒）；同步侧还要叠加 office 操作锁的等待（前方有在途 office 操作时，
+> 典型最坏约 2×10 秒，多个排队者时更长）——调用方在事件回调内调用会阻塞该回调线程。
+>
+> **取锁期间被抢占 ⇒ 本调用静默返回、不发包**（返回形如成功，不抛）。触发者是更新的声明（并发
+> `leave_office` / 换房）或会话边界（断连/重连钩子）：前者由后到者负责，后者在「传输中断且会自动
+> 重连」时保留意图交给重放，在手工断开 / 服务端踢出时意图已清空、不会再有重放。需要确认是否真的在
+> 房里时，以服务端事实为准。
+>
+> **身份在一条连接内不可变。** 协议规定：同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）。
+> 因此**同一条连接**上不能用不同的 `agent_name` 再次 `join_office`——服务端会以 `403` 拒绝。
+> 只要本端仍记得已确认的会话身份，异常文案就会附带「本连接会话身份已固化为 `<name>`；改名须重新建立
+> 连接」提示；**先 `leave_office` 再改名不会**出现该提示（退房会作废本地身份记忆），此时按同一条规则
+> 处理：换名须**重新建立连接**（新 sid）后再入房。换房（不同 `office_id`）不受影响，但 Agent **必须**
+> 先 `leave_office` 再入新房（见下文）。
+
+### 入房失败的处理
+
+```python
+from a2c_smcp.agent.errors import SMCPProtocolError
+
+try:
+    await async_client.join_office("my_office", "my_agent")
+except SMCPProtocolError as e:
+    # e.code: 4101 房内已有 Agent（本 role 席位已占）/ 4106 已在其它房 / 403 改名被拒 / 400 载荷畸形
+    #         按 e.code 分流即可：Agent 自己发起的入房，被占席位恒为 agent（入房异常不携带服务端 details）
+    #         -1 = 服务端拒绝但码不可解析（未获裁决）
+    print(f"入房被拒：{e.code} {e.error_message}")  # str(e) 形如 "[4101] Room already has an agent"
+```
+
+失败后的**本地状态**遵守一条统一规则（显式入房与自动回房同规则、同文案）：
+
+- **明确拒绝**：入房意图回退到「最近一次被服务端确认过的房间」——已经在一个房里换房被拒时，不会
+  连带丢掉原房的自动回房能力；
+- **未获裁决 / 传输层失败**（超时、连接已断）：意图与「已确认房」一并清空，**不臆断**服务端状态。
+
+> 上述效应**只在本次声明仍是最新时施加**：若同拍已被断连 / 重连的会话边界抢先（超时前连接已断，
+> 钩子推进了 generation），意图**保留**待重连重放——重放会用同一张表重新裁决，成功即恢复、被拒才清空。
+
+超时不是 builtin 异常：`socketio.exceptions.TimeoutError` **不是** `TimeoutError` 的子类，按
+`a2c_smcp.agent.OFFICE_ACK_TIMEOUT_ERRORS` 捕获（亦可从 `a2c_smcp.agent.base` 导入）；未连接就调用则抛
+`socketio.exceptions.BadNamespaceError`（发送前失败，**不保留**意图，请先连接）。
+
+**超时（`未获裁决`）后如何收敛**：服务端可能其实已把你加入房间。协议支持的恢复手段是**重发同一次
+入房**——同会话重复加入同一房间会被服务端幂等放行（成功 = 空 ack）；要换房则必须先 `leave_office`，
+否则会被 `4106` 拒绝。
+
+### 自动回房：瞬态冲突的有界退避重试（#212）
+
+传输层断线自动重连后，SDK 会重放同一份入房意图（`_desired_office`）。若服务端**尚未回收**本客户端的
+旧会话（静默断线时它要等自身心跳超时，socket.io 默认最长 **45 秒**），重放会被判 `4101`（旧会话仍占着
+本 role 的席位）——协议把这种成因定义为**瞬态冲突**，只允许在**重连恢复路径**上有界重试。`4105` 自
+protocol#66 起是**预留码**（服务端不得产出），收到即按对端协议违规记录、**不重试**。
+
+- 默认按 `1→2→4→5→5…` 秒退避重试，**预算 45 秒**（= socket.io 默认最长回收窗口）；预算耗尽才落失败
+  效应与错误日志 ⇒ 网络抖动通常**无感自愈**，无需手工重入。
+- **可配置**：`client.office_rejoin_retry_budget = 30.0`（`AsyncSMCPAgentClient` / `SMCPAgentClient`
+  的公开实例属性；`<= 0` 关掉重试，退化为单次尝试）。部署方调大了服务端 `ping_interval` /
+  `ping_timeout` 时须相应调大——协议的 SHOULD 级部署约束（回收窗口应与客户端可接受的恢复时延相称）
+  是补偿能生效的前提。
+- **只给回放路径**：显式 `join_office` 不重试（首次入房撞上冲突即永久冲突）；`4105` / `4106` / `500` / 未知码 /
+  无码 / 传输层失败也不重试。退避期间 office 操作锁是空闲的（每次尝试各取一次），恢复耗时上界 =
+  预算 + 一次有界 ACK 等待。
+- **重启不在重试范围之内**：退避重试只作用于**回放路径**（前提是一次「传输中断后意图被保留」的会话）。
+  进程被杀后重启是**新进程**，走的是**显式** `join_office`：撞上上一进程尚未回收的旧会话（仍占着席位）
+  ⇒ `4101`，会**直接抛** `SMCPProtocolError`（不重试）。此时只能等旧会话被回收后由调用方自己重试——
+  **改名无效**（席位与名字无关）。Computer 侧有对等通道（预置 `office_id` 再 `connect()` 即走
+  重放路径，见 computer-guide），Agent 侧没有。
+
 ### 离开房间
 
 ```python
@@ -303,6 +380,17 @@ client.leave_office("my_office")
 # 异步
 await async_client.leave_office("my_office")
 ```
+
+`leave_office` **等服务端 ACK**（协议 `server:leave_office` 有 ack：成功 = 空、失败 = flat `ErrorPayload`），
+有界 10 秒（`OFFICE_JOIN_TIMEOUT`）。本地入房意图与已确认房号**先于发包**清掉，无论结果如何；服务端拒绝
+（`400` / `500`）抛 `SMCPProtocolError`，超时按 `OFFICE_ACK_TIMEOUT_ERRORS` 捕获。换房请等 `leave_office`
+返回后再 `join_office`——只发不等时，紧随其后的 join 可能在服务端先落地而被判 `4106`。
+
+`join_office` / `leave_office` 的 `namespace` 参数可省略，缺省为客户端构造时的命名空间（默认 `/smcp`）。
+
+**断开连接**：`disconnect()` 在自动重连窗口内同样生效——清空入房意图并**中止**重连（此前 socketio 的
+`disconnect()` 在该窗口内什么都不做，重连成功后会自动回到旧房）。自动重连撞上 `4008`（协议版本不兼容）
+时，客户端停止重连、记 ERROR 并清空意图，不再无限重试。
 
 ## 错误处理
 

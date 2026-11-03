@@ -9,11 +9,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from a2c_smcp.exceptions import SMCPNamespaceError
 from a2c_smcp.server.utils import (
     aget_all_sessions_in_office,
     aget_computers_in_office,
     get_all_sessions_in_office,
     get_computers_in_office,
+    require_office_id,
 )
 
 
@@ -97,3 +99,28 @@ async def test_aget_and_get_all_sessions_in_office():
     sio2.get_session.side_effect = _get_session2
     out2 = get_all_sessions_in_office("r", sio2)
     assert {s["sid"] for s in out2} == {"a", "b"}
+
+
+# ── #212：房间广播的隔离前置 / office-membership guard for room broadcasts ──
+
+
+def test_require_office_id_returns_office_when_present():
+    """正常值直接返回（**非**假值/None 时不 raise）。"""
+    assert require_office_id({"role": "agent", "office_id": "room1"}, "sid1") == "room1"
+
+
+@pytest.mark.parametrize("session", [{}, {"role": "computer"}, {"role": "agent", "office_id": ""}])
+def test_require_office_id_raises_when_absent(session):
+    """无 ``office_id``（含空串）→ 显式 raise，**不得**返回 None 让调用方降级为全命名空间广播。
+
+    空串同拒：socketio 的 ``room=""`` 查不到参与者，投递静默丢失；而 ``room=None`` 会广播给
+    整个命名空间。二者都不是「房间广播」的合法语义，故一并拒绝。
+    """
+    with pytest.raises(SMCPNamespaceError, match="未加入任何房间"):
+        require_office_id(session, "sid1")
+
+
+def test_require_office_id_names_the_sid_in_error():
+    """错误信息带上发起者 SID，便于定位是哪条连接触发的拒绝。"""
+    with pytest.raises(SMCPNamespaceError, match="sid-xyz"):
+        require_office_id({}, "sid-xyz")

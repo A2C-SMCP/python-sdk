@@ -18,21 +18,22 @@ from socketio import AsyncClient
 
 from a2c_smcp.server import aget_all_sessions_in_office, aget_computers_in_office
 from a2c_smcp.smcp import JOIN_OFFICE_EVENT, SMCP_NAMESPACE
+from tests.room_acks import assert_empty_ack
 
 
 async def _join_office(client: AsyncClient, role: str, office_id: str, name: str) -> None:
-    ok, err = await client.call(
-        JOIN_OFFICE_EVENT,
-        {"role": role, "office_id": office_id, "name": name},
-        namespace=SMCP_NAMESPACE,
-    )
-    assert ok and err is None
+    payload: dict = {"role": role, "office_id": office_id, "name": name}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
+    ack = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_empty_ack(ack)
 
 
 @pytest.mark.asyncio
 async def test_aget_computers_and_sessions(socketio_server, basic_server_port: int):
     """
-    场景：Agent 与 2 个 Computer 加入同一房间，验证工具函数返回。
+    场景：Agent 与 1 个 Computer 加入同一房间（#230：每 role 一席），验证工具函数返回。
     """
     # socketio_server fixture 返回的是命名空间，可从中取 server（AsyncServer）
     ns = socketio_server
@@ -40,7 +41,6 @@ async def test_aget_computers_and_sessions(socketio_server, basic_server_port: i
 
     agent = AsyncClient()
     comp1 = AsyncClient()
-    comp2 = AsyncClient()
 
     office_id = "office-utils-1"
 
@@ -51,21 +51,17 @@ async def test_aget_computers_and_sessions(socketio_server, basic_server_port: i
     await comp1.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     await _join_office(comp1, role="computer", office_id=office_id, name="comp-U1")
 
-    await comp2.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
-    await _join_office(comp2, role="computer", office_id=office_id, name="comp-U2")
-
     # 等待会话写入完成
     await asyncio.sleep(0.2)
 
     computers = await aget_computers_in_office(office_id, sio)
     sessions = await aget_all_sessions_in_office(office_id, sio)
 
-    assert len(computers) == 2
+    assert len(computers) == 1
     assert all(c["role"] == "computer" for c in computers)
-    # 会话应包含3个（1 Agent + 2 Computer）
-    assert len(sessions) == 3
+    # 会话应包含2个（1 Agent + 1 Computer）
+    assert len(sessions) == 2
 
     # 清理
     await agent.disconnect()
     await comp1.disconnect()
-    await comp2.disconnect()

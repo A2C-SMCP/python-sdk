@@ -5,6 +5,7 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 import asyncio
+import contextvars
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
@@ -40,6 +41,23 @@ logger = get_logger("computer")
 # Overall graceful-teardown budget before the force-kill fallback fires. mcp's own child reaping
 # (2s graceful + SIGTERM→SIGKILL escalation) finishes in seconds; exceeding this means a wedge.
 _TEARDOWN_TIMEOUT = 10.0
+
+# #247：收敛任务遇到其它在途 transition 时的有界等待。aafter_connect 会 await 调用方传入的
+# async state_change_callback（真实挂起点），故不能「有在途 transition 就永久放弃收敛」；等待其
+# 结束再决定。超时仍不结束则告警放弃，把终态交给该 transition（它自己终会给出结论）。
+# Bounded wait for in-flight transitions before giving up on convergence (#247).
+_CONVERGE_INFLIGHT_TIMEOUT = 10.0
+
+# #247：connect 握手（initialize）总时长上界。mcp ClientSession 无读超时；stdio spawn 成功但
+# initialize 死锁 / SSE 不回响应时，keep-alive 任务**仍存活**，只靠「任务死亡」竞速永远不返回。
+# 与 manager bounded connect 的 30s 上界对齐；超时 → 取消 init + _afail_connect + ConnectionError。
+# Overall connect-handshake deadline (aligns with manager's bounded-connect 30s).
+_CONNECT_HANDSHAKE_TIMEOUT = 30.0
+
+# #247：取消 initialize 后的有界回收等待。initialize 若忽略取消（mcp 传输层不响应），不得让
+# 拆除挂死；超时后放弃该 detached 任务（随 loop 关闭回收）并告警。
+# Bounded grace for reaping the cancelled initialize task; abandon if it ignores cancellation.
+_INIT_CANCEL_GRACE = 2.0
 
 # 泛型参数，用于约束 MCP Server 参数类型
 # Generic parameter for constraining MCP Server parameter types
@@ -85,9 +103,14 @@ TRANSITIONS = [
         "before": "abefore_connect",
         "after": "aafter_connect",
     },
+    # #247：传输失败收敛到 error 的 client 仍必须能在 stop/shutdown 时断开。error 是「半断开」
+    # 的可达终态（会话已拆除、机器尚未转移），不是用户可感知的完成态。完全 disconnected 的
+    # 重复断开仍按既有契约抛 MachineError（test_disconnect_from_disconnected_state 钉死）。
+    # A failed client converged to `error` must still be disconnectable; a fully `disconnected`
+    # client keeps the existing MachineError contract (pinned by tests).
     {
         "trigger": "adisconnect",
-        "source": STATES.connected,
+        "source": [STATES.connected, STATES.error],
         "dest": STATES.disconnected,
         "prepare": "aprepare_disconnect",
         "conditions": "acan_disconnect",
@@ -164,6 +187,8 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         self._async_session: ClientSession | None = None
         self._session_keep_alive_task: asyncio.Task | None = None
         self._create_session_success_event = asyncio.Event()
+        # #247：保留的观测信号（兼容既有子类/测试）。**权威失败判据是 keep-alive 任务结束**——
+        # ``on_enter_connected`` 竞速 success event 与任务完成，不得在此事件上等待（否则会挂起）。
         self._create_session_failure_event = asyncio.Event()
         self._async_session_closed_event = asyncio.Event()
         # 优雅关闭信号：替代 task.cancel() 触发 keep-alive 收尾，确保 _aexit_stack.aclose()
@@ -189,6 +214,21 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         # Agent's auto GET_DESKTOP refresh (root cause of the #110 slow-CI hang). Cleared on session teardown so
         # a reconnect re-subscribes.
         self._subscribed_window_uris: set[str] = set()
+        # #247：会话是否已完成 MCP ``initialize()``（``on_enter_connected`` 末尾置位）。状态在进入
+        # ``on_enter_connected`` 之前就已置 ``connected``，故须以此区分「连接中失败」与「连接后传输
+        # 死亡」——只有后者才允许 done-callback 收敛为 ``error``（否则会把连接中的 client 提交成坏状态）。
+        # Whether MCP initialize() completed; only post-connect transport deaths converge to error.
+        self._session_ready: bool = False
+        # #247：意外终止收敛任务（强引用防 GC；测试据此确定性等待）。
+        # Task converging an unexpectedly-dead keep-alive task to `error`; held to prevent GC.
+        self._converge_task: asyncio.Task | None = None
+        # #247：会话创建失败原因。keep-alive 的 except-Exception 已消费原异常（任务以正常结束收场），
+        # 故须单独留存，供 connect 失败时作为 ConnectionError 的 __cause__（stdio 命令不存在等诊断）。
+        self._create_session_error: BaseException | None = None
+        # #247：connect 握手（initialize）总时长上界；由 client_factory 按传输类型设定（stdio 冷启动
+        # 120s / 非 OAuth HTTP·SSE 30s / coordinator-attached 交互式 OAuth 为 None）。
+        # Per-transport connect-handshake deadline; None = no SDK-level bound.
+        self._connect_handshake_timeout: float | None = _CONNECT_HANDSHAKE_TIMEOUT
 
         # 初始化异步状态机
         self.machine = A2CAsyncMachine(
@@ -221,12 +261,54 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         """
         异步会话对象
 
+        中文: 惰性建连**只允许从 ``initialized`` 发起**（#252）。其余状态（``connected`` 半断开 /
+        ``error`` / ``disconnected``）直接抛可读的 ``ConnectionError``——旧实现在这些状态下调
+        ``aconnect()``，只会撞 transitions 的内部错误 ``MachineError("Can't trigger event aconnect
+        from state …")``，既无诊断价值，也正是 #247 的原始根因形态。
+        English: Lazy connect is only allowed from `initialized`; other states raise a readable
+        ConnectionError instead of transitions' internal MachineError (#247 root-cause shape).
+
         Returns:
             ClientSession: MCP 官方异步会话，用于触发 MCP Server 指令
         """
         if self._async_session is None:
+            if self.state != STATES.initialized:
+                raise ConnectionError(
+                    f"MCP client has no active session in state {self.state!r}; "
+                    "lazy connect is only allowed from 'initialized'"
+                )
             await self.aconnect()
+            # ``acan_connect`` 可被子类否决 / 连接在握手期被拆除——aconnect 返回不等于拿到会话。
+            # `acan_connect` may veto, or the session may be torn down mid-handshake.
+            if self._async_session is None:
+                raise ConnectionError(
+                    f"MCP client still has no active session after connecting (state={self.state!r})"
+                )
         return cast(ClientSession, self._async_session)
+
+    @property
+    def is_session_usable(self) -> bool:
+        """本 client 当前是否**真的**可用——manager 提交与缓存复用的唯一判据（#252）。
+
+        中文: ``state == connected`` **不足以**证明可用：
+          - transitions 在进入 ``on_enter_connected`` **之前**就把状态置为 ``connected``（握手窗口内
+            状态恒为 connected）；
+          - 传输在 ``initialize()`` 返回后立即死亡时，keep-alive 的 ``finally`` 已清空 ``_async_session``，
+            而收敛任务必须**等在途的 aconnect 结束**才能把状态推到 ``error``（否则 transitions 会把
+            aerror 重新抛出，见 ``_aconverge_unexpected_exit``）。
+        故「aconnect 正常返回」时完全可能是 `connected + 无会话 + keep-alive 已死`——必须同时要求
+        有会话、且 keep-alive 任务存在且未结束。
+        English: `state == connected` alone is not proof of usability (the state is set before the
+        handshake, and teardown clears the session before convergence can move the machine); require
+        a live session and a live keep-alive task too.
+        """
+        task = self._session_keep_alive_task
+        return (
+            self.state == STATES.connected
+            and self._async_session is not None
+            and task is not None
+            and not task.done()
+        )
 
     @property
     def initialize_result(self) -> InitializeResult | None:
@@ -235,6 +317,16 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         Read-only access for InitializeResult (may be None if not initialized or already cleaned)
         """
         return self._initialize_result
+
+    def set_connect_handshake_timeout(self, timeout: float | None) -> None:
+        """配置 connect 握手（initialize）总时长上界；None 表示不设 SDK 层上界。
+
+        中文: 由 ``client_factory`` 按传输类型设定——stdio（npx/uvx 首次冷启动可 >30s）120s；
+        非 OAuth HTTP / SSE 30s（与 manager bounded connect 对齐）；coordinator-attached 交互式
+        OAuth 为 None（用户浏览器授权可达分钟级，由 flow TTL 10 分钟 + 取消链约束）。
+        English: per-transport handshake deadline; None = no SDK-level bound (interactive OAuth).
+        """
+        self._connect_handshake_timeout = timeout
 
     @abstractmethod
     async def _create_async_session(self) -> ClientSession:
@@ -246,7 +338,7 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         """
         raise NotImplementedError
 
-    async def _keep_alive_task(self) -> None:
+    async def _keep_alive_task(self, close_event: asyncio.Event) -> None:
         """
         async_session 保活，进而保证其它连接可以正常使用它。
 
@@ -261,10 +353,15 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         2. 将需要持续保证的上下文压栈 self._aexit_stack
         3. 通过 asyncio.Event().wait() 来保证上下文的持续，同时通过响应 self._session_keep_alive_task.done() 来完成上下文的关闭
         4. 得到关闭信号后，对 self._aexit_stack 里的上下文进行关闭
+
+        #252：``close_event`` 由**创建方**（``on_enter_connected``）为本代新建并显式传入，
+        本任务既不清除也不触碰任何一代的共享信号——旧实现「任务体内 ``clear()`` 共享事件」
+        会让晚启动的旧代任务抹掉新代已置位的关闭信号。
+        / The close signal is created per generation by the caller and passed in; this task never
+        clears or touches another generation's signal (the old in-task `clear()` could erase a
+        newer generation's already-set signal).
         """
         logger.debug(f"Session keep-alive task: {asyncio.current_task().get_name()}")
-        # 每个 keep-alive 任务实例使用干净的关闭信号 / fresh close signal per task instance
-        self._close_event.clear()
         try:
             # 创建异步会话，同时完成上下文的压栈
             self._async_session = await self._create_async_session()
@@ -277,27 +374,222 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
                 # CancelledError 抢占下跳过 mcp 的子进程强杀，导致 stdio 子进程残留、os.waitpid 永久阻塞。
                 # Wait for the graceful close signal; do NOT rely on task.cancel (it would let the
                 # finally-block aclose() be pre-empted by CancelledError, skipping mcp's child force-kill).
-                await self._close_event.wait()
+                await close_event.wait()
             except asyncio.CancelledError:
                 # 向后兼容：仍容忍历史 cancel 路径 / back-compat: still tolerate the legacy cancel path
-                logger.debug(f"Session keep-alive task cancelled: {asyncio.current_task().get_name()}")
+                # #247：关闭信号未置位 ⇒ 取消来自**传输任务组（anyio）失败**而非优雅关闭。这是
+                # 「会话已死、状态机待收敛」的首条可诊断线索，故记 WARNING；优雅关闭仍为 DEBUG。
+                # #252：必须读本代的 ``close_event``——读 ``self._close_event`` 会拿到别代的信号。
+                # Not a graceful close → most likely anyio cancelled us after a transport failure.
+                if close_event.is_set():
+                    logger.debug(f"Session keep-alive task cancelled: {asyncio.current_task().get_name()}")
+                else:
+                    logger.warning(
+                        f"Session keep-alive task cancelled unexpectedly (transport failure?): "
+                        f"{asyncio.current_task().get_name()}",
+                    )
         except Exception as e:
             logger.error(f"Session keep-alive task error: {asyncio.current_task().get_name()}: {e}", exc_info=True)
+            # #247：留存根因——任务随后以「正常结束」收场，task.exception() 不再携带它。
+            self._create_session_error = e
             self._create_session_failure_event.set()
             await self.aerror()
 
         finally:
             # 关闭上下文
-            await self._aexit_stack.aclose()
-            # 清理session
-            self._async_session = None
-            # 清理初始化结果，确保会话真正关闭时协议初始化态一并清理
-            # Cleanup InitializeResult to align with actual session teardown
-            self._initialize_result = None
-            # 会话关闭即清空已订阅集合：订阅随会话失效，重连后须重新订阅（幂等性以会话为界）。
-            # Subscriptions die with the session; clear so a reconnect re-subscribes (idempotency is per-session).
-            self._subscribed_window_uris.clear()
-            self._async_session_closed_event.set()
+            #
+            # ⚠️ #211 不变量：**关闭信号是无条件承诺**。``_async_session_closed_event`` 的语义是
+            #    「拆除已结束（无论成败）」，它是 ``on_enter_disconnected`` 唯一的放行条件；内层 try/finally
+            #    保证该信号**永不缺席**；三项状态清理另加 #247 代际守卫（仅本代任务可清，见下）。
+            #    旧实现把它们与 ``aclose()`` 平铺在同一层：``aclose()`` 抛异常（拆除窗口内服务端消息到达时，
+            #    mcp stdio 的 ``stdout_reader`` 向已关闭读流 send → ``ExceptionGroup(BrokenResourceError)``）
+            #    会跳过其后的**全部**语句 → 信号永久缺失 → ``on_enter_disconnected`` 永久等待 →
+            #    ``MCPServerManager._astop_all`` 持 ``_lock`` 卡死 → ``Computer.shutdown()`` 不返回。
+            #    刻意用**裸 try/finally 而非 except**：拆除异常照旧向上抛（由 ``_close_task`` 记账），
+            #    只是不再阻断信号与清理 —— 这不是吞异常。**禁止**把清理/置位再挪回 ``aclose()`` 之下，
+            #    也禁止把 ``set()`` 提到 ``aclose()`` 之前（那会让等待方在会话仍开着时被放行）。
+            #    ⚠️ 内层 finally **必须保持无 await**：一旦引入 await，正在传播的拆除异常会被新异常顶替，
+            #    ``_close_task`` 记账到的就不再是真实原因。
+            #    Do NOT move the cleanup/signal back below aclose(), do NOT set the event before it, and keep
+            #    the inner finally await-free (an await there would replace the in-flight teardown exception).
+            try:
+                await self._aexit_stack.aclose()
+            finally:
+                # #247 代际守卫：只有**当前** keep-alive 任务才有资格清共享字段。旧任务的 teardown
+                #    可能晚于新连接建立（``_close_task`` 超时后放弃并 ``task.cancel()`` 的窄路径）——
+                #    无条件清理会抹掉新代的 ``_async_session``，重新制造 connected + None 的半断开形态。
+                #    关闭信号仍**无条件**置位（#211 承诺：拆除已结束，无论成败）。
+                #    Guard by generation: only the current keep-alive task may clear shared fields;
+                #    the closed signal stays unconditional (#211).
+                #    ⚠️ 边界（#247）：``_aexit_stack`` 仍按 client 共享——同实例重连必须等旧代 teardown
+                #    收敛（生产每次 start/restart 都新建 client ⇒ 不可达）。若将来支持同实例快速重连，
+                #    需改为每代新栈 + keep-alive 任务捕获本代栈引用。
+                #    Boundary: the exit stack is per-client; same-instance reconnect must await the old
+                #    teardown (unreachable today: every start/restart builds a new client).
+                if asyncio.current_task() is self._session_keep_alive_task:
+                    # 清理session
+                    self._async_session = None
+                    # 清理初始化结果，确保会话真正关闭时协议初始化态一并清理
+                    # Cleanup InitializeResult to align with actual session teardown
+                    self._initialize_result = None
+                    # 会话关闭即清空已订阅集合：订阅随会话失效，重连后须重新订阅（幂等性以会话为界）。
+                    # Subscriptions die with the session; clear so a reconnect re-subscribes (idempotency is per-session).
+                    self._subscribed_window_uris.clear()
+                self._async_session_closed_event.set()
+
+    def _on_keep_alive_task_done(self, task: asyncio.Task) -> None:
+        """keep-alive 任务终态钩子（#247）：领取异常，并在**意外终止**时收敛状态机。
+
+        中文: 传输层失败会让 anyio 取消宿主 keep-alive 任务；旧实现吞掉取消后会话已清空、状态机却
+        滞留 ``connected``，后续 ``adisconnect`` 经惰性 ``async_session`` 转成 ``aconnect`` →
+        ``MachineError``。本钩子在任务结束后（已脱离其 anyio cancel scope）把状态机收敛到 ``error``。
+        不收敛的情况：``_close_task`` 发起的优雅关闭、已被新连接替换的旧代任务、非 ``connected``
+        状态、connect 阶段（``initialize()`` 未完成，由 ``on_enter_connected`` 的 ``_afail_connect`` 收口）。
+        English: converge the machine to ``error`` when the keep-alive host task ends unexpectedly
+        (anyio cancellation / transport death). Graceful close, superseded generations, non-connected
+        states and the connect window are left untouched (the latter is settled by `_afail_connect`).
+        """
+        # 1. 领取异常：cancelled task 调 exception() 会抛 CancelledError；正常结束返回 None。
+        #    无论是否收敛都先领取，杜绝 "Task exception was never retrieved"。
+        #    Retrieve the exception first (also for superseded/silent paths) to silence that warning.
+        exc: BaseException | None = None
+        if not task.cancelled():
+            exc = task.exception()
+        # 2. 旧代任务（新连接已接管）——不得干预新会话；保留 debug 线索但不打 WARNING。
+        if self._session_keep_alive_task is not task:
+            if exc is not None:
+                logger.debug(f"Superseded keep-alive task ended with: {exc!r}")
+            return
+        # 3. 优雅关闭（_close_task 先置位再等待）：状态转移由 disconnect 路径驱动。
+        if self._close_event.is_set():
+            if exc is not None:
+                # _close_task 的等待分支已按 WARNING 记账；此处只保留链路，避免重复告警。
+                logger.debug(f"Gracefully-closed keep-alive task ended with: {exc!r}")
+            return
+        # 4. 状态已离开 connected（例如并发 disconnect 已收敛）→ 无需收敛；保留拆除异常线索。
+        if self.state != STATES.connected:
+            if exc is not None:
+                logger.debug(f"Keep-alive task ended after state left connected; teardown error: {exc!r}")
+            return
+        # 5. connect 阶段（initialize() 未完成）→ 由 on_enter_connected 的失败检查收口（_afail_connect），
+        #    此处不抢跑，避免把「连接中失败」提前写成 error 而与 connect 结果竞争；保留异常线索。
+        if not self._session_ready:
+            if exc is not None:
+                logger.debug(f"Keep-alive task ended during connect handshake: {exc!r}")
+            return
+        logger.warning(
+            f"Session keep-alive task ended unexpectedly; converging client to error state. "
+            f"server params: {truncate(self.params)}",
+            exc_info=exc,
+        )
+        self._spawn_convergence(task)
+
+    def _spawn_convergence(self, task: asyncio.Task, *, after_intentional_teardown: bool = False) -> None:
+        """调度收敛任务（干净 transitions 上下文；强引用防 GC）。
+
+        中文: done callback 继承 keep-alive 任务的创建上下文（即 aconnect 的 ``current_context``）。
+        不剥离会让收敛事件走 ``process_context`` 的 nested 分支——自身不可取消，却能取消其它在途
+        transition（transitions 0.9.3 语义）。``after_intentional_teardown`` 供 connect 失败路径
+        在 ``_close_task`` 置位关闭信号后仍强制收敛。
+        """
+        if self._converge_task is not None and not self._converge_task.done():
+            # connect 失败收口与排队中的 done callback 可能都要求收敛——复用在途任务，不覆盖强引用。
+            logger.debug("Convergence already scheduled; skip duplicate")
+            return
+        try:
+            self._converge_task = asyncio.create_task(
+                self._aconverge_unexpected_exit(task, after_intentional_teardown=after_intentional_teardown),
+                context=contextvars.Context(),
+            )
+        except RuntimeError:
+            # loop 正在关闭（shutdown 竞态）——无收敛的必要/可能。
+            logger.debug("Event loop closed; skip keep-alive convergence task")
+
+    async def _aconverge_unexpected_exit(
+        self, task: asyncio.Task, *, after_intentional_teardown: bool = False
+    ) -> None:
+        """把客户端的 keep-alive 死亡收敛到 error（#247）。
+
+        中文: 执行前重新校验（TOCTOU）：期间可能已完成重连或 disconnect——此时不得动状态机。
+        三条防线：①任务身份仍是本代；②非 connect 失败收口时，优雅关闭（关闭信号已置位）不收敛；
+        ③存在其它在途 transition 时**有界等待**其结束再决定（不能永久放弃：``aafter_connect`` 会
+        await 调用方传入的 async ``state_change_callback``，传输在该挂起点死亡时若直接放弃收敛，
+        aconnect 会正常返回、client 停在 connected + 无会话 → 下次惰性 aconnect 抛 MachineError）。
+        等待超时则告警放弃，把终态交给该 transition。``async_tasks`` 是 transitions 的类级内部表
+        （按 id(model) 分桶），仅作防御性判据。
+        English: bounded-wait for in-flight transitions (aafter_connect awaits the caller's async
+        state callback); give up with a WARNING only after the timeout.
+        """
+        try:
+            if self._session_keep_alive_task is not task:
+                return
+            if not after_intentional_teardown and self._close_event.is_set():
+                return
+            if self.state != STATES.connected:
+                return
+            current = asyncio.current_task()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _CONVERGE_INFLIGHT_TIMEOUT
+            while True:
+                running = [t for t in self.machine.async_tasks.get(id(self), ()) if t is not current and not t.done()]
+                if not running:
+                    break
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "Keep-alive convergence gave up waiting for in-flight transitions; "
+                        "leaving the terminal state to them",
+                    )
+                    return
+                logger.debug("Deferring keep-alive convergence until in-flight transitions finish")
+                await asyncio.wait(running, timeout=remaining)
+                # 等待期间可能已完成重连/disconnect——重新校验后再决定
+                if self._session_keep_alive_task is not task:
+                    return
+                if not after_intentional_teardown and self._close_event.is_set():
+                    return
+                if self.state != STATES.connected:
+                    return
+            await self.aerror()
+        except Exception:
+            logger.exception("Failed to converge MCP client to error state after keep-alive exit")
+        finally:
+            if self._converge_task is asyncio.current_task():
+                self._converge_task = None
+
+    async def _afail_connect(self, task: asyncio.Task, reason: str) -> None:
+        """连接阶段失败收口（#247）：有界回收会话/子进程，并调度收敛到 error。
+
+        中文: 用于 ``on_enter_connected`` 的失败路径（会话已建立后 initialize 失败 / 传输在
+        initialize 窗口内死亡）。**不得**走惰性 ``async_session``——半断开时会 ``aconnect`` from
+        ``connected`` → ``MachineError``。必须先允许收敛判定再拆除（``_close_task`` 会置位关闭信号），
+        故收敛带 ``after_intentional_teardown=True``。绝不吞掉原始异常——调用方随即重抛。
+        English: bounded teardown + forced convergence for connect-phase failures; never swallows
+        the original exception (the caller re-raises immediately).
+        """
+        if self._session_keep_alive_task is not task:
+            # #247：迟到的旧代 connect 失败收口——不得拆/清新代（同实例重连边界；生产每次新建 client）。
+            logger.debug("Stale connect failure ignored; current generation already replaced")
+            return
+        logger.warning(
+            f"MCP connect failed ({reason}); tearing down and converging to error. server params: {truncate(self.params)}",
+        )
+        # 会话曾创建成功 → 允许 done callback 在拆除窗口内按「连接后失败」处理。
+        self._session_ready = True
+        try:
+            await self._close_task()
+        finally:
+            # #247：握手期失败可能已写入部分初始化态——清掉，避免 error 态携带陈旧 capabilities
+            # （list_windows 会据此走能力分支 → 惰性 aconnect → MachineError 被吞成周期日志）。
+            # 代际守卫：仅本代可清（旧代收口迟到不得清新代）。
+            if self._session_keep_alive_task is task:
+                self._initialize_result = None
+                self._subscribed_window_uris.clear()
+            self._spawn_convergence(task, after_intentional_teardown=True)
+            # #247：拆除被取消/短路时仍 best-effort 回收子进程（detached 收敛任务不保证能运行；
+            # 仅本代存活任务——不得强杀新代子进程）。
+            if self._session_keep_alive_task is task and not task.done():
+                await self._aforce_kill()
 
     # region 状态转换回调函数基类实现
     async def aprepare_connect(self, event: EventData) -> None:
@@ -316,13 +608,99 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
     async def on_enter_connected(self, event: EventData) -> None:
         """进入已连接状态（可重写）"""
         logger.debug(f"Entering connected state with event: {event}\n\nserver params: {truncate(self.params)}")
-        self._session_keep_alive_task = asyncio.create_task(self._keep_alive_task())
-        # 等待会话创建成功
-        await self._create_session_success_event.wait()
+        # #247：状态在进入本回调**之前**已被置为 connected；initialize() 完成前不得把任务死亡
+        # 当作「连接后失败」收敛（否则会把连接中失败的 client 以 error 状态提交给 manager）。
+        # The state is already `connected` before this callback; do not converge until initialize() completes.
+        self._session_ready = False
+        # #252：**换代即换关闭信号对象**（单点清理，任务体内不再 clear）。新建与建任务之间无 await
+        # ⇒ 二者天然同代；任何一代都不可能再抹掉别代已置位的信号。
+        # A fresh close signal per generation, created in the same synchronous block as the task.
+        self._close_event = asyncio.Event()
+        self._session_keep_alive_task = asyncio.create_task(self._keep_alive_task(self._close_event))
+        task = self._session_keep_alive_task
+        # #247：任务意外终止（anyio 取消 / 传输死亡）时由 done callback 把状态机收敛到 error，
+        # 避免 "connected + _async_session=None" 的半断开形态外泄到 adisconnect/shutdown。
+        task.add_done_callback(self._on_keep_alive_task_done)
+        # #247：同时等待「会话创建成功」与「keep-alive 任务提前结束」。旧实现只等 success 事件：
+        # 创建失败（stdio 命令不存在 / 传输被取消）时任务已死、事件永不置位 → aconnect() 永久挂起
+        # （stdio/sse 直连路径**没有** bounded connect 兜底），StartPermit 还会拖死 gate.drain()。
+        # Wait for either success or the keep-alive task ending early; a creation failure must fail fast.
+        success_wait = asyncio.create_task(self._create_session_success_event.wait())
+        try:
+            try:
+                await asyncio.wait({success_wait, task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                success_wait.cancel()
+                with suppress(asyncio.CancelledError):
+                    await success_wait
+        except BaseException:
+            # #247：connect 在「获取会话」阶段被取消（stdio spawn / sse 建连进行中）——transitions 的
+            # ``process_context`` 会吞掉 CancelledError；若不在此收口，keep-alive 稍后仍会把会话建出来
+            # 并永久等待 close_event ⇒ 会话/子进程/长连接孤儿。收口后原取消照旧上抛。
+            # The cancel is swallowed by transitions; tear the keep-alive down here or it orphans the session.
+            await self._afail_connect(task, "connect cancelled while acquiring session")
+            raise
+        # #247：直接取会话引用，**不得**走惰性 ``async_session``——半断开时会 ``aconnect`` from
+        # connected → MachineError。会话已被 keep-alive 的 finally 清空 = 创建失败或创建后被拆除。
+        session = self._async_session
+        if session is None:
+            exc = None if task.cancelled() else task.exception()
+            # keep-alive 的 except-Exception 已消费原异常（任务正常结束），用留存字段还原根因。
+            cause = exc if exc is not None else self._create_session_error
+            await self._afail_connect(task, "session creation failed or torn down before initialize()")
+            raise ConnectionError("MCP session creation failed") from cause
+        # #247：initialize() 与 keep-alive 任务竞速。mcp 的 ClientSession 无读超时：传输在握手窗口
+        # 死亡/黑洞时 initialize 可能永不返回（receive loop 取消后补发 CONNECTION_CLOSED 的 await
+        # 还会再抛 CancelledError）——stdio/sse 直连无 bounded connect，StartPermit 不返回会拖死
+        # gate.drain()/shutdown。任务先结束 ⇒ 取消 init 并失败快返。
+        # Race initialize() against keep-alive death; mcp has no read timeout, so initialize can hang.
+        init_task = asyncio.create_task(session.initialize())
+        try:
+            try:
+                done, _ = await asyncio.wait(
+                    {init_task, task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=self._connect_handshake_timeout,
+                )
+            finally:
+                if not init_task.done():
+                    init_task.cancel()
+                    # #247：有界等待取消生效；**不得**吞掉调用方自身的取消（asyncio.wait 会把外层
+                    # CancelledError 原样上抛，交由外层 except 收口）。initialize 若忽略取消，
+                    # 等待 _INIT_CANCEL_GRACE 后放弃（detached 任务随 loop 关闭回收）。
+                    cancel_done, _ = await asyncio.wait({init_task}, timeout=_INIT_CANCEL_GRACE)
+                    if init_task in cancel_done and not init_task.cancelled():
+                        with suppress(BaseException):
+                            init_task.exception()
+                    elif init_task not in cancel_done:
+                        logger.warning("MCP initialize() ignored cancellation; abandoning the task")
+                elif not init_task.cancelled():
+                    # 领取已完成的异常，避免 "Task exception was never retrieved"（任务同时完成分支）
+                    with suppress(BaseException):
+                        init_task.exception()
+        except BaseException:
+            await self._afail_connect(task, "connect cancelled during initialize()")
+            raise
+        if not done:
+            # #247：握手 deadline 超时（keep-alive 仍存活但 initialize 死锁/无响应）——不能只靠
+            # 「任务死亡」竞速，否则 stdio/sse 的 StartPermit 会永久拖死 gate.drain()/shutdown。
+            await self._afail_connect(task, "initialize() handshake timed out")
+            raise ConnectionError("MCP initialize() handshake timed out")
+        if task.done():
+            # 同时完成时 init_task 的异常已在 finally 领取；本失败携带 keep-alive 的拆除异常为因。
+            cause = None if task.cancelled() else task.exception()
+            await self._afail_connect(task, "transport died during initialize()")
+            raise ConnectionError("MCP transport failed during initialize()") from cause
         # 初始化client_session
         # 存储初始化返回结果，供后续使用
         # Store InitializeResult for later use
-        self._initialize_result = await (await self.async_session).initialize()
+        try:
+            self._initialize_result = init_task.result()
+        except BaseException:
+            # #247：握手期失败（含传输死亡/取消）→ 回收会话/子进程并按 error 收口，绝不吞原始异常。
+            await self._afail_connect(task, "initialize() failed")
+            raise
+        self._session_ready = True
 
     async def aafter_connect(self, event: EventData) -> None:
         """连接后操作（可重写）"""
@@ -334,9 +712,16 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         logger.debug(f"Preparing disconnection with event: {event}\n\nserver params: {truncate(self.params)}")
 
     async def acan_disconnect(self, event: EventData) -> bool:
-        """断开条件检查（可重写）"""
+        """断开条件检查（可重写）。
+
+        中文: **纯谓词**——合法 source 已由转移表限定（connected / error）。**禁止**在此经
+        ``async_session`` 惰性建连：半断开（connected + 无会话）时会触发 ``aconnect`` →
+        ``MachineError("Can't trigger event aconnect from state connected!")``（#247 根因）。
+        English: pure predicate; never lazily connect here — a half-broken client would raise
+        MachineError from aconnect (#247 root cause).
+        """
         logger.debug(f"Checking disconnection conditions with event: {event}\n\nserver params: {truncate(self.params)}")
-        return (await self.async_session) is not None
+        return True
 
     async def abefore_disconnect(self, event: EventData) -> None:
         """断开前操作（可重写）"""
@@ -347,9 +732,31 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         logger.debug(f"Entering disconnected state with event: {event}\n\nserver params: {truncate(self.params)}")
         # 关闭异步会话，保证资源的正常释放
         logger.debug(f"Enter disconnected state async task: {asyncio.current_task().get_name()}")
+        task = self._session_keep_alive_task
         await self._close_task()
-        # 等待会话关闭
-        await self._async_session_closed_event.wait()
+        # #247：没有**在途**拆除可等时直接跳过有界等待，避免半断开断开白等 _TEARDOWN_TIMEOUT：
+        # ① 从未建立 keep-alive 任务（connect 前就 aerror）；② 任务已结束（其 finally 已置位，
+        # 或 ainitialize 在任务已结束时清掉了事件——此时永远不会再有置位者）。
+        # Skip the wait when there is no live teardown to wait for.
+        if task is None or task.done():
+            return
+        # 等待会话关闭，**带兜底上界**（#211）：``_close_task`` 有两条**确实会**让信号缺席的路径 ——
+        #   ① 首段早退（``task is None or task.done()``）—— 无信号可等；
+        #   ② 首段等待被取消的 ``except asyncio.CancelledError: return`` —— 被 shield 的收尾任务仍在跑。
+        # （``except Exception`` 分支曾是第三条，F1 之后其 finally 已保证置位，不再算缺口；``except TimeoutError``
+        #  分支会落入强杀并补发信号，也不算缺口。此处按**分支内容**而非行号指代——行号会随每次 diff 腐化。）
+        # 任何单点异常都不该把「断开」变成永久等待；正常路径信号已置位 → 本 wait 立即返回，零额外时延。
+        # Bounded wait: a single failure point must never turn disconnect into a permanent wait.
+        try:
+            await asyncio.wait_for(self._async_session_closed_event.wait(), timeout=_TEARDOWN_TIMEOUT)
+        except TimeoutError:
+            logger.error(
+                f"MCP 会话关闭信号等待超时（{_TEARDOWN_TIMEOUT}s），强制继续断开并强杀子进程；"
+                f" server params: {truncate(self.params)}",
+            )
+            # 信号缺席即「拆除状态未知」→ 按 _close_task 同款姿态兑底强杀，确保子进程不会比本进程活得久。
+            # best-effort，绝不抛出 / same escalation as _close_task: never let a child outlive us.
+            await self._aforce_kill()
 
     async def aafter_disconnect(self, event: EventData) -> None:
         """断开后操作（可重写）"""
@@ -400,6 +807,9 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         self._create_session_success_event.clear()
         self._create_session_failure_event.clear()
         self._async_session_closed_event.clear()
+        # #247：换代后在新会话 initialize() 完成前不得把任务死亡当作「连接后失败」。
+        self._session_ready = False
+        self._create_session_error = None
         await self._close_task()
 
     async def aafter_initialize(self, event: EventData) -> None:
@@ -651,7 +1061,10 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             logger.debug("Session keep-alive task close-wait was cancelled")
             return
         except Exception as e:
-            logger.error(f"Session keep-alive task failed: {e}", exc_info=True)
+            # #211：拆除期上下文报错（典型为 anyio ``ExceptionGroup(BrokenResourceError)``）属**非致命** ——
+            # ``_keep_alive_task`` 的 finally 已保证关闭信号与状态清理照常执行、停机已收敛，故降为 WARNING，
+            # 但保留堆栈（真出别的问题时仍需第一手线索）。级别不再暗示「启动失败」。
+            logger.warning(f"Session keep-alive task ended with teardown error (关闭信号已照常置位): {e}", exc_info=True)
             return
         # 3. 兑底强杀 + 再次有限等待 / force-kill fallback then bounded re-wait
         await self._aforce_kill()
@@ -665,6 +1078,40 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
             # 子进程已强杀，补发 closed 事件，避免 on_enter_disconnected 的 closed 等待挂死
             # Child already force-killed; ensure closed-event is set so disconnect doesn't hang.
             self._async_session_closed_event.set()
+
+    async def adiscard(self) -> None:
+        """显式回收一个**从未提交**给 manager 的 client 的会话 / 传输 / 子进程上下文（#252）。
+
+        中文: 与 :meth:`adisconnect` 的分工——``adiscard`` **刻意不经状态机**：弃置对象的终态对任何
+        人（含状态回调的宿主）都没有意义，而半断开（connected + 无会话）或连接中调 ``adisconnect``
+        会撞 ``MachineError`` 或与在途 transition 竞速。``_close_task`` 幂等、有界、自带强杀兜底，
+        且对「从未建过 keep-alive 任务」的 client 立即返回。
+        非抛出（``CancelledError`` 由 ``_close_task`` 内部按既有语义处理）：调用点都在 ``finally`` 里，
+        绝不能顶替正在传播的主异常。
+        English: Best-effort, non-raising reclamation for a client that was never committed to a
+        manager; deliberately state-machine-free (a discarded client's terminal state is meaningless,
+        and `adisconnect` from a half-broken / connecting client raises or races in-flight transitions).
+        """
+        # ⚠️ 必须连 ``BaseExceptionGroup`` 一起拦：anyio 的拆除期聚合可能包含 ``CancelledError``，
+        # 此时抛的是 ``BaseExceptionGroup``（``except Exception`` 不拦）。放它逃逸会**顶替 finally
+        # 中正在传播的主异常**——上游据此分类的重定向 stop / 超时会被换成裸 group，``_aspawn_client``
+        # 的分类臂失配（不写 ERROR），``clear_oauth`` 的 ``suppress`` 也拦不住。本方法的契约是
+        # 「除 CancelledError 外不抛」。
+        # Must also swallow BaseExceptionGroup (anyio teardown may aggregate CancelledError): letting it
+        # escape would replace the primary exception in flight and break upstream classification.
+        try:
+            try:
+                await self._close_task()
+            except (Exception, BaseExceptionGroup):
+                logger.warning("Discarding an uncommitted MCP client failed during teardown", exc_info=True)
+        finally:
+            # ``_close_task`` 在「任务已结束 / 从未创建」时早退，不覆盖「子进程已在、任务没起来」的窄路径；
+            # 强杀是 best-effort 且无子进程时 no-op。/ Covers "child spawned but task never ran".
+            await self._aforce_kill()
+            # 弃置对象不会再被强杀：清空 PID 集，防止同一对象将来被复用时按陈旧 PID 误杀（PID 复用）。
+            # The discarded client is never force-killed again — drop the PID set so a future PID reuse
+            # can never make it kill an unrelated process.
+            self._child_pids.clear()
 
     async def _aforce_kill(self) -> None:
         """兑底强杀本 client 启动的子进程树（仅 stdio 传输有子进程；其它传输为 no-op）。

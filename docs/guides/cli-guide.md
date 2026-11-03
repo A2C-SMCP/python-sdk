@@ -22,7 +22,13 @@ a2c-computer run
 
 # 常用参数
 a2c-computer run --auto-connect true --auto-reconnect true
+
+# 限制 MCP Server 并发启动数（单个启动 / start all / 治理恢复共用同一上限）
+a2c-computer run --concurrency 4
 ```
+
+`--concurrency N`：MCP 最大并发启动数，属宿主运行时策略、不落盘。不传 = 保持串行启动的既有行为；`0` 按 `1`
+处理。该上限在启动前安装，运行期不可更改。
 
 启动后进入交互模式（提示符 `a2c>`），输入 `help` 查看可用命令。
 
@@ -87,9 +93,14 @@ a2c> stop filesystem
 | 命令 | 说明 |
 |------|------|
 | `socket connect <url>` | 连接信令服务器 |
-| `socket join <office_id> <name>` | 加入房间 |
+| `socket join <office_id> <name>` | 加入房间；`<name>` 与本连接**已尝试声明过**的名字不同时自动重建连接（见下） |
 | `socket leave` | 离开当前房间 |
 | `notify update` | 通知配置更新 |
+
+> **改名 = 换一条新连接。** 协议规定「同一 sid 声明与既有会话不同的 `role` / `name` ⇒ 拒绝（`403`）」
+> ——身份（role + name）在一条连接的生命周期内不可变。因此 `socket join <office> <new_name>` 若与本
+> 连接已声明的名字不同，CLI 会依次执行：离开旧房 → 断开 → 以新名重连 → 加入新房间（逐步打印进度）。
+> **同名换房**（`socket join <其它房> <当前名>`）不重建连接。
 
 ### 调试工具
 

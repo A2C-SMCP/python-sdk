@@ -188,13 +188,14 @@ def test_disabled_mcpjson_allowed_from_any_scope(scope: SettingsScope) -> None:
 def test_field_sets_exact() -> None:
     """字段集合内容精确（对拍 rust ``test_field_sets_exact``）——防「顺手增删」漂移。"""
     assert POLICY_ONLY_FIELDS == frozenset({"allowedMcpServers", "deniedMcpServers"})
-    # #157：enable 方向判据（拒 project）；#196：landingRoot（写目标重定向面，协议 blob-transfer.md §7）。
+    # #157：enable 方向判据（拒 project）；#196：landingRoot（写目标重定向面，协议 blob-transfer.md §7）；
+    # #236：readRoots（读授权扩张面，协议 security.md §读取通道安全 / computer-management §7 不变量 #7）。
     # **不含** disabledMcpjsonServers —— DENY 方向 fail-safe。
     assert TRUSTED_SCOPE_ONLY_FIELDS == frozenset(
-        {"enabledMcpjsonServers", "enableAllProjectMcpServers", "landingRoot"}
+        {"enabledMcpjsonServers", "enableAllProjectMcpServers", "landingRoot", "readRoots"}
     )
     assert BOOL_FIELDS == frozenset({"strictKnownMarketplaces", "enableAllProjectMcpServers"})
-    assert len(STRING_ARRAY_FIELDS) == 6
+    assert len(STRING_ARRAY_FIELDS) == 7
 
 
 # ---------------------------------------------------------------------------

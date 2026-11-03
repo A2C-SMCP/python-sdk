@@ -25,18 +25,21 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids
+from a2c_smcp.computer.cli.commands import identity as identity_cmd
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
 from a2c_smcp.computer.cli.commands import skill as skill_cmd
 from a2c_smcp.computer.cli.commands import validate as validate_cmd
 from a2c_smcp.computer.cli.completer import A2CCompleter
+from a2c_smcp.computer.cli.interactive_impl import ConnectionArgs
 from a2c_smcp.computer.cli.interactive_impl import interactive_loop as _interactive_loop_impl
 from a2c_smcp.computer.cli.utils import (
     parse_kv_pairs,
     resolve_import_target,
 )
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.identity import ComputerIdentityError
 from a2c_smcp.computer.inputs.resolver import InputResolver
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput as MCPServerInputModel,
@@ -192,6 +195,15 @@ def _root(
     approve_all_mcp: bool = typer.Option(
         False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
     ),
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help=(
+            "MCP 最大并发启动数（宿主运行时策略，不落盘；缺省不传 = 保持串行的既有行为，0 按 1 处理）。"
+            "约束单个启动 / `start all` / 治理恢复全路径。"
+            " / max concurrent MCP starts (runtime policy, not persisted; unset = serial as before, 0 → 1)"
+        ),
+    ),
 ) -> None:
     """
     根级入口：
@@ -223,6 +235,7 @@ def _root(
             mcp_config=mcp_config,
             approve_all_mcp=approve_all_mcp,
             settings_file=settings_file,
+            concurrency=concurrency if isinstance(concurrency, int) else None,
         )
 
 
@@ -230,6 +243,7 @@ async def _interactive_loop(
     comp: Computer,
     init_client: SMCPComputerClient | None = None,
     *,
+    init_connection: ConnectionArgs | None = None,
     approve_all_mcp: bool = False,
     settings_flag_path: Path | None = None,
 ) -> None:
@@ -240,6 +254,8 @@ async def _interactive_loop(
     ``settings_flag_path`` = ``--settings <file>``（flag 层 **settings.json**）。旧名 ``mcp_flag_config`` 已更名：
     它从来不是 mcp.json，那个名字主动误导（#154）。flag 层 **mcp.json**（``--mcp-config``）走另一条路——注入
     :class:`Computer`（boot 声明式输入），不经本参数。
+
+    ``init_connection`` = 启动参数建连所用的参数，供 ``socket join`` 改名时重放（协议 events.md:610）。
     """
     await _interactive_loop_impl(
         comp,
@@ -247,6 +263,7 @@ async def _interactive_loop(
         patch_stdout_ctx=patch_stdout,
         smcp_client_cls=SMCPComputerClient,
         init_client=init_client,
+        init_connection=init_connection,
         completer=A2CCompleter(comp),
         approve_all_mcp=approve_all_mcp,
         settings_flag_path=settings_flag_path,
@@ -265,6 +282,7 @@ def _run_impl(
     mcp_config: str | None,
     approve_all_mcp: bool = False,
     settings_file: str | None = None,
+    concurrency: int | None = None,
 ) -> None:
     """
     纯实现函数：不要在此处使用 Typer 的 Option 默认值，避免 OptionInfo 泄露到运行时。
@@ -310,8 +328,13 @@ def _run_impl(
             mcp_flag_config=flag_mcp_path,
             flag_settings_path=Path(settings_file) if isinstance(settings_file, str) else None,
         )
+        # #208：`--concurrency` 为宿主显式注入的运行时策略（不落盘；缺省不传 = 串行、行为不变）。
+        # 单启 / `start all` / 治理恢复共享该 Computer 级上限。须在 boot_up（`async with comp`）之前安装。
+        if isinstance(concurrency, int):
+            comp.with_mcp_start_concurrency(concurrency)
         async with comp:
             init_client: SMCPComputerClient | None = None
+            init_connection: ConnectionArgs | None = None
             if url:
                 try:
                     auth_dict = parse_kv_pairs(auth)
@@ -325,7 +348,21 @@ def _run_impl(
                 effective_namespace = namespace or SMCP_NAMESPACE
                 init_client = SMCPComputerClient(computer=comp, namespace=effective_namespace)
                 # 通过 CLI 指定命名空间，确保连接时建立对应 namespace 会话
-                await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
+                try:
+                    await init_client.connect(url, auth=auth_dict, headers=headers_dict, namespaces=[effective_namespace])
+                except ComputerIdentityError as e:
+                    # protocol#64：身份持久化损坏 / 不可读写 ⇒ 明确报错并以非零码终止，绝不静默用临时值
+                    # （否则宿主的持久引用会无信号地全部失效）。
+                    # Corrupt/unreadable identity aborts startup with a clear message and non-zero exit.
+                    console.print(f"[red]❌ Computer 身份不可用 / Computer identity unavailable: {e}[/red]")
+                    raise typer.Exit(1) from e
+                # 记录连接参数：``socket join`` 改名须换新连接（协议 events.md:610），该路径要重放这四个值
+                init_connection = {
+                    "url": url,
+                    "namespace": effective_namespace,
+                    "auth": auth_dict,
+                    "headers": headers_dict,
+                }
                 console.print("[green]已通过启动参数连接到 Socket.IO / Connected via CLI options[/green]")
 
             # `--mcp-config` 的 servers/inputs 不在此加载：它是 flag 层 mcp.json，已注入 Computer，由
@@ -334,6 +371,7 @@ def _run_impl(
             await _interactive_loop(
                 comp,
                 init_client=init_client,
+                init_connection=init_connection,
                 approve_all_mcp=approve_all_mcp is True,
                 settings_flag_path=Path(settings_file) if isinstance(settings_file, str) else None,
             )
@@ -368,6 +406,15 @@ def run(
     approve_all_mcp: bool = typer.Option(
         False, "--approve-all-mcp", help="启动期全批 pending MCP server（仅本次、不落盘）/ approve all pending MCP (this run)",
     ),
+    concurrency: int | None = typer.Option(
+        None,
+        "--concurrency",
+        help=(
+            "MCP 最大并发启动数（宿主运行时策略，不落盘；缺省不传 = 保持串行的既有行为，0 按 1 处理）。"
+            "约束单个启动 / `start all` / 治理恢复全路径。"
+            " / max concurrent MCP starts (runtime policy, not persisted; unset = serial as before, 0 → 1)"
+        ),
+    ),
 ) -> None:
     """
     中文: 启动计算机并进入持续运行模式。servers 与 inputs 经 mcp.json 各 scope（含 ``--mcp-config`` flag 层）声明。
@@ -389,6 +436,7 @@ def run(
         mcp_config=mcp_config,
         approve_all_mcp=approve_all_mcp,
         settings_file=settings_file,
+        concurrency=concurrency if isinstance(concurrency, int) else None,
     )
 
 
@@ -403,6 +451,9 @@ skill_app = typer.Typer(help="Skills cross-source query (list / info)")
 # MCP server 挂载延到下次 REPL boot 经批准框落地（§4.6）。settings 直读写物化意图层。
 plugin_app = typer.Typer(help="Plugins — skill+mcp bundles (install / enable / list ...)")
 settings_app = typer.Typer(help="settings.json intent layer (show / get / set / edit)")
+# identity（v0.5.0 / protocol#64）：Computer 稳定身份的重置入口。独立 CLI 只做原子文件替换 +
+# 重启提示（进程内无法判定运行中的 Computer 是否已连接；REPL 的 `identity reset` 才做已连接拒绝）。
+identity_app = typer.Typer(help="Computer identity (reset)")
 
 
 @marketplace_app.command("add")
@@ -659,10 +710,17 @@ def _settings_edit(
     raise typer.Exit(code)
 
 
+@identity_app.command("reset")
+def _identity_reset() -> None:
+    """重置本机 Computer 稳定身份（需重启运行中的 Computer）/ Reset the stable Computer identity."""
+    raise typer.Exit(identity_cmd.reset_identity_cli())
+
+
 app.add_typer(marketplace_app, name="marketplace")
 app.add_typer(skill_app, name="skill")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(settings_app, name="settings")
+app.add_typer(identity_app, name="identity")
 
 
 # 为 console_scripts 兼容提供入口

@@ -41,6 +41,7 @@ from a2c_smcp.smcp import (
     SMCPTool,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack
 
 pytestmark = pytest.mark.e2e
 
@@ -184,13 +185,13 @@ async def test_async_integration_agent_receives_vrl_transformed_result(
         await agent_client.connect_to_server(server_url)
         await asyncio.sleep(0.2)
 
-        ok, err = await agent_client.call(
+        ack = await agent_client.call(
             JOIN_OFFICE_EVENT,
             {"role": "agent", "name": "test-agent-vrl-1", "office_id": office_id},
             namespace=SMCP_NAMESPACE,
             timeout=5,
         )
-        assert ok is True, f"Agent join office failed: {err}"
+        assert_empty_ack(ack, action="agent join office")
         await asyncio.sleep(0.3)
 
         # 2. Computer 启动并连接到 Server

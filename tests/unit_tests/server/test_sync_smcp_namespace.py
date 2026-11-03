@@ -6,17 +6,19 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import RoomFullError, SMCPNamespaceError
 from a2c_smcp.server.sync_namespace import SyncSMCPNamespace
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
     LEAVE_OFFICE_NOTIFICATION,
 )
+from tests.room_acks import assert_empty_ack, assert_rejected_ack
 
 
 class _DummyAuthProv:
@@ -45,21 +47,10 @@ def test_enter_room_agent_rules(ns):
     with pytest.raises(ValueError):
         ns.enter_room("sidA", "B")
 
-    # agent 不在任何房间，房间已有 agent -> 抛错
+    # agent 不在任何房间，房间已有 agent（#230：席位表是唯一判据）-> 4101
     ns.get_session.return_value = {"role": "agent"}
-    ns.server.manager.get_participants.return_value = ["sidX"]
-    # 该参与者为 agent
-
-    def _get_sess_for_participant(sid):
-        if sid == "sidX":
-            return {"role": "agent"}
-        return {}
-
-    ns.get_session.side_effect = [
-        {"role": "agent"},  # self session
-        {"role": "agent"},  # participant session
-    ]
-    with pytest.raises(ValueError):
+    ns._seat_to_sid[("room1", "agent")] = "sidX"
+    with pytest.raises(RoomFullError):
         ns.enter_room("sidB", "room1")
 
     # agent 已在同一房间 -> 返回且不重复 emit
@@ -103,7 +94,7 @@ def test_enter_room_updates_session_and_broadcast(ns):
     ns.emit.assert_called_once()
     args, kwargs = ns.emit.call_args
     assert args[0] == ENTER_OFFICE_NOTIFICATION
-    assert kwargs.get("room") == "roomZ"
+    assert kwargs.get("room") == "office:roomZ"
     assert kwargs.get("skip_sid") == "sid1"
 
 
@@ -126,7 +117,7 @@ def test_leave_room_broadcast_and_clear_session(monkeypatch):
     assert "office_id" not in sess  # 已清理
 
 
-def test_on_server_join_office_ok_and_rollback_on_error():
+def test_on_server_join_office_ok_and_error_ack():
     ns = SyncSMCPNamespace(_DummyAuthProv())
     ns.get_session = MagicMock(return_value={})
     ns.save_session = MagicMock()
@@ -136,38 +127,52 @@ def test_on_server_join_office_ok_and_rollback_on_error():
     server.manager.get_participants = MagicMock(return_value=[])
     ns.server = server
 
-    # 正常路径
-    ok, err = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
-    assert ok is True and err is None
+    payload = {
+        "role": "computer",
+        "name": "n",
+        "office_id": "o",
+        # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id
+        "computer_id": "11111111-1111-4111-8111-111111111111",
+    }
 
-    # enter_room 抛错 -> 回滚
+    # 正常路径：成功 = 空 ack（v0.5.0 起；此前为 (True, None) 元组）
+    ack = ns.on_server_join_office("sid", payload)
+    assert_empty_ack(ack)
+
+    # enter_room 抛错 -> 回 500 笼统文案（原文只进日志）；身份声明**不回滚**（protocol#64）
     ns.enter_room = MagicMock(side_effect=RuntimeError("boom"))
-    ok2, err2 = ns.on_server_join_office("sid", {"role": "computer", "name": "n", "office_id": "o"})
-    assert ok2 is False and "Internal server error" in err2
+    ack2 = ns.on_server_join_office("sid", payload)
+    assert_rejected_ack(ack2, 500)
+    assert "boom" not in json.dumps(ack2)
 
 
 def test_on_server_leave_office_ok_and_error():
     ns = SyncSMCPNamespace(_DummyAuthProv())
+    # 房间号取自会话（权威），故会话必须带 office_id / the room comes from the session
+    ns.get_session = MagicMock(return_value={"role": "agent", "office_id": "o"})
     ns.leave_room = MagicMock()
-    ok, err = ns.on_server_leave_office("sid", {"office_id": "o"})
-    assert ok is True and err is None
+    ack = ns.on_server_leave_office("sid", {"office_id": "o"})
+    assert_empty_ack(ack, action="server:leave_office")
 
     ns.leave_room = MagicMock(side_effect=RuntimeError("x"))
-    ok2, err2 = ns.on_server_leave_office("sid", {"office_id": "o"})
-    assert ok2 is False and "Internal server error" in err2
+    ack2 = ns.on_server_leave_office("sid", {"office_id": "o"})
+    assert_rejected_ack(ack2, 500, action="server:leave_office")
+    assert "x" != ack2["message"] and "boom" not in json.dumps(ack2)
 
 
 def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     ns = SyncSMCPNamespace(_DummyAuthProv())
 
-    # cancel 仅允许 agent
-    ns.get_session = MagicMock(return_value={"role": "agent", "name": "a1"})
+    # cancel 仅允许 agent；广播必须锁定发起者自己的 office（#212：未入房的拒绝路径见
+    # tests/unit_tests/server/test_smcp_namespace_sync.py::TestServerBroadcastOfficeIsolationSync）
+    ns.get_session = MagicMock(return_value={"role": "agent", "office_id": "roomA", "name": "a1"})
     ns.emit = MagicMock()
     ns.on_server_tool_call_cancel("a1", {"agent": "a1", "req_id": "r1"})
     ns.emit.assert_called_once()
     args1, kwargs1 = ns.emit.call_args
     assert args1[0] == CANCEL_TOOL_CALL_NOTIFICATION
     assert kwargs1.get("skip_sid") == "a1"
+    assert kwargs1.get("room") == "office:roomA"
 
     # update_config 仅允许 computer
     ns.get_session = MagicMock(return_value={"role": "computer", "office_id": "roomR"})
@@ -175,7 +180,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     ns.on_server_update_config("c1", {"computer": "c1"})
     ns.emit.assert_called_once()
     _args2, kwargs2 = ns.emit.call_args
-    assert kwargs2.get("room") == "roomR"
+    assert kwargs2.get("room") == "office:roomR"
 
     # client tool_call：仅允许 agent，经 _relay_client_call 路由到目标 computer（#99）—— 目标 sess 须解析为 computer 且同 office
     # tool_call now routes via _relay_client_call (#99): target session must resolve to a computer in the same office
@@ -184,7 +189,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
     )
     ns.call = MagicMock(return_value={"ok": True, "result": "success"})
     ns.get_sid_by_name = MagicMock(return_value="c1")
-    ret = ns.on_client_tool_call("a1", {"robot_id": "a1", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5})
+    ret = ns.on_client_tool_call("a1", {"agent": "a1", "req_id": "r2", "computer": "c1", "tool_name": "t", "params": {}, "timeout": 5})
     assert ret == {"ok": True, "result": "success"}
     ns.call.assert_called_once()
     args, kwargs = ns.call.call_args
@@ -192,10 +197,7 @@ def test_on_server_tool_call_cancel_and_update_config_and_client_paths():
 
     # client get_tools：校验在同一房间并转发
     ns.get_session = MagicMock(
-        side_effect=[
-            {"role": "computer", "office_id": "room1"},  # computer sess
-            {"role": "agent", "office_id": "room1"},  # agent sess
-        ],
+        side_effect=lambda sid: {"role": "computer", "office_id": "room1"} if sid == "c1" else {"role": "agent", "office_id": "room1"},
     )
     ns.call = MagicMock(
         return_value={
@@ -281,13 +283,15 @@ def test_on_server_list_room_permission_denied():
 
     ns.get_session = MagicMock(return_value=agent_session)
 
-    # 执行测试，应该抛出 SMCPNamespaceError（隔离校验在 -O 下亦生效）
-    # Execute test, should raise SMCPNamespaceError (isolation holds even under -O)
-    with pytest.raises(SMCPNamespaceError, match="Agent只能查询自己所在房间的会话信息"):
-        ns.on_server_list_room(
-            agent_sid,
-            {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
-        )
+    # #214：越权不再"静默不 ack"（那会让客户端挂到自身超时），改回 flat ErrorPayload(4104)。
+    # 隔离不变量本身不变：**绝不**返回 office_B 的任何会话数据。
+    ack = ns.on_server_list_room(
+        agent_sid,
+        {"agent": agent_sid, "req_id": "req_456", "office_id": "office_B"},
+    )
+    assert_rejected_ack(ack, 4104, action="server:list_room")
+    assert ack["details"] == {"office_id": "office_B"}
+    assert "sessions" not in ack, "越权拒绝不得携带目标房成员信息"
 
 
 def test_on_server_list_room_filters_invalid_sessions(monkeypatch):
@@ -345,55 +349,29 @@ def test_enter_room_computer_duplicate_name_raises_error(ns):
     new_computer_sid = "new_sid"
     new_session = {"role": "computer", "name": "comp1", "sid": new_computer_sid}
 
-    # Mock get_participants 返回房间内已有的参与者
-    # Mock get_participants to return existing participant
-    ns.server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
+    # #230：同 role 第二个会话无论同名与否都先撞席位（4101，不再是 4105）
+    ns._seat_to_sid[(existing_session["office_id"], "computer")] = existing_computer_sid
+    ns.get_session.side_effect = None
+    ns.get_session.return_value = new_session
 
-    # Mock get_session：第一次返回新Computer的session，第二次返回已存在Computer的session
-    # Mock get_session: first call returns new Computer's session, second returns existing Computer's session
-    ns.get_session.side_effect = [new_session, existing_session]
-
-    # 应该抛出 ValueError，提示重名
-    # Should raise ValueError indicating duplicate name
-    with pytest.raises(ValueError, match="Computer with name 'comp1' already exists in room 'room1'"):
+    with pytest.raises(RoomFullError, match="Room already has a computer"):
         ns.enter_room(new_computer_sid, "room1")
 
 
-def test_enter_room_computer_different_name_succeeds(ns, monkeypatch):
+def test_enter_room_second_computer_with_different_name_is_room_full(ns):
     """
-    测试Computer不同名可以成功加入：房间内已有Computer，但名字不同，应该成功
-    Test Computer with different name can join: room has Computer but different name, should succeed
+    #230「每 role 一席」：房内已有 Computer 时，**不同名**的第二台同样被拒（4101），不替换、不驱逐（同步）
     """
-    from a2c_smcp.server.sync_base import SyncBaseNamespace
+    ns._seat_to_sid[("room1", "computer")] = "existing_sid"
+    ns.get_session.side_effect = None
+    ns.get_session.return_value = {"role": "computer", "name": "comp2", "sid": "new_sid"}
 
-    # 房间内已有一个名为 "comp1" 的 Computer
-    # Room already has a Computer named "comp1"
-    existing_computer_sid = "existing_sid"
-    existing_session = {"role": "computer", "name": "comp1", "office_id": "room1", "sid": existing_computer_sid}
+    with pytest.raises(RoomFullError):
+        ns.enter_room("new_sid", "room1")
 
-    # 新的 Computer 叫 "comp2"，名字不同
-    # New Computer named "comp2", different name
-    new_computer_sid = "new_sid"
-    new_session = {"role": "computer", "name": "comp2", "sid": new_computer_sid}
-
-    # Mock get_participants 返回房间内已有的参与者
-    ns.server.manager.get_participants.return_value = [(existing_computer_sid, "eio_sid")]
-
-    # Mock get_session
-    ns.get_session.side_effect = [new_session, existing_session, new_session]
-    ns._register_name = MagicMock()
-
-    # Mock 父类的 enter_room 方法
-    # Mock parent class enter_room method
-    monkeypatch.setattr(SyncBaseNamespace, "enter_room", MagicMock())
-
-    # 应该成功加入，不抛出异常
-    # Should succeed without raising exception
-    ns.enter_room(new_computer_sid, "room1")
-
-    # 验证 save_session 被调用
-    # Verify save_session was called
-    assert ns.save_session.called
+    ns.server.enter_room.assert_not_called()
+    ns.emit.assert_not_called()
+    assert ns._seat_to_sid == {("room1", "computer"): "existing_sid"}, "不替换旧 Computer"
 
 
 def test_enter_room_computer_same_sid_allowed(ns, monkeypatch):

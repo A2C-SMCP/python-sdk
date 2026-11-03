@@ -19,6 +19,10 @@ avoiding a reverse dependency from the Computer client onto the ``a2c_smcp.agent
 
 from __future__ import annotations
 
+from typing import ClassVar
+
+from a2c_smcp.smcp import ErrorCode
+
 
 class ProtocolVersionError(Exception):
     """
@@ -90,6 +94,65 @@ class SMCPNamespaceError(Exception):
     Placed at the top-level package: shared by both Server and Computer client, avoiding a
     reverse dependency from the Computer client onto ``a2c_smcp.server``.
 
+    **范围收窄（#214 / v0.5.0）**：三个**房间管理事件**中唯一走本异常的 ``server:list_room``
+    越权拒绝，自 v0.5.0 起改为回 flat ``ErrorPayload(4104)``（协议 §房间管理错误响应），不再走
+    「抛异常 ⇒ 静默不 ack」形态——「挂到客户端自身超时」与「立即收到结构化错误」是两种客户端
+    可感行为。本异常继续适用于 ``client:*`` 路由层与 Computer 端 socketio handler 的隔离校验
+    （那里的静默不 ack 由协议 §飞行中断连 许可）。
+    Scope narrowed by #214: the room-event cross-room rejection now returns a flat
+    ``ErrorPayload(4104)``; this exception still covers ``client:*`` routing and the
+    Computer-side handlers.
+
     协议依据 / Protocol: docs/specification/error-handling.md（§通用错误码 403 / §4104 Cross Room Access）
                           docs/specification/security.md（§房间隔离）
     """
+
+
+class RoomRejection(ValueError):
+    """
+    房间管理事件的**业务拒绝**（协议 flat ``ErrorPayload`` 的结构化载体）。
+    A room-management business rejection carrying the protocol error code.
+
+    适用 / Scope：``server:join_office`` 的两个业务闸门——目标房该 role 的席位已被其它会话占据（``4101``，
+    「每 role 一席」，#230）、Agent 已在其它房（``4106``）。由 ``SMCPNamespace.enter_room`` /
+    ``BaseNamespace._claim_seat`` 抛出，由 ``on_server_join_office`` 捕获并**按 code 转换为 flat
+    ErrorPayload**（#214）。``4105`` 已转为协议预留码（protocol#66），不再有对应的领域异常。
+
+    **为什么继承 ``ValueError``**：这些闸门历来抛 ``ValueError``（``except ValueError`` /
+    ``pytest.raises(ValueError)`` 是既有契约）。换型只增加**信息量**（带上协议码），不改变
+    「校验失败」这一**类别**——故既有调用方无需改动。
+
+    **消息构造上是安全的**：``str(e)`` 只含**与发起者自身相关**的上下文，**绝不**含对端会话
+    标识（sid 等）。即使将来有人误把 ``str(e)`` 塞进 ack 也无法泄露；冗长诊断（含对端 sid）
+    一律由抛出点的 ``logger.warning`` 承载。见 error-handling.md:149 / :328
+    （``details`` **MUST NOT** 携带其它会话的内部标识）。
+
+    Protocol: error-handling.md §连接与房间管理错误码 / §房间管理错误响应（protocol#61，v0.5.0）。
+    """
+
+    #: 协议错误码（:class:`~a2c_smcp.smcp.ErrorCode` 取值）；子类逐一钉死。
+    code: ClassVar[int] = 0
+
+
+class RoomFullError(RoomRejection):
+    """目标房该 role 的席位已被其它会话占据（``4101``）——「每 role 一席」规则（protocol#66，#230）。
+
+    一房至多 1 Agent、至多 1 Computer；同 role 的第二个会话**无论是否同名**都以本异常拒绝（同名不再单列
+    ``4105``）。``role`` 为**发起者自己声明**的 role（即被占的席位），不泄露对端信息。
+    The seat of the initiator's own role is taken (``4101``, "one seat per role"); same-name or not.
+    """
+
+    code: ClassVar[int] = ErrorCode.ROOM_FULL
+
+    def __init__(self, role: str) -> None:
+        self.role = role
+        super().__init__(f"Room already has {'an agent' if role == 'agent' else 'a computer'}")
+
+
+class AlreadyInRoomError(RoomRejection):
+    """Agent 已在其它房又请求入新房（``4106``）——Agent 换房 **MUST** 是显式两步。"""
+
+    code: ClassVar[int] = ErrorCode.ALREADY_IN_ROOM
+
+    def __init__(self) -> None:
+        super().__init__("Agent already in another room")

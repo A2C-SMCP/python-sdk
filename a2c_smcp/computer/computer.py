@@ -36,6 +36,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Optional
 
 from mcp import Tool, types
@@ -48,7 +49,6 @@ from mcp.types import (
     TextContent,
     ToolListChangedNotification,
 )
-from prompt_toolkit import PromptSession
 from pydantic import BaseModel, TypeAdapter
 
 from a2c_smcp.computer.base import BaseComputer
@@ -62,7 +62,18 @@ from a2c_smcp.computer.blob import (
     ToolspoolBlobStore,
     default_thresholds,
 )
+from a2c_smcp.computer.blob.path_resolver import (
+    PathPullResult,
+    ProtectedPaths,
+    ReadRoot,
+    ResolvedPath,
+    build_protected_paths,
+    build_read_roots,
+    resolve_for_pull,
+    resolve_path,
+)
 from a2c_smcp.computer.desktop.organize import organize_desktop
+from a2c_smcp.computer.identity import identity_store_path
 from a2c_smcp.computer.inputs.render import ConfigRender, collect_referenced_input_ids, load_env_file
 from a2c_smcp.computer.inputs.resolver import InputNotFoundError, InputResolver
 from a2c_smcp.computer.inventory import McpOwnership, McpPluginOwnership, McpServerWithMetadata, McpUserOwnership
@@ -88,6 +99,7 @@ from a2c_smcp.computer.mcp_clients.oauth_types import (
 )
 from a2c_smcp.computer.settings.installer import migrate_legacy_installs
 from a2c_smcp.computer.settings.mcp_config import (
+    MCP_CONFIG_FILENAME,
     McpApprovalStatus,
     McpWriteScope,
     McpWriteTargetError,
@@ -107,7 +119,8 @@ from a2c_smcp.computer.settings.recovery import (
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.schema import FIELD_LANDING_ROOT, FIELD_READ_ROOTS, SettingsScope
+from a2c_smcp.computer.settings.scope import LOCAL_SETTINGS_FILENAME, PROJECT_SETTINGS_FILENAME, TFROBOT_DIRNAME
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
     SkillEventDebouncer,
@@ -124,6 +137,7 @@ from a2c_smcp.computer.types import ToolCallRecord
 from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.cancellation import restores_cancellation
 from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.env_segment import raise_on_env_name_collisions
 from a2c_smcp.utils.logger import get_logger, truncate
@@ -137,8 +151,17 @@ _SKILL_URI_PREFIX = "skill://"
 
 if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
+    from prompt_toolkit import PromptSession
+
     from a2c_smcp.computer.settings.scope import ResolvedSettings
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
+else:
+    # 运行时占位（#226）：纯 core 安装不要求 cli extra。`PromptSession` 只用于类基类
+    # `BaseComputer[...]` 与注解求值；真正的 prompt_toolkit 由交互路径惰性导入。
+    # Runtime placeholder (#226): a bare-core install must not require the cli extra. The name is
+    # only needed for the `BaseComputer[...]` base expression / annotations; the real
+    # prompt_toolkit is imported lazily by the interactive paths.
+    PromptSession = Any
 
 
 @dataclass(frozen=True)
@@ -151,6 +174,47 @@ class _RawServerEntry:
     config: MCPServerConfig
     plugin: str | None
     marketplace: str | None
+
+
+def _absolute_path(path: Path | str | None) -> Path | None:
+    """构造期路径 → 绝对路径（展开 ``~``、相对路径按**构造期** cwd 解析、跟随符号链接）。
+
+    Normalize a constructor-supplied path to absolute (expanduser + resolve at construction).
+
+    ``resolve()`` 默认非严格：文件尚不存在也返回绝对路径（构造期允许「稍后创建」）。
+
+    ``expanduser()`` 在 ``~nosuchuser`` 形态下抛 ``RuntimeError``（本机无该用户），
+    ``resolve()`` 可抛 ``OSError``：这类输入**不得**把「flag/settings 缺文件可容错」变成构造器
+    裸 traceback（🟡3）。失败时降级为 :meth:`Path.absolute`（仍绝对、不丢拒绝集条目）并记 WARNING。
+    ``expanduser`` can raise RuntimeError for unknown users; degrade to ``absolute()`` instead of
+    crashing the constructor — the path stays absolute so the rejection set keeps its entry.
+    """
+    if path is None:
+        return None
+    raw = Path(path)
+    try:
+        return raw.expanduser().resolve()
+    except (RuntimeError, OSError, ValueError) as exc:
+        logger.warning(
+            f"路径归一失败，降级为 absolute（保持绝对形态）/ path normalization fell back to absolute: {raw!r}: {exc}",
+        )
+        return raw.absolute()
+
+
+@dataclass(frozen=True, slots=True)
+class PathAccessPolicy:
+    """一次请求的读取授权快照：读根 + 固定拒绝集（v0.5.0 #236 / protocol#65）。
+
+    A per-request snapshot of read authorization: read roots + the fixed rejection set.
+
+    ``Computer.path_access_policy()`` 由**一次** settings 解析同时得出两者，resolve 与
+    pull 共用同一快照——避免同请求内 settings 被解析多遍、也避免两次解析之间的不一致
+    （如解析途中另一进程改配置）。
+    Derived from a single settings parse so resolve/pull never disagree within one request.
+    """
+
+    roots: list[ReadRoot]
+    protected: ProtectedPaths
 
 
 class Computer(BaseComputer[PromptSession]):
@@ -167,10 +231,10 @@ class Computer(BaseComputer[PromptSession]):
         blob_resolvers: dict[str, BlobResolver] | None = None,
         blob_thresholds: BlobThresholds | None = None,
         skill_home: Path | None = None,
-        mcp_flag_config: Path | None = None,
-        flag_settings_path: Path | None = None,
+        mcp_flag_config: Path | str | None = None,
+        flag_settings_path: Path | str | None = None,
         env: Mapping[str, str] | None = None,
-        project_root: Path | None = None,
+        project_root: Path | str | None = None,
     ) -> None:
         """
         初始化 Computer 实例
@@ -244,13 +308,24 @@ class Computer(BaseComputer[PromptSession]):
         # 它在 CLI 下恒空不是缺陷，而是「CLI 不是嵌入式宿主」的正确表现。
         self._mcp_servers: set[MCPServerConfig] = set(mcp_servers or set())
         # flag 层 mcp.json 路径（`--mcp-config`）：与 `_mcp_servers` 同为当次 boot 的声明式输入（§2.5-5）。
-        self._mcp_flag_config: Path | None = mcp_flag_config
+        # **构造期归一到绝对路径**（🔴1）：审批门 origin / 固定拒绝集 / 文件读取三处必须看到同一绝对
+        # 路径。相对路径或 ``~`` 直接进拒绝集会被 ``normalize_path`` 判 invalid 后**静默丢弃**，
+        # 该文件的凭据内容仍可被 ``resolve`` + ``get_blob`` 读出（``./mcp.json`` + readRoots 含 cwd
+        # 即真实场景）。归一点选在构造器：CLI 与嵌入式宿主共用同一入口。
+        # Normalize at construction so the approval gate, the rejection set and file reads all see
+        # one absolute path; otherwise a relative/`~` flag path is silently dropped from the set.
+        self._mcp_flag_config: Path | None = _absolute_path(mcp_flag_config)
         # flag 层 settings.json 路径（`--settings`）：与 `_mcp_flag_config` 同为 flag scope 文件对（#167 子问题 3）。
-        self._flag_settings_path: Path | None = flag_settings_path
+        self._flag_settings_path: Path | None = _absolute_path(flag_settings_path)
         # #134（对齐 rust-sdk#121）：per-instance env/project_root 注入接缝。None = 进程 ambient（backward compat）。
         # 嵌入式宿主注入使 settings 解析轴（XDG / project cwd）与 ledger（skill_home）同锚点，消除归属混源。
         self._env: Mapping[str, str] | None = env
-        self._project_root: Path | None = project_root
+        # project_root 也必须归一（🔴1 同类）：嵌入式宿主传相对 ``Path("proj")`` 时，
+        # ``cwd/.tfrobot`` 会变成相对路径 → 进拒绝集时被 ``normalize_path`` 判 invalid 后静默丢弃，
+        # ``.tfrobot/mcp.json``（可含 server 字面量 env/凭据）仍可被 resolve + get_blob 读出。
+        # Normalize project_root too: a relative anchor would make `<cwd>/.tfrobot` a relative
+        # protected path that normalize_path silently drops.
+        self._project_root: Path | None = _absolute_path(project_root)
         # #149：运行期活跃集的**声明面 raw 投影**缓存（bundle_id → raw-with-bundle 未渲染 config）。get_config wire
         # 从此取 body（占位符字面保留、绝不外泄已解析 secret）；SET 仍以 manager 运行期权威为准（见 active_server_configs）。
         # #149: raw (un-rendered) projection of the runtime-active set, keyed by bundle_id — the body source for the
@@ -258,12 +333,41 @@ class Computer(BaseComputer[PromptSession]):
         self._active_raw: dict[str, _RawServerEntry] = {}
         self._auto_connect = auto_connect
         self._auto_reconnect = auto_reconnect
-        # #185：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——仅
-        # clear_oauth 的**实际能力撤回**时 +1（见 clear_oauth；config 轴分账见类内 §12 R2 注释）。
+        # #185/#197：capability 轴修订计数（对齐 Rust ``RuntimeStatus.capability_revision``）——两条推进
+        # 路径：① clear_oauth 的**实际能力撤回**；② 运行期工具投影的真实变化（tools/list_changed）。均经
+        # ``_bump_capability_revision`` 单一出口（config 轴分账见类内 §12 R2 注释）。
         self._capability_revision: int = 0
+        # #197：工具投影后台刷新任务句柄 + 在途标脏位。收到 tools/list_changed 时调度——刷新**不得**在 MCP
+        # 接收循环内联执行（会话级重入死锁，#127 实证；本 issue 复验 window 刷新内联 RPC 实测挂起）。
+        self._tool_refresh_task: asyncio.Task[None] | None = None
+        self._tool_refresh_dirty: bool = False
+        # #210：资源刷新后台任务句柄 + **按动作**分设的三个脏位。三条路径都含对**同一 MCP 会话**的真实 RPC
+        # （list_windows / list_skill_resources / read_resource），同样不得在接收循环内联执行。
+        #   ① ``_windows_list_dirty``   ：window:// 集合比对 → 变则 emit 桌面刷新
+        #   ② ``_skills_list_dirty``    ：skill:// 集合比对 → 变则重物化 + 提交 ``_skills_cache`` + 标脏去抖器
+        #   ③ ``_skills_content_dirty`` ：skill 内容级更新 → **无条件**重物化 + 标脏去抖器（**不比对、不提交缓存**）
+        # ② 与 ③ **不可合并**：``resources/updated`` 存在的意义正是「URI 集合不变、内容变了」，共用一位会让
+        # 比对把内容级更新挡掉 → Registry 永远停在旧内容（静默丢更新）。
+        # Resource-refresh background task handle + per-**action** dirty flags (#210); ② compares the
+        # resource set while ③ must not, so they cannot share a single flag.
+        self._resource_refresh_task: asyncio.Task[None] | None = None
+        self._windows_list_dirty: bool = False
+        self._skills_list_dirty: bool = False
+        self._skills_content_dirty: bool = False
+        # #227 / #210（0.4.2 回补）：停机 / boot 失败后禁止再调度资源刷新；重开由 boot_up / 懒挂载显式触发。
+        # Closed gate for the resource-refresh worker; reopened by boot_up or a lazy mount.
+        self._resource_refresh_closed: bool = False
         # #179：可注入 OAuth 凭据 store（默认进程内；宿主经 with_oauth_credential_store
         # 注入持久化实现做跨进程恢复）。两处 manager 构建点均透传。
         self._oauth_credential_store: OAuthCredentialStore = InMemoryOAuthCredentialStore()
+        # #208：Computer 级 MCP 启动并发策略（宿主经 with_mcp_start_concurrency 安装；缺省 None = 保持既有
+        # 逐项串行）。**值存于 Computer、门建于 manager**——boot_up 每次新建 manager，故 boot 回滚的
+        # aclose()（会关闸）随 manager 一起废弃，重试拿全新门，不会把 Computer 永久关死。
+        self._mcp_start_concurrency: int | None = None
+        # #208：Input 解析**全局串行锁**——并发启动期间只允许一个交互请求在飞（对齐 rust
+        # mcp_input_resolve_lock；协议 §5.13 每次实际启动重解析 Input，交互式 resolver 不得并行
+        # 弹多个提示）。锁只覆盖一次 render，**不**覆盖 spawn（提示期间不持任何 manager 锁）。
+        self._mcp_input_lock = asyncio.Lock()
         self._confirm_callback = confirm_callback
         # 中文: 按需解析器与渲染器（惰性解析 inputs，保持配置不可变）
         # English: Lazy input resolver and renderer (on-demand inputs, keep config immutable)
@@ -288,13 +392,6 @@ class Computer(BaseComputer[PromptSession]):
         # 窗口缓存（仅记录满足 WindowURI 的资源 URI，避免无关资源导致刷新）
         # Windows cache (only URIs that conform to WindowURI to avoid irrelevant refresh triggers)
         self._windows_cache: set[str] = set()
-        # #227: backport #210's per-action resource refresh worker to the 0.4.x lifecycle.
-        # Content changes cannot use the list flag: an unchanged URI set may have new content.
-        self._resource_refresh_task: asyncio.Task[None] | None = None
-        self._windows_list_dirty = False
-        self._skills_list_dirty = False
-        self._skills_content_dirty = False
-        self._resource_refresh_closed = False
 
         # v0.2.1 SKILL 子系统 / v0.2.1 SKILL subsystem（设计 §5.1，#66）
         # 持有 name → A2CSkillRef 物化索引；SKILL Home 于 boot_up 解析落盘；skill:// 缓存仿窗口缓存。
@@ -333,6 +430,10 @@ class Computer(BaseComputer[PromptSession]):
         # v0.4.0 #196：client:put_blob 上行会话 store + landingRoot（lazy；见 landing_root / blob_upload_store）
         self._blob_upload_store: BlobUploadStore | None = None
         self._landing_root: Path | None = None
+        # v0.5.0 #236 / protocol#65：client:resolve_path 的授权读根**不缓存**（见 read_roots —
+        # settings 与 root realpath 都必须每请求现算；缓存会让换指向后的旧目标被放行）。
+        # Read roots are intentionally not cached: both settings and each root's realpath must be
+        # current per request, otherwise a retargeted root symlink keeps the old target readable.
         self._blob_upload_lock = threading.Lock()
 
     # 工具调用历史类型已抽取到 a2c_smcp/computer/types.py 的 ToolCallRecord 供多处复用
@@ -425,6 +526,205 @@ class Computer(BaseComputer[PromptSession]):
                 self._blob_upload_store = candidate
             return self._blob_upload_store
 
+    # ------------------------
+    # 按路径读取 / Read-by-path (v0.5.0 #236 / protocol#65)
+    # ------------------------
+    @property
+    def read_roots(self) -> list[ReadRoot]:
+        """``client:resolve_path`` 的授权读根（settings 键 ``readRoots``）。
+
+        Authorized read roots for ``client:resolve_path`` (settings key ``readRoots``).
+
+        协议依据 / Protocol: ``security.md`` §读取通道安全；``blob-transfer.md`` §生产者三：按路径读取.
+        **默认空 = 不可读（fail-closed）**；仅受信 scope 可设（project 供给已在
+        :data:`~a2c_smcp.computer.settings.schema.TRUSTED_SCOPE_ONLY_FIELDS` 被整字段剔除），
+        跨 scope 按数组语义**拼接去重**（授权只增不减）。
+
+        **无缓存，每次请求重建（授权边界 MUST 反映当前状态）**：
+        - settings 可能被**另一进程**改写（``a2c-computer settings set``），运行期 Computer 收不到通知；
+        - 每个 root 的 realpath 形态必须反映**当前文件系统状态**——缓存编号会把「root 符号链接
+          换指向」后的旧目标无限期放行（拉取期按旧 real 围栏通过）。
+        成本 = 每请求读 2–4 个小 JSON + 每个 root 一次 realpath；root 通常 1–3 个，可忽略。
+        No cache: both the settings *and* each root's realpath must be current at every request
+        (another process may rewrite settings; a root symlink may be retargeted). Cost is a few
+        small reads + one realpath per root.
+
+        非法的单项（``build_read_roots`` 静默丢弃）与 realpath 失败的根在此记 WARNING；
+        逐项配置诊断另经 settings 校验错误通道呈现。
+        """
+        return self._compile_read_roots(self._resolve_declared_settings())
+
+    def _compile_read_roots(self, resolved: "ResolvedSettings") -> list[ReadRoot]:
+        """把已解析 settings 的 ``readRoots`` 编译为双形态根（含诊断日志）。"""
+        raw = resolved.settings.get(FIELD_READ_ROOTS)
+        if not isinstance(raw, list) or not raw:
+            return []
+        items = [item for item in raw if isinstance(item, str)]
+        compiled = build_read_roots(items)
+        for root in compiled:
+            if root.real is None:
+                logger.warning(
+                    f"readRoots 根 {root.configured!r} 的 realpath 解析失败，仅保留配置形态 / "
+                    f"realpath failed for read root {root.configured!r}; configured form kept only",
+                )
+        if len(compiled) < len(raw):
+            logger.warning(
+                f"readRoots 有 {len(raw) - len(compiled)} 项无法编译为规范路径（非法项已忽略）/ "
+                f"{len(raw) - len(compiled)} readRoots item(s) dropped as invalid",
+            )
+        return compiled
+
+    def protected_paths(self) -> ProtectedPaths:
+        """固定拒绝集：即便位于 ``readRoots`` 内也拒绝的 SDK 自管位置（每次现算）。
+
+        Fixed rejection set: SDK-managed locations refused even inside ``readRoots``.
+
+        协议依据 / Protocol: ``blob-transfer.md`` §固定拒绝集；``security.md`` §读取通道安全（零凭证传播）.
+        默认集（SDK config / state 目录，覆盖 settings / ``computer-id`` / input 值缓存）由
+        :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 计算；本方法只注入
+        **接线层已知的额外位置**：
+          - ``--settings``（flag 层 settings.json）
+          - ``--mcp-config``（flag 层 mcp.json——**可含 server 字面量 env / 凭据**，用户 readRoots
+            覆盖其目录时必须仍拒绝；隔离审查 🔴1）
+          - 工作目录治理目录 ``.tfrobot`` **及其中的具体文件**（``settings.json`` /
+            ``settings.local.json`` / ``mcp.json``，存在即加——硬链接防护靠文件身份，见实现注释）
+          - SKILL Home、blob 缓存根
+        ``landing_root`` 单独传入以获得 ``.part`` 规则。
+
+        每次现算（不缓存）：``landing_root`` 热启用、``.tfrobot`` 随 cwd 变化、文件身份
+        (``dev``/``ino``) 需反映当前文件系统状态.
+        Recomputed per call: landing root may be hot-enabled, and file identities must be current.
+        """
+        return self._build_protected_paths(self._resolve_declared_settings())
+
+    def _build_protected_paths(self, resolved: "ResolvedSettings") -> ProtectedPaths:
+        """由已解析 settings 构造拒绝集（``landing_root`` 取自同一份视图，避免二次解析）。"""
+        extra: list[str] = [str(self._blob_cache_root), str(self.skill_home)]
+        # #235 / protocol#64（blob-transfer.md §固定拒绝集）：``computer-id`` 的**实际使用位置**必须在拒绝集。
+        # 默认集按 ambient config dir 构造；注入 env（尤其仅 HOME、XDG 未设）时实际路径可能完全不同 ⇒
+        # 目录（路径前缀）+ 文件（硬链接文件身份）双保险。每次现算，随实例 env 变化。
+        # The identity's actual location is injected explicitly; the default set only covers the
+        # ambient config dir, which diverges when env is injected (HOME-only, XDG unset).
+        identity_path = identity_store_path(self._resolve_env())
+        extra.extend([str(identity_path.parent), str(identity_path)])
+        if self._flag_settings_path is not None:
+            extra.append(str(self._flag_settings_path))
+        if self._mcp_flag_config is not None:
+            # flag 层 mcp.json：可含 server 字面量 env / 凭据（🔴1）
+            extra.append(str(self._mcp_flag_config))
+        # project/local 治理目录随 cwd 走（#116 单 cwd 锚点）；与 resolve_settings 同源回退.
+        cwd = self._resolve_cwd() or Path(os.getcwd())
+        governance_dir = cwd / TFROBOT_DIRNAME
+        extra.append(str(governance_dir))
+        # 具体文件一并注入（隔离审查 🟡5）：硬链接到 ``.tfrobot/mcp.json`` 时**路径前缀失效**
+        # （链接在 readRoot 内、目标路径不同），只有**文件身份**（``dev``/``ino``）能挡；而目录
+        # 条目的 inode 与被链文件不同 ⇒ 只注入目录挡不住。存在即加（不存在时路径前缀仍是唯一
+        # 防线，且每次现算，文件一创建即被覆盖）。
+        # Inject the concrete files too: for a hard link only file identity (dev/ino) can block it,
+        # and the directory's own inode differs from the linked file's.
+        for governance_name in (PROJECT_SETTINGS_FILENAME, LOCAL_SETTINGS_FILENAME, MCP_CONFIG_FILENAME):
+            candidate = governance_dir / governance_name
+            if candidate.exists():
+                extra.append(str(candidate))
+        # ``.part`` 规则必须对准**实际写入根**：``blob_upload_store`` 用的是 :attr:`landing_root`
+        # （已配置时进程内缓存）。若这里改读「最新 settings」，运行期改值后保护罩与写入根错位——
+        # 旧 root 下的 ``.part`` 反而不再被拒（🟡4）。已缓存 → 用缓存值；未缓存 → 用同一份
+        # ``resolved`` 视图（存储将来也读最新值，二者一致且不额外解析）。
+        # Align the `.part` rule with the *actual* write root used by blob_upload_store.
+        if self._landing_root is not None:
+            landing: str | None = str(self._landing_root)
+        else:
+            raw_landing = resolved.settings.get(FIELD_LANDING_ROOT)
+            landing = raw_landing if isinstance(raw_landing, str) and raw_landing else None
+        return build_protected_paths(
+            extra_paths=extra,
+            landing_root=landing,
+            env=self._resolve_env(),
+        )
+
+    def path_access_policy(self) -> "PathAccessPolicy":
+        """一次 settings 解析同时得出 (读根, 固定拒绝集)，供 resolve / pull 共用。
+
+        Parse settings **once** and derive both the read roots and the rejection set.
+
+        授权边界每次请求现读（见 :attr:`read_roots`）；本方法把「一次请求 = 一次解析」固化，
+        避免 resolve 守卫与管线各解析一遍、以及每个 get_blob 块解析两遍。
+
+        ⚠️ 成本 / Cost（follow-up 观察项，非缺陷）：每个 ``get_blob`` 块触发**一次**完整 settings
+        解析（user/project/local/flag/policy 各一文件 + policy 环境探测；Windows 上注册表查询更贵）
+        加上每个 read root 一次 realpath。大文件多块拉取时这是 O(chunks) 次小文件读。
+        **不得**用「进程内长期缓存」优化——拉取期必须反映当前授权与文件系统状态（撤权 / root
+        换指向即时生效）。后续若成为热点，只能加**带 mtime 键**（settings 文件 mtime + 每个 root
+        的 realpath）的短命缓存，且 mtime/realpath 仍需每请求重算。
+        One full settings parse per chunk is intentional (authorization and realpath must be current).
+        Any future optimization MUST key on settings-file mtimes + fresh realpaths, never a long-lived
+        cache.
+        """
+        resolved = self._resolve_declared_settings()
+        roots = self._compile_read_roots(resolved)
+        if not roots:
+            # 未授权：短路掉拒绝集构造——它会 ``ensure_skill_home()``（mkdir）并 stat 约 8 条路径，
+            # 与「空 readRoots 时不触碰**目标路径**（不 lstat/open）」的语义冲突（🟡7）——注意
+            # 授权视图本身必然读 settings 文件，这是判定的前提，不在此列。
+            # 空拒绝集对调用方无差别：
+            # 空 roots 在 path core 第 2 步即 forbidden，绝不会走到拒绝集判定。
+            # Short-circuit: an empty rejection set is equivalent here because empty roots already
+            # mean `forbidden` at path core step 2 — and building it would mkdir skill home + stat.
+            return PathAccessPolicy(roots=[], protected=ProtectedPaths())
+        return PathAccessPolicy(roots=roots, protected=self._build_protected_paths(resolved))
+
+    def resolve_read_path(self, path: str, *, policy: PathAccessPolicy | None = None) -> ResolvedPath:
+        """按协议九步管线解析一个本地路径并**现铸** ``blob_handle``（v0.5.0 #236）。
+
+        Run the protocol's nine-step pipeline and mint a ``blob_handle``.
+
+        协议依据 / Protocol: ``blob-transfer.md`` §Computer 处理流程；``error-handling.md`` §4020.
+        顺序 MUST：``normalize_path``（``..`` 词法先消解）→ ``readRoots`` 空 / 词法围栏（不访问文件
+        系统）→ 非严格 realpath 围栏 → 固定拒绝集 → ``lstat`` 类型预检 → 非阻塞打开 + ``fstat`` →
+        同一句柄 stat / sha256 → 铸造句柄。**越界判定先于存在性探测**，故 ``readRoots`` 之外的路径
+        一律 ``forbidden``、不泄露存在性。
+
+        Args:
+            path: Agent 给出的 Computer 本地绝对路径（原生或 canonical ``/C:/...`` 形态）.
+            policy: 本请求的授权快照（``None`` = 现算一次）；接线层应传入，确保与调用方
+                的「空 readRoots 守卫」用**同一份**授权视图.
+
+        Returns:
+            ResolvedPath: ``canonical_path`` / ``blob_handle`` / ``mime_type`` / ``total_size`` /
+                ``sha256`` / ``mtime``（epoch ms）.
+
+        Raises:
+            PathResolveError: ``reason`` ∈ ``invalid_path`` / ``forbidden`` / ``not_found`` /
+                ``not_a_file``（接线层映射为 ``4020`` 扁平 ErrorPayload）.
+        """
+        snapshot = policy or self.path_access_policy()
+        return resolve_path(path, snapshot.roots, protected=snapshot.protected)
+
+    def pull_path_blob(self, handle_payload: Mapping[str, Any], *, policy: PathAccessPolicy | None = None) -> PathPullResult:
+        """``client:get_blob`` 解析 ``kind=path`` 句柄：按**当前**授权与文件系统状态复核。
+
+        Revalidate a ``kind=path`` handle at pull time against the *current* authorization.
+
+        协议依据 / Protocol: ``blob-transfer.md`` §Computer 处理流程（拉取期复核）；§生产者三.
+        重跑围栏 / 固定拒绝集 / 权限校验并按**当前** ``readRoots`` 判定：越界或撤权 →
+        ``BlobHandleForbiddenError``；删除 / 非普通文件 / stat 键不符（已改写）→
+        ``BlobHandleGoneError``；句柄结构非法 → ``BlobHandleInvalidError``（接线层统一映射 ``4018``）。
+        ``sha256`` / ``total_size`` 取句柄内值、**不重算**；字节从**复核时的同一打开句柄**读取。
+
+        ⚠️ 返回值持有已打开的文件句柄——调用方 **MUST** 在 ``finally`` 中 :meth:`PathPullResult.close`，
+        否则 fd 泄漏（GC 兜底不足以应对高频拉取）。
+        The returned object owns an open handle; callers MUST ``close()`` it in ``finally``.
+
+        Args:
+            handle_payload: ``decode_blob_handle`` 得到的 ``kind=path`` 载荷.
+            policy: 本请求的授权快照（``None`` = 现算一次；接线层传一次，避免每块重复解析）.
+
+        Returns:
+            PathPullResult: 复核通过的元数据 + :meth:`~PathPullResult.slice` 惰性读取能力.
+        """
+        snapshot = policy or self.path_access_policy()
+        return resolve_for_pull(handle_payload, snapshot.roots, protected=snapshot.protected)
+
     def mint_toolspool_handle(self, payload: bytes, mime: str) -> str:
         """铸造 ``kind=toolspool`` 不透明句柄并写盘 / Mint an opaque ``kind=toolspool`` handle.
 
@@ -464,9 +764,20 @@ class Computer(BaseComputer[PromptSession]):
 
     # ── #134 per-instance env/cwd 注入接缝（对齐 rust-sdk#121） ──────────────
 
+    @property
+    def env(self) -> Mapping[str, str] | None:
+        """per-instance env 注入（``None`` = ambient ``os.environ``），**只读视图**。
+
+        v0.5.0（protocol#64）：Computer 身份持久化必须跟随**本实例**的 env（与 settings / mcp.json
+        同一 XDG 锚点），否则同进程两台注入不同 env 的 Computer 会共读同一身份文件（SDK 自造克隆）。
+        返回 ``MappingProxyType`` 只读副本：调用方不得就地改写实例注入的 env。
+        Read-only view over the injected env; callers must not mutate it in place.
+        """
+        return MappingProxyType(self._env) if self._env is not None else None
+
     def _resolve_env(self) -> Mapping[str, str] | None:
-        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。"""
-        return self._env
+        """注入 env（``None`` = 延迟回退 ``os.environ``，保 CLI 向后兼容）。委托公开只读视图。"""
+        return self.env
 
     def _resolve_cwd(self) -> Path | None:
         """注入 project_root（``None`` = 延迟回退 ``os.getcwd()``，保 CLI 向后兼容）。"""
@@ -474,8 +785,13 @@ class Computer(BaseComputer[PromptSession]):
 
     # ── boot ───────────────────────────────────────────────────────────────
 
+    @restores_cancellation
     async def boot_up(self, *, session: PromptSession | None = None) -> None:
-        """Boot with resource-worker rollback, including cancellation / 启动失败时回收资源刷新。"""
+        """启动计算机；boot 失败 / 取消时回收资源刷新与已启动的 client（#227 / #211）。
+
+        外层统一负责生命周期回收：先作废旧一代资源刷新（禁止晚到通知复活任务），再重建去抖器；
+        ``_boot_up`` 抛错（含取消）时关闭资源刷新、watcher、去抖器并 aclose manager，保 retry-safe。
+        """
         await self._close_resource_refresh()
         await self._skill_debouncer.aclose()
         self._open_resource_refresh()
@@ -496,18 +812,16 @@ class Computer(BaseComputer[PromptSession]):
         启动计算机，初始化 MCP 服务器管理器。
         Boot up the computer and initialize the MCP server manager.
 
+        #211：``@restores_cancellation`` —— 内部 ``manager.ainitialize`` 会经过 client 状态机，其
+        ``process_context`` 按设计吞掉外部取消；装饰器在收尾处还原信号（见
+        :mod:`a2c_smcp.utils.cancellation`）。
+
         #192 / §5.13：boot 只做 **raw 声明形状校验 + 登记**，**不解析 input 值**（对齐 rust PR#190——input
         值与 command 不在 boot 解析，其结构化错误从下一次实际 start/restart surface）。auto-connect server
         的实际启动经 manager materializer 从 raw 重解析；重解析失败（如 Missing input）发生在 ainitialize
         中途 → 回滚已启动 client 后上抛（#173 retry-safe 保持：无残留 manager/task/transport，补值后同实例重试成功）。
         """
-        self.mcp_manager = MCPServerManager(
-            auto_connect=self._auto_connect,
-            auto_reconnect=self._auto_reconnect,
-            message_handler=self._on_manager_change,
-            oauth_credential_store=self._oauth_credential_store,
-            materializer=self._materialize_for_start,
-        )
+        self.mcp_manager = self._new_manager()
         # #165 Gap A：读取 settings 用于嵌入模式下 embed server 的安全层判定。
         # _resolve_declared_settings 不依赖 _skill_home，在 boot 早期安全调用；容错：读不到则空。
         try:
@@ -550,6 +864,7 @@ class Computer(BaseComputer[PromptSession]):
                 "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients",
                 exc_info=True,
             )
+            await self.mcp_manager.aclose()
             raise
 
         # v0.2.1 SKILL 子系统启动初始化（设计 §5.1，#66）：解析 SKILL Home → 治理启动恢复（#117）→
@@ -618,12 +933,21 @@ class Computer(BaseComputer[PromptSession]):
         message: RequestResponder[types.ServerRequest, types.ClientResult] | types.ServerNotification | Exception,
     ) -> None:
         """
-        当 MCPServerManager 检测到变化时的回调。
+        MCP 变化通知回调（``MCPServerManager`` 的 ``message_handler``）。
 
-        #210 / #227：本回调由 MCP 接收循环内联 await，资源查询必须调度到后台，避免同一会话重入死锁。
-        Resource RPCs run outside the MCP receive loop. Tool notifications still only emit (#127).
+        **#210 硬约束：本方法由 MCP ``ClientSession`` 接收循环内联 await，其中不得 await 任何对同一会话的
+        请求**（响应只能由正阻塞的接收循环读取 → 自阻塞，传参即永久失能：后续通知收不到、工具调用一并挂起）。
+        三条含真实 RPC 的刷新路径（工具投影 / 资源集合 / SKILL 内容）一律经**后台任务**调度；仅 Socket.IO
+        emit（异会话）保持内联。详见 :meth:`_schedule_tool_projection_refresh` 与 :meth:`_schedule_resource_refresh`。
+
+        Dispatch MCP change notifications. This callback runs **inline inside the MCP receive loop**, so it must
+        never await a same-session request; all RPC-bearing refreshes are scheduled onto background tasks.
         """
         if isinstance(getattr(message, "root", None), ToolListChangedNotification):
+            # #197：能力轴推进**先于** Socket.IO 早退（本地状态先行，与 clear_oauth 的既定姿态一致）——
+            # 未加入 office 不代表本地 capability_revision 应停滞。刷新经后台任务执行：本回调运行在 MCP
+            # 接收循环内，其中 await 任何对**同一会话**的请求都会自阻塞（#127 会话级重入死锁）。
+            self._schedule_tool_projection_refresh()
             client = self.socketio_client
             if client is None:
                 logger.debug("Socket.IO 客户端不存在或已释放，忽略更新上报")
@@ -664,6 +988,87 @@ class Computer(BaseComputer[PromptSession]):
                 logger.debug("收到资源更新但非 window/skill scheme，放行 / Non-window/skill resource updated, ignore")
         else:
             logger.warning(f"收到未处理的变化类型: {truncate(message)}，当前版本仅处理工具列表变化")
+
+    def _schedule_tool_projection_refresh(self) -> None:
+        """调度一次工具投影后台刷新（#197）：变更侧只标脏，刷新在 MCP 接收循环**之外**执行。
+
+        为何必须离开接收循环 / Why it must leave the receive loop: 本调度点由 :meth:`_on_manager_change`
+        触发，而该回调在 MCP ``ClientSession`` 接收循环内被**内联** await —— 在那里 await ``list_tools``
+        （对同一会话）会自阻塞，接收循环永远读不到自己的响应（#127 会话级重入死锁；#197 复验：window 刷新
+        的内联 RPC 实测使连通话一并挂起）。
+
+        在途合并 / Coalescing: 已有在途刷新时仅置标脏位，由在途任务结算后**补跑一轮** —— 既不丢通知，
+        也不并发多轮 RPC。
+        """
+        if self.mcp_manager is None:
+            logger.debug("MCP 管理器不存在（未 boot），忽略工具投影刷新调度")
+            return
+        if self._tool_refresh_task is not None and not self._tool_refresh_task.done():
+            self._tool_refresh_dirty = True  # 在途 → 标脏，结算后补跑（不得丢弃）
+            return
+        self._tool_refresh_dirty = False
+        self._tool_refresh_task = asyncio.create_task(self._arefresh_tool_projection())
+
+    async def _arefresh_tool_projection(self) -> None:
+        """后台刷新工具投影，并在**真实变化**时推进 capability 轴（#197）。
+
+        ``manager.arefresh_tools()`` 的返回值即「投影是否变化」（含 schema 的全字段比对，失败 bundle 已在
+        manager 侧对称剔除），**仅其为真时** bump —— 重复通知而投影未变不得产生虚假 revision（对齐 Rust
+        PR #199 的阴性对照）。
+
+        刷新失败（RPC / 连接错误）视为**本轮不可判定**：记 ERROR、不推进、不冒泡 —— 不确定即不推进，
+        宁可漏报一次也不虚增能力版本。失败轮在途期间若到达过新通知，照常补跑一轮（v0.5.0 审查 Y9）。
+        """
+        assert self.mcp_manager is not None  # 由 _schedule_tool_projection_refresh 前置守卫
+        manager = self.mcp_manager  # 捕获引用：结算期间 shutdown 可能已把属性置 None
+        while True:
+            try:
+                await self._arefresh_tools_and_bump(manager)
+            except Exception as e:
+                logger.error(f"工具投影刷新失败，本轮不推进能力轴: {e}", exc_info=True)
+                # 审查 Y9：失败轮不得吞掉「本轮在途期间」到达的通知——有新通知就补跑（它们要求的是一次
+                # 失败之后的真读）；没有则结束，持续失败 + 无新通知时不自旋。
+                if not self._tool_refresh_dirty:
+                    return
+                self._tool_refresh_dirty = False
+                continue
+            if not self._tool_refresh_dirty:
+                return
+            self._tool_refresh_dirty = False  # 在途期间到达过通知 → 补跑一轮
+
+    async def _arefresh_tools_and_bump(self, manager: MCPServerManager) -> None:
+        """强制刷新工具投影，投影**真实变化**即推进 capability 轴——**唯一**消费 ``arefresh_tools()`` 返回值的出口。
+
+        v0.5.0 跨节点审查 🔴1：manager 的变化判据是「新投影 vs 上次**提交**的投影」，任何一次强制刷新提交了新投影，
+        该变化就**只**体现在这一次的返回值里——丢掉它，后续刷新比对得 False，revision 永久少推进一次。
+        故 ``client:get_tools`` 服务前的刷新（#127）与 ``tools/list_changed`` 后台刷新（#197）必须共用本出口，
+        不得再直接 ``await manager.arefresh_tools()`` 而忽略返回值。
+
+        / Single consumer of ``arefresh_tools()``'s change flag: a forced refresh that commits a new projection
+        reports the change exactly once, so every caller must route through here or the revision is lost.
+        """
+        if await manager.arefresh_tools():
+            self._bump_capability_revision()
+
+    def _open_resource_refresh(self) -> None:
+        """重开通知生命周期（boot / 停机后懒挂载）——重建已被 ``shutdown`` 关闭的去抖器 / Reopen worker lifecycle."""
+        if self._resource_refresh_closed:
+            self._skill_debouncer = SkillEventDebouncer(
+                self._emit_update_skills_now,
+                invalidate=self._invalidate_user_skills,
+            )
+            self._resource_refresh_closed = False
+
+    async def _close_resource_refresh(self) -> None:
+        """禁止新投递并回收在途资源刷新；可重复调用 / Reject late events and await cancellation."""
+        self._resource_refresh_closed = True
+        self._windows_list_dirty = self._skills_list_dirty = self._skills_content_dirty = False
+        task = self._resource_refresh_task
+        self._resource_refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     def _schedule_resource_refresh(
         self,
@@ -706,9 +1111,11 @@ class Computer(BaseComputer[PromptSession]):
         本轮的动作位**还回**脏位（否则失败轮的工作永久丢失）；本轮在途期间若有新通知则补跑一轮，否则留待
         下一次通知连带重做——持续失败且无新通知时不自旋。
 
-        资源查询仅使用 manager 的无锁快照 API。稳定版工具映射仍由 get_tools 查询路径刷新（#127），
-        不回补开发线的工具投影 / capability revision 机制。
-        Resource queries use lock-free manager snapshots; 0.4.x tool-refresh behavior is unchanged.
+        锁不变量 / Lock invariant: 资源路径**刻意**只走 manager 的不取锁 API（``list_windows`` /
+        ``list_skill_resources`` / ``read_resource`` 仅做 ``_active_clients`` 快照），而工具路径走
+        ``arefresh_tools``（#222 起：自取 ``tool_refresh_lock`` → 状态锁两段，``list_tools`` 在锁外）、
+        ``manager.aclose()`` 取状态锁 —— 两者没有共同的持锁窗口，两个后台任务因此**没有锁边**，可安全并发。
+        **禁止**把本方法改走持锁的 manager API：「统一」会让资源 RPC 落进状态锁，正是 #222 刚移除的反模式。
         """
         while True:
             windows_list = self._windows_list_dirty
@@ -738,25 +1145,6 @@ class Computer(BaseComputer[PromptSession]):
                 continue
             if not (self._windows_list_dirty or self._skills_content_dirty or self._skills_list_dirty):
                 return
-
-    def _open_resource_refresh(self) -> None:
-        """Reopen notification work after boot/restart or a lazy mount / 重开通知生命周期。"""
-        if self._resource_refresh_closed:
-            self._skill_debouncer = SkillEventDebouncer(
-                self._emit_update_skills_now, invalidate=self._invalidate_user_skills,
-            )
-            self._resource_refresh_closed = False
-
-    async def _close_resource_refresh(self) -> None:
-        """Reject late events and await cancellation before closing MCP / 禁止新投递并回收查询。"""
-        self._resource_refresh_closed = True
-        self._windows_list_dirty = self._skills_list_dirty = self._skills_content_dirty = False
-        task = self._resource_refresh_task
-        self._resource_refresh_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
 
     async def _on_resource_list_changed_windows(self) -> None:
         """window:// 集合变化 → 比对缓存 → 触发桌面刷新（行为同 v0.2 既有逻辑，原样抽取）。
@@ -911,7 +1299,8 @@ class Computer(BaseComputer[PromptSession]):
         """
         去抖器结算末端：向信令服务器推送 ``server:update_skills`` / Debouncer settlement sink。
 
-        无 Socket.IO 客户端 / 未入房间 → no-op（emit 的 office_id 守卫在 client 侧）。该协程是
+        无 Socket.IO 客户端 → no-op；客户端侧按「已确认在房 ∧ 在册」判据决定发送或**记入待补发**（#223，
+        见 ``SMCPComputerClient._emit_or_defer_office_update``）。该协程是
         :class:`SkillEventDebouncer` 的 ``on_emit``，**不**应被事件处理器裸调（一律经去抖器 :meth:`mark_dirty`）。
         """
         client = self.socketio_client
@@ -1043,9 +1432,13 @@ class Computer(BaseComputer[PromptSession]):
         marketplace = entry.marketplace if entry is not None else None
         # 注入的自定义 resolver（如测试/嵌入宿主的 dict resolver）可能不继承 BaseInputResolver（无 session 属性）→ getattr 容错。
         session = getattr(self._input_resolver, "session", None)
-        _raw, rendered = await self._arender_and_validate_server(
-            raw, session=session, plugin=plugin, marketplace=marketplace
-        )
+        # #208：Input 解析串行化——并发启动期间**一次至多一个交互请求在飞**。锁只覆盖本次 render
+        # （提示期间的等待），**不**覆盖 spawn；幂等启动在 manager 侧早于本回调返回，故根本不进锁。
+        # 位置对齐 rust：rust 在 materialize 闭包内取 mcp_input_resolve_lock。
+        async with self._mcp_input_lock:
+            _raw, rendered = await self._arender_and_validate_server(
+                raw, session=session, plugin=plugin, marketplace=marketplace
+            )
         return rendered
 
     async def _arender_and_validate_server(
@@ -1177,6 +1570,7 @@ class Computer(BaseComputer[PromptSession]):
         *,
         plugin: str | None,
         marketplace: str | None,
+        start: bool = True,
     ) -> None:
         """物化 **raw 声明** 进 manager（#192 / §5.13：**不 eager render**——实际启动时经 materializer 从 raw 重解析）。
 
@@ -1187,14 +1581,9 @@ class Computer(BaseComputer[PromptSession]):
         ``_add_or_update`` 原地更新语义一致）。
         """
         if self.mcp_manager is None:
+            # #227：停机后的懒挂载重开通知生命周期（去抖器已被 shutdown 关闭）。
             self._open_resource_refresh()
-            self.mcp_manager = MCPServerManager(
-                auto_connect=self._auto_connect,
-                auto_reconnect=self._auto_reconnect,
-                message_handler=self._on_manager_change,
-                oauth_credential_store=self._oauth_credential_store,
-                materializer=self._materialize_for_start,
-            )
+            self.mcp_manager = self._new_manager()
         bid = resolve_bundle_id(raw_cfg)
         # 先登记 raw（auto-connect start 的 materializer 需按 bundle_id 查 scope），manager add 失败则**恢复旧条目**
         # （transactional：attempted≠running 不变式——失败不留 map 漂移，且**不得销毁仍在运行的旧 raw**：
@@ -1205,7 +1594,7 @@ class Computer(BaseComputer[PromptSession]):
         previous = self._active_raw.get(bid)
         self._active_raw[bid] = entry
         try:
-            await self.mcp_manager.aadd_or_aupdate_server(raw_cfg)
+            await self.mcp_manager.aadd_or_aupdate_server(raw_cfg, start=start)
         except Exception:
             if self._active_raw.get(bid) is entry:
                 if previous is not None:
@@ -1238,6 +1627,7 @@ class Computer(BaseComputer[PromptSession]):
         session: PromptSession | None = None,
         plugin: str | None = None,
         marketplace: str | None = None,
+        start: bool = True,
     ) -> None:
         """**运行期挂载**一个 MCP server（渲染校验 → 物化，**不落盘**）/ Transient mount (no disk write)。
 
@@ -1251,11 +1641,14 @@ class Computer(BaseComputer[PromptSession]):
             session: Computer 管理 Session（交互式 input 解析用）。
             plugin / marketplace: plugin 实时挂载 D2 上下文（#69 Group A）；非 None 时 bundled server 的裸
                 ``${input:id}`` 解析到带前缀池条目 ``<plugin>@<marketplace>/<id>``（§9.3 D2）。普通来源传 None。
+            start: ``False`` = **只挂载不启动**（#208）。治理恢复需要「先挂完所有、再经统一批量启动器启动」
+                （与单启 / ``start all`` 共享同一并发上限）——故其 ``register_server`` 回调传 ``False``，
+                启动收在挂载循环之后。缺省 ``True`` = 既有「挂载并按 ``auto_connect`` 启动」语义不变。
         """
         # #192 / §5.13：mount 只做形状校验 + 登记 raw（**不解析 input**——实际启动经 materializer 从 raw 重解析，
         # 对齐 rust ``mount_server``）。
         raw_cfg = self._validate_raw_shape(server)
-        await self._amount_raw(raw_cfg, plugin=plugin, marketplace=marketplace)
+        await self._amount_raw(raw_cfg, plugin=plugin, marketplace=marketplace, start=start)
 
     async def aunmount_server_by_id(self, bundle_id: str) -> None:
         """按 **bundle_id** 纯运行期**停摘**一个 server（不删声明、不落盘）/ Transient unmount by bundle_id。
@@ -1575,22 +1968,45 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._input_resolver.clear_cache(input_id)
 
+    @restores_cancellation
     async def shutdown(self, *, session: PromptSession | None = None) -> None:
         """
         关闭计算机，关闭 MCP 服务器管理器。
         Shutdown the computer and close the MCP server manager.
 
-        先回收资源刷新，再停 watcher/去抖器，最后关闭 MCP（#227）。
-        Cancel resource refreshes, stop the watcher/debouncer, then close MCP sessions.
+        v0.2.1（#67）：先停 user 源文件 watcher（不再产生新事件），再关去抖器（丢弃挂起 emit），最后关
+        MCP 管理器。Stop the file watcher, close the debouncer (drop pending emit), then the MCP manager.
+
+        #211：``@restores_cancellation`` —— 停机链路上多处按设计吞掉 ``CancelledError``（第三方状态机的
+        ``process_context``、``_close_task`` 的等待、``contextlib.suppress``），会让 ``wait_for`` /
+        ``asyncio.timeout`` 因协程「正常返回」而不抛 ``TimeoutError``，嵌入宿主拿不到超时信号。装饰器在
+        收尾处按**计数快照**还原本次调用期间被吞的取消。详见 :mod:`a2c_smcp.utils.cancellation`。
         """
         await self._close_resource_refresh()
         if self._skill_watcher is not None:
             self._skill_watcher.stop()
             self._skill_watcher = None
         await self._skill_debouncer.aclose()
-        if self.mcp_manager:
-            await self.mcp_manager.aclose()
+        # #197 / #210：**先摘引用、再作废在途刷新**（照 debouncer ``aclose`` 的 closed 门语义）——停机窗口内
+        # 到达的通知因 ``mcp_manager is None`` 不再调度新任务；在途任务 cancel 后 await 结算，避免其继续对已
+        # 关闭的 manager 发请求（或对工具路径持锁）。仅 cancel 不置位会在 ``aclose`` 的 await 窗口里被新通知
+        # 复活出一个必炸的任务；顺序也不可反转——放到 ``manager.aclose()`` 之后即变成对已销毁 client 发请求。
+        manager = self.mcp_manager
         self.mcp_manager = None
+        inflight = [
+            task
+            for task in (self._tool_refresh_task, self._resource_refresh_task)
+            if task is not None and not task.done()
+        ]
+        self._tool_refresh_task = None
+        self._resource_refresh_task = None
+        for task in inflight:
+            task.cancel()
+        for task in inflight:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if manager:
+            await manager.aclose()
         self._active_raw.clear()  # #149：运行期活跃集销毁 → 清空 raw 投影缓存
 
     async def __aenter__(self) -> "Computer":
@@ -1690,7 +2106,9 @@ class Computer(BaseComputer[PromptSession]):
         # _tool_mapping 已陈旧——available_tools() 迭代该映射键，**新增**工具不在其中永远漏掉。本方法运行于
         # socketio on_get_tools 安全上下文（非 MCP 接收循环），可安全 await 刷新（内联刷新会话级死锁见 #127）。
         # #127: refresh the tool mapping before serving get_tools; runtime tool additions are otherwise missed.
-        await self.mcp_manager.arefresh_tools()
+        # 🔴1（v0.5.0 审查）：经唯一出口刷新——本次提交若改变了投影，revision 在此推进（否则紧随其后的
+        # list_changed 后台刷新比对得 False，这次变化就永久漏记）。
+        await self._arefresh_tools_and_bump(self.mcp_manager)
         # 从 Manager 获取全部工具，携带各自归属 bundle_id（#152 D1）。
         tools = [(bundle_id, t) async for bundle_id, t in self.mcp_manager.available_tools()]
 
@@ -2103,6 +2521,9 @@ class Computer(BaseComputer[PromptSession]):
 
         existing = set(existing_bundle_ids()) if existing_bundle_ids is not None else set()
         injected_roots: set[Path] = set()
+        # #208：重挂成功的 bundled server **只收集**，循环结束后经**统一批量启动器**一次启动——
+        # 与单启 / ``start all`` 共享同一 Computer 级并发上限，避免恢复路径绕过上限（对齐 rust）。
+        pending_starts: list[str] = []
         for record in collect_enabled_bundled_servers(
             home, declared, per_scope_layers=per_scope_layers, env=self._resolve_env(),
         ):
@@ -2146,6 +2567,8 @@ class Computer(BaseComputer[PromptSession]):
                 if inject_inputs is not None and record.install_path not in injected_roots:
                     await inject_inputs(record)
                     injected_roots.add(record.install_path)
+                # #208：``register_server`` 应为**纯挂载**（CLI 参考客户端传 ``start=False``）——启动
+                # 统一收在循环之后，故治理校验 / input 注入 / 挂载全部完成后才批量启动。
                 await register_server(record.config, record)
             except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
                 logger.warning(
@@ -2157,6 +2580,25 @@ class Computer(BaseComputer[PromptSession]):
                 continue
             existing.add(bundle_id)
             report.remounted_servers.append(bundle_id)
+            pending_starts.append(bundle_id)
+
+        # #208：治理校验、input 注入与挂载**全部完成后**，经统一批量启动器启动全部待启动 bundled
+        # server（共享 Computer 级并发上限；结构化并发，非逐项独立 spawn）。best-effort 语义不变：
+        # 失败仅 WARN、不阻断其余（与 register_server 失败降级铁律一致），report 不受启动结果影响。
+        #
+        # ⚠️ 仍受 ``auto_connect`` 约束（**非**无条件启动）：本改动只改「谁来启动、在哪一步启动」
+        # （收拢到统一批量驱动），不改「是否启动」。#208 前一经 ``register_server`` → ``amount_server``
+        # 的启动同样以 ``auto_connect`` 为条件，故此处必须同判——否则 ``auto_connect=False`` 的嵌入宿主
+        # （单测即此形态）会突然拉起真实 MCP 进程。
+        if pending_starts and self.mcp_manager is not None and self._auto_connect:
+            for outcome in await self.mcp_manager.astart_clients_batch(pending_starts):
+                if outcome.error is not None:
+                    logger.warning(
+                        "governance recovery: remounted server %r failed to start "
+                        "(non-blocking; stays pending): %s",
+                        outcome.bundle_id,
+                        outcome.error,
+                    )
         return report
 
     def list_mcp_servers_with_metadata(self) -> list[McpServerWithMetadata]:
@@ -2278,6 +2720,48 @@ class Computer(BaseComputer[PromptSession]):
         self._oauth_credential_store = store
         return self
 
+    def with_mcp_start_concurrency(self, max_concurrency: int) -> "Computer":
+        """安装 Computer 级 **MCP 最大并发启动数**（构造期策略，builder，返回 self；#208）。
+
+        单个启动、批量启动（含 CLI ``start all``）与 Plugin 治理恢复**共享同一个** Computer 级控制器，
+        故任意时刻总在途启动事务数 ≤ 本值。**未配置**（缺省）= 保持既有行为：批量仍逐项串行、不新增并发。
+
+        对齐 rust ``Computer::with_mcp_start_concurrency``——属**宿主运行时策略**（下游 tfrobot-client
+        产品默认 5），不落盘、不成为用户配置。**Input 交互解析保持串行**（由 :attr:`_mcp_input_lock`
+        保证：并发启动期间一次至多一个交互请求在飞）。
+
+        须在 :meth:`boot_up` 之前调用（manager 构建时透传，与 :meth:`with_oauth_credential_store` 同约定）；
+        若 manager 已存在（``amount_server`` 惰性建台 / 已 boot），则直接透传——此时若已有**任何取门尝试**
+        （启动、批量启动、restart，**以及挂载/更新**——#208 起更新路径为与启动事务全序化而同过门），
+        会 fail-closed 抛 ``RuntimeError``（运行期换门会让已排队者脱离新上限）。
+        故标准流程是「先装策略，再 boot_up」；惰性建台（未 boot 先 mount）会锁死构造期，
+        之后想改并发上限请重建 Computer/manager。
+
+        Args:
+            max_concurrency: 最大并发启动数；``0`` 按 ``1`` 处理。
+
+        Returns:
+            Computer: self（链式调用）。
+        """
+        self._mcp_start_concurrency = max_concurrency
+        if self.mcp_manager is not None:
+            self.mcp_manager.with_mcp_start_concurrency(max_concurrency)
+        return self
+
+    def _new_manager(self) -> MCPServerManager:
+        """构建 MCP 管理器（boot 与惰性建台的**单一构造点**；#208 起透传并发策略）。
+
+        / The single construction site for the manager; threads the #208 concurrency policy through.
+        """
+        return MCPServerManager(
+            auto_connect=self._auto_connect,
+            auto_reconnect=self._auto_reconnect,
+            message_handler=self._on_manager_change,
+            oauth_credential_store=self._oauth_credential_store,
+            materializer=self._materialize_for_start,
+            mcp_start_concurrency=self._mcp_start_concurrency,
+        )
+
     async def oauth_status(self, bundle_id: str) -> OAuthStatus:
         """查询指定 MCP Server 的 OAuth 授权状态 / Query a server's OAuth authorization status.
 
@@ -2338,12 +2822,26 @@ class Computer(BaseComputer[PromptSession]):
 
     @property
     def capability_revision(self) -> int:
-        """capability 轴修订计数（#185，对齐 Rust ``Computer::capability_revision``）。
+        """capability 轴修订计数（#185/#197，对齐 Rust ``Computer::capability_revision``）。
 
-        仅当 :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）
-        时 +1；幂等重复 clear 不递增。config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
+        两条推进路径，均经 :meth:`_bump_capability_revision` 单一出口：
+
+        ① :meth:`clear_oauth` **实际撤回** Agent 面能力（活跃 client 退役或路由被撤回）时 +1；
+           幂等重复 clear 不递增。
+        ② 运行期**工具投影真实变化**（MCP ``tools/list_changed``，#197；或 ``client:get_tools`` 服务前的强制刷新
+           恰好提交了新投影，v0.5.0 审查 🔴1——两者共用 :meth:`_arefresh_tools_and_bump`）时 +1 —— 判据为含 schema 的
+           全字段投影比对（``manager.arefresh_tools()`` 的返回值）；重复通知而投影未变**不**推进。
+           config 轴变化（durable 落盘）不在此轴（§12 R2 分账）。
         """
         return self._capability_revision
+
+    def _bump_capability_revision(self) -> None:
+        """capability 轴推进**单一出口**（#197）：OAuth 撤销与工具投影变化共用，杜绝多路径语义漂移。
+
+        Single bump outlet for the capability axis (#197) — shared by OAuth revocation and tool-projection
+        changes so the two paths cannot drift apart. 本地状态先行：调用方**不得**把它置于 Socket.IO 早退之后。
+        """
+        self._capability_revision += 1
 
     async def clear_oauth(self, bundle_id: str) -> None:
         """清除该 server 的 OAuth 授权并传播能力撤销（#185）。
@@ -2365,13 +2863,13 @@ class Computer(BaseComputer[PromptSession]):
         capability_changed = await self.mcp_manager.clear_oauth(bundle_id)
         if not capability_changed:
             return
-        self._capability_revision += 1
+        self._bump_capability_revision()
         client = self.socketio_client
         if client is None:
             logger.debug("Socket.IO 客户端不存在或已释放，忽略能力撤销上报")
             return
         try:
-            # 直接通过事件常量发送（工具列表更新；office_id 守卫在 emit_update_tool_list 内）
+            # 直接通过事件常量发送（工具列表更新；发送/补发判据在 emit_update_tool_list 内，#223）
             await client.emit_update_tool_list()
         except Exception:
             logger.error("上报能力撤销（工具变更）失败", exc_info=True)

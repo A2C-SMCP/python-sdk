@@ -23,6 +23,7 @@ from a2c_smcp.agent._request_builders import (
     build_get_skill_request,
     build_get_skills_request,
     build_get_tools_request,
+    build_resolve_path_request,
     build_tool_call_request,
     validate_emit_event,
 )
@@ -140,3 +141,29 @@ def test_build_get_blob_request_with_offset_and_max() -> None:
     req = build_get_blob_request(_CFG, "comp-1", "opaque-handle", chunk_offset=65536, max_chunk_bytes=4096)
     assert req["chunk_offset"] == 65536
     assert req["max_chunk_bytes"] == 4096
+
+
+def test_build_resolve_path_request_structure() -> None:
+    """``client:resolve_path`` 请求结构（v0.5.0 #236 / protocol#65）."""
+    req = build_resolve_path_request(_CFG, "comp-1", "/srv/docs/a.txt")
+    assert req == {
+        "agent": "agent-1",
+        "req_id": req["req_id"],
+        "computer": "comp-1",
+        "path": "/srv/docs/a.txt",
+    }
+    assert isinstance(req["req_id"], str) and req["req_id"]
+
+
+def test_build_resolve_path_request_passes_path_through_verbatim() -> None:
+    """Agent 侧**不**预判路径形态：相对 / Windows / 含 ``..`` 一律原样透传，由 Computer 的
+    ``normalize_path`` 判定 ``invalid_path``（避免客户端与协议漂移）."""
+    for raw in ("relative/x.txt", "C:\\Users\\u\\a.txt", "/srv/../etc/passwd", ""):
+        req = build_resolve_path_request(_CFG, "comp-1", raw)
+        assert req["path"] == raw
+
+
+def test_build_resolve_path_request_req_id_is_unique() -> None:
+    first = build_resolve_path_request(_CFG, "comp-1", "/a")
+    second = build_resolve_path_request(_CFG, "comp-1", "/a")
+    assert first["req_id"] != second["req_id"]

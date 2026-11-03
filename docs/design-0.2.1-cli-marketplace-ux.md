@@ -526,6 +526,9 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 > 决策（CC 源码核实）：CC 的 settings **没有** version 字段、**无**迁移 runner——前向兼容完全靠「**全字段 `.optional()` + 顶层 `.passthrough()`**」的加法式纪律（CC `types.ts` schema 头注释明言「unknown fields preserved … invalid settings simply not used but remain in the file」）。A2C settings.json **复刻此模型**：人编文件不背版本负担；`version` 只留在 **CLI 维护的物化文件**（§6.1/§6.2）。
 
 - **未知字段**：**静默保留**（passthrough，照 CC `SettingsSchema.passthrough()`）——未知顶层键不报错、不剥离、原样留在磁盘。`settings set` 是**单字段写**、不整体重写文件，未知键自然留存（升降级都不丢）。
+- **写入期 raw 保真（v0.5.0 / #246，mirror rust-sdk#253）**：**所有** settings / `mcp.json` 真写路径一律走 **raw RMW**——读**原始 JSON**（`settings/raw.py`，不经 `validate_settings` 过滤视图），**只改目标键**再写回。因此上面「被过滤不用但留在文件」的纪律在**写侧**同样成立：改一个键不会顺带删除 `readRoots` / `landingRoot` / `enabledMcpjsonServers` / `enableAllProjectMcpServers`（project scope）、policy-only 越权字段、非法 `permissions` 条目或 `mcp.json` 的 `$schema` 等未知顶层键。
+- **写入期 fail-closed**：目标文件 corrupt / 根非对象 / IO 不可读，或**目标键类型不符**（含显式 `null`）→ **拒绝写入并报可操作错误，原文件逐字节不动**（绝不「当作空配置继续写」——那等价于静默清空用户文件）。只有「键缺失」与「空文件」才当空值。写路径与读路径的容错姿态**刻意相反**：读容错（不阻断启动），写 fail-closed（不销毁数据）。
+- **失效键诊断**：`readRoots` / `landingRoot` / `enabledMcpjsonServers` / `enableAllProjectMcpServers` 出现在 project scope，或 policy-only 字段出现在可写 scope 时，**保留在文件**但读面不生效——`settings set` 写完在 **stderr** 输出**一行**合并 WARN（不进 `--json` stdout），`settings show` / 诊断继续走 `ValidationError` 通道。
 - **类型/取值校验**：`settings/schema.py` 以 TypedDict 定结构 + Pydantic 运行时校验（scope 枚举、git url 形态、`<plugin>@<mp>` key 形态等）。**单个已知键**校验失败 → 该键**被过滤不用**（回退默认）但**仍留在文件**，错误收进 `ValidationError[]` 经 `settings show` / 诊断命令呈现（照 CC：错误不阻断启动、不整文件作废，类比 CC Doctor/status；非法权限/MCP 规则逐条过滤而非整文件作废）。
 - **前向兼容靠加法**：新增字段一律 `Optional` + 给默认；**不**引入 `version` 协商、**不**写迁移逻辑（与 CC 一致）。语义变更走「新字段 + 旧字段降级读」的加法式演进。
 - **scope 越权**：policy-only 字段（`allowedMcpServers`/`deniedMcpServers`）出现在非 policy scope → 过滤不用 + 记 `ValidationError`（杜绝用户态自我提权）。

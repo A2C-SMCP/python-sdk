@@ -1,0 +1,924 @@
+# -*- coding: utf-8 -*-
+"""
+* 文件名: test_room_event_acks
+* 描述: #214 —— 三个房间事件（server:join_office / server:leave_office / server:list_room）
+        的 ack 形态契约（**异步**实现）。
+
+        协议依据 / Protocol: a2c-smcp-protocol develop
+          - error-handling.md §错误响应格式（:95 作用域 = 所有具备 ack 通道的事件）
+          - error-handling.md §房间管理错误响应（:232-390 各码触发条件与 details 白名单）
+          - error-handling.md:102-106（载荷校验失败 MUST 回 400，MUST NOT 静默不 ack）
+          - events.md §server:join_office / §server:leave_office / §server:list_room
+          - room-model.md §隔离保障
+
+        核心契约 / Core contract：
+          - 成功 = **空 ack**（`None`）—— 不是元组、不是空 dict；
+          - 失败 = **flat `ErrorPayload`**（顶层 `code`）；
+          - `details` 只含**与发起者自身相关**的上下文，**MUST NOT** 出现其它会话的内部标识。
+
+        编号断言均为**协议字面值**（wire contract），刻意不写成 `ErrorCode.X`——契约是数字本身。
+
+#214 contract tests for the three room-management events (async implementation).
+Success is an **empty ack** (`None`); failures are flat `ErrorPayload` dicts; `details` MUST NOT
+carry other sessions' internal identifiers.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from a2c_smcp.server import AuthenticationProvider, SMCPNamespace
+from a2c_smcp.server.types import IdentityRecord
+from a2c_smcp.smcp import SMCP_NAMESPACE
+
+# 对端会话的「内部标识」哨兵：任何失败 ack 中出现它们即为泄露。
+# Sentinels for the peer session's internal identifiers: their presence in a failure ack = leak.
+PEER_SID = "PEER-SID-SENTINEL-9f3a"
+PEER_NAME = "peer-name-sentinel"
+NAMESPACE_NAME = SMCP_NAMESPACE
+
+# v0.5.0（protocol#64）：Computer 入房 MUST 携带合法 computer_id；Agent MUST NOT 出现该键。
+_COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _join(role: str, name: str, office: str) -> dict[str, Any]:
+    """构造协议合规的 ``server:join_office`` 载荷（Computer 自动带 ``computer_id``）。"""
+    payload: dict[str, Any] = {"role": role, "name": name, "office_id": office}
+    if role == "computer":
+        payload["computer_id"] = _COMPUTER_ID
+    return payload
+
+
+def _namespace(
+    sessions: dict[str, dict[str, Any]],
+    participants: list[tuple[str, str]] | None = None,
+) -> SMCPNamespace:
+    """构造一个会话表可控、socketio 层被 mock 的 SMCPNamespace。
+
+    会话用**同一个 dict 对象**承载（镜像 socketio 的 live-dict 语义），故 `get_session`
+    返回的引用上的原地修改对后续断言可见。
+    """
+    ns = SMCPNamespace(MagicMock(spec=AuthenticationProvider))
+    ns.server = MagicMock()
+    ns.server.enter_room = AsyncMock()
+    ns.server.leave_room = AsyncMock()
+    ns.server.rooms = MagicMock(return_value=[])
+    ns.server.manager = MagicMock()
+    ns.server.manager.get_participants = MagicMock(return_value=list(participants or []))
+    ns.get_session = AsyncMock(side_effect=lambda sid: sessions[sid])
+    ns.save_session = AsyncMock(side_effect=lambda sid, sess: sessions.__setitem__(sid, sess))
+    ns.emit = AsyncMock()
+    return ns
+
+
+def _seat(ns: Any, office_id: str, role: str, sid: str) -> None:
+    """预置席位（#230：席位表是「每 role 一席」的唯一准入判据）。Seed an occupied seat."""
+    ns._seat_to_sid[(office_id, role)] = sid
+    ns._sid_to_seats.setdefault(sid, set()).add((office_id, role))
+
+
+def _assert_no_leak(payload: dict[str, Any]) -> None:
+    """失败 ack 的 message / details MUST NOT 含其它会话的内部标识。"""
+    blob = json.dumps(payload, ensure_ascii=False, default=str)
+    for sentinel in (PEER_SID, PEER_NAME, NAMESPACE_NAME):
+        assert sentinel not in blob, f"失败 ack 泄露了 {sentinel!r}: {blob}"
+
+
+class TestJoinOfficeAckShape:
+    """`server:join_office` 的 ack 形态。"""
+
+    async def test_success_is_empty_ack(self) -> None:
+        """成功 ⇒ **空 ack**（`None`），不是元组、不是空 dict。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+
+        assert ack is None, f"成功必须是空 ack（None），实得 {ack!r}"
+        assert sessions["sid-1"]["office_id"] == "room-a"
+
+    @pytest.mark.parametrize(
+        "bad_payload",
+        [
+            {},
+            {"role": "agent"},
+            {"role": "not-a-role", "name": "n", "office_id": "o"},
+            None,
+            "not-a-dict",
+            {"office_id": "o"},
+        ],
+    )
+    async def test_malformed_payload_acks_400(self, bad_payload: Any) -> None:
+        """载荷 schema 校验失败 ⇒ 回 `400`，**绝不允许**静默不 ack（挂到客户端自身超时）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", bad_payload)
+
+        assert ack is not None, "载荷畸形必须产出 ack（否则客户端挂起到自身超时）"
+        assert ack["code"] == 400, f"载荷畸形应回 400，实得 {ack!r}"
+        assert "details" not in ack, f"400 不得回显客户端输入: {ack!r}"
+
+    async def test_role_mismatch_is_403(self) -> None:
+        """同一 sid 声明与**身份记录**不同的 role ⇒ `403`（身份声明冲突，**非**房间语义）。
+
+        v0.5.0（protocol#64）：权威判据是 ``_sid_identity`` 里的 `(role, name, computer_id)` 三元组
+        （首次 join 通过时记录），不再是会话字段。夹具须先种下记录，否则首次 join 会被当作「首次声明」。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent"}}
+        ns = _namespace(sessions)
+        ns._sid_identity["sid-1"] = IdentityRecord(role="agent", name="c1", computer_id=None)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+
+        assert isinstance(ack, dict), f"失败必须是 flat ErrorPayload，实得 {ack!r}"
+        assert ack["code"] == 403, ack
+        assert "details" not in ack, f"403 无 code-specific details: {ack!r}"
+        _assert_no_leak(ack)
+
+    async def test_name_mismatch_is_403(self) -> None:
+        """同一 sid 声明与会话不同的 name ⇒ `403`（#221：身份声明一致性的 **name** 那一半）。
+
+        协议依据 / Protocol: events.md:610「同一 sid 声明了与既有会话不同的 `role` / `name` ⇒ 拒绝，
+        `403`」——`role` / `name` 是同一条规则的两半，本仓此前**刻意未实现** name 半（#214 记录），
+        #221 对齐。`403` 无 code-specific 字段（error-handling.md §各错误码标准字段总表 无 403 行）。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "old-name"}}
+        ns = _namespace(sessions)
+        ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="old-name", computer_id=_COMPUTER_ID)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "new-name", "room-a"))
+
+        assert isinstance(ack, dict), f"失败必须是 flat ErrorPayload，实得 {ack!r}"
+        assert ack["code"] == 403, ack
+        assert "details" not in ack, f"403 无 code-specific details: {ack!r}"
+        _assert_no_leak(ack)
+        # 身份声明冲突须先于任何会话写入 ⇒ 名字不得被改成新值
+        assert sessions["sid-1"]["name"] == "old-name", f"被拒请求不得改动会话 name: {sessions['sid-1']!r}"
+
+    async def test_empty_declared_name_mismatch_is_403(self) -> None:
+        """声明**空串** name、而会话已有一个**非归一**名字 ⇒ 仍 `403`（空串也是「另一个身份」）。
+
+        .. note::
+           本用例**不**用于区分「判据写成 `is not None` 还是真值性」——两种写法在此都判 403（既有
+           name 非空，故 `session.get("name")` 真值性为真）。真正能区分的是「既有 name 为空串」，
+           而该态在服务端**不可持久化**：``enter_room`` 会把 falsy name 归一成默认名
+           （``namespace.py`` 的 ``default_session_name``），失败回滚又把它删除。故该差异在本仓
+           **不可观测**，代码取 `is not None` 是为了与 role 侧对称、语义更直白，而非行为差异。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "real-name"}}
+        ns = _namespace(sessions)
+        ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="real-name", computer_id=_COMPUTER_ID)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "", "room-a"))
+
+        assert isinstance(ack, dict) and ack["code"] == 403, ack
+
+    async def test_repeat_empty_name_join_is_idempotent_not_403(self) -> None:
+        """**声明空名**入房后再声明空名 ⇒ 放行（两次都归一成同一个默认名，不是身份变更）。
+
+        回归守卫：判据若拿「客户端声明的原样空串」去比「服务端归一后的默认名」，第二次会被误判成
+        403——而那个默认名含 ``sid`` 前缀，客户端**无法复现**，只能重连自救。归一必须单点同源。
+
+        **sid 刻意取 9 字符**（非 ``"sid-1"``）：后者只有 5 字符，``sid[:6]`` 与 ``sid[:5]`` 等值，
+        「判据与 ``enter_room`` 各写一份表达式且悄悄漂移」的变异在本用例下会**不可见**。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-abc123": {}}
+        ns = _namespace(sessions)
+
+        first = await ns.on_server_join_office("sid-abc123", _join("computer", "", "room-a"))
+        assert first is None, f"首次空名入房应放行，实得 {first!r}"
+        normalized = sessions["sid-abc123"]["name"]
+        # 逐字钉死归一形状：长度漂移（[:5]/[:7]）与分隔符漂移都会红
+        assert normalized == "computer_sid-ab", f"会话应被归一成默认名，实得 {normalized!r}"
+
+        second = await ns.on_server_join_office("sid-abc123", _join("computer", "", "room-a"))
+        assert second is None, f"重复空名入房应幂等放行（默认名同源），实得 {second!r}"
+
+        # 正对照：归一放行**不**放宽改身份——声明一个别的名字仍相撞
+        other = await ns.on_server_join_office(
+            "sid-abc123", _join("computer", "alice", "room-a")
+        )
+        assert isinstance(other, dict) and other["code"] == 403, other
+
+    async def test_same_name_rejoin_is_allowed(self) -> None:
+        """同名单连（重复 join / 换房）⇒ 放行——name 一致即无冲突。
+
+        正对照：本条与 `test_name_mismatch_is_403` 成对，防止把「声明过 name」误判成一律拒绝。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": _join("computer", "c1", "room-a")}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-b"))
+
+        assert ack is None, f"同名（换房）应放行，实得 {ack!r}"
+        assert sessions["sid-1"]["office_id"] == "room-b"
+
+    async def test_identity_record_survives_failed_join_so_rename_is_403(self) -> None:
+        """上次入房被 **4101** 拒绝后身份记录**不回滚**；同一连接换名重入 ⇒ `403`。
+
+        protocol#64（用户 2026-10-27 拍板）：记录点在 400/403 之后、4106/4101 之前，随连接存续——
+        本用例正是 #213 旧「字段级回滚」语义的**反向**断言（旧测试名 ``...rolled_it_back``）。
+        """
+        sessions: dict[str, dict[str, Any]] = {
+            "sid-1": {"role": "computer"},
+            PEER_SID: _join("computer", "dup", "room-a"),
+        }
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "computer", PEER_SID)  # #230：目标房的 Computer 席位已被对端占据
+
+        # 首次入房撞目标房席位 ⇒ 4101；身份声明**已记录**且会话字段保留（不回滚）
+        first = await ns.on_server_join_office("sid-1", _join("computer", "dup", "room-a"))
+        assert isinstance(first, dict) and first["code"] == 4101, first
+        assert sessions["sid-1"]["name"] == "dup", f"被拒后身份声明应保留: {sessions['sid-1']!r}"
+        assert ns._sid_identity["sid-1"] == ("computer", "dup", _COMPUTER_ID)
+
+        # 换名重入 ⇒ 403（身份在一条连接内不可变；新身份须新连接）
+        second = await ns.on_server_join_office("sid-1", _join("computer", "other", "room-b"))
+        assert isinstance(second, dict) and second["code"] == 403, f"改名应被 403，实得 {second!r}"
+
+    async def test_room_full_is_4101_with_rejected_target_room(self) -> None:
+        """目标房已有 Agent ⇒ `4101`，`details` = **被拒的目标房** + 被占席位 `role: agent`（protocol#66 字节级）。"""
+        sessions: dict[str, dict[str, Any]] = {
+            "sid-1": {"role": "agent"},
+            PEER_SID: {"role": "agent", "name": PEER_NAME, "office_id": "room-a"},
+        }
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "agent", PEER_SID)
+
+        ack = await ns.on_server_join_office("sid-1", {"role": "agent", "name": "a1", "office_id": "room-a"})
+
+        assert ack == {
+            "code": 4101,
+            "message": "Room already has an agent",
+            "details": {"office_id": "room-a", "role": "agent"},
+        }, ack
+        assert json.dumps(ack, separators=(",", ":")) == (
+            '{"code":4101,"message":"Room already has an agent","details":{"office_id":"room-a","role":"agent"}}'
+        ), "4101 线上字节须与对称 SDK 一致（键序 code/message/details，details 内 office_id/role）"
+        _assert_no_leak(ack)
+
+    async def test_agent_switch_is_4106_with_current_room(self) -> None:
+        """Agent 已在其它房又请求入新房 ⇒ `4106`，`details.office_id` = 会话**当前**所在房。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-old"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office("sid-1", {"role": "agent", "name": "a1", "office_id": "room-new"})
+
+        assert isinstance(ack, dict) and ack["code"] == 4106, ack
+        assert ack["details"] == {"office_id": "room-old"}, (
+            f"4106 的 details.office_id 必须是**当前**房而非目标房: {ack!r}"
+        )
+        # 换房被拒不得改动既有成员关系
+        assert sessions["sid-1"]["office_id"] == "room-old"
+        _assert_no_leak(ack)
+
+    async def test_computer_switch_into_occupied_room_is_4101(self) -> None:
+        """目标房已有（同名的）另一台 Computer ⇒ `4101 {role: computer}`，**不得**回 `4105`（protocol#66 场景 #2/#6）。
+
+        #213「校验先于副作用」：会话**已在旧房**（`room-a`）时，席位检查必须先于退旧房
+        （`leave_room`）与进目标房（`enter_room`）——否则失败后客户端已无房、旧房对端还收到了 leave。
+        """
+        sessions: dict[str, dict[str, Any]] = {
+            "sid-1": _join("computer", "dup", "room-a"),
+            PEER_SID: _join("computer", "dup", "room-b"),
+        }
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "computer", "sid-1")
+        _seat(ns, "room-b", "computer", PEER_SID)
+        ns._name_to_sid_map = {("room-a", "computer", "dup"): "sid-1", ("room-b", "computer", "dup"): PEER_SID}
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "dup", "room-b"))
+
+        assert isinstance(ack, dict) and ack["code"] == 4101, ack
+        assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
+        assert ack["message"] == "Room already has a computer", ack
+        _assert_no_leak(ack)
+        # 被拒 ⇒ 旧房未退、目标房未进（退房分支在会话带 office_id 时才是活分支）
+        ns.server.leave_room.assert_not_awaited()
+        ns.server.enter_room.assert_not_awaited()
+        assert sessions["sid-1"]["office_id"] == "room-a"
+        # 原房席位仍由本会话持有，目标房席位仍归对端（失败零副作用）
+        assert ns._seat_to_sid == {("room-a", "computer"): "sid-1", ("room-b", "computer"): PEER_SID}
+
+    async def test_seat_conflict_is_4101_without_peer_sid(self) -> None:
+        """席位冲突（**日志诊断内含对端 sid**）⇒ `4101`，且 ack **绝不**携带该 sid。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "taken"}}
+        ns = _namespace(sessions)
+        _seat(ns, "room-b", "computer", PEER_SID)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "taken", "room-b"))
+
+        assert isinstance(ack, dict) and ack["code"] == 4101, ack
+        assert ack["details"] == {"office_id": "room-b", "role": "computer"}, ack
+        _assert_no_leak(ack)  # 回归守卫：旧实现把 "sid '<peer>'" 自由文本塞进 error_msg
+
+    async def test_name_key_held_by_another_sid_with_free_seat_is_500_never_4105(self) -> None:
+        """席位空闲而名字键却被他人持有 ⇒ 注册表与席位表矛盾（不变量破坏）⇒ `500`，**不**伪装成 `4105` 预留码。
+
+        且失败收敛：本会话不留在目标房、不留席位。/ A broken invariant surfaces as 500, never the reserved 4105.
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "taken"}}
+        ns = _namespace(sessions)
+        ns._name_to_sid_map = {("room-b", "computer", "taken"): PEER_SID}
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "taken", "room-b"))
+
+        assert ack == {"code": 500, "message": "Internal error"}, ack
+        assert ns._seat_to_sid == {} and ns._sid_to_seats == {}, "失败必须回滚本次新占的席位"
+        assert "office_id" not in sessions["sid-1"]
+        assert ns._name_to_sid_map == {("room-b", "computer", "taken"): PEER_SID}, "绝不替他人注销"
+
+    async def test_missing_payload_still_acks(self) -> None:
+        """**参数绑定失败也必须回 ack**：客户端不带载荷 emit（零参包）时，绑定发生在 handler 体内之前
+        ——若 `data` 无默认值，异常会逃出 handler ⇒ socketio 根本不发 ACK ⇒ 调用方挂到自身超时
+        （协议 error-handling.md:102-106 明令禁止，且明确覆盖「框架层参数提取器」这一时机）。
+
+        本用例直接调用**生产 handler**（不经 mock 替身，替身自带默认值会掩盖真实签名）；
+        线上等价由集成层 `test_join_office_ack_shapes_over_wire` 覆盖。
+        """
+        ns = _namespace({"sid-1": {}})
+
+        ack = await ns.on_server_join_office("sid-1")
+
+        assert isinstance(ack, dict) and ack["code"] == 400, ack
+
+    async def test_valid_payload_plus_extra_argument_is_rejected(self) -> None:
+        """**合法载荷 + 多余位置参数** ⇒ 400（载荷是单个 dict，多参即形状非法，绝不静默忽略）。
+
+        这个用例是必需的：只测"零参"时，`*_extra` 到底是被拒绝还是被**静默丢弃**根本没被区分——
+        而静默丢弃会让「客户端多传了一个参数」变成看不见的兼容性问题。
+        A valid payload plus an extra positional arg must be rejected, not silently ignored.
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_join_office(
+            "sid-1", _join("computer", "c1", "room-a"), "unexpected"
+        )
+
+        assert isinstance(ack, dict) and ack["code"] == 400, ack
+        assert "office_id" not in sessions["sid-1"], "多参必须在**产生副作用之前**被拒"
+
+    async def test_registry_conflict_diagnostic_goes_to_log_not_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """席位冲突的冗长诊断（**含对端 sid**）必须进日志、且**不得**进 ack —— 两个方向都钉。
+
+        为什么不能只断言「payload 里没有 sid」：payload 由请求派生值与常量文案构成，**任何单点变异
+        都不会让它转红**（本单的变异验证实测如此）。反向断言（sid 确实出现在日志里）才把「诊断下沉
+        日志」这条不变量变成可单点判别的——否则把日志整条删掉，用例照绿。
+        Assert both directions: the peer sid must be in the log AND absent from the ack payload.
+        """
+        from a2c_smcp.server import base as base_mod
+
+        fake_logger = MagicMock()
+        monkeypatch.setattr(base_mod, "logger", fake_logger)
+
+        ns = _namespace({"sid-1": {"role": "computer", "name": "taken"}})
+        _seat(ns, "room-b", "computer", PEER_SID)
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "taken", "room-b"))
+
+        logged = " ".join(str(call) for call in fake_logger.warning.call_args_list)
+        assert PEER_SID in logged, "诊断（含对端 sid）必须留在服务端日志里，否则现场无法排查"
+        assert PEER_SID not in json.dumps(ack, ensure_ascii=False), "但绝不可进入 ack 载荷"
+
+    async def test_unmapped_rejection_code_degrades_to_500_not_escape(self) -> None:
+        """**未接入码表的领域拒绝**（如下游直接实例化基类 `RoomRejection`，其 `code = 0`）⇒ 回 500。
+
+        回归守卫：`build_room_rejection_error` 对未映射的码抛 `ValueError`；而该调用点在 handler 的
+        `except` 子句**内部**——若它抛出来，新异常会顶替原异常逃出 handler ⇒ socketio 根本不发 ACK
+        ⇒ 调用方挂到自身超时。那正是本单要消灭的形态，故必须走**不抛**的助手兜底成 500。
+        """
+        from a2c_smcp.exceptions import RoomRejection
+
+        ns = _namespace({"sid-1": {}})
+        ns.enter_room = AsyncMock(side_effect=RoomRejection())
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+
+    async def test_non_int_rejection_code_degrades_to_500_not_escape(self) -> None:
+        """`code` **非 int** 的领域拒绝 ⇒ 500（同样不得逃出 handler）。
+
+        与"未映射码"是同族但**不同异常类型**：builder 入口的 `int(code)` 对 `None` / 字符串抛
+        `TypeError`；助手若只捕 `ValueError`，这条路径依旧会二次抛出 ⇒ 不发 ACK。故必须以
+        `code=None` 的子类单独钉死，而不是只测未映射的 int 码。
+        """
+        from a2c_smcp.exceptions import RoomRejection
+
+        class NoneCodeRejection(RoomRejection):
+            code = None  # type: ignore[assignment]
+
+        ns = _namespace({"sid-1": {}})
+        ns.enter_room = AsyncMock(side_effect=NoneCodeRejection())
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+
+    async def test_unknown_exception_is_500_without_echoing_detail(self) -> None:
+        """未知内部异常 ⇒ `500` + 笼统文案；**原始异常文本只进日志**，不得回给客户端。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+        ns = _namespace(sessions)
+        ns.enter_room = AsyncMock(side_effect=RuntimeError("boom-internal-detail"))
+
+        ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+        assert "Internal server error" not in ack["message"], ack
+        assert "boom-internal-detail" not in json.dumps(ack, ensure_ascii=False), ack
+
+    @pytest.mark.parametrize("event", ["leave_office", "list_room"])
+    async def test_valid_payload_plus_extra_argument_is_rejected_for_all_room_events(self, event: str) -> None:
+        """三个房间事件的 `_extra` 分支都要有覆盖：只测 join 的话，把 leave / list_room 的检查
+        整段删掉套件仍全绿（变异 M12 只证明了 join 一处）。/ Cover the `_extra` guard on all three.
+
+        合法载荷 + 多余位置参数 ⇒ 400，且**不得产生副作用**。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+        ns.leave_room = AsyncMock()
+
+        if event == "leave_office":
+            ack = await ns.on_server_leave_office("sid-1", {"office_id": "room-a"}, "unexpected")
+        else:
+            ack = await ns.on_server_list_room(
+                "sid-1", {"agent": "a1", "req_id": "r-1", "office_id": "room-a"}, "unexpected"
+            )
+
+        assert isinstance(ack, dict) and ack["code"] == 400, ack
+        assert sessions["sid-1"]["office_id"] == "room-a", "多参必须在产生副作用之前被拒"
+        ns.leave_room.assert_not_awaited()
+
+
+class TestLeaveOfficeAckShape:
+    """`server:leave_office` 的 ack 形态。"""
+
+    async def test_success_is_empty_ack(self) -> None:
+        """有房退房 ⇒ 空 ack（`None`）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_leave_office("sid-1", {"office_id": "room-a"})
+
+        assert ack is None, f"成功必须是空 ack（None），实得 {ack!r}"
+        assert "office_id" not in sessions["sid-1"]
+
+    async def test_no_room_is_idempotent_empty_ack(self) -> None:
+        """无房退房 ⇒ **幂等成功**（空 ack），必须**不走** `4103`。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_leave_office("sid-1", {"office_id": "room-a"})
+
+        assert ack is None, f"无房退房是幂等成功，不得回错误载荷，实得 {ack!r}"
+
+    @pytest.mark.parametrize("bad_payload", [{}, {"office_id": 123}, {"office_id": None}, None, "x"])
+    async def test_malformed_payload_acks_400(self, bad_payload: Any) -> None:
+        """载荷 schema 校验失败 ⇒ `400`（**不**静默不 ack）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_leave_office("sid-1", bad_payload)
+
+        assert isinstance(ack, dict) and ack["code"] == 400, ack
+        # 校验失败不得产生副作用
+        assert sessions["sid-1"]["office_id"] == "room-a"
+
+    async def test_malformed_payload_wins_over_no_room_idempotence(self) -> None:
+        """「无房幂等」与「载荷畸形 400」的交界：**校验在前** ⇒ 回 400，而非空 ack。
+
+        协议对两者各有一句话（无房 ⇒ 幂等成功；schema 失败 ⇒ 400），交界处未明说。取「校验先于
+        业务」既符合 error-handling.md:102-106 的口径（校验失败必产出结构化错误），也让两条规则
+        不会因实现顺序不同而给出两种客户端可感行为。
+        """
+        ns = _namespace({"sid-1": {"role": "agent"}})  # 会话无房
+
+        ack = await ns.on_server_leave_office("sid-1", {})
+
+        assert isinstance(ack, dict) and ack["code"] == 400, ack
+
+    async def test_payload_room_mismatch_is_still_success(self) -> None:
+        """载荷房号与会话不符 ⇒ **仍成功**（协议：MUST NOT 因此拒绝，只按会话执行）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_leave_office("sid-1", {"office_id": "room-OTHER"})
+
+        assert ack is None, f"载荷与实情不符不得构成拒绝，实得 {ack!r}"
+        assert "office_id" not in sessions["sid-1"]
+
+    async def test_internal_error_is_500(self) -> None:
+        """未知内部异常 ⇒ `500` + 笼统文案（原文进日志）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+        ns.leave_room = AsyncMock(side_effect=RuntimeError("boom-internal-detail"))
+
+        ack = await ns.on_server_leave_office("sid-1", {"office_id": "room-a"})
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+        assert "boom-internal-detail" not in json.dumps(ack, ensure_ascii=False), ack
+
+
+class TestListRoomAckShape:
+    """`server:list_room` 的 ack 形态。"""
+
+    @staticmethod
+    def _sessions_in(office: str, members: list[dict[str, Any]]) -> Any:
+        return AsyncMock(return_value=members)
+
+    async def test_success_returns_list_room_ret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """成功仍为 `ListRoomRet`（`sessions` + `req_id`）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+        monkeypatch.setattr(
+            "a2c_smcp.server.namespace.aget_all_sessions_in_office",
+            self._sessions_in("room-a", [{"sid": "sid-1", "name": "a1", "role": "agent", "office_id": "room-a"}]),
+        )
+
+        ret = await ns.on_server_list_room("sid-1", {"agent": "a1", "req_id": "r-1", "office_id": "room-a"})
+
+        assert ret["req_id"] == "r-1"
+        assert len(ret["sessions"]) == 1
+
+    @pytest.mark.parametrize("bad_payload", [{}, {"agent": "a"}, {"office_id": "o"}, None])
+    async def test_malformed_payload_acks_400(self, bad_payload: Any) -> None:
+        """载荷畸形 ⇒ `400`（**不**静默不 ack）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_list_room("sid-1", bad_payload)
+
+        assert isinstance(ack, dict) and ack["code"] == 400, ack
+
+    async def test_not_in_room_is_4103(self) -> None:
+        """会话无 `office_id` ⇒ `4103`（无 code-specific details）。"""
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent"}}
+        ns = _namespace(sessions)
+
+        ack = await ns.on_server_list_room("sid-1", {"agent": "a1", "req_id": "r-1", "office_id": "room-a"})
+
+        assert isinstance(ack, dict) and ack["code"] == 4103, ack
+        assert "details" not in ack, f"4103 无 details（会话自身无房可报）: {ack!r}"
+
+    async def test_cross_room_is_4104_with_rejected_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """显式点名非自己所在房 ⇒ `4104`（**不再**静默不 ack），且**不泄露**目标房成员信息。
+
+        断言刻意分两层：payload 里没有成员数据（弱）+ **会话读取器根本没被调用**（强，形状无关）。
+        只做前者时，「先取全房成员、再拒绝」的实现照样全绿——那已经把泄露面打开了。
+        """
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-a"}}
+        ns = _namespace(sessions)
+        leaked = [{"sid": PEER_SID, "name": PEER_NAME, "role": "computer", "office_id": "room-b"}]
+        reader = self._sessions_in("room-b", leaked)
+        monkeypatch.setattr("a2c_smcp.server.namespace.aget_all_sessions_in_office", reader)
+
+        ack = await ns.on_server_list_room("sid-1", {"agent": "a1", "req_id": "r-1", "office_id": "room-b"})
+
+        assert isinstance(ack, dict) and ack["code"] == 4104, ack
+        assert ack["details"] == {"office_id": "room-b"}, ack
+        _assert_no_leak(ack)
+        reader.assert_not_called()
+
+    async def test_originator_session_gone_is_acked_not_raised(self) -> None:
+        """发起者会话取不到 ⇒ 仍**产出 ack**（500），而不是抛出去让调用方挂到超时。
+
+        与 join / leave 对称的 catch-all：本单的不变量是「有 ack 通道 ⇒ 失败必产出 ack」，
+        对 list_room 不设例外。
+
+        .. note::
+
+            ``is None`` 分支本身是**防御性死分支**：实测 ``socketio`` 的 ``get_session`` 对未知 sid
+            抛 ``KeyError('Session not found')`` 而**不返回 None**，故线上"发起者已断连"走 KeyError
+            ——它同样被这条 catch-all 收编为 500 ack（对已断连的 originator 没有读者，协议
+            §飞行中断连 亦许可不回；此处回 500 无害且保持了三条事件的一致性）。两条分支在此都
+            收敛到同一断言，故用例不区分它们。
+        """
+        ns = _namespace({})
+        ns.get_session = AsyncMock(return_value=None)
+
+        ack = await ns.on_server_list_room("sid-gone", {"agent": "a1", "req_id": "r-1", "office_id": "room-a"})
+
+        assert isinstance(ack, dict) and ack["code"] == 500, ack
+
+
+class TestEnterRoomDomainErrorTypes:
+    """`enter_room` 的业务闸门改抛**领域异常**（携带协议码），且仍是 `ValueError` 子类。
+
+    换型只增加信息量（码），不改变「校验失败」的类别 ⇒ #213 建立的 `except ValueError` /
+    `pytest.raises(ValueError)` 契约保持兼容。
+    """
+
+    async def test_agent_switch_raises_already_in_room(self) -> None:
+        from a2c_smcp.exceptions import AlreadyInRoomError
+
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "agent", "office_id": "room-old"}}
+        ns = _namespace(sessions)
+
+        with pytest.raises(AlreadyInRoomError) as exc_info:
+            await ns.enter_room("sid-1", "room-new")
+
+        assert exc_info.value.code == 4106
+        assert isinstance(exc_info.value, ValueError), "既有 except ValueError 契约必须保持"
+
+    async def test_room_full_raises_room_full(self) -> None:
+        from a2c_smcp.exceptions import RoomFullError
+
+        sessions: dict[str, dict[str, Any]] = {
+            "sid-1": {"role": "agent"},
+            PEER_SID: {"role": "agent", "name": PEER_NAME, "office_id": "room-a"},
+        }
+        ns = _namespace(sessions)
+        _seat(ns, "room-a", "agent", PEER_SID)
+
+        with pytest.raises(RoomFullError) as exc_info:
+            await ns.enter_room("sid-1", "room-a")
+
+        assert exc_info.value.code == 4101
+        assert exc_info.value.role == "agent"
+        assert isinstance(exc_info.value, ValueError)
+        # 异常消息**构造上**不含对端标识（冗长诊断走日志）——即使被误塞进 ack 也不会泄露
+        assert PEER_SID not in str(exc_info.value)
+
+    async def test_registry_contradiction_raises_invariant_error_not_rejection(self) -> None:
+        """名字键被他人持有而席位空闲 ⇒ :class:`RegistryInvariantError`（非 :class:`RoomRejection`）——不得产出协议拒绝码。"""
+        from a2c_smcp.exceptions import RoomRejection
+        from a2c_smcp.server.name_registry import RegistryInvariantError
+
+        sessions: dict[str, dict[str, Any]] = {"sid-1": {"role": "computer", "name": "taken"}}
+        ns = _namespace(sessions)
+        ns._name_to_sid_map = {("room-a", "computer", "taken"): PEER_SID}
+
+        with pytest.raises(RegistryInvariantError) as exc_info:
+            await ns.enter_room("sid-1", "room-a")
+
+        assert not isinstance(exc_info.value, RoomRejection)
+
+    def test_exception_message_matches_protocol_payload_message(self) -> None:
+        """防漂移：领域异常的文案必须与 builder 产出的协议文案**逐字一致**。
+
+        两处各写一份字符串，一旦分叉，日志里的原因就和客户端收到的原因不是同一回事。
+        Anti-drift: the exception text and the wire payload message must be one and the same string.
+        """
+        from a2c_smcp.exceptions import AlreadyInRoomError, RoomFullError
+        from a2c_smcp.smcp import build_room_rejection_error
+
+        for role in ("agent", "computer"):
+            full = RoomFullError(role)
+            assert str(full) == build_room_rejection_error(full.code, declared_role=role)["message"], role
+        moved = AlreadyInRoomError()
+        assert str(moved) == build_room_rejection_error(moved.code)["message"]
+
+
+class TestRoomRejectionCodesAreStructurallyConfined:
+    """`4102` / `4105` 为预留码：协议要求 SDK **MUST NOT** 主动返回（4105 自 protocol#66 起）。"""
+
+    async def test_reserved_codes_are_never_produced_by_any_room_event(self) -> None:
+        """三个房间事件在任何失败路径上都不得产出 `4102` / `4105`。
+
+        采样表**逐行**携带该场景所需的对端会话，避免「行写了、但夹具没构造出触发条件」⇒ 该行
+        静默变成"成功"，而 ``isinstance(p, dict)`` 的过滤又把它悄悄剔除（本单实锤踩到过）。
+        故下方先**硬断言每条路径都产出了 flat ErrorPayload**，再收集码。
+        """
+        rows: list[tuple[str, Any]] = []
+        # protocol#64：身份冲突的判据是 ``_sid_identity`` 记录（首次 join 通过时写入），不是会话字段。
+        # 需要「角色不符」这一行的夹具先种下记录，否则首次声明会被当作合法首次记录而放行。
+        seeded_identities: dict[str, IdentityRecord] = {
+            "角色不符": IdentityRecord(role="agent", name="n", computer_id=None),
+        }
+
+        # (标签, 请求载荷, 本会话, 对端会话, 对端占的席位, 注册表)
+        join_rows: list[tuple[str, Any, dict[str, Any], dict[str, Any] | None, list[tuple[str, str]], dict[Any, str]]] = [
+            ("载荷畸形", {}, {}, None, [], {}),
+            ("角色不符", _join("computer", "n", "r"), {"role": "agent"}, None, [], {}),
+            (
+                "目标房已有 Agent",
+                {"role": "agent", "name": "n", "office_id": "r"},
+                {"role": "agent"},
+                {"role": "agent", "name": "p", "office_id": "r"},
+                [("r", "agent")],
+                {},
+            ),
+            (
+                "Agent 已在其它房",
+                {"role": "agent", "name": "n", "office_id": "r2"},
+                {"role": "agent", "office_id": "r1"},
+                None,
+                [],
+                {},
+            ),
+            (
+                "房内同名 Computer",
+                _join("computer", "dup", "r"),
+                {"role": "computer", "name": "dup"},
+                # 对端必须**占着同房 computer 席位**，否则席位检查根本不触发（本行曾因此静默变成"成功"）
+                _join("computer", "dup", "r"),
+                [("r", "computer")],
+                {("r", "computer", "dup"): PEER_SID},
+            ),
+            (
+                "注册表与席位表矛盾",
+                _join("computer", "taken", "r"),
+                {"role": "computer", "name": "taken"},
+                None,
+                [],
+                {("r", "computer", "taken"): PEER_SID},
+            ),
+        ]
+        for label, payload, sess, peer, peer_seats, registry in join_rows:
+            sessions: dict[str, dict[str, Any]] = {"sid-1": dict(sess)}
+            if peer is not None:
+                sessions[PEER_SID] = dict(peer)
+            ns = _namespace(sessions)
+            if label in seeded_identities:
+                ns._sid_identity["sid-1"] = seeded_identities[label]
+            for office_id, role in peer_seats:
+                _seat(ns, office_id, role, PEER_SID)
+            ns._name_to_sid_map = dict(registry)
+            rows.append((label, await ns.on_server_join_office("sid-1", payload)))
+
+        # leave：载荷畸形 / 内部异常
+        ns_l1 = _namespace({"sid-1": {"role": "agent", "office_id": "r"}})
+        rows.append(("leave 载荷畸形", await ns_l1.on_server_leave_office("sid-1", {})))
+        ns_l2 = _namespace({"sid-1": {"role": "agent", "office_id": "r"}})
+        ns_l2.leave_room = AsyncMock(side_effect=RuntimeError("x"))
+        rows.append(("leave 内部异常", await ns_l2.on_server_leave_office("sid-1", {"office_id": "r"})))
+
+        # list_room：载荷畸形 / 无房 / 越权 / 内部异常
+        ns_r1 = _namespace({"sid-1": {"role": "agent"}})
+        rows.append(("list_room 载荷畸形", await ns_r1.on_server_list_room("sid-1", {})))
+        rows.append(
+            (
+                "list_room 无房",
+                await ns_r1.on_server_list_room("sid-1", {"agent": "a", "req_id": "r", "office_id": "r"}),
+            )
+        )
+        ns_r2 = _namespace({"sid-1": {"role": "agent", "office_id": "r1"}})
+        rows.append(
+            (
+                "list_room 越权",
+                await ns_r2.on_server_list_room("sid-1", {"agent": "a", "req_id": "r", "office_id": "r2"}),
+            )
+        )
+        ns_r3 = _namespace({"sid-1": {"role": "agent", "office_id": "r1"}})
+        ns_r3.get_session = AsyncMock(side_effect=RuntimeError("boom"))
+        rows.append(
+            (
+                "list_room 内部异常",
+                await ns_r3.on_server_list_room("sid-1", {"agent": "a", "req_id": "r", "office_id": "r1"}),
+            )
+        )
+
+        # 硬断言：**每一条**采样路径都必须产出 flat ErrorPayload。若某行因夹具不成立而变成"成功"
+        # （None），这里立刻转红——否则码集合会把该行静默剔除，用例看似覆盖、实则漏掉整行。
+        # Every sampled path must produce a flat ErrorPayload — never a silent success.
+        bad = [(label, ack) for label, ack in rows if not (isinstance(ack, dict) and "code" in ack)]
+        assert not bad, f"以下路径未产出 flat ErrorPayload（夹具或实现有问题）：{bad!r}"
+        codes = [ack["code"] for _, ack in rows]
+        assert 4102 not in codes, f"4102 是预留码，SDK MUST NOT 主动返回；实得 {codes}"
+        assert 4105 not in codes, f"4105 自 protocol#66 起是预留码，SDK MUST NOT 主动返回；实得 {codes}"
+        assert codes.count(4101) == 2, f"同 role 第二个会话（含同名）一律 4101：{codes}"
+        # 正对照：采样确实覆盖了多个**不同**码（否则"没有 4102"可能只是因为全都走了同一条兜底）
+        assert len(set(codes)) >= 5, f"采样面过窄，无法支撑「任何路径都不产出 4102」：{codes}"
+
+    def test_builder_refuses_to_emit_4102(self) -> None:
+        """`4102` 是预留码：builder **构造上**拒绝产出，而不是靠调用方自觉。
+
+        match 必须锚定**预留码专属**的那条守卫（而非「非房间管理码」的兜底分支）——两者都抛
+        ValueError，只匹配 "4102" 时，把预留码守卫删掉、靠兜底分支接住也能过（变异验证抓到的空转）。
+        """
+        from a2c_smcp.smcp import build_room_rejection_error
+
+        with pytest.raises(ValueError, match="预留码"):
+            build_room_rejection_error(4102)
+
+    def test_builder_refuses_to_emit_4105(self) -> None:
+        """`4105` 自 protocol#66 起同为预留码：builder 构造上拒绝（锚定预留码守卫，理由同上）。"""
+        from a2c_smcp.smcp import build_room_rejection_error
+
+        with pytest.raises(ValueError, match="预留码"):
+            build_room_rejection_error(4105, target_office_id="r", declared_role="computer")
+
+    @pytest.mark.parametrize("role", [None, "", "robot"])
+    def test_builder_requires_seat_role_for_4101(self, role: Any) -> None:
+        """`4101` 的 `details.role` 是唯一机器判据：缺失 / 非法即构造错误，不产出对端无法分流的 4101。"""
+        from a2c_smcp.smcp import build_room_rejection_error
+
+        with pytest.raises(ValueError, match="4101"):
+            build_room_rejection_error(4101, target_office_id="r", declared_role=role)
+
+    def test_no_name_conflict_reference_in_server_sources(self) -> None:
+        """源码扫描兜底：``a2c_smcp/server`` 不得引用 ``NAME_CONFLICT``（4105 的产出路径已整体移除）。"""
+        import pathlib as _pathlib
+
+        server_dir = _pathlib.Path(__file__).resolve().parents[3] / "a2c_smcp" / "server"
+        offenders = [
+            f"{path.name}:{lineno}"
+            for path in server_dir.glob("*.py")
+            for lineno, line in enumerate(path.read_text().splitlines(), 1)
+            if "NAME_CONFLICT" in line or "NameConflict" in line
+        ]
+        assert not offenders, f"4105 产出路径不得复活：{offenders}"
+
+    def test_builder_rejects_non_room_codes(self) -> None:
+        """非房间管理码（本 builder 的合法输入域之外）同样拒绝，避免悄悄产出无 code-specific 规则的载荷。"""
+        from a2c_smcp.smcp import build_room_rejection_error
+
+        for code in (4014, 4019, 9999):
+            with pytest.raises(ValueError, match="非房间管理错误码"):
+                build_room_rejection_error(code)
+
+    def test_no_4102_literal_in_server_sources(self) -> None:
+        """源码扫描兜底：``a2c_smcp/server`` 内不得出现裸 ``4102`` 字面量（新增路径的回归守卫）。"""
+        import pathlib as _pathlib
+
+        server_dir = _pathlib.Path(__file__).resolve().parents[3] / "a2c_smcp" / "server"
+        offenders = [
+            f"{path.name}:{lineno}"
+            for path in server_dir.glob("*.py")
+            for lineno, line in enumerate(path.read_text().splitlines(), 1)
+            if "4102" in line
+        ]
+        assert not offenders, f"预留码 4102 不得出现在服务端源码：{offenders}"
+
+
+@pytest.mark.asyncio
+async def test_same_sid_concurrent_different_declarations_record_at_most_one() -> None:
+    """protocol#64：「一致性校验 + 首次记录」对同一 sid **原子** —— 并发不同声明时至多一者被记录。
+
+    用 ``await asyncio.sleep(0)`` 的 get_session 强制两个 handler 在取会话处交错，再验证只有一个
+    声明落地（另一个 ⇒ 403）。没有原子核心时两者都会把自己写进记录。
+    """
+    import asyncio
+
+    from a2c_smcp.smcp import ErrorCode, build_room_rejection_error
+
+    sessions: dict[str, dict[str, Any]] = {"sid-1": {}}
+    ns = _namespace(sessions)
+
+    async def _get(sid: str) -> dict[str, Any]:
+        await asyncio.sleep(0)  # 强制交错：两个 handler 都先通过取会话
+        return sessions[sid]
+
+    ns.get_session = AsyncMock(side_effect=_get)
+    ns.save_session = AsyncMock(side_effect=lambda sid, sess: sessions.__setitem__(sid, sess))
+    ns.enter_room = AsyncMock()
+    x = "abcdef01-2345-4678-8abc-def012345678"
+    y = "abcdef02-2345-4678-8abc-def012345679"
+
+    def _payload(computer_id: str) -> dict[str, Any]:
+        return {"role": "computer", "name": "c1", "office_id": "room-a", "computer_id": computer_id}
+
+    acks = await asyncio.gather(
+        ns.on_server_join_office("sid-1", _payload(x)),
+        ns.on_server_join_office("sid-1", _payload(y)),
+    )
+
+    assert sorted(acks, key=lambda ack: ack is None) == [
+        build_room_rejection_error(ErrorCode.FORBIDDEN),
+        None,
+    ], acks
+    recorded = ns._sid_identity["sid-1"]
+    assert recorded[2] in (x, y)
+    assert recorded == ("computer", "c1", recorded[2])
+
+
+def test_record_identity_three_states() -> None:
+    """fix-review 🟡6：INSERTED / MATCHED / MISMATCH 三态（只 pop 自己插入的记录）。"""
+    from a2c_smcp.server.name_registry import IdentityClaim, record_identity
+
+    records: dict[str, IdentityRecord] = {}
+    identity = IdentityRecord(role="computer", name="c1", computer_id=_COMPUTER_ID)
+
+    assert record_identity(records, "sid-1", identity) is IdentityClaim.INSERTED
+    assert record_identity(records, "sid-1", identity) is IdentityClaim.MATCHED
+    assert (
+        record_identity(records, "sid-1", IdentityRecord(role="computer", name="c2", computer_id=_COMPUTER_ID))
+        is IdentityClaim.MISMATCH
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_gone_pops_only_self_inserted_identity() -> None:
+    """fix-review 🟡6：断连收尾只回收**本次新插入**的记录；匹配到既有记录时绝不 pop。"""
+    from a2c_smcp.server.name_registry import SessionGoneError
+
+    # MATCHED（既有记录）：保留——它是残留 leave 宣告的 computer_id 载体
+    ns = _namespace({"sid-1": {}})
+    ns._sid_identity["sid-1"] = IdentityRecord(role="computer", name="c1", computer_id=_COMPUTER_ID)
+    ns.enter_room = AsyncMock(side_effect=SessionGoneError("gone"))
+    ack = await ns.on_server_join_office("sid-1", _join("computer", "c1", "room-a"))
+    assert isinstance(ack, dict) and ack["code"] == 500, ack
+    assert "sid-1" in ns._sid_identity, "匹配到既有记录时不得 pop（残留 leave 需要它）"
+
+    # INSERTED（本次新插入）：由失败分支回收（正对照）
+    ns2 = _namespace({"sid-2": {}})
+    ns2.enter_room = AsyncMock(side_effect=SessionGoneError("gone"))
+    ack2 = await ns2.on_server_join_office("sid-2", _join("computer", "c1", "room-a"))
+    assert isinstance(ack2, dict) and ack2["code"] == 500, ack2
+    assert "sid-2" not in ns2._sid_identity

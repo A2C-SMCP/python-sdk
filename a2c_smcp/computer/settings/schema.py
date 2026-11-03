@@ -43,6 +43,7 @@ from enum import StrEnum
 from typing import Any, NotRequired, TypedDict
 
 from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.path_norm import InvalidPathError, native_platform, normalize_path
 
 logger = get_logger(__name__)
 
@@ -127,15 +128,21 @@ FIELD_PERMISSIONS = "permissions"
 # v0.4.0 新增（#196）：client:put_blob 上行写入的落盘根（绝对路径，顶层标量）。
 # v0.4.0 added (#196): the landing root for client:put_blob uploads (absolute path, top-level scalar).
 FIELD_LANDING_ROOT = "landingRoot"
+# v0.5.0 新增（#236 / protocol#65）：client:resolve_path 按路径读取的授权读根（绝对路径数组）。
+# v0.5.0 added (#236 / protocol#65): authorized read roots for client:resolve_path (array of absolute paths).
+FIELD_READ_ROOTS = "readRoots"
 
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
 POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS})
 
-# 仅受信 scope 可设字段：出现在 **project** scope → 过滤 + 记错。两类成员共用「project 供给即拒」管线：
-# 1) 审批门 **enable 方向**判据（#157）；2) ``landingRoot``（v0.4.0 #196，写目标重定向面）。
-# Trusted-scope-only fields: filtered + recorded when supplied by the **project** scope. Two member
-# families share this pipeline: approval-gate ENABLE inputs (#157) and ``landingRoot`` (#196).
+# 仅受信 scope 可设字段：出现在 **project** scope → 过滤 + 记错。三类成员共用「project 供给即拒」管线：
+# 1) 审批门 **enable 方向**判据（#157）；2) ``landingRoot``（v0.4.0 #196，写目标重定向面）；
+# 3) ``readRoots``（v0.5.0 #236 / protocol#65，读授权扩张面——clone 的仓库不得把读授权扩到任意路径，
+#    ``security.md`` §读取通道安全 / ``computer-management`` §7 不变量 #7）。
+# Trusted-scope-only fields: filtered + recorded when supplied by the **project** scope. Three member
+# families share this pipeline: approval-gate ENABLE inputs (#157), ``landingRoot`` (#196) and
+# ``readRoots`` (#236, read-authorization widening).
 #
 # 协议依据：``guides/mcp-approval-gate-alignment.md`` §2.1 通则（MUST）——
 #   「审批门的输入 MUST 来自比被判定 server 更高信任的来源；任何 scope 都不得为『自身是否受信』提供判据。」
@@ -162,10 +169,14 @@ POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD
 #   server 无安全影响，更严格永远安全。把它收进本类目属**过度矫正**，由单测
 #   ``test_disabled_mcpjson_allowed_from_any_scope`` 守护。
 TRUSTED_SCOPE_ONLY_FIELDS: frozenset[str] = frozenset(
-    {FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP, FIELD_LANDING_ROOT}
+    {FIELD_ENABLED_MCPJSON_SERVERS, FIELD_ENABLE_ALL_PROJECT_MCP, FIELD_LANDING_ROOT, FIELD_READ_ROOTS}
 )
 
 # 字符串数组字段（读合并：拼接去重；写回：整体替换，§5.4）/ String-array fields.
+# ``readRoots``（#236）按 arrays 默认语义跨 scope **拼接去重**（低 scope 在前）——多来源授权取并集，
+# 高 scope 不会遮蔽低 scope 已授的根（授权只增不减）。
+# ``readRoots`` uses the default array semantics: concat+dedup across scopes (lower first), so
+# authorizations union rather than being shadowed.
 STRING_ARRAY_FIELDS: frozenset[str] = frozenset(
     {
         FIELD_TRUSTED_MARKETPLACES,
@@ -174,6 +185,7 @@ STRING_ARRAY_FIELDS: frozenset[str] = frozenset(
         FIELD_DISABLED_MCPJSON_SERVERS,
         FIELD_ALLOWED_MCP_SERVERS,
         FIELD_DENIED_MCP_SERVERS,
+        FIELD_READ_ROOTS,
     }
 )
 
@@ -263,6 +275,7 @@ class ComputerSettings(TypedDict, total=False):
     deniedMcpServers: list[str]
     permissions: PermissionsBlock
     landingRoot: str  # v0.4.0 #196：client:put_blob 落盘根（绝对路径；仅受信 scope 可设）
+    readRoots: list[str]  # v0.5.0 #236 / protocol#65：client:resolve_path 授权读根（默认空 = 不可读）
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +412,7 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
             for idx, item in enumerate(sub_value):
                 if not isinstance(item, str):
                     errors.append(_err(scope, f"{key}.additionalDirectories[{idx}]", "expected string"))
-                elif not item.startswith("/") and not re.match(r"^[A-Za-z]:[\\/]", item):
+                elif not _is_absolute_path(item):
                     # 须绝对路径（POSIX ``/`` 或 Windows 盘符）；相对路径判废（§5.3.1）。
                     errors.append(_err(scope, f"{key}.additionalDirectories[{idx}]", "must be an absolute path"))
                 else:
@@ -408,6 +421,48 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
         else:
             # permissions 下未知子键 passthrough（与顶层 passthrough 同纪律）。
             cleaned[sub_key] = sub_value
+    return cleaned, errors
+
+
+def _is_absolute_path(value: str) -> bool:
+    """是否绝对路径（POSIX ``/`` 或 Windows 盘符前缀）/ Absolute path (POSIX root or Windows drive)."""
+    return value.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", value) is not None
+
+
+def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
+    """``readRoots``（v0.5.0 #236 / protocol#65）：字符串数组，每项须为绝对路径。
+
+    非法项**逐条过滤**并记诊断（不整字段判废——其余授权根仍然生效）；空数组 = 不可读
+    （fail-closed，语义由 resolve 管线保证）。**不做** ``~`` 展开：协议 ``normalize_path``
+    明确不展开 ``~``，含 ``~`` 的项在运行期按 ``invalid_path`` 处理，故此处不视为绝对路径。
+    绝对路径项再经 :func:`~a2c_smcp.utils.path_norm.normalize_path`（宿主平台）预判形态，
+    ``invalid_path`` 在**配置期**即记诊断。双形态（配置 / realpath）在运行期由
+    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` 编译。
+    Per-item filtering (one bad root never voids the others); empty = unreadable (fail-closed).
+    No ``~`` expansion: the protocol's ``normalize_path`` does not expand it either.
+    """
+    if not isinstance(value, list):
+        return _DROP, [_err(scope, key, f"expected array, got {type(value).__name__}")]
+    cleaned: list[str] = []
+    errors: list[SettingsValidationError] = []
+    platform = native_platform()
+    for idx, item in enumerate(value):
+        field = f"{key}[{idx}]"
+        if not isinstance(item, str):
+            errors.append(_err(scope, field, f"expected string, got {type(item).__name__}"))
+            continue
+        if not _is_absolute_path(item):
+            errors.append(_err(scope, field, "must be an absolute path"))
+            continue
+        # 形态与运行期同源：用协议 ``normalize_path``（宿主平台）预判 ``invalid_path``，
+        # 配置期即给出诊断，避免「写得进、读不了」。
+        # Same predicate as runtime: pre-validate with the protocol's normalize_path.
+        try:
+            normalize_path(item, platform)
+        except InvalidPathError as exc:
+            errors.append(_err(scope, field, f"invalid path: {exc}"))
+            continue
+        cleaned.append(item)
     return cleaned, errors
 
 
@@ -421,7 +476,7 @@ def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[
     """
     if not isinstance(value, str):
         return _DROP, [_err(scope, key, f"expected string, got {type(value).__name__}")]
-    if not value.startswith("/") and not re.match(r"^[A-Za-z]:[\\/]", value):
+    if not _is_absolute_path(value):
         return _DROP, [_err(scope, key, "must be an absolute path")]
     return value, []
 
@@ -441,6 +496,7 @@ _FIELD_VALIDATORS = {
     FIELD_DENIED_MCP_SERVERS: _validate_string_array,
     FIELD_PERMISSIONS: _validate_permissions,
     FIELD_LANDING_ROOT: _validate_landing_root,
+    FIELD_READ_ROOTS: _validate_read_roots,
 }
 
 

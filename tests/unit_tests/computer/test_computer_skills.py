@@ -87,8 +87,10 @@ def _computer(tmp_path: Path) -> Computer:
 
 async def _settle_resource_refresh(comp: Computer) -> None:
     """#210：资源刷新改由后台任务执行 —— 断言效果前必须结算（含结算后又起的新一轮）。"""
-    task = comp._resource_refresh_task
-    if task is not None:
+    while True:
+        task = getattr(comp, "_resource_refresh_task", None)
+        if task is None or task.done():
+            return
         await task
 
 

@@ -5,6 +5,7 @@
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
 from a2c_smcp.computer.computer import Computer
+from a2c_smcp.computer.identity import ComputerIdentityError  # noqa: F401 — #235 宿主必须捕获的身份错误
 from a2c_smcp.computer.mcp_clients.oauth_credential_store import (  # noqa: F401 — #179 宿主注入面
     InMemoryOAuthCredentialStore,
     OAuthCredentialStore,
@@ -25,6 +26,7 @@ from a2c_smcp.computer.socketio.client import AuthProvider, SMCPComputerClient  
 __all__ = [
     "AuthProvider",
     "Computer",
+    "ComputerIdentityError",
     "SMCPComputerClient",
     "InMemoryOAuthCredentialStore",
     "OAuthBeginRequest",

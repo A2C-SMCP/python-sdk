@@ -36,6 +36,7 @@ from a2c_smcp.smcp import (
     GetSkillsReq,
     GetToolsReq,
     PutBlobReq,
+    ResolvePathReq,
     ToolCallReq,
 )
 
@@ -233,6 +234,25 @@ def build_get_blob_request(
     if max_chunk_bytes is not None:
         req["max_chunk_bytes"] = max_chunk_bytes
     return req
+
+
+def build_resolve_path_request(agent_config: AgentConfig, computer: str, path: str) -> ResolvePathReq:
+    """创建按路径读取请求对象（v0.5.0 #236 / protocol#65）/ Create resolve-path request object.
+
+    协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq；
+    blob-transfer.md §生产者三：按路径读取.
+
+    ``path`` 由调用方给出（Computer 本地绝对路径）；本函数**不**做形态校验——路径形态判定
+    属 Computer 端 ``normalize_path``（``invalid_path`` / ``4020``），Agent 侧预判会与协议漂移.
+    ``path`` is passed through unvalidated; shape checks belong to the Computer's
+    ``normalize_path`` (``4020 invalid_path``), so the Agent never second-guesses the protocol.
+    """
+    return ResolvePathReq(
+        agent=agent_config["agent"],
+        req_id=uuid.uuid4().hex,
+        computer=computer,
+        path=path,
+    )
 
 
 def build_put_blob_request(

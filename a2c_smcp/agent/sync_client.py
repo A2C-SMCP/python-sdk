@@ -8,6 +8,9 @@
 * 描述: 同步Agent客户端实现 / Synchronous Agent client implementation
 """
 
+import threading
+import time
+import warnings
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -16,12 +19,12 @@ from socketio import Client
 
 from a2c_smcp import PROTOCOL_VERSION
 from a2c_smcp.agent import _blob_sideband as _sb
+from a2c_smcp.agent._cancel import CancelSendGate
 from a2c_smcp.agent.auth import AgentAuthProvider
-from a2c_smcp.agent.base import BaseAgentSyncClient
+from a2c_smcp.agent.base import TOOL_CALL_TIMEOUT_ERRORS, BaseAgentSyncClient, _the_computer_in_office
 from a2c_smcp.agent.errors import SMCPProtocolError, raise_for_error_payload
-from a2c_smcp.agent.types import AgentEventHandler
+from a2c_smcp.agent.types import AgentEventHandler, CancelSignal
 from a2c_smcp.smcp import (
-    CANCEL_TOOL_CALL_EVENT,
     ENTER_OFFICE_NOTIFICATION,
     GET_BLOB_EVENT,
     GET_CONFIG_EVENT,
@@ -30,17 +33,19 @@ from a2c_smcp.smcp import (
     GET_SKILL_EVENT,
     GET_SKILLS_EVENT,
     GET_TOOLS_EVENT,
+    JOIN_OFFICE_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     LIST_ROOM_EVENT,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
     UPDATE_DESKTOP_NOTIFICATION,
     UPDATE_SKILLS_NOTIFICATION,
     UPDATE_TOOL_LIST_NOTIFICATION,
-    AgentCallData,
     EnterOfficeNotification,
+    EnterOfficeReq,
     GetBlobRet,
     GetComputerConfigRet,
     GetDeskTopRet,
@@ -50,6 +55,7 @@ from a2c_smcp.smcp import (
     GetToolsRet,
     LeaveOfficeNotification,
     ListRoomReq,
+    ResolvePathRet,
     SessionInfo,
     UpdateMCPConfigNotification,
     UpdateToolListNotification,
@@ -65,6 +71,18 @@ from a2c_smcp.utils.handshake import (
 )
 from a2c_smcp.utils.logger import ContextLogger, get_logger
 from a2c_smcp.utils.mime import is_text_mime
+from a2c_smcp.utils.office import (
+    OFFICE_JOIN_TIMEOUT,
+    log_join_rejection,
+    parse_join_ack,
+    rejoin_retry_delay,
+    resolve_join_failure,
+)
+from a2c_smcp.utils.reconnect import (
+    disconnect_aborting_reconnect,
+    forget_finished_reconnect_task,
+    translate_reconnect_attempt_error,
+)
 
 logger = get_logger("agent")
 
@@ -76,6 +94,33 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
     注意：当前Client操作是非线程安全的，不可以在多线程环境下使用
     Note: Current Client operations are not thread-safe, cannot be used in multi-threaded environments
+
+    **线程模型（据实）/ Thread model, as it actually is**：engineio 对每个 MESSAGE 包**新建一个
+    daemon 线程**派发（``_trigger_event(..., run_async=True)`` ⇒ ``start_background_task``），
+    ``connect`` / ``disconnect`` 则是**内联**触发。故**事件处理器与用户主线程天然并发**——这正是
+    #218 给 office 操作补 ``_office_op_lock`` 的理由（此前 sync 侧无任何 wire 互斥，重放的
+    check-then-send 与显式 join 可交错 ⇒ 净效果「客户端以为退房、服务端仍在房」）。
+    Handlers run on per-packet threads and the lifecycle hooks are dispatched inline, so handlers
+    race the user thread by construction — hence the office op-lock added in #218.
+
+    已备案的**跨线程例外**共两处（其余仍不线程安全）：
+
+    - **#203/#218 自动回房**（``_rejoin_office``）：跑在独立 daemon 线程，只做"发出 join + 等 ACK"
+      这一件事——generation **双检（取到 op-lock 后 / 应用结果前）**保证陈旧结果不落状态，且与显式
+      join/leave 共用 ``_office_op_lock`` 互斥。可接受的最坏后果：等待期间连接被拆时，该线程吃满
+      ``OFFICE_JOIN_TIMEOUT``（10s）后退出（socketio ``call()`` 不会在断链时快速失败）。
+    - **#209 取消 watcher**（``_cancel.SyncCancelWatcher``）：仅在调用方传入 ``cancel`` 时启动，只做
+      "轮询 ``is_set()`` + 发一次 ``server:tool_call_cancel``"，**不接触**本类任何可变状态，且在
+      ``emit_tool_call`` 返回前被 join 收口（``threading.enumerate()`` 可断言无线程残留）。
+
+    **残余风险（已披露，非本类可控）**：python-socketio 自陈 ``call`` / ``emit`` **非线程安全**
+    （多线程同时 emit 会让多包消息乱序）⇒ ``_office_op_lock`` 只串行化**office 操作**，其它用户 RPC
+    与回房仍可能交错；跨线程调用本类的其它方法依旧不在支持范围内。
+    / Residual: socketio's own ``call``/``emit`` are not thread-safe; the op-lock serializes office
+    operations only.
+
+    / Two sanctioned cross-thread exceptions: the #203 office replay and the #209 cancel watcher
+    (started only when ``cancel`` is given; touches no mutable client state; joined before return).
     """
 
     def __init__(
@@ -137,7 +182,10 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         # 调用 Client 的 emit 方法
         # Call Client's emit method
-        Client.emit(self, event, data, namespace, callback)
+        # v0.5.0 审查 Y5：未显式传入 ⇒ 实例命名空间（与 Computer 侧一致）。上游 ``namespace or '/'`` 会把
+        # ``None`` 落到根命名空间 ⇒ 文档标准写法 ``join_office(office, name)`` 抛 ``BadNamespaceError``。
+        # Fall back to the instance namespace (upstream would route ``None`` to ``/``).
+        Client.emit(self, event, data, namespace or self._namespace, callback)
 
     def call(self, event: str, data: Any = None, namespace: str | None = None, timeout: int = 60) -> Any:
         """
@@ -159,7 +207,41 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         # 调用 Client 的 call 方法
         # Call Client's call method
-        return Client.call(self, event, data, namespace, timeout)
+        # v0.5.0 审查 Y5：同 emit —— 未显式传入 ⇒ 实例命名空间 / fall back to the instance namespace
+        return Client.call(self, event, data, namespace or self._namespace, timeout)
+
+    def connect(self, *args: Any, **kwargs: Any) -> None:
+        """
+        覆盖上游 ``connect``：重连循环内的握手失败规整（v0.5.0 审查 Y10）。
+
+        上游重连循环以本方法做每次尝试，且**只吞** ``ConnectionError`` / ``ValueError``。4008 在这里本是
+        ``ConnectionError`` ⇒ 被吞掉后**无限重试**（``reconnection_attempts`` 缺省 0 = 不限），违反 versioning.md
+        §4「不得静默重试」。故重连循环内识别到 4008 即中止重连（下一拍触发 ``__disconnect_final`` ⇒ 既有钩子
+        清入房意图），ERROR 日志可感。首连 / 宿主手工连接的行为不变（4008 仍由 :meth:`connect_to_server`
+        还原为 ``ProtocolVersionError``）。
+        Inside socketio's reconnect loop a 4008 aborts reconnection instead of retrying forever.
+        """
+        # 残留的「已结束重连任务」会让本次连接之后的掉线永不自动重连（见 forget_finished_reconnect_task）
+        forget_finished_reconnect_task(self)
+        try:
+            Client.connect(self, *args, **kwargs)
+        except HANDSHAKE_CONNECT_ERRORS as e:
+            loop_error = translate_reconnect_attempt_error(self, e, logger)
+            if loop_error is None or loop_error is e:
+                raise
+            raise loop_error from e
+
+    def disconnect(self) -> None:
+        """
+        断开连接，并**中止**进行中的自动重连（v0.5.0 审查 🔴5）。
+
+        上游 ``disconnect()`` 在重连窗口内是**空操作**（namespaces 已清空、eio 已断开；不置中止位、不触发钩子）
+        ⇒ 意图不清、重连不停，稍后自动回到旧房。故宿主在重连窗口内断开时，先走会话边界并清意图（手工断开是
+        最后的声明），再中止重连并等其收敛；若在途那次尝试恰好成功，再真正断开。其余情形（已连接 / 上游在
+        重连任务内部的自清理 / 空闲）原样走上游。
+        Disconnect, aborting an in-progress auto-reconnect (upstream ``disconnect()`` is a no-op there).
+        """
+        disconnect_aborting_reconnect(self, lambda: Client.disconnect(self), lambda: self._begin_office_session(drop_desired=True))
 
     def connect_to_server(
         self,
@@ -224,22 +306,62 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             raise build_protocol_version_error(payload) from e
         logger.info("Connected to SMCP server successfully")
 
-    def emit_tool_call(self, computer: str, tool_name: str, params: dict, timeout: int) -> CallToolResult:
+    def emit_tool_call(
+        self,
+        computer: str,
+        tool_name: str,
+        params: dict,
+        timeout: int,
+        cancel: CancelSignal | None = None,
+    ) -> CallToolResult:
         """
         发起SMCP工具调用
         Initiate SMCP tool call
+
+        #209 取消入口 / Cancel entry (#209):
+            宿主传入 ``cancel`` 即可中断一次**在途**工具调用（如用户点「停止」）。语义由协议
+            `events.md §server:tool_call_cancel`（protocol#58 / PR#60）冻结：
+
+            1. **仅投递信号** —— 信号置位后发出 ``server:tool_call_cancel``，随后**继续等待原
+               ``client:tool_call`` 的 ack**，以该 ack 为终态；**不**本地提早返回。Computer 未中断时
+               须**等满本次调用自身的 ``timeout``**（协议不保证提前返回）。本方法用后台 daemon 线程
+               轮询信号，**不会**去唤醒阻塞中的 ``socketio.Client.call``。
+            2. **不冒充 Computer** —— **不**本地合成 ``meta.a2c_cancelled``（该标记仅由 Computer 产出）。
+            3. **如实透出** —— 终态按 ack 的结果级 ``meta`` 分类，用
+               :func:`~a2c_smcp.agent.types.classify_tool_call_outcome` 读取；
+               **不得**依据「本端已发出取消信号」改写终态。
+
+            故「已请求取消」 **不是**「已取消」的充分条件：取消是协作式的，``req_id`` 命中不到时
+            Computer 静默忽略，该次调用可能照常返回正常结果，或（未中断且自身超时到点）以
+            ``meta.a2c_timeout`` 收尾 —— 后者即「取消未被确认」。
+
+            ``cancel`` 契约见 :class:`~a2c_smcp.agent.types.CancelSignal`：**只要求** ``is_set()``，
+            实现一律轮询（不假定存在可 await 的 ``wait``）。``threading.Event`` 或任意仅含
+            ``is_set()`` 的对象可直接从**另一线程**置位。
+
+            Cancel entry: pass ``cancel`` to interrupt an in-flight tool call. Only the signal is
+            delivered — the original ack remains the sole terminal-state source.
 
         Args:
             computer (str): 远程计算机名称 / Remote computer name
             tool_name (str): 工具名称 / Tool name
             params (dict): 工具调用参数 / Tool call parameters
             timeout (int): 超时时间 / Timeout duration
+            cancel (CancelSignal | None): 宿主取消信号（**只要求** ``is_set()``）/ host cancel signal.
 
         Returns:
             CallToolResult: MCP协议工具调用结果 / MCP protocol tool call result
+
+        Raises:
+            TypeError: ``cancel`` 非空但不满足 :class:`CancelSignal`（无 ``is_set()``）。
+                这是本方法唯一的非返回路径（调用方传参错误，不做静默降级）。
         """
         req = self.create_tool_call_request(computer, tool_name, params, timeout)
         ctx = ContextLogger(logger, {"computer": computer, "tool": tool_name, "req_id": req["req_id"]})
+
+        # #209：宿主信号 → 至多一次 server:tool_call_cancel 广播。watcher 只投递信号，不参与阻塞等待。
+        gate = CancelSendGate()
+        watcher = self._start_cancel_watcher(cancel, gate, req["req_id"], self._namespace)
 
         try:
             ctx.debug("Calling tool")
@@ -252,12 +374,11 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             res = self._resolve_tool_call_binary_sideband(res, computer)
             return CallToolResult.model_validate(res, by_name=True)
 
-        except TimeoutError:
-            # 发送取消请求
-            # Send cancel request
-            agent_config = self.auth_provider.get_agent_config()
-            cancel_data = AgentCallData(agent=agent_config["agent"], req_id=req["req_id"])
-            self.emit(CANCEL_TOOL_CALL_EVENT, cancel_data, namespace=self._namespace)
+        except TOOL_CALL_TIMEOUT_ERRORS:
+            # 发送取消请求（幂等：宿主信号已广播过则不再重复——闸门保证至多一次）
+            # Send cancel request (idempotent: the gate allows at most one broadcast per call)
+            if gate.try_claim():
+                self._broadcast_tool_call_cancel(req["req_id"], self._namespace)
             return self.handle_tool_call_timeout(req["req_id"])
 
         except SMCPProtocolError as e:
@@ -277,6 +398,12 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
                 isError=True,
             )
 
+        finally:
+            # ``stop()`` 内部先「关门」（抢占广播权）再叫停 —— 单一收口缝，杜绝「已返回后迟到广播」。
+            # ``stop()`` seals the gate then tears down: the single seam guaranteeing no late broadcast.
+            if watcher is not None:
+                watcher.stop()
+
     def get_tools_from_computer(self, computer: str, timeout: int = 20) -> GetToolsRet:
         """
         从指定计算机获取工具列表
@@ -294,6 +421,9 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         try:
             logger.debug(f"Getting tools from computer {computer}")
             response = self.call(GET_TOOLS_EVENT, req, namespace=self._namespace, timeout=timeout)
+            # 路由层 flat ErrorPayload（400 / 403 / 404 / 4103，#216）先于 req_id 校验解码，否则被误报为「req_id 不匹配」
+            # Decode routing-layer flat ErrorPayloads first, or they surface as a misleading req_id mismatch (#216)
+            raise_for_error_payload(response)
 
             # 验证响应
             # Validate response
@@ -320,11 +450,16 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
 
         备注 / Notes:
             ``GetComputerConfigRet`` 无 ``req_id`` 字段、``on_get_config`` 也不 echo req_id，故**不做** req_id 校验；
-            ``on_get_config`` 无 flat ErrorPayload 路径，故**不需** raise_for_error_payload。与 async 无语义差异。
+            Computer 的 ``on_get_config`` 虽无 flat ErrorPayload 路径，但 Server 路由层会回 ``400`` / ``403`` /
+            ``404`` / ``4103``（#216）⇒ 仍须 raise_for_error_payload。与 async 无语义差异。
         """
         req = self.create_get_config_request(computer)
         logger.debug(f"Getting config from computer {computer}")
         response = self.call(GET_CONFIG_EVENT, req, namespace=self._namespace, timeout=timeout)
+        # 路由层 flat ErrorPayload（400 / 403 / 404 / 4103，#216）⇒ 抛 SMCPProtocolError；否则会被下方
+        # ``response.get("servers", {})`` 静默当成「零个 server」的成功（假成功）。
+        # Decode routing-layer ErrorPayloads, which would otherwise read as a config with zero servers (#216).
+        raise_for_error_payload(response)
         ret: GetComputerConfigRet = {"servers": response.get("servers", {})}
         if response.get("inputs") is not None:
             ret["inputs"] = response["inputs"]
@@ -343,6 +478,152 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         self.on(UPDATE_SKILLS_NOTIFICATION, self._on_skills_updated, namespace=self._namespace)
         # #127 MCP 运行期工具集变化自动重拉 / #127 auto-refresh on runtime tool-set change
         self.on(UPDATE_TOOL_LIST_NOTIFICATION, self._on_computer_update_tool_list, namespace=self._namespace)
+        # #203 引擎级 namespace 生命周期钩子（自动重连后回房）。两个 handler 刻意写成**同步函数**：
+        # engineio 以 run_async=False 内联触发 'disconnect'，在其中做阻塞调用会卡住拆链。
+        # Engine-level namespace hooks (#203), deliberately sync — 'disconnect' is dispatched inline.
+        self.on("connect", self._on_namespace_connect, namespace=self._namespace)
+        self.on("disconnect", self._on_namespace_disconnect, namespace=self._namespace)
+        self.on("__disconnect_final", self._on_namespace_disconnect_final, namespace=self._namespace)
+
+    # ── #203 Office 成员关系：自动回房（与异步侧 / Computer 侧同构）──────────────────────────
+
+    def _on_namespace_connect(self) -> None:
+        """
+        namespace (重)连接钩子：desired 仍在则起 daemon 线程回房。**不得阻塞**。
+
+        Namespace (re)connect hook: spawn a daemon thread to replay the join. Must not block —
+        本钩子内联在读循环的分发线程上（engineio 对 MESSAGE 包 run_async 派发，socketio 的
+        ``_handle_connect`` 在其中 await 本钩子），而在其中同步 ``call`` 等 ACK 会把连接完成信号
+        （``connect()`` 的 wait_timeout）一并拖住。
+        Runs on the read-loop dispatch thread, where a blocking ack wait would also stall the
+        connect-completion signal.
+
+        会话边界（#217 裁决 5）：推进 generation 与会话纪元、作废随会话销毁的已确认成员关系；意图保留。
+        Begins a new office session: generation + session epoch advance, confirmed membership is dropped.
+
+        守卫用 ``self._namespace in self.namespaces`` 而非 ``self.connected``（后者要等
+        ``connect()`` 返回后才置位）。/ Guard on the registered namespace, not ``self.connected``.
+        """
+        self._begin_office_session(drop_desired=False)
+        desired = self._desired_office
+        if desired is None:
+            return
+        generation = self._office_generation
+        thread = threading.Thread(
+            target=self._rejoin_office,
+            args=(desired, generation),
+            name="a2c-agent-office-rejoin",
+            daemon=True,
+        )
+        self._office_rejoin_thread = thread
+        thread.start()
+
+    def _on_namespace_disconnect(self, reason: str | None = None) -> None:
+        """namespace 断连钩子：按原因决定回房意图去留。**不得阻塞**（内联触发路径）。
+
+        仅"传输中断且底层会自动重连"保留意图；手工断开 / 服务端踢出 / 未启用重连一律清空。
+        两种分支都走会话边界（清已确认房号：成员关系属于会话）。
+        """
+        if reason == self.reason.TRANSPORT_ERROR and self.reconnection:
+            self._begin_office_session(drop_desired=False)
+            return
+        self._begin_office_session(drop_desired=True)
+
+    def _on_namespace_disconnect_final(self) -> None:
+        """重连彻底放弃 → 会话边界 + 清空回房意图。"""
+        self._begin_office_session(drop_desired=True)
+
+    def _rejoin_office(self, desired: tuple[str, str], generation: int) -> None:
+        """
+        自动回房（daemon 线程）：重放 ``server:join_office`` 并校验 ACK；瞬态冲突按预算做**有界退避重试**。
+
+        Replay ``server:join_office`` on the fresh namespace and validate its ack, retrying the transient
+        conflicts within a bounded backoff budget (#212).
+
+        同步侧无法取消线程，故以 generation **双检**（**取到 op-lock 后**、应用结果前）作废陈旧结果
+        ——检查必须在锁内：线程不可取消，锁外检查会让陈旧线程在更新的 JOIN/LEAVE 之后仍把包发上线。
+        The staleness check runs *inside* the op-lock: threads are not cancellable, so a check made
+        outside could still emit the packet after a newer operation has landed.
+
+        失败效应与日志走与显式 ``join_office`` **同一张表、同一个产出者**（#217 同态口径）；**不再**
+        借 ``_drop_desired_office()`` 清状态（那次额外 generation bump 在补了 op-lock 后失去必要，
+        且会让两侧 generation 序列分叉）。
+
+        **重试语义与异步侧逐字同构**（只重试 ``4101``、预算 ``office_rejoin_retry_budget``、
+        退避期间**放锁**：每次尝试各取一次 op-lock，#217 补正 §三）；差异只在落地形态——线程不可取消，
+        故每次尝试的陈旧性检查与效应施加仍在**同一次** ``_office_state_lock`` 获取内，退避 sleep 在**两把
+        锁之外**。被抢占的**孤儿线程**最多多睡一轮退避，醒来即在守卫处退出（不再发包、不改状态）。
+        Same retry semantics as the async side; each attempt re-checks staleness under the state lock and
+        the backoff sleeps outside both locks (an orphaned thread exits at the guard after its nap).
+        """
+        session = self._office_session
+        deadline = time.monotonic() + max(0.0, self.office_rejoin_retry_budget)
+        attempt = 0
+        while True:
+            with self._office_op_lock:
+                if generation != self._office_generation or self._desired_office != desired:
+                    return  # 已被更新的操作接管 / superseded
+                if self._namespace not in self.namespaces:
+                    return  # 连接又断了：交给下一次 connect 钩子
+                office_id, agent_name = desired
+                try:
+                    result = self.call(
+                        JOIN_OFFICE_EVENT,
+                        EnterOfficeReq(office_id=office_id, role="agent", name=agent_name),
+                        namespace=self._namespace,
+                        timeout=OFFICE_JOIN_TIMEOUT,
+                    )
+                except Exception as e:
+                    # 陈旧性检查与效应施加必须在**同一次**状态锁获取内（隔离审查报出的竞态）：锁外比对会被
+                    # GIL 抢占 —— 并发 `join(B)` 的入口段（bump generation + 写 desired）落在窗口里时，
+                    # 本陈旧回放会把它的意图与已确认成员关系一并清成 None。/ Staleness check and effect
+                    # application share one acquisition; a lock-free compare can be preempted in between.
+                    with self._office_state_lock:
+                        if generation != self._office_generation or self._desired_office != desired:
+                            return
+                        effect = resolve_join_failure(None, confirmed=self._confirmed_office)
+                        self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                    logger.error(f"自动重新加入 Office 失败: {office_id} - {e}")
+                    return
+                verdict = parse_join_ack(result)
+                with self._office_state_lock:
+                    if verdict.ok and session == self._office_session:
+                        # 成功是对服务端**事实**的陈述 ⇒ 无视操作抢占（#213），受会话纪元约束（S11）
+                        self._confirmed_office = desired
+                    if generation != self._office_generation or self._desired_office != desired:
+                        return  # 结果已作废：除上面「已成事实」的落账外，不得改动 desired / 日志
+                    if verdict.ok:
+                        logger.info(f"已自动重新加入 Office: {office_id}")
+                        return
+                    confirmed_before = self._confirmed_office
+                    # 退避决策与效应施加同一次临界区（决策本身不碰状态，但「是否还有下一次」与
+                    # 「陈旧性」必须同一次判读，否则被抢占的重试会多发包一轮）
+                    delay = rejoin_retry_delay(verdict, attempt=attempt, remaining=deadline - time.monotonic())
+                    if delay is None:
+                        effect = resolve_join_failure(verdict, confirmed=confirmed_before)
+                        self._desired_office, self._confirmed_office = effect.desired, effect.confirmed
+                if delay is None:
+                    # 日志仍在 op-lock 之内（与异步侧逐字同构、也与本方法原实现一致）：锁外发日志会在并发
+                    # join 落地之后仍报旧状态。/ Logging stays inside the op-lock, as in the async path.
+                    if attempt:
+                        # 与共享 ERROR 分开：ERROR 文案须与显式路径逐字相同（#219 同态口径），
+                        # 「重试过几次」是回放路径独有的上下文。/ Kept apart from the shared ERROR text.
+                        logger.warning(f"自动回房重试耗尽（共 {attempt + 1} 次尝试）: {office_id} - code={verdict.code}")
+                    # 带协议码：4101 是重连撞旧会话（旧会话仍占席位）的**瞬态**冲突（重试预算见
+                    # ``office_rejoin_retry_budget``），无码则是「未获裁决」（形状不认识 / 空响应）。
+                    log_join_rejection(
+                        office_id,
+                        verdict,
+                        confirmed_name=confirmed_before[1] if confirmed_before else None,
+                    )
+                    return
+                attempt += 1
+                logger.debug(
+                    f"自动回房遇到瞬态冲突，{delay:.1f}s 后重试（第 {attempt} 次尝试）: "
+                    f"{office_id} - code={verdict.code}"
+                )
+            # 退避必须在两把锁之外：预算内逐次取/放锁（#217 补正 §三）
+            time.sleep(delay)
 
     def _on_computer_enter_office(self, data: EnterOfficeNotification) -> None:
         """
@@ -434,6 +715,8 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         req = self.create_get_desktop_request(computer, size=size, window=window)
         logger.debug(f"Getting desktop from computer {computer}, size={size}, window={window}")
         response = self.call(GET_DESKTOP_EVENT, req, namespace=self._namespace, timeout=timeout)
+        # 路由层 flat ErrorPayload 先于 req_id 校验解码（#216）/ decode routing-layer ErrorPayloads first (#216)
+        raise_for_error_payload(response)
         if response.get("req_id") != req["req_id"]:
             raise ValueError("Invalid response with mismatched req_id for desktop")
         return GetDeskTopRet(desktops=response.get("desktops", []), req_id=response["req_id"])
@@ -558,6 +841,21 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             raise ValueError("Invalid response with mismatched req_id for blob")
         return GetBlobRet(**response)
 
+    def resolve_path(self, computer: str, path: str, *, timeout: int = 30) -> ResolvePathRet:
+        """同步按路径读取（sync mirror of async ``resolve_path``；v0.5.0 #236 / protocol#65）.
+
+        协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取.
+        失败面与 async 版完全一致（``4020`` 四 reason 抛 :class:`SMCPProtocolError`）；完整语义文档见
+        :meth:`a2c_smcp.agent.client.AsyncSMCPAgentClient.resolve_path`.
+        """
+        req = self.create_resolve_path_request(computer, path)
+        logger.debug(f"Resolving path on computer {computer}")
+        response = self.call(RESOLVE_PATH_EVENT, req, namespace=self._namespace, timeout=timeout)
+        raise_for_error_payload(response)
+        if response.get("req_id") != req["req_id"]:
+            raise ValueError("Invalid response with mismatched req_id for resolve_path")
+        return cast(ResolvePathRet, response)
+
     def _make_blob_call(self) -> Any:
         """构造 :func:`drain_blob_sync` 的 ``call`` 适配器（sync mirror of async ``_make_blob_call``）."""
 
@@ -651,17 +949,23 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
         except Exception as e:
             logger.error(f"Error handling skills updated notification: {e}", exc_info=True)
 
-    def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
+    def get_computer_in_office(self, office_id: str, timeout: int = 20) -> SessionInfo | None:
         """
-        获取指定房间内的所有Computer信息
-        Get all computers info in the specified office
+        获取指定房间内**唯一**的 Computer 信息（#230：「每 role 一席」，房内至多一台 Computer）
+        Get the single computer in the specified office (#230: one seat per role)
+
+        换绑 Computer 由 ``notify:leave_office``（旧）→ ``notify:enter_office``（新）表达，无需遍历房内多台 Computer。
 
         Args:
             office_id (str): 房间ID / Office ID
             timeout (int): 超时时间 / Timeout duration
 
         Returns:
-            list[SessionInfo]: Computer信息列表 / List of computer info
+            SessionInfo | None: 房内的 Computer；房内暂无 Computer 时为 ``None`` / The computer, or ``None``
+
+        Raises:
+            SMCPProtocolError: 服务端以 flat ErrorPayload 拒绝（``400`` / ``4103`` / ``4104``）。
+            ValueError: 响应 ``req_id`` 不匹配，或房内列出多于一台 Computer（服务端协议违规）。
         """
         agent_config = self.auth_provider.get_agent_config()
         req = ListRoomReq(
@@ -674,15 +978,41 @@ class SMCPAgentClient(Client, BaseAgentSyncClient):
             logger.debug(f"Getting computers in office {office_id}")
             response = self.call(LIST_ROOM_EVENT, req, namespace=self._namespace, timeout=timeout)
 
+            # flat ErrorPayload（#214：400 / 4103 无房 / 4104 跨房）→ 抛 SMCPProtocolError。
+            # 必须**先于** req_id 校验：ErrorPayload 无 req_id，会被误报成「响应 req_id 不匹配」。
+            # Must precede the req_id check: an ErrorPayload carries no req_id.
+            raise_for_error_payload(response)
+
             # 验证响应 / Validate response
             if response.get("req_id") != req["req_id"]:
                 raise ValueError("Invalid response with mismatched req_id")
 
-            # 过滤出Computer角色的会话 / Filter sessions with computer role
-            all_sessions = response.get("sessions", [])
-            computers = [s for s in all_sessions if s.get("role") == "computer"]
-            return computers
+            # 房内唯一的 Computer（多于一台 ⇒ 服务端协议违规，抛错）/ The office's single Computer
+            return _the_computer_in_office(response.get("sessions", []), office_id)
 
         except Exception as e:
-            logger.error(f"Failed to get computers in office {office_id}: {e}", exc_info=True)
+            logger.error(f"Failed to get computer in office {office_id}: {e}", exc_info=True)
             raise
+
+    def get_computers_in_office(self, office_id: str, timeout: int = 20) -> list[SessionInfo]:
+        """
+        **已废弃**（#230）：改用 :meth:`get_computer_in_office`。房内至多一台 Computer，列表长度恒 ``<= 1``。
+        **Deprecated** (#230): use :meth:`get_computer_in_office`; the list has at most one element.
+
+        保留为过渡：委托 :meth:`get_computer_in_office` 并包装成列表，调用即发 ``DeprecationWarning``，将在后续版本移除。
+        Kept as a shim delegating to :meth:`get_computer_in_office`; scheduled for removal.
+
+        Args:
+            office_id (str): 房间ID / Office ID
+            timeout (int): 超时时间 / Timeout duration
+
+        Returns:
+            list[SessionInfo]: ``[computer]`` 或 ``[]`` / ``[computer]`` or ``[]``
+        """
+        warnings.warn(
+            "get_computers_in_office() is deprecated since 0.5.0 (one computer per office); use get_computer_in_office()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        computer = self.get_computer_in_office(office_id, timeout=timeout)
+        return [computer] if computer is not None else []

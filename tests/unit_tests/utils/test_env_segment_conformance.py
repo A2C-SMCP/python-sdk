@@ -11,12 +11,11 @@ input env 命名（ENV_SEGMENT）**跨 SDK 一致性对拍**（P0 硬门槛）/ 
     a2c-smcp-protocol ``docs/guides/computer-mcp-config-guide.md`` §「环境变量命名规则（双端统一规范）」
     @ develop ``9cde57c``（PROTO-5 / Discussion #23 F4-F5）。
 
-⚠️ **夹具落地状态：PENDING（#155）** —— 旁边的 ``fixtures/env_segment_conformance_vectors.json``
-    是 **python-sdk 首版**，**尚未**落到协议仓（协议仓当前只有 ``bundle_id_conformance_vectors.json``）。
-    故本轮验收 ①「与 rust 共享测试向量」**尚未成立**：向量已按规范正文写就并锁形态，但跨仓共享待协议仓收口。
-    协议仓落地后，此处应改为其**逐字节 vendored 副本**并按 bundle_id 同款方式同步
-    （``git show origin/develop:docs/specification/fixtures/... > fixtures/...``）——**在那之前勿跑该命令**，
-    会把本地首版清空。
+夹具来源 / Fixture source（唯一权威）：
+    a2c-smcp-protocol ``docs/specification/fixtures/env_segment_conformance_vectors.json``
+    @ develop ``648808d``（protocol#68 / PR#69 上收；sha256 ``c2489f25b896eeae28fd82fa92d39719c85c78cee97fb0e59e47f78bcd8953de``）。
+    本文件旁的 ``fixtures/env_segment_conformance_vectors.json`` 为该规范文件的**逐字节 vendored 副本**——
+    协议仓更新向量时须重新同步（``git show origin/develop:docs/specification/fixtures/... > fixtures/...``）。
 
 含义 / Meaning：任一 SDK 的 ``env_var_name(input_id, bundle_id, tool_name)`` **MUST** 对每条向量产出
 ``expected_env_var_name`` 方为合规。python 与 rust 逐字节一致是 F4 的硬门槛（rust 镜像 rust-sdk#140）。

@@ -20,6 +20,7 @@ from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
 from a2c_smcp.agent.types import AsyncAgentEventHandler
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_NOTIFICATION,
     GET_TOOLS_EVENT,
     JOIN_OFFICE_EVENT,
     SMCP_NAMESPACE,
@@ -32,6 +33,7 @@ from a2c_smcp.smcp import (
     SMCPTool,
     UpdateMCPConfigNotification,
 )
+from tests.room_acks import assert_empty_ack
 
 
 class _EH(AsyncAgentEventHandler):
@@ -65,8 +67,11 @@ async def _join_office(client: AsyncClient, role: Literal["computer", "agent"], 
     English: Join office via server:join_office.
     """
     payload: EnterOfficeReq = {"role": role, "office_id": office_id, "name": name}
-    ok, err = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
-    assert ok and err is None
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
+    ack = await client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_empty_ack(ack)
 
 
 @pytest.mark.asyncio
@@ -188,6 +193,70 @@ async def test_agent_tool_call_roundtrip(socketio_server, basic_server_port: int
 
 
 @pytest.mark.asyncio
+async def test_agent_tool_call_real_timeout_reaches_timeout_arm(socketio_server, basic_server_port: int):
+    """真实链路上的 ack 等待超时必须落进超时兜底臂：广播取消 + 结果级 ``meta.a2c_timeout``。
+
+    ⚠️ 本用例锁的是一个**只有真 wire 才暴露**的缺陷：python-socketio 在 ``Client.call`` 超时时抛的
+    ``socketio.exceptions.TimeoutError`` **不是** builtin ``TimeoutError`` 的子类，故只写
+    ``except TimeoutError`` 的实现会让超时臂在生产上**永不可达** —— 自身超时被 ``except Exception``
+    接走，既不广播取消也不标超时（协议 error-handling.md §Agent 端超时要求两者都做）。
+    用 mock 传 builtin 异常抬桩的用例抓不到它（曾长期假绿），必须由真实 server + 真实计时器触发。
+
+    / A real-wire lock for the timeout arm: socketio's TimeoutError is not a builtin subclass, so only
+    a genuine transport timeout exercises this path.
+    """
+    computer = AsyncClient()
+    cancels: list[dict] = []
+
+    @computer.on(TOOL_CALL_EVENT, namespace=SMCP_NAMESPACE)
+    async def _on_tool_call(data: dict) -> dict:
+        # 故意远超 Agent 的 timeout 且不回 ack ⇒ 由 Agent 自身 socketio 计时器超时。
+        # Deliberately never acks in time, so the Agent's own socketio timer fires.
+        await asyncio.sleep(10)
+        return CallToolResult(isError=False, content=[TextContent(type="text", text="late")]).model_dump(mode="json")
+
+    @computer.on(CANCEL_TOOL_CALL_NOTIFICATION, namespace=SMCP_NAMESPACE)
+    async def _on_cancel(data: dict) -> None:
+        cancels.append(data)
+
+    handler = _EH()
+    office_id = "office-timeout"
+    auth = DefaultAgentAuthProvider(agent_id="robot-timeout", office_id=office_id)
+    agent = AsyncSMCPAgentClient(auth_provider=auth, event_handler=handler)
+
+    await agent.connect_to_server(
+        f"http://localhost:{basic_server_port}",
+        namespace=SMCP_NAMESPACE,
+        socketio_path="/socket.io",
+    )
+    await agent.join_office(office_id=office_id, agent_name="robot-timeout", namespace=SMCP_NAMESPACE)
+
+    await computer.connect(
+        f"http://localhost:{basic_server_port}",
+        namespaces=[SMCP_NAMESPACE],
+        socketio_path="/socket.io",
+    )
+    await _join_office(computer, role="computer", office_id=office_id, name="comp-timeout")
+    await asyncio.sleep(0.3)
+
+    res = await agent.emit_tool_call(computer="comp-timeout", tool_name="echo", params={"text": "hi"}, timeout=1)
+
+    # 超时臂必须被触达：如实标 a2c_timeout（而非空消息的普通失败），且已广播取消。
+    assert res.isError is True
+    assert res.meta == {"a2c_timeout": True}, f"超时臂未触达 / timeout arm not reached: {res.meta}"
+    assert "工具调用超时" in res.content[0].text  # type: ignore[union-attr]
+    # 取消广播是 fire-and-forget，给 Server 广播留一拍。
+    for _ in range(30):
+        if cancels:
+            break
+        await asyncio.sleep(0.1)
+    assert cancels, "超时必须广播 server:tool_call_cancel / timeout must broadcast a cancel"
+
+    await agent.disconnect()
+    await computer.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_agent_receives_update_config(socketio_server, basic_server_port: int):
     """
     中文：验证当Computer发出更新配置，Agent收到并再次拉取工具列表。
@@ -263,22 +332,19 @@ async def test_agent_receives_update_config(socketio_server, basic_server_port: 
 
 
 @pytest.mark.asyncio
-async def test_get_computers_in_office(socketio_server, basic_server_port: int):
+async def test_get_computer_in_office(socketio_server, basic_server_port: int):
     """
-    中文：验证Agent可以获取房间内所有Computer的信息。
-    English: Verify Agent can get all computers info in the office.
+    中文：#230「每 role 一席」——Agent 取到房内唯一的 Computer；第二台 Computer 入房被 4101 拒绝且不替换前者。
+    English: the Agent gets the office's single computer; a second computer is rejected (4101) and replaces nothing.
     """
-    # 创建多个Computer客户端 / Create multiple Computer clients
     computer1 = AsyncClient()
     computer2 = AsyncClient()
 
-    # 创建Agent客户端 / Create Agent client
     handler = _EH()
     office_id = "office-4"
     auth = DefaultAgentAuthProvider(agent_id="robot-4", office_id=office_id)
     agent = AsyncSMCPAgentClient(auth_provider=auth, event_handler=handler)
 
-    # Agent连接并加入办公室 / Agent connects and joins office
     await agent.connect_to_server(
         f"http://localhost:{basic_server_port}",
         namespace=SMCP_NAMESPACE,
@@ -286,73 +352,56 @@ async def test_get_computers_in_office(socketio_server, basic_server_port: int):
     )
     await agent.join_office(office_id=office_id, agent_name="robot-4", namespace=SMCP_NAMESPACE)
 
-    # Computer1加入办公室 / Computer1 joins office
-    await computer1.connect(
-        f"http://localhost:{basic_server_port}",
-        namespaces=[SMCP_NAMESPACE],
-        socketio_path="/socket.io",
-    )
+    await computer1.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
     await _join_office(computer1, role="computer", office_id=office_id, name="comp-04-1")
 
-    # Computer2加入办公室 / Computer2 joins office
-    await computer2.connect(
-        f"http://localhost:{basic_server_port}",
-        namespaces=[SMCP_NAMESPACE],
-        socketio_path="/socket.io",
+    # 第二台 Computer ⇒ 4101 {role: computer}
+    await computer2.connect(f"http://localhost:{basic_server_port}", namespaces=[SMCP_NAMESPACE], socketio_path="/socket.io")
+    ack = await computer2.call(
+        JOIN_OFFICE_EVENT,
+        {
+            "role": "computer",
+            "office_id": office_id,
+            "name": "comp-04-2",
+            "computer_id": "abcdef02-2345-4678-8abc-def012345679",
+        },
+        namespace=SMCP_NAMESPACE,
     )
-    await _join_office(computer2, role="computer", office_id=office_id, name="comp-04-2")
+    assert isinstance(ack, dict) and ack["code"] == 4101 and ack["details"]["role"] == "computer", ack
 
-    # 等待所有客户端加入完成 / Wait for all clients to join
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.3)
 
-    # 调用get_computers_in_office获取Computer列表 / Call get_computers_in_office to get computers list
-    computers = await agent.get_computers_in_office(office_id)
+    computer = await agent.get_computer_in_office(office_id)
+    assert computer is not None and computer["role"] == "computer" and computer["name"] == "comp-04-1", computer
 
-    # 验证返回的Computer数量 / Verify number of computers returned
-    assert len(computers) == 2, f"Expected 2 computers, got {len(computers)}"
+    # 废弃的复数 API 仍可用（委托单数版）/ the deprecated plural shim still works
+    with pytest.warns(DeprecationWarning):
+        assert await agent.get_computers_in_office(office_id) == [computer]
 
-    # 验证所有返回的会话都是computer角色 / Verify all returned sessions are computer role
-    assert all(c["role"] == "computer" for c in computers), "All sessions should be computer role"
-
-    # 验证Computer名称 / Verify computer names
-    computer_names = {c["name"] for c in computers}
-    assert "comp-04-1" in computer_names, "comp-04-1 should be in the list"
-    assert "comp-04-2" in computer_names, "comp-04-2 should be in the list"
-
-    # 清理连接 / Cleanup connections
     await agent.disconnect()
     await computer1.disconnect()
     await computer2.disconnect()
 
 
 @pytest.mark.asyncio
-async def test_get_computers_in_office_empty(socketio_server, basic_server_port: int):
+async def test_get_computer_in_office_empty(socketio_server, basic_server_port: int):
     """
-    中文：验证当房间内没有Computer时，返回空列表。
-    English: Verify empty list is returned when no computers in office.
+    中文：房间内没有 Computer 时返回 None。
+    English: None is returned when no computer is in the office.
     """
-    # 创建Agent客户端 / Create Agent client
     handler = _EH()
     office_id = "office-5"
     auth = DefaultAgentAuthProvider(agent_id="robot-5", office_id=office_id)
     agent = AsyncSMCPAgentClient(auth_provider=auth, event_handler=handler)
 
-    # Agent连接并加入办公室 / Agent connects and joins office
     await agent.connect_to_server(
         f"http://localhost:{basic_server_port}",
         namespace=SMCP_NAMESPACE,
         socketio_path="/socket.io",
     )
     await agent.join_office(office_id=office_id, agent_name="robot-5", namespace=SMCP_NAMESPACE)
-
-    # 等待连接完成 / Wait for connection to complete
     await asyncio.sleep(0.3)
 
-    # 调用get_computers_in_office，应该返回空列表 / Call get_computers_in_office, should return empty list
-    computers = await agent.get_computers_in_office(office_id)
+    assert await agent.get_computer_in_office(office_id) is None
 
-    # 验证返回空列表 / Verify empty list is returned
-    assert len(computers) == 0, f"Expected 0 computers, got {len(computers)}"
-
-    # 清理连接 / Cleanup connections
     await agent.disconnect()

@@ -203,9 +203,9 @@ smcp_namespace = SMCPNamespace(auth_provider)
 from a2c_smcp.server import aget_computers_in_office, aget_all_sessions_in_office
 
 async def get_office_status(office_id: str, sio):
-    # 获取房间内所有 Computer
+    # 获取房间内的 Computer（v0.5.0 起「每 role 一席」⇒ 列表长度恒 <= 1）
     computers = await aget_computers_in_office(office_id, sio)
-    print(f"Office {office_id} has {len(computers)} computers:")
+    print(f"Office {office_id} has {len(computers)} computer(s):")
     for computer in computers:
         print(f"  - {computer['name']} (sid: {computer['sid']})")
 

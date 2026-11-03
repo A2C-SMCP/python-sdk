@@ -56,6 +56,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig, MCPServerInput
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
+from a2c_smcp.computer.settings.raw import (
+    SettingsFileCorruptError,
+    bool_field_or_none,
+    list_field_or_empty,
+    mapping_field_or_empty,
+    read_raw_object,
+)
 from a2c_smcp.computer.settings.schema import (
     FIELD_ALLOWED_MCP_SERVERS,
     FIELD_DENIED_MCP_SERVERS,
@@ -68,7 +75,6 @@ from a2c_smcp.computer.settings.schema import (
 )
 from a2c_smcp.computer.settings.scope import (
     apply_write,
-    load_settings_file,
     resolve_user_config_dir,
     workdir_local_settings_path,
     workdir_settings_dir,
@@ -206,7 +212,9 @@ def load_mcp_config_file(path: Path, scope: SettingsScope) -> tuple[dict[str, An
         return dict(empty), []
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # 同 :func:`~a2c_smcp.computer.settings.scope.load_settings_file`：``UnicodeDecodeError`` 不是
+        # ``OSError`` 子类，漏捕会让非 UTF-8 的 mcp.json 在解析处崩溃而非「容错 + 记错、留盘」。
         logger.warning("MCP config %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
         return dict(empty), [_err(scope, "<file>", f"unreadable or corrupt JSON: {exc}", src)]
     if not isinstance(raw, dict):
@@ -519,18 +527,24 @@ def _append_local_mcp_array(field_name: str, name: str) -> None:
     """
     把 ``name`` 追加进 local ``settings.local.json`` 的某 MCP 数组字段（持锁原子 RMW + dedup）/ Append to a local array。
 
-    复用 store 原语：:func:`file_lock`（旁车 ``.lock``）+ :func:`load_settings_file`（容错）+ :func:`apply_write`
-    （数组**整体替换**写语义，§5.4）+ :func:`atomic_write_json`（``header=None``——人编意图层无写保护头/version）。
-    锁内读-改-写杜绝并发丢更新。
+    复用 store 原语：:func:`file_lock`（旁车 ``.lock``）+ :func:`read_raw_object`（**raw 保真**，不经校验过滤视图）
+    + :func:`apply_write`（数组**整体替换**写语义，§5.4）+ :func:`atomic_write_json`（``header=None``——人编意图层
+    无写保护头/version）。锁内读-改-写杜绝并发更新丢失。
+
+    **#246**：只改该数组键，其余字段（含 policy-only 越权字段、非法 ``permissions`` 条目、未知键）与数组内的
+    **非字符串条目**逐字保留。目标文件 corrupt / 该键非数组 → 抛 :class:`McpConfigCorruptError`，原文件不动。
     """
     path = _local_settings_write_path()
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
-        current = [v for v in existing.get(field_name, []) if isinstance(v, str)]
-        if name not in current:
-            current.append(name)
-        updated = apply_write(existing, {field_name: current})
-        atomic_write_json(path, updated)
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            current = list_field_or_empty(existing, field_name, path=path)
+            if name not in current:
+                current.append(name)
+            updated = apply_write(existing, {field_name: current})
+            atomic_write_json(path, updated)
+    except SettingsFileCorruptError as e:
+        raise McpConfigCorruptError(str(e)) from e
 
 
 def approve_mcp_server(name: str) -> None:
@@ -544,12 +558,23 @@ def deny_mcp_server(name: str) -> None:
 
 
 def approve_all_project_mcp() -> None:
-    """批准框 ``[a]ll``：``enableAllProjectMcpServers=true`` 写 local scope（§9.2）/ Approve-all: set the bool (local)。"""
+    """
+    批准框 ``[a]ll``：``enableAllProjectMcpServers=true`` 写 local scope（§9.2）/ Approve-all: set the bool (local)。
+
+    **#246 raw 保真**：只写该标量键，其余字段逐字保留；目标文件 corrupt → :class:`McpConfigCorruptError`。
+
+    **目标键形状守卫**：既存 ``enableAllProjectMcpServers`` 若非布尔（含显式 ``null``）→ 拒绝写入。它是
+    「无条件写 true」的写助手，不守卫就会把用户的畸形值静默换成合法值——与 raw 保真契约相反（独立审查 🔴2）。
+    """
     path = _local_settings_write_path()
-    with file_lock(path):
-        existing, _errors = load_settings_file(path, SettingsScope.LOCAL)
-        updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})
-        atomic_write_json(path, updated)
+    try:
+        with file_lock(path):
+            existing = read_raw_object(path) or {}
+            bool_field_or_none(existing, FIELD_ENABLE_ALL_PROJECT_MCP, path=path)  # 形状守卫，值恒被覆盖
+            updated = apply_write(existing, {FIELD_ENABLE_ALL_PROJECT_MCP: True})
+            atomic_write_json(path, updated)
+    except SettingsFileCorruptError as e:
+        raise McpConfigCorruptError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -661,13 +686,26 @@ def mcp_write_path(
 
 def _write_servers_map(path: Path, servers: dict[str, Any], inputs: list[Any]) -> None:
     """
-    原子重写单个 ``mcp.json`` 的规整视图 ``{servers, inputs}`` / Atomically rewrite one mcp.json's normalized view。
+    原子写单个 ``mcp.json`` 的 ``servers`` / ``inputs`` 两键，**其余顶层键原样保留**（#246 raw 保真）
+    Atomically write the ``servers`` / ``inputs`` keys of one mcp.json, preserving every other top-level key.
 
-    经 :func:`load_mcp_config_file` 规整（未知顶层 key 如 ``$schema`` 不保留——``mcp.json`` 的 SDK 权威形状
-    即 ``{servers, inputs}``）；``atomic_write_json`` 无 ``header``（``mcp.json`` 是人编意图层，无写保护头/version，
-    照批准写助手姿态）。**调用方须已持 :func:`file_lock`**。
+    过去整文件重写成 ``{servers, inputs}``，会静默丢弃 IDE 补全用的 ``$schema`` 等未知顶层键；现在读回**原始
+    JSON 对象**、只覆写这两个键再写回。``atomic_write_json`` 无 ``header``（``mcp.json`` 是人编意图层，无写保护头/
+    version，照批准写助手姿态）。**调用方须已持 :func:`file_lock`**。
+
+    :raises McpConfigCorruptError: 目标文件在读写之间变成 corrupt / 根非对象（防御性；调用方通常已先行拦截）。
     """
-    atomic_write_json(path, {"servers": servers, "inputs": inputs})
+    try:
+        doc: dict[str, Any] = read_raw_object(path) or {}
+        # 目标键形状守卫（与 settings 轴同口径）：缺失或已是正确形状才允许覆写；`null` / 错类型 → fail-closed，
+        # 不得当成「空值」直接覆盖掉用户写的畸形内容（#246 独立审查 🟡2）。
+        mapping_field_or_empty(doc, "servers", path=path)
+        list_field_or_empty(doc, "inputs", path=path)
+    except SettingsFileCorruptError as e:
+        raise McpConfigCorruptError(str(e)) from e
+    doc["servers"] = servers
+    doc["inputs"] = inputs
+    atomic_write_json(path, doc)
 
 
 def upsert_mcp_server(
@@ -706,8 +744,8 @@ def upsert_mcp_server(
       :class:`McpConfigCorruptError`，**绝不覆盖**（否则销毁既有内容，见该异常文档）。
     - **内容未变 = no-op**：目标 scope 现存定义与 ``body`` 逐字相等 → 不落盘、``changed=False``（对齐 rust 仅
       真变才 bump revision）。
-    - **规整副作用**：落盘经 :func:`load_mcp_config_file` 规整为 ``{servers, inputs}``——目标文件的**未知顶层
-      key**（如 IDE 补全用的 ``$schema``）在改写时**不保留**（``mcp.json`` 的 SDK 权威形状即 ``{servers, inputs}``）。
+    - **raw 保真（#246）**：落盘只覆写 ``servers`` / ``inputs`` 两个顶层键，目标文件的**其余顶层键**
+      （如 IDE 补全用的 ``$schema``）**原样保留**（见 :func:`_write_servers_map`）。
 
     :param name: server 身份（``mcp.json`` map key）/ the server identity (mcp.json map key).
     :param body: **未渲染** server 定义体（不含 map key；``name`` 由 key 承载）/ the un-rendered server body.
@@ -766,15 +804,24 @@ def remove_mcp_server(name: str, *, env: Mapping[str, str] | None = None, cwd: P
         if not path.exists():
             continue  # 该 scope 无 mcp.json → 无可删，不创建 .lock/目录、不触碰 / skip untouched.
         settings_scope = _WRITE_SCOPE_TO_SETTINGS[wscope]
-        with file_lock(path):
-            data, errors = load_mcp_config_file(path, settings_scope)
-            if errors:
-                # 结构损坏 → 跳过、不重写（保住既有内容）；best-effort 跨 scope 清理容忍局部不彻底。
-                logger.warning("MCP config %s corrupt, skipped during remove of %r (kept on disk)", path, name)
-                continue
-            if name not in data["servers"]:
-                continue  # 该 scope 未声明 → no-op（不重写、不 normalize）/ not declared here → no-op.
-            servers = {k: v for k, v in data["servers"].items() if k != name}
-            _write_servers_map(path, servers, data["inputs"])
-            removed = True
+        # 「损坏 scope 跳过 + WARN」的 best-effort 契约必须覆盖**写段**，不只读段（#246 复审 🟡1）：
+        # `inputs: null` / `servers: null` 在 `load_mcp_config_file` 里被当**缺失**（不报错，故不进上面的
+        # errors 分支），到 `_write_servers_map` 的形状守卫才抛 `McpConfigCorruptError`——不在此按 scope 捕获的话
+        # 异常会穿出跨 scope 循环，`Computer.aremove_server` 没有声明它，整条 `server rm` 失败且后续 scope 不处理。
+        try:
+            with file_lock(path):
+                data, errors = load_mcp_config_file(path, settings_scope)
+                if errors:
+                    # 结构损坏 → 跳过、不重写（保住既有内容）；best-effort 跨 scope 清理容忍局部不彻底。
+                    logger.warning("MCP config %s corrupt, skipped during remove of %r (kept on disk)", path, name)
+                    continue
+                if name not in data["servers"]:
+                    continue  # 该 scope 未声明 → no-op（不重写、不 normalize）/ not declared here → no-op.
+                servers = {k: v for k, v in data["servers"].items() if k != name}
+                _write_servers_map(path, servers, data["inputs"])
+                removed = True
+        except McpConfigCorruptError as e:
+            # 与上面 load-errors 分支同姿态：WARN + continue，保住原文件、继续其余 scope。
+            logger.warning("MCP config %s unwritable, skipped during remove of %r (kept on disk): %s", path, name, e)
+            continue
     return removed

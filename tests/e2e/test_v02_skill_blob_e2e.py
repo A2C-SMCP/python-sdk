@@ -226,7 +226,7 @@ async def test_inflight_disconnect_guard_relay_target_gone(tmp_path) -> None:
                 await asyncio.wait_for(agent.get_skills("comp-guard", timeout=3), timeout=10)
 
             # Server 仍存活：房间查询正常应答（守卫未让命名空间崩溃）/ server survived
-            sessions = await agent.get_computers_in_office(office_id)
-            assert isinstance(sessions, list)
+            # 目标 Computer 已断连 ⇒ 房内无 Computer（None），且查询本身正常应答
+            assert await agent.get_computer_in_office(office_id) is None
         finally:
             await teardown(agent, computer)

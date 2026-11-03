@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -160,6 +161,44 @@ async def test_reconcile_governance_remounts_via_hooks_and_idempotent(tmp_path: 
             declared=_DECLARED_ENABLED,
         )
         assert report2.remounted_servers == [FIGMA_BID]  # 幂等：结果一致
+
+
+@pytest.mark.asyncio
+async def test_reconcile_governance_collects_then_batch_starts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#208：治理恢复 = **先挂完所有、再经统一批量启动器一次启动**（共享 Computer 级并发上限）。
+
+    三条契约一并钉住：① 挂载阶段 ``start=False``（不在循环内融合启动）；② 循环内**不**调批量 API；
+    ③ 循环后**恰好一次**批量启动，且入参 = 全部重挂成功的 bundle_id（输入序）。
+    """
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, servers=[FIGMA_NAME], skills=["lint"])
+
+    mounts: list[tuple[str, bool]] = []
+    batch_calls: list[list[str]] = []
+
+    async with Computer(name="t", auto_connect=True, skill_home=home) as comp:
+        assert comp.mcp_manager is not None
+
+        async def _fake_batch(ids: list[str]) -> list[Any]:
+            batch_calls.append(list(ids))
+            return []
+
+        monkeypatch.setattr(comp.mcp_manager, "astart_clients_batch", _fake_batch)
+
+        async def register(cfg, record: BundledServerRecord) -> None:
+            mounts.append((cfg.name, False))
+            assert batch_calls == [], "挂载循环内不得触发批量启动（须全部挂完再启）"
+            await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace, start=False)
+
+        report = await comp.reconcile_governance(
+            existing_bundle_ids=lambda: set(),
+            register_server=register,
+            declared=_DECLARED_ENABLED,
+        )
+
+    assert report.remounted_servers == [FIGMA_BID]
+    assert mounts == [(FIGMA_NAME, False)]
+    assert batch_calls == [[FIGMA_BID]], "循环后须经统一批量启动器启动，且入参为已重挂的 bundle_id"
 
 
 @pytest.mark.asyncio

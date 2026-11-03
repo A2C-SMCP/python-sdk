@@ -15,9 +15,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from mcp.types import CallToolResult
+from socketio.exceptions import TimeoutError as SioTimeoutError
 
 from a2c_smcp.agent.auth import DefaultAgentAuthProvider
 from a2c_smcp.agent.client import AsyncSMCPAgentClient
+from a2c_smcp.agent.errors import SMCPProtocolError
 from a2c_smcp.smcp import (
     CANCEL_TOOL_CALL_EVENT,
     SMCP_NAMESPACE,
@@ -144,7 +146,7 @@ async def test_emit_tool_call_timeout_sends_cancel(mock_call: AsyncMock, mock_em
     中文：工具调用超时触发取消请求并返回错误结果。
     English: Tool call timeout triggers cancel and returns error result.
     """
-    mock_call.side_effect = TimeoutError("Timeout")
+    mock_call.side_effect = SioTimeoutError("Timeout")
 
     res = await client.emit_tool_call("comp-1", "echo", {"text": "hi"}, timeout=1)
 
@@ -239,10 +241,12 @@ async def test_event_handlers_enter_leave_update(client: AsyncSMCPAgentClient, h
         return {"tools": [{"name": "t-x"}], "req_id": "r"}
 
     with patch.object(client, "get_tools_from_computer", new=AsyncMock(side_effect=_mock_get_tools)):
-        # enter
-        enter: EnterOfficeNotification = {"office_id": "test_office", "computer": "c1"}
+        # enter（v0.5.0 / protocol#64：Computer 成员的通知带 computer_id，Agent 须原样透传给宿主）
+        cid = "abcdef01-2345-4678-8abc-def012345678"
+        enter: EnterOfficeNotification = {"office_id": "test_office", "computer": "c1", "computer_id": cid}
         await client._on_computer_enter_office(enter)
         assert handler.enter_office_calls and handler.tools_received_calls
+        assert handler.enter_office_calls[-1]["computer_id"] == cid, "Agent 必须把 computer_id 透传给事件处理器"
 
         # leave
         leave: LeaveOfficeNotification = {"office_id": "test_office", "computer": "c1"}
@@ -344,44 +348,63 @@ async def test_sio_param_passed_to_tools_received_handler(client: AsyncSMCPAgent
 
 @pytest.mark.asyncio
 @patch("socketio.AsyncClient.call", new_callable=AsyncMock)
-async def test_get_computers_in_office_success(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
+async def test_get_computer_in_office_returns_the_single_computer(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
     """
-    中文：成功获取房间内的Computer列表。
-    English: Successfully get computers list in office.
+    中文：#230「每 role 一席」——返回房内唯一的 Computer（过滤掉 Agent 会话）。
+    English: Returns the office's single computer (agent sessions filtered out).
     """
     office_id = "test_office"
-    req_id = f"list_computers_test_agent_{office_id}"
-
-    # 模拟响应包含多个会话，包括computer和agent角色
-    # Mock response with multiple sessions including computer and agent roles
-    mock_resp = {
-        "req_id": req_id,
+    computer_id = "abcdef01-2345-4678-8abc-def012345678"
+    mock_call.return_value = {
+        "req_id": f"list_computers_test_agent_{office_id}",
         "sessions": [
-            {"sid": "comp1", "role": "computer", "computer_id": "computer-1"},
-            {"sid": "comp2", "role": "computer", "computer_id": "computer-2"},
-            {"sid": "agent1", "role": "agent", "agent_id": "agent-1"},
+            {"sid": "comp1", "role": "computer", "name": "computer-1", "computer_id": computer_id},
+            {"sid": "agent1", "role": "agent", "name": "agent-1"},
         ],
     }
-    mock_call.return_value = mock_resp
 
-    computers = await client.get_computers_in_office(office_id)
+    computer = await client.get_computer_in_office(office_id)
 
-    # 验证只返回computer角色的会话 / Verify only computer role sessions are returned
-    assert len(computers) == 2
-    assert all(c["role"] == "computer" for c in computers)
-    assert computers[0]["computer_id"] == "computer-1"
-    assert computers[1]["computer_id"] == "computer-2"
-
-    # 验证调用参数 / Verify call arguments
+    # 协议#64：SessionInfo 的 computer_id 原样交给宿主（持久引用的机器身份）
+    assert computer == {"sid": "comp1", "role": "computer", "name": "computer-1", "computer_id": computer_id}
     mock_call.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 @patch("socketio.AsyncClient.call", new_callable=AsyncMock)
-async def test_get_computers_in_office_empty(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
+async def test_get_computer_in_office_more_than_one_is_protocol_violation(
+    mock_call: AsyncMock, client: AsyncSMCPAgentClient
+) -> None:
+    """房内列出多于一台 Computer ⇒ 服务端协议违规 ⇒ 显式报错，**不**挑其中一台（替调用方猜正是要消灭的歧义）。"""
+    office_id = "test_office"
+    mock_call.return_value = {
+        "req_id": f"list_computers_test_agent_{office_id}",
+        "sessions": [{"sid": "c1", "role": "computer"}, {"sid": "c2", "role": "computer"}],
+    }
+
+    with pytest.raises(ValueError, match="Protocol violation"):
+        await client.get_computer_in_office(office_id)
+
+
+@pytest.mark.asyncio
+async def test_get_computers_in_office_is_deprecated_shim(client: AsyncSMCPAgentClient) -> None:
+    """旧复数 API 已废弃（#230）：发 DeprecationWarning，委托单数 API 并包装为 ``[c]`` / ``[]``。"""
+    single = AsyncMock(side_effect=[{"sid": "c1", "role": "computer"}, None])
+    client.get_computer_in_office = single  # type: ignore[method-assign]
+
+    with pytest.warns(DeprecationWarning, match="get_computer_in_office"):
+        assert await client.get_computers_in_office("o", timeout=3) == [{"sid": "c1", "role": "computer"}]
+    with pytest.warns(DeprecationWarning):
+        assert await client.get_computers_in_office("o") == []
+    assert single.await_args_list[0].args == ("o",) and single.await_args_list[0].kwargs == {"timeout": 3}
+
+
+@pytest.mark.asyncio
+@patch("socketio.AsyncClient.call", new_callable=AsyncMock)
+async def test_get_computer_in_office_empty(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
     """
-    中文：房间内没有Computer时返回空列表。
-    English: Return empty list when no computers in office.
+    中文：房间内没有Computer时返回 None。
+    English: Return None when no computer is in the office.
     """
     office_id = "test_office"
     req_id = f"list_computers_test_agent_{office_id}"
@@ -396,15 +419,38 @@ async def test_get_computers_in_office_empty(mock_call: AsyncMock, client: Async
     }
     mock_call.return_value = mock_resp
 
-    computers = await client.get_computers_in_office(office_id)
-
-    # 验证返回空列表 / Verify empty list is returned
-    assert len(computers) == 0
+    # 房内暂无 Computer ⇒ None / no computer in the office ⇒ None
+    assert await client.get_computer_in_office(office_id) is None
 
 
 @pytest.mark.asyncio
 @patch("socketio.AsyncClient.call", new_callable=AsyncMock)
-async def test_get_computers_in_office_invalid_response(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
+async def test_get_computer_in_office_error_payload_raises_protocol_error(
+    mock_call: AsyncMock, client: AsyncSMCPAgentClient
+) -> None:
+    """#214：`server:list_room` 的 flat ErrorPayload（此处 4104 越权）⇒ `SMCPProtocolError`。
+
+    必须**先于** `req_id` 校验：ErrorPayload 不带 `req_id`，若顺序反了会被误报成
+    「Invalid response with mismatched req_id」——把结构化拒绝伪装成协议违约，客户端再也读不到码。
+
+    A flat ErrorPayload from list_room must surface as SMCPProtocolError (with its code), not as a
+    misleading "mismatched req_id" ValueError.
+    """
+    mock_call.return_value = {
+        "code": 4104,
+        "message": "Cross-room access denied",
+        "details": {"office_id": "other_office"},
+    }
+
+    with pytest.raises(SMCPProtocolError) as exc_info:
+        await client.get_computer_in_office("test_office")
+
+    assert exc_info.value.code == 4104
+
+
+@pytest.mark.asyncio
+@patch("socketio.AsyncClient.call", new_callable=AsyncMock)
+async def test_get_computer_in_office_invalid_response(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
     """
     中文：响应req_id不匹配时抛出异常。
     English: Raise exception when response req_id mismatches.
@@ -420,12 +466,12 @@ async def test_get_computers_in_office_invalid_response(mock_call: AsyncMock, cl
     mock_call.return_value = mock_resp
 
     with pytest.raises(ValueError, match="Invalid response with mismatched req_id"):
-        await client.get_computers_in_office(office_id)
+        await client.get_computer_in_office(office_id)
 
 
 @pytest.mark.asyncio
 @patch("socketio.AsyncClient.call", new_callable=AsyncMock)
-async def test_get_computers_in_office_timeout(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
+async def test_get_computer_in_office_timeout(mock_call: AsyncMock, client: AsyncSMCPAgentClient) -> None:
     """
     中文：请求超时时抛出异常。
     English: Raise exception on timeout.
@@ -434,4 +480,16 @@ async def test_get_computers_in_office_timeout(mock_call: AsyncMock, client: Asy
     mock_call.side_effect = TimeoutError("Request timeout")
 
     with pytest.raises(TimeoutError):
-        await client.get_computers_in_office(office_id, timeout=1)
+        await client.get_computer_in_office(office_id, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_join_office_payload_never_carries_computer_id(client: AsyncSMCPAgentClient) -> None:
+    """v0.5.0（protocol#64）：Agent 入房 MUST NOT 携带 ``computer_id``（该键只属于 Computer）。"""
+    with patch.object(client, "call", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = None  # 空 ack = 成功
+        await client.join_office("office-1", "agent-1")
+
+    payload = mock_call.await_args.args[1]
+    assert payload["role"] == "agent"
+    assert "computer_id" not in payload, f"Agent 载荷不得出现 computer_id: {payload!r}"

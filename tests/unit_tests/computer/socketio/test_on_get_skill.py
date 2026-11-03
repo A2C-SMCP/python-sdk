@@ -31,7 +31,7 @@ from a2c_smcp.computer.blob import BlobThresholds, decode_blob_handle
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.exceptions import SMCPNamespaceError
-from a2c_smcp.smcp import UPDATE_SKILLS_EVENT, A2CSkillRef, ErrorCode
+from a2c_smcp.smcp import SMCP_NAMESPACE, UPDATE_SKILLS_EVENT, A2CSkillRef, ErrorCode
 
 _SKILL_MD = "---\nname: demo\nversion: 1.0.0\n---\n# Demo\n\nshort body\n"
 _SKILL_BODY = "# Demo\n\nshort body\n"  # frontmatter 剥离后正文
@@ -264,6 +264,10 @@ class TestEmitUpdateSkills:
     async def test_emits_when_in_office(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         client = SMCPComputerClient(computer=_computer(tmp_path, name="comp-x"))
         client.office_id = "office-1"
+        # #223：emit 判据 = "服务端**已确认**成员关系 **且** namespace 在册"（desired 在重连窗口内被保留、
+        # namespace 也可能已重新在册，但那时服务端新会话尚无 office_id ⇒ 发包会被 require_office_id 丢弃）
+        client._confirmed_office_id = "office-1"
+        client.namespaces[SMCP_NAMESPACE] = "sid-x"
         called: dict[str, Any] = {}
 
         async def fake_emit(self, event: str, data: Any = None, namespace: str | None = None, callback: Any = None) -> None:
@@ -286,4 +290,5 @@ class TestEmitUpdateSkills:
 
         monkeypatch.setattr(SMCPComputerClient, "emit", fake_emit)
         await client.emit_update_skills()
-        assert "event" not in called  # office_id 守卫：未入房间不发送
+        assert "event" not in called  # 上报判据：未入房间不发送
+        assert client._deferred_office_updates == set(), "无入房意图时不记待补发（#223）"

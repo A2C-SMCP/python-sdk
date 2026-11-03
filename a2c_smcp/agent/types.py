@@ -10,8 +10,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol, TypeAlias
+from collections.abc import Callable, Mapping
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
 
 from mcp.types import CallToolResult
 from typing_extensions import TypedDict
@@ -262,3 +263,122 @@ AsyncToolCallCallback = Callable[[str, str, dict, int], CallToolResult]
 # Agent ID获取函数类型 / Agent ID getter function types
 AgentIDGetter = Callable[[], str]
 AsyncAgentIDGetter = Callable[[], str]
+
+
+# ────────────────────── #209 在途工具调用取消 / In-flight tool-call cancellation ──────────────────────
+
+# 取消信号的轮询间隔（秒）。协议硬约束：实现一律**轮询**，不得假定存在可 await 的 ``wait``。
+# Cancel-signal poll interval (seconds). The protocol forbids assuming an awaitable ``wait`` exists.
+DEFAULT_CANCEL_POLL_INTERVAL: float = 0.05
+
+
+@runtime_checkable
+class CancelSignal(Protocol):
+    """宿主侧取消信号的**最小**契约：只要求 ``is_set()``（#209）。
+
+    协议 `events.md §server:tool_call_cancel`（protocol#58 / PR#60）冻结了「Agent 侧主动取消」的
+    行为语义，但**不规定** SDK 侧接口形状。本协议刻意取最小面：
+
+    - **只依赖 ``is_set()``** —— 实现**不得**假定存在可 await 的 ``wait``。宿主形态各异：内核
+      ``CancellationToken`` 只有 ``is_cancelled`` property；``asyncio.Event.wait()`` 在
+      Celery threads 池的 ``loop=None`` 下会 ``RuntimeError``；取消信号还可能从**另一线程**打入。
+      故 SDK 一律**轮询** ``is_set()``；信号对象存在其他成员时也**不会**被访问。
+    - **粘滞性由宿主负责** —— 「取消早于调用开始」是否生效取决于宿主信号本身是否粘滞（``is_set()``
+      置位后保持为真）。SDK 不做额外记忆。
+    - **跨线程**：``threading.Event`` 或任意仅含 ``is_set()`` 的对象可直接跨线程置位。若宿主用的是
+      ``asyncio.Event``，``set()`` **非线程安全** —— 非事件循环线程须经
+      ``loop.call_soon_threadsafe(event.set)``。
+
+    满足该形状的 ``threading.Event`` / ``asyncio.Event`` / 自定义 token 均可直接传入
+    :meth:`AsyncSMCPAgentClient.emit_tool_call` / :meth:`SMCPAgentClient.emit_tool_call` 的 ``cancel``。
+
+    / The minimal host-side cancel-signal contract: ``is_set()`` and nothing else.
+    """
+
+    def is_set(self) -> bool:
+        """信号是否已置位 / whether the cancel signal is set."""
+        ...
+
+
+class ToolCallOutcome(StrEnum):
+    """``client:tool_call`` 结果的三态（+ 成功）分类（#209）。
+
+    据**结果级** A2C 标记在 ``isError`` 之上进一步分流，供调用方区分「取消 / 超时 / 普通失败」：
+
+    - :attr:`CANCELLED`：被 ``notify:tool_call_cancel`` 中断（结果级 ``meta.a2c_cancelled=true``）；
+    - :attr:`TIMED_OUT`：超时（结果级 ``meta.a2c_timeout=true``）—— Agent 自身超时路径**本地合成**
+      亦归此态；
+    - :attr:`FAILED`：其它工具级失败（``isError=true`` 但无取消/超时标记）；
+    - :attr:`COMPLETED`：成功。
+
+    取值与 rust-sdk 的 ``ToolCallOutcome`` 逐字对齐（``completed`` / ``timed_out`` / ``cancelled`` /
+    ``failed``，见 rust-sdk#218）；枚举取值即字符串，宿主日志与轨迹字段按此落库。
+
+    / Tri-state (+success) classification of a ``client:tool_call`` result.
+    """
+
+    COMPLETED = "completed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+def _meta_containers(result: CallToolResult | Mapping[str, Any]) -> tuple[Any, ...]:
+    """收集结果级 meta 的所有候选容器（协议：Consumer **SHOULD** 宽松读取）。
+
+    - ``Mapping``（wire dict）：``meta`` / ``_meta`` 两种线上 key —— 不同 SDK 序列化路径可能不同。
+    - ``CallToolResult`` 形态：真实 ``.meta`` 字段；再兜底 ``model_extra`` —— MCP ``Result.meta``
+      的字段 alias 是 ``_meta``，宿主若以构造器写法 ``CallToolResult(meta={...})`` 造结果，标记会落
+      ``extra`` 而非字段（本仓 ``base.py`` 的 ``handle_tool_call_timeout`` 对此陷阱有注记），
+      不兜底则这类结果被**静默误判**为普通失败。
+
+    / Collect every candidate result-level meta container, leniently (protocol SHOULD).
+    """
+    if isinstance(result, Mapping):
+        return (result.get("meta"), result.get("_meta"))
+    extra = getattr(result, "model_extra", None)
+    return (
+        getattr(result, "meta", None),
+        extra.get("meta") if isinstance(extra, Mapping) else None,
+        extra.get("_meta") if isinstance(extra, Mapping) else None,
+    )
+
+
+def _result_meta_flag(result: CallToolResult | Mapping[str, Any], key: str) -> bool:
+    """读结果级 meta 的布尔标记，**仅** ``is True`` 计真（与 rust ``as_bool()`` 同判）。
+
+    / Read a result-level meta bool flag; strictly ``is True`` (mirrors rust's ``as_bool()``).
+    """
+    return any(isinstance(c, Mapping) and c.get(key) is True for c in _meta_containers(result))
+
+
+def _result_is_error(result: CallToolResult | Mapping[str, Any]) -> bool:
+    """读 ``isError``；缺席 / 非布尔真值均视为 False（与 rust ``unwrap_or(false)`` 同判）。"""
+    value = result.get("isError") if isinstance(result, Mapping) else getattr(result, "isError", None)
+    return value is True
+
+
+def classify_tool_call_outcome(result: CallToolResult | Mapping[str, Any]) -> ToolCallOutcome:
+    """把 ``client:tool_call`` 的结果分类为三态（+ 成功）（#209）。
+
+    判定优先级 **取消 > 超时 > 失败 > 成功** —— 取消/超时同样 ``isError=True``，是对 ``isError`` 的
+    **语义细化**，故**先判标记再判 ``isError``**；顺序写反会把取消态误归普通失败。
+
+    纯函数、无 I/O；调用方对 ``emit_tool_call`` 的返回值自行调一次即可（``emit_tool_call`` 的返回
+    类型恒为 ``CallToolResult``，不因此改变）。
+
+    Args:
+        result: ``emit_tool_call`` 的返回值，或 wire 形态的结果映射 / the call result, or a wire mapping.
+
+    Returns:
+        ToolCallOutcome: 三态（+ 成功）分类 / the tri-state (+success) classification.
+
+    / Classify a ``client:tool_call`` result: cancelled > timed_out > failed > completed.
+    """
+    if _result_meta_flag(result, "a2c_cancelled"):
+        return ToolCallOutcome.CANCELLED
+    if _result_meta_flag(result, "a2c_timeout"):
+        return ToolCallOutcome.TIMED_OUT
+    if _result_is_error(result):
+        return ToolCallOutcome.FAILED
+    return ToolCallOutcome.COMPLETED

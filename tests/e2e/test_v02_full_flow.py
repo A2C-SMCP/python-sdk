@@ -162,10 +162,10 @@ async def test_v02_full_flow_compatible(compat_server: int) -> None:
         await asyncio.sleep(0.5)  # 等待 join 在房间内可见 / wait for room visibility
 
         # 协商结果落地：Server 在 HTTP 握手阶段从 URL query 写入 a2c_version，经 server:list_room 带出
-        computers = await agent.get_computers_in_office(office_id)
-        assert computers, "应能在房间内发现 Computer 会话 / Computer session must be discoverable"
-        assert all(c.get("a2c_version") == PROTOCOL_VERSION for c in computers), (
-            f"协商版本须等于 SDK PROTOCOL_VERSION={PROTOCOL_VERSION}，实际={[c.get('a2c_version') for c in computers]}"
+        comp_session = await agent.get_computer_in_office(office_id)
+        assert comp_session is not None, "应能在房间内发现 Computer 会话 / Computer session must be discoverable"
+        assert comp_session.get("a2c_version") == PROTOCOL_VERSION, (
+            f"协商版本须等于 SDK PROTOCOL_VERSION={PROTOCOL_VERSION}，实际={comp_session.get('a2c_version')}"
         )
 
         # —— window:// 资源聚合：桌面仅聚合 window://，非 window 资源不进桌面 ——

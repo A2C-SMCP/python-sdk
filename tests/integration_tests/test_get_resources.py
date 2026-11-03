@@ -44,6 +44,7 @@ from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.smcp import GET_RESOURCES_EVENT, JOIN_OFFICE_EVENT, SMCP_NAMESPACE
 from a2c_smcp.testing import UvicornTestServer, create_local_sync_server
 from tests.integration_tests.mock_socketio_server import create_computer_test_socketio
+from tests.room_acks import assert_empty_ack
 
 MCP_SERVERS_DIR = Path(__file__).resolve().parent / "computer" / "mcp_servers"
 PAGED_SERVER = MCP_SERVERS_DIR / "resources_paged_mixed_stdio_server.py"
@@ -265,12 +266,12 @@ def sync_smcp_server(sync_server_port: int) -> Generator[int, Any, None]:
 
 
 def _sync_join(client: Client, role: Literal["computer", "agent"], office_id: str, name: str) -> None:
-    ok, err = client.call(
-        JOIN_OFFICE_EVENT,
-        {"role": role, "office_id": office_id, "name": name},
-        namespace=SMCP_NAMESPACE,
-    )
-    assert ok and err is None
+    payload: dict = {"role": role, "office_id": office_id, "name": name}
+    # v0.5.0（protocol#64）：Computer 入房 MUST 携带 computer_id；Agent MUST NOT 出现该键
+    if role == "computer":
+        payload["computer_id"] = "abcdef01-2345-4678-8abc-def012345678"
+    ack = client.call(JOIN_OFFICE_EVENT, payload, namespace=SMCP_NAMESPACE)
+    assert_empty_ack(ack)
 
 
 def _run_mock_computer_process(port: int, ready_q: multiprocessing.Queue, err_q: multiprocessing.Queue) -> None:

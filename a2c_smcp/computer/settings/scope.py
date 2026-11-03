@@ -60,7 +60,9 @@ PROJECT_SETTINGS_FILENAME = "settings.json"
 LOCAL_SETTINGS_FILENAME = "settings.local.json"
 USER_SETTINGS_FILENAME = "settings.json"
 
-_A2C_CONFIG_SUBDIR = "a2c"
+#: SDK 在用户配置目录下的子目录名（settings / mcp.json / ``computer-id`` 共用）。
+#: Public so the identity store can converge on the same constant (no duplicate literal).
+A2C_CONFIG_SUBDIR = "a2c"
 
 
 def resolve_user_config_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -76,8 +78,8 @@ def resolve_user_config_dir(env: Mapping[str, str] | None = None) -> Path:
     return resolve_xdg_first(
         environ,
         XDG_CONFIG_HOME_ENV,
-        _A2C_CONFIG_SUBDIR,
-        fallback=Path.home() / ".config" / _A2C_CONFIG_SUBDIR,
+        A2C_CONFIG_SUBDIR,
+        fallback=Path.home() / ".config" / A2C_CONFIG_SUBDIR,
     )
 
 
@@ -209,7 +211,10 @@ def load_settings_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any]
         return {}, []
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # ``UnicodeDecodeError`` 是 ``ValueError`` 子类而非 ``OSError``：原样漏捕会让非 UTF-8 的 settings.json
+        # （如 Windows 记事本存成 UTF-16LE）在启动解析处直接崩溃，而不是按文档契约「容错 + 记错、留盘」。
+        # #246 独立审查 🔴1 同族问题（写侧已在 ``settings/raw.py`` 归入 fail-closed）。
         logger.warning("Settings file %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
         return {}, [SettingsValidationError(scope=scope, field="<file>", reason=f"unreadable or corrupt JSON: {exc}", source_path=str(p))]
     return validate_settings(raw, scope, source_path=str(p))

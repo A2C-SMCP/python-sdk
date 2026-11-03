@@ -7,6 +7,410 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 > 注：v0.3.1 / v0.3.2 发版时未单独切段（Bugfix / OAuth 收敛类），本段累积至 [0.3.0]。
 
+## [Unreleased] — #214 房间事件失败 ack 契约（协议 v0.5.0）
+
+> **A2C-SMCP 协议 v0.5.0 实现**：`PROTOCOL_VERSION` 由 `0.4.0` 抬至 `0.5.0`（v0.x 下 `MINOR` 严格匹配，
+> 抬位后握手层才会正确拒绝 `0.4.x` 对端）。SDK 包版本（`__version__`）由发版流程另行推进。
+
+### Breaking Changes
+
+- **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer
+  ⇒ 一个 Agent 同一时刻至多连一台 Computer。无新事件、无能力字段（随 0.5 MINOR 握手生效）。
+  - **第二台 Computer 入房被拒 `4101`**（此前允许任意多台）：不替换、不驱逐已在房的 Computer；同名与否都一样。
+    换绑 = 旧 Computer `leave_office` → 新 Computer `join_office`（Agent 观察到 `notify:leave_office` →
+    `notify:enter_office`）。
+  - **`4101` 泛化为「本 role 席位已占」**，ack 载荷字节级对齐协议示例：
+    `{"code":4101,"message":"Room already has an agent"|"Room already has a computer","details":{"office_id":…,"role":…}}`
+    （服务端载荷中 `details.role` = 发起者自己声明的 role，即被占席位；客户端 `SMCPProtocolError`
+    同时带出 `details`——`4101` `{office_id, role}`、`4106` `{office_id}`，按 `code` + `details` 分流，
+    见 #234）。`build_room_rejection_error(4101, …)` 要求
+    `declared_role` 必填；`RoomFullError` 构造改为 `RoomFullError(role)`。
+  - **`4105` 收回为预留码**：服务端不再产出（同 role 同名先撞席位 ⇒ `4101`），`build_room_rejection_error`
+    构造上拒绝 `4105`（与 `4102` 同款）；**`NameConflictError` 删除**（未发布即收回，不留别名）。客户端收到
+    `4102` / `4105` ⇒ 记协议违规告警、按非校验类拒绝处理、**不重试**。
+  - **重连回房的瞬态重试集合由 `{4101, 4105}` 收敛为 `{4101}`**（`TRANSIENT_JOIN_CONFLICT_CODES`；
+    `JOIN_VALIDATION_REJECTION_CODES` 同步去掉 `4105`）。
+  - **服务端准入改由席位表原子判定**：新增 `_seat_to_sid: (office_id, role) → sid`（`server.types.SEAT_KEY`）
+    与反向索引 `_sid_to_seats`。`enter_room` 在**任何副作用之前**（含 Computer 换房的「自动离开旧房」）原子
+    「检查 + 占席」（async 零挂起点 / sync 注册表锁内）⇒ 并发加入空房恰一者成功，输家在动旧房之前即被拒
+    （此前「竞争输家短暂入房、换房者已先退旧房」的已知边界随之消失）；失败即回滚新占席位，退房 / 断连 /
+    relay 自愈时释放。名字注册表只承担路由解析：键被他人持有 ⇒ `RegistryInvariantError`（`500`），不伪装成协议码。
+    Server 子类化 API：`_ensure_name_registerable` 删除，改为 `_claim_seat(office_id, role, sid)` /
+    `_release_seats(sid, office_id=None)`；Agent 占用判定不再扫描 socketio 房成员。
+  - **幂等重入统一**：会话已在目标房再次 join（Agent / Computer 同）⇒ 空 ack、不重复广播 `notify:enter_office`。
+  - **Agent API**：新增 `get_computer_in_office(office_id) -> SessionInfo | None`（async / sync）；房内列出多于
+    一台 Computer ⇒ 判服务端协议违规抛 `ValueError`（不挑其中一台）。**`get_computers_in_office` 已废弃**：
+    仍可用（委托新方法，返回 `[c]` / `[]`）并发 `DeprecationWarning`，将在后续版本移除——**使用方请迁移到
+    `get_computer_in_office`**。rust-sdk 侧同步新增同名单数方法（rust-sdk#232）。
+  - 一致性：新增 `tests/integration_tests/server/test_single_computer_room_conformance.py`，对 async / sync 两种
+    服务端线上覆盖 room-model §一致性测试场景全部 9 条。
+- **Agent 显式 `join_office` 改为等 ACK（#218）**：`AsyncSMCPAgentClient.join_office` /
+  `SMCPAgentClient.join_office` 由「无 ack 的 `emit`」改为 `call`，三类后果：
+  1. **可能抛**：服务端裁决为拒绝时抛既有 `SMCPProtocolError`（`.code` 可机器分流 `400/403/4101/
+     4106`；码不可解析 / 形状不认识时 `.code == -1`，「未获裁决」）。此前入房被拒**完全静默**
+     ——包括同一连接改名被拒的 `403`（本地意图与服务端身份会静默分叉）。`403` 的异常文案追加
+     「本连接会话身份已固化为 `<name>`；改名须重新建立连接」。
+  2. **变阻塞调用**：ACK 等待由 `0` 变为**有界 10s**（新常量 `OFFICE_JOIN_TIMEOUT`；sync 侧还要叠加
+     office 操作锁 ⇒ 最坏约 20s）。超时按 `a2c_smcp.agent.base.OFFICE_ACK_TIMEOUT_ERRORS` 捕获
+     （socketio 的 `TimeoutError` **不是** builtin 子类）。
+  3. **失败后本地意图去留按统一表**（显式 join 与自动回房同规则、同文案）：明确拒绝 ⇒ 意图回退到
+     「已确认房」；未获裁决 / 传输层失败 ⇒ 双清空。效应只在**本次声明仍是最新**时施加（同拍已被
+     断连 / 重连的会话边界抢先 ⇒ 意图保留待重放）；未连接即调用（`BadNamespaceError`，发送前）按同一
+     规则 ⇒ **不保留**意图（此前会残留待重连重放）。
+  4. **取锁期间被抢占 ⇒ 静默返回、不发包**（返回形如成功）：并发 `leave_office` / 换房，或断连 / 重连
+     会话边界抢先时，本调用不再把 JOIN 发上线（wire 顺序恒与最后声明一致）。调用方需确认是否真的在房
+     时，请以服务端事实为准。
+  - 附带：新增 `_confirmed_office` / `_office_session` 状态，sync 侧新增 office 操作锁；拒绝日志由
+    `a2c_smcp.utils.office` 的共享产出者统一产出（两路径同文案，不含 SID / namespace）。
+- **`OFFICE_REJOIN_TIMEOUT` 硬切为 `OFFICE_JOIN_TIMEOUT`**（#218，不留别名）：Agent 两侧显式 join 与
+  自动回房共用该有界等待常量；Computer 显式 join 起初未纳入，本版审查收尾时已纳入（见 Changed）。
+- **三个房间事件的失败 ack 改为 flat `ErrorPayload`**（#214，protocol#61）：
+  `server:join_office` / `server:leave_office` 的**成功 = 空 ack**（`None`），失败 = 顶层含 `code` 的
+  flat `ErrorPayload`；`server:list_room` 成功仍为 `ListRoomRet`，失败为 flat `ErrorPayload`。
+  **`(bool, str | None)` 元组形态已废除**（该形态的 ack 载荷字节序列与 arity 均变化：由两参 ACK
+  变为零参 / 单 dict）。
+- **`a2c_smcp.utils.parse_join_ack` 返回类型变更**（SDK 公开 API）：由 `tuple[bool, str]` 改为
+  `JoinOfficeVerdict(ok, code, message)`，便于下游按 `code` 机器分流。**刻意不再兼容**旧元组形态——
+  `MINOR` 严格匹配使跨版本对端物理上不可能互联，兼容分支只会掩盖未迁移的调用方。
+- **名字唯一性键空间收敛为 `(office_id, role, name)`**（#215，protocol#61 Q3）：唯一性改为**房内同 role**
+  （协议 MUST NOT 施加全局唯一）。用户可感：**跨 office 同名**、**同名 Agent + Computer** 不再被误拒；
+  同房同 role 同名由「每 role 一席」先拦为 `4101`（#230，见上条）。`client:*` 路由改为在**发起者所在房内**解析——目标只在他房 / 名字属于
+  Agent 时立即回 flat `404`（与「不存在」逐字节相同，不泄露他房成员存在性），此前为抛异常致调用方挂满超时。
+  未入房发起者的路由拒绝现为 flat `4103`（#216，见下条）。
+  - Server 子类化 API 签名变更（不留兼容）：`get_sid_by_name(office_id, role, name)`、
+    `_register_name(office_id, role, name, sid)`（`_ensure_name_registerable` 已由 #230 删除，见上条）；
+    `_name_to_sid_map` 键改为 `(office_id, role, name)` 元组（`server.types.NAME_KEY`），新增反向索引
+    `_sid_to_name_key`：`_unregister_name` 按 sid 注销、不再从可变会话字段反推（杜绝回滚后残留键永久占用），
+    并内置归属守卫（只删本 sid 持有的键）。
+- **边界校验加固 + office 房名命名空间分离**（#216，protocol#61 自查 A / B + `office_id` 取值域）：
+  - **`client:*` 路由的拒绝一律经 ack 可感**（此前多为抛异常 ⇒ 调用方挂满超时）：载荷畸形（缺字段 / 类型错 /
+    无载荷 / 多余位置参数）⇒ `400`；未入房 ⇒ `4103`；**非 Agent 发起任一 `client:*` ⇒ `403`**（此前只有
+    `tool_call` 校验角色，其余路由对 Computer 放行）；房内解析不到 ⇒ `404`。唯一保留的静默路径是「发起者会话
+    已不存在」。同步版 `client:tool_call` 的载荷改按 `ToolCallReq` 校验（与 async 一致；`timeout` 等字段必填）。
+  - **fire-and-forget 事件**（`server:tool_call_cancel` / `server:update_*` ×4）：载荷非法 / 角色不符 / 未入房时
+    改为**告警日志 + 静默丢弃**（协议：MUST NOT 为此新增 ack），不再抛 `SMCPNamespaceError`（此前会往服务端日志灌
+    traceback；线上行为不变——本就不广播、不回执）。`require_office_id` 保留导出，但本仓不再调用。
+  - **出向 `notify:*` 的身份字段改取发起者会话**（events.md §房间广播类事件的目标来源 MUST）：`notify:update_*` 的
+    `computer`、`notify:tool_call_cancel` 的 `agent` 不再原样转发载荷自称值（此前可用 `computer="peer"` 让房内 Agent
+    去刷新**另一台** Computer）；载荷与会话不符时只告警、**按会话执行**——`tool_call_cancel` 不再因 `agent` 名不符而丢弃
+    （协议 MUST NOT 拒绝）。
+  - `server:join_office` 的 `office_id=""` ⇒ `400`（此前入房成功却处处被当成「未入房」）。
+  - **socketio 房名改为 `office:{office_id}`**（`server.utils.office_room` / `office_id_of_room`），与 socketio
+    为每个连接自动建立的私有 sid 房**无条件不相交**——此前取 `office_id = <对端 SID>` 即可进入对端私有房并向其
+    投递广播。**线上载荷不变**（会话 / ack / 通知里的 `office_id` 仍是原值），但**自行 `emit(room=office_id)`、
+    直接读 `manager.rooms` 或 `get_participants(namespace, office_id)` 的 `SMCPNamespace` 子类须改用 `office_room()`**；
+    房间广播在基类统一经 `_emit_to_office` 发出；`rooms(sid)` 遍历只处理 `office:` 前缀房。
+  - handler 签名统一为 `(sid, data=None, *_extra)`（绑定失败也落到校验层）；边界校验单点 `server.utils.parse_payload`；
+    `_relay_client_call` 签名变为 `(sid, data, extra, event, req_adapter, ret_adapter, *, timeout_from_request=False)`。
+    `client:*` 校验通过后**原样转发**原始载荷（async `tool_call` 此前转发校验后的 dict——会剥掉额外键、做类型强转；
+    现与 sync 及其余路由一致）。
+  - 公开导出 `a2c_smcp.server.office_room` / `office_id_of_room` / `OFFICE_ROOM_PREFIX`。断连清理改经可覆写钩子
+    `_rooms_to_leave_on_disconnect(sid)`：`BaseNamespace` 保持原语义（离开除私有 sid 房外的全部房），`SMCPNamespace`
+    覆写为只处理 `office:` 房并交出原始 office_id。
+  - **Agent 侧**：`get_tools_from_computer` / `get_config_from_computer` / `get_desktop_from_computer`（sync + async）
+    解码路由层 flat ErrorPayload 并抛 `SMCPProtocolError`——此前 `get_config` 把 `404` / `4103` **静默当成「零个
+    server」的成功**，另两者报误导性的「req_id 不匹配」。
+  - 失败 reason 不含对端 `sid` / namespace（自 #214 起已成立，本单补真实链路验收）。
+- **`enter_room` / `_ensure_name_registerable` 的业务拒绝改抛领域异常**
+  （`RoomFullError` / `NameConflictError` / `AlreadyInRoomError`，均为 `ValueError` 子类，携带 `code`）。
+- **`join_office` 身份声明一致性补齐 name 半（#221）**：Server（async + sync）的身份判据由「role 不符」扩为
+  「role **或** name 不符」⇒ flat `ErrorPayload(403)`（`events.md:610`，与 rust 对齐），仍在任何会话写入与
+  房间副作用之前。**同一连接上改名再入房不再可能**——改身份须新连接（`faq.md:162`「重连或换 sid」）。
+  - 空名归一单点同源：`server/utils.py::default_session_name`（两处 `enter_room` 与两处身份判据共用）。
+  - CLI `socket join <office> <name>` 与本连接已尝试过的名字不同 ⇒ 透明重连四步（离开旧房 → 断开 → 以新名
+    重连 → 入房）；建连失败回滚 `comp.name`，入房被拒保留那条连接。
+  - `403` 文案泛化为 `"Role or name mismatch with existing session"`；`ConnectionArgs.namespace` 收敛为必填
+    `str`（存生效值，避免重连时显式传 `None` 覆盖默认命名空间）。
+
+### Added
+
+- **按路径读取 `client:resolve_path` + `readRoots` 授权（#236，protocol#65）**：新增事件
+  `client:resolve_path`（`ResolvePathReq` / `ResolvePathRet`）与错误码 `4020 Path Not Accessible`
+  （`details.reason ∈ {invalid_path, forbidden, not_found, not_a_file}`，开放枚举；resolve 成功后
+  拉取期的撤权 / 删除仍走 `4018 forbidden` / `gone`，**`4018` 枚举不变**）。
+  - **授权边界 = settings `readRoots`**（默认空 = 不可读，fail-closed）：仅受信 scope 可设，
+    `project` scope 提供该键**整字段拒绝**；跨 scope 按数组语义拼接去重；逐项须为绝对路径且通过
+    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。
+  - **授权每请求现读、无进程内缓存**：拉取期 `get_blob` 按**当前** `readRoots` 与**当前文件系统状态**
+    重施围栏（覆盖 resolve 后的撤权、root 符号链接换指向）；正确性不依赖宿主调用任何失效入口。
+  - **固定拒绝集**（即便在 `readRoots` 内也拒绝）：`.skillenv`、SDK 配置/状态/凭据目录
+    （含 `--settings` / `--mcp-config` / `.tfrobot` / SKILL Home / blob 缓存根 / keyring 文件后端）、
+    未定稿 `.part`。
+  - `resolve`（对全量字节算 sha256）与 `get_blob` 的 path 分支均 offload 到 worker 线程，
+    避免阻塞 socket.io 事件循环；path 句柄在 `finally` 中关闭（fd 泄漏守卫）。
+  - Agent 侧：`SMCPAgentClient.resolve_path` / `AsyncSMCPAgentClient.resolve_path`；Server 侧走统一
+    `_relay_client_call` 路由（与其它 `client:*` 一致）。
+- **入房失败处理的单一权威 API**（#218，`a2c_smcp.utils`）：`resolve_join_failure`（失败效应表：
+  明确拒绝 ⇒ 意图回退到已确认房；未获裁决 / 传输层失败 ⇒ 双清空）、`join_failure_message` /
+  `build_join_failure_payload`（异常与日志**同一文案**；`403` 追加身份提示；未获裁决省略 `code` 键 ⇒
+  `SMCPProtocolError.code == -1`）、`log_join_rejection`（两路径共用的 ERROR 产出者）、
+  `OfficeMembership`（效应结果）。另新增 `a2c_smcp.agent.base.OFFICE_ACK_TIMEOUT_ERRORS`。
+- `ErrorCode` 新增 `400` / `403` / `500` / `4101`–`4106`（`4102 Room Not Found` 为预留码，
+  builder **构造上拒绝**产出）。载荷构造收敛到 `build_bad_request_error` / `build_internal_error` /
+  `build_room_rejection_error` 三个共享 builder（sync / async 逐字节一致）。
+- **`is_protocol_error_payload` 增加形状守卫**：带 `content` 的 dict（MCP `CallToolResult` 形状）
+  **优先判否**。`CallToolResult` 是 `extra="allow"`，工具可携带恰好撞上协议码的顶层 `code`；
+  `client:tool_call` 的 ack 直接透传该结果，误判会把真实工具结果顶替成协议错误（码集合并入
+  `400/403/500` 后这一风险上升）。协议 `ErrorPayload` 从不带 `content`，判别无损。
+- **载荷校验失败必回 ack**：`server:join_office` / `leave_office` / `list_room` 在载荷畸形
+  （含**框架层参数绑定失败**——不带载荷 emit、多参 emit）时回 `400`，不再"静默不 ack"让调用方挂到
+  自身超时（error-handling.md:102-106）。
+- `server:list_room` 越权统一：无房 → `4103`；显式点名他房 → `4104`（**不再**静默不 ack、
+  **不再**返回空 `sessions`）；且**不调用**会话读取器 ⇒ 目标房成员信息不可能进响应。
+- 三个事件的 handler 都补齐 **catch-all**：未知内部异常一律回 `500` + 笼统文案（原文进日志），
+  不再让异常逃出 handler 导致"根本不发 ACK、调用方挂到自身超时"。
+- **重连回房的瞬态冲突有界退避重试（#212）**：静默断线后服务端要等自身心跳超时才回收旧会话，而客户端
+  在秒级内就重连重放 ⇒ 必然撞上 `4101`（旧会话仍占着本 role 的席位；#230 起 `4105` 为预留码、不再重试）。
+  协议把这种成因定义为**瞬态冲突**，并只对「本端刚经历传输层重连」的恢复路径放行**有界**重试（`error-handling.md`
+  §建议的重试策略）。三条回放路径（Agent async / Agent sync / Computer）现在按 `1→2→4→5…` 秒退避
+  重试，**默认预算 45s** = socket.io 默认最长回收窗口（`ping_interval(25) + ping_timeout(20)`），
+  预算耗尽才落失败效应与错误日志（与显式入房**同一张效应表、同一句 ERROR 文案**，故 #219 的同态口径
+  不受影响）。静默断线族因此从「需人工重入」变为「无感自愈」。
+  - **可配置**：`AsyncSMCPAgentClient.office_rejoin_retry_budget` / `SMCPAgentClient.…` /
+    `SMCPComputerClient.…`（公开实例属性，默认取 `OFFICE_REJOIN_RETRY_BUDGET`；`<= 0` 退化回单次尝试）。
+    部署方调大了服务端 `ping_interval` / `ping_timeout` 时须相应调大——协议 `room-model.md` 的同名
+    SHOULD 级部署约束是客户端补偿能生效的前提。
+  - **只作用于回放路径**：显式 `join_office` **不重试**（首次入房撞上冲突即永久冲突）；`4106`（重连产生
+    的是新会话，不可能「已在其它房」）/ `500` / 未知码 / 无码 / 传输层失败一律不重试。
+    > **协议对齐说明（有意的一次解释扩张）**：协议把重试限定为「本端刚经历传输层重连」，而 Computer 侧
+    > 「宿主预置 `office_id` 再 `connect()`」的**首连**也走重放通道 ⇒ 也会重试。冷启动（进程被杀后
+    > 以同名重启）撞的正是**上一进程**尚未回收的僵尸会话，与协议给出的瞬态成因（「旧会话未回收」）同源，
+    > 故判为落在「重试判定由客户端依自身状态做出」的自治范围内；Agent 侧无此通道（其重启走显式
+    > `join_office`，不重试）。若协议要收紧该边界，两侧需同步收窄。
+  - **锁语义**：预算内**逐次取/放锁**（每次尝试各取一次 office 操作锁）⇒ 退避不会占满 office 操作
+    互斥；恢复耗时的上界 = 预算 + 一次有界 ACK 等待（末次尝试可在预算边界上发起）。
+  - 新增单一权威纯函数 `rejoin_retry_delay` 与常量 `OFFICE_REJOIN_RETRY_BASE_DELAY` /
+    `OFFICE_REJOIN_RETRY_MAX_DELAY` / `TRANSIENT_JOIN_CONFLICT_CODES`（`a2c_smcp.utils`）。
+- **回放在途窗口的状态上报不再丢失（#223）**：`server:update_config` / `update_tool_list` /
+  `update_desktop` / `update_skills` 的发送判据由「desired 非空 ∧ namespace 在册」收敛为「有入房意图 ∧
+  **服务端已确认在房** ∧ namespace 在册」——与协议 `computer.md §2.2`「Computer SHOULD 在**成功加入
+  Office 后**才发送这四个事件」对齐（rust 侧早已是同款 `has_confirmed_office()` 判据）。判据不成立时不再
+  对服务端发注定被丢弃的包，而是把**事件名记入待补发集合**；成员关系重新确立（自动回房成功 / 显式入房
+  成功）后**逐条补发一次**（协议同节明许「未加入 Office 时，本地变化可以被记录或合并，但不应产生跨房间
+  可见通知」）。由此，**自本端感知断连起**，断连 / 退避重试窗口内改配置、改工具、改 SKILL、改桌面时，
+  房内 Agent 不再漏收——工具面本就有 `notify:enter_office` 自动重拉兜底，config / skills / desktop 三类
+  此前会一直漏到下一次变更（#212 把该窗口从毫秒级拉长到最长 ≈ 预算 + 一次有界 ACK 等待，放大了这一既存
+  缺口）。「物理掉线 → 本端察觉」之间的残留窗口属 fire-and-forget 固有不可知（消除它必须加 ack，协议
+  禁止），不在本保证范围内。
+  - 规则：同一类别在窗口内改多次**合并为一次**补发（按事件名去重，域恒为 4）；补发失败的条目留待**下一次**
+    成员关系确立时再补（逐条独立，一条失败不饿死其余类别）；从未入房 / 预算耗尽 / 已退房后不记录；退房
+    不清空待补发集合。
+  - 空转语义（写进 docstring）：条目移除 = 「已交给传输层」，**不是**「服务端已收到」——协议明文禁止给这
+    四个事件新增 ack 通道（`error-handling.md` §无 ack 通道的 fire-and-forget 事件），客户端永远无法确证
+    送达。
+  > **跨 SDK 对齐说明（有意的一次分叉）**：本单的**判据**半与 rust 对齐；**合并补发**半是 python 先行
+  > （rust 今天判据不成立即静默丢弃、无补发）⇒ 已开 rust 镜像单跟踪，由 rust 侧决定是否跟进。
+- **MCP 启动并发门（#208）**：单个启动 / 批量启动（`start all`）/ Plugin 治理恢复共享同一个 Computer 级
+  并发门（`a2c_smcp.computer.mcp_clients.start_gate.McpStartGate`，FIFO、关闸即令排队者失败，语义对齐 rust
+  `mcp_start_gate.rs`）。
+  - 新增 CLI 参数 `--concurrency N`（root callback 与 `run` 均可用；宿主运行时策略、不落盘；缺省 = 保持
+    串行的既有行为，`0` 按 `1` 处理）。
+  - 新增 `Computer.with_mcp_start_concurrency(n)` / `MCPServerManager.with_mcp_start_concurrency(n)`：
+    **构造期策略**，须在 `boot_up` 与任何启动 / 挂载尝试之前安装，之后调用抛 `RuntimeError`（fail-closed）。
+  - 新增 `MCPServerManager.astart_clients_batch(bundle_ids) -> list[StartOutcome]`（逐项结果，全部尝试）；
+    `ainitialize` 改为「先收集再批量启动」，失败时报首错（对齐 rust `start_all_mcp_clients`）。
+  - manager 锁层次重构为单向三层（门 → per-bundle 生命周期锁 → 状态锁）；更新 / 重启 / 停止 / 移除与同
+    bundle 的启动事务全序化。
+- **Agent `emit_tool_call` 支持宿主取消信号 + 三态分类（#209，protocol#58）**：`emit_tool_call(..., cancel=None)`
+  末位追加参数，只投递 `server:tool_call_cancel` 信号、仍以原 ack 为终态（不本地合成 `a2c_cancelled`）。
+  新增公开面 `CancelSignal`（只要求 `is_set()`）、`ToolCallOutcome` + `classify_tool_call_outcome`（与 rust
+  逐条一致：cancelled > timed_out > isError > completed）、`TOOL_CALL_TIMEOUT_ERRORS`。
+- **`tools/list_changed` 推进 `Computer.capability_revision`（#197）**：manager 以含 description /
+  inputSchema / annotations / meta 的全字段投影指纹判定「投影是否真实变化」，`arefresh_tools()` 返回该
+  bool；失败 bundle 两侧对称剔除（临时故障不读成移除、恢复不抖出虚假 revision）。对齐 rust PR #199。
+- **自动重连后恢复 Office 成员关系（#203，Computer + Agent async/sync）**：房间成员关系属于会话，断线重连换
+  新 SID 后客户端自动重放 `server:join_office`（desired + generation 模型，镜像 rust-sdk#204）。手工断开 /
+  服务端踢出 / 重连彻底放弃清空回房意图；新增 `a2c_smcp/utils/office.py`（入房 ACK 判定与有界超时的单一
+  权威）。
+- **Computer 稳定唯一身份 `computer_id`（#235，protocol#64）**：Computer 首次连接生成随机 UUID v4，持久化到
+  `<config>/a2c/computer-id`（`$XDG_CONFIG_HOME` 优先，否则注入 env 的 `HOME/.config`；文件 0600、新建目录
+  0700；并发首启原子；损坏 / 不可读写 ⇒ fail-fast，不静默临时值），跨重连 / 重启复用。
+  - **wire**：`EnterOfficeReq.computer_id`（`role="computer"` MUST 携带、Agent MUST NOT 出现该键）；
+    `notify:enter_office` / `notify:leave_office` 与 `server:list_room` 的 `SessionInfo` 对 Computer 回显，
+    Agent 省略该键（不得为 `null`）。形态：小写规范 UUID，整串且恰 36 字符，拒绝 nil / max。
+  - **Server**：`400`（缺失 / 非法 / Agent 携带）、`403`（同一 sid 改值）；身份三元组 `(role, name,
+    computer_id)` 在首次校验通过时原子记录，`4101`/`4106`/`500` 与 `leave_office` 均不回滚。
+  - **重置**：SDK `SMCPComputerClient.reset_identity()`（已连接 / 有入房意图时拒绝）、REPL `identity reset`、
+    独立 CLI `a2c-computer identity reset`（原子替换 + 重启提示）；新值只经新连接生效。
+  - 新增包级导出 `ComputerIdentityError`（持久化不可读写 / 损坏 ⇒ 明确报错终止启动，CLI 非零退出）。
+  - **破坏性**：v0.5.0 起 Computer 入房不携带 `computer_id` 将被 `400` 拒绝。
+
+### Fixed
+
+- **Computer 停机卡死 + 外部取消信号被吞（#211）**：`_keep_alive_task` 拆除窗口内服务端消息到达时
+  `aclose()` 抛 `ExceptionGroup`，跳过关闭信号 ⇒ `Computer.shutdown()` 永不返回。关闭信号与状态清理改为
+  无条件执行，断开等待加上界（超时强杀子进程）。
+  - **行为变化**：新增 `a2c_smcp.utils.cancellation.restores_cancellation`，装饰 `Computer.boot_up` /
+    `shutdown` 与 `MCPServerManager.aclose` / `astart_all` / `astart_client` / `astop_all` /
+    `astop_client`——下游（如 transitions `process_context`）吞掉的外部取消会在最外层入口**补抛
+    `CancelledError`**。宿主 `wait_for(computer.shutdown(), t)` 现在能如实拿到超时信号；此前会「正常返回」。
+- **资源变更刷新离开 MCP 接收循环（#210）**：`ResourceListChanged` / `ResourceUpdated(skill://)` 的刷新含
+  对同一会话的 RPC，在接收循环内联执行会自阻塞，使该 server 永久失能。改为后台任务 + 按动作分设三个脏位；
+  资源刷新改为「本地状态先行」（未加入 office 也推进本地 Registry）。
+- **被拒的 `server:join_office` 不再真入房（#213）**：`enter_room` 拆「校验阶段 → 生效阶段」，校验全部
+  先于任何成员关系变更（`room-model.md`「校验必须先于副作用」）；生效阶段抛错按提交点收敛；回滚改为字段级
+  （只回 `role` / `name`）。Computer 新增 `_confirmed_office_id`，被明确拒绝时回退到已确认房。
+- **房间广播目标只取服务端权威状态（跨房间隔离泄漏）**：`server:update_config` / `update_tool_list` /
+  `update_desktop` / `update_skills` / `tool_call_cancel` 在发起者未入房时曾以 `room=None` 广播给**整个
+  命名空间**；`server:leave_office` 曾把客户端载荷里的 `office_id` 当广播目标（可向任意房注入
+  `notify:leave_office`）。统一收敛到 `server/utils.py::require_office_id`（未入房即 raise）；leave 房号
+  只取服务端会话，无房可退时幂等成功。
+
+- 失败原因不再以自由文本回传：`message` 使用协议规范文案，`details` 只含**与发起者自身相关**的
+  上下文（目标房 / 自己声明的 role / 自己当前所在房），**MUST NOT** 携带任何对端会话标识（`sid` 等）。
+  名字冲突的冗长诊断（含对端 sid）下沉到服务端日志。
+- 未预期内部异常回 `500` + 笼统文案，原文只进日志（此前把 `str(e)` 原样回给客户端）。
+- **入房失败的效应判据由「顶层有没有码」收敛为「是否校验类」（#212，`is_validation_rejection`）**：
+  `room-model.md` 明写「校验必须先于副作用」⇒ 只有 `400`/`403`/`4101`/`4106` 才保证
+  「既有成员关系未被改变」，回退到「已确认房」才成立。`500` 是 handler catch-all，**可发生在成员关系
+  已提交之后**（入房广播抛错 ⇒ 服务端按提交点收敛为无房）——旧判据此时会让客户端宣称仍在旧房；未知码
+  同理 fail-safe。二者改按「未获裁决」处置（Agent 双清空；Computer 清 desired、保留
+  `_confirmed_office_id`，与它既有的「无码」支同形）。新增常量 `JOIN_VALIDATION_REJECTION_CODES`。
+  > 代价（已裁决接受）：`500` 若发生在**提交之前**，双清空会多丢一次恢复机会（旧房号不再回退）——
+  > 协议未覆盖此处，按「不臆断、不撒谎」取双清空。
+- **`emit_update_*` 在「回放在途」窗口内误放行（#223）**：判据只看 desired ⇒ 窗口内照发，而服务端**新会话
+  尚无 `office_id`** ⇒ `require_office_id` 拒收；这四个事件是 fire-and-forget、无 ack ⇒ 客户端**无感**，
+  房内 Agent 静默漏掉这几类变更。详见上面 Added 条目的判据 + 合并补发。
+- **Computer 侧补上「会话纪元」守卫，堵住两条会把 `_confirmed_office_id` 写脏的路径（#223 隔离审查）**：
+  「成功落账」在同一会话内刻意不受操作抢占约束（#213），但成员关系**属于会话**——跨会话的一律不得落账。
+  两条实测可达的脏写：①**显式 `join_office`** 等 ACK 期间断连（断连钩子是内联同步触发的，ACK 就绪与钩子
+  清账可同拍）⇒ 那条「成功」属于已销毁的会话；②**退房**在等 office 操作锁期间通知失败（`emit` 抛）⇒
+  临界区之后的清理被整段跳过（现改为 `finally`，异常照旧透传）。两者都会留下「服务端会话无房、本地却
+  自称已确认在房」的幻影态，使上面的判据放行一批注定被丢弃的上报**且不记入待补发**（变更真丢）。
+  新增字段 `_office_session`（镜像 Agent 侧的 #217 裁决 5：`generation` 只管操作抢占，会话作废另立纪元——
+  用 `generation` 守卫落账会连「同一会话内被抢占的成功」一起否掉，#213 明令不得）。
+
+### Changed
+
+- **`SMCPComputerClient.update_config` 与 `emit_update_config` 收敛为同一实现（#223）**：`update_config`
+  此前**无守卫**（无条件发送），与其孪生 `emit_update_config` 行为分叉；现委托后者（同判据、同补发）。
+  宿主若曾在「未确认在房」时依赖它把包发上线，请改用其它通道——那个包本来也会被服务端丢弃。
+- **`SMCPComputerClient.leave_office` 不再因未连接而抛异常（#223）**：改为**先无条件清本地意图**
+  （清 desired + 已确认房号、作废在途自动回房），再在 namespace 在册时通知服务端；不在册时记 DEBUG 并
+  正常返回（服务端会话已随连接销毁，本就没有可退的成员关系）。此前「先发包后清」在断线时抛
+  `BadNamespaceError` ⇒ 清理语句执行不到 ⇒ 本地意图残留 ⇒ 重连后自动回房把用户刚退掉的房又回了一遍。
+  CLI `socket leave` 相应改为「desired 有值就必须真的退」（不再因「未连接 / 未在房」跳过），文案区分
+  「已离开房间」与「未连接：已清除本地入房意图，重连后不再自动回房」。
+- **工具列表按 bundle 缓存 + 刷新移出状态锁（#222）**：结构性变更（启动 / 更新 / 移除 / 停止）只重读自身
+  失效的 bundle，批量启动 N 个的 `list_tools` 次数由 N(N+1)/2 收敛为 N（实测 210 → 20 次）；状态锁不再跨越
+  任何 RPC，另设 `tool_refresh_lock` 串行化整轮刷新。公开入口 `arefresh_tools()` 语义不变（恒全量重读）。
+- **`leave_office` 改为等 ACK（Agent async/sync + Computer，v0.5.0 跨节点审查）**：由 fire-and-forget `emit`
+  改为 `call(..., timeout=OFFICE_JOIN_TIMEOUT)`（协议 `events.md` 规定 `server:leave_office` 有 ack）。本地意图
+  与已确认房号仍**先于发包**清掉（#223 顺序不变）；服务端拒绝时 Agent 抛 `SMCPProtocolError`、Computer 抛
+  `RuntimeError`；超时按 `OFFICE_ACK_TIMEOUT_ERRORS` 捕获。新增 `a2c_smcp.utils.parse_leave_ack`（与
+  `parse_join_ack` 同一 ack 契约）。Agent 在未连接时调用仍抛 `BadNamespaceError`（意图已先清）。
+- **Computer 显式 `join_office` 的 ACK 等待由 socketio 默认 60s 改为 `OFFICE_JOIN_TIMEOUT`（10s）**：此前断线后
+  op 锁会被占住 60s，重连回房与 leave 一并卡住。
+- **Agent `emit` / `call` 缺省命名空间 = 客户端实例命名空间**：`join_office(office, name)` 等不传 `namespace` 的
+  调用此前落到 `/` 命名空间 ⇒ 抛 `BadNamespaceError`（文档示例即此写法），现与 Computer 同口径回退。
+- **`OFFICE_ACK_TIMEOUT_ERRORS` / `TOOL_CALL_TIMEOUT_ERRORS` 从 `a2c_smcp.agent` 导出**。
+- **sync Agent 的 office 操作锁改为 FIFO**：`threading.Lock` 不公平，后发的 `join` 可能抢在先发的 `leave` 之前，
+  最终 LEAVE 把新房退掉而本地仍以为在房。
+- **MCP 管理层（v0.5.0 跨节点审查）**：
+  - `client:get_tools` 直接服务**已提交的**工具投影（`available_tools()` 读 `_tool_list_cache`），每个 bundle
+    只发一次 `list_tools`；单个 bundle 失败不再拖垮整个调用。强刷提交的投影变化经 Computer 单一出口推进
+    `capability_revision`（此前被丢弃，紧随其后的 `list_changed` 比对为「未变」⇒ revision 永久少一次）。
+  - 公开的 `astop_client` / `aremove_server` / `astop_all` 纳入启动门的生命周期票据（不占并发上限、计入
+    `drain()`）：`aclose` 不再在子进程未停下时返回，`aremove_server` 与 `aclose` 并发不再抛 `KeyError`。
+    **关闸后调用改抛 `McpStartGateClosed`**（对齐 rust `mcp_lifecycle_gate`）。
+  - `_commit_active_client` 的冲突裁决按**声明身份**：用已被替换的声明构造的 client 一律让位（新来者被拒 /
+    旧活跃者被退役），两方都是当前声明时先到者保留、后到者断开退役（此前 OAuth 后台连接可覆盖并泄漏，且可能让
+    旧配置的进程顶替 restart 后的新声明）。
+  - 资源 / 工具刷新一轮失败后不再丢弃本轮工作与期间到达的通知。
+
+### Fixed（v0.5.0 跨节点审查）
+
+- **重连窗口内 `disconnect()` 无效（Computer + Agent async/sync）**：socketio 的 `disconnect()` 在自动重连
+  窗口内是空操作 ⇒ 意图不清、重连不停，约 1 秒后自动回到旧房。三个客户端覆写 `disconnect()`：先清意图，
+  再中止重连并等待重连任务结束（`a2c_smcp.utils.reconnect`；等待上界 10s，到点记 WARNING 返回，中止位保持置位）。CLI `socket connect` / 改名重连因此不再留下
+  CLI 管不到的「幽灵 Computer」。
+- **自动重连撞上 `4008`**：Computer 侧 `ProtocolVersionError` 逃出重连任务（任务死掉、意图永久残留）；Agent
+  侧被当作普通连接错误**无限重试**。现两端一律停止重连、记 ERROR、经既有钩子清空意图。
+- **Agent 工具调用超时分支的取消广播可抛**：断链后等到超时，`emit` 抛 `BadNamespaceError` 逃出
+  `emit_tool_call`，`a2c_timeout` 标记丢失。广播改为 best-effort（超时分支与 watcher 共用）。
+- **sync Agent `join_office` 入口分两次取锁**：与断连钩子交错时可能静默不发包却残留意图，或复活已清空的意图；
+  现单次取锁，与 async 同构。
+- **Server 名字注册表原子化**：sync 服务端每个事件一个线程，入房注册与断连清理交错会留下指向死 sid 的条目
+  ⇒ 同名重连永久被拒。注册改为一步完成「sid 存活校验 + 判定 + 写入」（sync 加
+  `RLock`，async 无 await 段），并发同名 join 只会一个成功；断连改为先广播 leave 再注销；relay 与断连守卫
+  统一以「仍解析到同一 sid」复查，目标会话已不存在时回 `404` 并自愈，不再让 Agent 干等超时。断连清理包在
+  `try/finally` 里：leave 广播抛错（pubsub publish 失败等）也照常注销名字、唤醒在途调用。
+  > 原「并发竞争的输家短暂进入目标房、换房的 Computer 已先退旧房」的已知边界已由 #230 的阶段 1 原子占席消除
+  > （见 Breaking Changes）；名字注册本身仍留在生效阶段（前移会让 relay 误报注册表损坏，#213）。
+
+### Fixed（#224 打包依赖 —— 干净安装可用性）
+
+- **`pyyaml` 未声明为运行时依赖，干净安装下 Computer CLI 导入即崩**（#224）：`pip install a2c-smcp`
+  后执行 `a2c-computer --help` 在导入阶段抛 `ModuleNotFoundError: No module named 'yaml'`
+  （`computer/skills/staging.py` 的模块级 `import yaml`），Computer CLI 完全不可用。
+  - **根因**：该 `import` 自 v0.2.1（commit `21e6016`，SKILL 子系统）引入起就是**运行期硬需求**，
+    但 `pyyaml` 从未写进 `[project] dependencies`。同一提交只给 mypy 加了 `yaml` / `yaml.*` 的
+    `ignore_missing_imports` —— 把「库无类型存根」误当成「库可不安装」，让静态检查对「未安装」主动沉默。
+    dev / CI 环境因 `poethepoet`（dev 组）传递依赖 pyyaml 而**恒能 import**，故本地与 CI 从不复现；
+    坏包形状自 v0.2.1 起未变，一路发布至 v0.4.0 才由使用者在干净 pipx 环境暴露。
+  - **修复**：`pyyaml (>=6.0.2,<7.0.0)` 落入 **`[project] dependencies`（core，非 extra）**——SKILL 是
+    协议核心通道（非可选能力），`parse_skill_frontmatter` 由 `Computer.boot_up()` 的**库路径**调用，
+    与 CLI 无关，塞进 `cli` extra 只能修一半。对称的 rust-sdk 同样把 `serde_yaml_ng` 声明在
+    `crates/smcp-computer` 的依赖里。
+    > 未走「自写极简 frontmatter 解析器」路线：frontmatter 非扁平结构，`tags`（`list[str]`）/
+    > `allowed-tools`（`list`）/ `metadata`（`dict`）均需覆盖，且偏离协议「YAML frontmatter」措辞。
+  - **回归守卫**：新增 `tests/unit_tests/test_packaging_dependencies.py`——断言源码中每个第三方顶层
+    import 都有一条**声明路径**（先按 import 名直配声明面，未中再按发行包映射回落，以兼容
+    `yaml → pyyaml` 这类改名；只用后者会把「已声明但当前环境未装」的可选依赖如 `keyring` 误判违规）。
+    含正对照（防「扫不到东西」的假绿）、marker 求值不变量（PEP 508 marker 必须以 `extra=""` 求值，
+    否则会顺着 `mcp → starlette → "pyyaml ; extra == 'full'"` 误判可达，对本 bug 假绿），
+    以及 `pyyaml` 必须落 **core** 的单点回归锁（通用守卫不区分 core / extra，无法阻止它被挪进 extra）。
+    另有一条「已声明但当前环境未装」的回归锁：CI 的 `uv sync --group dev --group test --extra cli`
+    只装 cli extra，`keyring` 等其它 extra 成员**并不在场**，故判据必须是「声明面直配」而非
+    「已在环境中安装」——否则守卫会在 CI 恒红并把维护者引向错误的修法。上述每条断言均以变异验证
+    （逐个反向改动后确认其真的会红）。
+  - **CI 纵深**：`tests.yml` 新增 `clean-install-smoke` job（空 venv 只装制品声明的依赖后跑
+    `a2c-computer --help` + 断言导入来源为制品而非仓库源码）；`publish.yml` 在**上传制品前**调用同款冒烟
+    ——此前 publish job 只 `uv build`（隔离环境里连包本体都不安装），制品从未被验证过，
+    正是「坏包直达 PyPI」的通道。两处共用 `scripts/clean_install_smoke.sh` 单一来源，防止漂移。
+
+### Fixed（#234 入房/退房失败详情）
+
+- **Agent 入房/退房被拒时丢弃协议 `details`**（#234）：`4101` 的 `details.office_id` / `details.role`、
+  `4106` 的 `details.office_id`（会话**当前**所在房）此前恒为空——宿主无法从 `SMCPProtocolError` 得知
+  当前房号与席位角色，与 rust-sdk 行为不对称。现 `JoinOfficeVerdict` 携带 `details`，显式 `join_office` /
+  `leave_office`（async / sync）与自动回房共用同一裁决与日志产出者：
+  - `SMCPProtocolError.details` 原样带出 ack 的 `details`（其余码同样透传，不按码特判；无 `details` 仍为 `{}`）；
+  - **非 mapping 的 `details` 一律归一为空映射**（新增单一权威 `smcp.normalize_details`，`4014`–`4020`
+    全族共用，含 `get_resources` / `get_skill[s]` / `get_blob` / `put_blob`）——对端违规不再把可感的协议
+    拒绝升级成 `ValueError` / `AttributeError`，与 rust `SmcpProtocolError::from_value`
+    （`as_object` + `unwrap_or_default`）对齐；
+  - `details.reason` 仅接受字符串，非字符串视同未提供（与 rust `as_str` 对齐）；
+  - 重放路径没有异常通道，拒绝日志（`log_join_rejection`）现同时携带 `details`。
+
+### Fixed（#245 macOS 拒绝集大小写）
+
+- **固定拒绝集在 macOS 上未按大小写不敏感匹配**（#245，protocol#76）：协议要求 Windows 与 macOS 上
+  拒绝集的名称判定（`.skillenv` / `.part`）与目录判定 MUST 使用 Unicode casefold（其他平台 MAY）。
+  `_is_protected` 此前仅在 `platform == "windows"` 时折叠，而 macOS 的路径形态是 `posix`：`.skillenv`
+  与 protected 目录名的大小写变体只在第 8 步 final-path 复核（协议 SHOULD，且依赖 `/proc` 或
+  `F_GETPATH` 可用）时才被兜住；**`.part` 名称与 landing 目录的大小写变体没有任何兜底，实测可被读取**。
+  现新增单一宿主映射 `_rejection_case_insensitive`（Windows 或宿主 `sys.platform` 为 `win32` /
+  `darwin`），`.skillenv` 名称、`.part` 名称与 protected 目录前缀（如 `.tfrobot`）三处一并折叠，
+  step 6 / step 8 / 拉取期重跑结构上一致；Linux 及其他平台保持码点（协议 MAY，避免误拒真实存在的
+  `.SKILLENV`）。**已知边界**：大小写不敏感但平台串不在上述集合的挂载（如 WSL DrvFs `/mnt/c`、
+  Cygwin/MSYS）仍按码点——协议 MAY 不违规，覆盖需卷能力探测，另行评估。readRoots 词法 / realpath
+  围栏语义不变（协议要求区分大小写）。rust 侧目录折叠缺口见 rust-sdk#256。
+
+### Fixed（#226 纯 core 导入契约）
+
+- **纯 core 安装（不装 `[cli]` extra）下 `import a2c_smcp.computer` 崩溃**（#226）：`rich` / `prompt_toolkit`
+  此前在 `computer.py`、`inputs/resolver.py`、`inputs/cli_io.py`、`utils/console.py` 被模块级硬引用，
+  与 #187 的 extra 惰性契约相悖。现改为惰性导入：
+  - `import a2c_smcp.computer` 不再要求 cli extra（类基类 / 注解用 `TYPE_CHECKING` + 运行时占位求值）；
+  - `utils/console.py` 的 `console` / `console_err` 改为首次访问时创建（PEP 562），保留 #160 的
+    实例身份与 `set_no_color` 就地 mutate 契约；`set_no_color` 本身不触发导入；
+  - `utils/console` 新增 `console_available()` 谓词与 `__dir__`：缺 extra 时 `hasattr` /
+    `getattr(..., default)` 会抛 `ImportError`（PEP 562 语义），可选 UI 降级须先查该谓词；
+  - 交互式输入 / 控制台渲染在依赖缺失时抛携带 `pip install "a2c-smcp[cli]"` 的 `ImportError`；
+  - 新增子进程回归锁（阻断 rich / prompt_toolkit）与 `clean_install_smoke.sh none` 制品级闸门（CI 双跑）。
+  - 注：`a2c-computer` 命令行入口本身仍需要 `a2c-smcp[cli]`（typer）。
+
 ## [0.4.2] - 2026-09-29
 
 ### Fixed

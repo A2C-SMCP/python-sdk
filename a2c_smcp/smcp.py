@@ -4,6 +4,7 @@
 # @Author  : JQQ
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
+from collections.abc import Mapping
 from enum import IntEnum
 from typing import Annotated, Any, Literal, NotRequired, TypeAlias
 
@@ -33,6 +34,12 @@ GET_BLOB_EVENT = "client:get_blob"
 # v0.4.0 新增：上行写入通道（Agent → Computer 分块落盘）/ v0.4.0 added: upload write channel
 # 协议依据 / Protocol: events.md §client:put_blob；blob-transfer.md §3（上行）/ §7（landing 沙箱）
 PUT_BLOB_EVENT = "client:put_blob"
+# v0.5.0 新增：按路径读取（blob_handle 的第三个生产者，protocol#65）
+# v0.5.0 added: read-by-path (the third blob_handle producer, protocol#65)
+# 协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取
+# 授权边界 = settings ``readRoots``（默认空 = 不可读）；字节仍经 ``client:get_blob`` 拉取。
+# Authorization boundary = settings ``readRoots`` (empty default = unreadable); bytes still flow via get_blob.
+RESOLVE_PATH_EVENT = "client:resolve_path"
 # 服务端事件 由server:开头的事件服务端执行
 JOIN_OFFICE_EVENT = "server:join_office"
 LEAVE_OFFICE_EVENT = "server:leave_office"
@@ -136,6 +143,11 @@ class EnterOfficeReq(TypedDict):
     role: Literal["computer", "agent"]
     name: str
     office_id: str
+    # v0.5.0（protocol#64）：Computer 稳定唯一身份。``role="computer"`` 时 MUST 携带；``role="agent"`` 时
+    # MUST NOT 出现该键（含 ``null``）。形态为小写规范 UUID（8-4-4-4-12），接收方视为不透明。
+    # v0.5.0 (protocol#64): stable Computer identity. MUST for role="computer"; MUST NOT appear
+    # (not even as null) for role="agent"; received as an opaque canonical lowercase UUID.
+    computer_id: NotRequired[str]
 
 
 class LeaveOfficeReq(TypedDict):
@@ -347,6 +359,9 @@ class LeaveOfficeNotification(TypedDict, total=False):
 
     office_id: str
     computer: str | None
+    # v0.5.0（protocol#64）：成员为 Computer 时回显其 ``computer_id``；Agent 时 MUST 省略该键（不得为 null）。
+    # v0.5.0 (protocol#64): echoed for Computer members; omitted entirely for Agents.
+    computer_id: str
     agent: str | None
 
 
@@ -355,6 +370,9 @@ class EnterOfficeNotification(TypedDict, total=False):
 
     office_id: str
     computer: str | None  # Computer Name
+    # v0.5.0（protocol#64）：成员为 Computer 时回显其 ``computer_id``；Agent 时 MUST 省略该键（不得为 null）。
+    # v0.5.0 (protocol#64): echoed for Computer members; omitted entirely for Agents.
+    computer_id: str
     agent: str | None  # Agent Name
 
 
@@ -420,6 +438,9 @@ class SessionInfo(TypedDict, total=False):
     # v0.2 新增：协议版本号，由 Server 在 HTTP 握手阶段从 URL query 写入；仅用于展示与诊断，不参与二次校验
     # v0.2 added: protocol version, written by Server from URL query during HTTP handshake; for display/diagnostics only
     a2c_version: NotRequired[str]
+    # v0.5.0（protocol#64）：``role="computer"`` 时 MUST 存在；Agent 的 SessionInfo MUST 省略该键。
+    # v0.5.0 (protocol#64): MUST exist for role="computer"; MUST be omitted for Agents.
+    computer_id: NotRequired[str]
 
 
 class ListRoomRet(TypedDict):
@@ -486,6 +507,39 @@ class ErrorCode(IntEnum):
     # client:put_blob 写入期 reason：invalid_upload / invalid_declaration / range / too_large /
     # busy / forbidden / integrity / io_error（开放枚举）
     BLOB_WRITE_FAILED = 4019
+
+    # v0.5.0 新增：按路径读取铸造期 / v0.5.0 added: read-by-path mint stage (protocol#65)
+    # 协议依据 / Protocol: error-handling.md §Path Not Accessible（4020）
+    # 与 4018 的分界：4020 属**铸造期**（resolve 失败、不铸句柄）；resolve 成功后拉取期的
+    # 撤权 / 删除仍走 4018（forbidden / gone），**4018 枚举不变**。
+    # Boundary: 4020 is mint-time (no handle minted); pull-time revoke/removal stays on 4018.
+    # details.reason ∈ {invalid_path, forbidden, not_found, not_a_file}（开放枚举 / open enum）。
+    PATH_NOT_ACCESSIBLE = 4020
+
+    # v0.5.0 新增：通用请求错误 / v0.5.0 added: generic request errors
+    # 协议依据 / Protocol: error-handling.md §通用错误码
+    # 三者此前缺位于本枚举，而房间事件的失败通道需要它们作为**结构化**取值（#214）：
+    #   - 400：载荷 schema 校验失败（**含校验在进入业务 handler 之前即失败**的场景）
+    #   - 403：role / name 与会话不符（身份声明冲突；房间语义走 4101/4104，**不**复用本码）
+    #   - 500：未预期内部异常。协议 §传输分层 的 ack 层码表未列举本码（协议空档），
+    #          但「有 ack 通道 ⇒ 失败必须产出 ack」是硬约束：不 ack 会让客户端挂到自身超时，
+    #          故以 §通用错误码的 500 承载，文案笼统、原文只进日志。
+    BAD_REQUEST = 400
+    FORBIDDEN = 403
+    INTERNAL_ERROR = 500
+
+    # v0.5.0 新增：连接与房间管理 / v0.5.0 added: connection & room management
+    # 协议依据 / Protocol: error-handling.md §连接与房间管理错误码 / §房间管理错误响应
+    # 由具备 ack 通道的三个房间事件产出（server:join_office / server:leave_office /
+    # server:list_room），一律以 flat ErrorPayload 承载（protocol#61）。
+    ROOM_FULL = 4101  # join 时目标房**该 role 的席位**已被其它会话占据（每 role 一席，protocol#66）
+    ROOM_NOT_FOUND = 4102  # **预留码**：协议当前任何路径都不产生，SDK **MUST NOT** 主动返回
+    NOT_IN_ROOM = 4103  # 会话无 office_id 时发起需要房间上下文的操作
+    CROSS_ROOM_ACCESS = 4104  # 调用方**显式指定**了非自己所在房的操作（如 list_room 查他房）
+    # **预留码**（protocol#66）：仅在 0.5.0-dev 草案表示过「房内同 role 同名」；「每 role 一席」后同 role 的
+    # 第二个会话无论同名与否都先撞 4101，本码再无可达路径。SDK **MUST NOT** 返回；收到时按协议违规记录并放弃。
+    NAME_CONFLICT = 4105
+    ALREADY_IN_ROOM = 4106  # **Agent** 已在其它房又请求入新房（Computer 自动换房，不产生本码）
 
 
 # WebSocket close code（RFC 6455 私有段 4000-4999），用于 WS-only 直连握手按版本不匹配拒绝
@@ -576,7 +630,18 @@ class ErrorPayload(TypedDict, total=False):
     v0.4.0 起，4019 同样 ``details`` 下沉：
     From v0.4.0, 4019 follows the same ``details`` convention:
       - 4019: details.reason (invalid_upload/invalid_declaration/range/too_large/busy/forbidden/integrity/io_error)
-    协议依据 / Protocol: error-handling.md §各错误码标准字段总表 / §4016 / §4017 / §4018 / §4019.
+    v0.5.0 起，连接与房间管理码（400 / 403 / 500 / 4101–4106）同样只用 ``details``：
+    From v0.5.0, the room-management codes likewise use ``details`` only:
+      - 4101: details.office_id（被拒的目标房）/ details.role（被占的席位 = **发起者自己声明**的 role）
+      - 4102: 预留码，无触发
+      - 4103: 无 code-specific 字段
+      - 4104: details.office_id（被拒的目标房）
+      - 4105: 预留码，无触发（protocol#66）
+      - 4106: details.office_id（会话**当前**所在房）
+    400 / 403 / 500 无 code-specific 字段。**``details`` 只含与发起者自身相关的上下文**，
+    **MUST NOT** 携带任何对端会话标识（sid 等）——见 error-handling.md:149 / :328。
+    协议依据 / Protocol: error-handling.md §各错误码标准字段总表 / §4016 / §4017 / §4018 / §4019
+                          / §房间管理错误响应（v0.5.0）。
 
     details 是诊断容器；Agent MUST NOT 透传给最终用户（防泄露）。
     details is a diagnostic container; Agent MUST NOT propagate to end users.
@@ -799,6 +864,46 @@ class GetBlobRet(TypedDict, total=False):
     req_id: str
 
 
+class ResolvePathReq(AgentCallData, total=True):
+    """
+    按路径读取请求（``client:resolve_path``，v0.5.0 protocol#65）。
+    Read-by-path request (``client:resolve_path``, v0.5.0 protocol#65).
+
+    协议依据 / Protocol: events.md §client:resolve_path；data-structures.md §ResolvePathReq。
+
+    Agent 给出 Computer **本地绝对路径**（原生形态或 ``canonical_path`` 形态 ``/C:/...``），
+    Computer 在 settings ``readRoots`` 授权内规范化 + stat，返回规范路径与元数据并**现铸**
+    ``blob_handle``；字节仍经 ``client:get_blob`` 拉取。**Agent MUST NOT** 自行构造句柄。
+    The Agent gives a **local absolute path**; the Computer normalizes + stats it inside the
+    settings-authorized ``readRoots``, returning metadata and minting an opaque handle.
+    """
+
+    computer: str
+    path: str  # 本地绝对路径：原生形态或 canonical_path 形态 / native or canonical form
+
+
+class ResolvePathRet(TypedDict, total=True):
+    """
+    按路径读取响应（v0.5.0 protocol#65）。
+    Read-by-path response (v0.5.0 protocol#65).
+
+    协议依据 / Protocol: data-structures.md §ResolvePathRet；blob-transfer.md §生产者三。
+
+    持久引用 = ``computer_id`` + ``canonical_path``，**不是** ``blob_handle``——每次读取重新
+    resolve 现铸句柄。只需变更检测时比对 ``sha256``，不必拉字节。
+    Durable reference = ``computer_id`` + ``canonical_path``, never the handle. Compare
+    ``sha256`` for change detection without pulling bytes.
+    """
+
+    canonical_path: str  # realpath 后经 normalize_path；可直接回用作 path / reusable as path
+    blob_handle: str  # 现铸不透明句柄，转 client:get_blob 拉取字节 / minted opaque handle
+    mime_type: str  # 确定性推断（同 SKILL §6.4 (1)）/ deterministic inference
+    total_size: int  # 文件字节数 / file size in bytes
+    sha256: str  # 全量 sha256 十六进制（小写）/ full sha256 hex (lowercase)
+    mtime: int  # Unix epoch 毫秒（向负无穷取整；仅作提示）/ epoch ms, floor; advisory only
+    req_id: str
+
+
 class PutBlobReq(AgentCallData, total=True):
     """
     上行写入单块请求（``client:put_blob``，v0.4.0）。``client:get_blob`` 的方向镜像：
@@ -864,8 +969,43 @@ def is_protocol_error_payload(data: object) -> bool:
     server（透传判定）与 agent（抛 SMCPProtocolError）共用同一谓词，避免双重启发式漂移。
     Shared by server (passthrough decision) and agent (raise SMCPProtocolError) to avoid
     divergent heuristics. 协议依据 / Protocol: error-handling.md（禁止二次 unwrap）。
+
+    **MCP ``CallToolResult`` 形状优先判否**：MCP 的 ``CallToolResult`` 是 ``extra="allow"``，
+    工具可携带任意顶层字段——包括名为 ``code`` 的自定义字段。:data:`_ERROR_CODE_VALUES` 是**有限的
+    协议码集合**，故只有 `code` 恰好等于某个协议码时才会误判；但 ``client:tool_call`` 的 ack 是
+    直接把 ``CallToolResult`` dump 透传的，一旦误判就会把**真实工具结果**顶替成协议错误
+    （``400 / 403 / 500`` 被并入集合后这一类风险上升）。协议 ``ErrorPayload`` **从不带** ``content``，
+    故以该键做形状判别是无损的。/ `CallToolResult` (extra="allow") may carry a top-level `code`
+    field; a protocol ErrorPayload never has `content`, so the shape check is lossless.
     """
+    if isinstance(data, dict) and "content" in data:
+        return False
     return isinstance(data, dict) and data.get("code") in _ERROR_CODE_VALUES
+
+
+def normalize_details(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    归一 flat ``ErrorPayload`` 的 ``details`` 诊断容器（**单一权威**，`#234`）。
+    Normalize the ``details`` diagnostic container of a flat ``ErrorPayload`` (single authority).
+
+    协议把 ``details`` 定义为**对象**（standard key 的承载容器，error-handling.md §details 字段约束）。
+    对端给出字符串 / 数组 / 标量属协议违规；调用方各自写 ``details.get(...)`` 会直接 ``AttributeError``
+    （既不诚实也不可分流）。本函数把任何**非 mapping** 值（含缺失 / ``None``）一律归一为空 dict，
+    调用方拿到的必然是可直接 ``.get()`` 的 mapping。
+
+    / Any non-mapping ``details`` (including absent) becomes ``{}``, matching rust
+    ``SmcpProtocolError::from_value`` (``as_object`` + ``unwrap_or_default``). The returned dict is a
+    **top-level-only** (shallow) copy, so mutating the source payload afterwards cannot change the
+    caller's view at the top level (nested mutable values stay shared — standard keys are scalars).
+
+    Args:
+        payload (Mapping[str, Any]): flat ``ErrorPayload``（或任何含 ``details`` 键的映射）。
+
+    Returns:
+        dict[str, Any]: 总是 mapping；非 mapping 值为空 dict。
+    """
+    raw = payload.get("details")
+    return dict(raw) if isinstance(raw, Mapping) else {}
 
 
 def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
@@ -884,3 +1024,146 @@ def build_computer_not_found_error(computer_name: str) -> ErrorPayload:
         "message": f"Computer with name '{computer_name}' not found",
         "details": {"computer_name": computer_name},
     }
+
+
+# =====================================================================
+# v0.5.0 房间管理事件失败 ack / v0.5.0 room-event failure acks（#214）
+# 协议依据 / Protocol: error-handling.md §错误响应格式 / §房间管理错误响应
+#   - 成功 = **空 ack**（handler 返回 ``None``）；失败 = flat ``ErrorPayload``；
+#   - ``(bool, str | None)`` 元组形态**已废除**（error-handling.md:201-205）；
+#   - ``details`` 只含**与发起者自身相关**的上下文（自己所在的房 / 自己声明的 role /
+#     被拒的目标房），**MUST NOT** 携带任何对端会话标识（sid 等）——见 :149 / :328。
+# =====================================================================
+
+# 房间管理「业务拒绝」的 code → 协议标准文案（4103/4104/4106 逐字对齐 error-handling.md 与
+# room-model.md 的响应示例；**403 例外**——协议未给该码的示例文案，本仓自拟，须同时覆盖 role 与
+# name 两半，见 #221）。4101 的文案随被占席位而变，见 :data:`_ROOM_FULL_MESSAGES`。
+# code → canonical message; 4103/4104/4106 verbatim from the protocol examples, 403 is SDK-authored
+# (the protocol ships no 403 example) and must cover both the role and name halves of the rule.
+_ROOM_REJECTION_MESSAGES: dict[int, str] = {
+    int(ErrorCode.FORBIDDEN): "Role or name mismatch with existing session",
+    int(ErrorCode.NOT_IN_ROOM): "Not in any room",
+    int(ErrorCode.CROSS_ROOM_ACCESS): "Cross-room access denied",
+    int(ErrorCode.ALREADY_IN_ROOM): "Agent already in another room",
+}
+
+# 4101「本 role 席位已占」按被占席位（= 发起者声明的 role）取文案，逐字对齐 room-model.md 加入伪代码与
+# error-handling.md §Room Full 的示例（protocol#66）。``details.role`` 才是机器判据，文案只供人读。
+# 4101 message per occupied seat, verbatim from the protocol examples; ``details.role`` is the machine field.
+_ROOM_FULL_MESSAGES: dict[str, str] = {
+    "agent": "Room already has an agent",
+    "computer": "Room already has a computer",
+}
+
+
+def build_bad_request_error() -> ErrorPayload:
+    """载荷 schema 校验失败 → flat ``ErrorPayload(400)``。
+    Build the flat ``ErrorPayload(400)`` for a payload that failed schema validation.
+
+    协议依据 / Protocol: error-handling.md:102-106——对**具备 ack 通道**的事件，校验失败时
+    服务端 **MUST** 回 flat ``ErrorPayload``，**MUST NOT** 静默不 ack（「挂到客户端自身超时」与
+    「立即收到结构化错误」是两种客户端可感行为）。本要求**覆盖校验的触发时机**：校验放在
+    handler 之前也照样要回写 ack。
+
+    **刻意不带 ``details``**：避免把客户端原始输入回显进诊断面（校验器文案可能内嵌输入值）。
+    Deliberately carries no ``details`` — never echo client input back into the ack.
+    """
+    return {"code": int(ErrorCode.BAD_REQUEST), "message": "Invalid request payload"}
+
+
+def build_internal_error() -> ErrorPayload:
+    """未预期内部异常 → flat ``ErrorPayload(500)``：**笼统文案**，原文只进日志。
+    Build the flat ``ErrorPayload(500)`` for an unexpected internal error: generic message only.
+
+    刻意**不**沿用历史上的 ``f"Internal server error: {str(e)}"`` 形态——那会把内部细节
+    （路径 / 标识 / 堆栈线索）回给客户端，且无法机器判定。原始异常由调用方 ``logger.error`` 落盘。
+    Never echoes the exception text (it can carry internal detail); callers log it instead.
+    """
+    return {"code": int(ErrorCode.INTERNAL_ERROR), "message": "Internal error"}
+
+
+def build_non_agent_client_call_error() -> ErrorPayload:
+    """非 Agent 会话发起 ``client:*`` 路由 → flat ``ErrorPayload(403)``（#216）。
+    Build the flat ``ErrorPayload(403)`` returned when a non-agent session issues a ``client:*`` call.
+
+    协议依据 / Protocol: events.md §Client 事件（``client:*`` 发起方为 Agent）+ error-handling.md
+    §通用错误码 403（业务层未授权操作）。存活调用方的拒绝 **MUST** 经 ack 可感，不得静默挂到超时
+    （#216 §四）。无 ``details``：发起者自身的 role 它自己知道，无需回显。
+    sync / async 命名空间共用本 builder，保证两实现逐字节一致。
+    """
+    return {"code": int(ErrorCode.FORBIDDEN), "message": "Only agents may issue client:* calls"}
+
+
+def build_room_rejection_error(
+    code: int,
+    *,
+    target_office_id: str | None = None,
+    declared_role: str | None = None,
+    current_office_id: str | None = None,
+) -> ErrorPayload:
+    """房间管理事件的**业务拒绝** → flat ``ErrorPayload``。
+    Build the flat ``ErrorPayload`` for a room-management business rejection.
+
+    sync / async 命名空间共用本 builder，保证两实现返回**逐字节一致**的负载（双实现镜像约束，
+    同 :func:`build_computer_not_found_error`）。
+
+    本函数是「``details`` 只含**与发起者自身相关**上下文」这条不变量的**格式化 choke point**：
+    code → 文案与 code → ``details`` 键集**只在这里**决定，调用方无从绕过。
+    Formatting choke point for the "self-relative context only" invariant: the canonical message and
+    the ``details`` key set are decided here and cannot be bypassed by a call site.
+
+    .. warning::
+
+        **这不是信息流保证**：三个 ``*_office_id`` / ``role`` 形参都是调用方给的**裸字符串**，
+        本函数无从校验其来源。真正的来源约束在调用点——``current_office_id`` 取自会话自身、
+        ``target_office_id`` 取自请求载荷、``declared_role`` 取自请求声明——并由
+        ``tests/unit_tests/server/test_room_event_acks.py`` 的泄露守卫逐条钉死。
+        **不是**信息流保证 / **not** an information-flow guarantee: the builder cannot verify the
+        provenance of the raw strings it is handed; that constraint lives at the call sites and is
+        pinned by the leak-guard tests.
+
+    Args:
+        code: 房间管理错误码（:class:`ErrorCode` 取值之一）。
+        target_office_id: **被拒的目标房**（``4101`` / ``4104`` 用）——发起者自己声明的目标。
+        declared_role: 发起者**自己声明**的 role（``4101`` 用，即被占的席位；**必填**）——不是冲突方的 role。
+        current_office_id: 会话**当前**所在房（``4106`` 用）——不是被拒的目标房。
+
+    Returns:
+        flat ``ErrorPayload``；``code`` 无 code-specific ``details`` 时不带 ``details`` 键。
+
+    Raises:
+        ValueError: ``code`` 为预留码 ``4102`` / ``4105``（协议 **MUST NOT** 主动返回），不属于房间管理错误码，
+            或 ``4101`` 未给出合法的 ``declared_role``。把「不可产出」做成结构性保证，而不是靠调用方自觉。
+    """
+    # 归一为 int：``ErrorCode`` 是 ``IntEnum``，但载荷一律以裸整数出线（与
+    # ``build_computer_not_found_error`` 一致，避免 dict 里出现 enum 对象的 repr）。
+    # Normalize to a plain int so the payload is byte-identical across the sync/async mirrors.
+    code = int(code)
+    if code in (int(ErrorCode.ROOM_NOT_FOUND), int(ErrorCode.NAME_CONFLICT)):
+        raise ValueError(
+            f"{code} 是预留码：协议当前任何路径都不产生它，SDK MUST NOT 主动返回 "
+            f"/ {code} is reserved: no protocol path produces it and SDKs MUST NOT return it",
+        )
+    if code == int(ErrorCode.ROOM_FULL):
+        # 4101 的 ``details.role`` 是区分「哪个席位被占」的唯一机器字段（protocol#66）⇒ 缺失即构造错误，
+        # 不静默产出一个对端无法分流的 4101。/ ``details.role`` is the only machine field of 4101 — required.
+        seat_message = _ROOM_FULL_MESSAGES.get(declared_role or "")
+        if seat_message is None:
+            raise ValueError(f"4101 须给出被占席位的 role（agent / computer）/ 4101 requires a seat role: {declared_role!r}")
+        full_details: dict[str, Any] = {} if target_office_id is None else {"office_id": target_office_id}
+        full_details["role"] = declared_role
+        return {"code": code, "message": seat_message, "details": full_details}
+    try:
+        message = _ROOM_REJECTION_MESSAGES[code]
+    except KeyError:
+        raise ValueError(f"非房间管理错误码 / not a room-management error code: {code!r}") from None
+
+    payload: ErrorPayload = {"code": code, "message": message}
+    if code == int(ErrorCode.CROSS_ROOM_ACCESS):
+        if target_office_id is not None:
+            payload["details"] = {"office_id": target_office_id}
+    elif code == int(ErrorCode.ALREADY_IN_ROOM):
+        if current_office_id is not None:
+            payload["details"] = {"office_id": current_office_id}
+    # 403 / 4103 无 code-specific 字段（协议 §各错误码标准字段总表：两者 details 列为「—」）
+    return payload

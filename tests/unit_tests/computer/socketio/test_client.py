@@ -29,10 +29,10 @@ async def test_emit_disallows_notify_and_client_events():
 
 
 @pytest.mark.asyncio
-async def test_emit_update_config_only_when_in_office(monkeypatch):
+async def test_emit_update_config_only_when_confirmed_and_live(monkeypatch):
     """
-    中文：仅当已加入房间（有 office_id）时触发 UPDATE_MCP_CONFIG_EVENT；未加入时不触发
-    English: Fire UPDATE_MCP_CONFIG_EVENT only when office_id set; otherwise do nothing
+    中文：仅当**服务端已确认**在房（``_confirmed_office_id``）且 namespace 在册时触发 UPDATE_MCP_CONFIG_EVENT
+    English: Fire UPDATE_MCP_CONFIG_EVENT only with a server-confirmed office on a live namespace
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "sid-123"
@@ -44,19 +44,42 @@ async def test_emit_update_config_only_when_in_office(monkeypatch):
 
     # 注入必要上下文（无需真实连接）/ Inject minimal context (no real connection)
     client.namespaces[SMCP_NAMESPACE] = "sid-123"
-
-    # 场景1：未加入房间，不应发送
     monkeypatch.setattr(SMCPComputerClient, "emit", fake_emit, raising=False)
+
+    # 场景1：从未入房（无意图）⇒ 不发，且不记待补发
     client.office_id = None
     await SMCPComputerClient.emit_update_config(client)
     assert not sent
+    assert client._deferred_office_updates == set()
 
-    # 场景2：已加入房间，应发送 UPDATE_MCP_CONFIG_EVENT
+    # 场景2：服务端已确认且 namespace 在册 ⇒ 正常发送
     client.office_id = "office-1"
+    client._confirmed_office_id = "office-1"
     await SMCPComputerClient.emit_update_config(client)
     assert len(sent) == 1
     assert sent[0][0] == UPDATE_CONFIG_EVENT
     assert sent[0][1] == {"computer": "sid-123"}
+
+
+@pytest.mark.asyncio
+async def test_emit_update_config_defers_when_office_not_confirmed(monkeypatch):
+    """#223：desired 有值但服务端**尚未确认**（回放在途窗口）⇒ 不发包（发了也会被服务端丢弃），
+    改记入待补发集合，等成员关系确立后补发。"""
+    client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "sid-123"
+    client.namespaces[SMCP_NAMESPACE] = "sid-123"
+    client.office_id = "office-1"
+    assert client._confirmed_office_id is None, "前置：服务端尚未确认成员关系"
+    sent = []
+
+    async def fake_emit(self, event, data=None, namespace=None, callback=None):
+        sent.append((event, data, namespace))
+
+    monkeypatch.setattr(SMCPComputerClient, "emit", fake_emit, raising=False)
+    await SMCPComputerClient.emit_update_config(client)
+
+    assert not sent, "未确认在房时不得发包"
+    assert client._deferred_office_updates == {UPDATE_CONFIG_EVENT}, "窗口内的变更必须被记录"
 
 
 @pytest.mark.asyncio
@@ -281,69 +304,68 @@ async def test_on_get_config_fails_closed_when_raw_record_missing(monkeypatch):
 @pytest.mark.asyncio
 async def test_join_office_success():
     """
-    测试成功加入房间：服务器返回 (True, None)
-    Test successful join office: server returns (True, None)
+    测试成功加入房间：v0.5.0 起成功 = **空 ack**（socketio 把零参 ACK 折叠为 ``None``）。
+
+    Test successful join office: since v0.5.0 success is an **empty ack** (`None`).
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "test_computer"
 
-    # Mock call 方法返回成功结果
-    # Mock call method to return success result
-    client.call = AsyncMock(return_value=[True, None])
+    # Mock call 方法返回空 ack（成功）
+    # Mock call method to return the empty ack (success)
+    client.call = AsyncMock(return_value=None)
 
-    # 应该成功加入，不抛出异常
-    # Should succeed without exception
     await client.join_office("office_123")
 
-    # 验证 office_id 被设置
-    # Verify office_id is set
     assert client.office_id == "office_123"
+    # 成功是对服务端**事实**的陈述 ⇒ 同时落账已确认房号（#213）
+    assert client._confirmed_office_id == "office_123"
 
 
 @pytest.mark.asyncio
-async def test_join_office_duplicate_name_raises_error():
+async def test_join_office_seat_taken_raises_error():
     """
-    测试加入房间失败（重名）：服务器返回 (False, error_msg)，应抛出 RuntimeError
-    Test join office fails (duplicate name): server returns (False, error_msg), should raise RuntimeError
+    测试加入房间失败（目标房已有 Computer，#230 每 role 一席）：服务器回 flat ErrorPayload(4101)，应抛出 RuntimeError。
+
+    Test join office fails (the office already has a computer): the server returns a flat ErrorPayload(4101).
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "duplicate_name"
 
-    # Mock call 方法返回失败结果
-    # Mock call method to return failure result
-    error_msg = "Computer with name 'duplicate_name' already exists in room 'office_123'"
-    client.call = AsyncMock(return_value=[False, error_msg])
+    client.call = AsyncMock(
+        return_value={
+            "code": 4101,
+            "message": "Room already has a computer",
+            "details": {"office_id": "office_123", "role": "computer"},
+        }
+    )
 
-    # 应该抛出 RuntimeError
-    # Should raise RuntimeError
     with pytest.raises(RuntimeError, match="加入房间失败"):
         await client.join_office("office_123")
 
-    # office_id 不应该被设置
-    # office_id should not be set
+    # 从未确认过任何房号 ⇒ 回退后仍是 None（#213：被拒不改变既有成员关系）
     assert client.office_id is None
 
 
 @pytest.mark.asyncio
-async def test_join_office_no_response_raises_error():
+async def test_join_office_indeterminate_shape_raises_and_clears():
     """
-    测试加入房间失败（无响应）：服务器返回 None 或空值，应抛出 RuntimeError
-    Test join office fails (no response): server returns None or empty, should raise RuntimeError
+    测试加入房间失败（**无法判定**的响应形状）：既非空 ack 也非 flat ErrorPayload ⇒ RuntimeError。
+
+    旧版成功形态 `[True, None]` 元组已被 v0.5.0 废除（协议 error-handling.md:201-205），
+    解析器**刻意不再兼容**它——留着兼容分支只会把未迁移的调用方静默判成成功。这里以它作为
+    「形状不认识」的代表：必须抛错且**清空**房号（无裁决 ⇒ 不臆断）。
+
+    An unrecognised ack shape (here the retired tuple) must raise and clear, never pass as success.
     """
     client = SMCPComputerClient(computer=MagicMock())
     client.computer.name = "test_computer"
 
-    # Mock call 方法返回 None
-    # Mock call method to return None
-    client.call = AsyncMock(return_value=None)
+    client.call = AsyncMock(return_value=[True, None])
 
-    # 应该抛出 RuntimeError
-    # Should raise RuntimeError
     with pytest.raises(RuntimeError, match="服务器未返回结果"):
         await client.join_office("office_123")
 
-    # office_id 不应该被设置
-    # office_id should not be set
     assert client.office_id is None
 
 
@@ -476,3 +498,30 @@ async def test_on_tool_call_cancel_unknown_req_id_no_raise():
 
     assert ret is None
     computer.acancel_tool.assert_awaited_once_with("nope")
+
+
+@pytest.mark.asyncio
+async def test_join_office_rejection_without_message_still_restores_confirmed():
+    """被拒判据必须看**协议码**，不是文案哨兵：`message` 为空但带 `code` 仍算显式拒绝。
+
+    回归守卫（#214）：旧实现对「服务端明确拒绝」与「未获裁决」靠 `error_msg != NO_RESPONSE_MESSAGE`
+    这一**字符串比较**区分；文案一旦为空串/被改，语义就静默翻转（把拒绝当未裁决 ⇒ 错误清空房号）。
+    本用例用「空 message + 有 code」把两种判据分开：只有看码的实现才回退到已确认房号。
+
+    **#212 起判据再收紧一步**：不仅要看码，还要看该码是否属**校验类**
+    （``is_validation_rejection``——``500``/未知码不回退）。本用例用 ``4101``（校验类）钉住「看码」
+    这一层；「非校验类码不回退」由 ``test_post_commit_code_clears_desired_but_keeps_confirmed`` 覆盖。
+
+    The rejection test is "does a *validation* protocol code exist" — not a string sentinel; a payload
+    with an empty message but a pre-commit code must still restore the last confirmed office.
+    """
+    client = SMCPComputerClient(computer=MagicMock())
+    client.computer.name = "test_computer"
+    client._confirmed_office_id = "office_old"
+
+    client.call = AsyncMock(return_value={"code": 4101, "message": ""})
+
+    with pytest.raises(RuntimeError):
+        await client.join_office("office_new")
+
+    assert client.office_id == "office_old", "显式拒绝（带码）应回退到已确认房号，与文案无关"

@@ -8,13 +8,36 @@
 * 描述: Server端类型定义 / Server-side type definitions
 """
 
-from typing import Literal, TypeAlias
+from typing import Literal, NamedTuple, TypeAlias
 
 from typing_extensions import TypedDict
 
 # 类型别名定义 / Type aliases
 OFFICE_ID: TypeAlias = str
 SID: TypeAlias = str
+# 名字注册表键 ``(office_id, role, name)``（#215，协议 room-model.md §房内名字唯一性）：唯一性是**房内同 role**
+# 的，跨房同名 / 同名异 role 均允许。元组键天然无字符串拼接歧义。
+# Name-registry key ``(office_id, role, name)`` (#215): uniqueness is per room and per role.
+NAME_KEY: TypeAlias = tuple[OFFICE_ID, str, str]
+# 席位键 ``(office_id, role)``（#230，协议 room-model.md §成员类型「每 role 一席」）：房内每个 role 至多一个会话。
+# 席位是**准入**的权威判据（4101），名字注册表只承担路由解析；同 role 的第二个会话无论同名与否都先撞席位。
+# Seat key ``(office_id, role)`` (#230, "one seat per role"): the admission authority (4101); the name
+# registry above only serves routing.
+SEAT_KEY: TypeAlias = tuple[OFFICE_ID, str]
+
+
+class IdentityRecord(NamedTuple):
+    """同一 sid 的身份声明**单一三元组**（v0.5.0 / protocol#64）。
+
+    ``role`` / ``name`` / ``computer_id`` 必须作为一个整体比对与记录：拆成三个独立字段再逐项拼接，
+    会在「记录到一半」或「部分字段被其它路径改写」时产生自相矛盾的身份。``computer_id`` 仅 Computer
+    有值（Agent 恒为 ``None``，与「Agent MUST NOT 携带该键」同构）。
+    The single identity triple per sid (protocol#64); Agent's computer_id is always None.
+    """
+
+    role: str
+    name: str
+    computer_id: str | None
 
 
 class BaseSession(TypedDict):

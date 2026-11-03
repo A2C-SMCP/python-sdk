@@ -4,7 +4,7 @@
 创建日期: 2025/9/18
 最后修改日期: 2025/9/18
 版权: 2023 JQQ. All rights reserved.
-依赖: prompt_toolkit, rich
+依赖: 可选依赖（``a2c-smcp[cli]`` extra）: prompt_toolkit, rich —— 惰性导入（#226）
 描述:
   中文: 命令行交互 I/O 抽象，提供异步的提示输入、密码输入、选项选择与命令执行封装。
   English: CLI interactive I/O abstraction. Provides async prompt input, password input,
@@ -15,14 +15,24 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Any
-
-from prompt_toolkit import PromptSession
-from prompt_toolkit.patch_stdout import patch_stdout
-from rich.table import Table
+from typing import TYPE_CHECKING, Any
 
 from a2c_smcp.computer.mcp_clients.model import PickStringOption
 from a2c_smcp.computer.utils import console as console_util
+from a2c_smcp.computer.utils.optional_deps import require_cli_dependency
+
+if TYPE_CHECKING:
+    from prompt_toolkit import PromptSession
+else:
+
+    def PromptSession(*args: Any, **kwargs: Any) -> Any:
+        """中文: 惰性 shim（#226）——调用时才导入 prompt_toolkit；缺依赖抛可行动 ImportError。
+
+        English: Lazy shim (#226): imports prompt_toolkit at call time and raises an actionable
+        ImportError when the ``[cli]`` extra is missing. Kept under the real name because tests
+        monkeypatch ``cli_io.PromptSession``.
+        """
+        return require_cli_dependency("prompt_toolkit").PromptSession(*args, **kwargs)
 
 
 async def ainput_prompt(
@@ -43,6 +53,7 @@ async def ainput_prompt(
     value: str
     if session is None:
         prompt_text = "\n" + prompt_text
+        patch_stdout = require_cli_dependency("prompt_toolkit.patch_stdout").patch_stdout
         with patch_stdout(raw=True):
             try:
                 value = str(await sess.prompt_async(prompt_text, is_password=password))
@@ -78,7 +89,8 @@ async def ainput_pick(
     if not options:
         return [] if multi else ""
 
-    table = Table(title=message)
+    table_cls = require_cli_dependency("rich.table").Table
+    table = table_cls(title=message)
     table.add_column("#", justify="right")
     table.add_column("Option", overflow="fold")
     for idx, opt in enumerate(options):

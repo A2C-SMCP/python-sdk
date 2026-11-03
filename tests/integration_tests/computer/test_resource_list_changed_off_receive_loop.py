@@ -69,10 +69,22 @@ async def _drive_tool(computer: Computer, tool: str, args: dict[str, Any], timeo
 
 
 async def _drain_resource_refresh(computer: Computer, timeout: float = 10.0) -> None:
-    """The server writes its notification before the tool response: the task must exist now."""
-    task = computer._resource_refresh_task
-    assert task is not None, "resource notification must schedule a refresh"
-    await asyncio.wait_for(task, timeout=timeout)
+    """等待资源刷新后台任务结算（轮询任务句柄——通知异步到达后才创建任务）。
+
+    同 #197 集成侧的 ``_drain_tool_refresh``：工具调用返回前 server 已先写通知、再写响应，接收循环按序
+    处理 → 返回时任务必已调度；但刷新也可能在返回前就结算，故「在途则 await、已结算则返回」两种都要覆盖。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        task = computer._resource_refresh_task
+        if task is not None and not task.done():
+            await task  # 结算在途刷新（结算后可能又起新任务 → 再查一轮）
+            continue
+        if task is not None:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("等待资源刷新任务结算超时")
 
 
 @pytest.mark.anyio
@@ -82,9 +94,6 @@ async def test_resources_list_changed_does_not_disable_server(tmp_path: Path) ->
         name="comp-210",
         mcp_servers={_config()},
         skill_home=tmp_path / "home",
-        blob_cache_root=tmp_path / "blobs",
-        project_root=tmp_path,
-        env={"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_DATA_HOME": str(tmp_path / "data")},
     )
     await computer.boot_up()
     client = _RecordingClient()
@@ -116,9 +125,6 @@ async def test_resources_updated_skill_content_rematerializes(tmp_path: Path) ->
         name="comp-210-skill",
         mcp_servers={_config()},
         skill_home=tmp_path / "home",
-        blob_cache_root=tmp_path / "blobs",
-        project_root=tmp_path,
-        env={"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_DATA_HOME": str(tmp_path / "data")},
     )
     await computer.boot_up()
     client = _RecordingClient()
@@ -149,9 +155,6 @@ async def test_resources_list_changed_without_office_still_updates_local_state(t
         name="comp-210-offline",
         mcp_servers={_config()},
         skill_home=tmp_path / "home",
-        blob_cache_root=tmp_path / "blobs",
-        project_root=tmp_path,
-        env={"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_DATA_HOME": str(tmp_path / "data")},
     )
     await computer.boot_up()
     assert computer.socketio_client is None

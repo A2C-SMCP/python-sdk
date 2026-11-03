@@ -8,18 +8,35 @@
 * 描述: 同步版本SMCP协议Namespace实现 / Synchronous SMCP protocol Namespace implementation
 """
 
-import copy
 import threading
 from typing import Any, cast
 
 from pydantic import TypeAdapter
 
-from a2c_smcp.exceptions import SMCPNamespaceError
+from a2c_smcp.exceptions import (
+    AlreadyInRoomError,
+    RoomRejection,
+    SMCPNamespaceError,
+)
+from a2c_smcp.server.name_registry import IdentityClaim, SessionGoneError
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
 from a2c_smcp.server.sync_base import SyncBaseNamespace
-from a2c_smcp.server.types import OFFICE_ID, SID
-from a2c_smcp.server.utils import get_all_sessions_in_office
+from a2c_smcp.server.types import NAME_KEY, OFFICE_ID, SID
+from a2c_smcp.server.utils import (
+    build_enter_notification,
+    build_leave_notification,
+    build_room_rejection_ack,
+    default_session_name,
+    get_all_sessions_in_office,
+    office_ids_of_rooms,
+    office_room,
+    parse_payload,
+    project_session_info,
+    resolve_broadcast_origin,
+    warn_on_claimed_identity_mismatch,
+)
 from a2c_smcp.smcp import (
+    CANCEL_TOOL_CALL_EVENT,
     CANCEL_TOOL_CALL_NOTIFICATION,
     ENTER_OFFICE_NOTIFICATION,
     GET_BLOB_EVENT,
@@ -31,15 +48,20 @@ from a2c_smcp.smcp import (
     GET_TOOLS_EVENT,
     LEAVE_OFFICE_NOTIFICATION,
     PUT_BLOB_EVENT,
+    RESOLVE_PATH_EVENT,
     SMCP_NAMESPACE,
     TOOL_CALL_EVENT,
+    UPDATE_CONFIG_EVENT,
     UPDATE_CONFIG_NOTIFICATION,
+    UPDATE_DESKTOP_EVENT,
     UPDATE_DESKTOP_NOTIFICATION,
+    UPDATE_SKILLS_EVENT,
     UPDATE_SKILLS_NOTIFICATION,
+    UPDATE_TOOL_LIST_EVENT,
     UPDATE_TOOL_LIST_NOTIFICATION,
     AgentCallData,
-    EnterOfficeNotification,
     EnterOfficeReq,
+    ErrorCode,
     ErrorPayload,
     GetBlobReq,
     GetBlobRet,
@@ -55,18 +77,24 @@ from a2c_smcp.smcp import (
     GetSkillsRet,
     GetToolsReq,
     GetToolsRet,
-    LeaveOfficeNotification,
     LeaveOfficeReq,
     ListRoomReq,
     ListRoomRet,
     PutBlobReq,
     PutBlobRet,
+    ResolvePathReq,
+    ResolvePathRet,
     SessionInfo,
+    ToolCallReq,
     UpdateComputerConfigReq,
-    UpdateMCPConfigNotification,
+    build_bad_request_error,
     build_computer_not_found_error,
+    build_internal_error,
+    build_non_agent_client_call_error,
+    build_room_rejection_error,
     is_protocol_error_payload,
 )
+from a2c_smcp.utils.computer_id import is_canonical_computer_id
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("server")
@@ -105,8 +133,11 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         不触碰信号 registry，故 fire 置于其后对已登记信号零损失；``_fire`` 持 ``_inflight_lock`` 而 ``super()`` 不持锁，无死锁。
         Super-then-fire (mirrors async) closes the TOCTOU window; already-registered signals still wake.
         """
-        super().on_disconnect(sid)
-        self._fire_inflight_disconnect_signals(sid)
+        try:
+            super().on_disconnect(sid)
+        finally:
+            # 清理中途抛错也必须唤醒在途调用（与 async 同构）：否则以该 sid 为目标的 relay 只能挂到超时。
+            self._fire_inflight_disconnect_signals(sid)
 
     def _fire_inflight_disconnect_signals(self, sid: SID) -> None:
         """唤醒以 ``sid`` 为目标的全部在途断连信号（幂等）。Wake all in-flight signals targeting ``sid`` (idempotent)."""
@@ -131,73 +162,141 @@ class SyncSMCPNamespace(SyncBaseNamespace):
                 if not bucket:
                     self._inflight_disconnect_signals.pop(computer_sid, None)
 
+    def _rooms_to_leave_on_disconnect(self, sid: SID) -> list[str]:
+        """只离开 **office 房**（``office:`` 前缀）并交出**原始 office_id**——本类 ``leave_room`` 以 office_id 为参数（#216）。
+        Only office rooms, as raw office ids (this class's ``leave_room`` takes an office id, #216).
+        """
+        return office_ids_of_rooms(self.rooms(sid))
+
+    def _announce_residual_leave(self, sid: SID, key: NAME_KEY, computer_id: str | None) -> None:
+        """断连时发现的残留键（注册落在退房快照之后）补发 ``notify:leave_office``——对端可能已收到其 enter。
+
+        ``computer_id`` 由调用方在注册表锁段内连同 ``release_name`` 一并取出后传入（fix-review 🟡6）。
+        The caller passes the computer_id captured in the same locked cleanup section.
+        """
+        office_id, role, name = key
+        self._emit_to_office(
+            LEAVE_OFFICE_NOTIFICATION,
+            build_leave_notification(office_id, role, name, computer_id),
+            office_id,
+            skip_sid=sid,
+        )
+
+    def _target_still_resolves(self, office_id: OFFICE_ID, computer_name: str, computer_sid: SID) -> bool:
+        """房内名字此刻是否**仍解析到同一 sid**（relay 复查与在途断连守卫的唯一判据，S4）。
+        Whether the in-room name still resolves to the *same* sid (single criterion for both re-checks).
+        """
+        return self.get_sid_by_name(office_id, "computer", computer_name) == computer_sid
+
     def enter_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
         客户端加入房间，维护session中的sid/name/office_id字段（同步）
         Client joins room, maintain sid/name/office_id in session (sync)
+
+        #213 两阶段结构（协议 room-model.md §Computer 加入规则 注记 3「校验必须先于副作用」）：
+        阶段 1 校验（角色约束 / 幂等重入 / 注册表锁内**原子占席** ``4101``（#230），零成员关系副作用）；阶段 2 生效
+        （退旧房 → 入新房 → 写会话 → 注册 name → 广播）。不变量：本方法抛错后 socketio 真实成员
+        关系与会话状态**一致**——被拒客户端绝不留在目标房里收该房 ``notify:*``。
+        Two-phase structure mirroring the async implementation (#213).
         """
         session = self.get_session(sid)
 
         if session.get("sid") != sid:
             session["sid"] = sid
         if not session.get("name"):
-            session["name"] = f"{session.get('role', 'unknown')}_{sid[:6]}"
+            session["name"] = default_session_name(session.get("role"), sid)
 
-        if session.get("role") == "agent":
-            if session.get("office_id") and session.get("office_id") != room:
-                logger.error(f"Agent sid: {sid} already in room: {session.get('office_id')}, can't join room: {room}")
-                raise ValueError("Agent sid already in room")
-            elif not session.get("office_id"):
-                for participant_sid, _participant_eio_sid in self.server.manager.get_participants(SMCP_NAMESPACE, room):
-                    participant_session = self.get_session(participant_sid)
-                    if participant_session.get("role") == "agent":
-                        raise ValueError("Agent already in room")
-            else:
-                logger.warning(
-                    f"Agent sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间",
-                )
-                return
-        else:
-            if session.get("office_id") and (past_room := session.get("office_id")) != room:
+        # ── 阶段 1：校验（零成员关系副作用） / Phase 1: validation (no membership side effect) ──
+        role = session["role"]
+        current_room = session.get("office_id") or None
+        if current_room == room:
+            # 幂等重入（protocol#66，Agent / Computer 通用）：空 ack，MUST NOT 重复广播 ``notify:enter_office``。镜像 async。
+            logger.warning(f"{role} sid: {sid} already in room: {room}. 正在重复加入房间")
+            return
+        if role == "agent" and current_room is not None:
+            # Agent 换房 MUST 显式两步；领域异常承载协议码（4106）：handler 据此回 flat ErrorPayload（#214）
+            logger.warning(f"Agent sid: {sid} already in room: {current_room}, can't join room: {room}")
+            raise AlreadyInRoomError()
+        # Computer 可切换房间，但**退房动作推迟到阶段 2**：目标房闸门必须先查完（协议 注记 4，
+        # 否则目标房席位被占时它已离开原房且对端已收到 notify:leave_office，落成无房中间态）。
+        # The old room is left in phase 2 — all target-room gates must run first.
+        past_room: OFFICE_ID | None = current_room
+
+        # 「每 role 一席」准入（#230）：注册表锁内**原子**检查并占下 ``(room, role)`` 席位（同名与否无关）。必须早于
+        # 任何成员关系变更（#213）；目标房显式传入。此后任何失败都释放本次新占的席位。镜像 async 实现。
+        # Atomic seat claim (#230) before any membership change; released on any later failure.
+        claimed_seat = self._claim_seat(room, role, sid)
+
+        # ── 阶段 2：生效（成员关系变更） / Phase 2: effects (membership changes) ──
+        registered = False
+        try:
+            if past_room:
+                # 旧房离开不可撤销（广播已发出）⇒ 必须排在校验之后 / irreversible: post-validation only
                 self.leave_room(sid, past_room)
-            elif session.get("office_id") == room:
-                logger.warning(
-                    f"Computer sid: {sid} already in room: {session.get('office_id')}. 正在重复加入房间",
+
+            # socketio 房名 = ``office:{room}``，与私有 sid 房命名空间不相交（#216）/ prefixed room name (#216)
+            super().enter_room(sid, office_room(room))
+            session["office_id"] = room
+            self.save_session(sid, session)
+
+            # 注册name到sid的映射（路由解析用）：**原子**「存活」校验并写入（🔴7/S1）。准入已由阶段 1 的占席决定；
+            # 断连收尾落在占席与此处之间 ⇒ 被拒 ⇒ 下方失败收敛摘房。
+            # Register the routing name (admission was decided by the phase-1 seat claim).
+            name = session["name"]
+            self._register_name(room, role, name, sid)
+            registered = True
+
+            # 根据角色发送不同的通知（builder 与 async 共用，protocol#64）
+            # Role-specific notification via the shared builder.
+            notification_data = build_enter_notification(room, role, name, session.get("computer_id"))
+
+            self._emit_to_office(ENTER_OFFICE_NOTIFICATION, notification_data, room, skip_sid=sid)
+            # 宣告后复查（线程窗口）：注册与本次 enter 广播之间，断连收尾 / 并发退房可能已注销该键并**先**发出
+            # leave ⇒ 对端最终看到「leave → enter」的幻影成员。键已不归本 sid ⇒ 补发一次 leave 收敛对端视图
+            # （可能与已发出的 leave 重复——重复 leave 对端幂等，缺失则永久幻影）。
+            # Post-announce re-check: if the key was released meanwhile, re-announce the leave (duplicates are harmless).
+            if not self._holds_name(room, role, name, sid):
+                self._emit_to_office(
+                    LEAVE_OFFICE_NOTIFICATION,
+                    build_leave_notification(room, role, name, session.get("computer_id")),
+                    room,
+                    skip_sid=sid,
                 )
-                return
-
-            # 检查房间内是否已有同名的Computer
-            # Check if there's already a Computer with the same name in the room
-            computer_name = session.get("name")
-            if computer_name:
-                for participant_sid, _participant_eio_sid in self.server.manager.get_participants(SMCP_NAMESPACE, room):
-                    if participant_sid == sid:
-                        continue
-                    participant_session = self.get_session(participant_sid)
-                    if participant_session.get("role") == "computer" and participant_session.get("name") == computer_name:
-                        raise ValueError(f"Computer with name '{computer_name}' already exists in room '{room}'")
-
-        super().enter_room(sid, room)
-        session["office_id"] = room
-        self.save_session(sid, session)
-
-        # 注册name到sid的映射
-        # Register name-to-sid mapping
-        self._register_name(session["name"], sid)
-
-        # 根据角色发送不同的通知 / Send different notifications based on role
-        notification_data: EnterOfficeNotification = {"office_id": room}
-        if session.get("role") == "computer":
-            notification_data["computer"] = session.get("name")
-        else:
-            notification_data["agent"] = session.get("name")
-
-        self.emit(
-            ENTER_OFFICE_NOTIFICATION,
-            notification_data,
-            skip_sid=sid,
-            room=room,
-        )
+        except Exception:
+            # 失败收敛 —— 按**提交点**分刀：旧房离开未提交（会话 office_id 仍 == past_room）⇒ 一切原样，
+            # 不收敛（否则会把客户端从合法所属的旧房无声摘除）；否则摘成「无房」并与会话同步。
+            # Commit-point discrimination; see the async implementation for the full rationale.
+            if past_room is None or session.get("office_id") != past_room:
+                try:
+                    # 按反向索引注销本次注册的键；``_unregister_name`` 自带归属守卫，绝不替并发抢占者注销
+                    # Unregisters via the reverse index; ``_unregister_name`` is ownership-guarded.
+                    if registered:
+                        self._unregister_name(sid)
+                    for stale_office in office_ids_of_rooms(list(self.rooms(sid))):
+                        # 非成员退房是安全 no-op。**静默**摘除、不发 notify:leave_office（同 async：目标房
+                        # 从未宣告；旧房若已提交离开，其广播已由 leave_room 发出）。已知边界：末步 enter
+                        # 广播部分投递后抛错时，已收到的对端会留下幻影成员（协议无撤回原语）。
+                        # Silent eviction, mirroring the async implementation.
+                        super().leave_room(sid, office_room(stale_office))
+                    if "office_id" in session:
+                        del session["office_id"]
+                        self.save_session(sid, session)
+                    # 席位**最后**释放（#230 审查 🟡1/🟡2，与 leave_room / 断连同序）：名字已注销、已摘出 socketio 房后
+                    # 才放席位 ⇒ 新来者占到席位时不会撞上残留名字键、也收不到本会话的广播。已收敛为「无房」⇒ 释放
+                    # **全部**席位（含换房途中旧房 leave 已删 office_id、却未及释放的旧房席位）：无房 ⇒ 不持任何席位。
+                    # 收敛失败（下方 except）则保留席位——与「会话 / 成员关系可能仍在房」一致，由退房 / 断连回收。
+                    # Seats go last, and all of them: a room-less session holds no seat.
+                    self._release_seats(sid)
+                except Exception as conv_err:
+                    # 收敛不得掩盖原始异常（**已知边界**：收敛自身失败则该 sid 可能仍留房且会话带 office_id，
+                    # 二者一致但未清零；刻意不做二次收敛、不上抛）。镜像 async 实现。
+                    # Convergence must not mask the original error; no second convergence (#213).
+                    logger.error(f"enter_room 失败收敛未完成 sid={sid} room={room}: {conv_err}", exc_info=True)
+            elif claimed_seat:
+                # 旧房离开**未提交** ⇒ 仍是旧房成员（旧房席位照旧归它），只回滚本次新占的目标房席位（归属守卫）。
+                # Old-room leave not committed: still a member there; roll back only the target seat.
+                self._release_seats(sid, room)
+            raise
 
     def leave_room(self, sid: SID, room: OFFICE_ID, namespace: str | None = None) -> None:
         """
@@ -206,150 +305,265 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         session = self.get_session(sid)
 
-        # 构建离开通知，使用name而不是sid
-        # Build leave notification using name instead of sid
-        client_name = session.get("name", "")
-        notification = (
-            LeaveOfficeNotification(office_id=room, computer=client_name)
-            if session.get("role") == "computer"
-            else LeaveOfficeNotification(office_id=room, agent=client_name)
-        )
-        self.emit(LEAVE_OFFICE_NOTIFICATION, notification, skip_sid=sid, room=room)
+        # 构建离开通知，使用name而不是sid；Computer 另带 computer_id（身份记录优先——断连收尾时
+        # 会话字段可能已不可靠，记录才是权威）。Agent 省略该键（protocol#64）。
+        # Build leave notification; Computer carries computer_id from the identity record (authority).
+        record = self._sid_identity.get(sid)
+        computer_id = record.computer_id if record is not None else session.get("computer_id")
+        notification = build_leave_notification(room, session.get("role"), session.get("name", ""), computer_id)
+        self._emit_to_office(LEAVE_OFFICE_NOTIFICATION, notification, room, skip_sid=sid)
 
-        # 注销name映射
-        # Unregister name mapping
-        self._unregister_name(sid)
+        # 注销name映射：只注销**本房**的键（并发线程可能已为同 sid 登记了别的房，不得顺手删掉）
+        # Unregister only this office's key.
+        self._unregister_name(sid, room)
 
         if "office_id" in session:
             del session["office_id"]
         self.save_session(sid, session)
 
-        super().leave_room(sid, room)
+        # 释放本房席位（#230，与 async 同序）：名字注销之后、会话持久化之后（save 抛错的残留由调用方收敛 / 断连回收，见 async）。
+        # Seat released after the session save; leftovers of a failed save are reclaimed by convergence / disconnect.
+        self._release_seats(sid, room)
 
-    def on_server_join_office(self, sid: str, data: EnterOfficeReq) -> tuple[bool, str | None]:
+        # socketio 房名带 ``office:`` 前缀（#216）/ prefixed socketio room name (#216)
+        super().leave_room(sid, office_room(room))
+
+    def on_server_join_office(
+        self, sid: str, data: EnterOfficeReq | None = None, *_extra: Any
+    ) -> ErrorPayload | None:
         """
         同步：Computer/Agent加入房间
         Sync: Computer or Agent joins room
+
+        #214 ack 形态（镜像 async；协议 error-handling.md:177-205）：**成功 ⇒ 空 ack**（``None``）；
+        失败 ⇒ flat ``ErrorPayload``（400 / 403 / 4101 / 4106 / 500；``4105`` 为预留码，不产出）。
+        Ack shape per #214 — mirrors the async implementation.
+
+        **参数绑定也必须回 ack**（error-handling.md:102-106 覆盖「框架层参数提取器」时机）：
+        ``data`` 具默认值、多余位置参数由 ``*_extra`` 吸收 ⇒ 二者都落到 schema 校验 ⇒ ``400``；
+        否则异常逃出 handler ⇒ 不发 ACK ⇒ 调用方挂到自身超时。
         """
-        role_info = TypeAdapter(EnterOfficeReq).validate_python(data)
+        # 具备 ack 通道 ⇒ 校验失败（含多余位置参数）MUST 回 400，MUST NOT 静默不 ack（error-handling.md:102-106）
+        role_info = parse_payload("server:join_office", TypeAdapter(EnterOfficeReq), data, _extra, sid)
+        if role_info is None:
+            return build_bad_request_error()
         expected_role = role_info["role"]
+        declared_name = role_info["name"]
+        office_id = role_info["office_id"]
+        if not office_id:
+            # ``office_id`` 取值非法 ⇒ 400（空串入房后会话 office_id 为假值 ⇒ 幽灵成员）。镜像 async 实现。
+            logger.warning(f"server:join_office office_id 为空 sid={sid}")
+            return build_bad_request_error()
+
+        # v0.5.0（protocol#64）：``computer_id`` 的取值校验（**400**，排在 403 与任何副作用之前）。
+        # role="computer" MUST 携带规范 UUID（非 nil/max，版本不校验）；role="agent" MUST NOT 出现该键。
+        # 400 validation of computer_id, before 403 and every side effect.
+        computer_id: str | None
+        if expected_role == "agent":
+            if "computer_id" in role_info:
+                logger.warning(f"server:join_office Agent 携带 computer_id sid={sid}")
+                return build_bad_request_error()
+            computer_id = None
+        else:
+            declared_computer_id = role_info.get("computer_id")
+            if not is_canonical_computer_id(declared_computer_id):
+                logger.warning(f"server:join_office computer_id 非法 sid={sid}: {declared_computer_id!r}")
+                return build_bad_request_error()
+            computer_id = declared_computer_id
 
         session = self.get_session(sid)
-        backup_session = copy.deepcopy(session)
+        # 4106 的 details 需报「会话**当前**所在房」⇒ 必须在 enter_room 可能改动/收敛会话之前取。
+        previous_office = session.get("office_id")
+        # 身份记录三态：只有 INSERTED（本次新插入）才允许在失败收尾时 pop（fix-review 🟡6）。
+        claim: IdentityClaim | None = None
 
         try:
-            if session.get("role") and session["role"] != expected_role:
-                return False, f"Role mismatch, expected {expected_role}, but {session['role']} use this sid exists"
+            # 身份声明一致性 + **首次记录**（protocol#64；与 #221 的 role/name 同一规则）。记录点是
+            # 400 / 403 之后、4106 / 4101 之前；记录随连接存续（leave 不清除，4101/4106/500 不回滚）。
+            # 校验与记录在注册表锁内的同一同步核心完成 ⇒ 并发声明不同身份时至多一者被记录。镜像 async。
+            # Atomic compare-and-record of the identity triple; the record survives later rejections.
+            expected_name = declared_name or default_session_name(expected_role, sid)
+            claim = self._claim_identity(sid, expected_role, expected_name, computer_id)
+            if claim is IdentityClaim.MISMATCH:
+                logger.warning(
+                    f"server:join_office 身份声明不符 sid={sid}: request="
+                    f"({expected_role!r}, {declared_name!r}, {computer_id!r})",
+                )
+                return build_room_rejection_error(ErrorCode.FORBIDDEN)
 
+            # 会话字段是身份记录的投影；Agent 不保留 computer_id 键（protocol#64 MUST NOT）。镜像 async。
+            # Session fields project the authoritative record; Agents never carry computer_id.
             session["role"] = expected_role
-            session["name"] = role_info["name"]
+            session["name"] = expected_name
+            if computer_id is None:
+                session.pop("computer_id", None)
+            else:
+                session["computer_id"] = computer_id
             self.save_session(sid, session)
 
-            self.enter_room(sid, role_info["office_id"])
-            return True, None
+            self.enter_room(sid, office_id)
+            return None
         except Exception as e:
-            self.save_session(sid, backup_session)
-            return False, f"Internal server error: {str(e)}"
+            # **不回滚**身份声明：记录与 4101 / 4106 / 500 的拒绝正交（protocol#64）。房间归属仍由
+            # ``enter_room`` 按提交点收敛（#213）。Mirrors async.
+            if isinstance(e, SessionGoneError):
+                # 发起者已进入断连收尾：身份记录随连接销毁（断连清理可能早于本次写入 ⇒ 显式收尾）。
+                # fix-review 🟡10：与 ``sync_base.on_disconnect`` 一样在注册表锁内 pop——并发的断连清理
+                # 与本分支会同时改写同一 dict。🟡6：只有本次**新插入**的记录才回收；匹配到既有记录时
+                # 绝不 pop（它是断连清理/残留 leave 宣告的 computer_id 载体）。
+                if claim is IdentityClaim.INSERTED:
+                    with self._registry_lock:
+                        self._sid_identity.pop(sid, None)
+                logger.info(f"server:join_office 发起者已断连，放弃入房 sid={sid}")
+                return build_internal_error()
 
-    def on_server_leave_office(self, sid: str, data: LeaveOfficeReq) -> tuple[bool, str | None]:
+            if isinstance(e, RoomRejection):
+                # 业务拒绝：领域异常承载结构化 reason ⇒ 转 flat ErrorPayload（协议码 + 自身相关上下文）
+                logger.warning(f"server:join_office 被拒 sid={sid} code={e.code}: {e}")
+                # 走**不抛**的助手（本分支在 except 子句内，二次抛出会顶替原异常逃出 handler）
+                return build_room_rejection_ack(
+                    e,
+                    target_office_id=office_id,
+                    declared_role=expected_role,
+                    current_office_id=previous_office,
+                )
+
+            # 未知内部异常：笼统文案回 ack（不让客户端挂到超时），原文只进日志（#214 / §通用错误码 500）
+            logger.error(f"server:join_office 未预期异常 sid={sid}: {e}", exc_info=True)
+            return build_internal_error()
+
+    def on_server_leave_office(
+        self, sid: str, data: LeaveOfficeReq | None = None, *_extra: Any
+    ) -> ErrorPayload | None:
         """
         同步：Computer/Agent离开房间
         Sync: Computer or Agent leaves room
-        """
-        try:
-            self.leave_room(sid, data["office_id"])
-            return True, None
-        except Exception as e:
-            return False, f"Internal server error: {str(e)}"
 
-    def on_server_tool_call_cancel(self, sid: str, data: AgentCallData) -> None:
+        房间号**只取服务端权威的会话状态**，绝不用客户端载荷（载荷可携带任意房间号 ⇒ 跨房注入，
+        或携带 None ⇒ ``room=None`` 即全命名空间广播）。无房可退时幂等成功。
+        The room comes from the authoritative session only, never from the client payload.
+
+        #214 ack 形态：**成功与「无房幂等」都回空 ack**（``None``）；载荷 schema 校验失败回 ``400``；
+        未预期内部异常回 ``500``。「载荷房号与会话不符」**不是**错误（协议 MUST NOT 因此拒绝）。
+
+        **参数绑定也必须回 ack**：``data`` 具默认值、``*_extra`` 吸收多余位置参数 ⇒ 二者都落到
+        schema 校验 ⇒ ``400``（否则异常逃出 handler ⇒ 不发 ACK ⇒ 调用方挂到自身超时）。
+        """
+        # 具备 ack 通道 ⇒ 校验失败 MUST 回 400，MUST NOT 静默不 ack（error-handling.md:102-106）
+        leave_info = parse_payload("server:leave_office", TypeAdapter(LeaveOfficeReq), data, _extra, sid)
+        if leave_info is None:
+            return build_bad_request_error()
+
+        try:
+            session = self.get_session(sid)
+
+            office_id = session.get("office_id")
+            if not office_id:
+                # 无房可退：清理路径幂等成功。但会话可能已与真实成员关系**漂移**（旧版采信载荷
+                # ⇒ 清空会话却把人留在原房），故按服务端权威的 socketio 成员关系收敛一次。
+                # Idempotent success, but first converge the authoritative socketio membership.
+                # 只收敛 **office 房**（``office:`` 前缀，#216）——结构上排除私有 sid 房与其它房。
+                for stale_office in office_ids_of_rooms(list(self.rooms(sid))):
+                    self.leave_room(sid, stale_office)
+                return None
+
+            claimed = leave_info.get("office_id")
+            if claimed != office_id:
+                # 载荷与会话不一致：仅告警并按会话执行（协议明令 MUST NOT 因此拒绝）
+                # Payload disagrees with the session: warn and follow the session.
+                logger.warning(
+                    f"leave_office: payload claims office {claimed!r} but session {sid} is in {office_id!r}; "
+                    f"leaving the session's office",
+                )
+
+            self.leave_room(sid, office_id)
+            return None
+        except Exception as e:
+            # 未知内部异常：笼统文案回 ack（不让客户端挂到超时），原文只进日志（#214 / §通用错误码 500）
+            logger.error(f"server:leave_office 未预期异常 sid={sid}: {e}", exc_info=True)
+            return build_internal_error()
+
+    def on_server_tool_call_cancel(self, sid: str, data: AgentCallData | None = None, *_extra: Any) -> None:
         """
         同步：广播取消ToolCall到房间内的其他成员
         Sync: broadcast tool call cancellation to other members in the room
-        """
-        session = self.get_session(sid)
-        if session["role"] != "agent":
-            raise SMCPNamespaceError("目前仅支持Agent调用取消ToolCall的操作")
 
-        agent_call = TypeAdapter(AgentCallData).validate_python(data)
-        if session.get("name") != agent_call["agent"]:
-            raise SMCPNamespaceError("取消工具调用的广播仅可以由对应Agent发出")
+        fire-and-forget：载荷非法 / 非 Agent / 未入房 ⇒ 告警后**静默丢弃**；载荷 ``agent`` 与会话不符只告警、
+        按会话执行（#216）。镜像 async。
+        """
+        agent_call = parse_payload(CANCEL_TOOL_CALL_EVENT, TypeAdapter(AgentCallData), data, _extra, sid)
+        if agent_call is None:
+            return
+        origin = resolve_broadcast_origin(CANCEL_TOOL_CALL_EVENT, self._get_session_or_none(sid), sid, "agent")
+        if origin is None:
+            return
+        office_id, agent_name = origin
+        # 出向 ``agent`` 取会话名；载荷自称不符只告警、按会话执行（events.md §房间广播类事件的目标来源：MUST NOT 拒绝）
+        # The outbound ``agent`` is the session's name; a mismatching claim is logged, never rejected.
+        warn_on_claimed_identity_mismatch(CANCEL_TOOL_CALL_EVENT, sid, "agent", agent_call["agent"], agent_name)
+        agent_call = AgentCallData(agent=agent_name, req_id=agent_call["req_id"])
 
         # 广播到 office 房间，而不是 Agent 的私有房间 / Broadcast to office room, not Agent's private room
-        office_id = session.get("office_id")
-        self.emit(
-            CANCEL_TOOL_CALL_NOTIFICATION,
-            agent_call,
-            room=office_id,
-            skip_sid=sid,
-        )
+        self._emit_to_office(CANCEL_TOOL_CALL_NOTIFICATION, agent_call, office_id, skip_sid=sid)
 
-    def on_server_update_config(self, sid: str, data: UpdateComputerConfigReq) -> None:
+    def _broadcast_computer_update(self, sid: str, data: Any, extra: tuple[Any, ...], event: str, notification: str) -> None:
+        """``server:update_*`` ×4 的公共实现（同步）：校验 → 判定发起者 → 向其所在房广播。镜像 async（#216）。
+        Shared body of the four ``server:update_*`` handlers (sync mirror).
+        """
+        update_req = parse_payload(event, TypeAdapter(UpdateComputerConfigReq), data, extra, sid)
+        if update_req is None:
+            return
+        origin = resolve_broadcast_origin(event, self._get_session_or_none(sid), sid, "computer")
+        if origin is None:
+            return
+        office_id, computer_name = origin
+        # 出向 ``computer`` 取会话名：否则可用 ``computer="peer"`` 让接收方去刷新另一个 Computer（events.md
+        # §房间广播类事件的目标来源）。载荷自称不符只告警、按会话执行（MUST NOT 拒绝）。
+        # The outbound ``computer`` is the session's name, never the payload's claim.
+        warn_on_claimed_identity_mismatch(event, sid, "computer", update_req["computer"], computer_name)
+        self._emit_to_office(notification, {"computer": computer_name}, office_id, skip_sid=sid)
+
+    def on_server_update_config(self, sid: str, data: UpdateComputerConfigReq | None = None, *_extra: Any) -> None:
         """
         同步：广播更新MCP配置
         Sync: broadcast MCP config update
         """
-        session = self.get_session(sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持Computer调用更新MCP配置的操作")
+        self._broadcast_computer_update(sid, data, _extra, UPDATE_CONFIG_EVENT, UPDATE_CONFIG_NOTIFICATION)
 
-        update_config = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
-        self.emit(
-            UPDATE_CONFIG_NOTIFICATION,
-            UpdateMCPConfigNotification(computer=update_config["computer"]),
-            room=session["office_id"],
-            skip_sid=sid,
-        )
-
-    def on_server_update_tool_list(self, sid: str, data: UpdateComputerConfigReq) -> None:
+    def on_server_update_tool_list(self, sid: str, data: UpdateComputerConfigReq | None = None, *_extra: Any) -> None:
         """
         同步：广播工具列表更新
         Sync: broadcast tool list update
         """
-        session = self.get_session(sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持Computer上报工具列表变更")
+        self._broadcast_computer_update(sid, data, _extra, UPDATE_TOOL_LIST_EVENT, UPDATE_TOOL_LIST_NOTIFICATION)
 
-        update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
-
-        self.emit(
-            UPDATE_TOOL_LIST_NOTIFICATION,
-            {"computer": update_req["computer"]},
-            room=session.get("office_id"),
-            skip_sid=sid,
-        )
-
-    def on_client_tool_call(self, sid: str, data: dict) -> dict | ErrorPayload:
+    def on_client_tool_call(self, sid: str, data: ToolCallReq | None = None, *_extra: Any) -> dict | ErrorPayload:
         """
         同步：响应工具调用，使用 call 方法等待 Computer 返回结果
         Sync: respond to tool call, use call method to wait for Computer response
 
-        经 :meth:`_relay_client_call` 统一 SID 解析 + office/role 隔离 + flat ErrorPayload(404) 透传（#99：
-        目标 Computer 不存在不再 raise ValueError 致 Agent ``call`` 静默超时，与其余 ``client:*`` 事件对齐）。
-        仅 Agent 可发起工具调用，故委托前保留角色校验。
-        Routed via ``_relay_client_call`` (#99: missing Computer → flat ErrorPayload(404), not an uncaught
-        ValueError that times the Agent out). Only an Agent may invoke a tool, hence the role check before relay.
+        经 :meth:`_relay_client_call` 统一载荷校验 + SID 解析 + office/role 隔离 + flat ErrorPayload 透传
+        （#99/#216）；「仅 Agent 可发起」由 relay 对全部 ``client:*`` 统一判定。载荷按 ``ToolCallReq`` 校验
+        （#216 起与 async 同一 schema；此前 sync 只校验「是 dict」、timeout 可缺省）。
+        Routed via ``_relay_client_call`` (#99/#216); validated as ``ToolCallReq`` like the async side.
         """
-        session = self.get_session(sid)
-        if session["role"] != "agent":
-            raise SMCPNamespaceError("目前仅支持Agent调用工具")
-
         # tool_call 响应是 Computer 回传的 CallToolResult 原样 dict（无固定 A2C TypedDict），ret_adapter 用
-        # TypeAdapter(dict) 原样透传；per-request timeout 若提供则透传（缺省回落 socketio 默认，保持同步旧行为）。
-        # tool_call's response is the Computer's raw CallToolResult dict; pass through timeout when present.
-        tool_call = TypeAdapter(dict).validate_python(data)
+        # TypeAdapter(dict) 原样透传；per-request timeout（取自校验后的载荷）透传给底层 self.call。
+        # tool_call's response is the Computer's raw CallToolResult dict, so use TypeAdapter(dict) passthrough.
         return cast(
             "dict | ErrorPayload",
             self._relay_client_call(
                 sid,
-                tool_call,
+                data,
+                _extra,
                 TOOL_CALL_EVENT,
+                TypeAdapter(ToolCallReq),
                 TypeAdapter(dict),
-                timeout=tool_call.get("timeout"),
+                timeout_from_request=True,
             ),
         )
 
-    def on_client_get_tools(self, sid: str, data: GetToolsReq) -> GetToolsRet | ErrorPayload:
+    def on_client_get_tools(self, sid: str, data: GetToolsReq | None = None, *_extra: Any) -> GetToolsRet | ErrorPayload:
         """
         同步：获取指定 Computer 的工具列表（``client:get_tools``）/ Sync: get tool list of specified Computer.
 
@@ -358,10 +572,10 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         return cast(
             "GetToolsRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_TOOLS_EVENT, TypeAdapter(GetToolsRet)),
+            self._relay_client_call(sid, data, _extra, GET_TOOLS_EVENT, TypeAdapter(GetToolsReq), TypeAdapter(GetToolsRet)),
         )
 
-    def on_client_get_desktop(self, sid: str, data: GetDeskTopReq) -> GetDeskTopRet | ErrorPayload:
+    def on_client_get_desktop(self, sid: str, data: GetDeskTopReq | None = None, *_extra: Any) -> GetDeskTopRet | ErrorPayload:
         """
         同步：获取指定 Computer 的桌面视图（``client:get_desktop``）/ Sync: get desktop view from Computer.
 
@@ -369,59 +583,100 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         return cast(
             "GetDeskTopRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_DESKTOP_EVENT, TypeAdapter(GetDeskTopRet)),
+            self._relay_client_call(sid, data, _extra, GET_DESKTOP_EVENT, TypeAdapter(GetDeskTopReq), TypeAdapter(GetDeskTopRet)),
         )
 
     def _relay_client_call(
         self,
         sid: str,
         data: Any,
+        extra: tuple[Any, ...],
         event: str,
+        req_adapter: TypeAdapter[Any],
         ret_adapter: TypeAdapter[Any],
-        timeout: float | None = None,
+        *,
+        timeout_from_request: bool = False,
     ) -> Any:
         """同步版通用 ``client:*`` 事件路由 / Sync mirror of ``_relay_client_call``.
 
         统一收敛 office/role 隔离校验、Computer SID 解析、flat ErrorPayload 透传。
         Unifies office/role isolation, Computer SID lookup, and flat-ErrorPayload pass-through.
 
-        Computer 名未命中 → 回 flat ``ErrorPayload(404)``（#92，error-handling.md §20 + §78），**不**抛
-        未捕获异常（同步 socketio 下抛异常会杀线程、不回 ack，致 Agent ``call`` 静默超时）。office/role
-        隔离失败仍 raise ``SMCPNamespaceError``（安全：跨房间不泄露 Computer 存在性，见 exceptions.py）。
-        Computer name miss → flat ``ErrorPayload(404)`` (no uncaught raise); isolation failures still raise.
+        Computer 名在**发起者所在房内**未命中（#215：他房同名 / 名字属于 Agent 同样落此分支，与「不存在」不可区分）
+        → 回 flat ``ErrorPayload(404)``（#92，error-handling.md §20 + §78），**不**抛未捕获异常（同步 socketio 下
+        抛异常会杀线程、不回 ack，致 Agent ``call`` 静默超时）。
 
-        ``timeout`` 仅 ``tool_call`` 透传 per-request 超时；其余 ``client:*`` 事件留 None → 走 socketio 默认。
-        ``timeout`` is only passed through for ``tool_call``; other events leave it None (socketio default).
+        拒绝顺序镜像 async（#216）：载荷非法 ``400`` → 发起者会话已不存在（raise，唯一静默路径）→ 未入房
+        ``4103`` → 非 Agent ``403`` → 房内解析不到 ``404``；注册表不变量破坏仍 raise ``SMCPNamespaceError``。
+        Rejection order mirrors async (#216): 400 → silent → 4103 → 403 → 404.
+
+        ``timeout_from_request`` 仅 ``tool_call`` 为真（取载荷 ``timeout``）；其余 ``client:*`` 走 socketio 默认。
+        Only ``tool_call`` passes its per-request timeout; other events use the socketio default.
 
         协议依据 / Protocol: events.md 各 ``client:*`` 事件 + error-handling.md flat ErrorPayload.
         """
-        computer_name = data["computer"]
-        computer_sid = self.get_sid_by_name(computer_name)
-        if not computer_sid:
-            return build_computer_not_found_error(computer_name)
-
-        session = self.get_session(computer_sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError(f"目前仅支持 Computer 响应 {event} / target SID is not a Computer")
+        req = parse_payload(event, req_adapter, data, extra, sid)
+        if req is None:
+            return build_bad_request_error()
 
         agent_session = self.get_session(sid)
         if agent_session is None:
             # 发起者（Agent）飞行中断连：会话已不存在。显式 raise 替代 None.get 的 AttributeError
-            # （对齐 #31）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            # （对齐 #31 隔离不变量显式 raise）；协议许可 Server MAY 静默不 ack、不新增错误码（v0.2.2）。
+            # Originator (Agent) disconnected in-flight: session gone. Explicit raise instead of an
+            # AttributeError on None.get (aligns with #31). Protocol allows Server MAY silently not-ack.
             raise SMCPNamespaceError(f"发起者会话不存在（可能已断连）：{event} / originator session gone")
-        if session.get("office_id") != agent_session.get("office_id"):
-            raise SMCPNamespaceError(
-                f"跨房间访问被拒绝：{event} 仅限同一 office / cross-office {event} access denied",
-            )
+        agent_office = agent_session.get("office_id")
+        if not agent_office:
+            # 无房发起者无从在房内解析目标（room-model.md §跨房间访问防护）⇒ flat 4103（#216 §四）
+            # An office-less initiator cannot resolve anything in-room ⇒ flat 4103 (#216)
+            logger.warning(f"{event} 发起者未加入任何房间 sid={sid}")
+            return build_room_rejection_error(ErrorCode.NOT_IN_ROOM)
+        if agent_session.get("role") != "agent":
+            # client:* 发起方为 Agent；存活调用方的拒绝必须可感 ⇒ flat 403（#216）。镜像 async。
+            logger.warning(f"{event} 非 Agent 发起 sid={sid} role={agent_session.get('role')!r}")
+            return build_non_agent_client_call_error()
+
+        # #215：名字解析**限定在发起者所在房内**、按 role=computer 查（MUST NOT 全局裸名解析）。解析不到统一回
+        # 404——与「该名字存在于其它房 / 属于同房 Agent」对外不可区分，杜绝探测他房成员存在性。
+        # #215: resolve inside the initiator's office only; a miss is a uniform 404 (no cross-room probing).
+        computer_name = req["computer"]
+        computer_sid = self.get_sid_by_name(agent_office, "computer", computer_name)
+        if not computer_sid:
+            return build_computer_not_found_error(computer_name)
+
+        # 会话字段**先快照、后复查**（S2）：会话是活对象，并发退房先注销、后删 ``office_id``——快照早于复查 ⇒
+        # 快照若已陈旧，复查必然判「已离开」；反过来（先复查后读）会读到半途被删的字段而误报注册表损坏。
+        # Snapshot the live session's fields *before* the registry re-check (leave unregisters, then clears office_id).
+        session = self._get_session_or_none(computer_sid)
+        target_role = session.get("role") if session else None
+        target_office = session.get("office_id") if session else None
+        # 解析后目标已离房 / 断连（同步服务端多线程分发下可达：解析与读会话之间另一线程跑完 on_disconnect / 换房）
+        # ⇒ 与「不存在」同义回 404（同在途断连分支）。判据与在途断连守卫共用 :meth:`_target_still_resolves`（S4）。
+        # Target left between resolution and session read (reachable under threaded sync dispatch) → 404.
+        if not self._target_still_resolves(agent_office, computer_name, computer_sid):
+            return build_computer_not_found_error(computer_name)
+        if session is None:
+            # 注册表仍指向一个会话已不存在的 sid：死 sid 残留。自愈注销（归属守卫只删它自己的键）并回 404，
+            # 不 raise——raise 会让 Agent 收不到 ack、干等满超时（S2）。
+            # Registry points at a vanished session: self-heal the residue and answer 404 instead of raising.
+            logger.warning(f"{event} 目标 sid={computer_sid} 会话已不存在，注销残留名字并回 404")
+            self._unregister_name(computer_sid)
+            self._release_seats(computer_sid)  # 死 sid 的席位同样收回（#230）/ its seats too
+            return build_computer_not_found_error(computer_name)
+        # 不变量守卫：注册表仍指向该 sid、会话却与键矛盾 ⇒ 注册表损坏，显式 raise（#31：隔离不变量只 raise）。
+        # Invariant guard: registry still points at the sid but the session contradicts the key → raise (#31).
+        if target_role != "computer" or target_office != agent_office:
+            raise SMCPNamespaceError(f"名字注册表与会话不一致：{event} / name registry diverged from session")
 
         # tool_call 透传 per-request timeout；其余 client:* 事件 timeout=None → 用 socketio 默认
         # （勿对默认事件传 timeout=None，socketio 下会变成永久等待而非默认 60s）。
         # Pass tool_call's per-request timeout; other client:* events leave it None (socketio default).
         call_kwargs: dict[str, Any] = {"to": computer_sid, "namespace": SMCP_NAMESPACE}
-        if timeout is not None:
-            call_kwargs["timeout"] = timeout
+        if timeout_from_request:
+            call_kwargs["timeout"] = req["timeout"]
 
-        client_response = self._call_with_disconnect_guard(event, data, computer_name, computer_sid, call_kwargs)
+        client_response = self._call_with_disconnect_guard(event, data, agent_office, computer_name, computer_sid, call_kwargs)
         if client_response is _DISCONNECTED:
             # 目标在途断连：Computer 中途消失 == 不存在，回 flat ErrorPayload(404)（与 #92/#99 同一 payload）。
             # Target disconnected mid-flight: a vanished Computer == not found → flat ErrorPayload(404).
@@ -434,6 +689,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         self,
         event: str,
         data: Any,
+        office_id: OFFICE_ID,
         computer_name: str,
         computer_sid: SID,
         call_kwargs: dict[str, Any],
@@ -459,7 +715,9 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             # TOCTOU 复查：解析 SID 与登记之间目标可能已断连（信号永不会被 fire）。用 ``get_sid_by_name`` 复查
             # （``on_disconnect`` → base ``_unregister_name`` 清掉 name 映射）关闭该窗口。
             # TOCTOU re-check: target may have died between SID resolve and registration → short-circuit to 404.
-            if disconnect_ev.is_set() or self.get_sid_by_name(computer_name) is None:
+            # 判据与 relay 复查同一（``!= sid``，S4）：只判 ``is None`` 会漏掉「旧 sid 断连、同名新 sid 已注册」——
+            # 信号登记在旧 sid 上且其 fire 已发生过 ⇒ 调用挂到满超时而非 404。
+            if disconnect_ev.is_set() or not self._target_still_resolves(office_id, computer_name, computer_sid):
                 return _DISCONNECTED
 
             # ``disconnect_ev`` 一事二用：完成路径由 ``_runner`` 在 finally 触发，断连路径由 ``on_disconnect`` 触发，
@@ -485,7 +743,7 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         finally:
             self._discard_inflight_signal(computer_sid, disconnect_ev)
 
-    def on_client_get_config(self, sid: str, data: GetComputerConfigReq) -> GetComputerConfigRet | ErrorPayload:
+    def on_client_get_config(self, sid: str, data: GetComputerConfigReq | None = None, *_extra: Any) -> GetComputerConfigRet | ErrorPayload:
         """同步：透明转发 ``client:get_config`` 至目标 Computer，返回其 MCP 配置 / Sync relay of ``client:get_config``.
 
         返回协议已定义的 ``GetComputerConfigRet``（``servers`` 占位符原样，解析后密钥不外传）；
@@ -494,34 +752,41 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         return cast(
             "GetComputerConfigRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_CONFIG_EVENT, TypeAdapter(GetComputerConfigRet)),
+            self._relay_client_call(
+                sid,
+                data,
+                _extra,
+                GET_CONFIG_EVENT,
+                TypeAdapter(GetComputerConfigReq),
+                TypeAdapter(GetComputerConfigRet),
+            ),
         )
 
-    def on_client_get_resources(self, sid: str, data: GetResourcesReq) -> GetResourcesRet | ErrorPayload:
+    def on_client_get_resources(self, sid: str, data: GetResourcesReq | None = None, *_extra: Any) -> GetResourcesRet | ErrorPayload:
         """
         同步：透明转发 ``client:get_resources`` 至目标 Computer（含 cursor 翻页）。
         Sync: relay ``client:get_resources`` to the target Computer (with cursor pagination).
         """
         return cast(
             "GetResourcesRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_RESOURCES_EVENT, TypeAdapter(GetResourcesRet)),
+            self._relay_client_call(sid, data, _extra, GET_RESOURCES_EVENT, TypeAdapter(GetResourcesReq), TypeAdapter(GetResourcesRet)),
         )
 
-    def on_client_get_skills(self, sid: str, data: GetSkillsReq) -> GetSkillsRet | ErrorPayload:
+    def on_client_get_skills(self, sid: str, data: GetSkillsReq | None = None, *_extra: Any) -> GetSkillsRet | ErrorPayload:
         """同步：透明转发 ``client:get_skills`` / Sync relay of ``client:get_skills``."""
         return cast(
             "GetSkillsRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_SKILLS_EVENT, TypeAdapter(GetSkillsRet)),
+            self._relay_client_call(sid, data, _extra, GET_SKILLS_EVENT, TypeAdapter(GetSkillsReq), TypeAdapter(GetSkillsRet)),
         )
 
-    def on_client_get_skill(self, sid: str, data: GetSkillReq) -> GetSkillRet | ErrorPayload:
+    def on_client_get_skill(self, sid: str, data: GetSkillReq | None = None, *_extra: Any) -> GetSkillRet | ErrorPayload:
         """同步：透明转发 ``client:get_skill`` / Sync relay of ``client:get_skill``."""
         return cast(
             "GetSkillRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_SKILL_EVENT, TypeAdapter(GetSkillRet)),
+            self._relay_client_call(sid, data, _extra, GET_SKILL_EVENT, TypeAdapter(GetSkillReq), TypeAdapter(GetSkillRet)),
         )
 
-    def on_client_get_blob(self, sid: str, data: GetBlobReq) -> GetBlobRet | ErrorPayload:
+    def on_client_get_blob(self, sid: str, data: GetBlobReq | None = None, *_extra: Any) -> GetBlobRet | ErrorPayload:
         """同步：透明转发 ``client:get_blob`` / Sync relay of ``client:get_blob``.
 
         Server **不**重组 blob，按 ``computer`` 逐 ack 透传（与 async 一致）.
@@ -529,10 +794,22 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         return cast(
             "GetBlobRet | ErrorPayload",
-            self._relay_client_call(sid, data, GET_BLOB_EVENT, TypeAdapter(GetBlobRet)),
+            self._relay_client_call(sid, data, _extra, GET_BLOB_EVENT, TypeAdapter(GetBlobReq), TypeAdapter(GetBlobRet)),
         )
 
-    def on_client_put_blob(self, sid: str, data: PutBlobReq) -> PutBlobRet | ErrorPayload:
+    def on_client_resolve_path(self, sid: str, data: ResolvePathReq | None = None, *_extra: Any) -> ResolvePathRet | ErrorPayload:
+        """同步：透明转发 ``client:resolve_path`` / Sync relay of ``client:resolve_path``.
+
+        协议依据 / Protocol: events.md §client:resolve_path；blob-transfer.md §生产者三：按路径读取.
+        Server 不解释路径、不铸造句柄，flat ``4020`` 原样回传（与 async 一致）.
+        Server never interprets paths or mints handles; flat 4020 is relayed verbatim.
+        """
+        return cast(
+            "ResolvePathRet | ErrorPayload",
+            self._relay_client_call(sid, data, _extra, RESOLVE_PATH_EVENT, TypeAdapter(ResolvePathReq), TypeAdapter(ResolvePathRet)),
+        )
+
+    def on_client_put_blob(self, sid: str, data: PutBlobReq | None = None, *_extra: Any) -> PutBlobRet | ErrorPayload:
         """同步：透明转发 ``client:put_blob`` / Sync relay of ``client:put_blob`` (v0.4.0 #196).
 
         Server **不**缓冲 / 重组，按 ``computer`` 逐 ack 透传（与 async 一致）.
@@ -540,10 +817,10 @@ class SyncSMCPNamespace(SyncBaseNamespace):
         """
         return cast(
             "PutBlobRet | ErrorPayload",
-            self._relay_client_call(sid, data, PUT_BLOB_EVENT, TypeAdapter(PutBlobRet)),
+            self._relay_client_call(sid, data, _extra, PUT_BLOB_EVENT, TypeAdapter(PutBlobReq), TypeAdapter(PutBlobRet)),
         )
 
-    def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq) -> None:
+    def on_server_update_desktop(self, sid: str, data: UpdateComputerConfigReq | None = None, *_extra: Any) -> None:
         """
         同步：将事件广播至对应的房间内其他参与者，通知桌面刷新
         Sync: broadcast to others in the room to notify desktop update
@@ -552,79 +829,82 @@ class SyncSMCPNamespace(SyncBaseNamespace):
             sid (str): 发起者ID，应为Computer / Initiator ID, should be Computer
             data (UpdateComputerConfigReq): 载荷复用 UpdateConfigReq，仅需 computer 标识
         """
-        session = self.get_session(sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持Computer上报桌面刷新")
+        self._broadcast_computer_update(sid, data, _extra, UPDATE_DESKTOP_EVENT, UPDATE_DESKTOP_NOTIFICATION)
 
-        update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
-        self.emit(
-            UPDATE_DESKTOP_NOTIFICATION,
-            {"computer": update_req["computer"]},
-            room=session.get("office_id"),
-            skip_sid=sid,
-        )
-
-    def on_server_update_skills(self, sid: str, data: UpdateComputerConfigReq) -> None:
+    def on_server_update_skills(self, sid: str, data: UpdateComputerConfigReq | None = None, *_extra: Any) -> None:
         """同步：``server:update_skills`` → ``notify:update_skills`` 广播.
 
         Sync mirror of ``on_server_update_skills``; broadcasts SKILL set change to office.
         协议依据 / Protocol: events.md §server:update_skills / §notify:update_skills.
         """
-        session = self.get_session(sid)
-        if session["role"] != "computer":
-            raise SMCPNamespaceError("目前仅支持 Computer 上报 SKILL 变更 / only Computers may emit update_skills")
+        self._broadcast_computer_update(sid, data, _extra, UPDATE_SKILLS_EVENT, UPDATE_SKILLS_NOTIFICATION)
 
-        update_req = TypeAdapter(UpdateComputerConfigReq).validate_python(data)
-        self.emit(
-            UPDATE_SKILLS_NOTIFICATION,
-            {"computer": update_req["computer"]},
-            room=session.get("office_id"),
-            skip_sid=sid,
-        )
-
-    def on_server_list_room(self, sid: str, data: ListRoomReq) -> ListRoomRet:
+    def on_server_list_room(
+        self, sid: str, data: ListRoomReq | None = None, *_extra: Any
+    ) -> ListRoomRet | ErrorPayload:
         """
         同步：列出指定房间内的所有会话信息。Agent可以通过此事件查询房间内的所有Computer和Agent。
         Sync: List all sessions in the specified room. Agent can query all Computers and Agents in the room via this event.
+
+        #214 ack 形态（镜像 async）：**成功**回 ``ListRoomRet``；失败回 flat ``ErrorPayload``——
+        ``400``（载荷畸形）/ ``4103``（会话无房）/ ``4104``（显式点名他房）。**不再**静默不 ack。
+        Ack shape per #214 — mirrors the async implementation.
+
+        **参数绑定也必须回 ack**：``data`` 具默认值、``*_extra`` 吸收多余位置参数 ⇒ 二者都落到
+        schema 校验 ⇒ ``400``。
 
         Args:
             sid (str): 发起者ID，一般是Agent / Initiator ID, usually Agent
             data (ListRoomReq): 列出房间请求数据，包含office_id和req_id / List room request data with office_id and req_id
 
         Returns:
-            ListRoomRet: 房间内所有会话信息列表 / List of all session info in the room
+            ListRoomRet | ErrorPayload: 房间内所有会话信息列表，或 flat ErrorPayload
+                                       / List of all session info in the room, or a flat ErrorPayload
         """
-        # 验证请求数据 / Validate request data
-        list_room_req = TypeAdapter(ListRoomReq).validate_python(data)
+        # 验证请求数据：具备 ack 通道 ⇒ 校验失败 MUST 回 400（error-handling.md:102-106）
+        list_room_req = parse_payload("server:list_room", TypeAdapter(ListRoomReq), data, _extra, sid)
+        if list_room_req is None:
+            return build_bad_request_error()
         office_id = list_room_req["office_id"]
         req_id = list_room_req["req_id"]
 
-        # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission: ensure Agent is in the requested room
-        agent_session = self.get_session(sid)
-        if agent_session is None:
-            # 发起者飞行中断连防御（同 _relay_client_call）：显式 raise 替代 None.get 的 AttributeError。
-            raise SMCPNamespaceError("发起者会话不存在（可能已断连）：server:list_room / originator session gone")
-        agent_office_id = agent_session.get("office_id")
+        try:
+            # 验证发起者权限：确保Agent在请求的房间内 / Verify initiator permission
+            agent_session = self.get_session(sid)
+            if agent_session is None:
+                # **防御性死分支**：实测 socketio 的 ``get_session`` 对未知 sid 抛
+                # ``KeyError('Session not found')`` 而**不返回 None**（由下方 catch-all 收编为 500）。
+                # Defensive dead branch: the real "originator gone" path raises KeyError.
+                raise SMCPNamespaceError(
+                    "发起者会话不存在（可能已断连）：server:list_room / originator session gone",
+                )
+            agent_office_id = agent_session.get("office_id")
 
-        if agent_office_id != office_id:
-            raise SMCPNamespaceError(f"Agent只能查询自己所在房间的会话信息。Agent office: {agent_office_id}, requested: {office_id}")
+            if not agent_office_id:
+                # 无房 ⇒ 4103（会话自身无房可报，故无 code-specific details）
+                logger.warning(f"server:list_room 无房 sid={sid}, requested={office_id!r}")
+                return build_room_rejection_error(ErrorCode.NOT_IN_ROOM)
 
-        # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
-        all_sessions = get_all_sessions_in_office(office_id, self.server)
+            if agent_office_id != office_id:
+                # 显式点名他房 ⇒ 4104，且**不泄露**目标房的存在性或成员信息（§Cross Room Access 不变量）
+                logger.warning(
+                    f"server:list_room 跨房越权 sid={sid}: session={agent_office_id!r} requested={office_id!r}",
+                )
+                return build_room_rejection_error(ErrorCode.CROSS_ROOM_ACCESS, target_office_id=office_id)
 
-        # 转换为SessionInfo格式 / Convert to SessionInfo format
-        sessions: list[SessionInfo] = []
-        for session in all_sessions:
-            if session.get("role") in ["computer", "agent"]:
-                session_info: SessionInfo = {
-                    "sid": session.get("sid", ""),
-                    "name": session.get("name", ""),
-                    "role": session["role"],
-                    "office_id": session.get("office_id", ""),
-                }
-                # a2c_version 为 NotRequired：仅在握手时记录到则带出 / NotRequired: include only if recorded at handshake
-                if session.get("a2c_version"):
-                    session_info["a2c_version"] = session["a2c_version"]
-                sessions.append(session_info)
+            # 使用工具函数获取房间内所有会话信息 / Use utility function to get all session info in the room
+            all_sessions = get_all_sessions_in_office(office_id, self.server)
 
-        return ListRoomRet(sessions=sessions, req_id=req_id)
+            # 转换为 SessionInfo 格式（投影与 async 共用，protocol#64）
+            # Project sessions via the shared helper.
+            sessions: list[SessionInfo] = []
+            for session in all_sessions:
+                session_info = project_session_info(session, self._sid_identity)
+                if session_info is not None:
+                    sessions.append(session_info)
+
+            return ListRoomRet(sessions=sessions, req_id=req_id)
+        except Exception as e:
+            # 与 join / leave 对称的 catch-all：有 ack 通道 ⇒ 失败必须产出 ack（error-handling.md:102-106）
+            logger.error(f"server:list_room 未预期异常 sid={sid}: {e}", exc_info=True)
+            return build_internal_error()
