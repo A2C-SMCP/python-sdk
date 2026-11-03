@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.mcp_clients import manager as manager_mod
+from a2c_smcp.computer.mcp_clients.auth_error import UpstreamRedirectStoppedError
 from a2c_smcp.computer.mcp_clients.base_client import STATES
 from a2c_smcp.computer.mcp_clients.http_client import AuthSignal
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
@@ -233,7 +234,7 @@ async def test_bounded_connect_discards_client_on_redirect_stop() -> None:
     manager = _manager()
     stopped = _FakeHttpClient(redirect_stop=302)
 
-    with pytest.raises(Exception):  # noqa: B017 - 具体类型由 #181 的 typed error 决定
+    with pytest.raises(UpstreamRedirectStoppedError):
         await manager._bounded_connect(stopped)  # type: ignore[arg-type]
 
     assert stopped.adiscard.await_count == 1
