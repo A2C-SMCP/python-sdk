@@ -272,24 +272,31 @@ def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | 
 
     为什么必须前置：uninstall 的顺序是「删树 → 注销 skill → 摘 server → 删账本 → 写意图」。若意图写在**最后**
     才因目标键畸形 fail-closed，此时安装已被不可逆删除，而重试又会因账本已空走 no-op——**永远清不干净**。
-    故在任何删除之前把 `installedPlugins`（数组）/ `enabledPlugins`（对象）的形状验一遍：畸形即
-    :class:`PluginInstallError` 且**零副作用**。
+    故在任何删除之前把**本次真的会写**的目标键形状验一遍：畸形即 :class:`PluginInstallError` 且**零副作用**。
 
-    :raises PluginInstallError: 任一待写文件的目板键畸形 / corrupt / 根非对象。
+    **检查范围按层收窄**（勿放宽）：``_write_installed_plugin`` 只写 **user** 层，project/local 只经
+    :func:`_write_enabled_plugin` 写 ``enabledPlugins``。project/local 里的 ``installedPlugins`` 残留声明是
+    只读诊断面（``prune_plugin_intent`` 只 WARN、**绝不改写**），拿它来挡 uninstall 属误伤——与本操作无关的
+    畸形字段不该阻塞删除。
+
+    :raises PluginInstallError: 任一**待写**目标键畸形 / 文件 corrupt / 根非对象。
     """
-    checks: list[tuple[Path, str]] = [(user_settings_path(env), "user")]
+    checks: list[tuple[Path, tuple[str, ...]]] = [(user_settings_path(env), ("installedPlugins", "enabledPlugins"))]
     targets = {str(Path(p)) for p in project_paths if p}
     targets.add(str(Path.cwd()))
     for project_path in sorted(targets):
         for s in ("project", "local"):
             layer_path, _layer_scope = _settings_path_for_scope(s, project_path, env)
             if layer_path.exists():  # 与清理同款存在性守卫：不存在的层不会被写
-                checks.append((layer_path, s))
+                checks.append((layer_path, ("enabledPlugins",)))
     try:
-        for check_path, _check_scope in checks:
+        for check_path, keys in checks:
             existing = read_raw_object(check_path) or {}
-            mapping_field_or_empty(existing, "enabledPlugins", path=check_path)
-            list_field_or_empty(existing, "installedPlugins", path=check_path)
+            for key in keys:
+                if key == "installedPlugins":
+                    list_field_or_empty(existing, key, path=check_path)
+                else:
+                    mapping_field_or_empty(existing, key, path=check_path)
     except SettingsFileCorruptError as e:
         raise PluginInstallError(str(e)) from e
 

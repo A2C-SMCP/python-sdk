@@ -776,9 +776,12 @@ def test_upsert_mcp_server_rejects_null_servers(tmp_path: Path, monkeypatch: pyt
 
 
 class _StubRegistry:
-    """uninstall/disable 在触发预检前不需要真实 registry（先于任何 skill 注销）。"""
+    """最小 registry 替身：无活跃 skill（预检阶段不需要真实 registry）。"""
 
-    def unregister(self, name: str) -> None:  # pragma: no cover - 预检失败时不可达
+    def active_refs(self) -> list[dict]:
+        return []
+
+    def unregister(self, name: str) -> None:  # pragma: no cover - 无活跃 ref 时不可达
         raise AssertionError(f"unregister({name!r}) must not be reached")
 
 
@@ -804,6 +807,44 @@ async def test_uninstall_precheck_fails_closed_before_destructive_steps(tmp_path
 
     assert installed_tree.exists(), "预检失败不得删安装树"
     assert "a@mp" in _read_json(home / "installed_plugins.json")["plugins"], "预检失败不得删账本"
+
+
+@pytest.mark.asyncio
+async def test_uninstall_not_blocked_by_project_installed_plugins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """预检范围收窄（正对照）：project/local 的 ``installedPlugins`` 是**只读诊断面**，畸形/``null`` 不得阻塞卸载。
+
+    uninstall 只写 user 层的 ``installedPlugins``；拿 project 里一个与本操作无关的畸形字段来挡删除属误伤。
+    """
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / "skill-home"
+    installed_tree = home / "tree"  # 须在 SKILL Home 内，否则 `_safe_rmtree` 的越界守卫会拒删
+    installed_tree.mkdir(parents=True)
+    _seed_plugin(home, "a@mp", installed_tree)
+    _write_json(_project_settings(tmp_path), {"installedPlugins": None})
+
+    assert await uninstall_plugin("a@mp", _StubRegistry(), home, non_plugin_bundle_ids=set, env=env) is True
+    assert not installed_tree.exists(), "卸载应正常完成（project 的 installedPlugins 不阻塞）"
+
+
+@pytest.mark.asyncio
+async def test_uninstall_blocked_by_project_enabled_plugins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """预检范围收窄（负对照）：project 的 ``enabledPlugins`` **是要写的**，``null`` → 零副作用拒绝。"""
+    env = _env(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / "skill-home"
+    installed_tree = home / "tree"
+    installed_tree.mkdir(parents=True)
+    _seed_plugin(home, "a@mp", installed_tree)
+    project_path = _project_settings(tmp_path)
+    _write_json(project_path, {"enabledPlugins": None})
+    before = project_path.read_text(encoding="utf-8")
+
+    with pytest.raises(PluginInstallError):
+        await uninstall_plugin("a@mp", _StubRegistry(), home, non_plugin_bundle_ids=set, env=env)
+
+    assert installed_tree.exists(), "预检失败不得删安装树"
+    assert project_path.read_text(encoding="utf-8") == before
 
 
 @pytest.mark.asyncio
