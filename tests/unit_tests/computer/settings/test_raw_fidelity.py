@@ -775,6 +775,119 @@ def test_upsert_mcp_server_rejects_null_servers(tmp_path: Path, monkeypatch: pyt
     assert path.read_text(encoding="utf-8") == before
 
 
+def test_upsert_mcp_server_rejects_null_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🟡2 独立用例：只把 `inputs` 置 null（`servers` 合法），确保守的是 `inputs` 而非被 `servers: null` 短路。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = wd / ".tfrobot" / "mcp.json"
+    _write_json(path, {"servers": {}, "inputs": None, "keep": 1})
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(McpConfigCorruptError):
+        upsert_mcp_server("figma", _stdio(), scope=McpWriteScope.PROJECT, env=env, cwd=wd)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_remove_mcp_server_skips_scope_with_null_inputs_but_clears_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🟡1 回归：写段的 `McpConfigCorruptError` 必须被**按 scope** 吞成 WARN，不得穿出跨 scope 循环。
+
+    场景：project 的 `inputs: null`（`load_mcp_config_file` 当缺失、**不**报错 → 不进 errors 分支）→ 写段才抛；
+    若不在循环内捕获，`Computer.aremove_server`（未声明该异常）整条失败、后续 scope 一个都不处理。
+    """
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    project_mcp = wd / ".tfrobot" / "mcp.json"
+    _write_json(project_mcp, {"servers": {"figma": _stdio()}, "inputs": None})
+    before = project_mcp.read_text(encoding="utf-8")
+    user_mcp = tmp_path / "cfg" / "a2c" / "mcp.json"
+    _write_json(user_mcp, {"servers": {"figma": _stdio()}, "inputs": []})
+
+    assert remove_mcp_server("figma", env=env, cwd=wd) is True  # 不抛；健康 scope 照清
+
+    assert project_mcp.read_text(encoding="utf-8") == before  # 损坏 scope 原样保留
+    assert _read_json(user_mcp)["servers"] == {}
+
+
+def test_write_installed_plugin_preserves_non_string_entries(tmp_path: Path) -> None:
+    """首轮声称已覆盖但实际未测：数组内非字符串元素必须逐字保留（过去 `isinstance` 过滤会丢弃）。"""
+    env = _env(tmp_path)
+    path = _user_settings(env)
+    _write_json(path, {"installedPlugins": ["keep@mp", 7]})
+
+    _write_installed_plugin("new@mp", True, env)
+
+    assert _read_json(path)["installedPlugins"] == ["keep@mp", 7, "new@mp"]
+
+
+def test_settings_set_project_read_roots_text_branch_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🟡11 非 `--json` 分支：stdout 说 ignored、stderr 说 NOT written（删掉 console_err 调用即红）。"""
+    env, wd = _env(tmp_path), tmp_path
+    monkeypatch.chdir(wd)
+    path = _project_settings(wd)
+    _write_json(path, {"theme": "light"})
+    before = path.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    assert settings_cmd.settings_set(tmp_path, env, "readRoots", '["/new"]', scope="project") == 0
+
+    captured = capsys.readouterr()
+    assert "ignored" in captured.out
+    assert "NOT written" in captured.err
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_marketplace_add_fails_closed_on_corrupt_settings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🔴A 链条：user settings corrupt → `marketplace add` 返回 1 且**不 clone**（trust 是前置条件）。"""
+    import asyncio
+
+    env = _env(tmp_path)
+    home = tmp_path / "skill-home"
+    home.mkdir()
+    path = _user_settings(env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ broken", encoding="utf-8")
+    capsys.readouterr()
+
+    code = asyncio.run(
+        marketplace_cmd.marketplace_add(
+            _StubRegistry(), home, env, "https://github.com/acme/mp.git", trust=True, json_output=True  # type: ignore[arg-type]
+        )
+    )
+
+    assert code == 1
+    assert not (home / "known_marketplaces.json").exists(), "trust 写失败不得继续 clone/登记"
+
+
+def test_marketplace_remove_completes_with_warn_when_revoke_trust_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """🔴A 另一面：`_revoke_trust` 抛错时移除**已完成**，只 WARN、不翻成失败。"""
+    import asyncio
+
+    env = _env(tmp_path)
+    home = tmp_path / "skill-home"
+    _write_json(
+        home / "known_marketplaces.json",
+        {"version": 1, "marketplaces": {"mp": {"source": {"type": "git", "url": "u"}, "installLocation": ""}}},
+    )
+    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: 0)
+    _write_json(_user_settings(env), {"trustedMarketplaces": "not-an-array"})  # 让 _revoke_trust 抛
+    capsys.readouterr()
+
+    code = asyncio.run(
+        marketplace_cmd.marketplace_remove(_StubRegistry(), home, env, "mp", json_output=True)  # type: ignore[arg-type]
+    )
+
+    assert code == 0, "移除已完成，revoke 失败只降级 WARN"
+    assert "failed to revoke" in capsys.readouterr().err
+
+
 class _StubRegistry:
     """最小 registry 替身：无活跃 skill（预检阶段不需要真实 registry）。"""
 

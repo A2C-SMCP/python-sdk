@@ -804,15 +804,24 @@ def remove_mcp_server(name: str, *, env: Mapping[str, str] | None = None, cwd: P
         if not path.exists():
             continue  # 该 scope 无 mcp.json → 无可删，不创建 .lock/目录、不触碰 / skip untouched.
         settings_scope = _WRITE_SCOPE_TO_SETTINGS[wscope]
-        with file_lock(path):
-            data, errors = load_mcp_config_file(path, settings_scope)
-            if errors:
-                # 结构损坏 → 跳过、不重写（保住既有内容）；best-effort 跨 scope 清理容忍局部不彻底。
-                logger.warning("MCP config %s corrupt, skipped during remove of %r (kept on disk)", path, name)
-                continue
-            if name not in data["servers"]:
-                continue  # 该 scope 未声明 → no-op（不重写、不 normalize）/ not declared here → no-op.
-            servers = {k: v for k, v in data["servers"].items() if k != name}
-            _write_servers_map(path, servers, data["inputs"])
-            removed = True
+        # 「损坏 scope 跳过 + WARN」的 best-effort 契约必须覆盖**写段**，不只读段（#246 复审 🟡1）：
+        # `inputs: null` / `servers: null` 在 `load_mcp_config_file` 里被当**缺失**（不报错，故不进上面的
+        # errors 分支），到 `_write_servers_map` 的形状守卫才抛 `McpConfigCorruptError`——不在此按 scope 捕获的话
+        # 异常会穿出跨 scope 循环，`Computer.aremove_server` 没有声明它，整条 `server rm` 失败且后续 scope 不处理。
+        try:
+            with file_lock(path):
+                data, errors = load_mcp_config_file(path, settings_scope)
+                if errors:
+                    # 结构损坏 → 跳过、不重写（保住既有内容）；best-effort 跨 scope 清理容忍局部不彻底。
+                    logger.warning("MCP config %s corrupt, skipped during remove of %r (kept on disk)", path, name)
+                    continue
+                if name not in data["servers"]:
+                    continue  # 该 scope 未声明 → no-op（不重写、不 normalize）/ not declared here → no-op.
+                servers = {k: v for k, v in data["servers"].items() if k != name}
+                _write_servers_map(path, servers, data["inputs"])
+                removed = True
+        except McpConfigCorruptError as e:
+            # 与上面 load-errors 分支同姿态：WARN + continue，保住原文件、继续其余 scope。
+            logger.warning("MCP config %s unwritable, skipped during remove of %r (kept on disk): %s", path, name, e)
+            continue
     return removed
