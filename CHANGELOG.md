@@ -411,6 +411,21 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 新增子进程回归锁（阻断 rich / prompt_toolkit）与 `clean_install_smoke.sh none` 制品级闸门（CI 双跑）。
   - 注：`a2c-computer` 命令行入口本身仍需要 `a2c-smcp[cli]`（typer）。
 
+## [0.4.2] - 2026-09-29
+
+### Fixed
+- **动态 MCP 资源通知阻塞工具调用及列表刷新**（#227，回补 #210）：将窗口 / Skills 资源查询移出
+  MCP 接收循环，避免同一会话重入死锁。列表变化与内容更新分开合并，保留在途新通知，并在后台任务捕获异常时保留待处理动作；
+  未绑定 Socket.IO 客户端时仍更新本地资源状态。停机及启动失败时取消并等待后台刷新，重启后恢复通知处理。
+  保持 0.4.x 的工具查询行为及 `PROTOCOL_VERSION=0.4.0`，不引入 0.5.0 的协议和工具投影改动。
+
+## [0.4.1] - 2026-09-28
+
+### Fixed
+- **Computer CLI 启动缺少 `yaml` 模块**（#224）：将 PyYAML 声明为核心运行时依赖，确保安装
+  `a2c-smcp[cli]` 后可正常导入 Computer、解析 Skills YAML 元数据及执行 `a2c-computer --help`。
+  新增独立 wheel 安装 CI 检查，避免开发依赖间接安装 PyYAML 掩盖缺失声明。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

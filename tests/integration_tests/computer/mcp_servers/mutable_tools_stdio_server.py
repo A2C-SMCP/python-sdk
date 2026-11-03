@@ -16,7 +16,11 @@
 
   由此可用一个真实 MCP 子进程驱动「新增 / 同名换 schema / 移除」三类运行期工具变化，且**不伴随任何
   config 变更**（纯 tools/list_changed），用于验证 #127 的全链路刷新。
+  #227 可选 --resource-notifications：同时在工具响应前发送资源通知，验证接收回调不会重入死锁。
 """
+
+import argparse
+from pathlib import Path
 
 import anyio
 import mcp.types as types
@@ -58,11 +62,43 @@ def _tools_for_phase(phase: int) -> list[types.Tool]:
 
 async def run() -> None:
     """中文: 启动服务器 / 英文: Start the server."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resource-notifications", choices=["unbound", "list", "content"])
+    parser.add_argument("--skill-dir", type=Path)
+    options = parser.parse_args()
+
+    def write_skill(phase: int) -> None:
+        options.skill_dir.mkdir(parents=True, exist_ok=True)
+        (options.skill_dir / "SKILL.md").write_text(
+            f"---\nname: demo\ndescription: phase {phase}\n---\n# Demo phase {phase}\n",
+            encoding="utf-8",
+        )
+
+    if options.resource_notifications:
+        write_skill(0)
+
     server = Server(name="mutable-tools-server", version="0.0.1", instructions="itest-mutable-tools")
 
     @server.list_tools()
     async def handle_list_tools() -> list[types.Tool]:
         return _tools_for_phase(_state["phase"])
+
+    if options.resource_notifications:
+
+        @server.list_resources()
+        async def handle_list_resources() -> list[types.Resource]:
+            resources: list[types.Resource] = []
+            if _state["phase"] or options.resource_notifications == "content":
+                resources.append(
+                    types.Resource(
+                        uri="skill://mutable-srv/demo",
+                        name="demo",
+                        _meta={"source": "mounted", "mount_dir": str(options.skill_dir)},
+                    )
+                )
+            if _state["phase"]:
+                resources.append(types.Resource(uri="window://dynamic", name="dynamic"))
+            return resources
 
     @server.call_tool()
     async def handle_call_tool(name: str, arguments: dict | None):
@@ -72,12 +108,20 @@ async def run() -> None:
             # 运行期改变工具集后立即广播列表变更（纯 tools/list_changed，不伴随 config 变更）
             # Broadcast list-changed right after mutating the tool set (pure tools/list_changed, no config change)
             await ctx.session.send_tool_list_changed()
+            if options.resource_notifications:
+                write_skill(_state["phase"])
+                if options.resource_notifications == "content":
+                    await ctx.session.send_resource_updated(types.AnyUrl("skill://mutable-srv/demo"))
+                else:
+                    await ctx.session.send_resource_list_changed()
             return [types.TextContent(type="text", text=f"phase={_state['phase']}")]
+        if name == "dynamic_tool" and _state["phase"] in (1, 2):
+            return [types.TextContent(type="text", text=f"dynamic phase={_state['phase']}")]
         return [types.TextContent(type="text", text=f"unknown tool: {name}")]
 
     async with stdio_server() as (read_stream, write_stream):
         init_opts = server.create_initialization_options(
-            notification_options=NotificationOptions(tools_changed=True),
+            notification_options=NotificationOptions(tools_changed=True, resources_changed=bool(options.resource_notifications)),
         )
         await server.run(read_stream, write_stream, init_opts)
 
