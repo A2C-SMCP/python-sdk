@@ -43,6 +43,9 @@ class MockMCPClient:
         call_ret.meta = ret_meta
         self.call_tool = AsyncMock(return_value=call_ret)
         self.state = "connected"
+
+        # #252：manager 的可用性判据改用 ``is_session_usable``（state 单独不足以证明可用）。
+        self.is_session_usable = True
         # #179：connect-phase challenge 事件（bounded connect 竞速的 mock 面）。
         # 永不触发 → manager 的竞速以 aconnect 完成收尾（mock 语义 = 匿名连通）。
         self._challenge_event: asyncio.Event | None = None

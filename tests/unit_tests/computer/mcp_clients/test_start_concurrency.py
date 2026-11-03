@@ -120,6 +120,11 @@ class ControlledMCPClient:
         self.call_tool = AsyncMock()
         self._challenge_event: asyncio.Event | None = None
 
+    @property
+    def is_session_usable(self) -> bool:
+        """#252：manager 的可用性判据。"""
+        return self.state == "connected"
+
     async def aconnect(self) -> None:
         await self._control.on_enter()
 

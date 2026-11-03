@@ -287,6 +287,30 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         return cast(ClientSession, self._async_session)
 
     @property
+    def is_session_usable(self) -> bool:
+        """本 client 当前是否**真的**可用——manager 提交与缓存复用的唯一判据（#252）。
+
+        中文: ``state == connected`` **不足以**证明可用：
+          - transitions 在进入 ``on_enter_connected`` **之前**就把状态置为 ``connected``（握手窗口内
+            状态恒为 connected）；
+          - 传输在 ``initialize()`` 返回后立即死亡时，keep-alive 的 ``finally`` 已清空 ``_async_session``，
+            而收敛任务必须**等在途的 aconnect 结束**才能把状态推到 ``error``（否则 transitions 会把
+            aerror 重新抛出，见 ``_aconverge_unexpected_exit``）。
+        故「aconnect 正常返回」时完全可能是 `connected + 无会话 + keep-alive 已死`——必须同时要求
+        有会话、且 keep-alive 任务存在且未结束。
+        English: `state == connected` alone is not proof of usability (the state is set before the
+        handshake, and teardown clears the session before convergence can move the machine); require
+        a live session and a live keep-alive task too.
+        """
+        task = self._session_keep_alive_task
+        return (
+            self.state == STATES.connected
+            and self._async_session is not None
+            and task is not None
+            and not task.done()
+        )
+
+    @property
     def initialize_result(self) -> InitializeResult | None:
         """
         初始化结果只读访问（可能为None，表示未初始化或已清理）
@@ -1068,13 +1092,26 @@ class BaseMCPClient(ABC, Generic[ParamsT]):
         manager; deliberately state-machine-free (a discarded client's terminal state is meaningless,
         and `adisconnect` from a half-broken / connecting client raises or races in-flight transitions).
         """
+        # ⚠️ 必须连 ``BaseExceptionGroup`` 一起拦：anyio 的拆除期聚合可能包含 ``CancelledError``，
+        # 此时抛的是 ``BaseExceptionGroup``（``except Exception`` 不拦）。放它逃逸会**顶替 finally
+        # 中正在传播的主异常**——上游据此分类的重定向 stop / 超时会被换成裸 group，``_aspawn_client``
+        # 的分类臂失配（不写 ERROR），``clear_oauth`` 的 ``suppress`` 也拦不住。本方法的契约是
+        # 「除 CancelledError 外不抛」。
+        # Must also swallow BaseExceptionGroup (anyio teardown may aggregate CancelledError): letting it
+        # escape would replace the primary exception in flight and break upstream classification.
         try:
-            await self._close_task()
-        except Exception:
-            logger.warning("Discarding an uncommitted MCP client failed during teardown", exc_info=True)
-        # ``_close_task`` 在「任务已结束 / 从未创建」时早退，不覆盖「子进程已在、任务没起来」的窄路径；
-        # 强杀是 best-effort 且无子进程时 no-op。/ Covers the narrow "child spawned but task never ran" path.
-        await self._aforce_kill()
+            try:
+                await self._close_task()
+            except (Exception, BaseExceptionGroup):
+                logger.warning("Discarding an uncommitted MCP client failed during teardown", exc_info=True)
+        finally:
+            # ``_close_task`` 在「任务已结束 / 从未创建」时早退，不覆盖「子进程已在、任务没起来」的窄路径；
+            # 强杀是 best-effort 且无子进程时 no-op。/ Covers "child spawned but task never ran".
+            await self._aforce_kill()
+            # 弃置对象不会再被强杀：清空 PID 集，防止同一对象将来被复用时按陈旧 PID 误杀（PID 复用）。
+            # The discarded client is never force-killed again — drop the PID set so a future PID reuse
+            # can never make it kill an unrelated process.
+            self._child_pids.clear()
 
     async def _aforce_kill(self) -> None:
         """兑底强杀本 client 启动的子进程树（仅 stdio 传输有子进程；其它传输为 no-op）。

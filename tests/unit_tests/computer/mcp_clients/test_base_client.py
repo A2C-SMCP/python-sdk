@@ -1416,3 +1416,70 @@ async def test_adiscard_is_noop_for_never_connected_client() -> None:
     assert client.state == STATES.initialized
     assert client._async_session is None
     assert client._session_keep_alive_task is None
+
+
+@pytest.mark.asyncio
+async def test_is_session_usable_requires_live_session_and_task() -> None:
+    """#252 🔴：可用性 = connected ∧ 有会话 ∧ keep-alive 存活——只看 state 抓不住半断开。
+
+    中文: 传输在 ``initialize()`` 返回后立即死亡时，keep-alive 的 finally 已清空会话，而收敛任务
+    要等在途的 ``aconnect`` 结束才能把状态翻成 ``error`` ⇒ `connected + 无会话` 是**真实可达**形态。
+    """
+    client = InitializeResultTestClient(DummyParams())
+    assert not client.is_session_usable, "未连接时不可用"
+
+    await client.aconnect()
+    try:
+        assert client.is_session_usable, "连通后必须可用"
+        # 半断开：状态仍是 connected，但会话已被清空
+        session = client._async_session
+        client._async_session = None
+        assert client.state == STATES.connected, "前置：state 仍是 connected（守卫失明的关键）"
+        assert not client.is_session_usable, "connected + 无会话 ⇒ 不可用"
+        # keep-alive 已结束同样不可用
+        client._async_session = session
+        client._session_keep_alive_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(asyncio.shield(client._session_keep_alive_task), timeout=2.0)
+        assert not client.is_session_usable, "keep-alive 已结束 ⇒ 不可用"
+    finally:
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(client.adisconnect(), timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_signal_is_not_cleared_in_task_body() -> None:
+    """#252 ③ 机制锁：任务体内**不得**再 clear 关闭信号。
+
+    中文: 旧实现在 ``_keep_alive_task`` 首行 ``self._close_event.clear()``。若把换代保留、只在任务体
+    加回 clear，代际用例仍会绿——本用例直接构造「任务创建后立刻收到关闭信号」：带 clear 的实现会
+    把信号抹掉并永久等待（超时），无 clear 的实现立即收尾。
+    """
+    client = InitializeResultTestClient(DummyParams())
+    close_event = asyncio.Event()
+    client._close_event = close_event
+    close_event.set()  # 任务创建后、首次调度前就已到达的关闭信号
+
+    task = asyncio.create_task(client._keep_alive_task(close_event))
+    client._session_keep_alive_task = task
+
+    await asyncio.wait_for(task, timeout=1.0)  # 带 clear 的实现在此超时
+    assert task.done() and not task.cancelled()
+    assert client._async_session is None, "收尾必须清空会话"
+
+
+@pytest.mark.asyncio
+async def test_adiscard_swallows_base_exception_group() -> None:
+    """#252 🔴：拆除期 anyio 聚合出的 ``BaseExceptionGroup`` 不得从 ``adiscard`` 逃逸。
+
+    中文: anyio 的拆除期聚合可能含 ``CancelledError`` ⇒ 抛 ``BaseExceptionGroup``（``except
+    Exception`` 不拦）。放它逃逸会顶替 ``finally`` 中正在传播的主异常，破坏上游的 typed 分类。
+    """
+    client = InitializeResultTestClient(DummyParams())
+
+    async def _explode() -> None:
+        raise BaseExceptionGroup("teardown", [asyncio.CancelledError()])
+
+    client._close_task = _explode  # type: ignore[method-assign]
+
+    await asyncio.wait_for(client.adiscard(), timeout=2.0)  # 不得抛出

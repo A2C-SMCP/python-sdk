@@ -20,7 +20,7 @@ from a2c_smcp.computer.mcp_clients.auth_error import (
     build_auth_error_result,
     classify_auth_error,
 )
-from a2c_smcp.computer.mcp_clients.base_client import STATES, MCPServerNotFoundError
+from a2c_smcp.computer.mcp_clients.base_client import MCPServerNotFoundError
 from a2c_smcp.computer.mcp_clients.http_client import AuthSignal, HttpMCPClient
 from a2c_smcp.computer.mcp_clients.model import (
     A2C_TOOL_META,
@@ -283,7 +283,12 @@ def _client_session_usable(client: MCPClientProtocol | None) -> bool:
     connected」）——故签名放宽为 ``| None``：未注册的 bundle 一律判为不可用。
     / Since #252 this is also the commit precondition; ``None`` (no client) is never usable.
     """
-    return getattr(client, "state", None) == STATES.connected
+    if client is None:
+        return False
+    # ⚠️ 必须用 ``is_session_usable`` 而非 ``state``：#252 的审查实证——传输在 ``initialize()``
+    # 解析后立即死亡时，keep-alive 的 finally 已清空会话，而收敛任务要等在途的 ``aconnect`` 结束，
+    # 故 aconnect 正常返回那一刻状态**必然仍是 connected**；只看 state 的守卫是否生效取决于调度顺序。
+    return bool(client.is_session_usable)
 
 
 class MCPServerManager:
@@ -986,8 +991,10 @@ class MCPServerManager:
             )
             try:
                 signal = await self._bounded_connect(client)
-            except UpstreamRedirectStoppedError:
-                # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛
+            except (UpstreamRedirectStoppedError, TimeoutError, ConnectionError):
+                # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛。
+                # #252：``_bounded_connect`` 现在会真实上抛超时 / connect 失败（旧实现落到
+                # ``return None`` 被当成成功）——若不在此收敛，连接态会永久停在 CONNECTING。
                 self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
                 raise
             if signal is None:
@@ -1043,8 +1050,9 @@ class MCPServerManager:
                 )
                 try:
                     signal = await self._bounded_connect(client, coordinator)
-                except UpstreamRedirectStoppedError:
-                    # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛
+                except (UpstreamRedirectStoppedError, TimeoutError, ConnectionError):
+                    # #181：跨 origin redirect 被安全守卫 stop（非授权错误）——ERROR + 上抛。
+                    # #252：同匿名首连分支——超时 / connect 失败必须收敛连接态，不得停在 CONNECTING。
                     self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
                     raise
                 if signal is None:
@@ -1249,6 +1257,11 @@ class MCPServerManager:
 
             if challenge_wait in done:
                 signal = client.take_connect_challenge()
+                if signal is None:
+                    # #252：竞速任务先到却取不到信号载荷——不得当成「连接成功」返回 None：此时
+                    # finally 会把 client 弃置回收，返回 None 等于让调用方提交一个已回收的 client。
+                    # Signalled without a payload: never report success (the client gets discarded).
+                    raise ConnectionError("connect challenge signaled without a signal payload")
                 return signal
             if redirect_stop_wait in done:
                 # #181：安全守卫 stop 的跨 origin redirect——mcp 吞掉 3xx 异常致
@@ -1418,54 +1431,50 @@ class MCPServerManager:
                 # launch 等待者（fail_launch 同步原子免锁）+ epoch 守卫写 ERROR（同
                 # aborted 分支模式）。
                 status = client.take_connect_redirect_stop() or 0
-                async with self._lock:
-                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
-                        coordinator.fail_launch(
-                            OAuthError(
-                                OAuthErrorCode.Protocol,
-                                f"cross-origin redirect (HTTP {status}) stopped by "
-                                "same-origin guard during interactive OAuth flow",
-                            )
-                        )
-                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                await self._aconverge_oauth_launch_failure(
+                    bundle_id,
+                    coordinator,
+                    clear_epoch,
+                    launch_error=OAuthError(
+                        OAuthErrorCode.Protocol,
+                        f"cross-origin redirect (HTTP {status}) stopped by "
+                        "same-origin guard during interactive OAuth flow",
+                    ),
+                )
                 return
             if aborted_wait in done:
                 # flow 已终止/失败（cancel / expire / clear / complete-Terminated）：provider
                 # 流程死亡后 mcp 请求侧挂起（#133 实证）——取消之，防 connect 任务泄漏、
                 # 并让 done_callback 的 re-kick 能为终态后新 flow 续派发。
-                # epoch 比对与状态写**同锁内同步段**（复核 R1）：比对在锁外时，锁获取
-                # await 会给 clear 快速段（持久化 store 的 clear() 有让出点）留插入窗口，
-                # 使陈旧比对结论覆盖 committed 状态。锁内重读 epoch 恒反映最新。
-                async with self._lock:
-                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
-                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                # 本臂只收敛连接状态、不动 launch 等待者（``launch_error=None``）。
+                await self._aconverge_oauth_launch_failure(bundle_id, coordinator, clear_epoch, launch_error=None)
                 return
             if connect_task.cancelled():
-                return  # pragma: no cover — 防御分支
+                # #252：connect 被取消不等于「无事发生」——旧实现静默 return，launch 等待者会永久
+                # 悬挂、连接态停在 CONNECTING。按 connect-exception 同款锁内收敛。
+                await self._aconverge_oauth_launch_failure(
+                    bundle_id, coordinator, clear_epoch, launch_error=OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG)
+                )
+                return
             exc = connect_task.exception()
             if exc is not None:
-                # 同 aborted 分支：比对 + fail_launch + 状态写同锁内同步段（复核 R1）。
-                async with self._lock:
-                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
-                        coordinator.fail_launch(
-                            OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG)
-                        )
-                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                await self._aconverge_oauth_launch_failure(
+                    bundle_id, coordinator, clear_epoch, launch_error=OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG)
+                )
                 return
             try:
                 # #208：_commit_active_client **自取**状态锁（外层不得再包——asyncio.Lock 不可重入）
                 await self._commit_active_client(bundle_id, client, clear_epoch, config=config)
                 committed = True
             except ConnectionError as commit_exc:
-                # #252：半断开 client 被提交守卫拒绝（``state != connected``）。与 aborted / connect-
-                # exception 同款收敛：比对 + fail_launch + 状态写同锁内同步段。**不得**上抛——本任务
-                # 是 detached 的 fire-and-forget，异常会变成未回收任务异常。
-                # A dead client rejected by the commit guard: converge exactly like the aborted /
-                # connect-exception arms (never let a detached task carry an unretrieved exception).
-                async with self._lock:
-                    if self._oauth_clear_epochs.get(bundle_id, 0) == clear_epoch:
-                        coordinator.fail_launch(OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG))
-                        self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
+                # #252：半断开 client 被提交守卫拒绝。收敛走同一 helper（含「本 bundle 有可用活跃
+                # client 时不降级状态面」的判据）。**不得**上抛——本任务是 detached 的 fire-and-forget，
+                # 异常会变成未回收任务异常。
+                # A dead client rejected by the commit guard: converge via the shared helper (which
+                # mirrors the guard's "do not clobber a healthy active client" rule).
+                await self._aconverge_oauth_launch_failure(
+                    bundle_id, coordinator, clear_epoch, launch_error=OAuthError(OAuthErrorCode.Protocol, _OAUTH_REQUIRED_MSG)
+                )
                 logger.warning(
                     f"oauth connect task for bundle_id={bundle_id!r} rejected at commit: {commit_exc}",
                 )
@@ -1497,8 +1506,44 @@ class MCPServerManager:
             finally:
                 # #252：未提交者一律显式回收（含清理期被取消的形态）。已提交的 client 归 manager，
                 # 由 stop / remove / clear_oauth / aclose 的正规拆除路径处置，此处绝不插手。
-                if not committed:
+                # ⚠️ ``committed`` 只在 ``_commit_active_client`` **返回后**才置位，而登记发生在它的
+                # 锁内、其后的 ``_arefresh_tool_mapping`` 之前——若刷新期被取消，client 已进
+                # ``_active_clients`` 但 ``committed`` 仍为 False，仅凭 flag 会把 manager-owned client
+                # 拆掉。故以**实际登记**为准（两条件取合）。
+                # Registration happens inside the commit call, before the tool refresh; a cancellation
+                # during that refresh must not discard a manager-owned client.
+                if not committed and self._active_clients.get(bundle_id) is not cast(MCPClientProtocol, client):
                     await client.adiscard()
+
+    async def _aconverge_oauth_launch_failure(
+        self,
+        bundle_id: BUNDLE_ID,
+        coordinator: OAuthCoordinator,
+        clear_epoch: int,
+        *,
+        launch_error: OAuthError | None,
+    ) -> None:
+        """detached OAuth connect 的失败收敛——**单一权威**（#252，四臂共用，防复制粘贴漂移）。
+
+        中文: epoch 比对 + ``fail_launch`` + 状态写**同锁内同步段**（复核 R1）：比对在锁外时，
+        锁获取的 await 会给 clear 快速段留插入窗口，使陈旧比对结论覆盖已 committed 的状态。
+
+        - ``launch_error`` 非 None ⇒ 解 ``wait_launch`` 的等待者；None = 只收敛连接状态
+          （aborted 臂语义：flow 本身已终止，launch 由 flow 终态驱动）。
+        - 状态面**只在本 bundle 没有可用活跃 client 时**才降级为 ERROR——与
+          :meth:`_commit_active_client` 守卫同源判据：detached 提交与并发 start 交叉时，不得把
+          健康 client 报成 error。
+        English: single authority for the epoch-guarded failure convergence of the detached OAuth
+        connect; never clobbers a healthy active client's connection status.
+        """
+        async with self._lock:
+            if self._oauth_clear_epochs.get(bundle_id, 0) != clear_epoch:
+                # clear 快速段已过（epoch 失配）⇒ 状态面归 clear 所有，不得覆盖（隔离审查 🔴2）。
+                return
+            if launch_error is not None:
+                coordinator.fail_launch(launch_error)
+            if not _client_session_usable(self._active_clients.get(bundle_id)):
+                self._connection_states[bundle_id] = MCPServerConnectionState.ERROR
 
     async def _ensure_oauth_coordinator(self, bundle_id: BUNDLE_ID) -> OAuthCoordinator:
         """OAuthFlow.launch 入口：coordinator 存在即返回；否则跑一次 bounded connect 触发
@@ -1518,6 +1563,15 @@ class MCPServerManager:
         except OAuthError as exc:
             if not _is_oauth_required_error(exc):
                 raise
+        except (TimeoutError, ConnectionError) as exc:
+            # #252：``_bounded_connect`` 现在会真实上抛超时 / 连接失败（旧实现谎报成功）——
+            # ``OAuthFlow.launch`` 是宿主的 typed facade 入口（#179 契约：一律 ``OAuthError``），
+            # 不得透出裸内建异常。
+            # `launch` is the host's typed facade; never surface bare builtin exceptions.
+            raise OAuthError(
+                OAuthErrorCode.Protocol,
+                f"OAuth bootstrap connect failed for bundle_id={bundle_id!r}: {exc}",
+            ) from exc
         coordinator = self._oauth_coordinators.get(bundle_id)
         if coordinator is None:
             raise OAuthError(

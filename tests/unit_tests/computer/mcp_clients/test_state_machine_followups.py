@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
@@ -35,7 +36,7 @@ from a2c_smcp.computer.mcp_clients.base_client import STATES
 from a2c_smcp.computer.mcp_clients.http_client import AuthSignal
 from a2c_smcp.computer.mcp_clients.manager import MCPServerManager
 from a2c_smcp.computer.mcp_clients.model import MCPServerConnectionState, StreamableHttpServerConfig
-from a2c_smcp.computer.mcp_clients.oauth_types import OAuthError
+from a2c_smcp.computer.mcp_clients.oauth_types import OAuthError, OAuthErrorCode
 from tests.unit_tests.computer.mcp_clients.test_tool_list_cache import _cfg
 
 
@@ -50,9 +51,13 @@ class _FakeHttpClient:
         self,
         *,
         challenge: AuthSignal | None = None,
+        signal_less_challenge: bool = False,
         redirect_stop: int | None = None,
         hang: bool = False,
         cancel: bool = False,
+        session_alive: bool = True,
+        keepalive_alive: bool = True,
+        list_gate: asyncio.Event | None = None,
     ) -> None:
         self._challenge = challenge
         self._redirect_stop = redirect_stop
@@ -60,13 +65,23 @@ class _FakeHttpClient:
         self._cancel = cancel
         self._challenge_event = asyncio.Event()
         self._redirect_event = asyncio.Event()
-        if challenge is not None:
+        if challenge is not None or signal_less_challenge:
             self._challenge_event.set()
         if redirect_stop is not None:
             self._redirect_event.set()
         self.state = STATES.connected
+        # #252：真实可用性判据的三要素（state / 会话 / keep-alive 存活）——假 client 也照此建模，
+        # 否则「connected + 无会话」这一真实形态无处构造。
+        self._async_session: Any = object() if session_alive else None
+        self._keepalive_alive = keepalive_alive
+        self._list_gate = list_gate
+        self.list_entered = asyncio.Event()
         self.adiscard: Any = _AsyncRecorder()
         self.adisconnect: Any = _AsyncRecorder()
+
+    @property
+    def is_session_usable(self) -> bool:
+        return self.state == STATES.connected and self._async_session is not None and self._keepalive_alive
 
     async def aconnect(self) -> None:
         if self._cancel:
@@ -76,6 +91,9 @@ class _FakeHttpClient:
 
     async def list_tools(self) -> list[Any]:
         """提交成功后 :meth:`MCPServerManager._arefresh_tool_mapping` 会真读一次。"""
+        self.list_entered.set()
+        if self._list_gate is not None:
+            await self._list_gate.wait()
         return []
 
     def connect_challenge_event(self) -> asyncio.Event:
@@ -281,3 +299,209 @@ async def test_aoauth_connect_commit_rejection_does_not_leak_task_exception(monk
     assert manager._connection_states[bundle_id] == MCPServerConnectionState.ERROR
     assert coordinator.failed_launches, "提交失败必须收敛 launch 等待者（不得留下悬挂的 launch）"
     assert dying.adiscard.await_count == 1
+
+
+# ────────────────────── 🔴 审查补强：真实半断开形态 / 外层取消 / 状态面 ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_commit_rejects_half_broken_client() -> None:
+    """🔴 真实形态：`state == connected` + 无会话 + keep-alive 已死 ⇒ 提交必须被拒。
+
+    中文: 这正是 #252 要拦的窗口——传输在 ``initialize()`` 返回后立即死亡时，keep-alive 的 finally
+    已清空会话，而收敛任务要等在途的 ``aconnect`` 结束才能把状态翻成 ``error``，故 aconnect 正常
+    返回那一刻 state **仍是 connected**。只判 state 的守卫会放行（审查指出的假绿源）。
+    """
+    manager = _manager()
+    config = _cfg("alpha")
+    manager._servers_config["alpha"] = config
+    half_broken = _FakeHttpClient(session_alive=False, keepalive_alive=False)
+    assert half_broken.state == STATES.connected, "前置：状态仍是 connected（假绿源的关键）"
+
+    with pytest.raises(ConnectionError):
+        await manager._commit_active_client("alpha", half_broken, config=config)  # type: ignore[arg-type]
+
+    assert "alpha" not in manager._active_clients
+    assert manager._connection_states["alpha"] == MCPServerConnectionState.ERROR
+    assert half_broken.adisconnect.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_commit_rejection_keeps_healthy_active_client_status() -> None:
+    """🔴：已有健康活跃 client 时，半断开 client 的提交被拒**不得**把状态面改成 ERROR。"""
+    manager = _manager()
+    config = _cfg("alpha")
+    manager._servers_config["alpha"] = config
+    healthy = _FakeHttpClient()
+    await manager._commit_active_client("alpha", healthy, config=config)  # type: ignore[arg-type]
+
+    half_broken = _FakeHttpClient(session_alive=False, keepalive_alive=False)
+    with pytest.raises(ConnectionError):
+        await manager._commit_active_client("alpha", half_broken, config=config)  # type: ignore[arg-type]
+
+    assert manager._active_clients["alpha"] is healthy
+    assert manager._connection_states["alpha"] == MCPServerConnectionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_bounded_connect_challenge_without_payload_is_a_failure() -> None:
+    """challenge 竞速先到但取不到信号载荷 ⇒ 必须失败（否则返回 None 会让调用方提交已弃置的 client）。"""
+    manager = _manager()
+    payload_less = _FakeHttpClient(signal_less_challenge=True)
+
+    with pytest.raises(ConnectionError):
+        await manager._bounded_connect(payload_less)  # type: ignore[arg-type]
+
+    assert payload_less.adiscard.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_connect_discards_client_when_outer_cancelled() -> None:
+    """外层取消：client 必须被回收，且 ``CancelledError`` 原样传播（不得包成 TimeoutError）。"""
+    manager = _manager()
+    hanging = _FakeHttpClient(hang=True)
+    task = asyncio.create_task(manager._bounded_connect(hanging))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)  # 让 connect 任务真正起来
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert hanging.adiscard.await_count == 1, "取消形态下弃置 client 也必须回收（cleanup 路径）"
+
+
+@pytest.mark.asyncio
+async def test_astart_client_marks_error_when_bounded_connect_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_bounded_connect` 现在会真实上抛超时 ⇒ 调用方必须把连接态收敛为 ERROR（不得停在 CONNECTING）。"""
+    monkeypatch.setattr(manager_mod, "_CONNECT_TIMEOUT", 0.05)
+    manager = _manager()
+    bundle_id = "hung_srv"
+    manager._servers_config[bundle_id] = StreamableHttpServerConfig(
+        name=bundle_id,
+        server_parameters={"url": "https://mcp.example.com/hung"},
+    )
+    monkeypatch.setattr(manager_mod, "client_factory", lambda *a, **kw: _FakeHttpClient(hang=True))
+
+    with pytest.raises(TimeoutError):
+        await manager.astart_client(bundle_id)
+
+    assert manager._connection_states[bundle_id] == MCPServerConnectionState.ERROR
+    assert bundle_id not in manager._active_clients
+
+
+@pytest.mark.asyncio
+async def test_aoauth_connect_does_not_discard_committed_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """正对照：成功提交的 client 归 manager 所有，绝不 `adiscard`（🔴 归属 bug 的回归锁）。"""
+    manager = _manager()
+    bundle_id = "oauth_srv"
+    manager._servers_config[bundle_id] = StreamableHttpServerConfig(
+        name=bundle_id,
+        server_parameters={"url": "https://mcp.example.com/x"},
+    )
+    coordinator = _StubCoordinator()
+    manager._oauth_coordinators[bundle_id] = coordinator  # type: ignore[assignment]
+    healthy = _FakeHttpClient()
+    monkeypatch.setattr(manager_mod, "client_factory", lambda *a, **kw: healthy)
+
+    await manager._aoauth_connect(bundle_id, coordinator, manager._oauth_clear_epochs.get(bundle_id, 0))  # type: ignore[arg-type]
+
+    assert manager._active_clients[bundle_id] is healthy
+    assert healthy.adiscard.await_count == 0, "已提交的 client 不得被弃置回收"
+
+
+@pytest.mark.asyncio
+async def test_aoauth_connect_cancelled_connect_converges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """connect 任务被取消不得静默 return——必须收敛 launch 等待者与连接态（旧实现静默返回）。"""
+    manager = _manager()
+    bundle_id = "oauth_srv"
+    manager._servers_config[bundle_id] = StreamableHttpServerConfig(
+        name=bundle_id,
+        server_parameters={"url": "https://mcp.example.com/x"},
+    )
+    coordinator = _StubCoordinator()
+    manager._oauth_coordinators[bundle_id] = coordinator  # type: ignore[assignment]
+    cancelled = _FakeHttpClient(cancel=True)
+    monkeypatch.setattr(manager_mod, "client_factory", lambda *a, **kw: cancelled)
+
+    await manager._aoauth_connect(bundle_id, coordinator, manager._oauth_clear_epochs.get(bundle_id, 0))  # type: ignore[arg-type]
+
+    assert coordinator.failed_launches, "取消形态也必须解 launch 等待者（不得悬挂）"
+    assert manager._connection_states[bundle_id] == MCPServerConnectionState.ERROR
+    assert cancelled.adiscard.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_aoauth_connect_commit_rejection_keeps_healthy_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """🔴：detached 提交被拒时不得覆盖**健康活跃 client** 的连接状态。"""
+    manager = _manager()
+    bundle_id = "oauth_srv"
+    config = StreamableHttpServerConfig(
+        name=bundle_id,
+        server_parameters={"url": "https://mcp.example.com/x"},
+    )
+    manager._servers_config[bundle_id] = config
+    healthy = _FakeHttpClient()
+    await manager._commit_active_client(bundle_id, healthy, config=config)  # type: ignore[arg-type]
+
+    coordinator = _StubCoordinator()
+    manager._oauth_coordinators[bundle_id] = coordinator  # type: ignore[assignment]
+    dying = _FakeHttpClient(session_alive=False, keepalive_alive=False)
+    monkeypatch.setattr(manager_mod, "client_factory", lambda *a, **kw: dying)
+
+    await manager._aoauth_connect(bundle_id, coordinator, manager._oauth_clear_epochs.get(bundle_id, 0))  # type: ignore[arg-type]
+
+    assert manager._active_clients[bundle_id] is healthy
+    assert manager._connection_states[bundle_id] == MCPServerConnectionState.CONNECTED, "健康 client 的状态面不得被坏提交覆盖"
+    assert dying.adiscard.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_oauth_coordinator_wraps_bounded_connect_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`OAuthFlow.launch` 是宿主的 typed facade 入口（#179）：bootstrap 的裸超时/连接失败必须转 OAuthError。"""
+    manager = _manager()
+
+    async def _boom(bundle_id: str) -> None:
+        raise TimeoutError("connect neither succeeded nor received an auth challenge")
+
+    monkeypatch.setattr(manager, "_astart_client_auto", _boom)
+
+    with pytest.raises(OAuthError) as exc:
+        await manager._ensure_oauth_coordinator("oauth_srv")
+
+    assert exc.value.code == OAuthErrorCode.Protocol
+    assert isinstance(exc.value.__cause__, TimeoutError), "原始异常必须保留为 __cause__（诊断不丢）"
+
+
+@pytest.mark.asyncio
+async def test_aoauth_connect_cancel_during_commit_refresh_keeps_owned_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """🔴：提交**已在锁内登记**、随后在 ``_arefresh_tool_mapping`` 期间被取消 ⇒ 不得回收 manager-owned client。
+
+    中文: ``committed`` 只在 ``_commit_active_client`` 整体返回后才置位，而登记发生在它内部、刷新之前。
+    若 finally 只信 flag，就会把已登记为 active 的 client 拆掉，重新制造「connected + 无会话」。
+    """
+    manager = _manager()
+    bundle_id = "oauth_srv"
+    manager._servers_config[bundle_id] = StreamableHttpServerConfig(
+        name=bundle_id,
+        server_parameters={"url": "https://mcp.example.com/x"},
+    )
+    coordinator = _StubCoordinator()
+    manager._oauth_coordinators[bundle_id] = coordinator  # type: ignore[assignment]
+    gate = asyncio.Event()
+    owned = _FakeHttpClient(list_gate=gate)
+    monkeypatch.setattr(manager_mod, "client_factory", lambda *a, **kw: owned)
+
+    task = asyncio.create_task(
+        manager._aoauth_connect(bundle_id, coordinator, manager._oauth_clear_epochs.get(bundle_id, 0))  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(owned.list_entered.wait(), timeout=2.0)
+    assert manager._active_clients.get(bundle_id) is owned, "前置：client 已在锁内登记"
+
+    task.cancel()
+    with contextlib.suppress(BaseException):
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+
+    assert manager._active_clients.get(bundle_id) is owned, "已登记的 client 不得被 finally 摘除"
+    assert owned.adiscard.await_count == 0, "归属 manager 的 client 绝不能被 adiscard"
