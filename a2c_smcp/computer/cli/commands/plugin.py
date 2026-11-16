@@ -330,7 +330,8 @@ async def plugin_uninstall(
     json_output: bool = False,
 ) -> int:
     """
-    卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据**回收 bundled server + 删账本）/ Uninstall a plugin。
+    卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 保留 + 注销 skills + **按判据**回收 bundled server +
+    删账本）/ Uninstall a plugin。
 
     :class:`PluginInstallError` → ``_err`` 退出码 1（#246 审查 🔴A）：settings raw 写入 fail-closed 后本命令可抛
     （目标键畸形 / 文件 corrupt），不翻译就会以未捕获异常逃成 traceback。

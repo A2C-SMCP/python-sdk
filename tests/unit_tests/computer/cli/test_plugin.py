@@ -745,7 +745,7 @@ async def test_gc_prunes_dangling_json_contract(
     assert out["dangling"] == [{"id": "ghost@nowhere", "reason": "marketplace-not-added"}]
     assert out["prunedIntents"] == ["ghost@nowhere"]
     assert out["recoverable"] == []
-    assert not orphan_path.exists()
+    assert orphan_path.exists()  # #258：catalog 内相对源落点保留（账本/意图仍删）
     user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert "ghost@nowhere" not in user.get("installedPlugins", [])  # 意图已 prune
     assert "ghost@nowhere" not in user.get("enabledPlugins", {})
@@ -845,7 +845,7 @@ async def test_gc_confirm_accept_removes_orphans_and_prunes_dangling(
     code = await plugin_cmd.plugin_gc(reg, home, env, non_plugin_bundle_ids=lambda: set(), confirm=_confirm, prune_dangling=True)
 
     assert code == 0
-    assert not orphan_path.exists()  # 孤儿已删
+    assert orphan_path.exists()  # #258：catalog 共享树保留；孤儿账本已删（下行断言）
     assert "orphan@acme" not in load_installed_plugins(home=home)["plugins"]
     user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert "ghost@nowhere" not in user.get("installedPlugins", [])  # 悬挂已 prune

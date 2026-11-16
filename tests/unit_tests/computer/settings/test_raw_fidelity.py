@@ -876,7 +876,7 @@ def test_marketplace_remove_completes_with_warn_when_revoke_trust_fails(
         home / "known_marketplaces.json",
         {"version": 1, "marketplaces": {"mp": {"source": {"type": "git", "url": "u"}, "installLocation": ""}}},
     )
-    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: ["mp"])
     _write_json(_user_settings(env), {"trustedMarketplaces": "not-an-array"})  # 让 _revoke_trust 抛
     capsys.readouterr()
 
@@ -937,13 +937,13 @@ async def test_uninstall_not_blocked_by_project_installed_plugins(tmp_path: Path
     env = _env(tmp_path)
     monkeypatch.chdir(tmp_path)
     home = tmp_path / "skill-home"
-    installed_tree = home / "tree"  # 须在 SKILL Home 内，否则 `_safe_rmtree` 的越界守卫会拒删
+    installed_tree = home / "tree"  # 不在 plugin 独占外部 clone 内 → #258 起按归属保守保留
     installed_tree.mkdir(parents=True)
     _seed_plugin(home, "a@mp", installed_tree)
     _write_json(_project_settings(tmp_path), {"installedPlugins": None})
 
     assert await uninstall_plugin("a@mp", _StubRegistry(), home, non_plugin_bundle_ids=set, env=env) is True
-    assert not installed_tree.exists(), "卸载应正常完成（project 的 installedPlugins 不阻塞）"
+    assert installed_tree.exists(), "卸载应正常完成（project 的 installedPlugins 不阻塞）"
 
 
 @pytest.mark.asyncio
@@ -1057,7 +1057,7 @@ def test_marketplace_remove_fails_per_victim_and_reports(
         return True
 
     monkeypatch.setattr(marketplace_cmd, "uninstall_plugin", _uninstall)
-    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: ["mp"])
     capsys.readouterr()
 
     code = asyncio.run(

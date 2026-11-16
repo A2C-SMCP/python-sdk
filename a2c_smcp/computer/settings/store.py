@@ -121,6 +121,8 @@ class InstalledPluginRecord(TypedDict):
     """
 
     scope: str  # managed | user | project | local
+    # plugin 物化落点。删除仅限 plugin 独占外部 clone ``<home>/marketplace/.plugins/<mp>/<plugin>``；相对源的
+    # 共享 catalog 内路径由 marketplace 级 remove/prune 清理（#258 / remove_plugin_install_path）。
     installPath: str
     projectPath: NotRequired[str]  # project / local scope 必填 / required for project/local
     version: NotRequired[str]

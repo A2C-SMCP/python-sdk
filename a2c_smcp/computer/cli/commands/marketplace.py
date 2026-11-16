@@ -54,6 +54,7 @@ from a2c_smcp.computer.settings.store import (
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import GITHUB_HOST, SkillSourceError, normalize_repo_shorthand
 from a2c_smcp.computer.skills.staging import stage_marketplace_skills
+from a2c_smcp.utils.git_url import git_url_for_display, known_git_source_for_display
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
 ConfirmFn = Callable[[str], Awaitable[bool]]
@@ -87,6 +88,17 @@ def _source_url(rec: Mapping[str, Any]) -> str | None:
     """从 marketplace 记录取 git url / Extract the git url from a marketplace record。"""
     src = rec.get("source")
     return src.get("url") if isinstance(src, Mapping) else None
+
+
+def _display_source_url(rec: Mapping[str, Any]) -> str | None:
+    """
+    marketplace 记录的**展示用** source URL（known-source 展示原语）/ Display-safe source URL.
+
+    ``#261``：存储值可能携带 userinfo / query / fragment（含 token），展示面前一律归一；缺失 → ``None``
+    （JSON ``null`` / 表格留空），畸形 → 占位符。**展示值不可用于 re-clone**。
+    """
+    raw = _source_url(rec)
+    return None if raw is None else known_git_source_for_display(raw)
 
 
 # ── URL / name 归一 / normalization ───────────────────────────────────────────
@@ -168,10 +180,16 @@ async def marketplace_add(
     """添加新 marketplace（首次 trust y/N，默认 eager clone）/ Add a marketplace (trust on first add, eager clone)。"""
     url = normalize_marketplace_url(git_url)
     if url is None:
-        return _err(f"not a well-formed git url or owner/repo shorthand: {git_url!r}", json_output=json_output)
+        return _err(
+            f"not a well-formed git url or owner/repo shorthand: {git_url_for_display(git_url)}",
+            json_output=json_output,
+        )
     mp_name = name or default_marketplace_name(url)
     if not mp_name or not is_valid_marketplace_name(mp_name):
-        return _err(f"cannot derive a valid marketplace name from {git_url!r}; pass --name", json_output=json_output)
+        return _err(
+            f"cannot derive a valid marketplace name from {git_url_for_display(url)}; pass --name",
+            json_output=json_output,
+        )
 
     if mp_name in _marketplaces(home, env):
         return _err(f"marketplace name conflict: {mp_name!r} already exists", json_output=json_output)
@@ -189,8 +207,13 @@ async def marketplace_add(
     # 门控/落盘按 **name**（§5.3.1），prompt 仍展示 url 供用户判断来源。
     if not trust:
         if confirm is None:
-            return _err(f"untrusted marketplace {mp_name!r} ({url}); pass --trust to confirm non-interactively", json_output=json_output)
-        if mp_name not in _load_trusted(env) and not await confirm(url):
+            return _err(
+                f"untrusted marketplace {mp_name!r} ({git_url_for_display(url)}); "
+                "pass --trust to confirm non-interactively",
+                json_output=json_output,
+            )
+        # 确认提示是 known-source 展示面（#261）：scp-like → host:path，去 userinfo/query/fragment。
+        if mp_name not in _load_trusted(env) and not await confirm(known_git_source_for_display(url)):
             return _err("aborted by user (untrusted)", json_output=json_output)
     try:
         _record_trust(mp_name, env)
@@ -216,10 +239,16 @@ async def marketplace_add(
 
     # 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
     if mp_name not in _marketplaces(home, env):
-        return _err(f"clone/refresh failed for {url!r} (see logs)", json_output=json_output, code=EXIT_NETWORK_ERROR)
+        return _err(
+            f"clone/refresh failed for {git_url_for_display(url)} (see logs)",
+            json_output=json_output,
+            code=EXIT_NETWORK_ERROR,
+        )
 
     if json_output:
-        console.print_json(data={"added": mp_name, "url": url, "skills": len(registered)})
+        console.print_json(
+            data={"added": mp_name, "url": known_git_source_for_display(url), "skills": len(registered)}
+        )
         return EXIT_OK
     return _ok(f"added {mp_name!r} — cloned, {len(registered)} skill(s) found")
 
@@ -234,7 +263,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
             data=[
                 {
                     "name": nm,
-                    "url": _source_url(rec),
+                    "url": _display_source_url(rec),
                     "trusted": nm in trusted,  # 信任按 name 判定（§5.3.1）
                     "autoUpdate": bool(rec.get("autoUpdate", False)),
                     "lastUpdated": rec.get("lastUpdated"),
@@ -252,7 +281,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
     for col in ("Name", "URL", "Trusted", "Auto-update", "Last updated", "Commit"):
         table.add_column(col)
     for nm, rec in mps.items():
-        url = _source_url(rec) or ""
+        url = _display_source_url(rec) or ""
         sha = rec.get("commitSha") or ""
         table.add_row(
             nm,
@@ -274,7 +303,7 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
 
     installed = load_installed_plugins(home, env).get("plugins") or {}
     plugins = [pid for pid in installed if pid.endswith(f"@{name}")]
-    url = _source_url(rec)
+    url = _display_source_url(rec)
     info: dict[str, Any] = {
         "name": name,
         "url": url,
@@ -292,7 +321,8 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     table.add_column("Field", style="bold cyan")
     table.add_column("Value")
     for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
-        table.add_row(k, str(info[k]))
+        # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
+        table.add_row(k, "" if info[k] is None else str(info[k]))
     table.add_row("installedPlugins", ", ".join(plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK
@@ -338,6 +368,12 @@ async def marketplace_remove(
                 console_err.print(f"[yellow]! failed to uninstall {pid!r}: {e}[/yellow]")
 
     pruned = prune_marketplaces([name], registry, home, env=env)
+    if name not in pruned:
+        # clone / 外部树未能清空（软链 / OSError）→ prune 保留 known 条目；marketplace 仍存在，不得撤销信任。
+        return _err(
+            f"failed to remove marketplace {name!r}: clone tree could not be removed",
+            json_output=json_output,
+        )
     # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。此时移除**已完成**，revoke 只是清理残留，
     # 故 fail-closed 的写失败降级为 WARN（不吞、不覆盖、不回滚已完成的开除动作）——#246。
     try:
@@ -457,12 +493,15 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             return
         from a2c_smcp.computer.cli.commands import build_mcp_callbacks
 
+        name = pos[0]
         code = await marketplace_remove(
-            registry, home, env, pos[0],
+            registry, home, env, name,
             keep_plugins="--keep-plugins" in args, confirm=_confirm,
             mcp_cbs=build_mcp_callbacks(comp), json_output=json_output,
         )
-        if code == EXIT_OK:
+        # 部分失败（uninstall 抛错）时返回非 EXIT_OK，但 marketplace 可能已被 prune 移除——按「是否仍在册」
+        # 标脏，否则已连接 Agent 继续看到已删除的 SKILL（#258 复审四轮 🟡1）。
+        if code == EXIT_OK or name not in _marketplaces(home, env):
             comp.mark_skills_dirty()
     elif sub == "refresh":
         target = pos[0] if pos else "all"
