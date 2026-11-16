@@ -352,12 +352,18 @@ async def test_refresh_over_double_install_keeps_first_registrant(tmp_path: Path
 
     reg = SkillRegistry()
     declared = resolve_settings(env=env).settings
-    await reconcile(reg, home, declared, env=env, refresh=True)
+    report = await reconcile(reg, home, declared, env=env, refresh=True)
 
     got = reg.resolve("alpha:foo")
     assert got is not None
     assert got["source"] == "marketplace:mp-a"  # 先注册者保留
     assert got["description"] == "from-a"
+    # 机制断言（复审 🟡3）：两 marketplace 都成功 stage、且 mp-b 的注册确实被注册点守卫拒掉，
+    # 而非「mp-b 被静默跳过」的终态巧合。
+    assert report.failed == []
+    assert report.registered_skills.count("alpha:foo") == 1
+    refused = [c for c in reg.drain_source_conflicts() if c.name == "alpha:foo"]
+    assert [c.refused_source for c in refused] == ["marketplace:mp-b"]
 
     # 幂等：再刷一次不改变结果
     await reconcile(reg, home, declared, env=env, refresh=True)

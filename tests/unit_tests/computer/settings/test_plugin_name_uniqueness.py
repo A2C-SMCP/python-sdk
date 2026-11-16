@@ -506,6 +506,31 @@ async def test_legacy_home_uninstall_clears_conflict(tmp_path: Path) -> None:
     await install_plugin("alpha@mp-b", reg, home, env=env)  # 冲突解除，可换源安装
 
 
+# ── 复审 🟡1：锁内复核必须复制预检的账本 carve-out ───────────────────────────
+async def test_reinstall_with_missing_user_intent_allowed_in_double_install(tmp_path: Path) -> None:
+    """存量双装 + user 意图缺目标 pid（手编 / 回滚失败 / 部分 prune）：预检放行的重装，锁内不得误拒。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    root_b = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(user_settings_path(env), {"installedPlugins": ["alpha@mp-b"]})  # 缺 alpha@mp-a
+    _seed_ledger(home, {"alpha@mp-a": [_record(root_a)], "alpha@mp-b": [_record(root_b)]})
+
+    record = await install_plugin("alpha@mp-a", SkillRegistry(), home, env=env)  # 不得抛
+
+    assert record["scope"] == "user"
+    assert "alpha@mp-a" in (_read_settings(env).get("installedPlugins") or [])
+
+
+def test_write_installed_plugin_guard_requires_home(tmp_path: Path) -> None:
+    """安全守卫不得静默 fail-open：``guard_bare_name=True`` 而缺 ``home`` 时直接报错（复审 🟡6）。"""
+    from a2c_smcp.computer.settings.installer import _write_installed_plugin
+
+    env = _env(tmp_path)
+    with pytest.raises(ValueError):
+        _write_installed_plugin("alpha@mp-a", True, env, guard_bare_name=True)
+
+
 # ── 决策 1 的幂等：存量双装下同一 pid 重装仍放行 ─────────────────────────────
 async def test_reinstall_same_pid_allowed_in_double_install(tmp_path: Path) -> None:
     """同一 pid 重装不改变安装集、不新增第二个 ``<plugin>`` → 不得误拒（决策 1）；新 marketplace 仍拒。"""
@@ -569,6 +594,9 @@ def test_concurrent_install_same_bare_name_only_one_succeeds(tmp_path: Path, mon
         thread.join(timeout=30)
 
     assert sorted(value == "ok" for value in outcomes.values()) == [False, True], outcomes
+    errors = [value for value in outcomes.values() if isinstance(value, PluginInstallError)]
+    assert len(errors) == 1
+    assert errors[0].error_code == "validation"  # 败者是结构化冲突，而非其它异常
     settings = _read_settings(env)
     assert len(settings.get("installedPlugins") or []) == 1
     assert len(load_installed_plugins(home=home)["plugins"]) == 1

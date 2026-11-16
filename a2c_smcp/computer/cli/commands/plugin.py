@@ -109,7 +109,7 @@ def _err(msg: str, *, json_output: bool, code: int = EXIT_USER_ERROR, error_code
 
 # ``details`` 中与 :func:`_err` 关键字参数 / payload 保留字段同名的键：展开前过滤，避免静默改退出码、
 # 在 ``except`` 内抛 ``TypeError``，或覆盖类别码与人读文案（#257 架构师审查 🟡3）。
-_RESERVED_DETAIL_KEYS = frozenset({"error", "message", "code", "json_output", "error_code"})
+_RESERVED_DETAIL_KEYS = frozenset({"error", "message", "msg", "code", "json_output", "error_code"})
 
 
 def _plugin_error(e: PluginInstallError, *, json_output: bool) -> int:

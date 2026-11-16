@@ -62,7 +62,7 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
 from __future__ import annotations
 
 import shutil
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -203,13 +203,24 @@ def _bare_name_conflicts(
     v0.2.x 存量 home 的 ``alpha@mp-a`` 对检查隐身——安装随后才由 :func:`migrate_legacy_installs` 从账本
     回填意图，正好形成「先绕过、后出现」的旁路。故此处与迁移路径读**同一视图**（只读 pid 键，不碰旧格式值）。
     """
-    plugin, _marketplace = _split_plugin_id(plugin_id)
     facts = _install_facts(home=home, env=env)
     # 幂等 carve-out 只认**账本记录**（真重装 / 存量双装）。project/local 的纯声明不是安装事实——拿 merged
     # 意图放行等于「声明一个从未安装的 `<plugin>@<mp>` 就能把同名第二个装进来」（#257 复审 🔴3）。
     if allow_if_installed and plugin_id in facts.ledger_pids:
         return []
-    return sorted(pid for pid in facts.installed_pids if pid != plugin_id and pid.partition("@")[0] == plugin)
+    return _bare_name_clash_pids(plugin_id, facts.installed_pids)
+
+
+def _bare_name_clash_pids(plugin_id: str, pids: Iterable[str]) -> list[str]:
+    """
+    给定 pid 集合，取与 ``plugin_id`` **同裸名、不同 marketplace** 的 pid（升序、排除自身）/
+    Bare-name clashes of ``plugin_id`` within ``pids``.
+
+    预检与 in-lock 复核的**唯一判据**（#257 复审 🟡1：两处曾各自实现，锁内漏了账本 carve-out）。
+    The single clash predicate shared by the unlocked pre-check and the in-lock recheck.
+    """
+    plugin, _marketplace = _split_plugin_id(plugin_id)
+    return sorted(pid for pid in pids if pid != plugin_id and pid.partition("@")[0] == plugin)
 
 
 def _bare_name_conflict_error(
@@ -219,20 +230,24 @@ def _bare_name_conflict_error(
     action: str,
     home: Path,
     env: Mapping[str, str] | None,
+    ledger_pids: frozenset[str] | None = None,
 ) -> PluginInstallError:
     """
     构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）/
     Build the structured conflict error.
 
     **补救按账本分档**（#257 架构师审查 🟡2）：「已安装」以**账本**为准——有物化记录 → ``plugin uninstall``
-    有效；仅存在于 settings 声明（project/local 或残留 user 意图，无账本）→ 该 pid 由声明维持，
-    ``plugin uninstall`` 是永久 no-op，必须让用户删声明键。
-    Remedies are split by ledger presence; a declaration-only pid cannot be cleared by uninstall.
+    有效；无物化记录（project/local 声明、残留意图，或并发窗口里刚写入的意向）→ 删对应 settings 条目 /
+    等其完成，``plugin uninstall`` 对这类条目恒为 no-op。
+    Remedies are split by ledger presence; a pid without a materialization record cannot be cleared by uninstall.
+
+    :param ledger_pids: 调用方已算出的账本 pid 快照（in-lock 复核传入，避免在持锁期间重读与分类漂移；
+        ``None`` → 自行经 :func:`_install_facts` 读取）。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    facts = _install_facts(home=home, env=env)
-    materialized = [pid for pid in conflicts if pid in facts.ledger_pids]
-    declared_only = [pid for pid in conflicts if pid not in facts.ledger_pids]
+    ledger = ledger_pids if ledger_pids is not None else _install_facts(home=home, env=env).ledger_pids
+    materialized = [pid for pid in conflicts if pid in ledger]
+    declared_only = [pid for pid in conflicts if pid not in ledger]
     existing = ", ".join(repr(pid) for pid in conflicts)
     remedies: list[str] = []
     if materialized:
@@ -241,8 +256,9 @@ def _bare_name_conflict_error(
     if declared_only:
         declared = " / ".join(repr(pid) for pid in declared_only)
         remedies.append(
-            f"{declared} has no materialization record (declaration-only, e.g. a project/local settings entry) — "
-            f"remove that entry from the declaring settings file; 'plugin uninstall' cannot clear a declaration"
+            f"{declared} has no materialization record (declaration-only e.g. a project/local settings entry, or an "
+            f"install still in flight) — remove that settings entry (or retry once the other install completes); "
+            f"'plugin uninstall' cannot clear a declaration"
         )
     message = (
         f"plugin {plugin!r} is already installed or declared from another marketplace ({existing}); a plugin name "
@@ -421,13 +437,20 @@ def _write_installed_plugin(
             entries: list[Any] = list_field_or_empty(existing, "installedPlugins", path=path)
             was_present = plugin_id in entries
             if present and not was_present:
-                if guard_bare_name and home is not None:
-                    plugin, _marketplace = _split_plugin_id(plugin_id)
-                    candidates = {e for e in entries if isinstance(e, str) and is_valid_enabled_plugin_key(e)}
-                    candidates |= _ledger_pids(home=home, env=env)
-                    clashes = sorted(pid for pid in candidates if pid != plugin_id and pid.partition("@")[0] == plugin)
-                    if clashes:
-                        raise _bare_name_conflict_error(plugin_id, clashes, action="install", home=home, env=env)
+                if guard_bare_name:
+                    if home is None:
+                        # 安全守卫不得静默 fail-open（#257 复审 🟡6）：缺 home 就无法做跨进程兜底，直接报错。
+                        raise ValueError("_write_installed_plugin(guard_bare_name=True) requires home for the ledger recheck")
+                    ledger = frozenset(_ledger_pids(home=home, env=env))
+                    # 与预检**同一 carve-out**（#257 复审 🟡1）：目标 pid 已有物化记录 = 真重装（不改安装集）。
+                    # 抢跑窗口里目标 pid 尚未入账本，复核照旧触发，不削弱并发闭合。
+                    if plugin_id not in ledger:
+                        candidates = {e for e in entries if isinstance(e, str) and is_valid_enabled_plugin_key(e)}
+                        clashes = _bare_name_clash_pids(plugin_id, candidates | ledger)
+                        if clashes:
+                            raise _bare_name_conflict_error(
+                                plugin_id, clashes, action="install", home=home, env=env, ledger_pids=ledger,
+                            )
                 entries.append(plugin_id)
             elif not present and was_present:
                 entries = [e for e in entries if e != plugin_id]
@@ -465,7 +488,12 @@ def _install_facts(*, home: Path, env: Mapping[str, str] | None) -> _InstallFact
     Single authority for install facts.
 
     ``drop_legacy=False``（见 :func:`_ledger_pids`）：旧格式记录也是安装事实，默认视图会让 v0.2.x 存量
-    在检查时隐身。pre-check、诊断分档与 in-lock 复核共用本函数，避免三处各自拼同一并集而漂移。
+    在检查时隐身。install/enable 的预检与冲突诊断分档共用本函数，避免两处各自拼同一并集而漂移。
+
+    .. note::
+       install 的**锁内复核**刻意不走本函数：它必须用锁内刚读到的 ``entries`` 快照（含并发进程刚写入的
+       user 意图）∪ 账本 pid，而非另一时刻的 merged 视图——两处共享的是 :func:`_bare_name_clash_pids`
+       判据与账本 carve-out，不是同一份快照。
     """
     declared = resolve_settings(env=env).settings
     return _InstallFacts(

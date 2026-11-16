@@ -451,21 +451,20 @@ def load_installed_plugins(
     :param drop_legacy: 是否丢弃旧格式记录（协议 §4.9.1-4，见 :func:`_drop_legacy_mcp_dep_records`）。默认 ``True``
         ——**几乎所有调用方都应该用默认值**，旧格式记录的依赖信息（display name 数组）不可用于任何判定。
 
-        ⚠️ **例外共四个消费点，语义分两组**：
+        ⚠️ **例外共三处调用点，语义分两组**：
         - **只读 pid（key），不碰旧格式字段值**：
           - v0.2.x→v0.3.0 意图迁移（:func:`~a2c_smcp.computer.settings.installer.migrate_legacy_installs`）——
             它从账本 pid 回填 ``installedPlugins`` 意图，而账本格式迁移（丢弃 → 从意图重建）**恰恰依赖该意图
             已存在**。两者顺序颠倒则 v0.2.x 存量用户的带 MCP server 的 plugin 会连 pid 一起消失、意图无从回填
             ⇒ 升级后 plugin 静默全丢。
-          - 安装事实集 ``installer._install_facts``（经 ``_ledger_pids``）——供 install 预检、冲突诊断的
-            账本/声明分档与 enable 的跨源复核共用；默认视图会丢旧格式记录的 pid，令存量 home 在检查时隐身、
-            随后迁移才「冒出来」⇒ 绕过拦截。
-          - install 的**锁内裸名复核**（``installer._write_installed_plugin(guard_bare_name=True)``）——同一
-            事实集的并发兜底；漏读旧格式 pid 会让并发窗口重新打穿「同名唯一」。
+          - ``installer._ledger_pids``——**同一调用点服务两个消费方**：install/enable 预检与冲突诊断分档
+            （经 :func:`~a2c_smcp.computer.settings.installer._install_facts`），以及 install 的锁内裸名复核
+            （直接调用，因为它同时要锁内 ``entries`` 快照）。默认视图会丢旧格式记录的 pid，令存量 home 在
+            检查时隐身、随后迁移才「冒出来」⇒ 绕过拦截。
         - **消费 legacy 记录字段做删除**：``installer.uninstall_plugin`` 用 ``False`` 读 ``installPath`` /
           ``scope`` / ``projectPath`` 以删树与清意图——若改回默认视图，v0.2.x home 的 uninstall 会退化成
           「not installed (no-op)」，令冲突诊断给出的补救命令永久失效（#257 审查 🔴3）。
-        故这四个消费点 MUST 传 ``False``；其余调用方一律保持默认。
+        故这三处 MUST 传 ``False``；其余调用方一律保持默认。
     """
     path = installed_plugins_path(home, env)
     data = read_jsonc_with_recovery(path)

@@ -256,6 +256,7 @@ def test_plugin_error_filters_reserved_detail_keys(capsys: pytest.CaptureFixture
             "code": 0,
             "json_output": True,
             "error_code": "hijacked",
+            "msg": "HIJACKED",  # `_err` 的位置参数名——漏过滤会在 except 内抛 TypeError（复审 🟡2）
             "error": "HIJACKED",
             "message": "HIJACKED",
             "conflictWith": "alpha@mp-a",
@@ -266,7 +267,7 @@ def test_plugin_error_filters_reserved_detail_keys(capsys: pytest.CaptureFixture
     assert payload["error"] == "validation"  # details["error"] 未覆盖类别码
     assert payload["message"] == "boom"  # details["message"] 未覆盖人读文案
     assert payload["conflictWith"] == "alpha@mp-a"  # 普通键原样透出
-    for reserved in ("code", "json_output", "error_code"):
+    for reserved in ("code", "json_output", "error_code", "msg"):
         assert reserved not in payload, f"reserved detail key {reserved!r} must be filtered"
 
 
