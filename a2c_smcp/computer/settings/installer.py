@@ -59,7 +59,6 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
 
 from __future__ import annotations
 
-import shutil
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,10 +72,13 @@ from a2c_smcp.computer.settings.raw import (
     read_raw_object,
 )
 from a2c_smcp.computer.settings.reconciler import (
+    InstallPathRemovalError,
     NonPluginBundleIds,
+    is_external_plugin_install_path,
     ledger_mcp_deps_of,
     other_plugin_mcp_deps,
     reclaimable_mcp_deps,
+    remove_plugin_install_path,
 )
 from a2c_smcp.computer.settings.schema import SettingsScope, is_valid_enabled_plugin_key
 from a2c_smcp.computer.settings.scope import (
@@ -116,7 +118,6 @@ from a2c_smcp.computer.skills.staging import (
 )
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.path import is_within
 
 logger = get_logger(__name__)
 
@@ -125,7 +126,13 @@ logger = get_logger(__name__)
 # 异常 / Exceptions（模块内本地异常，仿 ToolNameDuplicatedError / SkillStagingError 惯例）
 # ---------------------------------------------------------------------------
 class PluginInstallError(Exception):
-    """plugin install/enable 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope）。"""
+    """
+    plugin install / enable / uninstall 编排失败。
+
+    - install/enable 前置失败：marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope；
+    - uninstall 删除**独占外部 clone** 失败（软链重定向 / resolve 异常 / rmtree 失败）——此时账本与安装意图
+      保持不变，残留 clone 仍有索引可重试；调用方（CLI / marketplace_remove）必须按失败上报，不得当作 no-op。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -161,20 +168,6 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str]:
         raise PluginInstallError(f"invalid plugin id {plugin_id!r} (expect '<plugin>@<marketplace>', strict kebab, each ≤64)")
     plugin, _, marketplace = plugin_id.partition("@")
     return plugin, marketplace
-
-
-def _safe_rmtree(path: Path, home: Path) -> None:
-    """仅当 ``path`` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ Guarded rmtree within SKILL Home（同 reconciler 语义）。"""
-    rp = path.resolve()
-    if not is_within(rp, home.resolve()):
-        logger.error("installer: refusing to remove %s outside SKILL Home %s", rp, home)
-        return
-    if not rp.exists():
-        return
-    try:
-        shutil.rmtree(rp)
-    except OSError as e:  # 失败降级：删除受阻不阻断后续
-        logger.warning("installer: failed to remove %s: %s", rp, e)
 
 
 def _settings_path_for_scope(scope: str, project_path: str | None, env: Mapping[str, str] | None) -> tuple[Path, SettingsScope]:
@@ -594,7 +587,7 @@ async def uninstall_plugin(
     remove_server: RemoveServer | None = None,
 ) -> bool:
     """
-    卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据回收** MCP 依赖 + 删账本记录）/ Uninstall。
+    卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills + **按判据回收** MCP 依赖 + 删账本记录）/ Uninstall。
 
     **MCP 依赖回收**（协议 §4.9.1-2，#153/D3+F1）：plugin 声明依赖的 server **不是**它的所有物，故卸载
     **不无条件收回**——逐个过 :func:`~a2c_smcp.computer.settings.reconciler.reclaimable_mcp_deps`：
@@ -610,12 +603,19 @@ async def uninstall_plugin(
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
 
+    :raises PluginInstallError: 独占外部 clone 删除失败（软链重定向 / OSError）——账本与安装意图保持不变，
+        残留 clone 仍有索引可重试；调用方 MUST NOT 当作 no-op。
+
     .. note::
-       **相对源 plugin**（``source`` 为相对路径）的 ``installPath`` 位于**共享 catalog clone 内**
-       （``<home>/marketplace/<mp>/plugins/<plugin>``），:func:`_safe_rmtree` 删的是该 marketplace 共享 git
-       工作树的子目录——此行为与兄弟 :func:`gc_plugins` 一致（同一 ``_safe_rmtree`` 语义、非本工单新引入）；
-       后续 ``marketplace refresh`` 遇脏树会 fallback 全量重 clone 干净恢复。「仅删外部 ``.plugins/`` 树、跳过
-       catalog 内子树」的行为收敛是 installer + gc 的**跨切 follow-up**（须两处一致，避免与 #62 的 gc 分叉）。
+       **文件归属（#258 方案 A，对齐 rust-sdk#271）**：只有 **plugin 独占的外部 clone**
+       ``<home>/marketplace/.plugins/<mp>/<plugin>`` 会被删除（:func:`remove_plugin_install_path`；``git-subdir``
+       删整个 clone 根），且仅在**没有 retained 记录**（指定 scope 之外的其余 scope）的 ``installPath`` 仍引用该
+       clone 时删除。相对源（``source: "./plugins/x"``）的 ``installPath`` 位于**共享 catalog clone**
+       ``<home>/marketplace/<mp>/…``——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，
+       MUST NOT 在此删除；归 ``marketplace remove`` / ``prune``（reconcile 仅在 ``sourceChanged`` 整树重 clone 时
+       清理）清理。``marketplace refresh`` **不**保证
+       还原工作树内被删文件（上游未变时 ``git pull --ff-only`` 不重建已删路径），恢复须 ``marketplace remove`` +
+       ``add``。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
     installed = load_installed_plugins(home=home, env=env)
@@ -634,7 +634,7 @@ async def uninstall_plugin(
     migrate_legacy_installs(home, env=env)
 
     # ① 停摘候选 + 回收判定，**先于任何删除**取得（§4.9.1-3：名单 MUST 在账本记录移除之前取得，且 MUST 仅依赖
-    #    账本自身字段——``installPath`` 指向的树在下面就被删了，「从 install_path 重解析」在本路径恒不成立）。
+    #    账本自身字段——与 installPath 指向的树是否删除无关；#258 起 catalog 内的树不再被本函数删除）。
     #    ``retained``：scoped uninstall 时本 pid 其余 scope 的记录仍声明依赖 ⇒ 仍算依赖者，不可回收。
     deps = sorted(ledger_mcp_deps_of(targeted))
     retained = [r for r in records if r not in targeted]
@@ -652,11 +652,31 @@ async def uninstall_plugin(
         env,
     )
 
+    # #258：按「引用」判定而非记录数——仅当**没有 retained 记录**的 installPath 落在该 plugin 独占外部 clone
+    # 内时才删除。跨 scope 源类型变化（user=Git 源 / project=相对源）按记录数门控会在先卸 user 时误保留 clone，
+    # 随后卸 project 又不再命中 → 永久泄漏（对齐 rust-sdk#271 复审终版；多 scope 的 skills/servers 拆除另案 #262）。
+    # 口径与 rust 终版一致：缺 / 空 / 非 str / 损坏或相对路径的 retain 记录**不**算引用（删除侧另有 canonicalize
+    # + Home 守卫兜底）；归属判定本身纯词法，不解析 installPath 链上的软链。
+    ext_clone_still_referenced = any(
+        is_external_plugin_install_path(Path(ip), home, marketplace, plugin)
+        for r in retained
+        if isinstance(ip := r.get("installPath"), str) and ip
+    )
+
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
-    for rec in targeted:
-        install_path = rec.get("installPath")
-        if isinstance(install_path, str) and install_path:
-            _safe_rmtree(Path(install_path), home)
+    if not ext_clone_still_referenced:
+        for rec in targeted:
+            install_path = rec.get("installPath")
+            if isinstance(install_path, str) and install_path:
+                # 只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
+                try:
+                    remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                except InstallPathRemovalError as e:
+                    # 删除失败（软链重定向 / resolve 异常 / rmtree OSError）→ 抛错并保持账本与意图不变；
+                    # 布尔 ``False`` 的公开契约仍只表示「未安装 no-op」，避免调用方误报 not installed。
+                    raise PluginInstallError(
+                        f"failed to remove exclusive clone for {plugin_id!r}: {e}; ledger and intent preserved",
+                    ) from e
 
     for name in _plugin_skill_names(registry, marketplace, plugin):
         registry.unregister(name)

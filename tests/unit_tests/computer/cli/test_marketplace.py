@@ -40,9 +40,13 @@ from a2c_smcp.computer.cli.commands.marketplace import (
     marketplace_set,
     normalize_marketplace_url,
 )
+from a2c_smcp.computer.settings.installer import PluginInstallError
+from a2c_smcp.computer.settings.scope import user_settings_path
 from a2c_smcp.computer.settings.store import (
     known_marketplaces_path,
+    load_installed_plugins,
     load_known_marketplaces,
+    save_installed_plugins,
     save_known_marketplaces,
     update_known_marketplaces,
 )
@@ -250,6 +254,144 @@ async def test_info_and_remove(tmp_path: Path) -> None:
     # remove（无 installed plugin → 仅 prune clone）
     assert await marketplace_remove(reg, home, env, "acme", confirm=_yes) == 0
     assert "acme" not in (load_known_marketplaces(home, env).get("marketplaces") or {})
+
+
+@pytest.mark.asyncio
+async def test_remove_fails_when_clone_is_symlink_258(tmp_path: Path) -> None:
+    """#258 复审 🔴1：clone 为软链、prune 无法清空 → 退出码 1，known 条目保留（残留树仍可被 orphan 发现）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    real = home / "marketplace" / "real"
+    (real / "plugins").mkdir(parents=True)
+    (real / "plugins" / "keep").write_text("x", encoding="utf-8")
+    link = home / "marketplace" / "acme"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": "file:///x"}, "installLocation": str(real)}}},
+        home=home,
+    )
+    _record_trust("acme", env)
+
+    code = await marketplace_remove(reg, home, env, "acme", confirm=_yes)
+
+    assert code == 1
+    assert "acme" in load_known_marketplaces(home, env)["marketplaces"]
+    assert "acme" in _load_trusted(env), "移除失败不得撤销信任"
+    assert link.is_symlink() and (real / "plugins" / "keep").exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_reports_uninstall_delete_failure_258(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#258 复审四轮 🟡2：uninstall 删除失败 + prune 成功 → exit 1、账本/意图/trust 保留、stderr 可感。"""
+    monkeypatch.chdir(tmp_path)  # cwd 隔离：_precheck_settings_writes 读 cwd 锚定的 project/local 层
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    clone = home / "marketplace" / "acme"
+    (clone / "plugins").mkdir(parents=True)
+    (clone / "plugins" / "x").write_text("x", encoding="utf-8")
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": "file:///x"}, "installLocation": str(clone)}}},
+        home=home,
+    )
+    settings = user_settings_path(env)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(
+        json.dumps({"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}, "trustedMarketplaces": ["acme"]}),
+        encoding="utf-8",
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep").write_text("x", encoding="utf-8")
+    ext = home / "marketplace" / ".plugins" / "acme" / "audit"
+    ext.parent.mkdir(parents=True)
+    try:
+        ext.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(ext)}]}},
+        home=home,
+    )
+    capsys.readouterr()
+
+    code = await marketplace_remove(reg, home, env, "acme", confirm=_yes)
+
+    assert code == 1, "uninstall 删除失败必须可感，不得因 prune 成功而 exit 0"
+    err = capsys.readouterr().err
+    assert "failed to uninstall 'audit@acme'" in err, "stderr 须点名失败 victim"
+    ledger = load_installed_plugins(home, env)["plugins"]
+    assert "audit@acme" in ledger and ledger["audit@acme"][0]["installPath"] == str(ext), "账本与 installPath 保留"
+    user = json.loads(settings.read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["audit@acme"], "安装意图保留"
+    assert user["enabledPlugins"]["audit@acme"] is True, "enabled 保留"
+    # marketplace 本体已被 prune 移除 → 撤销信任属正确清理（避免同名 later re-add 继承旧信任）；
+    # 「移除真正失败（prune 未清空）」时信任保留，由 test_remove_fails_when_clone_is_symlink_258 锁定。
+    assert "acme" not in user["trustedMarketplaces"]
+    assert "acme" not in load_known_marketplaces(home, env)["marketplaces"], "prune 本身成功（场景前提）"
+    assert (target / "keep").exists(), "拒删：链接目标完好"
+
+
+class _ReplComp:
+    """``marketplace`` repl_dispatch 的最小 fake（仅需 skill_home / skill_registry / mark_skills_dirty）。"""
+
+    def __init__(self, home: Path, registry: SkillRegistry) -> None:
+        self.skill_home = home
+        self.skill_registry = registry
+        self.dirty = 0
+        self.mcp_manager = None
+
+    def mark_skills_dirty(self) -> None:
+        self.dirty += 1
+
+
+class _ReplSession:
+    """REPL confirm 最小替身：恒答 y。"""
+
+    async def prompt_async(self, _prompt: str) -> str:
+        return "y"
+
+
+@pytest.mark.asyncio
+async def test_repl_remove_partial_failure_marks_dirty_258(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#258 复审四轮 🟡1：一 victim 成功、一 victim 失败但 marketplace 已被 prune → REPL 必须标脏。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    monkeypatch.setenv("A2C_SKILL_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    clone = home / "marketplace" / "acme"
+    (clone / "plugins").mkdir(parents=True)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": "file:///x"}, "installLocation": str(clone)}}},
+        home=home,
+    )
+    save_installed_plugins(
+        {
+            "version": 1,
+            "plugins": {
+                "ok@acme": [{"scope": "user", "installPath": str(clone / "plugins" / "ok")}],
+                "bad@acme": [{"scope": "user", "installPath": str(clone / "plugins" / "bad")}],
+            },
+        },
+        home=home,
+    )
+
+    async def _uninstall(pid: str, *_a: object, **_kw: object) -> bool:
+        if pid == "bad@acme":
+            raise PluginInstallError("simulated removal failure")
+        return True
+
+    monkeypatch.setattr(marketplace_mod, "uninstall_plugin", _uninstall)
+    comp = _ReplComp(home, SkillRegistry())
+
+    await marketplace_mod.repl_dispatch(comp, ["marketplace", "remove", "acme"], session=_ReplSession())
+
+    assert comp.dirty == 1, "prune 已移除 marketplace ⇒ 即使 exit 1 也必须标脏（否则 Agent 看不到已删除 SKILL）"
+    assert "acme" not in load_known_marketplaces(home, env)["marketplaces"]
 
 
 @requires_git

@@ -888,8 +888,13 @@ def _entry_plugin_name(entry: Mapping[str, Any]) -> str:
     return name.strip()
 
 
-def _external_plugin_dir(home: Path, marketplace: str, plugin: str) -> Path:
-    """独立 clone plugin 的落点 ``<home>/marketplace/.plugins/<mp>/<plugin>/`` / External plugin clone dir。"""
+def external_plugin_dir(home: Path, marketplace: str, plugin: str) -> Path:
+    """
+    独立 clone plugin 的落点 ``<home>/marketplace/.plugins/<mp>/<plugin>/`` / External plugin clone dir。
+
+    归属边界（#258）：``url`` / ``github`` / ``cnb`` 的 ``installPath`` 即本根；``git-subdir`` 是它的后辈子目录
+    （删除时删整个根）；**相对源不在本命名空间**——它们就地落在共享 catalog clone 内，卸载 / GC MUST NOT 删除。
+    """
     return home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS / marketplace / plugin
 
 
@@ -1037,7 +1042,7 @@ async def locate_plugin_root(
             raise SkillStagingError(f"relative plugin source escapes marketplace clone: {resolved.rel_path!r}")
         version_fallback = catalog_sha
     else:  # GitCloneSpec：独立 clone（git-subdir sparse / sha 锁版本等）。
-        ext_dir = _external_plugin_dir(home, marketplace, plugin_name)
+        ext_dir = external_plugin_dir(home, marketplace, plugin_name)
         head = await _git_head_sha(ext_dir, timeout=timeout, env=env) if ext_dir.exists() else None
         # 复用既有 clone 的条件（否则重 clone）：
         #  - sha 锁版本：既有 HEAD 已等于 pin → 复用（重 clone 无收益）；pin 变更（A→B）→ 重 clone 重 pin（守住

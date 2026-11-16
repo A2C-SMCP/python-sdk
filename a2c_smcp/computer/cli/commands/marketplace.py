@@ -368,6 +368,12 @@ async def marketplace_remove(
                 console_err.print(f"[yellow]! failed to uninstall {pid!r}: {e}[/yellow]")
 
     pruned = prune_marketplaces([name], registry, home, env=env)
+    if name not in pruned:
+        # clone / 外部树未能清空（软链 / OSError）→ prune 保留 known 条目；marketplace 仍存在，不得撤销信任。
+        return _err(
+            f"failed to remove marketplace {name!r}: clone tree could not be removed",
+            json_output=json_output,
+        )
     # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。此时移除**已完成**，revoke 只是清理残留，
     # 故 fail-closed 的写失败降级为 WARN（不吞、不覆盖、不回滚已完成的开除动作）——#246。
     try:
@@ -487,12 +493,15 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             return
         from a2c_smcp.computer.cli.commands import build_mcp_callbacks
 
+        name = pos[0]
         code = await marketplace_remove(
-            registry, home, env, pos[0],
+            registry, home, env, name,
             keep_plugins="--keep-plugins" in args, confirm=_confirm,
             mcp_cbs=build_mcp_callbacks(comp), json_output=json_output,
         )
-        if code == EXIT_OK:
+        # 部分失败（uninstall 抛错）时返回非 EXIT_OK，但 marketplace 可能已被 prune 移除——按「是否仍在册」
+        # 标脏，否则已连接 Agent 继续看到已删除的 SKILL（#258 复审四轮 🟡1）。
+        if code == EXIT_OK or name not in _marketplaces(home, env):
             comp.mark_skills_dirty()
     elif sub == "refresh":
         target = pos[0] if pos else "all"
