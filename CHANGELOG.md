@@ -411,6 +411,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 新增子进程回归锁（阻断 rich / prompt_toolkit）与 `clean_install_smoke.sh none` 制品级闸门（CI 双跑）。
   - 注：`a2c-computer` 命令行入口本身仍需要 `a2c-smcp[cli]`（typer）。
 
+### Fixed（#261 marketplace URL 展示脱敏）
+
+- **marketplace CLI 原样展示 `source.url`，userinfo / token 可能外显**（#261，安全）：新增单一展示权威
+  `a2c_smcp/utils/git_url.py`（与 rust-sdk 同一展示契约，非镜像）：
+  - `list` / `info` / `add` 的表格、JSON、确认提示中的 `url` 改为**展示值**——去除 userinfo（用户名与
+    密码 / token）、query、fragment；scp-like `user@host:path` 显示 `host:path`。展示值不可用于 re-clone，
+    `known_marketplaces.json` 存储与 git clone/pull 入参保持原始 URL。
+  - 错误 / 诊断 / 日志走严格 fail-closed：不可解析 / host 缺失 / scp-like → `<redacted-git-source>`；
+    `_run_git` 异常（argv + git stderr）、SSH→HTTPS 回退日志、marketplace source 非法与 clone/refresh
+    失败日志均做 token 级脱敏，不再泄漏 git stderr 中的凭据。
+  - 与 rust-sdk#273 决策（2026-11-16）对齐；rust#154 fail-closed 边界不变。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

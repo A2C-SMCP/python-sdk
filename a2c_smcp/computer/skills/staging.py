@@ -117,6 +117,7 @@ from a2c_smcp.computer.skills.sources import (
     resolve_plugin_source,
 )
 from a2c_smcp.smcp import A2CSkillRef
+from a2c_smcp.utils.git_url import git_url_for_display, redact_git_urls_in_text, sanitize_git_text
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -754,7 +755,10 @@ async def _run_git(args: Sequence[str], *, timeout: float, env: Mapping[str, str
         raise SkillStagingError(f"git {args[0] if args else ''} timed out after {timeout}s") from None
     if proc.returncode != 0:
         err = stderr.decode(errors="ignore").strip()
-        raise SkillStagingError(f"git {' '.join(args)} failed (rc={proc.returncode}): {err}")
+        # #261：异常消息同时含 argv（可能带 URL userinfo）与 git stderr（可能回显远端 URL 或缩写端点
+        # ``user@host:``），先按本次 argv 的已知 URL 做 verbatim 替换，再走通用 token 级脱敏后抛出。
+        detail = sanitize_git_text(f"git {' '.join(args)} failed (rc={proc.returncode}): {err}", args)
+        raise SkillStagingError(detail)
     return stdout.decode(errors="ignore")
 
 
@@ -797,7 +801,12 @@ async def _git_clone_with_fallback(
         https = _ssh_to_https(url)
         if https is None or https == url:
             raise
-        logger.warning("git clone %s failed (%s); retrying via HTTPS %s", url, first, https)
+        logger.warning(
+            "git clone %s failed (%s); retrying via HTTPS %s",
+            git_url_for_display(url),
+            redact_git_urls_in_text(str(first)),
+            git_url_for_display(https),
+        )
         shutil.rmtree(dest, ignore_errors=True)
         await _run_git(["clone", *clone_args, "--", https, str(dest)], timeout=timeout, env=env)
 
@@ -1170,13 +1179,22 @@ async def stage_marketplace_skills(
     # 仅接受严格 kebab marketplace 名（与 settings load 的 is_valid_marketplace_name 同契约），天然拒
     # ``..`` / ``/`` 等路径穿越向量（上游 settings 已校验，此处兜底未来非 settings 调用方）。
     if not is_valid_marketplace_name(name):
-        logger.error("marketplace name %r is invalid (must be strict-kebab, 1-64), skipped (not registered)", name)
+        # #261：账本键可能被手编成携带 URL 凭据的串（rust `test_invalid_marketplace_name_log_redacts_embedded_credentials`）。
+        logger.error(
+            "marketplace name %r is invalid (must be strict-kebab, 1-64), skipped (not registered)",
+            redact_git_urls_in_text(name),
+        )
         return registered
 
     try:
         url = marketplace_clone_url(source)
     except SkillSourceError as e:
-        logger.error("marketplace %r has invalid source, skipped (not registered): %s", name, e)
+        # #261：SkillSourceError 消息内嵌 source dict（可能含凭据 URL），日志前必须脱敏。
+        logger.error(
+            "marketplace %r has invalid source, skipped (not registered): %s",
+            name,
+            redact_git_urls_in_text(str(e)),
+        )
         return registered
 
     # home 由调用方保证存在（与 stage_mcp_skills / stage_user_skills 一致）；clone 目录父级由
@@ -1194,7 +1212,11 @@ async def stage_marketplace_skills(
             await _git_clone_marketplace(url, clone_dir, timeout=timeout, env=env)
             changed = True
     except SkillStagingError as e:
-        logger.error("marketplace %r clone/refresh failed, skipped (not registered): %s", name, e)
+        logger.error(
+            "marketplace %r clone/refresh failed, skipped (not registered): %s",
+            name,
+            redact_git_urls_in_text(str(e)),
+        )
         return registered
 
     commit_sha = await _git_head_sha(clone_dir, timeout=timeout, env=env)

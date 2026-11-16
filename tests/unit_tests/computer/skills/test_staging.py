@@ -20,6 +20,7 @@ import base64
 import hashlib
 import io
 import logging
+import subprocess
 import tarfile
 import zipfile
 from collections.abc import Iterator
@@ -32,6 +33,7 @@ from mcp.types import BlobResourceContents, ReadResourceResult, Resource, TextRe
 import a2c_smcp.computer.skills.staging as staging_mod
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import _build_marketplace_ref, _partition_roots, stage_mcp_skills, stage_user_skills
+from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, redact_git_urls_in_text
 
 
 # ── 测试替身 / doubles ───────────────────────────────────────────────────────
@@ -867,3 +869,148 @@ def test_user_home_rescan_no_spurious_warning(tmp_path: Path, staging_logs: pyte
     assert first == ["uniq"] and second == ["uniq"]
     assert len(reg) == 1
     assert not any(r.levelno == logging.WARNING for r in staging_logs.records)
+
+
+# ── #261 marketplace URL 展示脱敏：异常 / 日志 / clone 入参 ────────────────────
+_CRED_CLONE_URL = "https://user:FAKE_TOKEN@127.0.0.1:1/org/repo.git"
+_CRED_SSH_URL = "ssh://alice:FAKE_TOKEN@127.0.0.1:1/org/repo.git"
+
+
+def _no_secret(records: list[logging.LogRecord] | object) -> str:
+    """把所有日志记录拼成文本，供负断言。"""
+    return "\n".join(r.getMessage() for r in records)  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_run_git_failure_redacts_argv_and_stderr(tmp_path: Path) -> None:
+    """真实 git 失败：异常消息不得含 argv / stderr 中的凭据 URL。"""
+    dest = tmp_path / "dest"
+    with pytest.raises(staging_mod.SkillStagingError) as ei:
+        await staging_mod._run_git(["clone", "--", _CRED_CLONE_URL, str(dest)], timeout=10, env=None)
+    msg = str(ei.value)
+    assert "FAKE_TOKEN" not in msg
+    assert "https://127.0.0.1:1/org/repo.git" in msg
+
+
+@pytest.mark.asyncio
+async def test_marketplace_clone_failure_log_redacts(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """marketplace clone 失败日志（真实 clone 分支）：不含凭据，含占位符。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "git", "url": _CRED_CLONE_URL}, SkillRegistry(), home, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "FAKE_TOKEN" not in text
+    assert "https://127.0.0.1:1/org/repo.git" in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_clone_fallback_log_redacts(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """SSH→HTTPS 回退日志：ssh 原始 URL 的 userinfo 不得落日志。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "git", "url": _CRED_SSH_URL}, SkillRegistry(), home, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "FAKE_TOKEN" not in text
+    assert "ssh://127.0.0.1:1/org/repo.git" in text
+    assert "https://127.0.0.1/org/repo.git" in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_source_log_redacts(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """source 非法日志：SkillSourceError 消息内嵌 source dict（含 URL）也必须脱敏。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "weird", "url": _CRED_CLONE_URL}, SkillRegistry(), home, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "FAKE_TOKEN" not in text
+    assert "https://127.0.0.1:1/org/repo.git" in text
+
+
+def test_scp_like_token_in_error_text_is_placeholder() -> None:
+    """scp-like 在错误/日志文本中整体占位符（strict 语义，与 rust 一致）。"""
+    out = redact_git_urls_in_text("git clone alice@127.0.0.1:org/repo.git failed")
+    assert "alice@" not in out
+    assert REDACTED_GIT_SOURCE in out
+
+
+@pytest.mark.asyncio
+async def test_marketplace_clone_passes_raw_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """存储 / git 入参不变：clone 收到的是原始 URL（含 userinfo），展示层才脱敏。"""
+    captured: dict[str, list[str]] = {}
+
+    async def fake_run_git(args: object, *, timeout: float, env: object) -> str:
+        captured["args"] = list(args)  # type: ignore[arg-type]
+        return ""
+
+    monkeypatch.setattr(staging_mod, "_run_git", fake_run_git)
+    await staging_mod._git_clone_marketplace(_CRED_CLONE_URL, tmp_path / "dest", timeout=5, env=None)
+    assert _CRED_CLONE_URL in captured["args"]
+
+
+@pytest.mark.asyncio
+async def test_marketplace_refresh_pull_failure_log_redacts(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """refresh 腿（git pull 失败 → 全量重 clone）：WARN/ERROR 均不得含凭据（rust 同款边界）。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    clone_dir = staging_mod.marketplace_skill_dir(home, "demo")
+    clone_dir.mkdir(parents=True)
+    _git_identity = ["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q"], cwd=str(clone_dir), check=True, capture_output=True)
+    subprocess.run(
+        ["git", *_git_identity, "commit", "--allow-empty", "-q", "-m", "init"],
+        cwd=str(clone_dir),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", _CRED_CLONE_URL],
+        cwd=str(clone_dir),
+        check=True,
+        capture_output=True,
+    )
+
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "git", "url": _CRED_CLONE_URL}, SkillRegistry(), home, refresh=True, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "FAKE_TOKEN" not in text
+    warnings = [r for r in staging_logs.records if r.levelno == logging.WARNING]
+    assert warnings, text
+    assert any("pull" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_name_log_redacts(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """账本键被手编成携带 URL 凭据的串：非法 name 日志必须脱敏（rust 同款用例）。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "x=https://alice:PW_LEAK@example.com/repo.git",
+        {"type": "git", "url": "https://example.com/r.git"},
+        SkillRegistry(),
+        home,
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "PW_LEAK" not in text
+    assert "alice" not in text
