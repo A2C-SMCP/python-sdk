@@ -351,7 +351,8 @@ async def test_refresh_over_double_install_keeps_first_registrant(tmp_path: Path
     )
 
     reg = SkillRegistry()
-    declared = resolve_settings(env=env).settings
+    # 显式锚定 tmp_path：本模块无 cwd 隔离，默认锚进程 cwd 会读进开发者本机 `.tfrobot/settings[.local].json`
+    declared = resolve_settings(env=env, cwd=tmp_path).settings
     report = await reconcile(reg, home, declared, env=env, refresh=True)
 
     got = reg.resolve("alpha:foo")

@@ -182,10 +182,8 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str]:
 def _bare_name_conflicts(
     plugin_id: str,
     *,
-    home: Path,
-    env: Mapping[str, str] | None,
+    facts: _InstallFacts,
     allow_if_installed: bool = False,
-    facts: _InstallFacts | None = None,
 ) -> list[str]:
     """
     跨 marketplace 裸名唯一性扫描（skill.md §1.2 note / §1.5；#257）/ Cross-marketplace bare-name scan.
@@ -196,23 +194,23 @@ def _bare_name_conflicts(
     扫描面 = merged ``installedPlugins``（user/project/local，经 :func:`resolve_settings`）∪ 物化账本
     ``installed_plugins.json`` 的 pid 键；返回**同名不同 marketplace** 的已安装 pid（升序、排除自身）。
 
-    ``allow_if_installed``（install 用）：目标 pid 自身已在安装集时直接放行——同一 pid 重装不改安装集、
-    不新增第二个 ``<plugin>``，属决策 1 的幂等情形（存量双装 home 里也须可重装/重钉版本）。enable 侧保持
-    fail-closed（决策 2）。
+    ``allow_if_installed``（install 用）：目标 pid 自身已在**物化账本**时直接放行——同一 pid 重装不改安装集、
+    不新增第二个 ``<plugin>``，属决策 1 的幂等情形（存量双装 home 里也须可重装/重钉版本）。carve-out
+    **只认账本，不认 merged 声明集**：project/local 的纯声明不是安装事实（否则声明一个从未安装的 pid 就能
+    把同名第二个装进来）。enable 侧保持 fail-closed（决策 2）。
 
     ``drop_legacy=False`` 是**承重墙**：账本默认视图会整条丢弃旧格式（``bundledMcpServers``）记录，令
     v0.2.x 存量 home 的 ``alpha@mp-a`` 对检查隐身——安装随后才由 :func:`migrate_legacy_installs` 从账本
     回填意图，正好形成「先绕过、后出现」的旁路。故此处与迁移路径读**同一视图**（只读 pid 键，不碰旧格式值）。
 
-    ``facts`` 可由调用方传入：预检与 :func:`_bare_name_conflict_error` 的诊断分档共用同一次读取，避免并发
-    窗口里「判定用旧快照、文案用新快照」的漂移（#257 复审 🟡3）；缺省自行读取。
+    ``facts`` **必填**：预检与 :func:`_bare_name_conflict_error` 的诊断分档必须共用同一次读取，避免并发
+    窗口里「判定用旧快照、文案用新快照」的漂移（#257 复审 🟡3）。不自读 fallback——调用方先算一次再传。
     """
-    resolved = facts if facts is not None else _install_facts(home=home, env=env)
     # 幂等 carve-out 只认**账本记录**（真重装 / 存量双装）。project/local 的纯声明不是安装事实——拿 merged
     # 意图放行等于「声明一个从未安装的 `<plugin>@<mp>` 就能把同名第二个装进来」（#257 复审 🔴3）。
-    if allow_if_installed and plugin_id in resolved.ledger_pids:
+    if allow_if_installed and plugin_id in facts.ledger_pids:
         return []
-    return _bare_name_clash_pids(plugin_id, resolved.installed_pids)
+    return _bare_name_clash_pids(plugin_id, facts.installed_pids)
 
 
 def _bare_name_clash_pids(plugin_id: str, pids: Iterable[str]) -> list[str]:
@@ -232,9 +230,7 @@ def _bare_name_conflict_error(
     conflicts: list[str],
     *,
     action: str,
-    home: Path,
-    env: Mapping[str, str] | None,
-    ledger_pids: frozenset[str] | None = None,
+    ledger_pids: frozenset[str],
 ) -> PluginInstallError:
     """
     构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）/
@@ -245,13 +241,12 @@ def _bare_name_conflict_error(
     等其完成，``plugin uninstall`` 对这类条目恒为 no-op。
     Remedies are split by ledger presence; a pid without a materialization record cannot be cleared by uninstall.
 
-    :param ledger_pids: 调用方已算出的账本 pid 快照（in-lock 复核传入，避免在持锁期间重读与分类漂移；
-        ``None`` → 自行经 :func:`_install_facts` 读取）。
+    :param ledger_pids: 调用方已算出的账本 pid 快照，**必填**——与判定冲突的 `facts` 同源，避免分档时
+        重读导致漂移（并发窗口）与持锁期间多余 I/O（#257 复审 🟡3）。不自读 fallback。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    ledger = ledger_pids if ledger_pids is not None else _install_facts(home=home, env=env).ledger_pids
-    materialized = [pid for pid in conflicts if pid in ledger]
-    declared_only = [pid for pid in conflicts if pid not in ledger]
+    materialized = [pid for pid in conflicts if pid in ledger_pids]
+    declared_only = [pid for pid in conflicts if pid not in ledger_pids]
     existing = ", ".join(repr(pid) for pid in conflicts)
     remedies: list[str] = []
     if materialized:
@@ -457,9 +452,7 @@ def _write_installed_plugin(
                         candidates = {e for e in entries if isinstance(e, str) and is_valid_enabled_plugin_key(e)}
                         clashes = _bare_name_clash_pids(plugin_id, candidates | ledger)
                         if clashes:
-                            raise _bare_name_conflict_error(
-                                plugin_id, clashes, action="install", home=home, env=env, ledger_pids=ledger,
-                            )
+                            raise _bare_name_conflict_error(plugin_id, clashes, action="install", ledger_pids=ledger)
                 entries.append(plugin_id)
             elif not present and was_present:
                 entries = [e for e in entries if e != plugin_id]
@@ -808,11 +801,9 @@ async def install_plugin(
     # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——
     #      含 :func:`migrate_legacy_installs` 的迁移标记键（那时才从账本回填意图的存量插件才会「冒出来」）。
     facts = _install_facts(home=home, env=env)
-    conflicts = _bare_name_conflicts(plugin_id, home=home, env=env, allow_if_installed=True, facts=facts)
+    conflicts = _bare_name_conflicts(plugin_id, facts=facts, allow_if_installed=True)
     if conflicts:
-        raise _bare_name_conflict_error(
-            plugin_id, conflicts, action="install", home=home, env=env, ledger_pids=facts.ledger_pids,
-        )
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="install", ledger_pids=facts.ledger_pids)
 
     # 1.5：预检过后、写意图键之前，先跑一次性迁移（幂等、标记键短路）。install 会写 installedPlugins 键——
     #      若迁移尚未发生（如升级后未经 boot 的 headless CLI install），先写键会把迁移标记误置为"已迁移"，
@@ -1124,11 +1115,9 @@ async def enable_plugin(
     # 0：跨 marketplace 裸名防御（#257 决策 2）——先于 enabledPlugins 写 / stage / 挂 server。存量双装
     #    （升级前两 marketplace 均已 install）升级后只能先 uninstall 被遮蔽的一方，不得靠 enable 触发覆盖。
     facts = _install_facts(home=home, env=env)
-    conflicts = _bare_name_conflicts(plugin_id, home=home, env=env, facts=facts)
+    conflicts = _bare_name_conflicts(plugin_id, facts=facts)
     if conflicts:
-        raise _bare_name_conflict_error(
-            plugin_id, conflicts, action="enable", home=home, env=env, ledger_pids=facts.ledger_pids,
-        )
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="enable", ledger_pids=facts.ledger_pids)
 
     # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 依赖预检（零持久化变更前）
     servers: list[MCPServerConfig] = []
