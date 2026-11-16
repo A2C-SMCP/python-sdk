@@ -673,6 +673,22 @@ def test_safe_rmtree_refuses_symlinked_parent_component_258(tmp_path: Path) -> N
     assert (target / "acme" / "pkg" / "keep").exists(), "父组件软链不得被跟随"
 
 
+def test_safe_rmtree_resolve_failure_returns_false_258(tmp_path: Path) -> None:
+    """#258 复审三轮 🟡3：路径不可解析（软链环）→ ``_safe_rmtree`` 拒删返回 False，不逃逸异常。"""
+    import a2c_smcp.computer.settings.reconciler as rec_mod
+
+    home = _home(tmp_path)
+    loop_a = home / "loop-a"
+    loop_b = home / "loop-b"
+    try:
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+
+    assert rec_mod._safe_rmtree(loop_a / "x", home) is False
+
+
 def test_prune_failure_does_not_block_other_marketplaces_258(tmp_path: Path) -> None:
     """#258 复审 🔴1：任一 marketplace 清理失败不阻断其余名字（失败项保留 known，成功项照常移除）。"""
     home = _home(tmp_path)
@@ -698,7 +714,7 @@ def test_prune_failure_does_not_block_other_marketplaces_258(tmp_path: Path) -> 
 
 
 async def test_gc_keeps_ledger_when_clone_removal_fails_258(tmp_path: Path) -> None:
-    """#258 复审 🟡2：gc 删除独占 clone 失败（软链根）→ 保留账本、不计入 removed，残留树仍有索引。"""
+    """#258 复审三轮 🟡6：gc 删除独占 clone 失败 → 保留账本/SKILL、不计 removed、不触发 MCP teardown。"""
     home = _home(tmp_path)
     target = home / "target"
     target.mkdir()
@@ -709,12 +725,20 @@ async def test_gc_keeps_ledger_when_clone_removal_fails_258(tmp_path: Path) -> N
         ext.symlink_to(target, target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("symlink not supported on this platform")
-    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext), "mcpServers": ["figma"]}]})
+    reg = SkillRegistry()
+    _reg_skill(reg, "audit:lint", "acme", ext)
+    teardown: list[list[str]] = []
 
-    removed = await gc_plugins(["audit@acme"], SkillRegistry(), home, non_plugin_bundle_ids=lambda: set())
+    async def _cb(servers: list[str]) -> None:
+        teardown.append(servers)
+
+    removed = await gc_plugins(["audit@acme"], reg, home, non_plugin_bundle_ids=lambda: set(), mcp_teardown=_cb)
 
     assert removed == []
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"]
+    assert reg.resolve("audit:lint") is not None, "删除失败不得注销 SKILL"
+    assert teardown == [], "删除失败不得触发 bundled server 摘除"
     assert (target / "keep").exists()
 
 

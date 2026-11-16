@@ -596,6 +596,9 @@ async def uninstall_plugin(
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
 
+    :raises PluginInstallError: 独占外部 clone 删除失败（软链重定向 / OSError）——账本与安装意图保持不变，
+        残留 clone 仍有索引可重试；调用方 MUST NOT 当作 no-op。
+
     .. note::
        **文件归属（#258 方案 A，对齐 rust-sdk#271）**：只有 **plugin 独占的外部 clone**
        ``<home>/marketplace/.plugins/<mp>/<plugin>`` 会被删除（:func:`remove_plugin_install_path`；``git-subdir``
@@ -664,9 +667,11 @@ async def uninstall_plugin(
                     logger.error("uninstall: failed to remove exclusive clone %s; aborting before ledger changes", install_path)
                     delete_failed = True
     if delete_failed:
-        # 删除失败（软链重定向 / OSError）→ 保持账本与意图不变、返回 False，避免残留 clone 失去索引
-        # （#258 复审 🔴1；此时尚未注销 skills / 回收 server / 删账本，副作用面为零或仅已成功删除的兄弟记录）。
-        return False
+        # 删除失败（软链重定向 / OSError）→ 抛错并保持账本与意图不变；布尔 ``False`` 的公开契约仍只表示
+        # 「未安装 no-op」，避免调用方把删除失败误报成 not installed（#258 复审三轮 🔴1/🟡2）。
+        raise PluginInstallError(
+            f"failed to remove exclusive clone for {plugin_id!r}; ledger and intent preserved",
+        )
 
     for name in _plugin_skill_names(registry, marketplace, plugin):
         registry.unregister(name)

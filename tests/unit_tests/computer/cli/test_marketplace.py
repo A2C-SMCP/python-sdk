@@ -42,7 +42,9 @@ from a2c_smcp.computer.cli.commands.marketplace import (
 )
 from a2c_smcp.computer.settings.store import (
     known_marketplaces_path,
+    load_installed_plugins,
     load_known_marketplaces,
+    save_installed_plugins,
     save_known_marketplaces,
     update_known_marketplaces,
 )
@@ -269,12 +271,46 @@ async def test_remove_fails_when_clone_is_symlink_258(tmp_path: Path) -> None:
         {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": "file:///x"}, "installLocation": str(real)}}},
         home=home,
     )
+    _record_trust("acme", env)
 
     code = await marketplace_remove(reg, home, env, "acme", confirm=_yes)
 
     assert code == 1
     assert "acme" in load_known_marketplaces(home, env)["marketplaces"]
+    assert "acme" in _load_trusted(env), "移除失败不得撤销信任"
     assert link.is_symlink() and (real / "plugins" / "keep").exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_reports_uninstall_delete_failure_258(tmp_path: Path) -> None:
+    """#258 复审三轮 🔴1：uninstall 删除独占 clone 失败（抛错）→ 即使 prune 成功也须 exit 1 且保留账本。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    clone = home / "marketplace" / "acme"
+    (clone / "plugins").mkdir(parents=True)
+    (clone / "plugins" / "x").write_text("x", encoding="utf-8")
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": "file:///x"}, "installLocation": str(clone)}}},
+        home=home,
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep").write_text("x", encoding="utf-8")
+    ext = home / "marketplace" / ".plugins" / "acme" / "audit"
+    ext.parent.mkdir(parents=True)
+    try:
+        ext.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(ext)}]}},
+        home=home,
+    )
+
+    code = await marketplace_remove(reg, home, env, "acme", confirm=_yes)
+
+    assert code == 1, "uninstall 删除失败必须可感，不得因 prune 成功而 exit 0"
+    assert "audit@acme" in load_installed_plugins(home, env)["plugins"], "删除失败账本保留"
+    assert (target / "keep").exists()
 
 
 @requires_git

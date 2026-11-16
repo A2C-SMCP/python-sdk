@@ -561,7 +561,7 @@ async def test_uninstall_malformed_install_path_does_not_raise_258(tmp_path: Pat
 
 
 async def test_uninstall_refuses_symlinked_clone_keeps_ledger_258(tmp_path: Path) -> None:
-    """#258 复审 🟡2：独占 clone 为软链（拒删）→ 返回 False、账本保留，残留树仍有索引可重试。"""
+    """#258 复审三轮 🔴1/🟡2：独占 clone 为软链（拒删）→ 抛 PluginInstallError，账本与意图保留。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
     target = tmp_path / "target"
@@ -574,10 +574,15 @@ async def test_uninstall_refuses_symlinked_clone_keeps_ledger_258(tmp_path: Path
     except (OSError, NotImplementedError):
         pytest.skip("symlink not supported on this platform")
     _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
 
-    assert await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is False
+    with pytest.raises(PluginInstallError, match="ledger and intent preserved"):
+        await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env)
 
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"], "删除失败不得删账本"
+    user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert user["installedPlugins"] == ["audit@acme"], "删除失败不得删安装意图"
+    assert user["enabledPlugins"]["audit@acme"] is True, "删除失败不得清 enabled"
     assert (target / "keep").exists() and ext.is_symlink()
 
 

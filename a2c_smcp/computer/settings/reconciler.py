@@ -164,7 +164,8 @@ def _safe_rmtree(path: Path, home: Path) -> bool:
     仅当 ``path`` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ rmtree only within SKILL Home.
 
     ``path`` 本身是符号链接 → 记 WARN + 拒删（``resolve`` 后 ``rmtree`` 会删链接目标，可指向 Home 内共享树）；
-    ``path`` 不存在 → no-op；越界 → 记 ERROR + 拒删（不抛）。删除失败 → 记 WARN（不阻断后续清理）。
+    路径不可解析（软链环 / 权限 / 内嵌 NUL）→ 记 WARN + 拒删；``path`` 不存在 → no-op；越界 → 记 ERROR + 拒删。
+    **本函数不抛**；删除失败 → 记 WARN（不阻断后续清理）。
 
     :return: ``True`` 表示目标已不存在（删除成功或本来就不存在）；``False`` 表示拒删 / 删除失败（目标可能仍在）。
         调用方需要区分「已清空」与「静默失败」时（如 reconcile 的 sourceChanged 换源）必须检查返回值。
@@ -172,8 +173,12 @@ def _safe_rmtree(path: Path, home: Path) -> bool:
     if path.is_symlink():
         logger.warning("reconcile: refusing to remove symlink %s", path)
         return False
-    rp = path.resolve()
-    home_rp = home.resolve()
+    try:
+        rp = path.resolve()
+        home_rp = home.resolve()
+    except (OSError, RuntimeError, ValueError) as e:  # 软链环 / 权限 / 内嵌 NUL / 平台路径错误 → 拒删
+        logger.warning("reconcile: cannot resolve %s (%s); refusing to remove", path, e)
+        return False
     if not is_within(rp, home_rp):
         logger.error("reconcile: refusing to remove %s outside SKILL Home %s", rp, home)
         return False
@@ -226,7 +231,8 @@ def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str,
     按 **plugin 文件归属** 删除 ``installPath``（#258 / rust-sdk#271 方案 A）/ Remove installPath by ownership.
 
     仅当 ``installPath`` 位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``（含
-    ``git-subdir`` 的后代）时，删除**整个 clone 根**并返回 ``True``；其余路径一律保留并返回 ``False``：
+    ``git-subdir`` 的后代）时，删除**整个 clone 根**并返回 ``True``；**非独占路径**（共享 catalog 等）保留并
+    返回 ``None``；**拒绝 / 删除失败**返回 ``False``：
 
     - 相对源（``source: "./plugins/x"``）的 ``installPath`` 落在**共享 catalog clone** ``<home>/marketplace/<mp>/…``
       ——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，归 ``marketplace remove`` /
