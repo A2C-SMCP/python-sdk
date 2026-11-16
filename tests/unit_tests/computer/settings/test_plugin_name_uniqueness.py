@@ -404,6 +404,48 @@ async def test_enable_rollback_restores_preexisting_orphan(tmp_path: Path) -> No
     assert after == before
 
 
+def test_source_conflict_error_remedy_branches(tmp_path: Path) -> None:
+    """诊断三档文案直测：未安装冲突方 → marketplace remove；已安装（跨进程交错可达）→ uninstall；兜底形态。
+
+    #257 复审 🟡1/🟡2：`enable` 进程内到不了「已安装冲突方」档（step 0 会先拦），但并发进程可在 staging
+    窗口内安装它；三档都必须给出**可执行**补救，兜底档不得无机读身份。
+    """
+    from a2c_smcp.computer.settings.installer import _source_conflict_error
+    from a2c_smcp.computer.skills.registry import SourceConflict
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    plugin_root = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+
+    not_installed = _source_conflict_error(
+        "alpha@mp-a",
+        [SourceConflict(name="alpha:foo", existing_source="marketplace:mp-b", refused_source="marketplace:mp-a")],
+        home=home,
+        env=env,
+    )
+    assert not_installed.details["conflictWith"] == "alpha@mp-b"
+    assert "marketplace remove mp-b" in str(not_installed)
+    assert "plugin uninstall alpha@mp-b" not in str(not_installed)
+
+    _seed_ledger(home, {"alpha@mp-b": [_record(plugin_root)]})  # 模拟并发进程在 staging 窗口内完成安装
+    installed = _source_conflict_error(
+        "alpha@mp-a",
+        [SourceConflict(name="alpha:foo", existing_source="marketplace:mp-b", refused_source="marketplace:mp-a")],
+        home=home,
+        env=env,
+    )
+    assert "plugin uninstall alpha@mp-b" in str(installed)
+
+    fallback = _source_conflict_error(
+        "alpha@mp-a",
+        [SourceConflict(name="alpha:foo", existing_source="user", refused_source="marketplace:mp-a")],
+        home=home,
+        env=env,
+    )
+    assert "conflictWith" not in fallback.details  # 不塞裸 plugin 名冒充 pid
+    assert "Remove the shadowing source registration" in str(fallback)
+
+
 # ── 审查 🔴2：disable → uninstall 的孤儿残留必须一并清掉 ─────────────────────
 async def test_disable_then_uninstall_clears_orphan_allows_switch(tmp_path: Path) -> None:
     """孤儿若不随 uninstall 注销，会被跨 source 守卫当作「先到者」永久拒绝新 source（本进程内不可自愈）。"""

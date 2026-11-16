@@ -51,7 +51,8 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
 - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
   ``enabledPlugins`` 门控重建（仅显式 true 激活）。**uninstall 连孤儿一并注销**（#257：``include_orphans=True``），
   :func:`_unregister_marketplace_skills`（marketplace remove / gc / prune）同样遍历含孤儿的全量条目——
-  否则残留孤儿会被注册点跨 source 守卫当作「先到者」，令换源 install/enable 在本进程内永久失败。
+  否则残留孤儿会被注册点跨 source 守卫当作「先到者」，令换源 **enable** 在本进程内永久失败
+  （install 侧另有 :func:`_bare_name_conflicts` 的裸名预检，与本条无关）。
   enable 失败回滚以含孤儿的快照为基线：调用前已存在的孤儿回孤儿态，本次新增者才注销。
 - :func:`enable_plugin` 不校验 ``installedPlugins`` 意图成员资格（以账本记录为"可启用"依据）：手编移除意图
   而账本未 gc 的窗口里 live enable 仍可点亮，但重启后 boot 门控（installed ∧ enabled）不会恢复，交由
@@ -479,7 +480,8 @@ def _source_conflict_error(
     names = ", ".join(repr(conflict.name) for conflict in conflicts)
     if not owners:
         message = (
-            f"skills of plugin {plugin!r} ({names}) are registered by another source; refusing to enable {plugin_id!r}."
+            f"skills of plugin {plugin!r} ({names}) are registered by another source; refusing to enable {plugin_id!r}. "
+            f"Remove the shadowing source registration (or restart the Computer), then retry."
         )
         return PluginInstallError(message, error_code="validation")
     installed = _installed_pids(home=home, env=env)

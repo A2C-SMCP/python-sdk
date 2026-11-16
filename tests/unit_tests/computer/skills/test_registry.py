@@ -360,4 +360,8 @@ def test_drain_source_conflicts_dedupes_repeated_refusals() -> None:
     reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo"))
     for _ in range(3):
         assert reg.register_or_update(_ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")) is False
-    assert len(reg.drain_source_conflicts()) == 1
+    # 不同 refused_source 是不同冲突：去重键不得退化为仅 name（#257 复审 🟡4）
+    assert reg.register_or_update(_ref("alpha:foo", source="marketplace:mp-c", path="/abs/c/foo")) is False
+    drained = reg.drain_source_conflicts()
+    assert len(drained) == 2
+    assert sorted(str(conflict.refused_source) for conflict in drained) == ["marketplace:mp-b", "marketplace:mp-c"]
