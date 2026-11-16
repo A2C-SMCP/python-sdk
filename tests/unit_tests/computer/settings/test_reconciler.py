@@ -372,7 +372,54 @@ async def test_list_and_gc_plugins(tmp_path: Path) -> None:
     assert teardown == [["blender", "figma"]]  # 可回收的 MCP 依赖经回调下线（#153：判据过滤后 sorted，确定序）
 
 
-async def test_gc_guards_installpath_outside_home(tmp_path: Path) -> None:
+def test_lexical_ownership_with_symlinked_install_path_component_258(tmp_path: Path) -> None:
+    """#258 架构师 🔴：installPath 链上含软链组件（git-subdir 仓库可携带）→ 仍判为 clone 内（纯词法，不 resolve）。"""
+    home = _home(tmp_path)
+    ext = _ext_dir(home, "acme") / "audit"
+    (ext / "pkg").mkdir(parents=True)
+    target = tmp_path / "target"
+    (target / "sub").mkdir(parents=True)
+    (target / "keep").write_text("x", encoding="utf-8")
+    (ext / "pkg").rmdir()
+    try:
+        (ext / "pkg").symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    install_path = ext / "pkg" / "sub"
+
+    assert is_external_plugin_install_path(install_path, home, "acme", "audit") is True, "词法命中，不受软链解析影响"
+    assert remove_plugin_install_path(install_path, home, "acme", "audit") is True
+    assert not ext.exists(), "删整个独占 clone 根"
+    assert (target / "sub").exists() and (target / "keep").exists(), "不得跟随 installPath 软链删外部目标"
+
+
+async def test_reconcile_source_changed_symlink_clone_marks_failed_258(tmp_path: Path, monkeypatch) -> None:
+    """#258 架构师 🟡3：换源时旧 clone 为软链、无法清空 → 必须报 failed，不得复用旧树后误报 updated。"""
+    home = _home(tmp_path)
+    real = marketplace_skill_dir(home, "other") / "plugins"
+    sentinel = real / "sentinel"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("x", encoding="utf-8")
+    link = marketplace_skill_dir(home, "acme")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    _seed_known(home, {"acme": _SRC_A})
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(_RECONCILER, _fake_stage(calls))
+
+    report = await reconcile(SkillRegistry(), home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
+
+    assert report.failed == ["acme"]
+    assert report.updated == [] and report.installed == [] and report.up_to_date == []
+    assert calls == [], "旧树未清空时不得继续 stage（否则复用旧树后误报 updated）"
+    assert link.is_symlink() and sentinel.exists(), "拒删：链接与目标均保留"
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme"]["source"] == _SRC_A
+
+
+async def test_gc_keeps_installpath_outside_home(tmp_path: Path) -> None:
     home = _home(tmp_path)
     outside = tmp_path / "outside-home"  # 故意落在 SKILL Home 之外
     outside.mkdir()
@@ -519,6 +566,20 @@ def test_remove_plugin_install_path_deletes_under_symlinked_home_258(tmp_path: P
 
     assert remove_plugin_install_path(ext, link_home, "acme", "audit") is True
     assert not (real_home / "marketplace" / ".plugins" / "acme" / "audit").exists()
+
+
+def test_safe_rmtree_refuses_path_outside_home_258(tmp_path: Path) -> None:
+    """#258 架构师 🟡5：Home 越界守卫仍有真实用例——盘外真实目录拒删，Home 内缺失路径返回成功。"""
+    import a2c_smcp.computer.settings.reconciler as rec_mod
+
+    home = _home(tmp_path)
+    outside = tmp_path / "outside-home"
+    outside.mkdir()
+    (outside / "keep").write_text("x", encoding="utf-8")
+
+    assert rec_mod._safe_rmtree(outside, home) is False
+    assert outside.exists() and (outside / "keep").exists()
+    assert rec_mod._safe_rmtree(home / "missing", home) is True  # 不存在视为已清空
 
 
 def test_safe_rmtree_refuses_symlink_target_258(tmp_path: Path) -> None:

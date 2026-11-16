@@ -73,9 +73,9 @@ from a2c_smcp.computer.settings.raw import (
 )
 from a2c_smcp.computer.settings.reconciler import (
     NonPluginBundleIds,
+    is_external_plugin_install_path,
     ledger_mcp_deps_of,
     other_plugin_mcp_deps,
-    plugin_install_path_ownership,
     reclaimable_mcp_deps,
     remove_plugin_install_path,
 )
@@ -602,7 +602,8 @@ async def uninstall_plugin(
        删整个 clone 根），且仅在**没有 retained 记录**（指定 scope 之外的其余 scope）的 ``installPath`` 仍引用该
        clone 时删除。相对源（``source: "./plugins/x"``）的 ``installPath`` 位于**共享 catalog clone**
        ``<home>/marketplace/<mp>/…``——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，
-       MUST NOT 在此删除；归 ``marketplace remove`` / reconcile / prune 清理。``marketplace refresh`` **不**保证
+       MUST NOT 在此删除；归 ``marketplace remove`` / ``prune``（reconcile 仅在 ``sourceChanged`` 整树重 clone 时
+       清理）清理。``marketplace refresh`` **不**保证
        还原工作树内被删文件（上游未变时 ``git pull --ff-only`` 不重建已删路径），恢复须 ``marketplace remove`` +
        ``add``。
     """
@@ -641,13 +642,13 @@ async def uninstall_plugin(
         env,
     )
 
-    # #258：按「引用」判定而非记录数——仅当**没有 retained 记录**的 installPath 仍落在该 plugin 独占外部 clone
+    # #258：按「引用」判定而非记录数——仅当**没有 retained 记录**的 installPath 落在该 plugin 独占外部 clone
     # 内时才删除。跨 scope 源类型变化（user=Git 源 / project=相对源）按记录数门控会在先卸 user 时误保留 clone，
     # 随后卸 project 又不再命中 → 永久泄漏（对齐 rust-sdk#271 复审终版；多 scope 的 skills/servers 拆除另案 #262）。
-    # 归属三态：``True`` 引用 / ``None`` 无法判定（相对路径、损坏记录）→ 均视为仍引用（保守保留，与删除谓词同口径）；
-    # 仅 ``False``（明确在 clone 外，如共享 catalog）才允许删除。
+    # 口径与 rust 终版一致：缺 / 空 / 非 str / 损坏或相对路径的 retain 记录**不**算引用（删除侧另有 canonicalize
+    # + Home 守卫兜底）；归属判定本身纯词法，不解析 installPath 链上的软链。
     ext_clone_still_referenced = any(
-        plugin_install_path_ownership(Path(ip), home, marketplace, plugin) is not False
+        is_external_plugin_install_path(Path(ip), home, marketplace, plugin)
         for r in retained
         if isinstance(ip := r.get("installPath"), str) and ip
     )

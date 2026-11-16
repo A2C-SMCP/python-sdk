@@ -496,10 +496,10 @@ async def test_uninstall_scoped_source_change_deletes_unreferenced_external_clon
 
 
 @pytest.mark.parametrize("bad_install_path", ["/tmp/bad\u0000path", "relative/path"])
-async def test_uninstall_scoped_unknown_retained_path_keeps_external_clone_258(
+async def test_uninstall_scoped_unknown_retained_path_treated_as_unreferenced_258(
     tmp_path: Path, bad_install_path: str,
 ) -> None:
-    """#258 复审 🟡1：retained 记录 installPath 无法判定归属（NUL/相对）→ 视作仍引用，独占 clone 保守保留。"""
+    """#258 架构师审查 🟡4：与 rust 终版对齐——retained 记录 installPath 损坏/相对 → 视为不引用，clone 删除。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
     ext = _ext_plugin_root(home, "acme", "audit")
@@ -520,7 +520,33 @@ async def test_uninstall_scoped_unknown_retained_path_keeps_external_clone_258(
         "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
     ) is True
 
-    assert ext.exists(), "retained 记录归属未知 → 漏删优于误删（与删除谓词同口径）"
+    assert not ext.exists(), "无法识别的 retained 路径不算引用（与 rust 终版一致）"
+    assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
+
+
+@pytest.mark.parametrize("record_shape", ["missing", "empty", "non-str"])
+async def test_uninstall_scoped_missing_retained_install_path_treated_as_unreferenced_258(
+    tmp_path: Path, record_shape: str,
+) -> None:
+    """#258 架构师审查 🟡2：retained 记录缺 / 空 / 非 str installPath → 与损坏路径同口径，不阻塞删除。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    project_record: dict = {"scope": "project", "projectPath": str(workdir)}
+    if record_shape == "empty":
+        project_record["installPath"] = ""
+    elif record_shape == "non-str":
+        project_record["installPath"] = None
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}, project_record]})
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True
+
+    assert not ext.exists()
     assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
 
 
