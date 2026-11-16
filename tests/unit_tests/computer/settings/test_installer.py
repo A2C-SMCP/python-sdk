@@ -495,6 +495,35 @@ async def test_uninstall_scoped_source_change_deletes_unreferenced_external_clon
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
 
 
+@pytest.mark.parametrize("bad_install_path", ["/tmp/bad\u0000path", "relative/path"])
+async def test_uninstall_scoped_unknown_retained_path_keeps_external_clone_258(
+    tmp_path: Path, bad_install_path: str,
+) -> None:
+    """#258 复审 🟡1：retained 记录 installPath 无法判定归属（NUL/相对）→ 视作仍引用，独占 clone 保守保留。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext)},
+                {"scope": "project", "projectPath": str(workdir), "installPath": bad_install_path},
+            ]
+        },
+    )
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True
+
+    assert ext.exists(), "retained 记录归属未知 → 漏删优于误删（与删除谓词同口径）"
+    assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
+
+
 async def test_uninstall_malformed_install_path_does_not_raise_258(tmp_path: Path) -> None:
     """#258 🟡2：损坏账本（installPath 含 NUL）→ 归属判定失败即保守保留，卸载仍完成、不抛。"""
     home = _home(tmp_path)

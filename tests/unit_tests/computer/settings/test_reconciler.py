@@ -504,6 +504,45 @@ def test_remove_plugin_install_path_refuses_symlinked_external_root_258(tmp_path
     assert ext_root.is_symlink()
 
 
+def test_remove_plugin_install_path_deletes_under_symlinked_home_258(tmp_path: Path) -> None:
+    """#258 复审 🟡4：home 本身是软链（或位于软链祖先下）→ 仍能正常删除，不得误拒（守卫不假阳性）。"""
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    link_home = tmp_path / "home-link"
+    try:
+        link_home.symlink_to(real_home, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    ext = _ext_dir(link_home, "acme") / "audit"
+    ext.mkdir(parents=True)
+    (ext / "pkg").mkdir()
+
+    assert remove_plugin_install_path(ext, link_home, "acme", "audit") is True
+    assert not (real_home / "marketplace" / ".plugins" / "acme" / "audit").exists()
+
+
+def test_safe_rmtree_refuses_symlink_target_258(tmp_path: Path) -> None:
+    """#258 复审 🟡2：共享删除原语拒绝软链路径（prune 等调用点不再跟随软链删到链接目标）。"""
+    home = _home(tmp_path)
+    real = marketplace_skill_dir(home, "real") / "plugins"
+    sentinel = real / "sentinel" / "SKILL.md"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("x", encoding="utf-8")
+    link = marketplace_skill_dir(home, "acme")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    _seed_known(home, {"acme": _SRC_A})
+
+    removed = prune_marketplaces(["acme"], SkillRegistry(), home)
+
+    assert removed == ["acme"]
+    assert real.exists() and sentinel.exists(), "不得跟随软链删除链接目标"
+    assert link.is_symlink()
+
+
 async def test_gc_relative_source_catalog_path_is_retained_258(tmp_path: Path) -> None:
     """#258：gc 删账本与 SKILL，但**不删**共享 catalog 内的相对源 installPath（归 marketplace remove/prune）。"""
     home = _home(tmp_path)

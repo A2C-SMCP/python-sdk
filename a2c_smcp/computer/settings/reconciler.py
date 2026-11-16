@@ -162,8 +162,12 @@ def _safe_rmtree(path: Path, home: Path) -> None:
     """
     仅当 ``path`` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ rmtree only within SKILL Home。
 
+    ``path`` 本身是符号链接 → 记 WARN + 拒删（``resolve`` 后 ``rmtree`` 会删链接目标，可指向 Home 内共享树）；
     ``path`` 不存在 → no-op；越界 → 记 ERROR + 拒删（不抛）。删除失败 → 记 WARN（不阻断后续清理）。
     """
+    if path.is_symlink():
+        logger.warning("reconcile: refusing to remove symlink %s", path)
+        return
     rp = path.resolve()
     if not is_within(rp, home.resolve()):
         logger.error("reconcile: refusing to remove %s outside SKILL Home %s", rp, home)
@@ -176,24 +180,33 @@ def _safe_rmtree(path: Path, home: Path) -> None:
         logger.warning("reconcile: failed to remove %s: %s", rp, e)
 
 
-def is_external_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
+def plugin_install_path_ownership(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool | None:
     """
-    ``installPath`` 是否位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``
-    （含 ``git-subdir`` 的后代子目录）/ Whether installPath lives in the plugin-exclusive external clone.
+    归属**三态**判定 / Three-state ownership check.
 
-    供删除谓词与 uninstall 的「retained 记录是否仍引用该 clone」判定共用。空 / 相对路径、非法
-    marketplace / plugin 名、无法解析的路径 → ``False``（无法识别独占根，保守保留，漏删优于误删）。
+    - ``True``：位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``（含
+      ``git-subdir`` 的后代子目录）内；
+    - ``False``：明确位于该 clone **之外**（如共享 catalog clone）；
+    - ``None``：**无法判定**（相对路径、非法 marketplace / plugin 名、``resolve`` 失败——内嵌 NUL / 符号链接环
+      / 权限等）。调用方对 ``None`` 必须按「保守」处理：删除侧保留，uninstall 门控侧视作仍引用。
+
+    供删除谓词与 uninstall 的「retained 记录是否仍引用该 clone」判定共用。
     """
     if not install_path.is_absolute():
-        return False
+        return None
     if not is_valid_marketplace_name(marketplace) or not is_valid_marketplace_name(plugin):
-        return False
+        return None
     try:
         resolved_path = install_path.resolve()
         resolved_root = external_plugin_dir(home, marketplace, plugin).resolve()
-    except (OSError, RuntimeError, ValueError):  # 符号链接环 / 权限 / 内嵌 NUL / 平台路径错误 → 保守保留
-        return False
+    except (OSError, RuntimeError, ValueError):  # 符号链接环 / 权限 / 内嵌 NUL / 平台路径错误
+        return None
     return is_within(resolved_path, resolved_root)
+
+
+def is_external_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
+    """``installPath`` 是否**确定**位于 plugin 独占外部 clone 内（``None`` 视为否）/ Whether definitely inside."""
+    return plugin_install_path_ownership(install_path, home, marketplace, plugin) is True
 
 
 def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
