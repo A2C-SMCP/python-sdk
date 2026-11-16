@@ -30,7 +30,12 @@ from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import MCPServerPromptStringInput
 from a2c_smcp.computer.settings.scope import user_settings_path, workdir_project_settings_path
-from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
+from a2c_smcp.computer.settings.store import (
+    load_installed_plugins,
+    load_known_marketplaces,
+    save_installed_plugins,
+    save_known_marketplaces,
+)
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -77,7 +82,11 @@ def _stdio(name: str, command: str = "node") -> dict:
 
 
 def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], inputs: list[dict] | None = None) -> Path:
-    """造 catalog 树（相对源 plugin）+ marketplace.json + plugin mcp-servers/，seed known_marketplaces。"""
+    """造 catalog 树（相对源 plugin）+ marketplace.json + plugin mcp-servers/，**合并** seed known_marketplaces。
+
+    #257：合并而非替换——跨 marketplace 同名 plugin 场景须同测试内共存两个 marketplace
+    （范式同 ``test_mcp_dependency_model.py``）。
+    """
     catalog = marketplace_skill_dir(home, mp)
     manifest = {
         "name": mp,
@@ -92,10 +101,9 @@ def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], inpu
         _write_json(plugin_root / "mcp-servers" / f"{sname}.json", _stdio(sname))
     if inputs is not None:
         _write_json(plugin_root / "mcp-servers" / "inputs.json", {"inputs": inputs})
-    save_known_marketplaces(
-        {"version": 1, "marketplaces": {mp: {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}}},
-        home=home,
-    )
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"][mp] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}
+    save_known_marketplaces(known, home=home)
     return plugin_root
 
 
@@ -187,6 +195,80 @@ async def test_install_dependency_satisfied_exit0_and_installs(
 async def test_install_invalid_id_exit1(tmp_path: Path) -> None:
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
     assert await plugin_cmd.plugin_install(reg, home, env, "nodelim", json_output=True) == 1
+
+
+@pytest.mark.asyncio
+async def test_install_second_marketplace_same_bare_name_exit1_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#257 / conformance §5：同名不同 marketplace 的 install → 退出码 1 + JSON ``error=validation``。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "mp-a", "alpha", servers=[])
+    _setup_catalog(home, "mp-b", "alpha", servers=[])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+
+    assert await plugin_cmd.plugin_install(reg, home, env, "alpha@mp-a", json_output=True) == 0
+    capsys.readouterr()  # 丢弃首个成功输出
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "alpha@mp-b", json_output=True)
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"
+    assert payload["conflictWith"] == "alpha@mp-a"
+    assert "alpha@mp-a" in payload["message"]
+    # 意图未被写入第二个 pid
+    assert json.loads(user_settings_path(env).read_text(encoding="utf-8"))["installedPlugins"] == ["alpha@mp-a"]
+
+
+@pytest.mark.asyncio
+async def test_enable_shadowed_by_other_marketplace_exit1_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """enable 被另一 marketplace 同名技能遮蔽 → 退出码 1 + JSON 结构化 validation 与可执行补救（#257 复审 🟡10）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "mp-a", "alpha", servers=[])
+    _setup_catalog(home, "mp-b", "alpha", servers=[])  # 补救指向的 marketplace 须真实存在（复审 🟡5）
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    assert "mp-b" in load_known_marketplaces(home=home)["marketplaces"]
+    # 预置 `marketplace add mp-b` 全量 stage 的效果：同名技能已由 mp-b 注册
+    reg.register({"name": "alpha:lint", "source": "marketplace:mp-b", "path": "/abs/b/lint", "description": "from-b"})
+
+    assert await plugin_cmd.plugin_install(reg, home, env, "alpha@mp-a", json_output=True) == 0
+    capsys.readouterr()
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "alpha@mp-a", json_output=True)
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"
+    assert payload["conflictWith"] == "alpha@mp-b"
+    assert "marketplace remove mp-b" in payload["message"]  # 冲突方未安装 → 不得给 no-op 的 uninstall
+
+
+def test_plugin_error_filters_reserved_detail_keys(capsys: pytest.CaptureFixture[str]) -> None:
+    """``details`` 的保留键必须被过滤，不得改写类别码/文案/退出码（#257 架构师审查 🟡3）。"""
+    from a2c_smcp.computer.cli.commands.plugin import _plugin_error
+    from a2c_smcp.computer.settings.installer import PluginInstallError
+
+    err = PluginInstallError(
+        "boom",
+        error_code="validation",
+        details={
+            "code": 0,
+            "json_output": True,
+            "error_code": "hijacked",
+            "msg": "HIJACKED",  # `_err` 的位置参数名——漏过滤会在 except 内抛 TypeError（复审 🟡2）
+            "error": "HIJACKED",
+            "message": "HIJACKED",
+            "conflictWith": "alpha@mp-a",
+        },
+    )
+    assert _plugin_error(err, json_output=True) == plugin_cmd.EXIT_USER_ERROR  # 退出码不被 details["code"] 改写
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"  # details["error"] 未覆盖类别码
+    assert payload["message"] == "boom"  # details["message"] 未覆盖人读文案
+    assert payload["conflictWith"] == "alpha@mp-a"  # 普通键原样透出
+    for reserved in ("code", "json_output", "error_code", "msg"):
+        assert reserved not in payload, f"reserved detail key {reserved!r} must be filtered"
 
 
 # ── enable / disable：scope 从 ledger 读（不默认 user）/ scope read from ledger ──

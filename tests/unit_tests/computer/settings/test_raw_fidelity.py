@@ -889,9 +889,15 @@ def test_marketplace_remove_completes_with_warn_when_revoke_trust_fails(
 
 
 class _StubRegistry:
-    """最小 registry 替身：无活跃 skill（预检阶段不需要真实 registry）。"""
+    """最小 registry 替身：无活跃 skill（预检阶段不需要真实 registry）。
+
+    ``all_refs`` 为 #257 起的必要面：marketplace remove / prune / gc 的注销路径改为连孤儿一并枚举。
+    """
 
     def active_refs(self) -> list[dict]:
+        return []
+
+    def all_refs(self) -> list[tuple[dict, bool]]:
         return []
 
     def unregister(self, name: str) -> None:  # pragma: no cover - 无活跃 ref 时不可达

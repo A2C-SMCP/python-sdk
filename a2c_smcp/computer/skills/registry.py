@@ -38,6 +38,7 @@ import copy
 from dataclasses import dataclass
 from pathlib import Path
 
+from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE
 from a2c_smcp.computer.skills.naming import SkillNameError, parse_skill_name
 from a2c_smcp.smcp import A2CSkillRef
 from a2c_smcp.utils.logger import get_logger
@@ -53,6 +54,24 @@ class _RegistryEntry:
     orphaned: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class SourceConflict:
+    """
+    一次**跨 source 拒绝**的记录（#257；对齐 rust-sdk#275 ``SkillSourceConflict``）/ One recorded refusal。
+
+    Cross-source refusal is silently degraded (log ERROR, never raise, §1.5); callers (enable) need to know
+    afterwards which names were refused so they can fail closed instead of reporting a false success — hence
+    :meth:`SkillRegistry.drain_source_conflicts`.
+
+    跨源拒绝是「记 ERROR、不抛」的静默降级（§1.5），调用方（enable）需要事后知道「本次 staging 究竟被拒了
+    哪些 name」才能 fail-closed 而不是假成功——故由 :meth:`SkillRegistry.drain_source_conflicts` 取走。
+    """
+
+    name: str
+    existing_source: object
+    refused_source: object
+
+
 class SkillRegistry:
     """
     name → A2CSkillRef 的内存物化索引 / In-memory materialized index of name → A2CSkillRef。
@@ -65,6 +84,7 @@ class SkillRegistry:
 
     def __init__(self) -> None:
         self._entries: dict[str, _RegistryEntry] = {}
+        self._source_conflicts: list[SourceConflict] = []
 
     def _validated_name(self, ref: A2CSkillRef, *, op: str) -> str | None:
         """
@@ -95,7 +115,9 @@ class SkillRegistry:
         校验（任一失败 → ERROR + ``False`` + no-op）见 :meth:`_validated_name`。校验通过后：
         - 同名条目不存在 → 写入活跃条目；
         - 同名 **active** 条目存在 → §1.5「拒绝第二注册者、保留先到者」→ ERROR + ``False``；
-        - 同名 **orphan** 条目存在 → 视为 source 回归：用新 ref 替换并清除 orphan（恢复）→ ``True``。
+        - 同名 **orphan** 条目存在且 ``source`` 相同 → 视为 source 回归：用新 ref 替换并清除 orphan（恢复）→ ``True``；
+        - 同名 **orphan** 条目存在但 ``source`` 不同 → 同 :meth:`register_or_update` 的跨 source 守卫：ERROR + ``False``
+          （不得借孤儿复活通道换源，#257）。
 
         **活跃 SKILL 的内容刷新**（§8.2 ResourceUpdated）请用 :meth:`update`，**不要**用 register
         （否则命中 active 冲突分支被静默拒绝、保留旧 ref）。
@@ -110,6 +132,17 @@ class SkillRegistry:
             return False
 
         if existing is not None:  # 孤儿恢复 / orphan recovery
+            if existing.ref.get("source") != ref.get("source"):
+                self._note_source_conflict(name, existing.ref.get("source"), ref.get("source"))
+                logger.error(
+                    "SkillRegistry cross-source conflict: name %r registered as orphan by source %r; refusing ref from "
+                    "source %r via register (keeping first registrant). %s",
+                    name,
+                    existing.ref.get("source"),
+                    ref.get("source"),
+                    self._cross_source_hint(name, existing.ref.get("source"), ref.get("source")),
+                )
+                return False
             logger.debug("SkillRegistry recovered orphaned skill via register name=%r", name)
         self._entries[name] = _RegistryEntry(ref=ref, orphaned=False)
         return True
@@ -138,9 +171,81 @@ class SkillRegistry:
         staging 重扫 / 跨 run 复现的统一入口（mcp 与 user 源共用），避免各处重复
         ``update(ref) if name in registry else register(ref)`` 惯用法。``name`` 缺失 / 未注册走 register
         分支，由其校验兜底（失败 → ERROR + ``False``）。
+
+        **跨 source 守卫（#257）**：同名但 ``source`` 不同 → **保留先到者、拒新 ref、记 ERROR**（skill.md
+        §1.5：已注册技能不得被后注册源静默覆盖）。孤儿条目同样 fail-closed——不得借"孤儿复活"通道换 source。
+        同一 source 的刷新 / 孤儿复活行为**不变**；守卫刻意**不下沉**到 :meth:`update`——其语义是调用方
+        明确表达的 ResourceUpdated 刷新，不参与"谁先注册"仲裁。
         """
         name = ref.get("name")
-        return self.update(ref) if name is not None and name in self._entries else self.register(ref)
+        if name is not None and name in self._entries:
+            existing = self._entries[name]
+            existing_source = existing.ref.get("source")
+            new_source = ref.get("source")
+            if existing_source != new_source:
+                self._note_source_conflict(name, existing_source, new_source)
+                logger.error(
+                    "SkillRegistry cross-source conflict: name %r already registered by source %r; refusing ref from "
+                    "source %r (keeping first registrant). %s",
+                    name,
+                    existing_source,
+                    new_source,
+                    self._cross_source_hint(name, existing_source, new_source),
+                )
+                return False
+            return self.update(ref)
+        return self.register(ref)
+
+    def _note_source_conflict(self, name: str, existing_source: object, refused_source: object) -> None:
+        """
+        登记一次跨 source 拒绝 / Record one cross-source refusal（去重）。
+
+        同一 ``(name, existing_source, refused_source)`` 只留一条：长驻 REPL 里 ``marketplace add/refresh`` /
+        boot 重扫会反复 restage 同一被遮蔽 name，无去重则缓冲无上界增长（#257 复审 🟡8）。
+        """
+        conflict = SourceConflict(name=name, existing_source=existing_source, refused_source=refused_source)
+        if conflict not in self._source_conflicts:
+            self._source_conflicts.append(conflict)
+
+    def drain_source_conflicts(self) -> list[SourceConflict]:
+        """
+        取走自上次 drain 以来的**跨 source 拒绝**记录 / Drain recorded cross-source refusals（#257）。
+
+        staging 的跨源拒绝是静默降级（记 ERROR、不抛），enable 必须据此判「本次是否真被遮蔽」——用
+        「plugin 名前缀 + source」猜会把「同 plugin 但 skill 名不同」的正常注册误判成冲突（#257 复审 🔴1）。
+        """
+        drained, self._source_conflicts = self._source_conflicts, []
+        return drained
+
+    @staticmethod
+    def _cross_source_hint(name: str, existing_source: object, new_source: object) -> str:
+        """
+        跨 source 冲突的可判诊断 / Actionable diagnostics for a cross-source conflict（#257 决策 5/6）。
+
+        Gives both derived ``<plugin>@<marketplace>`` ids when the marketplace shape is recoverable, plus a
+        switch-provenance hint.
+
+        marketplace 形态（2 段 name + ``marketplace:<mp>`` source）可完整派生 pid；其它形态退化为通用指引
+        （跨形态 name 按段数互斥，实际不可碰撞）。
+        """
+        try:
+            parsed = parse_skill_name(name)
+        except SkillNameError:
+            parsed = None
+        if parsed is not None and parsed.kind == "marketplace" and parsed.plugin:
+            prefix = f"{SOURCE_MARKETPLACE}:"
+            pids = [
+                f"{parsed.plugin}@{src[len(prefix):]}"
+                for src in (existing_source, new_source)
+                if isinstance(src, str) and src.startswith(prefix)
+            ]
+            if len(pids) == 2:
+                return (
+                    f"{pids[0]!r} currently owns this name in the registry; the copy from {pids[1]!r} is refused. To "
+                    f"switch provenance, uninstall the current registrant first ('plugin uninstall {pids[0]}'), or — "
+                    f"if {pids[0]!r} is not installed — remove its marketplace registration and retry."
+                )
+        return "Same name from different sources is refused; remove the shadowing source to switch provenance."
 
     def mark_orphan(self, name: str) -> bool:
         """把已注册 SKILL 标为孤儿（从活跃集排除，保留以便恢复）/ Mark a registered SKILL orphaned."""
