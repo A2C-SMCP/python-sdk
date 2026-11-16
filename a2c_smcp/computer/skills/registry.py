@@ -38,6 +38,7 @@ import copy
 from dataclasses import dataclass
 from pathlib import Path
 
+from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE
 from a2c_smcp.computer.skills.naming import SkillNameError, parse_skill_name
 from a2c_smcp.smcp import A2CSkillRef
 from a2c_smcp.utils.logger import get_logger
@@ -138,9 +139,55 @@ class SkillRegistry:
         staging 重扫 / 跨 run 复现的统一入口（mcp 与 user 源共用），避免各处重复
         ``update(ref) if name in registry else register(ref)`` 惯用法。``name`` 缺失 / 未注册走 register
         分支，由其校验兜底（失败 → ERROR + ``False``）。
+
+        **跨 source 守卫（#257）**：同名但 ``source`` 不同 → **保留先到者、拒新 ref、记 ERROR**（skill.md
+        §1.5：已注册技能不得被后注册源静默覆盖）。孤儿条目同样 fail-closed——不得借"孤儿复活"通道换 source。
+        同一 source 的刷新 / 孤儿复活行为**不变**；守卫刻意**不下沉**到 :meth:`update`——其语义是调用方
+        明确表达的 ResourceUpdated 刷新，不参与"谁先注册"仲裁。
         """
         name = ref.get("name")
-        return self.update(ref) if name is not None and name in self._entries else self.register(ref)
+        if name is not None and name in self._entries:
+            existing = self._entries[name]
+            existing_source = existing.ref.get("source")
+            new_source = ref.get("source")
+            if existing_source != new_source:
+                logger.error(
+                    "SkillRegistry cross-source conflict: name %r already registered by source %r; refusing ref from "
+                    "source %r (keeping first registrant). %s",
+                    name,
+                    existing_source,
+                    new_source,
+                    self._cross_source_hint(name, existing_source, new_source),
+                )
+                return False
+            return self.update(ref)
+        return self.register(ref)
+
+    @staticmethod
+    def _cross_source_hint(name: str, existing_source: object, new_source: object) -> str:
+        """
+        跨 source 冲突的可判诊断（#257 决策 5/6）：尽量给出双方 ``<plugin>@<marketplace>`` 与 uninstall 指引。
+
+        marketplace 形态（2 段 name + ``marketplace:<mp>`` source）可完整派生 pid；其它形态退化为通用指引
+        （跨形态 name 按段数互斥，实际不可碰撞）。
+        """
+        try:
+            parsed = parse_skill_name(name)
+        except SkillNameError:
+            parsed = None
+        if parsed is not None and parsed.kind == "marketplace" and parsed.plugin:
+            prefix = f"{SOURCE_MARKETPLACE}:"
+            pids = [
+                f"{parsed.plugin}@{src[len(prefix):]}"
+                for src in (existing_source, new_source)
+                if isinstance(src, str) and src.startswith(prefix)
+            ]
+            if len(pids) == 2:
+                return (
+                    f"Both {pids[0]!r} and {pids[1]!r} are installed; keeping {pids[0]!r}. To switch to the other "
+                    f"source, uninstall the current registrant first: 'plugin uninstall {pids[0]}'."
+                )
+        return "Same name from different sources is refused; remove the shadowing source to switch provenance."
 
     def mark_orphan(self, name: str) -> bool:
         """把已注册 SKILL 标为孤儿（从活跃集排除，保留以便恢复）/ Mark a registered SKILL orphaned."""

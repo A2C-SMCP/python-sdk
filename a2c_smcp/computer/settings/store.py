@@ -451,11 +451,14 @@ def load_installed_plugins(
     :param drop_legacy: 是否丢弃旧格式记录（协议 §4.9.1-4，见 :func:`_drop_legacy_mcp_dep_records`）。默认 ``True``
         ——**几乎所有调用方都应该用默认值**，旧格式记录的依赖信息（display name 数组）不可用于任何判定。
 
-        ⚠️ **唯一的例外是 v0.2.x→v0.3.0 意图迁移**（:func:`~a2c_smcp.computer.settings.installer
-        .migrate_legacy_installs`）：它从账本 **pid（key）** 回填 ``installedPlugins`` 意图，而账本格式迁移
-        （丢弃 → 从意图重建）**恰恰依赖该意图已存在**。两者顺序颠倒则 v0.2.x 存量用户的带 MCP server 的
-        plugin 会连 pid 一起消失、意图无从回填 ⇒ 升级后 plugin 静默全丢。故迁移路径 MUST 传 ``False``
-        （它只读 key，不碰旧格式的字段值）。
+        ⚠️ **例外仅两类，都是「只读 pid（key）、不碰旧格式字段值」**：
+        - v0.2.x→v0.3.0 意图迁移（:func:`~a2c_smcp.computer.settings.installer.migrate_legacy_installs`）——
+          它从账本 pid 回填 ``installedPlugins`` 意图，而账本格式迁移（丢弃 → 从意图重建）**恰恰依赖该意图
+          已存在**。两者顺序颠倒则 v0.2.x 存量用户的带 MCP server 的 plugin 会连 pid 一起消失、意图无从回填
+          ⇒ 升级后 plugin 静默全丢。
+        - 跨 marketplace 裸名唯一性检查（#257，``installer._bare_name_conflicts``）——默认视图会丢旧格式
+          记录的 pid，令存量 home 在安装检查时隐身、随后迁移才「冒出来」⇒ 绕过拦截。
+        故这两条路径 MUST 传 ``False``。
     """
     path = installed_plugins_path(home, env)
     data = read_jsonc_with_recovery(path)

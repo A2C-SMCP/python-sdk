@@ -74,6 +74,7 @@ from a2c_smcp.computer.settings.raw import (
 )
 from a2c_smcp.computer.settings.reconciler import (
     NonPluginBundleIds,
+    declared_installed_plugin_ids,
     ledger_mcp_deps_of,
     other_plugin_mcp_deps,
     reclaimable_mcp_deps,
@@ -125,7 +126,19 @@ logger = get_logger(__name__)
 # 异常 / Exceptions（模块内本地异常，仿 ToolNameDuplicatedError / SkillStagingError 惯例）
 # ---------------------------------------------------------------------------
 class PluginInstallError(Exception):
-    """plugin install/enable 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope）。"""
+    """
+    plugin install/enable 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope）。
+
+    **结构化类别**（#257）：可选 ``error_code``（机读类别，如跨 marketplace 同名冲突的 ``"validation"``）与
+    ``details``（附加 JSON 字段，如 ``{"conflictWith": "alpha@mp-a"}``）。缺省均为空 → CLI 输出形态与既有
+    契约一致（``{"error": "error", ...}``）。与 ``InputResolutionError.error_code`` 同姿态：只在已能判定
+    类别的位置填值，不在异常体系上另立新机制。
+    """
+
+    def __init__(self, message: str, *, error_code: str | None = None, details: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.details: dict[str, Any] = dict(details or {})
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +174,41 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str]:
         raise PluginInstallError(f"invalid plugin id {plugin_id!r} (expect '<plugin>@<marketplace>', strict kebab, each ≤64)")
     plugin, _, marketplace = plugin_id.partition("@")
     return plugin, marketplace
+
+
+def _bare_name_conflicts(plugin_id: str, *, home: Path, env: Mapping[str, str] | None) -> list[str]:
+    """
+    跨 marketplace 裸名唯一性扫描（skill.md §1.2 note / §1.5；#257）/ Cross-marketplace bare-name scan。
+
+    扫描面 = merged ``installedPlugins``（user/project/local，经 :func:`resolve_settings`）∪ 物化账本
+    ``installed_plugins.json`` 的 pid 键；返回**同名不同 marketplace** 的已安装 pid（升序、排除自身）。
+
+    ``drop_legacy=False`` 是**承重墙**：账本默认视图会整条丢弃旧格式（``bundledMcpServers``）记录，令
+    v0.2.x 存量 home 的 ``alpha@mp-a`` 对检查隐身——安装随后才由 :func:`migrate_legacy_installs` 从账本
+    回填意图，正好形成「先绕过、后出现」的旁路。故此处与迁移路径读**同一视图**（只读 pid 键，不碰旧格式值）。
+    """
+    plugin, _marketplace = _split_plugin_id(plugin_id)
+    declared = resolve_settings(env=env).settings
+    pids = set(declared_installed_plugin_ids(declared))
+    pids.update(
+        pid
+        for pid in load_installed_plugins(home=home, env=env, drop_legacy=False).get("plugins", {})
+        if is_valid_enabled_plugin_key(pid)
+    )
+    return sorted(pid for pid in pids if pid != plugin_id and pid.partition("@")[0] == plugin)
+
+
+def _bare_name_conflict_error(plugin_id: str, conflicts: list[str], *, action: str) -> PluginInstallError:
+    """构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）。"""
+    plugin, marketplace = _split_plugin_id(plugin_id)
+    existing = ", ".join(repr(pid) for pid in conflicts)
+    uninstall = " / ".join(f"'plugin uninstall {pid}'" for pid in conflicts)
+    message = (
+        f"plugin {plugin!r} is already installed from another marketplace ({existing}); a plugin name MUST be unique "
+        f"across marketplaces (skill.md §1.5), so {action} of {plugin_id!r} is refused. Uninstall the existing plugin "
+        f"first ({uninstall}) or rename the plugin in marketplace {marketplace!r}."
+    )
+    return PluginInstallError(message, error_code="validation", details={"conflictWith": conflicts[0]})
 
 
 def _safe_rmtree(path: Path, home: Path) -> None:
@@ -545,6 +593,12 @@ async def install_plugin(
     if find_plugin_entry(read_marketplace_manifest(catalog_dir), plugin) is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
 
+    # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——
+    #      含 :func:`migrate_legacy_installs` 的迁移标记键（那时才从账本回填意图的存量插件才会「冒出来」）。
+    conflicts = _bare_name_conflicts(plugin_id, home=home, env=env)
+    if conflicts:
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="install")
+
     # 1.5：预检过后、写意图键之前，先跑一次性迁移（幂等、标记键短路）。install 会写 installedPlugins 键——
     #      若迁移尚未发生（如升级后未经 boot 的 headless CLI install），先写键会把迁移标记误置为"已迁移"，
     #      永久丢弃 v0.2.x 存量活跃态（隔离审查 🔴#2 + N1：置于预检后保 fail-fast 无副作用）。
@@ -847,6 +901,12 @@ async def enable_plugin(
     records = installed.get("plugins", {}).get(plugin_id)
     if not records:
         raise PluginInstallError(f"plugin {plugin_id!r} not installed; cannot enable (run 'plugin install' first)")
+
+    # 0：跨 marketplace 裸名防御（#257 决策 2）——先于 enabledPlugins 写 / stage / 挂 server。存量双装
+    #    （升级前两 marketplace 均已 install）升级后只能先 uninstall 被遮蔽的一方，不得靠 enable 触发覆盖。
+    conflicts = _bare_name_conflicts(plugin_id, home=home, env=env)
+    if conflicts:
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="enable")
 
     # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 依赖预检（零持久化变更前）
     servers: list[MCPServerConfig] = []
