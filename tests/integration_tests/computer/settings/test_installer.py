@@ -33,8 +33,9 @@ from a2c_smcp.computer.settings.installer import (
     install_plugin,
     uninstall_plugin,
 )
-from a2c_smcp.computer.settings.scope import user_settings_path
-from a2c_smcp.computer.settings.store import load_installed_plugins
+from a2c_smcp.computer.settings.reconciler import reconcile
+from a2c_smcp.computer.settings.scope import resolve_settings, user_settings_path
+from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import stage_marketplace_skills
@@ -74,6 +75,11 @@ def _make_bare(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
 
 def _url(p: Path) -> str:
     return f"file://{p}"
+
+
+def _write_json(path: Path, obj: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj), encoding="utf-8")
 
 
 def _src(url: str) -> dict[str, str]:
@@ -303,3 +309,58 @@ async def test_install_strict_false_conflict_hard_fails_atomically(tmp_path: Pat
     settings_file = home / "cfg" / "a2c" / "settings.json"
     if settings_file.exists():
         assert "audit@acme-skills" not in json.loads(settings_file.read_text(encoding="utf-8")).get("installedPlugins", [])
+
+
+@requires_git
+async def test_refresh_over_double_install_keeps_first_registrant(tmp_path: Path) -> None:
+    """存量双装 + `reconcile(refresh=True)`：保留先注册者，后注册源被拒（#257 架构师审查测试补强）。
+
+    与 `conformance-tests.md §5`「跨 marketplace 同名 plugin 安装」的存量面无迁移口径一致：不自动迁移，
+    refresh 重扫后 `alpha:foo` 仍属于先声明的 marketplace，后注册者的 ref 被注册点守卫拒绝。
+    """
+    bare_a = _make_bare(tmp_path, "mp-a", _marketplace_files("mp-a", description="from-a"))
+    bare_b = _make_bare(tmp_path, "mp-b", _marketplace_files("mp-b", description="from-b"))
+    home = _home(tmp_path)
+    env = _env(home)
+    await _add_marketplace(home, bare_a, env, name="mp-a")
+    await _add_marketplace(home, bare_b, env, name="mp-b")
+
+    # 存量双装：两安装意图 + 双 enabled + 双账本 + 两条 marketplace 声明（mp-a 在前）
+    _write_json(
+        user_settings_path(env),
+        {
+            "installedPlugins": ["alpha@mp-a", "alpha@mp-b"],
+            "enabledPlugins": {"alpha@mp-a": True, "alpha@mp-b": True},
+            "extraKnownMarketplaces": {
+                "mp-a": {"source": _src(_url(bare_a))},
+                "mp-b": {"source": _src(_url(bare_b))},
+            },
+        },
+    )
+    root_a = marketplace_skill_dir(home, "mp-a") / "plugins" / "alpha"
+    root_b = marketplace_skill_dir(home, "mp-b") / "plugins" / "alpha"
+    save_installed_plugins(
+        {
+            "version": 1,
+            "plugins": {
+                "alpha@mp-a": [{"scope": "user", "installPath": str(root_a), "mcpServers": []}],
+                "alpha@mp-b": [{"scope": "user", "installPath": str(root_b), "mcpServers": []}],
+            },
+        },
+        home=home,
+    )
+
+    reg = SkillRegistry()
+    declared = resolve_settings(env=env).settings
+    await reconcile(reg, home, declared, env=env, refresh=True)
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"  # 先注册者保留
+    assert got["description"] == "from-a"
+
+    # 幂等：再刷一次不改变结果
+    await reconcile(reg, home, declared, env=env, refresh=True)
+    again = reg.resolve("alpha:foo")
+    assert again is not None
+    assert again["source"] == "marketplace:mp-a"

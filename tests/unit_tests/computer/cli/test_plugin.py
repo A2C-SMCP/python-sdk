@@ -244,22 +244,30 @@ async def test_enable_shadowed_by_other_marketplace_exit1_validation(
     assert "marketplace remove mp-b" in payload["message"]  # 冲突方未安装 → 不得给 no-op 的 uninstall
 
 
-def test_plugin_error_reserved_details_do_not_hijack_payload(capsys: pytest.CaptureFixture[str]) -> None:
-    """``details`` 的保留键不得改写类别码 / 人读文案 / 退出码（#257 审查 🟡6）。"""
+def test_plugin_error_filters_reserved_detail_keys(capsys: pytest.CaptureFixture[str]) -> None:
+    """``details`` 的保留键必须被过滤，不得改写类别码/文案/退出码（#257 架构师审查 🟡3）。"""
     from a2c_smcp.computer.cli.commands.plugin import _plugin_error
     from a2c_smcp.computer.settings.installer import PluginInstallError
 
     err = PluginInstallError(
         "boom",
         error_code="validation",
-        details={"code": 0, "message": "HIJACKED", "error": "HIJACKED", "conflictWith": "alpha@mp-a"},
+        details={
+            "code": 0,
+            "json_output": True,
+            "error_code": "hijacked",
+            "error": "HIJACKED",
+            "message": "HIJACKED",
+            "conflictWith": "alpha@mp-a",
+        },
     )
-    assert _plugin_error(err, json_output=True) == plugin_cmd.EXIT_USER_ERROR
+    assert _plugin_error(err, json_output=True) == plugin_cmd.EXIT_USER_ERROR  # 退出码不被 details["code"] 改写
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"] == "validation"  # details["error"] 未覆盖类别码
     assert payload["message"] == "boom"  # details["message"] 未覆盖人读文案
-    assert payload["conflictWith"] == "alpha@mp-a"
-    assert payload["code"] == 0  # details 的普通键仍原样透出（且不改退出码）
+    assert payload["conflictWith"] == "alpha@mp-a"  # 普通键原样透出
+    for reserved in ("code", "json_output", "error_code"):
+        assert reserved not in payload, f"reserved detail key {reserved!r} must be filtered"
 
 
 # ── enable / disable：scope 从 ledger 读（不默认 user）/ scope read from ledger ──

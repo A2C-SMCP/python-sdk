@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -203,27 +204,50 @@ def _bare_name_conflicts(
     回填意图，正好形成「先绕过、后出现」的旁路。故此处与迁移路径读**同一视图**（只读 pid 键，不碰旧格式值）。
     """
     plugin, _marketplace = _split_plugin_id(plugin_id)
-    ledger = _ledger_pids(home=home, env=env)
-    declared = resolve_settings(env=env).settings
-    pids = set(declared_installed_plugin_ids(declared)) | ledger
+    facts = _install_facts(home=home, env=env)
     # 幂等 carve-out 只认**账本记录**（真重装 / 存量双装）。project/local 的纯声明不是安装事实——拿 merged
     # 意图放行等于「声明一个从未安装的 `<plugin>@<mp>` 就能把同名第二个装进来」（#257 复审 🔴3）。
-    if allow_if_installed and plugin_id in ledger:
+    if allow_if_installed and plugin_id in facts.ledger_pids:
         return []
-    return sorted(pid for pid in pids if pid != plugin_id and pid.partition("@")[0] == plugin)
+    return sorted(pid for pid in facts.installed_pids if pid != plugin_id and pid.partition("@")[0] == plugin)
 
 
-def _bare_name_conflict_error(plugin_id: str, conflicts: list[str], *, action: str) -> PluginInstallError:
-    """构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）/ Build the structured conflict error."""
+def _bare_name_conflict_error(
+    plugin_id: str,
+    conflicts: list[str],
+    *,
+    action: str,
+    home: Path,
+    env: Mapping[str, str] | None,
+) -> PluginInstallError:
+    """
+    构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）/
+    Build the structured conflict error.
+
+    **补救按账本分档**（#257 架构师审查 🟡2）：「已安装」以**账本**为准——有物化记录 → ``plugin uninstall``
+    有效；仅存在于 settings 声明（project/local 或残留 user 意图，无账本）→ 该 pid 由声明维持，
+    ``plugin uninstall`` 是永久 no-op，必须让用户删声明键。
+    Remedies are split by ledger presence; a declaration-only pid cannot be cleared by uninstall.
+    """
     plugin, marketplace = _split_plugin_id(plugin_id)
+    facts = _install_facts(home=home, env=env)
+    materialized = [pid for pid in conflicts if pid in facts.ledger_pids]
+    declared_only = [pid for pid in conflicts if pid not in facts.ledger_pids]
     existing = ", ".join(repr(pid) for pid in conflicts)
-    uninstall = " / ".join(f"'plugin uninstall {pid}'" for pid in conflicts)
+    remedies: list[str] = []
+    if materialized:
+        uninstall = " / ".join(f"'plugin uninstall {pid}'" for pid in materialized)
+        remedies.append(f"Uninstall the materialized plugin(s) first ({uninstall})")
+    if declared_only:
+        declared = " / ".join(repr(pid) for pid in declared_only)
+        remedies.append(
+            f"{declared} has no materialization record (declaration-only, e.g. a project/local settings entry) — "
+            f"remove that entry from the declaring settings file; 'plugin uninstall' cannot clear a declaration"
+        )
     message = (
-        f"plugin {plugin!r} is already installed from another marketplace ({existing}); a plugin name MUST be unique "
-        f"across marketplaces (skill.md §1.5), so {action} of {plugin_id!r} is refused. Uninstall the existing plugin "
-        f"first ({uninstall}) or rename the plugin in marketplace {marketplace!r}. If {existing} comes from a project/"
-        f"local settings declaration, remove that entry from the declaration file instead — uninstall never rewrites "
-        f"committed project settings."
+        f"plugin {plugin!r} is already installed or declared from another marketplace ({existing}); a plugin name "
+        f"MUST be unique across marketplaces (skill.md §1.5), so {action} of {plugin_id!r} is refused. "
+        f"{'; '.join(remedies)}. Or rename the plugin in marketplace {marketplace!r}."
     )
     return PluginInstallError(message, error_code="validation", details={"conflictWith": conflicts[0]})
 
@@ -366,13 +390,26 @@ def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | 
         raise PluginInstallError(str(e)) from e
 
 
-def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str] | None) -> bool:
+def _write_installed_plugin(
+    plugin_id: str,
+    present: bool,
+    env: Mapping[str, str] | None,
+    *,
+    home: Path | None = None,
+    guard_bare_name: bool = False,
+) -> bool:
     """
     user scope ``installedPlugins`` 数组的持锁 RMW（增/删一个条目）；返回**写前**是否已含该条目 / RMW the install intent。
 
     安装是全局一次的事实（协议 v0.3.0 §2.1/§2.4「plugin_installation」）→ 意图固定落 **user** settings.json
     （#123 决策：不随 ``--scope`` 泄漏进可提交的 project 文件）；读取侧由 :func:`resolve_settings` merged
     并集承担（project/local 声明亦被认可，支持声明式复现）。数组写回整体替换（§5.4 写语义），保序去重。
+
+    **锁内裸名复核**（``guard_bare_name=True``，install 专用；#257 架构师审查 🔴1）：install 的预检
+    （:func:`_bare_name_conflicts`）是无锁读，与本次写入之间隔着迁移等步骤——两个进程可各自通过预检后再
+    先后持锁追加，造出「同名双装」。故在**同一把锁内**、``append`` 之前用刚读到的 ``entries``（已含并发
+    进程刚写入的 pid）∪ 账本 pid 复核一次；冲突则抛 :class:`PluginInstallError`（文件未写）。
+    **不得在外层再包一层 ``file_lock``**：锁基于旁车文件的新 fd，同进程二次获取会退避后抛 ``SettingsLockError``。
 
     **#246**：raw 保真 RMW——只改 ``installedPlugins``，其余字段（含 policy-only 越权字段 / 未知键）逐字保留。
     目标文件 corrupt / ``installedPlugins`` 非数组 → fail-closed（抛 :class:`PluginInstallError`，原文件不动）。
@@ -384,6 +421,13 @@ def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str
             entries: list[Any] = list_field_or_empty(existing, "installedPlugins", path=path)
             was_present = plugin_id in entries
             if present and not was_present:
+                if guard_bare_name and home is not None:
+                    plugin, _marketplace = _split_plugin_id(plugin_id)
+                    candidates = {e for e in entries if isinstance(e, str) and is_valid_enabled_plugin_key(e)}
+                    candidates |= _ledger_pids(home=home, env=env)
+                    clashes = sorted(pid for pid in candidates if pid != plugin_id and pid.partition("@")[0] == plugin)
+                    if clashes:
+                        raise _bare_name_conflict_error(plugin_id, clashes, action="install", home=home, env=env)
                 entries.append(plugin_id)
             elif not present and was_present:
                 entries = [e for e in entries if e != plugin_id]
@@ -402,9 +446,32 @@ def _ledger_pids(*, home: Path, env: Mapping[str, str] | None) -> set[str]:
     }
 
 
-def _installed_pids(*, home: Path, env: Mapping[str, str] | None) -> set[str]:
-    """安装集 = merged ``installedPlugins``（user/project/local 意图）∪ 物化账本 pid / Install set."""
-    return set(declared_installed_plugin_ids(resolve_settings(env=env).settings)) | _ledger_pids(home=home, env=env)
+@dataclass(frozen=True, slots=True)
+class _InstallFacts:
+    """安装事实集 / Install facts：merged 意图 pid 与物化账本 pid（#257 架构师审查 🟡4 的单一权威）。"""
+
+    declared_pids: frozenset[str]
+    ledger_pids: frozenset[str]
+
+    @property
+    def installed_pids(self) -> frozenset[str]:
+        """安装集 = 声明意图 ∪ 账本 / Declared intents ∪ ledger."""
+        return self.declared_pids | self.ledger_pids
+
+
+def _install_facts(*, home: Path, env: Mapping[str, str] | None) -> _InstallFacts:
+    """
+    安装事实集的**单一权威**：merged ``installedPlugins``（user/project/local）∪ 物化账本 pid /
+    Single authority for install facts.
+
+    ``drop_legacy=False``（见 :func:`_ledger_pids`）：旧格式记录也是安装事实，默认视图会让 v0.2.x 存量
+    在检查时隐身。pre-check、诊断分档与 in-lock 复核共用本函数，避免三处各自拼同一并集而漂移。
+    """
+    declared = resolve_settings(env=env).settings
+    return _InstallFacts(
+        declared_pids=frozenset(declared_installed_plugin_ids(declared)),
+        ledger_pids=frozenset(_ledger_pids(home=home, env=env)),
+    )
 
 
 def _plugin_skill_state(registry: SkillRegistry, marketplace: str, plugin: str) -> dict[str, bool]:
@@ -484,7 +551,7 @@ def _source_conflict_error(
             f"Remove the shadowing source registration (or restart the Computer), then retry."
         )
         return PluginInstallError(message, error_code="validation")
-    installed = _installed_pids(home=home, env=env)
+    installed = _install_facts(home=home, env=env).installed_pids
     hints: list[str] = []
     for owner in owners:
         pid = f"{plugin}@{owner}"
@@ -705,7 +772,7 @@ async def install_plugin(
     #      含 :func:`migrate_legacy_installs` 的迁移标记键（那时才从账本回填意图的存量插件才会「冒出来」）。
     conflicts = _bare_name_conflicts(plugin_id, home=home, env=env, allow_if_installed=True)
     if conflicts:
-        raise _bare_name_conflict_error(plugin_id, conflicts, action="install")
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="install", home=home, env=env)
 
     # 1.5：预检过后、写意图键之前，先跑一次性迁移（幂等、标记键短路）。install 会写 installedPlugins 键——
     #      若迁移尚未发生（如升级后未经 boot 的 headless CLI install），先写键会把迁移标记误置为"已迁移"，
@@ -713,7 +780,7 @@ async def install_plugin(
     migrate_legacy_installs(home, env=env)
 
     # 2：config-first 写全局安装意图（快照写前状态供原子回滚：重装时原已在 → 失败不误删）
-    was_present = _write_installed_plugin(plugin_id, True, env)
+    was_present = _write_installed_plugin(plugin_id, True, env, home=home, guard_bare_name=True)
 
     # 3-4：物化；失败回滚意图（best-effort，不掩盖原异常）
     try:
@@ -1018,7 +1085,7 @@ async def enable_plugin(
     #    （升级前两 marketplace 均已 install）升级后只能先 uninstall 被遮蔽的一方，不得靠 enable 触发覆盖。
     conflicts = _bare_name_conflicts(plugin_id, home=home, env=env)
     if conflicts:
-        raise _bare_name_conflict_error(plugin_id, conflicts, action="enable")
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="enable", home=home, env=env)
 
     # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 依赖预检（零持久化变更前）
     servers: list[MCPServerConfig] = []

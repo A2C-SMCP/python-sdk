@@ -107,24 +107,21 @@ def _err(msg: str, *, json_output: bool, code: int = EXIT_USER_ERROR, error_code
     return code
 
 
+# ``details`` 中与 :func:`_err` 关键字参数 / payload 保留字段同名的键：展开前过滤，避免静默改退出码、
+# 在 ``except`` 内抛 ``TypeError``，或覆盖类别码与人读文案（#257 架构师审查 🟡3）。
+_RESERVED_DETAIL_KEYS = frozenset({"error", "message", "code", "json_output", "error_code"})
+
+
 def _plugin_error(e: PluginInstallError, *, json_output: bool) -> int:
     """
     把结构化 :class:`PluginInstallError` 翻成 CLI 错误输出 / Render a structured installer error.
 
     ``error_code`` / ``details`` 由 installer 侧按需填写（如跨 marketplace 同名冲突 = ``validation`` +
     ``conflictWith``）；未填写时 payload 仍是 ``{"error": "error", ...}``，既有契约不变（#257）。
-
-    **不走 ``_err(**details)``**（#257 审查 🟡6）：``details`` 的键若与 ``_err`` 的关键字参数同名（``code`` /
-    ``json_output`` / ``error_code``）会静默改退出码或在 ``except`` 内抛 ``TypeError``。此处直接构造 payload，
-    并让保留键 ``error`` / ``message`` 不可被细节覆盖（类别码与人读文案由异常本身决定）。
+    保留键先被过滤，再统一委托 :func:`_err`（决策 4：不另起一套 payload/退出码渲染）。
     """
-    details = {k: v for k, v in e.details.items() if k not in ("error", "message")}
-    if json_output:
-        payload: dict[str, Any] = {"error": e.error_code or "error", "message": str(e), **details}
-        console.print_json(data=payload)
-    else:
-        console.print(f"[red]✗ {e}[/red]")
-    return EXIT_USER_ERROR
+    details = {key: value for key, value in e.details.items() if key not in _RESERVED_DETAIL_KEYS}
+    return _err(str(e), json_output=json_output, error_code=e.error_code, **details)
 
 
 def _ok(msg: str) -> int:

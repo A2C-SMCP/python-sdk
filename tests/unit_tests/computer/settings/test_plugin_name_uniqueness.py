@@ -24,9 +24,11 @@ marketplace 全局唯一，`<plugin>@<marketplace>` 是完整安装 id）。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -525,3 +527,96 @@ async def test_reinstall_same_pid_allowed_in_double_install(tmp_path: Path) -> N
     with pytest.raises(PluginInstallError) as ei:
         await install_plugin("alpha@mp-c", reg, home, env=env)
     assert ei.value.details["conflictWith"] == "alpha@mp-a"
+
+
+# ── 架构师审查 🔴1：install 预检与意图写必须同临界区（跨进程并发）──────────
+def test_concurrent_install_same_bare_name_only_one_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个线程同时 install 同名不同 marketplace：只允许一个成功，意图与账本都不得出现双装。
+
+    用 ``threading.Barrier`` 卡在预检之后，强制两边都先「看到空安装集」再进写意图路径——这正是
+    「预检无锁、写意图才持锁」的 TOCTOU 窗口。修复后由 ``_write_installed_plugin`` 的锁内复核兜住。
+    """
+    import a2c_smcp.computer.settings.installer as installer_mod
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+
+    barrier = threading.Barrier(2, timeout=15)
+    real_conflicts = installer_mod._bare_name_conflicts
+
+    def _rendezvous(*args, **kwargs):
+        result = real_conflicts(*args, **kwargs)
+        barrier.wait()  # 两个线程都完成预检后才继续
+        return result
+
+    monkeypatch.setattr(installer_mod, "_bare_name_conflicts", _rendezvous)
+
+    outcomes: dict[str, object] = {}
+
+    def _run(pid: str) -> None:
+        try:
+            asyncio.run(install_plugin(pid, SkillRegistry(), home, env=env))
+            outcomes[pid] = "ok"
+        except PluginInstallError as exc:  # noqa: BLE001 - 记录竞争结果
+            outcomes[pid] = exc
+
+    threads = [threading.Thread(target=_run, args=(pid,), daemon=True) for pid in ("alpha@mp-a", "alpha@mp-b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(value == "ok" for value in outcomes.values()) == [False, True], outcomes
+    settings = _read_settings(env)
+    assert len(settings.get("installedPlugins") or []) == 1
+    assert len(load_installed_plugins(home=home)["plugins"]) == 1
+
+
+# ── 字面 add-after-enable 全链（架构师审查测试补强）─────────────────────────
+async def test_add_marketplace_after_enable_then_install_rejected(tmp_path: Path) -> None:
+    """install+enable mp-a 之后才 add mp-b（全量 stage）：已启用技能保持 mp-a，install mp-b 被拒。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    # 用户此后添加 mp-b：`marketplace add` 的行为 = 合并 known_marketplaces + 不带 filter 的全量 stage
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"  # 注册点守卫：先到者保留
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+
+
+# ── 架构师审查 🟡2：纯声明冲突的文案分档与补救可执行性 ─────────────────────
+async def test_declaration_only_conflict_remedy_is_executable(tmp_path: Path) -> None:
+    """冲突集混合「已安装」与「仅声明」：文案分别给 uninstall / 删声明，且按提示执行后能装第三个。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-c", "alpha", skill="foo", description="from-c")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    declaration = workdir_project_settings_path(tmp_path)
+    _write_json(declaration, {"installedPlugins": ["alpha@mp-b"]})  # 仅声明、从未安装
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-c", reg, home, env=env)
+    message = str(ei.value)
+    assert "'plugin uninstall alpha@mp-a'" in message  # 已安装 → uninstall
+    assert "declaration" in message and "alpha@mp-b" in message  # 仅声明 → 删声明键
+    # 分档核心：仅声明的 pid 不得被建议 `plugin uninstall`（该命令清不掉声明，是永久 no-op）
+    assert "'plugin uninstall alpha@mp-b'" not in message
+
+    # 按提示执行补救：删声明 + 卸载已装的 mp-a
+    declaration.unlink()
+    assert await uninstall_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    await install_plugin("alpha@mp-c", reg, home, env=env)  # 冲突解除
