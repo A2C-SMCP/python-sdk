@@ -33,6 +33,7 @@ from a2c_smcp.computer.settings.installer import (
     install_plugin,
     uninstall_plugin,
 )
+from a2c_smcp.computer.settings.scope import user_settings_path
 from a2c_smcp.computer.settings.store import load_installed_plugins
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -106,9 +107,23 @@ def _plugin_files() -> dict[str, str]:
     }
 
 
-async def _add_marketplace(home: Path, bare: Path, env: dict[str, str]) -> None:
+def _marketplace_files(mp: str, *, plugin: str = "alpha", skill: str = "foo", description: str = "from-a") -> dict[str, str]:
+    """跨 marketplace 同名 plugin 夹具（#257）：同 plugin/skill 名、不同 description 便于鉴别 source。"""
+    manifest = {
+        "name": mp,
+        "owner": {"name": "X"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": plugin, "source": plugin, "version": "1.0.0"}],
+    }
+    return {
+        ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
+        f"plugins/{plugin}/skills/{skill}/SKILL.md": _skill_md(skill, description),
+    }
+
+
+async def _add_marketplace(home: Path, bare: Path, env: dict[str, str], *, name: str = "acme-skills") -> None:
     """模拟 ``marketplace add``：clone catalog + 写 known_marketplaces.json（plugin_filter=空 → 不注册 skill）。"""
-    await stage_marketplace_skills("acme-skills", _src(_url(bare)), SkillRegistry(), home, plugin_filter=set(), env=env)
+    await stage_marketplace_skills(name, _src(_url(bare)), SkillRegistry(), home, plugin_filter=set(), env=env)
 
 
 # ── install 端到端 / end-to-end ──────────────────────────────────────────────
@@ -139,6 +154,42 @@ async def test_install_end_to_end(tmp_path: Path) -> None:
     await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
     assert reg.resolve("audit:lint") is not None
     assert captured == ["figma"]
+
+
+@requires_git
+async def test_second_marketplace_same_bare_name_rejected_end_to_end(tmp_path: Path) -> None:
+    """#257 / conformance §5「跨 marketplace 同名 plugin 安装」：真 git clone 下第二个 install MUST 被拒。
+
+    断言：``PluginInstallError`` 带 ``error_code=validation``；``installedPlugins`` 不新增第二个 pid；
+    账本无第二个 pid；已启用 ``alpha:foo`` 的 ``source`` / 内容保持首个 marketplace（未被静默覆盖）。
+    """
+    bare_a = _make_bare(tmp_path, "mp-a", _marketplace_files("mp-a", description="from-a"))
+    bare_b = _make_bare(tmp_path, "mp-b", _marketplace_files("mp-b", description="from-b"))
+    home = _home(tmp_path)
+    env = _env(home)
+    await _add_marketplace(home, bare_a, env, name="mp-a")
+    await _add_marketplace(home, bare_b, env, name="mp-b")
+    reg = SkillRegistry()
+
+    await install_plugin("alpha@mp-a", reg, home, env=env, existing_bundle_ids=lambda: set())
+    await enable_plugin("alpha@mp-a", reg, home, env=env, existing_bundle_ids=lambda: set())
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"
+    assert got["description"] == "from-a"
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", reg, home, env=env, existing_bundle_ids=lambda: set())
+
+    assert ei.value.error_code == "validation"
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+    settings = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert settings["installedPlugins"] == ["alpha@mp-a"]
+    assert "alpha@mp-b" not in load_installed_plugins(home=home)["plugins"]
+    after = reg.resolve("alpha:foo")
+    assert after is not None
+    assert after["source"] == "marketplace:mp-a"
+    assert after["description"] == "from-a"
 
 
 @requires_git

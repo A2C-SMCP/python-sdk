@@ -30,7 +30,12 @@ from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.mcp_clients.model import MCPServerPromptStringInput
 from a2c_smcp.computer.settings.scope import user_settings_path, workdir_project_settings_path
-from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
+from a2c_smcp.computer.settings.store import (
+    load_installed_plugins,
+    load_known_marketplaces,
+    save_installed_plugins,
+    save_known_marketplaces,
+)
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -77,7 +82,11 @@ def _stdio(name: str, command: str = "node") -> dict:
 
 
 def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], inputs: list[dict] | None = None) -> Path:
-    """造 catalog 树（相对源 plugin）+ marketplace.json + plugin mcp-servers/，seed known_marketplaces。"""
+    """造 catalog 树（相对源 plugin）+ marketplace.json + plugin mcp-servers/，**合并** seed known_marketplaces。
+
+    #257：合并而非替换——跨 marketplace 同名 plugin 场景须同测试内共存两个 marketplace
+    （范式同 ``test_mcp_dependency_model.py``）。
+    """
     catalog = marketplace_skill_dir(home, mp)
     manifest = {
         "name": mp,
@@ -92,10 +101,9 @@ def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], inpu
         _write_json(plugin_root / "mcp-servers" / f"{sname}.json", _stdio(sname))
     if inputs is not None:
         _write_json(plugin_root / "mcp-servers" / "inputs.json", {"inputs": inputs})
-    save_known_marketplaces(
-        {"version": 1, "marketplaces": {mp: {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}}},
-        home=home,
-    )
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"][mp] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}
+    save_known_marketplaces(known, home=home)
     return plugin_root
 
 
@@ -187,6 +195,29 @@ async def test_install_dependency_satisfied_exit0_and_installs(
 async def test_install_invalid_id_exit1(tmp_path: Path) -> None:
     home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
     assert await plugin_cmd.plugin_install(reg, home, env, "nodelim", json_output=True) == 1
+
+
+@pytest.mark.asyncio
+async def test_install_second_marketplace_same_bare_name_exit1_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#257 / conformance §5：同名不同 marketplace 的 install → 退出码 1 + JSON ``error=validation``。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "mp-a", "alpha", servers=[])
+    _setup_catalog(home, "mp-b", "alpha", servers=[])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+
+    assert await plugin_cmd.plugin_install(reg, home, env, "alpha@mp-a", json_output=True) == 0
+    capsys.readouterr()  # 丢弃首个成功输出
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "alpha@mp-b", json_output=True)
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"
+    assert payload["conflictWith"] == "alpha@mp-a"
+    assert "alpha@mp-a" in payload["message"]
+    # 意图未被写入第二个 pid
+    assert json.loads(user_settings_path(env).read_text(encoding="utf-8"))["installedPlugins"] == ["alpha@mp-a"]
 
 
 # ── enable / disable：scope 从 ledger 读（不默认 user）/ scope read from ledger ──

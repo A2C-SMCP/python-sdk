@@ -274,3 +274,52 @@ def test_register_or_update_invalid_ref_returns_false(capture_errors: pytest.Log
     assert reg.register_or_update(bad) is False
     assert len(reg) == 0
     assert any(r.levelno == logging.ERROR for r in capture_errors.records)
+
+
+# ── 跨 source 守卫（#257：后注册 marketplace 不得静默覆盖已注册技能）────────────
+def test_register_or_update_cross_source_rejected_keeps_first(capture_errors: pytest.LogCaptureFixture) -> None:
+    """同名不同 ``source``：保留先到者、拒新 ref、记 ERROR（skill.md §1.5；#257）。"""
+    reg = SkillRegistry()
+    first = _ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo")
+    assert reg.register_or_update(first) is True
+    second = _ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")
+    assert reg.register_or_update(second) is False
+    assert reg.resolve("alpha:foo") == first  # 先到者原样保留（ref/source/path 均不变）
+    assert len(reg) == 1
+    messages = [r.getMessage() for r in capture_errors.records if r.levelno == logging.ERROR]
+    assert any("marketplace:mp-b" in m and "marketplace:mp-a" in m for m in messages), messages
+    # 诊断可判：指出双方 pid 与卸载指引（#257 决策 5/6）
+    assert any("alpha@mp-a" in m and "plugin uninstall" in m for m in messages), messages
+
+
+def test_register_or_update_cross_source_orphan_not_revived(capture_errors: pytest.LogCaptureFixture) -> None:
+    """跨 source 不得借孤儿复活通道替换：保持孤儿、不换 source（fail-closed）。"""
+    reg = SkillRegistry()
+    reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo"))
+    reg.mark_orphan("alpha:foo")
+    assert reg.register_or_update(_ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")) is False
+    assert reg.is_orphan("alpha:foo") is True  # 未复活
+    assert reg.resolve("alpha:foo") is None  # 仍不可见
+    assert len(reg) == 1
+    assert any("alpha@mp-b" in r.getMessage() for r in capture_errors.records if r.levelno == logging.ERROR)
+
+
+def test_register_or_update_same_source_refresh_still_updates() -> None:
+    """负对照：同 source 刷新（含孤儿复活）行为不变。"""
+    reg = SkillRegistry()
+    reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo", description="v1"))
+    assert reg.register_or_update(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo2", description="v2")) is True
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["description"] == "v2"
+    assert got["path"] == "/abs/a/foo2"
+
+
+def test_update_keeps_cross_source_semantics_unchanged() -> None:
+    """守卫不下沉到 ``update()``（ResourceUpdated 刷新语义不变；#257 决策 3）。"""
+    reg = SkillRegistry()
+    reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo"))
+    assert reg.update(_ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")) is True
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-b"
