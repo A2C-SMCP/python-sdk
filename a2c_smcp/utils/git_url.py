@@ -14,8 +14,9 @@ git URL 展示脱敏单一权威（python-sdk#261）/ Git URL display redaction,
     - rust-sdk#154（fail-closed）：错误 / 诊断 / 日志不得回显 git URL 的 username / password / token；
       无法安全呈现 → 同一占位符 :data:`REDACTED_GIT_SOURCE`。
     - rust-sdk PR #277（``fix/273-scp-like-display``）``settings/redaction.rs`` 与
-      ``skills/staging.rs::sanitize_git_stderr`` 为逐字节对拍源（散文 token 边界 = **仅空白**；外层引号
-      闭合由 ``split_outer_wrapper`` 判定；scp-like 散文由 ``redact_scp_like_sources`` 处理）。
+      ``skills/staging.rs::sanitize_git_stderr`` 为展示契约与散文算法的对拍源（散文 token 边界 = **仅空白**；
+      外层引号闭合由 ``split_outer_wrapper`` 判定；scp-like 散文由 ``redact_scp_like_sources`` 处理）。
+      **序列化层 best-effort**（非逐字节），差异清单见 :func:`git_url_for_display`。
 
 两模式 / Two modes：
     - :func:`known_git_source_for_display` —— 已校验 source 的**展示面**（可读性优先，仍去凭据）。
@@ -117,8 +118,9 @@ def git_url_for_display(raw: object) -> str:
     - scp-like 在严格模式一律占位符（``Url::parse`` 失败；rust 行为）；
     - path 按 url crate 序列化 percent-encode（空格 / C0 控制字符 / 非 ASCII 均转义，防终端注入）；
       host 走 IDNA；host 仍含非可视 ASCII（空格 / 控制字符）→ 占位符。序列化为 **best-effort 对齐**
-      rust ``Url::to_string()``（非逐字节一致）：不做 dot-segment 归一 / host ``%xx`` 归一；
-      反斜杠 host 解析以 Python（与 git 实际连接一致）为准。
+      rust ``Url::to_string()``（非逐字节一致），已知差异**例如**：不做 dot-segment 归一 / host ``%xx``
+      归一；path 保留字符集（``|`` / ``^`` 等）与 host IDNA 方言可能不同；反斜杠 host 解析以 Python
+      （与 git 实际连接一致）为准。清单为示例，非穷举。
     """
     if not isinstance(raw, str):
         return REDACTED_GIT_SOURCE

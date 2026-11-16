@@ -21,6 +21,7 @@ import hashlib
 import io
 import logging
 import subprocess
+import sys
 import tarfile
 import zipfile
 from collections.abc import Iterator
@@ -1032,6 +1033,10 @@ async def test_marketplace_invalid_source_log_hides_non_url_secret(
     assert "glpat-SECRET_TOKEN" not in text
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX os.fsencode 才抛 UnicodeEncodeError；Windows 会真实尝试网络 clone（复审 🟡2）",
+)
 @pytest.mark.asyncio
 async def test_marketplace_surrogate_name_and_url_degrade_without_raising(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
@@ -1055,3 +1060,18 @@ async def test_marketplace_surrogate_name_and_url_degrade_without_raising(
     text = _no_secret(staging_logs.records)
     assert "git spawn failed" in text
     assert "\ud800" not in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_nul_url_degrades_without_raising(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """NUL 字节 URL 触发 ValueError 臂（spawn 守卫；复审 🟡1）：返回 [] 且日志含 git spawn failed。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "git", "url": "https://example.com/\x00"}, SkillRegistry(), home, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "git spawn failed" in text

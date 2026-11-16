@@ -439,8 +439,9 @@ def test_info_missing_source_url_stays_null(
 
     assert marketplace_info(home, env, "demo") == 0
     out = capsys.readouterr().out
-    assert _flat("url") in _flat(out)
     assert "None" not in out, "缺失字段应留空，不得渲染字面 None"
+    url_row = next(line for line in out.splitlines() if "url" in line)
+    assert url_row.split("│")[2].strip() == "", "url 行 value 单元格必须为空白"
 
 
 def test_surrogate_url_fails_closed(
