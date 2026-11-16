@@ -308,10 +308,100 @@ async def test_enable_fails_closed_when_other_marketplace_shadows(tmp_path: Path
 
     assert ei.value.error_code == "validation"
     assert ei.value.details["conflictWith"] == "alpha@mp-b"
+    # 补救必须可执行：冲突方未安装 → 不得给 no-op 的 `plugin uninstall`（#257 复审 🔴2）
+    message = str(ei.value)
+    assert "marketplace remove mp-b" in message
+    assert "plugin uninstall alpha@mp-b" not in message
     after = _read_settings(env)
     assert after.get("installedPlugins") == before.get("installedPlugins")
     # 回滚语义：enabledPlugins 恢复为「原 absent」（DELETE 后可能留下空对象，等价于未启用）
     assert "alpha@mp-a" not in (after.get("enabledPlugins") or {})
+
+
+async def test_enable_succeeds_when_other_marketplace_has_different_skill_names(tmp_path: Path) -> None:
+    """复核面只认真正的 name 冲突：另一 marketplace 的同 plugin **不同 skill 名**不得把 enable 打死（复审 🔴1）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="baz", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+    assert reg.resolve("alpha:baz") is not None  # marketplace add 的全量 stage 既存行为
+
+    await enable_plugin("alpha@mp-a", reg, home, env=env)  # 无 name 冲突 → 必须成功
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"
+    assert (_read_settings(env).get("enabledPlugins") or {}).get("alpha@mp-a") is True
+
+
+async def test_enable_remedy_then_retry_succeeds(tmp_path: Path) -> None:
+    """错误给出的补救必须真的能清冲突：按提示移除 marketplace 后重试 enable 应成功（复审 🔴2 闭环）。"""
+    from a2c_smcp.computer.settings.reconciler import _unregister_marketplace_skills
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin("alpha@mp-a", reg, home, env=env)
+    assert "marketplace remove mp-b" in str(ei.value)
+
+    _unregister_marketplace_skills(reg, "mp-b")  # `marketplace remove` 的注销效果
+    await enable_plugin("alpha@mp-a", reg, home, env=env)  # 重试成功
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"
+
+
+async def test_install_rejects_declaration_only_pid_carve_out(tmp_path: Path) -> None:
+    """幂等 carve-out 只认账本：project 层**纯声明**的同名 pid 不得成为「装第二个」的通行证（复审 🔴3）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    # 仅声明（无账本记录）一个从未安装的同名 pid
+    _write_json(workdir_project_settings_path(tmp_path), {"installedPlugins": ["alpha@mp-b"]})
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+    assert "alpha@mp-b" not in load_installed_plugins(home=home)["plugins"]
+
+
+async def test_enable_rollback_restores_preexisting_orphan(tmp_path: Path) -> None:
+    """失败 enable 的净效果必须为零：本次复活的既有孤儿要回到孤儿态，不得被 unregister（复审 🟡5）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    baz_dir = root_a / "skills" / "baz"
+    baz_dir.mkdir(parents=True)
+    (baz_dir / "SKILL.md").write_text(_skill_md("baz", "from-a"), encoding="utf-8")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+
+    reg = SkillRegistry()
+    # 预置可达态：`marketplace add` 已把 mp-b 的 alpha:foo 全量 stage 成活跃；mp-a 的 alpha:baz 是既有孤儿
+    reg.register({"name": "alpha:foo", "source": "marketplace:mp-b", "path": "/abs/b/foo", "description": "from-b"})
+    reg.register({"name": "alpha:baz", "source": "marketplace:mp-a", "path": "/abs/a/baz", "description": "from-a"})
+    reg.mark_orphan("alpha:baz")
+    before = {ref["name"]: orphaned for ref, orphaned in reg.all_refs()}
+
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    with pytest.raises(PluginInstallError):
+        await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    after = {ref["name"]: orphaned for ref, orphaned in reg.all_refs()}
+    assert after == before
 
 
 # ── 审查 🔴2：disable → uninstall 的孤儿残留必须一并清掉 ─────────────────────

@@ -334,3 +334,21 @@ def test_register_orphan_cross_source_rejected(capture_errors: pytest.LogCapture
     assert reg.is_orphan("alpha:foo") is True  # 未复活、未换 source
     assert reg.resolve("alpha:foo") is None
     assert any("alpha@mp-b" in r.getMessage() for r in capture_errors.records if r.levelno == logging.ERROR)
+    [conflict] = reg.drain_source_conflicts()  # 拒绝可被调用方取走（孤儿分支同样登记）
+    assert conflict.refused_source == "marketplace:mp-b"
+
+
+def test_drain_source_conflicts_records_then_clears() -> None:
+    """跨 source 拒绝需可被调用方取走并在取走后清空（enable 据此 fail-closed；#257 复审 🔴1）。"""
+    reg = SkillRegistry()
+    reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo"))
+    assert reg.drain_source_conflicts() == []
+
+    assert reg.register_or_update(_ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")) is False
+
+    drained = reg.drain_source_conflicts()
+    assert len(drained) == 1
+    assert drained[0].name == "alpha:foo"
+    assert drained[0].existing_source == "marketplace:mp-a"
+    assert drained[0].refused_source == "marketplace:mp-b"
+    assert reg.drain_source_conflicts() == []  # drain 后清空

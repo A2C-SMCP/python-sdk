@@ -54,6 +54,20 @@ class _RegistryEntry:
     orphaned: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class SourceConflict:
+    """
+    一次**跨 source 拒绝**的记录（#257；对齐 rust-sdk#275 ``SkillSourceConflict``）。
+
+    跨源拒绝是「记 ERROR、不抛」的静默降级（§1.5），调用方（enable）需要事后知道「本次 staging 究竟被拒了
+    哪些 name」才能 fail-closed 而不是假成功——故由 :meth:`SkillRegistry.drain_source_conflicts` 取走。
+    """
+
+    name: str
+    existing_source: object
+    refused_source: object
+
+
 class SkillRegistry:
     """
     name → A2CSkillRef 的内存物化索引 / In-memory materialized index of name → A2CSkillRef。
@@ -66,6 +80,7 @@ class SkillRegistry:
 
     def __init__(self) -> None:
         self._entries: dict[str, _RegistryEntry] = {}
+        self._source_conflicts: list[SourceConflict] = []
 
     def _validated_name(self, ref: A2CSkillRef, *, op: str) -> str | None:
         """
@@ -114,6 +129,9 @@ class SkillRegistry:
 
         if existing is not None:  # 孤儿恢复 / orphan recovery
             if existing.ref.get("source") != ref.get("source"):
+                self._source_conflicts.append(
+                    SourceConflict(name=name, existing_source=existing.ref.get("source"), refused_source=ref.get("source"))
+                )
                 logger.error(
                     "SkillRegistry cross-source conflict: name %r registered as orphan by source %r; refusing ref from "
                     "source %r via register (keeping first registrant). %s",
@@ -163,6 +181,9 @@ class SkillRegistry:
             existing_source = existing.ref.get("source")
             new_source = ref.get("source")
             if existing_source != new_source:
+                self._source_conflicts.append(
+                    SourceConflict(name=name, existing_source=existing_source, refused_source=new_source)
+                )
                 logger.error(
                     "SkillRegistry cross-source conflict: name %r already registered by source %r; refusing ref from "
                     "source %r (keeping first registrant). %s",
@@ -174,6 +195,16 @@ class SkillRegistry:
                 return False
             return self.update(ref)
         return self.register(ref)
+
+    def drain_source_conflicts(self) -> list[SourceConflict]:
+        """
+        取走自上次 drain 以来的**跨 source 拒绝**记录 / Drain recorded cross-source refusals（#257）。
+
+        staging 的跨源拒绝是静默降级（记 ERROR、不抛），enable 必须据此判「本次是否真被遮蔽」——用
+        「plugin 名前缀 + source」猜会把「同 plugin 但 skill 名不同」的正常注册误判成冲突（#257 复审 🔴1）。
+        """
+        drained, self._source_conflicts = self._source_conflicts, []
+        return drained
 
     @staticmethod
     def _cross_source_hint(name: str, existing_source: object, new_source: object) -> str:
@@ -196,8 +227,9 @@ class SkillRegistry:
             ]
             if len(pids) == 2:
                 return (
-                    f"Both {pids[0]!r} and {pids[1]!r} are installed; keeping {pids[0]!r}. To switch to the other "
-                    f"source, uninstall the current registrant first: 'plugin uninstall {pids[0]}'."
+                    f"{pids[0]!r} currently owns this name in the registry; the copy from {pids[1]!r} is refused. To "
+                    f"switch provenance, uninstall the current registrant first ('plugin uninstall {pids[0]}'), or — "
+                    f"if {pids[0]!r} is not installed — remove its marketplace registration and retry."
                 )
         return "Same name from different sources is refused; remove the shadowing source to switch provenance."
 
