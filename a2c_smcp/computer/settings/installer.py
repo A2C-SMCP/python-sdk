@@ -49,9 +49,10 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
   自动重建；bundled MCP server 重挂由 client 显式经 ``Computer.reconcile_governance(hooks)`` 触发
   （#93 client owns MCP config；CLI 启动序列即参考接线）。
 - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
-  ``enabledPlugins`` 门控重建（仅显式 true 激活）。uninstall 仅注销**活跃** SKILL（与
-  :func:`_unregister_marketplace_skills` 同限）；先 disable（orphan）再 uninstall 会残留内存孤儿条目，
-  进程重启即清。
+  ``enabledPlugins`` 门控重建（仅显式 true 激活）。**uninstall 连孤儿一并注销**（#257：``include_orphans=True``），
+  :func:`_unregister_marketplace_skills`（marketplace remove / gc / prune）同样遍历含孤儿的全量条目——
+  否则残留孤儿会被注册点跨 source 守卫当作「先到者」，令换源 install/enable 在本进程内永久失败。
+  enable 失败回滚以含孤儿的快照为基线：调用前已存在的孤儿回孤儿态，本次新增者才注销。
 - :func:`enable_plugin` 不校验 ``installedPlugins`` 意图成员资格（以账本记录为"可启用"依据）：手编移除意图
   而账本未 gc 的窗口里 live enable 仍可点亮，但重启后 boot 门控（installed ∧ enabled）不会恢复，交由
   reconcile 收敛。
@@ -184,7 +185,10 @@ def _bare_name_conflicts(
     allow_if_installed: bool = False,
 ) -> list[str]:
     """
-    跨 marketplace 裸名唯一性扫描（skill.md §1.2 note / §1.5；#257）/ Cross-marketplace bare-name scan。
+    跨 marketplace 裸名唯一性扫描（skill.md §1.2 note / §1.5；#257）/ Cross-marketplace bare-name scan.
+
+    Scans merged ``installedPlugins`` (user/project/local via :func:`resolve_settings`) ∪ materialization-ledger
+    pids and returns the installed pids sharing the bare name from **another** marketplace (sorted, self excluded).
 
     扫描面 = merged ``installedPlugins``（user/project/local，经 :func:`resolve_settings`）∪ 物化账本
     ``installed_plugins.json`` 的 pid 键；返回**同名不同 marketplace** 的已安装 pid（升序、排除自身）。
@@ -209,7 +213,7 @@ def _bare_name_conflicts(
 
 
 def _bare_name_conflict_error(plugin_id: str, conflicts: list[str], *, action: str) -> PluginInstallError:
-    """构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）。"""
+    """构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）/ Build the structured conflict error."""
     plugin, marketplace = _split_plugin_id(plugin_id)
     existing = ", ".join(repr(pid) for pid in conflicts)
     uninstall = " / ".join(f"'plugin uninstall {pid}'" for pid in conflicts)
@@ -404,7 +408,10 @@ def _installed_pids(*, home: Path, env: Mapping[str, str] | None) -> set[str]:
 
 def _plugin_skill_state(registry: SkillRegistry, marketplace: str, plugin: str) -> dict[str, bool]:
     """
-    本 plugin 名下条目的 ``name → orphaned`` 快照（**含孤儿**）/ Snapshot name→orphaned including orphans。
+    本 plugin 名下条目的 ``name → orphaned`` 快照（**含孤儿**）/ Snapshot name→orphaned including orphans.
+
+    Rollback baseline for a failed enable (#257 review 🟡5): an active-only baseline would treat a
+    *pre-existing* orphan as "newly added" and ``unregister`` it, so the failed command would not be a no-op.
 
     enable 失败回滚的基线（#257 复审 🟡5）：只用活跃集做基线会把「调用前就存在的孤儿」当成本次新增而
     ``unregister``，令失败命令的净效果不为零（少一条既有条目）。
@@ -448,7 +455,12 @@ def _source_conflict_error(
     env: Mapping[str, str] | None,
 ) -> PluginInstallError:
     """
-    把「本次 staging 真正被拒的跨 source ref」转成结构化错误（#257 复审 🔴2）。
+    把「本次 staging 真正被拒的跨 source ref」转成结构化错误（#257 复审 🔴2）/ Turn refused refs into a structured error.
+
+    ``plugin uninstall`` only works on an **installed** conflicting plugin; when enable reaches here the
+    same-name installed pid has already been rejected by the pre-check, so the owner is usually **not
+    installed** (an in-memory registration left by ``marketplace add``'s full staging) — the remedy must be
+    chosen accordingly, otherwise it is a permanent no-op.
 
     ``plugin uninstall`` 只对**已安装**的冲突方有效；而 enable 走到本分支时，同名的已安装 pid 已被前置检查
     拦下，冲突方通常是**未安装**的（``marketplace add`` 全量 stage 留下的内存注册）——文案必须据此分档，
@@ -469,7 +481,7 @@ def _source_conflict_error(
         message = (
             f"skills of plugin {plugin!r} ({names}) are registered by another source; refusing to enable {plugin_id!r}."
         )
-        return PluginInstallError(message, error_code="validation", details={"conflictWith": plugin})
+        return PluginInstallError(message, error_code="validation")
     installed = _installed_pids(home=home, env=env)
     hints: list[str] = []
     for owner in owners:
@@ -484,7 +496,7 @@ def _source_conflict_error(
     message = (
         f"skills of plugin {plugin!r} ({names}) are currently registered from another marketplace "
         f"({', '.join(repr(owner) for owner in owners)}), refusing to enable {plugin_id!r}. Resolve by: "
-        f"{'; '.join(hints)}. Then retry 'plugin enable {plugin_id}': the copy from {marketplace!r} is refused."
+        f"{'; '.join(hints)}. Then retry 'plugin enable {plugin_id}' to adopt the copy from {marketplace!r}."
     )
     return PluginInstallError(message, error_code="validation", details={"conflictWith": f"{plugin}@{owners[0]}"})
 

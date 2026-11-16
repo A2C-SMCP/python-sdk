@@ -220,6 +220,28 @@ async def test_install_second_marketplace_same_bare_name_exit1_validation(
     assert json.loads(user_settings_path(env).read_text(encoding="utf-8"))["installedPlugins"] == ["alpha@mp-a"]
 
 
+@pytest.mark.asyncio
+async def test_enable_shadowed_by_other_marketplace_exit1_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """enable 被另一 marketplace 同名技能遮蔽 → 退出码 1 + JSON 结构化 validation 与可执行补救（#257 复审 🟡10）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "mp-a", "alpha", servers=[])
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    # 预置 `marketplace add mp-b` 全量 stage 的效果：同名技能已由 mp-b 注册
+    reg.register({"name": "alpha:lint", "source": "marketplace:mp-b", "path": "/abs/b/lint", "description": "from-b"})
+
+    assert await plugin_cmd.plugin_install(reg, home, env, "alpha@mp-a", json_output=True) == 0
+    capsys.readouterr()
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "alpha@mp-a", json_output=True)
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"
+    assert payload["conflictWith"] == "alpha@mp-b"
+    assert "marketplace remove mp-b" in payload["message"]  # 冲突方未安装 → 不得给 no-op 的 uninstall
+
+
 def test_plugin_error_reserved_details_do_not_hijack_payload(capsys: pytest.CaptureFixture[str]) -> None:
     """``details`` 的保留键不得改写类别码 / 人读文案 / 退出码（#257 审查 🟡6）。"""
     from a2c_smcp.computer.cli.commands.plugin import _plugin_error

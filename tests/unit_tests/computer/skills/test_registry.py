@@ -352,3 +352,12 @@ def test_drain_source_conflicts_records_then_clears() -> None:
     assert drained[0].existing_source == "marketplace:mp-a"
     assert drained[0].refused_source == "marketplace:mp-b"
     assert reg.drain_source_conflicts() == []  # drain 后清空
+
+
+def test_drain_source_conflicts_dedupes_repeated_refusals() -> None:
+    """同一 (name, source 对) 的反复拒绝只登记一条（长驻会话反复 restage 不无界增长；#257 复审 🟡8）。"""
+    reg = SkillRegistry()
+    reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo"))
+    for _ in range(3):
+        assert reg.register_or_update(_ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")) is False
+    assert len(reg.drain_source_conflicts()) == 1

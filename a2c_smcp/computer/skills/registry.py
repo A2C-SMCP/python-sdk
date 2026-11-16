@@ -57,7 +57,11 @@ class _RegistryEntry:
 @dataclass(frozen=True, slots=True)
 class SourceConflict:
     """
-    一次**跨 source 拒绝**的记录（#257；对齐 rust-sdk#275 ``SkillSourceConflict``）。
+    一次**跨 source 拒绝**的记录（#257；对齐 rust-sdk#275 ``SkillSourceConflict``）/ One recorded refusal。
+
+    Cross-source refusal is silently degraded (log ERROR, never raise, §1.5); callers (enable) need to know
+    afterwards which names were refused so they can fail closed instead of reporting a false success — hence
+    :meth:`SkillRegistry.drain_source_conflicts`.
 
     跨源拒绝是「记 ERROR、不抛」的静默降级（§1.5），调用方（enable）需要事后知道「本次 staging 究竟被拒了
     哪些 name」才能 fail-closed 而不是假成功——故由 :meth:`SkillRegistry.drain_source_conflicts` 取走。
@@ -129,9 +133,7 @@ class SkillRegistry:
 
         if existing is not None:  # 孤儿恢复 / orphan recovery
             if existing.ref.get("source") != ref.get("source"):
-                self._source_conflicts.append(
-                    SourceConflict(name=name, existing_source=existing.ref.get("source"), refused_source=ref.get("source"))
-                )
+                self._note_source_conflict(name, existing.ref.get("source"), ref.get("source"))
                 logger.error(
                     "SkillRegistry cross-source conflict: name %r registered as orphan by source %r; refusing ref from "
                     "source %r via register (keeping first registrant). %s",
@@ -181,9 +183,7 @@ class SkillRegistry:
             existing_source = existing.ref.get("source")
             new_source = ref.get("source")
             if existing_source != new_source:
-                self._source_conflicts.append(
-                    SourceConflict(name=name, existing_source=existing_source, refused_source=new_source)
-                )
+                self._note_source_conflict(name, existing_source, new_source)
                 logger.error(
                     "SkillRegistry cross-source conflict: name %r already registered by source %r; refusing ref from "
                     "source %r (keeping first registrant). %s",
@@ -195,6 +195,17 @@ class SkillRegistry:
                 return False
             return self.update(ref)
         return self.register(ref)
+
+    def _note_source_conflict(self, name: str, existing_source: object, refused_source: object) -> None:
+        """
+        登记一次跨 source 拒绝 / Record one cross-source refusal（去重）。
+
+        同一 ``(name, existing_source, refused_source)`` 只留一条：长驻 REPL 里 ``marketplace add/refresh`` /
+        boot 重扫会反复 restage 同一被遮蔽 name，无去重则缓冲无上界增长（#257 复审 🟡8）。
+        """
+        conflict = SourceConflict(name=name, existing_source=existing_source, refused_source=refused_source)
+        if conflict not in self._source_conflicts:
+            self._source_conflicts.append(conflict)
 
     def drain_source_conflicts(self) -> list[SourceConflict]:
         """
@@ -209,7 +220,10 @@ class SkillRegistry:
     @staticmethod
     def _cross_source_hint(name: str, existing_source: object, new_source: object) -> str:
         """
-        跨 source 冲突的可判诊断（#257 决策 5/6）：尽量给出双方 ``<plugin>@<marketplace>`` 与 uninstall 指引。
+        跨 source 冲突的可判诊断 / Actionable diagnostics for a cross-source conflict（#257 决策 5/6）。
+
+        Gives both derived ``<plugin>@<marketplace>`` ids when the marketplace shape is recoverable, plus a
+        switch-provenance hint.
 
         marketplace 形态（2 段 name + ``marketplace:<mp>`` source）可完整派生 pid；其它形态退化为通用指引
         （跨形态 name 按段数互斥，实际不可碰撞）。
