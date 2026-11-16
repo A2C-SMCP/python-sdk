@@ -285,6 +285,12 @@ MCP server 走 **`<plugin>/mcp-servers/<name>.json`** 文件式（mcp-servers �
 | `marketplace refresh [<name>|all]` | git pull 失败则全量重 clone；与缓存 plugin 集合对账；emit_update_skills。Rich 进度条 + 失败汇总表。 |
 | `marketplace set <name> auto-update=<bool>` | 设置 per-source `auto_update` 旗。 |
 
+**URL 展示语义（#261，单一权威 `a2c_smcp/utils/git_url.py`）**：`list` / `info` / `add` 的表格、JSON、
+确认提示中的 `url` 是**展示值**——去掉 userinfo（用户名与密码 / token）、query、fragment；scp-like
+`user@host:path` 显示 `host:path`（不保留 `user@`）。**展示值只用于识别，不可用于 re-clone**；
+`known_marketplaces.json` 存储与 git clone/pull 入参始终是原始 URL。错误 / 诊断 / 日志走严格模式
+（`git_url_for_display`）：不可解析 / host 缺失 / scp-like → `<redacted-git-source>`，其余去凭据后展示。
+
 ### 4.3 Plugin 命令
 
 | 命令 | 行为 |

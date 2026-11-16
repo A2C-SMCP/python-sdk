@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from a2c_smcp.computer.cli.commands import marketplace as marketplace_mod
 from a2c_smcp.computer.cli.commands.marketplace import (
     _load_trusted,
     _record_trust,
@@ -39,8 +40,14 @@ from a2c_smcp.computer.cli.commands.marketplace import (
     marketplace_set,
     normalize_marketplace_url,
 )
-from a2c_smcp.computer.settings.store import load_known_marketplaces
+from a2c_smcp.computer.settings.store import (
+    known_marketplaces_path,
+    load_known_marketplaces,
+    save_known_marketplaces,
+    update_known_marketplaces,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="requires the git binary")
 
@@ -322,3 +329,269 @@ async def test_refresh_states(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     # missing：未知 name
     await marketplace_refresh(reg, home, env, "ghost", json_output=True)
     assert json.loads(capsys.readouterr().out)[0]["status"] == "missing"
+
+
+# ── #261 展示脱敏：known-source 展示面 / display redaction ─────────────────────
+_CRED_URL = "https://user:FAKE_TOKEN@example.com/org/repo.git?token=FAKE_QUERY#FAKE_FRAGMENT"
+_SCP_URL = "git@example.com:org/repo.git"
+_SSH_URL = "ssh://git@example.com/org/repo.git"
+_QUERY_URL = "https://example.com/repo.git?x#y"
+_CLEAN_URL = "https://example.com/org/repo.git"
+
+# (input, expected display, forbidden literals in output)
+_LIST_INFO_VECTORS: list[tuple[str, str, tuple[str, ...]]] = [
+    (_SCP_URL, "example.com:org/repo.git", ("git@",)),
+    (_SSH_URL, "ssh://example.com/org/repo.git", ("git@",)),
+    (_CRED_URL, "https://example.com/org/repo.git", ("FAKE_TOKEN", "FAKE_QUERY", "FAKE_FRAGMENT", "user:")),
+    (_QUERY_URL, "https://example.com/repo.git", ("?x", "#y")),
+    (_CLEAN_URL, "https://example.com/org/repo.git", ()),
+]
+
+
+def _flat(text: str) -> str:
+    """去全部空白后比较（Rich 表格在窄终端会折行）。"""
+    return "".join(text.split())
+
+
+@pytest.fixture
+def wide_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rich 表格在窄终端会截断 URL（``…``）；测试用宽控制台保证断言整串。"""
+    from rich.console import Console
+
+    monkeypatch.setattr(marketplace_mod, "console", Console(width=200))
+
+
+def _seed_marketplace(home: Path, env: dict[str, str], name: str, url: str | None) -> None:
+    rec: dict[str, object] = {"installLocation": ""}
+    if url is not None:
+        rec["source"] = {"type": "git", "url": url}
+    save_known_marketplaces({"version": 1, "marketplaces": {name: rec}}, home, env)
+
+
+@pytest.mark.parametrize(("feed_url", "expected", "forbidden"), _LIST_INFO_VECTORS)
+def test_list_display_redacts_url(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    wide_console: None,
+    feed_url: str,
+    expected: str,
+    forbidden: tuple[str, ...],
+) -> None:
+    """list 表格 / JSON 均走 known-source 展示：无 userinfo/query/fragment。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_marketplace(home, env, "demo", feed_url)
+
+    marketplace_list(home, env, json_output=True)
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["url"] == expected
+    assert "FAKE_TOKEN" not in json.dumps(row) and "FAKE_QUERY" not in json.dumps(row)
+
+    marketplace_list(home, env)
+    out = capsys.readouterr().out
+    assert _flat(expected) in _flat(out)
+    if feed_url != expected:
+        assert _flat(feed_url) not in _flat(out), "表格不得回退为原始 URL"
+    for literal in forbidden:
+        assert literal not in out, f"表格输出不得含 {literal!r}"
+
+
+@pytest.mark.parametrize(("feed_url", "expected", "forbidden"), _LIST_INFO_VECTORS)
+def test_info_display_redacts_url(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    wide_console: None,
+    feed_url: str,
+    expected: str,
+    forbidden: tuple[str, ...],
+) -> None:
+    """info 表格 / JSON 均走 known-source 展示。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_marketplace(home, env, "demo", feed_url)
+
+    code = marketplace_info(home, env, "demo", json_output=True)
+    assert code == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info["url"] == expected
+    assert "FAKE_TOKEN" not in json.dumps(info) and "FAKE_QUERY" not in json.dumps(info)
+
+    code = marketplace_info(home, env, "demo")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert _flat(expected) in _flat(out)
+    if feed_url != expected:
+        assert _flat(feed_url) not in _flat(out), "表格不得回退为原始 URL"
+    for literal in forbidden:
+        assert literal not in out, f"表格输出不得含 {literal!r}"
+
+
+def test_info_missing_source_url_stays_null(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], wide_console: None
+) -> None:
+    """手编 / 历史记录缺 source.url：JSON 保持 null、表格留空（不渲染字面 None）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_marketplace(home, env, "demo", None)
+
+    assert marketplace_info(home, env, "demo", json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)["url"] is None
+
+    assert marketplace_list(home, env, json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)[0]["url"] is None
+
+    assert marketplace_info(home, env, "demo") == 0
+    out = capsys.readouterr().out
+    assert "None" not in out, "缺失字段应留空，不得渲染字面 None"
+    url_row = next(line for line in out.splitlines() if "url" in line)
+    assert url_row.split("│")[2].strip() == "", "url 行 value 单元格必须为空白"
+
+
+def test_surrogate_url_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], wide_console: None
+) -> None:
+    """手编 ledger 的孤立代理项 URL：展示层 fail-closed，不崩溃（#261 复审 🔴）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    path = known_marketplaces_path(home, env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "marketplaces": {
+                    "demo": {
+                        "source": {"type": "git", "url": "https://example.com/\ud800"},
+                        "installLocation": "",
+                    }
+                },
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+
+    assert marketplace_list(home, env, json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)[0]["url"] == REDACTED_GIT_SOURCE
+
+    assert marketplace_list(home, env) == 0
+    assert REDACTED_GIT_SOURCE in capsys.readouterr().out
+
+    assert marketplace_info(home, env, "demo", json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)["url"] == REDACTED_GIT_SOURCE
+
+
+def _patch_stage(monkeypatch: pytest.MonkeyPatch, *, register: bool) -> None:
+    """替换 staging：可按需模拟「成功注册」或「clone 失败（不注册）」。"""
+
+    async def fake_stage(
+        name: str,
+        source: object,
+        registry: object,
+        home: Path,
+        *,
+        auto_update: bool = False,
+        env: dict[str, str] | None = None,
+        **_kwargs: object,
+    ) -> list[str]:
+        if register:
+
+            def _mutate(f: dict[str, object]) -> object:
+                f["marketplaces"][name] = {  # type: ignore[index]
+                    "source": dict(source),  # type: ignore[arg-type]
+                    "installLocation": "",
+                    "autoUpdate": auto_update,
+                }
+                return f
+
+            update_known_marketplaces(_mutate, home, env)
+        return []
+
+    monkeypatch.setattr(marketplace_mod, "stage_marketplace_skills", fake_stage)
+
+
+@requires_git
+@pytest.mark.asyncio
+async def test_add_json_uses_known_display(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """add 成功 JSON 的 url 为 known-source 展示值（不可 re-clone）；存储仍是原始 URL。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    _patch_stage(monkeypatch, register=True)
+
+    code = await marketplace_add(reg, home, env, _CRED_URL, name="demo", trust=True, json_output=True)
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["url"] == "https://example.com/org/repo.git"
+    assert "FAKE_TOKEN" not in json.dumps(data)
+
+    stored = load_known_marketplaces(home, env)["marketplaces"]["demo"]["source"]["url"]
+    assert stored == _CRED_URL, "known_marketplaces 必须保留原始 URL"
+
+
+@pytest.mark.asyncio
+async def test_add_confirm_prompt_uses_known_display(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """交互确认提示展示 known-source（scp-like → host:path，不保留 user@）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    _patch_stage(monkeypatch, register=True)
+    seen: list[str] = []
+
+    async def confirm(target: str) -> bool:
+        seen.append(target)
+        return True
+
+    code = await marketplace_add(reg, home, env, _SCP_URL, confirm=confirm)
+    assert code == 0
+    assert seen == ["example.com:org/repo.git"]
+
+
+@pytest.mark.asyncio
+async def test_add_invalid_url_error_redacted(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """非法 URL 错误 fail-closed：无法解析 → 占位符，不回显原始输入。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    code = await marketplace_add(reg, home, env, "not a url", trust=True, json_output=True)
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "not a url" not in out
+    assert REDACTED_GIT_SOURCE in out
+
+
+@pytest.mark.asyncio
+async def test_add_untrusted_noninteractive_error_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """非交互 untrusted 错误走 strict：凭据 URL 去 userinfo/query/fragment（不泄漏 token）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    code = await marketplace_add(reg, home, env, _CRED_URL, trust=False, json_output=True)
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "FAKE_TOKEN" not in out and "FAKE_QUERY" not in out
+    assert "https://example.com/org/repo.git" in out
+
+
+@pytest.mark.asyncio
+async def test_add_clone_failure_error_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """clone/refresh 失败错误：凭据 scheme URL → 去凭据展示；scp-like → 占位符。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    _patch_stage(monkeypatch, register=False)
+
+    assert await marketplace_add(reg, home, env, _CRED_URL, name="demo", trust=True, json_output=True) == 2
+    out = capsys.readouterr().out
+    assert "FAKE_TOKEN" not in out and "FAKE_QUERY" not in out
+    assert "https://example.com/org/repo.git" in out
+
+    assert await marketplace_add(reg, home, env, _CLEAN_URL, name="demo2", trust=True, json_output=True) == 2
+    out = capsys.readouterr().out
+    assert "https://example.com/org/repo.git" in out
+
+    assert await marketplace_add(reg, home, env, _SCP_URL, name="demo3", trust=True, json_output=True) == 2
+    out = capsys.readouterr().out
+    assert "git@example.com" not in out
+    assert REDACTED_GIT_SOURCE in out
+
+
+@pytest.mark.asyncio
+async def test_add_name_derivation_error_redacted(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """派生名失败错误同样去凭据（strict 展示，不回显原串 userinfo）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    code = await marketplace_add(reg, home, env, "https://user:FAKE_TOKEN@example.com/@@@", trust=True, json_output=True)
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "FAKE_TOKEN" not in out
+    assert "https://example.com/@@@" in out
