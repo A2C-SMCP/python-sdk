@@ -573,16 +573,27 @@ async def test_uninstall_refuses_symlinked_clone_keeps_ledger_258(tmp_path: Path
         ext.symlink_to(target, target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("symlink not supported on this platform")
-    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext), "mcpServers": ["figma"]}]})
     _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
+    reg = SkillRegistry()
+    reg.register_or_update({"name": "audit:lint", "source": f"{SOURCE_MARKETPLACE}:acme", "path": str(target)})
+    removed_servers: list[str] = []
 
-    with pytest.raises(PluginInstallError, match="ledger and intent preserved"):
-        await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env)
+    async def _remove_server(bundle_id: str) -> None:
+        removed_servers.append(bundle_id)
+
+    with pytest.raises(PluginInstallError, match=r"failed to remove exclusive clone for 'audit@acme'.*symlinked external clone"):
+        await uninstall_plugin(
+            "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=_remove_server,
+        )
 
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"], "删除失败不得删账本"
+    assert load_installed_plugins(home=home)["plugins"]["audit@acme"][0]["installPath"] == str(ext), "installPath 不变"
     user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert user["installedPlugins"] == ["audit@acme"], "删除失败不得删安装意图"
     assert user["enabledPlugins"]["audit@acme"] is True, "删除失败不得清 enabled"
+    assert reg.resolve("audit:lint") is not None, "删除失败不得注销 skill（承重顺序）"
+    assert removed_servers == [], "删除失败不得摘除 bundled server（承重顺序）"
     assert (target / "keep").exists() and ext.is_symlink()
 
 

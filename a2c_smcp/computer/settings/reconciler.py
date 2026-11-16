@@ -226,27 +226,31 @@ def is_external_plugin_install_path(install_path: Path, home: Path, marketplace:
     return is_within(_lexical_normalize(install_path), _lexical_normalize(external_plugin_dir(home, marketplace, plugin)))
 
 
+class InstallPathRemovalError(Exception):
+    """独占外部 clone 删除失败（软链重定向 / 路径不可解析 / rmtree 失败）/ Exclusive-clone removal failure."""
+
+
 def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool | None:
     """
     按 **plugin 文件归属** 删除 ``installPath``（#258 / rust-sdk#271 方案 A）/ Remove installPath by ownership.
 
     仅当 ``installPath`` 位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``（含
     ``git-subdir`` 的后代）时，删除**整个 clone 根**并返回 ``True``；**非独占路径**（共享 catalog 等）保留并
-    返回 ``None``；**拒绝 / 删除失败**返回 ``False``：
+    返回 ``None``；**拒绝 / 删除失败**抛 :class:`InstallPathRemovalError`（消息含路径与原因）：
 
     - 相对源（``source: "./plugins/x"``）的 ``installPath`` 落在**共享 catalog clone** ``<home>/marketplace/<mp>/…``
       ——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，归 ``marketplace remove`` /
       ``prune``（reconcile 仅在 ``sourceChanged`` 整树重 clone 时清理）清理，``uninstall`` / plugin-gc MUST NOT
       删除（#258 方案 A）；
     - 空 / 相对 ``installPath``、非法 marketplace / plugin 名 → 无法识别归属，保守保留；
-    - ext root（或 ``.plugins/<mp>`` 段）被符号链接重定向 → 保守保留：``_safe_rmtree`` 按 canonicalize 后的路径
+    - ext root（或 ``.plugins/<mp>`` 段）被符号链接重定向 → 拒删：``_safe_rmtree`` 按 canonicalize 后的路径
       ``rmtree``，跟随软链会误删链接目标（可指向 Home 内共享 catalog，令 #258 破坏经 symlink 复活）。
 
     归属判定用纯词法（不解析 installPath 链上的软链）；实际删除仍由 canonicalize + SKILL Home 越界守卫兜底。
 
-    :return: ``True`` = 独占 clone 已删除或原本就不存在；``None`` = **非独占路径**，按设计保留（共享 catalog 等）；
-        ``False`` = **拒绝删除 / 删除失败**（软链重定向、canonical 守卫拒绝、OSError），目标可能仍在——调用方
-        （uninstall / gc）据此决定是否保留账本记录。
+    :return: ``True`` = 独占 clone 已删除或原本就不存在；``None`` = **非独占路径**，按设计保留（共享 catalog 等）。
+    :raises InstallPathRemovalError: 软链重定向 / 路径不可解析（软链环、权限、NUL）/ rmtree 失败——调用方
+        （uninstall / gc）必须保留账本记录，不得当作「已删除」。
     """
     if not is_external_plugin_install_path(install_path, home, marketplace, plugin):
         logger.debug("keeping installPath %s (shared marketplace catalog / non-exclusive path)", install_path)
@@ -255,12 +259,15 @@ def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str,
     try:
         resolved_root = lexical_root.resolve()
         canonical_root = external_plugin_dir(home.resolve(), marketplace, plugin)
-    except (OSError, RuntimeError, ValueError):
-        return False
+    except (OSError, RuntimeError, ValueError) as e:
+        raise InstallPathRemovalError(
+            f"cannot remove {lexical_root}: path resolve failed ({type(e).__name__}: {e})",
+        ) from e
     if resolved_root != canonical_root:  # 任一路径段是符号链接 → 删除会作用于链接目标
-        logger.warning("refusing to remove symlinked external clone %s", lexical_root)
-        return False
-    return _safe_rmtree(resolved_root, home)
+        raise InstallPathRemovalError(f"cannot remove {lexical_root}: symlinked external clone")
+    if not _safe_rmtree(resolved_root, home):
+        raise InstallPathRemovalError(f"cannot remove {resolved_root}: filesystem removal failed")
+    return True
 
 
 def _unregister_marketplace_skills(registry: SkillRegistry, marketplace: str, *, plugin: str | None = None) -> None:
@@ -711,9 +718,12 @@ async def gc_plugins(
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
                 # #258：只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
-                if remove_plugin_install_path(Path(install_path), home, marketplace, plugin) is False:
-                    logger.error("gc: failed to remove exclusive clone %s for %r; keeping ledger record", install_path, pid)
+                try:
+                    remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                except InstallPathRemovalError as e:
+                    logger.error("gc: %s; keeping ledger record for %r", e, pid)
                     delete_failed = True
+                    break
         if delete_failed:
             # 删除失败 → 保留账本 / SKILL / server，该 pid 不计入 removed，残留 clone 仍有索引可重试
             # （#258 复审 🔴1）。

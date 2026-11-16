@@ -72,6 +72,7 @@ from a2c_smcp.computer.settings.raw import (
     read_raw_object,
 )
 from a2c_smcp.computer.settings.reconciler import (
+    InstallPathRemovalError,
     NonPluginBundleIds,
     is_external_plugin_install_path,
     ledger_mcp_deps_of,
@@ -125,7 +126,13 @@ logger = get_logger(__name__)
 # 异常 / Exceptions（模块内本地异常，仿 ToolNameDuplicatedError / SkillStagingError 惯例）
 # ---------------------------------------------------------------------------
 class PluginInstallError(Exception):
-    """plugin install/enable 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope）。"""
+    """
+    plugin install / enable / uninstall 编排失败。
+
+    - install/enable 前置失败：marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope；
+    - uninstall 删除**独占外部 clone** 失败（软链重定向 / resolve 异常 / rmtree 失败）——此时账本与安装意图
+      保持不变，残留 clone 仍有索引可重试；调用方（CLI / marketplace_remove）必须按失败上报，不得当作 no-op。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -657,21 +664,19 @@ async def uninstall_plugin(
     )
 
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
-    delete_failed = False
     if not ext_clone_still_referenced:
         for rec in targeted:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
                 # 只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
-                if remove_plugin_install_path(Path(install_path), home, marketplace, plugin) is False:
-                    logger.error("uninstall: failed to remove exclusive clone %s; aborting before ledger changes", install_path)
-                    delete_failed = True
-    if delete_failed:
-        # 删除失败（软链重定向 / OSError）→ 抛错并保持账本与意图不变；布尔 ``False`` 的公开契约仍只表示
-        # 「未安装 no-op」，避免调用方把删除失败误报成 not installed（#258 复审三轮 🔴1/🟡2）。
-        raise PluginInstallError(
-            f"failed to remove exclusive clone for {plugin_id!r}; ledger and intent preserved",
-        )
+                try:
+                    remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                except InstallPathRemovalError as e:
+                    # 删除失败（软链重定向 / resolve 异常 / rmtree OSError）→ 抛错并保持账本与意图不变；
+                    # 布尔 ``False`` 的公开契约仍只表示「未安装 no-op」，避免调用方误报 not installed。
+                    raise PluginInstallError(
+                        f"failed to remove exclusive clone for {plugin_id!r}: {e}; ledger and intent preserved",
+                    ) from e
 
     for name in _plugin_skill_names(registry, marketplace, plugin):
         registry.unregister(name)

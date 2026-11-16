@@ -493,12 +493,15 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             return
         from a2c_smcp.computer.cli.commands import build_mcp_callbacks
 
+        name = pos[0]
         code = await marketplace_remove(
-            registry, home, env, pos[0],
+            registry, home, env, name,
             keep_plugins="--keep-plugins" in args, confirm=_confirm,
             mcp_cbs=build_mcp_callbacks(comp), json_output=json_output,
         )
-        if code == EXIT_OK:
+        # 部分失败（uninstall 抛错）时返回非 EXIT_OK，但 marketplace 可能已被 prune 移除——按「是否仍在册」
+        # 标脏，否则已连接 Agent 继续看到已删除的 SKILL（#258 复审四轮 🟡1）。
+        if code == EXIT_OK or name not in _marketplaces(home, env):
             comp.mark_skills_dirty()
     elif sub == "refresh":
         target = pos[0] if pos else "all"

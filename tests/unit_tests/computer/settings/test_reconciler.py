@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from a2c_smcp.computer.settings.reconciler import (
+    InstallPathRemovalError,
     ReconcileReport,
     declared_installed_plugin_ids,
     declared_marketplace_names,
@@ -595,7 +596,8 @@ def test_remove_plugin_install_path_refuses_symlinked_external_root_258(tmp_path
         pytest.skip("symlink not supported on this platform")
 
     assert is_external_plugin_install_path(ext_root, home, "acme", "audit") is True  # 纯词法命中 ext root
-    assert remove_plugin_install_path(ext_root, home, "acme", "audit") is False  # 但软链根拒删
+    with pytest.raises(InstallPathRemovalError, match="symlinked external clone"):
+        remove_plugin_install_path(ext_root, home, "acme", "audit")  # 软链根拒删（消息含路径与原因）
     assert catalog.exists() and sentinel.exists(), "链接目标（共享 catalog）不得被删"
     assert ext_root.is_symlink()
 
@@ -687,6 +689,41 @@ def test_safe_rmtree_resolve_failure_returns_false_258(tmp_path: Path) -> None:
         pytest.skip("symlink not supported on this platform")
 
     assert rec_mod._safe_rmtree(loop_a / "x", home) is False
+    assert loop_a.is_symlink() and loop_b.is_symlink(), "拒删不得先删链接本身"
+
+
+def test_remove_plugin_install_path_resolve_failure_258(tmp_path: Path) -> None:
+    """#258 复审四轮 🟡4/🟡5：ext root 为软链环 → 抛 InstallPathRemovalError（含路径与 resolve 原因）。"""
+    home = _home(tmp_path)
+    ext = _ext_dir(home, "acme") / "audit"
+    ext.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        ext.symlink_to(ext)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+
+    with pytest.raises(InstallPathRemovalError, match="path resolve failed"):
+        remove_plugin_install_path(ext, home, "acme", "audit")
+    assert ext.is_symlink()
+
+
+def test_prune_symlink_loop_keeps_known_entry_258(tmp_path: Path) -> None:
+    """#258 复审四轮 🟡4：marketplace clone 为软链环 → prune 拒删、保留 known、链接仍在。"""
+    home = _home(tmp_path)
+    clone = marketplace_skill_dir(home, "acme")
+    clone.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        clone.symlink_to(clone)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    # 软链环下不能经 _seed_known（其 installLocation 会 resolve）→ 直接写 known。
+    save_known_marketplaces({"version": 1, "marketplaces": {"acme": {"source": _SRC_A}}}, home=home)
+
+    removed = prune_marketplaces(["acme"], SkillRegistry(), home)
+
+    assert removed == []
+    assert clone.is_symlink()
+    assert "acme" in load_known_marketplaces(home=home)["marketplaces"]
 
 
 def test_prune_failure_does_not_block_other_marketplaces_258(tmp_path: Path) -> None:
