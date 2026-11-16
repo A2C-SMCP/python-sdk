@@ -368,6 +368,12 @@ async def marketplace_remove(
                 console_err.print(f"[yellow]! failed to uninstall {pid!r}: {e}[/yellow]")
 
     pruned = prune_marketplaces([name], registry, home, env=env)
+    if name not in pruned:
+        # clone / 外部树未能清空（软链 / OSError）→ prune 保留 known 条目；marketplace 仍存在，不得撤销信任。
+        return _err(
+            f"failed to remove marketplace {name!r}: clone tree could not be removed",
+            json_output=json_output,
+        )
     # 撤销信任，避免 trustedMarketplaces 只增不减（user scope）。此时移除**已完成**，revoke 只是清理残留，
     # 故 fail-closed 的写失败降级为 WARN（不吞、不覆盖、不回滚已完成的开除动作）——#246。
     try:

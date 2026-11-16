@@ -252,6 +252,31 @@ async def test_info_and_remove(tmp_path: Path) -> None:
     assert "acme" not in (load_known_marketplaces(home, env).get("marketplaces") or {})
 
 
+@pytest.mark.asyncio
+async def test_remove_fails_when_clone_is_symlink_258(tmp_path: Path) -> None:
+    """#258 复审 🔴1：clone 为软链、prune 无法清空 → 退出码 1，known 条目保留（残留树仍可被 orphan 发现）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    real = home / "marketplace" / "real"
+    (real / "plugins").mkdir(parents=True)
+    (real / "plugins" / "keep").write_text("x", encoding="utf-8")
+    link = home / "marketplace" / "acme"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": "file:///x"}, "installLocation": str(real)}}},
+        home=home,
+    )
+
+    code = await marketplace_remove(reg, home, env, "acme", confirm=_yes)
+
+    assert code == 1
+    assert "acme" in load_known_marketplaces(home, env)["marketplaces"]
+    assert link.is_symlink() and (real / "plugins" / "keep").exists()
+
+
 @requires_git
 @pytest.mark.asyncio
 async def test_json_output_shape(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

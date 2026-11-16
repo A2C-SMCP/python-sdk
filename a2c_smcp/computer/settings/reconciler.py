@@ -173,8 +173,18 @@ def _safe_rmtree(path: Path, home: Path) -> bool:
         logger.warning("reconcile: refusing to remove symlink %s", path)
         return False
     rp = path.resolve()
-    if not is_within(rp, home.resolve()):
+    home_rp = home.resolve()
+    if not is_within(rp, home_rp):
         logger.error("reconcile: refusing to remove %s outside SKILL Home %s", rp, home)
+        return False
+    # 父组件软链守卫：``path`` 下任一组件（如 ``.plugins`` / ``<mp>``）为软链时，``resolve`` 的落点会偏离
+    # 「仅解析 home、其余按词法拼接」的预期——直接 rmtree 会删到链接目标（可在 Home 内）。
+    try:
+        rel = _lexical_normalize(path).relative_to(_lexical_normalize(home))
+    except ValueError:
+        rel = None
+    if rel is not None and rp != _lexical_normalize(home_rp / rel):
+        logger.warning("reconcile: refusing to remove %s (symlinked path component)", path)
         return False
     if not rp.exists():
         return True
@@ -211,7 +221,7 @@ def is_external_plugin_install_path(install_path: Path, home: Path, marketplace:
     return is_within(_lexical_normalize(install_path), _lexical_normalize(external_plugin_dir(home, marketplace, plugin)))
 
 
-def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
+def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool | None:
     """
     按 **plugin 文件归属** 删除 ``installPath``（#258 / rust-sdk#271 方案 A）/ Remove installPath by ownership.
 
@@ -227,10 +237,14 @@ def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str,
       ``rmtree``，跟随软链会误删链接目标（可指向 Home 内共享 catalog，令 #258 破坏经 symlink 复活）。
 
     归属判定用纯词法（不解析 installPath 链上的软链）；实际删除仍由 canonicalize + SKILL Home 越界守卫兜底。
+
+    :return: ``True`` = 独占 clone 已删除或原本就不存在；``None`` = **非独占路径**，按设计保留（共享 catalog 等）；
+        ``False`` = **拒绝删除 / 删除失败**（软链重定向、canonical 守卫拒绝、OSError），目标可能仍在——调用方
+        （uninstall / gc）据此决定是否保留账本记录。
     """
     if not is_external_plugin_install_path(install_path, home, marketplace, plugin):
         logger.debug("keeping installPath %s (shared marketplace catalog / non-exclusive path)", install_path)
-        return False
+        return None
     lexical_root = external_plugin_dir(home, marketplace, plugin)
     try:
         resolved_root = lexical_root.resolve()
@@ -321,15 +335,16 @@ async def reconcile(
         if source_changed:
             # 源已变更：旧 clone 是「别的仓库」，必须 wipe 后重 clone（stage 只 pull 不换库）。
             logger.info("reconcile: marketplace %r source changed, wiping stale clone for re-clone", name)
-            _unregister_marketplace_skills(registry, name)
             # 未能真正清空旧树（软链路径 / 删除失败）→ 必须记 failed：否则 stage 复用旧树、把新源覆写成
-            # 「updated」的静默假成功（#258 复审 🟡3）。
+            # 「updated」的静默假成功（#258 复审 🟡3）。注销 SKILL 必须在 wipe 成功之后——失败分支无回滚，
+            # 先注销会让 live registry 永久缺失该源能力（#258 复审 🟡4）。
             clone_cleared = _safe_rmtree(clone_dir, home)
             ext_cleared = _safe_rmtree(ext_root / name, home)
             if not (clone_cleared and ext_cleared):
                 logger.error("reconcile: marketplace %r source change could not wipe old clone; marking failed", name)
                 failed.append(name)
                 continue
+            _unregister_marketplace_skills(registry, name)
 
         present_before = clone_dir.exists()
         do_refresh = bool(decl.get("autoUpdate")) or refresh
@@ -402,7 +417,10 @@ def prune_marketplaces(
     经用户确认后传入）。非法名跳过；删除越界守卫见 :func:`_safe_rmtree`。**不**触碰 ``installed_plugins.json``
     （plugin 账本归 #63 / :func:`gc_plugins`）。
 
-    :return: 实际清理的 marketplace 名列表。
+    clone / 外部树任一未能真正清空（软链 / OSError）→ **保留** ``known_marketplaces`` 条目、不计入返回列表
+    （避免残留树脱离 orphan 发现面而永久不可清理）；其余名字继续处理（失败不阻断）。SKILL 注销在清空成功之后。
+
+    :return: 实际清理的 marketplace 名列表（失败项不在其中，调用方据此暴露失败）。
     """
     ext_root = home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS
     removed: list[str] = []
@@ -410,9 +428,13 @@ def prune_marketplaces(
         if not is_valid_marketplace_name(name):
             logger.warning("prune: invalid marketplace name %r, skipped", name)
             continue
+        if not _safe_rmtree(marketplace_skill_dir(home, name), home):
+            logger.error("prune: could not remove clone tree for %r; keeping known entry", name)
+            continue
+        if not _safe_rmtree(ext_root / name, home):
+            logger.error("prune: could not remove external plugin tree for %r; keeping known entry", name)
+            continue
         _unregister_marketplace_skills(registry, name)
-        _safe_rmtree(marketplace_skill_dir(home, name), home)
-        _safe_rmtree(ext_root / name, home)
 
         def _drop(data: KnownMarketplacesFile, _n: str = name) -> None:
             data.get("marketplaces", {}).pop(_n, None)
@@ -678,11 +700,18 @@ async def gc_plugins(
             user_declared=non_plugin_bundle_ids(),
         )
         plugin, _, marketplace = pid.partition("@")
+        delete_failed = False
         for rec in records:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
-                # #258：只删 plugin 独占外部 clone；共享 catalog 内的相对源落点保留（归 marketplace 级清理）。
-                remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                # #258：只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
+                if remove_plugin_install_path(Path(install_path), home, marketplace, plugin) is False:
+                    logger.error("gc: failed to remove exclusive clone %s for %r; keeping ledger record", install_path, pid)
+                    delete_failed = True
+        if delete_failed:
+            # 删除失败 → 保留账本 / SKILL / server，该 pid 不计入 removed，残留 clone 仍有索引可重试
+            # （#258 复审 🔴1）。
+            continue
 
         if marketplace:
             _unregister_marketplace_skills(registry, marketplace, plugin=plugin)

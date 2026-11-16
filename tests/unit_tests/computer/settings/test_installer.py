@@ -551,13 +551,67 @@ async def test_uninstall_scoped_missing_retained_install_path_treated_as_unrefer
 
 
 async def test_uninstall_malformed_install_path_does_not_raise_258(tmp_path: Path) -> None:
-    """#258 🟡2：损坏账本（installPath 含 NUL）→ 归属判定失败即保守保留，卸载仍完成、不抛。"""
+    """#258 🟡2：损坏账本（installPath 含 NUL）→ 纯词法归属判定为 clone 外（非独占）→ 保留文件、卸载仍完成。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
     _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": "/tmp/a\u0000b"}]})
 
     assert await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+
+
+async def test_uninstall_refuses_symlinked_clone_keeps_ledger_258(tmp_path: Path) -> None:
+    """#258 复审 🟡2：独占 clone 为软链（拒删）→ 返回 False、账本保留，残留树仍有索引可重试。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep").write_text("x", encoding="utf-8")
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.parent.mkdir(parents=True)
+    try:
+        ext.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+
+    assert await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is False
+
+    assert "audit@acme" in load_installed_plugins(home=home)["plugins"], "删除失败不得删账本"
+    assert (target / "keep").exists() and ext.is_symlink()
+
+
+async def test_uninstall_scoped_symlink_component_retained_blocks_deletion_258(tmp_path: Path) -> None:
+    """#258 复审 🟡5：retained 记录 installPath 含软链组件 → 纯词法仍判 clone 内 → 门控保留 clone。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    (ext / "pkg").mkdir(parents=True)
+    target = tmp_path / "target"
+    (target / "sub").mkdir(parents=True)
+    (ext / "pkg").rmdir()
+    try:
+        (ext / "pkg").symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext)},
+                {"scope": "project", "projectPath": str(workdir), "installPath": str(ext / "pkg" / "sub")},
+            ]
+        },
+    )
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True
+
+    assert ext.exists(), "retained 记录的软链组件路径按词法仍引用 clone → 不得删除"
+    assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
 
 
 async def test_uninstall_keeps_installpath_outside_external_clone_258(tmp_path: Path) -> None:
@@ -571,7 +625,7 @@ async def test_uninstall_keeps_installpath_outside_external_clone_258(tmp_path: 
 
     assert await uninstall_plugin("evil@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
 
-    assert outside.exists() and (outside / "keepme").exists(), "无法识别归属 → 保守保留"
+    assert outside.exists() and (outside / "keepme").exists(), "非独占路径 → 按设计保留"
     assert "evil@acme" not in load_installed_plugins(home=home)["plugins"]
 
 

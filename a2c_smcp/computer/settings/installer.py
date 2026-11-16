@@ -654,12 +654,19 @@ async def uninstall_plugin(
     )
 
     # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
+    delete_failed = False
     if not ext_clone_still_referenced:
         for rec in targeted:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
-                # 只删 plugin 独占外部 clone；共享 catalog 内的相对源落点保留（归 marketplace 级清理）。
-                remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                # 只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
+                if remove_plugin_install_path(Path(install_path), home, marketplace, plugin) is False:
+                    logger.error("uninstall: failed to remove exclusive clone %s; aborting before ledger changes", install_path)
+                    delete_failed = True
+    if delete_failed:
+        # 删除失败（软链重定向 / OSError）→ 保持账本与意图不变、返回 False，避免残留 clone 失去索引
+        # （#258 复审 🔴1；此时尚未注销 skills / 回收 server / 删账本，副作用面为零或仅已成功删除的兄弟记录）。
+        return False
 
     for name in _plugin_skill_names(registry, marketplace, plugin):
         registry.unregister(name)

@@ -876,7 +876,7 @@ def test_marketplace_remove_completes_with_warn_when_revoke_trust_fails(
         home / "known_marketplaces.json",
         {"version": 1, "marketplaces": {"mp": {"source": {"type": "git", "url": "u"}, "installLocation": ""}}},
     )
-    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: ["mp"])
     _write_json(_user_settings(env), {"trustedMarketplaces": "not-an-array"})  # 让 _revoke_trust 抛
     capsys.readouterr()
 
@@ -1051,7 +1051,7 @@ def test_marketplace_remove_fails_per_victim_and_reports(
         return True
 
     monkeypatch.setattr(marketplace_cmd, "uninstall_plugin", _uninstall)
-    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(marketplace_cmd, "prune_marketplaces", lambda *_a, **_kw: ["mp"])
     capsys.readouterr()
 
     code = asyncio.run(
