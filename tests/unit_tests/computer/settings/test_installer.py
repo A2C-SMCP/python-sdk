@@ -16,7 +16,7 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §3.3/§
 - install（v0.3.0 #123 不激活）：happy 写 installedPlugins 意图 + 账本（不 stage、不挂 server）/ **依赖已满足
   不拒绝**（D3）/ 重装幂等 / 重装失败不丢既有意图与账本 / 未添加 mp / catalog 未 clone / 非法 id。
   install-only 目标行为与回滚细节另见 test_install_enable_separation.py。
-- uninstall：**按判据**回收 + 注销 + 删记录 + 删 installPath 树 / --keep-servers / 未安装 no-op。
+- uninstall：**按判据**回收 + 注销 + 删记录 + 删独占外部 clone（共享 catalog 保留）/ --keep-servers / 未安装 no-op。
 - disable：写 enabledPlugins=false + 按判据回收 + orphan skill（可复原）/ scope 路由 / 非法 scope。
 - enable：写 true + 复活 skill + 挂载未满足的依赖 / 未安装抛 / **依赖已满足 → 复用不覆盖**（D3）。
 
@@ -113,6 +113,36 @@ def _setup_catalog(home: Path, mp: str, plugin: str, *, servers: list[str], comm
 
 def _seed_installed(home: Path, plugins: dict[str, list[dict]]) -> None:
     save_installed_plugins({"version": 1, "plugins": plugins}, home=home)
+
+
+def _ext_plugin_root(home: Path, mp: str, plugin: str) -> Path:
+    """plugin 独占外部 clone 落点 ``<home>/marketplace/.plugins/<mp>/<plugin>``（#258 唯一可删归属）。"""
+    return home / SOURCE_MARKETPLACE / ".plugins" / mp / plugin
+
+
+def _setup_catalog_multi(home: Path, mp: str, entries: list[tuple[str, str]], *, commit: str = "abc123") -> dict[str, Path]:
+    """多 plugin catalog：``entries = (plugin, source)``（相对路径，裸名经 ``pluginRoot`` 展开）；返回各 plugin 根。"""
+    catalog = marketplace_skill_dir(home, mp)
+    manifest = {
+        "name": mp,
+        "owner": {"name": "X"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": p, "source": s, "version": "1.2.0"} for p, s in entries],
+    }
+    _write_json(catalog / ".tfrobot-plugin" / "marketplace.json", manifest)
+    roots: dict[str, Path] = {}
+    for plugin, source in entries:
+        rel = source[2:] if source.startswith("./") else f"plugins/{source}"
+        root = catalog / rel
+        skill_dir = root / "skills" / f"{plugin}-skill"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(f"---\nname: {plugin}-skill\ndescription: d\n---\n", encoding="utf-8")
+        roots[plugin] = root
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {mp: {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": commit}}},
+        home=home,
+    )
+    return roots
 
 
 def _fake_stage(calls: list[dict], *, fail: bool = False, register_skill: bool = True):
@@ -307,7 +337,7 @@ async def test_uninstall_default_cascades(tmp_path: Path, monkeypatch) -> None:
     assert mcp.removed == [FIGMA_BID]  # 级联 stop+remove
     assert reg.resolve("audit:lint") is None  # skills 注销
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]  # 记录删除
-    assert not install_path.exists()  # installPath 树清除
+    assert install_path.exists()  # #258：共享 catalog 内相对源落点保留（marketplace 级缓存）
     user = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert user["installedPlugins"] == []  # v0.3.0：安装意图删除（回 available）
     assert "audit@acme" not in user.get("enabledPlugins", {})  # enabledPlugins 条目清除
@@ -335,6 +365,159 @@ async def test_uninstall_not_installed_is_noop(tmp_path: Path) -> None:
     env = _env(tmp_path)
     assert await uninstall_plugin("ghost@acme", SkillRegistry(), _home(tmp_path), non_plugin_bundle_ids=lambda: set(), env=env) is False
     assert not user_settings_path(env).exists()  # 真 no-op：零写盘（迁移不被 no-op 路径触发，审查 N1）
+
+
+# ── #258：相对源卸载保留共享 catalog / 多 scope / 外部 clone 归属 ─────────────
+async def test_uninstall_relative_source_keeps_parent_child_and_same_source_258(tmp_path: Path, monkeypatch) -> None:
+    """#258：卸载 alpha 不得删除父子（beta）与同源兄弟（gamma）文件；卸载后可重装成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    roots = _setup_catalog_multi(home, "acme", [("alpha", "./plugin"), ("beta", "./plugin/nested"), ("gamma", "./plugin")])
+    assert roots["alpha"] == roots["gamma"], "同源 → 同一 installPath"
+    assert roots["beta"].is_relative_to(roots["alpha"]), "beta 位于 alpha 子树"
+    _seed_installed(home, {f"{p}@acme": [{"scope": "user", "installPath": str(r)}] for p, r in roots.items()})
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    assert await uninstall_plugin("alpha@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+
+    assert roots["alpha"].exists() and roots["beta"].exists() and roots["gamma"].exists()
+    ipf = load_installed_plugins(home=home)["plugins"]
+    assert "alpha@acme" not in ipf and "beta@acme" in ipf and "gamma@acme" in ipf
+
+    record = await install_plugin("alpha@acme", SkillRegistry(), home, env=env, existing_bundle_ids=lambda: set())
+    assert Path(record["installPath"]).resolve() == roots["alpha"].resolve(), "卸载后可重装且落点不变"
+
+
+async def test_uninstall_disjoint_relative_sources_control_258(tmp_path: Path) -> None:
+    """#258 对照：installPath 不相交的 plugin 卸载互不影响（两者均保留，归 marketplace 级清理）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    roots = _setup_catalog_multi(home, "acme", [("alpha", "./plugins/alpha"), ("beta", "./plugins/beta")])
+    _seed_installed(home, {f"{p}@acme": [{"scope": "user", "installPath": str(r)}] for p, r in roots.items()})
+
+    assert await uninstall_plugin("alpha@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+
+    assert roots["alpha"].exists() and roots["beta"].exists()
+    assert "beta@acme" in load_installed_plugins(home=home)["plugins"]
+
+
+async def test_uninstall_deletes_external_clone_only_258(tmp_path: Path) -> None:
+    """#258：url/github 类独占外部 clone 仍删除；同 marketplace 的 catalog 树保留。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    (ext / "pkg").mkdir(parents=True)
+    catalog = marketplace_skill_dir(home, "acme") / "plugins" / "audit"
+    catalog.mkdir(parents=True)
+    (catalog / "keep.txt").write_text("x", encoding="utf-8")
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+
+    assert await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+
+    assert not ext.exists(), "独占外部 clone 删除"
+    assert catalog.exists() and (catalog / "keep.txt").exists(), "catalog 共享树保留"
+
+
+async def test_uninstall_git_subdir_deletes_whole_external_clone_258(tmp_path: Path) -> None:
+    """#258：``git-subdir`` 的 installPath 是外部 clone 的子目录 → 删除整个 clone 根。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    sub = ext / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(sub)}]})
+
+    assert await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+
+    assert not ext.exists(), "subdir installPath → 删整个独占 clone 根"
+
+
+async def test_uninstall_scoped_keeps_external_clone_until_last_record_258(tmp_path: Path) -> None:
+    """#258：指定 scope 卸载且其余 scope 记录仍在 → 外部 clone 保留；最后一条记录卸载时才删。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext)},
+                {"scope": "project", "projectPath": str(workdir), "installPath": str(ext)},
+            ]
+        },
+    )
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+    ) is True
+    assert ext.exists(), "其余 scope 仍依赖同一 clone → 保留"
+    assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["user"]
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True
+    assert not ext.exists(), "最后一条记录卸载 → 删除独占 clone"
+
+
+async def test_uninstall_scoped_source_change_deletes_unreferenced_external_clone_258(tmp_path: Path) -> None:
+    """#258 🟡1：跨 scope 源类型变化（user=Git 源 / project=相对源）→ 先卸 user 时即删不再被引用的 ext clone。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    catalog_root = marketplace_skill_dir(home, "acme") / "plugin"
+    catalog_root.mkdir(parents=True)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext)},
+                {"scope": "project", "projectPath": str(workdir), "installPath": str(catalog_root)},
+            ]
+        },
+    )
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True
+    assert not ext.exists(), "retained（project）在 catalog 内、不引用 ext clone → 先卸 user 即删，不留泄漏"
+    remaining = load_installed_plugins(home=home)["plugins"]["audit@acme"]
+    assert [r["scope"] for r in remaining] == ["project"]
+
+    assert await uninstall_plugin(
+        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+    ) is True
+    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+
+
+async def test_uninstall_malformed_install_path_does_not_raise_258(tmp_path: Path) -> None:
+    """#258 🟡2：损坏账本（installPath 含 NUL）→ 归属判定失败即保守保留，卸载仍完成、不抛。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": "/tmp/a\u0000b"}]})
+
+    assert await uninstall_plugin("audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+
+
+async def test_uninstall_keeps_installpath_outside_external_clone_258(tmp_path: Path) -> None:
+    """#258：账本 installPath 不在独占外部 clone（盘外/历史）→ 文件保留、账本照删、不抛。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    outside = tmp_path / "outside-home"
+    outside.mkdir()
+    (outside / "keepme").write_text("x", encoding="utf-8")
+    _seed_installed(home, {"evil@acme": [{"scope": "user", "installPath": str(outside)}]})
+
+    assert await uninstall_plugin("evil@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+
+    assert outside.exists() and (outside / "keepme").exists(), "无法识别归属 → 保守保留"
+    assert "evil@acme" not in load_installed_plugins(home=home)["plugins"]
 
 
 # ── disable ───────────────────────────────────────────────────────────────────

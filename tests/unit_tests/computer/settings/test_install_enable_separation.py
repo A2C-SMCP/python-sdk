@@ -550,6 +550,8 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
     )
 
     assert ok is True
+    # #258：catalog 内相对源落点由归属谓词无条件保留；多 scope 门控回归锁见 test_installer.py 的 scoped external clone 用例。
+    assert root.exists()
     remaining = load_installed_plugins(home=home)["plugins"][_PID]
     assert [r["scope"] for r in remaining] == ["user"]  # 仅删 project 记录
     settings = _read_user_settings(env)

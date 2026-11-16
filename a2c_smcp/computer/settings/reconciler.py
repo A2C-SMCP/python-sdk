@@ -64,6 +64,7 @@ from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
     DEFAULT_GIT_TIMEOUT,
+    external_plugin_dir,
     stage_marketplace_skills,
 )
 from a2c_smcp.utils.logger import get_logger
@@ -173,6 +174,58 @@ def _safe_rmtree(path: Path, home: Path) -> None:
         shutil.rmtree(rp)
     except OSError as e:  # 失败降级：删除受阻不阻断其余清理
         logger.warning("reconcile: failed to remove %s: %s", rp, e)
+
+
+def is_external_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
+    """
+    ``installPath`` 是否位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``
+    （含 ``git-subdir`` 的后代子目录）/ Whether installPath lives in the plugin-exclusive external clone.
+
+    供删除谓词与 uninstall 的「retained 记录是否仍引用该 clone」判定共用。空 / 相对路径、非法
+    marketplace / plugin 名、无法解析的路径 → ``False``（无法识别独占根，保守保留，漏删优于误删）。
+    """
+    if not install_path.is_absolute():
+        return False
+    if not is_valid_marketplace_name(marketplace) or not is_valid_marketplace_name(plugin):
+        return False
+    try:
+        resolved_path = install_path.resolve()
+        resolved_root = external_plugin_dir(home, marketplace, plugin).resolve()
+    except (OSError, RuntimeError, ValueError):  # 符号链接环 / 权限 / 内嵌 NUL / 平台路径错误 → 保守保留
+        return False
+    return is_within(resolved_path, resolved_root)
+
+
+def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
+    """
+    按 **plugin 文件归属** 删除 ``installPath``（#258 / rust-sdk#271 方案 A）/ Remove installPath by ownership.
+
+    仅当 ``installPath`` 位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``（含
+    ``git-subdir`` 的后代）时，删除**整个 clone 根**并返回 ``True``；其余路径一律保留并返回 ``False``：
+
+    - 相对源（``source: "./plugins/x"``）的 ``installPath`` 落在**共享 catalog clone** ``<home>/marketplace/<mp>/…``
+      ——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，归 ``marketplace remove`` /
+      reconcile / prune 清理，``uninstall`` / plugin-gc MUST NOT 删除（#258 方案 A）；
+    - 空 / 相对 ``installPath``、非法 marketplace / plugin 名、无法解析的路径 → 保守保留（漏删优于误删）；
+    - ext root（或 ``.plugins/<mp>`` 段）被符号链接重定向 → 保守保留：``_safe_rmtree`` 按 canonicalize 后的路径
+      ``rmtree``，跟随软链会误删链接目标（可指向 Home 内共享 catalog，令 #258 破坏经 symlink 复活）。
+
+    实际删除仍由 :func:`_safe_rmtree` 的 canonicalize + SKILL Home 越界守卫兜底。
+    """
+    if not is_external_plugin_install_path(install_path, home, marketplace, plugin):
+        logger.debug("keeping installPath %s (shared marketplace catalog / non-exclusive path)", install_path)
+        return False
+    lexical_root = external_plugin_dir(home, marketplace, plugin)
+    try:
+        resolved_root = lexical_root.resolve()
+        canonical_root = external_plugin_dir(home.resolve(), marketplace, plugin)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if resolved_root != canonical_root:  # 任一路径段是符号链接 → 删除会作用于链接目标
+        logger.warning("refusing to remove symlinked external clone %s", lexical_root)
+        return False
+    _safe_rmtree(resolved_root, home)
+    return True
 
 
 def _unregister_marketplace_skills(registry: SkillRegistry, marketplace: str, *, plugin: str | None = None) -> None:
@@ -574,12 +627,14 @@ async def gc_plugins(
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> list[str]:
     """
-    清理孤儿 plugin（installPath 树 + installed_plugins.json 条目 + Registry SKILL + MCP 依赖回收）/ GC plugins。
+    清理孤儿 plugin（独占外部 clone + installed_plugins.json 条目 + Registry SKILL + MCP 依赖回收）/ GC plugins。
 
     y/N 确认交 CLI 层（#68）；``plugin_ids`` 应为 :func:`list_orphan_plugins` 的子集（用户确认后传入）。
-    每条记录的 ``installPath`` 仅在词法位于 SKILL Home 内才删（:func:`_safe_rmtree`）；其声明依赖的 MCP Server
-    经 **§4.9.1-2 回收判据**（:func:`reclaimable_mcp_deps`）过滤后才交 ``mcp_teardown`` 停/摘——gc 是 uninstall
-    的批量形态，同样 **MUST NOT 连坐用户自有 server**（#153）。
+    每条记录的 ``installPath`` **仅当位于该 plugin 独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``
+    内才删（:func:`remove_plugin_install_path`）；共享 catalog clone 内的相对源 installPath 保留，归
+    ``marketplace remove`` / prune 清理（#258 方案 A；无 ``@`` 的 pid 无法识别归属 ⇒ 文件保守保留）。其声明依赖的
+    MCP Server 经 **§4.9.1-2 回收判据**（:func:`reclaimable_mcp_deps`）过滤后才交 ``mcp_teardown`` 停/摘——gc 是
+    uninstall 的批量形态，同样 **MUST NOT 连坐用户自有 server**（#153）。
 
     逐 pid 处理且账本随之逐个删除 ⇒ 同批两 plugin 共享同一依赖时，先处理者因后者仍在账本而保留、后处理者
     （前者已删）回收 —— 自动满足「最后一个依赖者回收」。
@@ -601,12 +656,13 @@ async def gc_plugins(
             other_deps=other_plugin_mcp_deps(plugins, exclude_pid=pid),
             user_declared=non_plugin_bundle_ids(),
         )
+        plugin, _, marketplace = pid.partition("@")
         for rec in records:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
-                _safe_rmtree(Path(install_path), home)
+                # #258：只删 plugin 独占外部 clone；共享 catalog 内的相对源落点保留（归 marketplace 级清理）。
+                remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
 
-        plugin, _, marketplace = pid.partition("@")
         if marketplace:
             _unregister_marketplace_skills(registry, marketplace, plugin=plugin)
 
