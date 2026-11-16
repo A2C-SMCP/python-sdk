@@ -33,7 +33,13 @@ from pathlib import Path
 import pytest
 
 import a2c_smcp.computer.skills.registry as registry_mod
-from a2c_smcp.computer.settings.installer import PluginInstallError, enable_plugin, install_plugin
+from a2c_smcp.computer.settings.installer import (
+    PluginInstallError,
+    disable_plugin,
+    enable_plugin,
+    install_plugin,
+    uninstall_plugin,
+)
 from a2c_smcp.computer.settings.recovery import recover_marketplace_skills
 from a2c_smcp.computer.settings.scope import resolve_settings, user_settings_path, workdir_project_settings_path
 from a2c_smcp.computer.settings.store import (
@@ -44,6 +50,7 @@ from a2c_smcp.computer.settings.store import (
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.staging import stage_marketplace_skills
 
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
 
@@ -278,3 +285,111 @@ async def test_boot_rescan_double_install_keeps_first_registrant(
     again = reg.resolve("alpha:foo")
     assert again is not None
     assert again["source"] == "marketplace:mp-a"
+
+
+# ── 审查 🔴1：staging 的静默拒绝不得让 enable「假成功」────────────────────────
+async def test_enable_fails_closed_when_other_marketplace_shadows(tmp_path: Path) -> None:
+    """`marketplace add` 全量 stage 未安装 plugin → enable 本 pid 时必须报冲突并回滚，不得假成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    # 模拟 `marketplace add mp-b`：CLI 不传 plugin_filter → 全量 stage（含**未安装**的 alpha）
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+    shadow = reg.resolve("alpha:foo")
+    assert shadow is not None
+    assert shadow["source"] == "marketplace:mp-b"
+    before = _read_settings(env)
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    assert ei.value.error_code == "validation"
+    assert ei.value.details["conflictWith"] == "alpha@mp-b"
+    after = _read_settings(env)
+    assert after.get("installedPlugins") == before.get("installedPlugins")
+    # 回滚语义：enabledPlugins 恢复为「原 absent」（DELETE 后可能留下空对象，等价于未启用）
+    assert "alpha@mp-a" not in (after.get("enabledPlugins") or {})
+
+
+# ── 审查 🔴2：disable → uninstall 的孤儿残留必须一并清掉 ─────────────────────
+async def test_disable_then_uninstall_clears_orphan_allows_switch(tmp_path: Path) -> None:
+    """孤儿若不随 uninstall 注销，会被跨 source 守卫当作「先到者」永久拒绝新 source（本进程内不可自愈）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    await disable_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env)
+    assert reg.is_orphan("alpha:foo") is True
+
+    assert await uninstall_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    assert "alpha:foo" not in reg  # 孤儿随 uninstall 一起注销
+
+    await install_plugin("alpha@mp-b", reg, home, env=env)
+    await enable_plugin("alpha@mp-b", reg, home, env=env)
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-b"
+    assert got["description"] == "from-b"
+
+
+def test_marketplace_unregister_includes_orphans() -> None:
+    """``marketplace remove`` / gc / prune 的注销路径同样要清孤儿（#257 审查 🔴2 第二条路径）。"""
+    from a2c_smcp.computer.settings.reconciler import _unregister_marketplace_skills
+
+    reg = SkillRegistry()
+    reg.register({"name": "alpha:foo", "source": "marketplace:mp-a", "path": "/abs/a", "description": "d"})
+    reg.mark_orphan("alpha:foo")
+    assert reg.is_orphan("alpha:foo") is True
+
+    _unregister_marketplace_skills(reg, "mp-a", plugin="alpha")
+
+    assert "alpha:foo" not in reg
+
+
+# ── 审查 🔴3：冲突诊断给出的 uninstall 补救必须在 legacy 账本 home 真生效 ─────
+async def test_legacy_home_uninstall_clears_conflict(tmp_path: Path) -> None:
+    """v0.2.x 旧格式账本下，``plugin uninstall <conflict>`` 不得因默认视图丢弃记录而退化成 no-op。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _seed_ledger(
+        home,
+        {"alpha@mp-a": [{"scope": "user", "installPath": str(root_a), "bundledMcpServers": ["figma"]}]},
+    )
+    reg = SkillRegistry()
+    with pytest.raises(PluginInstallError):
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+
+    assert await uninstall_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    await install_plugin("alpha@mp-b", reg, home, env=env)  # 冲突解除，可换源安装
+
+
+# ── 决策 1 的幂等：存量双装下同一 pid 重装仍放行 ─────────────────────────────
+async def test_reinstall_same_pid_allowed_in_double_install(tmp_path: Path) -> None:
+    """同一 pid 重装不改变安装集、不新增第二个 ``<plugin>`` → 不得误拒（决策 1）；新 marketplace 仍拒。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    root_b = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(
+        user_settings_path(env),
+        {"installedPlugins": ["alpha@mp-a", "alpha@mp-b"], "enabledPlugins": {"alpha@mp-a": True}},
+    )
+    _seed_ledger(home, {"alpha@mp-a": [_record(root_a)], "alpha@mp-b": [_record(root_b)]})
+    reg = SkillRegistry()
+
+    record = await install_plugin("alpha@mp-a", reg, home, env=env)  # 不抛
+    assert record["scope"] == "user"
+
+    _setup_marketplace(home, "mp-c", "alpha", skill="foo", description="from-c")
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-c", reg, home, env=env)
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"

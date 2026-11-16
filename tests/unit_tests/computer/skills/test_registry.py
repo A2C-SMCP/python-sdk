@@ -323,3 +323,14 @@ def test_update_keeps_cross_source_semantics_unchanged() -> None:
     got = reg.resolve("alpha:foo")
     assert got is not None
     assert got["source"] == "marketplace:mp-b"
+
+
+def test_register_orphan_cross_source_rejected(capture_errors: pytest.LogCaptureFixture) -> None:
+    """公开 ``register()`` 的孤儿分支同样不得换源（#257 审查 🟡9：与 register_or_update 守卫一致）。"""
+    reg = SkillRegistry()
+    reg.register(_ref("alpha:foo", source="marketplace:mp-a", path="/abs/a/foo"))
+    reg.mark_orphan("alpha:foo")
+    assert reg.register(_ref("alpha:foo", source="marketplace:mp-b", path="/abs/b/foo")) is False
+    assert reg.is_orphan("alpha:foo") is True  # 未复活、未换 source
+    assert reg.resolve("alpha:foo") is None
+    assert any("alpha@mp-b" in r.getMessage() for r in capture_errors.records if r.levelno == logging.ERROR)

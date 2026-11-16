@@ -113,8 +113,18 @@ def _plugin_error(e: PluginInstallError, *, json_output: bool) -> int:
 
     ``error_code`` / ``details`` 由 installer 侧按需填写（如跨 marketplace 同名冲突 = ``validation`` +
     ``conflictWith``）；未填写时 payload 仍是 ``{"error": "error", ...}``，既有契约不变（#257）。
+
+    **不走 ``_err(**details)``**（#257 审查 🟡6）：``details`` 的键若与 ``_err`` 的关键字参数同名（``code`` /
+    ``json_output`` / ``error_code``）会静默改退出码或在 ``except`` 内抛 ``TypeError``。此处直接构造 payload，
+    并让保留键 ``error`` / ``message`` 不可被细节覆盖（类别码与人读文案由异常本身决定）。
     """
-    return _err(str(e), json_output=json_output, error_code=e.error_code, **(e.details or {}))
+    details = {k: v for k, v in e.details.items() if k not in ("error", "message")}
+    if json_output:
+        payload: dict[str, Any] = {"error": e.error_code or "error", "message": str(e), **details}
+        console.print_json(data=payload)
+    else:
+        console.print(f"[red]✗ {e}[/red]")
+    return EXIT_USER_ERROR
 
 
 def _ok(msg: str) -> int:

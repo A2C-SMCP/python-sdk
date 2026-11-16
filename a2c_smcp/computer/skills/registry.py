@@ -96,7 +96,9 @@ class SkillRegistry:
         校验（任一失败 → ERROR + ``False`` + no-op）见 :meth:`_validated_name`。校验通过后：
         - 同名条目不存在 → 写入活跃条目；
         - 同名 **active** 条目存在 → §1.5「拒绝第二注册者、保留先到者」→ ERROR + ``False``；
-        - 同名 **orphan** 条目存在 → 视为 source 回归：用新 ref 替换并清除 orphan（恢复）→ ``True``。
+        - 同名 **orphan** 条目存在且 ``source`` 相同 → 视为 source 回归：用新 ref 替换并清除 orphan（恢复）→ ``True``；
+        - 同名 **orphan** 条目存在但 ``source`` 不同 → 同 :meth:`register_or_update` 的跨 source 守卫：ERROR + ``False``
+          （不得借孤儿复活通道换源，#257）。
 
         **活跃 SKILL 的内容刷新**（§8.2 ResourceUpdated）请用 :meth:`update`，**不要**用 register
         （否则命中 active 冲突分支被静默拒绝、保留旧 ref）。
@@ -111,6 +113,16 @@ class SkillRegistry:
             return False
 
         if existing is not None:  # 孤儿恢复 / orphan recovery
+            if existing.ref.get("source") != ref.get("source"):
+                logger.error(
+                    "SkillRegistry cross-source conflict: name %r registered as orphan by source %r; refusing ref from "
+                    "source %r via register (keeping first registrant). %s",
+                    name,
+                    existing.ref.get("source"),
+                    ref.get("source"),
+                    self._cross_source_hint(name, existing.ref.get("source"), ref.get("source")),
+                )
+                return False
             logger.debug("SkillRegistry recovered orphaned skill via register name=%r", name)
         self._entries[name] = _RegistryEntry(ref=ref, orphaned=False)
         return True

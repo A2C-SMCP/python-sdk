@@ -180,12 +180,14 @@ def _unregister_marketplace_skills(registry: SkillRegistry, marketplace: str, *,
     从 Registry 注销某 marketplace（可选限定单 plugin）的 SKILL / Unregister a marketplace's SKILLs。
 
     按 ``A2CSkillRef.source == "marketplace:<mp>"`` 反查（marketplace SKILL name 形如 ``<plugin>:<skill>``，
-    ``plugin`` 给定时再按 ``<plugin>:`` 前缀过滤）。additive-only 模型下 marketplace clone 树不上 watcher，
-    其 SKILL 在 prune/gc 前恒活跃，故经 :meth:`SkillRegistry.active_refs` 枚举即可。
+    ``plugin`` 给定时再按 ``<plugin>:`` 前缀过滤）。
+
+    **孤儿一并枚举**（#257 审查 🔴2）：原假设「其 SKILL 在 prune/gc 前恒活跃」被 ``disable``（置孤儿）证伪；
+    残留孤儿会被注册点跨 source 守卫当作「先到者」，令 ``marketplace remove`` / gc / prune 都清不干净。
     """
     want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
     prefix = f"{plugin}:" if plugin is not None else None
-    for ref in registry.active_refs():
+    for ref, _orphaned in registry.all_refs():
         if ref.get("source") != want_source:
             continue
         name = ref.get("name")

@@ -220,6 +220,24 @@ async def test_install_second_marketplace_same_bare_name_exit1_validation(
     assert json.loads(user_settings_path(env).read_text(encoding="utf-8"))["installedPlugins"] == ["alpha@mp-a"]
 
 
+def test_plugin_error_reserved_details_do_not_hijack_payload(capsys: pytest.CaptureFixture[str]) -> None:
+    """``details`` 的保留键不得改写类别码 / 人读文案 / 退出码（#257 审查 🟡6）。"""
+    from a2c_smcp.computer.cli.commands.plugin import _plugin_error
+    from a2c_smcp.computer.settings.installer import PluginInstallError
+
+    err = PluginInstallError(
+        "boom",
+        error_code="validation",
+        details={"code": 0, "message": "HIJACKED", "error": "HIJACKED", "conflictWith": "alpha@mp-a"},
+    )
+    assert _plugin_error(err, json_output=True) == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"  # details["error"] 未覆盖类别码
+    assert payload["message"] == "boom"  # details["message"] 未覆盖人读文案
+    assert payload["conflictWith"] == "alpha@mp-a"
+    assert payload["code"] == 0  # details 的普通键仍原样透出（且不改退出码）
+
+
 # ── enable / disable：scope 从 ledger 读（不默认 user）/ scope read from ledger ──
 @pytest.mark.asyncio
 async def test_enable_reads_scope_from_ledger_writes_project_not_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

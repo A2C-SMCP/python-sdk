@@ -176,12 +176,22 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str]:
     return plugin, marketplace
 
 
-def _bare_name_conflicts(plugin_id: str, *, home: Path, env: Mapping[str, str] | None) -> list[str]:
+def _bare_name_conflicts(
+    plugin_id: str,
+    *,
+    home: Path,
+    env: Mapping[str, str] | None,
+    allow_if_installed: bool = False,
+) -> list[str]:
     """
     跨 marketplace 裸名唯一性扫描（skill.md §1.2 note / §1.5；#257）/ Cross-marketplace bare-name scan。
 
     扫描面 = merged ``installedPlugins``（user/project/local，经 :func:`resolve_settings`）∪ 物化账本
     ``installed_plugins.json`` 的 pid 键；返回**同名不同 marketplace** 的已安装 pid（升序、排除自身）。
+
+    ``allow_if_installed``（install 用）：目标 pid 自身已在安装集时直接放行——同一 pid 重装不改安装集、
+    不新增第二个 ``<plugin>``，属决策 1 的幂等情形（存量双装 home 里也须可重装/重钉版本）。enable 侧保持
+    fail-closed（决策 2）。
 
     ``drop_legacy=False`` 是**承重墙**：账本默认视图会整条丢弃旧格式（``bundledMcpServers``）记录，令
     v0.2.x 存量 home 的 ``alpha@mp-a`` 对检查隐身——安装随后才由 :func:`migrate_legacy_installs` 从账本
@@ -195,6 +205,8 @@ def _bare_name_conflicts(plugin_id: str, *, home: Path, env: Mapping[str, str] |
         for pid in load_installed_plugins(home=home, env=env, drop_legacy=False).get("plugins", {})
         if is_valid_enabled_plugin_key(pid)
     )
+    if allow_if_installed and plugin_id in pids:
+        return []
     return sorted(pid for pid in pids if pid != plugin_id and pid.partition("@")[0] == plugin)
 
 
@@ -206,7 +218,9 @@ def _bare_name_conflict_error(plugin_id: str, conflicts: list[str], *, action: s
     message = (
         f"plugin {plugin!r} is already installed from another marketplace ({existing}); a plugin name MUST be unique "
         f"across marketplaces (skill.md §1.5), so {action} of {plugin_id!r} is refused. Uninstall the existing plugin "
-        f"first ({uninstall}) or rename the plugin in marketplace {marketplace!r}."
+        f"first ({uninstall}) or rename the plugin in marketplace {marketplace!r}. If {existing} comes from a project/"
+        f"local settings declaration, remove that entry from the declaration file instead — uninstall never rewrites "
+        f"committed project settings."
     )
     return PluginInstallError(message, error_code="validation", details={"conflictWith": conflicts[0]})
 
@@ -376,23 +390,48 @@ def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str
         raise PluginInstallError(str(e)) from e
 
 
-def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str) -> list[str]:
+def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str, *, include_orphans: bool = False) -> list[str]:
     """
-    某 plugin 当前**活跃**的 marketplace SKILL name / A plugin's currently-active marketplace SKILL names。
+    某 plugin 名下的 marketplace SKILL name / A plugin's marketplace SKILL names。
 
     过滤 ``A2CSkillRef.source == "marketplace:<mp>"`` 且 ``name`` 以 ``<plugin>:`` 起（marketplace name = ``<plugin>:<skill>``）。
-    仅枚举活跃集（:meth:`SkillRegistry.active_refs` 排除孤儿）——同 :func:`_unregister_marketplace_skills`。
+    默认仅枚举活跃集（:meth:`SkillRegistry.active_refs` 排除孤儿）；``include_orphans=True`` 时连孤儿一并返回
+    （uninstall 用：孤儿残留会被跨 source 守卫当作「先到者」永久拒绝新 source，必须一并清掉，#257 审查 🔴2）。
     """
     want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
     prefix = f"{plugin}:"
+    refs = [ref for ref, _orphaned in registry.all_refs()] if include_orphans else registry.active_refs()
     names: list[str] = []
-    for ref in registry.active_refs():
+    for ref in refs:
         if ref.get("source") != want_source:
             continue
         name = ref.get("name")
         if isinstance(name, str) and name.startswith(prefix):
             names.append(name)
     return names
+
+
+def _shadowed_plugin_pids(registry: SkillRegistry, marketplace: str, plugin: str) -> list[str]:
+    """
+    本 plugin 名下、``source`` 不属于 ``marketplace`` 的已注册条目 → 派生的冲突 pid（#257 审查 🔴1）。
+
+    ``stage_marketplace_skills`` 对跨 source 同名条目的拒绝是**静默**的（registry 记 ERROR、返回 False，不抛）。
+    enable 若不复核，就会出现「命令成功、``enabledPlugins=true``、但 ``get_skills`` 里是另一个（可能未安装的）
+    marketplace 的技能」。此处把被遮蔽事实转成结构化错误，由 enable 的既有回滚路径收口。
+    孤儿也计入（同一失效形态，只是 `resolve` 为 None）。
+    """
+    prefix = f"{plugin}:"
+    source_prefix = f"{SOURCE_MARKETPLACE}:"
+    want_source = f"{source_prefix}{marketplace}"
+    pids: set[str] = set()
+    for ref, _orphaned in registry.all_refs():
+        name = ref.get("name")
+        source = ref.get("source")
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        if isinstance(source, str) and source.startswith(source_prefix) and source != want_source:
+            pids.add(f"{plugin}@{source[len(source_prefix):]}")
+    return sorted(pids)
 
 
 def _resolve_marketplace_source(marketplace: str, home: Path, env: Mapping[str, str] | None) -> tuple[Mapping[str, Any], str | None]:
@@ -595,7 +634,7 @@ async def install_plugin(
 
     # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——
     #      含 :func:`migrate_legacy_installs` 的迁移标记键（那时才从账本回填意图的存量插件才会「冒出来」）。
-    conflicts = _bare_name_conflicts(plugin_id, home=home, env=env)
+    conflicts = _bare_name_conflicts(plugin_id, home=home, env=env, allow_if_installed=True)
     if conflicts:
         raise _bare_name_conflict_error(plugin_id, conflicts, action="install")
 
@@ -672,7 +711,9 @@ async def uninstall_plugin(
        catalog 内子树」的行为收敛是 installer + gc 的**跨切 follow-up**（须两处一致，避免与 #62 的 gc 分叉）。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    installed = load_installed_plugins(home=home, env=env)
+    # ``drop_legacy=False``（#257 审查 🔴3）：v0.2.x 旧格式账本记录在默认视图里被整条丢弃 → 早返回 no-op，
+    # 令冲突诊断给出的 ``plugin uninstall`` 补救在 headless CLI 上永远无效（migrate 在早返回之后）。
+    installed = load_installed_plugins(home=home, env=env, drop_legacy=False)
     records = installed.get("plugins", {}).get(plugin_id)
     if not records:
         logger.info("uninstall: plugin %r not installed (no-op)", plugin_id)
@@ -712,7 +753,9 @@ async def uninstall_plugin(
         if isinstance(install_path, str) and install_path:
             _safe_rmtree(Path(install_path), home)
 
-    for name in _plugin_skill_names(registry, marketplace, plugin):
+    # 孤儿一并注销（#257 审查 🔴2）：``disable → uninstall`` 的残留孤儿会被跨 source 守卫当作「先到者」，
+    # 令后续换源 install/enable 永久失败且本进程内无命令可清。uninstall 是「该 plugin 彻底消失」，含孤儿才闭环。
+    for name in _plugin_skill_names(registry, marketplace, plugin, include_orphans=True):
         registry.unregister(name)
 
     if not keep_servers and remove_server is not None:
@@ -939,6 +982,13 @@ async def enable_plugin(
             timeout=timeout,
             env=env,
         )
+        # ③.5 跨 source 占位复核（#257 审查 🔴1）：staging 对同名异源条目的拒绝是静默的（记 ERROR、不抛），
+        #     若不复核，enable 会「假成功」——enabledPlugins=true、server 已挂，但 get_skills 里是本 plugin
+        #     名下的**另一个 marketplace** 的技能（可能来自从未安装的 marketplace，如 `marketplace add` 的
+        #     全量 stage）。转成结构化错误 → 走下方既有回滚（注销本次新增 skill / 摘 server / 还原 enabled）。
+        shadowed = _shadowed_plugin_pids(registry, marketplace, plugin)
+        if shadowed:
+            raise _bare_name_conflict_error(plugin_id, shadowed, action="enable")
         # ④ 挂载依赖：仅挂**尚未满足**者；已满足 → 复用既有实例，不覆盖（§2.5-1）
         if register_server is not None:
             for cfg in servers:
