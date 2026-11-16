@@ -929,7 +929,7 @@ async def test_marketplace_clone_fallback_log_redacts(
 async def test_marketplace_invalid_source_log_redacts(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
 ) -> None:
-    """source 非法日志：SkillSourceError 消息内嵌 source dict（含 URL）也必须脱敏。"""
+    """source 非法日志：不插值 source dict / 异常全文，只记脱敏后的 name（复审 🟡）。"""
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     names = await staging_mod.stage_marketplace_skills(
@@ -938,7 +938,8 @@ async def test_marketplace_invalid_source_log_redacts(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "FAKE_TOKEN" not in text
-    assert "https://127.0.0.1:1/org/repo.git" in text
+    assert "demo" in text
+    assert "127.0.0.1" not in text
 
 
 def test_scp_like_token_in_error_text_is_placeholder() -> None:
@@ -1014,3 +1015,43 @@ async def test_marketplace_invalid_name_log_redacts(
     text = _no_secret(staging_logs.records)
     assert "PW_LEAK" not in text
     assert "alice" not in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_source_log_hides_non_url_secret(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """非 URL 形态 secret（如裸 `glpat-...`）不得经 SkillSourceError 全文进入日志。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "git", "url": "glpat-SECRET_TOKEN"}, SkillRegistry(), home, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "glpat-SECRET_TOKEN" not in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_surrogate_name_and_url_degrade_without_raising(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """孤立代理项（手编 ledger / JSON 转义可达）：只记日志、不抛，展示层占位符。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+
+    names = await staging_mod.stage_marketplace_skills(
+        "x=\ud800", {"type": "git", "url": "https://example.com/r.git"}, SkillRegistry(), home
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "x=" in text
+    assert "\ud800" not in text, "日志不得含未转义的孤立代理项"
+
+    names = await staging_mod.stage_marketplace_skills(
+        "demo", {"type": "git", "url": "https://example.com/\ud800"}, SkillRegistry(), home, timeout=10
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "git spawn failed" in text
+    assert "\ud800" not in text

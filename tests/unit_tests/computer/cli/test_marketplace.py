@@ -41,6 +41,7 @@ from a2c_smcp.computer.cli.commands.marketplace import (
     normalize_marketplace_url,
 )
 from a2c_smcp.computer.settings.store import (
+    known_marketplaces_path,
     load_known_marketplaces,
     save_known_marketplaces,
     update_known_marketplaces,
@@ -423,8 +424,10 @@ def test_info_display_redacts_url(
         assert literal not in out, f"表格输出不得含 {literal!r}"
 
 
-def test_info_missing_source_url_stays_null(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """手编 / 历史记录缺 source.url：JSON 保持 null、表格留空，不臆造占位符。"""
+def test_info_missing_source_url_stays_null(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], wide_console: None
+) -> None:
+    """手编 / 历史记录缺 source.url：JSON 保持 null、表格留空（不渲染字面 None）。"""
     env, home = _env(tmp_path), _home(tmp_path)
     _seed_marketplace(home, env, "demo", None)
 
@@ -433,6 +436,44 @@ def test_info_missing_source_url_stays_null(tmp_path: Path, capsys: pytest.Captu
 
     assert marketplace_list(home, env, json_output=True) == 0
     assert json.loads(capsys.readouterr().out)[0]["url"] is None
+
+    assert marketplace_info(home, env, "demo") == 0
+    out = capsys.readouterr().out
+    assert _flat("url") in _flat(out)
+    assert "None" not in out, "缺失字段应留空，不得渲染字面 None"
+
+
+def test_surrogate_url_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], wide_console: None
+) -> None:
+    """手编 ledger 的孤立代理项 URL：展示层 fail-closed，不崩溃（#261 复审 🔴）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    path = known_marketplaces_path(home, env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "marketplaces": {
+                    "demo": {
+                        "source": {"type": "git", "url": "https://example.com/\ud800"},
+                        "installLocation": "",
+                    }
+                },
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+
+    assert marketplace_list(home, env, json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)[0]["url"] == REDACTED_GIT_SOURCE
+
+    assert marketplace_list(home, env) == 0
+    assert REDACTED_GIT_SOURCE in capsys.readouterr().out
+
+    assert marketplace_info(home, env, "demo", json_output=True) == 0
+    assert json.loads(capsys.readouterr().out)["url"] == REDACTED_GIT_SOURCE
 
 
 def _patch_stage(monkeypatch: pytest.MonkeyPatch, *, register: bool) -> None:

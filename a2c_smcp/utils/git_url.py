@@ -116,7 +116,9 @@ def git_url_for_display(raw: object) -> str:
     - scheme 与 host 小写；http 80 / https 443 默认端口不输出；空 path 补 ``/``（url crate 序列化）；
     - scp-like 在严格模式一律占位符（``Url::parse`` 失败；rust 行为）；
     - path 按 url crate 序列化 percent-encode（空格 / C0 控制字符 / 非 ASCII 均转义，防终端注入）；
-      host 走 IDNA；host 仍含非可视 ASCII（空格 / 控制字符）→ 占位符。
+      host 走 IDNA；host 仍含非可视 ASCII（空格 / 控制字符）→ 占位符。序列化为 **best-effort 对齐**
+      rust ``Url::to_string()``（非逐字节一致）：不做 dot-segment 归一 / host ``%xx`` 归一；
+      反斜杠 host 解析以 Python（与 git 实际连接一致）为准。
     """
     if not isinstance(raw, str):
         return REDACTED_GIT_SOURCE
@@ -134,21 +136,23 @@ def git_url_for_display(raw: object) -> str:
         return REDACTED_GIT_SOURCE
     if scheme != "file" and not host:
         return REDACTED_GIT_SOURCE
-    host_for_display = host or ""
-    if host_for_display and ":" not in host_for_display:  # IPv6 字面量已是 ASCII
-        try:
+    try:
+        host_for_display = host or ""
+        if host_for_display and ":" not in host_for_display:  # IPv6 字面量已是 ASCII
             host_for_display = host_for_display.encode("idna").decode("ascii")
-        except UnicodeError:
-            return REDACTED_GIT_SOURCE
-    host_repr = f"[{host_for_display}]" if host_for_display and ":" in host_for_display else host_for_display
-    if port is not None and port != _DEFAULT_PORTS.get(scheme):
-        netloc = f"{host_repr}:{port}"
-    else:
-        netloc = host_repr
-    path = quote(parts.path or "/", safe="/%:@!$&'()*+,;=-._~[]")
+        host_repr = f"[{host_for_display}]" if host_for_display and ":" in host_for_display else host_for_display
+        if port is not None and port != _DEFAULT_PORTS.get(scheme):
+            netloc = f"{host_repr}:{port}"
+        else:
+            netloc = host_repr
+        path = quote(parts.path or "/", safe="/%:@!$&'()*+,;=-._~[]")
+        return_value = urlunsplit((scheme, netloc, path, "", ""))
+    except UnicodeError:
+        # 孤立代理项 / 非法 IDNA 等：无法安全序列化 → 占位符（fixture 来自手编 ledger / JSON 转义）。
+        return REDACTED_GIT_SOURCE
     if not (_ascii_graphic(scheme) and _ascii_graphic(netloc)):
         return REDACTED_GIT_SOURCE
-    return urlunsplit((scheme, netloc, path, "", ""))
+    return return_value
 
 
 def _split_outer_wrapper(prefix: str, candidate: str) -> tuple[str, str]:

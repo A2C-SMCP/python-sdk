@@ -321,7 +321,8 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     table.add_column("Field", style="bold cyan")
     table.add_column("Value")
     for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
-        table.add_row(k, str(info[k]))
+        # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
+        table.add_row(k, "" if info[k] is None else str(info[k]))
     table.add_row("installedPlugins", ", ".join(plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK

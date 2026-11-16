@@ -737,13 +737,18 @@ async def _run_git(args: Sequence[str], *, timeout: float, env: Mapping[str, str
     用 ``create_subprocess_exec`` 显式 argv（**不**经 shell，杜绝 url 注入）；超时 ``kill`` 并回收，
     避免遗留僵尸进程。仿 :func:`a2c_smcp.computer.inputs.cli_io.arun_command` 的超时姿态。
     """
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_git_env(env),
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_git_env(env),
+        )
+    except (UnicodeError, ValueError) as exc:
+        # 孤立代理项 / NUL 等无法编码进 argv：包成 SkillStagingError，避免裸 UnicodeError 击穿
+        # stage_marketplace_skills 的「只记日志、不抛」降级铁律（手编 ledger / JSON 转义可达）。
+        raise SkillStagingError(redact_git_urls_in_text(f"git spawn failed: {exc}")) from None
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
     except TimeoutError:
@@ -1188,12 +1193,12 @@ async def stage_marketplace_skills(
 
     try:
         url = marketplace_clone_url(source)
-    except SkillSourceError as e:
-        # #261：SkillSourceError 消息内嵌 source dict（可能含凭据 URL），日志前必须脱敏。
+    except SkillSourceError:
+        # #261：SkillSourceError 消息内嵌 source dict 原值（可能是 URL 凭据，也可能是 `glpat-...`
+        # 这类非 URL secret）；不插值全文，只记脱敏后的 marketplace 名（对齐 rust：非法 source 只记 name）。
         logger.error(
-            "marketplace %r has invalid source, skipped (not registered): %s",
-            name,
-            redact_git_urls_in_text(str(e)),
+            "marketplace %r has invalid source, skipped (not registered)",
+            redact_git_urls_in_text(name),
         )
         return registered
 

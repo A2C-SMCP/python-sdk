@@ -294,3 +294,13 @@ def test_sanitize_git_text_argv_and_sub_delims() -> None:
     out2 = sanitize_git_text(f"git clone -- {raw2} failed", ["clone", "--", raw2])
     assert "QUERY_SECRET" not in out2
     assert "https://example.com/r.git" in out2
+
+
+def test_lone_surrogate_fails_closed_without_crashing() -> None:
+    """孤立代理项（手编 ledger / JSON 转义可达）→ 占位符，不得抛 UnicodeEncodeError。"""
+    raw = "https://example.com/\ud800"
+    assert git_url_for_display(raw) == REDACTED_GIT_SOURCE
+    assert known_git_source_for_display(raw) == REDACTED_GIT_SOURCE
+    out = redact_git_urls_in_text(f"x {raw} y")
+    assert REDACTED_GIT_SOURCE in out
+    assert "\ud800" not in out
