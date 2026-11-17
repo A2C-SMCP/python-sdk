@@ -809,6 +809,8 @@ def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str, 
     过滤 ``A2CSkillRef.source == "marketplace:<mp>"`` 且 ``name`` 以 ``<plugin>:`` 起（marketplace name = ``<plugin>:<skill>``）。
     默认仅枚举活跃集（:meth:`SkillRegistry.active_refs` 排除孤儿）；``include_orphans=True`` 时连孤儿一并返回
     （uninstall 用：孤儿残留会被跨 source 守卫当作「先到者」永久拒绝新 source，必须一并清掉，#257 审查 🔴2）。
+    **#262**：uninstall **仅在该 pid 账本记录全部移除时**才以 ``include_orphans=True`` 调用；有 retained 记录时
+    registry 完全不动——新增卸载路径切勿照抄「必须清孤儿」而无此门控。
     """
     want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
     prefix = f"{plugin}:"
@@ -1132,7 +1134,8 @@ async def uninstall_plugin(
     remove_server: RemoveServer | None = None,
 ) -> bool:
     """
-    卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills + **按判据回收** MCP 依赖 + 删账本记录）/ Uninstall。
+    卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills（**仅账本记录全部移除时**）+ **按判据回收** MCP 依赖
+    + 删账本记录）/ Uninstall。
 
     **MCP 依赖回收**（协议 §4.9.1-2，#153/D3+F1）：plugin 声明依赖的 server **不是**它的所有物，故卸载
     **不无条件收回**——逐个过 :func:`~a2c_smcp.computer.settings.reconciler.reclaimable_mcp_deps`：
@@ -1145,7 +1148,10 @@ async def uninstall_plugin(
     一并 best-effort——managed/policy 只读层不触碰）。指定 ``scope`` 仅删该 scope 记录且其余 scope 仍在 →
     意图与 enabled 条目保留（安装事实未消失）。
 
-    **skills 拆除（#262 裁决 A）**：与文件（#258 的 ``retained`` 引用）和 server（``retained_records``）同一判据——
+    **skills 拆除（#262 裁决 A）**：与文件（#258）和 server（``retained_records``）**同源于 ``retained`` 记录集合，
+    但粒度不同**——文件看「retained 的 installPath 是否仍引用该 clone」、server 看「retained 声明的依赖」、
+    skills 看「是否还有 retained 记录」。故 retained 记录 installPath 缺失/损坏时文件侧会删 clone 而 skills 仍保留，
+    是**有意分叉**（#262 验收用例固化），勿把一侧改成另一侧。
     仅当该 pid 的账本记录**全部移除**时才注销其全部 skills（含孤儿）；指定 ``scope`` 卸载且其余 scope 记录仍在
     → registry **完全不动**（活跃与孤儿原样）。判据是「有无 retained 记录」，**不是**「是否指定了 ``scope``」：
     只装了一个 scope 时指定该 scope 卸载，记录即全部移除，照常注销。

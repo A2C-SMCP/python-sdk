@@ -413,12 +413,23 @@ async def test_scoped_uninstall_keeps_dep_for_remaining_scope(tmp_path: Path, mo
     )
     monkeypatch.setattr(_STAGE, _fake_stage())
     mcp = _FakeMCP()
+    # #262：预置非空 registry——空 registry 会让「多 scope 卸载误删技能」完全失明（验收第 3 条）。
+    reg = SkillRegistry()
+    assert reg.register(
+        {
+            "name": "audit:lint",
+            "source": f"{SOURCE_MARKETPLACE}:acme",
+            "path": str(marketplace_skill_dir(home, "acme").resolve()),
+            "description": "d",
+        },
+    ), "seed 失败：技能未入册"
 
     await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=_declared(env), env=env, scope="user", remove_server=mcp.remove,
+        "audit@acme", reg, home, non_plugin_bundle_ids=_declared(env), env=env, scope="user", remove_server=mcp.remove,
     )
 
     assert mcp.removed == []  # project scope 记录仍依赖 X
+    assert reg.resolve("audit:lint") is not None  # #262：retained 记录仍在 → 技能保留
 
 
 async def test_disable_applies_reclaim_criterion(tmp_path: Path, monkeypatch) -> None:
