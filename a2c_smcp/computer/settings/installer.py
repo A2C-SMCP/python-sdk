@@ -49,7 +49,8 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
   自动重建；bundled MCP server 重挂由 client 显式经 ``Computer.reconcile_governance(hooks)`` 触发
   （#93 client owns MCP config；CLI 启动序列即参考接线）。
 - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
-  ``enabledPlugins`` 门控重建（仅显式 true 激活）。**uninstall 连孤儿一并注销**（#257：``include_orphans=True``），
+  ``enabledPlugins`` 门控重建（仅显式 true 激活）。**uninstall 连孤儿一并注销**（#257：``include_orphans=True``；
+  **限该 pid 账本记录全部移除时**——#262：有 retained 记录则 registry 不动），
   :func:`_unregister_marketplace_skills`（marketplace remove / gc / prune）同样遍历含孤儿的全量条目——
   否则残留孤儿会被注册点跨 source 守卫当作「先到者」，令换源 **enable** 在本进程内永久失败
   （install 侧另有 :func:`_bare_name_conflicts` 的裸名预检，与本条无关）。
@@ -808,6 +809,8 @@ def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str, 
     过滤 ``A2CSkillRef.source == "marketplace:<mp>"`` 且 ``name`` 以 ``<plugin>:`` 起（marketplace name = ``<plugin>:<skill>``）。
     默认仅枚举活跃集（:meth:`SkillRegistry.active_refs` 排除孤儿）；``include_orphans=True`` 时连孤儿一并返回
     （uninstall 用：孤儿残留会被跨 source 守卫当作「先到者」永久拒绝新 source，必须一并清掉，#257 审查 🔴2）。
+    **#262**：uninstall **仅在该 pid 账本记录全部移除时**才以 ``include_orphans=True`` 调用；有 retained 记录时
+    registry 完全不动——新增卸载路径切勿照抄「必须清孤儿」而无此门控。
     """
     want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
     prefix = f"{plugin}:"
@@ -1131,7 +1134,8 @@ async def uninstall_plugin(
     remove_server: RemoveServer | None = None,
 ) -> bool:
     """
-    卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills + **按判据回收** MCP 依赖 + 删账本记录）/ Uninstall。
+    卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills（**仅账本记录全部移除时**）+ **按判据回收** MCP 依赖
+    + 删账本记录）/ Uninstall。
 
     **MCP 依赖回收**（协议 §4.9.1-2，#153/D3+F1）：plugin 声明依赖的 server **不是**它的所有物，故卸载
     **不无条件收回**——逐个过 :func:`~a2c_smcp.computer.settings.reconciler.reclaimable_mcp_deps`：
@@ -1143,6 +1147,14 @@ async def uninstall_plugin(
     ``installedPlugins`` 意图条目 + 清 ``enabledPlugins`` 条目（user 必清；给了 ``project_path`` 时 project/local
     一并 best-effort——managed/policy 只读层不触碰）。指定 ``scope`` 仅删该 scope 记录且其余 scope 仍在 →
     意图与 enabled 条目保留（安装事实未消失）。
+
+    **skills 拆除（#262 裁决 A）**：与文件（#258）和 server（``retained_records``）**同源于 ``retained`` 记录集合，
+    但粒度不同**——文件看「retained 的 installPath 是否仍引用该 clone」、server 看「retained 声明的依赖」、
+    skills 看「是否还有 retained 记录」。故 retained 记录 installPath 缺失/损坏时文件侧会删 clone 而 skills 仍保留，
+    是**有意分叉**（#262 验收用例固化），勿把一侧改成另一侧。
+    仅当该 pid 的账本记录**全部移除**时才注销其全部 skills（含孤儿）；指定 ``scope`` 卸载且其余 scope 记录仍在
+    → registry **完全不动**（活跃与孤儿原样）。判据是「有无 retained 记录」，**不是**「是否指定了 ``scope``」：
+    只装了一个 scope 时指定该 scope 卸载，记录即全部移除，照常注销。
 
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
@@ -1224,10 +1236,16 @@ async def uninstall_plugin(
                         f"failed to remove exclusive clone for {plugin_id!r}: {e}; ledger and intent preserved",
                     ) from e
 
-    # 孤儿一并注销（#257 审查 🔴2）：``disable → uninstall`` 的残留孤儿会被跨 source 守卫当作「先到者」，
-    # 令后续换源 install/enable 永久失败且本进程内无命令可清。uninstall 是「该 plugin 彻底消失」，含孤儿才闭环。
-    for name in _plugin_skill_names(registry, marketplace, plugin, include_orphans=True):
-        registry.unregister(name)
+    # ③ 注销 skills——**仅当该 pid 账本记录全部移除**（#262 裁决 A）：``retained`` 非空（指定 scope 卸载、其余
+    #    scope 仍在）时 registry 不动。判据与文件（#258 的 retained 引用）、server（``retained_records``）同源，
+    #    且判据是「有无 retained 记录」而**非**「是否指定了 scope」；否则同进程内技能消失、重启 boot 又按保留
+    #    记录重 stage——同一操作前后矛盾。
+    #    全部记录移除时连孤儿一并注销（#257 审查 🔴2）：``disable → uninstall`` 的残留孤儿会被跨 source 守卫
+    #    当作「先到者」，令后续换源 install/enable 永久失败且本进程内无命令可清。uninstall 是「该 plugin 彻底消失」，
+    #    含孤儿才闭环。
+    if not retained:
+        for name in _plugin_skill_names(registry, marketplace, plugin, include_orphans=True):
+            registry.unregister(name)
 
     if not keep_servers and remove_server is not None:
         for bundle_id in reclaim:

@@ -547,9 +547,19 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
     )
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
+    # #262：预置**非空** registry——空 registry 会让「多 scope 卸载误删技能」完全失明（验收第 3 条）。
+    reg = SkillRegistry()
+    reg.register(
+        {
+            "name": "audit:lint",
+            "source": f"{SOURCE_MARKETPLACE}:acme",
+            "path": str(marketplace_skill_dir(home, "acme").resolve()),
+            "description": "d",
+        },
+    )
 
     ok = await uninstall_plugin(
-        _PID, SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+        _PID, reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
     )
 
     assert ok is True
@@ -557,6 +567,7 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
     assert root.exists()
     remaining = load_installed_plugins(home=home)["plugins"][_PID]
     assert [r["scope"] for r in remaining] == ["user"]  # 仅删 project 记录
+    assert reg.resolve("audit:lint") is not None  # #262：retained 记录仍在 → 技能保留
     settings = _read_user_settings(env)
     assert settings["installedPlugins"] == [_PID]  # 安装事实未消失 → 意图保留
     assert settings["enabledPlugins"][_PID] is True  # enabled 条目保留

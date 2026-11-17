@@ -16,7 +16,8 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §3.3/§
 - install（v0.3.0 #123 不激活）：happy 写 installedPlugins 意图 + 账本（不 stage、不挂 server）/ **依赖已满足
   不拒绝**（D3）/ 重装幂等 / 重装失败不丢既有意图与账本 / 未添加 mp / catalog 未 clone / 非法 id。
   install-only 目标行为与回滚细节另见 test_install_enable_separation.py。
-- uninstall：**按判据**回收 + 注销 + 删记录 + 删独占外部 clone（共享 catalog 保留）/ --keep-servers / 未安装 no-op。
+- uninstall：**按判据**回收 + 注销（**仅账本记录全部移除时**，#262）+ 删记录 + 删独占外部 clone（共享 catalog 保留）/
+  --keep-servers / 未安装 no-op。
 - disable：写 enabledPlugins=false + 按判据回收 + orphan skill（可复原）/ scope 路由 / 非法 scope。
 - enable：写 true + 复活 skill + 挂载未满足的依赖 / 未安装抛 / **依赖已满足 → 复用不覆盖**（D3）。
 
@@ -118,6 +119,26 @@ def _seed_installed(home: Path, plugins: dict[str, list[dict]]) -> None:
 def _ext_plugin_root(home: Path, mp: str, plugin: str) -> Path:
     """plugin 独占外部 clone 落点 ``<home>/marketplace/.plugins/<mp>/<plugin>``（#258 唯一可删归属）。"""
     return home / SOURCE_MARKETPLACE / ".plugins" / mp / plugin
+
+
+def _seed_registry(home: Path, mp: str, plugin: str) -> SkillRegistry:
+    """预置**非空** registry（#262 验收第 3 条）：活跃 ``<plugin>:lint`` + 孤儿 ``<plugin>:old``。
+
+    scoped uninstall 的技能拆除断言必须建立在非空 registry 上——空 registry 下 ``unregister`` 天然
+    no-op，「多 scope 卸载误删技能」的回归会完全失明（#262 验收明令禁止空 registry + ``_fake_stage``）。
+    ``register`` 失败是「记 ERROR + 返回 False」**不抛**（§1.5），故必须断言返回值——否则 seed 静默失败时
+    ``len(reg) == 0`` 型断言会永真通过，退化成新的空 registry 失明。
+    """
+    reg = SkillRegistry()
+    path = str(marketplace_skill_dir(home, mp).resolve())
+
+    def _ref(name: str) -> dict:
+        return {"name": name, "source": f"{SOURCE_MARKETPLACE}:{mp}", "path": path, "description": "d"}
+
+    assert reg.register(_ref(f"{plugin}:lint")), "seed 失败：活跃技能未入册"
+    assert reg.register(_ref(f"{plugin}:old")), "seed 失败：孤儿技能未入册"
+    reg.mark_orphan(f"{plugin}:old")
+    return reg
 
 
 def _setup_catalog_multi(home: Path, mp: str, entries: list[tuple[str, str]], *, commit: str = "abc123") -> dict[str, Path]:
@@ -450,16 +471,22 @@ async def test_uninstall_scoped_keeps_external_clone_until_last_record_258(tmp_p
         },
     )
 
+    reg = _seed_registry(home, "acme", "audit")
+
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
     ) is True
     assert ext.exists(), "其余 scope 仍依赖同一 clone → 保留"
     assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["user"]
+    # #262：retained 记录仍在 → 技能（含孤儿）原样保留，不得被无条件注销
+    assert reg.resolve("audit:lint") is not None
+    assert reg.is_orphan("audit:old")
 
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
     ) is True
     assert not ext.exists(), "最后一条记录卸载 → 删除独占 clone"
+    assert len(reg) == 0, "全部 scope 移除 → 技能（含孤儿）一并注销"
 
 
 async def test_uninstall_scoped_source_change_deletes_unreferenced_external_clone_258(tmp_path: Path) -> None:
@@ -482,17 +509,21 @@ async def test_uninstall_scoped_source_change_deletes_unreferenced_external_clon
         },
     )
 
+    reg = _seed_registry(home, "acme", "audit")
+
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
     ) is True
     assert not ext.exists(), "retained（project）在 catalog 内、不引用 ext clone → 先卸 user 即删，不留泄漏"
     remaining = load_installed_plugins(home=home)["plugins"]["audit@acme"]
     assert [r["scope"] for r in remaining] == ["project"]
+    assert reg.resolve("audit:lint") is not None, "#262：retained 记录仍在 → 技能保留"
 
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
     ) is True
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+    assert len(reg) == 0, "最后一份记录移除 → 技能（含孤儿）一并注销"
 
 
 @pytest.mark.parametrize("bad_install_path", ["/tmp/bad\u0000path", "relative/path"])
@@ -516,12 +547,17 @@ async def test_uninstall_scoped_unknown_retained_path_treated_as_unreferenced_25
         },
     )
 
+    reg = _seed_registry(home, "acme", "audit")
+
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
     ) is True
 
     assert not ext.exists(), "无法识别的 retained 路径不算引用（与 rust 终版一致）"
     assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
+    # #262：技能保留判据 = 账本记录存在性（与文件归属谓词**无关**）——installPath 损坏不改变「其余 scope 仍装」
+    assert reg.resolve("audit:lint") is not None
+    assert reg.is_orphan("audit:old")
 
 
 @pytest.mark.parametrize("record_shape", ["missing", "empty", "non-str"])
@@ -542,12 +578,85 @@ async def test_uninstall_scoped_missing_retained_install_path_treated_as_unrefer
         project_record["installPath"] = None
     _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}, project_record]})
 
+    reg = _seed_registry(home, "acme", "audit")
+
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
     ) is True
 
     assert not ext.exists()
     assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
+    # #262：同上——installPath 缺失/畸形不影响技能保留（判据只看记录存在性）
+    assert reg.resolve("audit:lint") is not None
+    assert reg.is_orphan("audit:old")
+
+
+# ── #262：多 scope 卸载后的 skills 拆除语义（裁决 A = 保留）────────────────────
+async def test_uninstall_scoped_keeps_skills_until_last_record_removed_262(tmp_path: Path) -> None:
+    """#262 裁决 A：有 retained 记录时 registry 不动（active + 孤儿）、server 不回收；全部记录移除才清理。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext), "mcpServers": [FIGMA_BID]},
+                {"scope": "project", "projectPath": str(workdir), "installPath": str(ext), "mcpServers": [FIGMA_BID]},
+            ]
+        },
+    )
+    reg = _seed_registry(home, "acme", "audit")
+    mcp = _FakeMCP(existing={FIGMA_BID})
+
+    # 只卸 project：其余 scope（user）仍装 → 技能（含孤儿）原样、server 不回收
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", remove_server=mcp.remove,
+    ) is True
+    assert reg.resolve("audit:lint") is not None, "retained 记录仍在 → 活跃技能保留"
+    assert reg.is_orphan("audit:old"), "retained 记录仍在 → 孤儿原样保留（既不注销也不复活）"
+    assert mcp.removed == [], "retained 记录仍声明依赖 → server 按 retained 判据保留"
+    assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["user"]
+
+    # 卸最后一份记录：技能（含孤儿）完整注销 + server 按 §4.9.1-2 回收
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", remove_server=mcp.remove,
+    ) is True
+    assert len(reg) == 0, "全部 scope 移除 → active + 孤儿一并注销（#257 闭环）"
+    assert mcp.removed == [FIGMA_BID], "最后一个依赖者卸载 → server 回收"
+
+
+async def test_uninstall_specified_scope_clears_skills_when_last_record_262(tmp_path: Path) -> None:
+    """#262 判据是「账本记录全部移除」而**非**「未指定 scope」——单 scope 账本指定该 scope 卸载也要清技能。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+    reg = _seed_registry(home, "acme", "audit")
+
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True
+
+    assert len(reg) == 0
+
+
+async def test_uninstall_full_clears_orphans_nonempty_registry_262(tmp_path: Path) -> None:
+    """#262 回归锁（#257 闭环不因保留语义失效）：全量卸载（``scope=None``）连孤儿一并注销。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext)}]})
+    reg = _seed_registry(home, "acme", "audit")
+
+    assert await uninstall_plugin("audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+
+    assert len(reg) == 0
 
 
 async def test_uninstall_malformed_install_path_does_not_raise_258(tmp_path: Path) -> None:
@@ -622,12 +731,16 @@ async def test_uninstall_scoped_symlink_component_retained_blocks_deletion_258(t
         },
     )
 
+    reg = _seed_registry(home, "acme", "audit")
+
     assert await uninstall_plugin(
-        "audit@acme", SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
     ) is True
 
     assert ext.exists(), "retained 记录的软链组件路径按词法仍引用 clone → 不得删除"
     assert [r["scope"] for r in load_installed_plugins(home=home)["plugins"]["audit@acme"]] == ["project"]
+    assert reg.resolve("audit:lint") is not None, "#262：retained 记录仍在 → 技能保留"
+    assert reg.is_orphan("audit:old")
 
 
 async def test_uninstall_keeps_installpath_outside_external_clone_258(tmp_path: Path) -> None:
