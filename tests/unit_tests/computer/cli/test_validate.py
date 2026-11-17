@@ -26,6 +26,11 @@ from a2c_smcp.computer.cli import main as cli_main
 from a2c_smcp.computer.cli.commands.validate import plugin_validate
 
 
+def _flat(text: str) -> str:
+    """去掉全部空白：rich 会按终端宽度折行（长 token 会被从中间折断），人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
 def _w(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -128,13 +133,13 @@ def test_human_output_escapes_bracketed_message(tmp_path: Path, capsys: pytest.C
         "owner": {"name": "Acme"},
         "plugins": [{"name": "data-toolkit", "source": "data-toolkit"}],
     }))
-    # stdio 缺 server_parameters → pydantic ValidationError 文本自带 [type=missing, ...] 段。
+    # stdio 缺 server_parameters → 诊断 message 含 `[字段:类型]` 方括号段（#263 复审后不再带 input_value）。
     _w(root / "plugins" / "data-toolkit" / "mcp-servers" / "etl.json",
        json.dumps({"name": "etl", "type": "stdio"}))
     code = plugin_validate(root)
     assert code == 1
-    out = capsys.readouterr().out
-    assert "type=missing" in out  # 方括号段完整呈现（未被 rich markup 消费）
+    out = _flat(capsys.readouterr().out)
+    assert "[StdioServerConfig.server_parameters:missing" in out  # 方括号段完整呈现（未被 rich markup 消费）
 
 
 # ── 双入口 alias（#193 用户裁决）/ dual entry alias ─────────────────────────────
@@ -155,3 +160,95 @@ def test_dual_entry_json_flag(tmp_path: Path) -> None:
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["valid"] is True and data["mode"] == "marketplace"
+
+
+# ── #263 凭据脱敏（--json 与文本同一 message）/ credential redaction ─────────────
+def _cred_marketplace(tmp_path: Path) -> Path:
+    root = tmp_path / "mp-cred"
+    _w(root / ".tfrobot-plugin" / "marketplace.json", json.dumps({
+        "name": "acme-mp",
+        "owner": {"name": "Acme"},
+        "plugins": [
+            {"name": "bad", "source": "key=https://alice:PW_JSON@example.com/r.git"},
+            {"name": "remote", "source": {"source": "url", "url": "https://bob:PW_REMOTE@example.com/r.git"}},
+        ],
+    }))
+    return root
+
+
+def test_json_output_redacts_source_credentials(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`plugin validate --json`：错误与 warning 的 message 均不得含 userinfo。"""
+    code = plugin_validate(_cred_marketplace(tmp_path), json_output=True)
+    out = capsys.readouterr().out
+    assert code == 1
+    for secret in ("PW_JSON", "PW_REMOTE", "alice:", "bob:"):
+        assert secret not in out
+    data = json.loads(out)
+    msgs = "\n".join(i["message"] for i in data["errors"] + data["warnings"])
+    assert "https://example.com/r.git" in msgs
+
+
+def test_human_output_redacts_source_credentials(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """文本路径同一口径（同一 ValidationIssue.message，仅渲染方式不同）。"""
+    code = plugin_validate(_cred_marketplace(tmp_path))
+    out = capsys.readouterr().out
+    assert code == 1
+    for secret in ("PW_JSON", "PW_REMOTE", "alice:", "bob:"):
+        assert secret not in out
+
+
+def test_json_file_axis_redacts_credential_source_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#263 复审：`--json` 的 `file` / `checked_files` 轴同样不得回显 source 内的凭据。"""
+    bad = "x=https:.//alice:PW_FILE@example.com/repo.git"
+    root = tmp_path / "mp-file"
+    _w(root / ".tfrobot-plugin" / "marketplace.json", json.dumps({
+        "name": "acme-mp",
+        "owner": {"name": "Acme"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": "audit", "source": f"./plugins/{bad}"}],
+    }))
+    from a2c_smcp.computer.skills.validator import CODE_PLUGIN_MANIFEST_MISSING  # noqa: PLC0415
+
+    d = root / "plugins" / bad / "skills" / "etl"
+    d.mkdir(parents=True)
+    _w(d / "SKILL.md", "---\nname: etl\ndescription: d\n---\n\nbody\n")
+
+    code = plugin_validate(root, json_output=True)
+    out = capsys.readouterr().out
+    assert code == 0  # plugin.json 缺失是 warning（不挡）
+    assert "PW_FILE" not in out
+    data = json.loads(out)
+    assert any(i["code"] == CODE_PLUGIN_MANIFEST_MISSING for i in data["warnings"])
+    assert data["checked_files"], "夹具应至少检查过文件（否则下面的否定断言恒真）"
+    assert any("<redacted-source>" in i["file"] for i in data["errors"] + data["warnings"])
+    for issue in data["errors"] + data["warnings"]:
+        assert "PW_FILE" not in issue["file"] and "alice:" not in issue["file"]
+        assert "PW_FILE" not in issue["message"] and "alice:" not in issue["message"]
+    assert all("PW_FILE" not in f for f in data["checked_files"])
+    assert any("<redacted-source>" in f for f in data["checked_files"])
+
+
+def test_json_path_and_human_line_redact_credential_root(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#263 三轮复审：`--json` 的 `path` 与人类输出的 root 也不得回显凭据形态。"""
+    root = tmp_path / "x=https:/TOKEN@host/mp"
+    _w(root / ".tfrobot-plugin" / "marketplace.json", json.dumps({
+        "name": "acme-mp",
+        "owner": {"name": "Acme"},
+        "plugins": [{"name": "data-toolkit", "source": "data-toolkit"}],
+    }))
+    _w(root / "plugins" / "data-toolkit" / "skills" / "etl" / "SKILL.md",
+       "---\nname: etl\ndescription: d\n---\n\nbody\n")
+
+    code = plugin_validate(root, json_output=True)
+    out = capsys.readouterr().out
+    assert code == 0  # 夹具本身合法：确定性退出码（旧 `in (0,1)` 是恒真断言）
+    assert "TOKEN" not in out
+    data = json.loads(out)
+    assert "<redacted-source>" in data["path"]
+
+    plugin_validate(root)
+    human = _flat(capsys.readouterr().out)  # 折行与断言无关
+    assert "TOKEN" not in human
+    # 正对照：人类输出确实渲染了 root 行（否则上面的否定断言恒真）
+    assert "Validatingmarketplaceat" in human
+    assert "<redacted-source>" in human

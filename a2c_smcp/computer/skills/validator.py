@@ -63,9 +63,17 @@ from a2c_smcp.computer.skills.sources import (
     GitCloneSpec,
     LocalPluginSource,
     SkillSourceError,
+    redact_source_display,
     resolve_plugin_source,
+    safe_exception_text,
 )
 from a2c_smcp.computer.skills.staging import SKILL_MD, SKILLS_SUBDIR, parse_skill_frontmatter
+from a2c_smcp.utils.git_url import (
+    git_url_for_display,
+    redact_git_urls_in_text,
+    sanitize_path_for_diagnostics,
+    sanitize_text_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -155,14 +163,30 @@ class _Collector:
         self.result = ValidationResult(root=self.root, mode=None)
 
     def rel(self, p: Path) -> str:
-        """绝对路径 → 相对 root 的 POSIX 串（越界时退回绝对串，防 crash）/ Absolute → root-relative POSIX."""
+        """绝对路径 → 相对 root 的 POSIX 串（越界时退回绝对串，防 crash）/ Absolute → root-relative POSIX.
+
+        #263：路径会进入 ``ValidationIssue.file`` / ``checked`` 两条展示轴，故在此**单一漏斗**做诊断脱敏
+        （source 归一会把 ``://`` 坍缩成 ``:/``，普通散文脱敏抓不到，必须按路径片段遮蔽）。
+        """
         try:
-            return p.relative_to(self.root).as_posix() or "."
+            rel = p.relative_to(self.root).as_posix() or "."
         except ValueError:
-            return p.as_posix()
+            rel = p.as_posix()
+        return sanitize_path_for_diagnostics(rel)
 
     def add(self, code: str, file: str, location: str, message: str, *, severity: Severity = "error") -> None:
-        self.result.issues.append(ValidationIssue(code=code, file=file, location=location, message=message, severity=severity))
+        # #263：诊断三轴的统一出口——file / location 走路径脱敏，message 走**逐 token 路径**脱敏。
+        # 不再对 message 二次 `redact_git_urls_in_text`：message 可能已是构造期脱敏的 JSON 回显，
+        # 散文规则会把 JSON 标点吞进 URL token，改写成 percent-encoded 乱码。
+        self.result.issues.append(
+            ValidationIssue(
+                code=code,
+                file=sanitize_path_for_diagnostics(file),
+                location=sanitize_path_for_diagnostics(location),
+                message=sanitize_text_for_diagnostics(message),
+                severity=severity,
+            )
+        )
 
     def checked_file(self, p: Path) -> None:
         rel = self.rel(p)
@@ -176,8 +200,8 @@ def _load_json_object(path: Path, c: _Collector) -> dict[str, Any] | None:
     rel = c.rel(path)
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        c.add(CODE_UNREADABLE, rel, ".", f"cannot read {rel}: {e}")
+    except (OSError, UnicodeDecodeError) as e:  # #263：非 UTF-8 文件（ValueError 子类）也要归一成诊断
+        c.add(CODE_UNREADABLE, rel, ".", f"cannot read {rel}: {safe_exception_text(e)}")
         return None
     try:
         data = json.loads(text)
@@ -213,7 +237,13 @@ def _require_str_field(
         c.add(CODE_INVALID_TYPE, file, loc, f"field {key!r} must be a non-empty string (got {type(v).__name__})")
         return None
     if kebab and not is_valid_marketplace_name(v.strip()):
-        c.add(CODE_INVALID_NAME, file, loc, f"{key} {v!r} must be strict kebab-case ([a-z0-9-], 1-64, no leading/trailing/double '-')")
+        c.add(
+            CODE_INVALID_NAME,
+            file,
+            loc,
+            f"{key} {redact_git_urls_in_text(v)!r} must be strict kebab-case "
+            "([a-z0-9-], 1-64, no leading/trailing/double '-')",
+        )
         return None
     return v.strip()
 
@@ -307,9 +337,11 @@ def _validate_marketplace(c: _Collector) -> None:
         name = _require_str_field(entry, "name", mfile, c, location=f"{loc}.name", kebab=True)
         if name is not None and name in seen_names:
             # find_plugin_entry take-first：后续同名 entry 永不可达。
+            # 注（#263）：此处 name 已经过 kebab 校验（`_require_str_field` 非法名返回 None），内嵌凭据
+            # 结构上不可达；脱敏保留为纵深防御，避免将来放宽校验时重新变成回显面。
             c.add(
                 CODE_DUPLICATE_PLUGIN_NAME, mfile, f"{loc}.name",
-                f"duplicate plugin name {name!r} (install resolves the first matching entry only)",
+                f"duplicate plugin name {redact_git_urls_in_text(name)!r} (install resolves the first matching entry only)",
                 severity="warning",
             )
         if name is not None:
@@ -327,8 +359,12 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
     if "source" not in entry or entry.get("source") is None:
         c.add(CODE_MISSING_FIELD, mfile, f"{loc}.source", "required field 'source' is missing")
         return
+    raw_source = entry.get("source")
+    # #263：回显一律用**归一化前**的原始 source（`resolved.rel_path` 把 ``//`` 折叠成 ``/``，
+    # URL 规则再也认不出 query / fragment；原始串里 ``://`` 完整，strict 脱敏才生效）。
+    source_display = redact_source_display(raw_source)
     try:
-        resolved = resolve_plugin_source(entry.get("source"), plugin_root=base)
+        resolved = resolve_plugin_source(raw_source, plugin_root=base)
     except SkillSourceError as e:
         c.add(CODE_INVALID_SOURCE, mfile, f"{loc}.source", str(e))
         return
@@ -337,7 +373,7 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
         # 远程 source：仅 source 字段自身已校验；plugin 本体不在本地，跳过深检（#193 裁决）。
         c.add(
             CODE_REMOTE_SOURCE_SKIPPED, mfile, f"{loc}.source",
-            f"remote plugin source {resolved.url!r} skipped (local-only validation; source field format checked)",
+            f"remote plugin source {git_url_for_display(resolved.url)!r} skipped (local-only validation; source field format checked)",
             severity="warning",
         )
         return
@@ -346,12 +382,17 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
     plugin_root = (c.root / resolved.rel_path).resolve()
     if not is_within(plugin_root, c.root):
         # resolve_plugin_source 已禁 '..'，此处与 locate_plugin_root 同款防御（belt + suspenders）。
-        c.add(CODE_PATH_ESCAPE, mfile, f"{loc}.source", f"relative plugin source {resolved.rel_path!r} escapes the marketplace root")
+        c.add(
+            CODE_PATH_ESCAPE,
+            mfile,
+            f"{loc}.source",
+            f"relative plugin source {source_display!r} escapes the marketplace root",
+        )
         return
     if not plugin_root.is_dir():
         c.add(
             CODE_PATH_MISSING, mfile, f"{loc}.source",
-            f"local plugin directory not found: {resolved.rel_path!r} (resolved to {plugin_root})",
+            f"local plugin directory not found for source {source_display!r}",
         )
         return
     _validate_plugin(c, plugin_root, entry=entry, entry_loc=loc, plugin_name=name)
@@ -414,11 +455,16 @@ def _validate_plugin(
         cand = (plugin_root / raw).resolve()
         if not is_within(cand, plugin_root_resolved):
             # 装载路径 resolve_skill_override_dirs 记 ERROR 跳过——validator 同级 error。
-            c.add(CODE_PATH_ESCAPE, override_src, override_loc, f"skills override path {raw!r} escapes plugin root {pfile}")
+            c.add(
+                CODE_PATH_ESCAPE,
+                override_src,
+                override_loc,
+                f"skills override path {redact_git_urls_in_text(raw)!r} escapes plugin root {pfile}",
+            )
         elif not cand.is_dir():
             c.add(
                 CODE_PATH_MISSING, override_src, override_loc,
-                f"skills override path {raw!r} is not an existing directory under the plugin",
+                f"skills override path {redact_git_urls_in_text(raw)!r} is not an existing directory under the plugin",
             )
         elif cand not in containers:
             containers.append(cand)
@@ -475,7 +521,7 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
             children = sorted(p for p in container.iterdir() if p.is_dir())
         except OSError as e:
             # 容器存在但不可列（权限等）：记 issue 继续，不 traceback 中断全量收集（collect-all 承诺）。
-            c.add(CODE_UNREADABLE, c.rel(container), ".", f"cannot list {c.rel(container)}: {e}")
+            c.add(CODE_UNREADABLE, c.rel(container), ".", f"cannot list {c.rel(container)}: {safe_exception_text(e)}")
             continue
         for skill_dir in children:
             skill_md = skill_dir / SKILL_MD
@@ -488,8 +534,11 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
                 continue
             try:
                 text = skill_md.read_text(encoding="utf-8")
-            except OSError as e:
-                c.add(CODE_SKILL_MD_UNREADABLE, c.rel(skill_md), ".", f"cannot read {c.rel(skill_md)}: {e}")
+            except (OSError, UnicodeDecodeError) as e:  # #263：非 UTF-8 SKILL.md 同属「不可读」
+                c.add(
+                    CODE_SKILL_MD_UNREADABLE, c.rel(skill_md), ".",
+                    f"cannot read {c.rel(skill_md)}: {safe_exception_text(e)}",
+                )
                 continue
             c.checked_file(skill_md)
             frontmatter = parse_skill_frontmatter(text)
@@ -503,7 +552,7 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
                 # 1 段形态判据 = naming §1.4 严格 kebab（与 synthesize_marketplace_name 的 leaf 段同字符集）。
                 c.add(
                     CODE_SKILL_NAME_INVALID, c.rel(skill_dir), ".",
-                    f"skill dir name {leaf!r} is not strict kebab-case (skill name synthesis fails at load time)",
+                    f"skill dir name {redact_git_urls_in_text(leaf)!r} is not strict kebab-case (skill name synthesis fails at load time)",
                 )
                 continue
             synth = f"{plugin_name}:{leaf}" if plugin_name else leaf
@@ -511,7 +560,8 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
                 first_at = seen_skill_names[synth]
                 c.add(
                     CODE_DUPLICATE_SKILL, c.rel(skill_dir), ".",
-                    f"duplicate skill name {synth!r} (first seen at {first_at!r}; later ones are dropped at load time)",
+                    f"duplicate skill name {redact_git_urls_in_text(synth)!r} "
+                    f"(first seen at {redact_git_urls_in_text(first_at)!r}; later ones are dropped at load time)",
                 )
             else:
                 seen_skill_names[synth] = c.rel(skill_dir)

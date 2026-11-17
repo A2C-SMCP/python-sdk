@@ -36,8 +36,9 @@ git URL 展示脱敏单一权威（python-sdk#261）/ Git URL display redaction,
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Sequence
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 # 无法安全呈现时的统一占位符（与 rust 逐字节一致）/ Placeholder literal shared with rust.
 REDACTED_GIT_SOURCE = "<redacted-git-source>"
@@ -234,6 +235,14 @@ def _redact_scp_like_sources(text: str) -> str:
             if rest[index].isspace():
                 end = index
                 break
+        if "://" in rest[start:at]:
+            # 已由 `_redact_scheme_urls` 处理过的 scheme token（含 path 里的 `@`，如
+            # `file:///home/alice@corp/repo.git`）：再按 scp-like 处理会把**展示安全**的 URL 吞成占位符。
+            # 判据只看 `@` **之前**是否出现 `://`——`alice:PW@host,https://…` 这类 `@` 在前、URL 在后的
+            # token 仍是 scp-like 凭据，必须继续脱敏。
+            out.append(rest[: at + 1])
+            rest = rest[at + 1 :]
+            continue
         userinfo = rest[start:at]
         destination = rest[at + 1 : end]
         colon = destination.find(":")
@@ -260,6 +269,132 @@ def redact_git_urls_in_text(text: str) -> str:
     :data:`REDACTED_GIT_SOURCE`。无 ``:`` 的邮箱地址（如 ``alice@example.com``）不匹配，不会误伤。
     """
     return _redact_scp_like_sources(_redact_scheme_urls(text))
+
+
+# 会被转义成可见形式的字符类别（Cc = 控制字符含 ESC/BEL/换行；Cs = 孤立代理项）。#263：终端转义注入
+# （OSC 52 改写剪贴板）与日志行伪造的根源；Cf（方向覆盖等）与 rust 口径一致不处理。
+_UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cs"})
+
+# userinfo 形态片段：`user:secret@`（要求 `@` 前存在 `:`，避免误伤 `alice@corp` 这类合法路径名）。
+# #263 复审：PAT / username-only 的 `TOKEN@host` 也是凭据——**但只在 URL 语境下**（路径里出现 scheme 残形
+# `:/` 或 `://`）才遮蔽，否则 `alice@corp` 这类合法文件名会被误伤。percent-encoded 冒号（`alice%3Apw@`）
+# 先 decode 再判定。
+_USERINFO_SEGMENT_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
+# scheme 段尾（`x=https:` / `ssh:`）：要求 scheme 名 ≥2 字符，避免把 Windows 盘符 `C:` 当 scheme。
+_SCHEME_TAIL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:$")
+
+
+def escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
+    """
+    把控制字符 / 孤立代理项转义为可见形式 / Escape control and surrogate code points for display.
+
+    ``json_safe=True`` 时统一用 ``\\uXXXX``（``\\xNN`` 不是合法 JSON 转义——DEL 0x7f / C1 0x80-0x9f
+    不会被 :func:`json.dumps` 转义，混进 JSON 形态的 raw 会产出无法解析的文本）。
+    """
+    if not any(unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES for ch in text):
+        return text
+    out: list[str] = []
+    for ch in text:
+        if unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES:
+            code = ord(ch)
+            out.append(f"\\u{code:04x}" if json_safe or code > 0xFF else f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _is_credential_segment(segment: str, *, authority_context: bool) -> bool:
+    """
+    段是否携带凭据 / Whether a path segment carries credentials.
+
+    判定（#263 四轮）：percent-decode 后命中 ``user:secret@``；或该段处于 URL **authority** 位置（紧跟
+    scheme 残形段，如 ``x=https:``）且含 ``@``——PAT / username-only 的 ``TOKEN@host`` 也算凭据，
+    而路径里的普通 ``@``（``file:///home/alice@corp/repo.git``、``repo@2.git``）保留。
+    """
+    if _USERINFO_SEGMENT_RE.search(unquote(segment)) is not None:
+        return True
+    return authority_context and "@" in segment
+
+
+def sanitize_path_for_diagnostics(path: str) -> str:
+    """
+    诊断用路径脱敏：逐段遮蔽携带凭据的片段 / Mask credential-bearing path segments for diagnostics.
+
+    仅用于**展示**（validator 的 ``file`` / ``checked`` / ``message``、日志里的落盘路径），**不得**用于
+    文件系统访问。规则（#263 四轮复审修正）：
+
+    - 控制字符 / 孤立代理项先按 :func:`escape_unsafe_chars` 转义（仓库可控目录名不得注入终端序列）；
+    - 分隔符 ``/`` 与 ``\\`` 都视为段边界（Windows 路径不得整条被吞）；
+    - 段头（``?`` / ``#`` 之前的部分）先判凭据：命中则**整段**替换——否则 ``alice:pw@host?token=x``
+      会把 userinfo 留在截断后的前缀里；
+    - 一旦出现 ``?`` / ``#``（query / fragment 起点）→ 从该字符起把**余下整条路径**遮蔽（query 值里
+      可以再出现分隔符，逐段判定会漏掉尾段）；
+    - authority 位置（紧跟 scheme 残形段）的 ``TOKEN@host`` 按凭据处理；路径段内普通 ``@`` 保留。
+
+    合法 kebab / 普通路径（含 ``alice@corp``、Windows 路径）逐字保留。
+    """
+    escaped = escape_unsafe_chars(path)
+    if not any(marker in escaped for marker in ("@", "?", "#")):
+        return escaped
+    parts = re.split(r"([/\\])", escaped)
+    out: list[str] = []
+    tail_masked = False
+    authority_next = False
+    for index, part in enumerate(parts):
+        if index % 2 == 1:  # 分隔符原样保留
+            out.append(part)
+            continue
+        if tail_masked:
+            if part:
+                out.append("<redacted-source>")
+            continue
+        if not part:
+            out.append(part)
+            continue
+        cut = min((pos for pos in (part.find("?"), part.find("#")) if pos >= 0), default=-1)
+        head = part[:cut] if cut >= 0 else part
+        if _is_credential_segment(head, authority_context=authority_next):
+            out.append("<redacted-source>")
+            tail_masked = cut >= 0
+            authority_next = False
+            continue
+        if cut >= 0:
+            out.append(head + "<redacted-source>")
+            tail_masked = True
+            authority_next = False
+            continue
+        out.append(part)
+        # 该段以 scheme 形态结尾（`x=https:` / `ssh:`，scheme 名 ≥2 字符）→ 下一个非空段处于
+        # authority 位置。Windows 盘符 `C:` 只有单字符，不会命中（否则 `C:\alice@corp` 会被误遮）。
+        authority_next = _SCHEME_TAIL_RE.search(part) is not None
+    return "".join(out)
+
+
+# 路径 token 的判定（供 :func:`sanitize_text_for_diagnostics` 逐 token 使用）：带 URL 残形 / userinfo 形态，
+# 或「含分隔符且含 query/fragment 起点」的 token 才按路径处理；散文其余部分（含换行与可读前缀）逐字保留。
+_PATH_TOKEN_RE = re.compile(r":[/\\]|://")
+_USERINFO_TOKEN_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
+
+
+def sanitize_text_for_diagnostics(text: str) -> str:
+    """
+    诊断**散文**的路径级脱敏：逐 token 判定，仅遮蔽 URL 残形 / 路径 + query 形态的 token / Token-level.
+
+    非路径 token 仍过 :func:`escape_unsafe_chars`（ESC / 孤立代理项等），但空白分隔符原样保留——
+    换行与缩进因此不受影响。
+    """
+    out: list[str] = []
+    for token in re.split(r"([ \t\n]+)", text):
+        if not token or token in (" ", "\t", "\n") or set(token) <= {" ", "\t", "\n"}:
+            out.append(token)
+            continue
+        looks_like_path = (
+            _PATH_TOKEN_RE.search(token) is not None
+            or _USERINFO_TOKEN_RE.search(unquote(token)) is not None
+            or (("/" in token or "\\" in token) and ("?" in token or "#" in token))
+        )
+        out.append(sanitize_path_for_diagnostics(token) if looks_like_path else escape_unsafe_chars(token))
+    return "".join(out)
 
 
 def sanitize_git_text(text: str, args: Sequence[str]) -> str:

@@ -63,6 +63,11 @@ def _isolate_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ── 辅助（镜像 test_installer.py）/ helpers mirroring test_installer.py ─────────
+def _flat(text: str) -> str:
+    """去掉全部空白：rich 会按终端宽度折行（长 token 会被从中间折断），人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
 def _home(tmp_path: Path) -> Path:
     h = tmp_path / "skill-home"
     h.mkdir()
@@ -866,6 +871,75 @@ def test_list_available_json_stdout_stays_pure(tmp_path: Path, capsys: pytest.Ca
     assert "deprecated" not in out
 
 
+# ── #263 plugin source 非法：结构化错误 + 脱敏（无 traceback）─────────────────────
+def _seed_bad_source_catalog(home: Path, *, source: object) -> None:
+    """造一个 catalog，其 plugin entry 的 source 非法（可携带凭据）。"""
+    catalog = marketplace_skill_dir(home, "acme")
+    _write_json(
+        catalog / ".tfrobot-plugin" / "marketplace.json",
+        {
+            "name": "acme",
+            "owner": {"name": "X"},
+            "metadata": {"pluginRoot": "./plugins"},
+            "plugins": [{"name": "audit", "source": source}],
+        },
+    )
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"]["acme"] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}
+    save_known_marketplaces(known, home=home)
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_source_json_error_is_redacted_and_rolls_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """非法 source（含凭据）→ 结构化 JSON 错误（非 traceback），消息脱敏，且「失败 = 零变更」。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source="key=https://alice:PW_CLI@example.com/r.git")
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme", json_output=True)
+    raw = capsys.readouterr().out
+    assert code == 1
+    assert "PW_CLI" not in _flat(raw) and "alice:" not in _flat(raw)
+    payload = json.loads(raw)
+    assert "https://example.com/r.git" in payload["message"]
+    assert "source invalid" in payload["message"]
+    # 原子回滚：不留下安装意图
+    assert "audit@acme" not in load_installed_plugins(home=home, env=env)["plugins"]
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_source_human_error_is_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """人类可读路径同一口径：红字错误、无 traceback、无凭据。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "url", "url": "glpat-SECRET_TOKEN"})
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+    assert code == 1
+    assert "glpat-SECRET_TOKEN" not in out
+    assert "sourceinvalid" in out
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_source_with_rich_markup_does_not_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 回归锁：source 文本里的 rich 标记（如 `[/red]`）不得让结构化错误路径抛 MarkupError。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(
+        home, source={"source": "url", "url": "bogus", "note": "[/red][link=https://evil]x[/link]"}
+    )
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+    assert code == 1
+    assert "sourceinvalid" in out
+    assert "[/red]" in out  # 作为字面文本渲染，而非被 rich 解析
+
+
 @pytest.mark.asyncio
 async def test_enable_missing_install_path_exit1_with_recovery_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
@@ -920,3 +994,81 @@ async def test_enable_multi_scope_any_dead_record_exits1_without_partial_enable(
     payload = json.loads(capsys.readouterr().out)
     assert str(dead) in payload["message"]  # 点名死路径
     assert "enabledPlugins" not in json.loads(user_settings_path(env).read_text(encoding="utf-8"))  # 零部分启用
+
+
+@pytest.mark.asyncio
+async def test_install_staging_error_is_structured_not_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 三轮复审：`SkillStagingError` / `PluginManifestError` 也不再以 traceback 逃出 CLI。"""
+    from a2c_smcp.computer.skills.staging import SkillStagingError
+
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "url", "url": "https://example.com/r.git"})
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise SkillStagingError("git clone failed for https://alice:PW_STAGE@example.com/r.git?token=Q")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+    assert code == 1
+    assert "pluginstagingfailed" in out
+    assert "PW_STAGE" not in out
+    assert "token=Q" not in out
+
+
+@pytest.mark.asyncio
+async def test_install_manifest_error_is_structured_not_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 四轮：manifest 层错误（materialize 内）同样归一为结构化错误。"""
+    from a2c_smcp.computer.skills.manifest import PluginManifestError
+
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "url", "url": "https://example.com/r.git"})
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise PluginManifestError("invalid MCP server config at /x/y: boom")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+    assert code == 1
+    assert "pluginmanifestinvalid" in out
+
+
+@pytest.mark.asyncio
+async def test_install_corrupt_catalog_manifest_is_structured_not_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 四轮：预检阶段 `read_marketplace_manifest` 损坏同样不得 traceback（此前在 try 之外）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    catalog = marketplace_skill_dir(home, "acme")
+    catalog.mkdir(parents=True)
+    (catalog / ".tfrobot-plugin").mkdir(parents=True)
+    (catalog / ".tfrobot-plugin" / "marketplace.json").write_text("{ broken", encoding="utf-8")
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"]["acme"] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}
+    save_known_marketplaces(known, home=home)
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+    assert code == 1
+    assert "manifestinvalid" in out
+
+
+@pytest.mark.asyncio
+async def test_install_schemeless_query_source_token_is_masked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 七轮 🔴：installer 的 `SkillSourceError` 分支也要走 safe_exception_text（无 scheme query token）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source="x/r.git?token=SECRET_Q#f")
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+    assert code == 1
+    assert "sourceinvalid" in out
+    assert "token=SECRET_Q" not in out
+    assert "#f" not in out

@@ -452,6 +452,73 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 打包守卫补位：`uvicorn` 转为动态导入后失去 AST 静态见证，新增「`server` extra 恰含
     werkzeug + uvicorn」单点断言（`tests/unit_tests/test_packaging_dependencies.py`）。
 
+### Fixed（#263 plugin source / validator 错误与日志脱敏）
+
+- **plugin source 解析 / `plugin validate` 诊断 / plugin staging 失败日志 / CLI 未捕获路径回显凭据 URL**
+  （#263，安全；#261 未覆盖的同类面）：
+  - `SkillSourceError` 改为**构造期脱敏**（对齐 rust `SkillSourceError::new`）：`raw` 与 `reason` 存已脱敏
+    文本，`str(e)` / traceback / 日志 / `plugin validate`（文本与 `--json`）自动安全。`raw` 口径改为
+    紧凑 JSON（对象形态）/ 原字符串（字符串形态），与 rust 同形；全仓无 `.raw` 读取方，无兼容负担。
+  - `url` / `repo` 字段走 `git_url_for_display` 严格展示（可解析 scheme URL 保留 scheme/host/path，去
+    userinfo / query / fragment；scp-like / opaque / ftp / 裸 token → `<redacted-git-source>`）；其余
+    name / entry / 本地路径按 `redact_git_urls_in_text` 脱敏（合法 kebab 名逐字保留）。
+  - `plugin install` 遇 marketplace source 非法：由 `SkillSourceError` 未捕获（traceback）改为 installer
+    边界包装成 `PluginInstallError`，CLI 走既有结构化错误输出（红字 + 非零退出码；`--json` 同 payload），
+    回滚语义不变。
+  - 存储与 git 入参保持原始 URL（`marketplace add` 落盘断言 + `plugin clone` argv 断言）。
+  - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
+    另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
+  - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，七轮）：`plugin install` 的 `SkillSourceError` 分支与 boot 重物化 WARN 改走
+    `safe_exception_text`（无 scheme 的 `x/r.git?token=…` 不再漏）；`UnicodeDecodeError` 统一归一为
+    `<undecodable content (non-UTF-8)>`（不回显原始字节 / 解码细节）；staging 的 `skill_dir.name` /
+    `name` / `skill_md` 回显分支补齐路径脱敏。已知降级（本单接受）：对**构造期已脱敏 JSON 回显**再做
+    token 级路径脱敏时，值里的 `?`/`#` 会截断尾部——仅影响诊断可读性，不降低脱敏强度（JSON 感知的保真
+    处理另立 follow-up）。
+  - 复审补口（同一 PR，六轮）：新增 `safe_exception_text` 统一异常文本出口——**裸**异常文本（OSError /
+    git / manifest）先散文脱敏再 token 级路径脱敏（scp-like `user@host:path` 只有散文规则能识别，
+    上一轮去掉 R 属真实回退），`SkillSourceError` 的 JSON 回显只做 token 级；SKILL.md 读取点的
+    `UnicodeDecodeError` 归一（GBK/UTF-16 不再 traceback；mcp 源单 SKILL 失败隔离，不中止整个 run）；
+    covered-root DEBUG 的 uri / coverer 与其余 root_uri 分支统一脱敏。
+  - 复审补口（同一 PR，五轮）：plugin 源 SKILL.md 不可读分支的 `OSError` 全文与 mcp 源各跳过分支的
+    `root_uri` 统一走脱敏漏斗；`_read_json_object` / validator 的 JSON 读取并入 `UnicodeDecodeError`
+    （非 UTF-8 manifest 归一为诊断/`PluginManifestError`，不再 traceback）；消费端不再对**构造期已脱敏**的
+    文本二次 `redact_git_urls_in_text`（对象源 JSON 回显曾被改写成 percent-encoded 乱码）；散文脱敏只放行
+    空格 / `\n` / `\t`（CR、VT、FS、NEL 等空白类 Cc 转义，防日志行伪造）；authority 判据改用 scheme 尾形态
+    （`[A-Za-z][A-Za-z0-9+.-]+:`），Windows 盘符 `C:` 不再被当作 scheme。
+  - 复审补口（同一 PR，四轮）：路径轴在 `?`/`#` 截断**之前**先判凭据（`alice:pw@host?token=x`
+    不再把 userinfo 留在截断前缀里）；authority 判据取代「有 `@` 就遮」，`file:///home/alice@corp/repo.git`
+    与 `repo@2.git` 保留；散文 token 一律转义 Cc/Cs（换行/缩进保留），无 scheme 的 `./x/r.git?token=…`
+    也路由到路径脱敏；`plugin install` 预检阶段（catalog `marketplace.json` 损坏）同样归一为结构化错误。
+  - 复审补口（同一 PR，三轮）：scp-like 判据只看 `@` **之前**是否含 `://`（`alice:PW@host,https://…`
+    这类 `@` 在前的 token 仍是凭据）；路径轴把 PAT / username-only userinfo（URL 语境下的 `TOKEN@host`）
+    与 percent-encoded 冒号一并按凭据处理，同时不误伤 `alice@corp` 与 Windows 盘符；`plugin install` 把
+    `SkillStagingError` / `PluginManifestError` 也归一为结构化错误（仍脱敏）；manifest 的 pydantic 诊断
+    改为「字段:类型 + 条数」（不带 `input_value` / URL），stem / name 回显脱敏；`plugin validate` 的
+    `--json path` 与人类输出同一口径；message 轴改为**逐 token** 路径遮蔽（保留可读前缀与换行）。
+  - 复审补口（同一 PR，二轮）：validator 的 `message` 轴同样过路径级遮蔽（`_Collector.add()` 单一漏斗）；
+    `sanitize_path_for_diagnostics` 修正——`/` 与 `\` 都算段边界、query/fragment 从首个 `?`/`#` 起遮蔽余下整条
+    路径、仅遮蔽 userinfo 形态（`user:secret@`）不再误伤 `alice@corp`、控制字符先转义；
+    散文脱敏跳过已含 `://` 的 token（`file:///home/alice@corp/repo.git` 这类展示安全 URL 不再被吞）；
+    `PluginManifestError` 消息与 `stage_mcp_skills` 物化失败分支（原 `exc_info=True`）同口径脱敏。
+  - 复审补口（同一 PR，一轮）：`ValidationIssue.file` / `checked` 两条路径轴在 `_Collector` **单一漏斗**脱敏
+    （`sanitize_path_for_diagnostics` 逐段遮蔽 `@` / `?` / `#` 片段）；消息一律用**归一化前**的原始 source
+    回显（`://` 被路径归一折叠成 `:/` 后 URL 规则会失效，query / fragment 因而漏出）；staging 兜底
+    `except Exception` 的 traceback 改为「格式化后整体脱敏」输出（`exc_info=True` 绕不过 logging）；
+    非对象 plugin entry 只记类型名；manifest loader 侧 override / ignore 日志同口径脱敏；`raw` 对象形态的
+    DEL / C1 兜底转义改用 `\uXXXX`（`\xNN` 不是合法 JSON 转义）。
+
+### Fixed（#272 plugin entry name 路径穿越）
+
+- **`marketplace.json` 的 plugin `name` 未校验即作外部 clone 路径段 → 可删除任意目录**（#272，安全，高危；
+  既有缺陷，非 #263 引入）：`_entry_plugin_name` 仅判非空，`external_plugin_dir` 直接把 `entry.name` 拼进
+  `<home>/marketplace/.plugins/<marketplace>/<plugin>`，而 clone 落盘前会 `shutil.rmtree(dest)`；`marketplace
+  add` / `refresh` / boot recovery / reconciler 均以 `plugin_filter=None` 全量 stage ⇒ 恶意或被投毒
+  marketplace.json 写 `name: "../../../x"`（或绝对路径）即可删除任意目录并写入 clone。
+  - 修法：`_entry_plugin_name` 按协议 §4.1 严格 kebab 校验（`is_valid_marketplace_name`，固定错误文案、
+    不回显原值，对齐 rust `entry_plugin_name`）；`locate_plugin_root` 在 clone/rmtree 之前补
+    `is_within(ext_dir.resolve(), home.resolve())` 纵深守卫。显式 `plugin install` 路径本已校验，不受影响。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

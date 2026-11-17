@@ -63,6 +63,7 @@ from a2c_smcp.computer.settings.store import (
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.logger import get_logger
@@ -339,7 +340,11 @@ async def recover_marketplace_skills(
                     )
                 report.rematerialized.append(pid)
             except Exception as e:  # noqa: BLE001 - 失败降级铁律：WARN 跳过，不阻断 boot
-                logger.warning("governance recovery: re-materialize %r failed; kept installed_disabled (skills not staged): %s", pid, e)
+                logger.warning(
+                    "governance recovery: re-materialize %r failed; kept installed_disabled (skills not staged): %s",
+                    pid,
+                    safe_exception_text(e),
+                )
                 active_plugins.discard(plugin)
                 continue
             if normalized:

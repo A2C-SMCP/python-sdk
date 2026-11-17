@@ -35,6 +35,7 @@ from a2c_smcp.computer.skills.validator import (
     ValidationResult,
     validate_path,
 )
+from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,7 +55,9 @@ def _issue_dict(issue: ValidationIssue) -> dict[str, Any]:
 def _render_human(result: ValidationResult) -> None:
     """rich 人类可读输出：逐条 ``file:location — message`` + 汇总 / Human-readable rendering with summary."""
     mode = _MODE_LABEL.get(result.mode or "", "unknown")
-    console.print(f"[bold]Validating {mode}[/bold] at {result.root}")
+    console.print(
+        f"[bold]Validating {mode}[/bold] at {escape(sanitize_path_for_diagnostics(str(result.root)))}"
+    )
     for issue in result.issues:
         where = f"{issue.file}:{issue.location}" if issue.location != "." else issue.file
         marker, color = ("✗", "red") if issue.severity == "error" else ("⚠", "yellow")
@@ -73,7 +76,7 @@ def _render_json(result: ValidationResult) -> dict[str, Any]:
     return {
         "valid": result.valid,
         "mode": result.mode,
-        "path": str(result.root),
+        "path": sanitize_path_for_diagnostics(str(result.root)),
         "checked_files": list(result.checked),
         "errors": [_issue_dict(i) for i in result.errors],
         "warnings": [_issue_dict(i) for i in result.warnings],

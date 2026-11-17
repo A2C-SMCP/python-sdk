@@ -121,10 +121,12 @@ from a2c_smcp.computer.skills.manifest import (
     resolve_skill_override_dirs,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
+from a2c_smcp.computer.skills.sources import SkillSourceError, safe_exception_text
 from a2c_smcp.computer.skills.staging import (
     DEFAULT_GIT_TIMEOUT,
     SKILL_MD,
     SKILLS_SUBDIR,
+    SkillStagingError,
     locate_plugin_root,
     stage_marketplace_skills,
 )
@@ -1075,7 +1077,15 @@ async def install_plugin(
     catalog_dir = marketplace_skill_dir(home, marketplace)
     if not catalog_dir.is_dir():
         raise PluginInstallError(f"marketplace {marketplace!r} catalog not cloned at {catalog_dir} (run 'marketplace add/refresh' first)")
-    if find_plugin_entry(read_marketplace_manifest(catalog_dir), plugin) is None:
+    try:
+        manifest = read_marketplace_manifest(catalog_dir)
+    except PluginManifestError as e:
+        # #263 四轮：catalog 的 marketplace.json 损坏/缺失同属本地配置问题 → 结构化错误（不 traceback）。
+        raise PluginInstallError(
+            f"marketplace {marketplace!r} manifest invalid: "
+            f"{safe_exception_text(e)}"
+        ) from None
+    if find_plugin_entry(manifest, plugin) is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
 
     # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——
@@ -1106,12 +1116,28 @@ async def install_plugin(
             env=env,
             existing_bundle_ids=existing_bundle_ids,
         )
-    except Exception:
+    except Exception as e:
         if not was_present:
             try:
                 _write_installed_plugin(plugin_id, False, env)
-            except Exception as e:  # noqa: BLE001 - 回滚 best-effort
-                logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, e)
+            except Exception as rollback_exc:  # noqa: BLE001 - 回滚 best-effort
+                logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, rollback_exc)
+        # #263：source / staging / manifest 非法属本地配置问题（非崩溃）→ 结构化错误上抛，
+        # CLI 经 _plugin_error 输出（无 traceback）。消息只取各异常**已脱敏**的文本，不在此重新拼接原始值。
+        if isinstance(e, SkillSourceError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} source invalid: {safe_exception_text(e)}"
+            ) from None
+        if isinstance(e, SkillStagingError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} plugin staging failed: "
+                f"{safe_exception_text(e)}"
+            ) from None
+        if isinstance(e, PluginManifestError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} plugin manifest invalid: "
+                f"{safe_exception_text(e)}"
+            ) from None
         raise
 
     logger.info(
