@@ -79,7 +79,9 @@ from a2c_smcp.computer.settings.reconciler import (
     NonPluginBundleIds,
     declared_installed_plugin_ids,
     is_external_plugin_install_path,
+    ledger_entry_fully_materialized,
     ledger_mcp_deps_of,
+    ledger_record_materialized,
     other_plugin_mcp_deps,
     reclaimable_mcp_deps,
     remove_plugin_install_path,
@@ -107,16 +109,21 @@ from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
     check_strict_conflict,
+    entry_is_strict,
     find_plugin_entry,
     load_bundled_servers,
     plugin_root_base,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
+    resolve_skill_override_dirs,
+    skill_override_raw_paths,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
 from a2c_smcp.computer.skills.staging import (
     DEFAULT_GIT_TIMEOUT,
+    SKILL_MD,
+    SKILLS_SUBDIR,
     locate_plugin_root,
     stage_marketplace_skills,
 )
@@ -394,6 +401,207 @@ def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | 
                     mapping_field_or_empty(existing, key, path=check_path)
     except SettingsFileCorruptError as e:
         raise PluginInstallError(str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# enable 内容预检（#259）/ Enable content preflight
+# ---------------------------------------------------------------------------
+def _enable_recovery_hint(plugin_id: str) -> str:
+    """
+    #259 失败消息的恢复指引 / Recovery guidance for #259 failures。
+
+    措辞须与真实行为一致（审查 🟡3）：``marketplace refresh`` 只做 ``git pull``（甚至不还原本地已删文件）；
+    ``plugin install`` 复用既有 clone（``refresh=False``）；boot 重物化仅在记录的 ``installPath`` **根**缺失 /
+    不可解析时触发，且同样复用 clone——三者都修不好「根在、文件被删」。故首选是**从干净副本重建**：
+    外部独占 clone 走 uninstall+install（uninstall 删树 → install 重 clone）；catalog 相对源走
+    marketplace remove+add（重 clone catalog）。
+    """
+    _plugin, marketplace = _split_plugin_id(plugin_id)
+    return (
+        f"Recovery: re-materialize from a clean copy, then retry. Plugin fetched into its own clone: run "
+        f"'plugin uninstall {plugin_id}' then 'plugin install {plugin_id}'. Plugin shipped by the marketplace "
+        f"catalog: run 'marketplace remove {marketplace}', 'marketplace add <source>', then 'plugin install "
+        f"{plugin_id}'. 'marketplace refresh {marketplace}' only helps when the upstream repo still has the files; "
+        f"a restart only re-materializes records whose recorded install root is missing or unparsable (it reuses "
+        f"the existing clone, so deleted files are not restored)."
+    )
+
+
+def _describe_dead_record(rec: object) -> str:
+    """失效账本记录 → 「点名路径 + 原因」短语（判定权威是 reconciler 判据，此处只做分档展示）/ Dead-record detail。"""
+    if not isinstance(rec, Mapping):
+        return f"ledger record is not an object ({type(rec).__name__})"
+    scope = rec.get("scope")
+    scope_hint = f" (scope={scope})" if isinstance(scope, str) and scope else ""
+    install_path = rec.get("installPath")
+    if not (isinstance(install_path, str) and install_path):
+        return f"ledger record has no installPath{scope_hint}"
+    if not Path(install_path).is_dir():
+        return f"installPath {install_path}{scope_hint}: directory does not exist"
+    # 判据已排除「installPath 缺失」与「目录不存在」两个分支 ⇒ 剩余唯一原因是 bundled JSON 不可解析。
+    return f"installPath {install_path}{scope_hint}: bundled server JSON is unparsable"
+
+
+def _marketplace_entry_for(marketplace: str, plugin: str, home: Path) -> Mapping[str, Any] | None:
+    """读 marketplace 条目；catalog 清单缺失/损坏 → ``None``（声明面不可判定，交由后续 stage 报错）。"""
+    try:
+        manifest = read_marketplace_manifest(marketplace_skill_dir(home, marketplace))
+    except PluginManifestError as e:
+        logger.warning(
+            "enable preflight: marketplace %r manifest unreadable, content declaration unknown: %s", marketplace, e,
+        )
+        return None
+    return find_plugin_entry(manifest, plugin)
+
+
+def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[str, Any]) -> bool:
+    """该 plugin 是否**声明**了 SKILL 内容（声明态判据，#259 架构师裁决）。
+
+    声明源 = ``entry.skills``（恒取）+ ``plugin.json.skills``（仅 strict=true，复用装载同源归一
+    :func:`~a2c_smcp.computer.skills.manifest.skill_override_raw_paths`）。
+
+    **约定 ``skills/`` 容器存在不算声明**（审查 🔴1）：MCP-only plugin 可能顺带提交 ``skills/README.md`` /
+    ``.gitkeep`` / 空目录，把「容器在」当声明会让它在旧版本可启用、新版本永久不可启用且无命令可修。
+    「容器在但零 SKILL.md」的静默零投影由 stage 后的零注册兜底（见 :func:`_preflight_enable_content`
+    的返回与 :func:`enable_plugin` ③.6）覆盖，而不是在这里强判。
+    """
+    strict = entry_is_strict(entry) if entry is not None else True
+    return bool(skill_override_raw_paths(entry or {}, plugin_manifest, strict=strict))
+
+
+def _projectable_skill_count(
+    plugin_root: Path, entry: Mapping[str, Any] | None, plugin_manifest: Mapping[str, Any],
+) -> int:
+    """可投影 SKILL 包数：容器（约定 ``skills/`` + 声明覆写）内 ``<skill>/SKILL.md`` 的个数。
+
+    与装载同源（:func:`~a2c_smcp.computer.skills.manifest.resolve_skill_override_dirs` + 一级目录扫描）。
+    任何文件系统异常（权限 / 软链环 / 非法路径）→ 记 WARNING 并计 0（fail-closed，不静默放行；审查 🟡9）。
+    """
+    strict = entry_is_strict(entry) if entry is not None else True
+    try:
+        containers = [
+            plugin_root / SKILLS_SUBDIR,
+            *resolve_skill_override_dirs(entry or {}, plugin_manifest, plugin_root, strict=strict),
+        ]
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.warning("enable preflight: cannot resolve SKILL containers under %s, counted as empty: %s", plugin_root, e)
+        return 0
+    seen: set[Path] = set()
+    total = 0
+    for container in containers:
+        try:
+            resolved = container.resolve()
+            if resolved in seen or not container.is_dir():
+                continue
+            seen.add(resolved)
+            total += sum(1 for child in container.iterdir() if child.is_dir() and (child / SKILL_MD).is_file())
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning("enable preflight: cannot list SKILL container %s, counted as empty: %s", container, e)
+    return total
+
+
+@dataclass(frozen=True)
+class _EnablePreflight:
+    """enable 内容预检结果 / Enable content preflight outcome。"""
+
+    servers: list[MCPServerConfig]
+    # installPath 内确实存在 ``<skill>/SKILL.md`` 包 → stage 后必须为该 plugin 注册到非空技能集
+    # （真实装载还会因 frontmatter / 名字 / catalog 清单问题跳过，见 #259 审查 🔴2）。
+    expects_skills: bool
+
+
+def _enable_content_error(plugin_id: str, problems: Sequence[str]) -> str:
+    """组装 #259 的公开诊断（点名死路径 + 零变更事实 + 恢复指引）/ Public diagnostic message。
+
+    措辞不得断言 ``installed_disabled``（审查 🟡7）：``enabledPlugins`` 可能原本就是显式 true，本命令只是
+    **未改动**它——如实陈述「no changes」并给出当原值为 true 时的补救。
+    """
+    details = "\n  - ".join(problems)
+    return (
+        f"cannot enable plugin {plugin_id!r}: its installed content is missing or unusable, so its declared skills / "
+        f"bundled servers cannot be projected. This command made no changes (enabledPlugins is unchanged; if it is "
+        f"already true for this scope, run 'plugin disable {plugin_id}' first).\n  - {details}\n"
+        f"{_enable_recovery_hint(plugin_id)}"
+    )
+
+
+def _preflight_enable_content(
+    plugin_id: str,
+    plugin: str,
+    marketplace: str,
+    home: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> _EnablePreflight:
+    """
+    enable 内容预检（#259）：账本记录必须仍有效物化，且**声明的内容**必须完整可投影 / Enable content preflight。
+
+    为什么必须前置：旧实现从记录 ``installPath`` 裸读 bundled servers（缺失目录 → 空集）、随后 re-stage 的
+    失败又被 :func:`~a2c_smcp.computer.skills.staging.stage_marketplace_skills` 的逐 plugin 降级吞掉，于是写出
+    ``enabledPlugins=true`` 而零技能零 server——协议 runtime-contract §2.4 明令禁止的「enabled 但不可用」半态。
+    预检在**任何持久化变更之前**失败，且本命令不写任何状态；本函数**不**重物化（重物化归重装 / boot）。
+
+    三条判据：
+    1. **物化**：复用 :func:`~a2c_smcp.computer.settings.reconciler.ledger_record_materialized`
+       （``installPath`` 目录存在 ∧ bundled JSON 可解析）；多 scope 取 **∀**
+       （:func:`~a2c_smcp.computer.settings.reconciler.ledger_entry_fully_materialized`）——与 boot 重物化判据
+       同源，任一记录失效即整体失败，不启用健康子集。
+    2. **声明面一致**：记录 ``mcpServers``（声明依赖的 bundle_id，经
+       :func:`~a2c_smcp.computer.settings.reconciler.ledger_mcp_deps_of` 取值域守卫）必须全部可从该
+       ``installPath`` 重新解析，防「根在、部分 bundled 文件被删」静默少挂。
+    3. **声明态可投影**（#259 架构师裁决）：manifest/entry 声明了 SKILL 内容（见 :func:`_declares_skills`）
+       却零 ``<skill>/SKILL.md`` → 失败；**真正未声明任何内容**的空 plugin 仍允许启用（正对照）。
+
+    预检只做「文件存在」层判定；装载层的更严判据（frontmatter / 重名 / catalog 清单）由 stage 后的
+    零注册兜底收口（``_EnablePreflight.expects_skills`` → :func:`enable_plugin` ③.6）。
+
+    :return: 聚合的 bundled servers（供依赖预检与挂载复用，避免二次解析）+ 是否期望 SKILL 投影。
+    :raises PluginInstallError: 任一记录不可物化 / 声明 server 不可解析 / 声明 SKILL 零投影。
+
+    .. note::
+       声明面取自**活 catalog**（``entry``），内容取自账本 pin 的 ``installPath``。对 sha pin 的外部源，若 catalog
+       的 ``skills`` 声明已变而克隆仍钉旧提交，预检会要求先 ``plugin install`` 重装对齐——这是刻意的 fail-fast，
+       不是误报（审查 🟢11 记边界）。
+    """
+    problems: list[str] = []
+    if not ledger_entry_fully_materialized(records):
+        problems.extend(_describe_dead_record(rec) for rec in records if not ledger_record_materialized(rec))
+        if not problems:  # 防御：判据说失效却逐条都通过（不应发生）→ 仍须失败，不得静默放行
+            problems.append("no usable ledger record")
+        raise PluginInstallError(_enable_content_error(plugin_id, problems))
+
+    entry = _marketplace_entry_for(marketplace, plugin, home)
+    servers: list[MCPServerConfig] = []
+    expects_skills = False
+    for rec in records:
+        install_path = Path(str(rec.get("installPath")))
+        try:
+            parsed = load_bundled_servers(install_path)
+        except PluginManifestError as e:  # 判据刚通过后文件又被改坏（TOCTOU）→ 仍按失败处理
+            problems.append(f"installPath {install_path}: bundled server JSON is unparsable ({e})")
+            continue
+        missing = sorted(ledger_mcp_deps_of([rec]) - {resolve_bundle_id(cfg) for cfg in parsed})
+        if missing:
+            problems.append(
+                f"installPath {install_path}: declared bundled server(s) {', '.join(repr(m) for m in missing)} "
+                "cannot be resolved (re-run 'plugin install' to refresh the ledger)"
+            )
+        plugin_manifest = read_plugin_metadata(install_path)
+        try:
+            declares_skills = _declares_skills(entry, plugin_manifest)
+            skill_count = _projectable_skill_count(install_path, entry, plugin_manifest)
+        except (OSError, RuntimeError, ValueError) as e:
+            problems.append(f"installPath {install_path}: cannot inspect SKILL packages: {e}")
+            continue
+        expects_skills = expects_skills or skill_count > 0
+        if declares_skills and skill_count == 0:
+            problems.append(
+                f"installPath {install_path}: declares SKILL packages but none are projectable "
+                f"(no <skill>/{SKILL_MD} under the conventional {SKILLS_SUBDIR}/ dir or declared overrides)"
+            )
+        servers.extend(parsed)
+    if problems:
+        raise PluginInstallError(_enable_content_error(plugin_id, problems))
+    return _EnablePreflight(servers=servers, expects_skills=expects_skills)
 
 
 def _write_installed_plugin(
@@ -1112,13 +1320,19 @@ async def enable_plugin(
     ``collect_enabled_bundled_servers``（plugin 集内 first-wins、不与用户声明比对）**同姿态**，parity 保持；
     且协议 §5 item 10 明定 plugin 声明 MUST NOT 进审批门，故门控结果本就不该反向决定 plugin 基线。
 
-    v0.3.0 §2.4「enable 原子性」：顺序 ① 从物化记录的 ``installPath`` 重解析 bundled servers →
-    **依赖预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →
+    v0.3.0 §2.4「enable 原子性」：顺序 ① **内容预检 + 重解析 bundled servers**
+    （:func:`_preflight_enable_content`，#259：记录必须仍有效物化、声明内容必须可完整投影，任一不满足即在
+    **零持久化变更**前抛 :class:`PluginInstallError`）→ **依赖预检（先于 settings 写）**；② 快照该 scope
+    ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →
     写 ``enabledPlugins[id]=true``；③ 复活 skills——re-stage（:func:`stage_marketplace_skills` 的
     :meth:`register_or_update` 把孤儿同名翻 ``orphaned=False``，``refresh=False`` 复用既有 clone）；
     ④ 重挂 servers。③/④ 任一失败 → **回滚**：注销本次新增 skill、摘除本次新增 server（经 ``remove_server``）、
     ``enabledPlugins`` 恢复原值（原 absent → 删条目）→ 上抛，净效果回 ``installed_disabled``。
     未安装 → :class:`PluginInstallError`（须先 install）。
+
+    :raises PluginInstallError: 未安装；或 **内容预检失败**（#259——账本记录 ``installPath`` 缺失 / bundled JSON
+        不可解析 / 声明 server 不可解析 / 声明 SKILL 零投影）。后者在**任何持久化变更之前**抛出，消息点名死路径
+        并给出恢复指引，净效果保持 ``installed_disabled``（不重物化、不重 clone）。
 
     ⚠️ **scope 契约**：同 :func:`disable_plugin`——``scope`` 须与安装 scope 一致（调用方 / #69 从上下文传），否则
     ``enabledPlugins[id]=true`` 写错层、与 live 态背离。
@@ -1137,12 +1351,10 @@ async def enable_plugin(
     if conflicts:
         raise _bare_name_conflict_error(plugin_id, conflicts, action="enable", ledger_pids=facts.ledger_pids)
 
-    # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 依赖预检（零持久化变更前）
-    servers: list[MCPServerConfig] = []
-    for rec in records:
-        install_path = rec.get("installPath")
-        if isinstance(install_path, str) and install_path:
-            servers.extend(load_bundled_servers(Path(install_path)))
+    # ① 内容预检（#259，零持久化变更前）：记录仍有效物化 + 声明内容可完整投影 + 拒绝半态
+    #    （判据复用 reconciler；不重物化、不重 clone）→ 聚合 bundled servers 供依赖预检与挂载复用。
+    preflight = _preflight_enable_content(plugin_id, plugin, marketplace, home, records)
+    servers = preflight.servers
     existing = existing_bundle_ids() if existing_bundle_ids is not None else set()
     _log_satisfied_deps(servers, existing)
 
@@ -1181,6 +1393,16 @@ async def enable_plugin(
         ]
         if refused:
             raise _source_conflict_error(plugin_id, refused, home=home, env=env)
+        # ③.6 stage 零注册兜底（#259 审查 🔴2）：预检只按「SKILL.md 存在」判可投影，而真实装载还会因
+        #     frontmatter 缺 description / 名字非法 / marketplace 清单不可读而**静默跳过**（staging 的逐 plugin
+        #     降级不抛）。installPath 内确实有 SKILL.md 包、却一个都没注册 → 不得报「启用成功」；转结构化错误走
+        #     既有回滚。**不改** staging 的全局降级（recovery/reconciler 依赖它），只收口 enable 调用方。
+        if preflight.expects_skills and not _plugin_skill_names(registry, marketplace, plugin):
+            raise PluginInstallError(
+                f"plugin {plugin_id!r} ships SKILL packages but staging registered none (invalid SKILL.md "
+                f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); nothing is enabled. "
+                f"{_enable_recovery_hint(plugin_id)}"
+            )
         # ④ 挂载依赖：仅挂**尚未满足**者；已满足 → 复用既有实例，不覆盖（§2.5-1）
         if register_server is not None:
             for cfg in servers:
