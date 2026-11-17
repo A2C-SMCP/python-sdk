@@ -1,7 +1,7 @@
 # 设计文档：0.5.1 — 存量 marketplace 注册名迁移（D3）
 
-> 状态：**Phase 1 设计已定稿，实现（Phase 2）待前置**——`#270`（派生算法与凭据 slug 约束）、`#276`（staging/source 安全）、
-> `#260`（核心语义 + **D4 legacy refresh baseline**）合入后开工。
+> 状态：**Phase 1 设计已审查通过（2026-11-17），实现（Phase 2）待前置**——`#270`（派生算法与凭据 slug 约束）、
+> `#276`（staging/source 安全）、`#260`（核心语义 + **D4 legacy refresh baseline**）合入后开工。
 > 关联：python-sdk#268（本单）/ #260（核心语义）/ #270 / #276 / #275 / #271 / rust-sdk#289（镜像）/ rust-sdk#272 /
 > a2c-smcp-protocol#79（协议裁决）/ Discussion [a2c-smcp-protocol#81](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/81)（双端对齐留痕）。
 > 性质：**SDK 自治**（protocol#79 定「名称唯一性 / 禁止静默改名」归协议管辖，**派生与迁移算法归 SDK 自治**）；
@@ -132,8 +132,8 @@ Discussion#81 已双端确认「迁移语义各自实现」。rust 侧实现面�
 
 结论：**两侧代码同构**（python `resolver.py:185/227-280` 同形）。因此：
 
-- 本设计**不应**声称「rust 不需要重键」；正确表述是「两侧都需要重键，但各自实现」；
-- 该事实须回写 Discussion#81 并由 rust 侧确认（见 §15 Q8）——**不据此单边推进 rust 计划**；
+- 本设计**不**声称「rust 不需要重键」；正确表述是「两侧都需要重键，但各自实现」；
+- 该事实已在 Discussion#81 订正（2026-11-17，两侧均 scoped id、各自重键），记录层与代码一致；
 - 对 python 实现无影响：无论 rust 如何，python 只处理 `<plugin>@<mp>/<id>` 键空间。
 
 ---
@@ -482,7 +482,7 @@ plugin-scoped input/secret 变成新名下的孤儿键（旧键已删）。**物
 - 报告内容：文件绝对路径 + JSON 点路径（如 `/enabledPlugins/figma@acme`）+ 建议改法 + **后果**
   （`will-be-inactive` / `will-stay-disabled`）；
 - 绝不写入（含「顺手清掉旧键」）：project 入 git、随仓库分发（`schema.py:139-173` 的受信供给讨论同源关注点）；
-  local 虽不入 git（`scope.py:101-103`），仍按用户裁决保持同处置口径（见 §15 Q7）；
+  local 虽不入 git（`scope.py:101-103`），仍按用户裁决（Q7）保持同处置口径；
 - `--json` 下进 `item.followUps[]`；人读形态在表格下方汇总一行 + 详情见 JSON；
 - **不**因为存在 project/local 残留就把该项判失败——它是正常可预期状态（D6），但警告必须显著。
 
@@ -519,6 +519,17 @@ a2c-computer marketplace migrate [--name <old>]... [--dry-run] [--yes] [--json] 
   `a2c_smcp/computer/settings/marketplace_migration.py`（检测 / 计划 / 执行，便于单测）；
 - **单一权威**：检测 / 计划 / 执行全在库层，CLI 只做参数解析与展示（同 #260 详细描述第 10 条）。
 
+### 10.4 `marketplace info` 增加 `manifestName`（Q9 已裁决，Phase 2 一并实现）
+
+`marketplace_info`（`marketplace.py:298-328`）当前 payload 为
+`name / url / installLocation / commitSha / autoUpdate / trusted / lastUpdated / installedPlugins`，**不含清单名**，
+导致用户无法自查「我这条注册是不是 legacy」。Phase 2 在该 payload（及其人读表格）中增加：
+
+- `manifestName`：本地 clone 清单顶层 `name`；不可读时 `null`；
+- `legacyName: bool`：`manifestName is not None and manifestName != name`（= §3.1 判据的直接呈现）。
+
+两者**只读派生**，不写盘、不影响 `known_marketplaces` 记录形态（不是 #260 baseline 字段，勿混）。
+
 ---
 
 ## 11. 与相邻 Issue 的边界
@@ -554,6 +565,7 @@ a2c-computer marketplace migrate [--name <old>]... [--dry-run] [--yes] [--json] 
 | known 记录形态 | 新记录字段集与 staging 写出的一致，且 `installLocation` 指向 `<home>/marketplace/<new>` |
 | 并发提示 | 先跑一次正常 `marketplace add`（留下 `.lock`）→ 迁移**不**报「另一实例在运行」；另一端真持锁时 → 探测提示 |
 | 顺序无关 | 打乱 `known_marketplaces` 键序（同 rust serde Map）→ 计划与结果不变 |
+| `info` 展示字段（§10.4） | legacy 注册 → `manifestName != name` 且 `legacyName is True`；清单不可读 → `manifestName` 为 `null`、`legacyName` 为 `False` |
 
 **变异验证要求**（沿用本仓纪律）：至少对「先加后减」「先写新 secret 再删旧」「P4 成功才删旧账本」「C4 排除源 pid」
 四处做变异，各至少 1 个用例转红。
@@ -568,7 +580,8 @@ a2c-computer marketplace migrate [--name <old>]... [--dry-run] [--yes] [--json] 
 # 升级迁移：marketplace 注册名改为清单 name
 1. 背景与影响面（旧名来源：URL 派生 / --name）
 2. 如何判断自己受影响
-   a2c-computer marketplace migrate --dry-run     # 计划非空即受影响（当前 marketplace info 不展示清单名）
+   a2c-computer marketplace info <name>           # manifestName 与 name 不同 → legacy
+   a2c-computer marketplace migrate --dry-run     # 计划非空即受影响的完整清单
 3. 迁移步骤
    a2c-computer marketplace migrate --dry-run     # 先看计划与冲突
    a2c-computer marketplace migrate               # 交互确认后执行（脚本用 --yes）
@@ -582,10 +595,8 @@ a2c-computer marketplace migrate [--name <old>]... [--dry-run] [--yes] [--json] 
 7. 失败与续跑（重跑即可；无回滚）
 ```
 
-> **自查路径必须可执行**：当前 `marketplace info` 的 payload 只有
-> `name/url/installLocation/commitSha/autoUpdate/trusted/lastUpdated/installedPlugins`（`marketplace.py:307-328`），
-> **不展示清单名**。因此 Phase 2 二选一：给 `info` 增加 `manifestName` 展示字段，或（更省）把自查方式写成
-> `marketplace migrate --dry-run`（见 §15 Q9）。
+> **自查路径依赖 §10.4**：`marketplace info` 当前 payload 不含清单名，Phase 2 一并加 `manifestName` / `legacyName`
+> （Q9 已裁决）。迁移文档的两条自查路径都以该字段为前提，故 §10.4 与本文档必须同 PR 落地。
 
 ### 13.2 CHANGELOG / release notes 要点
 
@@ -601,7 +612,7 @@ a2c-computer marketplace migrate [--name <old>]... [--dry-run] [--yes] [--json] 
 | 模块 | 改动 |
 |------|------|
 | `settings/marketplace_migration.py`（新） | 检测 / 计划 / 执行（纯编排 + 显式资源注入，便于单测） |
-| `cli/commands/marketplace.py` | 新增 `marketplace_migrate` handler + REPL dispatch 分支 |
+| `cli/commands/marketplace.py` | 新增 `marketplace_migrate` handler + REPL dispatch 分支；`marketplace_info` 增加 `manifestName` / `legacyName`（§10.4，Q9） |
 | `cli/main.py` | 注册 `marketplace_app.command("migrate")` |
 | `settings/installer.py` | 复用 `_write_installed_plugin` / `_write_enabled_plugin` / `materialize_plugin`，**不新造写原语** |
 | `inputs/plugin_pool.py` | 复用 `prefix_input_id` 做键改写（不复制格式字符串） |
@@ -612,16 +623,25 @@ a2c-computer marketplace migrate [--name <old>]... [--dry-run] [--yes] [--json] 
 
 ---
 
-## 15. 未决项（Phase 2 开工前请架构师裁决）
+## 15. 裁决记录（2026-11-17 架构师审查通过）
 
-| # | 问题 | 本设计倾向 |
-|---|------|-----------|
-| Q1 | 命令名 `marketplace migrate` 与 rust 侧命名是否统一 | 保持 python 自有命名，语义在 Discussion#81 对齐即可 |
-| Q2 | 非交互是否强制 `--yes` | 强制（破坏面大，参照 `--trust` 纪律） |
-| Q3 | F10 删旧账本记录 vs 保留为孤儿；是否给 `materialize_plugin` 加「沿用 installedAt」可选入参 | 重建成功才删；`installedAt` 默认重写，加参留待 #271/#275 一并考虑 |
-| Q4 | `origin` 诊断标签是否 Phase 2 就做 | 倾向延后（§3.2） |
-| Q5 | `blockedMarketplaces` 陈旧条目 | 本次只报告；**要求 #80 落地时复查**（fail-open 风险） |
-| Q6 | baseline 未落地时的降级行为 | Phase 2 硬前置，不降级实现 |
-| Q7 | **local scope 是否应改写**（它不入 git，D6 的理由只对 project 成立） | 本设计按用户裁决保持「只报告」；请确认是否给 local 开改写口子 |
-| Q8 | **Discussion#81 的 rust secret 键空间说法需订正**（rust 代码实际按 scoped id 存取，见 §2.4） | 先回写 Discussion 由 rust 侧确认，再定 rust#289 是否含重键 |
-| Q9 | `marketplace info` 是否增加 `manifestName` 展示字段（决定迁移文档的自查路径） | 倾向加（同时也让「我受不受影响」可自查） |
+| # | 问题 | 结论 | 状态 |
+|---|------|------|------|
+| Q1 | 命令名 `marketplace migrate` 与 rust 侧命名是否统一 | 保持 python 自有命名，语义在 Discussion#81 对齐即可 | ✅ 已批准 |
+| Q2 | 非交互是否强制 `--yes` | 强制（破坏面大，参照 `--trust` 纪律） | ✅ 已批准 |
+| Q3 | F10 删旧账本记录 vs 保留为孤儿；`installedAt` 是否加参沿用 | 重建成功才删旧记录；`installedAt` 由重物化重写，不加参（留待 #271/#275 一并考虑） | ✅ 已批准 |
+| Q4 | `origin` 诊断标签是否 Phase 2 就做 | 延后（§3.2），Phase 2 只输出 `legacy` | ✅ 已批准 |
+| Q5 | `blockedMarketplaces` 陈旧条目 | 本次只报告；**要求 #80 落地时复查**（fail-open 风险） | ✅ 已批准 |
+| Q6 | baseline 未落地时的降级行为 | Phase 2 **硬前置**，不降级实现 | ✅ 已批准 |
+| Q7 | local scope 是否应改写（它不入 git，D6 的理由只对 project 成立） | **用户裁决：local 也只报告不改**，保持 D6 单一处置口径 | ✅ 已裁决 |
+| Q8 | Discussion#81 的 rust secret 键空间说法 | **已按代码订正**：两侧均 scoped id、各自重键；§2.4 正文已与该结论一致 | ✅ 已订正 |
+| Q9 | `marketplace info` 是否增加 `manifestName` | **用户裁决：增加**，Phase 2 一并实现（§10.4，含 `legacyName`） | ✅ 已裁决 |
+
+---
+
+## 16. 变更记录
+
+| 日期 | 变更 |
+|------|------|
+| 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
+| 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
