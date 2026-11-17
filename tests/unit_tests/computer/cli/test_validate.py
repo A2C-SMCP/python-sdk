@@ -26,6 +26,11 @@ from a2c_smcp.computer.cli import main as cli_main
 from a2c_smcp.computer.cli.commands.validate import plugin_validate
 
 
+def _flat(text: str) -> str:
+    """去掉全部空白：rich 会按终端宽度折行（长 token 会被从中间折断），人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
 def _w(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -133,7 +138,7 @@ def test_human_output_escapes_bracketed_message(tmp_path: Path, capsys: pytest.C
        json.dumps({"name": "etl", "type": "stdio"}))
     code = plugin_validate(root)
     assert code == 1
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert "[StdioServerConfig.server_parameters:missing" in out  # 方括号段完整呈现（未被 rich markup 消费）
 
 
@@ -242,8 +247,8 @@ def test_json_path_and_human_line_redact_credential_root(tmp_path: Path, capsys:
     assert "<redacted-source>" in data["path"]
 
     plugin_validate(root)
-    human = capsys.readouterr().out
+    human = _flat(capsys.readouterr().out)  # 折行与断言无关
     assert "TOKEN" not in human
     # 正对照：人类输出确实渲染了 root 行（否则上面的否定断言恒真）
-    assert "Validating marketplace at" in human
+    assert "Validatingmarketplaceat" in human
     assert "<redacted-source>" in human

@@ -63,6 +63,11 @@ def _isolate_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ── 辅助（镜像 test_installer.py）/ helpers mirroring test_installer.py ─────────
+def _flat(text: str) -> str:
+    """去掉全部空白：rich 会按终端宽度折行（长 token 会被从中间折断），人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
 def _home(tmp_path: Path) -> Path:
     h = tmp_path / "skill-home"
     h.mkdir()
@@ -893,11 +898,10 @@ async def test_install_invalid_source_json_error_is_redacted_and_rolls_back(
     _seed_bad_source_catalog(home, source="key=https://alice:PW_CLI@example.com/r.git")
 
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme", json_output=True)
-    out = capsys.readouterr().out
+    raw = capsys.readouterr().out
     assert code == 1
-    assert "PW_CLI" not in out
-    assert "alice:" not in out
-    payload = json.loads(out)
+    assert "PW_CLI" not in _flat(raw) and "alice:" not in _flat(raw)
+    payload = json.loads(raw)
     assert "https://example.com/r.git" in payload["message"]
     assert "source invalid" in payload["message"]
     # 原子回滚：不留下安装意图
@@ -913,10 +917,10 @@ async def test_install_invalid_source_human_error_is_redacted(
     _seed_bad_source_catalog(home, source={"source": "url", "url": "glpat-SECRET_TOKEN"})
 
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert code == 1
     assert "glpat-SECRET_TOKEN" not in out
-    assert "source invalid" in out
+    assert "sourceinvalid" in out
 
 
 @pytest.mark.asyncio
@@ -930,9 +934,9 @@ async def test_install_invalid_source_with_rich_markup_does_not_crash(
     )
 
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert code == 1
-    assert "source invalid" in out
+    assert "sourceinvalid" in out
     assert "[/red]" in out  # 作为字面文本渲染，而非被 rich 解析
 
 
@@ -1007,9 +1011,9 @@ async def test_install_staging_error_is_structured_not_traceback(
 
     monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert code == 1
-    assert "plugin staging failed" in out
+    assert "pluginstagingfailed" in out
     assert "PW_STAGE" not in out
     assert "token=Q" not in out
 
@@ -1029,9 +1033,9 @@ async def test_install_manifest_error_is_structured_not_traceback(
 
     monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert code == 1
-    assert "plugin manifest invalid" in out
+    assert "pluginmanifestinvalid" in out
 
 
 @pytest.mark.asyncio
@@ -1049,9 +1053,9 @@ async def test_install_corrupt_catalog_manifest_is_structured_not_traceback(
     save_known_marketplaces(known, home=home)
 
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert code == 1
-    assert "manifest invalid" in out
+    assert "manifestinvalid" in out
 
 
 @pytest.mark.asyncio
@@ -1063,8 +1067,8 @@ async def test_install_schemeless_query_source_token_is_masked(
     _seed_bad_source_catalog(home, source="x/r.git?token=SECRET_Q#f")
 
     code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
-    out = capsys.readouterr().out
+    out = _flat(capsys.readouterr().out)
     assert code == 1
-    assert "source invalid" in out
+    assert "sourceinvalid" in out
     assert "token=SECRET_Q" not in out
     assert "#f" not in out
