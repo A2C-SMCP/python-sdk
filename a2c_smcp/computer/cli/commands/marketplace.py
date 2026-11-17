@@ -116,30 +116,49 @@ def normalize_marketplace_url(raw: str) -> str | None:
         return None
 
 
+# 凭据样判据的解码轮数上限（每轮 = percent-decode → NFKC）/ Bounded decode rounds.
+# 一轮只能解一层：全角 ``％３Ａ`` 要两轮（NFKC 出 ``%3A`` 再 decode），encoded-全角-percent 要两轮，
+# 三重编码 ``%25253A`` 要三轮。**有界不追无限嵌套**：更深的编码属刻意构造，且名字仍须过严格 kebab。
+_DECODE_ROUNDS = 3
+
+
 def _credential_like(text: str) -> bool:
     """
     文本是否含凭据样分隔符（userinfo ``@`` / 密码段 ``:``）/ Whether text carries credential-like separators.
 
-    **#270**：先做**有界两次** percent-decode，再做 NFKC 归一——挡住 ``alice%3APW%40host``、
-    percent-encoded 全角 ``%EF%BC%9A`` / ``%EF%BC%A0`` 与双重编码 ``%253A`` 等等价变体
-    （只 NFKC 不 unquote，或只 unquote 一次，都会漏）。
+    **#270**：做**有界** ``_DECODE_ROUNDS`` 轮「percent-decode → NFKC」迭代——挡住
+    ``alice%3APW%40host``、percent-encoded 全角 ``%EF%BC%9A``/``%EF%BC%A0``、双重/三重编码 ``%253A``/
+    ``%25253A``，以及**全角百分号** ``alice％３ＡPW``（NFKC 会先把它归一成 ``%3A``，下一轮才 decode；
+    单轮「decode 后归一」会漏）。
     """
-    probe = normalize("NFKC", unquote(unquote(text)))
+    probe = text
+    for _ in range(_DECODE_ROUNDS):
+        probe = normalize("NFKC", unquote(probe))
     return "@" in probe or ":" in probe
 
 
 def _error_url_display(raw: str) -> str:
     """
-    错误 / 提示文案里的 URL 展示 / Display-safe URL for error and prompt messages.
+    ``marketplace add`` **失败文案**里的 URL 展示 / Display-safe URL in add-failure messages.
 
-    在 #261 展示脱敏（去 userinfo / query / fragment）之上，再挡住 **path 段**携带的凭据样文本——
-    ``ssh://-/alice:PW_LEAK@example.com`` / ``https://host/alice:PW@example.com`` 的展示值仍保留 path，
-    直接回显会把凭据写进 stdout / ``--json``。命中 → 统一占位符。
+    在 #261 展示脱敏（去 userinfo / query / fragment）之上，再挡住 **path 任意段**携带的凭据样文本——
+    ``ssh://-/alice:PW_LEAK@example.com``、``https://host/team/alice:PW@example.com/repo``（中间段）、
+    ``.../alice:PW@example.com/``（尾斜杠）的展示值都仍保留 path，直接回显会把凭据写进 stdout /
+    ``--json``。空 path 或解析失败同样 fail-closed。
+    **范围**：仅 add 失败文案；``list`` / ``info`` / confirm 提示 / 成功 ``--json`` 的 ``url`` 仍按 #261
+    的 known-source 契约保留 path（见 CHANGELOG 的范围说明）。
     """
     shown = git_url_for_display(raw)
     if shown == REDACTED_GIT_SOURCE:
         return shown
-    if _credential_like(shown.rsplit("/", 1)[-1]):
+    try:
+        path = urlsplit(shown).path
+    except ValueError:
+        return REDACTED_GIT_SOURCE
+    segments = [seg for seg in path.split("/") if seg]
+    if not segments:  # 无 path：无法判定来源内容 → fail-closed
+        return REDACTED_GIT_SOURCE
+    if any(_credential_like(seg) for seg in segments):
         return REDACTED_GIT_SOURCE
     return shown
 

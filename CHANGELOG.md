@@ -541,13 +541,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     （`alice%3APW%40host`、全角 `：`/`＠` 等价变体一并挡）——凭据样文本交给 `--name` 显式命名。
     无 path（`https://host`；`https://github.com` 此前派生 `github-com`）、hostless / junk host、非法、
     末段构不成严格 kebab → `None`，CLI 提示 `--name`。scp-like 多冒号取最后一个 `:`（与 rust 一致）。
-    另有界两次 percent-decode 后再判，挡住 `%253A` 双重编码与 percent-encoded 全角分隔符
-    （`%EF%BC%9A` / `%EF%BC%A0`）。
-  - **错误 / 提示文案不再回显 path 段凭据**：`marketplace add` 的失败文案在 #261 展示脱敏之上再挡一层
-    （`ssh://-/alice:PW@x`、`https://host/alice:PW@x` → `<redacted-git-source>`）。
+    另有界 3 轮「percent-decode → NFKC」迭代后再判，挡住双重 / 三重编码（`%253A` / `%25253A`）、
+    percent-encoded 全角分隔符（`%EF%BC%9A` / `%EF%BC%A0`）与**全角百分号**（`alice％３ＡPW`）。
+  - **`marketplace add` 失败文案不再回显 path 段凭据**：在 #261 展示脱敏之上再挡一层，按 path **任意段**
+    判定（含尾斜杠、中间段、编码变体），命中 → `<redacted-git-source>`。**范围仅限 add 失败文案**：
+    `marketplace list` / `info` / confirm 提示 / 成功 `--json` 的 `url` 仍按 #261 known-source 契约保留
+    path（path 内凭据的外显属 #261 显示契约面，未在本单扩大）。
   - **只防新增**：存量已落盘的凭据 slug 不自动删除 / 改名（迁移归 #268 / #260）；`marketplace remove`
     与 `--name` 显式命名不受影响；`--name` 不能绕过 URL 校验（校验先于命名）。
   - 存储与 git argv 保持原始 URL（raw 保真），展示脱敏（#261）不变。
+  - **合并顺序（已满足）**：本改动让 hostless 的 plugin source 新走 fail-closed，该路径的原始 URL 回显面由
+    #263 / PR #276 修复，且 **#276 已先合入 develop（`319847c`）**——`SkillSourceError` 构造期脱敏已覆盖
+    本单新增的输入，无需另等。
 
 ## [0.4.0] - 2026-08-25
 

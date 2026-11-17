@@ -185,6 +185,10 @@ _NAME_VECTORS: list[tuple[str, str | None]] = [
     ("https://host/alice：PW＠example.com", None),
     ("https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com", None),
     ("https://host/alice%253APW_LEAK%2540example.com", None),
+    # 全角百分号 / encoded-全角-percent / 三重编码（有界 3 轮覆盖）
+    ("https://host/alice％３ＡPW_LEAK", None),
+    ("https://host/alice%EF%BC%85%EF%BC%93%EF%BC%A1PW_LEAK", None),
+    ("https://host/alice%25253APW_LEAK", None),
     # 入参先 strip（与 normalize_marketplace_url 一致；is_valid_git_url 本身不 strip）
     ("  https://host/repo  ", "repo"),
     # 尾点 FQDN 正常派生
@@ -855,20 +859,37 @@ async def test_add_hostless_url_rejected_even_with_name(
     "url",
     [
         "ssh://-/alice:PW_LEAK@example.com",  # junk host：URL 校验失败文案
-        "https://host/alice:PW_LEAK@example.com",  # 合法 host、凭据在 path：派生名失败文案
+        "https://host/alice:PW_LEAK@example.com",  # 合法 host、凭据在末段：派生名失败文案
         "https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com",  # percent-encoded 全角分隔符
+        "https://host/alice％３ＡPW_LEAK",  # 全角百分号编码（NFKC 后才成 %3A）
+        "https://host/alice:PW_LEAK@example.com/",  # 尾斜杠：末段为空，不得漏判
+        "https://host/team/alice:PW_LEAK@example.com/repo",  # 凭据在**中间段**：untrusted 文案
+        "https://host",  # 无 path：无法判定 → fail-closed（派生名失败文案）
     ],
 )
 async def test_add_error_message_never_echoes_path_credentials(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], url: str
 ) -> None:
-    """#270：错误 / 提示文案不得回显 path 段里的凭据样文本（展示层保留 path，须再挡一次）。"""
+    """#270：add 失败文案不得回显 path 任一段里的凭据样文本（展示层保留 path，须再挡一次）。"""
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
-    code = await marketplace_add(reg, home, env, url, trust=True, no_clone=True, json_output=True)
+    code = await marketplace_add(reg, home, env, url, trust=False, no_clone=True, json_output=True)
     assert code == 1
     out = capsys.readouterr().out
     assert "PW_LEAK" not in out and "alice" not in out
     assert REDACTED_GIT_SOURCE in out
+
+
+def test_error_url_display_keeps_clean_urls_readable() -> None:
+    """正对照：干净 URL 必须原样可读——否则「一律占位符」的退化实现也会全绿。"""
+    assert (
+        marketplace_mod._error_url_display("https://example.com/org/repo.git")
+        == "https://example.com/org/repo.git"
+    )
+    # query / fragment / userinfo 由 #261 展示层剥掉，path 保留
+    assert (
+        marketplace_mod._error_url_display("https://user:FAKE_TOKEN@example.com/org/repo.git?token=Q#f")
+        == "https://example.com/org/repo.git"
+    )
 
 
 @pytest.mark.asyncio
