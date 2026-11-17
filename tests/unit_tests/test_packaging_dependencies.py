@@ -52,9 +52,12 @@ CI 与本地都装 ``uv sync --group dev --group test``，而 ``poethepoet``（d
 已知边界 / Known limitations（措辞勿强于实现）
 --------------------------------------------
 - 只认 **AST 静态 import**（含函数内静态 import）：``importlib.import_module(...)`` 这类**动态**导入
-  不可见 —— 如 ``computer/cli/utils.py`` 加载配置给出的 ``pkg.mod:attr``、``testing/server.py:195``
-  加载 ``"werkzeug.serving"``。注意同一文件的 ``:166`` / ``:261`` 是**函数内静态** import，
-  **在**扫描面内（靠判据 1 放行），勿据本条误以为 server extra 的成员未被覆盖。
+  不可见 —— 如 ``computer/cli/utils.py`` 加载配置给出的 ``pkg.mod:attr``，以及 ``testing/server.py``
+  经 ``a2c_smcp.utils.optional_deps.require_extra`` 加载 ``"werkzeug.serving"`` / ``"uvicorn"``（#248）。
+  该文件 ``:166`` 的 ``werkzeug.serving`` 仍是**函数内静态** import（**在**扫描面内，靠判据 1 放行）；
+  但 ``uvicorn`` 自 #248 起在 ``a2c_smcp/`` 内**再无静态见证**，由
+  :func:`test_server_extra_declares_the_lazily_imported_runners` 单点补位 ——
+  勿据本条误以为 server extra 的成员整体未被覆盖。
 - 可达根收纳**全部** extra，故本守卫只看「有无声明路径」，**不**区分 core / extra 归属。
   「核心路径 import 却只声明在 extra」这一反向错位需另行把关：针对 #224 的具体裁决，
   由 :func:`test_yaml_provider_is_a_core_dependency` 单点钉住（理由见 CHANGELOG：SKILL 是协议核心通道，
@@ -395,6 +398,25 @@ def test_yaml_provider_is_a_core_dependency() -> None:
             f"{dist} 只声明在 extras {sorted(declaration.extras)} 里，不在 [project] dependencies（core）。"
             "SKILL frontmatter 解析由库路径调用（Computer.boot_up），必须落 core —— 见 #224 / CHANGELOG。"
         )
+
+
+def test_server_extra_declares_the_lazily_imported_runners() -> None:
+    """
+    #248 补位锁：``server`` extra 必须恰为 ``a2c_smcp.testing`` 的两个 runner 依赖。
+
+    改 ``testing/server.py`` 的 ``import uvicorn`` 为 ``require_extra("uvicorn", …)`` 之后，
+    ``uvicorn`` 在 ``a2c_smcp/`` 内**再无 AST 静态见证**，通用守卫（只认静态 import）对它
+    彻底失明 —— 「从 pyproject 删掉 uvicorn 声明」这类改动会让通用守卫**保持绿**，直到运行期
+    才炸。本用例把那块失明的覆盖面单点补回（与 :func:`test_yaml_provider_is_a_core_dependency`
+    同款「单点钉住」手法）。
+    """
+    declaration = _load_declaration()
+    server_extra = {_canonical(req.name) for req in declaration.extras.get("server", ())}
+
+    assert server_extra == {"werkzeug", "uvicorn"}, (
+        "server extra 必须恰为 a2c_smcp.testing 的 runner 依赖（werkzeug=WSGI / uvicorn=ASGI）；"
+        f"实际: {sorted(server_extra)}。改动成员须同步本断言与 README extras 表。"
+    )
 
 
 def _find_gating_probe() -> tuple[str, frozenset[str], str, str] | None:
