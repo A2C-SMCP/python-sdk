@@ -112,6 +112,7 @@ from a2c_smcp.computer.skills.manifest import (
     entry_is_strict,
     find_plugin_entry,
     load_bundled_servers,
+    manifest_declared_components,
     plugin_root_base,
     read_marketplace_manifest,
     read_plugin_metadata,
@@ -443,7 +444,12 @@ def _describe_dead_record(rec: object) -> str:
 
 
 def _marketplace_entry_for(marketplace: str, plugin: str, home: Path) -> Mapping[str, Any] | None:
-    """读 marketplace 条目；catalog 清单缺失/损坏 → ``None``（声明面不可判定，交由后续 stage 报错）。"""
+    """读 marketplace 条目；catalog 清单缺失/损坏 → ``None``（声明面不可判定）。
+
+    注意（审查 🟡3）：stage **不会**因 catalog 清单损坏而抛错——:func:`stage_marketplace_skills` 对
+    marketplace 级失败同样走「记 ERROR + 返回空」的静默降级。声明面不可判定时只跳过声明态判据；
+    installPath 内确有 ``SKILL.md`` 时，仍由 stage 返回值为空的零注册兜底（③.6）捕获。
+    """
     try:
         manifest = read_marketplace_manifest(marketplace_skill_dir(home, marketplace))
     except PluginManifestError as e:
@@ -462,8 +468,10 @@ def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[s
 
     **约定 ``skills/`` 容器存在不算声明**（审查 🔴1）：MCP-only plugin 可能顺带提交 ``skills/README.md`` /
     ``.gitkeep`` / 空目录，把「容器在」当声明会让它在旧版本可启用、新版本永久不可启用且无命令可修。
-    「容器在但零 SKILL.md」的静默零投影由 stage 后的零注册兜底（见 :func:`_preflight_enable_content`
-    的返回与 :func:`enable_plugin` ③.6）覆盖，而不是在这里强判。
+
+    **已知边界**（审查 🟡3，与 rust 对齐）：convention-only plugin（entry / plugin.json 均无 skills 声明、
+    只有约定 ``skills/`` 目录）在 SKILL.md 被全部删除后 **enable 仍成功**——无从判定「曾经有过」。
+    「容器在但零 SKILL.md」不由此判据抓，而由 stage 返回值零注册的兜底（③.6）在**有文件被装载跳过**时抓。
     """
     strict = entry_is_strict(entry) if entry is not None else True
     return bool(skill_override_raw_paths(entry or {}, plugin_manifest, strict=strict))
@@ -563,14 +571,27 @@ def _preflight_enable_content(
        不是误报（审查 🟢11 记边界）。
     """
     problems: list[str] = []
-    if not ledger_entry_fully_materialized(records):
-        problems.extend(_describe_dead_record(rec) for rec in records if not ledger_record_materialized(rec))
+    try:
+        fully_materialized = ledger_entry_fully_materialized(records)
+    except OSError as e:
+        # 权限等文件系统异常不得裸逸出（审查 🟡7）：归一为结构化错误。
+        raise PluginInstallError(
+            _enable_content_error(plugin_id, [f"cannot inspect recorded install paths: {e}"]),
+        ) from e
+    if not fully_materialized:
+        for rec in records:
+            try:
+                if not ledger_record_materialized(rec):
+                    problems.append(_describe_dead_record(rec))
+            except OSError as e:
+                problems.append(f"cannot inspect recorded install path ({rec!r}): {e}")
         if not problems:  # 防御：判据说失效却逐条都通过（不应发生）→ 仍须失败，不得静默放行
             problems.append("no usable ledger record")
         raise PluginInstallError(_enable_content_error(plugin_id, problems))
 
     entry = _marketplace_entry_for(marketplace, plugin, home)
-    servers: list[MCPServerConfig] = []
+    # bundle_id → 首次出现顺序（多 scope 同根记录会重复声明同一 server：按身份去重，审查 🟡5）
+    by_id: dict[str, MCPServerConfig] = {}
     expects_skills = False
     for rec in records:
         install_path = Path(str(rec.get("installPath")))
@@ -579,16 +600,25 @@ def _preflight_enable_content(
         except PluginManifestError as e:  # 判据刚通过后文件又被改坏（TOCTOU）→ 仍按失败处理
             problems.append(f"installPath {install_path}: bundled server JSON is unparsable ({e})")
             continue
+        except OSError as e:  # iterdir 权限等（审查 🟡7）
+            problems.append(f"installPath {install_path}: bundled servers cannot be read ({e})")
+            continue
         missing = sorted(ledger_mcp_deps_of([rec]) - {resolve_bundle_id(cfg) for cfg in parsed})
         if missing:
             problems.append(
                 f"installPath {install_path}: declared bundled server(s) {', '.join(repr(m) for m in missing)} "
-                "cannot be resolved (re-run 'plugin install' to refresh the ledger)"
+                "cannot be resolved (the install tree is stale; see the recovery steps below)"
             )
         plugin_manifest = read_plugin_metadata(install_path)
         try:
+            if entry is not None:
+                # strict=false + plugin.json 声明组件 → staging 会**整体拒绝**该 plugin（审查 🟡6）；预检先转结构化错误。
+                check_strict_conflict(entry, plugin_manifest)
             declares_skills = _declares_skills(entry, plugin_manifest)
             skill_count = _projectable_skill_count(install_path, entry, plugin_manifest)
+        except PluginManifestError as e:
+            problems.append(f"installPath {install_path}: plugin manifests conflict ({e})")
+            continue
         except (OSError, RuntimeError, ValueError) as e:
             problems.append(f"installPath {install_path}: cannot inspect SKILL packages: {e}")
             continue
@@ -598,10 +628,29 @@ def _preflight_enable_content(
                 f"installPath {install_path}: declares SKILL packages but none are projectable "
                 f"(no <skill>/{SKILL_MD} under the conventional {SKILLS_SUBDIR}/ dir or declared overrides)"
             )
-        servers.extend(parsed)
+        # 声明了 bundled servers（账本 mcpServers，或 strict plugin.json 的 mcpServers 组件）却零投影 → 失败
+        # （架构师审查 🔴1，与 rust#274 `declared_components.contains("mcpServers")` 同口径）。
+        strict = entry_is_strict(entry) if entry is not None else True
+        declares_servers = bool(ledger_mcp_deps_of([rec])) or (
+            strict and "mcpServers" in manifest_declared_components(plugin_manifest)
+        )
+        if declares_servers and not parsed:
+            problems.append(
+                f"installPath {install_path}: declares bundled MCP servers but none are projectable "
+                f"(no mcp-servers/*.json under the install path)"
+            )
+        for cfg in parsed:
+            bundle_id = resolve_bundle_id(cfg)
+            existing_cfg = by_id.get(bundle_id)
+            if existing_cfg is None:
+                by_id[bundle_id] = cfg
+            elif existing_cfg != cfg:
+                problems.append(
+                    f"bundle_id {bundle_id!r} resolves to conflicting configs across install records"
+                )
     if problems:
         raise PluginInstallError(_enable_content_error(plugin_id, problems))
-    return _EnablePreflight(servers=servers, expects_skills=expects_skills)
+    return _EnablePreflight(servers=list(by_id.values()), expects_skills=expects_skills)
 
 
 def _write_installed_plugin(
@@ -1371,7 +1420,7 @@ async def enable_plugin(
         # ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）
         registry.drain_source_conflicts()  # 清掉此前无关流程（如 marketplace add）留下的跨源记录
         source, _commit_sha = _resolve_marketplace_source(marketplace, home, env)
-        await stage_marketplace_skills(
+        staged = await stage_marketplace_skills(
             marketplace,
             source,
             registry,
@@ -1393,11 +1442,13 @@ async def enable_plugin(
         ]
         if refused:
             raise _source_conflict_error(plugin_id, refused, home=home, env=env)
-        # ③.6 stage 零注册兜底（#259 审查 🔴2）：预检只按「SKILL.md 存在」判可投影，而真实装载还会因
-        #     frontmatter 缺 description / 名字非法 / marketplace 清单不可读而**静默跳过**（staging 的逐 plugin
-        #     降级不抛）。installPath 内确实有 SKILL.md 包、却一个都没注册 → 不得报「启用成功」；转结构化错误走
-        #     既有回滚。**不改** staging 的全局降级（recovery/reconciler 依赖它），只收口 enable 调用方。
-        if preflight.expects_skills and not _plugin_skill_names(registry, marketplace, plugin):
+        # ③.6 stage 零注册兜底（#259 审查 🔴2 / 架构师复审 🟡2）：预检只按「SKILL.md 存在」判可投影，而真实
+        #     装载还会因 frontmatter 缺 description / 名字非法 / catalog 清单不可读而**静默跳过**（staging 的逐
+        #     plugin 降级不抛）。判据必须取**本次** stage 的返回值（`register_or_update` 对既有同源条目也返回 True，
+        #     `staged` 非空即「本次装载工作正常」）——查 registry 里的旧活跃集会被旧投影掩盖本次失败。
+        #     installPath 内确有 SKILL.md 包、却零注册 → 不得报「启用成功」；转结构化错误走既有回滚。
+        #     **不改** staging 的全局降级（recovery/reconciler 依赖它），只收口 enable 调用方。
+        if preflight.expects_skills and not staged:
             raise PluginInstallError(
                 f"plugin {plugin_id!r} ships SKILL packages but staging registered none (invalid SKILL.md "
                 f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); nothing is enabled. "
