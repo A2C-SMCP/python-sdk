@@ -38,6 +38,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from rich.table import Table
 
 from a2c_smcp.computer.cli.commands import (
@@ -103,7 +104,9 @@ def _err(msg: str, *, json_output: bool, code: int = EXIT_USER_ERROR, error_code
         payload: dict[str, Any] = {"error": error_code or "error", "message": msg, **extra}
         console.print_json(data=payload)
     else:
-        console.print(f"[red]✗ {msg}[/red]")
+        # #263：msg 可含不可信 source 文本（如 `[/red]`），必须转义 rich 标记——否则 MarkupError 会把
+        # 「结构化错误」重新变成 traceback（与 validate.py 的 `escape(issue.message)` 同一约定）。
+        console.print(f"[red]✗ {escape(msg)}[/red]")
     return code
 
 

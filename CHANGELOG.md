@@ -423,6 +423,35 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     失败日志均做 token 级脱敏，不再泄漏 git stderr 中的凭据。
   - 与 rust-sdk#273 决策（2026-11-16）对齐；rust#154 fail-closed 边界不变。
 
+### Fixed（#263 plugin source / validator 错误与日志脱敏）
+
+- **plugin source 解析 / `plugin validate` 诊断 / plugin staging 失败日志 / CLI 未捕获路径回显凭据 URL**
+  （#263，安全；#261 未覆盖的同类面）：
+  - `SkillSourceError` 改为**构造期脱敏**（对齐 rust `SkillSourceError::new`）：`raw` 与 `reason` 存已脱敏
+    文本，`str(e)` / traceback / 日志 / `plugin validate`（文本与 `--json`）自动安全。`raw` 口径改为
+    紧凑 JSON（对象形态）/ 原字符串（字符串形态），与 rust 同形；全仓无 `.raw` 读取方，无兼容负担。
+  - `url` / `repo` 字段走 `git_url_for_display` 严格展示（可解析 scheme URL 保留 scheme/host/path，去
+    userinfo / query / fragment；scp-like / opaque / ftp / 裸 token → `<redacted-git-source>`）；其余
+    name / entry / 本地路径按 `redact_git_urls_in_text` 脱敏（合法 kebab 名逐字保留）。
+  - `plugin install` 遇 marketplace source 非法：由 `SkillSourceError` 未捕获（traceback）改为 installer
+    边界包装成 `PluginInstallError`，CLI 走既有结构化错误输出（红字 + 非零退出码；`--json` 同 payload），
+    回滚语义不变。
+  - 存储与 git 入参保持原始 URL（`marketplace add` 落盘断言 + `plugin clone` argv 断言）。
+  - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
+    另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
+  - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+
+### Fixed（#272 plugin entry name 路径穿越）
+
+- **`marketplace.json` 的 plugin `name` 未校验即作外部 clone 路径段 → 可删除任意目录**（#272，安全，高危；
+  既有缺陷，非 #263 引入）：`_entry_plugin_name` 仅判非空，`external_plugin_dir` 直接把 `entry.name` 拼进
+  `<home>/marketplace/.plugins/<marketplace>/<plugin>`，而 clone 落盘前会 `shutil.rmtree(dest)`；`marketplace
+  add` / `refresh` / boot recovery / reconciler 均以 `plugin_filter=None` 全量 stage ⇒ 恶意或被投毒
+  marketplace.json 写 `name: "../../../x"`（或绝对路径）即可删除任意目录并写入 clone。
+  - 修法：`_entry_plugin_name` 按协议 §4.1 严格 kebab 校验（`is_valid_marketplace_name`，固定错误文案、
+    不回显原值，对齐 rust `entry_plugin_name`）；`locate_plugin_root` 在 clone/rmtree 之前补
+    `is_within(ext_dir.resolve(), home.resolve())` 纵深守卫。显式 `plugin install` 路径本已校验，不受影响。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

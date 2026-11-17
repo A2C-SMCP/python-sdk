@@ -66,6 +66,7 @@ from a2c_smcp.computer.skills.sources import (
     resolve_plugin_source,
 )
 from a2c_smcp.computer.skills.staging import SKILL_MD, SKILLS_SUBDIR, parse_skill_frontmatter
+from a2c_smcp.utils.git_url import git_url_for_display, redact_git_urls_in_text
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -213,7 +214,13 @@ def _require_str_field(
         c.add(CODE_INVALID_TYPE, file, loc, f"field {key!r} must be a non-empty string (got {type(v).__name__})")
         return None
     if kebab and not is_valid_marketplace_name(v.strip()):
-        c.add(CODE_INVALID_NAME, file, loc, f"{key} {v!r} must be strict kebab-case ([a-z0-9-], 1-64, no leading/trailing/double '-')")
+        c.add(
+            CODE_INVALID_NAME,
+            file,
+            loc,
+            f"{key} {redact_git_urls_in_text(v)!r} must be strict kebab-case "
+            "([a-z0-9-], 1-64, no leading/trailing/double '-')",
+        )
         return None
     return v.strip()
 
@@ -307,9 +314,11 @@ def _validate_marketplace(c: _Collector) -> None:
         name = _require_str_field(entry, "name", mfile, c, location=f"{loc}.name", kebab=True)
         if name is not None and name in seen_names:
             # find_plugin_entry take-first：后续同名 entry 永不可达。
+            # 注（#263）：此处 name 已经过 kebab 校验（`_require_str_field` 非法名返回 None），内嵌凭据
+            # 结构上不可达；脱敏保留为纵深防御，避免将来放宽校验时重新变成回显面。
             c.add(
                 CODE_DUPLICATE_PLUGIN_NAME, mfile, f"{loc}.name",
-                f"duplicate plugin name {name!r} (install resolves the first matching entry only)",
+                f"duplicate plugin name {redact_git_urls_in_text(name)!r} (install resolves the first matching entry only)",
                 severity="warning",
             )
         if name is not None:
@@ -337,7 +346,7 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
         # 远程 source：仅 source 字段自身已校验；plugin 本体不在本地，跳过深检（#193 裁决）。
         c.add(
             CODE_REMOTE_SOURCE_SKIPPED, mfile, f"{loc}.source",
-            f"remote plugin source {resolved.url!r} skipped (local-only validation; source field format checked)",
+            f"remote plugin source {git_url_for_display(resolved.url)!r} skipped (local-only validation; source field format checked)",
             severity="warning",
         )
         return
@@ -346,12 +355,18 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
     plugin_root = (c.root / resolved.rel_path).resolve()
     if not is_within(plugin_root, c.root):
         # resolve_plugin_source 已禁 '..'，此处与 locate_plugin_root 同款防御（belt + suspenders）。
-        c.add(CODE_PATH_ESCAPE, mfile, f"{loc}.source", f"relative plugin source {resolved.rel_path!r} escapes the marketplace root")
+        c.add(
+            CODE_PATH_ESCAPE,
+            mfile,
+            f"{loc}.source",
+            f"relative plugin source {redact_git_urls_in_text(resolved.rel_path)!r} escapes the marketplace root",
+        )
         return
     if not plugin_root.is_dir():
         c.add(
             CODE_PATH_MISSING, mfile, f"{loc}.source",
-            f"local plugin directory not found: {resolved.rel_path!r} (resolved to {plugin_root})",
+            f"local plugin directory not found: {redact_git_urls_in_text(resolved.rel_path)!r} "
+            f"(resolved to {redact_git_urls_in_text(str(plugin_root))})",
         )
         return
     _validate_plugin(c, plugin_root, entry=entry, entry_loc=loc, plugin_name=name)
@@ -414,11 +429,16 @@ def _validate_plugin(
         cand = (plugin_root / raw).resolve()
         if not is_within(cand, plugin_root_resolved):
             # 装载路径 resolve_skill_override_dirs 记 ERROR 跳过——validator 同级 error。
-            c.add(CODE_PATH_ESCAPE, override_src, override_loc, f"skills override path {raw!r} escapes plugin root {pfile}")
+            c.add(
+                CODE_PATH_ESCAPE,
+                override_src,
+                override_loc,
+                f"skills override path {redact_git_urls_in_text(raw)!r} escapes plugin root {pfile}",
+            )
         elif not cand.is_dir():
             c.add(
                 CODE_PATH_MISSING, override_src, override_loc,
-                f"skills override path {raw!r} is not an existing directory under the plugin",
+                f"skills override path {redact_git_urls_in_text(raw)!r} is not an existing directory under the plugin",
             )
         elif cand not in containers:
             containers.append(cand)
@@ -503,7 +523,7 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
                 # 1 段形态判据 = naming §1.4 严格 kebab（与 synthesize_marketplace_name 的 leaf 段同字符集）。
                 c.add(
                     CODE_SKILL_NAME_INVALID, c.rel(skill_dir), ".",
-                    f"skill dir name {leaf!r} is not strict kebab-case (skill name synthesis fails at load time)",
+                    f"skill dir name {redact_git_urls_in_text(leaf)!r} is not strict kebab-case (skill name synthesis fails at load time)",
                 )
                 continue
             synth = f"{plugin_name}:{leaf}" if plugin_name else leaf
@@ -511,7 +531,8 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
                 first_at = seen_skill_names[synth]
                 c.add(
                     CODE_DUPLICATE_SKILL, c.rel(skill_dir), ".",
-                    f"duplicate skill name {synth!r} (first seen at {first_at!r}; later ones are dropped at load time)",
+                    f"duplicate skill name {redact_git_urls_in_text(synth)!r} "
+                    f"(first seen at {redact_git_urls_in_text(first_at)!r}; later ones are dropped at load time)",
                 )
             else:
                 seen_skill_names[synth] = c.rel(skill_dir)

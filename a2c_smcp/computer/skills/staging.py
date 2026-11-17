@@ -881,10 +881,18 @@ async def _git_head_sha(dest: Path, *, timeout: float, env: Mapping[str, str] | 
 
 # ── plugin entry 解析 / plugin-entry parsing（marketplace.json/plugin.json/version 解析见 :mod:`skills.manifest`）──
 def _entry_plugin_name(entry: Mapping[str, Any]) -> str:
-    """plugin 条目 ID = entry.name（marketplace-v1 §4.1 必填；kebab 校验交 name 合成）/ The plugin entry name。"""
+    """
+    plugin 条目 ID = entry.name（marketplace-v1 §4.1 必填，**严格 kebab**）/ The plugin entry name.
+
+    安全（#272）：name 直接作外部 clone 的路径段（:func:`external_plugin_dir`），且落盘前会 ``rmtree``
+    ——因此必须按 §4.1 严格校验，否则 ``"../../x"`` / 绝对路径可删除任意目录（与 rust `entry_plugin_name`
+    同口径）。错误文案固定、**不回显** entry / name 原值（#263）。
+    """
     name = entry.get("name")
     if not isinstance(name, str) or not name.strip():
-        raise SkillStagingError(f"plugin entry missing required 'name': {entry!r}")
+        raise SkillStagingError("plugin entry missing required 'name'")
+    if not is_valid_marketplace_name(name.strip()):
+        raise SkillStagingError("plugin entry 'name' must be lowercase kebab-case (1-64 characters)")
     return name.strip()
 
 
@@ -1039,10 +1047,17 @@ async def locate_plugin_root(
         # 相对路径：就地在 catalog clone 内（不独立 clone）；越界保护（is_within 词法判定，两侧均已 resolve）。
         plugin_root = (catalog_dir / resolved.rel_path).resolve()
         if not is_within(plugin_root, catalog_dir.resolve()):
-            raise SkillStagingError(f"relative plugin source escapes marketplace clone: {resolved.rel_path!r}")
+            raise SkillStagingError(
+                f"relative plugin source escapes marketplace clone: {redact_git_urls_in_text(resolved.rel_path)!r}"
+            )
         version_fallback = catalog_sha
     else:  # GitCloneSpec：独立 clone（git-subdir sparse / sha 锁版本等）。
         ext_dir = external_plugin_dir(home, marketplace, plugin_name)
+        # #272 纵深防御：名字已由 _entry_plugin_name 按 §4.1 严格 kebab 校验，但 clone 前会 rmtree(dest)
+        # ——这里再断言落点确实在 skill home 内，避免任何上游绕过（直接调用本 API 的调用方）造成越界删除。
+        # 两侧先 resolve：`..` 只在规范化后才体现为越界（词法前缀比较会把 `<home>/a/../../x` 误判为内部）。
+        if not is_within(ext_dir.resolve(), home.resolve()):
+            raise SkillStagingError("plugin install path escapes the skill home")
         head = await _git_head_sha(ext_dir, timeout=timeout, env=env) if ext_dir.exists() else None
         # 复用既有 clone 的条件（否则重 clone）：
         #  - sha 锁版本：既有 HEAD 已等于 pin → 复用（重 clone 无收益）；pin 变更（A→B）→ 重 clone 重 pin（守住
@@ -1056,7 +1071,8 @@ async def locate_plugin_root(
         version_fallback = head
 
     if not plugin_root.is_dir():
-        raise SkillStagingError(f"plugin root not found after resolve: {plugin_root}")
+        # #263：解析结果可能内嵌凭据 URL（`.` + 凭据形态的相对源），回显前脱敏。
+        raise SkillStagingError(f"plugin root not found after resolve: {redact_git_urls_in_text(str(plugin_root))}")
     return plugin_root, version_fallback
 
 
@@ -1247,12 +1263,16 @@ async def stage_marketplace_skills(
     seen: set[str] = set()
     for entry in plugins:
         if not isinstance(entry, Mapping):
-            logger.error("marketplace %r has a non-object plugin entry, skipped: %r", name, entry)
+            logger.error(
+                "marketplace %r has a non-object plugin entry, skipped: %r",
+                redact_git_urls_in_text(name),
+                redact_git_urls_in_text(repr(entry)),
+            )
             continue
         try:
             plugin_name = _entry_plugin_name(entry)
         except SkillStagingError as e:
-            logger.error("marketplace %r plugin entry invalid, skipped: %s", name, e)
+            logger.error("marketplace %r plugin entry invalid, skipped: %s", redact_git_urls_in_text(name), e)
             continue
         if plugin_filter is not None and plugin_name not in plugin_filter:
             continue
@@ -1274,7 +1294,20 @@ async def stage_marketplace_skills(
             registered.extend(names)
         except (SkillSourceError, SkillStagingError, PluginManifestError) as e:
             # PluginManifestError 含 strict=false 冲突（§4.4）——预期降级，记 ERROR、该 plugin 不入册、不阻断其余。
-            logger.error("marketplace %r plugin %r staging failed, skipped: %s", name, plugin_name, e)
+            # 注：#272 起 plugin_name 必经 `_entry_plugin_name` 严格 kebab 校验，内嵌凭据结构上不可达；
+            # 此处脱敏与 `e` 的文本脱敏保留为纵深防御（新增携带 entry/source 的 raise 点时不至于开洞）。
+            logger.error(
+                "marketplace %r plugin %r staging failed, skipped: %s",
+                redact_git_urls_in_text(name),
+                redact_git_urls_in_text(plugin_name),
+                redact_git_urls_in_text(str(e)),
+            )
         except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
-            logger.error("marketplace %r plugin %r unexpected staging error, skipped: %s", name, plugin_name, e, exc_info=True)
+            logger.error(
+                "marketplace %r plugin %r unexpected staging error, skipped: %s",
+                redact_git_urls_in_text(name),
+                redact_git_urls_in_text(plugin_name),
+                redact_git_urls_in_text(str(e)),
+                exc_info=True,
+            )
     return registered

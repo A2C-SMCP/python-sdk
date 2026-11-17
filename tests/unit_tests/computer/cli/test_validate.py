@@ -155,3 +155,38 @@ def test_dual_entry_json_flag(tmp_path: Path) -> None:
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["valid"] is True and data["mode"] == "marketplace"
+
+
+# ── #263 凭据脱敏（--json 与文本同一 message）/ credential redaction ─────────────
+def _cred_marketplace(tmp_path: Path) -> Path:
+    root = tmp_path / "mp-cred"
+    _w(root / ".tfrobot-plugin" / "marketplace.json", json.dumps({
+        "name": "acme-mp",
+        "owner": {"name": "Acme"},
+        "plugins": [
+            {"name": "bad", "source": "key=https://alice:PW_JSON@example.com/r.git"},
+            {"name": "remote", "source": {"source": "url", "url": "https://bob:PW_REMOTE@example.com/r.git"}},
+        ],
+    }))
+    return root
+
+
+def test_json_output_redacts_source_credentials(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`plugin validate --json`：错误与 warning 的 message 均不得含 userinfo。"""
+    code = plugin_validate(_cred_marketplace(tmp_path), json_output=True)
+    out = capsys.readouterr().out
+    assert code == 1
+    for secret in ("PW_JSON", "PW_REMOTE", "alice:", "bob:"):
+        assert secret not in out
+    data = json.loads(out)
+    msgs = "\n".join(i["message"] for i in data["errors"] + data["warnings"])
+    assert "https://example.com/r.git" in msgs
+
+
+def test_human_output_redacts_source_credentials(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """文本路径同一口径（同一 ValidationIssue.message，仅渲染方式不同）。"""
+    code = plugin_validate(_cred_marketplace(tmp_path))
+    out = capsys.readouterr().out
+    assert code == 1
+    for secret in ("PW_JSON", "PW_REMOTE", "alice:", "bob:"):
+        assert secret not in out

@@ -412,3 +412,67 @@ def test_override_from_plugin_json_strict_true(tmp_path: Path) -> None:
     r = validate_path(root)
     assert r.valid, [i.message for i in r.issues]
     assert "plugins/data-toolkit/alt-skills/report/SKILL.md" in r.checked
+
+
+# ── 诊断脱敏（#263）/ diagnostic redaction ─────────────────────────────────────
+# 校验结果的 message 会同时进 CLI 文本与 `--json`（validate.py 直接渲染 issue.message），
+# 因此断言 message 本身：不得含 userinfo / query / fragment 或内嵌凭据的名称。
+_REDACTED = "<redacted-git-source>"
+
+
+def _messages(result: Any) -> str:
+    return "\n".join(i.message for i in result.issues)
+
+
+def test_invalid_marketplace_name_with_credentials_is_redacted(tmp_path: Path) -> None:
+    root = _marketplace(tmp_path, {"name": "x=https://alice:PW_NAME@example.com/repo.git", "owner": {"name": "A"}, "plugins": []})
+    r = validate_path(root)
+    assert CODE_INVALID_NAME in _codes(r)
+    text = _messages(r)
+    assert "PW_NAME" not in text
+    assert "alice:" not in text
+    assert "https://example.com/repo.git" in text
+
+
+def test_invalid_plugin_source_with_credentials_is_redacted(tmp_path: Path) -> None:
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "bad", "source": "key=https://alice:PW_SRC@example.com/r.git"}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_INVALID_SOURCE in _codes(r)
+    text = _messages(r)
+    assert "PW_SRC" not in text
+    assert "alice:" not in text
+    assert "https://example.com/r.git" in text
+
+
+def test_remote_source_warning_redacts_url_credentials(tmp_path: Path) -> None:
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "remote", "source": {"source": "url", "url": "https://alice:PW_REMOTE@example.com/r.git"}}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_REMOTE_SOURCE_SKIPPED in _codes(r, "warning")
+    text = _messages(r)
+    assert "PW_REMOTE" not in text
+    assert "alice:" not in text
+    # strict 展示语义：保留 scheme/host/path
+    assert "https://example.com/r.git" in text
+
+
+def test_missing_local_source_redacts_embedded_credentials(tmp_path: Path) -> None:
+    """相对源路径内嵌凭据 URL（rust#154 向量⑤）：rel_path 与解析结果都不得回显凭据。"""
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "ghost", "source": "./x=https://alice:PW_LOCAL@example.com/repo.git"}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_PATH_MISSING in _codes(r)
+    text = _messages(r)
+    assert "PW_LOCAL" not in text
+    assert "alice:" not in text
+    assert _REDACTED in text

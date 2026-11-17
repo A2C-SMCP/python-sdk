@@ -1075,3 +1075,208 @@ async def test_marketplace_nul_url_degrades_without_raising(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "git spawn failed" in text
+
+
+# ── #263 plugin source / staging 回显脱敏（构造期 SkillSourceError + 日志面）────────
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_plugin_source_errors_log_redacts_all_vectors(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """rust#154 五向量：plugin staging 失败日志（name / plugin_name / str(e)）均不得含凭据。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        """{"plugins":[
+            {"name":"ftp","source":{"source":"url","url":"ftp://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT"}},
+            {"name":"prefix","source":"key=https://user:PW_PREFIX@example.com/org/repo.git"},
+            {"name":"scp","source":{"source":"github","repo":"git@example.com:org/repo.git"}},
+            {"name":"x=https://alice:PW_NAME@example.com/repo.git","source":{"source":"url","url":"bogus"}},
+            {"name":"local-leak","source":"./x=https://alice:PW_LOCAL@example.com/repo.git"}
+        ]}""",
+        encoding="utf-8",
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "staging failed, skipped" in text
+    for secret in (
+        "cnb",
+        "FAKE_TOKEN",
+        "QUERY",
+        "FRAGMENT",
+        "user:",
+        "PW_PREFIX",
+        "PW_NAME",
+        "PW_LOCAL",
+        "git@example.com",
+    ):
+        assert secret not in text
+
+
+@pytest.mark.asyncio
+async def test_plugin_entry_missing_name_with_credentials_is_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """entry 缺 name 且 entry 内嵌凭据 URL：日志不得回显整包 entry。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        '{"plugins":[{"source":{"source":"url","url":"https://alice:PW_ENTRY@example.com/r.git"}}]}',
+        encoding="utf-8",
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "plugin entry invalid" in text
+    assert "PW_ENTRY" not in text
+    assert "alice:" not in text
+
+
+@pytest.mark.asyncio
+async def test_plugin_root_not_found_redacts_path_credentials(tmp_path: Path) -> None:
+    """相对源解析出的路径内嵌凭据（rust#154 向量⑤）：「plugin root not found」不得回显凭据。"""
+    catalog_dir = tmp_path / "catalog"
+    catalog_dir.mkdir()
+    with pytest.raises(staging_mod.SkillStagingError) as ei:
+        await staging_mod.locate_plugin_root(
+            "acme",
+            "local-leak",
+            {"source": "./x=https://alice:PW_PATH@example.com/repo.git"},
+            catalog_dir,
+            "./plugins",
+            tmp_path / "home",
+            None,
+        )
+    msg = str(ei.value)
+    assert "PW_PATH" not in msg
+    assert "alice:" not in msg
+
+
+@pytest.mark.asyncio
+async def test_plugin_clone_passes_raw_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """git 入参不变：plugin clone 的 argv 仍是原始凭据 URL（只有展示面脱敏）。"""
+    from a2c_smcp.computer.skills.sources import GitCloneSpec
+
+    captured: dict[str, list[str]] = {}
+
+    async def fake_run_git(args: object, *, timeout: float, env: object) -> str:
+        captured["args"] = list(args)  # type: ignore[arg-type]
+        return "deadbeef" * 5
+
+    monkeypatch.setattr(staging_mod, "_run_git", fake_run_git)
+    await staging_mod._git_clone_plugin(
+        GitCloneSpec(url=_CRED_CLONE_URL), tmp_path / "dest", timeout=5, env=None
+    )
+    assert _CRED_CLONE_URL in captured["args"]
+
+
+# ── #263 / #272：entry 名 / 非对象 entry / 路径穿越 ────────────────────────────
+@pytest.mark.asyncio
+async def test_non_object_plugin_entry_log_is_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """非对象 plugin entry（字符串形态）同样按凭据脱敏后再记日志。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        '{"plugins":["https://alice:PW_ENTRY_RAW@example.com/r.git"]}', encoding="utf-8"
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "non-object plugin entry" in text
+    assert "PW_ENTRY_RAW" not in text
+    assert "alice:" not in text
+
+
+@pytest.mark.parametrize("bad", ["../../evil", "/tmp/evil", "Foo", "a/b", ".hidden", "x" * 65, "tab\tname"])
+def test_entry_plugin_name_rejects_traversal_and_non_kebab(bad: str) -> None:
+    """#272：entry name 直接作路径段（且 clone 前 rmtree）⇒ 必须严格 kebab（协议 §4.1）。"""
+    with pytest.raises(staging_mod.SkillStagingError) as ei:
+        staging_mod._entry_plugin_name({"name": bad})
+    assert "kebab" in str(ei.value)
+
+
+def test_entry_plugin_name_accepts_kebab() -> None:
+    assert staging_mod._entry_plugin_name({"name": "data-toolkit"}) == "data-toolkit"
+
+
+@pytest.mark.asyncio
+async def test_traversal_entry_name_cannot_delete_outside_dir(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """#272 回归锁：恶意 name（绝对路径 / 越界相对路径）不得触发 home 外目录删除。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    # 名字从 `<home>/marketplace/.plugins/acme/` 上跳四级正好落到 `tmp_path`，指向下面的 sentinel 目录。
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        '{"plugins":[{"name":"../../../../sentinel","source":{"source":"url","url":"https://example.com/r.git"}}]}',
+        encoding="utf-8",
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    sentinel = tmp_path / "sentinel"
+    sentinel.mkdir()
+    (sentinel / "keep.txt").write_text("keep", encoding="utf-8")
+
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    assert (sentinel / "keep.txt").is_file()
+    assert "plugin entry invalid" in _no_secret(staging_logs.records)
+
+
+@pytest.mark.asyncio
+async def test_locate_plugin_root_rejects_escaping_install_path(tmp_path: Path) -> None:
+    """#272 纵深防御：即使上游绕过 name 校验，越界 install 路径也在 clone/rmtree 之前被拒。"""
+    catalog_dir = tmp_path / "catalog"
+    catalog_dir.mkdir()
+    with pytest.raises(staging_mod.SkillStagingError) as ei:
+        await staging_mod.locate_plugin_root(
+            "acme",
+            "../../../../escape",
+            {"source": {"source": "url", "url": "https://example.com/r.git"}},
+            catalog_dir,
+            "./plugins",
+            tmp_path / "home",
+            None,
+        )
+    assert "escapes the skill home" in str(ei.value)

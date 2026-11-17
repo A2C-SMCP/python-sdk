@@ -30,12 +30,15 @@ disjoint union，协议 §5.3）的克隆 url 提取见 :func:`marketplace_clone
 
 from __future__ import annotations
 
+import json
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_git_url
+from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, redact_git_urls_in_text
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +46,11 @@ logger = get_logger(__name__)
 # 简写糖归一化目标 host / Shorthand normalization hosts（协议 §5.2.1 / §5.2.4）。
 GITHUB_HOST = "github.com"
 CNB_HOST = "cnb.cool"
+
+# 错误回显时按 git source 处理（strict fail-closed）的字段名 / Source-bearing field names.
+# 这些字段的合法形态就是 URL / ``owner/repo`` 简写；畸形时一律走 :func:`git_url_for_display`
+# （可解析 scheme URL 保留 host/path，其余占位符），避免 ``glpat-...`` 这类裸 token 原样外泄。
+_GIT_SOURCE_FIELDS = frozenset({"url", "repo"})
 
 # 裸名经 metadata.pluginRoot 解析的默认前缀（协议 §3.2）/ Default pluginRoot for bare-name plugin sources.
 DEFAULT_PLUGIN_ROOT = "./plugins"
@@ -54,6 +62,89 @@ _REPO_SHORTHAND_RE = re.compile(r"^[^\s/]+/[^\s/]+$")
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
+# ── 错误展示脱敏 / error-display redaction（#263）───────────────────────────────
+# 嵌套超过该深度即整体按文本脱敏（自引用容器可达——本类接收任意对象，不能假设 JSON 形状）。
+_MAX_ERROR_DEPTH = 8
+
+# 需要转义成可见形式的字符类别（Cc = 控制字符含 ESC/BEL/换行；Cs = 孤立代理项）。
+# 目的：阻止终端转义序列注入（如 OSC 52 改写剪贴板）与日志行伪造；Cf（方向覆盖等）与 rust 口径一致不处理。
+_UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cs"})
+
+
+def _is_source_field(key: object) -> bool:
+    """字段名是否为 git source 字段（大小写不敏感）/ Whether the key names a git source field (case-insensitive)."""
+    return isinstance(key, str) and key.casefold() in _GIT_SOURCE_FIELDS
+
+
+def _escape_unsafe_chars(text: str) -> str:
+    """把控制字符 / 孤立代理项转义为可见形式 / Escape control and surrogate code points for display."""
+    if not any(unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES for ch in text):
+        return text
+    out: list[str] = []
+    for ch in text:
+        if unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES:
+            code = ord(ch)
+            out.append(f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _safe_repr(value: object) -> str:
+    """`repr` 兜底且自身不可抛（深嵌套会让 ``repr`` 再爆 ``RecursionError``）/ Never-raising repr fallback."""
+    try:
+        return redact_git_urls_in_text(repr(value))
+    except Exception:  # noqa: BLE001 - 错误展示路径禁止再抛（含自定义 __repr__ / 超深递归）
+        return REDACTED_GIT_SOURCE
+
+
+def _redact_error_value(value: object, *, source_field: bool = False, depth: int = 0) -> object:
+    """
+    返回可安全嵌入错误文本的值副本 / A display-safe copy of an untrusted value.
+
+    ``source_field`` 为真（``url`` / ``repo``，大小写不敏感）时走
+    :func:`~a2c_smcp.utils.git_url.git_url_for_display` 的 strict fail-closed：可解析 scheme URL 保留
+    scheme/host/path 并去掉 userinfo / query / fragment，其余形态（scp-like / opaque / 不支持 scheme /
+    裸 token）整体占位符；字段标记向容器元素传播（``{"url": ["..."]}`` 同样 strict）。其余键值走散文
+    token 级脱敏（与 rust ``redact_git_urls_in_text`` 同语义，合法的 kebab 名 / 相对路径逐字保留）。
+    **字典键同样脱敏**：键名由配置作者任意指定，同属不可信回显面。
+    """
+    if isinstance(value, str):
+        return git_url_for_display(value) if source_field else redact_git_urls_in_text(value)
+    if depth >= _MAX_ERROR_DEPTH:
+        return _safe_repr(value)
+    if isinstance(value, Mapping):
+        return {
+            (redact_git_urls_in_text(key) if isinstance(key, str) else key): _redact_error_value(
+                item,
+                source_field=source_field or _is_source_field(key),
+                depth=depth + 1,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_error_value(item, source_field=source_field, depth=depth + 1) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    # 非 JSON 原生对象：`repr` 后仍过散文脱敏（避免未脱敏文本经序列化写进结果）。
+    return _safe_repr(value)
+
+
+def _redacted_source_display(raw: object) -> str:
+    """把不可信 source 渲染为紧凑、已脱敏的错误回显文本 / Compact redacted echo of an untrusted source."""
+    if isinstance(raw, str):
+        return _escape_unsafe_chars(redact_git_urls_in_text(raw))
+    try:
+        # 每个字符串值/键已在 _redact_error_value 内脱敏；此处**不再**对整段 JSON 做散文脱敏——
+        # token 边界是空白，JSON 的引号/逗号会被吞进 URL token 而把回显改写成 percent-encoded 乱码。
+        # ``allow_nan=False``：NaN/Infinity 不是合法 JSON，回退 repr 更诚实。
+        text = json.dumps(_redact_error_value(raw), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):  # 非常规容器（如 tuple 键）/ 非有限浮点 / 循环引用 → repr 兜底
+        return _safe_repr(raw)
+    # 兜底转义：JSON 字符串已转义 Cc，这里只可能命中孤立代理项（输出 ``\uXXXX``，仍是合法 JSON）。
+    return _escape_unsafe_chars(text)
+
+
 class SkillSourceError(ValueError):
     """
     plugin / marketplace source 形态非法 / Malformed plugin or marketplace source.
@@ -63,12 +154,18 @@ class SkillSourceError(ValueError):
     （marketplace source 解析失败属本地配置问题，非协议错误码语义）。
     Caught by staging and handled per the failure-isolation rule (logged ERROR, not registered, does
     not block other sources). Carries no protocol code.
+
+    安全（#263）/ Security：脱敏在**构造期**完成（对齐 rust `SkillSourceError::new`）——``raw`` 与
+    ``reason`` 存的是已脱敏文本，``str(e)`` / traceback / 日志 / ``plugin validate`` 诊断因此自动安全，
+    消费者无需各自打补丁。``raw`` 口径为紧凑 JSON（对象形态）或原字符串（字符串形态），与 rust 同形。
+    Redaction happens at construction time: ``raw`` and ``reason`` hold already-redacted text, so every
+    consumer (logs, validator diagnostics, CLI errors, tracebacks) is safe without extra patches.
     """
 
     def __init__(self, raw: object, reason: str) -> None:
-        self.raw = raw
-        self.reason = reason
-        super().__init__(f"invalid skill source {raw!r}: {reason}")
+        self.raw: str = _redacted_source_display(raw)
+        self.reason: str = _escape_unsafe_chars(redact_git_urls_in_text(reason))
+        super().__init__(f"invalid skill source {self.raw}: {self.reason}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +241,7 @@ def normalize_repo_shorthand(repo: str, host: str) -> str:
     Used by ``github`` / ``cnb`` (same normalization). Raises if ``repo`` is not a two-segment shorthand.
     """
     if not isinstance(repo, str) or not _is_repo_shorthand(repo.strip()):
-        raise SkillSourceError(repo, f"'repo' must be an '<owner>/<repo>' shorthand, not a full URL (got {repo!r})")
+        raise SkillSourceError(repo, f"'repo' must be an '<owner>/<repo>' shorthand, not a full URL (got {git_url_for_display(repo)})")
     r = repo.strip().removesuffix(".git")
     return f"https://{host}/{r}.git"
 
@@ -201,7 +298,7 @@ def resolve_plugin_source(raw: object, *, plugin_root: str = DEFAULT_PLUGIN_ROOT
     if kind == "url":
         url = _require_str(raw, "url")
         if not is_valid_git_url(url):
-            raise SkillSourceError(dict(raw), f"'url' is not a well-formed git url (got {url!r})")
+            raise SkillSourceError(dict(raw), f"'url' is not a well-formed git url (got {git_url_for_display(url)})")
         ref, sha = _extract_ref_sha(raw)
         return GitCloneSpec(url=url, ref=ref, sha=sha)
     if kind == "github":
@@ -240,5 +337,5 @@ def marketplace_clone_url(source: object) -> str:
         raise SkillSourceError(dict(source), f"marketplace source 'type' must be 'git' (got {stype!r})")
     url = source.get("url")
     if not isinstance(url, str) or not is_valid_git_url(url):
-        raise SkillSourceError(dict(source), f"marketplace source 'url' is not a well-formed git url (got {url!r})")
+        raise SkillSourceError(dict(source), f"marketplace source 'url' is not a well-formed git url (got {git_url_for_display(url)})")
     return url

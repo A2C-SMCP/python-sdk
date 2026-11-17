@@ -863,3 +863,73 @@ def test_list_available_json_stdout_stays_pure(tmp_path: Path, capsys: pytest.Ca
     rows = json.loads(out)  # stdout 可整体解析 = 纯 JSON
     assert rows[0]["id"] == "audit@acme"
     assert "deprecated" not in out
+
+
+# ── #263 plugin source 非法：结构化错误 + 脱敏（无 traceback）─────────────────────
+def _seed_bad_source_catalog(home: Path, *, source: object) -> None:
+    """造一个 catalog，其 plugin entry 的 source 非法（可携带凭据）。"""
+    catalog = marketplace_skill_dir(home, "acme")
+    _write_json(
+        catalog / ".tfrobot-plugin" / "marketplace.json",
+        {
+            "name": "acme",
+            "owner": {"name": "X"},
+            "metadata": {"pluginRoot": "./plugins"},
+            "plugins": [{"name": "audit", "source": source}],
+        },
+    )
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"]["acme"] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}
+    save_known_marketplaces(known, home=home)
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_source_json_error_is_redacted_and_rolls_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """非法 source（含凭据）→ 结构化 JSON 错误（非 traceback），消息脱敏，且「失败 = 零变更」。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source="key=https://alice:PW_CLI@example.com/r.git")
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme", json_output=True)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "PW_CLI" not in out
+    assert "alice:" not in out
+    payload = json.loads(out)
+    assert "https://example.com/r.git" in payload["message"]
+    assert "source invalid" in payload["message"]
+    # 原子回滚：不留下安装意图
+    assert "audit@acme" not in load_installed_plugins(home=home, env=env)["plugins"]
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_source_human_error_is_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """人类可读路径同一口径：红字错误、无 traceback、无凭据。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "url", "url": "glpat-SECRET_TOKEN"})
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "glpat-SECRET_TOKEN" not in out
+    assert "source invalid" in out
+
+
+@pytest.mark.asyncio
+async def test_install_invalid_source_with_rich_markup_does_not_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 回归锁：source 文本里的 rich 标记（如 `[/red]`）不得让结构化错误路径抛 MarkupError。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(
+        home, source={"source": "url", "url": "bogus", "note": "[/red][link=https://evil]x[/link]"}
+    )
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "source invalid" in out
+    assert "[/red]" in out  # 作为字面文本渲染，而非被 rich 解析
