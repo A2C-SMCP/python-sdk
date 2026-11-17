@@ -176,7 +176,7 @@ class _Collector:
                 code=code,
                 file=sanitize_path_for_diagnostics(file),
                 location=sanitize_path_for_diagnostics(location),
-                message=redact_git_urls_in_text(message),
+                message=sanitize_path_for_diagnostics(redact_git_urls_in_text(message)),
                 severity=severity,
             )
         )

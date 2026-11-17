@@ -304,3 +304,42 @@ def test_lone_surrogate_fails_closed_without_crashing() -> None:
     out = redact_git_urls_in_text(f"x {raw} y")
     assert REDACTED_GIT_SOURCE in out
     assert "\ud800" not in out
+
+
+# ── #263 复审：路径诊断轴与散文脱敏的非破坏性 / path diagnostics ──────────────────
+def test_path_sanitizer_masks_userinfo_segment() -> None:
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("plugins/x=https:.//alice:PW@example.com/repo.git/f") == "plugins/x=https:.//<redacted-source>/repo.git/f"
+
+
+def test_path_sanitizer_keeps_legit_at_names() -> None:
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("plugins/alice@corp/repo") == "plugins/alice@corp/repo"
+    assert P("C:\\Users\\alice@corp\\repo") == "C:\\Users\\alice@corp\\repo"
+
+
+def test_path_sanitizer_masks_query_and_remaining_tail() -> None:
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    # query 值里可以再出现分隔符：从 `?` 起余下整条路径都要遮蔽（逐段判定会漏尾段）
+    out = P("plugins/x=https:/h/r.git?token=SECRET/extra/skills")
+    assert "SECRET" not in out and "extra" not in out and "skills" not in out
+    assert out.startswith("plugins/x=https:/h/r.git<redacted-source>")
+
+
+def test_path_sanitizer_escapes_control_characters() -> None:
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    out = P("plugins/\x1b]52;c;ZXZpbA==\x07evil/SKILL.md")
+    assert "\x1b" not in out and "\x07" not in out
+    assert "\\x1b" in out
+
+
+def test_prose_redaction_keeps_display_safe_urls() -> None:
+    """正对照（#263 复审）：path 里含 `@` 的合法 URL 已由 strict 展示，散文脱敏不得再吞成占位符。"""
+    from a2c_smcp.utils.git_url import redact_git_urls_in_text
+
+    text = "see file:///home/alice@corp/repo.git and https://example.com/org/repo@2.git"
+    assert redact_git_urls_in_text(text) == text

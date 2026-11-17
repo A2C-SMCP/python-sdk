@@ -564,7 +564,14 @@ async def stage_mcp_skills(
                     subs = [r for r in resources if _is_under(str(r.uri), root_uri)]
                     await _materialize_resources(partial(manager.read_resource, bid), root_uri, subs, staged)
             except Exception as e:
-                logger.error("materialize failed for %s (mode=%s): %s", root_uri, mode, e, exc_info=True)
+                # #263：与 plugin 级兜底同款——`exc_info=True` 的 traceback 由 logging 直接渲染、无法脱敏。
+                logger.error(
+                    "materialize failed for %s (mode=%s): %s\n%s",
+                    sanitize_path_for_diagnostics(root_uri),
+                    mode,
+                    redact_git_urls_in_text(str(e)),
+                    redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__))),
+                )
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
 

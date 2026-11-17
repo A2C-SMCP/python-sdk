@@ -36,6 +36,7 @@ git URL 展示脱敏单一权威（python-sdk#261）/ Git URL display redaction,
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Sequence
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -234,6 +235,12 @@ def _redact_scp_like_sources(text: str) -> str:
             if rest[index].isspace():
                 end = index
                 break
+        if "://" in rest[start:end]:
+            # 已由 `_redact_scheme_urls` 处理过的 scheme token（含 path 里的 `@`，如
+            # `file:///home/alice@corp/repo.git`）：再按 scp-like 处理会把**展示安全**的 URL 吞成占位符。
+            out.append(rest[: at + 1])
+            rest = rest[at + 1 :]
+            continue
         userinfo = rest[start:at]
         destination = rest[at + 1 : end]
         colon = destination.find(":")
@@ -262,26 +269,69 @@ def redact_git_urls_in_text(text: str) -> str:
     return _redact_scp_like_sources(_redact_scheme_urls(text))
 
 
-# 诊断路径片段的「可疑标记」：``@``（userinfo / scp-like）、``?`` / ``#``（query / fragment）。
-# 说明：source 串经 :func:`_norm_rel_segments` 归一后 ``://`` 会坍缩成 ``:/``（不再是 URL token），
-# 通用散文脱敏抓不到；路径轴（``ValidationIssue.file`` / ``checked`` / 日志里的落盘路径）因此改用
-# **逐段遮蔽**：片段内出现任一标记即整体替换为占位符（宁可少显示，不可回显凭据）。
-_SUSPECT_PATH_MARKERS = ("@", "?", "#", "://")
+# 会被转义成可见形式的字符类别（Cc = 控制字符含 ESC/BEL/换行；Cs = 孤立代理项）。#263：终端转义注入
+# （OSC 52 改写剪贴板）与日志行伪造的根源；Cf（方向覆盖等）与 rust 口径一致不处理。
+_UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cs"})
+
+# userinfo 形态片段：`user:secret@`（要求 `@` 前存在 `:`，避免误伤 `alice@corp` 这类合法路径名）。
+_USERINFO_SEGMENT_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
+
+
+def escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
+    """
+    把控制字符 / 孤立代理项转义为可见形式 / Escape control and surrogate code points for display.
+
+    ``json_safe=True`` 时统一用 ``\\uXXXX``（``\\xNN`` 不是合法 JSON 转义——DEL 0x7f / C1 0x80-0x9f
+    不会被 :func:`json.dumps` 转义，混进 JSON 形态的 raw 会产出无法解析的文本）。
+    """
+    if not any(unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES for ch in text):
+        return text
+    out: list[str] = []
+    for ch in text:
+        if unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES:
+            code = ord(ch)
+            out.append(f"\\u{code:04x}" if json_safe or code > 0xFF else f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def sanitize_path_for_diagnostics(path: str) -> str:
     """
-    诊断用路径脱敏：逐段遮蔽携带 URL / 凭据标记的片段 / Mask URL-ish path segments for diagnostics.
+    诊断用路径脱敏：逐段遮蔽携带凭据的片段 / Mask credential-bearing path segments for diagnostics.
 
-    仅用于**展示**（validator 的 ``file`` / ``checked``、staging 日志里的落盘路径）；不得用于文件系统
-    访问。合法 kebab / 普通路径逐字保留。
+    仅用于**展示**（validator 的 ``file`` / ``checked`` / ``message``、日志里的落盘路径），**不得**用于
+    文件系统访问。规则（#263 复审修正）：
+
+    - 控制字符 / 孤立代理项先按 :func:`escape_unsafe_chars` 转义（仓库可控目录名不得注入终端序列）；
+    - 分隔符 ``/`` 与 ``\\`` 都视为段边界（Windows 路径不得整条被吞）；
+    - 段内含 userinfo 形态（``user:secret@``，要求 ``@`` 前有 ``:``）→ 整段遮蔽；
+    - 一旦出现 ``?`` / ``#``（query / fragment 起点）→ 从该字符起把**余下整条路径**遮蔽（query 值里
+      可以再出现分隔符，逐段判定会漏掉尾段）。
+
+    合法 kebab / 普通路径（含 ``alice@corp`` 这类文件名）逐字保留。
     """
-    if not any(marker in path for marker in _SUSPECT_PATH_MARKERS):
-        return path
-    return "/".join(
-        "<redacted-source>" if segment and any(marker in segment for marker in _SUSPECT_PATH_MARKERS) else segment
-        for segment in path.split("/")
-    )
+    escaped = escape_unsafe_chars(path)
+    if not any(marker in escaped for marker in ("@", "?", "#")):
+        return escaped
+    parts = re.split(r"([/\\])", escaped)
+    out: list[str] = []
+    tail_masked = False
+    for index, part in enumerate(parts):
+        if index % 2 == 1:  # 分隔符原样保留
+            out.append(part)
+            continue
+        if tail_masked:
+            if part:
+                out.append("<redacted-source>")
+            continue
+        cut = min((pos for pos in (part.find("?"), part.find("#")) if pos >= 0), default=-1)
+        if cut >= 0:
+            out.append(part[:cut] + "<redacted-source>")
+            tail_masked = True
+            continue
+        out.append("<redacted-source>" if _USERINFO_SEGMENT_RE.search(part) else part)
+    return "".join(out)
 
 
 def sanitize_git_text(text: str, args: Sequence[str]) -> str:

@@ -32,13 +32,17 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_git_url
-from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, redact_git_urls_in_text
+from a2c_smcp.utils.git_url import (
+    REDACTED_GIT_SOURCE,
+    escape_unsafe_chars,
+    git_url_for_display,
+    redact_git_urls_in_text,
+)
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -66,33 +70,10 @@ _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # 嵌套超过该深度即整体按文本脱敏（自引用容器可达——本类接收任意对象，不能假设 JSON 形状）。
 _MAX_ERROR_DEPTH = 8
 
-# 需要转义成可见形式的字符类别（Cc = 控制字符含 ESC/BEL/换行；Cs = 孤立代理项）。
-# 目的：阻止终端转义序列注入（如 OSC 52 改写剪贴板）与日志行伪造；Cf（方向覆盖等）与 rust 口径一致不处理。
-_UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cs"})
-
 
 def _is_source_field(key: object) -> bool:
     """字段名是否为 git source 字段（大小写不敏感）/ Whether the key names a git source field (case-insensitive)."""
     return isinstance(key, str) and key.casefold() in _GIT_SOURCE_FIELDS
-
-
-def _escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
-    """
-    把控制字符 / 孤立代理项转义为可见形式 / Escape control and surrogate code points for display.
-
-    ``json_safe=True`` 时统一用 ``\\uXXXX``（``\\xNN`` 不是合法 JSON 转义——DEL 0x7f / C1 0x80-0x9f
-    不会被 :func:`json.dumps` 转义，混进 JSON 形态的 ``raw`` 会产出无法解析的文本）。
-    """
-    if not any(unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES for ch in text):
-        return text
-    out: list[str] = []
-    for ch in text:
-        if unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES:
-            code = ord(ch)
-            out.append(f"\\u{code:04x}" if json_safe or code > 0xFF else f"\\x{code:02x}")
-        else:
-            out.append(ch)
-    return "".join(out)
 
 
 def _safe_repr(value: object) -> str:
@@ -143,7 +124,7 @@ def redact_source_display(raw: object) -> str:
     路径塞进消息（``://`` 会被路径归一折叠成 ``/``，token 级脱敏随即失效）。
     """
     if isinstance(raw, str):
-        return _escape_unsafe_chars(redact_git_urls_in_text(raw))
+        return escape_unsafe_chars(redact_git_urls_in_text(raw))
     try:
         # 每个字符串值/键已在 _redact_error_value 内脱敏；此处**不再**对整段 JSON 做散文脱敏——
         # token 边界是空白，JSON 的引号/逗号会被吞进 URL token 而把回显改写成 percent-encoded 乱码。
@@ -153,7 +134,7 @@ def redact_source_display(raw: object) -> str:
         return _safe_repr(raw)
     # 兜底转义：JSON 字符串已转义 Cc(<0x20)，命中量只剩孤立代理项 / DEL / C1——必须用 ``\uXXXX``
     # 才能保持合法 JSON（``\x7f`` / ``\x9b`` 不是 JSON 转义）。
-    return _escape_unsafe_chars(text, json_safe=True)
+    return escape_unsafe_chars(text, json_safe=True)
 
 
 class SkillSourceError(ValueError):
@@ -175,7 +156,7 @@ class SkillSourceError(ValueError):
 
     def __init__(self, raw: object, reason: str) -> None:
         self.raw: str = redact_source_display(raw)
-        self.reason: str = _escape_unsafe_chars(redact_git_urls_in_text(reason))
+        self.reason: str = escape_unsafe_chars(redact_git_urls_in_text(reason))
         super().__init__(f"invalid skill source {self.raw}: {self.reason}")
 
 

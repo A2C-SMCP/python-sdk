@@ -214,6 +214,10 @@ def test_json_file_axis_redacts_credential_source_dir(tmp_path: Path, capsys: py
     assert "PW_FILE" not in out
     data = json.loads(out)
     assert any(i["code"] == CODE_PLUGIN_MANIFEST_MISSING for i in data["warnings"])
+    assert data["checked_files"], "夹具应至少检查过文件（否则下面的否定断言恒真）"
+    assert any("<redacted-source>" in i["file"] for i in data["errors"] + data["warnings"])
     for issue in data["errors"] + data["warnings"]:
         assert "PW_FILE" not in issue["file"] and "alice:" not in issue["file"]
+        assert "PW_FILE" not in issue["message"] and "alice:" not in issue["message"]
     assert all("PW_FILE" not in f for f in data["checked_files"])
+    assert any("<redacted-source>" in f for f in data["checked_files"])

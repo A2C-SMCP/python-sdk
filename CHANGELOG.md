@@ -455,7 +455,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
-  - 复审补口（同一 PR）：`ValidationIssue.file` / `checked` 两条路径轴在 `_Collector` **单一漏斗**脱敏
+  - 复审补口（同一 PR，二轮）：validator 的 `message` 轴同样过路径级遮蔽（`_Collector.add()` 单一漏斗）；
+    `sanitize_path_for_diagnostics` 修正——`/` 与 `\` 都算段边界、query/fragment 从首个 `?`/`#` 起遮蔽余下整条
+    路径、仅遮蔽 userinfo 形态（`user:secret@`）不再误伤 `alice@corp`、控制字符先转义；
+    散文脱敏跳过已含 `://` 的 token（`file:///home/alice@corp/repo.git` 这类展示安全 URL 不再被吞）；
+    `PluginManifestError` 消息与 `stage_mcp_skills` 物化失败分支（原 `exc_info=True`）同口径脱敏。
+  - 复审补口（同一 PR，一轮）：`ValidationIssue.file` / `checked` 两条路径轴在 `_Collector` **单一漏斗**脱敏
     （`sanitize_path_for_diagnostics` 逐段遮蔽 `@` / `?` / `#` 片段）；消息一律用**归一化前**的原始 source
     回显（`://` 被路径归一折叠成 `:/` 后 URL 规则会失效，query / fragment 因而漏出）；staging 兜底
     `except Exception` 的 traceback 改为「格式化后整体脱敏」输出（`exc_info=True` 绕不过 logging）；

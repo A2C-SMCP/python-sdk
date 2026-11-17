@@ -69,9 +69,9 @@ def _read_json_object(path: Path, *, what: str) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
-        raise PluginManifestError(f"{what} unreadable/invalid at {path}: {e}") from e
+        raise PluginManifestError(f"{what} unreadable/invalid at {sanitize_path_for_diagnostics(str(path))}: {e}") from e
     if not isinstance(data, dict):
-        raise PluginManifestError(f"{what} root is not an object: {path}")
+        raise PluginManifestError(f"{what} root is not an object: {sanitize_path_for_diagnostics(str(path))}")
     return data
 
 
@@ -80,7 +80,7 @@ def read_marketplace_manifest(catalog_dir: Path) -> dict[str, Any]:
     """读 ``<catalog>/.tfrobot-plugin/marketplace.json``（缺失/损坏 → 抛）/ Read the marketplace manifest (raise if absent)。"""
     path = catalog_dir / MARKETPLACE_MANIFEST_DIR / MARKETPLACE_MANIFEST
     if not path.is_file():
-        raise PluginManifestError(f"marketplace manifest not found: {path}")
+        raise PluginManifestError(f"marketplace manifest not found: {sanitize_path_for_diagnostics(str(path))}")
     return _read_json_object(path, what="marketplace manifest")
 
 
@@ -266,10 +266,13 @@ def parse_bundled_server(path: Path) -> MCPServerConfig:
     try:
         cfg = _MCP_SERVER_ADAPTER.validate_python(data)
     except ValidationError as e:
-        raise PluginManifestError(f"invalid MCP server config at {path}: {e}") from e
+        raise PluginManifestError(
+            f"invalid MCP server config at {sanitize_path_for_diagnostics(str(path))}: {e}"
+        ) from e
     if cfg.name != path.stem:
         raise PluginManifestError(
-            f"bundled MCP server filename stem {path.stem!r} != config name {cfg.name!r} at {path} "
+            f"bundled MCP server filename stem {path.stem!r} != config name {cfg.name!r} "
+            f"at {sanitize_path_for_diagnostics(str(path))} "
             "(mcp-servers protocol §1: filename = server identity)",
         )
     return cfg

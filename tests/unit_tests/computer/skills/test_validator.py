@@ -25,6 +25,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from a2c_smcp.computer.skills.validator import (
     CODE_DUPLICATE_PLUGIN_NAME,
     CODE_DUPLICATE_SKILL,
@@ -506,3 +508,66 @@ def test_issue_file_axis_redacts_credential_path(tmp_path: Path) -> None:
         assert "PW_FILE" not in issue.message
     for checked in r.checked:
         assert "PW_FILE" not in checked
+
+
+# ── 复审第二轮：message 轴 + 正对照 ─────────────────────────────────────────────
+def test_issue_message_axis_redacts_path_from_deep_check(tmp_path: Path) -> None:
+    """深检报错（bundled server / plugin.json）的 message 内嵌路径时也不得带 query / fragment。"""
+    bad = "x=https:/h/r.git?token=SECRET#frag"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    p = root / "plugins" / bad
+    (p / ".tfrobot-plugin").mkdir(parents=True)
+    (p / ".tfrobot-plugin" / "plugin.json").write_text('{"name":"audit"}', encoding="utf-8")
+    (p / "mcp-servers").mkdir()
+    (p / "mcp-servers" / "bad.json").write_text("{ broken", encoding="utf-8")
+    (p / "skills" / "etl").mkdir(parents=True)
+    (p / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    r = validate_path(root)
+    text = _messages(r)
+    assert "token=SECRET" not in text
+    assert "#frag" not in text
+    # 正对照：确实产出了深检诊断（否则以上否定断言恒真）
+    assert any(i.code == CODE_INVALID_MCP_SERVER for i in r.issues), [i.code for i in r.issues]
+
+
+def test_file_and_checked_axis_positive_control(tmp_path: Path) -> None:
+    """正对照：file / checked 轴确实拿到了遮蔽值（否定断言不能靠「轴为空」蒙混）。"""
+    bad = "x=https:.//alice:PW_POS@example.com/repo.git"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    p = root / "plugins" / bad
+    (p / "skills" / "etl").mkdir(parents=True)
+    (p / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    r = validate_path(root)
+    assert r.checked, "夹具应至少检查过文件"
+    assert any("<redacted-source>" in i.file for i in r.issues), [i.file for i in r.issues]
+    assert any("<redacted-source>" in f for f in r.checked), list(r.checked)
+
+
+def test_collector_add_sanitizes_message_and_file(tmp_path: Path) -> None:
+    """`_Collector.add()` 是诊断三轴的兜底出口：新增诊断点即使直接塞归一化路径也不会泄漏。"""
+    from a2c_smcp.computer.skills.validator import _Collector
+
+    c = _Collector(tmp_path)
+    bad = "plugins/x=https:/h/r.git?token=SECRET#frag"
+    c.add("x-code", bad, bad, f"cannot read {bad}: boom")
+    issue = c.result.issues[0]
+    assert "token=SECRET" not in issue.message
+    assert "token=SECRET" not in issue.file
+    assert "token=SECRET" not in issue.location
+
+
+def test_manifest_error_message_redacts_credential_path(tmp_path: Path) -> None:
+    """manifest 层（PluginManifestError）自身的 message 也要遮蔽路径里的 query / fragment。"""
+    from a2c_smcp.computer.skills.manifest import PluginManifestError, parse_bundled_server
+
+    bad_dir = tmp_path / "x=https:/h/r.git?token=SECRET#frag"
+    bad_dir.mkdir(parents=True)
+    bad = bad_dir / "srv.json"
+    bad.write_text("{ broken", encoding="utf-8")
+    with pytest.raises(PluginManifestError) as ei:
+        parse_bundled_server(bad)
+    msg = str(ei.value)
+    assert "token=SECRET" not in msg
+    assert "#frag" not in msg

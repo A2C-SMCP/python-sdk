@@ -1391,5 +1391,59 @@ async def test_unexpected_staging_error_traceback_is_redacted(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "unexpected staging error" in text
+    # 正对照：traceback 本身必须仍在日志里（脱敏不能靠「整段丢弃」蒙混）
+    assert "Traceback (most recent call last)" in text and "RuntimeError" in text
     assert "PW_TRACE" not in text
+    assert "token=QUERY" not in text
+
+
+@pytest.mark.asyncio
+async def test_plugin_root_message_redacts_query_fragment_without_userinfo(tmp_path: Path) -> None:
+    """staging 侧同样要以原始 source 回显：向量**不含 userinfo**（否则 scp-like 兜底会掩盖问题）。"""
+    catalog_dir = tmp_path / "catalog"
+    catalog_dir.mkdir()
+    with pytest.raises(staging_mod.SkillStagingError) as ei:
+        await staging_mod.locate_plugin_root(
+            "acme",
+            "ghost",
+            {"source": "./x=https://example.com/repo.git?token=QUERY#frag"},
+            catalog_dir,
+            "./plugins",
+            tmp_path / "home",
+            None,
+        )
+    msg = str(ei.value)
+    assert "token=QUERY" not in msg
+    assert "#frag" not in msg
+
+
+@pytest.mark.asyncio
+async def test_mcp_materialize_failure_traceback_is_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """#263 复审：`stage_mcp_skills` 物化失败分支的 traceback 同样不得带凭证（fetcher 的 archive URL）。"""
+    res = Resource(
+        uri="skill://host/my-skill/SKILL.md",  # type: ignore[arg-type]
+        name="my-skill",
+        mimeType="text/markdown",
+        _meta={"source": "archive", "archive_uri": "https://alice:PW_ARCH@example.com/s.tar.gz?token=QUERY", "archive_format": "tar.gz"},
+    )
+
+    class BoomManager(FakeManager):
+        async def read_resource(self, server: str, uri: str) -> ReadResourceResult:
+            raise RuntimeError("unused")
+
+    async def boom_fetch(url: str):
+        raise RuntimeError(f"download failed for {url}")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(
+        BoomManager([("bid", res)]), SkillRegistry(), home, archive_fetch=boom_fetch
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "materialize failed" in text
+    assert "Traceback (most recent call last)" in text  # 正对照：traceback 仍在
+    assert "PW_ARCH" not in text
     assert "token=QUERY" not in text
