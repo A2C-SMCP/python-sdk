@@ -179,10 +179,14 @@ _NAME_VECTORS: list[tuple[str, str | None]] = [
     ("https://example.com/alice:PW@example.com", None),
     ("git@host:alice:PW_LEAK@example.com", None),
     ("https://host/repo:tag", None),
-    # 等价变体：percent-encoded / 全角分隔符同样挡（NFKC + unquote 后再判）
+    # 等价变体：percent-encoded / 全角分隔符 / 双重编码 / percent-encoded 全角 同样挡
     ("https://host/alice%3APW%40example.com", None),
     ("git@host:alice%3APW%40example.com", None),
     ("https://host/alice：PW＠example.com", None),
+    ("https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com", None),
+    ("https://host/alice%253APW_LEAK%2540example.com", None),
+    # 入参先 strip（与 normalize_marketplace_url 一致；is_valid_git_url 本身不 strip）
+    ("  https://host/repo  ", "repo"),
     # 尾点 FQDN 正常派生
     ("https://example.com./team/repo.git", "repo"),
     # 无 path（只有 host）→ None（用户 2026-11-17 拍板，不再派生 host 名）
@@ -810,13 +814,14 @@ async def test_add_clone_failure_error_redacted(
 
 @pytest.mark.asyncio
 async def test_add_name_derivation_error_redacted(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """派生名失败错误同样去凭据（strict 展示，不回显原串 userinfo）。"""
+    """派生名失败错误同样去凭据：尾段 ``@@@`` 命中凭据样判据 → 整体占位符（#270）。"""
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
     code = await marketplace_add(reg, home, env, "https://user:FAKE_TOKEN@example.com/@@@", trust=True, json_output=True)
     assert code == 1
     out = capsys.readouterr().out
     assert "FAKE_TOKEN" not in out
-    assert "https://example.com/@@@" in out
+    assert REDACTED_GIT_SOURCE in out
+    assert "example.com" not in out
 
 
 # ── #270 hostless URL / 派生名入账 / hostless + derived-name flows ─────────────
@@ -842,6 +847,28 @@ async def test_add_hostless_url_rejected_even_with_name(
     assert REDACTED_GIT_SOURCE in out
     assert "evil" not in _load_trusted(env), "URL 校验失败不得写 trust"
     assert load_known_marketplaces(home, env).get("marketplaces") in (None, {}), "不得写 known_marketplaces"
+    assert not user_settings_path(env).exists(), "user settings（trust 落盘）不得被创建"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ssh://-/alice:PW_LEAK@example.com",  # junk host：URL 校验失败文案
+        "https://host/alice:PW_LEAK@example.com",  # 合法 host、凭据在 path：派生名失败文案
+        "https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com",  # percent-encoded 全角分隔符
+    ],
+)
+async def test_add_error_message_never_echoes_path_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], url: str
+) -> None:
+    """#270：错误 / 提示文案不得回显 path 段里的凭据样文本（展示层保留 path，须再挡一次）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    code = await marketplace_add(reg, home, env, url, trust=True, no_clone=True, json_output=True)
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert REDACTED_GIT_SOURCE in out
 
 
 @pytest.mark.asyncio

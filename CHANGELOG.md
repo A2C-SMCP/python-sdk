@@ -528,12 +528,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     的 host**——拒绝 `ssh:///alice:PW@example.com`、`git:///x`、`https:///x`、`ssh://user@:22/path`，
     以及把 host 槽位填成非主机占位串的变体（空白 / `-` / `_` / `%20` / 纯点，如 `ssh:// /alice:PW@x`）；
     `file:` 一律不要求 host（`file:///abs/path`、`file://host/path` 均合法）；scp-like 形态不变。
-    非法端口 / 畸形 netloc 一并 fail-closed（比展示层 `git_url_for_display` 更严：展示层仍可展示
-    `ssh://-/x`，校验不认它）。percent-encoded host（`https://ex%61mple.com/x`）有意拒绝；下划线 host、
-    子域、IDN（IDNA 归一）、尾点 FQDN（`example.com.`）、IPv6 字面量（含 zone-id）仍合法。既有消费者
-    （`validate_settings`、plugin source 解析、`marketplace_clone_url`）随之 fail-closed。新增公开谓词
-    `settings.is_scp_like_git_url()`（仅形态分类，合法性仍走 `is_valid_git_url`）；scp-like 形态改按
-    整串匹配判定（尾随换行不再视为合法）。
+    非法端口 / 畸形 netloc 一并 fail-closed（`file:` 除外——file 全例外，`file://C:\repos\repo` 保持合法；
+    比展示层 `git_url_for_display` 更严：展示层仍可展示 `ssh://-/x`，校验不认它）。percent-encoded host
+    （`https://ex%61mple.com/x`）有意拒绝；下划线 host、子域、IDN（IDNA 归一）、尾点 FQDN
+    （`example.com.`）、IPv6 字面量（含 zone-id）仍合法。既有消费者（`validate_settings`、plugin source
+    解析、`marketplace_clone_url`）随之 fail-closed。新增公开谓词 `settings.is_scp_like_git_url()`
+    （仅形态分类，合法性仍走 `is_valid_git_url`）；scp-like 形态改按整串匹配判定（尾随换行不再视为合法）。
   - **派生名改解析式**（`marketplace.default_marketplace_name`）：只取解析后 **path 的末段**——userinfo /
     query / fragment 不再参与命名（`https://host/repo?token=SECRET` → `repo`，此前 `repo-token-secret`；
     `git@host:o/r?token=SECRET` → `r`）。末段含 userinfo/密码分隔符（`@` / `:`，如
@@ -541,6 +541,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     （`alice%3APW%40host`、全角 `：`/`＠` 等价变体一并挡）——凭据样文本交给 `--name` 显式命名。
     无 path（`https://host`；`https://github.com` 此前派生 `github-com`）、hostless / junk host、非法、
     末段构不成严格 kebab → `None`，CLI 提示 `--name`。scp-like 多冒号取最后一个 `:`（与 rust 一致）。
+    另有界两次 percent-decode 后再判，挡住 `%253A` 双重编码与 percent-encoded 全角分隔符
+    （`%EF%BC%9A` / `%EF%BC%A0`）。
+  - **错误 / 提示文案不再回显 path 段凭据**：`marketplace add` 的失败文案在 #261 展示脱敏之上再挡一层
+    （`ssh://-/alice:PW@x`、`https://host/alice:PW@x` → `<redacted-git-source>`）。
   - **只防新增**：存量已落盘的凭据 slug 不自动删除 / 改名（迁移归 #268 / #260）；`marketplace remove`
     与 `--name` 显式命名不受影响；`--name` 不能绕过 URL 校验（校验先于命名）。
   - 存储与 git argv 保持原始 URL（raw 保真），展示脱敏（#261）不变。

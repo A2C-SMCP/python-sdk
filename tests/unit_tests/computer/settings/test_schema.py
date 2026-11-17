@@ -81,9 +81,13 @@ from a2c_smcp.computer.settings.schema import (
         # percent-encoded host / 非法 IPv6：fail-closed（有意拒绝，见 CHANGELOG）
         ("https://ex%61mple.com/x", False),
         ("ssh://[a:b]/x", False),
+        # file: 全例外——端口形态也不校验（`file://C:\repos\repo` 在收紧前一直合法）
+        ("file://C:\\repos\\repo", True),
         # 非法端口 / 畸形 IPv6：fail-closed（比展示层更严）
         ("https://host:abc/x", False),
         ("file://[bad", False),
+        # scp-like 按整串判定：尾随换行不再视为合法
+        ("git@host:p\n", False),
         ("not a url", False),
         ("ftp://host/x", False),
         ("", False),

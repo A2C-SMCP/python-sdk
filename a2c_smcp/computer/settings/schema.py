@@ -288,11 +288,14 @@ def is_valid_git_url(url: str) -> bool:
         return False
     try:
         parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme == "file":  # file: 一律不要求 host；也不做端口形态校验（file://C:\repos\repo 历史合法）
+        return True
+    try:
         _ = parts.port  # 非法端口（如 :abc / 越界）→ ValueError；此处仅为触发校验
     except ValueError:
         return False
-    if parts.scheme == "file":
-        return True
     return _has_valid_host(parts)
 
 

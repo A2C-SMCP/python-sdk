@@ -57,7 +57,7 @@ from a2c_smcp.computer.settings.store import (
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import GITHUB_HOST, SkillSourceError, normalize_repo_shorthand
 from a2c_smcp.computer.skills.staging import stage_marketplace_skills
-from a2c_smcp.utils.git_url import git_url_for_display, known_git_source_for_display
+from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, known_git_source_for_display
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
 ConfirmFn = Callable[[str], Awaitable[bool]]
@@ -116,6 +116,34 @@ def normalize_marketplace_url(raw: str) -> str | None:
         return None
 
 
+def _credential_like(text: str) -> bool:
+    """
+    文本是否含凭据样分隔符（userinfo ``@`` / 密码段 ``:``）/ Whether text carries credential-like separators.
+
+    **#270**：先做**有界两次** percent-decode，再做 NFKC 归一——挡住 ``alice%3APW%40host``、
+    percent-encoded 全角 ``%EF%BC%9A`` / ``%EF%BC%A0`` 与双重编码 ``%253A`` 等等价变体
+    （只 NFKC 不 unquote，或只 unquote 一次，都会漏）。
+    """
+    probe = normalize("NFKC", unquote(unquote(text)))
+    return "@" in probe or ":" in probe
+
+
+def _error_url_display(raw: str) -> str:
+    """
+    错误 / 提示文案里的 URL 展示 / Display-safe URL for error and prompt messages.
+
+    在 #261 展示脱敏（去 userinfo / query / fragment）之上，再挡住 **path 段**携带的凭据样文本——
+    ``ssh://-/alice:PW_LEAK@example.com`` / ``https://host/alice:PW@example.com`` 的展示值仍保留 path，
+    直接回显会把凭据写进 stdout / ``--json``。命中 → 统一占位符。
+    """
+    shown = git_url_for_display(raw)
+    if shown == REDACTED_GIT_SOURCE:
+        return shown
+    if _credential_like(shown.rsplit("/", 1)[-1]):
+        return REDACTED_GIT_SOURCE
+    return shown
+
+
 def default_marketplace_name(url: str) -> str | None:
     """
     从 git URL **解析后 path 的末段**派生严格-kebab marketplace 名 / Derive a kebab name from the URL path。
@@ -127,6 +155,8 @@ def default_marketplace_name(url: str) -> str | None:
     NFKC 归一 + percent-decode）同样视为凭据样文本 → ``None``；无 path（``https://host``）、非法、
     hostless / junk host、末段构不成严格 kebab → ``None``（CLI 侧提示 ``--name``）。
     本函数只产出名字：存储与 git argv 仍用 :func:`normalize_marketplace_url` 的结果（原始 URL）。
+    入参先 ``strip()``（与 :func:`normalize_marketplace_url` 一致；:func:`is_valid_git_url` 本身**不** strip，
+    故 ``" https://host/repo "`` 在本函数可派生、在 ``is_valid_git_url`` 为 False）。
     Only the parsed path tail is used; credentials / query / fragment never enter the name.
     """
     raw = url.strip()
@@ -144,9 +174,7 @@ def default_marketplace_name(url: str) -> str | None:
     tail = segments[-1]
     # 凭据样文本不进名字：末段含 userinfo 分隔符 ``@`` 或密码段分隔符 ``:``
     # （如 ``https://host/alice:PW@example.com``）→ 交给 ``--name`` 显式命名。
-    # 先做 NFKC 归一并 percent-decode，挡住 ``alice%3APW%40host`` / 全角 ``：`` `＠` 等价变体。
-    probe = unquote(normalize("NFKC", tail))
-    if "@" in probe or ":" in probe:
+    if _credential_like(tail):
         return None
     if tail.endswith(".git"):
         tail = tail[:-4]
@@ -212,13 +240,13 @@ async def marketplace_add(
     url = normalize_marketplace_url(git_url)
     if url is None:
         return _err(
-            f"not a well-formed git url or owner/repo shorthand: {git_url_for_display(git_url)}",
+            f"not a well-formed git url or owner/repo shorthand: {_error_url_display(git_url)}",
             json_output=json_output,
         )
     mp_name = name or default_marketplace_name(url)
     if not mp_name or not is_valid_marketplace_name(mp_name):
         return _err(
-            f"cannot derive a valid marketplace name from {git_url_for_display(url)}; pass --name",
+            f"cannot derive a valid marketplace name from {_error_url_display(url)}; pass --name",
             json_output=json_output,
         )
 
@@ -239,7 +267,7 @@ async def marketplace_add(
     if not trust:
         if confirm is None:
             return _err(
-                f"untrusted marketplace {mp_name!r} ({git_url_for_display(url)}); "
+                f"untrusted marketplace {mp_name!r} ({_error_url_display(url)}); "
                 "pass --trust to confirm non-interactively",
                 json_output=json_output,
             )
@@ -271,7 +299,7 @@ async def marketplace_add(
     # 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
     if mp_name not in _marketplaces(home, env):
         return _err(
-            f"clone/refresh failed for {git_url_for_display(url)} (see logs)",
+            f"clone/refresh failed for {_error_url_display(url)} (see logs)",
             json_output=json_output,
             code=EXIT_NETWORK_ERROR,
         )
