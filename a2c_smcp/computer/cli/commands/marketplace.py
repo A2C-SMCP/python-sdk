@@ -24,6 +24,8 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
+from unicodedata import normalize
+from urllib.parse import unquote, urlsplit
 
 from rich.table import Table
 
@@ -40,6 +42,7 @@ from a2c_smcp.computer.settings.reconciler import prune_marketplaces
 from a2c_smcp.computer.settings.schema import (
     FIELD_TRUSTED_MARKETPLACES,
     SettingsScope,
+    is_scp_like_git_url,
     is_valid_git_url,
     is_valid_marketplace_name,
 )
@@ -114,12 +117,40 @@ def normalize_marketplace_url(raw: str) -> str | None:
 
 
 def default_marketplace_name(url: str) -> str | None:
-    """从 git URL 末段派生严格-kebab marketplace 名（去 ``.git``、非字母数字折叠为 ``-``）/ Derive a kebab name from URL。"""
-    tail = url.rstrip("/")
-    seg = re.split(r"[/:]", tail)[-1]
-    if seg.endswith(".git"):
-        seg = seg[:-4]
-    slug = re.sub(r"[^a-z0-9]+", "-", seg.lower()).strip("-")
+    """
+    从 git URL **解析后 path 的末段**派生严格-kebab marketplace 名 / Derive a kebab name from the URL path。
+
+    **#270**：URL 解析式派生——userinfo / query / fragment 不参与命名
+    （``https://host/repo?token=SECRET`` → ``repo``，此前是 ``repo-token-secret``；
+    ``ssh:///alice:PW@example.com`` 这类 hostless 形态不合法 → ``None``）。
+    ``file:`` 不要求 host，按 path 末段派生；末段含 userinfo / 密码分隔符（``@`` / ``:``，判定前做
+    NFKC 归一 + percent-decode）同样视为凭据样文本 → ``None``；无 path（``https://host``）、非法、
+    hostless / junk host、末段构不成严格 kebab → ``None``（CLI 侧提示 ``--name``）。
+    本函数只产出名字：存储与 git argv 仍用 :func:`normalize_marketplace_url` 的结果（原始 URL）。
+    Only the parsed path tail is used; credentials / query / fragment never enter the name.
+    """
+    raw = url.strip()
+    if not is_valid_git_url(raw):  # hostless / junk host / 非法 → 不派生（复用单一权威，不复制 host 规则）
+        return None
+    if is_scp_like_git_url(raw):
+        # scp-like ``user@host:path``：先截 query / fragment，再取最后一个 ``:`` 之后的 path
+        # （与 rust ``rsplit_once(':')`` 对齐；scp 的 host 段不含 ``:``）
+        path = re.split(r"[?#]", raw, maxsplit=1)[0].rsplit(":", 1)[1]
+    else:
+        path = urlsplit(raw).path  # path 天然不含 query / fragment
+    segments = [seg for seg in path.split("/") if seg]
+    if not segments:
+        return None
+    tail = segments[-1]
+    # 凭据样文本不进名字：末段含 userinfo 分隔符 ``@`` 或密码段分隔符 ``:``
+    # （如 ``https://host/alice:PW@example.com``）→ 交给 ``--name`` 显式命名。
+    # 先做 NFKC 归一并 percent-decode，挡住 ``alice%3APW%40host`` / 全角 ``：`` `＠` 等价变体。
+    probe = unquote(normalize("NFKC", tail))
+    if "@" in probe or ":" in probe:
+        return None
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    slug = re.sub(r"[^a-z0-9]+", "-", tail.lower()).strip("-")
     return slug if slug and is_valid_marketplace_name(slug) else None
 
 

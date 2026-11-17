@@ -37,10 +37,12 @@ definitions / inputs (those live in ``.tfrobot/mcp.json``).
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, NotRequired, TypedDict
+from urllib.parse import SplitResult, unquote, urlsplit
 
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path_norm import InvalidPathError, native_platform, normalize_path
@@ -207,6 +209,12 @@ _PLUGIN_AT_MP_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+
 _GIT_SCP_LIKE_RE = re.compile(r"^[\w.+-]+@[\w.-]+:.+$")
 _GIT_URL_SCHEME_RE = re.compile(r"^(?:ssh|git|https?|file)://.+$")
 
+# host 形态（RFC 1123 宽松版：字母数字 / 下划线 / 点 / 连字符，且至少含一个字母数字）。
+# 目的不是校验 DNS 合法性，而是挡住「非 host 的占位串」——空白 / 控制字符 / 纯 `-` / `_` / `.` / `%20`
+# 这类占位会让 hostless 攻击串（`ssh:///alice:PW@x`）以「随便填个非空 junk」的方式复活凭据入名链路（#270）。
+# Loose RFC 1123 host shape; rejects placeholder strings that are not a host at all.
+_HOSTNAME_RE = re.compile(r"^(?=[A-Za-z0-9._-]*[A-Za-z0-9])[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?$")
+
 MAX_NAME_LEN = 64
 
 
@@ -223,11 +231,69 @@ def is_valid_enabled_plugin_key(key: str) -> bool:
     return len(plugin) <= MAX_NAME_LEN and len(marketplace) <= MAX_NAME_LEN
 
 
+def is_scp_like_git_url(url: str) -> bool:
+    """
+    是否 scp-like **形态** ``user@host:path`` / Whether the url has the scp-like shape.
+
+    仅形态分类，**不**校验 host 合法性、也不排除 path 内含 ``://``（如 ``git@h:r?x=://y``）——
+    合法性判定一律走 :func:`is_valid_git_url`。shape-only; use :func:`is_valid_git_url` for validity.
+    """
+    return isinstance(url, str) and _GIT_SCP_LIKE_RE.fullmatch(url) is not None
+
+
+def _has_valid_host(parts: SplitResult) -> bool:
+    """
+    host 是否形如主机名 / IPv6 字面量（非 host 形态一律 fail-closed）/ Whether host looks like a host.
+
+    **#270**：只判「非空」不够——``ssh:// /alice:PW@x``、``ssh://-/…``、``ssh://_/…``、``ssh://%20/…``
+    的 host 都非空但根本不是主机，凭据段会经 path 末段滑进 marketplace 注册名。IDN host 先经 IDNA 归一；
+    尾点 FQDN（``example.com.``）合法；IPv6 用 :mod:`ipaddress` 判定（含 zone-id ``[fe80::1%25eth0]``，
+    也避免旧补丁版 ``urlsplit`` 不校验 bracketed host 的缺口）。percent-encoded host 有意拒绝（fail-closed）。
+    """
+    host = parts.hostname or ""
+    if ":" in host:  # IPv6 字面量（urlsplit 已剥去方括号；zone-id 的 ``%25`` 需解码）
+        try:
+            ipaddress.IPv6Address(unquote(host))
+        except ValueError:
+            return False
+        return True
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return False
+    if host.endswith("."):  # 尾点 FQDN（RFC 3986 reg-name 允许）
+        host = host[:-1]
+    return _HOSTNAME_RE.match(host) is not None
+
+
 def is_valid_git_url(url: str) -> bool:
-    """git url 形态是否合规（scp-like 或 ssh/git/http(s)/file scheme）/ Whether a git url is well-formed."""
+    """
+    git url 形态是否合规（scp-like 或 ssh/git/http(s)/file scheme）/ Whether a git url is well-formed.
+
+    **#270 收紧**：ssh / git / http(s) 必须有**形如主机名的 host**——``ssh:///alice:PW@example.com``、
+    ``ssh://user@:22/path`` 这类 hostless 形态，以及把 host 槽位填成非主机占位串（空白 / ``-`` / ``_`` /
+    ``%20`` / 纯点）的变体，都会被下游 :func:`default_marketplace_name` 当成 path 取末段，把 userinfo 里的
+    凭据 slug 进 marketplace 注册名（trust / 账本 / ``A2CSkillRef.source`` 可见）。
+    ``file:`` 一律不要求 host（``file:///abs/path`` 与 ``file://host/path`` 均合法）；scp-like 形态不变。
+    非法端口 / 畸形 netloc 一并 fail-closed（比展示层 :func:`a2c_smcp.utils.git_url.git_url_for_display`
+    更严：展示层对 ``ssh://-/x`` 仍可展示，校验不认它）。
+    ssh/git/http(s) require a host-shaped authority; ``file:`` does not; malformed authorities fail closed.
+    """
     if not isinstance(url, str) or not url.strip():
         return False
-    return _GIT_URL_SCHEME_RE.match(url) is not None or _GIT_SCP_LIKE_RE.match(url) is not None
+    if is_scp_like_git_url(url):
+        return True
+    if _GIT_URL_SCHEME_RE.match(url) is None:
+        return False
+    try:
+        parts = urlsplit(url)
+        _ = parts.port  # 非法端口（如 :abc / 越界）→ ValueError；此处仅为触发校验
+    except ValueError:
+        return False
+    if parts.scheme == "file":
+        return True
+    return _has_valid_host(parts)
 
 
 # ---------------------------------------------------------------------------

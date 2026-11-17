@@ -127,12 +127,92 @@ def test_normalize_marketplace_url() -> None:
     assert normalize_marketplace_url("team/skills") == "https://github.com/team/skills.git"
     # 非法 → None
     assert normalize_marketplace_url("not a url at all !!") is None
+    # #270：hostless 既非合法 URL、也不是 owner/repo 简写 → None（此前原样放行）
+    assert normalize_marketplace_url("ssh:///alice:PW_LEAK@example.com") is None
+    assert normalize_marketplace_url("ssh://user@:22/path") is None
 
 
-def test_default_marketplace_name() -> None:
-    assert default_marketplace_name("https://github.com/team/My_Skills.git") == "my-skills"
-    assert default_marketplace_name("git@github.com:team/acme-skills.git") == "acme-skills"
-    assert default_marketplace_name("file:///tmp/foo.git") == "foo"
+# #270：名称只取**解析后 path 的末段**——userinfo / query / fragment 不参与派生
+_NAME_VECTORS: list[tuple[str, str | None]] = [
+    # 既有正例（行为不变）
+    ("https://github.com/team/My_Skills.git", "my-skills"),
+    ("git@github.com:team/acme-skills.git", "acme-skills"),
+    ("file:///tmp/foo.git", "foo"),
+    # query / fragment 剥离（此前折叠进名字：repo-token-secret / repo-git-frag）
+    ("https://host/repo?token=SECRET", "repo"),
+    ("https://host/repo.git#frag", "repo"),
+    ("git@host:o/r?token=SECRET", "r"),
+    ("git@host:o/r#frag", "r"),
+    ("https://host/repo.git?", "repo"),
+    # scp-like 的 query / fragment 里出现 ``://`` 不得把整串当 URL 解析（曾得 git-host-repo）
+    ("git@host:repo?x=://y", "repo"),
+    ("git@host:repo#frag://y", "repo"),
+    ("alice@host:repo?redirect=https://x", "repo"),
+    # scp-like 多冒号取最后一个 ``:``（与 rust rsplit_once 及旧实现一致）
+    ("git@host:a:b", "b"),
+    ("git@host:o/r", "r"),
+    # userinfo 不参与派生
+    ("https://user:FAKE_TOKEN@host/o/repo.git", "repo"),
+    ("ssh://alice:PW@host/o/repo.git", "repo"),
+    # file: 不要求 host；带 host 形态同样按 path 末段派生
+    ("file://host/path/repo.git", "repo"),
+    ("file:///abs/path", "path"),
+    # 尾斜杠 / 大小写 / 多段 path
+    ("https://host/repo/", "repo"),
+    ("https://HOST/Repo", "repo"),
+    ("ssh://host/a/b/c.git", "c"),
+    # hostless / 非法 / 无法判定 → None
+    ("ssh:///alice:PW_LEAK@example.com", None),
+    ("git:///x", None),
+    ("https:///x", None),
+    ("ssh://user@:22/path", None),
+    ("file:alice@host", None),
+    ("ssh://", None),
+    ("file://[bad", None),
+    # host 槽位的非主机占位串（空白 / ``-`` / ``_`` / ``%20`` / 纯点）→ 不派生
+    ("ssh:// /alice:PW_LEAK@example.com", None),
+    ("ssh://-/alice:PW_LEAK@example.com", None),
+    ("ssh://_/alice:PW_LEAK@example.com", None),
+    ("ssh://%20/alice:PW_LEAK@example.com", None),
+    ("ssh://./alice:PW_LEAK@example.com", None),
+    # 凭据样文本落在 **path 末段**（不在 userinfo）→ 同样不派生（交给 --name）
+    ("https://example.com/alice:PW@example.com", None),
+    ("git@host:alice:PW_LEAK@example.com", None),
+    ("https://host/repo:tag", None),
+    # 等价变体：percent-encoded / 全角分隔符同样挡（NFKC + unquote 后再判）
+    ("https://host/alice%3APW%40example.com", None),
+    ("git@host:alice%3APW%40example.com", None),
+    ("https://host/alice：PW＠example.com", None),
+    # 尾点 FQDN 正常派生
+    ("https://example.com./team/repo.git", "repo"),
+    # 无 path（只有 host）→ None（用户 2026-11-17 拍板，不再派生 host 名）
+    ("https://host", None),
+    ("https://host/", None),
+    ("https://user:pw@host", None),
+    # 末段都构不成合法 kebab
+    ("https://example.com/@@@", None),
+    ("not a url", None),
+    ("", None),
+]
+
+
+@pytest.mark.parametrize(("url", "expected"), _NAME_VECTORS)
+def test_default_marketplace_name(url: str, expected: str | None) -> None:
+    assert default_marketplace_name(url) == expected
+
+
+def test_default_marketplace_name_never_leaks_credentials() -> None:
+    """派生名会进 trust / 账本键 / clone 目录段 / ``A2CSkillRef.source``：#270 起不得含凭据片段。"""
+    # 正对照：合法 URL 必须**仍能**派生出干净名字——否则「恒返回 None」的退化实现也会全绿。
+    assert default_marketplace_name("https://user:FAKE_TOKEN@host/org/repo.git?token=FAKE_QUERY") == "repo"
+    for url in (
+        "ssh:///alice:PW_LEAK@example.com",
+        "ssh:// /alice:PW_LEAK@example.com",
+        "ssh://-/alice:PW_LEAK@example.com",
+        "https://example.com/alice:PW@example.com",
+        "git@host:alice:PW_LEAK@example.com",
+    ):
+        assert default_marketplace_name(url) is None
 
 
 # ── add：trust 门 / add: trust gate ───────────────────────────────────────────
@@ -737,3 +817,72 @@ async def test_add_name_derivation_error_redacted(tmp_path: Path, capsys: pytest
     out = capsys.readouterr().out
     assert "FAKE_TOKEN" not in out
     assert "https://example.com/@@@" in out
+
+
+# ── #270 hostless URL / 派生名入账 / hostless + derived-name flows ─────────────
+@pytest.mark.asyncio
+async def test_add_hostless_url_rejected_even_with_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """hostless URL 在 URL 校验处即拒绝：``--name`` 不能绕过，零 trust / 零账本写入。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    code = await marketplace_add(
+        reg,
+        home,
+        env,
+        "ssh:///alice:PW_LEAK@example.com",
+        name="evil",
+        trust=True,
+        no_clone=True,
+        json_output=True,
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert REDACTED_GIT_SOURCE in out
+    assert "evil" not in _load_trusted(env), "URL 校验失败不得写 trust"
+    assert load_known_marketplaces(home, env).get("marketplaces") in (None, {}), "不得写 known_marketplaces"
+
+
+@pytest.mark.asyncio
+async def test_add_query_url_derives_clean_name_and_keeps_raw_url(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """query / fragment / userinfo 不进派生名；账本键干净、``source.url`` 仍原样（raw 保真）。"""
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    seen: list[str] = []
+
+    async def fake_stage(
+        name: str,
+        source: object,
+        registry: object,
+        home_: Path,
+        *,
+        auto_update: bool = False,
+        env: dict[str, str] | None = None,
+        **_kwargs: object,
+    ) -> list[str]:
+        seen.append(name)
+
+        def _mutate(f: dict[str, object]) -> object:
+            f["marketplaces"][name] = {  # type: ignore[index]
+                "source": dict(source),  # type: ignore[arg-type]
+                "installLocation": "",
+                "autoUpdate": auto_update,
+            }
+            return f
+
+        update_known_marketplaces(_mutate, home_, env)
+        return []
+
+    monkeypatch.setattr(marketplace_mod, "stage_marketplace_skills", fake_stage)
+    url = "https://example.com/org/repo.git?token=FAKE_QUERY#FAKE_FRAGMENT"
+    code = await marketplace_add(reg, home, env, url, trust=True, json_output=True)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert json.loads(out)["added"] == "repo", "派生名只取 path 末段"
+    assert "FAKE_QUERY" not in out and "FAKE_FRAGMENT" not in out
+    assert seen == ["repo"], "进入 staging 的 name 必须干净（A2CSkillRef.source = marketplace:repo）"
+    assert _load_trusted(env) == {"repo"}, "trust 键同样只能是干净名"
+    stored = load_known_marketplaces(home, env)["marketplaces"]["repo"]["source"]["url"]
+    assert stored == url, "known_marketplaces 存储与 git argv 必须保留原始 URL（raw 保真）"
