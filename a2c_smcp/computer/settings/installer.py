@@ -1075,7 +1075,15 @@ async def install_plugin(
     catalog_dir = marketplace_skill_dir(home, marketplace)
     if not catalog_dir.is_dir():
         raise PluginInstallError(f"marketplace {marketplace!r} catalog not cloned at {catalog_dir} (run 'marketplace add/refresh' first)")
-    if find_plugin_entry(read_marketplace_manifest(catalog_dir), plugin) is None:
+    try:
+        manifest = read_marketplace_manifest(catalog_dir)
+    except PluginManifestError as e:
+        # #263 四轮：catalog 的 marketplace.json 损坏/缺失同属本地配置问题 → 结构化错误（不 traceback）。
+        raise PluginInstallError(
+            f"marketplace {marketplace!r} manifest invalid: "
+            f"{sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e)))}"
+        ) from None
+    if find_plugin_entry(manifest, plugin) is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
 
     # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——

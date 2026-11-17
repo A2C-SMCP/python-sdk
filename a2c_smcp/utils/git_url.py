@@ -303,30 +303,43 @@ def escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
     return "".join(out)
 
 
+def _is_credential_segment(segment: str, *, authority_context: bool) -> bool:
+    """
+    段是否携带凭据 / Whether a path segment carries credentials.
+
+    判定（#263 四轮）：percent-decode 后命中 ``user:secret@``；或该段处于 URL **authority** 位置（紧跟
+    scheme 残形段，如 ``x=https:``）且含 ``@``——PAT / username-only 的 ``TOKEN@host`` 也算凭据，
+    而路径里的普通 ``@``（``file:///home/alice@corp/repo.git``、``repo@2.git``）保留。
+    """
+    if _USERINFO_SEGMENT_RE.search(unquote(segment)) is not None:
+        return True
+    return authority_context and "@" in segment
+
+
 def sanitize_path_for_diagnostics(path: str) -> str:
     """
     诊断用路径脱敏：逐段遮蔽携带凭据的片段 / Mask credential-bearing path segments for diagnostics.
 
     仅用于**展示**（validator 的 ``file`` / ``checked`` / ``message``、日志里的落盘路径），**不得**用于
-    文件系统访问。规则（#263 复审修正）：
+    文件系统访问。规则（#263 四轮复审修正）：
 
     - 控制字符 / 孤立代理项先按 :func:`escape_unsafe_chars` 转义（仓库可控目录名不得注入终端序列）；
     - 分隔符 ``/`` 与 ``\\`` 都视为段边界（Windows 路径不得整条被吞）；
-    - 段内含 userinfo 形态（``user:secret@``，要求 ``@`` 前有 ``:``）→ 整段遮蔽；
+    - 段头（``?`` / ``#`` 之前的部分）先判凭据：命中则**整段**替换——否则 ``alice:pw@host?token=x``
+      会把 userinfo 留在截断后的前缀里；
     - 一旦出现 ``?`` / ``#``（query / fragment 起点）→ 从该字符起把**余下整条路径**遮蔽（query 值里
-      可以再出现分隔符，逐段判定会漏掉尾段）。
+      可以再出现分隔符，逐段判定会漏掉尾段）；
+    - authority 位置（紧跟 scheme 残形段）的 ``TOKEN@host`` 按凭据处理；路径段内普通 ``@`` 保留。
 
-    合法 kebab / 普通路径（含 ``alice@corp`` 这类文件名）逐字保留。
+    合法 kebab / 普通路径（含 ``alice@corp``、Windows 路径）逐字保留。
     """
     escaped = escape_unsafe_chars(path)
     if not any(marker in escaped for marker in ("@", "?", "#")):
         return escaped
-    # URL 语境：路径里残留 scheme 形态（`x=https:/…`）。只有这种语境下 `TOKEN@host` 的无冒号 userinfo
-    # 才按凭据处理——否则 `alice@corp` 这类合法文件名会被误伤。
-    url_context = _SCHEME_REMNANT_RE.search(escaped) is not None
     parts = re.split(r"([/\\])", escaped)
     out: list[str] = []
     tail_masked = False
+    authority_next = False
     for index, part in enumerate(parts):
         if index % 2 == 1:  # 分隔符原样保留
             out.append(part)
@@ -335,36 +348,51 @@ def sanitize_path_for_diagnostics(path: str) -> str:
             if part:
                 out.append("<redacted-source>")
             continue
-        cut = min((pos for pos in (part.find("?"), part.find("#")) if pos >= 0), default=-1)
-        if cut >= 0:
-            out.append(part[:cut] + "<redacted-source>")
-            tail_masked = True
+        if not part:
+            out.append(part)
             continue
-        decoded = unquote(part)
-        userinfo = _USERINFO_SEGMENT_RE.search(decoded) is not None or (url_context and "@" in part)
-        out.append("<redacted-source>" if userinfo else part)
+        cut = min((pos for pos in (part.find("?"), part.find("#")) if pos >= 0), default=-1)
+        head = part[:cut] if cut >= 0 else part
+        if _is_credential_segment(head, authority_context=authority_next):
+            out.append("<redacted-source>")
+            tail_masked = cut >= 0
+            authority_next = False
+            continue
+        if cut >= 0:
+            out.append(head + "<redacted-source>")
+            tail_masked = True
+            authority_next = False
+            continue
+        out.append(part)
+        # 该段是 scheme 残形（`x=https:` / `ssh:`）→ 下一个非空段处于 authority 位置。
+        authority_next = part.endswith(":")
     return "".join(out)
 
 
-# 路径 token 的判定（供 :func:`sanitize_text_for_diagnostics` 逐 token 使用）：只有带 URL 残形 / userinfo
-# 形态的 token 才按路径处理，散文其余部分（含换行与可读前缀）逐字保留。
+# 路径 token 的判定（供 :func:`sanitize_text_for_diagnostics` 逐 token 使用）：带 URL 残形 / userinfo 形态，
+# 或「含分隔符且含 query/fragment 起点」的 token 才按路径处理；散文其余部分（含换行与可读前缀）逐字保留。
 _PATH_TOKEN_RE = re.compile(r":[/\\]|://")
 _USERINFO_TOKEN_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
 
 
 def sanitize_text_for_diagnostics(text: str) -> str:
     """
-    诊断**散文**的路径级脱敏：逐 token 判定，仅遮蔽 URL 残形 / userinfo 形态的 token / Token-level.
+    诊断**散文**的路径级脱敏：逐 token 判定，仅遮蔽 URL 残形 / 路径 + query 形态的 token / Token-level.
+
+    非路径 token 仍过 :func:`escape_unsafe_chars`（ESC / 孤立代理项等），但空白分隔符原样保留——
+    换行与缩进因此不受影响。
     """
     out: list[str] = []
     for token in re.split(r"(\s+)", text):
         if not token or token.isspace():
             out.append(token)
             continue
-        if _PATH_TOKEN_RE.search(token) or _USERINFO_TOKEN_RE.search(unquote(token)):
-            out.append(sanitize_path_for_diagnostics(token))
-        else:
-            out.append(token)
+        looks_like_path = (
+            _PATH_TOKEN_RE.search(token) is not None
+            or _USERINFO_TOKEN_RE.search(unquote(token)) is not None
+            or (("/" in token or "\\" in token) and ("?" in token or "#" in token))
+        )
+        out.append(sanitize_path_for_diagnostics(token) if looks_like_path else escape_unsafe_chars(token))
     return "".join(out)
 
 

@@ -236,7 +236,7 @@ def test_json_path_and_human_line_redact_credential_root(tmp_path: Path, capsys:
 
     code = plugin_validate(root, json_output=True)
     out = capsys.readouterr().out
-    assert code in (0, 1)
+    assert code == 0  # 夹具本身合法：确定性退出码（旧 `in (0,1)` 是恒真断言）
     assert "TOKEN" not in out
     data = json.loads(out)
     assert "<redacted-source>" in data["path"]
@@ -244,3 +244,6 @@ def test_json_path_and_human_line_redact_credential_root(tmp_path: Path, capsys:
     plugin_validate(root)
     human = capsys.readouterr().out
     assert "TOKEN" not in human
+    # 正对照：人类输出确实渲染了 root 行（否则上面的否定断言恒真）
+    assert "Validating marketplace at" in human
+    assert "<redacted-source>" in human

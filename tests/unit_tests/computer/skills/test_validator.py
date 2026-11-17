@@ -605,3 +605,18 @@ def test_collector_add_preserves_prose_around_masked_path(tmp_path: Path) -> Non
     # 正对照：前缀 / prose 的 `?` / 换行都还在（不得整段吞掉或转义成 \x0a）
     assert msg.startswith("cannot read plugins/x=https:/h/r.git")
     assert msg.endswith("why? oops\nsecond line")
+
+
+def test_checked_axis_masks_userinfo_with_query(tmp_path: Path) -> None:
+    """#263 四轮：`file` / `checked` 轴在 userinfo + `?` 同段时也不得漏凭据头。"""
+    bad = "x=https:/alice:pw@host?token=SECRET"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    p = root / "plugins" / bad
+    (p / "skills" / "etl").mkdir(parents=True)
+    (p / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    r = validate_path(root)
+    assert r.checked
+    blob = "\n".join([*(i.file for i in r.issues), *r.checked])
+    assert "pw@" not in blob and "token=SECRET" not in blob
+    assert "<redacted-source>" in blob

@@ -386,3 +386,39 @@ def test_text_sanitizer_keeps_readable_prose_and_masks_only_path_tokens() -> Non
     # 正对照：可读前缀 / 行尾散文 / 换行都保留（不整段吞掉）
     assert out.startswith("cannot read plugins/x=https:/h/r.git")
     assert out.endswith("oops\nsecond line")
+
+
+# ── #263 四轮复审：截断前判凭据 / 文脉转义 / 无 scheme query / authority 判据 ──────
+def test_path_sanitizer_checks_userinfo_before_query_cut() -> None:
+    """`?`/`#` 截断分支必须先判凭据：`alice:pw@host?token=x` 不得把 userinfo 留在截断前缀里。"""
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("plugins/alice:pw@host?token=x") == "plugins/<redacted-source>"
+    assert P("plugins/alice:pw@host#frag") == "plugins/<redacted-source>"
+
+
+def test_text_sanitizer_escapes_control_chars_in_plain_tokens() -> None:
+    """非路径 token 也要转义 Cc/Cs（env 键名等由仓库控制），但换行分隔符保留。"""
+    from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics as T
+
+    out = T("bad \x1b]52;c;ZXZpbA==\x07 loc env\nnext line")
+    assert "\x1b" not in out and "\x07" not in out
+    assert "\\x1b" in out
+    assert out.endswith("\nnext line")  # 换行未被转义
+
+
+def test_text_sanitizer_masks_query_token_without_scheme() -> None:
+    """无 scheme 的 `./x/r.git?token=…` 也要按路径遮蔽（此前只认 `:/` / `://`）。"""
+    from a2c_smcp.utils.git_url import redact_git_urls_in_text
+    from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics as T
+
+    out = T(redact_git_urls_in_text("see ./x/r.git?token=SECRET#f"))
+    assert "token=SECRET" not in out and "#f" not in out
+
+
+def test_path_sanitizer_keeps_file_url_and_at_paths() -> None:
+    """authority 判据：`file:///home/alice@corp/repo.git` / `repo@2.git` 的普通 `@` 保留。"""
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("file:///home/alice@corp/repo.git") == "file:///home/alice@corp/repo.git"
+    assert P("plugins/repo@2.git") == "plugins/repo@2.git"

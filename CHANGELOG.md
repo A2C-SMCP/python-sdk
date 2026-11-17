@@ -455,6 +455,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，四轮）：路径轴在 `?`/`#` 截断**之前**先判凭据（`alice:pw@host?token=x`
+    不再把 userinfo 留在截断前缀里）；authority 判据取代「有 `@` 就遮」，`file:///home/alice@corp/repo.git`
+    与 `repo@2.git` 保留；散文 token 一律转义 Cc/Cs（换行/缩进保留），无 scheme 的 `./x/r.git?token=…`
+    也路由到路径脱敏；`plugin install` 预检阶段（catalog `marketplace.json` 损坏）同样归一为结构化错误。
   - 复审补口（同一 PR，三轮）：scp-like 判据只看 `@` **之前**是否含 `://`（`alice:PW@host,https://…`
     这类 `@` 在前的 token 仍是凭据）；路径轴把 PAT / username-only userinfo（URL 语境下的 `TOKEN@host`）
     与 percent-encoded 冒号一并按凭据处理，同时不误伤 `alice@corp` 与 Windows 盘符；`plugin install` 把

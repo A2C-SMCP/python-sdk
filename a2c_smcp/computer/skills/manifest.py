@@ -43,6 +43,7 @@ from pydantic import TypeAdapter, ValidationError
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT
 from a2c_smcp.utils.git_url import (
+    escape_unsafe_chars,
     redact_git_urls_in_text,
     sanitize_path_for_diagnostics,
     sanitize_text_for_diagnostics,
@@ -276,7 +277,7 @@ def parse_bundled_server(path: Path) -> MCPServerConfig:
         # #263 复审：pydantic 默认 str 会带 `input_value=…`（env / headers 里可能是 token）→ 只报字段与条数。
         details = e.errors(include_input=False, include_url=False)
         fields = ", ".join(
-            f"{'.'.join(str(part) for part in err.get('loc', ())) or '<root>'}:{err.get('type', 'invalid')}"
+            f"{escape_unsafe_chars('.'.join(str(part) for part in err.get('loc', ())) or '<root>')}:{err.get('type', 'invalid')}"
             for err in details
         )
         raise PluginManifestError(

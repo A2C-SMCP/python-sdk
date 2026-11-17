@@ -1012,3 +1012,43 @@ async def test_install_staging_error_is_structured_not_traceback(
     assert "plugin staging failed" in out
     assert "PW_STAGE" not in out
     assert "token=Q" not in out
+
+
+@pytest.mark.asyncio
+async def test_install_manifest_error_is_structured_not_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 四轮：manifest 层错误（materialize 内）同样归一为结构化错误。"""
+    from a2c_smcp.computer.skills.manifest import PluginManifestError
+
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "url", "url": "https://example.com/r.git"})
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise PluginManifestError("invalid MCP server config at /x/y: boom")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "plugin manifest invalid" in out
+
+
+@pytest.mark.asyncio
+async def test_install_corrupt_catalog_manifest_is_structured_not_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 四轮：预检阶段 `read_marketplace_manifest` 损坏同样不得 traceback（此前在 try 之外）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    catalog = marketplace_skill_dir(home, "acme")
+    catalog.mkdir(parents=True)
+    (catalog / ".tfrobot-plugin").mkdir(parents=True)
+    (catalog / ".tfrobot-plugin" / "marketplace.json").write_text("{ broken", encoding="utf-8")
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"]["acme"] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc"}
+    save_known_marketplaces(known, home=home)
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "manifest invalid" in out
