@@ -120,7 +120,7 @@ from a2c_smcp.computer.skills.manifest import (
     resolve_skill_override_dirs,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
-from a2c_smcp.computer.skills.sources import SkillSourceError
+from a2c_smcp.computer.skills.sources import SkillSourceError, safe_exception_text
 from a2c_smcp.computer.skills.staging import (
     DEFAULT_GIT_TIMEOUT,
     SKILL_MD,
@@ -130,7 +130,6 @@ from a2c_smcp.computer.skills.staging import (
     stage_marketplace_skills,
 )
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
-from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -1081,7 +1080,7 @@ async def install_plugin(
         # #263 四轮：catalog 的 marketplace.json 损坏/缺失同属本地配置问题 → 结构化错误（不 traceback）。
         raise PluginInstallError(
             f"marketplace {marketplace!r} manifest invalid: "
-            f"{sanitize_text_for_diagnostics(str(e))}"
+            f"{safe_exception_text(e)}"
         ) from None
     if find_plugin_entry(manifest, plugin) is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
@@ -1127,12 +1126,12 @@ async def install_plugin(
         if isinstance(e, SkillStagingError):
             raise PluginInstallError(
                 f"marketplace {marketplace!r} plugin staging failed: "
-                f"{sanitize_text_for_diagnostics(str(e))}"
+                f"{safe_exception_text(e)}"
             ) from None
         if isinstance(e, PluginManifestError):
             raise PluginInstallError(
                 f"marketplace {marketplace!r} plugin manifest invalid: "
-                f"{sanitize_text_for_diagnostics(str(e))}"
+                f"{safe_exception_text(e)}"
             ) from None
         raise
 

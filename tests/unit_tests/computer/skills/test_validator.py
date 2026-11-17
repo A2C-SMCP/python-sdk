@@ -658,4 +658,6 @@ def test_manifest_reader_reports_non_utf8_as_manifest_error(tmp_path: Path) -> N
     path.write_bytes(b"\xff\xfe not utf-8")
     with pytest.raises(PluginManifestError) as ei:
         read_marketplace_manifest(root)
-    assert "unreadable" in str(ei.value) or "invalid" in str(ei.value)
+    # 断言确实命中 UnicodeDecodeError 归一（不是别的分支）——避免「unreadable or invalid」近似恒真。
+    assert isinstance(ei.value.__cause__, UnicodeDecodeError)
+    assert "marketplace manifest" in str(ei.value)

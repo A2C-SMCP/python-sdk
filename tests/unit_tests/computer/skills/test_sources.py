@@ -387,3 +387,16 @@ def test_del_and_c1_characters_keep_object_raw_json_safe() -> None:
     json.loads(e.raw)  # 不抛 = 合法 JSON
     assert "\\u007f" in e.raw and "\\u009b" in e.raw
     assert "\x7f" not in e.raw and "\x9b" not in e.raw  # 原字符不得裸露（否则又不是合法 JSON）
+
+
+def test_safe_exception_text_handles_both_text_classes() -> None:
+    """裸异常文本先散文脱敏（scp-like 只有它能识别）；SkillSourceError 已是构造期脱敏 JSON，不得二次散文化。"""
+    from a2c_smcp.computer.skills.sources import safe_exception_text
+
+    oserr = safe_exception_text(OSError("[Errno 13] 'plugins/deploy-token@example.com:org/repo.git/skills'"))
+    assert "deploy-token" not in oserr and "example.com:org" not in oserr
+
+    source_err = SkillSourceError({"source": "url", "url": "https://alice:PW_S@example.com/r.git", "ref": ""}, "bad ref")
+    out = safe_exception_text(source_err)
+    assert "PW_S" not in out
+    assert "%22" not in out and '"ref":""' in out  # JSON 回显保持可读

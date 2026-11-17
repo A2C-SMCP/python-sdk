@@ -455,6 +455,11 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，六轮）：新增 `safe_exception_text` 统一异常文本出口——**裸**异常文本（OSError /
+    git / manifest）先散文脱敏再 token 级路径脱敏（scp-like `user@host:path` 只有散文规则能识别，
+    上一轮去掉 R 属真实回退），`SkillSourceError` 的 JSON 回显只做 token 级；SKILL.md 读取点的
+    `UnicodeDecodeError` 归一（GBK/UTF-16 不再 traceback；mcp 源单 SKILL 失败隔离，不中止整个 run）；
+    covered-root DEBUG 的 uri / coverer 与其余 root_uri 分支统一脱敏。
   - 复审补口（同一 PR，五轮）：plugin 源 SKILL.md 不可读分支的 `OSError` 全文与 mcp 源各跳过分支的
     `root_uri` 统一走脱敏漏斗；`_read_json_object` / validator 的 JSON 读取并入 `UnicodeDecodeError`
     （非 UTF-8 manifest 归一为诊断/`PluginManifestError`，不再 traceback）；消费端不再对**构造期已脱敏**的

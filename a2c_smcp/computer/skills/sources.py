@@ -42,6 +42,7 @@ from a2c_smcp.utils.git_url import (
     escape_unsafe_chars,
     git_url_for_display,
     redact_git_urls_in_text,
+    sanitize_text_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -135,6 +136,21 @@ def redact_source_display(raw: object) -> str:
     # 兜底转义：JSON 字符串已转义 Cc(<0x20)，命中量只剩孤立代理项 / DEL / C1——必须用 ``\uXXXX``
     # 才能保持合法 JSON（``\x7f`` / ``\x9b`` 不是 JSON 转义）。
     return escape_unsafe_chars(text, json_safe=True)
+
+
+def safe_exception_text(exc: BaseException) -> str:
+    """
+    异常文本的诊断出口 / Diagnostic text of an exception.
+
+    :class:`SkillSourceError` 的 message 已在**构造期**脱敏（且可能是紧凑 JSON 回显）——再走散文脱敏会把
+    JSON 标点吞进 URL token、改写成 percent-encoded 乱码，故只做 token 级路径脱敏；其余异常文本
+    （``OSError`` / git / manifest）是裸文本，必须先散文脱敏（scp-like ``user@host:path`` 只有它能识别）
+    再做 token 级路径脱敏。
+    """
+    text = str(exc)
+    if isinstance(exc, SkillSourceError):
+        return sanitize_text_for_diagnostics(text)
+    return sanitize_text_for_diagnostics(redact_git_urls_in_text(text))
 
 
 class SkillSourceError(ValueError):

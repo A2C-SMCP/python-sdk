@@ -117,6 +117,7 @@ from a2c_smcp.computer.skills.sources import (
     marketplace_clone_url,
     redact_source_display,
     resolve_plugin_source,
+    safe_exception_text,
 )
 from a2c_smcp.smcp import A2CSkillRef
 from a2c_smcp.utils.git_url import (
@@ -542,8 +543,8 @@ async def stage_mcp_skills(
                 logger.debug(
                     "bundle %s: skill resource %s covered by skill resource %s (immediate parent); skipping",
                     bid,
-                    uri,
-                    coverer,
+                    sanitize_path_for_diagnostics(uri),
+                    sanitize_path_for_diagnostics(coverer),
                 )
         for res in roots:
             meta = dict(getattr(res, "meta", None) or {})
@@ -573,7 +574,7 @@ async def stage_mcp_skills(
                     "materialize failed for %s (mode=%s): %s\n%s",
                     sanitize_path_for_diagnostics(root_uri),
                     mode,
-                    sanitize_text_for_diagnostics(str(e)),
+                    safe_exception_text(e),
                     sanitize_text_for_diagnostics(
                         redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
                     ),
@@ -605,7 +606,17 @@ def _finalize_and_register(
         shutil.rmtree(staged, ignore_errors=True)
         return None
 
-    frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
+    try:
+        frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        # #263：单 SKILL 失败隔离——读取/解码异常只跳过该 SKILL，不得中止整个 run。
+        logger.error(
+            "SKILL.md unreadable, skipped: %s (%s)",
+            sanitize_path_for_diagnostics(root_uri),
+            safe_exception_text(e),
+        )
+        shutil.rmtree(staged, ignore_errors=True)
+        return None
     if not frontmatter.get("name") or not frontmatter.get("description"):
         logger.error(
             "SKILL.md frontmatter missing required 'name'/'description', skipped: %s",
@@ -692,8 +703,13 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
     skill_md = skill_dir / SKILL_MD
     try:
         text = skill_md.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.error("user SKILL %r SKILL.md unreadable, skipped: %s (%s)", name, skill_md, e)
+    except (OSError, UnicodeDecodeError) as e:
+        logger.error(
+            "user SKILL %r SKILL.md unreadable, skipped: %s (%s)",
+            redact_git_urls_in_text(name),
+            sanitize_path_for_diagnostics(str(skill_md)),
+            safe_exception_text(e),
+        )
         return None
     frontmatter = parse_skill_frontmatter(text)
     if not frontmatter.get("description"):
@@ -1004,14 +1020,14 @@ def _scan_and_register_plugin_skills(
                 continue
             try:
                 frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
-            except OSError as e:
+            except (OSError, UnicodeDecodeError) as e:  # #263：非 UTF-8 SKILL.md 同属「不可读」
                 # #263：OSError 文本会带完整路径（本地相对 source 可内嵌凭据 URL）→ 路径 + 文本双脱敏。
                 logger.error(
                     "marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
                     sanitize_path_for_diagnostics(skill_dir.name),
-                    sanitize_text_for_diagnostics(str(e)),
+                    safe_exception_text(e),
                 )
                 continue
             if not frontmatter.get("description"):
@@ -1281,7 +1297,7 @@ async def stage_marketplace_skills(
         logger.error(
             "marketplace %r clone/refresh failed, skipped (not registered): %s",
             redact_git_urls_in_text(name),
-            sanitize_text_for_diagnostics(str(e)),
+            safe_exception_text(e),
         )
         return registered
 
@@ -1294,7 +1310,7 @@ async def stage_marketplace_skills(
         logger.error(
             "marketplace %r manifest invalid, skipped (clone kept): %s",
             redact_git_urls_in_text(name),
-            sanitize_text_for_diagnostics(str(e)),
+            safe_exception_text(e),
         )
         return registered
 
@@ -1320,7 +1336,7 @@ async def stage_marketplace_skills(
             logger.error(
                 "marketplace %r plugin entry invalid, skipped: %s",
                 redact_git_urls_in_text(name),
-                sanitize_text_for_diagnostics(str(e)),
+                safe_exception_text(e),
             )
             continue
         if plugin_filter is not None and plugin_name not in plugin_filter:
@@ -1349,7 +1365,7 @@ async def stage_marketplace_skills(
                 "marketplace %r plugin %r staging failed, skipped: %s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
-                sanitize_text_for_diagnostics(str(e)),
+                safe_exception_text(e),
             )
         except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
             # #263：`exc_info=True` 的 traceback 由 logging 直接渲染、无法脱敏 ⇒ 先格式化再整体脱敏后单条输出。
@@ -1357,7 +1373,7 @@ async def stage_marketplace_skills(
                 "marketplace %r plugin %r unexpected staging error, skipped: %s\n%s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
-                sanitize_text_for_diagnostics(str(e)),
+                safe_exception_text(e),
                 sanitize_text_for_diagnostics(
                     redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
                 ),

@@ -1509,3 +1509,202 @@ async def test_mcp_skill_root_uri_logs_are_redacted(
     assert "no path segment" in text  # 正对照：确实命中了该分支
     assert "PW_URI" not in text
     assert "alice:" not in text
+
+
+# ── #263 六轮复审：其余 root_uri 分支 / 非 UTF-8 SKILL.md / scp-like 源 ──────────
+_CRED_ROOT = "skill://alice:PW_ROOT@host/leak"
+
+
+@pytest.mark.asyncio
+async def test_skill_md_missing_branch_root_uri_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """`staged SKILL missing` 分支的 root_uri 回显脱敏。"""
+    mount = tmp_path / "mount" / "nofile"
+    mount.mkdir(parents=True)  # 无 SKILL.md
+    res = Resource(
+        uri=_CRED_ROOT,  # type: ignore[arg-type]
+        name="leak",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount)},
+    )
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(FakeManager([("bid", res)]), SkillRegistry(), home)
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "staged SKILL missing" in text
+    assert "PW_ROOT" not in text
+
+
+@pytest.mark.asyncio
+async def test_frontmatter_missing_branch_root_uri_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """`frontmatter missing required name/description` 分支脱敏。"""
+    mount = tmp_path / "mount" / "nodesc"
+    mount.mkdir(parents=True)
+    (mount / "SKILL.md").write_text("---\nname: x\n---\nbody\n", encoding="utf-8")
+    res = Resource(
+        uri=_CRED_ROOT,  # type: ignore[arg-type]
+        name="leak",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount)},
+    )
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(FakeManager([("bid", res)]), SkillRegistry(), home)
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "frontmatter missing" in text
+    assert "PW_ROOT" not in text
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_skill_md_is_isolated_and_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """非 UTF-8 SKILL.md：单 SKILL 失败隔离（不得中止整个 run），日志脱敏。"""
+    mount_bad = tmp_path / "mount" / "bad"
+    mount_bad.mkdir(parents=True)
+    (mount_bad / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")
+    mount_ok = tmp_path / "mount" / "good"
+    mount_ok.mkdir(parents=True)
+    (mount_ok / "SKILL.md").write_text(_skill_md(name="good"), encoding="utf-8")
+
+    bad = Resource(
+        uri="skill://host/bad",  # type: ignore[arg-type]
+        name="bad",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount_bad)},
+    )
+    good = Resource(
+        uri="skill://host/good",  # type: ignore[arg-type]
+        name="good",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount_ok)},
+    )
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(FakeManager([("bid", bad), ("bid", good)]), SkillRegistry(), home)
+    # 失败隔离正对照：好的 SKILL 仍被注册
+    assert names == ["mcp:bid:good"], names
+    text = _no_secret(staging_logs.records)
+    assert "SKILL.md unreadable" in text
+    assert "\xff" not in text
+
+
+@pytest.mark.asyncio
+async def test_scp_like_source_unreadable_log_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """scp-like 相对 source（`deploy-token@example.com:org/repo.git`）在 SKILL.md 读失败时也不得漏。"""
+    bad = "deploy-token@example.com:org/repo.git"
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "audit", "source": f"./plugins/{bad}"}]}), encoding="utf-8"
+    )
+    skill_md = repo / "plugins" / bad / "skills" / "etl" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text(_skill_md(), encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    def boom(_text: str):
+        raise OSError(f"[Errno 13] Permission denied: '{skill_md}'")
+
+    monkeypatch.setattr(staging_mod, "parse_skill_frontmatter", boom)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "SKILL.md unreadable" in text
+    assert "deploy-token" not in text
+    assert "example.com:org" not in text
+
+
+@pytest.mark.asyncio
+async def test_name_synthesis_failed_branch_root_uri_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """`skill name synthesis failed` 分支的 root_uri 回显脱敏。"""
+    mount = tmp_path / "mount" / "badname"
+    mount.mkdir(parents=True)
+    (mount / "SKILL.md").write_text("---\nname: 'Not Kebab!'\ndescription: d\n---\nbody\n", encoding="utf-8")
+    res = Resource(
+        uri=_CRED_ROOT,  # type: ignore[arg-type]
+        name="leak",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount)},
+    )
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(FakeManager([("bid", res)]), SkillRegistry(), home)
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "name synthesis failed" in text
+    assert "PW_ROOT" not in text
+
+
+@pytest.mark.asyncio
+async def test_duplicate_synthesized_branch_root_uri_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """`duplicate synthesized SKILL name` 分支的 root_uri 回显脱敏。"""
+    resources: list[Resource] = []
+    for tag in ("a", "b"):
+        mount = tmp_path / "mount" / tag
+        mount.mkdir(parents=True)
+        (mount / "SKILL.md").write_text(_skill_md(name="dup-skill"), encoding="utf-8")
+        resources.append(Resource(
+            uri=f"skill://alice:PW_ROOT_{tag}@host/{tag}",  # type: ignore[arg-type]
+            name=tag,
+            mimeType="text/markdown",
+            _meta={"source": "mounted", "mount_dir": str(mount)},
+        ))
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(FakeManager([("bid", r) for r in resources]), SkillRegistry(), home)
+    assert len(names) == 1  # 保留先到者
+    text = _no_secret(staging_logs.records)
+    assert "duplicate synthesized" in text
+    assert "PW_ROOT" not in text
+
+
+@pytest.mark.asyncio
+async def test_covered_root_debug_log_is_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """covered-root 跳过分支的 DEBUG 不得原样回显带凭据的 uri / coverer。"""
+    mount_c = tmp_path / "mount" / "coverer"
+    mount_c.mkdir(parents=True)
+    (mount_c / "SKILL.md").write_text(_skill_md(name="coverer"), encoding="utf-8")
+    mount_r = tmp_path / "mount" / "covered"
+    mount_r.mkdir(parents=True)
+    (mount_r / "SKILL.md").write_text(_skill_md(name="covered"), encoding="utf-8")
+
+    coverer = Resource(
+        uri="skill://alice:PW_COV@host/a/b",  # type: ignore[arg-type]
+        name="coverer",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount_c)},
+    )
+    covered = Resource(
+        uri="skill://alice:PW_COV@host/a",  # type: ignore[arg-type]
+        name="covered",
+        mimeType="text/markdown",
+        _meta={"source": "mounted", "mount_dir": str(mount_r)},
+    )
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    staging_logs.set_level(logging.DEBUG)
+    names = await staging_mod.stage_mcp_skills(FakeManager([("bid", coverer), ("bid", covered)]), SkillRegistry(), home)
+    assert names == ["mcp:bid:covered"]  # 短前缀是根，长前缀（/a/b）被覆盖、不进册
+    text = _no_secret(staging_logs.records)
+    assert "covered by skill resource" in text  # 正对照：DEBUG 分支确实执行
+    assert "PW_COV" not in text

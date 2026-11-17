@@ -65,6 +65,7 @@ from a2c_smcp.computer.skills.sources import (
     SkillSourceError,
     redact_source_display,
     resolve_plugin_source,
+    safe_exception_text,
 )
 from a2c_smcp.computer.skills.staging import SKILL_MD, SKILLS_SUBDIR, parse_skill_frontmatter
 from a2c_smcp.utils.git_url import (
@@ -200,7 +201,7 @@ def _load_json_object(path: Path, c: _Collector) -> dict[str, Any] | None:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:  # #263：非 UTF-8 文件（ValueError 子类）也要归一成诊断
-        c.add(CODE_UNREADABLE, rel, ".", f"cannot read {rel}: {sanitize_text_for_diagnostics(str(e))}")
+        c.add(CODE_UNREADABLE, rel, ".", f"cannot read {rel}: {safe_exception_text(e)}")
         return None
     try:
         data = json.loads(text)
@@ -520,7 +521,7 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
             children = sorted(p for p in container.iterdir() if p.is_dir())
         except OSError as e:
             # 容器存在但不可列（权限等）：记 issue 继续，不 traceback 中断全量收集（collect-all 承诺）。
-            c.add(CODE_UNREADABLE, c.rel(container), ".", f"cannot list {c.rel(container)}: {e}")
+            c.add(CODE_UNREADABLE, c.rel(container), ".", f"cannot list {c.rel(container)}: {safe_exception_text(e)}")
             continue
         for skill_dir in children:
             skill_md = skill_dir / SKILL_MD
@@ -533,8 +534,11 @@ def _validate_skills(c: _Collector, plugin_root: Path, containers: list[Path], p
                 continue
             try:
                 text = skill_md.read_text(encoding="utf-8")
-            except OSError as e:
-                c.add(CODE_SKILL_MD_UNREADABLE, c.rel(skill_md), ".", f"cannot read {c.rel(skill_md)}: {e}")
+            except (OSError, UnicodeDecodeError) as e:  # #263：非 UTF-8 SKILL.md 同属「不可读」
+                c.add(
+                    CODE_SKILL_MD_UNREADABLE, c.rel(skill_md), ".",
+                    f"cannot read {c.rel(skill_md)}: {safe_exception_text(e)}",
+                )
                 continue
             c.checked_file(skill_md)
             frontmatter = parse_skill_frontmatter(text)
