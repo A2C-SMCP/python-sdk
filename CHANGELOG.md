@@ -455,6 +455,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，三轮）：scp-like 判据只看 `@` **之前**是否含 `://`（`alice:PW@host,https://…`
+    这类 `@` 在前的 token 仍是凭据）；路径轴把 PAT / username-only userinfo（URL 语境下的 `TOKEN@host`）
+    与 percent-encoded 冒号一并按凭据处理，同时不误伤 `alice@corp` 与 Windows 盘符；`plugin install` 把
+    `SkillStagingError` / `PluginManifestError` 也归一为结构化错误（仍脱敏）；manifest 的 pydantic 诊断
+    改为「字段:类型 + 条数」（不带 `input_value` / URL），stem / name 回显脱敏；`plugin validate` 的
+    `--json path` 与人类输出同一口径；message 轴改为**逐 token** 路径遮蔽（保留可读前缀与换行）。
   - 复审补口（同一 PR，二轮）：validator 的 `message` 轴同样过路径级遮蔽（`_Collector.add()` 单一漏斗）；
     `sanitize_path_for_diagnostics` 修正——`/` 与 `\` 都算段边界、query/fragment 从首个 `?`/`#` 起遮蔽余下整条
     路径、仅遮蔽 userinfo 形态（`user:secret@`）不再误伤 `alice@corp`、控制字符先转义；

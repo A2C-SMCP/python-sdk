@@ -124,6 +124,7 @@ from a2c_smcp.utils.git_url import (
     redact_git_urls_in_text,
     sanitize_git_text,
     sanitize_path_for_diagnostics,
+    sanitize_text_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
@@ -569,8 +570,10 @@ async def stage_mcp_skills(
                     "materialize failed for %s (mode=%s): %s\n%s",
                     sanitize_path_for_diagnostics(root_uri),
                     mode,
-                    redact_git_urls_in_text(str(e)),
-                    redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__))),
+                    sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+                    sanitize_text_for_diagnostics(
+                        redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                    ),
                 )
                 shutil.rmtree(staged, ignore_errors=True)
                 continue
@@ -1271,7 +1274,11 @@ async def stage_marketplace_skills(
     try:
         manifest = read_marketplace_manifest(clone_dir)
     except PluginManifestError as e:
-        logger.error("marketplace %r manifest invalid, skipped (clone kept): %s", name, e)
+        logger.error(
+            "marketplace %r manifest invalid, skipped (clone kept): %s",
+            redact_git_urls_in_text(name),
+            sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+        )
         return registered
 
     plugins = manifest.get("plugins")
@@ -1293,7 +1300,11 @@ async def stage_marketplace_skills(
         try:
             plugin_name = _entry_plugin_name(entry)
         except SkillStagingError as e:
-            logger.error("marketplace %r plugin entry invalid, skipped: %s", redact_git_urls_in_text(name), e)
+            logger.error(
+                "marketplace %r plugin entry invalid, skipped: %s",
+                redact_git_urls_in_text(name),
+                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+            )
             continue
         if plugin_filter is not None and plugin_name not in plugin_filter:
             continue
@@ -1321,7 +1332,7 @@ async def stage_marketplace_skills(
                 "marketplace %r plugin %r staging failed, skipped: %s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
-                redact_git_urls_in_text(str(e)),
+                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
             )
         except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
             # #263：`exc_info=True` 的 traceback 由 logging 直接渲染、无法脱敏 ⇒ 先格式化再整体脱敏后单条输出。
@@ -1329,7 +1340,9 @@ async def stage_marketplace_skills(
                 "marketplace %r plugin %r unexpected staging error, skipped: %s\n%s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
-                redact_git_urls_in_text(str(e)),
-                redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__))),
+                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+                sanitize_text_for_diagnostics(
+                    redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                ),
             )
     return registered

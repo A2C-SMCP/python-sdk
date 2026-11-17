@@ -125,10 +125,12 @@ from a2c_smcp.computer.skills.staging import (
     DEFAULT_GIT_TIMEOUT,
     SKILL_MD,
     SKILLS_SUBDIR,
+    SkillStagingError,
     locate_plugin_root,
     stage_marketplace_skills,
 )
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_text_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -1110,10 +1112,20 @@ async def install_plugin(
                 _write_installed_plugin(plugin_id, False, env)
             except Exception as rollback_exc:  # noqa: BLE001 - 回滚 best-effort
                 logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, rollback_exc)
-        # #263：source 非法属本地配置问题（非崩溃）→ 结构化错误上抛，CLI 经 _plugin_error 输出（无 traceback）。
-        # 消息只取 SkillSourceError **构造期已脱敏**的文本，不在此重新拼接原始值。
+        # #263：source / staging / manifest 非法属本地配置问题（非崩溃）→ 结构化错误上抛，
+        # CLI 经 _plugin_error 输出（无 traceback）。消息只取各异常**已脱敏**的文本，不在此重新拼接原始值。
         if isinstance(e, SkillSourceError):
             raise PluginInstallError(f"marketplace {marketplace!r} source invalid: {e}") from None
+        if isinstance(e, SkillStagingError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} plugin staging failed: "
+                f"{sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e)))}"
+            ) from None
+        if isinstance(e, PluginManifestError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} plugin manifest invalid: "
+                f"{sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e)))}"
+            ) from None
         raise
 
     logger.info(

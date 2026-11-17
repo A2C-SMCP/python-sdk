@@ -343,3 +343,46 @@ def test_prose_redaction_keeps_display_safe_urls() -> None:
 
     text = "see file:///home/alice@corp/repo.git and https://example.com/org/repo@2.git"
     assert redact_git_urls_in_text(text) == text
+
+
+# ── #263 三轮复审：scp 判据 / PAT userinfo / Cs ────────────────────────────────
+def test_scp_like_followed_by_url_still_redacted() -> None:
+    """负向量：`@` 在前、`://` 在后的 token 仍属 scp-like 凭据（判据只看 `@` 之前）。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, redact_git_urls_in_text
+
+    out = redact_git_urls_in_text("alice:PW@example.com,https://example.com/repo.git")
+    assert "PW" not in out and "alice" not in out
+    assert REDACTED_GIT_SOURCE in out
+
+
+def test_path_sanitizer_masks_pat_userinfo_in_url_context() -> None:
+    """PAT（无冒号的 `TOKEN@host`）在 URL 语境下同样是凭据。"""
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("plugins/x=https:/TOKEN@host/repo") == "plugins/x=https:/<redacted-source>/repo"
+    assert P("plugins/alice%3Apw@host/repo") == "plugins/<redacted-source>/repo"
+
+
+def test_path_sanitizer_masks_windows_credential_segment() -> None:
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("C:\\Users\\alice:PW@host\\repo") == "C:\\Users\\<redacted-source>\\repo"
+
+
+def test_path_sanitizer_escapes_lone_surrogate() -> None:
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    out = P("plugins/\ud800bad/SKILL.md")
+    assert "\ud800" not in out
+    assert "\\ud800" in out
+
+
+def test_text_sanitizer_keeps_readable_prose_and_masks_only_path_tokens() -> None:
+    from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics as T
+
+    msg = "cannot read plugins/x=https:/h/r.git?token=S: oops\nsecond line"
+    out = T(msg)
+    assert "token=S" not in out
+    # 正对照：可读前缀 / 行尾散文 / 换行都保留（不整段吞掉）
+    assert out.startswith("cannot read plugins/x=https:/h/r.git")
+    assert out.endswith("oops\nsecond line")

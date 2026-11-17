@@ -38,7 +38,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 # 无法安全呈现时的统一占位符（与 rust 逐字节一致）/ Placeholder literal shared with rust.
 REDACTED_GIT_SOURCE = "<redacted-git-source>"
@@ -235,9 +235,11 @@ def _redact_scp_like_sources(text: str) -> str:
             if rest[index].isspace():
                 end = index
                 break
-        if "://" in rest[start:end]:
+        if "://" in rest[start:at]:
             # 已由 `_redact_scheme_urls` 处理过的 scheme token（含 path 里的 `@`，如
             # `file:///home/alice@corp/repo.git`）：再按 scp-like 处理会把**展示安全**的 URL 吞成占位符。
+            # 判据只看 `@` **之前**是否出现 `://`——`alice:PW@host,https://…` 这类 `@` 在前、URL 在后的
+            # token 仍是 scp-like 凭据，必须继续脱敏。
             out.append(rest[: at + 1])
             rest = rest[at + 1 :]
             continue
@@ -274,7 +276,12 @@ def redact_git_urls_in_text(text: str) -> str:
 _UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cs"})
 
 # userinfo 形态片段：`user:secret@`（要求 `@` 前存在 `:`，避免误伤 `alice@corp` 这类合法路径名）。
+# #263 复审：PAT / username-only 的 `TOKEN@host` 也是凭据——**但只在 URL 语境下**（路径里出现 scheme 残形
+# `:/` 或 `://`）才遮蔽，否则 `alice@corp` 这类合法文件名会被误伤。percent-encoded 冒号（`alice%3Apw@`）
+# 先 decode 再判定。
 _USERINFO_SEGMENT_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
+# scheme 残形（`https:/`、`https:\\`）：要求 scheme 名 ≥2 字符，避免把 Windows 盘符 `C:\\` 当 URL 语境。
+_SCHEME_REMNANT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:[/\\]")
 
 
 def escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
@@ -314,6 +321,9 @@ def sanitize_path_for_diagnostics(path: str) -> str:
     escaped = escape_unsafe_chars(path)
     if not any(marker in escaped for marker in ("@", "?", "#")):
         return escaped
+    # URL 语境：路径里残留 scheme 形态（`x=https:/…`）。只有这种语境下 `TOKEN@host` 的无冒号 userinfo
+    # 才按凭据处理——否则 `alice@corp` 这类合法文件名会被误伤。
+    url_context = _SCHEME_REMNANT_RE.search(escaped) is not None
     parts = re.split(r"([/\\])", escaped)
     out: list[str] = []
     tail_masked = False
@@ -330,7 +340,31 @@ def sanitize_path_for_diagnostics(path: str) -> str:
             out.append(part[:cut] + "<redacted-source>")
             tail_masked = True
             continue
-        out.append("<redacted-source>" if _USERINFO_SEGMENT_RE.search(part) else part)
+        decoded = unquote(part)
+        userinfo = _USERINFO_SEGMENT_RE.search(decoded) is not None or (url_context and "@" in part)
+        out.append("<redacted-source>" if userinfo else part)
+    return "".join(out)
+
+
+# 路径 token 的判定（供 :func:`sanitize_text_for_diagnostics` 逐 token 使用）：只有带 URL 残形 / userinfo
+# 形态的 token 才按路径处理，散文其余部分（含换行与可读前缀）逐字保留。
+_PATH_TOKEN_RE = re.compile(r":[/\\]|://")
+_USERINFO_TOKEN_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
+
+
+def sanitize_text_for_diagnostics(text: str) -> str:
+    """
+    诊断**散文**的路径级脱敏：逐 token 判定，仅遮蔽 URL 残形 / userinfo 形态的 token / Token-level.
+    """
+    out: list[str] = []
+    for token in re.split(r"(\s+)", text):
+        if not token or token.isspace():
+            out.append(token)
+            continue
+        if _PATH_TOKEN_RE.search(token) or _USERINFO_TOKEN_RE.search(unquote(token)):
+            out.append(sanitize_path_for_diagnostics(token))
+        else:
+            out.append(token)
     return "".join(out)
 
 

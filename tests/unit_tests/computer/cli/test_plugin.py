@@ -990,3 +990,25 @@ async def test_enable_multi_scope_any_dead_record_exits1_without_partial_enable(
     payload = json.loads(capsys.readouterr().out)
     assert str(dead) in payload["message"]  # 点名死路径
     assert "enabledPlugins" not in json.loads(user_settings_path(env).read_text(encoding="utf-8"))  # 零部分启用
+
+
+@pytest.mark.asyncio
+async def test_install_staging_error_is_structured_not_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 三轮复审：`SkillStagingError` / `PluginManifestError` 也不再以 traceback 逃出 CLI。"""
+    from a2c_smcp.computer.skills.staging import SkillStagingError
+
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "url", "url": "https://example.com/r.git"})
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise SkillStagingError("git clone failed for https://alice:PW_STAGE@example.com/r.git?token=Q")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "plugin staging failed" in out
+    assert "PW_STAGE" not in out
+    assert "token=Q" not in out

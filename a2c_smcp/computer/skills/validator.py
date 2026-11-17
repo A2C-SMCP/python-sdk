@@ -67,7 +67,12 @@ from a2c_smcp.computer.skills.sources import (
     resolve_plugin_source,
 )
 from a2c_smcp.computer.skills.staging import SKILL_MD, SKILLS_SUBDIR, parse_skill_frontmatter
-from a2c_smcp.utils.git_url import git_url_for_display, redact_git_urls_in_text, sanitize_path_for_diagnostics
+from a2c_smcp.utils.git_url import (
+    git_url_for_display,
+    redact_git_urls_in_text,
+    sanitize_path_for_diagnostics,
+    sanitize_text_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -176,7 +181,7 @@ class _Collector:
                 code=code,
                 file=sanitize_path_for_diagnostics(file),
                 location=sanitize_path_for_diagnostics(location),
-                message=sanitize_path_for_diagnostics(redact_git_urls_in_text(message)),
+                message=sanitize_text_for_diagnostics(redact_git_urls_in_text(message)),
                 severity=severity,
             )
         )

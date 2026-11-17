@@ -128,13 +128,13 @@ def test_human_output_escapes_bracketed_message(tmp_path: Path, capsys: pytest.C
         "owner": {"name": "Acme"},
         "plugins": [{"name": "data-toolkit", "source": "data-toolkit"}],
     }))
-    # stdio 缺 server_parameters → pydantic ValidationError 文本自带 [type=missing, ...] 段。
+    # stdio 缺 server_parameters → 诊断 message 含 `[字段:类型]` 方括号段（#263 复审后不再带 input_value）。
     _w(root / "plugins" / "data-toolkit" / "mcp-servers" / "etl.json",
        json.dumps({"name": "etl", "type": "stdio"}))
     code = plugin_validate(root)
     assert code == 1
     out = capsys.readouterr().out
-    assert "type=missing" in out  # 方括号段完整呈现（未被 rich markup 消费）
+    assert "[StdioServerConfig.server_parameters:missing" in out  # 方括号段完整呈现（未被 rich markup 消费）
 
 
 # ── 双入口 alias（#193 用户裁决）/ dual entry alias ─────────────────────────────
@@ -221,3 +221,26 @@ def test_json_file_axis_redacts_credential_source_dir(tmp_path: Path, capsys: py
         assert "PW_FILE" not in issue["message"] and "alice:" not in issue["message"]
     assert all("PW_FILE" not in f for f in data["checked_files"])
     assert any("<redacted-source>" in f for f in data["checked_files"])
+
+
+def test_json_path_and_human_line_redact_credential_root(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#263 三轮复审：`--json` 的 `path` 与人类输出的 root 也不得回显凭据形态。"""
+    root = tmp_path / "x=https:/TOKEN@host/mp"
+    _w(root / ".tfrobot-plugin" / "marketplace.json", json.dumps({
+        "name": "acme-mp",
+        "owner": {"name": "Acme"},
+        "plugins": [{"name": "data-toolkit", "source": "data-toolkit"}],
+    }))
+    _w(root / "plugins" / "data-toolkit" / "skills" / "etl" / "SKILL.md",
+       "---\nname: etl\ndescription: d\n---\n\nbody\n")
+
+    code = plugin_validate(root, json_output=True)
+    out = capsys.readouterr().out
+    assert code in (0, 1)
+    assert "TOKEN" not in out
+    data = json.loads(out)
+    assert "<redacted-source>" in data["path"]
+
+    plugin_validate(root)
+    human = capsys.readouterr().out
+    assert "TOKEN" not in human

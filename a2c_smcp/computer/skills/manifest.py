@@ -42,7 +42,11 @@ from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT
-from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_path_for_diagnostics
+from a2c_smcp.utils.git_url import (
+    redact_git_urls_in_text,
+    sanitize_path_for_diagnostics,
+    sanitize_text_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -69,7 +73,10 @@ def _read_json_object(path: Path, *, what: str) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
-        raise PluginManifestError(f"{what} unreadable/invalid at {sanitize_path_for_diagnostics(str(path))}: {e}") from e
+        raise PluginManifestError(
+            f"{what} unreadable/invalid at {sanitize_path_for_diagnostics(str(path))}: "
+            f"{sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e)))}"
+        ) from e
     if not isinstance(data, dict):
         raise PluginManifestError(f"{what} root is not an object: {sanitize_path_for_diagnostics(str(path))}")
     return data
@@ -121,7 +128,7 @@ def read_plugin_metadata(plugin_root: Path) -> dict[str, Any]:
         return _read_json_object(path, what="plugin manifest")
     except PluginManifestError as e:
         # plugin.json 仅供 version / 显示名兜底，损坏不致命（SKILL/server 由路径推导）。
-        logger.warning("plugin manifest ignored (%s)", redact_git_urls_in_text(str(e)))
+        logger.warning("plugin manifest ignored (%s)", sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))))
         return {}
 
 
@@ -266,12 +273,20 @@ def parse_bundled_server(path: Path) -> MCPServerConfig:
     try:
         cfg = _MCP_SERVER_ADAPTER.validate_python(data)
     except ValidationError as e:
+        # #263 复审：pydantic 默认 str 会带 `input_value=…`（env / headers 里可能是 token）→ 只报字段与条数。
+        details = e.errors(include_input=False, include_url=False)
+        fields = ", ".join(
+            f"{'.'.join(str(part) for part in err.get('loc', ())) or '<root>'}:{err.get('type', 'invalid')}"
+            for err in details
+        )
         raise PluginManifestError(
-            f"invalid MCP server config at {sanitize_path_for_diagnostics(str(path))}: {e}"
+            f"invalid MCP server config at {sanitize_path_for_diagnostics(str(path))}: "
+            f"{len(details)} validation error(s) in [{fields}]"
         ) from e
     if cfg.name != path.stem:
         raise PluginManifestError(
-            f"bundled MCP server filename stem {path.stem!r} != config name {cfg.name!r} "
+            f"bundled MCP server filename stem {redact_git_urls_in_text(path.stem)!r} != "
+            f"config name {redact_git_urls_in_text(str(cfg.name))!r} "
             f"at {sanitize_path_for_diagnostics(str(path))} "
             "(mcp-servers protocol §1: filename = server identity)",
         )

@@ -571,3 +571,37 @@ def test_manifest_error_message_redacts_credential_path(tmp_path: Path) -> None:
     msg = str(ei.value)
     assert "token=SECRET" not in msg
     assert "#frag" not in msg
+
+
+def test_manifest_validation_message_hides_input_values(tmp_path: Path) -> None:
+    """#263 三轮复审：pydantic 诊断不得带 `input_value`（env / headers 里可能是 token）。"""
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": "audit"}]), plugins=())
+    p = root / "plugins" / "audit" / "mcp-servers"
+    p.mkdir(parents=True)
+    (p / "evil.json").write_text(
+        json.dumps({
+            "name": "evil",
+            "type": "stdio",
+            "server_parameters": {"command": "node", "env": {"TOKEN": "ghp_SUPERSECRET"}},
+            "unexpected_field": "ghp_SUPERSECRET",
+        }),
+        encoding="utf-8",
+    )
+    r = validate_path(root)
+    text = _messages(r)
+    assert "ghp_SUPERSECRET" not in text
+    assert "input_value" not in text
+
+
+def test_collector_add_preserves_prose_around_masked_path(tmp_path: Path) -> None:
+    """#263 三轮复审：message 轴只遮蔽路径 token——可读前缀、问号散文、换行必须保留。"""
+    from a2c_smcp.computer.skills.validator import _Collector
+
+    c = _Collector(tmp_path)
+    bad = "plugins/x=https:/h/r.git?token=SECRET#frag"
+    c.add("x-code", bad, ".", f"cannot read {bad}: why? oops\nsecond line")
+    msg = c.result.issues[0].message
+    assert "token=SECRET" not in msg
+    # 正对照：前缀 / prose 的 `?` / 换行都还在（不得整段吞掉或转义成 \x0a）
+    assert msg.startswith("cannot read plugins/x=https:/h/r.git")
+    assert msg.endswith("why? oops\nsecond line")
