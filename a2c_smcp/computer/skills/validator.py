@@ -63,10 +63,11 @@ from a2c_smcp.computer.skills.sources import (
     GitCloneSpec,
     LocalPluginSource,
     SkillSourceError,
+    redact_source_display,
     resolve_plugin_source,
 )
 from a2c_smcp.computer.skills.staging import SKILL_MD, SKILLS_SUBDIR, parse_skill_frontmatter
-from a2c_smcp.utils.git_url import git_url_for_display, redact_git_urls_in_text
+from a2c_smcp.utils.git_url import git_url_for_display, redact_git_urls_in_text, sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -156,14 +157,29 @@ class _Collector:
         self.result = ValidationResult(root=self.root, mode=None)
 
     def rel(self, p: Path) -> str:
-        """绝对路径 → 相对 root 的 POSIX 串（越界时退回绝对串，防 crash）/ Absolute → root-relative POSIX."""
+        """绝对路径 → 相对 root 的 POSIX 串（越界时退回绝对串，防 crash）/ Absolute → root-relative POSIX.
+
+        #263：路径会进入 ``ValidationIssue.file`` / ``checked`` 两条展示轴，故在此**单一漏斗**做诊断脱敏
+        （source 归一会把 ``://`` 坍缩成 ``:/``，普通散文脱敏抓不到，必须按路径片段遮蔽）。
+        """
         try:
-            return p.relative_to(self.root).as_posix() or "."
+            rel = p.relative_to(self.root).as_posix() or "."
         except ValueError:
-            return p.as_posix()
+            rel = p.as_posix()
+        return sanitize_path_for_diagnostics(rel)
 
     def add(self, code: str, file: str, location: str, message: str, *, severity: Severity = "error") -> None:
-        self.result.issues.append(ValidationIssue(code=code, file=file, location=location, message=message, severity=severity))
+        # #263：诊断三轴的统一出口——file / location 走路径脱敏，message 走散文脱敏。
+        # 各调用点仍可在生成 message 时先脱敏（幂等），此处兜底避免新增诊断点重新开洞。
+        self.result.issues.append(
+            ValidationIssue(
+                code=code,
+                file=sanitize_path_for_diagnostics(file),
+                location=sanitize_path_for_diagnostics(location),
+                message=redact_git_urls_in_text(message),
+                severity=severity,
+            )
+        )
 
     def checked_file(self, p: Path) -> None:
         rel = self.rel(p)
@@ -336,8 +352,12 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
     if "source" not in entry or entry.get("source") is None:
         c.add(CODE_MISSING_FIELD, mfile, f"{loc}.source", "required field 'source' is missing")
         return
+    raw_source = entry.get("source")
+    # #263：回显一律用**归一化前**的原始 source（`resolved.rel_path` 把 ``//`` 折叠成 ``/``，
+    # URL 规则再也认不出 query / fragment；原始串里 ``://`` 完整，strict 脱敏才生效）。
+    source_display = redact_source_display(raw_source)
     try:
-        resolved = resolve_plugin_source(entry.get("source"), plugin_root=base)
+        resolved = resolve_plugin_source(raw_source, plugin_root=base)
     except SkillSourceError as e:
         c.add(CODE_INVALID_SOURCE, mfile, f"{loc}.source", str(e))
         return
@@ -359,14 +379,13 @@ def _validate_entry_source(c: _Collector, entry: Mapping[str, Any], loc: str, mf
             CODE_PATH_ESCAPE,
             mfile,
             f"{loc}.source",
-            f"relative plugin source {redact_git_urls_in_text(resolved.rel_path)!r} escapes the marketplace root",
+            f"relative plugin source {source_display!r} escapes the marketplace root",
         )
         return
     if not plugin_root.is_dir():
         c.add(
             CODE_PATH_MISSING, mfile, f"{loc}.source",
-            f"local plugin directory not found: {redact_git_urls_in_text(resolved.rel_path)!r} "
-            f"(resolved to {redact_git_urls_in_text(str(plugin_root))})",
+            f"local plugin directory not found for source {source_display!r}",
         )
         return
     _validate_plugin(c, plugin_root, entry=entry, entry_loc=loc, plugin_name=name)

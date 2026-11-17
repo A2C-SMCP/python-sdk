@@ -76,15 +76,20 @@ def _is_source_field(key: object) -> bool:
     return isinstance(key, str) and key.casefold() in _GIT_SOURCE_FIELDS
 
 
-def _escape_unsafe_chars(text: str) -> str:
-    """把控制字符 / 孤立代理项转义为可见形式 / Escape control and surrogate code points for display."""
+def _escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
+    """
+    把控制字符 / 孤立代理项转义为可见形式 / Escape control and surrogate code points for display.
+
+    ``json_safe=True`` 时统一用 ``\\uXXXX``（``\\xNN`` 不是合法 JSON 转义——DEL 0x7f / C1 0x80-0x9f
+    不会被 :func:`json.dumps` 转义，混进 JSON 形态的 ``raw`` 会产出无法解析的文本）。
+    """
     if not any(unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES for ch in text):
         return text
     out: list[str] = []
     for ch in text:
         if unicodedata.category(ch) in _UNSAFE_CHAR_CATEGORIES:
             code = ord(ch)
-            out.append(f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}")
+            out.append(f"\\u{code:04x}" if json_safe or code > 0xFF else f"\\x{code:02x}")
         else:
             out.append(ch)
     return "".join(out)
@@ -130,8 +135,13 @@ def _redact_error_value(value: object, *, source_field: bool = False, depth: int
     return _safe_repr(value)
 
 
-def _redacted_source_display(raw: object) -> str:
-    """把不可信 source 渲染为紧凑、已脱敏的错误回显文本 / Compact redacted echo of an untrusted source."""
+def redact_source_display(raw: object) -> str:
+    """
+    把不可信 source 渲染为紧凑、已脱敏的错误回显文本 / Compact redacted echo of an untrusted source.
+
+    公开给 validator / staging 复用（#263）：错误消息引用 source 时必须走本函数，而不是把归一化后的
+    路径塞进消息（``://`` 会被路径归一折叠成 ``/``，token 级脱敏随即失效）。
+    """
     if isinstance(raw, str):
         return _escape_unsafe_chars(redact_git_urls_in_text(raw))
     try:
@@ -141,8 +151,9 @@ def _redacted_source_display(raw: object) -> str:
         text = json.dumps(_redact_error_value(raw), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, RecursionError):  # 非常规容器（如 tuple 键）/ 非有限浮点 / 循环引用 → repr 兜底
         return _safe_repr(raw)
-    # 兜底转义：JSON 字符串已转义 Cc，这里只可能命中孤立代理项（输出 ``\uXXXX``，仍是合法 JSON）。
-    return _escape_unsafe_chars(text)
+    # 兜底转义：JSON 字符串已转义 Cc(<0x20)，命中量只剩孤立代理项 / DEL / C1——必须用 ``\uXXXX``
+    # 才能保持合法 JSON（``\x7f`` / ``\x9b`` 不是 JSON 转义）。
+    return _escape_unsafe_chars(text, json_safe=True)
 
 
 class SkillSourceError(ValueError):
@@ -163,7 +174,7 @@ class SkillSourceError(ValueError):
     """
 
     def __init__(self, raw: object, reason: str) -> None:
-        self.raw: str = _redacted_source_display(raw)
+        self.raw: str = redact_source_display(raw)
         self.reason: str = _escape_unsafe_chars(redact_git_urls_in_text(reason))
         super().__init__(f"invalid skill source {self.raw}: {self.reason}")
 

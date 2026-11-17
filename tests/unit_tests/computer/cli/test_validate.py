@@ -190,3 +190,30 @@ def test_human_output_redacts_source_credentials(tmp_path: Path, capsys: pytest.
     assert code == 1
     for secret in ("PW_JSON", "PW_REMOTE", "alice:", "bob:"):
         assert secret not in out
+
+
+def test_json_file_axis_redacts_credential_source_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#263 复审：`--json` 的 `file` / `checked_files` 轴同样不得回显 source 内的凭据。"""
+    bad = "x=https:.//alice:PW_FILE@example.com/repo.git"
+    root = tmp_path / "mp-file"
+    _w(root / ".tfrobot-plugin" / "marketplace.json", json.dumps({
+        "name": "acme-mp",
+        "owner": {"name": "Acme"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": "audit", "source": f"./plugins/{bad}"}],
+    }))
+    from a2c_smcp.computer.skills.validator import CODE_PLUGIN_MANIFEST_MISSING  # noqa: PLC0415
+
+    d = root / "plugins" / bad / "skills" / "etl"
+    d.mkdir(parents=True)
+    _w(d / "SKILL.md", "---\nname: etl\ndescription: d\n---\n\nbody\n")
+
+    code = plugin_validate(root, json_output=True)
+    out = capsys.readouterr().out
+    assert code == 0  # plugin.json 缺失是 warning（不挡）
+    assert "PW_FILE" not in out
+    data = json.loads(out)
+    assert any(i["code"] == CODE_PLUGIN_MANIFEST_MISSING for i in data["warnings"])
+    for issue in data["errors"] + data["warnings"]:
+        assert "PW_FILE" not in issue["file"] and "alice:" not in issue["file"]
+    assert all("PW_FILE" not in f for f in data["checked_files"])

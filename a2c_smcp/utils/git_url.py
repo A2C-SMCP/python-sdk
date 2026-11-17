@@ -262,6 +262,28 @@ def redact_git_urls_in_text(text: str) -> str:
     return _redact_scp_like_sources(_redact_scheme_urls(text))
 
 
+# 诊断路径片段的「可疑标记」：``@``（userinfo / scp-like）、``?`` / ``#``（query / fragment）。
+# 说明：source 串经 :func:`_norm_rel_segments` 归一后 ``://`` 会坍缩成 ``:/``（不再是 URL token），
+# 通用散文脱敏抓不到；路径轴（``ValidationIssue.file`` / ``checked`` / 日志里的落盘路径）因此改用
+# **逐段遮蔽**：片段内出现任一标记即整体替换为占位符（宁可少显示，不可回显凭据）。
+_SUSPECT_PATH_MARKERS = ("@", "?", "#", "://")
+
+
+def sanitize_path_for_diagnostics(path: str) -> str:
+    """
+    诊断用路径脱敏：逐段遮蔽携带 URL / 凭据标记的片段 / Mask URL-ish path segments for diagnostics.
+
+    仅用于**展示**（validator 的 ``file`` / ``checked``、staging 日志里的落盘路径）；不得用于文件系统
+    访问。合法 kebab / 普通路径逐字保留。
+    """
+    if not any(marker in path for marker in _SUSPECT_PATH_MARKERS):
+        return path
+    return "/".join(
+        "<redacted-source>" if segment and any(marker in segment for marker in _SUSPECT_PATH_MARKERS) else segment
+        for segment in path.split("/")
+    )
+
+
 def sanitize_git_text(text: str, args: Sequence[str]) -> str:
     """
     git 输出专用脱敏：先按已知 URL 参数 verbatim 替换，再走通用散文脱敏 / Sanitize git output.

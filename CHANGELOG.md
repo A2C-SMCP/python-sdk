@@ -455,6 +455,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR）：`ValidationIssue.file` / `checked` 两条路径轴在 `_Collector` **单一漏斗**脱敏
+    （`sanitize_path_for_diagnostics` 逐段遮蔽 `@` / `?` / `#` 片段）；消息一律用**归一化前**的原始 source
+    回显（`://` 被路径归一折叠成 `:/` 后 URL 规则会失效，query / fragment 因而漏出）；staging 兜底
+    `except Exception` 的 traceback 改为「格式化后整体脱敏」输出（`exc_info=True` 绕不过 logging）；
+    非对象 plugin entry 只记类型名；manifest loader 侧 override / ignore 日志同口径脱敏；`raw` 对象形态的
+    DEL / C1 兜底转义改用 `\uXXXX`（`\xNN` 不是合法 JSON 转义）。
 
 ### Fixed（#272 plugin entry name 路径穿越）
 

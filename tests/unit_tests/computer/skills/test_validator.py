@@ -417,9 +417,6 @@ def test_override_from_plugin_json_strict_true(tmp_path: Path) -> None:
 # ── 诊断脱敏（#263）/ diagnostic redaction ─────────────────────────────────────
 # 校验结果的 message 会同时进 CLI 文本与 `--json`（validate.py 直接渲染 issue.message），
 # 因此断言 message 本身：不得含 userinfo / query / fragment 或内嵌凭据的名称。
-_REDACTED = "<redacted-git-source>"
-
-
 def _messages(result: Any) -> str:
     return "\n".join(i.message for i in result.issues)
 
@@ -475,4 +472,37 @@ def test_missing_local_source_redacts_embedded_credentials(tmp_path: Path) -> No
     text = _messages(r)
     assert "PW_LOCAL" not in text
     assert "alice:" not in text
-    assert _REDACTED in text
+    assert "https://example.com/repo.git" in text
+
+
+# ── 复审 delta（#263 第二轮）：路径轴 / query-fragment / file 轴 ─────────────────
+def test_query_and_fragment_not_echoed_for_normalized_source(tmp_path: Path) -> None:
+    """source 归一后 ``://`` 坍缩成 ``:/``：query / fragment 不得借路径泄漏（用原始 source 回显）。"""
+    root = _marketplace(
+        tmp_path,
+        # 关键：不含 userinfo —— scp-like 兜底规则抓不到，只有原始 source 的 URL 规则才认得 query/fragment。
+        _mp_manifest(plugins=[{"name": "ghost", "source": "./x=https://example.com/r.git?token=QUERY#frag"}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_PATH_MISSING in _codes(r)
+    text = _messages(r)
+    for secret in ("token=QUERY", "#frag"):
+        assert secret not in text
+
+
+def test_issue_file_axis_redacts_credential_path(tmp_path: Path) -> None:
+    """`ValidationIssue.file`（--json 的 file 轴）：凭据形态的 source 目录名不得原样进 file。"""
+    bad = "x=https:.//alice:PW_FILE@example.com/repo.git"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    # 造出深检分支需要的目录（触发 plugin.json 缺失等以该路径为 file 的诊断）
+    (root / "plugins" / bad / "skills" / "etl").mkdir(parents=True)
+    (root / "plugins" / bad / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+    r = validate_path(root)
+    assert r.issues, "夹具应至少产出一条诊断"
+    for issue in r.issues:
+        assert "PW_FILE" not in issue.file
+        assert "alice:" not in issue.file
+        assert "PW_FILE" not in issue.message
+    for checked in r.checked:
+        assert "PW_FILE" not in checked

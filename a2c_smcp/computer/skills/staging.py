@@ -71,6 +71,7 @@ import os
 import re
 import shutil
 import tarfile
+import traceback
 import zipfile
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -114,10 +115,16 @@ from a2c_smcp.computer.skills.sources import (
     LocalPluginSource,
     SkillSourceError,
     marketplace_clone_url,
+    redact_source_display,
     resolve_plugin_source,
 )
 from a2c_smcp.smcp import A2CSkillRef
-from a2c_smcp.utils.git_url import git_url_for_display, redact_git_urls_in_text, sanitize_git_text
+from a2c_smcp.utils.git_url import (
+    git_url_for_display,
+    redact_git_urls_in_text,
+    sanitize_git_text,
+    sanitize_path_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -1000,7 +1007,11 @@ def _scan_and_register_plugin_skills(
                 )
                 continue
             if name in seen:
-                logger.error("duplicate marketplace SKILL name within staging run, keeping first: %s (%s)", name, skill_dir)
+                logger.error(
+                    "duplicate marketplace SKILL name within staging run, keeping first: %s (%s)",
+                    redact_git_urls_in_text(name),
+                    sanitize_path_for_diagnostics(str(skill_dir)),
+                )
                 continue
             seen.add(name)
             ref = _build_marketplace_ref(name, marketplace, frontmatter, version, skill_dir)
@@ -1042,14 +1053,15 @@ async def locate_plugin_root(
     if raw_source is None:
         raise SkillSourceError(dict(entry), "plugin entry missing required 'source'")
     resolved = resolve_plugin_source(raw_source, plugin_root=plugin_root_base)
+    # #263：错误回显一律用**归一化前**的原始 source —— `resolved.rel_path` 把 ``//`` 折叠成 ``/``，
+    # URL 规则再也认不出 query / fragment（`./x=https://h/r.git?token=S#f` → `x=https:/h/r.git?token=S#f`）。
+    source_display = redact_source_display(raw_source)
 
     if isinstance(resolved, LocalPluginSource):
         # 相对路径：就地在 catalog clone 内（不独立 clone）；越界保护（is_within 词法判定，两侧均已 resolve）。
         plugin_root = (catalog_dir / resolved.rel_path).resolve()
         if not is_within(plugin_root, catalog_dir.resolve()):
-            raise SkillStagingError(
-                f"relative plugin source escapes marketplace clone: {redact_git_urls_in_text(resolved.rel_path)!r}"
-            )
+            raise SkillStagingError(f"relative plugin source escapes marketplace clone: {source_display!r}")
         version_fallback = catalog_sha
     else:  # GitCloneSpec：独立 clone（git-subdir sparse / sha 锁版本等）。
         ext_dir = external_plugin_dir(home, marketplace, plugin_name)
@@ -1071,8 +1083,9 @@ async def locate_plugin_root(
         version_fallback = head
 
     if not plugin_root.is_dir():
-        # #263：解析结果可能内嵌凭据 URL（`.` + 凭据形态的相对源），回显前脱敏。
-        raise SkillStagingError(f"plugin root not found after resolve: {redact_git_urls_in_text(str(plugin_root))}")
+        # #263：回显原始 source（已脱敏）而非解析后的路径——路径经归一化会丢掉 URL 语义，
+        # query / fragment 与原值残留都会漏过 token 级脱敏。
+        raise SkillStagingError(f"plugin root not found after resolve: {source_display}")
     return plugin_root, version_fallback
 
 
@@ -1263,10 +1276,11 @@ async def stage_marketplace_skills(
     seen: set[str] = set()
     for entry in plugins:
         if not isinstance(entry, Mapping):
+            # #263：只记类型名（与 validator 同口径）——整值回显对裸 token（非 URL 形态）无脱敏能力。
             logger.error(
-                "marketplace %r has a non-object plugin entry, skipped: %r",
+                "marketplace %r has a non-object plugin entry (got %s), skipped",
                 redact_git_urls_in_text(name),
-                redact_git_urls_in_text(repr(entry)),
+                type(entry).__name__,
             )
             continue
         try:
@@ -1303,11 +1317,12 @@ async def stage_marketplace_skills(
                 redact_git_urls_in_text(str(e)),
             )
         except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
+            # #263：`exc_info=True` 的 traceback 由 logging 直接渲染、无法脱敏 ⇒ 先格式化再整体脱敏后单条输出。
             logger.error(
-                "marketplace %r plugin %r unexpected staging error, skipped: %s",
+                "marketplace %r plugin %r unexpected staging error, skipped: %s\n%s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
                 redact_git_urls_in_text(str(e)),
-                exc_info=True,
+                redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__))),
             )
     return registered

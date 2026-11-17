@@ -42,6 +42,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT
+from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -120,7 +121,7 @@ def read_plugin_metadata(plugin_root: Path) -> dict[str, Any]:
         return _read_json_object(path, what="plugin manifest")
     except PluginManifestError as e:
         # plugin.json 仅供 version / 显示名兜底，损坏不致命（SKILL/server 由路径推导）。
-        logger.warning("plugin manifest ignored (%s)", e)
+        logger.warning("plugin manifest ignored (%s)", redact_git_urls_in_text(str(e)))
         return {}
 
 
@@ -220,12 +221,20 @@ def resolve_skill_override_dirs(
     for rel in raw:
         cand = (plugin_root / rel).resolve()
         if not is_within(cand, plugin_root_resolved):
-            logger.error("skills override path %r escapes plugin root %s, skipped", rel, plugin_root)
+            logger.error(
+                "skills override path %r escapes plugin root %s, skipped",
+                redact_git_urls_in_text(rel),
+                sanitize_path_for_diagnostics(str(plugin_root)),
+            )
             continue
         if cand in seen_paths:
             continue
         if not cand.is_dir():
-            logger.warning("skills override path %r is not a directory at %s, skipped", rel, cand)
+            logger.warning(
+                "skills override path %r is not a directory at %s, skipped",
+                redact_git_urls_in_text(rel),
+                sanitize_path_for_diagnostics(str(cand)),
+            )
             continue
         seen_paths.add(cand)
         out.append(cand)

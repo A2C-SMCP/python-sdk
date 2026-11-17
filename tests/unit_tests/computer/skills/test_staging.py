@@ -878,8 +878,15 @@ _CRED_SSH_URL = "ssh://alice:FAKE_TOKEN@127.0.0.1:1/org/repo.git"
 
 
 def _no_secret(records: list[logging.LogRecord] | object) -> str:
-    """把所有日志记录拼成文本，供负断言。"""
-    return "\n".join(r.getMessage() for r in records)  # type: ignore[union-attr]
+    """把所有日志记录（含 exc_info 渲染出的 traceback 文本）拼成文本，供负断言 / Log text incl. traceback."""
+    chunks: list[str] = []
+    for r in records:  # type: ignore[union-attr]
+        chunks.append(r.getMessage())
+        if r.exc_info is not None:
+            chunks.append("".join(logging.Formatter().formatException(r.exc_info)))
+        if r.exc_text:
+            chunks.append(r.exc_text)
+    return "\n".join(chunks)
 
 
 @pytest.mark.asyncio
@@ -1280,3 +1287,109 @@ async def test_locate_plugin_root_rejects_escaping_install_path(tmp_path: Path) 
             None,
         )
     assert "escapes the skill home" in str(ei.value)
+
+
+def test_no_secret_helper_covers_exc_info() -> None:
+    """`_no_secret` 必须覆盖 exc_info / exc_text（traceback 同样属回显面）。"""
+    try:
+        raise RuntimeError("https://alice:PW_EXC@example.com/r.git")
+    except RuntimeError:
+        import sys
+
+        rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "msg", None, sys.exc_info())
+    assert "PW_EXC" in _no_secret([rec])
+    rec2 = logging.LogRecord("t", logging.ERROR, __file__, 1, "msg", None, None)
+    rec2.exc_text = "Traceback ... https://alice:PW_EXC@example.com/r.git"
+    assert "PW_EXC" in _no_secret([rec2])
+
+
+@pytest.mark.parametrize("bad", [".", "", "..", " ", "a/b", "\\", "C:"])
+def test_entry_plugin_name_rejects_dot_and_empty_forms(bad: str) -> None:
+    with pytest.raises(staging_mod.SkillStagingError):
+        staging_mod._entry_plugin_name({"name": bad})
+
+
+@pytest.mark.asyncio
+async def test_bare_token_entry_is_not_echoed(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """非对象 entry 只记类型名：裸 token（非 URL 形态）无从脱敏，因此根本不回显整值。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text('{"plugins":["glpat-SECRET_TOKEN"]}', encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "non-object plugin entry" in text
+    assert "str" in text  # 记录类型名
+    assert "glpat-SECRET_TOKEN" not in text
+
+
+@pytest.mark.asyncio
+async def test_traversal_entry_name_never_reaches_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """恶意 name 在 `marketplace add/refresh` 的 stage 路径上绝不会走到 `_git_clone_plugin`（不会 rmtree）。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        '{"plugins":[{"name":"../../../../sentinel","source":{"source":"url","url":"https://example.com/r.git"}}]}',
+        encoding="utf-8",
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    called: list[object] = []
+
+    async def fake_clone_plugin(*args: object, **kwargs: object) -> Path:
+        called.append(args)
+        raise AssertionError("clone must not be reached for invalid entry name")
+
+    monkeypatch.setattr(staging_mod, "_git_clone_plugin", fake_clone_plugin)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    assert called == []
+    assert "plugin entry invalid" in _no_secret(staging_logs.records)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_staging_error_traceback_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """兜底 `except Exception` 分支：格式化后的 traceback 也必须脱敏（不得靠 logging 直接渲染 exc_info）。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        '{"plugins":[{"name":"audit","source":{"source":"url","url":"https://example.com/r.git"}}]}', encoding="utf-8"
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    async def boom(*args: object, **kwargs: object):
+        raise RuntimeError("unexpected failure for https://alice:PW_TRACE@example.com/r.git?token=QUERY")
+
+    monkeypatch.setattr(staging_mod, "_stage_one_plugin", boom)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "unexpected staging error" in text
+    assert "PW_TRACE" not in text
+    assert "token=QUERY" not in text

@@ -379,3 +379,11 @@ def test_marketplace_clone_url_vector_is_redacted() -> None:
     e = _capture_source_error(lambda: marketplace_clone_url({"type": "git", "url": "ftp://cnb:FAKE_TOKEN@example.com/r.git?k=Q"}))
     assert e.raw == '{"type":"git","url":"' + _REDACTED + '"}'
     assert "FAKE_TOKEN" not in str(e)
+
+
+def test_del_and_c1_characters_keep_object_raw_json_safe() -> None:
+    """DEL(0x7f)/C1(0x80-0x9f) 不被 json.dumps 转义：兜底转义必须用 \\uXXXX 才是合法 JSON。"""
+    e = SkillSourceError({"k": "a\x7fb\x9bc"}, "boom")
+    json.loads(e.raw)  # 不抛 = 合法 JSON
+    assert "\\u007f" in e.raw and "\\u009b" in e.raw
+    assert "\x7f" not in e.raw and "\x9b" not in e.raw  # 原字符不得裸露（否则又不是合法 JSON）
