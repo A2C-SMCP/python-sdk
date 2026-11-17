@@ -1,21 +1,35 @@
+# -*- coding: utf-8 -*-
+# filename: optional_deps.py
 """
-中文: 可选 `[cli]` extra 依赖的惰性导入助手（#226）。
-    与 #187 为 `a2c_smcp.testing` 定下的契约一致：未安装 extra 时 **import 不报错**，
-    仅真正调用需要该依赖的功能时抛携带安装提示的 ``ImportError``。
-English: Lazy-import helper for the optional ``[cli]`` extra (#226). Mirrors the #187 contract used by
-    ``a2c_smcp.testing``: importing never requires the extra; only calling the feature that needs it
-    raises an actionable ``ImportError`` carrying the install command.
+中文: 可选 ``[cli]`` extra 依赖的惰性导入助手（#226），#248 起**委托**到共享实现。
+
+    ``require_cli_dependency`` 与 ``CLI_EXTRA_HINT`` 是 v0.5.0 已发布的公开面
+    （``computer/utils/console.py``、``computer/inputs/cli_io.py``、``clean_install_smoke.sh`` 都走它），
+    故保留为 re-export shim：粒度与文案全部由 :func:`a2c_smcp.utils.optional_deps.require_extra`
+    决定，真正实现在那里（``[cli]`` / ``[server]`` 共用一套）。**不要在本模块再长出第二份实现**——
+    两份实现的粒度漂移正是 #248 要消除的问题。
+English: Lazy-import helper for the optional ``[cli]`` extra (#226); since #248 it **delegates** to
+    the shared implementation. ``require_cli_dependency`` and ``CLI_EXTRA_HINT`` are public surface
+    published in v0.5.0 (``computer/utils/console.py``, ``computer/inputs/cli_io.py`` and
+    ``clean_install_smoke.sh`` still use them), so they survive as a re-export shim; the granularity
+    and the message come from :func:`a2c_smcp.utils.optional_deps.require_extra`, which both extras
+    share. Never grow a second implementation here — diverging granularity is exactly what #248 fixed.
 
 约束 / Constraint:
-    本模块只允许导入标准库——它位于 `computer` 包导入链的底层，反向 a2c_smcp.* 导入会形成环。
-    This module may import stdlib only: it sits at the bottom of the `computer` import chain, so an
-    ``a2c_smcp.*`` import here would create a cycle.
+    #248 之前本模块只允许导入标准库（它位于 ``computer`` 导入链底层）。现在会经 ``a2c_smcp.utils``
+    的 eager ``__init__`` 导入其同级模块——已核实这条链不反向加载 ``a2c_smcp.computer``，且
+    ``mcp_clients/base_client.py`` 本就导入 ``a2c_smcp.utils``，故导入面未变宽、不成环。
+    Before #248 this module was stdlib-only (it sits at the bottom of the ``computer`` import chain).
+    It now pulls ``a2c_smcp.utils``' eager ``__init__`` siblings; that chain provably never imports
+    ``a2c_smcp.computer`` back, and ``mcp_clients/base_client.py`` already imports ``a2c_smcp.utils``,
+    so the import surface neither widens nor closes a cycle.
 """
 
 from __future__ import annotations
 
-import importlib
 from types import ModuleType
+
+from a2c_smcp.utils.optional_deps import require_extra
 
 CLI_EXTRA_HINT = (
     '交互式终端输入 / 渲染需要可选依赖（rich / prompt-toolkit），请安装: pip install "a2c-smcp[cli]"'
@@ -39,14 +53,4 @@ def require_cli_dependency(module: str) -> ModuleType:
     Raises:
         ImportError: 模块缺失（``ModuleNotFoundError`` 为其子类），消息含 ``pip install "a2c-smcp[cli]"``。
     """
-    try:
-        return importlib.import_module(module)
-    except ModuleNotFoundError as exc:
-        # 只有「缺的正是请求的模块或其父包」才套 extra 处方；若是传递依赖缺失
-        # （如 prompt_toolkit 在、wcwidth 不在），说明装坏了，原样抛让真因可见。
-        # Only rewrite when the missing name is the requested module (or a parent package).
-        # A missing transitive dependency means a broken install: surface the real cause untouched.
-        missing = exc.name or ""
-        if missing != module and not module.startswith(f"{missing}."):
-            raise
-        raise ImportError(f"{CLI_EXTRA_HINT} (missing: {module})") from exc
+    return require_extra(module, CLI_EXTRA_HINT)

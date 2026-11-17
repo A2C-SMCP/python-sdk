@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib
 import multiprocessing
 import socket
 import time
@@ -48,6 +47,7 @@ from a2c_smcp.server import (
 )
 from a2c_smcp.server.auth import AuthenticationProvider
 from a2c_smcp.server.sync_auth import SyncAuthenticationProvider
+from a2c_smcp.utils.optional_deps import require_extra
 
 _SERVER_EXTRA_HINT = (
     '起本地信令服务需要可选依赖（werkzeug / uvicorn），请安装: pip install "a2c-smcp[server]"'
@@ -191,10 +191,7 @@ def run_http_server() -> Iterator[tuple[str, int]]:
         werkzeug availability is validated in the parent process before entering — without the
         ``a2c-smcp[server]`` extra an actionable ImportError is raised (lazy-import contract).
     """
-    try:
-        importlib.import_module("werkzeug.serving")
-    except ImportError as e:
-        raise ImportError(_SERVER_EXTRA_HINT) from e
+    require_extra("werkzeug.serving", _SERVER_EXTRA_HINT)
 
     # 选取随机可用端口 / pick a free port
     port = pick_free_port()
@@ -257,19 +254,24 @@ class UvicornTestServer:
             host: the host interface. Defaults to "127.0.0.1".
             port: the port. Defaults to 8000.
         """
-        try:
-            import uvicorn
-        except ImportError as e:
-            raise ImportError(_SERVER_EXTRA_HINT) from e
+        uvicorn = require_extra("uvicorn", _SERVER_EXTRA_HINT)
 
         startup_done = asyncio.Event()
         self._startup_done = startup_done
+
+        # 中文: 基类先绑到 ``Any`` 再用于 class 语句——``ModuleType.__getattr__`` 只救值上下文，
+        #       直接写 ``class X(uvicorn.Server)`` 会让 mypy 报 ``Name "uvicorn.Server" is not defined``
+        #       （且本仓 ``warn_unused_ignores`` 开着，不能靠 ``# type: ignore`` 糊过去）。
+        # English: bind the base to ``Any`` first — ``ModuleType.__getattr__`` only covers value
+        #       contexts; ``class X(uvicorn.Server)`` fails mypy with a name-defined error, and
+        #       ``warn_unused_ignores`` is on, so a ``# type: ignore`` is not an option.
+        server_base: Any = uvicorn.Server
 
         # 中文: 内层子类仅用于在 startup 完成时点亮就绪事件（等价原 mock_uv_server 的覆写手法）；
         #       事件经闭包捕获——它属于外层实例而非内层 server
         # English: inner subclass signals readiness from startup (same trick as the old mock_uv_server);
         #       the event is captured by closure since it belongs to the outer instance
-        class _StartupSignalingServer(uvicorn.Server):
+        class _StartupSignalingServer(server_base):
             async def startup(self, sockets: list[Any] | None = None) -> None:
                 await super().startup(sockets=sockets)
                 # self.config.setup_event_loop()  # 从0.36版本开始，不再需要这个方法 / not needed since 0.36

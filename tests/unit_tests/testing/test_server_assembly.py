@@ -39,6 +39,8 @@ from a2c_smcp.testing import (
     pick_free_port,
     run_http_server,
 )
+from a2c_smcp.utils import optional_deps
+from tests.optional_deps_fakes import RecordingImportlib
 from tests.protocol_versions import max_supported_of, min_supported_of
 
 _INCOMPATIBLE = "99.0.0"  # 与任意 0.x/1.x 均不兼容的定值 MAJOR 差异（不耦合具体 PROTOCOL_VERSION）
@@ -163,6 +165,48 @@ def test_uvicorn_test_server_missing_uvicorn_raises_actionable_error(monkeypatch
 
     with pytest.raises(ImportError, match=r"a2c-smcp\[server\]"):
         UvicornTestServer(app=None)
+
+
+def test_missing_extra_message_names_the_missing_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """中文: 提示里要带上缺的模块名（#248 统一后的文案格式 `{hint} (missing: {module})`）——
+        只给「请装 extra」而不说缺哪个模块，用户在面对一堆 extra 成员时无从下手。"""
+    monkeypatch.setitem(sys.modules, "uvicorn", None)
+
+    with pytest.raises(ImportError, match=r"\(missing: uvicorn\)"):
+        UvicornTestServer(app=None)
+
+
+def test_uvicorn_test_server_broken_install_surfaces_real_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """中文: **装坏了**的情形（uvicorn 已装、其急切的传递依赖 ``click`` 缺）必须原样抛，不得说成
+        「没装 [server]」。异常体是**合成分类夹具**——真实触发点是 ``import uvicorn`` 里急切导入的
+        ``click``；``h11`` **不**在此列（uvicorn 到 ``Config.load()`` 才导入它，构造期不会抛）。
+        #248 之前服务端宽捕 `ImportError`，把这类坏安装一律改写成「请安装 a2c-smcp[server]」，
+        开发者按提示重装一遍 extra 依然报错，真因被吞。"""
+    exc = ModuleNotFoundError("No module named 'click'", name="click")
+    fake = RecordingImportlib(exc=exc)
+    monkeypatch.setattr(optional_deps, "importlib", fake)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        UvicornTestServer(app=None)
+
+    assert fake.calls == ["uvicorn"], "必须走注入的 importlib，否则断言的是真实环境而非被测逻辑"
+    assert excinfo.value is exc
+    assert "a2c-smcp[server]" not in str(excinfo.value), "传递依赖缺失不得伪装成没装 extra"
+
+
+def test_run_http_server_broken_install_surfaces_real_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """中文: `run_http_server` 的 werkzeug 预检同理——werkzeug 在、其传递依赖缺时原样抛。"""
+    exc = ModuleNotFoundError("No module named 'markupsafe'", name="markupsafe")
+    fake = RecordingImportlib(exc=exc)
+    monkeypatch.setattr(optional_deps, "importlib", fake)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        with run_http_server():
+            pass  # pragma: no cover - 进入 with 前即抛
+
+    assert fake.calls == ["werkzeug.serving"]
+    assert excinfo.value is exc
+    assert "a2c-smcp[server]" not in str(excinfo.value)
 
 
 # ============================================================================
