@@ -21,6 +21,7 @@ installed ∧ ``enabledPlugins[pid] is True``，缺省翻转）:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Sequence
 from pathlib import Path
@@ -466,3 +467,45 @@ def test_collect_enabled_origin_none_without_per_scope_layers(tmp_path: Path) ->
     )
     assert len(records) == 1
     assert records[0].enabled_origin is None
+
+
+@pytest.mark.asyncio
+async def test_recover_rematerialize_failure_log_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#263 七轮：boot 重物化失败的 WARN 不得回显 source 里的无 scheme query token。"""
+    from a2c_smcp.computer.skills.sources import SkillSourceError
+
+    home = _home(tmp_path)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": {"type": "git", "url": f"file://{tmp_path}/repo"}}}},
+        home=home,
+    )
+    # installPath 不存在 → `ledger_entry_fully_materialized` 为假 → 进入重物化分支
+    _seed_installed(home, {"audit@acme": [_record(tmp_path / "gone" / "audit")]})
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+    # catalog 树存在 → 跳过 clone、直达 ② 重物化
+    catalog = marketplace_skill_dir(home, "acme")
+    (catalog / ".tfrobot-plugin").mkdir(parents=True)
+    (catalog / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"name": "acme", "owner": {"name": "X"}, "plugins": [{"name": "audit", "source": "audit"}]}),
+        encoding="utf-8",
+    )
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise SkillSourceError("x/r.git?token=SECRET_BOOT#f", "boom")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.recovery.materialize_plugin", boom)
+    caplog.set_level(logging.WARNING)
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    recovery_logger = recovery_mod.logger
+    recovery_logger.addHandler(caplog.handler)  # 项目 logger 关闭 propagate，直接挂 handler
+    try:
+        await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+    finally:
+        recovery_logger.removeHandler(caplog.handler)
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "re-materialize" in text  # 正对照：确实走到了该分支
+    assert "token=SECRET_BOOT" not in text

@@ -455,6 +455,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，七轮）：`plugin install` 的 `SkillSourceError` 分支与 boot 重物化 WARN 改走
+    `safe_exception_text`（无 scheme 的 `x/r.git?token=…` 不再漏）；`UnicodeDecodeError` 统一归一为
+    `<undecodable content (non-UTF-8)>`（不回显原始字节 / 解码细节）；staging 的 `skill_dir.name` /
+    `name` / `skill_md` 回显分支补齐路径脱敏。已知降级（本单接受）：对**构造期已脱敏 JSON 回显**再做
+    token 级路径脱敏时，值里的 `?`/`#` 会截断尾部——仅影响诊断可读性，不降低脱敏强度（JSON 感知的保真
+    处理另立 follow-up）。
   - 复审补口（同一 PR，六轮）：新增 `safe_exception_text` 统一异常文本出口——**裸**异常文本（OSError /
     git / manifest）先散文脱敏再 token 级路径脱敏（scp-like `user@host:path` 只有散文规则能识别，
     上一轮去掉 R 属真实回退），`SkillSourceError` 的 JSON 回显只做 token 级；SKILL.md 读取点的

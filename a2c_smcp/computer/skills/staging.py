@@ -713,11 +713,19 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         return None
     frontmatter = parse_skill_frontmatter(text)
     if not frontmatter.get("description"):
-        logger.error("user SKILL %r frontmatter missing required 'description', skipped: %s", name, skill_md)
+        logger.error(
+            "user SKILL %r frontmatter missing required 'description', skipped: %s",
+            redact_git_urls_in_text(name),
+            sanitize_path_for_diagnostics(str(skill_md)),
+        )
         return None
     fm_name = frontmatter.get("name")
     if fm_name and str(fm_name) != name:
-        logger.debug("user SKILL dir basename %r != frontmatter.name %r; basename is authoritative (in-place addressing)", name, fm_name)
+        logger.debug(
+            "user SKILL dir basename %r != frontmatter.name %r; basename is authoritative (in-place addressing)",
+            redact_git_urls_in_text(name),
+            sanitize_text_for_diagnostics(str(fm_name)),
+        )
     ref: A2CSkillRef = {
         "name": name,
         "source": SOURCE_USER,
@@ -1033,9 +1041,9 @@ def _scan_and_register_plugin_skills(
             if not frontmatter.get("description"):
                 logger.error(
                     "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
-                    marketplace,
-                    plugin_name,
-                    skill_dir.name,
+                    redact_git_urls_in_text(marketplace),
+                    redact_git_urls_in_text(plugin_name),
+                    sanitize_path_for_diagnostics(skill_dir.name),
                 )
                 continue
             try:
@@ -1043,10 +1051,10 @@ def _scan_and_register_plugin_skills(
             except SkillNameError as e:
                 logger.error(
                     "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
-                    marketplace,
-                    plugin_name,
-                    skill_dir.name,
-                    e.reason,
+                    redact_git_urls_in_text(marketplace),
+                    redact_git_urls_in_text(plugin_name),
+                    sanitize_path_for_diagnostics(skill_dir.name),
+                    sanitize_text_for_diagnostics(e.reason),
                 )
                 continue
             if name in seen:

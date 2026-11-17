@@ -1636,8 +1636,9 @@ async def test_name_synthesis_failed_branch_root_uri_redacted(
     mount = tmp_path / "mount" / "badname"
     mount.mkdir(parents=True)
     (mount / "SKILL.md").write_text("---\nname: 'Not Kebab!'\ndescription: d\n---\nbody\n", encoding="utf-8")
+    # leaf 带 userinfo 形态：`skill_dir.name` 会进日志，未脱敏时即泄漏
     res = Resource(
-        uri=_CRED_ROOT,  # type: ignore[arg-type]
+        uri="skill://host/alice:pw@host",  # type: ignore[arg-type]
         name="leak",
         mimeType="text/markdown",
         _meta={"source": "mounted", "mount_dir": str(mount)},
@@ -1648,7 +1649,7 @@ async def test_name_synthesis_failed_branch_root_uri_redacted(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "name synthesis failed" in text
-    assert "PW_ROOT" not in text
+    assert "pw@" not in text and "alice:" not in text
 
 
 @pytest.mark.asyncio
@@ -1708,3 +1709,81 @@ async def test_covered_root_debug_log_is_redacted(
     text = _no_secret(staging_logs.records)
     assert "covered by skill resource" in text  # 正对照：DEBUG 分支确实执行
     assert "PW_COV" not in text
+
+
+# ── #263 七轮复审：解码分支用例 / 未脱敏分支 ────────────────────────────────────
+def test_user_skill_non_utf8_is_isolated(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """user 源非 UTF-8 SKILL.md：跳过该 SKILL、日志脱敏，且好 SKILL 仍注册（失败隔离）。"""
+    home = tmp_path / "home"
+    bad = home / "user" / "bad-skill"
+    bad.mkdir(parents=True)
+    (bad / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")
+    _write_user_skill(home / "user", "good-skill")
+
+    names = staging_mod.stage_user_skills(SkillRegistry(), home)
+    assert names == ["good-skill"], names
+    text = _no_secret(staging_logs.records)
+    assert "user SKILL" in text and "unreadable" in text
+    assert "\\xff" not in text and "\xff" not in text  # 不打印原始字节
+    assert "codec can't decode" not in text  # 不泄漏解码细节
+
+
+@pytest.mark.asyncio
+async def test_marketplace_plugin_non_utf8_skill_is_isolated(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """marketplace plugin 源非 UTF-8 SKILL.md：该 SKILL 跳过，同 marketplace 的其它 SKILL 仍注册。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+    )
+    skills = repo / "plugins" / "audit" / "skills"
+    (skills / "bad").mkdir(parents=True)
+    (skills / "bad" / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")
+    (skills / "good").mkdir(parents=True)
+    (skills / "good" / "SKILL.md").write_text(_skill_md(name="good"), encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == ["audit:good"], names
+    text = _no_secret(staging_logs.records)
+    assert "SKILL.md unreadable" in text
+    assert "\\xff" not in text and "\xff" not in text
+    assert "codec can't decode" not in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_synthesis_failed_skill_dir_name_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """marketplace plugin 分支的 `skill_dir.name` 回显：userinfo 形态目录名不得漏。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+    )
+    bad_dir = repo / "plugins" / "audit" / "skills" / "alice:pw@host"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "SKILL.md").write_text(_skill_md(name="Not Kebab!"), encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "name synthesis failed" in text
+    assert "pw@" not in text and "alice:" not in text

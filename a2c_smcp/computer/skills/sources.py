@@ -147,6 +147,9 @@ def safe_exception_text(exc: BaseException) -> str:
     （``OSError`` / git / manifest）是裸文本，必须先散文脱敏（scp-like ``user@host:path`` 只有它能识别）
     再做 token 级路径脱敏。
     """
+    if isinstance(exc, UnicodeDecodeError):
+        # 解码失败的原始字节 / 偏移无诊断价值（定位由日志里的路径给出），统一归一为固定文案。
+        return "<undecodable content (non-UTF-8)>"
     text = str(exc)
     if isinstance(exc, SkillSourceError):
         return sanitize_text_for_diagnostics(text)

@@ -1052,3 +1052,19 @@ async def test_install_corrupt_catalog_manifest_is_structured_not_traceback(
     out = capsys.readouterr().out
     assert code == 1
     assert "manifest invalid" in out
+
+
+@pytest.mark.asyncio
+async def test_install_schemeless_query_source_token_is_masked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#263 七轮 🔴：installer 的 `SkillSourceError` 分支也要走 safe_exception_text（无 scheme query token）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source="x/r.git?token=SECRET_Q#f")
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "source invalid" in out
+    assert "token=SECRET_Q" not in out
+    assert "#f" not in out

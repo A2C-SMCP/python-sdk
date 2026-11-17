@@ -44,6 +44,7 @@ from a2c_smcp.computer.skills.validator import (
     CODE_REMOTE_SOURCE_SKIPPED,
     CODE_SKILL_DESC_MISSING,
     CODE_SKILL_MD_MISSING,
+    CODE_SKILL_MD_UNREADABLE,
     CODE_SKILL_NAME_INVALID,
     CODE_STRICT_CONFLICT,
     CODE_UNREADABLE,
@@ -661,3 +662,15 @@ def test_manifest_reader_reports_non_utf8_as_manifest_error(tmp_path: Path) -> N
     # 断言确实命中 UnicodeDecodeError 归一（不是别的分支）——避免「unreadable or invalid」近似恒真。
     assert isinstance(ei.value.__cause__, UnicodeDecodeError)
     assert "marketplace manifest" in str(ei.value)
+
+
+def test_non_utf8_skill_md_reported_as_unreadable(tmp_path: Path) -> None:
+    """#263 七轮：非 UTF-8 SKILL.md 深检归一为 skill-md-unreadable（不得 traceback、不得泄漏解码细节）。"""
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": "audit"}]), plugins=())
+    p = root / "plugins" / "audit" / "skills" / "bad"
+    p.mkdir(parents=True)
+    (p / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")
+    r = validate_path(root)
+    assert any(i.code == CODE_SKILL_MD_UNREADABLE for i in r.issues), [i.code for i in r.issues]
+    msg = next(i.message for i in r.issues if i.code == CODE_SKILL_MD_UNREADABLE)
+    assert "codec" not in msg

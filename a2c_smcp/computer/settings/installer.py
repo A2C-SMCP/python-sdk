@@ -1122,7 +1122,9 @@ async def install_plugin(
         # #263：source / staging / manifest 非法属本地配置问题（非崩溃）→ 结构化错误上抛，
         # CLI 经 _plugin_error 输出（无 traceback）。消息只取各异常**已脱敏**的文本，不在此重新拼接原始值。
         if isinstance(e, SkillSourceError):
-            raise PluginInstallError(f"marketplace {marketplace!r} source invalid: {e}") from None
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} source invalid: {safe_exception_text(e)}"
+            ) from None
         if isinstance(e, SkillStagingError):
             raise PluginInstallError(
                 f"marketplace {marketplace!r} plugin staging failed: "

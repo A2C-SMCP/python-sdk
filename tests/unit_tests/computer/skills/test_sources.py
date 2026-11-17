@@ -400,3 +400,23 @@ def test_safe_exception_text_handles_both_text_classes() -> None:
     out = safe_exception_text(source_err)
     assert "PW_S" not in out
     assert "%22" not in out and '"ref":""' in out  # JSON 回显保持可读
+
+
+def test_safe_exception_text_masks_schemeless_query_token() -> None:
+    """SkillSourceError（字符串 source）里的无 scheme query token 也要遮蔽；JSON 回显保持可读（#263 七轮）。"""
+    from a2c_smcp.computer.skills.sources import safe_exception_text
+
+    out = safe_exception_text(SkillSourceError("x/r.git?token=SECRET_Q#f", "boom"))
+    assert "token=SECRET_Q" not in out
+    assert "#f" not in out
+
+
+def test_safe_exception_text_json_echo_truncation_is_documented() -> None:
+    """已知降级（#263 七轮 🟡6，本单接受）：对**构造期已脱敏的 JSON 回显**再做 token 级路径脱敏时，
+    值里的 `?`/`#` 会触发截断——只影响诊断可读性，不影响脱敏强度；后续如需保真另立 JSON 感知 follow-up。"""
+    from a2c_smcp.computer.skills.sources import safe_exception_text
+
+    e = SkillSourceError({"source": "url", "url": "https://example.com/r.git", "ref": "a?b/c"}, "boom")
+    out = safe_exception_text(e)
+    assert "b/c" not in out  # 已截断（降级），但结构前缀仍在
+    assert out.startswith("invalid skill source {")
