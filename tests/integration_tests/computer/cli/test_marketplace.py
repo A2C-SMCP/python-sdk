@@ -93,6 +93,33 @@ def test_typer_add_list_info_remove(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert "acme" not in (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {})
 
 
+def test_typer_add_query_url_derives_clean_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#270：默认名只取解析后 path 末段——query/fragment 不进账本键（``--no-clone`` 不打印 URL）。"""
+    _set_env(monkeypatch, tmp_path)
+    url = "https://example.invalid/team/acme-skills.git?token=FAKE_QUERY#frag"
+    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", url, "--trust", "--no-clone"])
+    assert r.exit_code == 0, r.output
+    assert "acme-skills" in r.output
+    mps = load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}
+    assert set(mps) == {"acme-skills"}, "账本键只能是干净派生名"
+    assert mps["acme-skills"]["source"]["url"] == url, "存储与 git argv 保留原始 URL（raw 保真）"
+
+
+def test_typer_add_hostless_url_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#270：hostless URL → 退出码 1、零 trust / 零账本写入，且输出不回显凭据段（``--name`` 不绕过）。"""
+    _set_env(monkeypatch, tmp_path)
+    r = CliRunner().invoke(
+        cli_main.app,
+        ["marketplace", "add", "ssh:///alice:PW_LEAK@example.com", "--name", "evil", "--trust", "--no-clone"],
+    )
+    assert r.exit_code == 1
+    assert "PW_LEAK" not in r.output and "alice" not in r.output
+    assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}
+    assert not (tmp_path / "cfg").exists() or not any((tmp_path / "cfg").rglob("settings.json")), (
+        "user settings（trust 落盘）不得被创建"
+    )
+
+
 @requires_git
 def test_typer_add_missing_trust_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """非交互缺 --trust → 退出码 1、不落盘（§4.6 / §11）/ missing --trust exits 1, nothing recorded。"""

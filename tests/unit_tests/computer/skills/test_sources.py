@@ -90,6 +90,12 @@ def test_url_invalid_rejected() -> None:
         resolve_plugin_source({"source": "url", "url": "not a url"})
 
 
+def test_url_hostless_rejected() -> None:
+    """#270：hostless ssh URL（凭据落在 path 段）不再被当作合法 plugin source。"""
+    with pytest.raises(SkillSourceError):
+        resolve_plugin_source({"source": "url", "url": "ssh:///alice:PW_LEAK@example.com"})
+
+
 def test_url_missing_rejected() -> None:
     with pytest.raises(SkillSourceError):
         resolve_plugin_source({"source": "url"})
@@ -205,6 +211,12 @@ def test_marketplace_clone_url_wrong_type_rejected() -> None:
 def test_marketplace_clone_url_invalid_url_rejected() -> None:
     with pytest.raises(SkillSourceError):
         marketplace_clone_url({"type": "git", "url": "bogus"})
+
+
+def test_marketplace_clone_url_hostless_rejected() -> None:
+    """#270：账本里的 hostless source 在 clone 前 fail-closed（不发起 git argv）。"""
+    with pytest.raises(SkillSourceError):
+        marketplace_clone_url({"type": "git", "url": "ssh:///alice:PW_LEAK@example.com"})
 
 
 def test_marketplace_clone_url_non_mapping_rejected() -> None:

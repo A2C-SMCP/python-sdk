@@ -51,10 +51,49 @@ from a2c_smcp.computer.settings.schema import (
         ("ssh://git@host:22/team/skills.git", True),
         ("git://host/path", True),
         ("file:///abs/path/repo", True),
+        # #270：file: 一律不要求 host，带 host 形态同样合法
+        ("file://host/path/repo", True),
+        # #270：userinfo 里的凭据不使 URL 非法（host 存在即可）；query 合法（不进派生名即可）
+        ("ssh://alice:PW@example.com/repo", True),
+        ("https://host/repo?token=SECRET", True),
+        ("ssh://[::1]:22/repo", True),
+        # #270 hostless：ssh/git/http(s) 必须有非空 host（否则凭据段会滑进派生名）
+        ("ssh:///alice:PW_LEAK@example.com", False),
+        ("git:///x", False),
+        ("https:///x", False),
+        ("http:///x", False),
+        ("ssh://user@:22/path", False),
+        ("ssh://", False),
+        ("file://", False),
+        # host 槽位填「非 host 占位串」同样拒绝：否则 hostless 攻击串只要填个非空 junk 就复活
+        ("ssh:// /alice:PW_LEAK@example.com", False),
+        ("ssh://-/x", False),
+        ("ssh://_/x", False),
+        ("ssh://%20/x", False),
+        ("ssh://./x", False),
+        ("https://ho st/repo", False),
+        # 下划线 / 子域 / IDN / 尾点 FQDN / IPv6 zone-id 是真实主机名形态，不误伤
+        ("ssh://my_host/x", True),
+        ("https://sub.example.com/x", True),
+        ("https://例子.测试/repo", True),
+        ("https://example.com./repo", True),
+        ("ssh://[fe80::1%25eth0]/x", True),
+        # percent-encoded host / 非法 IPv6：fail-closed（有意拒绝，见 CHANGELOG）
+        ("https://ex%61mple.com/x", False),
+        ("ssh://[a:b]/x", False),
+        # file: 全例外——端口形态也不校验（`file://C:\repos\repo` 在收紧前一直合法）
+        ("file://C:\\repos\\repo", True),
+        # 非法端口 / 畸形 IPv6：fail-closed（比展示层更严）
+        ("https://host:abc/x", False),
+        ("file://[bad", False),
+        # scp-like 按整串判定：尾随换行不再视为合法
+        ("git@host:p\n", False),
         ("not a url", False),
         ("ftp://host/x", False),
         ("", False),
         ("   ", False),
+        # 既有边界：不 strip 入参（归一在 normalize_marketplace_url 做）
+        (" https://host/x", False),
     ],
 )
 def test_is_valid_git_url(url: str, ok: bool) -> None:
@@ -249,6 +288,12 @@ def test_extra_marketplaces_valid_entry_normalized() -> None:
         ("Bad_Name", {"source": {"type": "git", "url": "git@h:p"}}, "extraKnownMarketplaces.Bad_Name"),
         ("ok-mp", {"source": {"type": "svn", "url": "x"}}, "extraKnownMarketplaces.ok-mp.source.type"),
         ("ok-mp", {"source": {"type": "git", "url": "garbage"}}, "extraKnownMarketplaces.ok-mp.source.url"),
+        # #270：hostless URL 在 settings 加载层同样 fail-closed（整条剔除，文件不被改写）
+        (
+            "ok-mp",
+            {"source": {"type": "git", "url": "ssh:///alice:PW_LEAK@example.com"}},
+            "extraKnownMarketplaces.ok-mp.source.url",
+        ),
         ("ok-mp", {"noSource": 1}, "extraKnownMarketplaces.ok-mp.source"),
         ("ok-mp", {"source": {"type": "git", "url": "git@h:p"}, "autoUpdate": "yes"}, "extraKnownMarketplaces.ok-mp.autoUpdate"),
     ],

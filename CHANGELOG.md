@@ -519,6 +519,41 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     不回显原值，对齐 rust `entry_plugin_name`）；`locate_plugin_root` 在 clone/rmtree 之前补
     `is_within(ext_dir.resolve(), home.resolve())` 纵深守卫。显式 `plugin install` 路径本已校验，不受影响。
 
+### Fixed（#270 hostless git URL 与 marketplace 名称派生）
+
+- **hostless ssh/git/http(s) URL 通过校验，凭据被 slug 进 marketplace 注册名**（#270，安全）：注册名会进入
+  CLI 文案 / `--json`、`trustedMarketplaces`、`known_marketplaces.json` 键、`marketplace list` 与 staging
+  日志，并经 `A2CSkillRef.source = marketplace:<name>` 下发到 Agent。镜像 rust-sdk#285。
+  - **公共 API 收紧**（`settings.is_valid_git_url`，行为变更）：`ssh` / `git` / `http(s)` 必须有**形如主机名
+    的 host**——拒绝 `ssh:///alice:PW@example.com`、`git:///x`、`https:///x`、`ssh://user@:22/path`，
+    以及把 host 槽位填成非主机占位串的变体（空白 / `-` / `_` / `%20` / 纯点，如 `ssh:// /alice:PW@x`）；
+    `file:` 一律不要求 host（`file:///abs/path`、`file://host/path` 均合法）；scp-like 形态不变。
+    非法端口 / 畸形 netloc 一并 fail-closed（`file:` 除外——file 全例外，`file://C:\repos\repo` 保持合法；
+    比展示层 `git_url_for_display` 更严：展示层仍可展示 `ssh://-/x`，校验不认它）。percent-encoded host
+    （`https://ex%61mple.com/x`）有意拒绝；下划线 host、子域、IDN（IDNA 归一）、尾点 FQDN
+    （`example.com.`）、IPv6 字面量（含 zone-id）仍合法。既有消费者（`validate_settings`、plugin source
+    解析、`marketplace_clone_url`）随之 fail-closed。新增公开谓词 `settings.is_scp_like_git_url()`
+    （仅形态分类，合法性仍走 `is_valid_git_url`）；scp-like 形态改按整串匹配判定（尾随换行不再视为合法）。
+  - **派生名改解析式**（`marketplace.default_marketplace_name`）：只取解析后 **path 的末段**——userinfo /
+    query / fragment 不再参与命名（`https://host/repo?token=SECRET` → `repo`，此前 `repo-token-secret`；
+    `git@host:o/r?token=SECRET` → `r`）。末段含 userinfo/密码分隔符（`@` / `:`，如
+    `https://host/alice:PW@example.com`）同样不派生，且判定前做 NFKC 归一 + percent-decode
+    （`alice%3APW%40host`、全角 `：`/`＠` 等价变体一并挡）——凭据样文本交给 `--name` 显式命名。
+    无 path（`https://host`；`https://github.com` 此前派生 `github-com`）、hostless / junk host、非法、
+    末段构不成严格 kebab → `None`，CLI 提示 `--name`。scp-like 多冒号取最后一个 `:`（与 rust 一致）。
+    另有界 3 轮「percent-decode → NFKC」迭代后再判，挡住双重 / 三重编码（`%253A` / `%25253A`）、
+    percent-encoded 全角分隔符（`%EF%BC%9A` / `%EF%BC%A0`）与**全角百分号**（`alice％３ＡPW`）。
+  - **`marketplace add` 失败文案不再回显 path 段凭据**：在 #261 展示脱敏之上再挡一层，按 path **任意段**
+    判定（含尾斜杠、中间段、编码变体），命中 → `<redacted-git-source>`。**范围仅限 add 失败文案**：
+    `marketplace list` / `info` / confirm 提示 / 成功 `--json` 的 `url` 仍按 #261 known-source 契约保留
+    path（path 内凭据的外显属 #261 显示契约面，未在本单扩大）。
+  - **只防新增**：存量已落盘的凭据 slug 不自动删除 / 改名（迁移归 #268 / #260）；`marketplace remove`
+    与 `--name` 显式命名不受影响；`--name` 不能绕过 URL 校验（校验先于命名）。
+  - 存储与 git argv 保持原始 URL（raw 保真），展示脱敏（#261）不变。
+  - **合并顺序（已满足）**：本改动让 hostless 的 plugin source 新走 fail-closed，该路径的原始 URL 回显面由
+    #263 / PR #276 修复，且 **#276 已先合入 develop（`319847c`）**——`SkillSourceError` 构造期脱敏已覆盖
+    本单新增的输入，无需另等。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。
