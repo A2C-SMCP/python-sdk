@@ -12,6 +12,20 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > **A2C-SMCP 协议 v0.5.0 实现**：`PROTOCOL_VERSION` 由 `0.4.0` 抬至 `0.5.0`（v0.x 下 `MINOR` 严格匹配，
 > 抬位后握手层才会正确拒绝 `0.4.x` 对端）。SDK 包版本（`__version__`）由发版流程另行推进。
 
+### Upgrade Notes（0.5.0 → 0.5.1：marketplace catalog 子树恢复）
+
+- **0.5.0 上卸载过相对 source 插件的环境需要手工恢复（#267，镜像 rust-sdk#278）**：0.5.0 的
+  `plugin uninstall` / `plugin gc` 会删除插件的安装目录；相对 source（`"source": "./plugin"`）插件落在
+  marketplace 的**共享** clone 内（`<A2C_SKILL_HOME>/marketplace/<mp>/<rel_path>`），连带删掉父子 / 同源 / 多 scope
+  的文件，其后再安装报 `plugin root not found after resolve`。0.5.1 起卸载不再删除该共享子树，但**已损坏的本地
+  clone 不会自愈**。
+- 恢复路径：`a2c-computer marketplace remove <name>`（默认级联卸载其下所有已安装插件并撤销 trust）→
+  `a2c-computer marketplace add <git-url> --trust` → 逐个 `plugin install <plugin>@<name>` + `plugin enable <plugin>@<name>`。
+- **不要使用 `marketplace remove --keep-plugins`**：它保留 installed 状态与账本，留下指向已删 clone 的孤儿记录。
+- `marketplace refresh`（`refresh=true`）**不能**可靠自愈：上游未变时 `git pull --ff-only` 不会还原本地已删文件；
+  `plugin install` 与 boot 重物化都复用既有 clone。
+- 详见 [`docs/upgrade-0.5.1-marketplace-catalog-recovery.md`](docs/upgrade-0.5.1-marketplace-catalog-recovery.md)。
+
 ### Breaking Changes
 
 - **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer
