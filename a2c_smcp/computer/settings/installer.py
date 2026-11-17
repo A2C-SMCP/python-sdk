@@ -118,7 +118,6 @@ from a2c_smcp.computer.skills.manifest import (
     read_plugin_metadata,
     resolve_plugin_version,
     resolve_skill_override_dirs,
-    skill_override_raw_paths,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
 from a2c_smcp.computer.skills.staging import (
@@ -446,9 +445,10 @@ def _describe_dead_record(rec: object) -> str:
 def _marketplace_entry_for(marketplace: str, plugin: str, home: Path) -> Mapping[str, Any] | None:
     """读 marketplace 条目；catalog 清单缺失/损坏 → ``None``（声明面不可判定）。
 
-    注意（审查 🟡3）：stage **不会**因 catalog 清单损坏而抛错——:func:`stage_marketplace_skills` 对
-    marketplace 级失败同样走「记 ERROR + 返回空」的静默降级。声明面不可判定时只跳过声明态判据；
-    installPath 内确有 ``SKILL.md`` 时，仍由 stage 返回值为空的零注册兜底（③.6）捕获。
+    注意（审查 🟡3/🟡7）：stage **不会**因 catalog 清单损坏而抛错——:func:`stage_marketplace_skills` 对
+    marketplace 级失败同样走「记 ERROR + 返回空」的静默降级。声明面不可判定时只跳过声明态判据；上述
+    SKILL 容器（约定 ``skills/`` 或声明覆写）内确有 ``SKILL.md`` 时，仍由 stage 返回值为空的零注册兜底
+    （③.6）捕获——容器之外散落的 ``SKILL.md`` 两个判据都不扫描（与装载同源）。
     """
     try:
         manifest = read_marketplace_manifest(marketplace_skill_dir(home, marketplace))
@@ -460,11 +460,29 @@ def _marketplace_entry_for(marketplace: str, plugin: str, home: Path) -> Mapping
     return find_plugin_entry(manifest, plugin)
 
 
+def _json_truthy(value: object) -> bool:
+    """JSON 真值判据（对齐 rust ``json_truthy``）：``null``/``false``/``0``/``""``/``[]``/``{}`` 为假，其余为真。
+
+    审查 🟡2：声明态判据必须按**原始 JSON 真值**判，而不是按「能归一出可用路径列表」判——否则
+    ``skills: [123]`` / ``{"x": 1}`` 在 rust 侧算「已声明且零投影 → 失败」，Python 侧却算「未声明 → 放行」；
+    ``skills: ""`` 则相反。畸形声明同样属于「声明了但不可投影」，应走失败路径。
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):  # True 在此处恒真（False 已返回）
+        return True
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, (str, list, tuple, dict)):
+        return len(value) > 0
+    return True
+
+
 def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[str, Any]) -> bool:
     """该 plugin 是否**声明**了 SKILL 内容（声明态判据，#259 架构师裁决）。
 
-    声明源 = ``entry.skills``（恒取）+ ``plugin.json.skills``（仅 strict=true，复用装载同源归一
-    :func:`~a2c_smcp.computer.skills.manifest.skill_override_raw_paths`）。
+    声明源 = ``entry.skills``（恒取）+ ``plugin.json.skills``（仅 strict=true），**按 JSON 真值**判
+    （见 :func:`_json_truthy`，与 rust ``entry_declares_component`` 同口径）。
 
     **约定 ``skills/`` 容器存在不算声明**（审查 🔴1）：MCP-only plugin 可能顺带提交 ``skills/README.md`` /
     ``.gitkeep`` / 空目录，把「容器在」当声明会让它在旧版本可启用、新版本永久不可启用且无命令可修。
@@ -474,7 +492,9 @@ def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[s
     「容器在但零 SKILL.md」不由此判据抓，而由 stage 返回值零注册的兜底（③.6）在**有文件被装载跳过**时抓。
     """
     strict = entry_is_strict(entry) if entry is not None else True
-    return bool(skill_override_raw_paths(entry or {}, plugin_manifest, strict=strict))
+    if _json_truthy((entry or {}).get("skills")):
+        return True
+    return strict and _json_truthy(plugin_manifest.get("skills"))
 
 
 def _projectable_skill_count(
@@ -590,8 +610,10 @@ def _preflight_enable_content(
         raise PluginInstallError(_enable_content_error(plugin_id, problems))
 
     entry = _marketplace_entry_for(marketplace, plugin, home)
-    # bundle_id → 首次出现顺序（多 scope 同根记录会重复声明同一 server：按身份去重，审查 🟡5）
-    by_id: dict[str, MCPServerConfig] = {}
+    # bundle_id → (安装根, 配置)（首次出现顺序）。多 scope **同根同配置**记录重复声明同一 server 时去重；
+    # 异根 / 异配置 = identity collapse，硬错（对齐 rust#274；审查 🟡1）。
+    by_id: dict[str, tuple[Path, MCPServerConfig]] = {}
+    identity_conflicts: list[str] = []
     expects_skills = False
     for rec in records:
         install_path = Path(str(rec.get("installPath")))
@@ -641,16 +663,23 @@ def _preflight_enable_content(
             )
         for cfg in parsed:
             bundle_id = resolve_bundle_id(cfg)
-            existing_cfg = by_id.get(bundle_id)
-            if existing_cfg is None:
-                by_id[bundle_id] = cfg
-            elif existing_cfg != cfg:
+            existing = by_id.get(bundle_id)
+            if existing is None:
+                by_id[bundle_id] = (install_path, cfg)
+            elif existing[0] != install_path or existing[1] != cfg:
+                identity_conflicts.append(bundle_id)
                 problems.append(
-                    f"bundle_id {bundle_id!r} resolves to conflicting configs across install records"
+                    f"bundle_id {bundle_id!r} collapses distinct identities ({existing[0]} vs {install_path}); "
+                    f"refusing to enable an ambiguous projection"
                 )
     if problems:
-        raise PluginInstallError(_enable_content_error(plugin_id, problems))
-    return _EnablePreflight(servers=list(by_id.values()), expects_skills=expects_skills)
+        raise PluginInstallError(
+            _enable_content_error(plugin_id, problems),
+            # 身份坍缩属可判定的配置冲突类别（对齐既有 validation / conflictWith 约定，审查 🟡1）。
+            error_code="validation" if identity_conflicts else None,
+            details={"conflictWith": identity_conflicts[0]} if identity_conflicts else None,
+        )
+    return _EnablePreflight(servers=[cfg for _root, cfg in by_id.values()], expects_skills=expects_skills)
 
 
 def _write_installed_plugin(
@@ -1451,8 +1480,8 @@ async def enable_plugin(
         if preflight.expects_skills and not staged:
             raise PluginInstallError(
                 f"plugin {plugin_id!r} ships SKILL packages but staging registered none (invalid SKILL.md "
-                f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); nothing is enabled. "
-                f"{_enable_recovery_hint(plugin_id)}"
+                f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); enabledPlugins was "
+                f"restored to its previous value. {_enable_recovery_hint(plugin_id)}"
             )
         # ④ 挂载依赖：仅挂**尚未满足**者；已满足 → 复用既有实例，不覆盖（§2.5-1）
         if register_server is not None:
