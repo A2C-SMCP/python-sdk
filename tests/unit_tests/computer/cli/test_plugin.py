@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -863,3 +864,59 @@ def test_list_available_json_stdout_stays_pure(tmp_path: Path, capsys: pytest.Ca
     rows = json.loads(out)  # stdout 可整体解析 = 纯 JSON
     assert rows[0]["id"] == "audit@acme"
     assert "deprecated" not in out
+
+
+@pytest.mark.asyncio
+async def test_enable_missing_install_path_exit1_with_recovery_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#259：账本记录 installPath 缺失 → 退出码 1，JSON message 点名死路径 + 恢复指引（不再静默「启用成功」）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(root), "mcpServers": []}]}},
+        home=home,
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"]})
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    shutil.rmtree(root)  # 直接构造损坏态（不依赖卸载行为）
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "audit@acme", json_output=True)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "error"  # 无新增机读码（架构师裁决，对齐 rust Precondition）
+    assert str(root) in payload["message"]  # 点名死路径
+    assert "enabledPlugins is unchanged" in payload["message"]
+    assert "marketplace remove acme" in payload["message"] and "plugin install audit@acme" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_enable_multi_scope_any_dead_record_exits1_without_partial_enable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#259 裁决 ∀：CLI 逐 scope 循环在第一次调用即失败——健康 scope 也不得被启用（无部分成功）。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    healthy = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    dead = tmp_path / "dead-project-copy"
+    save_installed_plugins(
+        {
+            "version": 1,
+            "plugins": {
+                "audit@acme": [
+                    {"scope": "user", "installPath": str(healthy), "mcpServers": []},
+                    {"scope": "project", "installPath": str(dead), "projectPath": str(tmp_path / "proj"), "mcpServers": []},
+                ]
+            },
+        },
+        home=home,
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"]})
+    monkeypatch.setattr(_STAGE, _fake_stage())
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "audit@acme", json_output=True)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert str(dead) in payload["message"]  # 点名死路径
+    assert "enabledPlugins" not in json.loads(user_settings_path(env).read_text(encoding="utf-8"))  # 零部分启用
