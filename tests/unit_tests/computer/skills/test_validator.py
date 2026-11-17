@@ -46,6 +46,7 @@ from a2c_smcp.computer.skills.validator import (
     CODE_SKILL_MD_MISSING,
     CODE_SKILL_NAME_INVALID,
     CODE_STRICT_CONFLICT,
+    CODE_UNREADABLE,
     validate_path,
 )
 
@@ -620,3 +621,41 @@ def test_checked_axis_masks_userinfo_with_query(tmp_path: Path) -> None:
     blob = "\n".join([*(i.file for i in r.issues), *r.checked])
     assert "pw@" not in blob and "token=SECRET" not in blob
     assert "<redacted-source>" in blob
+
+
+# ── #263 五轮复审：非 UTF-8 / 对象源回显不再二次散文化 ──────────────────────────
+def test_non_utf8_manifest_is_reported_not_raised(tmp_path: Path) -> None:
+    """非 UTF-8 的 marketplace.json（UnicodeDecodeError）→ 记诊断，不得 traceback。"""
+    root = tmp_path / "mp-bytes"
+    path = root / ".tfrobot-plugin" / "marketplace.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe not utf-8")
+    r = validate_path(root)
+    assert any(i.code == CODE_UNREADABLE for i in r.issues), [i.code for i in r.issues]
+
+
+def test_object_source_message_stays_readable(tmp_path: Path) -> None:
+    """对象源诊断不得被二次散文脱敏改写成 percent-encoded 乱码。"""
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "audit", "source": {"source": "url", "url": "https://alice:PW_OBJ@example.com/r.git", "ref": ""}}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    text = _messages(r)
+    assert "PW_OBJ" not in text
+    assert "%22" not in text and "%2C" not in text  # 没有 percent-encoded 的 JSON 标点
+    assert '"ref":""' in text  # 结构仍可读
+
+
+def test_manifest_reader_reports_non_utf8_as_manifest_error(tmp_path: Path) -> None:
+    """manifest 层 `_read_json_object` 也必须把非 UTF-8 归一成 PluginManifestError（install 预检同路径）。"""
+    from a2c_smcp.computer.skills.manifest import PluginManifestError, read_marketplace_manifest
+
+    root = tmp_path / "mp"
+    path = root / ".tfrobot-plugin" / "marketplace.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe not utf-8")
+    with pytest.raises(PluginManifestError) as ei:
+        read_marketplace_manifest(root)
+    assert "unreadable" in str(ei.value) or "invalid" in str(ei.value)

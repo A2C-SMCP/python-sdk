@@ -422,3 +422,29 @@ def test_path_sanitizer_keeps_file_url_and_at_paths() -> None:
 
     assert P("file:///home/alice@corp/repo.git") == "file:///home/alice@corp/repo.git"
     assert P("plugins/repo@2.git") == "plugins/repo@2.git"
+
+
+# ── #263 五轮复审：CR 等空白类 Cc / Windows 盘符 / 无二次散文化 ────────────────
+def test_text_sanitizer_escapes_cr_and_other_whitespace_controls() -> None:
+    """仅空格 / `\\n` / `\\t` 作为分隔符放行；CR、VT、FS、NEL 等空白类 Cc 必须转义（防日志行伪造）。"""
+    from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics as T
+
+    out = T("a\rb\x0bc\x0cd\x1ce\x85f\ng h\ti")
+    for raw in ("\r", "\x0b", "\x0c", "\x1c", "\x85"):
+        assert raw not in out
+    assert out.endswith("g h\ti") and "\n" in out  # 合法分隔符保留
+
+
+def test_path_sanitizer_drive_letter_is_not_scheme() -> None:
+    """Windows 盘符 `C:` 只有单字符，不构成 scheme → `alice@corp` 保留。"""
+    from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics as P
+
+    assert P("C:\\alice@corp\\repo") == "C:\\alice@corp\\repo"
+    assert P("plugins/x=https:/TOKEN@host/repo") == "plugins/x=https:/<redacted-source>/repo"
+
+
+def test_text_sanitizer_masks_query_token_without_scheme_exact() -> None:
+    """无 scheme 的 query token：精确期望（防「只断言不存在」的弱断言）。"""
+    from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics as T
+
+    assert T("see ./x/r.git?token=SECRET#f now") == "see ./x/r.git<redacted-source> now"

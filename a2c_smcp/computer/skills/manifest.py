@@ -73,10 +73,10 @@ def _read_json_object(path: Path, *, what: str) -> dict[str, Any]:
     """读 JSON 文件并要求根为对象 / Read a JSON file requiring an object root（失败 → :class:`PluginManifestError`）。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         raise PluginManifestError(
             f"{what} unreadable/invalid at {sanitize_path_for_diagnostics(str(path))}: "
-            f"{sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e)))}"
+            f"{sanitize_text_for_diagnostics(str(e))}"
         ) from e
     if not isinstance(data, dict):
         raise PluginManifestError(f"{what} root is not an object: {sanitize_path_for_diagnostics(str(path))}")
@@ -129,7 +129,7 @@ def read_plugin_metadata(plugin_root: Path) -> dict[str, Any]:
         return _read_json_object(path, what="plugin manifest")
     except PluginManifestError as e:
         # plugin.json 仅供 version / 显示名兜底，损坏不致命（SKILL/server 由路径推导）。
-        logger.warning("plugin manifest ignored (%s)", sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))))
+        logger.warning("plugin manifest ignored (%s)", sanitize_text_for_diagnostics(str(e)))
         return {}
 
 

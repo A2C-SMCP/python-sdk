@@ -19,6 +19,7 @@ SKILL staging（mcp 源）单元测试（v0.2.1 #59）
 import base64
 import hashlib
 import io
+import json
 import logging
 import subprocess
 import sys
@@ -1447,3 +1448,64 @@ async def test_mcp_materialize_failure_traceback_is_redacted(
     assert "Traceback (most recent call last)" in text  # 正对照：traceback 仍在
     assert "PW_ARCH" not in text
     assert "token=QUERY" not in text
+
+
+# ── #263 五轮复审：plugin 源 SKILL.md 不可读 / root_uri 回显 ─────────────────────
+@pytest.mark.asyncio
+async def test_plugin_source_skill_md_unreadable_log_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """plugin（相对）源内嵌凭据 URL 时，SKILL.md 读失败的 OSError 全文不得进日志。"""
+    bad = "x=https://alice:PW_UNREAD@example.com/repo.git"
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "audit", "source": f"./plugins/{bad}"}]}), encoding="utf-8"
+    )
+    skill_md = repo / "plugins" / bad / "skills" / "etl" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text(_skill_md(), encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    def boom(_text: str):
+        raise OSError(f"[Errno 13] Permission denied: '{skill_md}'")
+
+    monkeypatch.setattr(staging_mod, "parse_skill_frontmatter", boom)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "SKILL.md unreadable" in text  # 正对照：确实走到了该分支
+    assert "PW_UNREAD" not in text
+    assert "alice:" not in text
+
+
+@pytest.mark.asyncio
+async def test_mcp_skill_root_uri_logs_are_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """mcp 源各跳过分支的 root_uri 回显统一脱敏（凭据形态 URI 不得原样落日志）。"""
+    # 无 path segment → 命中「skill root URI has no path segment」分支（该分支此前原样回显 root_uri）
+    res = Resource(
+        uri="skill://alice:PW_URI@host",  # type: ignore[arg-type]
+        name="leak",
+        mimeType="text/markdown",
+        _meta={"source": "mounted"},
+    )
+
+    class Manager(FakeManager):
+        pass
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_mcp_skills(Manager([("bid", res)]), SkillRegistry(), home)
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "no path segment" in text  # 正对照：确实命中了该分支
+    assert "PW_URI" not in text
+    assert "alice:" not in text

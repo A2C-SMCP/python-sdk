@@ -280,8 +280,8 @@ _UNSAFE_CHAR_CATEGORIES = frozenset({"Cc", "Cs"})
 # `:/` 或 `://`）才遮蔽，否则 `alice@corp` 这类合法文件名会被误伤。percent-encoded 冒号（`alice%3Apw@`）
 # 先 decode 再判定。
 _USERINFO_SEGMENT_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]+@")
-# scheme 残形（`https:/`、`https:\\`）：要求 scheme 名 ≥2 字符，避免把 Windows 盘符 `C:\\` 当 URL 语境。
-_SCHEME_REMNANT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:[/\\]")
+# scheme 段尾（`x=https:` / `ssh:`）：要求 scheme 名 ≥2 字符，避免把 Windows 盘符 `C:` 当 scheme。
+_SCHEME_TAIL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:$")
 
 
 def escape_unsafe_chars(text: str, *, json_safe: bool = False) -> str:
@@ -364,8 +364,9 @@ def sanitize_path_for_diagnostics(path: str) -> str:
             authority_next = False
             continue
         out.append(part)
-        # 该段是 scheme 残形（`x=https:` / `ssh:`）→ 下一个非空段处于 authority 位置。
-        authority_next = part.endswith(":")
+        # 该段以 scheme 形态结尾（`x=https:` / `ssh:`，scheme 名 ≥2 字符）→ 下一个非空段处于
+        # authority 位置。Windows 盘符 `C:` 只有单字符，不会命中（否则 `C:\alice@corp` 会被误遮）。
+        authority_next = _SCHEME_TAIL_RE.search(part) is not None
     return "".join(out)
 
 
@@ -383,8 +384,8 @@ def sanitize_text_for_diagnostics(text: str) -> str:
     换行与缩进因此不受影响。
     """
     out: list[str] = []
-    for token in re.split(r"(\s+)", text):
-        if not token or token.isspace():
+    for token in re.split(r"([ \t\n]+)", text):
+        if not token or token in (" ", "\t", "\n") or set(token) <= {" ", "\t", "\n"}:
             out.append(token)
             continue
         looks_like_path = (

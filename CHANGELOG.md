@@ -455,6 +455,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
     另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
   - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，五轮）：plugin 源 SKILL.md 不可读分支的 `OSError` 全文与 mcp 源各跳过分支的
+    `root_uri` 统一走脱敏漏斗；`_read_json_object` / validator 的 JSON 读取并入 `UnicodeDecodeError`
+    （非 UTF-8 manifest 归一为诊断/`PluginManifestError`，不再 traceback）；消费端不再对**构造期已脱敏**的
+    文本二次 `redact_git_urls_in_text`（对象源 JSON 回显曾被改写成 percent-encoded 乱码）；散文脱敏只放行
+    空格 / `\n` / `\t`（CR、VT、FS、NEL 等空白类 Cc 转义，防日志行伪造）；authority 判据改用 scheme 尾形态
+    （`[A-Za-z][A-Za-z0-9+.-]+:`），Windows 盘符 `C:` 不再被当作 scheme。
   - 复审补口（同一 PR，四轮）：路径轴在 `?`/`#` 截断**之前**先判凭据（`alice:pw@host?token=x`
     不再把 userinfo 留在截断前缀里）；authority 判据取代「有 `@` 就遮」，`file:///home/alice@corp/repo.git`
     与 `repo@2.git` 保留；散文 token 一律转义 Cc/Cs（换行/缩进保留），无 scheme 的 `./x/r.git?token=…`

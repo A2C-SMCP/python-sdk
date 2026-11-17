@@ -174,14 +174,15 @@ class _Collector:
         return sanitize_path_for_diagnostics(rel)
 
     def add(self, code: str, file: str, location: str, message: str, *, severity: Severity = "error") -> None:
-        # #263：诊断三轴的统一出口——file / location 走路径脱敏，message 走散文脱敏。
-        # 各调用点仍可在生成 message 时先脱敏（幂等），此处兜底避免新增诊断点重新开洞。
+        # #263：诊断三轴的统一出口——file / location 走路径脱敏，message 走**逐 token 路径**脱敏。
+        # 不再对 message 二次 `redact_git_urls_in_text`：message 可能已是构造期脱敏的 JSON 回显，
+        # 散文规则会把 JSON 标点吞进 URL token，改写成 percent-encoded 乱码。
         self.result.issues.append(
             ValidationIssue(
                 code=code,
                 file=sanitize_path_for_diagnostics(file),
                 location=sanitize_path_for_diagnostics(location),
-                message=sanitize_text_for_diagnostics(redact_git_urls_in_text(message)),
+                message=sanitize_text_for_diagnostics(message),
                 severity=severity,
             )
         )
@@ -198,8 +199,8 @@ def _load_json_object(path: Path, c: _Collector) -> dict[str, Any] | None:
     rel = c.rel(path)
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as e:
-        c.add(CODE_UNREADABLE, rel, ".", f"cannot read {rel}: {e}")
+    except (OSError, UnicodeDecodeError) as e:  # #263：非 UTF-8 文件（ValueError 子类）也要归一成诊断
+        c.add(CODE_UNREADABLE, rel, ".", f"cannot read {rel}: {sanitize_text_for_diagnostics(str(e))}")
         return None
     try:
         data = json.loads(text)

@@ -552,7 +552,10 @@ async def stage_mcp_skills(
             root_uri = str(res.uri)
             leaf = _uri_leaf(root_uri)
             if not leaf:
-                logger.error("skill root URI has no path segment, skipped: %s", root_uri)
+                logger.error(
+                    "skill root URI has no path segment, skipped: %s",
+                    sanitize_path_for_diagnostics(root_uri),
+                )
                 continue
 
             staged = mcp_skill_dir(home, bid, leaf)
@@ -570,7 +573,7 @@ async def stage_mcp_skills(
                     "materialize failed for %s (mode=%s): %s\n%s",
                     sanitize_path_for_diagnostics(root_uri),
                     mode,
-                    sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+                    sanitize_text_for_diagnostics(str(e)),
                     sanitize_text_for_diagnostics(
                         redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
                     ),
@@ -596,27 +599,40 @@ def _finalize_and_register(
     """读 frontmatter → 真冲突拒绝（落盘前）→ 校正包根目录名 → register/update。失败返回 None。"""
     skill_md = staged / SKILL_MD
     if not skill_md.is_file():
-        logger.error("staged SKILL missing %s, skipped: %s", SKILL_MD, root_uri)
+        logger.error(
+            "staged SKILL missing %s, skipped: %s", SKILL_MD, sanitize_path_for_diagnostics(root_uri)
+        )
         shutil.rmtree(staged, ignore_errors=True)
         return None
 
     frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
     if not frontmatter.get("name") or not frontmatter.get("description"):
-        logger.error("SKILL.md frontmatter missing required 'name'/'description', skipped: %s", root_uri)
+        logger.error(
+            "SKILL.md frontmatter missing required 'name'/'description', skipped: %s",
+            sanitize_path_for_diagnostics(root_uri),
+        )
         shutil.rmtree(staged, ignore_errors=True)
         return None
 
     try:
         name = synthesize_mcp_name(bundle_id, str(frontmatter["name"]))
     except SkillNameError as e:
-        logger.error("skill name synthesis failed, skipped: %s (%s)", root_uri, e.reason)
+        logger.error(
+            "skill name synthesis failed, skipped: %s (%s)",
+            sanitize_path_for_diagnostics(root_uri),
+            sanitize_text_for_diagnostics(e.reason),
+        )
         shutil.rmtree(staged, ignore_errors=True)
         return None
 
     # 真冲突（本 run 内两个不同 SKILL 合成同 name）必须在 rename 落盘前拒绝——否则会覆盖先到者的磁盘文件。
     # §1.5「拒绝第二注册者、保留先到者」；区别于 register/update 分流：跨 run 既存同一 SKILL 才走 update（刷新/孤儿恢复）。
     if name in seen_this_run:
-        logger.error("duplicate synthesized SKILL name within staging run (collision), keeping first: %s (%s)", name, root_uri)
+        logger.error(
+            "duplicate synthesized SKILL name within staging run (collision), keeping first: %s (%s)",
+            redact_git_urls_in_text(name),
+            sanitize_path_for_diagnostics(root_uri),
+        )
         shutil.rmtree(staged, ignore_errors=True)
         return None
     seen_this_run.add(name)
@@ -989,12 +1005,13 @@ def _scan_and_register_plugin_skills(
             try:
                 frontmatter = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
             except OSError as e:
+                # #263：OSError 文本会带完整路径（本地相对 source 可内嵌凭据 URL）→ 路径 + 文本双脱敏。
                 logger.error(
                     "marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s",
-                    marketplace,
-                    plugin_name,
-                    skill_dir.name,
-                    e,
+                    redact_git_urls_in_text(marketplace),
+                    redact_git_urls_in_text(plugin_name),
+                    sanitize_path_for_diagnostics(skill_dir.name),
+                    sanitize_text_for_diagnostics(str(e)),
                 )
                 continue
             if not frontmatter.get("description"):
@@ -1263,8 +1280,8 @@ async def stage_marketplace_skills(
     except SkillStagingError as e:
         logger.error(
             "marketplace %r clone/refresh failed, skipped (not registered): %s",
-            name,
-            redact_git_urls_in_text(str(e)),
+            redact_git_urls_in_text(name),
+            sanitize_text_for_diagnostics(str(e)),
         )
         return registered
 
@@ -1277,7 +1294,7 @@ async def stage_marketplace_skills(
         logger.error(
             "marketplace %r manifest invalid, skipped (clone kept): %s",
             redact_git_urls_in_text(name),
-            sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+            sanitize_text_for_diagnostics(str(e)),
         )
         return registered
 
@@ -1303,7 +1320,7 @@ async def stage_marketplace_skills(
             logger.error(
                 "marketplace %r plugin entry invalid, skipped: %s",
                 redact_git_urls_in_text(name),
-                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+                sanitize_text_for_diagnostics(str(e)),
             )
             continue
         if plugin_filter is not None and plugin_name not in plugin_filter:
@@ -1332,7 +1349,7 @@ async def stage_marketplace_skills(
                 "marketplace %r plugin %r staging failed, skipped: %s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
-                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+                sanitize_text_for_diagnostics(str(e)),
             )
         except Exception as e:  # 失败降级铁律：单 plugin 任意异常不阻断其余
             # #263：`exc_info=True` 的 traceback 由 logging 直接渲染、无法脱敏 ⇒ 先格式化再整体脱敏后单条输出。
@@ -1340,7 +1357,7 @@ async def stage_marketplace_skills(
                 "marketplace %r plugin %r unexpected staging error, skipped: %s\n%s",
                 redact_git_urls_in_text(name),
                 redact_git_urls_in_text(plugin_name),
-                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(e))),
+                sanitize_text_for_diagnostics(str(e)),
                 sanitize_text_for_diagnostics(
                     redact_git_urls_in_text("".join(traceback.format_exception(type(e), e, e.__traceback__)))
                 ),
