@@ -423,6 +423,21 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     失败日志均做 token 级脱敏，不再泄漏 git stderr 中的凭据。
   - 与 rust-sdk#273 决策（2026-11-16）对齐；rust#154 fail-closed 边界不变。
 
+### Fixed（#248 可选依赖惰性导入契约统一）
+
+- **两套 extra 惰性导入实现合流为单一 helper**（#248）：新增 `a2c_smcp/utils/optional_deps.py`
+  的 `require_extra(module, hint)`——`a2c_smcp.computer`（`[cli]`）与 `a2c_smcp.testing`（`[server]`）
+  共用同一套异常粒度与文案格式 `"{hint} (missing: {module})"`。旧路径
+  `a2c_smcp/computer/utils/optional_deps.py` 保留为 re-export shim（`require_cli_dependency` /
+  `CLI_EXTRA_HINT` 均可用，v0.5.0 已发布面不破）。
+  - **对下游可见的行为变化**：`a2c_smcp.testing` 的 runner 在**已装** `[server]` extra 但传递依赖
+    损坏（如 `click` / `markupsafe` 缺失）时，改为原样抛出 `ModuleNotFoundError`，不再一律改写成
+    「请安装 `a2c-smcp[server]`」——后者把坏安装指成缺 extra，按提示重装依然失败。真·未装 extra 时
+    的提示不变，仅追加 `(missing: <模块名>)` 便于定位。
+  - `[cli]` 侧文案与行为保持不变。`secret_store.py` 的 keyring 探测降级语义不在本单范围。
+  - 打包守卫补位：`uvicorn` 转为动态导入后失去 AST 静态见证，新增「`server` extra 恰含
+    werkzeug + uvicorn」单点断言（`tests/unit_tests/test_packaging_dependencies.py`）。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。
