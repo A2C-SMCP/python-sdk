@@ -43,6 +43,7 @@ from a2c_smcp.utils.git_url import (
     git_url_for_display,
     redact_git_urls_in_text,
     sanitize_text_for_diagnostics,
+    sanitize_value_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -126,11 +127,8 @@ def redact_source_display(raw: object) -> str:
     """
     if isinstance(raw, str):
         # #281：字符串形态同样要过 path-token 轴——无 scheme 的 `x/r.git?token=…#…` 只有它能识别；
-        # 构造期即遮蔽，消费者（str(e) / .raw / 新增 sink）无需各自打补丁。
-        # ``escape_unsafe_chars`` 必须先做：``raw`` 是**单个不可信值**而不是散文，换行会伪造日志行
-        # （``sanitize_text_for_diagnostics`` 按散文口径**保留**换行）；先转义也保证后续 token 判定不
-        # 被换行切开（凭据不会被劈成两段而漏掉后半）。
-        return sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(raw)))
+        # ``raw`` 是**单个不可信值**（不是散文），控制字符必须先转义（见 helper 文档）。
+        return sanitize_value_for_diagnostics(raw)
     try:
         # 每个字符串值/键已在 _redact_error_value 内脱敏；此处**不再**对整段 JSON 做散文脱敏——
         # token 边界是空白，JSON 的引号/逗号会被吞进 URL token 而把回显改写成 percent-encoded 乱码。
@@ -171,17 +169,22 @@ class SkillSourceError(ValueError):
     Caught by staging and handled per the failure-isolation rule (logged ERROR, not registered, does
     not block other sources). Carries no protocol code.
 
-    安全（#263）/ Security：脱敏在**构造期**完成（对齐 rust `SkillSourceError::new`）——``raw`` 与
+    安全（#263 / #281）/ Security：脱敏在**构造期**完成（对齐 rust `SkillSourceError::new`）——``raw`` 与
     ``reason`` 存的是已脱敏文本，``str(e)`` / traceback / 日志 / ``plugin validate`` 诊断因此自动安全，
     消费者无需各自打补丁。``raw`` 口径为紧凑 JSON（对象形态）或原字符串（字符串形态），与 rust 同形。
     Redaction happens at construction time: ``raw`` and ``reason`` hold already-redacted text, so every
     consumer (logs, validator diagnostics, CLI errors, tracebacks) is safe without extra patches.
+
+    **已知边界**（#281 复审，不变）：无法按 URL / 路径形态识别的 token 原样保留——裸 token
+    （``glpat-…``）与**无 ``/`` 的 query 形态**（``url?token=…``）不在 path-token 判据内（放宽会误伤
+    ``why?`` 这类散文）。Known boundary: tokens with no URL/path shape (bare tokens, ``url?token=…``
+    without a slash) are left as-is — widening the predicate would mangle ordinary prose.
     """
 
     def __init__(self, raw: object, reason: str) -> None:
         self.raw: str = redact_source_display(raw)
-        # #281：reason 与 raw 同口径（raise site 可能把 source 拼进 reason）；同样先转义控制字符。
-        self.reason: str = sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(reason)))
+        # #281：reason 与 raw 同口径（raise site 可能把 source 拼进 reason）。
+        self.reason: str = sanitize_value_for_diagnostics(reason)
         super().__init__(f"invalid skill source {self.raw}: {self.reason}")
 
 

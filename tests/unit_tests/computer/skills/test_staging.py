@@ -780,6 +780,26 @@ def test_user_basename_credential_like_name_redacted(tmp_path: Path, staging_log
     text = _no_secret(staging_logs.records)
     assert "name invalid" in text  # 正对照：确实走了该分支
     assert "deploy-token" not in text and "example.com:org" not in text
+    assert "<redacted-git-source>" in text  # 占位符正向断言（删掉脱敏参数也会转红）
+
+
+def test_user_basename_control_chars_are_escaped(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """非法目录名里的控制字符必须转义（#281 复审）：换行可伪造日志行，且会把 userinfo 劈成两半漏遮。"""
+    home = tmp_path / "home"
+    for bad in ("alice:pw\n@host", "bad\tname"):
+        d = home / "user" / bad
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\ndescription: x\n---\n", encoding="utf-8")
+
+    names = stage_user_skills(SkillRegistry(), home)
+
+    assert names == []
+    msgs = [r.getMessage() for r in staging_logs.records if r.levelno == logging.ERROR]
+    assert len(msgs) == 2 and all("name invalid" in m for m in msgs)
+    text = " | ".join(msgs)  # 用非空白分隔，避免把 join 用的换行误当泄漏
+    assert "\n" not in text and "\t" not in text  # 换行 / TAB 已转义成可见形式
+    assert "alice:pw" not in text  # 换行前的 userinfo 不得因被劈开而残留
+    assert "<redacted-git-source>" in text
 
 
 def test_user_skill_md_unreadable_log_masks_home_credential(
@@ -803,6 +823,7 @@ def test_user_skill_md_unreadable_log_masks_home_credential(
     text = _no_secret(staging_logs.records)
     assert "unreadable" in text  # 正对照：确实走了该分支
     assert "pw@" not in text and "alice:" not in text
+    assert "<redacted-git-source>" in text  # 占位符正向断言
 
 
 def test_user_missing_description_log_masks_home_credential(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
@@ -818,21 +839,52 @@ def test_user_missing_description_log_masks_home_credential(tmp_path: Path, stag
     text = _no_secret(staging_logs.records)
     assert "missing required 'description'" in text  # 正对照：确实走了该分支
     assert "pw@" not in text and "alice:" not in text
+    assert "<redacted-git-source>" in text  # 占位符正向断言
 
 
+@pytest.mark.parametrize(
+    "fm_name, secret, expected",
+    [
+        ("https://alice:FM_PW@example.com/r.git", "FM_PW", "https://example.com/r.git"),  # userinfo URL → 严格展示
+        ("deploy-token@example.com:org", "deploy-token", "<redacted-git-source>"),  # scp-like → 占位符
+    ],
+    ids=["userinfo-url", "scp-like"],
+)
 def test_user_frontmatter_name_mismatch_debug_is_redacted(
-    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture, fm_name: str, secret: str, expected: str
 ) -> None:
-    """`_build_user_ref` frontmatter.name 不一致的 DEBUG 分支（#281）：name 可带凭据 URL，不得回显。"""
+    """`_build_user_ref` frontmatter.name 不一致的 DEBUG 分支（#281）：name 可带凭据，不得回显。
+
+    scp-like 形态是复审补口：path 轴不识别 `user@host:path`，只有散文轴能遮。
+    """
     home = tmp_path / "home"
-    _write_user_skill(home / "user", "real-dir", fm_name="https://alice:FM_PW@example.com/r.git")
+    _write_user_skill(home / "user", "real-dir", fm_name=fm_name)
 
     names = stage_user_skills(SkillRegistry(), home)
 
     assert names == ["real-dir"]
     text = _no_secret(staging_logs.records)
     assert "basename is authoritative" in text  # 正对照：确实走了该分支
-    assert "FM_PW" not in text and "alice:" not in text
+    assert secret not in text
+    assert expected in text  # 正向断言：脱敏结果就是这条形态（删掉脱敏会转红）
+
+
+def test_user_dropin_debug_paths_are_redacted(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """发现期 DEBUG 日志（根下直放 SKILL.md / wrapper 深层 SKILL.md）同样不得回显凭据路径（#281 复审）。"""
+    home = tmp_path / "alice:pw@host"
+    root = home / "user"
+    (root / "deploy-token@example.com:org" / "sub").mkdir(parents=True)
+    (root / "SKILL.md").write_text(_skill_md(), encoding="utf-8")  # 根下直放 → 第一条 DEBUG
+    (root / "deploy-token@example.com:org" / "sub" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    names = stage_user_skills(SkillRegistry(), home)
+
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "directly under root" in text and "one-level depth" in text  # 正对照：两条 DEBUG 都执行
+    assert "pw@" not in text and "alice:" not in text
+    assert "deploy-token" not in text
+    assert "<redacted-git-source>" in text
 
 
 def test_frontmatter_yaml_error_log_is_redacted(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:

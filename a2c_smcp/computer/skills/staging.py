@@ -126,6 +126,7 @@ from a2c_smcp.utils.git_url import (
     sanitize_git_text,
     sanitize_path_for_diagnostics,
     sanitize_text_for_diagnostics,
+    sanitize_value_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
@@ -678,14 +679,21 @@ def _iter_user_skill_dirs(root: Path) -> Iterator[Path]:
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             if child.name == SKILL_MD:  # 根下直接的 <root>/SKILL.md（无 <skill>/ 包装）→ 非发现单元
-                logger.debug("user DropIn ignoring SKILL.md directly under root (not in a skill dir): %s", child)
+                logger.debug(
+                    "user DropIn ignoring SKILL.md directly under root (not in a skill dir): %s",
+                    sanitize_value_for_diagnostics(str(child)),
+                )
             continue
         if (child / SKILL_MD).is_file():
             yield child  # 一级 SKILL 包，不深入其内部
         else:
             # wrapper 目录无直接 SKILL.md：补扫深层 SKILL.md 仅为记 DEBUG（不进入有效包，故仅扫此异常分支）
             for deeper in sorted(child.rglob(SKILL_MD)):
-                logger.debug("user DropIn ignoring SKILL.md not at one-level depth under %s: %s", root, deeper)
+                logger.debug(
+                    "user DropIn ignoring SKILL.md not at one-level depth under %s: %s",
+                    sanitize_value_for_diagnostics(str(root)),
+                    sanitize_value_for_diagnostics(str(deeper)),
+                )
 
 
 def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
@@ -708,7 +716,7 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         logger.error(
             "user SKILL %r SKILL.md unreadable, skipped: %s (%s)",
             redact_git_urls_in_text(name),
-            sanitize_path_for_diagnostics(str(skill_md)),
+            sanitize_value_for_diagnostics(str(skill_md)),
             safe_exception_text(e),
         )
         return None
@@ -717,7 +725,7 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         logger.error(
             "user SKILL %r frontmatter missing required 'description', skipped: %s",
             redact_git_urls_in_text(name),
-            sanitize_path_for_diagnostics(str(skill_md)),
+            sanitize_value_for_diagnostics(str(skill_md)),
         )
         return None
     fm_name = frontmatter.get("name")
@@ -725,7 +733,7 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         logger.debug(
             "user SKILL dir basename %r != frontmatter.name %r; basename is authoritative (in-place addressing)",
             redact_git_urls_in_text(name),
-            sanitize_text_for_diagnostics(str(fm_name)),
+            sanitize_value_for_diagnostics(str(fm_name)),
         )
     ref: A2CSkillRef = {
         "name": name,
@@ -757,12 +765,13 @@ def stage_user_skills(
         try:
             name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
         except SkillNameError as e:
-            # #281：目录名本身不可信（scp-like `user@host:path` / userinfo / query 形态）——先散文脱敏
-            # （scp-like 只有它能识别）再按 path-token 轴遮蔽；不裸传 Path。
+            # #281：目录名本身不可信（scp-like `user@host:path` / userinfo / 控制字符 / query 形态）——
+            # 走单个不可信值的单一漏斗（先转义控制字符，再散文轴识别 scp-like，最后 path-token 轴）；
+            # 不裸传 Path。reason 同一漏斗（今天是固定文案，属潜伏口）。
             logger.error(
                 "user DropIn skill dir name invalid, skipped: %s (%s)",
-                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(skill_dir))),
-                e.reason,
+                sanitize_value_for_diagnostics(str(skill_dir)),
+                sanitize_value_for_diagnostics(e.reason),
             )
             continue
         ref = _build_user_ref(name, skill_dir)

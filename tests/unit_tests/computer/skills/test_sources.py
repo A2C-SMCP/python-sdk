@@ -437,6 +437,7 @@ def test_reason_schemeless_query_is_redacted_at_construction() -> None:
     e = SkillSourceError("x", "bad source x/r.git?token=SECRET_R#frag")
     assert "token=SECRET_R" not in str(e)
     assert "#frag" not in str(e)
+    assert "<redacted-source>" in e.reason  # 占位符正向断言（删掉脱敏也会转红）
 
 
 def test_safe_exception_text_json_echo_truncation_is_documented() -> None:

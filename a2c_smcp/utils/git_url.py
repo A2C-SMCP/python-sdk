@@ -397,6 +397,22 @@ def sanitize_text_for_diagnostics(text: str) -> str:
     return "".join(out)
 
 
+def sanitize_value_for_diagnostics(value: str) -> str:
+    """
+    诊断用**单个不可信值**脱敏（非散文）/ Sanitize a single untrusted value for diagnostics.
+
+    与 :func:`sanitize_text_for_diagnostics` 的唯一区别：**先** :func:`escape_unsafe_chars`。散文口径按
+    设计保留空白与换行（多行异常消息的可读性），但单个原始值里的换行可以伪造日志行，还会把 userinfo /
+    scp-like 切成两段而漏遮（``alice:pw\\n@host`` 两半都不命中任何规则）。转义后值退回单 token，后续
+    散文轴（scp-like 与 ``scheme:`` opaque 形态只有它能识别）与 path 轴才按整体判定。
+    Escapes control characters first: a single value is not prose — newlines forge log lines and split
+    userinfo/scp-like tokens so neither half matches.
+
+    顺序不可交换（#281 复审）：先 path 再转义会把 ``x/r.git?token=…`` 的尾部截断后仍留在转义前的 token 里。
+    """
+    return sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(value)))
+
+
 def sanitize_git_text(text: str, args: Sequence[str]) -> str:
     """
     git 输出专用脱敏：先按已知 URL 参数 verbatim 替换，再走通用散文脱敏 / Sanitize git output.

@@ -525,21 +525,26 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   字符串 `raw` 只做散文 token 级 `redact_git_urls_in_text`，没有 path/query 轴 ⇒
   `SkillSourceError("x/r.git?token=SECRET#f", …)` 的 `.raw` / `str(e)` 仍带凭据。类 docstring「消费者无需
   打补丁」的承诺因此不成立——仓内 sink 全靠 `safe_exception_text` 兜住，新增消费点会重新开洞。
-  - 修法：字符串 `raw` 与 `reason` 走 `sanitize_text_for_diagnostics(redact_git_urls_in_text(
-    escape_unsafe_chars(…)))`。`escape_unsafe_chars` **必须最先**：`raw` 是单个不可信值，散文脱敏按口径
-    **保留**换行（可伪造日志行），且转义后 token 不会被换行劈开（凭据不会只遮前半段）。合法路径 /
-    kebab 名（`./../escape`、`https://example.com/r.git`）逐字不变。
+  - 修法：新增单一漏斗 **`utils.git_url.sanitize_value_for_diagnostics()`**（`escape_unsafe_chars` →
+    `redact_git_urls_in_text` → `sanitize_text_for_diagnostics`），**单个不可信值**（非散文）一律走它：
+    字符串 `raw` / `reason`、`stage_user_skills` 的目录名与 `reason`、`_build_user_ref` 的 `SKILL.md`
+    路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径。`escape_unsafe_chars` **必须最先**：散文口径按
+    设计**保留**换行与空白（单值里的换行可伪造日志行），且不先转义时 `alice:pw\n@host` 会被切成两半而
+    两半都不命中任何规则（漏遮）；先转义后整串退回单 token，散文轴（scp-like / `scheme:` opaque）与
+    path 轴均按整体判定。合法路径 / kebab 名（`./../escape`、`https://example.com/r.git`、
+    `file:///home/alice@corp/repo.git`）逐字不变。
   - `stage_user_skills` 非法目录名 ERROR 不再裸传 `Path`：scp-like 目录名（`deploy-token@example.com:org`）
-    整条路径遮为 `<redacted-git-source>`，userinfo 段只替换该段（`sanitize_path_for_diagnostics` 不识别
-    scp-like，故按散文+path 两级漏斗，与 `safe_exception_text` 同口径）。
+    与换行/TAB 形态均被遮蔽或转义（`sanitize_path_for_diagnostics` 不识别 scp-like，故统一走上述漏斗）。
   - `parse_skill_frontmatter` 的 PyYAML 错误改走 `safe_exception_text`：其错误文本会回显出错行片段
     （远端 SKILL.md 的凭据 URL）。`plugin validate` 与 staging 两条路径同时受益。
   - 测试加固：decode 诊断三处恒真断言（`assert "\xff" not in text`——`UnicodeDecodeError.__str__` 只含
     ASCII `0xff`）改为 `<undecodable content (non-UTF-8)>` 精确文案；validator 三处 decode 用例补固定文案
-    正向断言与「好 SKILL 仍被 check」正对照；`_build_user_ref` 三处脱敏补真实凭据用例（home 根含
-    userinfo / `frontmatter.name` 带凭据 URL）。
-  - 已知边界（不变）：裸 token（`glpat-…` 这类无 `@ : /` 形态）仍不可识别；JSON 感知的保真脱敏
-    （`?`/`#` 截断）另案。
+    正向断言与「好 SKILL 仍被 check」正对照；user 源六处脱敏补真实凭据用例（userinfo 与 scp-like 两种
+    形态、换行/TAB 控制字符、DEBUG 路径），并统一补**占位符正向断言**（只断言「不存在」时，删掉脱敏参数
+    仍会绿）。
+  - 已知边界（不变）：无法按 URL/路径形态识别的 token 原样保留——裸 token（`glpat-…`）与**无 `/` 的
+    query 形态**（`url?token=…`，如 `{"source": "url?token=…"}`）。放宽 path 谓词会误伤 `why?` 这类散文。
+    另：JSON 感知的保真脱敏（`?`/`#` 截断影响可读性）仍属另案。
 
 ### Fixed（#270 hostless git URL 与 marketplace 名称派生）
 
