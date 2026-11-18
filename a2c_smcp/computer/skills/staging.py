@@ -71,10 +71,13 @@ import os
 import re
 import shutil
 import tarfile
+import time
 import traceback
+import uuid
 import zipfile
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -102,6 +105,20 @@ from a2c_smcp.computer.skills.manifest import (
 )
 from a2c_smcp.computer.skills.manifest import (
     plugin_root_base as resolve_plugin_root_base,
+)
+from a2c_smcp.computer.skills.marketplace_identity import (
+    MANIFEST_NAME_BASELINE_FIELD,
+    REASON_DANGLING_REFERENCES,
+    REASON_EXPECTED_NAME_MISMATCH,
+    REASON_NAME_CONFLICT,
+    REASON_SOURCE_CONFLICT,
+    MarketplaceIdentityError,
+    MarketplaceNameChangeError,
+    display_source,
+    intent_reference_pids,
+    read_manifest_marketplace_name,
+    registered_name_for_source,
+    same_source,
 )
 from a2c_smcp.computer.skills.naming import (
     SkillNameError,
@@ -898,14 +915,68 @@ async def _git_clone_marketplace(url: str, dest: Path, *, timeout: float, env: M
     await _git_clone_with_fallback(["--depth", "1"], url, dest, timeout=timeout, env=env)
 
 
-async def _git_refresh_marketplace(dest: Path, url: str, *, timeout: float, env: Mapping[str, str] | None) -> None:
-    """原地 ``git pull --ff-only``；失败 → 全量重 clone / In-place pull, full re-clone on failure（design §2.2）。"""
+# marketplace 目录下的临时工作目录前缀（同 fs 的兄弟目录，名字不合严格 kebab ⇒ 不会被当成 marketplace）：
+# `.staging-*` = 待提交的新 clone；`.trash-*` = 已换下的旧 clone（提交后锁外删除）。
+_MARKETPLACE_STAGING_PREFIX = ".staging-"
+_MARKETPLACE_TRASH_PREFIX = ".trash-"
+
+# 崩溃残留清扫阈值：只清**足够旧**的临时目录，避免误删另一个进程正在进行中的 staging（clone 在锁外）。
+_STALE_MARKETPLACE_TEMP_MAX_AGE = 86400.0
+
+
+def _marketplace_work_parent(clone_dir: Path) -> Path:
+    """marketplace 工作目录的父级（``<home>/marketplace``）/ Parent of a marketplace clone dir。"""
+    return clone_dir.parent
+
+
+def _new_marketplace_staging_dir(clone_dir: Path) -> Path:
+    """在 marketplace 工作目录下分配一个待提交的 staging 目录 / Allocate a pending-clone dir。"""
+    parent = _marketplace_work_parent(clone_dir)
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / f"{_MARKETPLACE_STAGING_PREFIX}{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def purge_stale_marketplace_temps(clone_dir: Path, *, max_age: float = _STALE_MARKETPLACE_TEMP_MAX_AGE) -> None:
+    """
+    清扫崩溃残留的 ``.staging-*`` / ``.trash-*``（best-effort）/ Best-effort sweep of stale temp dirs.
+
+    只删 **mtime 早于 ``max_age``** 的条目：clone/提交在锁外进行，另一个进程正在进行中的 staging 目录
+    不能被误删。失败静默（清理是卫生动作，不是正确性前提）。
+    """
+    parent = _marketplace_work_parent(clone_dir)
     try:
-        await _run_git(["-C", str(dest), "pull", "--ff-only"], timeout=timeout, env=env)
+        entries = list(parent.iterdir())
+    except OSError:
         return
-    except SkillStagingError as e:
-        logger.warning("git pull in %s failed (%s); full re-clone", dest, e)
-    await _git_clone_marketplace(url, dest, timeout=timeout, env=env)
+    now = time.time()
+    for entry in entries:
+        if not entry.name.startswith((_MARKETPLACE_STAGING_PREFIX, _MARKETPLACE_TRASH_PREFIX)):
+            continue
+        try:
+            if now - entry.stat().st_mtime < max_age:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
+async def clone_marketplace_to_staging(
+    url: str,
+    clone_dir: Path,
+    *,
+    timeout: float = DEFAULT_GIT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """
+    clone 到 marketplace 工作目录下的 staging 目录（**不落最终落点**）/ Clone into a pending staging dir.
+
+    #260 起 add / refresh 都先 clone 到 staging：只有清单名通过身份校验、且提交点锁内复核通过后，才由
+    :func:`commit_marketplace_registration` 原子换入 ``<home>/marketplace/<name>``——拒绝时旧内容零损伤，
+    失败时删 staging 即零残留。
+    """
+    pending = _new_marketplace_staging_dir(clone_dir)
+    await _git_clone_marketplace(url, pending, timeout=timeout, env=env)
+    return pending
 
 
 async def _git_clone_plugin(spec: GitCloneSpec, dest: Path, *, timeout: float, env: Mapping[str, str] | None) -> Path:
@@ -1199,6 +1270,43 @@ async def _stage_one_plugin(
     return _scan_and_register_plugin_skills(marketplace, plugin_name, skill_dirs, version, registry, seen)
 
 
+def _build_marketplace_record(
+    prior: Mapping[str, Any] | None,
+    source: Mapping[str, Any],
+    clone_dir: Path,
+    commit_sha: str | None,
+    auto_update: bool,
+    *,
+    changed: bool,
+    observed_manifest_name: str | None,
+) -> MarketplaceRecord:
+    """
+    构造 ``known_marketplaces.json`` 单条记录 / Build one materialized marketplace record（§6.1）。
+
+    - ``lastUpdated``：实际 clone/pull 或首次记录 → 刷新；纯复用 → 保留既有值（语义 = 最后**更新**时间）。
+    - ``autoUpdate``：本次未传但既有记录为真 → **保留**（add 重复注册不得静默丢掉用户的自动更新旗）。
+    - ``manifestNameBaseline``（#260）：既有值**永不改写**；无则取本次观测的清单名（``None`` = 本次未观测，
+      例如纯复用路径 —— 保持 legacy 形态，留待下次实际 clone/refresh 补写）。
+    """
+    record: MarketplaceRecord = {
+        "source": dict(source),  # type: ignore[typeddict-item]  # GitSource {type, url}
+        "installLocation": str(clone_dir.resolve()),
+    }
+    prior_last = prior.get("lastUpdated") if prior else None
+    record["lastUpdated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if (changed or not prior_last) else prior_last
+    if commit_sha:
+        record["commitSha"] = commit_sha
+    if auto_update or (prior is not None and bool(prior.get("autoUpdate"))):
+        record["autoUpdate"] = True
+    prior_baseline = prior.get(MANIFEST_NAME_BASELINE_FIELD) if prior else None
+    # TypedDict 赋值须字面量键；读取侧仍用常量（`store.MarketplaceRecord` 已声明同名字段，二者不可漂移）。
+    if isinstance(prior_baseline, str) and prior_baseline:
+        record["manifestNameBaseline"] = prior_baseline
+    elif observed_manifest_name:
+        record["manifestNameBaseline"] = observed_manifest_name
+    return record
+
+
 def _record_known_marketplace(
     name: str,
     source: Mapping[str, Any],
@@ -1209,14 +1317,17 @@ def _record_known_marketplace(
     env: Mapping[str, str] | None,
     *,
     changed: bool,
+    observed_manifest_name: str | None = None,
 ) -> None:
     """
     写 ``known_marketplaces.json`` 物化记录（持锁原子 RMW）/ Record into known_marketplaces.json（§6.1）。
 
-    记 ``source`` / ``installLocation``（+ 可选 ``commitSha`` / ``autoUpdate``）。``lastUpdated`` 仅在
-    ``changed``（本次实际 clone/pull）或无既有记录时刷为当下；复用既有 clone（``changed=False``）则**保留**原
-    ``lastUpdated``——使该字段语义为「最后更新时间」而非「最后扫描时间」（§6.1）。失败（锁不可得 / I/O）仅记
-    ERROR、**不**中断 staging（物化记录是诊断/对账元数据，丢失靠下次 reconcile 重建）。
+    **纯复用路径**的写入口（``stage_marketplace_skills`` 在 clone 已在、非 refresh 时调用）；真正的注册提交
+    走 :func:`commit_marketplace_registration`。两者共用 :func:`_build_marketplace_record`，但本函数**不做**
+    身份校验，因此当既有记录与待写值等价时**跳过写**——add 提交后的二次写会因此变成 no-op，避免把并发
+    ``marketplace remove`` 删掉的记录**复活**、或丢掉用户旗（#260 设计审查）。
+
+    失败（锁不可得 / I/O）仅记 ERROR、**不**中断 staging（物化记录是诊断/对账元数据，丢失靠下次 reconcile 重建）。
 
     settings.store 经 skills.home 反向依赖本包，故在此**惰性 import** 破除模块级环依赖（store 仅在本函数调用时
     才被加载，彼时所有模块已初始化完毕）。
@@ -1225,17 +1336,17 @@ def _record_known_marketplace(
 
     def _mutate(current: KnownMarketplacesFile) -> None:
         prior = current["marketplaces"].get(name)
-        record: MarketplaceRecord = {
-            "source": dict(source),  # type: ignore[typeddict-item]  # GitSource {type, url}
-            "installLocation": str(clone_dir.resolve()),
-        }
-        # lastUpdated：实际 clone/pull 或首次记录 → 刷新；纯复用 → 保留既有值。
-        prior_last = prior.get("lastUpdated") if prior else None
-        record["lastUpdated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if (changed or not prior_last) else prior_last
-        if commit_sha:
-            record["commitSha"] = commit_sha
-        if auto_update:
-            record["autoUpdate"] = True
+        record = _build_marketplace_record(
+            prior,
+            source,
+            clone_dir,
+            commit_sha,
+            auto_update,
+            changed=changed,
+            observed_manifest_name=observed_manifest_name,
+        )
+        if prior is not None and dict(prior) == record:
+            return None  # 等价 → 不写（避免复活竞态 / 无谓锁）
         current["marketplaces"][name] = record
         return None
 
@@ -1243,6 +1354,275 @@ def _record_known_marketplace(
         update_known_marketplaces(_mutate, home, env)
     except Exception as e:  # 锁不可得 / I/O 失败 → 不阻断 staging
         logger.error("failed to record known_marketplaces.json for %r: %s", name, e)
+
+
+# ── 注册身份校验与提交点（#260）/ Registration identity checks & commit point ──
+def registration_violation(
+    name: str,
+    source: Mapping[str, Any],
+    prior: Mapping[str, Any] | None,
+    known: Mapping[str, Any],
+    observed_manifest_name: str,
+    *,
+    env: Mapping[str, str] | None,
+) -> MarketplaceIdentityError | None:
+    """
+    注册提交点的身份判定（**唯一**权威）/ The single identity predicate of the registration commit point.
+
+    读取 ``known``（锁内刚读到的账本 ``marketplaces`` 快照）与 merged settings 引用，返回违约对象（无违约 → ``None``）：
+
+    | 场景 | 判定 |
+    |---|---|
+    | 新注册 ∧ 同 source 已以他名注册 | :data:`REASON_SOURCE_CONFLICT`（诊断给旧名与处置） |
+    | 新注册 ∧ 存在 ``<plugin>@<name>`` 意图引用 | :data:`REASON_DANGLING_REFERENCES`（§5.14 remove/re-add） |
+    | 新注册 ∧ 观测清单名 ≠ 注册名 | :data:`REASON_EXPECTED_NAME_MISMATCH`（D1：不以非清单名注册） |
+    | 已注册 ∧ source 不同 | :data:`REASON_NAME_CONFLICT`（同名不同源 MUST 拒绝，防并发静默换源） |
+    | 已注册 ∧ 有 baseline ∧ 观测 ≠ baseline | :class:`MarketplaceNameChangeError`（§5.14 refresh 改名） |
+    | 已注册 ∧ 无 baseline（legacy） | 不违约 —— 首次观测即建立 baseline、保留旧注册名 |
+
+    **调用方须持账本锁**（由 :func:`commit_marketplace_registration` 保证）。
+    """
+    if prior is None:
+        existing_name = registered_name_for_source(known, source)
+        if existing_name is not None and existing_name != name:
+            return MarketplaceIdentityError(
+                f"this source is already registered as {existing_name!r}; registering it again as {name!r} is "
+                f"refused (a marketplace name MUST bind at most one source, runtime-contract §5.14). Remove the "
+                f"old registration first ('marketplace remove {existing_name}'), or use the existing name; "
+                f"in-place rename is handled by the #268 migration.",
+                reason=REASON_SOURCE_CONFLICT,
+                details={
+                    "existingName": existing_name,
+                    "name": name,
+                    "remedy": f"marketplace remove {existing_name}",
+                },
+            )
+        references = intent_reference_pids(name, env=env)
+        if references:
+            shown_refs = references[:5]
+            suffix = "…" if len(references) > len(shown_refs) else ""
+            return MarketplaceIdentityError(
+                f"cannot register marketplace {name!r}: plugin intent references still point at that name "
+                f"({', '.join(shown_refs)}{suffix}). Re-adding under the same name would silently rebind them; "
+                f"remove those plugin references first.",
+                reason=REASON_DANGLING_REFERENCES,
+                details={"name": name, "references": shown_refs, "referenceCount": len(references)},
+            )
+        if observed_manifest_name != name:
+            return MarketplaceIdentityError(
+                f"marketplace manifest declares name {observed_manifest_name!r}, but the registration name is "
+                f"{name!r}; a marketplace is registered under its manifest name (pass --name {observed_manifest_name} "
+                f"to check, or update the caller).",
+                reason=REASON_EXPECTED_NAME_MISMATCH,
+                details={"manifestName": observed_manifest_name, "expectedName": name},
+            )
+        return None
+
+    if not same_source(prior.get("source"), source):
+        prior_source = prior.get("source")
+        return MarketplaceIdentityError(
+            f"marketplace name {name!r} is already registered from a different source "
+            f"({display_source(prior_source)}); refusing to replace it. Remove the old registration first "
+            f"('marketplace remove {name}') and add the new source explicitly.",
+            reason=REASON_NAME_CONFLICT,
+            details={
+                "name": name,
+                "existingSource": display_source(prior_source),
+                "remedy": f"marketplace remove {name}",
+            },
+        )
+    baseline = prior.get(MANIFEST_NAME_BASELINE_FIELD)
+    if not isinstance(baseline, str) or not baseline:
+        return None  # legacy：首次观测建立 baseline（保留旧注册名，不报改名）
+    if observed_manifest_name != baseline:
+        return MarketplaceNameChangeError(
+            f"marketplace {name!r} was refreshed from a manifest that renames it to {observed_manifest_name!r}; "
+            f"the refresh is refused and the existing registration/content is kept unchanged (a marketplace name "
+            f"MUST NOT be silently renamed, runtime-contract §5.14). Rename it explicitly"
+            f"{_rename_hint(name, observed_manifest_name)}.",
+            details={
+                "name": name,
+                "manifestName": observed_manifest_name,
+                "baselineManifestName": baseline,
+            },
+        )
+    return None
+
+
+def _rename_hint(name: str, observed_manifest_name: str) -> str:
+    """改名拒绝的可执行处置提示（不含内部实现细节）/ Executable remedy hint for a rename rejection."""
+    return (
+        f" (e.g. 'marketplace remove {name}' then 'marketplace add <url>') or migrate the registration "
+        f"with the #268 migration tooling"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MarketplaceCommit:
+    """一次注册提交的结果 / Outcome of one registration commit."""
+
+    committed: bool
+    trash: Path | None = None
+    idempotent: bool = False
+
+
+def commit_marketplace_registration(
+    name: str,
+    source: Mapping[str, Any],
+    *,
+    pending_clone: Path,
+    clone_dir: Path,
+    observed_manifest_name: str,
+    commit_sha: str | None,
+    auto_update: bool,
+    home: Path,
+    env: Mapping[str, str] | None,
+    strict: bool,
+    allow_replace: bool,
+) -> MarketplaceCommit:
+    """
+    **唯一**的注册提交点：锁内身份复核 → 原子换入 clone → 写账本 / The single, locked registration commit.
+
+    一次 ``update_known_marketplaces``（旁车锁覆盖 load→mutate→save）内完成三件事，杜绝「判定用旧快照、写入
+    用新快照」的窗口：
+
+    1. :func:`registration_violation` 复核（同名不同源 / 同源不同名 / 断链引用 / 清单名不符 / 改名）；
+    2. ``clone_dir → .trash-*``、``pending_clone → clone_dir``（同 fs 两次 rename，锁内只做 O(1) 操作）；
+    3. 写记录（含 ``manifestNameBaseline``）。
+
+    **异常策略**：``strict=True``（add 路径）→ 身份违约抛 :class:`MarketplaceIdentityError`；``strict=False``
+    （reconcile / recovery / refresh / rebuild）→ 记 ERROR、**不换不写**、返回 ``committed=False`` 降级。
+    **唯一例外**：清单改名（:class:`MarketplaceNameChangeError`）任何路径都抛——§5.14 要求 refresh 结果
+    可判别，不得报成功/no-op。
+
+    ``allow_replace=False``（add）时：同名同源且 clone 已在 → **幂等**（丢弃 pending、不换不写、返回
+    ``idempotent=True``）；同名同源但 clone 缺失 → 照常换入（修复路径）。``allow_replace=True``（refresh /
+    缺失重建）→ 总是换入。
+
+    :return: :class:`MarketplaceCommit`；``trash`` 非空时调用方须**在锁外**删除（锁内 rmtree 会阻塞事件循环
+        并放大锁竞争）。
+    :raises MarketplaceIdentityError: ``strict`` 下的身份违约；:class:`MarketplaceNameChangeError`（任何路径）。
+    """
+    from a2c_smcp.computer.settings.store import update_known_marketplaces
+
+    outcome: dict[str, Any] = {"committed": False, "trash": None, "idempotent": False}
+
+    def _mutate(current: KnownMarketplacesFile) -> None:
+        marketplaces = current["marketplaces"]
+        prior = marketplaces.get(name)
+        if prior is not None and not allow_replace and clone_dir.exists() and same_source(prior.get("source"), source):
+            # 同名同源重复 add / reconcile：幂等——丢弃 pending、不换不写（不刷新 lastUpdated/commitSha）。
+            outcome.update(committed=True, idempotent=True)
+            return None
+        violation = registration_violation(name, source, prior, marketplaces, observed_manifest_name, env=env)
+        if violation is not None:
+            if strict or isinstance(violation, MarketplaceNameChangeError):
+                raise violation
+            logger.error(
+                "marketplace %r registration rejected (%s); keeping the existing registration untouched",
+                redact_git_urls_in_text(name),
+                violation.reason,
+            )
+            outcome.update(committed=False, reason=violation.reason)
+            return None
+        record = _build_marketplace_record(
+            prior,
+            source,
+            clone_dir,
+            commit_sha,
+            auto_update,
+            changed=True,
+            observed_manifest_name=observed_manifest_name,
+        )
+        trash: Path | None = None
+        if clone_dir.exists():
+            trash = clone_dir.with_name(f"{_MARKETPLACE_TRASH_PREFIX}{name}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+            os.replace(clone_dir, trash)
+        try:
+            os.replace(pending_clone, clone_dir)
+        except OSError:
+            if trash is not None:
+                os.replace(trash, clone_dir)  # 换入失败 → 恢复旧树，再让异常冒泡
+            raise
+        marketplaces[name] = record
+        outcome.update(committed=True, trash=trash)
+        return None
+
+    try:
+        update_known_marketplaces(_mutate, home, env)
+    except BaseException:
+        if outcome.get("committed"):
+            # 账本写失败（原子写不产生半截文件）→ 尽力回滚目录：删掉刚换入的新树；旧树（若有）从 trash 复位。
+            trash = outcome.get("trash")
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            if isinstance(trash, Path) and trash.exists():
+                try:
+                    os.replace(trash, clone_dir)
+                except OSError:  # 回滚 best-effort：失败不掩盖原异常
+                    logger.error(
+                        "failed to restore the previous clone of %r after a commit failure", redact_git_urls_in_text(name)
+                    )
+        raise
+    return MarketplaceCommit(
+        committed=bool(outcome.get("committed")),
+        trash=outcome.get("trash"),
+        idempotent=bool(outcome.get("idempotent")),
+    )
+
+
+async def add_marketplace_source(
+    source: Mapping[str, Any],
+    home: Path,
+    *,
+    expected_name: str | None = None,
+    auto_update: bool = False,
+    timeout: float = DEFAULT_GIT_TIMEOUT,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """
+    ``marketplace add`` 的注册事务：staging clone → 读清单名 → 严格提交 / Register one marketplace from a source.
+
+    **不做** SKILL 扫描——调用方在返回最终注册名后调 :func:`stage_marketplace_skills`（clone 已就位 → 复用
+    路径）完成物化。失败（清单非法 / ``--name`` 不符 / 冲突）抛 :class:`MarketplaceIdentityError`，且
+    staging 目录在 ``finally`` 清理（零残留）。
+
+    :param expected_name: ``--name``（D6 B：**期望清单名**，不是别名）；不符即 ``expected-name-mismatch``。
+    :return: 最终注册名（= 清单顶层 ``name``）。
+    """
+    clone_dir = marketplace_skill_dir(home, expected_name or "placeholder")
+    purge_stale_marketplace_temps(clone_dir)
+    url = marketplace_clone_url(source)
+    pending = await clone_marketplace_to_staging(url, clone_dir, timeout=timeout, env=env)
+    try:
+        observed = read_manifest_marketplace_name(pending)  # 非法/缺失 → validation（不落地）
+        if expected_name is not None and expected_name != observed:
+            raise MarketplaceIdentityError(
+                f"marketplace manifest declares name {observed!r}, but --name {expected_name!r} was requested; "
+                f"--name only asserts the expected manifest name and never renames a marketplace.",
+                reason=REASON_EXPECTED_NAME_MISMATCH,
+                details={"manifestName": observed, "expectedName": expected_name},
+            )
+        target = marketplace_skill_dir(home, observed)
+        commit_sha = await _git_head_sha(pending, timeout=timeout, env=env)
+        outcome = commit_marketplace_registration(
+            observed,
+            source,
+            pending_clone=pending,
+            clone_dir=target,
+            observed_manifest_name=observed,
+            commit_sha=commit_sha,
+            auto_update=auto_update,
+            home=home,
+            env=env,
+            strict=True,
+            allow_replace=False,
+        )
+        if outcome.trash is not None:
+            shutil.rmtree(outcome.trash, ignore_errors=True)  # 锁外删旧树
+        return observed
+    finally:
+        # 提交成功时 pending 已被 rename 走；幂等 / 失败 / 拒绝时它仍在 → 清掉（零残留）。
+        shutil.rmtree(pending, ignore_errors=True)
 
 
 async def stage_marketplace_skills(
@@ -1270,9 +1650,14 @@ async def stage_marketplace_skills(
     :param home: SKILL Home 绝对根。
     :param plugin_filter: 仅物化这些 plugin 名（``None`` = marketplace.json 全部）；#62 注入 ``enabledPlugins ∩ installed``。
     :param auto_update: 写入物化记录的 ``autoUpdate`` 旗（仅记录，本函数不据此自动刷新）。
-    :param refresh: ``True`` → 已存在 catalog clone 走 ``git pull``（失败重 clone）+ 独立 plugin 重 clone
-        （sha 锁版本例外：仅在既有 HEAD ≠ pin 时重 clone，等于 pin 则复用）；``False`` → 缺失才 clone、
-        已存在则就地复用（重扫）。
+    :param refresh: ``True`` → 重新 clone 到 staging（**不再原地 ``git pull``**）并通过提交点原子换入；独立
+        plugin 亦重 clone（sha 锁版本例外：仅在既有 HEAD ≠ pin 时重 clone，等于 pin 则复用）；``False`` →
+        缺失才 clone、已存在则就地复用（重扫）。
+
+    :raises MarketplaceNameChangeError: **唯一**新增抛点——本次实际 clone/refresh 观测到的清单名与账本
+        ``manifestNameBaseline`` 不符（§5.14 改名拒绝）。调用方 MUST 捕获并**区分于普通失败**（refresh 报
+        ``validation`` 而非 updated/unchanged；reconcile 归 failed；recovery / rebuild 降级）。其余失败
+        （clone/pull/清单不可读/身份违约的非 add 路径）维持既有「记 ERROR 不抛」降级铁律。
 
     .. note::
        本函数经 :func:`_record_known_marketplace` 写 ``known_marketplaces.json`` 时持**同步阻塞**文件锁
@@ -1308,29 +1693,62 @@ async def stage_marketplace_skills(
         return registered
 
     # home 由调用方保证存在（与 stage_mcp_skills / stage_user_skills 一致）；clone 目录父级由
-    # _git_clone_with_fallback 落盘前 mkdir。
+    # _git_clone_with_fallback / 提交点落盘前 mkdir。
     clone_dir = marketplace_skill_dir(home, name)
-    # changed：本次是否实际发生 clone/pull——决定 known_marketplaces.json 的 lastUpdated 是否刷新
-    # （复用既有 clone 不算更新，避免 lastUpdated 退化为「最后扫描时间」）。
-    changed = False
-    try:
-        if clone_dir.exists():
-            if refresh:
-                await _git_refresh_marketplace(clone_dir, url, timeout=timeout, env=env)
-                changed = True
-        else:
-            await _git_clone_marketplace(url, clone_dir, timeout=timeout, env=env)
-            changed = True
-    except SkillStagingError as e:
-        logger.error(
-            "marketplace %r clone/refresh failed, skipped (not registered): %s",
-            redact_git_urls_in_text(name),
-            safe_exception_text(e),
-        )
-        return registered
 
-    commit_sha = await _git_head_sha(clone_dir, timeout=timeout, env=env)
-    _record_known_marketplace(name, source, clone_dir, commit_sha, auto_update, home, env, changed=changed)
+    # #260：需要「新内容」时（缺失 or refresh）一律先 clone 到 staging，身份校验与原子换入都在锁内提交点完成
+    # ——刷新被拒（清单改名）时旧 clone / 旧账本 / 旧能力零损伤；refresh 不再原地 git pull。
+    pending: Path | None = None
+    if refresh or not clone_dir.exists():
+        purge_stale_marketplace_temps(clone_dir)
+        try:
+            pending = await clone_marketplace_to_staging(url, clone_dir, timeout=timeout, env=env)
+        except SkillStagingError as e:
+            logger.error(
+                "marketplace %r clone/refresh failed, keeping the existing clone (if any): %s",
+                redact_git_urls_in_text(name),
+                safe_exception_text(e),
+            )
+            return registered
+
+    commit_sha: str | None = None
+    if pending is not None:
+        try:
+            observed = read_manifest_marketplace_name(pending)
+        except MarketplaceIdentityError as e:
+            # 清单不可读 → 无法判定身份：不换内容、不写账本（旧注册保持原样），按既有降级记 ERROR。
+            shutil.rmtree(pending, ignore_errors=True)
+            logger.error(
+                "marketplace %r manifest unusable, registration not updated: %s",
+                redact_git_urls_in_text(name),
+                e,
+            )
+            return registered
+        try:
+            commit_sha = await _git_head_sha(pending, timeout=timeout, env=env)
+            outcome = commit_marketplace_registration(
+                name,
+                source,
+                pending_clone=pending,
+                clone_dir=clone_dir,
+                observed_manifest_name=observed,
+                commit_sha=commit_sha,
+                auto_update=auto_update,
+                home=home,
+                env=env,
+                strict=False,
+                allow_replace=True,
+            )
+        finally:
+            shutil.rmtree(pending, ignore_errors=True)  # 成功时已被 rename 走；失败/拒绝时清 staging
+        if not outcome.committed:
+            return registered  # 降级：账本与内容均未变（旧注册继续可用）
+        if outcome.trash is not None:
+            shutil.rmtree(outcome.trash, ignore_errors=True)  # 旧树在**锁外**删（锁内只做 rename）
+    else:
+        # 纯复用（离线优先）：不触网、不校验身份，仅补写缺失/不一致的账本记录（等价则 no-op）。
+        commit_sha = await _git_head_sha(clone_dir, timeout=timeout, env=env)
+        _record_known_marketplace(name, source, clone_dir, commit_sha, auto_update, home, env, changed=False)
 
     try:
         manifest = read_marketplace_manifest(clone_dir)

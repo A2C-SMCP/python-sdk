@@ -52,8 +52,9 @@
 # 1) 移除受影响 marketplace：默认级联卸载其下所有已安装插件，并撤销该 marketplace 的 trust
 a2c-computer marketplace remove <marketplace-name>
 
-# 2) 重新添加（重新 clone）。非交互执行时必须带 --trust；
-#    原 marketplace 名不是从 URL 派生的默认值时，再加 --name <marketplace-name>
+# 2) 重新添加（重新 clone）。非交互执行时必须带 --trust。
+#    #260 起注册名**取清单顶层 name**（不再从 URL 派生、--name 也不再是别名——它只作期望名校验）。
+#    若上一步移除前的名字与清单名不同（legacy 注册），重新 add 会得到清单名，插件 id 的 @ 段要按新名改用。
 a2c-computer marketplace add <git-url> --trust
 
 # 3) 逐个重装并重新启用
@@ -65,8 +66,9 @@ a2c-computer plugin enable  <plugin>@<marketplace-name>
 
 - 第 1 步需要完整 marketplace 名（`a2c-computer marketplace list` 可查）。
 - 第 2 步的 `<git-url>` 用该 marketplace 原来的 source（`a2c-computer marketplace info <name>` 在移除前可查）。
-  若原 marketplace 名不是从 URL 派生的默认值（当初 `add` 时用了 `--name`），重新 `add` 时要用**同一个** `--name`
-  ——否则插件 id 里的 `@<marketplace>` 对不上，重装会找不到 marketplace。
+  **v0.5.1（#260）起注册名 = 清单顶层 `name`**：若移除前看到的名字与清单名不同（URL 派生名或当初 `--name`
+  指定的别名，属 legacy 注册），重新 `add` 后 marketplace 会注册成**清单名**，后续 `plugin install/enable`
+  的 `@<marketplace>` 段要相应改用清单名。存量注册的统一迁移见 #268。
 - `plugin install` **只安装不激活**，所以每个插件都要再 `plugin enable` 一次，才能恢复 SKILL 投影与插件携带的
   MCP server。
 - 第 3 步对每个受影响的插件重复执行。

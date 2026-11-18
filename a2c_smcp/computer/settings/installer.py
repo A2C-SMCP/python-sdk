@@ -122,6 +122,7 @@ from a2c_smcp.computer.skills.manifest import (
     resolve_plugin_version,
     resolve_skill_override_dirs,
 )
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
 from a2c_smcp.computer.skills.sources import SkillSourceError, safe_exception_text
 from a2c_smcp.computer.skills.staging import (
@@ -1574,7 +1575,7 @@ async def enable_plugin(
                     continue
                 await register_server(cfg)
                 registered.append(bundle_id)  # 身份 = bundle_id：按 name 记会在「同名异 id」时回滚摘错对象
-    except Exception:
+    except Exception as exc:
         # 回滚（逆序，best-effort 不掩盖原异常）：撤销本次新增 skill / server，enabledPlugins 恢复原值。
         # ``registered`` 只含本次真正挂上的（依赖已满足者已在 ④ skip），故此处无需再判「是否本来就在」。
         for name in _plugin_skill_names(registry, marketplace, plugin, include_orphans=True):
@@ -1592,6 +1593,13 @@ async def enable_plugin(
             _write_enabled_plugin(plugin_id, prev_value, scope, project_path, env)
         except Exception as e:  # noqa: BLE001 - 回滚 best-effort
             logger.warning("enable rollback: failed to restore enabledPlugins[%s]=%r: %s", plugin_id, prev_value, e)
+        # #260：staging 的清单身份违约（clone 缺失时的重建可能观测到改名）在这里**收敛为**库层公开错误类型
+        # ——CLI `plugin enable` 只认 :class:`PluginInstallError`，裸异常会变成 traceback。转换本身不改状态
+        # （回滚已完成），构造 `PluginInstallError` 不会抛。
+        if isinstance(exc, MarketplaceNameChangeError):
+            raise PluginInstallError(
+                str(exc), error_code=exc.error_code, details=exc.payload_details()
+            ) from exc
         raise
     logger.info("enabled plugin %r (scope=%s, skills recovered, servers remounted)", plugin_id, scope)
 

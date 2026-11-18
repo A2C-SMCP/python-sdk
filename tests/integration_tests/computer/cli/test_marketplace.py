@@ -47,7 +47,7 @@ def _skill_md(name: str) -> str:
 
 def _make_bare(tmp_path: Path) -> Path:
     manifest = {
-        "name": "acme-skills",
+        "name": "acme",
         "owner": {"name": "Acme"},
         "metadata": {"pluginRoot": "./plugins"},
         "plugins": [{"name": "audit", "source": "audit", "version": "1.0.0"}],
@@ -93,16 +93,19 @@ def test_typer_add_list_info_remove(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert "acme" not in (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {})
 
 
-def test_typer_add_query_url_derives_clean_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """#270：默认名只取解析后 path 末段——query/fragment 不进账本键（``--no-clone`` 不打印 URL）。"""
+def test_typer_add_no_clone_new_source_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    #260 / D5：新源 ``--no-clone`` 无法确定清单名 → ``validation``（``unresolvable-name``），
+    零账本、零 trust 残留；URL 原值（含 query）不回显。
+    """
     _set_env(monkeypatch, tmp_path)
     url = "https://example.invalid/team/acme-skills.git?token=FAKE_QUERY#frag"
-    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", url, "--trust", "--no-clone"])
-    assert r.exit_code == 0, r.output
-    assert "acme-skills" in r.output
-    mps = load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}
-    assert set(mps) == {"acme-skills"}, "账本键只能是干净派生名"
-    assert mps["acme-skills"]["source"]["url"] == url, "存储与 git argv 保留原始 URL（raw 保真）"
+    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", url, "--trust", "--no-clone", "--json"])
+    assert r.exit_code == 1, r.output
+    payload = json.loads(r.output)
+    assert payload["error"] == "validation" and payload["code"] == "unresolvable-name"
+    assert "FAKE_QUERY" not in r.output
+    assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}
 
 
 def test_typer_add_hostless_url_exits_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -196,3 +199,81 @@ async def test_repl_add_trust_yes_then_skill_list(tmp_path: Path, monkeypatch: p
         assert "audit:audit-code" in names
     finally:
         await comp._skill_debouncer.aclose()  # 排空 mark_skills_dirty 触发的去抖任务
+
+
+@requires_git
+def test_typer_add_registers_manifest_name_not_repo_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    #260 验收①（D1）：仓库目录名与清单 `name` 不同 → 注册名取**清单名**（URL 只是定位符）。
+    """
+    _set_env(monkeypatch, tmp_path)
+    work = tmp_path / "repo-dir"  # 仓库名（与清单名不同）
+    work.mkdir(parents=True, exist_ok=True)
+    _git(work, "init", "-q", "-b", "main")
+    manifest = {
+        "name": "team-tools",  # 清单名
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": "audit", "source": "audit"}],
+    }
+    for rel, content in {
+        ".tfrobot-plugin/marketplace.json": json.dumps(manifest),
+        "plugins/audit/skills/audit-code/SKILL.md": _skill_md("audit-code"),
+    }.items():
+        p = work / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init")
+    bare = tmp_path / "repo-dir.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+
+    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", f"file://{bare}", "--trust", "--json"])
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output)["added"] == "team-tools"
+
+    mps = load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}
+    assert set(mps) == {"team-tools"}, "注册名 = 清单名，不是仓库名 repo-dir"
+    assert mps["team-tools"]["manifestNameBaseline"] == "team-tools"
+    assert mps["team-tools"]["source"]["url"] == f"file://{bare}"
+
+
+@requires_git
+def test_typer_add_name_mismatch_rejected_zero_residue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D6 B：``--name`` 与清单名不符 → ``validation``，零账本 / 零 clone / 零 trust 残留。"""
+    _set_env(monkeypatch, tmp_path)
+    url = f"file://{_make_bare(tmp_path)}"
+    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", url, "--name", "wrong", "--trust", "--json"])
+
+    assert r.exit_code == 1, r.output
+    payload = json.loads(r.output)
+    assert payload["error"] == "validation" and payload["code"] == "expected-name-mismatch"
+    assert payload["manifestName"] == "acme" and payload["expectedName"] == "wrong"
+    assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}
+    assert not (tmp_path / "home" / "marketplace").exists() or not any(
+        p.is_dir() and not p.name.startswith(".") for p in (tmp_path / "home" / "marketplace").iterdir()
+    ), "失败不得留下 clone 目录"
+    settings = tmp_path / "cfg"
+    assert not settings.exists() or "wrong" not in "".join(p.read_text(encoding="utf-8") for p in settings.rglob("settings.json")), (
+        "注册失败不得残留 trust"
+    )
+
+
+@requires_git
+def test_typer_add_manifest_missing_name_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """验收②：清单缺 `name` → ``validation``（``manifest-name-invalid``），不静默回退为仓库名。"""
+    _set_env(monkeypatch, tmp_path)
+    work = tmp_path / "noname-work"
+    work.mkdir(parents=True, exist_ok=True)
+    _git(work, "init", "-q", "-b", "main")
+    p = work / ".tfrobot-plugin" / "marketplace.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"plugins": []}), encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init")
+    bare = tmp_path / "noname.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+
+    r = CliRunner().invoke(cli_main.app, ["marketplace", "add", f"file://{bare}", "--trust", "--json"])
+    assert r.exit_code == 1
+    assert json.loads(r.output)["code"] == "manifest-name-invalid"
+    assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}

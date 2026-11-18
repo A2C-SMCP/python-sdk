@@ -43,12 +43,23 @@ def clone_spinner(description: str, *, enabled: bool = True) -> contextlib.Abstr
 
 
 def refresh_summary_table(rows: list[dict[str, Any]]) -> Table:
-    """多 marketplace 刷新汇总表（updated / unchanged / missing）/ Build the refresh summary table。"""
+    """
+    多 marketplace 刷新汇总表（updated / unchanged / missing / validation）/ Build the refresh summary table.
+
+    ``validation``（#260 / §5.14 清单改名拒绝）带可读原因，不得被渲染成成功或 no-op；出现该列时追加
+    ``Detail`` 列，其余状态保持原三列形态。
+    """
     table = Table(title="Refresh summary", header_style="bold magenta")
     for col in ("Marketplace", "Status", "Skills"):
         table.add_column(col)
-    marks = {"updated": "✓", "unchanged": "·", "missing": "✗"}
+    has_detail = any(r.get("error") for r in rows)
+    if has_detail:
+        table.add_column("Detail")
+    marks = {"updated": "✓", "unchanged": "·", "missing": "✗", "validation": "✗"}
     for r in rows:
         status = str(r.get("status", "?"))
-        table.add_row(str(r.get("name", "")), f"{marks.get(status, '?')} {status}", str(r.get("skills", "—")))
+        row = [str(r.get("name", "")), f"{marks.get(status, '?')} {status}", str(r.get("skills", "—"))]
+        if has_detail:
+            row.append(str(r.get("error") or ""))
+        table.add_row(*row)
     return table

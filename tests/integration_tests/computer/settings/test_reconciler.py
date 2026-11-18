@@ -135,7 +135,11 @@ async def test_reconcile_clones_and_registers_only_enabled_plugin(tmp_path: Path
 
 
 @requires_git
-async def test_reconcile_source_changed_switches_repo(tmp_path: Path) -> None:
+async def test_reconcile_source_changed_rejected_keeps_old_repo(tmp_path: Path) -> None:
+    """
+    #260 / §5.14：声明换源 MUST 拒绝（``validation``）——旧 clone / 旧 SKILL 能力 / 旧账本原样保留，
+    新库内容**不**注册；换源只能经显式 remove / re-add。
+    """
     bare1 = _make_bare(tmp_path, "repo1", _one_plugin_files("p", "old-skill"))
     bare2 = _make_bare(tmp_path, "repo2", _one_plugin_files("p", "new-skill"))
     home = _home(tmp_path)
@@ -145,15 +149,15 @@ async def test_reconcile_source_changed_switches_repo(tmp_path: Path) -> None:
     await reconcile(reg, home, {"extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare1))}}, **enabled}, env=_env(home))
     assert reg.resolve("p:old-skill") is not None
 
-    # 声明换源 → sourceChanged 重 clone
     report = await reconcile(
         reg, home, {"extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare2))}}, **enabled}, env=_env(home)
     )
 
-    assert report.updated == ["acme-skills"]
-    assert reg.resolve("p:new-skill") is not None  # 新库 SKILL 注册
-    assert reg.resolve("p:old-skill") is None  # 旧库 SKILL 注销
-    assert load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]["source"] == _src(_url(bare2))
+    assert report.validation == {"acme-skills": "source-conflict"}
+    assert report.updated == [] and report.installed == []
+    assert reg.resolve("p:old-skill") is not None, "旧库 SKILL 保持 active（不进入 degraded）"
+    assert reg.resolve("p:new-skill") is None, "新库内容不得被注册"
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]["source"] == _src(_url(bare1))
 
 
 @requires_git

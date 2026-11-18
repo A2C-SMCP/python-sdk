@@ -628,3 +628,221 @@ async def test_strict_false_with_plugin_components_degrades_without_blocking_oth
     assert names == ["fmt:format"]  # audit 降级不入册；fmt 不受阻断
     assert reg.resolve("audit:should-not-appear") is None
     assert reg.resolve("fmt:format") is not None
+
+
+# ── #260：注册名取自清单 / baseline / 改名拒绝（§5.14）─────────────────────────
+def _seed_known(home: Path, records: dict[str, dict[str, object]]) -> None:
+    from a2c_smcp.computer.settings.store import save_known_marketplaces
+
+    save_known_marketplaces({"version": 1, "marketplaces": records}, home=home)
+
+
+def _clone_into(home: Path, name: str, bare: Path) -> Path:
+    """把 bare clone 到 ``<home>/marketplace/<name>``（模拟已物化的既有 clone）。"""
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+
+    dest = marketplace_skill_dir(home, name)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "-q", "--depth", "1", _url(bare), str(dest)], check=True, capture_output=True)
+    return dest
+
+
+@requires_git
+async def test_refresh_rename_after_baseline_rejected_and_content_preserved(tmp_path: Path) -> None:
+    """§5.14 六景③：refresh 观测到清单改名 → 抛改名拒绝；旧内容 / 账本 / 既有 SKILL 全部保留。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+
+    work, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    # 首次注册（清单名 = 注册名）→ baseline 落账本
+    assert await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, env=_env(home))
+    record_before = dict(load_known_marketplaces(home=home)["marketplaces"]["acme-skills"])
+    assert record_before["manifestNameBaseline"] == "acme-skills"
+    clone = marketplace_skill_dir(home, "acme-skills")
+    old_skills = sorted(p.name for p in (clone / "plugins" / "audit" / "skills").iterdir())
+
+    # 上游把清单改名 + 增补新 skill
+    _write(
+        work,
+        {
+            ".tfrobot-plugin/marketplace.json": json.dumps(
+                {"name": "acme-renamed", "metadata": {"pluginRoot": "./plugins"},
+                 "plugins": [{"name": "audit", "source": "audit", "version": "1.0.0"}]}
+            ),
+            "plugins/audit/skills/brand-new/SKILL.md": _skill_md("brand-new"),
+        },
+    )
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "rename")
+    _git(work, "push", "-q", "origin", "main")
+
+    with pytest.raises(MarketplaceNameChangeError) as ei:
+        await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, refresh=True, env=_env(home))
+    assert ei.value.reason == "manifest-name-changed"
+    assert ei.value.details == {
+        "name": "acme-skills",
+        "manifestName": "acme-renamed",
+        "baselineManifestName": "acme-skills",
+    }
+
+    # 旧内容零损伤（未换入新树）、账本原样、既有 SKILL 仍 active
+    assert sorted(p.name for p in (clone / "plugins" / "audit" / "skills").iterdir()) == old_skills
+    assert not (clone / "plugins" / "audit" / "skills" / "brand-new").exists()
+    assert dict(load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]) == record_before
+    assert reg.resolve("audit:audit-code") is not None
+
+
+@requires_git
+async def test_refresh_legacy_record_writes_baseline_and_keeps_old_name(tmp_path: Path) -> None:
+    """D4 legacy baseline：无 baseline 的旧注册首次成功 refresh → 补写清单名、**保留旧注册名**、不拒。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    # 模拟 legacy：注册键 = 旧名（URL 派生/显式别名），clone 已物化，账本无 manifestNameBaseline
+    _clone_into(home, "legacy-name", bare)
+    _seed_known(home, {"legacy-name": {"source": _src(_url(bare)), "installLocation": ""}})
+
+    names = await stage_marketplace_skills("legacy-name", _src(_url(bare)), reg, home, refresh=True, env=_env(home))
+
+    assert "audit:audit-code" in names
+    record = load_known_marketplaces(home=home)["marketplaces"]["legacy-name"]
+    assert record["manifestNameBaseline"] == "acme-skills", "首次成功 refresh 记录清单名基线"
+    assert set(load_known_marketplaces(home=home)["marketplaces"]) == {"legacy-name"}, "保留旧注册名，不静默改名"
+
+
+@requires_git
+async def test_clone_rebuild_with_renamed_manifest_rejected(tmp_path: Path) -> None:
+    """已有 baseline 的注册在 clone 缺失重建时观测到改名 → 拒绝（不建树、不写账本）。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+
+    work, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    _seed_known(
+        home,
+        {"acme-skills": {"source": _src(_url(bare)), "installLocation": "", "manifestNameBaseline": "acme-skills"}},
+    )
+    record_before = dict(load_known_marketplaces(home=home)["marketplaces"]["acme-skills"])
+
+    _write(work, {".tfrobot-plugin/marketplace.json": json.dumps({"name": "acme-renamed", "plugins": []})})
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "rename")
+    _git(work, "push", "-q", "origin", "main")
+
+    with pytest.raises(MarketplaceNameChangeError):
+        await stage_marketplace_skills("acme-skills", _src(_url(bare)), SkillRegistry(), home, env=_env(home))
+
+    assert not marketplace_skill_dir(home, "acme-skills").exists(), "拒绝时不得落地新 clone"
+    assert dict(load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]) == record_before
+
+
+@requires_git
+async def test_new_registration_with_manifest_name_mismatch_is_degraded(tmp_path: Path) -> None:
+    """D1：无既有记录时，清单名 ≠ 注册名 → 不注册（降级，不抛）、不落地 clone、不写账本。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())  # 清单名 acme-skills
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+
+    names = await stage_marketplace_skills("acme", _src(_url(bare)), reg, home, env=_env(home))
+
+    assert names == []
+    assert reg.active_refs() == []
+    assert load_known_marketplaces(home=home).get("marketplaces") in (None, {})
+    assert not marketplace_skill_dir(home, "acme").exists()
+
+
+@requires_git
+async def test_refresh_same_source_same_name_is_updated(tmp_path: Path) -> None:
+    """正对照：清单名未变时 refresh 正常换入新内容（拒绝路径不得把正常刷新打死）。"""
+    work, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, env=_env(home))
+
+    _write(work, {"plugins/audit/skills/brand-new/SKILL.md": _skill_md("brand-new")})
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "add skill")
+    _git(work, "push", "-q", "origin", "main")
+
+    names = await stage_marketplace_skills("acme-skills", _src(_url(bare)), reg, home, refresh=True, env=_env(home))
+    assert "audit:brand-new" in names
+    assert reg.resolve("audit:brand-new") is not None
+
+
+@requires_git
+async def test_add_commit_failure_leaves_no_residue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """提交点写账本失败 → 目录回滚、无 staging / clone / 账本残留（「失败零残留」验收）。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.staging import add_marketplace_source
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.store.atomic_write_json", _boom)
+
+    with pytest.raises(OSError):
+        await add_marketplace_source(_src(_url(bare)), home, env=_env(home))
+
+    assert not marketplace_skill_dir(home, "acme-skills").exists(), "提交失败不得留下换入后的 clone"
+    assert load_known_marketplaces(home=home).get("marketplaces") in (None, {}), "不得留下账本记录"
+    staging_parent = marketplace_skill_dir(home, "acme-skills").parent
+    leftovers = [p.name for p in staging_parent.iterdir() if p.name.startswith((".staging-", ".trash-"))]
+    assert leftovers == [], f"不得留下临时目录：{leftovers}"
+
+
+@requires_git
+async def test_commit_point_recheck_catches_concurrent_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    并发面（#260「提交点锁内复核」）：clone 完、尚未进提交锁时，另一进程已用**同名不同源**注册 →
+    我们的提交必须在锁内复核并拒绝，且**不覆盖**并发方写入的注册（不静默替换）。
+    """
+    import a2c_smcp.computer.skills.staging as staging_mod
+    from a2c_smcp.computer.settings.store import load_known_marketplaces, update_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceIdentityError
+    from a2c_smcp.computer.skills.staging import add_marketplace_source
+
+    _, bare_ours = _make_bare(tmp_path / "ours", "acme", _marketplace_files())
+    _, bare_theirs = _make_bare(tmp_path / "theirs", "acme", _marketplace_files())
+    home = _home(tmp_path)
+    real_clone = staging_mod.clone_marketplace_to_staging
+
+    async def _clone_then_race(url: str, clone_dir: Path, *, timeout: float = 120.0, env=None) -> Path:  # type: ignore[no-untyped-def]
+        pending = await real_clone(url, clone_dir, timeout=timeout, env=env)
+
+        def _mutate(f: dict) -> None:  # type: ignore[type-arg]
+            # 竞态窗口：另一进程已用**同名**（清单名 acme-skills）注册了**另一个** source。
+            f["marketplaces"]["acme-skills"] = {
+                "source": _src(_url(bare_theirs)),
+                "installLocation": str(marketplace_skill_dir(home, "acme-skills")),
+                "manifestNameBaseline": "acme-skills",
+            }
+            return None
+
+        update_known_marketplaces(_mutate, home, env)
+        return pending
+
+    monkeypatch.setattr(staging_mod, "clone_marketplace_to_staging", _clone_then_race)
+
+    with pytest.raises(MarketplaceIdentityError) as ei:
+        await add_marketplace_source(_src(_url(bare_ours)), home, env=_env(home))
+    assert ei.value.reason == "name-conflict"
+
+    record = load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]
+    assert record["source"] == _src(_url(bare_theirs)), "并发方写入的注册必须原样保留（不得静默替换）"

@@ -27,6 +27,7 @@ from typing import Any
 from unicodedata import normalize
 from urllib.parse import unquote, urlsplit
 
+from rich.markup import escape
 from rich.table import Table
 
 from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
@@ -48,15 +49,23 @@ from a2c_smcp.computer.settings.schema import (
 )
 from a2c_smcp.computer.settings.scope import apply_write, load_settings_file, user_settings_path
 from a2c_smcp.computer.settings.store import (
+    SettingsLockError,
     atomic_write_json,
     file_lock,
     load_installed_plugins,
     load_known_marketplaces,
     update_known_marketplaces,
 )
+from a2c_smcp.computer.skills.home import marketplace_skill_dir
+from a2c_smcp.computer.skills.marketplace_identity import (
+    MarketplaceIdentityError,
+    MarketplaceNameChangeError,
+    read_manifest_marketplace_name,
+    registered_name_for_source,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import GITHUB_HOST, SkillSourceError, normalize_repo_shorthand
-from a2c_smcp.computer.skills.staging import stage_marketplace_skills
+from a2c_smcp.computer.skills.staging import SkillStagingError, add_marketplace_source, stage_marketplace_skills
 from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, known_git_source_for_display
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
@@ -69,12 +78,32 @@ EXIT_NETWORK_ERROR = 2
 
 
 # ── 输出辅助 / output helpers ─────────────────────────────────────────────────
-def _err(msg: str, *, json_output: bool, code: int = EXIT_USER_ERROR) -> int:
+# ``details`` 中与 :func:`_err` 保留字段同名的键：展开前过滤，避免覆盖类别码 / 人读文案（#257 先例）。
+# 注：``code``（退出码）**不在**此集——它是签名参数，``**extra`` 撞名会在调用点 TypeError，根本到不了过滤；
+# 而结构化 payload 的机器码键就叫 ``code``（:meth:`MarketplaceIdentityError.payload_details`），须放行。
+_RESERVED_DETAIL_KEYS = frozenset({"error", "message", "msg", "exit_code", "error_code"})
+
+
+def _err(msg: str, *, json_output: bool, exit_code: int = EXIT_USER_ERROR, error_code: str | None = None, **extra: Any) -> int:
+    """
+    错误输出（结构化 ``validation`` 可选）/ Error output with an optional structured category.
+
+    ``error_code`` 非空时输出 ``{"error": <category>, "message": …, **diagnostics}``（对齐
+    ``cli/commands/plugin.py:102`` 的 #257/PR #266 先例）；为空保持既有 ``{"error": <文案>}`` 形态。
+    非 JSON 输出经 ``escape()``——文案可含不可信 source 文本，rich 标记会把「结构化错误」变成 traceback（#263）。
+    """
     if json_output:
-        console.print_json(data={"error": msg})
+        details = {key: value for key, value in extra.items() if key not in _RESERVED_DETAIL_KEYS}
+        payload: dict[str, Any] = {"error": error_code or "error", "message": msg, **details}
+        console.print_json(data=payload)
     else:
-        console.print(f"[red]✗ {msg}[/red]")
-    return code
+        console.print(f"[red]✗ {escape(msg)}[/red]")
+    return exit_code
+
+
+def _identity_error(e: MarketplaceIdentityError, *, json_output: bool) -> int:
+    """把 :class:`MarketplaceIdentityError` 翻成结构化 CLI 错误（``validation`` + reason/诊断）/ Render it."""
+    return _err(str(e), json_output=json_output, error_code=e.error_code, **e.payload_details())
 
 
 def _ok(msg: str) -> int:
@@ -269,6 +298,90 @@ def _revoke_trust(name: str, env: Mapping[str, str] | None) -> None:
         atomic_write_json(path, apply_write(existing, {FIELD_TRUSTED_MARKETPLACES: current}))
 
 
+def _precheck_trust_write(env: Mapping[str, str] | None) -> None:
+    """
+    trust 落盘前的**只读**预检（#246 破坏半径）/ Read-only pre-check before any clone happens.
+
+    注册成功后才写 trust（#260），但「settings 损坏 ⇒ add 失败且不 clone」这条 #246 语义必须保住：
+    在 clone 前把**将要写**的目标键形状验一遍，corrupt / 非数组 → :class:`SettingsFileCorruptError`
+    （CLI 退出码 1、零副作用）。
+    """
+    path = user_settings_path(env)
+    existing = read_raw_object(path) or {}
+    list_field_or_empty(existing, FIELD_TRUSTED_MARKETPLACES, path=path)
+
+
+def _register_intent_only(
+    home: Path,
+    env: Mapping[str, str] | None,
+    url: str,
+    name: str | None,
+    *,
+    auto_update: bool,
+    json_output: bool,
+) -> int:
+    """
+    ``--no-clone``：只登记意图（D5：无 pending、无临时派生名）/ Register intent only (no clone).
+
+    允许的两种形态（其余一律 ``validation``——无法在注册前确定名称）：
+
+    1. **已注册**同名同源 / 同源任意名 → 幂等意图，保留既有 ``installLocation``（绝不用空值覆盖有效记录）；
+    2. ``--name N`` 且本地缓存 ``<home>/marketplace/N`` 已存在、其清单名 == ``N`` → 以缓存确定名称并登记意图。
+    """
+    source = {"type": "git", "url": url}
+    known = _marketplaces(home, env)
+
+    existing_name = registered_name_for_source(known, source)
+    if existing_name is not None:
+        # 已以该 source 注册（add 的幂等面）：不新建、不覆盖；trust 幂等落盘（注册事实已成立）。
+        try:
+            _record_trust(existing_name, env)
+        except SettingsFileCorruptError as e:
+            console_err.print(
+                f"[yellow]! marketplace {existing_name!r} is registered but its trust entry could not be persisted: {e}[/yellow]"
+            )
+        if json_output:
+            console.print_json(data={"registered": existing_name, "url": known_git_source_for_display(url), "cloned": True})
+            return EXIT_OK
+        return _ok(f"marketplace {existing_name!r} is already registered (no clone needed)")
+
+    if name is not None:
+        clone_dir = marketplace_skill_dir(home, name)
+        if clone_dir.is_dir():
+            try:
+                observed = read_manifest_marketplace_name(clone_dir)
+            except MarketplaceIdentityError:
+                observed = None
+            if observed == name:
+                def _mutate(f: Any) -> None:
+                    prior = f["marketplaces"].get(name) or {}
+                    f["marketplaces"][name] = {
+                        "source": dict(source),
+                        "installLocation": str(clone_dir.resolve()),
+                        "autoUpdate": bool(auto_update or prior.get("autoUpdate")),
+                        "manifestNameBaseline": prior.get("manifestNameBaseline") or name,
+                    }
+
+                update_known_marketplaces(_mutate, home, env)
+                try:
+                    _record_trust(name, env)
+                except SettingsFileCorruptError as e:
+                    console_err.print(f"[yellow]! registered {name!r} but failed to persist its trust entry: {e}[/yellow]")
+                if json_output:
+                    console.print_json(data={"registered": name, "url": known_git_source_for_display(url), "cloned": True})
+                    return EXIT_OK
+                return _ok(f"registered marketplace {name!r} from the local clone (no clone)")
+
+    return _err(
+        "cannot determine the marketplace name without cloning: --no-clone only works for an already "
+        "registered source, or with --name pointing at an existing local clone whose manifest declares that name. "
+        "Run without --no-clone to clone and read the manifest name.",
+        json_output=json_output,
+        error_code="validation",
+        code="unresolvable-name",
+    )
+
+
 # ── handlers ──────────────────────────────────────────────────────────────────
 async def marketplace_add(
     registry: SkillRegistry,
@@ -283,80 +396,101 @@ async def marketplace_add(
     confirm: ConfirmFn | None = None,
     json_output: bool = False,
 ) -> int:
-    """添加新 marketplace（首次 trust y/N，默认 eager clone）/ Add a marketplace (trust on first add, eager clone)。"""
+    """
+    添加新 marketplace（D1 注册名取清单 ``name``；首次 trust y/N，默认 eager clone）/
+    Add a marketplace: the registration name is the manifest's top-level ``name``.
+
+    **D6 B**：``--name`` 只作**期望清单名**校验，不再是别名（不符即 ``validation``，不覆盖）。
+
+    trust 门（§10.5/#95/#260）：
+    - 非交互（``confirm is None``）：``--trust`` 无条件强制；
+    - 交互（REPL）：**一律**弹确认——``trustedMarketplaces`` 不再豁免 prompt（#260 裁决：``--name`` 已不
+      命名任何东西，拿它当免提示开关与其语义不一致，且会绕过确认）。trust 在**注册成功后**才落盘，
+      注册失败零残留。
+    """
     url = normalize_marketplace_url(git_url)
     if url is None:
         return _err(
             f"not a well-formed git url or owner/repo shorthand: {_error_url_display(git_url)}",
             json_output=json_output,
+            error_code="validation",
+            code="invalid-source",
         )
-    mp_name = name or default_marketplace_name(url)
-    if not mp_name or not is_valid_marketplace_name(mp_name):
+    if name is not None and not is_valid_marketplace_name(name):
+        # ``--name`` 现在是「期望清单名」，先按同一语法契约快速拒绝（避免白跑一次 clone）。
         return _err(
-            f"cannot derive a valid marketplace name from {_error_url_display(url)}; pass --name",
+            f"--name {name!r} is not a valid marketplace name (strict kebab-case, 1-64); pass the manifest's name",
             json_output=json_output,
+            error_code="validation",
+            code="invalid-name",
         )
 
-    if mp_name in _marketplaces(home, env):
-        return _err(f"marketplace name conflict: {mp_name!r} already exists", json_output=json_output)
+    # #246：写前**只读**预检（corrupt → 退出码 1 且**不 clone**），保持既有 fail-closed 破坏半径。
+    try:
+        _precheck_trust_write(env)
+    except SettingsFileCorruptError as e:
+        return _err(str(e), json_output=json_output)
 
-    # trust 门（§10.5/§11，#95 收紧）/ trust gate:
-    #   - 非交互（confirm is None）：``--trust`` **无条件**强制（契约「非交互须 --trust」）。持久化的
-    #     user-scope trust **不豁免**——能走到「已 trusted 但不在 known_marketplaces」的只有 desync/
-    #     泄漏态（remove 未撤销 / clone 失败 orphan / 跨 A2C_SKILL_HOME；trust 落全局 user settings、
-    #     与 home 解耦），陈旧 trust 不得静默授权一次全新的远端 clone+注册。
-    #   - 交互（confirm 非空，REPL）：已 trusted 的 name 跳过重复 prompt；否则弹 confirm。该跳过
-    #     **仅 desync 态可达**——line 160 同名拦截保证走到此处 name 必不在 known_marketplaces，故"已
-    #     trusted"⇒desync；保留是为避免 clone 失败后重试同一 URL 时重复弹窗。残留：trust 按 name 键控，
-    #     <新URL> 套 <旧trusted名> 会跳过 confirm 不再展示 url——交互态由在场真人把关，威胁模型有意接受
-    #     （§10.5；回归守卫 test_add_pretrusted_name_interactive_skips_prompt）。
-    # 门控/落盘按 **name**（§5.3.1），prompt 仍展示 url 供用户判断来源。
     if not trust:
         if confirm is None:
             return _err(
-                f"untrusted marketplace {mp_name!r} ({_error_url_display(url)}); "
-                "pass --trust to confirm non-interactively",
+                f"untrusted source ({_error_url_display(url)}); pass --trust to confirm non-interactively",
                 json_output=json_output,
             )
         # 确认提示是 known-source 展示面（#261）：scp-like → host:path，去 userinfo/query/fragment。
-        if mp_name not in _load_trusted(env) and not await confirm(known_git_source_for_display(url)):
+        if not await confirm(known_git_source_for_display(url)):
             return _err("aborted by user (untrusted)", json_output=json_output)
-    try:
-        _record_trust(mp_name, env)
-    except SettingsFileCorruptError as e:
-        # fail-closed：trust 是后续 clone+注册的前置条件；写不进去就不继续（#246）。
-        return _err(str(e), json_output=json_output)
 
     if no_clone:
-        # 仅注册意图（不推荐，§4.2 debug 用）：记 known_marketplaces 但不 clone/stage。
-        update_known_marketplaces(
-            lambda f: f["marketplaces"].__setitem__(  # type: ignore[func-returns-value]
-                mp_name, {"source": {"type": "git", "url": url}, "installLocation": "", "autoUpdate": auto_update}
-            )
-            or f,
-            home,
-            env,
-        )
-        return _ok(f"registered marketplace intent {mp_name!r} (no clone)")
+        return _register_intent_only(home, env, url, name, auto_update=auto_update, json_output=json_output)
 
     source = {"type": "git", "url": url}
-    with clone_spinner(f"Cloning {mp_name}...", enabled=not json_output):
-        registered = await stage_marketplace_skills(mp_name, source, registry, home, auto_update=auto_update, env=env)
+    try:
+        with clone_spinner("Cloning marketplace...", enabled=not json_output):
+            final_name = await add_marketplace_source(source, home, expected_name=name, auto_update=auto_update, env=env)
+    except MarketplaceIdentityError as e:
+        return _identity_error(e, json_output=json_output)
+    except (SkillStagingError, SkillSourceError):
+        # 不插值 e：git 失败文本含 argv（原始 URL，可能是带凭据的形态），失败文案只走脱敏展示面。
+        return _err(
+            f"clone failed for {_error_url_display(url)} (see logs)",
+            json_output=json_output,
+            exit_code=EXIT_NETWORK_ERROR,
+        )
+    except SettingsLockError:
+        # 并发写账本的锁被占满（退避约 6s）→ 干净报错（提交点已回滚，无残留）；用户稍后重试即可。
+        return _err(
+            "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
+            json_output=json_output,
+        )
 
-    # 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
-    if mp_name not in _marketplaces(home, env):
+    # 注册已提交 → 落 trust（失败仅 WARN，不回滚已成功的注册）。
+    try:
+        _record_trust(final_name, env)
+    except SettingsFileCorruptError as e:
+        console_err.print(f"[yellow]! added {final_name!r} but failed to persist its trust entry: {e}[/yellow]")
+
+    try:
+        with clone_spinner(f"Staging {final_name}...", enabled=not json_output):
+            registered = await stage_marketplace_skills(final_name, source, registry, home, auto_update=auto_update, env=env)
+    except MarketplaceNameChangeError as e:
+        # 防御：提交后的复用路径不观测清单名，此处理论不可达；真发生也不得 traceback（注册已提交）。
+        return _identity_error(e, json_output=json_output)
+
+    # 成功判定：注册提交点已写账本；此处再确认一次，避免 stage 的并发 remove 把记录抹掉后误报成功。
+    if final_name not in _marketplaces(home, env):
         return _err(
             f"clone/refresh failed for {_error_url_display(url)} (see logs)",
             json_output=json_output,
-            code=EXIT_NETWORK_ERROR,
+            exit_code=EXIT_NETWORK_ERROR,
         )
 
     if json_output:
         console.print_json(
-            data={"added": mp_name, "url": known_git_source_for_display(url), "skills": len(registered)}
+            data={"added": final_name, "url": known_git_source_for_display(url), "skills": len(registered)}
         )
         return EXIT_OK
-    return _ok(f"added {mp_name!r} — cloned, {len(registered)} skill(s) found")
+    return _ok(f"added {final_name!r} — cloned, {len(registered)} skill(s) found")
 
 
 def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: bool = False) -> int:
@@ -507,33 +641,47 @@ async def marketplace_refresh(
     *,
     json_output: bool = False,
 ) -> int:
-    """``git pull`` 失败则全量重 clone；与缓存 plugin 集合对账 + 失败汇总（§10.4）/ Refresh marketplaces。"""
+    """
+    重新 clone 并原子换入（拒绝时旧内容保留）；与缓存 plugin 集合对账 + 失败汇总（§10.4）/
+    Refresh marketplaces by re-cloning into staging and atomically swapping.
+
+    **#260 / §5.14**：清单改名 → 该行 ``status="validation"``（结构化、带 reason 与诊断），**不得**报
+    ``updated`` / ``unchanged``；旧内容、账本与既有运行时能力保持不动。其余 marketplace 继续刷新。
+    """
     mps = _marketplaces(home, env)
     names = list(mps) if target == "all" else [target]
 
     rows: list[dict[str, Any]] = []
+    exit_code = EXIT_OK
     for nm in names:
         rec = mps.get(nm)
         if rec is None:
             rows.append({"name": nm, "status": "missing"})
             continue
         before = rec.get("commitSha")
-        with clone_spinner(f"Refreshing {nm}...", enabled=not json_output):
-            registered = await stage_marketplace_skills(
-                nm, rec.get("source") or {}, registry, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=True, env=env
-            )
+        try:
+            with clone_spinner(f"Refreshing {nm}...", enabled=not json_output):
+                registered = await stage_marketplace_skills(
+                    nm, rec.get("source") or {}, registry, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=True, env=env
+                )
+        except MarketplaceNameChangeError as e:
+            # 改名拒绝：结构化 outcome，非 updated/unchanged；旧注册与旧能力原样保留。
+            rows.append({"name": nm, "status": "validation", "error": str(e), **e.payload_details()})
+            exit_code = EXIT_USER_ERROR
+            continue
         after = _marketplaces(home, env).get(nm) or {}
         status = "updated" if after.get("commitSha") != before else "unchanged"
         rows.append({"name": nm, "status": status, "skills": len(registered)})
 
     if json_output:
         console.print_json(data=rows)
-        return EXIT_OK
+        return exit_code
     console.print(refresh_summary_table(rows))
     updated = sum(1 for r in rows if r["status"] == "updated")
     failed = sum(1 for r in rows if r["status"] == "missing")
-    console.print(f"[dim]{len(rows)} marketplace(s) · {updated} updated · {failed} failed[/dim]")
-    return EXIT_OK
+    rejected = sum(1 for r in rows if r["status"] == "validation")
+    console.print(f"[dim]{len(rows)} marketplace(s) · {updated} updated · {failed} failed · {rejected} validation[/dim]")
+    return exit_code
 
 
 def marketplace_set(
@@ -611,8 +759,12 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             comp.mark_skills_dirty()
     elif sub == "refresh":
         target = pos[0] if pos else "all"
+        # #260：部分源刷新成功 + 部分 validation 时退出码为 1，但 registry 已变——不能只看退出码，
+        # 否则已连接 Agent 继续看到旧投影。
+        before_skills = {ref.get("name") for ref, _orphaned in comp.skill_registry.all_refs()}
         code = await marketplace_refresh(registry, home, env, target, json_output=json_output)
-        if code == EXIT_OK:
+        after_skills = {ref.get("name") for ref, _orphaned in comp.skill_registry.all_refs()}
+        if code == EXIT_OK or before_skills != after_skills:
             comp.mark_skills_dirty()
     elif sub == "set":
         # marketplace set <name> auto-update=<bool>

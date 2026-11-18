@@ -139,7 +139,11 @@ async def test_reconcile_missing_clones(tmp_path: Path, monkeypatch) -> None:
     assert calls[0]["plugin_filter"] == {"audit"}
 
 
-async def test_reconcile_source_changed_wipes_and_reclones(tmp_path: Path, monkeypatch) -> None:
+async def test_reconcile_source_change_rejected_without_wipe(tmp_path: Path, monkeypatch) -> None:
+    """
+    #260 / §5.14：声明式**换源** MUST 以 ``validation`` 拒绝——不 wipe、不重 clone、不 stage，
+    既有注册/内容/能力原样保留；显式 remove / re-add 才是换源路径。
+    """
     home = _home(tmp_path)
     _seed_known(home, {"acme": _SRC_A})
     clone = _make_clone(home, "acme")  # 旧 clone + sentinel
@@ -152,11 +156,40 @@ async def test_reconcile_source_changed_wipes_and_reclones(tmp_path: Path, monke
 
     report = await reconcile(SkillRegistry(), home, declared)
 
-    assert report.updated == ["acme"]
-    assert not (clone / "SENTINEL").exists()  # 旧 catalog clone 被 wipe
-    assert not ext.exists()  # 外部 plugin 树同样被 wipe（sourceChanged 清两处）
-    assert clone.exists()  # mock 重新 clone
-    assert calls[0]["source"] == _SRC_B
+    assert report.validation == {"acme": "source-conflict"}
+    assert report.updated == [] and report.installed == [] and report.failed == []
+    assert calls == [], "换源被拒时不得进入 stage/重 clone"
+    assert (clone / "SENTINEL").exists(), "旧 catalog clone 不得被 wipe"
+    assert ext.exists() and (ext / "plug").exists(), "外部 plugin 树同样不得被 wipe"
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme"]["source"] == _SRC_A, "账本 source 不得被改"
+
+
+async def test_reconcile_source_change_does_not_touch_symlinked_clone(tmp_path: Path, monkeypatch) -> None:
+    """换源拒绝路径**完全不碰目录**：即便旧 clone 是软链（旧实现 wipe 失败会报 failed）也不做删除尝试。"""
+    home = _home(tmp_path)
+    real = marketplace_skill_dir(home, "other") / "plugins"
+    sentinel = real / "sentinel"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("x", encoding="utf-8")
+    link = marketplace_skill_dir(home, "acme")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported on this platform")
+    _seed_known(home, {"acme": _SRC_A})
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(_RECONCILER, _fake_stage(calls))
+    reg = SkillRegistry()
+    _reg_skill(reg, "audit:lint", "acme", link)
+
+    report = await reconcile(reg, home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
+
+    assert report.validation == {"acme": "source-conflict"}
+    assert report.failed == [] and report.updated == [] and report.installed == []
+    assert calls == []
+    assert link.is_symlink() and sentinel.exists(), "拒绝路径不得尝试删除（链接与目标均保留）"
+    assert reg.resolve("audit:lint") is not None, "既有能力保持 active"
 
 
 async def test_reconcile_autoupdate_pulls_without_wipe(tmp_path: Path, monkeypatch) -> None:
@@ -394,61 +427,8 @@ def test_lexical_ownership_with_symlinked_install_path_component_258(tmp_path: P
     assert (target / "sub").exists() and (target / "keep").exists(), "不得跟随 installPath 软链删外部目标"
 
 
-async def test_reconcile_source_changed_symlink_clone_marks_failed_258(tmp_path: Path, monkeypatch) -> None:
-    """#258 架构师 🟡3：换源时旧 clone 为软链、无法清空 → 必须报 failed，不得复用旧树后误报 updated。"""
-    home = _home(tmp_path)
-    real = marketplace_skill_dir(home, "other") / "plugins"
-    sentinel = real / "sentinel"
-    sentinel.parent.mkdir(parents=True)
-    sentinel.write_text("x", encoding="utf-8")
-    link = marketplace_skill_dir(home, "acme")
-    link.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        link.symlink_to(real, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlink not supported on this platform")
-    _seed_known(home, {"acme": _SRC_A})
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(_RECONCILER, _fake_stage(calls))
-    reg = SkillRegistry()
-    _reg_skill(reg, "audit:lint", "acme", link)
-
-    report = await reconcile(reg, home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
-
-    assert report.failed == ["acme"]
-    assert report.updated == [] and report.installed == [] and report.up_to_date == []
-    assert calls == [], "旧树未清空时不得继续 stage（否则复用旧树后误报 updated）"
-    assert link.is_symlink() and sentinel.exists(), "拒删：链接与目标均保留"
-    assert reg.resolve("audit:lint") is not None, "wipe 失败时不得先注销 SKILL（无回滚）"
-    assert load_known_marketplaces(home=home)["marketplaces"]["acme"]["source"] == _SRC_A
-
-
-async def test_reconcile_source_changed_ext_tree_failure_marks_failed_258(tmp_path: Path, monkeypatch) -> None:
-    """#258 复审 🟡5：clone 清空成功但外部 plugin 树失败（``.plugins/<mp>`` 软链）→ failed 且不 stage。"""
-    home = _home(tmp_path)
-    _make_clone(home, "acme")
-    target = home / "elsewhere"
-    (target / "x").mkdir(parents=True)
-    (target / "x" / "keep").write_text("x", encoding="utf-8")
-    ext = _ext_dir(home, "acme")
-    ext.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        ext.symlink_to(target, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlink not supported on this platform")
-    _seed_known(home, {"acme": _SRC_A})
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(_RECONCILER, _fake_stage(calls))
-
-    report = await reconcile(SkillRegistry(), home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
-
-    assert report.failed == ["acme"] and report.updated == []
-    assert calls == []
-    assert (target / "x" / "keep").exists()
-
-
-async def test_reconcile_source_changed_rmtree_oserror_marks_failed_258(tmp_path: Path, monkeypatch) -> None:
-    """#258 复审 🟡5：``_safe_rmtree`` OSError → reconcile 报 failed 且不 stage（不得静默假成功）。"""
+async def test_reconcile_source_change_never_calls_rmtree(tmp_path: Path, monkeypatch) -> None:
+    """拒绝路径的机制断言：``reconcile`` 在换源分支**不得**调用任何 rmtree（旧实现 wipe 的承重墙）。"""
     import a2c_smcp.computer.settings.reconciler as rec_mod
 
     home = _home(tmp_path)
@@ -457,14 +437,18 @@ async def test_reconcile_source_changed_rmtree_oserror_marks_failed_258(tmp_path
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(_RECONCILER, _fake_stage(calls))
 
-    def _boom(*_a: object, **_k: object) -> None:
-        raise OSError("disk busy")
+    rmtree_calls: list[object] = []
 
-    monkeypatch.setattr(rec_mod.shutil, "rmtree", _boom)
+    def _record(*args: object, **kwargs: object) -> None:
+        rmtree_calls.append(args)
+        raise OSError("must not be called")
+
+    monkeypatch.setattr(rec_mod.shutil, "rmtree", _record)
 
     report = await reconcile(SkillRegistry(), home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
 
-    assert report.failed == ["acme"] and report.updated == []
+    assert report.validation == {"acme": "source-conflict"}
+    assert rmtree_calls == [], "换源拒绝不得尝试删除任何目录"
     assert calls == []
 
 

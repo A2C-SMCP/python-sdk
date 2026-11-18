@@ -459,13 +459,21 @@ identity_app = typer.Typer(help="Computer identity (reset)")
 @marketplace_app.command("add")
 def _mp_add(
     git_url: str = typer.Argument(..., help="git URL 或 owner/repo 简写 / git URL or owner/repo shorthand"),
-    name: str | None = typer.Option(None, "--name", help="marketplace 名（默认从 URL 派生）/ name (derived from URL by default)"),
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        help="期望的清单名（仅校验，不覆盖；注册名取 marketplace.json 顶层 name）/ expected manifest name (validated, never an alias)",
+    ),
     trust: bool = typer.Option(False, "--trust", help="跳过 trust 确认（非交互必需）/ skip trust prompt (required non-interactively)"),
     auto_update: bool = typer.Option(False, "--auto-update", help="启用 per-source 自动更新 / enable per-source auto-update"),
-    no_clone: bool = typer.Option(False, "--no-clone", help="仅注册意图、不 clone（debug）/ register intent only (debug)"),
+    no_clone: bool = typer.Option(
+        False,
+        "--no-clone",
+        help="仅注册意图；新源必须先 clone 才能确定清单名 / intent only; a new source needs a clone to resolve its manifest name",
+    ),
     json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
 ) -> None:
-    """添加 marketplace（非交互须 --trust）/ Add a marketplace (requires --trust non-interactively)."""
+    """添加 marketplace（注册名 = 清单 name；非交互须 --trust）/ Add a marketplace (registered under the manifest name)."""
     code = asyncio.run(
         mp_cmd.marketplace_add(
             SkillRegistry(), ensure_skill_home(), os.environ, git_url,

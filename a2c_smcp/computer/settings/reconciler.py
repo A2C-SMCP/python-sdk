@@ -61,6 +61,7 @@ from a2c_smcp.computer.skills.manifest import (
     load_bundled_servers,
     read_marketplace_manifest,
 )
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError, same_source
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
@@ -88,10 +89,13 @@ class ReconcileReport:
     """
 
     installed: list[str] = field(default_factory=list)  # 本次新 clone 的 marketplace
-    updated: list[str] = field(default_factory=list)  # autoUpdate pull / sourceChanged 重 clone
+    updated: list[str] = field(default_factory=list)  # autoUpdate refresh（#260 起重 clone + 原子换入）
     up_to_date: list[str] = field(default_factory=list)  # 声明且已在、未刷新
-    failed: list[str] = field(default_factory=list)  # 声明但 stage 后 clone 树仍缺失（clone 失败，已降级）
+    failed: list[str] = field(default_factory=list)  # 声明但 stage 后 clone 树仍缺失 / refresh 被拒（改名）
     skipped: list[str] = field(default_factory=list)  # 预留（trust 门控落 #68 / strict 延后 #80）
+    # #260 / §5.14：`validation` 拒绝（name → reason）。声明式换源 MUST 拒绝且**不** wipe——旧注册与旧能力
+    # 保持 active，故不归 `failed`（那会误导为「能力已降级」）。
+    validation: dict[str, str] = field(default_factory=dict)
     registered_skills: list[str] = field(default_factory=list)
 
 
@@ -310,9 +314,10 @@ async def reconcile(
 
     四分支（§7.1 step 3）/ Four branches:
     - **missing**（declared∖materialized）→ clone（``stage_marketplace_skills`` 缺失即 clone）。
-    - **sourceChanged**（``record.source != decl.source``）→ 先 ``rmtree`` 旧 clone 树（含外部 plugin 树）
-      再重 clone（**reconciler 兜底**：:func:`stage_marketplace_skills` 仅 pull 不换库）。
-    - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ ``git pull``。
+    - **sourceChanged**（``not same_source(record.source, decl.source)``）→ **`validation` 拒绝**：不 wipe、
+      不重 clone、不 stage，旧注册/旧内容/旧能力原样保留（协议 §5.14 同名不同源 MUST 拒绝；换源只能经
+      显式 remove / re-add）。记入 :attr:`ReconcileReport.validation`，其余 source 继续。
+    - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ 重 clone + 原子换入（#260）。
     - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 :func:`prune_marketplaces` 显式清）。
 
     每个 declared marketplace 物化其**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0）plugin 的
@@ -338,44 +343,52 @@ async def reconcile(
     updated: list[str] = []
     up_to_date: list[str] = []
     failed: list[str] = []
+    rejected: dict[str, str] = {}
     registered_skills: list[str] = []
 
-    ext_root = home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS
     for name, decl in declared_mps.items():
         source = decl.get("source")
         record = materialized.get(name)
-        source_changed = record is not None and record.get("source") != source
+        # #260 / §5.14：同源判定走 SDK 单一权威 `same_source`（不做 ssh/https 归一，无法确定即不同源）。
+        source_changed = record is not None and not same_source(record.get("source"), source)
         clone_dir = marketplace_skill_dir(home, name)
 
         if source_changed:
-            # 源已变更：旧 clone 是「别的仓库」，必须 wipe 后重 clone（stage 只 pull 不换库）。
-            logger.info("reconcile: marketplace %r source changed, wiping stale clone for re-clone", name)
-            # 未能真正清空旧树（软链路径 / 删除失败）→ 必须记 failed：否则 stage 复用旧树、把新源覆写成
-            # 「updated」的静默假成功（#258 复审 🟡3）。注销 SKILL 必须在 wipe 成功之后——失败分支无回滚，
-            # 先注销会让 live registry 永久缺失该源能力（#258 复审 🟡4）。
-            clone_cleared = _safe_rmtree(clone_dir, home)
-            ext_cleared = _safe_rmtree(ext_root / name, home)
-            if not (clone_cleared and ext_cleared):
-                logger.error("reconcile: marketplace %r source change could not wipe old clone; marking failed", name)
-                failed.append(name)
-                continue
-            _unregister_marketplace_skills(registry, name)
+            # §5.14：声明式换源 MUST 以 `validation` 拒绝——**不 wipe、不重 clone**，旧内容与旧能力原样保留；
+            # 换源只经显式 remove / re-add。此前「wipe + 重 clone」会静默把既有注册绑到新仓库。
+            logger.error(
+                "reconcile: marketplace %r is declared from a source different from its registration; refused "
+                "(remove it explicitly to switch the source, runtime-contract §5.14)",
+                name,
+            )
+            rejected[name] = "source-conflict"
+            continue
 
         present_before = clone_dir.exists()
         do_refresh = bool(decl.get("autoUpdate")) or refresh
         plugin_filter = _enabled_plugin_names_for(name, declared)
 
-        names = await stage_marketplace_skills(
-            name,
-            source if isinstance(source, Mapping) else {},
-            registry,
-            home,
-            plugin_filter=plugin_filter,
-            auto_update=bool(decl.get("autoUpdate")),
-            refresh=do_refresh,
-            timeout=timeout,
-            env=env,
-        )
+        try:
+            names = await stage_marketplace_skills(
+                name,
+                source if isinstance(source, Mapping) else {},
+                registry,
+                home,
+                plugin_filter=plugin_filter,
+                auto_update=bool(decl.get("autoUpdate")),
+                refresh=do_refresh,
+                timeout=timeout,
+                env=env,
+            )
+        except MarketplaceNameChangeError as e:
+            # §5.14 refresh 改名拒绝：不进入 degraded——旧注册与旧能力保持 active，仅该源本轮不刷新。
+            logger.error(
+                "reconcile: marketplace %r refresh rejected (%s); keeping the existing registration and skills",
+                name,
+                e.reason,
+            )
+            failed.append(name)
+            continue
         registered_skills.extend(names)
 
         if not clone_dir.exists():
@@ -394,6 +407,7 @@ async def reconcile(
         updated=updated,
         up_to_date=up_to_date,
         failed=failed,
+        validation=rejected,
         registered_skills=registered_skills,
     )
 
