@@ -116,24 +116,44 @@ def normalize_marketplace_url(raw: str) -> str | None:
         return None
 
 
-# 凭据样判据的解码轮数上限（每轮 = percent-decode → NFKC）/ Bounded decode rounds.
-# 一轮只能解一层：全角 ``％３Ａ`` 要两轮（NFKC 出 ``%3A`` 再 decode），encoded-全角-percent 要两轮，
-# 三重编码 ``%25253A`` 要三轮。**有界不追无限嵌套**：更深的编码属刻意构造，且名字仍须过严格 kebab。
-_DECODE_ROUNDS = 3
+# 凭据样判据的**硬上界**解码轮数（每轮 = 判残形 ``%`` → percent-decode → NFKC）/ Hard cap on decode rounds.
+# **#282**：由固定 3 轮改为**不动点循环**（见 :func:`_credential_like`）。轮数**不承担**多层编码的覆盖面
+# ——那由「残形 ``%`` 即 fail-closed」保证（与 rust #285 同口径），故 ``%25253A`` / ``%2525253A`` 之流
+# 在**第一轮**就返回 True，与层数无关。轮数真正承担的是「NFKC 归一后再看 ``%`` / ``：`` / ``＠``」：
+# 全角 ``％３Ａ`` 要**两轮**才现出 ASCII ``%``（故上界不可退化为 1），其余输入一轮即达不动点。
+# 上界本身只保证终止。
+_MAX_DECODE_ROUNDS = 10
 
 
 def _credential_like(text: str) -> bool:
     """
-    文本是否含凭据样分隔符（userinfo ``@`` / 密码段 ``:``）/ Whether text carries credential-like separators.
+    文本是否含凭据样文本（userinfo ``@`` / 密码段 ``:`` / 残形 percent 转义）/
+    Whether text carries credential-like text.
 
-    **#270**：做**有界** ``_DECODE_ROUNDS`` 轮「percent-decode → NFKC」迭代——挡住
-    ``alice%3APW%40host``、percent-encoded 全角 ``%EF%BC%9A``/``%EF%BC%A0``、双重/三重编码 ``%253A``/
-    ``%25253A``，以及**全角百分号** ``alice％３ＡPW``（NFKC 会先把它归一成 ``%3A``，下一轮才 decode；
-    单轮「decode 后归一」会漏）。
+    **#270**：做「percent-decode → NFKC」迭代——挡住 ``alice%3APW%40host``、percent-encoded 全角
+    ``%EF%BC%9A``/``%EF%BC%A0``、双重/三重编码 ``%253A``/``%25253A``，以及**全角百分号**
+    ``alice％３ＡPW``（NFKC 会先把它归一成 ``%3A``，下一轮才 decode；单轮「decode 后归一」会漏）。
+
+    **#282**：① **残形 percent 转义一律 fail-closed**——任一解码轮里出现 ``%`` 即判可疑
+    （对齐 rust-sdk#285 ``seg.contains([':', '@', '%'])``）：percent 转义本身说明来源被编码过（还能再解
+    一层，或本就不该出现在注册名 / 来源里），故四层 ``alice%2525253APW_LEAK`` 与解码后本可干净的
+    ``repo%20name`` 一并拒。**这一条让覆盖面不依赖解码深度**（>N 层不再有漏判残余）。
+    ② 解码为**不动点循环**（本轮结果与上轮相同即提前退出）：轮次仍承担①——全角 ``％`` 要经一轮 NFKC
+    才现出 ASCII ``%``；``@`` / ``:`` 也在 NFKC 归一（全角 ``：`` / ``＠``）+ decode 之后判定。
+    ``_MAX_DECODE_ROUNDS`` **只保证终止**（``unquote`` 只减不增，NFKC 幂等，有变化的轮次有限；
+    **不**宣称「每轮严格缩短」——NFKC 存在 1→2 兼容展开，如 ``ﬁ``→``fi``）。轮次实际承担的是
+    「NFKC 归一后再看 ``%``」：全角 ``％３Ａ`` 类输入要**两轮**（第一轮才把 ``％`` 归一成 ``%``），
+    故上界不能退化为 1；更深的编码由 ① 的 ``%`` 判据兜住，与轮数无关。
     """
     probe = text
-    for _ in range(_DECODE_ROUNDS):
-        probe = normalize("NFKC", unquote(probe))
+    for _ in range(_MAX_DECODE_ROUNDS):
+        # ① 残形 percent 转义 ⇒ 不可判定（含上一轮 NFKC 从全角 ``％`` 归一出来的 ``%``）
+        if "%" in probe:
+            return True
+        decoded = normalize("NFKC", unquote(probe))
+        if decoded == probe:  # 不动点：再迭代也不变
+            break
+        probe = decoded
     return "@" in probe or ":" in probe
 
 
@@ -145,14 +165,19 @@ def _error_url_display(raw: str) -> str:
     ``ssh://-/alice:PW_LEAK@example.com``、``https://host/team/alice:PW@example.com/repo``（中间段）、
     ``.../alice:PW@example.com/``（尾斜杠）的展示值都仍保留 path，直接回显会把凭据写进 stdout /
     ``--json``。空 path 或解析失败同样 fail-closed。
+    判定对象是**原始 source** 的 path 段（渲染才用展示串）：展示层会把空格 / 非 ASCII ``quote()`` 成
+    ``%XX``，「残形 ``%`` 即拒」若跑在展示串上会把干净 URL 误打码。
     **范围**：仅 add 失败文案；``list`` / ``info`` / confirm 提示 / 成功 ``--json`` 的 ``url`` 仍按 #261
     的 known-source 契约保留 path（见 CHANGELOG 的范围说明）。
     """
     shown = git_url_for_display(raw)
     if shown == REDACTED_GIT_SOURCE:
         return shown
+    # 判据取**原始 source** 的 path 段，不取展示串：展示层会对空格 / 非 ASCII / ``|`` / ``\`` 等做
+    # ``quote()``（``my team``→``my%20team``、``团队``→``%E5%9B%A2%E9%98%9F``），拿展示串跑「残形 ``%``
+    # 即拒」会把**源里根本没有编码**的干净 URL 整条打码（#282 审查 🟡）。
     try:
-        path = urlsplit(shown).path
+        path = urlsplit(raw).path
     except ValueError:
         return REDACTED_GIT_SOURCE
     segments = [seg for seg in path.split("/") if seg]
