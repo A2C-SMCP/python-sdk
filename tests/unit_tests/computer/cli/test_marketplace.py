@@ -185,10 +185,14 @@ _NAME_VECTORS: list[tuple[str, str | None]] = [
     ("https://host/alice：PW＠example.com", None),
     ("https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com", None),
     ("https://host/alice%253APW_LEAK%2540example.com", None),
-    # 全角百分号 / encoded-全角-percent / 三重编码（有界 3 轮覆盖）
+    # 全角百分号 / encoded-全角-percent / 三重编码 / 四层 / 八层（#282：不动点解码 + 残形 `%` 即拒）
     ("https://host/alice％３ＡPW_LEAK", None),
     ("https://host/alice%EF%BC%85%EF%BC%93%EF%BC%A1PW_LEAK", None),
     ("https://host/alice%25253APW_LEAK", None),
+    ("https://host/alice%2525253APW_LEAK", None),
+    ("https://host/alice%252525252525253APW_LEAK", None),
+    # 残形 percent 转义一律不可判定（#282 对齐 rust #285 `seg.contains('%')`）：即便解码后是干净文本
+    ("https://host/repo%20name", None),
     # 入参先 strip（与 normalize_marketplace_url 一致；is_valid_git_url 本身不 strip）
     ("  https://host/repo  ", "repo"),
     # 尾点 FQDN 正常派生
@@ -856,19 +860,54 @@ async def test_add_hostless_url_rejected_even_with_name(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "url",
+    ("url", "markers"),
     [
-        "ssh://-/alice:PW_LEAK@example.com",  # junk host：URL 校验失败文案
-        "https://host/alice:PW_LEAK@example.com",  # 合法 host、凭据在末段：派生名失败文案
-        "https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com",  # percent-encoded 全角分隔符
-        "https://host/alice％３ＡPW_LEAK",  # 全角百分号编码（NFKC 后才成 %3A）
-        "https://host/alice:PW_LEAK@example.com/",  # 尾斜杠：末段为空，不得漏判
-        "https://host/team/alice:PW_LEAK@example.com/repo",  # 凭据在**中间段**：untrusted 文案
-        "https://host",  # 无 path：无法判定 → fail-closed（派生名失败文案）
+        # 每条向量钉住它**实际走的文案分支**（#282）：只断言「凭据没回显」时，host 校验一变就会静默
+        # 滑到另一条更早的失败分支（文案仍占位符）而测试照绿——回归锁失效。
+        ("ssh://-/alice:PW_LEAK@example.com", ("not a well-formed git url",)),  # junk host：URL 校验失败文案
+        (
+            "https://host/alice:PW_LEAK@example.com",  # 合法 host、凭据在末段：派生名失败文案
+            ("cannot derive a valid marketplace name",),
+        ),
+        (
+            "https://host/alice%EF%BC%9APW_LEAK%EF%BC%A0example.com",  # percent-encoded 全角分隔符
+            ("cannot derive a valid marketplace name",),
+        ),
+        (
+            "https://host/alice％３ＡPW_LEAK",  # 全角百分号编码（NFKC 后才成 %3A）
+            ("cannot derive a valid marketplace name",),
+        ),
+        (
+            "https://host/alice%2525253APW_LEAK",  # 四层编码（#282：不动点解码后命中）
+            ("cannot derive a valid marketplace name",),
+        ),
+        (
+            "https://host/repo%20name",  # 残形 `%`：解码后是干净文本也拒（#282 对齐 rust #285）
+            ("cannot derive a valid marketplace name",),
+        ),
+        (
+            "https://host/alice:PW_LEAK@example.com/",  # 尾斜杠：末段为空，不得漏判
+            ("cannot derive a valid marketplace name",),
+        ),
+        # 凭据在**中间段**：派生名成功（`repo`）才会走到 untrusted 文案——两个 marker 同时钉住
+        # 「分支」与「派生出的名字」，避免 host 校验/派生规则变化后本条静默失效。
+        ("https://host/team/alice:PW_LEAK@example.com/repo", ("untrusted marketplace", "'repo'")),
+        (
+            # 中间段 + 四层编码：钉住深解码与 untrusted 分支共存（解码到 `alice:PW_LEAK` 即已命中 `:`）
+            "https://host/team/alice%2525253APW_LEAK/repo",
+            ("untrusted marketplace", "'repo'"),
+        ),
+        (
+            # 中间段 + **解码后干净**的残形 `%`（`repo%20name` → `repo name`）：只有「残形 `%` 作用于
+            # path **任意段**」能抓住它——收窄为末段时本条转红，这是 `%` 判据唯一的有效回归锁
+            "https://host/team/repo%20name/repo",
+            ("untrusted marketplace", "'repo'"),
+        ),
+        ("https://host", ("cannot derive a valid marketplace name",)),  # 无 path：无法判定 → fail-closed
     ],
 )
 async def test_add_error_message_never_echoes_path_credentials(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], url: str
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], url: str, markers: tuple[str, ...]
 ) -> None:
     """#270：add 失败文案不得回显 path 任一段里的凭据样文本（展示层保留 path，须再挡一次）。"""
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
@@ -877,6 +916,9 @@ async def test_add_error_message_never_echoes_path_credentials(
     out = capsys.readouterr().out
     assert "PW_LEAK" not in out and "alice" not in out
     assert REDACTED_GIT_SOURCE in out
+    assert url not in out, f"失败文案不得回显原始 URL：{out}"
+    for marker in markers:
+        assert marker in out, f"向量应走 {marker!r} 分支，实际输出：{out}"
 
 
 def test_error_url_display_keeps_clean_urls_readable() -> None:
@@ -890,6 +932,29 @@ def test_error_url_display_keeps_clean_urls_readable() -> None:
         marketplace_mod._error_url_display("https://user:FAKE_TOKEN@example.com/org/repo.git?token=Q#f")
         == "https://example.com/org/repo.git"
     )
+
+
+def test_error_url_display_judges_raw_source_not_quoted_display() -> None:
+    """判定用**原始 source**：展示层 quote() 造出的 ``%XX`` 不得让干净 URL 被误打码（#282 审查 🟡）。
+
+    反向保护：若把判据换回展示串（`urlsplit(git_url_for_display(raw)).path`），本条全部转红——
+    这些 URL 的源码里没有 percent 转义，`%` 是展示层为了可读性自己造的。
+    断言**精确展示值**（不写成 ``!= REDACTED_GIT_SOURCE``）：后者对「吞掉 path 只剩 host」的退化实现
+    仍然全绿，且无法验证 CHANGELOG 声明的「按 #261 展示契约输出 `%XX` 形态」。
+    """
+    cases = {
+        "https://host/团队/repo": "https://host/%E5%9B%A2%E9%98%9F/repo",
+        "https://host/my team/repo": "https://host/my%20team/repo",
+        "https://host/café/repo": "https://host/caf%C3%A9/repo",
+        "https://host/repo|name": "https://host/repo%7Cname",
+        # path-scoped 正对照（#282 复核 🟡）：query / fragment / userinfo 里的 `%` **不**触发
+        # fail-closed——判据只看 path（展示层本就剥掉 query / fragment / userinfo，见 #261 契约）。
+        # 若把判据改成对整条 raw 跑 `_credential_like`，下面两条会转红（本条即其回归锁）。
+        "https://host/org/repo?redirect=https%3A%2F%2Fx": "https://host/org/repo",
+        "https://alice%3APW@host/org/repo": "https://host/org/repo",
+    }
+    for url, expected in cases.items():
+        assert marketplace_mod._error_url_display(url) == expected
 
 
 @pytest.mark.asyncio

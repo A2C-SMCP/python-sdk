@@ -541,10 +541,23 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     （`alice%3APW%40host`、全角 `：`/`＠` 等价变体一并挡）——凭据样文本交给 `--name` 显式命名。
     无 path（`https://host`；`https://github.com` 此前派生 `github-com`）、hostless / junk host、非法、
     末段构不成严格 kebab → `None`，CLI 提示 `--name`。scp-like 多冒号取最后一个 `:`（与 rust 一致）。
-    另有界 3 轮「percent-decode → NFKC」迭代后再判，挡住双重 / 三重编码（`%253A` / `%25253A`）、
-    percent-encoded 全角分隔符（`%EF%BC%9A` / `%EF%BC%A0`）与**全角百分号**（`alice％３ＡPW`）。
+    判定前迭代「percent-decode → NFKC」至**不动点**，且**残形 percent 转义一律 fail-closed**
+    （#282 修正：原固定 3 轮会被四层编码 `alice%2525253APW_LEAK` 旁路；口径对齐 rust-sdk#285
+    `seg.contains([':', '@', '%'])`）。故双重 / 三重 / 四层及更深编码、percent-encoded 全角分隔符
+    （`%EF%BC%9A` / `%EF%BC%A0`）、**全角百分号**（`alice％３ＡPW`），乃至解码后本可干净的
+    `repo%20name`（**行为变更**：此前派生 `repo-20name`），一律不派生名字 —— CLI 提示 `--name`
+    显式命名。`_MAX_DECODE_ROUNDS=10` 只保证解码循环终止，**不**承担覆盖面，不存在「N 层以上漏判」的
+    深度残余。
   - **`marketplace add` 失败文案不再回显 path 段凭据**：在 #261 展示脱敏之上再挡一层，按 path **任意段**
-    判定（含尾斜杠、中间段、编码变体），命中 → `<redacted-git-source>`。**范围仅限 add 失败文案**：
+    判定（含尾斜杠、中间段、编码变体、残形 `%` 与上述不动点解码），命中 → `<redacted-git-source>`。
+    判定对象是**原始 source** 的 path 段（渲染才用展示串）：展示层会把空格 / 非 ASCII `quote()` 成 `%XX`，
+    若拿展示串当判据，`https://host/团队/repo`、`https://host/my team/repo` 这类干净 URL 会被误整条打码。
+    现在它们**不再整体占位符**，按 #261 展示契约输出（`团队` → `%E5%9B%A2%E9%98%9F`、`my team` → `my%20team`，
+    即源里本就存在的 percent 转义仍按 `%` 规则 fail-closed，展示层自己 quote 出来的不算）。
+    **无 path 时同样整体占位符**（#282 补记，行为自 #270 起即如此；无法判定即为 fail-closed）：
+    `marketplace add https://host` 的文案是
+    `cannot derive a valid marketplace name from <redacted-git-source>; pass --name`，不展示主机部分。
+    **范围仅限 add 失败文案**：
     `marketplace list` / `info` / confirm 提示 / 成功 `--json` 的 `url` 仍按 #261 known-source 契约保留
     path（path 内凭据的外显属 #261 显示契约面，未在本单扩大）。
   - **只防新增**：存量已落盘的凭据 slug 不自动删除 / 改名（迁移归 #268 / #260）；`marketplace remove`
