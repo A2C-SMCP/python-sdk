@@ -526,13 +526,19 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `SkillSourceError("x/r.git?token=SECRET#f", …)` 的 `.raw` / `str(e)` 仍带凭据。类 docstring「消费者无需
   打补丁」的承诺因此不成立——仓内 sink 全靠 `safe_exception_text` 兜住，新增消费点会重新开洞。
   - 修法：新增单一漏斗 **`utils.git_url.sanitize_value_for_diagnostics()`**（`escape_unsafe_chars` →
-    `redact_git_urls_in_text` → `sanitize_text_for_diagnostics`），**单个不可信值**（非散文）一律走它：
-    字符串 `raw` / `reason`、`stage_user_skills` 的目录名与 `reason`、`_build_user_ref` 的 `SKILL.md`
-    路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径。`escape_unsafe_chars` **必须最先**：散文口径按
-    设计**保留**换行与空白（单值里的换行可伪造日志行），且不先转义时 `alice:pw\n@host` 会被切成两半而
-    两半都不命中任何规则（漏遮）；先转义后整串退回单 token，散文轴（scp-like / `scheme:` opaque）与
-    path 轴均按整体判定。合法路径 / kebab 名（`./../escape`、`https://example.com/r.git`、
-    `file:///home/alice@corp/repo.git`）逐字不变。
+    `redact_git_urls_in_text` → `sanitize_text_for_diagnostics`），**单个不可信值**（非散文）走它。
+    本单迁移的站点：字符串 `raw` / `reason`、`stage_user_skills` 的目录名与 `reason`、
+    `_build_user_ref` 的 `SKILL.md` 路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径。
+    `escape_unsafe_chars` **必须最先**：散文口径按设计**保留**换行与空白（单值里的换行可伪造日志行），
+    且不先转义时 `alice:pw\n@host` 会被切成两半而两半都不命中任何规则（漏遮）；先转义后整串退回单
+    token，散文轴（scp-like / `scheme:` opaque）与 path 轴均按整体判定。合法路径 / kebab 名
+    （`./../escape`、`https://example.com/r.git`、`file:///home/alice@corp/repo.git`）逐字不变。
+  - **取舍（有意，安全优先）**：值漏斗的散文轴对整条无空白 token 判定，含「冒号早于 `@`」的**普通**
+    路径（如 `…/build:2024/alice@corp/…`、Windows `C:\Users\alice@corp\…`）会被整串遮为
+    `<redacted-git-source>`（改前逐字保留）——落点改由同一行里的 `%r` 名称标识。
+  - **未迁移（既有面，follow-up）**：marketplace clone 的 skill 目录名、`validator._Collector.rel()`
+    的 `issue.file`/`checked`、manifest override 路径、home/watcher 的 DEBUG 路径仍是 path-only 轴
+    （scp-like 段不识别）；改它们会变更 `plugin validate` 的既有诊断形状，不属本单。
   - `stage_user_skills` 非法目录名 ERROR 不再裸传 `Path`：scp-like 目录名（`deploy-token@example.com:org`）
     与换行/TAB 形态均被遮蔽或转义（`sanitize_path_for_diagnostics` 不识别 scp-like，故统一走上述漏斗）。
   - `parse_skill_frontmatter` 的 PyYAML 错误改走 `safe_exception_text`：其错误文本会回显出错行片段
