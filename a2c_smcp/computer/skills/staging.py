@@ -187,7 +187,8 @@ def parse_skill_frontmatter(skill_md_text: str) -> dict[str, Any]:
             try:
                 data = yaml.safe_load(block)
             except yaml.YAMLError as e:
-                logger.error("SKILL.md frontmatter YAML parse failed: %s", e)
+                # #281：PyYAML 错误文本会回显出错行片段（远端 SKILL.md 的凭据 URL）——统一走诊断脱敏漏斗。
+                logger.error("SKILL.md frontmatter YAML parse failed: %s", safe_exception_text(e))
                 return {}
             return data if isinstance(data, dict) else {}
     return {}
@@ -756,7 +757,13 @@ def stage_user_skills(
         try:
             name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
         except SkillNameError as e:
-            logger.error("user DropIn skill dir name invalid, skipped: %s (%s)", skill_dir, e.reason)
+            # #281：目录名本身不可信（scp-like `user@host:path` / userinfo / query 形态）——先散文脱敏
+            # （scp-like 只有它能识别）再按 path-token 轴遮蔽；不裸传 Path。
+            logger.error(
+                "user DropIn skill dir name invalid, skipped: %s (%s)",
+                sanitize_text_for_diagnostics(redact_git_urls_in_text(str(skill_dir))),
+                e.reason,
+            )
             continue
         ref = _build_user_ref(name, skill_dir)
         if ref is None:

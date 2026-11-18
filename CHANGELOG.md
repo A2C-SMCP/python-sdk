@@ -519,6 +519,28 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     不回显原值，对齐 rust `entry_plugin_name`）；`locate_plugin_root` 在 clone/rmtree 之前补
     `is_within(ext_dir.resolve(), home.resolve())` 纵深守卫。显式 `plugin install` 路径本已校验，不受影响。
 
+### Fixed（#281 source 脱敏收尾）
+
+- **`SkillSourceError` 字符串形态的构造期脱敏不完整**（#281，安全；#263/#272 终审 4🟡 收口）：
+  字符串 `raw` 只做散文 token 级 `redact_git_urls_in_text`，没有 path/query 轴 ⇒
+  `SkillSourceError("x/r.git?token=SECRET#f", …)` 的 `.raw` / `str(e)` 仍带凭据。类 docstring「消费者无需
+  打补丁」的承诺因此不成立——仓内 sink 全靠 `safe_exception_text` 兜住，新增消费点会重新开洞。
+  - 修法：字符串 `raw` 与 `reason` 走 `sanitize_text_for_diagnostics(redact_git_urls_in_text(
+    escape_unsafe_chars(…)))`。`escape_unsafe_chars` **必须最先**：`raw` 是单个不可信值，散文脱敏按口径
+    **保留**换行（可伪造日志行），且转义后 token 不会被换行劈开（凭据不会只遮前半段）。合法路径 /
+    kebab 名（`./../escape`、`https://example.com/r.git`）逐字不变。
+  - `stage_user_skills` 非法目录名 ERROR 不再裸传 `Path`：scp-like 目录名（`deploy-token@example.com:org`）
+    整条路径遮为 `<redacted-git-source>`，userinfo 段只替换该段（`sanitize_path_for_diagnostics` 不识别
+    scp-like，故按散文+path 两级漏斗，与 `safe_exception_text` 同口径）。
+  - `parse_skill_frontmatter` 的 PyYAML 错误改走 `safe_exception_text`：其错误文本会回显出错行片段
+    （远端 SKILL.md 的凭据 URL）。`plugin validate` 与 staging 两条路径同时受益。
+  - 测试加固：decode 诊断三处恒真断言（`assert "\xff" not in text`——`UnicodeDecodeError.__str__` 只含
+    ASCII `0xff`）改为 `<undecodable content (non-UTF-8)>` 精确文案；validator 三处 decode 用例补固定文案
+    正向断言与「好 SKILL 仍被 check」正对照；`_build_user_ref` 三处脱敏补真实凭据用例（home 根含
+    userinfo / `frontmatter.name` 带凭据 URL）。
+  - 已知边界（不变）：裸 token（`glpat-…` 这类无 `@ : /` 形态）仍不可识别；JSON 感知的保真脱敏
+    （`?`/`#` 截断）另案。
+
 ### Fixed（#270 hostless git URL 与 marketplace 名称派生）
 
 - **hostless ssh/git/http(s) URL 通过校验，凭据被 slug 进 marketplace 注册名**（#270，安全）：注册名会进入

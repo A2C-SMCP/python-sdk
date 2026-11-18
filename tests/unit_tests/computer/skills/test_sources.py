@@ -423,6 +423,22 @@ def test_safe_exception_text_masks_schemeless_query_token() -> None:
     assert "#f" not in out
 
 
+def test_string_source_schemeless_query_is_redacted_at_construction() -> None:
+    """字符串形态 raw 的 scheme-less query 必须在**构造期**遮蔽（#281 根因）：`.raw` / `str(e)` 即安全，
+    新增消费点无需各自打补丁（类 docstring 的承诺由此成立）。"""
+    e = SkillSourceError("x/r.git?token=SECRET_Q#f", "boom")
+    assert e.raw == "x/r.git<redacted-source>"
+    assert "token=SECRET_Q" not in str(e)
+    assert "#f" not in str(e)
+
+
+def test_reason_schemeless_query_is_redacted_at_construction() -> None:
+    """reason 与 raw 同口径（#281）：raise site 拼进 reason 的无 scheme path+query 同样在构造期遮蔽。"""
+    e = SkillSourceError("x", "bad source x/r.git?token=SECRET_R#frag")
+    assert "token=SECRET_R" not in str(e)
+    assert "#frag" not in str(e)
+
+
 def test_safe_exception_text_json_echo_truncation_is_documented() -> None:
     """已知降级（#263 七轮 🟡6，本单接受）：对**构造期已脱敏的 JSON 回显**再做 token 级路径脱敏时，
     值里的 `?`/`#` 会触发截断——只影响诊断可读性，不影响脱敏强度；后续如需保真另立 JSON 感知 follow-up。"""

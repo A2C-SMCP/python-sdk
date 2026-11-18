@@ -766,6 +766,93 @@ def test_user_basename_not_kebab_skipped(tmp_path: Path, staging_logs: pytest.Lo
     assert any(r.levelno == logging.ERROR and "name invalid" in r.getMessage() for r in staging_logs.records)
 
 
+def test_user_basename_credential_like_name_redacted(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """非法目录名分支不得回显凭据形状（#281）：scp-like 目录名（`user@host:path`）整条路径遮蔽；
+    合法兄弟仍入册（失败隔离正对照）。"""
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "deploy-token@example.com:org")
+    _write_user_skill(home / "user", "good-one")
+    reg = SkillRegistry()
+
+    names = stage_user_skills(reg, home)
+
+    assert names == ["good-one"]
+    text = _no_secret(staging_logs.records)
+    assert "name invalid" in text  # 正对照：确实走了该分支
+    assert "deploy-token" not in text and "example.com:org" not in text
+
+
+def test_user_skill_md_unreadable_log_masks_home_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """`_build_user_ref` 不可读分支的路径轴脱敏真实用例（#281）：home 根含 userinfo 段时不得回显。"""
+    home = tmp_path / "alice:pw@host"
+    _write_user_skill(home / "user", "toctou")
+    orig_read = Path.read_text
+
+    def boom(self: Path, *a: object, **k: object) -> str:
+        if self.name == "SKILL.md":
+            raise OSError("simulated unreadable after discovery (TOCTOU)")
+        return orig_read(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", boom)
+
+    names = stage_user_skills(SkillRegistry(), home)
+
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "unreadable" in text  # 正对照：确实走了该分支
+    assert "pw@" not in text and "alice:" not in text
+
+
+def test_user_missing_description_log_masks_home_credential(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """`_build_user_ref` 缺 description 分支的路径轴脱敏真实用例（#281）。"""
+    home = tmp_path / "alice:pw@host"
+    d = home / "user" / "no-desc"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: no-desc\n---\n# body\n", encoding="utf-8")
+
+    names = stage_user_skills(SkillRegistry(), home)
+
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "missing required 'description'" in text  # 正对照：确实走了该分支
+    assert "pw@" not in text and "alice:" not in text
+
+
+def test_user_frontmatter_name_mismatch_debug_is_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """`_build_user_ref` frontmatter.name 不一致的 DEBUG 分支（#281）：name 可带凭据 URL，不得回显。"""
+    home = tmp_path / "home"
+    _write_user_skill(home / "user", "real-dir", fm_name="https://alice:FM_PW@example.com/r.git")
+
+    names = stage_user_skills(SkillRegistry(), home)
+
+    assert names == ["real-dir"]
+    text = _no_secret(staging_logs.records)
+    assert "basename is authoritative" in text  # 正对照：确实走了该分支
+    assert "FM_PW" not in text and "alice:" not in text
+
+
+def test_frontmatter_yaml_error_log_is_redacted(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
+    """PyYAML 错误文本可能带回出错行片段（远端 SKILL.md 的凭据 URL）——日志必须脱敏（#281）。"""
+    home = tmp_path / "home"
+    d = home / "user" / "bad-yaml"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: [unclosed\nsource: https://alice:PW_YAML@example.com/r.git\n---\n# body\n",
+        encoding="utf-8",
+    )
+
+    names = stage_user_skills(SkillRegistry(), home)
+
+    assert names == []  # frontmatter 解析失败 → 缺 description → 跳过（失败隔离）
+    text = _no_secret(staging_logs.records)
+    assert "YAML parse failed" in text  # 正对照：确实命中 PyYAML 错误分支
+    assert "PW_YAML" not in text and "alice:" not in text
+
+
 def test_user_deeper_skill_md_ignored_with_debug(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
     # 深于一级的 SKILL.md（<root>/a/b/SKILL.md）→ 忽略 + DEBUG；根下一级的仍发现（验收第 2 条）
     home = tmp_path / "home"
@@ -1591,7 +1678,9 @@ async def test_non_utf8_skill_md_is_isolated_and_redacted(
     assert names == ["mcp:bid:good"], names
     text = _no_secret(staging_logs.records)
     assert "SKILL.md unreadable" in text
-    assert "\xff" not in text
+    # #281：精确文案正向断言（原 `"\xff" not in text` 恒真——UnicodeDecodeError.__str__ 只含 ASCII `0xff`）。
+    assert "<undecodable content (non-UTF-8)>" in text
+    assert "codec can't decode" not in text
 
 
 @pytest.mark.asyncio
@@ -1726,7 +1815,8 @@ def test_user_skill_non_utf8_is_isolated(
     assert names == ["good-skill"], names
     text = _no_secret(staging_logs.records)
     assert "user SKILL" in text and "unreadable" in text
-    assert "\\xff" not in text and "\xff" not in text  # 不打印原始字节
+    # #281：精确文案正向断言（原 `"\xff" not in text` 恒真——解码错误文本只含 ASCII `0xff`）。
+    assert "<undecodable content (non-UTF-8)>" in text
     assert "codec can't decode" not in text  # 不泄漏解码细节
 
 
@@ -1757,7 +1847,8 @@ async def test_marketplace_plugin_non_utf8_skill_is_isolated(
     assert names == ["audit:good"], names
     text = _no_secret(staging_logs.records)
     assert "SKILL.md unreadable" in text
-    assert "\\xff" not in text and "\xff" not in text
+    # #281：精确文案正向断言（原 `"\xff" not in text` 恒真）。
+    assert "<undecodable content (non-UTF-8)>" in text
     assert "codec can't decode" not in text
 
 

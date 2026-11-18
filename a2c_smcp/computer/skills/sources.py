@@ -125,7 +125,12 @@ def redact_source_display(raw: object) -> str:
     路径塞进消息（``://`` 会被路径归一折叠成 ``/``，token 级脱敏随即失效）。
     """
     if isinstance(raw, str):
-        return escape_unsafe_chars(redact_git_urls_in_text(raw))
+        # #281：字符串形态同样要过 path-token 轴——无 scheme 的 `x/r.git?token=…#…` 只有它能识别；
+        # 构造期即遮蔽，消费者（str(e) / .raw / 新增 sink）无需各自打补丁。
+        # ``escape_unsafe_chars`` 必须先做：``raw`` 是**单个不可信值**而不是散文，换行会伪造日志行
+        # （``sanitize_text_for_diagnostics`` 按散文口径**保留**换行）；先转义也保证后续 token 判定不
+        # 被换行切开（凭据不会被劈成两段而漏掉后半）。
+        return sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(raw)))
     try:
         # 每个字符串值/键已在 _redact_error_value 内脱敏；此处**不再**对整段 JSON 做散文脱敏——
         # token 边界是空白，JSON 的引号/逗号会被吞进 URL token 而把回显改写成 percent-encoded 乱码。
@@ -175,7 +180,8 @@ class SkillSourceError(ValueError):
 
     def __init__(self, raw: object, reason: str) -> None:
         self.raw: str = redact_source_display(raw)
-        self.reason: str = escape_unsafe_chars(redact_git_urls_in_text(reason))
+        # #281：reason 与 raw 同口径（raise site 可能把 source 拼进 reason）；同样先转义控制字符。
+        self.reason: str = sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(reason)))
         super().__init__(f"invalid skill source {self.raw}: {self.reason}")
 
 

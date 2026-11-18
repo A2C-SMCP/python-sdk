@@ -633,6 +633,9 @@ def test_non_utf8_manifest_is_reported_not_raised(tmp_path: Path) -> None:
     path.write_bytes(b"\xff\xfe not utf-8")
     r = validate_path(root)
     assert any(i.code == CODE_UNREADABLE for i in r.issues), [i.code for i in r.issues]
+    # #281：固定文案正向断言（只有 code 断言时，文案漂移仍绿）。
+    msg = next(i.message for i in r.issues if i.code == CODE_UNREADABLE)
+    assert "<undecodable content (non-UTF-8)>" in msg
 
 
 def test_object_source_message_stays_readable(tmp_path: Path) -> None:
@@ -662,15 +665,27 @@ def test_manifest_reader_reports_non_utf8_as_manifest_error(tmp_path: Path) -> N
     # 断言确实命中 UnicodeDecodeError 归一（不是别的分支）——避免「unreadable or invalid」近似恒真。
     assert isinstance(ei.value.__cause__, UnicodeDecodeError)
     assert "marketplace manifest" in str(ei.value)
+    # #281：固定文案正向断言（解码细节不外泄、也不得漂移）。
+    assert "<undecodable content (non-UTF-8)>" in str(ei.value)
 
 
 def test_non_utf8_skill_md_reported_as_unreadable(tmp_path: Path) -> None:
-    """#263 七轮：非 UTF-8 SKILL.md 深检归一为 skill-md-unreadable（不得 traceback、不得泄漏解码细节）。"""
+    """#263 七轮：非 UTF-8 SKILL.md 深检归一为 skill-md-unreadable（不得 traceback、不得泄漏解码细节）。
+
+    #281：补固定文案正向断言 + 「好 SKILL 仍被 check」正对照（原用例只有坏 SKILL，无法区分「深检没跑」）。
+    """
     root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": "audit"}]), plugins=())
     p = root / "plugins" / "audit" / "skills" / "bad"
     p.mkdir(parents=True)
     (p / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")
+    good = root / "plugins" / "audit" / "skills" / "good"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
     r = validate_path(root)
     assert any(i.code == CODE_SKILL_MD_UNREADABLE for i in r.issues), [i.code for i in r.issues]
     msg = next(i.message for i in r.issues if i.code == CODE_SKILL_MD_UNREADABLE)
+    assert "<undecodable content (non-UTF-8)>" in msg
     assert "codec" not in msg
+    # 正对照：坏的不进 checked、好的仍进（证明深检确实遍历到了 skill dir 层）
+    assert not any("skills/bad/SKILL.md" in f for f in r.checked), r.checked
+    assert any("skills/good/SKILL.md" in f for f in r.checked), r.checked
