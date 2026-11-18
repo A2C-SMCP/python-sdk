@@ -947,6 +947,11 @@ def test_error_url_display_judges_raw_source_not_quoted_display() -> None:
         "https://host/my team/repo": "https://host/my%20team/repo",
         "https://host/café/repo": "https://host/caf%C3%A9/repo",
         "https://host/repo|name": "https://host/repo%7Cname",
+        # path-scoped 正对照（#282 复核 🟡）：query / fragment / userinfo 里的 `%` **不**触发
+        # fail-closed——判据只看 path（展示层本就剥掉 query / fragment / userinfo，见 #261 契约）。
+        # 若把判据改成对整条 raw 跑 `_credential_like`，下面两条会转红（本条即其回归锁）。
+        "https://host/org/repo?redirect=https%3A%2F%2Fx": "https://host/org/repo",
+        "https://alice%3APW@host/org/repo": "https://host/org/repo",
     }
     for url, expected in cases.items():
         assert marketplace_mod._error_url_display(url) == expected

@@ -196,7 +196,9 @@ def default_marketplace_name(url: str) -> str | None:
     （``https://host/repo?token=SECRET`` → ``repo``，此前是 ``repo-token-secret``；
     ``ssh:///alice:PW@example.com`` 这类 hostless 形态不合法 → ``None``）。
     ``file:`` 不要求 host，按 path 末段派生；末段含 userinfo / 密码分隔符（``@`` / ``:``，判定前做
-    NFKC 归一 + percent-decode）同样视为凭据样文本 → ``None``；无 path（``https://host``）、非法、
+    NFKC 归一 + percent-decode）同样视为凭据样文本 → ``None``；**#282**：末段含**残形 percent 转义**
+    也一律 → ``None``（含解码后本可干净的 ``repo%20name``，口径对齐 rust-sdk#285
+    ``seg.contains([':', '@', '%'])``）；无 path（``https://host``）、非法、
     hostless / junk host、末段构不成严格 kebab → ``None``（CLI 侧提示 ``--name``）。
     本函数只产出名字：存储与 git argv 仍用 :func:`normalize_marketplace_url` 的结果（原始 URL）。
     入参先 ``strip()``（与 :func:`normalize_marketplace_url` 一致；:func:`is_valid_git_url` 本身**不** strip，
@@ -216,8 +218,9 @@ def default_marketplace_name(url: str) -> str | None:
     if not segments:
         return None
     tail = segments[-1]
-    # 凭据样文本不进名字：末段含 userinfo 分隔符 ``@`` 或密码段分隔符 ``:``
-    # （如 ``https://host/alice:PW@example.com``）→ 交给 ``--name`` 显式命名。
+    # 凭据样文本不进名字：末段含 userinfo 分隔符 ``@`` / 密码段分隔符 ``:``
+    # （如 ``https://host/alice:PW@example.com``），或含**残形 percent 转义**（#282：``repo%20name``
+    # 这类解码后本可干净的也算，对齐 rust-sdk#285）→ 交给 ``--name`` 显式命名。
     if _credential_like(tail):
         return None
     if tail.endswith(".git"):
