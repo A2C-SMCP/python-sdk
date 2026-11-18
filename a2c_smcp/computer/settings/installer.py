@@ -1210,10 +1210,10 @@ async def uninstall_plugin(
        删整个 clone 根），且仅在**没有 retained 记录**（指定 scope 之外的其余 scope）的 ``installPath`` 仍引用该
        clone 时删除。相对源（``source: "./plugins/x"``）的 ``installPath`` 位于**共享 catalog clone**
        ``<home>/marketplace/<mp>/…``——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，
-       MUST NOT 在此删除；归 ``marketplace remove`` / ``prune``（reconcile 仅在 ``sourceChanged`` 整树重 clone 时
-       清理）清理。``marketplace refresh`` **不**保证
-       还原工作树内被删文件（上游未变时 ``git pull --ff-only`` 不重建已删路径），恢复须 ``marketplace remove`` +
-       ``add``。
+       MUST NOT 在此删除；该树的清理**只**归 ``marketplace remove`` / ``prune``（#260 起 reconcile 对声明换源
+       一律 ``validation`` 拒绝，**不再** wipe 重 clone）。``marketplace refresh``（#260 起为「重新 clone 到
+       staging + 原子换入」）**会**还原上游仍存在的被删路径——本地 clone 与上游一致时仍无变化（没有可恢复的
+       内容），彻底重建请 ``marketplace remove`` + ``add``。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
     # ``drop_legacy=False``（#257 审查 🔴3）：v0.2.x 旧格式账本记录在默认视图里被整条丢弃 → 早返回 no-op，

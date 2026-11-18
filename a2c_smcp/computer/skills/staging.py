@@ -1346,7 +1346,9 @@ def _record_known_marketplace(
             observed_manifest_name=observed_manifest_name,
         )
         if prior is not None and dict(prior) == record:
-            return None  # 等价 → 不写（避免复活竞态 / 无谓锁）
+            # 记录已等价：不改内存结构（`update_known_marketplaces` 仍会重写同一份 JSON——本层无「跳过写」
+            # 语义）。这里的作用是**不改变记录内容**，不是阻止落盘。
+            return None
         current["marketplaces"][name] = record
         return None
 
@@ -1385,16 +1387,18 @@ def registration_violation(
     if prior is None:
         existing_name = registered_name_for_source(known, source)
         if existing_name is not None and existing_name != name:
+            # 账本键可被手编成携带 URL 凭据的串（#261 同口径）→ 回显前统一脱敏。
+            shown_existing = redact_git_urls_in_text(existing_name)
             return MarketplaceIdentityError(
-                f"this source is already registered as {existing_name!r}; registering it again as {name!r} is "
+                f"this source is already registered as {shown_existing!r}; registering it again as {name!r} is "
                 f"refused (a marketplace name MUST bind at most one source, runtime-contract §5.14). Remove the "
-                f"old registration first ('marketplace remove {existing_name}'), or use the existing name; "
+                f"old registration first ('marketplace remove {shown_existing}'), or use the existing name; "
                 f"in-place rename is handled by the #268 migration.",
                 reason=REASON_SOURCE_CONFLICT,
                 details={
-                    "existingName": existing_name,
+                    "existingName": shown_existing,
                     "name": name,
-                    "remedy": f"marketplace remove {existing_name}",
+                    "remedy": f"marketplace remove {shown_existing}",
                 },
             )
         references = intent_reference_pids(name, env=env)
@@ -1403,8 +1407,8 @@ def registration_violation(
             suffix = "…" if len(references) > len(shown_refs) else ""
             return MarketplaceIdentityError(
                 f"cannot register marketplace {name!r}: plugin intent references still point at that name "
-                f"({', '.join(shown_refs)}{suffix}). Re-adding under the same name would silently rebind them; "
-                f"remove those plugin references first.",
+                f"({', '.join(shown_refs)}{suffix}). The previous registration is gone, so the source cannot be "
+                f"proven unchanged — re-adding here could silently rebind those references; remove them first.",
                 reason=REASON_DANGLING_REFERENCES,
                 details={"name": name, "references": shown_refs, "referenceCount": len(references)},
             )
@@ -1505,7 +1509,9 @@ def commit_marketplace_registration(
     """
     from a2c_smcp.computer.settings.store import update_known_marketplaces
 
-    outcome: dict[str, Any] = {"committed": False, "trash": None, "idempotent": False}
+    # ``committed`` = 注册事实成立（含幂等 no-op）；``swapped`` = 本次真的动过目录（rename 已发生）。
+    # 回滚**只看 ``swapped``**：幂等分支没有换入，若按 committed 回滚会把正在使用的既有 clone 删掉。
+    outcome: dict[str, Any] = {"committed": False, "swapped": False, "trash": None, "idempotent": False}
 
     def _mutate(current: KnownMarketplacesFile) -> None:
         marketplaces = current["marketplaces"]
@@ -1545,13 +1551,13 @@ def commit_marketplace_registration(
                 os.replace(trash, clone_dir)  # 换入失败 → 恢复旧树，再让异常冒泡
             raise
         marketplaces[name] = record
-        outcome.update(committed=True, trash=trash)
+        outcome.update(committed=True, swapped=True, trash=trash)
         return None
 
     try:
         update_known_marketplaces(_mutate, home, env)
     except BaseException:
-        if outcome.get("committed"):
+        if outcome.get("swapped"):
             # 账本写失败（原子写不产生半截文件）→ 尽力回滚目录：删掉刚换入的新树；旧树（若有）从 trash 复位。
             trash = outcome.get("trash")
             shutil.rmtree(clone_dir, ignore_errors=True)
@@ -1724,21 +1730,33 @@ async def stage_marketplace_skills(
                 e,
             )
             return registered
+        from a2c_smcp.computer.settings.store import SettingsLockError
+
         try:
             commit_sha = await _git_head_sha(pending, timeout=timeout, env=env)
-            outcome = commit_marketplace_registration(
-                name,
-                source,
-                pending_clone=pending,
-                clone_dir=clone_dir,
-                observed_manifest_name=observed,
-                commit_sha=commit_sha,
-                auto_update=auto_update,
-                home=home,
-                env=env,
-                strict=False,
-                allow_replace=True,
-            )
+            try:
+                outcome = commit_marketplace_registration(
+                    name,
+                    source,
+                    pending_clone=pending,
+                    clone_dir=clone_dir,
+                    observed_manifest_name=observed,
+                    commit_sha=commit_sha,
+                    auto_update=auto_update,
+                    home=home,
+                    env=env,
+                    strict=False,
+                    allow_replace=True,
+                )
+            except (SettingsLockError, OSError) as e:
+                # 账本锁被占满 / 写盘失败：按既有降级铁律记 ERROR 返回空（本函数只放行改名拒绝这一个抛点），
+                # 否则 `refresh all` / reconcile / recovery 的裸循环会被整段打断。
+                logger.error(
+                    "marketplace %r registration commit failed, keeping the existing clone (if any): %s",
+                    redact_git_urls_in_text(name),
+                    safe_exception_text(e),
+                )
+                return registered
         finally:
             shutil.rmtree(pending, ignore_errors=True)  # 成功时已被 rename 走；失败/拒绝时清 staging
         if not outcome.committed:

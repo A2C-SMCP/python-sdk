@@ -381,20 +381,19 @@ async def reconcile(
                 env=env,
             )
         except MarketplaceNameChangeError as e:
-            # §5.14 refresh 改名拒绝：不进入 degraded——旧注册与旧能力保持 active，仅该源本轮不刷新。
+            # §5.14 refresh 改名拒绝：**不进入 degraded**（协议明文「返回 validation，旧注册的既有能力保持
+            # active」），故归 ``validation`` 而非 ``failed``——后者在调用方眼里等于「能力已降级 / 需回收」。
             logger.error(
                 "reconcile: marketplace %r refresh rejected (%s); keeping the existing registration and skills",
                 name,
                 e.reason,
             )
-            failed.append(name)
+            rejected[name] = e.reason
             continue
         registered_skills.extend(names)
 
         if not clone_dir.exists():
             failed.append(name)
-        elif source_changed:
-            updated.append(name)
         elif not present_before:
             installed.append(name)
         elif do_refresh:

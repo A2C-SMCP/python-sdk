@@ -846,3 +846,63 @@ async def test_commit_point_recheck_catches_concurrent_registration(
 
     record = load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]
     assert record["source"] == _src(_url(bare_theirs)), "并发方写入的注册必须原样保留（不得静默替换）"
+
+
+@requires_git
+async def test_idempotent_readd_write_failure_keeps_existing_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    审查 🔴1 回归锁：同名同源重复 add 走**幂等分支**（不换入任何目录）时，账本写失败**不得**回滚删掉
+    正在使用的既有 clone——回滚只认「本次真的换入过」。
+    """
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.staging import add_marketplace_source
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    await add_marketplace_source(_src(_url(bare)), home, env=_env(home))
+    clone = marketplace_skill_dir(home, "acme-skills")
+    marker = clone / "KEEP.txt"
+    marker.write_text("in use", encoding="utf-8")
+    record_before = dict(load_known_marketplaces(home=home)["marketplaces"]["acme-skills"])
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.store.atomic_write_json", _boom)
+
+    with pytest.raises(OSError):
+        await add_marketplace_source(_src(_url(bare)), home, env=_env(home))  # 幂等分支
+
+    assert marker.exists(), "幂等分支没有换入，回滚不得删除既有 clone"
+    assert dict(load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]) == record_before
+
+
+@requires_git
+async def test_stage_refresh_degrades_on_ledger_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """审查 🟡3 回归锁：提交点账本写失败 → ``stage_marketplace_skills`` 记 ERROR 降级（不抛），旧内容保留。"""
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.staging import add_marketplace_source
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    await add_marketplace_source(_src(_url(bare)), home, env=_env(home))
+    clone = marketplace_skill_dir(home, "acme-skills")
+    marker = clone / "KEEP.txt"
+    marker.write_text("old", encoding="utf-8")
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.store.atomic_write_json", _boom)
+
+    names = await stage_marketplace_skills(
+        "acme-skills", _src(_url(bare)), SkillRegistry(), home, refresh=True, env=_env(home)
+    )
+
+    assert names == [], "降级：不抛、该源本轮不注册"
+    assert marker.exists(), "旧内容保留"

@@ -1115,3 +1115,44 @@ async def test_refresh_rename_reports_validation_not_updated(
     assert row["status"] == "validation", "改名拒绝 MUST NOT 报 updated / unchanged"
     assert row["code"] == "manifest-name-changed"
     assert row["manifestName"] == "acme-renamed"
+
+
+@pytest.mark.asyncio
+async def test_no_clone_rejects_name_registered_from_other_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    审查 🔴2 回归锁：``--no-clone`` 的「本地缓存定名」形态**不得**绕过提交点——同名已绑定另一 source 时
+    必须 ``validation``，且**不得**改写既有记录的 source。
+    """
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    clone = home / "marketplace" / "acme"
+    (clone / ".tfrobot-plugin").mkdir(parents=True)
+    (clone / ".tfrobot-plugin" / "marketplace.json").write_text(json.dumps({"name": "acme", "plugins": []}), encoding="utf-8")
+    old_source = {"type": "git", "url": "https://example.com/OLD.git"}
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": old_source, "installLocation": str(clone), "manifestNameBaseline": "acme"}}},
+        home,
+        env,
+    )
+
+    code = await marketplace_add(
+        reg, home, env, "https://example.com/NEW.git", name="acme", trust=True, no_clone=True, json_output=True
+    )
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation" and payload["code"] == "name-conflict"
+    stored = load_known_marketplaces(home, env)["marketplaces"]["acme"]
+    assert stored["source"] == old_source, "不得静默改写既有注册的 source"
+
+
+def test_refresh_summary_table_escapes_untrusted_text(capsys: pytest.CaptureFixture[str]) -> None:
+    """审查 🟡4/5 回归锁：账本键 / 错误文案含 rich 标记时，汇总表不得抛 MarkupError。"""
+    from a2c_smcp.computer.cli.progress import refresh_summary_table
+    from a2c_smcp.computer.cli.utils import console
+
+    table = refresh_summary_table([{"name": "[/]x", "status": "validation", "error": "[bold]boom[/bold]"}])
+    console.print(table)  # 真实渲染路径：未转义会抛 MarkupError
+    out = capsys.readouterr().out
+    assert "[/]x" in out and "boom" in out

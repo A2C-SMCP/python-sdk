@@ -121,7 +121,7 @@ async def rebuild_registry(home: Path, env: Mapping[str, str] | None) -> SkillRe
         except MarketplaceNameChangeError as e:
             # #260/§5.14：重建路径观测到清单改名 → 拒绝且不换内容；跳过该源（不阻断其余源的重建）。
             # 账本键可被手编，rich 标记须转义（#263 教训：不可信文本进 console 会变 MarkupError）。
-            console.print(f"[yellow]! marketplace {escape(nm)!r} skipped: {escape(e.reason)}[/yellow]")
+            console.print(f"[yellow]! marketplace {escape(repr(nm))} skipped: {escape(e.reason)}[/yellow]")
     stage_user_skills(reg, home)
     return reg
 

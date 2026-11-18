@@ -58,6 +58,8 @@ from a2c_smcp.computer.settings.store import (
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.marketplace_identity import (
+    MANIFEST_NAME_BASELINE_FIELD,
+    REASON_UNRESOLVABLE_NAME,
     MarketplaceIdentityError,
     MarketplaceNameChangeError,
     read_manifest_marketplace_name,
@@ -65,7 +67,12 @@ from a2c_smcp.computer.skills.marketplace_identity import (
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import GITHUB_HOST, SkillSourceError, normalize_repo_shorthand
-from a2c_smcp.computer.skills.staging import SkillStagingError, add_marketplace_source, stage_marketplace_skills
+from a2c_smcp.computer.skills.staging import (
+    SkillStagingError,
+    add_marketplace_source,
+    registration_violation,
+    stage_marketplace_skills,
+)
 from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, known_git_source_for_display
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
@@ -221,6 +228,10 @@ def default_marketplace_name(url: str) -> str | None:
     """
     从 git URL **解析后 path 的末段**派生严格-kebab marketplace 名 / Derive a kebab name from the URL path。
 
+    .. deprecated:: 0.5.1
+       **#260 起 `marketplace add` 不再调用本函数**——注册名取清单顶层 ``name``（D1）。本函数保留仅为
+       兼容既有调用方/测试；存量 URL 派生名的迁移由 #268 负责，**不要**用它推断「旧名是否合法」。
+
     **#270**：URL 解析式派生——userinfo / query / fragment 不参与命名
     （``https://host/repo?token=SECRET`` → ``repo``，此前是 ``repo-token-secret``；
     ``ssh:///alice:PW@example.com`` 这类 hostless 形态不合法 → ``None``）。
@@ -325,60 +336,88 @@ def _register_intent_only(
 
     允许的两种形态（其余一律 ``validation``——无法在注册前确定名称）：
 
-    1. **已注册**同名同源 / 同源任意名 → 幂等意图，保留既有 ``installLocation``（绝不用空值覆盖有效记录）；
+    1. **已以该 source 注册**（任意名）→ 幂等意图，保留既有 ``installLocation``（绝不用空值覆盖有效记录）；
     2. ``--name N`` 且本地缓存 ``<home>/marketplace/N`` 已存在、其清单名 == ``N`` → 以缓存确定名称并登记意图。
+
+    两种形态都在 ``update_known_marketplaces`` 的**锁内**过一遍与 add 相同的身份判定
+    （:func:`~a2c_smcp.computer.skills.staging.registration_violation`）：同名不同源 / 断链引用一律
+    ``validation``，**不得**绕过提交点静默改写既有注册的 source。
     """
     source = {"type": "git", "url": url}
-    known = _marketplaces(home, env)
+    outcome: dict[str, Any] = {"existing": None, "registered": None}
 
-    existing_name = registered_name_for_source(known, source)
-    if existing_name is not None:
-        # 已以该 source 注册（add 的幂等面）：不新建、不覆盖；trust 幂等落盘（注册事实已成立）。
-        try:
-            _record_trust(existing_name, env)
-        except SettingsFileCorruptError as e:
-            console_err.print(
-                f"[yellow]! marketplace {existing_name!r} is registered but its trust entry could not be persisted: {e}[/yellow]"
-            )
-        if json_output:
-            console.print_json(data={"registered": existing_name, "url": known_git_source_for_display(url), "cloned": True})
-            return EXIT_OK
-        return _ok(f"marketplace {existing_name!r} is already registered (no clone needed)")
-
-    if name is not None:
+    def _mutate(current: Any) -> None:
+        known = current["marketplaces"]
+        existing_name = registered_name_for_source(known, source)
+        if existing_name is not None:
+            outcome["existing"] = existing_name  # 幂等：不新建、不覆盖
+            return None
+        if name is None:
+            raise _unresolvable_name_error()
         clone_dir = marketplace_skill_dir(home, name)
+        observed: str | None = None
         if clone_dir.is_dir():
             try:
                 observed = read_manifest_marketplace_name(clone_dir)
             except MarketplaceIdentityError:
                 observed = None
-            if observed == name:
-                def _mutate(f: Any) -> None:
-                    prior = f["marketplaces"].get(name) or {}
-                    f["marketplaces"][name] = {
-                        "source": dict(source),
-                        "installLocation": str(clone_dir.resolve()),
-                        "autoUpdate": bool(auto_update or prior.get("autoUpdate")),
-                        "manifestNameBaseline": prior.get("manifestNameBaseline") or name,
-                    }
+        if observed != name:
+            raise _unresolvable_name_error()
+        prior = known.get(name)
+        violation = registration_violation(name, source, prior, known, name, env=env)
+        if violation is not None:
+            raise violation  # 同名不同源 / 断链引用 / baseline 冲突（fail-closed）
+        prior_record: Mapping[str, Any] = prior if isinstance(prior, Mapping) else {}
+        known[name] = {
+            "source": dict(source),
+            "installLocation": str(clone_dir.resolve()),
+            "autoUpdate": bool(auto_update or prior_record.get("autoUpdate")),
+            "manifestNameBaseline": prior_record.get(MANIFEST_NAME_BASELINE_FIELD) or name,
+        }
+        outcome["registered"] = name
+        return None
 
-                update_known_marketplaces(_mutate, home, env)
-                try:
-                    _record_trust(name, env)
-                except SettingsFileCorruptError as e:
-                    console_err.print(f"[yellow]! registered {name!r} but failed to persist its trust entry: {e}[/yellow]")
-                if json_output:
-                    console.print_json(data={"registered": name, "url": known_git_source_for_display(url), "cloned": True})
-                    return EXIT_OK
-                return _ok(f"registered marketplace {name!r} from the local clone (no clone)")
+    try:
+        update_known_marketplaces(_mutate, home, env)
+    except MarketplaceIdentityError as e:
+        return _identity_error(e, json_output=json_output)
+    except SettingsLockError:
+        return _err(
+            "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
+            json_output=json_output,
+        )
 
-    return _err(
+    final_name = outcome["existing"] or outcome["registered"]
+    if final_name is None:  # 防御：mutator 既没判幂等、也没登记（不应发生）
+        return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
+    record = _marketplaces(home, env).get(final_name) or {}
+    try:
+        _record_trust(final_name, env)
+    except SettingsFileCorruptError as e:
+        console_err.print(
+            f"[yellow]! marketplace {final_name!r} is registered but its trust entry could not be persisted: {e}[/yellow]"
+        )
+    if json_output:
+        console.print_json(
+            data={
+                "registered": final_name,
+                "url": known_git_source_for_display(url),
+                "installLocation": record.get("installLocation"),
+            }
+        )
+        return EXIT_OK
+    if outcome["existing"] is not None:
+        return _ok(f"marketplace {final_name!r} is already registered (no clone needed)")
+    return _ok(f"registered marketplace {final_name!r} from the local clone (no clone)")
+
+
+def _unresolvable_name_error() -> MarketplaceIdentityError:
+    """``--no-clone`` 无法确定名称时的结构化错误（D5）/ Structured error for an unresolvable name."""
+    return MarketplaceIdentityError(
         "cannot determine the marketplace name without cloning: --no-clone only works for an already "
         "registered source, or with --name pointing at an existing local clone whose manifest declares that name. "
         "Run without --no-clone to clone and read the manifest name.",
-        json_output=json_output,
-        error_code="validation",
-        code="unresolvable-name",
+        reason=REASON_UNRESOLVABLE_NAME,
     )
 
 

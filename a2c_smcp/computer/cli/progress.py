@@ -22,6 +22,7 @@ import contextlib
 from collections.abc import Iterator
 from typing import Any
 
+from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
@@ -58,8 +59,9 @@ def refresh_summary_table(rows: list[dict[str, Any]]) -> Table:
     marks = {"updated": "✓", "unchanged": "·", "missing": "✗", "validation": "✗"}
     for r in rows:
         status = str(r.get("status", "?"))
-        row = [str(r.get("name", "")), f"{marks.get(status, '?')} {status}", str(r.get("skills", "—"))]
+        # 账本键（name）与错误文案都可含不可信文本（手编账本 / 清单来源），rich 标记必须转义（#263）。
+        row = [escape(str(r.get("name", ""))), f"{marks.get(status, '?')} {status}", str(r.get("skills", "—"))]
         if has_detail:
-            row.append(str(r.get("error") or ""))
+            row.append(escape(str(r.get("error") or "")))
         table.add_row(*row)
     return table

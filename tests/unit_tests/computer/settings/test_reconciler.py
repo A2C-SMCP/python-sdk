@@ -881,3 +881,25 @@ def test_ledger_entry_materialized_rejects_corrupt_bundled_json(tmp_path: Path) 
     assert ledger_entry_materialized([{"scope": "user", "installPath": str(ok_root)}]) is True  # 无 bundled server 合法
     assert ledger_entry_materialized([{"scope": "user", "installPath": str(tmp_path / "gone")}]) is False  # 目录缺失
     assert ledger_entry_materialized(None) is False  # 非 list 防御
+
+
+async def test_reconcile_rename_rejection_goes_to_validation_not_failed(tmp_path: Path, monkeypatch) -> None:
+    """
+    审查 🟡7（协议 §5.14）：refresh 改名拒绝**不进入 degraded** —→ 归 ``validation``，不是 ``failed``
+    （后者在调用方语义里等于「能力已降级 / 需回收」，而旧能力实际保持 active）。
+    """
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+
+    home = _home(tmp_path)
+    _seed_known(home, {"acme": _SRC_A})
+    _make_clone(home, "acme")
+
+    async def _rename(*_args: object, **_kwargs: object) -> list[str]:
+        raise MarketplaceNameChangeError("renamed upstream", details={"name": "acme"})
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.reconciler.stage_marketplace_skills", _rename)
+
+    report = await reconcile(SkillRegistry(), home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_A, "autoUpdate": True}}})
+
+    assert report.validation == {"acme": "manifest-name-changed"}
+    assert report.failed == [] and report.updated == [] and report.up_to_date == []

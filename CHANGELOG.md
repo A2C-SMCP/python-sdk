@@ -38,8 +38,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - **交互式 `marketplace add` 一律弹 trust 确认**：`trustedMarketplaces` 不再豁免 prompt；trust 在**注册成功后**
     才写入 user settings（注册失败零残留，settings 损坏仍在 clone 前 fail-closed）。非交互恒需 `--trust`（不变）。
   - **同名不同源 → `validation` 拒绝**（不替换、不自动后缀）；同名同源重复 add 幂等；同一 source 已以旧名注册时
-    新名 add → `validation`（诊断给旧名与处置）；remove 后同名不同源 re-add 且仍有 `<plugin>@<name>` 意图引用
-    → 拒绝。
+    新名 add → `validation`（诊断给旧名与处置）；remove（含 `--keep-plugins`）后 re-add 且仍有
+    `<plugin>@<name>` 意图引用 → 拒绝（登记已删、无法证同源，同源 re-add 亦 fail-closed）。
   - **`marketplace refresh` 遇清单改名 → `validation` 结构化失败**（不再报 updated/unchanged），旧内容 / 账本 /
     运行时能力保留；legacy 注册（账本无 `manifestNameBaseline`）首次成功 clone/refresh 记 baseline、保留旧名、
     不报改名拒绝，仅 baseline 之后再改名才拒绝。refresh 改为「重新 clone + 原子换入」，不再原地 `git pull`。

@@ -1016,7 +1016,7 @@ a2c> plugin install frontend-design@my-team-skills
 | 同名不同源 | `validation`（`name-conflict`），诊断给旧源与 `marketplace remove <name>` |
 | 同名同源重复 add | **幂等**：不产生第二个注册、不刷新既有记录 |
 | 同一 source 已以旧名注册，新名 add | `validation`（`source-conflict`），诊断给旧名与处置 |
-| remove 后同名不同源 re-add，且仍有 `<plugin>@<name>` 引用 | `validation`（`dangling-references`） |
+| remove（含 `--keep-plugins`）后 re-add，且仍有 `<plugin>@<name>` 引用 | `validation`（`dangling-references`）——登记已删除、**无法证明 source 未变**，故同源 re-add 同样 fail-closed；先清掉这些 plugin 引用 |
 | refresh 清单改名 | `validation`（`manifest-name-changed`）；旧内容 / 账本 / 能力保留，不报 updated/unchanged |
 | declared 换源（`extraKnownMarketplaces`） | `validation`；不 wipe / 不重 clone，需显式 remove / re-add |
 | `--no-clone` 新源 | `validation`（`unresolvable-name`）；仅已注册源或可确认的本地缓存可登记意图 |
