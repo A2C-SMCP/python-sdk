@@ -19,7 +19,6 @@ Trust（§10.5）首见经 ``confirm`` 回调（REPL=session y/N；Typer 非交�
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -92,8 +91,8 @@ EXIT_NETWORK_ERROR = 2
 
 # ── 输出辅助 / output helpers ─────────────────────────────────────────────────
 # ``details`` 中与 :func:`_err` 保留字段同名的键：展开前过滤，避免覆盖类别码 / 人读文案（#257 先例）。
-# 注：``code``（退出码）**不在**此集——它是签名参数，``**extra`` 撞名会在调用点 TypeError，根本到不了过滤；
-# 而结构化 payload 的机器码键就叫 ``code``（:meth:`MarketplaceIdentityError.payload_details`），须放行。
+# 注：退出码参数叫 ``exit_code``（不是 ``code``）——后者留给结构化 payload 之外的历史调用面；
+# 机器码统一走 ``reason`` 键（:meth:`MarketplaceIdentityError.payload_details`），不在保留集内。
 _RESERVED_DETAIL_KEYS = frozenset({"error", "message", "msg", "exit_code", "error_code"})
 
 
@@ -665,7 +664,7 @@ async def marketplace_refresh(
                 )
         except MarketplaceNameChangeError as e:
             # 改名拒绝：结构化 outcome，非 updated/unchanged；旧注册与旧能力原样保留。
-            rows.append({"name": nm, "status": "validation", "error": str(e), **e.payload_details()})
+            rows.append({"name": nm, "status": "validation", "message": str(e), **e.payload_details()})
             exit_code = EXIT_USER_ERROR
             continue
         after = _marketplaces(home, env).get(nm) or {}
@@ -704,16 +703,25 @@ def marketplace_set(
     return _ok(f"{name!r} auto-update set to {val}")
 
 
-def _registry_fingerprints(registry: SkillRegistry) -> frozenset[str]:
-    """
-    registry 活跃条目的**完整指纹**（JSON 序列化 ref，排序稳定）/ Full fingerprints of the registry refs.
+# 指纹取这几个**协议字段**（`A2CSkillRef`），逐项显式取值——不序列化整个 ref：frontmatter 的
+# `metadata` / `tags` 是不可信结构（YAML 允许非 str 键 → `json.dumps(sort_keys=True)` 抛 TypeError；
+# alias 环 → Circular reference），在 refresh 之前抛会把整个 REPL 命令打挂（#260 终审 🟡1）。
+_FINGERPRINT_FIELDS = ("name", "source", "path", "uri", "version", "description")
 
-    #260 独立审查 🟡4：REPL `marketplace refresh` 原先只比 SKILL **名字集合**——「A 内容更新（version/uri 变）
-    + B 改名被拒」时名字集相同，退出码为 1 但不会标脏，已连接 Agent 继续看到旧投影。改用完整 ref 结构指纹
-    （含 version / uri / description 等），内容更新即能被识别。
+
+def _registry_fingerprints(registry: SkillRegistry) -> frozenset[tuple[tuple[str, str], ...]]:
+    """
+    registry 条目的**完整指纹**（协议字段 + 孤儿标志）/ Full fingerprints of the registry refs.
+
+    #260 独立审查 🟡4 / 终审 🟡1–2：REPL `marketplace refresh` 原先只比 SKILL **名字集合**——「A 内容更新
+    （version/uri 变）+ B 改名被拒」时名字集相同，退出码为 1 但不会标脏，已连接 Agent 继续看到旧投影。
+
+    指纹 = 上述协议字段的 ``(键, 字符串值)`` 元组 + **``orphaned`` 标志**：`plugin disable` 置孤儿后
+    refresh 重扫会把 ``orphaned`` 翻回 False 而 ref 内容不变——不纳入孤儿标志就同样漏标脏。
     """
     return frozenset(
-        json.dumps(ref, sort_keys=True, default=str) for ref, _orphaned in registry.all_refs()
+        tuple((field, str(ref.get(field) or "")) for field in _FINGERPRINT_FIELDS) + (("orphaned", str(orphaned)),)
+        for ref, orphaned in registry.all_refs()
     )
 
 

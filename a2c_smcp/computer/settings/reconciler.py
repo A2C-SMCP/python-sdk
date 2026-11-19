@@ -191,7 +191,8 @@ def _safe_rmtree(path: Path, home: Path) -> bool:
     **本函数不抛**；删除失败 → 记 WARN（不阻断后续清理）。
 
     :return: ``True`` 表示目标已不存在（删除成功或本来就不存在）；``False`` 表示拒删 / 删除失败（目标可能仍在）。
-        调用方需要区分「已清空」与「静默失败」时（如 reconcile 的 sourceChanged 换源）必须检查返回值。
+        调用方需要区分「已清空」与「静默失败」时必须检查返回值（#260 起 reconcile 的换源分支已**不再**
+        wipe，只由 ``prune_marketplaces`` 消费本函数）。
     """
     if path.is_symlink():
         logger.warning("reconcile: refusing to remove symlink %s", path)
@@ -263,8 +264,8 @@ def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str,
 
     - 相对源（``source: "./plugins/x"``）的 ``installPath`` 落在**共享 catalog clone** ``<home>/marketplace/<mp>/…``
       ——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，归 ``marketplace remove`` /
-      ``prune``（reconcile 仅在 ``sourceChanged`` 整树重 clone 时清理）清理，``uninstall`` / plugin-gc MUST NOT
-      删除（#258 方案 A）；
+      ``prune`` 清理（#260 起 reconcile 对声明换源一律 ``validation`` 拒绝，不再 wipe 重 clone），
+      ``uninstall`` / plugin-gc MUST NOT 删除（#258 方案 A）；
     - 空 / 相对 ``installPath``、非法 marketplace / plugin 名 → 无法识别归属，保守保留；
     - ext root（或 ``.plugins/<mp>`` 段）被符号链接重定向 → 拒删：``_safe_rmtree`` 按 canonicalize 后的路径
       ``rmtree``，跟随软链会误删链接目标（可指向 Home 内共享 catalog，令 #258 破坏经 symlink 复活）。

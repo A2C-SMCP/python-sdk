@@ -86,9 +86,10 @@ a2c-computer plugin enable  <plugin>@<marketplace-name>
 
 ## 5. 为什么 `refresh` / 重启不能自愈
 
-- `marketplace refresh <name>` 只对 catalog clone 执行 `git pull --ff-only`。上游未变时 pull 结果是 up-to-date，
-  **不会**还原本地已删除的文件；只有 pull 失败时才会全量重新 clone。单个插件 staging 失败只记 ERROR 并继续，
-  刷新汇总仍可能显示 `0 failed`、退出码 0——**不要**把它当成已恢复的信号。
+- `marketplace refresh <name>` 现为「重新 clone 到 staging + 原子换入」（#260 起，不再原地 `git pull`）：
+  上游仍存在的被删文件**会**被还原；本地 clone 与上游一致时则无变化。清单改名会以 `validation` 拒绝刷新
+  （旧内容保留）。注意：**普通失败**（远端不可达 / 非法 source 等）目前仍可能显示 `unchanged`、退出码 0——
+  **不要**把它当成已恢复的信号。
 - `plugin install` 默认复用既有 clone（不做 pull）。
 - 启动时的重物化（boot rematerialize）只在账本记录的安装根**整体缺失或不可解析**时触发，且同样复用既有 clone，
   无法把已删除的文件取回来。

@@ -418,9 +418,10 @@ def _enable_recovery_hint(plugin_id: str) -> str:
     """
     #259 失败消息的恢复指引 / Recovery guidance for #259 failures。
 
-    措辞须与真实行为一致（审查 🟡3）：``marketplace refresh`` 只做 ``git pull``（甚至不还原本地已删文件）；
-    ``plugin install`` 复用既有 clone（``refresh=False``）；boot 重物化仅在记录的 ``installPath`` **根**缺失 /
-    不可解析时触发，且同样复用 clone——三者都修不好「根在、文件被删」。故首选是**从干净副本重建**：
+    措辞须与真实行为一致（审查 🟡3 / #260）：``marketplace refresh`` 现为「重新 clone 到 staging + 原子
+    换入」，**会**还原上游仍存在的被删文件（本地与上游一致时仍无变化）；``plugin install`` 复用既有 clone
+    （``refresh=False``）；boot 重物化仅在记录的 ``installPath`` **根**缺失 / 不可解析时触发，且同样复用
+    clone——后两者修不好「根在、文件被删」。故首选仍是**从干净副本重建**：
     外部独占 clone 走 uninstall+install（uninstall 删树 → install 重 clone）；catalog 相对源走
     marketplace remove+add（重 clone catalog）。
     """

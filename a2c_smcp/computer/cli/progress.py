@@ -53,7 +53,7 @@ def refresh_summary_table(rows: list[dict[str, Any]]) -> Table:
     table = Table(title="Refresh summary", header_style="bold magenta")
     for col in ("Marketplace", "Status", "Skills"):
         table.add_column(col)
-    has_detail = any(r.get("error") for r in rows)
+    has_detail = any(r.get("message") for r in rows)
     if has_detail:
         table.add_column("Detail")
     marks = {"updated": "✓", "unchanged": "·", "missing": "✗", "validation": "✗"}
@@ -62,6 +62,6 @@ def refresh_summary_table(rows: list[dict[str, Any]]) -> Table:
         # 账本键（name）与错误文案都可含不可信文本（手编账本 / 清单来源），rich 标记必须转义（#263）。
         row = [escape(str(r.get("name", ""))), f"{marks.get(status, '?')} {status}", str(r.get("skills", "—"))]
         if has_detail:
-            row.append(escape(str(r.get("error") or "")))
+            row.append(escape(str(r.get("message") or "")))
         table.add_row(*row)
     return table

@@ -21,7 +21,8 @@ DropIn discovery (#60), and **marketplace git-source** clone/refresh + plugin sc
 marketplace 流程 / marketplace flow（对账编排 / additive-only diff 归 reconciler #62，本模块只提供「clone 单个
 marketplace + 解析 plugin source + 扫描 skills + 注册」原语）：
 1. 按 ``{type:"git", url}`` ``git clone --depth 1``（SSH→HTTPS 回退、``GIT_TERMINAL_PROMPT=0``、超时默认
-   120s）到 ``<home>/marketplace/<mp>/``；已存在且 ``refresh`` → ``git pull`` 失败则全量重 clone；
+   120s）到 ``<home>/marketplace/.staging-*/``，读清单名并过身份判定后**原子换入** ``<home>/marketplace/<mp>/``
+   （#260：换入前拒绝则旧 clone 零损伤；已存在且 ``refresh`` 同样重 clone + 换入，不再原地 ``git pull``）；
 2. 读 ``.tfrobot-plugin/marketplace.json`` 枚举 ``plugins[]``（``metadata.pluginRoot`` 默认 ``./plugins``）；
 3. 每个 plugin：``resolve_plugin_source`` 定位 plugin 根（相对路径在 clone 内 / ``git-subdir`` sparse clone /
    ``url``·``github``·``cnb`` 独立 clone 到 ``<home>/marketplace/.plugins/<mp>/<plugin>/``）；
@@ -118,6 +119,7 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     display_source,
     intent_reference_pids,
     read_manifest_marketplace_name,
+    redact_ledger_key,
     registered_name_for_source,
     same_source,
 )
@@ -1333,7 +1335,7 @@ def _record_known_marketplace(
     changed: bool,
     observed_manifest_name: str | None = None,
     guard_identity: bool = False,
-) -> None:
+) -> bool:
     """
     写 ``known_marketplaces.json`` 物化记录（持锁原子 RMW）/ Record into known_marketplaces.json（§6.1）。
 
@@ -1341,6 +1343,8 @@ def _record_known_marketplace(
     走 :func:`commit_marketplace_registration`。两者共用 :func:`_build_marketplace_record`；当既有记录与待写
     值等价时**不改记录内容**（``update_known_marketplaces`` 仍会重写同一份 JSON——本层无「跳过写」语义）。
 
+    :return: ``False`` = 身份判据拒写（调用方 MUST 跳过注册——否则 registry 会出现 ``list/info`` 里不存在的
+        marketplace，reconcile / remove 均无法清理）；``True`` = 已写 / 无需写 / 写失败（降级继续）。
     :param guard_identity: **复用路径必开**（#260 独立审查 🟡2）。复用分支没有经过提交点，若直接写账本可造出
         两种坏态：①把既有记录的 ``source`` 静默改成新值，而盘上 clone 仍是旧库；②为同一 source 新建**第二个**
         名字的注册。故写前做无 swap 的最小判据——既有记录 source 不同 → 拒写；无既有记录但同源已挂在别的
@@ -1353,6 +1357,8 @@ def _record_known_marketplace(
     """
     from a2c_smcp.computer.settings.store import update_known_marketplaces
 
+    outcome: dict[str, bool] = {"rejected": False}
+
     def _mutate(current: KnownMarketplacesFile) -> None:
         marketplaces = current["marketplaces"]
         prior = marketplaces.get(name)
@@ -1361,23 +1367,26 @@ def _record_known_marketplace(
                 if not same_source(prior.get("source"), source):
                     logger.error(
                         "marketplace %r reuse: recorded source differs from the requested one; record left untouched",
-                        redact_git_urls_in_text(name),
+                        redact_ledger_key(name),
                     )
+                    outcome["rejected"] = True
                     return None
             else:
                 other = registered_name_for_source(marketplaces, source)
                 if other is not None:
                     logger.error(
                         "marketplace %r reuse: this source is already registered as %r; not creating a second record",
-                        redact_git_urls_in_text(name),
-                        redact_git_urls_in_text(other),
+                        redact_ledger_key(name),
+                        redact_ledger_key(other),
                     )
+                    outcome["rejected"] = True
                     return None
                 if not observed_manifest_name:
                     logger.error(
                         "marketplace %r reuse: manifest unreadable, refusing to create a registration record",
-                        redact_git_urls_in_text(name),
+                        redact_ledger_key(name),
                     )
+                    outcome["rejected"] = True
                     return None
         record = _build_marketplace_record(
             prior,
@@ -1398,7 +1407,9 @@ def _record_known_marketplace(
     try:
         update_known_marketplaces(_mutate, home, env)
     except Exception as e:  # 锁不可得 / I/O 失败 → 不阻断 staging
-        logger.error("failed to record known_marketplaces.json for %r: %s", name, e)
+        logger.error("failed to record known_marketplaces.json for %r: %s", redact_ledger_key(name), e)
+        return True
+    return not outcome["rejected"]
 
 
 # ── 注册身份校验与提交点（#260）/ Registration identity checks & commit point ──
@@ -1430,8 +1441,9 @@ def registration_violation(
     if prior is None:
         existing_name = registered_name_for_source(known, source)
         if existing_name is not None and existing_name != name:
-            # 账本键可被手编成携带 URL 凭据的串（#261 同口径）→ 回显前统一脱敏。
-            shown_existing = redact_git_urls_in_text(existing_name)
+            # 账本键可被手编成携带 URL 凭据的串（#261 同口径）→ 回显前统一脱敏（URL 形态走诊断面权威，
+            # 散文脱敏只去 userinfo、**保留 path**，挡不住路径段凭据）。
+            shown_existing = redact_ledger_key(existing_name)
             return MarketplaceIdentityError(
                 f"this source is already registered as {shown_existing!r}; registering it again as {name!r} is "
                 f"refused (a marketplace name MUST bind at most one source, runtime-contract §5.14). Remove the "
@@ -1823,7 +1835,7 @@ async def stage_marketplace_skills(
             local_manifest_name: str | None = read_manifest_marketplace_name(clone_dir)
         except MarketplaceIdentityError:
             local_manifest_name = None
-        _record_known_marketplace(
+        recorded = _record_known_marketplace(
             name,
             source,
             clone_dir,
@@ -1835,6 +1847,11 @@ async def stage_marketplace_skills(
             observed_manifest_name=local_manifest_name,
             guard_identity=True,
         )
+        if not recorded:
+            # 身份判据拒写 → 不注册该 clone 的 SKILL：否则 registry 出现账本里不存在的 marketplace，
+            # `marketplace list/info` 看不到、reconcile / remove 也清不掉（#260 终审 🟡3）。
+            logger.error("marketplace %r registration refused, skipping skill registration", redact_ledger_key(name))
+            return registered
 
     try:
         manifest = read_marketplace_manifest(clone_dir)

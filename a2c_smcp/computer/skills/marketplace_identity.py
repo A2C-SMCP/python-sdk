@@ -31,7 +31,12 @@ from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_marketplace_name
 from a2c_smcp.computer.skills.manifest import read_marketplace_manifest
-from a2c_smcp.utils.git_url import diagnostic_url_for_display
+from a2c_smcp.utils.git_url import (
+    REDACTED_GIT_SOURCE,
+    diagnostic_url_for_display,
+    redact_git_urls_in_text,
+    sanitize_text_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -44,7 +49,7 @@ logger = get_logger(__name__)
 # legacy 判据之一。缺省键 = 旧账本，按「首次观测」处理。
 MANIFEST_NAME_BASELINE_FIELD = "manifestNameBaseline"
 
-# 机器可读原因码（结构化错误的 ``details["reason"]`` / payload ``code``）/ Machine-readable reasons.
+# 机器可读原因码（结构化错误的 ``reason`` 键）/ Machine-readable reasons.
 REASON_MANIFEST_NAME_INVALID = "manifest-name-invalid"
 REASON_MANIFEST_NAME_CHANGED = "manifest-name-changed"
 REASON_NAME_CONFLICT = "name-conflict"
@@ -60,9 +65,10 @@ class MarketplaceIdentityError(Exception):
     """
     Marketplace 注册身份违约（结构化 ``validation``）/ A marketplace identity violation (structured validation).
 
-    :param reason: :data:`REASON_*` 之一（机器可读，CLI payload 的 ``code``）。
+    :param reason: :data:`REASON_*` 之一（机器可读，结构化 payload 的 ``reason`` 键）。
     :param details: 结构化诊断；**调用方只放脱敏值**（合法 kebab 名可回显；非法清单名只给固定文案；
-        source 一律经 :func:`~a2c_smcp.utils.git_url.known_git_source_for_display`）。
+        source 一律经 :func:`~a2c_smcp.utils.git_url.diagnostic_url_for_display`，账本键经
+        :func:`redact_ledger_key`）。
     """
 
     def __init__(self, message: str, *, reason: str, details: Mapping[str, Any] | None = None) -> None:
@@ -179,6 +185,27 @@ def display_source(source: object) -> str:
     """
     url = source.get("url") if isinstance(source, Mapping) else None
     return diagnostic_url_for_display(url)
+
+
+def redact_ledger_key(key: object) -> str:
+    """
+    账本键的**诊断展示值**（#261 口径的两段式）/ Display-safe ledger key for diagnostics.
+
+    ``known_marketplaces.json`` 可被手编（``_coerce_known_marketplaces`` 不校验键），键可能是携带凭据的
+    URL 或 URL 残形。**散文脱敏（``redact_git_urls_in_text``）只去 userinfo，保留 path**——路径段里的
+    ``alice:PW@example.com`` 会照原样回显，故此处：
+
+    1. URL 形态（含 ``://``）→ 走诊断面单一权威 :func:`diagnostic_url_for_display`（path 段也判）；
+    2. 其余 → ``sanitize_text_for_diagnostics(redact_git_urls_in_text(key))`` 两段式（与
+       ``safe_exception_text`` 同款），覆盖路径残形 / query 形态。
+
+    已知边界：**裸 token**（如 ``glpat-…``）不可识别，属既有口径。
+    """
+    if not isinstance(key, str):
+        return REDACTED_GIT_SOURCE
+    if "://" in key:
+        return diagnostic_url_for_display(key)
+    return sanitize_text_for_diagnostics(redact_git_urls_in_text(key))
 
 
 def registered_name_for_source(known: Mapping[str, Any], source: object) -> str | None:

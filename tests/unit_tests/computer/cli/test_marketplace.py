@@ -1127,6 +1127,7 @@ async def test_refresh_rename_reports_validation_not_updated(
     assert row["status"] == "validation", "改名拒绝 MUST NOT 报 updated / unchanged"
     assert row["reason"] == "manifest-name-changed"
     assert row["manifestName"] == "acme-renamed"
+    assert "message" in row and "error" not in row, "--json 行的人读文案在 message（与 CHANGELOG 契约一致）"
 
 
 @pytest.mark.asyncio
@@ -1164,7 +1165,7 @@ def test_refresh_summary_table_escapes_untrusted_text(capsys: pytest.CaptureFixt
     from a2c_smcp.computer.cli.progress import refresh_summary_table
     from a2c_smcp.computer.cli.utils import console
 
-    table = refresh_summary_table([{"name": "[/]x", "status": "validation", "error": "[bold]boom[/bold]"}])
+    table = refresh_summary_table([{"name": "[/]x", "status": "validation", "message": "[bold]boom[/bold]"}])
     console.print(table)  # 真实渲染路径：未转义会抛 MarkupError
     out = capsys.readouterr().out
     assert "[/]x" in out and "boom" in out
@@ -1253,3 +1254,73 @@ def test_add_conflict_payload_redacts_credential_like_path(
     assert payload["error"] == "validation" and payload["reason"] == "name-conflict"
     assert payload["existingSource"] == REDACTED_GIT_SOURCE
     assert "PW_LEAK" not in out and "alice" not in out
+
+
+@pytest.mark.asyncio
+async def test_source_conflict_payload_redacts_path_credential_ledger_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    终审 🔴 回归锁（CLI 面）：手编账本键为含 path 段凭据的 URL 时，`--json` 的 message / `existingName` /
+    `remedy` 均不得回显凭据。
+    """
+    from a2c_smcp.computer.skills.staging import registration_violation
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    key = "https://host/team/alice:PW_LEAK@example.com/repo.git"
+    source = {"type": "git", "url": "https://example.com/new.git"}
+    known = {key: {"source": source, "installLocation": ""}}
+    violation = registration_violation("acme", source, None, known, "acme", env=env)
+    assert violation is not None
+
+    async def _conflict(*_args: object, **_kwargs: object) -> str:
+        raise violation
+
+    monkeypatch.setattr(marketplace_mod, "add_marketplace_source", _conflict)
+    code = await marketplace_add(SkillRegistry(), home, env, "https://example.com/new.git", trust=True, json_output=True)
+
+    assert code == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["error"] == "validation" and payload["reason"] == "source-conflict"
+    assert "PW_LEAK" not in out and "alice" not in out
+
+
+def test_registry_fingerprints_tolerate_hostile_metadata(tmp_path: Path) -> None:
+    """终审 🟡1 回归锁：frontmatter metadata 含非 str 键 / 自引用环时，指纹不得抛（旧实现用 json.dumps）。"""
+    from a2c_smcp.computer.skills.registry import A2CSkillRef
+
+    ref = A2CSkillRef(
+        name="audit:lint",
+        source="marketplace:acme",
+        uri="skill://acme/audit/lint/SKILL.md",
+        path=str(tmp_path / "x"),
+        description="d",
+        metadata={1: "int-key", "loop": None},  # type: ignore[typeddict-item]
+    )
+    ref["metadata"]["self"] = ref  # 自引用环
+    reg = SkillRegistry()
+    assert reg.register(ref)
+
+    fps = marketplace_mod._registry_fingerprints(reg)
+    assert len(fps) == 1
+
+
+def test_registry_fingerprints_track_orphan_flag(tmp_path: Path) -> None:
+    """终审 🟡2 回归锁：ref 内容不变、仅 orphaned 翻转时，指纹也必须变化（否则 refresh 复活孤儿不标脏）。"""
+    from a2c_smcp.computer.skills.registry import A2CSkillRef
+
+    reg = SkillRegistry()
+    reg.register(
+        A2CSkillRef(
+            name="audit:lint",
+            source="marketplace:acme",
+            uri="skill://acme/audit/lint/SKILL.md",
+            path=str(tmp_path / "x"),
+            description="d",
+        )
+    )
+    before = marketplace_mod._registry_fingerprints(reg)
+    assert reg.mark_orphan("audit:lint") is True
+    after = marketplace_mod._registry_fingerprints(reg)
+    assert before != after, "孤儿标志必须进入指纹"

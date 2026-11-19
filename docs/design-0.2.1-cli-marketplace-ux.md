@@ -628,8 +628,8 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 2. 读 known_marketplaces.json（物化）
 3. reconcileMarketplaces()  ← additive-only:
    - declared∖materialized（missing） → git clone --depth 1（SSH→HTTPS fallback），写 known_marketplaces.json
-   - source 变了（sourceChanged）     → 重 clone 覆盖
-   - autoUpdate=true                  → git pull
+   - source 变了（sourceChanged）     → **validation 拒绝**（不 wipe / 不重 clone；#260/§5.14，需显式 remove+add）
+   - autoUpdate=true                  → 重 clone 到 staging + 原子换入（#260；不再原地 git pull）
    - materialized∖declared            → **不动**（不清理；孤儿留存，靠 §7.3 显式清）
 4. 读 installed_plugins.json
 5. 加载 plugin（按 enabledPlugins × installed_plugins.json 交集）
@@ -716,7 +716,7 @@ class SkillEventDebouncer:
 **为什么 clone 树不上 watcher**（与 CC `getWatchablePaths()` 一致——CC 的 `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/skills/` 也不在监控列表）：
 
 1. **变更只经操作发生**：clone 树是 CLI 自有，唯一改动入口是 `marketplace add/refresh/remove` 与 `plugin install/uninstall/enable/disable`，这些操作自己已调 `mark_dirty()`/缓存失效（§8.1 第二条线，对应 CC `clearAllCaches()`），无需 watcher 重复探测。
-2. **避免 git pull 雪崩**：一次 `git pull`/重 clone 会写入几十~上百文件，若监控 clone 树则每个文件触发 watcher——即便 300ms debounce 也会和「显式 refresh 末尾一次 emit」语义打架（变成假 emit 叠加）。
+2. **避免重 clone 雪崩**：一次重 clone + 整树换入会写入几十~上百文件，若监控 clone 树则每个文件触发 watcher——即便 300ms debounce 也会和「显式 refresh 末尾一次 emit」语义打架（变成假 emit 叠加）。
 3. **守住意图/物化两层边界**：clone 树是物化产物，监控它等于让物化层自己产生「变更意图」，破坏 reconciler 的单向同步模型。
 
 **已知副作用与开发期姿势**：手工 `cd` 进 `$A2C_SKILL_HOME/marketplace/<mp>/` 直接编辑 SKILL.md **不会被实时检测**，须等下次 `marketplace refresh` 或重启（CC 同样接受此取舍——clone 树不应被手编）。若需对某个 marketplace skill 做本地快速迭代，正确做法是把它 symlink/copy 到 `$CWD/.tfrobot/skills/`（被监控的 project 源）开发，定稿后回推 marketplace 仓库。
@@ -1117,7 +1117,7 @@ a2c_smcp/computer/
 
 - `settings/scope.py`：**读/写两套 merge 语义**——读时 object **递归深合并** + array 拼接去重（低先）；写时 array **整体替换**、`undefined` 删 key（§5.4）。`project=true`+`local=false`→false。
 - `settings/policy.py`：policy scope 四子源 first-source-wins（不合并）。
-- `settings/reconciler.py`：**additive-only**——missing→clone、sourceChanged→重 clone、`materialized∖declared`→**不动**（断言不删）；失败降级；`plugin gc` 列孤儿。
+- `settings/reconciler.py`：**additive-only**——missing→clone、sourceChanged→**validation 拒绝（不 wipe）**、autoUpdate→重 clone+换入、`materialized∖declared`→**不动**（断言不删）；失败降级；`plugin gc` 列孤儿。
 - `settings/mcp_config.py`：`.tfrobot/mcp.json` 多 scope 加载优先级；门控 `pending`/`enabled`/`disabled` 判定；plugin-bundled 免批准。
 - `inputs/secret_store.py`：keyring 可用→存取 password；keyring 不可用→降级 env、无 env 无 TTY→硬错误（**不写明文**）。
 - `inputs/render.py`：`${env:}`/`${input:}`/`${workspaceFolder}` 替换；`envFile` 加载 + 显式 env 覆盖。

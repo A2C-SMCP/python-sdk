@@ -516,7 +516,7 @@ def _mp_refresh(
     target: str = typer.Argument("all", help="marketplace 名或 all / a name or 'all'"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """刷新 marketplace（git pull / 重 clone + 对账）/ Refresh marketplaces."""
+    """刷新 marketplace（重 clone + 原子换入；改名拒绝 → validation）/ Refresh marketplaces."""
     code = asyncio.run(
         mp_cmd.marketplace_refresh(SkillRegistry(), ensure_skill_home(), os.environ, target, json_output=json_output),
     )

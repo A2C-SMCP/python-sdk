@@ -1007,3 +1007,24 @@ async def test_reuse_write_refuses_second_registration_for_same_source(tmp_path:
     await stage_marketplace_skills("second", _src(_url(bare)), SkillRegistry(), home, env=_env(home))
 
     assert set(load_known_marketplaces(home=home)["marketplaces"]) == {"acme-skills"}, "不得新建同源第二注册"
+
+
+@requires_git
+async def test_reuse_rejection_skips_skill_registration(tmp_path: Path) -> None:
+    """终审 🟡3：复用分支身份拒写时**不得**继续注册 SKILL（否则 registry 出现账本里不存在的 marketplace）。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+
+    _, bare_a = _make_bare(tmp_path / "a", "acme", _marketplace_files())
+    _, bare_b = _make_bare(tmp_path / "b", "acme", _marketplace_files())
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    _clone_into(home, "acme-skills", bare_a)
+    _seed_known(
+        home,
+        {"acme-skills": {"source": _src(_url(bare_a)), "installLocation": "", "manifestNameBaseline": "acme-skills"}},
+    )
+
+    names = await stage_marketplace_skills("acme-skills", _src(_url(bare_b)), reg, home, env=_env(home))
+
+    assert names == [] and reg.active_refs() == [], "拒写时不得注册该 clone 的 SKILL"
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]["source"] == _src(_url(bare_a))

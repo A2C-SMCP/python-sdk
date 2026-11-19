@@ -252,3 +252,23 @@ def test_source_conflict_redacts_ledger_key_in_details() -> None:
     assert v.reason == "source-conflict"
     assert "TOKEN" not in json.dumps(v.details)
     assert "TOKEN" not in str(v)
+
+
+def test_source_conflict_redacts_credential_like_path_in_ledger_key() -> None:
+    """
+    终审 🔴 回归锁：账本键本身是含 **path 段凭据** 的 URL 时，`source-conflict` 的 message / `existingName`
+    / `remedy` 必须全部遮蔽（散文脱敏只去 userinfo、保留 path，挡不住这一面）。
+    """
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    key = "https://host/team/alice:PW_LEAK@example.com/repo.git"
+    known = {key: {"source": dict(_GIT), "installLocation": "/x"}}
+
+    v = _violation("acme", _GIT, None, known, "acme")
+
+    assert isinstance(v, MarketplaceIdentityError)
+    assert v.reason == "source-conflict"
+    assert v.details["existingName"] == REDACTED_GIT_SOURCE
+    assert "marketplace remove" in v.details["remedy"]
+    assert "PW_LEAK" not in json.dumps(v.details)
+    assert "PW_LEAK" not in str(v) and "alice" not in str(v)
