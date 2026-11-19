@@ -569,8 +569,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Fixed（#275 legacy 账本 scoped 卸载残留 + uninstall 失败序）
 
-- **legacy 账本记录的 scoped 卸载不再留下 skills / clone 残留**：`plugin uninstall --scope <s>` 的「存活记录」
-  判据改与落盘视图同源——含 `bundledMcpServers` 的 v0.2.x 旧格式记录按协议 §4.9.1-4 会被整条 sweep，
+- **legacy 账本记录的 scoped 卸载不再留下 skills / clone 残留**：库层 `uninstall_plugin(..., scope=...)`（含嵌入
+  宿主经公开 API 的调用；CLI 不暴露 `--scope`，见下条触发面）的「存活记录」判据改与落盘视图同源——
+  含 `bundledMcpServers` 的 v0.2.x 旧格式记录按协议 §4.9.1-4 会被整条 sweep，
   故**不再算作**「其余 scope 仍安装」的证据。此前该场景会留下账本/意图/enabled 全清、而同进程 registry
   仍注册其 skills（可硬挡换源 enable）、plugin 独占外部 clone 无人引用（后续 `uninstall` 已 no-op、`gc`
   只遍历账本 pid ⇒ 持久磁盘泄漏）的自相矛盾终态。判据以 `store.is_legacy_ledger_record` 单点导出，

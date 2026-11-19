@@ -743,6 +743,7 @@ async def test_uninstall_remove_server_failure_keeps_skills_and_ledger_275(tmp_p
     assert load_installed_plugins(home=home, drop_legacy=False)["plugins"]["audit@acme"], "账本记录保留"
     settings = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
     assert settings.get("installedPlugins") == ["audit@acme"], "安装意图保留"
+    assert settings.get("enabledPlugins", {}).get("audit@acme") is True, "enabled 条目保留（三面均未动）"
 
     # 重试收敛：clone 已在失败那轮删除（缺失删除视为成功），不得阻塞
     mcp = _FakeMCP()
@@ -752,6 +753,50 @@ async def test_uninstall_remove_server_failure_keeps_skills_and_ledger_275(tmp_p
     assert mcp.removed == [FIGMA_BID]
     assert len(reg) == 0
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+
+
+@pytest.mark.parametrize(
+    ("retained_extra", "expect_reclaimed"),
+    [
+        pytest.param({"mcpServers": [FIGMA_BID]}, False, id="live-record"),
+        pytest.param({"mcpServers": [FIGMA_BID], "bundledMcpServers": [FIGMA_NAME]}, True, id="legacy-mixed-record"),
+    ],
+)
+async def test_uninstall_scoped_legacy_record_does_not_block_server_reclaim_275(
+    tmp_path: Path, retained_extra: dict, expect_reclaimed: bool,
+) -> None:
+    """
+    #275 第三消费者（server 回收）：``retained`` 同时喂给 ``other_plugin_mcp_deps(..., retained_records=...)``。
+
+    本次写盘即被 sweep 的 legacy 记录**不得**被当作「仍有依赖者」——否则该记录随后从账本消失，X 再无认领者
+    却未被回收（正是 #275 要根治的泄漏形态，只是换到 server 面）。夹具用**混合记录**（``bundledMcpServers``
+    与 ``mcpServers`` 并存；手编 / 半迁移形态）才能让回收面也被同一存活判据钉住；``live-record`` 是负对照。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext), "mcpServers": [FIGMA_BID]},
+                {"scope": "project", "projectPath": str(workdir), "installPath": str(ext), **retained_extra},
+            ]
+        },
+    )
+    reg = _seed_registry(home, "acme", "audit")
+    mcp = _FakeMCP()
+
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", remove_server=mcp.remove,
+    ) is True
+
+    assert mcp.removed == ([FIGMA_BID] if expect_reclaimed else []), (
+        "legacy 记录写盘即被 sweep ⇒ 不得阻断 server 回收" if expect_reclaimed else "存活记录仍声明依赖 ⇒ server 保留"
+    )
 
 
 async def test_uninstall_reclaim_list_taken_from_ledger_before_tree_removal_275(

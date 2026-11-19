@@ -377,8 +377,9 @@ def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | 
     uninstall 的**破坏性动作之前**预检所有待写 settings 文件的目板键形状（#246 独立审查 🟡1）
     Validate every settings file that uninstall will write **before** the irreversible steps.
 
-    为什么必须前置：uninstall 的顺序是「删树 → 注销 skill → 摘 server → 删账本 → 写意图」。若意图写在**最后**
-    才因目标键畸形 fail-closed，此时安装已被不可逆删除，而重试又会因账本已空走 no-op——**永远清不干净**。
+    为什么必须前置：uninstall 的顺序是「删树 → 摘 server → 注销 skill → 删账本 → 写意图」（顺序的**单点权威**
+    见 :func:`uninstall_plugin` 的 docstring，勿在此另立副本；#275 起 skills 注销在摘 server 之后）。若意图写在
+    **最后**才因目标键畸形 fail-closed，此时安装已被不可逆删除，而重试又会因账本已空走 no-op——**永远清不干净**。
     故在任何删除之前把**本次真的会写**的目标键形状验一遍：畸形即 :class:`PluginInstallError` 且**零副作用**。
 
     **检查范围按层收窄**（勿放宽）：``_write_installed_plugin`` 只写 **user** 层，project/local 只经
@@ -1184,7 +1185,8 @@ async def uninstall_plugin(
     → registry **完全不动**（活跃与孤儿原样）。判据是「有无 retained 记录」，**不是**「是否指定了 ``scope``」：
     只装了一个 scope 时指定该 scope 卸载，记录即全部移除，照常注销。
     ``retained`` 只计**本次写盘后仍在账本中的记录**——旧格式（``bundledMcpServers``）记录按 §4.9.1-4 会被
-    sweep，**不算存活**（#275；三个消费者共用 :func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`）。
+    sweep，**不算存活**（#275；判据来自 :func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`，
+    clone 门控 / server 回收 / skills 注销三个消费者共用**这一份** ``retained`` 定义）。
 
     **失败序（#275 / §5.5）**：② 删树 → ③ 回收依赖（``remove_server``，唯一可达的可抛外部调用）→ ④ 注销 skills
     → ⑤ 删账本记录 + 清意图/enabled。③ 抛错时账本、意图、技能**一律原样**，重试可自愈（已删的 clone 按
