@@ -2117,3 +2117,43 @@ async def test_marketplace_duplicate_skill_dir_path_redacted(
     assert "duplicate marketplace SKILL name" in text  # 正对照：确实走了该分支
     assert "deploy-token" not in text and "example.com:org" not in text
     assert "<redacted-git-source>" in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_name_log_redacts_path_credentials(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """
+    终审 🔴 回归锁：非法 name 的账本键是含 **path 段凭据** 的 URL 时，日志也必须遮蔽（散文脱敏只去
+    userinfo、保留 path，旧实现照原样打 `alice:PW_LEAK@example.com`）。
+    """
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "https://host/team/alice:PW_LEAK@example.com/repo.git",
+        {"type": "git", "url": "https://example.com/r.git"},
+        SkillRegistry(),
+        home,
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "PW_LEAK" not in text and "alice" not in text
+    assert any(r.levelno >= logging.ERROR for r in staging_logs.records)
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_source_log_redacts_path_credentials(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """终审 🔴 回归锁（另一入口）：非法 source 的日志同样按账本键脱敏。"""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "https://host/team/alice:PW_LEAK@example.com/repo.git",
+        {"type": "git", "url": ""},  # 非法 source（空 url）
+        SkillRegistry(),
+        home,
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "PW_LEAK" not in text and "alice" not in text

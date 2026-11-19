@@ -703,24 +703,61 @@ def marketplace_set(
     return _ok(f"{name!r} auto-update set to {val}")
 
 
-# 指纹取这几个**协议字段**（`A2CSkillRef`），逐项显式取值——不序列化整个 ref：frontmatter 的
-# `metadata` / `tags` 是不可信结构（YAML 允许非 str 键 → `json.dumps(sort_keys=True)` 抛 TypeError；
-# alias 环 → Circular reference），在 refresh 之前抛会把整个 REPL 命令打挂（#260 终审 🟡1）。
-_FINGERPRINT_FIELDS = ("name", "source", "path", "uri", "version", "description")
+# 指纹覆盖 `A2CSkillRef` **全部**协议字段（含可选），逐项显式取值 + 安全定型——不序列化整个 ref：
+# frontmatter 的 `skill_metadata` / `tags` 是不可信结构（YAML 允许非 str 键 → `json.dumps(sort_keys=True)`
+# 抛 TypeError；自引用环 → Circular reference），在 refresh 之前抛会把整个 REPL 命令打挂
+# （#260 终审 🟡1 / 🟡3）。
+_FINGERPRINT_FIELDS = (
+    "name",
+    "source",
+    "uri",
+    "path",
+    "description",
+    "license",
+    "compatibility",
+    "allowed_tools",
+    "tags",
+    "version",
+    "skill_metadata",
+)
+
+_STABLE_MAX_DEPTH = 6
+
+
+def _stable_text(value: Any, _depth: int = 0) -> str:
+    """
+    任意 JSON-ish 值的**稳定字符串化**（键序稳定、拒绝不可控异常）/ Stable text for arbitrary values.
+
+    用于指纹：容器递归到 ``_STABLE_MAX_DEPTH`` 封顶（自引用环因此终止），映射按键的稳定文本排序
+    （非 str 键不会触发 ``TypeError``），未知类型退化为类型名。
+    """
+    if _depth >= _STABLE_MAX_DEPTH:
+        return "<max-depth>"
+    if isinstance(value, str):
+        return value
+    if value is None or isinstance(value, (bool, int, float)):
+        return str(value)
+    if isinstance(value, Mapping):
+        items = sorted(((_stable_text(k, _depth + 1), _stable_text(v, _depth + 1)) for k, v in value.items()))
+        return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_stable_text(item, _depth + 1) for item in value) + "]"
+    return type(value).__name__
 
 
 def _registry_fingerprints(registry: SkillRegistry) -> frozenset[tuple[tuple[str, str], ...]]:
     """
-    registry 条目的**完整指纹**（协议字段 + 孤儿标志）/ Full fingerprints of the registry refs.
+    registry 条目的**完整指纹**（`A2CSkillRef` 全字段 + 孤儿标志）/ Full fingerprints of the registry refs.
 
-    #260 独立审查 🟡4 / 终审 🟡1–2：REPL `marketplace refresh` 原先只比 SKILL **名字集合**——「A 内容更新
-    （version/uri 变）+ B 改名被拒」时名字集相同，退出码为 1 但不会标脏，已连接 Agent 继续看到旧投影。
+    #260 独立审查 🟡4 / 终审 🟡1–3：REPL `marketplace refresh` 原先只比 SKILL **名字集合**——「A 内容更新
+    （version/uri/tags 变）+ B 改名被拒」时名字集相同，退出码为 1 但不会标脏，已连接 Agent 继续看到旧投影。
 
-    指纹 = 上述协议字段的 ``(键, 字符串值)`` 元组 + **``orphaned`` 标志**：`plugin disable` 置孤儿后
-    refresh 重扫会把 ``orphaned`` 翻回 False 而 ref 内容不变——不纳入孤儿标志就同样漏标脏。
+    指纹 = 全部协议字段（经 :func:`_stable_text` 定型）的 ``(键, 值)`` 元组 + **``orphaned`` 标志**：
+    `plugin disable` 置孤儿后 refresh 重扫会把 ``orphaned`` 翻回 False 而 ref 内容不变——不纳入孤儿标志
+    就同样漏标脏。
     """
     return frozenset(
-        tuple((field, str(ref.get(field) or "")) for field in _FINGERPRINT_FIELDS) + (("orphaned", str(orphaned)),)
+        tuple((field, _stable_text(ref.get(field))) for field in _FINGERPRINT_FIELDS) + (("orphaned", str(orphaned)),)
         for ref, orphaned in registry.all_refs()
     )
 

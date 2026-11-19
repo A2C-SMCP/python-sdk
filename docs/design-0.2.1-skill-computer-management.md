@@ -66,8 +66,8 @@
 ### 2.2 决策 ② marketplace git 源刷新/对账 → **Claude Code 对标（无 TTL）**
 
 - **eager add**：用户配置 git 源即时 `git clone --depth 1`（SSH→HTTPS 回退；`GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=''`；超时可配，默认 120s）。不走 `gh`。
-- **显式 refresh**：原地 `git pull`（失败则全量重 clone）→ 与缓存 SKILL 集合对账。
-- **启动对账（reconcile）**：Computer 启动时按意图同步物化（缺的 clone、变的重拉、删的清理）；尊重 per-source `auto_update` 标志（对标 Claude Code「autoUpdate 启动时触发」，非 TTL）。
+- **显式 refresh**（#260）：重新 clone 到 staging 并**原子换入**（不再原地 `git pull`；拒绝时旧内容零损伤）→ 与缓存 SKILL 集合对账；清单改名以 `validation` 拒绝。
+- **启动对账（reconcile）**：Computer 启动时按意图**additive-only** 同步物化（缺的 clone；`auto_update` 重 clone + 换入；materialized∖declared **不删**）；声明式**换源**（#260/§5.14）以 `validation` 拒绝、不 wipe 重 clone（换源需显式 remove + add）；尊重 per-source `auto_update` 标志（对标 Claude Code「autoUpdate 启动时触发」，非 TTL）。
 - **无 TTL 自动刷新**。后台定时对账守护进程**显式后置**为 backlog（协议 `skill.md §8.3` 只要求「定时 / 用户触发」其一；启动对账 + 显式 refresh 已满足；可日后非破坏加性引入）。
 - **失败降级铁律**（工单 §8）：网络/clone/对账失败记 ERROR，不阻断其余 source，不向 Agent 硬报错，不入协议错误码（物化失败的 SKILL 不进 Registry，对 Agent 不可见）。
 

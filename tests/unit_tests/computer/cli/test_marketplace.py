@@ -1290,20 +1290,33 @@ def test_registry_fingerprints_tolerate_hostile_metadata(tmp_path: Path) -> None
     """终审 🟡1 回归锁：frontmatter metadata 含非 str 键 / 自引用环时，指纹不得抛（旧实现用 json.dumps）。"""
     from a2c_smcp.computer.skills.registry import A2CSkillRef
 
+    metadata: dict[object, object] = {1: "int-key", "mixed": [1, {"nested": None}]}
     ref = A2CSkillRef(
         name="audit:lint",
         source="marketplace:acme",
         uri="skill://acme/audit/lint/SKILL.md",
         path=str(tmp_path / "x"),
         description="d",
-        metadata={1: "int-key", "loop": None},  # type: ignore[typeddict-item]
+        skill_metadata=metadata,  # type: ignore[typeddict-item]
     )
-    ref["metadata"]["self"] = ref  # 自引用环
+    metadata["self"] = ref  # 自引用环：指纹必须靠深度封顶终止
     reg = SkillRegistry()
     assert reg.register(ref)
 
     fps = marketplace_mod._registry_fingerprints(reg)
     assert len(fps) == 1
+    # 可选字段（skill_metadata）参与指纹：改值即可识别（避免「字段没进指纹」也照绿）
+    assert reg.register_or_update(
+        A2CSkillRef(
+            name="audit:lint",
+            source="marketplace:acme",
+            uri="skill://acme/audit/lint/SKILL.md",
+            path=str(tmp_path / "x"),
+            description="d",
+            skill_metadata={"other": 2},  # type: ignore[typeddict-item]
+        )
+    )
+    assert marketplace_mod._registry_fingerprints(reg) != fps
 
 
 def test_registry_fingerprints_track_orphan_flag(tmp_path: Path) -> None:
@@ -1324,3 +1337,50 @@ def test_registry_fingerprints_track_orphan_flag(tmp_path: Path) -> None:
     assert reg.mark_orphan("audit:lint") is True
     after = marketplace_mod._registry_fingerprints(reg)
     assert before != after, "孤儿标志必须进入指纹"
+
+
+def test_registry_fingerprints_track_tags_only_change(tmp_path: Path) -> None:
+    """终审 🟡3 回归锁：仅 `tags`（或其它可选字段）变化也必须改变指纹。"""
+    from a2c_smcp.computer.skills.registry import A2CSkillRef
+
+    reg = SkillRegistry()
+    base = dict(
+        name="audit:lint",
+        source="marketplace:acme",
+        uri="skill://acme/audit/lint/SKILL.md",
+        path=str(tmp_path / "x"),
+        description="d",
+        version="1.0.0",
+    )
+    reg.register(A2CSkillRef(**base, tags=["sec"]))  # type: ignore[typeddict-item]
+    before = marketplace_mod._registry_fingerprints(reg)
+    reg.register_or_update(A2CSkillRef(**base, tags=["sec", "audit"]))  # type: ignore[typeddict-item]
+    assert before != marketplace_mod._registry_fingerprints(reg)
+
+
+@pytest.mark.asyncio
+async def test_repl_refresh_marks_dirty_on_tags_only_update(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """终审 🟡3：另一源改名拒绝（退出码 1）+ 本源仅 tags 变化 → 仍须标脏。"""
+    from a2c_smcp.computer.skills.registry import A2CSkillRef
+
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    base = dict(
+        name="audit:lint",
+        source="marketplace:acme",
+        uri="skill://acme/audit/lint/SKILL.md",
+        path=str(home / "marketplace" / "acme" / "audit" / "lint"),
+        description="d",
+    )
+    reg.register(A2CSkillRef(**base, tags=["sec"]))  # type: ignore[typeddict-item]
+    comp = _ReplComp(home, reg)
+
+    async def fake_refresh(*_args: object, **_kwargs: object) -> int:
+        reg.register_or_update(A2CSkillRef(**base, tags=["sec", "audit"]))  # type: ignore[typeddict-item]
+        return 1  # 另一源改名被拒
+
+    monkeypatch.setattr(marketplace_mod, "marketplace_refresh", fake_refresh)
+
+    await marketplace_mod.repl_dispatch(comp, ["marketplace", "refresh", "all"], session=_ReplSession())
+
+    assert comp.dirty == 1, "tags-only 更新也必须标脏"

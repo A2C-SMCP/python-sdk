@@ -1408,7 +1408,9 @@ def _record_known_marketplace(
         update_known_marketplaces(_mutate, home, env)
     except Exception as e:  # 锁不可得 / I/O 失败 → 不阻断 staging
         logger.error("failed to record known_marketplaces.json for %r: %s", redact_ledger_key(name), e)
-        return True
+        # 身份判据已在 mutator 里拒写时，落盘失败**不能**翻回 True——否则调用方继续注册 SKILL，
+        # 复活「registry 有、账本无/异源」的分叉（#260 终审 🟡1）。
+        return not outcome["rejected"]
     return not outcome["rejected"]
 
 
@@ -1500,9 +1502,10 @@ def registration_violation(
             f"MUST NOT be silently renamed, runtime-contract §5.14). Rename it explicitly"
             f"{_rename_hint(name, observed_manifest_name)}.",
             details={
-                "name": name,
+                "name": redact_ledger_key(name),
                 "manifestName": observed_manifest_name,
-                "baselineManifestName": baseline,
+                # baseline 来自账本（可被手编成携带凭据的串）→ 回显前脱敏；比较仍用原值。
+                "baselineManifestName": redact_ledger_key(baseline),
             },
         )
     return None
@@ -1747,7 +1750,7 @@ async def stage_marketplace_skills(
         # #261：账本键可能被手编成携带 URL 凭据的串（rust `test_invalid_marketplace_name_log_redacts_embedded_credentials`）。
         logger.error(
             "marketplace name %r is invalid (must be strict-kebab, 1-64), skipped (not registered)",
-            redact_git_urls_in_text(name),
+            redact_ledger_key(name),
         )
         return registered
 
@@ -1758,7 +1761,7 @@ async def stage_marketplace_skills(
         # 这类非 URL secret）；不插值全文，只记脱敏后的 marketplace 名（对齐 rust：非法 source 只记 name）。
         logger.error(
             "marketplace %r has invalid source, skipped (not registered)",
-            redact_git_urls_in_text(name),
+            redact_ledger_key(name),
         )
         return registered
 

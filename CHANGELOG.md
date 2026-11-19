@@ -22,8 +22,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - 恢复路径：`a2c-computer marketplace remove <name>`（默认级联卸载其下所有已安装插件并撤销 trust）→
   `a2c-computer marketplace add <git-url> --trust` → 逐个 `plugin install <plugin>@<name>` + `plugin enable <plugin>@<name>`。
 - **不要使用 `marketplace remove --keep-plugins`**：它保留 installed 状态与账本，留下指向已删 clone 的孤儿记录。
-- `marketplace refresh`（`refresh=true`）**不能**可靠自愈：上游未变时 `git pull --ff-only` 不会还原本地已删文件；
-  `plugin install` 与 boot 重物化都复用既有 clone。
+- `marketplace refresh`（`refresh=true`）**会**还原上游仍存在的被删文件（#260 起为「重新 clone 到 staging + 原子换入」，
+  不再原地 `git pull`）；但上游本身已删的路径、以及本地 clone 与上游一致时仍无变化。`plugin install` 与 boot 重物化
+  都复用既有 clone。
 - 详见 [`docs/upgrade-0.5.1-marketplace-catalog-recovery.md`](docs/upgrade-0.5.1-marketplace-catalog-recovery.md)。
 
 ### Breaking Changes

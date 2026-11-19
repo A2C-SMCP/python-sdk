@@ -191,8 +191,9 @@ def _safe_rmtree(path: Path, home: Path) -> bool:
     **本函数不抛**；删除失败 → 记 WARN（不阻断后续清理）。
 
     :return: ``True`` 表示目标已不存在（删除成功或本来就不存在）；``False`` 表示拒删 / 删除失败（目标可能仍在）。
-        调用方需要区分「已清空」与「静默失败」时必须检查返回值（#260 起 reconcile 的换源分支已**不再**
-        wipe，只由 ``prune_marketplaces`` 消费本函数）。
+        调用方需要区分「已清空」与「静默失败」时必须检查返回值。消费方：``prune_marketplaces``（marketplace 级）与
+        ``remove_plugin_install_path``（plugin 独占 clone，uninstall/gc 路径）；#260 起 reconcile 的换源分支已**不再**
+        wipe。
     """
     if path.is_symlink():
         logger.warning("reconcile: refusing to remove symlink %s", path)

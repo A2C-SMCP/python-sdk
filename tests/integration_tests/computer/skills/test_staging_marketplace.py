@@ -1004,8 +1004,10 @@ async def test_reuse_write_refuses_second_registration_for_same_source(tmp_path:
     # 人为造出同一 source 的第二个 clone（无记录）
     _clone_into(home, "second", bare)
 
-    await stage_marketplace_skills("second", _src(_url(bare)), SkillRegistry(), home, env=_env(home))
+    second_reg = SkillRegistry()
+    names = await stage_marketplace_skills("second", _src(_url(bare)), second_reg, home, env=_env(home))
 
+    assert names == [] and second_reg.active_refs() == [], "拒写时不得注册该 clone 的 SKILL"
     assert set(load_known_marketplaces(home=home)["marketplaces"]) == {"acme-skills"}, "不得新建同源第二注册"
 
 
@@ -1028,3 +1030,52 @@ async def test_reuse_rejection_skips_skill_registration(tmp_path: Path) -> None:
 
     assert names == [] and reg.active_refs() == [], "拒写时不得注册该 clone 的 SKILL"
     assert load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]["source"] == _src(_url(bare_a))
+
+
+@requires_git
+async def test_reuse_rejection_survives_ledger_write_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    终审 🟡1：mutator 已判「拒写」后落盘又失败（只读 / ENOSPC）时，不得把结果翻回 True ——
+    否则调用方继续注册 SKILL，复活「registry 有、账本无/异源」的分叉。
+    """
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+
+    _, bare_a = _make_bare(tmp_path / "a", "acme", _marketplace_files())
+    _, bare_b = _make_bare(tmp_path / "b", "acme", _marketplace_files())
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    _clone_into(home, "acme-skills", bare_a)
+    _seed_known(
+        home,
+        {"acme-skills": {"source": _src(_url(bare_a)), "installLocation": "", "manifestNameBaseline": "acme-skills"}},
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.store.atomic_write_json", _boom)
+
+    names = await stage_marketplace_skills("acme-skills", _src(_url(bare_b)), reg, home, env=_env(home))
+
+    assert names == [] and reg.active_refs() == [], "拒写 + 落盘失败仍不得注册 SKILL"
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]["source"] == _src(_url(bare_a))
+
+
+@requires_git
+async def test_reuse_refuses_record_when_manifest_unreadable(tmp_path: Path) -> None:
+    """终审 🟡4：无记录且清单不可读（无法证明身份）→ 不建记录、不注册 SKILL。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    clone = marketplace_skill_dir(home, "acme-skills")
+    (clone / ".tfrobot-plugin").mkdir(parents=True)
+    (clone / ".tfrobot-plugin" / "marketplace.json").write_text("{ not json", encoding="utf-8")
+
+    names = await stage_marketplace_skills(
+        "acme-skills", _src("https://example.com/acme.git"), reg, home, env=_env(home)
+    )
+
+    assert names == [] and reg.active_refs() == []
+    assert "acme-skills" not in load_known_marketplaces(home=home)["marketplaces"]

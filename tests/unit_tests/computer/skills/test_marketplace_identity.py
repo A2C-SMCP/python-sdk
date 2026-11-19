@@ -272,3 +272,38 @@ def test_source_conflict_redacts_credential_like_path_in_ledger_key() -> None:
     assert "marketplace remove" in v.details["remedy"]
     assert "PW_LEAK" not in json.dumps(v.details)
     assert "PW_LEAK" not in str(v) and "alice" not in str(v)
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("acme-skills", "acme-skills"),  # 正常账本键原样
+        ("alice:PW@example.com", "<redacted-git-source>"),  # 非 URL 的 userinfo 形态
+        ("x=https:/host/alice:PW@example.com/repo.git", "<redacted-git-source>"),  # URL 残形
+        ("https://host/team/alice:PW_LEAK@example.com/repo.git", "<redacted-git-source>"),  # path 段凭据
+        # #281 组合锁：非 URL 键的 `?query` 尾部由 segment 漏斗截断（散文漏斗会原样保留 → 回退即转红）
+        ("foo?token=SECRET", "foo<redacted-source>"),
+    ],
+)
+def test_redact_ledger_key_matrix(key: str, expected: str) -> None:
+    """终审 🟡5：账本键脱敏的 URL / 非 URL / URL 残形三支都要有向量（非 URL 支此前零覆盖）。"""
+    from a2c_smcp.computer.skills.marketplace_identity import redact_ledger_key
+
+    assert redact_ledger_key(key) == expected
+
+
+def test_rename_rejection_redacts_credential_like_baseline() -> None:
+    """终审 🟡2：`baselineManifestName` 来自账本（可手编）→ 回显前脱敏；`manifestName` 是清单名可原样。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    prior = {
+        "source": dict(_GIT),
+        "installLocation": "/x",
+        MANIFEST_NAME_BASELINE_FIELD: "https://host/team/alice:PW_LEAK@example.com/repo.git",
+    }
+    v = _violation("acme", _GIT, prior, {"acme": prior}, "acme-renamed")
+
+    assert isinstance(v, MarketplaceNameChangeError)
+    assert v.details["baselineManifestName"] == REDACTED_GIT_SOURCE
+    assert "PW_LEAK" not in json.dumps(v.details)
+    assert "PW_LEAK" not in str(v)

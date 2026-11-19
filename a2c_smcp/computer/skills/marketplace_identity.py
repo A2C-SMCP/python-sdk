@@ -34,8 +34,7 @@ from a2c_smcp.computer.skills.manifest import read_marketplace_manifest
 from a2c_smcp.utils.git_url import (
     REDACTED_GIT_SOURCE,
     diagnostic_url_for_display,
-    redact_git_urls_in_text,
-    sanitize_text_for_diagnostics,
+    sanitize_segment_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -196,8 +195,9 @@ def redact_ledger_key(key: object) -> str:
     ``alice:PW@example.com`` 会照原样回显，故此处：
 
     1. URL 形态（含 ``://``）→ 走诊断面单一权威 :func:`diagnostic_url_for_display`（path 段也判）；
-    2. 其余 → ``sanitize_text_for_diagnostics(redact_git_urls_in_text(key))`` 两段式（与
-       ``safe_exception_text`` 同款），覆盖路径残形 / query 形态。
+    2. 其余 → 走 **#281 单值/segment 漏斗** :func:`sanitize_segment_for_diagnostics`——它是「单个不可信值」
+       的正确原语（先转义控制字符、空白不作 token 边界、scp-like/userinfo 整值 fail-closed，并补 path 轴
+       兜住 ``?``/``#`` 尾部）；散文漏斗（``sanitize_text_for_diagnostics``）刻意保留空白与换行，不适用。
 
     已知边界：**裸 token**（如 ``glpat-…``）不可识别，属既有口径。
     """
@@ -205,7 +205,7 @@ def redact_ledger_key(key: object) -> str:
         return REDACTED_GIT_SOURCE
     if "://" in key:
         return diagnostic_url_for_display(key)
-    return sanitize_text_for_diagnostics(redact_git_urls_in_text(key))
+    return sanitize_segment_for_diagnostics(key)
 
 
 def registered_name_for_source(known: Mapping[str, Any], source: object) -> str | None:
