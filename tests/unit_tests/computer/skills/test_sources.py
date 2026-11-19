@@ -440,6 +440,38 @@ def test_reason_schemeless_query_is_redacted_at_construction() -> None:
     assert "<redacted-source>" in e.reason  # 占位符正向断言（删掉脱敏也会转红）
 
 
+def test_object_raw_schemeless_query_value_is_redacted() -> None:
+    """对象形态 raw 的**非 source 字段值**同样是单个不可信值（#281 复审）：散文轴不识别
+    无 scheme 的 `path?token=…`（`{"source":"git-subdir", …, "path": …}` 可达）；JSON 结构须保持。"""
+    e = SkillSourceError(
+        {"source": "git-subdir", "url": "https://example.com/r.git", "path": "../x/r.git?token=SECRET_P#f"}, "boom"
+    )
+    assert "SECRET_P" not in e.raw and "SECRET_P" not in str(e)
+    assert "#f" not in e.raw
+    assert json.loads(e.raw) == {
+        "source": "git-subdir",
+        "url": "https://example.com/r.git",
+        "path": "../x/r.git<redacted-source>",
+    }
+
+
+def test_object_raw_schemeless_query_key_is_redacted() -> None:
+    """字典**键**同属不可信回显面（#281 复审）：键里的无 scheme `path?token=…` 也要遮蔽。"""
+    e = SkillSourceError({"../x/r.git?token=SECRET_K#f": "v"}, "boom")
+    assert "SECRET_K" not in e.raw and "SECRET_K" not in str(e)
+    assert json.loads(e.raw) == {"../x/r.git<redacted-source>": "v"}
+
+
+def test_deep_nested_repr_fallback_is_redacted() -> None:
+    """深度 ≥ `_MAX_ERROR_DEPTH` 的 ``repr`` 兜底（`_safe_repr`）同样走单值漏斗（#281 复审）：
+    兜底路径不得成为 scheme-less `path?token=…` 的旁路。"""
+    deep: dict[str, object] = {"leaf": "../x/r.git?token=SECRET_D#f"}
+    for _ in range(10):  # 超过 _MAX_ERROR_DEPTH(8) → 内层整体 repr
+        deep = {"n": deep}
+    e = SkillSourceError(deep, "boom")
+    assert "SECRET_D" not in e.raw and "SECRET_D" not in str(e)
+
+
 def test_safe_exception_text_json_echo_truncation_is_documented() -> None:
     """已知降级（#263 七轮 🟡6，本单接受）：对**构造期已脱敏的 JSON 回显**再做 token 级路径脱敏时，
     值里的 `?`/`#` 会触发截断——只影响诊断可读性，不影响脱敏强度；后续如需保真另立 JSON 感知 follow-up。"""

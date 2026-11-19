@@ -784,9 +784,10 @@ def test_user_basename_credential_like_name_redacted(tmp_path: Path, staging_log
 
 
 def test_user_basename_control_chars_are_escaped(tmp_path: Path, staging_logs: pytest.LogCaptureFixture) -> None:
-    """非法目录名里的控制字符必须转义（#281 复审）：换行可伪造日志行，且会把 userinfo 劈成两半漏遮。"""
+    """非法目录名里的控制字符 / 空白类必须转义或整段遮蔽（#281 复审）：换行可伪造日志行，空白会把
+    userinfo 劈成两半而两半都不命中规则。"""
     home = tmp_path / "home"
-    for bad in ("alice:pw\n@host", "bad\tname"):
+    for bad in ("alice:pw\n@host", "bad\tname", "alice:pw @host", "alice:pw @host", "alice:pw　@host"):
         d = home / "user" / bad
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text("---\ndescription: x\n---\n", encoding="utf-8")
@@ -795,11 +796,15 @@ def test_user_basename_control_chars_are_escaped(tmp_path: Path, staging_logs: p
 
     assert names == []
     msgs = [r.getMessage() for r in staging_logs.records if r.levelno == logging.ERROR]
-    assert len(msgs) == 2 and all("name invalid" in m for m in msgs)
+    assert len(msgs) == 5 and all("name invalid" in m for m in msgs)
     text = " | ".join(msgs)  # 用非空白分隔，避免把 join 用的换行误当泄漏
     assert "\n" not in text and "\t" not in text  # 换行 / TAB 已转义成可见形式
-    assert "alice:pw" not in text  # 换行前的 userinfo 不得因被劈开而残留
+    assert "alice:pw" not in text  # 被控制字符 / 空白劈开的 userinfo 不得残留
     assert "<redacted-git-source>" in text
+    # parent 落点逐条可读（basename 遮蔽不牺牲定位）——逐记录断言：拼接文本会被任一条「本来就干净」的
+    # 记录掩盖（M18 变异即因此存活）。
+    parent = str(home / "user")
+    assert all(parent in m for m in msgs), [m for m in msgs if parent not in m]
 
 
 def test_user_skill_md_unreadable_log_masks_home_credential(
@@ -902,6 +907,7 @@ def test_frontmatter_yaml_error_log_is_redacted(tmp_path: Path, staging_logs: py
     assert names == []  # frontmatter 解析失败 → 缺 description → 跳过（失败隔离）
     text = _no_secret(staging_logs.records)
     assert "YAML parse failed" in text  # 正对照：确实命中 PyYAML 错误分支
+    assert "source: https://example" in text  # 正向：出错行确实被回显（且已被脱敏），不是整段丢弃
     assert "PW_YAML" not in text and "alice:" not in text
 
 
@@ -1930,3 +1936,34 @@ async def test_marketplace_synthesis_failed_skill_dir_name_redacted(
     text = _no_secret(staging_logs.records)
     assert "name synthesis failed" in text
     assert "pw@" not in text and "alice:" not in text
+    assert "<redacted-git-source>" in text  # 占位符正向断言（单值漏斗对 `alice:pw@host` 整值遮）
+
+
+@pytest.mark.asyncio
+async def test_marketplace_skill_dir_name_credential_like_redacted(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """marketplace clone（远端内容）的 skill 目录名同样不可信（#281 复审）：scp-like 名称不得原样入日志。"""
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+    )
+    bad_dir = repo / "plugins" / "audit" / "skills" / "deploy-token@example.com:org"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "SKILL.md").write_text("---\nname: x\n---\n# body\n", encoding="utf-8")  # 缺 description
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "missing frontmatter 'description'" in text  # 正对照：确实走了该分支
+    assert "deploy-token" not in text and "example.com:org" not in text
+    assert "<redacted-git-source>" in text  # 占位符正向断言

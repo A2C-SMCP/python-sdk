@@ -397,20 +397,31 @@ def sanitize_text_for_diagnostics(text: str) -> str:
     return "".join(out)
 
 
-def sanitize_value_for_diagnostics(value: str) -> str:
+# 单值里的 userinfo 被**空白**劈开（`alice:pw @host`：ASCII 空格 / NBSP（U+00A0）/ U+2028 / 全角空格
+# U+3000）：散文 token 边界就是空白，两半都不命中 userinfo/scp-like 规则。单值模式的 token 边界不该是
+# 空白 —— 按整值 fail-closed（#281 复审）。要求 `:` 前有非空 user 段，避免 `note: see @team` 命中。
+_VALUE_SPLIT_USERINFO_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\:@]*\s+@")
+
+
+def sanitize_value_for_diagnostics(value: str, *, json_safe: bool = False) -> str:
     """
     诊断用**单个不可信值**脱敏（非散文）/ Sanitize a single untrusted value for diagnostics.
 
-    与 :func:`sanitize_text_for_diagnostics` 的唯一区别：**先** :func:`escape_unsafe_chars`。散文口径按
-    设计保留空白与换行（多行异常消息的可读性），但单个原始值里的换行可以伪造日志行，还会把 userinfo /
-    scp-like 切成两段而漏遮（``alice:pw\\n@host`` 两半都不命中任何规则）。转义后值退回单 token，后续
-    散文轴（scp-like 与 ``scheme:`` opaque 形态只有它能识别）与 path 轴才按整体判定。
-    Escapes control characters first: a single value is not prose — newlines forge log lines and split
-    userinfo/scp-like tokens so neither half matches.
+    与 :func:`sanitize_text_for_diagnostics` 的三处差异（#281）：
+
+    1. **先** :func:`escape_unsafe_chars`——散文口径按设计保留空白与换行（多行异常消息的可读性），但
+       单个值里的换行可伪造日志行，还会把 userinfo / scp-like 切成两段而漏遮。
+    2. 空白类（含 NBSP / U+2028 / 全角空格）**不得**作为 token 边界：出现 ``user:secret <空白>@host``
+       形态时整值 fail-closed 为 :data:`REDACTED_GIT_SOURCE`（``token=…`` 内容随之消失）。
+    3. ``json_safe=True`` 时控制字符用 ``\\uXXXX`` 转义（嵌入 JSON 回显时 ``\\xNN`` 不是合法 JSON 转义）。
 
     顺序不可交换（#281 复审）：先 path 再转义会把 ``x/r.git?token=…`` 的尾部截断后仍留在转义前的 token 里。
+    Escapes first (a single value is not prose), treats no whitespace class as a token boundary, and
+    emits JSON-safe escapes when asked.
     """
-    return sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(value)))
+    if _VALUE_SPLIT_USERINFO_RE.search(value) is not None:
+        return REDACTED_GIT_SOURCE
+    return sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(value, json_safe=json_safe)))
 
 
 def sanitize_git_text(text: str, args: Sequence[str]) -> str:

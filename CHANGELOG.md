@@ -527,18 +527,26 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   打补丁」的承诺因此不成立——仓内 sink 全靠 `safe_exception_text` 兜住，新增消费点会重新开洞。
   - 修法：新增单一漏斗 **`utils.git_url.sanitize_value_for_diagnostics()`**（`escape_unsafe_chars` →
     `redact_git_urls_in_text` → `sanitize_text_for_diagnostics`），**单个不可信值**（非散文）走它。
-    本单迁移的站点：字符串 `raw` / `reason`、`stage_user_skills` 的目录名与 `reason`、
-    `_build_user_ref` 的 `SKILL.md` 路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径。
+    本单迁移的站点：字符串 `raw` / `reason`、对象形态 raw 的**每个字符串值与字典键**（`{"path":
+    "../x/r.git?token=…"}` 可达；`json_safe` 口径保证 JSON 合法）、`stage_user_skills` 的目录名与
+    `reason`、`_build_user_ref` 的 `SKILL.md` 路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径、
+    marketplace clone 的 skill 目录名与 `reason`。
     `escape_unsafe_chars` **必须最先**：散文口径按设计**保留**换行与空白（单值里的换行可伪造日志行），
     且不先转义时 `alice:pw\n@host` 会被切成两半而两半都不命中任何规则（漏遮）；先转义后整串退回单
     token，散文轴（scp-like / `scheme:` opaque）与 path 轴均按整体判定。合法路径 / kebab 名
     （`./../escape`、`https://example.com/r.git`、`file:///home/alice@corp/repo.git`）逐字不变。
-  - **取舍（有意，安全优先）**：值漏斗的散文轴对整条无空白 token 判定，含「冒号早于 `@`」的**普通**
-    路径（如 `…/build:2024/alice@corp/…`、Windows `C:\Users\alice@corp\…`）会被整串遮为
-    `<redacted-git-source>`（改前逐字保留）——落点改由同一行里的 `%r` 名称标识。
-  - **未迁移（既有面，follow-up）**：marketplace clone 的 skill 目录名、`validator._Collector.rel()`
-    的 `issue.file`/`checked`、manifest override 路径、home/watcher 的 DEBUG 路径仍是 path-only 轴
-    （scp-like 段不识别）；改它们会变更 `plugin validate` 的既有诊断形状，不属本单。
+  - **单值模式的 token 边界不是空白**：`alice:pw @host`（ASCII 空格 / NBSP `U+00A0` / `U+2028` /
+    全角空格 `U+3000`）会被散文轴劈成两半而两半都不命中规则 ⇒ 命中
+    `user:secret<空白>@host` 形态时整值 fail-closed 为 `<redacted-git-source>`（不放宽 path 谓词，
+    避免误伤 `note: see @team` 这类散文）。
+  - **非法目录名日志保留定位**：只把不可信的 **basename** 过单值漏斗，parent 走 path 轴（段级遮蔽）——
+    既不让 `deploy-token@example.com:org` 这类名称外泄，也不让 `…/build:2024/alice@corp/…` 整行失去落点。
+  - **取舍（有意，安全优先）**：`_build_user_ref` 两处**整条路径** sink（`SKILL.md` 路径）走单值漏斗，
+    含「冒号早于 `@`」的普通路径（`…/build:2024/alice@corp/…`、Windows `C:\Users\alice@corp\…`）会被整串
+    遮为 `<redacted-git-source>`——该行仍有同行的 `%r` 名称标识。
+  - **未迁移（既有面，follow-up）**：`validator._Collector.rel()` 的 `issue.file`/`checked` 与 manifest
+    override 路径仍是 path-only 轴（scp-like 段不识别）；改它们会变更 `plugin validate` 的既有诊断
+    形状，不属本单。home / watcher 的 DEBUG 路径同理。
   - `stage_user_skills` 非法目录名 ERROR 不再裸传 `Path`：scp-like 目录名（`deploy-token@example.com:org`）
     与换行/TAB 形态均被遮蔽或转义（`sanitize_path_for_diagnostics` 不识别 scp-like，故统一走上述漏斗）。
   - `parse_skill_frontmatter` 的 PyYAML 错误改走 `safe_exception_text`：其错误文本会回显出错行片段

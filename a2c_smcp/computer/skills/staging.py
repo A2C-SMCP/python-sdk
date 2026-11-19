@@ -765,12 +765,14 @@ def stage_user_skills(
         try:
             name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
         except SkillNameError as e:
-            # #281：目录名本身不可信（scp-like `user@host:path` / userinfo / 控制字符 / query 形态）——
-            # 走单个不可信值的单一漏斗（先转义控制字符，再散文轴识别 scp-like，最后 path-token 轴）；
-            # 不裸传 Path。reason 同一漏斗（今天是固定文案，属潜伏口）。
+            # #281：不可信的只有 basename（scp-like / userinfo / 控制字符 / query 形态）；parent 是可信落点。
+            # parent 走 path 轴（段级遮蔽、保留其余部分），basename 走单值漏斗（整段 fail-closed）——
+            # 若整条走单值漏斗，`…/build:2024/alice@corp/…` 这类普通路径会被整串遮掉、ERROR 行失去定位。
+            # 不裸传 Path；reason 同一单值漏斗（今天是固定文案，属潜伏口）。
             logger.error(
                 "user DropIn skill dir name invalid, skipped: %s (%s)",
-                sanitize_value_for_diagnostics(str(skill_dir)),
+                f"{sanitize_path_for_diagnostics(str(skill_dir.parent))}{os.sep}"
+                f"{sanitize_value_for_diagnostics(skill_dir.name)}",
                 sanitize_value_for_diagnostics(e.reason),
             )
             continue
@@ -1050,7 +1052,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_path_for_diagnostics(skill_dir.name),
+                    sanitize_value_for_diagnostics(skill_dir.name),
                     safe_exception_text(e),
                 )
                 continue
@@ -1059,7 +1061,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_path_for_diagnostics(skill_dir.name),
+                    sanitize_value_for_diagnostics(skill_dir.name),
                 )
                 continue
             try:
@@ -1069,15 +1071,15 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_path_for_diagnostics(skill_dir.name),
-                    sanitize_text_for_diagnostics(e.reason),
+                    sanitize_value_for_diagnostics(skill_dir.name),
+                    sanitize_value_for_diagnostics(e.reason),
                 )
                 continue
             if name in seen:
                 logger.error(
                     "duplicate marketplace SKILL name within staging run, keeping first: %s (%s)",
                     redact_git_urls_in_text(name),
-                    sanitize_path_for_diagnostics(str(skill_dir)),
+                    sanitize_value_for_diagnostics(str(skill_dir)),
                 )
                 continue
             seen.add(name)

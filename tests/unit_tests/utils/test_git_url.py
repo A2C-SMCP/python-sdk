@@ -448,3 +448,47 @@ def test_text_sanitizer_masks_query_token_without_scheme_exact() -> None:
     from a2c_smcp.utils.git_url import sanitize_text_for_diagnostics as T
 
     assert T("see ./x/r.git?token=SECRET#f now") == "see ./x/r.git<redacted-source> now"
+
+
+# ── #281：单个不可信值的单一漏斗（escape → 散文 → path）────────────────────────
+# (desc, input, expected)——逐字节期望，覆盖 scheme-less query / scp-like / 空白劈开 / 保留值。
+_VALUE_VECTORS: list[tuple[str, str, str]] = [
+    ("相对路径逐字保留", "./../escape", "./../escape"),
+    ("scheme URL 去 query/fragment（严格展示）", "https://example.com/r.git?token=SECRET_Q#f", "https://example.com/r.git"),
+    ("scp-like 整值占位符", "deploy-token@example.com:org", REDACTED_GIT_SOURCE),
+    ("无 scheme 的 path+query", "x/r.git?token=SECRET_Q#f", "x/r.git<redacted-source>"),
+    ("file URL 的普通 @ 路径保留", "file:///home/alice@corp/repo.git", "file:///home/alice@corp/repo.git"),
+    ("合法 @ 文件名保留", "repo@2.git", "repo@2.git"),
+    ("换行先转义（防日志行伪造）", "/tmp/a\nb/SKILL.md", "/tmp/a\\x0ab/SKILL.md"),
+    # 空白类劈开 userinfo：单值模式不把空白当 token 边界 → 整值 fail-closed
+    ("ASCII 空格劈开 userinfo", "alice:pw @host", REDACTED_GIT_SOURCE),
+    ("NBSP 劈开 userinfo", "alice:pw\u00a0@host", REDACTED_GIT_SOURCE),
+    ("U+2028 劈开 userinfo", "alice:pw\u2028@host", REDACTED_GIT_SOURCE),
+    ("全角空格劈开 userinfo", "alice:pw\u3000@host", REDACTED_GIT_SOURCE),
+]
+
+
+@pytest.mark.parametrize("desc, raw, expected", _VALUE_VECTORS, ids=[v[0] for v in _VALUE_VECTORS])
+def test_value_sanitizer_exact_vectors(desc: str, raw: str, expected: str) -> None:
+    """单值漏斗逐字节对拍（#281）：含 escape-first、scheme-less query、scp-like、空白劈开、保留值。"""
+    from a2c_smcp.utils.git_url import sanitize_value_for_diagnostics as V
+
+    assert V(raw) == expected
+    assert V(V(raw)) == expected  # 幂等（脱敏结果再次过漏斗不变）
+
+
+def test_value_sanitizer_json_safe_escapes_are_json_legal() -> None:
+    """嵌入 JSON 回显时控制字符必须用 `\\\\uXXXX`（`\\\\xNN` 不是合法 JSON 转义）。"""
+    from a2c_smcp.utils.git_url import sanitize_value_for_diagnostics as V
+
+    out = V("a\x7fb\x9bc", json_safe=True)
+    assert "\\u007f" in out and "\\u009b" in out
+    assert "\x7f" not in out and "\x9b" not in out
+
+
+def test_value_sanitizer_does_not_over_mask_prose_like_values() -> None:
+    """避免误伤：不带 userinfo 形态的普通散文 / 普通路径逐字保留（防「空白即遮」的过度反应）。"""
+    from a2c_smcp.utils.git_url import sanitize_value_for_diagnostics as V
+
+    for plain in ("note: see @team", "user <skill> must be strict kebab", "/home/u/my-skill/SKILL.md", "C:\\repo\\x"):
+        assert V(plain) == plain

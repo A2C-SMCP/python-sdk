@@ -79,9 +79,12 @@ def _is_source_field(key: object) -> bool:
 
 
 def _safe_repr(value: object) -> str:
-    """`repr` 兜底且自身不可抛（深嵌套会让 ``repr`` 再爆 ``RecursionError``）/ Never-raising repr fallback."""
+    """`repr` 兜底且自身不可抛（深嵌套会让 ``repr`` 再爆 ``RecursionError``）/ Never-raising repr fallback.
+
+    ``repr`` 里同样可能嵌 scheme-less ``path?token=…``（#281 复审）→ 与单值同漏斗（JSON 回显口径）。
+    """
     try:
-        return redact_git_urls_in_text(repr(value))
+        return sanitize_value_for_diagnostics(repr(value), json_safe=True)
     except Exception:  # noqa: BLE001 - 错误展示路径禁止再抛（含自定义 __repr__ / 超深递归）
         return REDACTED_GIT_SOURCE
 
@@ -98,12 +101,14 @@ def _redact_error_value(value: object, *, source_field: bool = False, depth: int
     **字典键同样脱敏**：键名由配置作者任意指定，同属不可信回显面。
     """
     if isinstance(value, str):
-        return git_url_for_display(value) if source_field else redact_git_urls_in_text(value)
+        # #281 复审：非 source 字段的字符串值同样是**单个不可信值**——散文轴漏 scheme-less
+        # `path?token=…`（`{"path": "../x/r.git?token=…"}` 可达），故走单值漏斗（JSON 回显口径）。
+        return git_url_for_display(value) if source_field else sanitize_value_for_diagnostics(value, json_safe=True)
     if depth >= _MAX_ERROR_DEPTH:
         return _safe_repr(value)
     if isinstance(value, Mapping):
         return {
-            (redact_git_urls_in_text(key) if isinstance(key, str) else key): _redact_error_value(
+            (sanitize_value_for_diagnostics(key, json_safe=True) if isinstance(key, str) else key): _redact_error_value(
                 item,
                 source_field=source_field or _is_source_field(key),
                 depth=depth + 1,
