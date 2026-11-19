@@ -465,6 +465,11 @@ _VALUE_VECTORS: list[tuple[str, str, str]] = [
     ("NBSP 劈开 userinfo", "alice:pw\u00a0@host", REDACTED_GIT_SOURCE),
     ("U+2028 劈开 userinfo", "alice:pw\u2028@host", REDACTED_GIT_SOURCE),
     ("全角空格劈开 userinfo", "alice:pw\u3000@host", REDACTED_GIT_SOURCE),
+    # percent-encoded 冒号 / 空格：先 unquote 再判定
+    ("%3A 冒号 + 空格劈开", "alice%3Apw @host", REDACTED_GIT_SOURCE),
+    ("%3A + %20 劈开", "alice%3Apw%20@host", REDACTED_GIT_SOURCE),
+    ("%3A 后空格再接 pw@", "alice%3A pw@host", REDACTED_GIT_SOURCE),
+    ("冒号后多词再 @host", "alice:my pass@host", REDACTED_GIT_SOURCE),
 ]
 
 
@@ -492,3 +497,16 @@ def test_value_sanitizer_does_not_over_mask_prose_like_values() -> None:
 
     for plain in ("note: see @team", "user <skill> must be strict kebab", "/home/u/my-skill/SKILL.md", "C:\\repo\\x"):
         assert V(plain) == plain
+
+
+def test_segment_sanitizer_covers_query_tail_on_bare_basename() -> None:
+    """**basename 无分隔符**（#281 复审 🔴）：单值漏斗的 path-token 谓词不触发 `?`/`#` 遮蔽，
+    segment 漏斗必须补 path 轴；scp-like / 空白劈开仍按整值 fail-closed；合法名逐字保留。"""
+    from a2c_smcp.utils.git_url import sanitize_segment_for_diagnostics as S
+
+    assert S("foo?token=SECRET_Q") == "foo<redacted-source>"
+    assert S("foo#frag") == "foo<redacted-source>"
+    assert S("deploy-token@example.com:org") == REDACTED_GIT_SOURCE
+    assert S("alice:pw @host") == REDACTED_GIT_SOURCE
+    assert S("my-skill") == "my-skill"
+    assert S("alice@corp") == "alice@corp"  # 合法 @ 文件名不误伤

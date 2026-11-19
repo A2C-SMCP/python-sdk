@@ -536,9 +536,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     token，散文轴（scp-like / `scheme:` opaque）与 path 轴均按整体判定。合法路径 / kebab 名
     （`./../escape`、`https://example.com/r.git`、`file:///home/alice@corp/repo.git`）逐字不变。
   - **单值模式的 token 边界不是空白**：`alice:pw @host`（ASCII 空格 / NBSP `U+00A0` / `U+2028` /
-    全角空格 `U+3000`）会被散文轴劈成两半而两半都不命中规则 ⇒ 命中
-    `user:secret<空白>@host` 形态时整值 fail-closed 为 `<redacted-git-source>`（不放宽 path 谓词，
-    避免误伤 `note: see @team` 这类散文）。
+    全角空格 `U+3000`，含 percent-encoded 冒号/空格如 `alice%3A pw@host`、`alice:my pass@host`）会被
+    散文轴劈成两半而两半都不命中规则 ⇒ 命中 `user:secret<空白>…@host` 形态时整值 fail-closed 为
+    `<redacted-git-source>`（判定前先 `unquote`；不放宽 path 谓词，避免误伤 `note: see @team` 这类散文）。
+  - **路径段 / 名字走「单值漏斗 + path 轴」复合**（`sanitize_segment_for_diagnostics`）：basename 天然不含
+    `/`，单值漏斗的 path-token 谓词不会触发 `?`/`#` 遮蔽（`foo?token=…` 会原样回显）——故 segment 漏斗
+    在单值漏斗之后再补 path 轴。user 源非法目录名与 marketplace 的 skill 目录名（4 处落点）均用它。
   - **非法目录名日志保留定位**：只把不可信的 **basename** 过单值漏斗，parent 走 path 轴（段级遮蔽）——
     既不让 `deploy-token@example.com:org` 这类名称外泄，也不让 `…/build:2024/alice@corp/…` 整行失去落点。
   - **取舍（有意，安全优先）**：`_build_user_ref` 两处**整条路径** sink（`SKILL.md` 路径）走单值漏斗，
@@ -556,9 +559,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     正向断言与「好 SKILL 仍被 check」正对照；user 源六处脱敏补真实凭据用例（userinfo 与 scp-like 两种
     形态、换行/TAB 控制字符、DEBUG 路径），并统一补**占位符正向断言**（只断言「不存在」时，删掉脱敏参数
     仍会绿）。
-  - 已知边界（不变）：无法按 URL/路径形态识别的 token 原样保留——裸 token（`glpat-…`）与**无 `/` 的
-    query 形态**（`url?token=…`，如 `{"source": "url?token=…"}`）。放宽 path 谓词会误伤 `why?` 这类散文。
-    另：JSON 感知的保真脱敏（`?`/`#` 截断影响可读性）仍属另案。
+  - 已知边界（不变）：无法按 URL/路径形态识别的 token 原样保留——裸 token（`glpat-…`）与**无分隔符的
+    query 形态**（`url?token=…`，如 `{"source": "url?token=…"}` 这类**对象值**；basename 落点不在其内，
+    已由 segment 漏斗的 path 轴覆盖）。放宽 path 谓词会误伤 `why?` 这类散文。另：JSON 感知的保真脱敏
+    （`?`/`#` 截断影响可读性）仍属另案。
 
 ### Fixed（#270 hostless git URL 与 marketplace 名称派生）
 

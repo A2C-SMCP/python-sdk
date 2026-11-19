@@ -125,6 +125,7 @@ from a2c_smcp.utils.git_url import (
     redact_git_urls_in_text,
     sanitize_git_text,
     sanitize_path_for_diagnostics,
+    sanitize_segment_for_diagnostics,
     sanitize_text_for_diagnostics,
     sanitize_value_for_diagnostics,
 )
@@ -772,7 +773,7 @@ def stage_user_skills(
             logger.error(
                 "user DropIn skill dir name invalid, skipped: %s (%s)",
                 f"{sanitize_path_for_diagnostics(str(skill_dir.parent))}{os.sep}"
-                f"{sanitize_value_for_diagnostics(skill_dir.name)}",
+                f"{sanitize_segment_for_diagnostics(skill_dir.name)}",
                 sanitize_value_for_diagnostics(e.reason),
             )
             continue
@@ -1052,7 +1053,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_value_for_diagnostics(skill_dir.name),
+                    sanitize_segment_for_diagnostics(skill_dir.name),
                     safe_exception_text(e),
                 )
                 continue
@@ -1061,7 +1062,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_value_for_diagnostics(skill_dir.name),
+                    sanitize_segment_for_diagnostics(skill_dir.name),
                 )
                 continue
             try:
@@ -1071,7 +1072,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_value_for_diagnostics(skill_dir.name),
+                    sanitize_segment_for_diagnostics(skill_dir.name),
                     sanitize_value_for_diagnostics(e.reason),
                 )
                 continue

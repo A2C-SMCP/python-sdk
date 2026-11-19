@@ -397,10 +397,12 @@ def sanitize_text_for_diagnostics(text: str) -> str:
     return "".join(out)
 
 
-# 单值里的 userinfo 被**空白**劈开（`alice:pw @host`：ASCII 空格 / NBSP（U+00A0）/ U+2028 / 全角空格
-# U+3000）：散文 token 边界就是空白，两半都不命中 userinfo/scp-like 规则。单值模式的 token 边界不该是
-# 空白 —— 按整值 fail-closed（#281 复审）。要求 `:` 前有非空 user 段，避免 `note: see @team` 命中。
-_VALUE_SPLIT_USERINFO_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\:@]*\s+@")
+# 单值里的 userinfo 被**空白**劈开（`alice:pw @host` / `alice: pw@host` / `alice:my pass@host`：ASCII
+# 空格 / NBSP（U+00A0）/ U+2028 / 全角空格 U+3000，含 percent-encoded 冒号/空格）：散文 token 边界就是
+# 空白，两半都不命中 userinfo / scp-like 规则 ⇒ 单值模式按整值 fail-closed（#281 复审）。
+# 判据：`user:` 之后、`@` 之前的**同一段**里出现过空白，且 `@` 紧跟非空白 / 非分隔符串（`note: see @team`
+# 因 `@` 前有空白而不命中；含 `/` 的段走 path 轴，不在此判）。
+_VALUE_SPLIT_USERINFO_RE = re.compile(r"[^\s/\\:@]+:[^\s/\\@]*\s[^\s/\\@]*@")
 
 
 def sanitize_value_for_diagnostics(value: str, *, json_safe: bool = False) -> str:
@@ -419,9 +421,34 @@ def sanitize_value_for_diagnostics(value: str, *, json_safe: bool = False) -> st
     Escapes first (a single value is not prose), treats no whitespace class as a token boundary, and
     emits JSON-safe escapes when asked.
     """
-    if _VALUE_SPLIT_USERINFO_RE.search(value) is not None:
+    if _has_split_userinfo(value):
         return REDACTED_GIT_SOURCE
     return sanitize_text_for_diagnostics(redact_git_urls_in_text(escape_unsafe_chars(value, json_safe=json_safe)))
+
+
+def _has_split_userinfo(value: str) -> bool:
+    """空白劈开的 userinfo 判定（含 percent-encoded 冒号 / 空格）/ Whitespace-split userinfo present.
+
+    ``unquote`` 对孤立代理项可能抛 ``UnicodeEncodeError``——诊断路径不得再抛，失败按原文判定。
+    """
+    try:
+        decoded = unquote(value)
+    except (UnicodeEncodeError, ValueError):  # pragma: no cover - 非法百分号 / 代理项
+        decoded = value
+    return _VALUE_SPLIT_USERINFO_RE.search(decoded) is not None
+
+
+def sanitize_segment_for_diagnostics(value: str) -> str:
+    """
+    单个**路径段 / 名字**（不含分隔符的不可信值）脱敏 / Sanitize a single path segment or name.
+
+    basename 天然不含 ``/``：单值漏斗的 path-token 谓词不会触发 ``?``/``#`` 遮蔽，故再补 path 轴兜底
+    （``foo?token=…`` → ``foo<redacted-source>``）。顺序：单值漏斗先把 scp-like / 空白劈开整值
+    fail-closed，残余的 ``?``/``#`` 尾部再由 path 轴截断。
+    A basename has no separator, so the value funnel's path-token predicate never fires — compose the
+    path axis on top for the ``?``/``#`` tail.
+    """
+    return sanitize_path_for_diagnostics(sanitize_value_for_diagnostics(value))
 
 
 def sanitize_git_text(text: str, args: Sequence[str]) -> str:
