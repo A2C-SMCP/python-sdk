@@ -519,6 +519,58 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     不回显原值，对齐 rust `entry_plugin_name`）；`locate_plugin_root` 在 clone/rmtree 之前补
     `is_within(ext_dir.resolve(), home.resolve())` 纵深守卫。显式 `plugin install` 路径本已校验，不受影响。
 
+### Fixed（#281 source 脱敏收尾）
+
+- **`SkillSourceError` 字符串形态的构造期脱敏不完整**（#281，安全；#263/#272 终审 4🟡 收口）：
+  字符串 `raw` 只做散文 token 级 `redact_git_urls_in_text`，没有 path/query 轴 ⇒
+  `SkillSourceError("x/r.git?token=SECRET#f", …)` 的 `.raw` / `str(e)` 仍带凭据。类 docstring「消费者无需
+  打补丁」的承诺因此不成立——仓内 sink 全靠 `safe_exception_text` 兜住，新增消费点会重新开洞。
+  - 修法：新增单一漏斗 **`utils.git_url.sanitize_value_for_diagnostics()`**（`escape_unsafe_chars` →
+    `redact_git_urls_in_text` → `sanitize_text_for_diagnostics`），**单个不可信值**（非散文）走它。
+    本单迁移的站点：字符串 `raw` / `reason`、对象形态 raw 的**每个字符串值与字典键**（`{"path":
+    "../x/r.git?token=…"}` 可达；`json_safe` 口径保证 JSON 合法）、`stage_user_skills` 的目录名与
+    `reason`、`_build_user_ref` 的 `SKILL.md` 路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径、
+    marketplace clone 的 skill 目录名与 `reason`。
+    `escape_unsafe_chars` **必须最先**：散文口径按设计**保留**换行与空白（单值里的换行可伪造日志行），
+    且不先转义时 `alice:pw\n@host` 会被切成两半而两半都不命中任何规则（漏遮）；先转义后整串退回单
+    token，散文轴（scp-like / `scheme:` opaque）与 path 轴均按整体判定。合法路径 / kebab 名
+    （`./../escape`、`https://example.com/r.git`、`file:///home/alice@corp/repo.git`）逐字不变。
+  - **单值模式的 token 边界不是空白**：`alice:pw @host`（ASCII 空格 / NBSP `U+00A0` / `U+2028` /
+    全角空格 `U+3000`，含 percent-encoded 冒号/空格如 `alice%3A pw@host`、`alice:my pass@host`）会被
+    散文轴劈成两半而两半都不命中规则 ⇒ 命中 `user:secret<空白>…@host` 形态时整值 fail-closed 为
+    `<redacted-git-source>`（判定前先 `unquote`；不放宽 path 谓词，避免误伤 `note: see @team` 这类散文）。
+  - **路径段 / 名字走「单值漏斗 + path 轴」复合**（`sanitize_segment_for_diagnostics`）：basename 天然不含
+    `/`，单值漏斗的 path-token 谓词不会触发 `?`/`#` 遮蔽（`foo?token=…` 会原样回显）——故 segment 漏斗
+    在单值漏斗之后再补 path 轴。user 源非法目录名与 marketplace 的 skill 目录名（4 处落点）均用它。
+  - **非法目录名日志保留定位**：只把不可信的 **basename** 过单值漏斗，parent 走 path 轴（段级遮蔽）——
+    既不让 `deploy-token@example.com:org` 这类名称外泄，也不让 `…/build:2024/alice@corp/…` 整行失去落点。
+  - **取舍（有意，安全优先）**：`_build_user_ref` 两处**整条路径** sink（`SKILL.md` 路径）走单值漏斗，
+    含「冒号早于 `@`」的普通路径（`…/build:2024/alice@corp/…`、Windows `C:\Users\alice@corp\…`）会被整串
+    遮为 `<redacted-git-source>`——该行仍有同行的 `%r` 名称标识。
+  - **未迁移（既有面，follow-up）**：`validator._Collector.rel()` 的 `issue.file`/`checked` 与 manifest
+    override 路径仍是 path-only 轴（scp-like 段不识别）；改它们会变更 `plugin validate` 的既有诊断
+    形状，不属本单。home / watcher 的 DEBUG 路径同理。
+  - `stage_user_skills` 非法目录名 ERROR 不再裸传 `Path`：scp-like 目录名（`deploy-token@example.com:org`）
+    与换行/TAB 形态均被遮蔽或转义（`sanitize_path_for_diagnostics` 不识别 scp-like，故统一走上述漏斗）。
+  - `parse_skill_frontmatter` 的 PyYAML 错误改走 `safe_exception_text`：其错误文本会回显出错行片段
+    （远端 SKILL.md 的凭据 URL）。`plugin validate` 与 staging 两条路径同时受益。
+  - 测试加固：decode 诊断三处恒真断言（`assert "\xff" not in text`——`UnicodeDecodeError.__str__` 只含
+    ASCII `0xff`）改为 `<undecodable content (non-UTF-8)>` 精确文案；validator 三处 decode 用例补固定文案
+    正向断言与「好 SKILL 仍被 check」正对照；user 源六处脱敏补真实凭据用例（userinfo 与 scp-like 两种
+    形态、换行/TAB 控制字符、DEBUG 路径），并统一补**占位符正向断言**（只断言「不存在」时，删掉脱敏参数
+    仍会绿）。
+  - **空白的取舍（有意，安全优先）**：判据无法区分 `alice: pw@host`（被空白劈开的 userinfo）与
+    `contact: alice@example.com`（普通散文），故一律 fail-closed（整值遮）；`note: see @team`
+    （`@` 前有空白）仍逐字保留，已入反例向量。
+  - 已知边界（不变）：无法按 URL/路径形态识别的 token 原样保留——裸 token（`glpat-…`）与**无分隔符的
+    query 形态**（`url?token=…`，如 `{"source": "url?token=…"}` 这类**对象值**；basename 落点不在其内，
+    已由 segment 漏斗的 path 轴覆盖）。放宽 path 谓词会误伤 `why?` 这类散文。
+  - 已知边界（既有，**非本单引入**，另案）：**percent-encoded 分隔符**把 userinfo 劈开时仍原样保留
+    （如 `alice:pw%2Fmore @host` / `alice:pw%5Cmore @host`：`unquote` 后含 `/`/`\`，被段判据排除）；
+    `frontmatter.name` 的 DEBUG 回显同理——该 sink 走单值漏斗，`name: foo?token=…` 形态无分隔符、
+    path 谓词不触发（改为 segment 漏斗会动这一行的行为面，留待另案）。
+  - JSON 感知的保真脱敏（`?`/`#` 截断影响可读性）仍属另案。
+
 ### Fixed（#270 hostless git URL 与 marketplace 名称派生）
 
 - **hostless ssh/git/http(s) URL 通过校验，凭据被 slug 进 marketplace 注册名**（#270，安全）：注册名会进入

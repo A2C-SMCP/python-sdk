@@ -43,6 +43,7 @@ from a2c_smcp.utils.git_url import (
     git_url_for_display,
     redact_git_urls_in_text,
     sanitize_text_for_diagnostics,
+    sanitize_value_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -78,9 +79,12 @@ def _is_source_field(key: object) -> bool:
 
 
 def _safe_repr(value: object) -> str:
-    """`repr` 兜底且自身不可抛（深嵌套会让 ``repr`` 再爆 ``RecursionError``）/ Never-raising repr fallback."""
+    """`repr` 兜底且自身不可抛（深嵌套会让 ``repr`` 再爆 ``RecursionError``）/ Never-raising repr fallback.
+
+    ``repr`` 里同样可能嵌 scheme-less ``path?token=…``（#281 复审）→ 与单值同漏斗（JSON 回显口径）。
+    """
     try:
-        return redact_git_urls_in_text(repr(value))
+        return sanitize_value_for_diagnostics(repr(value), json_safe=True)
     except Exception:  # noqa: BLE001 - 错误展示路径禁止再抛（含自定义 __repr__ / 超深递归）
         return REDACTED_GIT_SOURCE
 
@@ -97,12 +101,14 @@ def _redact_error_value(value: object, *, source_field: bool = False, depth: int
     **字典键同样脱敏**：键名由配置作者任意指定，同属不可信回显面。
     """
     if isinstance(value, str):
-        return git_url_for_display(value) if source_field else redact_git_urls_in_text(value)
+        # #281 复审：非 source 字段的字符串值同样是**单个不可信值**——散文轴漏 scheme-less
+        # `path?token=…`（`{"path": "../x/r.git?token=…"}` 可达），故走单值漏斗（JSON 回显口径）。
+        return git_url_for_display(value) if source_field else sanitize_value_for_diagnostics(value, json_safe=True)
     if depth >= _MAX_ERROR_DEPTH:
         return _safe_repr(value)
     if isinstance(value, Mapping):
         return {
-            (redact_git_urls_in_text(key) if isinstance(key, str) else key): _redact_error_value(
+            (sanitize_value_for_diagnostics(key, json_safe=True) if isinstance(key, str) else key): _redact_error_value(
                 item,
                 source_field=source_field or _is_source_field(key),
                 depth=depth + 1,
@@ -125,7 +131,9 @@ def redact_source_display(raw: object) -> str:
     路径塞进消息（``://`` 会被路径归一折叠成 ``/``，token 级脱敏随即失效）。
     """
     if isinstance(raw, str):
-        return escape_unsafe_chars(redact_git_urls_in_text(raw))
+        # #281：字符串形态同样要过 path-token 轴——无 scheme 的 `x/r.git?token=…#…` 只有它能识别；
+        # ``raw`` 是**单个不可信值**（不是散文），控制字符必须先转义（见 helper 文档）。
+        return sanitize_value_for_diagnostics(raw)
     try:
         # 每个字符串值/键已在 _redact_error_value 内脱敏；此处**不再**对整段 JSON 做散文脱敏——
         # token 边界是空白，JSON 的引号/逗号会被吞进 URL token 而把回显改写成 percent-encoded 乱码。
@@ -166,16 +174,22 @@ class SkillSourceError(ValueError):
     Caught by staging and handled per the failure-isolation rule (logged ERROR, not registered, does
     not block other sources). Carries no protocol code.
 
-    安全（#263）/ Security：脱敏在**构造期**完成（对齐 rust `SkillSourceError::new`）——``raw`` 与
+    安全（#263 / #281）/ Security：脱敏在**构造期**完成（对齐 rust `SkillSourceError::new`）——``raw`` 与
     ``reason`` 存的是已脱敏文本，``str(e)`` / traceback / 日志 / ``plugin validate`` 诊断因此自动安全，
     消费者无需各自打补丁。``raw`` 口径为紧凑 JSON（对象形态）或原字符串（字符串形态），与 rust 同形。
     Redaction happens at construction time: ``raw`` and ``reason`` hold already-redacted text, so every
     consumer (logs, validator diagnostics, CLI errors, tracebacks) is safe without extra patches.
+
+    **已知边界**（#281 复审，不变）：无法按 URL / 路径形态识别的 token 原样保留——裸 token
+    （``glpat-…``）与**无 ``/`` 的 query 形态**（``url?token=…``）不在 path-token 判据内（放宽会误伤
+    ``why?`` 这类散文）。Known boundary: tokens with no URL/path shape (bare tokens, ``url?token=…``
+    without a slash) are left as-is — widening the predicate would mangle ordinary prose.
     """
 
     def __init__(self, raw: object, reason: str) -> None:
         self.raw: str = redact_source_display(raw)
-        self.reason: str = escape_unsafe_chars(redact_git_urls_in_text(reason))
+        # #281：reason 与 raw 同口径（raise site 可能把 source 拼进 reason）。
+        self.reason: str = sanitize_value_for_diagnostics(reason)
         super().__init__(f"invalid skill source {self.raw}: {self.reason}")
 
 

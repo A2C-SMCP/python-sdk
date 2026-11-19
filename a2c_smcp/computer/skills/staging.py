@@ -125,7 +125,9 @@ from a2c_smcp.utils.git_url import (
     redact_git_urls_in_text,
     sanitize_git_text,
     sanitize_path_for_diagnostics,
+    sanitize_segment_for_diagnostics,
     sanitize_text_for_diagnostics,
+    sanitize_value_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
@@ -187,7 +189,8 @@ def parse_skill_frontmatter(skill_md_text: str) -> dict[str, Any]:
             try:
                 data = yaml.safe_load(block)
             except yaml.YAMLError as e:
-                logger.error("SKILL.md frontmatter YAML parse failed: %s", e)
+                # #281：PyYAML 错误文本会回显出错行片段（远端 SKILL.md 的凭据 URL）——统一走诊断脱敏漏斗。
+                logger.error("SKILL.md frontmatter YAML parse failed: %s", safe_exception_text(e))
                 return {}
             return data if isinstance(data, dict) else {}
     return {}
@@ -677,14 +680,21 @@ def _iter_user_skill_dirs(root: Path) -> Iterator[Path]:
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             if child.name == SKILL_MD:  # 根下直接的 <root>/SKILL.md（无 <skill>/ 包装）→ 非发现单元
-                logger.debug("user DropIn ignoring SKILL.md directly under root (not in a skill dir): %s", child)
+                logger.debug(
+                    "user DropIn ignoring SKILL.md directly under root (not in a skill dir): %s",
+                    sanitize_value_for_diagnostics(str(child)),
+                )
             continue
         if (child / SKILL_MD).is_file():
             yield child  # 一级 SKILL 包，不深入其内部
         else:
             # wrapper 目录无直接 SKILL.md：补扫深层 SKILL.md 仅为记 DEBUG（不进入有效包，故仅扫此异常分支）
             for deeper in sorted(child.rglob(SKILL_MD)):
-                logger.debug("user DropIn ignoring SKILL.md not at one-level depth under %s: %s", root, deeper)
+                logger.debug(
+                    "user DropIn ignoring SKILL.md not at one-level depth under %s: %s",
+                    sanitize_value_for_diagnostics(str(root)),
+                    sanitize_value_for_diagnostics(str(deeper)),
+                )
 
 
 def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
@@ -707,7 +717,7 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         logger.error(
             "user SKILL %r SKILL.md unreadable, skipped: %s (%s)",
             redact_git_urls_in_text(name),
-            sanitize_path_for_diagnostics(str(skill_md)),
+            sanitize_value_for_diagnostics(str(skill_md)),
             safe_exception_text(e),
         )
         return None
@@ -716,7 +726,7 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         logger.error(
             "user SKILL %r frontmatter missing required 'description', skipped: %s",
             redact_git_urls_in_text(name),
-            sanitize_path_for_diagnostics(str(skill_md)),
+            sanitize_value_for_diagnostics(str(skill_md)),
         )
         return None
     fm_name = frontmatter.get("name")
@@ -724,7 +734,7 @@ def _build_user_ref(name: str, skill_dir: Path) -> A2CSkillRef | None:
         logger.debug(
             "user SKILL dir basename %r != frontmatter.name %r; basename is authoritative (in-place addressing)",
             redact_git_urls_in_text(name),
-            sanitize_text_for_diagnostics(str(fm_name)),
+            sanitize_value_for_diagnostics(str(fm_name)),
         )
     ref: A2CSkillRef = {
         "name": name,
@@ -756,7 +766,17 @@ def stage_user_skills(
         try:
             name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
         except SkillNameError as e:
-            logger.error("user DropIn skill dir name invalid, skipped: %s (%s)", skill_dir, e.reason)
+            # #281：不可信的只有 basename（scp-like / userinfo / 控制字符 / query 尾部）；parent 是可信落点。
+            # parent 走 path 轴（段级遮蔽、保留其余部分）；basename 走 **segment 漏斗**（单值漏斗 + path 轴：
+            # basename 无分隔符，path-token 谓词不触发 `?`/`#` 遮蔽，须复合才能遮尾部）——
+            # 若整条走单值漏斗，`…/build:2024/alice@corp/…` 这类普通路径会被整串遮掉、ERROR 行失去定位。
+            # 不裸传 Path；reason 走单值漏斗（今天是固定文案，属潜伏口）。
+            logger.error(
+                "user DropIn skill dir name invalid, skipped: %s (%s)",
+                f"{sanitize_path_for_diagnostics(str(skill_dir.parent))}{os.sep}"
+                f"{sanitize_segment_for_diagnostics(skill_dir.name)}",
+                sanitize_value_for_diagnostics(e.reason),
+            )
             continue
         ref = _build_user_ref(name, skill_dir)
         if ref is None:
@@ -1034,7 +1054,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill %r SKILL.md unreadable, skipped: %s",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_path_for_diagnostics(skill_dir.name),
+                    sanitize_segment_for_diagnostics(skill_dir.name),
                     safe_exception_text(e),
                 )
                 continue
@@ -1043,7 +1063,7 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill %r missing frontmatter 'description', skipped",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_path_for_diagnostics(skill_dir.name),
+                    sanitize_segment_for_diagnostics(skill_dir.name),
                 )
                 continue
             try:
@@ -1053,15 +1073,15 @@ def _scan_and_register_plugin_skills(
                     "marketplace %r plugin %r skill name synthesis failed, skipped: %s (%s)",
                     redact_git_urls_in_text(marketplace),
                     redact_git_urls_in_text(plugin_name),
-                    sanitize_path_for_diagnostics(skill_dir.name),
-                    sanitize_text_for_diagnostics(e.reason),
+                    sanitize_segment_for_diagnostics(skill_dir.name),
+                    sanitize_value_for_diagnostics(e.reason),
                 )
                 continue
             if name in seen:
                 logger.error(
                     "duplicate marketplace SKILL name within staging run, keeping first: %s (%s)",
                     redact_git_urls_in_text(name),
-                    sanitize_path_for_diagnostics(str(skill_dir)),
+                    sanitize_value_for_diagnostics(str(skill_dir)),
                 )
                 continue
             seen.add(name)
