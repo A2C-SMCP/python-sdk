@@ -1344,7 +1344,8 @@ def _record_known_marketplace(
     值等价时**不改记录内容**（``update_known_marketplaces`` 仍会重写同一份 JSON——本层无「跳过写」语义）。
 
     :return: ``False`` = 身份判据拒写（调用方 MUST 跳过注册——否则 registry 会出现 ``list/info`` 里不存在的
-        marketplace，reconcile / remove 均无法清理）；``True`` = 已写 / 无需写 / 写失败（降级继续）。
+        marketplace，reconcile / remove 均无法清理）；**拒写 ∧ 落盘失败同为 ``False``**（不得翻回可注册）。
+        ``True`` = 已写 / 无需写 / 无拒写前提下的写失败（降级继续）。
     :param guard_identity: **复用路径必开**（#260 独立审查 🟡2）。复用分支没有经过提交点，若直接写账本可造出
         两种坏态：①把既有记录的 ``source`` 静默改成新值，而盘上 clone 仍是旧库；②为同一 source 新建**第二个**
         名字的注册。故写前做无 swap 的最小判据——既有记录 source 不同 → 拒写；无既有记录但同源已挂在别的

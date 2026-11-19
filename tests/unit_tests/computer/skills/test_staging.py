@@ -1998,7 +1998,7 @@ async def test_marketplace_skill_dir_name_credential_like_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     bad_dir = repo / "plugins" / "audit" / "skills" / "deploy-token@example.com:org"
     bad_dir.mkdir(parents=True)
@@ -2028,7 +2028,7 @@ async def test_marketplace_skill_dir_name_query_tail_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     bad_dir = repo / "plugins" / "audit" / "skills" / "foo?token=SECRET_Q"
     bad_dir.mkdir(parents=True)
@@ -2062,7 +2062,7 @@ async def test_marketplace_skill_md_unreadable_dir_name_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     bad_dir = repo / "plugins" / "audit" / "skills" / "foo?token=SECRET_Q"
     bad_dir.mkdir(parents=True)
@@ -2094,7 +2094,7 @@ async def test_marketplace_duplicate_skill_dir_path_redacted(
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
         json.dumps(
-            {"plugins": [{"name": "audit", "source": "./plugins/a"}, {"name": "audit", "source": "./plugins/b"}]}
+            {"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/a"}, {"name": "audit", "source": "./plugins/b"}]}
         ),
         encoding="utf-8",
     )
@@ -2142,18 +2142,19 @@ async def test_marketplace_invalid_name_log_redacts_path_credentials(
 
 
 @pytest.mark.asyncio
-async def test_marketplace_invalid_source_log_redacts_path_credentials(
+async def test_marketplace_invalid_source_log_hits_source_branch(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
 ) -> None:
-    """终审 🔴 回归锁（另一入口）：非法 source 的日志同样按账本键脱敏。"""
+    """
+    覆盖率锁（`:1744` 非法 source 分支）：**合法 kebab name** + 非法 source 才能真正走到该分支——
+    用凭据样 name 会被前面的 `is_valid_marketplace_name` 先拒，永远到不了这里（旧用例是盲的）。
+    该分支的 name 已过严格 kebab 校验，故不含凭据样文本。
+    """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     names = await staging_mod.stage_marketplace_skills(
-        "https://host/team/alice:PW_LEAK@example.com/repo.git",
-        {"type": "git", "url": ""},  # 非法 source（空 url）
-        SkillRegistry(),
-        home,
+        "acme", {"type": "git", "url": ""}, SkillRegistry(), home
     )
     assert names == []
     text = _no_secret(staging_logs.records)
-    assert "PW_LEAK" not in text and "alice" not in text
+    assert "has invalid source" in text, "必须命中非法 source 分支（而非 name 校验分支）"

@@ -1070,12 +1070,19 @@ async def test_reuse_refuses_record_when_manifest_unreadable(tmp_path: Path) -> 
     home = _home(tmp_path)
     reg = SkillRegistry()
     clone = marketplace_skill_dir(home, "acme-skills")
+    # 合法 JSON、**无顶层 name**（无法证明身份），但含可注册 plugin/SKILL——这样「零注册」只能由守卫造成；
+    # 若用坏 JSON，下游解析同样会挡，断言就是空的（#260 终审 🟡4）。
     (clone / ".tfrobot-plugin").mkdir(parents=True)
-    (clone / ".tfrobot-plugin" / "marketplace.json").write_text("{ not json", encoding="utf-8")
+    (clone / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+    )
+    skill_dir = clone / "plugins" / "audit" / "skills" / "lint"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_skill_md("lint"), encoding="utf-8")
 
     names = await stage_marketplace_skills(
         "acme-skills", _src("https://example.com/acme.git"), reg, home, env=_env(home)
     )
 
-    assert names == [] and reg.active_refs() == []
+    assert names == [] and reg.active_refs() == [], "无 name 的清单不得建立注册、也不得注册 SKILL"
     assert "acme-skills" not in load_known_marketplaces(home=home)["marketplaces"]

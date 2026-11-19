@@ -1384,3 +1384,107 @@ async def test_repl_refresh_marks_dirty_on_tags_only_update(tmp_path: Path, monk
     await marketplace_mod.repl_dispatch(comp, ["marketplace", "refresh", "all"], session=_ReplSession())
 
     assert comp.dirty == 1, "tags-only 更新也必须标脏"
+
+
+# ── #260 终审 🔴：展示面（refresh/list/info）不得回显手编凭据账本键 ─────────────
+_CRED_KEY = "https://host/team/alice:PW_LEAK@example.com/repo.git"
+
+
+def _seed_credential_ledger(home: Path, env: dict[str, str]) -> None:
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                _CRED_KEY: {"source": {"type": "git", "url": "https://example.com/r.git"}, "installLocation": ""},
+                "acme": {"source": {"type": "git", "url": "https://example.com/a.git"}, "installLocation": ""},
+            },
+        },
+        home,
+        env,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_display_redacts_credential_ledger_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """终审 🔴：`refresh --json` 行与 rich 汇总表都不回显账本键里的凭据；干净 kebab 名仍可读。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_credential_ledger(home, env)
+
+    assert await marketplace_refresh(SkillRegistry(), home, env, "all", json_output=True) == 0
+    out = capsys.readouterr().out
+    rows = json.loads(out)
+    names = {row["name"] for row in rows}
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert REDACTED_GIT_SOURCE in names and "acme" in names
+
+    await marketplace_refresh(SkillRegistry(), home, env, "all")
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert "acme" in out
+
+
+def test_list_and_info_redact_credential_ledger_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """终审 🔴：`list` / `info` 的 name 展示面同样走账本键脱敏。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_credential_ledger(home, env)
+
+    marketplace_list(home, env, json_output=True)
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    names = {row["name"] for row in payload}
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert REDACTED_GIT_SOURCE in names and "acme" in names
+
+    marketplace_list(home, env)
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+
+    marketplace_info(home, env, _CRED_KEY, json_output=True)
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert json.loads(out)["name"] == REDACTED_GIT_SOURCE
+
+    marketplace_info(home, env, _CRED_KEY)
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+
+
+def test_stable_text_is_injective_on_known_collisions() -> None:
+    """终审 🟡2 回归锁：旧 `str()` 实现的已知碰撞对必须被区分开。"""
+    from a2c_smcp.computer.cli.commands.marketplace import _stable_text
+
+    pairs = [
+        (["a,b"], ["a", "b"]),
+        (None, "None"),
+        (1, "1"),
+        ({"a": 1}, {"a": "1"}),
+        ([1], ["1"]),
+        ({"a"}, {"a", "b"}),
+        (True, 1),
+    ]
+    for left, right in pairs:
+        assert _stable_text(left) != _stable_text(right), f"{left!r} 与 {right!r} 不应碰撞"
+
+
+def test_stable_text_bounded_on_wide_and_cyclic_metadata() -> None:
+    """
+    终审 🟡3 回归锁：超宽容器（alias bomb 的宽形态，如 ``[0]*200000``）与自引用环都必须在
+    **节点预算**内终止、输出有界——深度封顶挡不住宽容器。
+    """
+    from a2c_smcp.computer.cli.commands.marketplace import _stable_text
+
+    wide = {"metadata": list(range(200_000))}
+    text = _stable_text(wide)
+    assert len(text) < 200_000, f"输出必须有界，实际 {len(text)}"
+
+    cyclic: dict[str, object] = {"x": 1}
+    cyclic["self"] = cyclic
+    assert len(_stable_text(cyclic)) < 10_000

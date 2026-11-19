@@ -64,6 +64,7 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     MarketplaceIdentityError,
     MarketplaceNameChangeError,
     read_manifest_marketplace_name,
+    redact_ledger_key,
     registered_name_for_source,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -500,7 +501,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         console.print_json(
             data=[
                 {
-                    "name": nm,
+                    "name": redact_ledger_key(nm),
                     "url": _display_source_url(rec),
                     "trusted": nm in trusted,  # 信任按 name 判定（§5.3.1）
                     "autoUpdate": bool(rec.get("autoUpdate", False)),
@@ -522,7 +523,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         url = _display_source_url(rec) or ""
         sha = rec.get("commitSha") or ""
         table.add_row(
-            nm,
+            redact_ledger_key(nm),
             url,
             "✓" if nm in trusted else "—",
             "on" if rec.get("autoUpdate") else "off",
@@ -543,7 +544,7 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     plugins = [pid for pid in installed if pid.endswith(f"@{name}")]
     url = _display_source_url(rec)
     info: dict[str, Any] = {
-        "name": name,
+        "name": redact_ledger_key(name),
         "url": url,
         "installLocation": rec.get("installLocation"),
         "commitSha": rec.get("commitSha"),
@@ -555,13 +556,13 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     if json_output:
         console.print_json(data=info)
         return EXIT_OK
-    table = Table(title=f"Marketplace · {name}", show_header=False)
+    table = Table(title=f"Marketplace · {escape(redact_ledger_key(name))}", show_header=False)
     table.add_column("Field", style="bold cyan")
     table.add_column("Value")
     for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
         # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
         table.add_row(k, "" if info[k] is None else str(info[k]))
-    table.add_row("installedPlugins", ", ".join(plugins) if plugins else "—")
+    table.add_row("installedPlugins", ", ".join(escape(redact_ledger_key(pid)) for pid in plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK
 
@@ -652,24 +653,26 @@ async def marketplace_refresh(
     rows: list[dict[str, Any]] = []
     exit_code = EXIT_OK
     for nm in names:
+        # 展示名统一脱敏（账本键可被手编成携带凭据的串）；内部查找 / staging 仍用原值。
+        shown = redact_ledger_key(nm)
         rec = mps.get(nm)
         if rec is None:
-            rows.append({"name": nm, "status": "missing"})
+            rows.append({"name": shown, "status": "missing"})
             continue
         before = rec.get("commitSha")
         try:
-            with clone_spinner(f"Refreshing {nm}...", enabled=not json_output):
+            with clone_spinner(f"Refreshing {shown}...", enabled=not json_output):
                 registered = await stage_marketplace_skills(
                     nm, rec.get("source") or {}, registry, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=True, env=env
                 )
         except MarketplaceNameChangeError as e:
             # 改名拒绝：结构化 outcome，非 updated/unchanged；旧注册与旧能力原样保留。
-            rows.append({"name": nm, "status": "validation", "message": str(e), **e.payload_details()})
+            rows.append({"name": shown, "status": "validation", "message": str(e), **e.payload_details()})
             exit_code = EXIT_USER_ERROR
             continue
         after = _marketplaces(home, env).get(nm) or {}
         status = "updated" if after.get("commitSha") != before else "unchanged"
-        rows.append({"name": nm, "status": status, "skills": len(registered)})
+        rows.append({"name": shown, "status": status, "skills": len(registered)})
 
     if json_output:
         console.print_json(data=rows)
@@ -722,27 +725,114 @@ _FINGERPRINT_FIELDS = (
 )
 
 _STABLE_MAX_DEPTH = 6
+# 单字段的**节点预算**：`skill_metadata` 是 frontmatter 原样透传，YAML alias 可把结构放大到指数级
+# （#260 终审 🟡3：261B 输入 → 1.42MB/0.09s，分支 50 时节点数 ~1.5e10）。预算耗尽即截断，保证
+# `_registry_fingerprints` 在 async 处理器里的同步开销有界。
+_STABLE_NODE_BUDGET = 512
+_TRUNCATED = "<truncated>"
 
 
-def _stable_text(value: Any, _depth: int = 0) -> str:
+class _StableBudget:
+    """一次深度遍历的共享预算 + 环检测（同一对象在多分支出现属 DAG，允许复用）。"""
+
+    __slots__ = ("remaining", "active")
+
+    def __init__(self) -> None:
+        self.remaining = _STABLE_NODE_BUDGET
+        self.active: set[int] = set()
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _stable_text(value: Any, budget: _StableBudget | None = None, _depth: int = 0) -> str:
     """
-    任意 JSON-ish 值的**稳定字符串化**（键序稳定、拒绝不可控异常）/ Stable text for arbitrary values.
+    任意 JSON-ish 值的**稳定且可判别**字符串化 / Stable, discriminating text for arbitrary values.
 
-    用于指纹：容器递归到 ``_STABLE_MAX_DEPTH`` 封顶（自引用环因此终止），映射按键的稳定文本排序
-    （非 str 键不会触发 ``TypeError``），未知类型退化为类型名。
+    #260 终审 🟡2–3：早期实现用 ``str()`` 序列化容器，**非单射**——``["a,b"]`` 与 ``["a","b"]``、
+    ``None`` 与 ``"None"``、``1`` 与 ``"1"``、``{"a":1}`` 与 ``{"a":"1"}`` 都会碰撞（漏标脏）。现在：
+
+    - 标量带**类型前缀**（``s`` + ``repr`` / ``int:`` / ``float:`` / ``bool:`` / ``null``）；
+    - 容器带**类型标签 + 元素数 + 定界符**，映射键按序列化结果排序（非 str 键安全）；
+    - 深度与**节点预算**双封顶（:data:`_STABLE_MAX_DEPTH` / :data:`_STABLE_NODE_BUDGET`），并用
+      ``id()`` 活动集做环检测 → alias bomb / 自引用都有界；
+    - 集合按序列化结果排序（无序容器也稳定）。
     """
-    if _depth >= _STABLE_MAX_DEPTH:
-        return "<max-depth>"
+    budget = budget if budget is not None else _StableBudget()
+    if _depth >= _STABLE_MAX_DEPTH or not budget.take():
+        return _TRUNCATED
     if isinstance(value, str):
-        return value
-    if value is None or isinstance(value, (bool, int, float)):
-        return str(value)
+        return "s" + repr(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool:1" if value else "bool:0"
+    if isinstance(value, int):
+        return "int:" + str(value)
+    if isinstance(value, float):
+        return "float:" + repr(value)
     if isinstance(value, Mapping):
-        items = sorted(((_stable_text(k, _depth + 1), _stable_text(v, _depth + 1)) for k, v in value.items()))
-        return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
+        if id(value) in budget.active:
+            return "<cycle>"
+        budget.active.add(id(value))
+        try:
+            rendered: list[str] = []
+            truncated = False
+            for key, item in value.items():
+                if budget.remaining <= 0:
+                    truncated = True
+                    break
+                rendered.append(
+                    _stable_text(key, budget, _depth + 1) + "=" + _stable_text(item, budget, _depth + 1)
+                )
+        finally:
+            budget.active.discard(id(value))
+        body = ";".join(sorted(rendered))
+        if truncated:
+            body = f"{body};{_TRUNCATED}" if body else _TRUNCATED
+        return f"map[{len(value)}]{{{body}}}"
     if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_stable_text(item, _depth + 1) for item in value) + "]"
-    return type(value).__name__
+        if id(value) in budget.active:
+            return "<cycle>"
+        budget.active.add(id(value))
+        try:
+            rendered = []
+            truncated = False
+            for item in value:
+                if budget.remaining <= 0:
+                    truncated = True
+                    break
+                rendered.append(_stable_text(item, budget, _depth + 1))
+        finally:
+            budget.active.discard(id(value))
+        body = ";".join(rendered)
+        if truncated:
+            body = f"{body};{_TRUNCATED}" if body else _TRUNCATED
+        tag = "list" if isinstance(value, list) else "tuple"
+        return f"{tag}[{len(value)}]{{{body}}}"
+    if isinstance(value, (set, frozenset)):
+        if id(value) in budget.active:
+            return "<cycle>"
+        budget.active.add(id(value))
+        try:
+            rendered = []
+            truncated = False
+            for item in value:
+                if budget.remaining <= 0:
+                    truncated = True
+                    break
+                rendered.append(_stable_text(item, budget, _depth + 1))
+        finally:
+            budget.active.discard(id(value))
+        body = ";".join(sorted(rendered))
+        if truncated:
+            body = f"{body};{_TRUNCATED}" if body else _TRUNCATED
+        tag = "set" if isinstance(value, set) else "frozenset"
+        return f"{tag}[{len(value)}]{{{body}}}"
+    return "obj:" + type(value).__name__
 
 
 def _registry_fingerprints(registry: SkillRegistry) -> frozenset[tuple[tuple[str, str], ...]]:
