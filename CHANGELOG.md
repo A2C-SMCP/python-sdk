@@ -619,6 +619,23 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     #263 / PR #276 修复，且 **#276 已先合入 develop（`319847c`）**——`SkillSourceError` 构造期脱敏已覆盖
     本单新增的输入，无需另等。
 
+### Fixed（#275 legacy 账本 scoped 卸载残留 + uninstall 失败序）
+
+- **legacy 账本记录的 scoped 卸载不再留下 skills / clone 残留**：库层 `uninstall_plugin(..., scope=...)`（含嵌入
+  宿主经公开 API 的调用；CLI 不暴露 `--scope`，见下条触发面）的「存活记录」判据改与落盘视图同源——
+  含 `bundledMcpServers` 的 v0.2.x 旧格式记录按协议 §4.9.1-4 会被整条 sweep，
+  故**不再算作**「其余 scope 仍安装」的证据。此前该场景会留下账本/意图/enabled 全清、而同进程 registry
+  仍注册其 skills（可硬挡换源 enable）、plugin 独占外部 clone 无人引用（后续 `uninstall` 已 no-op、`gc`
+  只遍历账本 pid ⇒ 持久磁盘泄漏）的自相矛盾终态。判据以 `store.is_legacy_ledger_record` 单点导出，
+  sweep 本体与 clone 门控 / server 回收 / skills 注销共用，避免两处谓词漂移。
+- **`uninstall` 失败序：skills 注销后置到 `remove_server` 之后**（`§5.5`）：停摘 server 是本函数唯一可达的
+  可抛外部调用（`McpStartGateClosed` 关闸 / 状态机 / 传输异常）。原顺序下它一抛就是「账本说已安装、技能已丢」
+  半态；新顺序失败时账本、意图、技能一律原样保留，重试即可收敛（已删 clone 的重试按「缺失即视为已删除」）。
+  **非 best-effort**：吞掉停摘失败再提交账本会把「plugin 已卸但 server 仍可调用」写死。
+- 触发面：**库层 / 嵌入宿主的 scoped uninstall**——CLI 的 `plugin uninstall` / `marketplace remove` 均不传
+  `scope`；v0.2.x 账本在首次成功 boot 的治理恢复中通常已被整体重物化，窗口为「升级后未成功 boot + 库层 scoped
+  卸载」。`gc_plugins` 的同款失败序不在本单范围（另案）。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

@@ -370,6 +370,20 @@ def _coerce_known_marketplaces(data: Mapping[str, Any], path: Path) -> KnownMark
     return {"version": MATERIALIZED_VERSION, "marketplaces": marketplaces}
 
 
+def is_legacy_ledger_record(record: object) -> bool:
+    """
+    该账本记录是否会被 legacy sweep **整条丢弃**（协议 §4.9.1-4）/ Whether the sweep drops this ledger record。
+
+    单一权威：:func:`_drop_legacy_mcp_dep_records` 本体与「写入后该记录是否还存在」的**存活判据**共用本谓词
+    （#275：``installer.uninstall_plugin`` 的 ``retained`` 经它剔除旧格式记录——原始视图（``drop_legacy=False``）
+    里它们还在，落盘视图里已不在；两边判据分叉会让 scoped uninstall 留下 skills / 外部 clone 残留）。
+
+    判据同 sweep 本体：**含** ``_LEGACY_MCP_DEPS_KEY`` 键即旧格式；非 ``Mapping`` 记录与非法结构原样透传，
+    故返回 ``False``（不被 sweep 丢弃）。
+    """
+    return isinstance(record, Mapping) and _LEGACY_MCP_DEPS_KEY in record
+
+
 def _drop_legacy_mcp_dep_records(plugins: dict[str, Any], path: Path) -> dict[str, Any]:
     """
     丢弃旧格式（``bundledMcpServers`` = display name 数组）的账本记录（协议 §4.9.1-4，#153）/ Drop legacy records。
@@ -388,7 +402,7 @@ def _drop_legacy_mcp_dep_records(plugins: dict[str, Any], path: Path) -> dict[st
         if not isinstance(records, list):
             out[pid] = records  # 非法结构原样透传（与本模块既有容错姿态一致，不在此处收敛）
             continue
-        kept = [r for r in records if not (isinstance(r, Mapping) and _LEGACY_MCP_DEPS_KEY in r)]
+        kept = [r for r in records if not is_legacy_ledger_record(r)]
         if len(kept) != len(records):
             logger.warning(
                 "Ledger record(s) for %r in %s use the legacy %r (display-name) format; discarded and will be "
