@@ -156,7 +156,8 @@ async def test_reconcile_source_change_rejected_without_wipe(tmp_path: Path, mon
 
     report = await reconcile(SkillRegistry(), home, declared)
 
-    assert report.validation == {"acme": "source-conflict"}
+    assert report.validation["acme"].reason == "source-conflict"
+    assert set(report.validation) == {"acme"}
     assert report.updated == [] and report.installed == [] and report.failed == []
     assert calls == [], "换源被拒时不得进入 stage/重 clone"
     assert (clone / "SENTINEL").exists(), "旧 catalog clone 不得被 wipe"
@@ -185,7 +186,8 @@ async def test_reconcile_source_change_does_not_touch_symlinked_clone(tmp_path: 
 
     report = await reconcile(reg, home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
 
-    assert report.validation == {"acme": "source-conflict"}
+    assert report.validation["acme"].reason == "source-conflict"
+    assert set(report.validation) == {"acme"}
     assert report.failed == [] and report.updated == [] and report.installed == []
     assert calls == []
     assert link.is_symlink() and sentinel.exists(), "拒绝路径不得尝试删除（链接与目标均保留）"
@@ -447,7 +449,8 @@ async def test_reconcile_source_change_never_calls_rmtree(tmp_path: Path, monkey
 
     report = await reconcile(SkillRegistry(), home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_B}}})
 
-    assert report.validation == {"acme": "source-conflict"}
+    assert report.validation["acme"].reason == "source-conflict"
+    assert set(report.validation) == {"acme"}
     assert rmtree_calls == [], "换源拒绝不得尝试删除任何目录"
     assert calls == []
 
@@ -901,5 +904,6 @@ async def test_reconcile_rename_rejection_goes_to_validation_not_failed(tmp_path
 
     report = await reconcile(SkillRegistry(), home, {"extraKnownMarketplaces": {"acme": {"source": _SRC_A, "autoUpdate": True}}})
 
-    assert report.validation == {"acme": "manifest-name-changed"}
+    assert report.validation["acme"].reason == "manifest-name-changed"
+    assert report.validation["acme"].details == {"name": "acme"}, "拒绝须带结构化诊断，不能只是名字列表"
     assert report.failed == [] and report.updated == [] and report.up_to_date == []

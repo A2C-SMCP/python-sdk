@@ -44,6 +44,7 @@ import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_valid_marketplace_name
 from a2c_smcp.computer.settings.store import (
@@ -61,7 +62,7 @@ from a2c_smcp.computer.skills.manifest import (
     load_bundled_servers,
     read_marketplace_manifest,
 )
-from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError, same_source
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError, display_source, same_source
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
@@ -79,23 +80,41 @@ logger = get_logger(__name__)
 # 对账报告 / Reconcile report
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
+class ReconcileRejection:
+    """
+    一次 ``validation`` 拒绝（#260 / runtime-contract §5.14）/ One validation rejection.
+
+    **结构化到可判别**：``reason`` 是机器码（``manifest-name-changed`` = 刷新改名拒绝 /
+    ``source-conflict`` = 声明式换源拒绝），``details`` 携带脱敏后的诊断（如 ``manifestName`` /
+    ``baselineManifestName`` / 两侧 source 展示值）。调用方据此区分「改名拒绝」与普通失败，
+    **不要**只按名字列表猜。
+
+    .. note::
+       ``details`` 只放**脱敏值**：账本键 / source 一律过展示原语；不得直接回显原始 URL。
+    """
+
+    reason: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ReconcileReport:
     """
     一次 :func:`reconcile` 的结果（镜像 CC reconcile 返回值；**无 removed** —— additive-only）。
     The result of one :func:`reconcile` run (mirrors CC's return shape; **no removed** — additive-only)。
 
-    各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / skipped 之一；
+    各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / validation / skipped 之一；
     ``registered_skills`` 汇总本次成功注册 / 刷新的全部 SKILL 名（供 watcher / emit diff）。
     """
 
     installed: list[str] = field(default_factory=list)  # 本次新 clone 的 marketplace
     updated: list[str] = field(default_factory=list)  # autoUpdate refresh（#260 起重 clone + 原子换入）
     up_to_date: list[str] = field(default_factory=list)  # 声明且已在、未刷新
-    failed: list[str] = field(default_factory=list)  # 声明但 stage 后 clone 树仍缺失 / refresh 被拒（改名）
+    failed: list[str] = field(default_factory=list)  # 声明但 stage 后 clone 树仍缺失（clone 失败，已降级）
     skipped: list[str] = field(default_factory=list)  # 预留（trust 门控落 #68 / strict 延后 #80）
-    # #260 / §5.14：`validation` 拒绝（name → reason）。声明式换源 MUST 拒绝且**不** wipe——旧注册与旧能力
-    # 保持 active，故不归 `failed`（那会误导为「能力已降级」）。
-    validation: dict[str, str] = field(default_factory=dict)
+    # #260 / §5.14：`validation` 拒绝（name → :class:`ReconcileRejection`）。声明式换源与 refresh 改名
+    # 都 MUST 拒绝且**不** wipe——旧注册与旧能力保持 active，故**不**归 `failed`（那是降级桶）。
+    validation: dict[str, ReconcileRejection] = field(default_factory=dict)
     registered_skills: list[str] = field(default_factory=list)
 
 
@@ -343,7 +362,7 @@ async def reconcile(
     updated: list[str] = []
     up_to_date: list[str] = []
     failed: list[str] = []
-    rejected: dict[str, str] = {}
+    rejected: dict[str, ReconcileRejection] = {}
     registered_skills: list[str] = []
 
     for name, decl in declared_mps.items():
@@ -361,7 +380,13 @@ async def reconcile(
                 "(remove it explicitly to switch the source, runtime-contract §5.14)",
                 name,
             )
-            rejected[name] = "source-conflict"
+            rejected[name] = ReconcileRejection(
+                reason="source-conflict",
+                details={
+                    "existingSource": display_source(record.get("source") if isinstance(record, Mapping) else None),
+                    "declaredSource": display_source(source),
+                },
+            )
             continue
 
         present_before = clone_dir.exists()
@@ -388,7 +413,7 @@ async def reconcile(
                 name,
                 e.reason,
             )
-            rejected[name] = e.reason
+            rejected[name] = ReconcileRejection(reason=e.reason, details=dict(e.details))
             continue
         registered_skills.extend(names)
 

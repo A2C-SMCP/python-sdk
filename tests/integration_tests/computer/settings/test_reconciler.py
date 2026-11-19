@@ -153,7 +153,8 @@ async def test_reconcile_source_changed_rejected_keeps_old_repo(tmp_path: Path) 
         reg, home, {"extraKnownMarketplaces": {"acme-skills": {"source": _src(_url(bare2))}}, **enabled}, env=_env(home)
     )
 
-    assert report.validation == {"acme-skills": "source-conflict"}
+    assert report.validation["acme-skills"].reason == "source-conflict"
+    assert set(report.validation["acme-skills"].details) == {"existingSource", "declaredSource"}
     assert report.updated == [] and report.installed == []
     assert reg.resolve("p:old-skill") is not None, "旧库 SKILL 保持 active（不进入 degraded）"
     assert reg.resolve("p:new-skill") is None, "新库内容不得被注册"
