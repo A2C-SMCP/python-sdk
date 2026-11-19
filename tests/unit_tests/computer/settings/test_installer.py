@@ -937,6 +937,80 @@ async def test_uninstall_scoped_legacy_project_path_prechecked_before_destructiv
     assert load_installed_plugins(home=home, drop_legacy=False)["plugins"]["audit@acme"], "账本未动"
 
 
+async def test_uninstall_retained_nonempty_does_not_precheck_swept_legacy_project_path_275(tmp_path: Path) -> None:
+    """
+    #275 复审 🟡1（反向用例）：``retained`` 非空时**不得**把被 sweep 的 legacy 记录 projectPath 纳入预检。
+
+    末段 enabled 清理被 ``not remaining``（等价 ``not retained``）门控——有存活记录时那层**根本不会被写**。
+    若预检无条件取 ``doomed``，就会为一个不会写的层 fail-closed：同一命令增量前成功、增量后失败，且重试
+    （账本已在）不自愈。故预检面与清理门控同源：``retained`` 非空按 ``targeted``。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    local_dir = tmp_path / "local-proj"
+    local_dir.mkdir()
+    legacy_dir = tmp_path / "legacy-proj"
+    legacy_dir.mkdir()
+    malformed_project = workdir_project_settings_path(legacy_dir)
+    malformed = '{"enabledPlugins": ["not", "an", "object"]}'
+    malformed_project.parent.mkdir(parents=True, exist_ok=True)
+    malformed_project.write_text(malformed, encoding="utf-8")
+    _seed_installed(
+        home,
+        {
+            "audit@acme": [
+                {"scope": "user", "installPath": str(ext)},
+                {"scope": "local", "projectPath": str(local_dir), "installPath": str(ext)},
+                {
+                    "scope": "project",
+                    "projectPath": str(legacy_dir),
+                    "installPath": str(ext),
+                    "bundledMcpServers": [FIGMA_NAME],
+                },
+            ]
+        },
+    )
+    reg = _seed_registry(home, "acme", "audit")
+
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="user", keep_servers=True,
+    ) is True, "retained 非空 ⇒ 不写 project/local 层 ⇒ 其畸形不得 fail-closed"
+
+    assert malformed_project.read_text(encoding="utf-8") == malformed, "该层未被读写（通道未被碰）"
+    remaining = load_installed_plugins(home=home)["plugins"]["audit@acme"]
+    assert [r["scope"] for r in remaining] == ["local"], "存活记录保留；被 sweep 的 legacy 记录消失"
+    assert reg.resolve("audit:lint") is not None, "存活记录仍在 ⇒ 技能保留"
+
+
+async def test_uninstall_pure_legacy_record_does_not_reclaim_by_display_name_275(tmp_path: Path) -> None:
+    """
+    #275 复审 🟡2：纯 legacy 记录（**仅** ``bundledMcpServers``）不产生任何停摘候选。
+
+    旧格式记的是 display **name**（协议 §4.9.1-1 MUST NOT 当身份用）。若将来给 ``ledger_mcp_deps_of`` 加
+    「缺失 ``mcpServers`` 回退 ``bundledMcpServers``」，旧 name 会被当 ``bundle_id`` 停摘——本用例是这条的锁。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    ext.mkdir(parents=True)
+    _seed_installed(
+        home,
+        {"audit@acme": [{"scope": "user", "installPath": str(ext), "bundledMcpServers": [FIGMA_NAME]}]},
+    )
+    reg = _seed_registry(home, "acme", "audit")
+    mcp = _FakeMCP()
+
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=mcp.remove,
+    ) is True
+
+    assert mcp.removed == [], "display name 不得被当作 bundle_id 停摘（§4.9.1-1）"
+    assert len(reg) == 0
+    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
+
+
 async def test_uninstall_reclaim_list_taken_from_ledger_before_tree_removal_275(
     tmp_path: Path, monkeypatch,
 ) -> None:

@@ -1258,10 +1258,13 @@ async def uninstall_plugin(
 
     # ①.5 破坏性动作之前预检待写 settings 的目标键形状（#246 审查 🟡1）：畸形 → 零副作用 fail-closed，
     #      否则会在「已删树」之后才抛错，而重试因账本已空走 no-op → 永远清不干净。
-    #      预检面 = 后续**真的会清**的 enabled 层 ⇒ 与末段同取 ``doomed`` 的 projectPath（漏取会在
-    #      「已删树」之后才撞畸形键）。
+    #      预检面 = 后续**真的会清**的 enabled 层，且门控与末段严格同源：末段仅在 ``not retained``（账本记录
+    #      全部移除、回 available）时才清 project/local 层。故 ``retained`` 非空时按 ``targeted`` 预检（既有口径），
+    #      **不得**把被 sweep 的 legacy 记录 projectPath 纳入——那会为一个根本不会写的层 fail-closed，把增量前
+    #      能成功的卸载变成失败且重试不自愈（#275 复审 🟡1）。
+    precheck_paths = targeted if retained else doomed
     _precheck_settings_writes(
-        {p for r in doomed if isinstance(p := r.get("projectPath"), str) and p},
+        {p for r in precheck_paths if isinstance(p := r.get("projectPath"), str) and p},
         env,
     )
 
