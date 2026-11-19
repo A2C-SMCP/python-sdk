@@ -31,7 +31,7 @@ from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_marketplace_name
 from a2c_smcp.computer.skills.manifest import read_marketplace_manifest
-from a2c_smcp.utils.git_url import known_git_source_for_display
+from a2c_smcp.utils.git_url import diagnostic_url_for_display
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -52,6 +52,8 @@ REASON_SOURCE_CONFLICT = "source-conflict"
 REASON_EXPECTED_NAME_MISMATCH = "expected-name-mismatch"
 REASON_DANGLING_REFERENCES = "dangling-references"
 REASON_UNRESOLVABLE_NAME = "unresolvable-name"
+REASON_INVALID_NAME = "invalid-name"
+REASON_INVALID_SOURCE = "invalid-source"
 
 
 class MarketplaceIdentityError(Exception):
@@ -70,8 +72,13 @@ class MarketplaceIdentityError(Exception):
         self.details: dict[str, Any] = dict(details or {})
 
     def payload_details(self) -> dict[str, Any]:
-        """CLI 结构化输出用的诊断（``code`` = reason）/ Diagnostics for the structured CLI payload."""
-        return {"code": self.reason, **self.details}
+        """
+        CLI / 库消费方的结构化诊断（机读键 ``reason``）/ Diagnostics for structured error payloads.
+
+        **机读键统一用 ``reason``**（不用 ``code``）：plugin 侧 ``_err`` 的 ``code`` 是退出码保留参数，
+        用 ``code`` 会让 enable 路径的改名拒绝丢失机读原因（#260 独立审查 🟡8）。
+        """
+        return {"reason": self.reason, **self.details}
 
 
 class MarketplaceNameChangeError(MarketplaceIdentityError):
@@ -162,9 +169,16 @@ def same_source(left: object, right: object) -> bool:
 
 
 def display_source(source: object) -> str:
-    """source 的**展示值**（去凭据；不可解析 → 占位符）/ Display-safe source for diagnostics."""
+    """
+    source 的**诊断展示值** / Display-safe source for diagnostics.
+
+    走 :func:`~a2c_smcp.utils.git_url.diagnostic_url_for_display`（**错误 / 诊断面单一权威**，与
+    ``marketplace add`` 失败文案同一判据）：去 userinfo / query / fragment，且 path 任一段含凭据样文本
+    （``https://host/team/alice:PW@example.com/repo.git``）一律占位符；scp-like / 不可解析同样占位符。
+    **不可**用于 re-clone。
+    """
     url = source.get("url") if isinstance(source, Mapping) else None
-    return known_git_source_for_display(url)
+    return diagnostic_url_for_display(url)
 
 
 def registered_name_for_source(known: Mapping[str, Any], source: object) -> str | None:

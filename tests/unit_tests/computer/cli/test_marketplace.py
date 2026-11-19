@@ -288,22 +288,30 @@ async def test_add_same_name_same_source_is_idempotent(tmp_path: Path) -> None:
 
 @requires_git
 @pytest.mark.asyncio
-async def test_add_same_name_different_source_rejected(tmp_path: Path) -> None:
+async def test_add_same_name_different_source_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """#260 六景①/D2：同名**不同源** → ``validation`` 拒绝，既有注册/内容不变（不静默替换）。"""
     bare_a = _make_bare(tmp_path / "a", "acme", _marketplace_files())
     bare_b = _make_bare(tmp_path / "b", "acme", _marketplace_files())
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
     assert await marketplace_add(reg, home, env, f"file://{bare_a}", trust=True) == 0
     before = dict(load_known_marketplaces(home, env)["marketplaces"]["acme"])
+    capsys.readouterr()  # 清掉首次 add 的人类可读输出（下面要解析 JSON）
 
-    assert await marketplace_add(reg, home, env, f"file://{bare_b}", trust=True) == 1
+    assert await marketplace_add(reg, home, env, f"file://{bare_b}", trust=True, json_output=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation" and payload["reason"] == "name-conflict"
+    assert payload["name"] == "acme" and payload["existingSource"], "结构化诊断须给旧源与处置"
     after = dict(load_known_marketplaces(home, env)["marketplaces"]["acme"])
     assert after == before, "被拒的换源不得改动既有注册"
 
 
 @requires_git
 @pytest.mark.asyncio
-async def test_add_same_source_different_name_rejected(tmp_path: Path) -> None:
+async def test_add_same_source_different_name_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """#260 裁决 3：同一 source 已以旧名注册时，新名 add → ``validation``，诊断给旧名与处置。"""
     work = tmp_path / "acme-work"
     work.mkdir(parents=True, exist_ok=True)
@@ -317,6 +325,7 @@ async def test_add_same_source_different_name_rejected(tmp_path: Path) -> None:
 
     env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
     assert await marketplace_add(reg, home, env, f"file://{bare}", trust=True) == 0
+    capsys.readouterr()  # 清掉首次 add 的人类可读输出
 
     # 上游把清单改名（同一 source）→ 再次 add 会解析出新名 → 与既有注册同源不同名 → 拒绝
     _write(work, {".tfrobot-plugin/marketplace.json": json.dumps({"name": "acme-renamed", "plugins": []})})
@@ -325,6 +334,9 @@ async def test_add_same_source_different_name_rejected(tmp_path: Path) -> None:
     _git(work, "push", "-q", "origin", "main")
 
     assert await marketplace_add(reg, home, env, f"file://{bare}", trust=True, json_output=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation" and payload["reason"] == "source-conflict"
+    assert payload["existingName"] == "acme", "诊断须给旧名与处置"
     assert list(load_known_marketplaces(home, env)["marketplaces"]) == ["acme"], "不得新增同源第二注册"
 
 
@@ -571,7 +583,7 @@ async def test_no_clone_new_source_rejected(tmp_path: Path, capsys: pytest.Captu
     )
     assert code == 1
     payload = json.loads(capsys.readouterr().out)
-    assert payload["error"] == "validation" and payload["code"] == "unresolvable-name"
+    assert payload["error"] == "validation" and payload["reason"] == "unresolvable-name"
     assert load_known_marketplaces(home, env).get("marketplaces") in (None, {})
     assert reg.active_refs() == []
 
@@ -949,7 +961,7 @@ async def test_add_manifest_name_invalid_payload(
     assert payload == {
         "error": "validation",
         "message": "marketplace manifest has no usable top-level 'name' (must be a non-empty string)",
-        "code": "manifest-name-invalid",
+        "reason": "manifest-name-invalid",
     }
     assert load_known_marketplaces(home, env).get("marketplaces") in (None, {})
     assert not _load_trusted(env), "注册失败不得残留 trust"
@@ -1113,7 +1125,7 @@ async def test_refresh_rename_reports_validation_not_updated(
     row = rows[0]
     assert row["name"] == "acme"
     assert row["status"] == "validation", "改名拒绝 MUST NOT 报 updated / unchanged"
-    assert row["code"] == "manifest-name-changed"
+    assert row["reason"] == "manifest-name-changed"
     assert row["manifestName"] == "acme-renamed"
 
 
@@ -1142,7 +1154,7 @@ async def test_no_clone_rejects_name_registered_from_other_source(
 
     assert code == 1
     payload = json.loads(capsys.readouterr().out)
-    assert payload["error"] == "validation" and payload["code"] == "name-conflict"
+    assert payload["error"] == "validation" and payload["reason"] == "name-conflict"
     stored = load_known_marketplaces(home, env)["marketplaces"]["acme"]
     assert stored["source"] == old_source, "不得静默改写既有注册的 source"
 
@@ -1156,3 +1168,88 @@ def test_refresh_summary_table_escapes_untrusted_text(capsys: pytest.CaptureFixt
     console.print(table)  # 真实渲染路径：未转义会抛 MarkupError
     out = capsys.readouterr().out
     assert "[/]x" in out and "boom" in out
+
+
+@pytest.mark.asyncio
+async def test_repl_refresh_marks_dirty_on_partial_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    审查 🟡4 回归锁：`refresh` 部分源内容更新 + 部分源改名拒绝（退出码 1）时，registry 的**完整 ref**
+    已变化 → 必须标脏；只比 SKILL 名字集合会漏（名字相同、version 变了）。
+    """
+    from a2c_smcp.computer.skills.registry import A2CSkillRef
+
+    home = _home(tmp_path)
+    reg = SkillRegistry()
+    reg.register(
+        A2CSkillRef(
+            name="audit:lint",
+            source="marketplace:acme",
+            uri="skill://acme/audit/lint/SKILL.md",
+            path=str(home / "marketplace" / "acme" / "audit" / "lint"),
+            version="1.0.0",
+        )
+    )
+    comp = _ReplComp(home, reg)
+
+    async def fake_refresh(*_args: object, **_kwargs: object) -> int:
+        # 模拟「A 内容更新（version 变）+ B 改名被拒」：退出码 1，但名字集合不变
+        reg.register_or_update(
+            A2CSkillRef(
+                name="audit:lint",
+                source="marketplace:acme",
+                uri="skill://acme/audit/lint/SKILL.md",
+                path=str(home / "marketplace" / "acme" / "audit" / "lint"),
+                version="2.0.0",
+            )
+        )
+        return 1
+
+    monkeypatch.setattr(marketplace_mod, "marketplace_refresh", fake_refresh)
+
+    await marketplace_mod.repl_dispatch(comp, ["marketplace", "refresh", "all"], session=_ReplSession())
+
+    assert comp.dirty == 1, "内容更新（version 变）必须标脏，即使退出码为 1"
+
+
+@requires_git
+def test_add_conflict_payload_redacts_credential_like_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    审查 🔴 回归锁：`name-conflict` 的 `existingSource` 走**诊断面** URL 判据——path 段含凭据样文本时
+    必须占位符（不能只挡 authority 段 userinfo）。变异 = 改回 known 展示原语 → 本条转红。
+    """
+    import asyncio
+
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {
+                    "source": {"type": "git", "url": "https://host/team/alice:PW_LEAK@example.com/repo.git"},
+                    "installLocation": "",
+                }
+            },
+        },
+        home,
+        env,
+    )
+
+    bare = _make_bare(tmp_path, "acme", _marketplace_files())  # 本地源，清单名 acme → 与既有记录同名异源
+
+    async def _run() -> int:
+        return await marketplace_add(
+            SkillRegistry(), home, env, f"file://{bare}", trust=True, json_output=True
+        )
+
+    assert asyncio.run(_run()) == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["error"] == "validation" and payload["reason"] == "name-conflict"
+    assert payload["existingSource"] == REDACTED_GIT_SOURCE
+    assert "PW_LEAK" not in out and "alice" not in out

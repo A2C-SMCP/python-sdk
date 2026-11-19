@@ -103,7 +103,7 @@ def test_typer_add_no_clone_new_source_rejected(tmp_path: Path, monkeypatch: pyt
     r = CliRunner().invoke(cli_main.app, ["marketplace", "add", url, "--trust", "--no-clone", "--json"])
     assert r.exit_code == 1, r.output
     payload = json.loads(r.output)
-    assert payload["error"] == "validation" and payload["code"] == "unresolvable-name"
+    assert payload["error"] == "validation" and payload["reason"] == "unresolvable-name"
     assert "FAKE_QUERY" not in r.output
     assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}
 
@@ -246,7 +246,7 @@ def test_typer_add_name_mismatch_rejected_zero_residue(tmp_path: Path, monkeypat
 
     assert r.exit_code == 1, r.output
     payload = json.loads(r.output)
-    assert payload["error"] == "validation" and payload["code"] == "expected-name-mismatch"
+    assert payload["error"] == "validation" and payload["reason"] == "expected-name-mismatch"
     assert payload["manifestName"] == "acme" and payload["expectedName"] == "wrong"
     assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}
     assert not (tmp_path / "home" / "marketplace").exists() or not any(
@@ -275,5 +275,5 @@ def test_typer_add_manifest_missing_name_validation(tmp_path: Path, monkeypatch:
 
     r = CliRunner().invoke(cli_main.app, ["marketplace", "add", f"file://{bare}", "--trust", "--json"])
     assert r.exit_code == 1
-    assert json.loads(r.output)["code"] == "manifest-name-invalid"
+    assert json.loads(r.output)["reason"] == "manifest-name-invalid"
     assert (load_known_marketplaces(tmp_path / "home").get("marketplaces") or {}) == {}

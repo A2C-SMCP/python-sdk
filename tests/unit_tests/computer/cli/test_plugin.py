@@ -1072,3 +1072,26 @@ async def test_install_schemeless_query_source_token_is_masked(
     assert "sourceinvalid" in out
     assert "token=SECRET_Q" not in out
     assert "#f" not in out
+
+
+def test_plugin_error_keeps_machine_reason(capsys: pytest.CaptureFixture[str]) -> None:
+    """
+    #260 独立审查 🟡8 回归锁：机读键 ``reason`` 必须透出——plugin 的 ``_err`` 把 ``code`` 当退出码保留参数，
+    改名拒绝若用 ``code`` 承载 reason 会在 enable 路径被过滤掉；三条路径（marketplace add/refresh、
+    plugin enable）统一用 ``reason``。
+    """
+    from a2c_smcp.computer.cli.commands.plugin import _plugin_error
+    from a2c_smcp.computer.settings.installer import PluginInstallError
+
+    err = PluginInstallError(
+        "manifest renamed upstream",
+        error_code="validation",
+        details={"reason": "manifest-name-changed", "name": "acme"},
+    )
+    from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
+
+    assert _plugin_error(err, json_output=True) == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"
+    assert payload["reason"] == "manifest-name-changed"
+    assert payload["name"] == "acme"

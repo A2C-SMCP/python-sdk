@@ -45,9 +45,12 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     不报改名拒绝，仅 baseline 之后再改名才拒绝。refresh 改为「重新 clone + 原子换入」，不再原地 `git pull`。
   - **declared 换源拒绝**：`extraKnownMarketplaces` 中同名 source 变更 → `validation`，**不** wipe / 重 clone；
     换源需显式 remove / re-add。
-  - 结构化错误：`{"error":"validation","message":…,"code":<reason>,…诊断}`（reason ∈ `manifest-name-invalid` /
+  - **`--json` 错误载荷形状变更（breaking）**：此前为 `{"error": "<人读文案>"}`；现在统一为
+    `{"error": "<类别>", "message": "<人读文案>", …诊断}`，机读原因在 **`reason`** 键（`error` 为
+    `validation` / `error`）。类别与 reason 取值：`validation` × {`manifest-name-invalid` /
     `manifest-name-changed` / `name-conflict` / `source-conflict` / `expected-name-mismatch` /
-    `dangling-references` / `unresolvable-name`）。
+    `dangling-references` / `unresolvable-name` / `invalid-name` / `invalid-source`}。
+    消费方需改为读 `message`/`reason`（旧的「整个 `error` 就是文案」读法不再成立）。
   - **存量迁移不在本版**：已有 URL 派生名 / `--name` 别名的注册**不追溯改名**，由 #268 的
     `marketplace migrate` 处理（账本字段 `manifestNameBaseline` 已就位供其消费）。
 - **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer

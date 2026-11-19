@@ -222,3 +222,33 @@ def test_baseline_rename_is_rejected() -> None:
 def test_baseline_equal_is_allowed() -> None:
     prior = {"source": dict(_GIT), "installLocation": "/x", MANIFEST_NAME_BASELINE_FIELD: "acme"}
     assert _violation("acme", _GIT, prior, {"acme": prior}, "acme") is None
+
+
+def test_name_conflict_redacts_credential_like_path_in_source() -> None:
+    """
+    独立审查 🔴 回归锁：``existingSource`` 走**诊断面**判据——path 段含凭据样文本时必须占位符
+    （authority 段 userinfo 之外的第二条泄漏面）。变异 = 改回 `known_git_source_for_display` → 转红。
+    """
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    prior = {
+        "source": {"type": "git", "url": "https://host/team/alice:PW_LEAK@example.com/repo.git"},
+        "installLocation": "/x",
+    }
+    v = _violation("acme", _GIT, prior, {"acme": prior}, "acme")
+
+    assert isinstance(v, MarketplaceIdentityError)
+    assert v.details["existingSource"] == REDACTED_GIT_SOURCE
+    assert "PW_LEAK" not in str(v) and "alice" not in str(v)
+    assert "PW_LEAK" not in json.dumps(v.details)
+
+
+def test_source_conflict_redacts_ledger_key_in_details() -> None:
+    """账本键含凭据样文本时，``existingName`` 与 remedy 也必须脱敏（与文案同一口径）。"""
+    known = {"https://user:TOKEN@host/x": {"source": dict(_GIT), "installLocation": "/x"}}
+    v = _violation("acme", _GIT, None, known, "acme")
+
+    assert isinstance(v, MarketplaceIdentityError)
+    assert v.reason == "source-conflict"
+    assert "TOKEN" not in json.dumps(v.details)
+    assert "TOKEN" not in str(v)

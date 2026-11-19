@@ -19,13 +19,13 @@ Trust（§10.5）首见经 ``confirm`` 回调（REPL=session y/N；Typer 非交�
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
-from unicodedata import normalize
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from rich.markup import escape
 from rich.table import Table
@@ -58,7 +58,9 @@ from a2c_smcp.computer.settings.store import (
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.marketplace_identity import (
-    MANIFEST_NAME_BASELINE_FIELD,
+    REASON_INVALID_NAME,
+    REASON_INVALID_SOURCE,
+    REASON_NAME_CONFLICT,
     REASON_UNRESOLVABLE_NAME,
     MarketplaceIdentityError,
     MarketplaceNameChangeError,
@@ -73,7 +75,11 @@ from a2c_smcp.computer.skills.staging import (
     registration_violation,
     stage_marketplace_skills,
 )
-from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, known_git_source_for_display
+from a2c_smcp.utils.git_url import (
+    credential_like_text,
+    diagnostic_url_for_display,
+    known_git_source_for_display,
+)
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
 ConfirmFn = Callable[[str], Awaitable[bool]]
@@ -152,76 +158,23 @@ def normalize_marketplace_url(raw: str) -> str | None:
         return None
 
 
-# 凭据样判据的**硬上界**解码轮数（每轮 = 判残形 ``%`` → percent-decode → NFKC）/ Hard cap on decode rounds.
-# **#282**：由固定 3 轮改为**不动点循环**（见 :func:`_credential_like`）。轮数**不承担**多层编码的覆盖面
-# ——那由「残形 ``%`` 即 fail-closed」保证（与 rust #285 同口径），故 ``%25253A`` / ``%2525253A`` 之流
-# 在**第一轮**就返回 True，与层数无关。轮数真正承担的是「NFKC 归一后再看 ``%`` / ``：`` / ``＠``」：
-# 全角 ``％３Ａ`` 要**两轮**才现出 ASCII ``%``（故上界不可退化为 1），其余输入一轮即达不动点。
-# 上界本身只保证终止。
-_MAX_DECODE_ROUNDS = 10
-
-
+# 凭据样判据 / URL 诊断展示：**单一权威**在 :mod:`a2c_smcp.utils.git_url`（#260 上移，供注册身份诊断复用）。
+# 本模块保留同名薄包装：①`default_marketplace_name` / add 失败文案既有调用面不变（#270/#282 行为与回归锁
+# 保持）；②外部（测试 / 其他命令）按既有符号引用。
 def _credential_like(text: str) -> bool:
-    """
-    文本是否含凭据样文本（userinfo ``@`` / 密码段 ``:`` / 残形 percent 转义）/
-    Whether text carries credential-like text.
-
-    **#270**：做「percent-decode → NFKC」迭代——挡住 ``alice%3APW%40host``、percent-encoded 全角
-    ``%EF%BC%9A``/``%EF%BC%A0``、双重/三重编码 ``%253A``/``%25253A``，以及**全角百分号**
-    ``alice％３ＡPW``（NFKC 会先把它归一成 ``%3A``，下一轮才 decode；单轮「decode 后归一」会漏）。
-
-    **#282**：① **残形 percent 转义一律 fail-closed**——任一解码轮里出现 ``%`` 即判可疑
-    （对齐 rust-sdk#285 ``seg.contains([':', '@', '%'])``）：percent 转义本身说明来源被编码过（还能再解
-    一层，或本就不该出现在注册名 / 来源里），故四层 ``alice%2525253APW_LEAK`` 与解码后本可干净的
-    ``repo%20name`` 一并拒。**这一条让覆盖面不依赖解码深度**（>N 层不再有漏判残余）。
-    ② 解码为**不动点循环**（本轮结果与上轮相同即提前退出）：轮次仍承担①——全角 ``％`` 要经一轮 NFKC
-    才现出 ASCII ``%``；``@`` / ``:`` 也在 NFKC 归一（全角 ``：`` / ``＠``）+ decode 之后判定。
-    ``_MAX_DECODE_ROUNDS`` **只保证终止**（``unquote`` 只减不增，NFKC 幂等，有变化的轮次有限；
-    **不**宣称「每轮严格缩短」——NFKC 存在 1→2 兼容展开，如 ``ﬁ``→``fi``）。轮次实际承担的是
-    「NFKC 归一后再看 ``%``」：全角 ``％３Ａ`` 类输入要**两轮**（第一轮才把 ``％`` 归一成 ``%``），
-    故上界不能退化为 1；更深的编码由 ① 的 ``%`` 判据兜住，与轮数无关。
-    """
-    probe = text
-    for _ in range(_MAX_DECODE_ROUNDS):
-        # ① 残形 percent 转义 ⇒ 不可判定（含上一轮 NFKC 从全角 ``％`` 归一出来的 ``%``）
-        if "%" in probe:
-            return True
-        decoded = normalize("NFKC", unquote(probe))
-        if decoded == probe:  # 不动点：再迭代也不变
-            break
-        probe = decoded
-    return "@" in probe or ":" in probe
+    """文本是否含凭据样文本（userinfo ``@`` / 密码段 ``:`` / 残形 percent 转义）/ Credential-like text."""
+    return credential_like_text(text)
 
 
 def _error_url_display(raw: str) -> str:
     """
     ``marketplace add`` **失败文案**里的 URL 展示 / Display-safe URL in add-failure messages.
 
-    在 #261 展示脱敏（去 userinfo / query / fragment）之上，再挡住 **path 任意段**携带的凭据样文本——
-    ``ssh://-/alice:PW_LEAK@example.com``、``https://host/team/alice:PW@example.com/repo``（中间段）、
-    ``.../alice:PW@example.com/``（尾斜杠）的展示值都仍保留 path，直接回显会把凭据写进 stdout /
-    ``--json``。空 path 或解析失败同样 fail-closed。
-    判定对象是**原始 source** 的 path 段（渲染才用展示串）：展示层会把空格 / 非 ASCII ``quote()`` 成
-    ``%XX``，「残形 ``%`` 即拒」若跑在展示串上会把干净 URL 误打码。
-    **范围**：仅 add 失败文案；``list`` / ``info`` / confirm 提示 / 成功 ``--json`` 的 ``url`` 仍按 #261
-    的 known-source 契约保留 path（见 CHANGELOG 的范围说明）。
+    委托 :func:`~a2c_smcp.utils.git_url.diagnostic_url_for_display`（去 userinfo/query/fragment +
+    **path 任意段**凭据样文本 fail-closed）；判据跑在**原始 source** 上（展示层 ``quote()`` 的 ``%xx``
+    不得误伤干净 URL，#282 复核）。
     """
-    shown = git_url_for_display(raw)
-    if shown == REDACTED_GIT_SOURCE:
-        return shown
-    # 判据取**原始 source** 的 path 段，不取展示串：展示层会对空格 / 非 ASCII / ``|`` / ``\`` 等做
-    # ``quote()``（``my team``→``my%20team``、``团队``→``%E5%9B%A2%E9%98%9F``），拿展示串跑「残形 ``%``
-    # 即拒」会把**源里根本没有编码**的干净 URL 整条打码（#282 审查 🟡）。
-    try:
-        path = urlsplit(raw).path
-    except ValueError:
-        return REDACTED_GIT_SOURCE
-    segments = [seg for seg in path.split("/") if seg]
-    if not segments:  # 无 path：无法判定来源内容 → fail-closed
-        return REDACTED_GIT_SOURCE
-    if any(_credential_like(seg) for seg in segments):
-        return REDACTED_GIT_SOURCE
-    return shown
+    return diagnostic_url_for_display(raw)
 
 
 def default_marketplace_name(url: str) -> str | None:
@@ -366,13 +319,20 @@ def _register_intent_only(
         prior = known.get(name)
         violation = registration_violation(name, source, prior, known, name, env=env)
         if violation is not None:
-            raise violation  # 同名不同源 / 断链引用 / baseline 冲突（fail-closed）
-        prior_record: Mapping[str, Any] = prior if isinstance(prior, Mapping) else {}
+            raise violation  # 同名不同源 / 断链引用（fail-closed）
+        if prior is not None:
+            # 不可达：同名同源已在入口被 `registered_name_for_source` 认作幂等早返回，同名异源由上面的
+            # `registration_violation` 抛出。留显式拒绝（而非静默覆盖）作为纵深防御。
+            raise MarketplaceIdentityError(
+                f"marketplace {name!r} is already registered; refusing to overwrite its record from --no-clone",
+                reason=REASON_NAME_CONFLICT,
+                details={"name": name},
+            )
         known[name] = {
             "source": dict(source),
             "installLocation": str(clone_dir.resolve()),
-            "autoUpdate": bool(auto_update or prior_record.get("autoUpdate")),
-            "manifestNameBaseline": prior_record.get(MANIFEST_NAME_BASELINE_FIELD) or name,
+            "autoUpdate": bool(auto_update),
+            "manifestNameBaseline": name,
         }
         outcome["registered"] = name
         return None
@@ -453,7 +413,7 @@ async def marketplace_add(
             f"not a well-formed git url or owner/repo shorthand: {_error_url_display(git_url)}",
             json_output=json_output,
             error_code="validation",
-            code="invalid-source",
+            reason=REASON_INVALID_SOURCE,
         )
     if name is not None and not is_valid_marketplace_name(name):
         # ``--name`` 现在是「期望清单名」，先按同一语法契约快速拒绝（避免白跑一次 clone）。
@@ -461,7 +421,7 @@ async def marketplace_add(
             f"--name {name!r} is not a valid marketplace name (strict kebab-case, 1-64); pass the manifest's name",
             json_output=json_output,
             error_code="validation",
-            code="invalid-name",
+            reason=REASON_INVALID_NAME,
         )
 
     # #246：写前**只读**预检（corrupt → 退出码 1 且**不 clone**），保持既有 fail-closed 破坏半径。
@@ -744,6 +704,19 @@ def marketplace_set(
     return _ok(f"{name!r} auto-update set to {val}")
 
 
+def _registry_fingerprints(registry: SkillRegistry) -> frozenset[str]:
+    """
+    registry 活跃条目的**完整指纹**（JSON 序列化 ref，排序稳定）/ Full fingerprints of the registry refs.
+
+    #260 独立审查 🟡4：REPL `marketplace refresh` 原先只比 SKILL **名字集合**——「A 内容更新（version/uri 变）
+    + B 改名被拒」时名字集相同，退出码为 1 但不会标脏，已连接 Agent 继续看到旧投影。改用完整 ref 结构指纹
+    （含 version / uri / description 等），内容更新即能被识别。
+    """
+    return frozenset(
+        json.dumps(ref, sort_keys=True, default=str) for ref, _orphaned in registry.all_refs()
+    )
+
+
 # ── REPL dispatcher（绑定 Computer 的活跃 registry / home / session）/ REPL adapter ──
 async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     """把 ``marketplace ...`` REPL 行解析为 flags → 调 handler；变更后触发去抖 emit / Parse a REPL line and dispatch。"""
@@ -800,10 +773,10 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         target = pos[0] if pos else "all"
         # #260：部分源刷新成功 + 部分 validation 时退出码为 1，但 registry 已变——不能只看退出码，
         # 否则已连接 Agent 继续看到旧投影。
-        before_skills = {ref.get("name") for ref, _orphaned in comp.skill_registry.all_refs()}
+        before_state = _registry_fingerprints(comp.skill_registry)
         code = await marketplace_refresh(registry, home, env, target, json_output=json_output)
-        after_skills = {ref.get("name") for ref, _orphaned in comp.skill_registry.all_refs()}
-        if code == EXIT_OK or before_skills != after_skills:
+        after_state = _registry_fingerprints(comp.skill_registry)
+        if code == EXIT_OK or before_state != after_state:
             comp.mark_skills_dirty()
     elif sub == "set":
         # marketplace set <name> auto-update=<bool>

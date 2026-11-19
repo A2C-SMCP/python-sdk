@@ -906,3 +906,104 @@ async def test_stage_refresh_degrades_on_ledger_write_failure(
 
     assert names == [], "降级：不抛、该源本轮不注册"
     assert marker.exists(), "旧内容保留"
+
+
+@requires_git
+async def test_add_rejects_traversal_expected_name(tmp_path: Path) -> None:
+    """审查 🟡5：公开 API 的 `expected_name` 参与路径段，`../../x` 必须被结构化拒绝（不触盘）。"""
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceIdentityError
+    from a2c_smcp.computer.skills.staging import add_marketplace_source
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+
+    with pytest.raises(MarketplaceIdentityError) as ei:
+        await add_marketplace_source(_src(_url(bare)), home, expected_name="../../x", env=_env(home))
+    assert ei.value.reason == "invalid-name"
+    assert not (tmp_path / "x").exists()
+    assert not (tmp_path / "skill-home" / "marketplace").exists()
+
+
+async def test_clone_failure_leaves_no_staging_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    审查 🟡3：clone 失败/超时不得残留 `.staging-*`（失败零残留）。
+
+    用**真会留下半成品**的替身（`git` 自己在失败时会删 dest，直接跑 git 测不出调用点的清理）。
+    """
+    import a2c_smcp.computer.skills.staging as staging_mod
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.staging import SkillStagingError, clone_marketplace_to_staging
+
+    async def _partial_then_fail(url: str, dest: Path, *, timeout: float, env: object) -> None:
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "partial").write_text("half", encoding="utf-8")
+        raise SkillStagingError("clone timed out")
+
+    monkeypatch.setattr(staging_mod, "_git_clone_marketplace", _partial_then_fail)
+    home = _home(tmp_path)
+    clone_dir = marketplace_skill_dir(home, "acme")
+
+    with pytest.raises(SkillStagingError):
+        await clone_marketplace_to_staging(f"file://{tmp_path}/no-such-repo", clone_dir, timeout=10, env=_env(home))
+
+    parent = clone_dir.parent
+    leftovers = [p.name for p in parent.iterdir() if p.name.startswith(".staging-")] if parent.exists() else []
+    assert leftovers == [], f"clone 失败不得留下 staging 目录：{leftovers}"
+
+
+@requires_git
+def test_purge_stale_temp_removes_broken_symlink(tmp_path: Path) -> None:
+    """审查 🟡3：`.trash-*` 是断链软链时也必须能清掉（旧实现 stat 抛错 → 永不清理）。"""
+    import os as _os
+
+    from a2c_smcp.computer.skills.home import marketplace_skill_dir
+    from a2c_smcp.computer.skills.staging import purge_stale_marketplace_temps
+
+    home = _home(tmp_path)
+    clone_dir = marketplace_skill_dir(home, "acme")
+    parent = clone_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    link = parent / ".trash-acme-dead"
+    link.symlink_to(tmp_path / "gone")
+    old = 1_000_000.0
+    _os.utime(link, (old, old), follow_symlinks=False)
+
+    purge_stale_marketplace_temps(clone_dir, max_age=0)
+
+    assert not link.is_symlink() and not link.exists()
+
+
+@requires_git
+async def test_reuse_write_refuses_recorded_source_mismatch(tmp_path: Path) -> None:
+    """审查 🟡2：复用分支不得把既有记录的 source 静默改成与盘上 clone 不符的值。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces, save_known_marketplaces
+
+    _, bare_a = _make_bare(tmp_path / "a", "acme", _marketplace_files())
+    _, bare_b = _make_bare(tmp_path / "b", "acme", _marketplace_files())
+    home = _home(tmp_path)
+    _clone_into(home, "acme-skills", bare_a)
+    _seed_known(
+        home,
+        {"acme-skills": {"source": _src(_url(bare_a)), "installLocation": "", "manifestNameBaseline": "acme-skills"}},
+    )
+
+    await stage_marketplace_skills("acme-skills", _src(_url(bare_b)), SkillRegistry(), home, env=_env(home))
+
+    record = load_known_marketplaces(home=home)["marketplaces"]["acme-skills"]
+    assert record["source"] == _src(_url(bare_a)), "复用分支不得改写与盘上 clone 不符的 source"
+
+
+@requires_git
+async def test_reuse_write_refuses_second_registration_for_same_source(tmp_path: Path) -> None:
+    """审查 🟡2：复用分支不得为同一 source 新建第二个名字的注册。"""
+    from a2c_smcp.computer.settings.store import load_known_marketplaces
+
+    _, bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    home = _home(tmp_path)
+    await stage_marketplace_skills("acme-skills", _src(_url(bare)), SkillRegistry(), home, env=_env(home))
+    # 人为造出同一 source 的第二个 clone（无记录）
+    _clone_into(home, "second", bare)
+
+    await stage_marketplace_skills("second", _src(_url(bare)), SkillRegistry(), home, env=_env(home))
+
+    assert set(load_known_marketplaces(home=home)["marketplaces"]) == {"acme-skills"}, "不得新建同源第二注册"
