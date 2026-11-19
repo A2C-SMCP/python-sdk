@@ -754,6 +754,53 @@ async def test_uninstall_remove_server_failure_keeps_skills_and_ledger_275(tmp_p
     assert "audit@acme" not in load_installed_plugins(home=home)["plugins"]
 
 
+async def test_uninstall_reclaim_list_taken_from_ledger_before_tree_removal_275(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """
+    #275 / §4.9.1-3 机制断言：停摘名单在删树**之前**取得，且只依赖账本字段。
+
+    钉死两种容易退化的实现失误：
+    1. **取得时机**——``ledger_mcp_deps_of`` 被调用时独占 clone 仍在盘上（= 早于 ② 删树）；
+    2. **字段来源**——盘上 ``mcp-servers/`` 声明的是另一个 server（诱饵），但 ``remove_server`` 收到的必须是
+       账本 ``mcpServers`` 里的 bundle_id。若有人改成「删树后从 installPath 重解析」，两条同时失守。
+
+    成功路径的完整正对照也在此：``remove_server`` 收到账本 bundle_ids ∧ skills（含孤儿）注销 ∧ 账本/意图清空。
+    """
+    from a2c_smcp.computer.settings import installer as installer_module
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = _ext_plugin_root(home, "acme", "audit")
+    _write_json(ext / "mcp-servers" / "decoy.json", _stdio("decoy.mcp"))  # 盘上诱饵：bundle_id 应为 decoy_mcp
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": str(ext), "mcpServers": [FIGMA_BID]}]})
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
+    reg = _seed_registry(home, "acme", "audit")
+    mcp = _FakeMCP()
+
+    real_ledger_deps = installer_module.ledger_mcp_deps_of
+    seen: list[tuple[set[str], bool]] = []
+
+    def _spy(records: object) -> set[str]:
+        deps = real_ledger_deps(records)
+        seen.append((deps, ext.exists()))
+        return deps
+
+    monkeypatch.setattr(installer_module, "ledger_mcp_deps_of", _spy)
+
+    assert await uninstall_plugin(
+        "audit@acme", reg, home, non_plugin_bundle_ids=lambda: set(), env=env, remove_server=mcp.remove,
+    ) is True
+
+    assert seen == [({FIGMA_BID}, True)], "停摘名单必须在删树之前、从账本字段取得"
+    assert mcp.removed == [FIGMA_BID], "回收的是账本声明的 bundle_id（盘上 decoy 不参与）"
+    assert not ext.exists(), "独占 clone 已回收"
+    assert len(reg) == 0, "skills（含孤儿）已注销"
+    assert "audit@acme" not in load_installed_plugins(home=home)["plugins"], "账本记录已删"
+    settings = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert settings.get("installedPlugins") == [], "安装意图已删"
+
+
 async def test_uninstall_malformed_install_path_does_not_raise_258(tmp_path: Path) -> None:
     """#258 🟡2：损坏账本（installPath 含 NUL）→ 纯词法归属判定为 clone 外（非独占）→ 保留文件、卸载仍完成。"""
     home = _home(tmp_path)
