@@ -50,7 +50,8 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
   （#93 client owns MCP config；CLI 启动序列即参考接线）。
 - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
   ``enabledPlugins`` 门控重建（仅显式 true 激活）。**uninstall 连孤儿一并注销**（#257：``include_orphans=True``；
-  **限该 pid 账本记录全部移除时**——#262：有 retained 记录则 registry 不动），
+  **限该 pid 账本记录全部移除时**——#262：有 retained 记录则 registry 不动；retained 只计**写盘后仍在账本中的
+  记录**，#275 起剔除被 §4.9.1-4 sweep 的 legacy 记录），
   :func:`_unregister_marketplace_skills`（marketplace remove / gc / prune）同样遍历含孤儿的全量条目——
   否则残留孤儿会被注册点跨 source 守卫当作「先到者」，令换源 **enable** 在本进程内永久失败
   （install 侧另有 :func:`_bare_name_conflicts` 的裸名预检，与本条无关）。
@@ -102,6 +103,7 @@ from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
     atomic_write_json,
     file_lock,
+    is_legacy_ledger_record,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
@@ -1181,6 +1183,13 @@ async def uninstall_plugin(
     仅当该 pid 的账本记录**全部移除**时才注销其全部 skills（含孤儿）；指定 ``scope`` 卸载且其余 scope 记录仍在
     → registry **完全不动**（活跃与孤儿原样）。判据是「有无 retained 记录」，**不是**「是否指定了 ``scope``」：
     只装了一个 scope 时指定该 scope 卸载，记录即全部移除，照常注销。
+    ``retained`` 只计**本次写盘后仍在账本中的记录**——旧格式（``bundledMcpServers``）记录按 §4.9.1-4 会被
+    sweep，**不算存活**（#275；三个消费者共用 :func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`）。
+
+    **失败序（#275 / §5.5）**：② 删树 → ③ 回收依赖（``remove_server``，唯一可达的可抛外部调用）→ ④ 注销 skills
+    → ⑤ 删账本记录 + 清意图/enabled。③ 抛错时账本、意图、技能**一律原样**，重试可自愈（已删的 clone 按
+    「缺失即视为已删除」收敛）；**不做 best-effort teardown**——吞掉停摘失败再提交账本会把「plugin 已卸但
+    server 仍可调用」写死。
 
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
@@ -1219,9 +1228,14 @@ async def uninstall_plugin(
 
     # ① 停摘候选 + 回收判定，**先于任何删除**取得（§4.9.1-3：名单 MUST 在账本记录移除之前取得，且 MUST 仅依赖
     #    账本自身字段——与 installPath 指向的树是否删除无关；#258 起 catalog 内的树不再被本函数删除）。
-    #    ``retained``：scoped uninstall 时本 pid 其余 scope 的记录仍声明依赖 ⇒ 仍算依赖者，不可回收。
+    #    ``retained`` = **存活记录**（本次操作的写盘完成后仍在账本中的记录），三消费者共用同一份定义：
+    #    clone 门控 / server 回收 / skills 注销。**必须**剔除 legacy 记录（#275，协议 §4.9.1-4）：
+    #    ``records`` 取自 ``drop_legacy=False`` 原始视图（#257 审查 🔴3 承重墙），而 ⑤ 的
+    #    ``update_installed_plugins`` 落盘时按默认视图把旧格式记录整条 sweep——若把 legacy 记录算作存活，
+    #    scoped uninstall 会留下「账本/意图/enabled 全清、registry 仍有技能、独占 clone 无人引用（泄漏）」的
+    #    自相矛盾终态。判据与 sweep 本体同源（:func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`）。
     deps = sorted(ledger_mcp_deps_of(targeted))
-    retained = [r for r in records if r not in targeted]
+    retained = [r for r in records if r not in targeted and not is_legacy_ledger_record(r)]
     ledger_plugins = installed.get("plugins", {})
     reclaim = reclaimable_mcp_deps(
         deps,
@@ -1247,7 +1261,7 @@ async def uninstall_plugin(
         if isinstance(ip := r.get("installPath"), str) and ip
     )
 
-    # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
+    # ② 删树 → ③ 回收依赖 → ④ 注销 skills → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3；③ 先于 ④ 见 #275）
     if not ext_clone_still_referenced:
         for rec in targeted:
             install_path = rec.get("installPath")
@@ -1262,7 +1276,16 @@ async def uninstall_plugin(
                         f"failed to remove exclusive clone for {plugin_id!r}: {e}; ledger and intent preserved",
                     ) from e
 
-    # ③ 注销 skills——**仅当该 pid 账本记录全部移除**（#262 裁决 A）：``retained`` 非空（指定 scope 卸载、其余
+    # ③ 回收 MCP 依赖——**先于 skills 注销**（#275 失败序）：``remove_server`` 是本函数唯一可达的可抛外部
+    #    调用（``McpStartGateClosed`` 关闸 / 状态机 / 传输异常；``KeyError`` 经 ``Computer.aunmount_server_by_id``
+    #    的成员预检不可达，仅并发 TOCTOU）。先注销技能再停摘，它一抛就是「账本说已安装、技能已丢」半态；
+    #    反序则失败时账本/意图/技能一律原样，重试可自愈（已删 clone 的重试按「缺失即视为已删除」收敛）。
+    #    **不选 best-effort teardown**：吞掉失败再提交账本会把「plugin 已卸但 server 仍可调用」写死（§5.5）。
+    if not keep_servers and remove_server is not None:
+        for bundle_id in reclaim:
+            await remove_server(bundle_id)
+
+    # ④ 注销 skills——**仅当该 pid 账本记录全部移除**（#262 裁决 A）：``retained`` 非空（指定 scope 卸载、其余
     #    scope 仍在）时 registry 不动。判据与文件（#258 的 retained 引用）、server（``retained_records``）同源，
     #    且判据是「有无 retained 记录」而**非**「是否指定了 scope」；否则同进程内技能消失、重启 boot 又按保留
     #    记录重 stage——同一操作前后矛盾。
@@ -1272,10 +1295,6 @@ async def uninstall_plugin(
     if not retained:
         for name in _plugin_skill_names(registry, marketplace, plugin, include_orphans=True):
             registry.unregister(name)
-
-    if not keep_servers and remove_server is not None:
-        for bundle_id in reclaim:
-            await remove_server(bundle_id)
 
     def _drop(data: InstalledPluginsFile, _pid: str = plugin_id, _scope: str | None = scope) -> None:
         plugins = data["plugins"]
