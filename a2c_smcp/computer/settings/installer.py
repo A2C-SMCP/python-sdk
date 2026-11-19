@@ -346,8 +346,9 @@ def _clear_enabled_entries_visible_layers(plugin_id: str, project_paths: set[str
     会 ``mkdir(parents=True)`` 建父目录 + 建 ``.lock``，而 :func:`_write_enabled_plugin` 的 no-op 短路在锁后——
     无守卫会在无 ``.tfrobot/`` 的 cwd 制造垃圾目录。managed/policy 只读层不触碰；清失败 WARN 不阻断（best-effort）。
 
-    **user 层也在 best-effort 之内**（#246 独立审查 🔴B）：本函数在 uninstall **已删树/注销 skill/摘 server/删账本
-    之后**才被调用，user 层若抛 :class:`PluginInstallError` 会把整个卸载打断在半途，留下 project/local 残留。
+    **user 层也在 best-effort 之内**（#246 独立审查 🔴B）：本函数在 uninstall **已删树/摘 server/注销 skill/删账本
+    之后**才被调用（顺序的单点权威见 :func:`uninstall_plugin` 的 docstring，勿在此另立副本；#275 起 skills 注销在
+    摘 server 之后），user 层若抛 :class:`PluginInstallError` 会把整个卸载打断在半途，留下 project/local 残留。
     故三层同姿态——失败只 WARN。真正的「目标键畸形」已由 :func:`_precheck_settings_writes` 在任何破坏性动作
     **之前**拦下，这里只是纵深防御。
     """
@@ -1186,7 +1187,10 @@ async def uninstall_plugin(
     只装了一个 scope 时指定该 scope 卸载，记录即全部移除，照常注销。
     ``retained`` 只计**本次写盘后仍在账本中的记录**——旧格式（``bundledMcpServers``）记录按 §4.9.1-4 会被
     sweep，**不算存活**（#275；判据来自 :func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`，
-    clone 门控 / server 回收 / skills 注销三个消费者共用**这一份** ``retained`` 定义）。
+    clone 门控 / server 回收 / skills 注销三个消费者共用**这一份** ``retained`` 定义）。其补集 ``doomed``
+    （= ``targeted`` ∪ 非目标 legacy）是**删除/回收候选**：删 clone、回收 server、清 enabled 三面都按它取——
+    只按 ``targeted`` 取会在「目标 scope 指向共享 catalog、非目标 legacy 指向唯一独占 clone」时漏删（#275 复审 🔴），
+    在被 sweep 的 legacy 记录带来 project 层 ``enabledPlugins`` 时漏清（🟡1），在唯一声明者被 sweep 时漏回收（🟡2）。
 
     **失败序（#275 / §5.5）**：② 删树 → ③ 回收依赖（``remove_server``，唯一可达的可抛外部调用）→ ④ 注销 skills
     → ⑤ 删账本记录 + 清意图/enabled。③ 抛错时账本、意图、技能**一律原样**，重试可自愈（已删的 clone 按
@@ -1236,8 +1240,15 @@ async def uninstall_plugin(
     #    ``update_installed_plugins`` 落盘时按默认视图把旧格式记录整条 sweep——若把 legacy 记录算作存活，
     #    scoped uninstall 会留下「账本/意图/enabled 全清、registry 仍有技能、独占 clone 无人引用（泄漏）」的
     #    自相矛盾终态。判据与 sweep 本体同源（:func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`）。
-    deps = sorted(ledger_mcp_deps_of(targeted))
     retained = [r for r in records if r not in targeted and not is_legacy_ledger_record(r)]
+    #    ``doomed`` = 本次写盘后**不再存在**的记录 = targeted ∪ 非目标 legacy（落盘时被 §4.9.1-4 sweep）。
+    #    三面都按它取而非按 ``targeted``（#275 复审 🔴）：删 clone 候选、server 回收候选、enabled 清理面。
+    #    只取 ``targeted`` 会漏掉「目标 scope 指向共享 catalog、非目标 legacy 指向唯一独占 clone」形态——
+    #    ``retained`` 门控说可删，删除循环却拿不到那条 legacy 记录的 installPath ⇒ clone 永久留盘
+    #    （账本已空 ⇒ 再 uninstall 是 no-op、gc 只遍历账本 pid）。删除侧自带归属校验
+    #    （:func:`remove_plugin_install_path` 仅删 plugin 独占 clone，共享 catalog 返回 ``None``），纳入安全。
+    doomed = [r for r in records if r in targeted or is_legacy_ledger_record(r)]
+    deps = sorted(ledger_mcp_deps_of(doomed))
     ledger_plugins = installed.get("plugins", {})
     reclaim = reclaimable_mcp_deps(
         deps,
@@ -1247,8 +1258,10 @@ async def uninstall_plugin(
 
     # ①.5 破坏性动作之前预检待写 settings 的目标键形状（#246 审查 🟡1）：畸形 → 零副作用 fail-closed，
     #      否则会在「已删树」之后才抛错，而重试因账本已空走 no-op → 永远清不干净。
+    #      预检面 = 后续**真的会清**的 enabled 层 ⇒ 与末段同取 ``doomed`` 的 projectPath（漏取会在
+    #      「已删树」之后才撞畸形键）。
     _precheck_settings_writes(
-        {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p},
+        {p for r in doomed if isinstance(p := r.get("projectPath"), str) and p},
         env,
     )
 
@@ -1265,7 +1278,7 @@ async def uninstall_plugin(
 
     # ② 删树 → ③ 回收依赖 → ④ 注销 skills → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3；③ 先于 ④ 见 #275）
     if not ext_clone_still_referenced:
-        for rec in targeted:
+        for rec in doomed:  # #275 复审 🔴：候选 = 写盘后不再存在的记录，非仅 targeted（见 ① 的 ``doomed``）
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
                 # 只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
@@ -1316,7 +1329,9 @@ async def uninstall_plugin(
     remaining = load_installed_plugins(home=home, env=env).get("plugins", {}).get(plugin_id)
     if not remaining:
         _write_installed_plugin(plugin_id, False, env)
-        project_paths = {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p}
+        # #275 复审 🟡1：取 ``doomed`` 而非 ``targeted``——被 sweep 的非目标 legacy 记录若带 ``projectPath``，
+        # 其 project/local 层的 ``enabledPlugins[id]=true`` 同样必须清掉，否则重装即激活（违反 §2.4 install 不激活）。
+        project_paths = {p for r in doomed if isinstance(p := r.get("projectPath"), str) and p}
         _clear_enabled_entries_visible_layers(plugin_id, project_paths, env)
     logger.info(
         "uninstalled plugin %r (scope=%s, MCP deps declared=%s, reclaimed=%s)",

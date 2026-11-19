@@ -560,8 +560,9 @@ def other_plugin_mcp_deps(
 
     :param plugins: 账本 ``plugins`` 映射（**移除本次记录之前**的视图——§4.9.1-3 要求停摘名单在账本移除前取得）。
     :param exclude_pid: 正在 disable/uninstall/gc 的 plugin id（其记录不算「其他 plugin」）。
-    :param retained_records: ``exclude_pid`` 本次**未被移除**的记录（scoped uninstall 时的其余 scope）——它们
-        仍声明依赖，故仍算依赖者。整 pid 移除（disable / 全 scope uninstall / gc）时传空。
+    :param retained_records: ``exclude_pid`` **本次写盘后仍存在**的记录（scoped uninstall 时的其余 scope；
+        被 §4.9.1-4 sweep 的 legacy 记录**不在内**，#275）——它们仍声明依赖，故仍算依赖者。整 pid 移除
+        （disable / 全 scope uninstall / gc）时传空。
 
     「其他 plugin」= 账本中的 **installed** 记录（**含 disabled**），不按 enabled 过滤：协议 §4.9.1-2 字面为
     「无其他 plugin **声明依赖** X」（声明 = 账本有记录），``conformance-tests.md`` §285「**最后一个依赖者卸载**
