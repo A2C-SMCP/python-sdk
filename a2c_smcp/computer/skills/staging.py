@@ -766,10 +766,11 @@ def stage_user_skills(
         try:
             name = synthesize_user_name(basename)  # 校验严格 kebab（§1.5 失败不入册）
         except SkillNameError as e:
-            # #281：不可信的只有 basename（scp-like / userinfo / 控制字符 / query 形态）；parent 是可信落点。
-            # parent 走 path 轴（段级遮蔽、保留其余部分），basename 走单值漏斗（整段 fail-closed）——
+            # #281：不可信的只有 basename（scp-like / userinfo / 控制字符 / query 尾部）；parent 是可信落点。
+            # parent 走 path 轴（段级遮蔽、保留其余部分）；basename 走 **segment 漏斗**（单值漏斗 + path 轴：
+            # basename 无分隔符，path-token 谓词不触发 `?`/`#` 遮蔽，须复合才能遮尾部）——
             # 若整条走单值漏斗，`…/build:2024/alice@corp/…` 这类普通路径会被整串遮掉、ERROR 行失去定位。
-            # 不裸传 Path；reason 同一单值漏斗（今天是固定文案，属潜伏口）。
+            # 不裸传 Path；reason 走单值漏斗（今天是固定文案，属潜伏口）。
             logger.error(
                 "user DropIn skill dir name invalid, skipped: %s (%s)",
                 f"{sanitize_path_for_diagnostics(str(skill_dir.parent))}{os.sep}"

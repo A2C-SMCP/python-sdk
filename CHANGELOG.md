@@ -559,10 +559,17 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     正向断言与「好 SKILL 仍被 check」正对照；user 源六处脱敏补真实凭据用例（userinfo 与 scp-like 两种
     形态、换行/TAB 控制字符、DEBUG 路径），并统一补**占位符正向断言**（只断言「不存在」时，删掉脱敏参数
     仍会绿）。
+  - **空白的取舍（有意，安全优先）**：判据无法区分 `alice: pw@host`（被空白劈开的 userinfo）与
+    `contact: alice@example.com`（普通散文），故一律 fail-closed（整值遮）；`note: see @team`
+    （`@` 前有空白）仍逐字保留，已入反例向量。
   - 已知边界（不变）：无法按 URL/路径形态识别的 token 原样保留——裸 token（`glpat-…`）与**无分隔符的
     query 形态**（`url?token=…`，如 `{"source": "url?token=…"}` 这类**对象值**；basename 落点不在其内，
-    已由 segment 漏斗的 path 轴覆盖）。放宽 path 谓词会误伤 `why?` 这类散文。另：JSON 感知的保真脱敏
-    （`?`/`#` 截断影响可读性）仍属另案。
+    已由 segment 漏斗的 path 轴覆盖）。放宽 path 谓词会误伤 `why?` 这类散文。
+  - 已知边界（既有，**非本单引入**，另案）：**percent-encoded 分隔符**把 userinfo 劈开时仍原样保留
+    （如 `alice:pw%2Fmore @host` / `alice:pw%5Cmore @host`：`unquote` 后含 `/`/`\`，被段判据排除）；
+    `frontmatter.name` 的 DEBUG 回显同理——该 sink 走单值漏斗，`name: foo?token=…` 形态无分隔符、
+    path 谓词不触发（改为 segment 漏斗会动这一行的行为面，留待另案）。
+  - JSON 感知的保真脱敏（`?`/`#` 截断影响可读性）仍属另案。
 
 ### Fixed（#270 hostless git URL 与 marketplace 名称派生）
 

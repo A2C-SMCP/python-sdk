@@ -1950,15 +1950,19 @@ async def test_marketplace_plugin_non_utf8_skill_is_isolated(
 async def test_marketplace_synthesis_failed_skill_dir_name_redacted(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
 ) -> None:
-    """marketplace plugin 分支的 `skill_dir.name` 回显：userinfo 形态目录名不得漏。"""
+    """marketplace plugin 分支的 `skill_dir.name` 回显：userinfo / 尾部 query 两种形态都不得漏。
+
+    `foo?token=…` 是**只有 path 轴能遮**的形态（返回到纯值漏斗会转红）；`alice:pw@host` 覆盖整值遮。
+    """
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
         json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
-    bad_dir = repo / "plugins" / "audit" / "skills" / "alice:pw@host"
-    bad_dir.mkdir(parents=True)
-    (bad_dir / "SKILL.md").write_text(_skill_md(name="Not Kebab!"), encoding="utf-8")
+    for bad in ("alice:pw@host", "foo?token=SECRET_Q"):
+        bad_dir = repo / "plugins" / "audit" / "skills" / bad
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "SKILL.md").write_text(_skill_md(name="Not Kebab!"), encoding="utf-8")
     _git(repo, "init", "-q")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "init")
@@ -1972,7 +1976,9 @@ async def test_marketplace_synthesis_failed_skill_dir_name_redacted(
     text = _no_secret(staging_logs.records)
     assert "name synthesis failed" in text
     assert "pw@" not in text and "alice:" not in text
+    assert "SECRET_Q" not in text
     assert "<redacted-git-source>" in text  # 占位符正向断言（单值漏斗对 `alice:pw@host` 整值遮）
+    assert "foo<redacted-source>" in text  # 尾部 query 由 path 轴截断（回退即转红）
 
 
 @pytest.mark.asyncio
@@ -2039,13 +2045,17 @@ async def test_marketplace_skill_dir_name_query_tail_redacted(
 async def test_marketplace_skill_md_unreadable_dir_name_redacted(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
 ) -> None:
-    """`SKILL.md unreadable` 分支的目录名回显（#281 复审 🟡2）：凭据形态目录名不得原样入日志。"""
+    """`SKILL.md unreadable` 分支的目录名回显（#281 复审 🟡2）：凭据形态目录名不得原样入日志。
+
+    向量用 `foo?token=…`（**只有 path 轴能遮**的形态）：落点若退回纯 `sanitize_value_for_diagnostics`
+    会原样回显，本用例即转红——`deploy-token@example.com:org` 这类值漏斗本来就能遮，测不出回退。
+    """
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
         json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
-    bad_dir = repo / "plugins" / "audit" / "skills" / "deploy-token@example.com:org"
+    bad_dir = repo / "plugins" / "audit" / "skills" / "foo?token=SECRET_Q"
     bad_dir.mkdir(parents=True)
     (bad_dir / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")  # 触发 unreadable 分支
     _git(repo, "init", "-q")
@@ -2061,8 +2071,8 @@ async def test_marketplace_skill_md_unreadable_dir_name_redacted(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "SKILL.md unreadable" in text  # 正对照：确实走了该分支
-    assert "deploy-token" not in text and "example.com:org" not in text
-    assert "<redacted-git-source>" in text
+    assert "SECRET_Q" not in text
+    assert "foo<redacted-source>" in text  # 正向：尾部 query 被 path 轴截断（回退成纯值漏斗即转红）
 
 
 @pytest.mark.asyncio
