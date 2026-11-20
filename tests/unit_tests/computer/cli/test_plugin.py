@@ -936,6 +936,9 @@ async def test_install_invalid_source_json_error_is_redacted_and_rolls_back(
     payload = json.loads(raw)
     assert "https://example.com/r.git" in payload["message"]
     assert "source invalid" in payload["message"]
+    # #278 负向锁：source 非法不附 remove/add 指引（remove/add 修不了上游非法配置，会误导）
+    assert "marketplaceremove" not in _flat(payload["message"])
+    assert "pluginenable" not in _flat(payload["message"])
     # 原子回滚：不留下安装意图
     assert "audit@acme" not in load_installed_plugins(home=home, env=env)["plugins"]
 
@@ -1048,6 +1051,86 @@ async def test_install_staging_error_is_structured_not_traceback(
     assert "pluginstagingfailed" in out
     assert "PW_STAGE" not in out
     assert "token=Q" not in out
+    # #278 负向锁：独占 clone（git 源）失败**不得**给任何恢复指引。`marketplace remove` 会级联卸载该
+    # marketplace 的全部插件并撤销 trust，却修不好 clone / 上游 subdir / 网络问题；`plugin uninstall` 同样是死路
+    # ——安装失败不写账本，uninstall 无记录即 no-op（退出码 1、不删残留 clone），再 install 复用同一坏 clone。
+    assert "marketplaceremove" not in out
+    assert "pluginuninstall" not in out and "plugininstall" not in out and "pluginenable" not in out
+
+
+# ── #278 catalog 子树被删：install 失败附恢复指引（不再只丢一句「root not found」）───────
+@pytest.mark.asyncio
+async def test_install_missing_catalog_subtree_exits1_with_recovery_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278：相对源子树被 0.5.0 旧卸载删除 → 真实 `locate_plugin_root` 走「root not found」分支。
+
+    退出码 1、无 traceback，并给出 remove→add→重装(+enable) 的恢复指引；「失败 = 零变更」不变。
+    """
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    plugin_root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    shutil.rmtree(plugin_root)  # 只删子树，catalog 与清单仍在（#278 描述的损坏态；不 monkeypatch）
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    assert "Traceback" not in out
+    assert "pluginrootnotfoundafterresolve" in out  # 根因仍点名
+    assert "Recovery:" in out
+    assert "marketplaceremoveacme" in out  # 第 1 步：移除重 clone
+    assert "marketplaceadd<source>" in out  # 第 2 步：重新 add（缺这步恢复链就断了）
+    assert "plugininstallaudit@acme" in out  # 第 3 步：重装
+    assert "pluginenableaudit@acme" in out  # install 不激活 ⇒ 恢复后须 enable
+    # 原子回滚：**意图**（user settings 的 installedPlugins）被撤销。账本 installed_plugins.json 在物化成功前
+    # 根本不会被写，拿它断言是恒真的空转（复审 🟡3）。
+    assert "audit@acme" not in json.loads(user_settings_path(env).read_text(encoding="utf-8")).get("installedPlugins", [])
+
+
+@pytest.mark.asyncio
+async def test_install_missing_catalog_subtree_json_error_has_recovery_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278 同场景 `--json`：**不新增机读码**（仍 `error`/`message` 两键），指引落在 message 内。"""
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    plugin_root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    shutil.rmtree(plugin_root)
+
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme", json_output=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    assert set(payload) == {"error", "message"}  # 无新检测码（#267 裁决）
+    assert payload["error"] == "error"
+    message = _flat(payload["message"])
+    assert "pluginrootnotfoundafterresolve" in message
+    assert "marketplaceremoveacme" in message
+    assert "marketplaceadd<source>" in message
+    assert "plugininstallaudit@acme" in message
+    assert "pluginenableaudit@acme" in message
+
+
+@pytest.mark.asyncio
+async def test_install_local_escape_gets_no_remove_add_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278 负向锁：相对源**越界声明**（根并非缺失）不附 remove/add——重 clone 拿到的还是同一份坏清单。"""
+    from a2c_smcp.computer.skills.staging import SkillStagingError
+
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])  # source 为相对路径的 Local 条目
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise SkillStagingError("relative plugin source escapes marketplace clone: '../evil'")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    assert "pluginstagingfailed" in out  # 主错误仍完整
+    assert "marketplaceremove" not in out
+    assert "pluginuninstall" not in out and "plugininstall" not in out
 
 
 @pytest.mark.asyncio
@@ -1068,6 +1151,9 @@ async def test_install_manifest_error_is_structured_not_traceback(
     out = _flat(capsys.readouterr().out)
     assert code == 1
     assert "pluginmanifestinvalid" in out
+    # #278 负向锁：manifest 分支不附 remove/add 指引（载荷本身损坏，重 clone 同一份还是坏的）
+    assert "marketplaceremove" not in out
+    assert "pluginenable" not in out
 
 
 @pytest.mark.asyncio

@@ -680,6 +680,20 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   现按「已声明」处理（fail-closed），而旧的 Python 真值按「未声明」。本仓调用方全部读 `json.loads` 结果，
   该差异不可达；嵌入宿主若自行构造非 JSON 值需注意。
 
+### Fixed（#278 install 失败的恢复指引 + 迁移文档口径）
+
+- **损坏 catalog 上 `plugin install` 失败不再只丢一句根因**：`install_plugin` 把 `SkillStagingError` 归一为
+  `PluginInstallError` 时追加与 `plugin enable` 路径同源的 `Recovery:` 指引——`marketplace remove <name>` →
+  `marketplace add <source>` → `plugin install <plugin>@<name>` →（install 不激活）`plugin enable`。此前 PR #276
+  已消灭 traceback 并给出退出码 1 / `--json` 结构化错误，但用户仍需自行猜到这条恢复路径。
+  **该指引只给「相对源插件根缺失」**（0.5.0 旧卸载删共享 catalog 子树这一种损坏）：`marketplace remove` 会级联
+  卸载该 marketplace 的全部插件并撤销 trust，对独占 clone（`url` / `github` / `cnb` / `git-subdir`）的
+  根缺失、clone 失败或相对源越界声明既修不好又有损失，故这些情形**一律不给**恢复指引（与 rust-sdk 同单一致）；
+  `SkillSourceError` / `PluginManifestError` 分支同样不附。
+  不新增机读码（`--json` 仍是 `{"error": "error", "message": …}`）。
+- **迁移文档 §2 口径订正**：`docs/upgrade-0.5.1-marketplace-catalog-recovery.md` 不再写「可能以未处理异常、
+  带堆栈的形式打印」，改为 0.5.1 的实际行为（结构化错误 + 恢复指引，`--json` 形态），保留 remove/add/重装步骤。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

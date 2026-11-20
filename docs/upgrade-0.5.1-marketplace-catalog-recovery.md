@@ -40,8 +40,15 @@
 
 - `plugin enable <plugin>@<marketplace>` 失败，提示
   `cannot enable plugin …: its installed content is missing or unusable`，并附带 `Recovery: …` 指引；
-- `plugin install <plugin>@<marketplace>` 失败，错误文本包含 `plugin root not found after resolve`
-  （当前版本可能以未处理异常、带堆栈的形式打印，不影响按本文恢复）；
+- `plugin install <plugin>@<marketplace>` 失败，错误文本包含 `plugin root not found after resolve`。
+  0.5.1 起这是**结构化错误**：退出码 1、不打印堆栈，首行点名根因。**相对源插件**（`"source": "./plugin"`）的
+  消息随后给出 `Recovery: …` 指引，即本文第 3 节的 `marketplace remove <name>` → `marketplace add <source>` →
+  重装 → 按需 `plugin enable`；`url` / `github` / `cnb` / `git-subdir` 这类**独占 clone** 的插件不走 remove/add
+  （`marketplace remove` 会级联卸载全部插件却修不好它们），同样的报错**不带**该指引——那类失败按上游
+  manifest / clone 问题排查，不在本文恢复范围（见 §1「不受影响」）；
+  `--json` 时为 `{"error": "error", "message": …}`，指引在 `message` 内。照指引操作时注意：**v0.5.1（#260）起
+  重新 `add` 后的注册名取清单顶层 `name`**，若原注册名是 URL 派生名或当初的 `--name` 别名（legacy 注册），
+  重 `add` 后会改名，后续命令里的 `@<marketplace>` 段要相应改用——详见第 3 节；
 - 直接检查：`<A2C_SKILL_HOME>/marketplace/<marketplace>/<rel_path>` 已不存在，而 `plugin list` 中该插件仍在册。
 
 ## 3. 恢复步骤
