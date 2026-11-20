@@ -250,6 +250,38 @@ async def test_enable_shadowed_by_other_marketplace_exit1_validation(
     assert "marketplace remove mp-b" in payload["message"]  # 冲突方未安装 → 不得给 no-op 的 uninstall
 
 
+@pytest.mark.asyncio
+async def test_enable_identity_collapse_json_reports_bundle_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#271：identity collapse 的 CLI JSON 用 ``bundleId``，且**不得**出现 ``conflictWith``。
+
+    ``conflictWith`` 是 ``<plugin>@<marketplace>`` pid 的专属键（跨 marketplace 同名冲突）；身份坍缩给
+    ``bundleId``。二者若混用，下游按 ``conflictWith`` 解析 pid 的消费者会拿到裸 bundle_id。
+    """
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    root = _setup_catalog(home, "acme", "audit", servers=[])
+    for name in ("alpha", "beta"):
+        _write_json(
+            root / "mcp-servers" / f"{name}.json",
+            {"name": name, "type": "stdio", "server_parameters": {"command": "node"}, "bundle_id": "shared"},
+        )
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(root)}]}}, home=home
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"]})
+    monkeypatch.setattr(_STAGE, _fake_stage())
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "audit@acme", json_output=True)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "validation"
+    assert payload["bundleId"] == "shared"
+    assert "conflictWith" not in payload
+    assert "different configs under the same install root" in payload["message"]
+
+
 def test_plugin_error_filters_reserved_detail_keys(capsys: pytest.CaptureFixture[str]) -> None:
     """``details`` 的保留键必须被过滤，不得改写类别码/文案/退出码（#257 架构师审查 🟡3）。"""
     from a2c_smcp.computer.cli.commands.plugin import _plugin_error

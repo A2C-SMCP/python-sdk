@@ -25,8 +25,10 @@ import pytest
 
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig
 from a2c_smcp.computer.skills.manifest import (
+    COMPONENT_FIELDS,
     PluginManifestError,
     check_strict_conflict,
+    entry_declares_component,
     entry_is_strict,
     enumerate_bundled_server_files,
     find_plugin_entry,
@@ -214,6 +216,57 @@ def test_manifest_declared_components() -> None:
     assert manifest_declared_components({"skills": [], "commands": None, "version": "1.0"}) == []
     assert manifest_declared_components({"skills": ["x"], "mcpServers": {"s": {}}, "version": "1.0"}) == ["skills", "mcpServers"]
     assert manifest_declared_components({"hooks": "h", "agents": "a", "lspServers": {"l": {}}}) == ["agents", "hooks", "lspServers"]
+
+
+def test_entry_declares_component_json_truth_table() -> None:
+    """#271：声明态判据的真值表（镜像 rust ``entry_declares_component``）。
+
+    **本用例钉的是文档化真值表，不宣称变异可杀**（Issue #271 裁决）：JSON 解码值域上 ``bool(value)`` 与本
+    判据同表，把实现换成 ``bool`` 仍会全绿——这是刻意接受的口径，因为两条路径在真实输入上等价。真正与
+    ``bool`` 分叉的只有**非 JSON 类型**（见下一条用例），而它在本仓不可达（调用方一律传 ``json.loads`` 结果）。
+    """
+    falsy = [None, False, 0, 0.0, "", [], {}]
+    for value in falsy:
+        assert entry_declares_component({"k": value}, "k") is False, value
+    truthy = [True, 1, -1, 0.5, "x", [123], [0], {"x": 1}, {"x": 0}]
+    for value in truthy:
+        assert entry_declares_component({"k": value}, "k") is True, value
+    assert entry_declares_component({}, "k") is False  # 缺键 = 未声明
+    assert entry_declares_component({"other": "v"}, "k") is False  # 只看指定键
+
+
+def test_entry_declares_component_non_json_fallback_is_fail_closed() -> None:
+    """#271 已知边界：非 JSON 类型一律算「已声明」（fail-closed 取真）。
+
+    ``bool()`` 对这些值可能为假（``set()`` / 自定义对象），本判据落到末尾 ``return True``——这是刻意的：
+    「判不准就当作已声明」让调用方走失败/诊断路径（strict 冲突报错、零投影失败），而不是静默放行。
+    **本仓不可达**（``read_plugin_metadata`` / ``read_marketplace_manifest`` 都返回 ``json.loads`` 结果），
+    但嵌入宿主可能自行构造，故把语义钉死，避免将来被当作 bug「修」成 fail-open。
+    """
+    for value in (set(), frozenset(), b"", object()):
+        assert entry_declares_component({"k": value}, "k") is True, value
+
+
+def test_manifest_declared_components_shares_entry_declares_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#271：``manifest_declared_components`` 与 ``entry_declares_component`` **结构共用**（口径不漂移）。
+
+    只比输出不足以发现漂移——JSON 值上 Python 真值与 JSON 真值同表，退回旧写法
+    ``[f for f in COMPONENT_FIELDS if plugin_manifest.get(f)]`` 照样全绿（审查 🟡2）。故用 spy 断言
+    「每个字段各经一次单一权威判定」。
+    """
+    from a2c_smcp.computer.skills import manifest as manifest_mod
+
+    seen: list[str] = []
+    original = manifest_mod.entry_declares_component
+
+    def _spy(entry: dict, key: str) -> bool:
+        seen.append(key)
+        return original(entry, key)
+
+    monkeypatch.setattr(manifest_mod, "entry_declares_component", _spy)
+
+    assert manifest_declared_components({"skills": ["x"], "hooks": 0}) == ["skills"]
+    assert seen == list(COMPONENT_FIELDS)  # 六字段逐一委托，不是另写一套真值
 
 
 def test_check_strict_conflict_false_with_components_raises() -> None:
