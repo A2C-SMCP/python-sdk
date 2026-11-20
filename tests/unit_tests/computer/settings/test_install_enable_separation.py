@@ -1309,6 +1309,34 @@ async def test_enable_plugin_json_skills_strict_true_zero_projection_fails(tmp_p
     assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
 
 
+def test_declares_skills_delegates_to_manifest_authority(monkeypatch) -> None:
+    """#271：installer 的 SKILL 声明判据**结构上**经 manifest 的单一权威。
+
+    只断言 ``_declares_skills`` 的返回值不够——把委托换成 ``bool((entry or {}).get("skills"))`` 在 JSON 值上
+    结果完全相同，全量仍绿（审查 🟡2）。故 spy 住 ``installer.entry_declares_component``，断言两条声明源
+    各经一次委托，且 entry 命中时短路、不再问 plugin.json。
+    """
+    from a2c_smcp.computer.settings import installer as installer_mod
+
+    seen: list[tuple[dict, str]] = []
+    original = installer_mod.entry_declares_component
+
+    def _spy(entry, key: str) -> bool:
+        seen.append((dict(entry), key))
+        return original(entry, key)
+
+    monkeypatch.setattr(installer_mod, "entry_declares_component", _spy)
+
+    # entry 未声明 + plugin.json 声明（strict 默认 true）→ 只有经 plugin.json 的那次委托能得 True
+    assert installer_mod._declares_skills(None, {"skills": ["skills"]}) is True
+    assert seen == [({}, "skills"), ({"skills": ["skills"]}, "skills")]
+
+    # entry 侧命中即短路，同样经委托
+    seen.clear()
+    assert installer_mod._declares_skills({"skills": ["x"]}, {}) is True
+    assert seen == [({"skills": ["x"]}, "skills")]
+
+
 @pytest.mark.asyncio
 async def test_enable_staging_zero_registration_not_masked_by_old_active(tmp_path: Path) -> None:
     """#259 架构师审查 🟡2：旧活跃 refs 不得掩盖**本次** stage 零注册——判据取 stage 返回值。"""

@@ -168,7 +168,9 @@ def _json_truthy(value: object) -> bool:
         return True
     if isinstance(value, (int, float)):
         return value != 0
-    if isinstance(value, (str, list, tuple, dict)):
+    # 只覆盖 **JSON 的五种容器/标量**；``tuple`` 刻意不在列（JSON 无 tuple）——空 tuple 走末尾 fallback
+    # 取真，与 :func:`entry_declares_component` 的「非 JSON 类型一律 fail-closed」承诺一致（审查 🟡1）。
+    if isinstance(value, (str, list, dict)):
         return len(value) > 0
     return True
 

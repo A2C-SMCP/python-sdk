@@ -243,8 +243,11 @@ def test_entry_declares_component_non_json_fallback_is_fail_closed() -> None:
     **本仓不可达**（``read_plugin_metadata`` / ``read_marketplace_manifest`` 都返回 ``json.loads`` 结果），
     但嵌入宿主可能自行构造，故把语义钉死，避免将来被当作 bug「修」成 fail-open。
     """
-    for value in (set(), frozenset(), b"", object()):
+    for value in (set(), frozenset(), b"", object(), (), (1,), ("a",)):
         assert entry_declares_component({"k": value}, "k") is True, value
+    # 空 tuple 是这条边界的**承重点**：``tuple`` 曾与 ``(str, list, dict)`` 同列走 ``len`` 分支 → ``()`` 判假，
+    # 与「非 JSON 取真」的承诺自相矛盾（审查 🟡1）。JSON 无 tuple，故它必须落到末尾 fallback。
+    assert entry_declares_component({"skills": ()}, "skills") is True
 
 
 def test_manifest_declared_components_shares_entry_declares_component(monkeypatch: pytest.MonkeyPatch) -> None:

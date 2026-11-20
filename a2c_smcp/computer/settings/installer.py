@@ -1469,6 +1469,9 @@ async def enable_plugin(
     """
     启用单个 plugin（**原子激活**：skills 与 bundled server 一并入投影，失败回滚 ``installed_disabled``）/ Enable。
 
+    回滚是 **best-effort**：撤销本次新增的 skill / server 与恢复 ``enabledPlugins`` 各自独立尝试，任一失败只记
+    ``enable rollback: ...`` WARNING 而**不掩盖**最初那个异常（③.6 的消息也据此不承诺「一定已恢复」）。
+
     **依赖已满足 ⇒ 复用既有实例**（协议 §2.5-1，#153/D3）：声明的 ``bundle_id`` 若已在运行期活跃集里，
     **跳过 register**——既有实例（用户 mcp.json 声明的，或他 plugin 带入的）胜出，本 plugin 复用它而非覆盖。
     与 :meth:`Computer.reconcile_governance` 的「existing wins → skip」同姿态。
