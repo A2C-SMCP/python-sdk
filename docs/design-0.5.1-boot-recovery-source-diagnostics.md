@@ -44,9 +44,11 @@
 对 **`installedPlugins` 意图涉及**的每个 marketplace（无安装意图的市场不检测；空意图早退行为不变）：
 
 1. 无 `extraKnownMarketplaces[name]` 声明条目 → 不检测（没有「声明源」可比）。
-2. 无 `known_marketplaces[name]` 记录，或记录在但 `source` 缺失/非映射 → 不检测（没有**可用的**「已注册源」
-   可比；该情形由既有 `failed_marketplaces` 降级路径负责）。判据与 stage 循环完全同源，否则同一次恢复会
-   同时打「沿用已注册源」与「已降级」两条互斥诊断。
+2. 无**可用**的 `known_marketplaces[name]` 记录（记录缺失 / 记录非映射 / `source` 缺失或非映射）→ 不检测
+   （没有可比的「已注册源」）。该情形不由本诊断报告：**非惰性市场**由 stage 循环记入 `failed_marketplaces`
+   （降级）；**全惰性市场**（`installed_disabled` ∧ 账本完好）在 stage 循环里先零动作 `continue`，因此两处
+   报告都不出现。判据与 stage 循环共用 `store.known_marketplace_source`（单一出处），否则同一次恢复会同时打
+   「沿用已注册源」与「已降级」两条互斥诊断。
 3. 否则用 **`same_source`**（SDK 单一权威，与 `reconcile` 同一函数）比对两侧 `source`。
 
 `same_source` **只做字符串级比较**：`url` 去首尾空白、其余键逐字段相等。`ssh://` / `https://` /
@@ -66,7 +68,7 @@ scp-like / `.git` 后缀等等价写法**不归一**——协议明许 SDK 不�
 | 面 | 内容 |
 |----|------|
 | `GovernanceRecoveryReport.marketplace_source_conflicts` | `list[MarketplaceSourceConflict]`，条目含 `marketplace` / `declared_source_display` / `known_source_display` |
-| recovery 日志 | 1 条 `WARNING` 汇总（冲突数）+ 每市场 1 条 `DEBUG`（两侧脱敏 URL） |
+| recovery 日志 | 1 条 `WARNING` 汇总（**冲突数 + 脱敏后的市场名列表**，不含 URL）+ 每市场 1 条 `DEBUG`（两侧脱敏 URL） |
 | `Computer.boot_up` 汇总行 | `... N declared-source conflicts`，且冲突数**单独即可触发**汇总行（否则「零恢复 + 有冲突」会静默无痕） |
 | CLI `run_governance_remount` | **不在本版**（follow-up [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)） |
 
@@ -102,7 +104,7 @@ boot 不会替你做这件事——重启多少次都只是重复同一条诊断
 
 ## 6. 与 rust-sdk#295 的差异
 
-两端**语义一致**（同名不同源 → 只诊断、不换源、旧能力保留、不降级），但两处实现口径不同，均属有意的 SDK
+两端**语义一致**（同名不同源 → 只诊断、不换源、旧能力保留、不降级），但三处实现口径不同，均属有意的 SDK
 自治差异，**不是漂移**：
 
 | 维度 | rust-sdk#295（PR rust-sdk#298） | python-sdk#287（本单） |
@@ -112,8 +114,14 @@ boot 不会替你做这件事——重启多少次都只是重复同一条诊断
 | CLI 展示 | `marketplace_source_conflict_line` 纯函数提示（只展示注册名） | **follow-up**（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)；本版仅日志 + report 字段） |
 
 差异 1 的理由：用户裁决只看「有安装意图、真会被恢复」的市场，避免对从未安装的声明噪音告警；若未来要与
-rust 对齐为全量，需在两端同时改并重新裁决。差异 3 的理由：python 的 CLI 展示面另开 follow-up（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)），本版先保证
-`GovernanceRecoveryReport` 与日志可观测。
+rust 对齐为全量，需在两端同时改并重新裁决。
+
+差异 2 的理由：python 默认日志级别是 `INFO`、且 CLI 展示面在本版未接线 ⇒ 若只逐条打 `WARN`，用户要么被
+N 条重复告警淹没、要么（降为 DEBUG 时）完全看不见；故改为「一条汇总点名 + 逐条 DEBUG 给 URL 明细」。
+rust 侧的逐条结构化 `WARN` 带 `reason` 码，适合被日志检索/告警规则消费——两端面向的消费方式不同。
+
+差异 3 的理由：python 的 CLI 展示面另开 follow-up（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)），
+本版先保证 `GovernanceRecoveryReport` 与日志可观测。
 
 两端共同点（对拍口径）：报告字段只放脱敏展示值；声明源变化**永不**导致换源；换源只经显式 remove → re-add。
 

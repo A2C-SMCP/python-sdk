@@ -56,6 +56,7 @@ from a2c_smcp.computer.settings.scope import (
 )
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
+    known_marketplace_source,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
@@ -166,9 +167,12 @@ def detect_marketplace_source_conflicts(
 
     - **只看传进来的 marketplace**——调用方只传 ``installedPlugins`` 意图涉及的集合，无意图项不检测。
     - 无声明（``extraKnownMarketplaces`` 缺该键 / 条目非映射）→ 跳过：没有可比的"声明源"。
-    - 无 ``known_marketplaces`` 记录，或记录在但 ``source`` 缺失/非映射 → 跳过：没有可比的"已注册源"，
-      该情形由 ``failed_marketplaces`` 降级路径报告，不在此重复（与 stage 循环**同一可用性判据**，
-      否则同一次恢复会同时打「沿用已注册源」与「已降级」两条互斥诊断）。
+    - 无**可用**的 ``known_marketplaces`` 记录（记录缺失 / 记录非映射 / ``source`` 缺失或非映射）→ 跳过：
+      没有可比的"已注册源"。该情形**不由本函数报告**——非惰性市场由 stage 循环记入 ``failed_marketplaces``
+      （降级）；**全惰性市场**（``installed_disabled`` ∧ 账本完好）在 stage 循环里先 ``continue`` 零动作，
+      因此两处报告都不出现。判据与 stage 循环共用
+      :func:`~a2c_smcp.computer.settings.store.known_marketplace_source`，否则同一次恢复会同时打
+      「沿用已注册源」与「已降级」两条互斥诊断。
     - **同源判据 = :func:`~a2c_smcp.computer.skills.marketplace_identity.same_source`**（SDK 单一权威，与
       ``reconciler.reconcile`` 同一函数）：只做字符串级比较，``ssh://`` / ``https://`` / scp-like / ``.git``
       后缀等等价写法**不归一** → 视为不同源（§5.14「无法确定时 MUST fail-closed」）。
@@ -195,13 +199,11 @@ def detect_marketplace_source_conflicts(
         decl = declarations.get(marketplace)
         if not isinstance(decl, Mapping):
             continue
-        record = known.get(marketplace)
-        if not isinstance(record, Mapping):
-            continue
-        known_source = record.get("source")
-        if not isinstance(known_source, Mapping):
-            # 与 stage 循环**同一可用性判据**：没有可用的「已注册源」⇒ 该市场走 ``failed_marketplaces``
-            # 降级路径。此处若仍报冲突，同一次恢复会同时打「沿用已注册源」与「已降级」两条互斥诊断。
+        known_source = known_marketplace_source(known, marketplace)
+        if known_source is None:
+            # 与 stage 循环**同一可用性判据**（:func:`~a2c_smcp.computer.settings.store.known_marketplace_source`）：
+            # 没有可用的「已注册源」⇒ 该市场走 ``failed_marketplaces`` 降级路径。此处若仍报冲突，同一次恢复会
+            # 同时打「沿用已注册源」与「已降级」两条互斥诊断。
             continue
         declared_source = decl.get("source")
         if same_source(known_source, declared_source):
@@ -371,7 +373,9 @@ async def recover_marketplace_skills(
     对账本缺失/installPath 全失效的 installed pid（含 installed_disabled）经
     :func:`~a2c_smcp.computer.settings.installer.materialize_plugin` 重物化（§4.9 删除无损；失败 WARN 跳过）。
     降级判定与 rust 同构：stage 内部吞错，事后 clone 树仍缺 → 该 marketplace 入 ``failed_marketplaces``；
-    known_marketplaces 缺记录 → 同样降级。**绝不抛、不阻断其余**。
+    known_marketplaces 无**可用**记录（缺失 / 记录非映射 / ``source`` 非映射）→ 同样降级。**绝不抛、不阻断其余**。
+    注意「全惰性市场」（无活跃 plugin ∧ 账本完好）在查 known **之前**就 ``continue``（零动作是设计）——它们
+    既不入 ``failed_marketplaces`` 也不产生声明源冲突。
 
     声明源诊断（#287，镜像 rust-sdk#295）：对 ``installedPlugins`` 意图涉及的每个 marketplace，比对
     ``declared["extraKnownMarketplaces"][name]["source"]`` 与 ``known_marketplaces[name]["source"]``——
@@ -431,11 +435,13 @@ async def recover_marketplace_skills(
         if not active_plugins and not needs_materialize:
             continue  # 全惰性且账本完好 → 零动作（installed_disabled 静止态）
 
-        record = known.get(marketplace)
-        source = record.get("source") if isinstance(record, Mapping) else None
-        if not isinstance(source, Mapping):
+        source = known_marketplace_source(known, marketplace)
+        if source is None:
+            # 记录缺失 / 记录非映射 / source 非映射 同属「无可用已注册源」（与 :func:`detect_marketplace_source_conflicts`
+            # 同一判据）——文案不再断言「记录缺失」，账本可被手编成半形。
             logger.warning(
-                "governance recovery: marketplace %r has no known_marketplaces record; its plugins %s degraded (not restored)",
+                "governance recovery: marketplace %r has no usable known_marketplaces record (missing or malformed "
+                "source); its plugins %s degraded (not restored)",
                 marketplace,
                 sorted(plugins),
             )

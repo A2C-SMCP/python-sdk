@@ -172,8 +172,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `known_source_display`（三者均为**展示值**：账本键走 `redact_ledger_key`，两侧 source 走
     `display_source`，不可用于再克隆）。
   - 检测范围 = **`installedPlugins` 意图涉及**的 marketplace（无安装意图的市场不检测，空意图早退行为不变）；
-    无声明条目、无 known 记录、或 known 记录无可用 `source` 的市场不在此报告（末者仍由既有
-    `failed_marketplaces` 报降级）。
+    无声明条目、或无**可用** known 记录（缺失 / 记录非映射 / `source` 非映射）的市场不在此报告——后者由
+    stage 循环记入 `failed_marketplaces`，但**全惰性市场**（`installed_disabled` ∧ 账本完好）在 stage 循环
+    里零动作 `continue`，因此两处报告都不出现。
   - 同源判据 = `same_source`（SDK 单一权威，与 `reconcile` 同一函数）：**只做字符串级比较**，
     `ssh://` / `https://` / scp-like / `.git` 后缀等等价写法**不归一**，任一侧面目不可识别即视为不同源
     ——协议 §5.14「无法确定时 MUST fail-closed」。

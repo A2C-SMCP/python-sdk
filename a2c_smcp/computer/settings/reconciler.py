@@ -50,6 +50,7 @@ from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_va
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
     KnownMarketplacesFile,
+    known_marketplace_source,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
@@ -697,8 +698,9 @@ def list_dangling_plugin_intents(
         if ledger_entry_materialized(ledger.get(pid)):
             continue
         plugin, _, marketplace = pid.partition("@")
-        record = known.get(marketplace)
-        if not isinstance(record, Mapping) or not isinstance(record.get("source"), Mapping):
+        # 「无可用已注册源」= 记录缺失 / 记录非映射 / source 非映射——与 recovery 的 stage 循环与声明源诊断
+        # 共用同一判据（:func:`~a2c_smcp.computer.settings.store.known_marketplace_source`），三处不得各写副本。
+        if known_marketplace_source(known, marketplace) is None:
             out.append((pid, DANGLING_MARKETPLACE_NOT_ADDED))
             continue
         catalog_dir = marketplace_skill_dir(home, marketplace)

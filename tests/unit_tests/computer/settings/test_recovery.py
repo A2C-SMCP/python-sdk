@@ -717,6 +717,45 @@ async def test_recover_no_conflict_when_known_record_has_no_source(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_recover_no_conflict_when_known_source_is_not_mapping(tmp_path: Path) -> None:
+    """known 记录的 ``source`` 是**非映射值**（如裸字符串）同样视为「无可用已注册源」→ 不报冲突。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": "https://example.com/acme.git", "installLocation": "/nope"}}},
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/other.git"))
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == ["acme"]
+
+
+@pytest.mark.asyncio
+async def test_recover_lazy_marketplace_without_usable_source_reports_nothing(tmp_path: Path) -> None:
+    """
+    全惰性市场（installed_disabled ∧ 账本完好）+ 无可用已注册源 → **两处报告都不出现**。
+
+    文档不得声称「无 known 记录一律进 ``failed_marketplaces``」：stage 循环对全惰性市场在查 known **之前**
+    就 ``continue``（零动作是设计），故既无冲突也无降级。
+    """
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = {**_with_declarations({}, ("acme", "https://example.com/other.git")), "installedPlugins": ["audit@acme"],
+                "enabledPlugins": {"audit@acme": False}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.skipped_disabled == ["audit@acme"]
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == []
+
+
+@pytest.mark.asyncio
 async def test_recover_no_conflict_when_known_record_absent(tmp_path: Path) -> None:
     """无 known 记录 → 无可比对的「已注册源」，不报冲突（仍走既有 ``failed_marketplaces`` 降级）。"""
     home = _home(tmp_path)
@@ -836,3 +875,29 @@ def test_detect_marketplace_source_conflicts_redacts_ledger_key() -> None:
 def test_detect_marketplace_source_conflicts_tolerates_malformed_entries(declared: dict, known: dict) -> None:
     """形状不合（声明条目 / known 记录 / ``extraKnownMarketplaces`` 整体）→ 跳过，不抛、不报冲突。"""
     assert detect_marketplace_source_conflicts(["acme"], declared, known) == []
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        pytest.param({}, id="decl-no-source-key"),
+        pytest.param({"source": "oops"}, id="decl-source-not-mapping"),
+        pytest.param({"source": None}, id="decl-source-none"),
+    ],
+)
+def test_detect_conflicts_fail_closed_on_malformed_declared_source(decl: dict) -> None:
+    """
+    纯函数契约：**已注册源可用**但**声明源不可识别** ⇒ fail-closed 报冲突（展示面占位符）。
+
+    与「known 侧不可用 → 跳过」刻意不对称：known 侧不可用意味着没有可比对象（交 ``failed_marketplaces``）；
+    声明侧不可用意味着用户确实声明了什么、却无法证明同源（§5.14「无法确定时 MUST fail-closed」）。
+    """
+    known = {"acme": {"source": {"type": "git", "url": "https://example.com/acme.git"}}}
+    declared = {"extraKnownMarketplaces": {"acme": decl}}
+
+    conflicts = detect_marketplace_source_conflicts(["acme"], declared, known)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].marketplace == "acme"
+    assert conflicts[0].known_source_display == "https://example.com/acme.git"
+    assert conflicts[0].declared_source_display == "<redacted-git-source>"
