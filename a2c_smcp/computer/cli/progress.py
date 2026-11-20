@@ -31,7 +31,14 @@ from a2c_smcp.computer.cli.utils import console
 
 @contextlib.contextmanager
 def _spinner(description: str) -> Iterator[None]:
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console) as p:
+    # ``markup=False``：spinner 文案永远是**内部派生文本**（可能内插用户输入 / 账本键），rich 的
+    # ``Text.from_markup`` 会把 ``[/b]x`` 之类当标记并在 TTY 抛 ``MarkupError``（#260 七审 🔴2）。
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}", markup=False),
+        transient=True,
+        console=console,
+    ) as p:
         p.add_task(description, total=None)
         yield
 

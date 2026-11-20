@@ -68,7 +68,12 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     registered_name_for_source,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
-from a2c_smcp.computer.skills.sources import GITHUB_HOST, SkillSourceError, normalize_repo_shorthand
+from a2c_smcp.computer.skills.sources import (
+    GITHUB_HOST,
+    SkillSourceError,
+    normalize_repo_shorthand,
+    safe_exception_text,
+)
 from a2c_smcp.computer.skills.staging import (
     SkillStagingError,
     add_marketplace_source,
@@ -76,13 +81,17 @@ from a2c_smcp.computer.skills.staging import (
     stage_marketplace_skills,
 )
 from a2c_smcp.utils.git_url import (
+    REDACTED_GIT_SOURCE,
     credential_like_text,
     diagnostic_url_for_display,
     known_git_source_for_display,
 )
+from a2c_smcp.utils.logger import get_logger
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
 ConfirmFn = Callable[[str], Awaitable[bool]]
+
+logger = get_logger(__name__)
 
 # 退出码语义（§4.6）/ Exit code semantics。
 EXIT_OK = 0
@@ -347,34 +356,36 @@ def _register_intent_only(
             "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
             json_output=json_output,
         )
-    except OSError:
+    except OSError as e:
+        logger.error("marketplace intent registration failed: %s", safe_exception_text(e))
         return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
 
     final_name = outcome["existing"] or outcome["registered"]
     if final_name is None:  # 防御：mutator 既没判幂等、也没登记（不应发生）
         return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
     # 展示名脱敏：`final_name` 可能是 `registered_name_for_source` 返回的**账本键原值**（可被手编成携带
-    # 凭据的串）；rich 面再 `escape()`（`[/]x` 之类会 MarkupError）。查找 / trust 仍用原值。
-    shown = escape(redact_ledger_key(final_name))
+    # 凭据的串）。**只脱敏、不在此处 escape**——`_ok` 内部统一转义，双重转义会输出 `\[/]x`。
+    # 查找 / trust 仍用原值。
+    redacted = redact_ledger_key(final_name)
     record = _marketplaces(home, env).get(final_name) or {}
     try:
         _record_trust(final_name, env)
-    except SettingsFileCorruptError as e:
+    except (SettingsFileCorruptError, OSError) as e:
         console_err.print(
-            f"[yellow]! marketplace {shown} is registered but its trust entry could not be persisted: {escape(str(e))}[/yellow]"
+            f"[yellow]! marketplace {escape(redacted)} is registered but its trust entry could not be persisted: {escape(str(e))}[/yellow]"
         )
     if json_output:
         console.print_json(
             data={
-                "registered": redact_ledger_key(final_name),
+                "registered": redacted,
                 "url": known_git_source_for_display(url),
                 "installLocation": record.get("installLocation"),
             }
         )
         return EXIT_OK
     if outcome["existing"] is not None:
-        return _ok(f"marketplace {shown} is already registered (no clone needed)")
-    return _ok(f"registered marketplace {shown} from the local clone (no clone)")
+        return _ok(f"marketplace {redacted!r} is already registered (no clone needed)")
+    return _ok(f"registered marketplace {redacted!r} from the local clone (no clone)")
 
 
 def _unresolvable_name_error() -> MarketplaceIdentityError:
@@ -468,19 +479,24 @@ async def marketplace_add(
             "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
             json_output=json_output,
         )
-    except OSError:
-        # 提交点的 `os.replace` 失败（Windows 文件占用 / 权限 / 磁盘异常）→ 结构化错误，不抛 traceback。
-        # 提交点自身已尽力回滚（新树删除、旧树复位），状态与提交前一致。
+    except OSError as e:
+        # `os.replace` 失败（Windows 文件占用 / 权限 / 磁盘异常）→ 结构化错误，不抛 traceback。提交点自身
+        # 已尽力回滚（新树删除、旧树复位），状态与提交前一致。文案保持泛化：OSSerror 也可能来自 clone 前的
+        # 目录操作，不宜断言「commit 失败」。
+        logger.error("marketplace registration failed: %s", safe_exception_text(e))
         return _err(
-            f"failed to commit the marketplace registration for {_error_url_display(url)} (see logs)",
+            f"failed to register the marketplace (see logs): {_error_url_display(url)}",
             json_output=json_output,
         )
 
-    # 注册已提交 → 落 trust（失败仅 WARN，不回滚已成功的注册）。
+    # 注册已提交 → 落 trust（失败仅 WARN，不回滚已成功的注册）。`file_lock` / `os.replace` 也可能抛
+    # OSError（只读 / 磁盘满 / 权限），一并降级为 WARN 而不是 traceback（#260 七审 🟡3）。
     try:
         _record_trust(final_name, env)
-    except SettingsFileCorruptError as e:
-        console_err.print(f"[yellow]! added {final_name!r} but failed to persist its trust entry: {e}[/yellow]")
+    except (SettingsFileCorruptError, OSError) as e:
+        console_err.print(
+            f"[yellow]! added {escape(final_name)!r} but failed to persist its trust entry: {escape(str(e))}[/yellow]"
+        )
 
     try:
         with clone_spinner(f"Staging {final_name}...", enabled=not json_output):
@@ -516,7 +532,9 @@ def _redact_pid(pid: str) -> str:
     plugin, sep, market = pid.partition("@")
     if not sep:
         return redact_ledger_key(pid)
-    return f"{plugin}@{redact_ledger_key(market)}"
+    # 机器写入路径两段均为严格 kebab；**手编**账本可把凭据样文本塞进 plugin 段 → 同样 fail-closed。
+    shown_plugin = REDACTED_GIT_SOURCE if credential_like_text(plugin) else plugin
+    return f"{shown_plugin}@{redact_ledger_key(market)}"
 
 
 def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: bool = False) -> int:
@@ -548,14 +566,15 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         table.add_column(col)
     for nm, rec in mps.items():
         url = _display_source_url(rec) or ""
-        sha = rec.get("commitSha") or ""
+        # 手编账本可把 `commitSha` 写成非 str → 先 `str()` 再截断（旧实现 `sha[:10]` 会 TypeError）。
+        sha = str(rec.get("commitSha") or "")
         table.add_row(
             escape(redact_ledger_key(nm)),
             escape(url),
             "✓" if nm in trusted else "—",
             "on" if rec.get("autoUpdate") else "off",
-            str(rec.get("lastUpdated") or "—"),
-            sha[:10] if sha else "—",
+            escape(str(rec.get("lastUpdated") or "—")),
+            escape(sha[:10]) if sha else "—",
         )
     console.print(table)
     return EXIT_OK
@@ -589,7 +608,8 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     table.add_column("Value")
     for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
         # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
-        table.add_row(k, "" if info[k] is None else str(info[k]))
+        # 值可能来自**手编**账本（或 URL path）→ rich 单元格必须 escape（#260 七审 🔴1）。
+        table.add_row(k, "" if info[k] is None else escape(str(info[k])))
     table.add_row("installedPlugins", ", ".join(escape(_redact_pid(pid)) for pid in plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK

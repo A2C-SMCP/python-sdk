@@ -1630,7 +1630,10 @@ async def test_add_commit_oserror_returns_structured_error(
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert payload["error"] == "error"
-    assert "failed to commit the marketplace registration" in payload["message"]
+    assert "failed to register the marketplace" in payload["message"]
+    # 状态一致：失败不得写账本、不得残留 trust
+    assert (load_known_marketplaces(home, env).get("marketplaces") or {}) == {}
+    assert not _load_trusted(env)
 
 
 def test_ok_message_escapes_markup(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1644,3 +1647,181 @@ def test_ok_message_escapes_markup(tmp_path: Path, capsys: pytest.CaptureFixture
     assert marketplace_set(home, env, "[/]x", "auto-update", "true") == 0
     out = capsys.readouterr().out
     assert "[/]x" in out
+
+
+# ── #260 七审收敛：rich 渲染面 / 双转义 / OSError 口径 ────────────────────────
+def test_info_table_escapes_markup_and_non_string_fields(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """七审 🔴1：`info` 非 JSON 表格的每个单元格都须 escape（手编 `lastUpdated`/URL path 含标记）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {
+                    "source": {"type": "git", "url": "https://example.com/repo[/]src.git"},
+                    "installLocation": "/tmp/[/]x",
+                    "commitSha": "[/]sha",
+                    "lastUpdated": "[/]ts",
+                }
+            },
+        },
+        home,
+        env,
+    )
+
+    assert marketplace_info(home, env, "acme") == 0
+    out = capsys.readouterr().out
+    assert "[/]ts" in out and "[/]sha" in out
+
+
+def test_list_table_escapes_timestamp_and_commit(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """七审 🟡2：`list` 的 lastUpdated / commitSha 单元格须 escape 且容忍非 str。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {
+                    "source": {"type": "git", "url": "https://example.com/a.git"},
+                    "installLocation": "",
+                    "lastUpdated": "[/]ts",
+                    "commitSha": 12345,  # 非 str：旧实现 `sha[:10]` 会 TypeError
+                }
+            },
+        },
+        home,
+        env,
+    )
+
+    assert marketplace_list(home, env) == 0
+    out = capsys.readouterr().out
+    assert "[/]ts" in out
+
+
+@pytest.mark.asyncio
+async def test_refresh_spinner_renders_markup_like_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    七审 🔴2：spinner 描述参与 rich 渲染时不得抛 `MarkupError`（`progress.py` 的 `TextColumn(markup=False)`）。
+
+    用**真实渲染**（forced-terminal 的 Console 写 StringIO），而非不渲染的 spy。
+    """
+    import io as _io
+
+    from rich.console import Console
+
+    import a2c_smcp.computer.cli.progress as progress_mod
+
+    sink = _io.StringIO()
+    monkeypatch.setattr(progress_mod, "console", Console(file=sink, force_terminal=True, width=120))
+
+    with progress_mod.clone_spinner("Refreshing [/b]x..."):
+        pass  # 渲染发生在 enter/exit
+
+    assert "[/b]x" in sink.getvalue()
+
+
+def test_redact_pid_fails_closed_on_credential_like_plugin_segment() -> None:
+    """七审 🟡7：手编 pid 的 plugin 段含凭据样文本 → 该段 fail-closed（机器写入路径两段均为严格 kebab）。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    assert marketplace_mod._redact_pid("alice:PW_LEAK@acme") == f"{REDACTED_GIT_SOURCE}@acme"
+    assert marketplace_mod._redact_pid("audit@acme") == "audit@acme"
+
+
+@pytest.mark.asyncio
+async def test_no_clone_intent_display_not_double_escaped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """七审 🟡1：脱敏后由 `_ok` 统一转义，不得出现二次转义（`\\[`）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    source = {"type": "git", "url": "https://example.com/markup.git"}
+    save_known_marketplaces({"version": 1, "marketplaces": {"[/]x": {"source": source, "installLocation": ""}}}, home, env)
+
+    assert await marketplace_add(SkillRegistry(), home, env, "https://example.com/markup.git", trust=True, no_clone=True) == 0
+    out = capsys.readouterr().out
+    assert "[/]x" in out
+    assert "\\[" not in out, "不得二次转义"
+
+
+@pytest.mark.asyncio
+async def test_add_trust_persist_oserror_is_warn_not_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """七审 🟡3：`_record_trust` 抛 OSError（file_lock / os.replace）→ WARN，不回滚已成功注册、不 traceback。"""
+    bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(marketplace_mod, "_record_trust", _boom)
+
+    code = await marketplace_add(reg, home, env, f"file://{bare}", trust=True)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "acme" in (load_known_marketplaces(home, env).get("marketplaces") or {})
+    assert "failed to persist its trust entry" in captured.out + captured.err  # WARN 面可感
+
+
+@pytest.mark.asyncio
+async def test_intent_oserror_returns_structured_error_and_leaves_no_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """七审 🟡6：intent 路径的 OSError 分支有覆盖，且账本/trust 状态不变。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(marketplace_mod, "update_known_marketplaces", _boom)
+
+    code = await marketplace_add(
+        SkillRegistry(), home, env, "https://example.com/x.git", trust=True, no_clone=True, json_output=True
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "failed to register the marketplace intent" in json.loads(out)["message"]
+    assert (load_known_marketplaces(home, env).get("marketplaces") or {}) == {}
+    assert not _load_trusted(env), "失败不得残留 trust"
+
+
+def test_info_table_installed_plugins_redacted_non_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """七审 🟡5：非 JSON `info` 的 installedPlugins 分支同样脱敏（此前只有 JSON 面有锁）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_credential_ledger(home, env)
+    save_installed_plugins(
+        {"version": 1, "plugins": {f"audit@{_CRED_KEY}": [{"scope": "user", "installPath": str(home)}]}},
+        home,
+        env,
+    )
+
+    assert marketplace_info(home, env, _CRED_KEY) == 0
+    out = capsys.readouterr().out
+    assert "PW_LEAK" not in out and "alice" not in out
+
+
+@pytest.mark.asyncio
+async def test_intent_trust_persist_oserror_is_warn_not_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """七审 🟡3（intent 面）：`_record_trust` 抛 OSError → WARN，注册事实保持、不 traceback。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    source = {"type": "git", "url": "https://example.com/x.git"}
+    save_known_marketplaces({"version": 1, "marketplaces": {"acme": {"source": source, "installLocation": str(home)}}}, home, env)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(marketplace_mod, "_record_trust", _boom)
+
+    code = await marketplace_add(SkillRegistry(), home, env, "https://example.com/x.git", trust=True, no_clone=True)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "acme" in (load_known_marketplaces(home, env).get("marketplaces") or {})
+    assert "could not be persisted" in captured.out + captured.err  # WARN 面可感（intent 路径）
