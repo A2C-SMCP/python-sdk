@@ -35,7 +35,7 @@ ownership; process materialization stays with the client (#93).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,13 +56,19 @@ from a2c_smcp.computer.settings.scope import (
 )
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
+    known_marketplace_source,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
-from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+from a2c_smcp.computer.skills.marketplace_identity import (
+    MarketplaceNameChangeError,
+    display_source,
+    redact_ledger_key,
+    same_source,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
@@ -88,6 +94,8 @@ class GovernanceRecoveryReport:
       有线索时经 :func:`_infer_record_scopes` 推回原 scope，不入此列）。
     - ``pending_bundled_servers``：project scope enabledPlugins 激活 → 回落审批门 PENDING 的 bundled
       server 记录（#159 Option B / 协议 §2.2）；client 据此展示审批 UI。
+    - ``marketplace_source_conflicts``：**声明源 ≠ 已注册源**的 marketplace（#287 / §5.14，**只诊断不换源**）。
+      本报告是观测信号而非降级信号——冲突项照常按 known 旧源恢复，**不**进 ``failed_marketplaces``。
     """
 
     restored_plugins: list[str] = field(default_factory=list)
@@ -98,6 +106,7 @@ class GovernanceRecoveryReport:
     rematerialized: list[str] = field(default_factory=list)
     scope_normalized: list[str] = field(default_factory=list)
     pending_bundled_servers: list[BundledServerRecord] = field(default_factory=list)
+    marketplace_source_conflicts: list[MarketplaceSourceConflict] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +130,117 @@ class BundledServerRecord:
 # 阶段二重挂回调：携归属记录（供 client 带 plugin/marketplace 上下文注册，D2 ${input:} 前缀回退解析）。
 # Phase-2 remount callback carrying ownership context (unlike installer's context-free RegisterServer).
 RegisterBundledServer = Callable[[MCPServerConfig, BundledServerRecord], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class MarketplaceSourceConflict:
+    """
+    声明源与已注册源不一致（#287，镜像 rust-sdk#295）/ Declared-vs-registered marketplace source mismatch.
+
+    **只诊断、不换源**（runtime-contract §2.3 派生方向 + §5.14「MUST NOT 静默替换」）：boot 仍按
+    ``known_marketplaces.json`` 的**已注册源**恢复，本记录只让用户看见不一致。换源唯一的合法路径是显式
+    ``marketplace remove`` → ``add``。
+
+    三个字段**全部是展示值**，不可用于任何再克隆 / 比较：
+
+    - ``marketplace``：账本键经 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key`
+      （known 键可手编，可能是携带凭据的 URL 残形，#261/#263/#281 同口径）。
+    - ``declared_source_display`` / ``known_source_display``：两侧 ``source`` 经
+      :func:`~a2c_smcp.computer.skills.marketplace_identity.display_source`（去 userinfo / query / fragment，
+      path 段含凭据样文本一律占位符）。
+    """
+
+    marketplace: str
+    declared_source_display: str
+    known_source_display: str
+
+
+def detect_marketplace_source_conflicts(
+    marketplaces: Iterable[str],
+    declared: Mapping[str, Any],
+    known: Mapping[str, Any],
+) -> list[MarketplaceSourceConflict]:
+    """
+    比对声明源与已注册源，列出不一致的 marketplace（纯函数、零 IO）/ Detect declared-vs-registered mismatches.
+
+    判定口径（#287 用户裁决 2026-11-20）：
+
+    - **只看传进来的 marketplace**——调用方只传 ``installedPlugins`` 意图涉及的集合，无意图项不检测。
+    - 无声明（``extraKnownMarketplaces`` 缺该键 / 条目非映射）→ 跳过：没有可比的"声明源"。
+    - 无**可用**的 ``known_marketplaces`` 记录（记录缺失 / 记录非映射 / ``source`` 缺失或非映射）→ 跳过：
+      没有可比的"已注册源"。该情形**不由本函数报告**——非惰性市场由 stage 循环记入 ``failed_marketplaces``
+      （降级）；**全惰性市场**（``installed_disabled`` ∧ 账本完好）在 stage 循环里先 ``continue`` 零动作，
+      因此两处报告都不出现。判据与 stage 循环共用
+      :func:`~a2c_smcp.computer.settings.store.known_marketplace_source`，否则同一次恢复会同时打
+      「沿用已注册源」与「已降级」两条互斥诊断。
+    - **同源判据 = :func:`~a2c_smcp.computer.skills.marketplace_identity.same_source`**（SDK 单一权威，与
+      ``reconciler.reconcile`` 同一函数）：只做字符串级比较，``ssh://`` / ``https://`` / scp-like / ``.git``
+      后缀等等价写法**不归一** → 视为不同源（§5.14「无法确定时 MUST fail-closed」）。
+    - 声明条目存在但 ``source`` 缺失/畸形 → ``same_source`` 返回 ``False`` → 同样报冲突（fail-closed，
+      与 ``reconcile`` 的 ``sourceChanged`` 分支同姿态）。
+
+    .. note::
+       上面这条 fail-closed 只在调用方传入**未经 schema 校验**的 ``declared`` 时可达。boot 生产路径的
+       ``declared`` 来自 :func:`~a2c_smcp.computer.settings.scope.resolve_settings`，其
+       ``_validate_extra_marketplaces``（``settings/schema.py``）会把 ``source`` 缺失 / 非 ``git`` / URL 畸形
+       的声明**整条丢弃**——此时本函数看到的是「无声明」，既不报冲突也无从诊断（校验错误在
+       :attr:`ResolvedSettings.errors`，``Computer`` 当前不呈现它）。已知边界，见
+       ``docs/design-0.5.1-boot-recovery-source-diagnostics.md`` §7。
+
+    :param marketplaces: 待检测的 marketplace 名（调用方保证 = 安装意图涉及集）。
+    :param declared: 合并声明视图（取 ``extraKnownMarketplaces``）。
+    :param known: ``known_marketplaces.json`` 的 ``marketplaces`` 映射。
+    :return: 按 marketplace 名稳定排序的冲突列表（字段均为脱敏展示值）。
+    """
+    raw = declared.get("extraKnownMarketplaces")
+    declarations: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    conflicts: list[MarketplaceSourceConflict] = []
+    for marketplace in sorted(set(marketplaces)):
+        decl = declarations.get(marketplace)
+        if not isinstance(decl, Mapping):
+            continue
+        known_source = known_marketplace_source(known, marketplace)
+        if known_source is None:
+            # 与 stage 循环**同一可用性判据**（:func:`~a2c_smcp.computer.settings.store.known_marketplace_source`）：
+            # 没有可用的「已注册源」⇒ 该市场走 ``failed_marketplaces`` 降级路径。此处若仍报冲突，同一次恢复会
+            # 同时打「沿用已注册源」与「已降级」两条互斥诊断。
+            continue
+        declared_source = decl.get("source")
+        if same_source(known_source, declared_source):
+            continue
+        # marketplace 走账本键脱敏：进入本函数的名字上游已过 `is_valid_enabled_plugin_key`（严格 kebab）⇒
+        # 当前恒为恒等映射，保留它是与 #261/#263/#281 展示口径一致 + 纵深防御（不把账本键当可信值）。
+        conflicts.append(
+            MarketplaceSourceConflict(
+                marketplace=redact_ledger_key(marketplace),
+                declared_source_display=display_source(declared_source),
+                known_source_display=display_source(known_source),
+            ),
+        )
+    return conflicts
+
+
+def _log_marketplace_source_conflicts(conflicts: Sequence[MarketplaceSourceConflict]) -> None:
+    """冲突诊断日志：WARN 汇总（不带不可信值）+ 逐条 DEBUG（脱敏展示值）/ Summary WARN + per-item DEBUG."""
+    if not conflicts:
+        return
+    for conflict in conflicts:
+        logger.debug(
+            "governance recovery: marketplace %r is declared from a different source "
+            "(declared %s, registered %s); keeping the registered source",
+            conflict.marketplace,
+            conflict.declared_source_display,
+            conflict.known_source_display,
+        )
+    # 汇总行**带脱敏后的 marketplace 名**：默认日志级别是 INFO、CLI 展示面留 follow-up，只给计数的话用户
+    # 根本不知道该处理哪一个。两侧 URL 仍只在逐条 DEBUG 里（同为脱敏展示值）。
+    logger.warning(
+        "governance recovery: %d marketplace(s) are declared from a different source than their registration (%s); "
+        "keeping the registered source and its existing capabilities (declared-source changes are diagnostic only "
+        "— switch by explicit marketplace remove / add, runtime-contract §5.14)",
+        len(conflicts),
+        ", ".join(conflict.marketplace for conflict in conflicts),
+    )
 
 
 def _plugin_boot_active(declared: Mapping[str, Any], pid: str) -> bool:
@@ -253,7 +373,15 @@ async def recover_marketplace_skills(
     对账本缺失/installPath 全失效的 installed pid（含 installed_disabled）经
     :func:`~a2c_smcp.computer.settings.installer.materialize_plugin` 重物化（§4.9 删除无损；失败 WARN 跳过）。
     降级判定与 rust 同构：stage 内部吞错，事后 clone 树仍缺 → 该 marketplace 入 ``failed_marketplaces``；
-    known_marketplaces 缺记录 → 同样降级。**绝不抛、不阻断其余**。
+    known_marketplaces 无**可用**记录（缺失 / 记录非映射 / ``source`` 非映射）→ 同样降级。**绝不抛、不阻断其余**。
+    注意「全惰性市场」（无活跃 plugin ∧ 账本完好）在查 known **之前**就 ``continue``（零动作是设计）——它们
+    既不入 ``failed_marketplaces`` 也不产生声明源冲突。
+
+    声明源诊断（#287，镜像 rust-sdk#295）：对 ``installedPlugins`` 意图涉及的每个 marketplace，比对
+    ``declared["extraKnownMarketplaces"][name]["source"]`` 与 ``known_marketplaces[name]["source"]``——
+    不同则记入 :attr:`GovernanceRecoveryReport.marketplace_source_conflicts`（展示值脱敏）+ WARN 汇总 +
+    逐条 DEBUG。**只诊断**：恢复仍用已知的**已注册源**，``failed_marketplaces`` 与降级语义不变。理由：
+    boot 自动换源即 §5.14 禁止的"静默替换"；换源只经显式 ``marketplace remove`` → ``add``。
 
     scope 推回（#125 任务 1）：重物化前经 :func:`_infer_record_scopes` 扫描 user / cwd 锚定 project/local
     三层的 ``enabledPlugins`` 条目（及 project/local 的 ``installedPlugins`` 声明）作 scope 线索——
@@ -267,7 +395,8 @@ async def recover_marketplace_skills(
 
     :param registry: 目标 :class:`SkillRegistry`（恢复注册进当前活跃集）。
     :param home: SKILL Home 绝对根。
-    :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控）。
+    :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控；#287 起**另只读**
+        ``extraKnownMarketplaces`` 作声明源诊断，缺该键 ⇒ 不产生 ``marketplace_source_conflicts``）。
     :param env: 环境映射（账本路径解析 + git 子进程），默认 ``os.environ``。
     :param timeout: 单次 git 操作超时（仅 clone 缺失重建时可能触发）。
     """
@@ -292,6 +421,12 @@ async def recover_marketplace_skills(
         plugin, marketplace = split
         by_marketplace.setdefault(marketplace, {})[plugin] = active
 
+    # #287：声明源 vs 已注册源诊断。放在 stage 循环**外**——循环内降级分支多且会 ``continue``，而「全惰性
+    # 零动作」的市场同样应被诊断（口径 = 意图涉及即检测）。**只读**：不改 ``source`` / ``failed_marketplaces``，
+    # 恢复仍按 known 旧源（§2.3 派生方向 + §5.14 MUST NOT 静默替换）。
+    report.marketplace_source_conflicts = detect_marketplace_source_conflicts(by_marketplace, declared, known)
+    _log_marketplace_source_conflicts(report.marketplace_source_conflicts)
+
     for marketplace, plugins in sorted(by_marketplace.items()):
         active_plugins = {p for p, is_active in plugins.items() if is_active}
         # ∀ 语义（fully）：混合健康度（一条健康 + 一条损坏/死路径）也触发重物化——健康 scope 幂等重建、
@@ -300,11 +435,13 @@ async def recover_marketplace_skills(
         if not active_plugins and not needs_materialize:
             continue  # 全惰性且账本完好 → 零动作（installed_disabled 静止态）
 
-        record = known.get(marketplace)
-        source = record.get("source") if isinstance(record, Mapping) else None
-        if not isinstance(source, Mapping):
+        source = known_marketplace_source(known, marketplace)
+        if source is None:
+            # 记录缺失 / 记录非映射 / source 非映射 同属「无可用已注册源」（与 :func:`detect_marketplace_source_conflicts`
+            # 同一判据）——文案不再断言「记录缺失」，账本可被手编成半形。
             logger.warning(
-                "governance recovery: marketplace %r has no known_marketplaces record; its plugins %s degraded (not restored)",
+                "governance recovery: marketplace %r has no usable known_marketplaces record (missing or malformed "
+                "source); its plugins %s degraded (not restored)",
                 marketplace,
                 sorted(plugins),
             )

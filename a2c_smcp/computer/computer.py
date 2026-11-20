@@ -867,12 +867,20 @@ class Computer(BaseComputer[PromptSession]):
                 logger.warning(f"v0.3.0 治理迁移失败（不阻断启动）/ governance migration failed (non-blocking): {e}")
             try:
                 recovery_report = await self.reconcile_governance()
-                if recovery_report.restored_skills or recovery_report.failed_marketplaces:
+                # #287：声明源冲突是**诊断**信号（不降级、不阻断），也纳入汇总条件——否则「零恢复 + 有冲突」
+                # 的启动会静默无输出，而它恰恰是最需要被看见的情形。
+                if (
+                    recovery_report.restored_skills
+                    or recovery_report.failed_marketplaces
+                    or recovery_report.marketplace_source_conflicts
+                ):
                     logger.info(
-                        "governance recovery: %d skills restored, %d plugins, %d marketplaces degraded",
+                        "governance recovery: %d skills restored, %d plugins, %d marketplaces degraded, "
+                        "%d declared-source conflicts",
                         len(recovery_report.restored_skills),
                         len(recovery_report.restored_plugins),
                         len(recovery_report.failed_marketplaces),
+                        len(recovery_report.marketplace_source_conflicts),
                     )
             except Exception as e:  # pragma: no cover — 防御性兜底（recovery 内部已各自降级）
                 logger.error(f"治理启动恢复失败（不阻断启动）/ governance recovery failed (non-blocking): {e}", exc_info=True)
@@ -2449,7 +2457,8 @@ class Computer(BaseComputer[PromptSession]):
             重挂时**应当传入**，仅在明确无既有面的受控场景省略。
         :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
         :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
-        :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；
+        :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；#287 起另**只读**
+            ``extraKnownMarketplaces`` 作声明源诊断——override 时省略该键会让冲突诊断静默失效、report 恒空；
             ``None`` = 现算 user/project/local/policy）。
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """

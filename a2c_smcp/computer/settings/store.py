@@ -459,6 +459,26 @@ def load_known_marketplaces(home: Path | None = None, env: Mapping[str, str] | N
     return _coerce_known_marketplaces(data, path)
 
 
+def known_marketplace_source(known: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    """
+    ``known_marketplaces.json`` 中某 marketplace 的**可用** ``source``（单一判据）/ Usable recorded source.
+
+    "可用" = 记录在 **且** ``source`` 是映射。账本可被手编（``_coerce_known_marketplaces`` 不校验记录内容），
+    故 ``source`` 可能是裸字符串 / ``None``。三个消费方必须用同一判据，否则同一次恢复会打出互斥诊断：
+
+    - :func:`~a2c_smcp.computer.settings.recovery.recover_marketplace_skills`：不可用 → ``failed_marketplaces``；
+    - :func:`~a2c_smcp.computer.settings.recovery.detect_marketplace_source_conflicts`：不可用 → 无可比对象，跳过；
+    - :func:`~a2c_smcp.computer.settings.reconciler.list_dangling_plugin_intents`：不可用 → ``marketplace-not-added``。
+
+    :return: 可用的 ``source`` 映射；记录缺失 / 非映射 / ``source`` 非映射 → ``None``。
+    """
+    record = known.get(name)
+    if not isinstance(record, Mapping):
+        return None
+    source = record.get("source")
+    return source if isinstance(source, Mapping) else None
+
+
 def load_installed_plugins(
     home: Path | None = None,
     env: Mapping[str, str] | None = None,

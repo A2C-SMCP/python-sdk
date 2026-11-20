@@ -164,6 +164,32 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 
+- **boot 治理恢复诊断声明源变化（#287，语义镜像 rust-sdk#295；检测范围按 2026-11-20 用户裁决收窄）**：
+  此前 boot 只按 `known_marketplaces.json` 的已注册源恢复，用户改了
+  `extraKnownMarketplaces[name].source` 后**静默沿用旧源**、无诊断。现在：
+  - `GovernanceRecoveryReport` 新增 additive 字段 `marketplace_source_conflicts：
+    list[MarketplaceSourceConflict]`，条目含 `marketplace` / `declared_source_display` /
+    `known_source_display`（三者均为**展示值**：账本键走 `redact_ledger_key`，两侧 source 走
+    `display_source`，不可用于再克隆）。
+  - 检测范围 = **`installedPlugins` 意图涉及**的 marketplace（无安装意图的市场不检测，空意图早退行为不变）；
+    无声明条目、或无**可用** known 记录（缺失 / 记录非映射 / `source` 非映射）的市场不在此报告——后者由
+    stage 循环记入 `failed_marketplaces`，但**全惰性市场**（`installed_disabled` ∧ 账本完好）在 stage 循环
+    里零动作 `continue`，因此两处报告都不出现。
+  - 同源判据 = `same_source`（SDK 单一权威，与 `reconcile` 同一函数）：**只做字符串级比较**，
+    `ssh://` / `https://` / scp-like / `.git` 后缀等等价写法**不归一**，任一侧面目不可识别即视为不同源
+    ——协议 §5.14「无法确定时 MUST fail-closed」。
+  - 可见面：recovery `WARNING` 汇总（冲突数 + **脱敏后的市场名列表**，不含 URL）+ 逐条 `DEBUG`（两侧脱敏
+    URL）；`Computer.boot_up` 的恢复汇总行纳入冲突数。CLI `run_governance_remount` 的展示留 follow-up
+    [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)（这是与 rust-sdk#295 的两处有意差异之一，
+    见设计文档 §6）。
+  - **只诊断、不换源**：恢复仍用已注册源 stage，旧能力保留，`failed_marketplaces` 与降级语义**不变**。
+    boot 自动换源即 §5.14 禁止的「静默替换」；换源只经显式 `marketplace remove` → `add`。与 #268 的迁移
+    模型互不替代——该迁移**仅由显式 `marketplace migrate` 触发**（boot 不执行它，也不跑 `reconciler.reconcile`），
+    且不改 `extraKnownMarketplaces`。
+  - **已知边界**：声明本身**不合法**（`source` 缺失 / 非 `git` / URL 畸形，如少写 scheme）时，settings 校验会
+    把该声明整条丢弃，boot 只看到「无声明」⇒ 仍静默用旧源、无诊断。补救见 follow-up
+    [#293](https://github.com/A2C-SMCP/python-sdk/issues/293)。
+    详见 [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md)。
 - **按路径读取 `client:resolve_path` + `readRoots` 授权（#236，protocol#65）**：新增事件
   `client:resolve_path`（`ResolvePathReq` / `ResolvePathRet`）与错误码 `4020 Path Not Accessible`
   （`details.reason ∈ {invalid_path, forbidden, not_found, not_a_file}`，开放枚举；resolve 成功后

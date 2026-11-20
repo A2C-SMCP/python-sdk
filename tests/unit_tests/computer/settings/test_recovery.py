@@ -29,12 +29,18 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.settings.recovery import (
+    MarketplaceSourceConflict,
     _plugin_enable_origin,
     collect_enabled_bundled_servers,
+    detect_marketplace_source_conflicts,
     recover_marketplace_skills,
 )
 from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
-from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
+from a2c_smcp.computer.settings.store import (
+    load_known_marketplaces,
+    save_installed_plugins,
+    save_known_marketplaces,
+)
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -540,3 +546,358 @@ async def test_recover_degrades_on_manifest_rename_without_touching_capabilities
     assert report.failed_marketplaces == ["acme"]
     assert report.restored_skills == [] and report.restored_plugins == []
     assert reg.resolve("audit:lint") is not None, "降级不得摘掉既有能力"
+
+
+# ── #287：声明源 / known 源比对（只诊断、不换源）─────────────────────────────
+def _intent_only(plugin: str, mp: str) -> dict:
+    """只含安装/启用意图的 declared（不含 ``extraKnownMarketplaces``）。"""
+    pid = f"{plugin}@{mp}"
+    return {"installedPlugins": [pid], "enabledPlugins": {pid: True}}
+
+
+def _with_declarations(declared: dict, *entries: tuple[str, str]) -> dict:
+    """给 declared 追加 ``extraKnownMarketplaces`` 声明（name, url）。"""
+    return {**declared, "extraKnownMarketplaces": {name: {"source": {"type": "git", "url": url}} for name, url in entries}}
+
+
+@pytest.mark.asyncio
+async def test_recover_reports_declared_source_conflict_and_keeps_registered_source(tmp_path: Path) -> None:
+    """#287：声明源 ≠ known 源 → 报一条冲突（两侧脱敏展示值），仍按 known 旧源恢复、不降级、不改写账本。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/other.git"))
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.marketplace_source_conflicts == [
+        MarketplaceSourceConflict(
+            marketplace="acme",
+            declared_source_display="https://example.com/other.git",
+            known_source_display="https://example.com/acme.git",
+        )
+    ]
+    # 行为不变：旧源能力照常恢复、不降级、known 记录不被改成声明源
+    assert "audit:lint" in report.restored_skills
+    assert report.failed_marketplaces == []
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme"]["source"] == _SRC
+
+
+@pytest.mark.asyncio
+async def test_recover_no_conflict_when_declared_source_is_identical(tmp_path: Path) -> None:
+    """正对照：声明源与 known 源为**同一 URL 字符串** → 不产生冲突。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", _SRC["url"]))
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.marketplace_source_conflicts == []
+    assert "audit:lint" in report.restored_skills
+
+
+@pytest.mark.asyncio
+async def test_recover_reports_ssh_https_equivalent_as_conflict(tmp_path: Path) -> None:
+    """§5.14 fail-closed：ssh / https 等价写法**不归一** → 报冲突（诊断-only，不换源）。"""
+    home = _home(tmp_path)
+    catalog = marketplace_skill_dir(home, "acme")
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {
+                    "source": {"type": "git", "url": "git@example.com:acme.git"},
+                    "installLocation": str(catalog.resolve()),
+                    "commitSha": "abc123",
+                }
+            },
+        },
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/acme.git"))
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert len(report.marketplace_source_conflicts) == 1
+    conflict = report.marketplace_source_conflicts[0]
+    # scp-like 无法解析 → 展示面 fail-closed 占位符（同一权威判定，不做等价归一）
+    assert conflict.known_source_display == "<redacted-git-source>"
+    assert conflict.declared_source_display == "https://example.com/acme.git"
+    assert "audit:lint" in report.restored_skills, "冲突只诊断，旧源能力照常恢复"
+
+
+@pytest.mark.asyncio
+async def test_recover_fails_closed_when_source_is_not_recognizable(tmp_path: Path) -> None:
+    """
+    §5.14 fail-closed：任一侧 source 不可识别（非 ``git``）→ **视为不同源**。
+
+    钉住「同源判据是 :func:`same_source` 单一权威、而不是 ``==`` 字面相等」：两侧 dict **逐字节相同**，
+    但都不是 git source ⇒ 无法证明同源 ⇒ 报冲突（协议明许 SDK 不做等价归一，宁可诊断也不静默认定同源）。
+    """
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    weird = {"type": "file", "url": "https://example.com/acme.git"}
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": weird, "installLocation": str(root.parent.resolve())}}},
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = {**_intent_only("audit", "acme"), "extraKnownMarketplaces": {"acme": {"source": dict(weird)}}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert len(report.marketplace_source_conflicts) == 1
+    conflict = report.marketplace_source_conflicts[0]
+    assert conflict.marketplace == "acme"
+    assert conflict.declared_source_display == conflict.known_source_display == "https://example.com/acme.git"
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_conflict_for_marketplace_without_install_intent(tmp_path: Path) -> None:
+    """#287：只检测 ``installedPlugins`` 意图涉及的市场——未涉及者即使声明源不同也不报。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {"source": _SRC, "installLocation": str(root.parent.resolve())},
+                "ghost": {"source": {"type": "git", "url": "https://example.com/ghost.git"}, "installLocation": "/nope"},
+            },
+        },
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(
+        _intent_only("audit", "acme"),
+        ("acme", _SRC["url"]),  # 同源，无冲突
+        ("ghost", "https://example.com/ghost-moved.git"),  # 异源，但 ghost 无安装意图
+    )
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.marketplace_source_conflicts == []
+
+
+@pytest.mark.asyncio
+async def test_recover_no_conflict_when_known_record_has_no_source(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    known 记录在、但 ``source`` 缺失/非 Mapping ⇒ **没有可用的已注册源**：不报冲突（交 ``failed_marketplaces``）。
+
+    与 stage 循环的可用性判据同源（``not isinstance(source, Mapping)`` → degraded）。否则同一次恢复会同时打
+    「沿用已注册源」与「已降级」两条互斥诊断。
+    """
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"installLocation": str(root.parent.resolve())}}},
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/other.git"))
+
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    recovery_mod.logger.addHandler(caplog.handler)
+    try:
+        caplog.set_level(logging.WARNING)
+        report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+    finally:
+        recovery_mod.logger.removeHandler(caplog.handler)
+
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == ["acme"]
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "keeping the registered source" not in text, "无可用已注册源时不得声称沿用已注册源"
+
+
+@pytest.mark.asyncio
+async def test_recover_no_conflict_when_known_source_is_not_mapping(tmp_path: Path) -> None:
+    """known 记录的 ``source`` 是**非映射值**（如裸字符串）同样视为「无可用已注册源」→ 不报冲突。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"source": "https://example.com/acme.git", "installLocation": "/nope"}}},
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/other.git"))
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == ["acme"]
+
+
+@pytest.mark.asyncio
+async def test_recover_lazy_marketplace_without_usable_source_reports_nothing(tmp_path: Path) -> None:
+    """
+    全惰性市场（installed_disabled ∧ 账本完好）+ 无可用已注册源 → **两处报告都不出现**。
+
+    文档不得声称「无 known 记录一律进 ``failed_marketplaces``」：stage 循环对全惰性市场在查 known **之前**
+    就 ``continue``（零动作是设计），故既无冲突也无降级。
+    """
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = {**_with_declarations({}, ("acme", "https://example.com/other.git")), "installedPlugins": ["audit@acme"],
+                "enabledPlugins": {"audit@acme": False}}
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.skipped_disabled == ["audit@acme"]
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == []
+
+
+@pytest.mark.asyncio
+async def test_recover_no_conflict_when_known_record_absent(tmp_path: Path) -> None:
+    """无 known 记录 → 无可比对的「已注册源」，不报冲突（仍走既有 ``failed_marketplaces`` 降级）。"""
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/other.git"))
+
+    report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == ["acme"]
+
+
+@pytest.mark.asyncio
+async def test_recover_empty_intent_reports_no_conflict(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """空 intent 早退行为不变：不检测、无冲突、**不产生任何 WARNING**。"""
+    home = _home(tmp_path)
+    _setup_catalog(home, "acme", "audit", skills=["lint"])
+    declared = _with_declarations({}, ("acme", "https://example.com/other.git"))
+
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    recovery_mod.logger.addHandler(caplog.handler)  # 项目 logger 关闭 propagate，直接挂 handler
+    try:
+        caplog.set_level(logging.WARNING)
+        report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+    finally:
+        recovery_mod.logger.removeHandler(caplog.handler)
+
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == []
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.asyncio
+async def test_recover_source_conflict_diagnostics_are_redacted(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    #287：冲突的 report 字段与 recovery 日志（汇总 WARN + 逐条 DEBUG）均不得回显 URL 凭据。
+
+    **两侧都带凭据**：只给 known 侧注入凭据的话，「declared 侧直接取原值」的变异会存活。
+    """
+    home = _home(tmp_path)
+    catalog = marketplace_skill_dir(home, "acme")
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {
+                    "source": {"type": "git", "url": "https://alice:s3cret@example.com/acme.git"},
+                    "installLocation": str(catalog.resolve()),
+                }
+            },
+        },
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://bob:t0ken@example.com/other.git"))
+
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    a2c_logger = logging.getLogger("a2c_smcp")  # 逐条诊断是 DEBUG，需放开包级 logger 等级才能被捕获
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.DEBUG)
+    recovery_mod.logger.addHandler(caplog.handler)  # 项目 logger 关闭 propagate，直接挂 handler
+    try:
+        caplog.set_level(logging.DEBUG)
+        report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+    finally:
+        recovery_mod.logger.removeHandler(caplog.handler)
+        a2c_logger.setLevel(prev_level)
+
+    conflict = report.marketplace_source_conflicts[0]
+    assert conflict.known_source_display == "https://example.com/acme.git"
+    assert conflict.declared_source_display == "https://example.com/other.git"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    for secret in ("s3cret", "alice", "t0ken", "bob"):
+        assert secret not in conflict.known_source_display and secret not in conflict.declared_source_display
+        assert secret not in text, f"report / 日志不得回显 {secret}"
+    # 正对照：确实走到了冲突诊断分支（WARN 汇总 + 逐条 DEBUG）
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("different source" in message for message in warnings)
+    # 汇总行带得出「该处理哪个市场」（默认 INFO 级别下逐条 DEBUG 看不见），但**不含两侧 URL**
+    summary = next(message for message in warnings if "different source" in message)
+    assert "acme" in summary
+    assert "https://" not in summary
+    assert any(r.levelno == logging.DEBUG and "acme" in r.getMessage() for r in caplog.records)
+
+
+def test_detect_marketplace_source_conflicts_redacts_ledger_key() -> None:
+    """
+    纯函数契约：``marketplace`` 字段是**账本键脱敏值**（#261/#263/#281 口径）。
+
+    经 recovery 不可达（pid 上游已过严格 kebab 校验，见 :func:`detect_marketplace_source_conflicts` 注释），
+    故在此直接钉住纯函数契约——否则「去掉 redact_ledger_key」会是个杀不死的变异。
+    """
+    ledger_key = "https://alice:s3cret@example.com/mp"
+    known = {ledger_key: {"source": {"type": "git", "url": "https://example.com/a.git"}}}
+    declared = {"extraKnownMarketplaces": {ledger_key: {"source": {"type": "git", "url": "https://example.com/b.git"}}}}
+
+    conflicts = detect_marketplace_source_conflicts([ledger_key], declared, known)
+
+    assert len(conflicts) == 1
+    assert "s3cret" not in conflicts[0].marketplace
+    assert "alice" not in conflicts[0].marketplace
+    assert conflicts[0].marketplace == "https://example.com/mp"
+
+
+@pytest.mark.parametrize(
+    ("declared", "known"),
+    [
+        pytest.param({"extraKnownMarketplaces": {"acme": "not-a-mapping"}}, {"acme": {"source": _SRC}}, id="decl-not-mapping"),
+        pytest.param({"extraKnownMarketplaces": {"acme": {"source": _SRC}}}, {"acme": "not-a-mapping"}, id="known-not-mapping"),
+        pytest.param({"extraKnownMarketplaces": "not-a-mapping"}, {"acme": {"source": _SRC}}, id="decls-not-mapping"),
+    ],
+)
+def test_detect_marketplace_source_conflicts_tolerates_malformed_entries(declared: dict, known: dict) -> None:
+    """形状不合（声明条目 / known 记录 / ``extraKnownMarketplaces`` 整体）→ 跳过，不抛、不报冲突。"""
+    assert detect_marketplace_source_conflicts(["acme"], declared, known) == []
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        pytest.param({}, id="decl-no-source-key"),
+        pytest.param({"source": "oops"}, id="decl-source-not-mapping"),
+        pytest.param({"source": None}, id="decl-source-none"),
+    ],
+)
+def test_detect_conflicts_fail_closed_on_malformed_declared_source(decl: dict) -> None:
+    """
+    纯函数契约：**已注册源可用**但**声明源不可识别** ⇒ fail-closed 报冲突（展示面占位符）。
+
+    与「known 侧不可用 → 跳过」刻意不对称：known 侧不可用意味着没有可比对象（交 ``failed_marketplaces``）；
+    声明侧不可用意味着用户确实声明了什么、却无法证明同源（§5.14「无法确定时 MUST fail-closed」）。
+    """
+    known = {"acme": {"source": {"type": "git", "url": "https://example.com/acme.git"}}}
+    declared = {"extraKnownMarketplaces": {"acme": decl}}
+
+    conflicts = detect_marketplace_source_conflicts(["acme"], declared, known)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].marketplace == "acme"
+    assert conflicts[0].known_source_display == "https://example.com/acme.git"
+    assert conflicts[0].declared_source_display == "<redacted-git-source>"

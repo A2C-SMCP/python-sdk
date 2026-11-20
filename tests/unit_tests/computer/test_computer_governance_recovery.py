@@ -16,6 +16,7 @@ Computer 级治理启动恢复测试（#117，协议 v0.2.3 §4.8）/ Computer-l
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,11 @@ import pytest
 from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.settings.recovery import BundledServerRecord
 from a2c_smcp.computer.settings.schema import SettingsScope
-from a2c_smcp.computer.settings.store import save_installed_plugins, save_known_marketplaces
+from a2c_smcp.computer.settings.store import (
+    load_known_marketplaces,
+    save_installed_plugins,
+    save_known_marketplaces,
+)
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 
 # 夹具身份对（#153 隔离审查 🔴2 + 协议 conformance §2.0）：原 "figma"/"blender" 的 bundle_id 恰等于自身
@@ -406,3 +411,91 @@ async def test_user_scope_enabled_plugin_bundled_server_auto_mounted(
         assert mounted == [FIGMA_NAME]
         assert report.remounted_servers == [FIGMA_BID]
         assert report.pending_bundled_servers == []
+
+
+# ── #287：声明源 / known 源诊断（只诊断、不换源）─────────────────────────────
+_DECLARED_MOVED = {
+    **_DECLARED_ENABLED,
+    "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": "https://example.com/moved.git"}}},
+}
+
+
+@pytest.mark.asyncio
+async def test_boot_diagnoses_declared_source_change_but_keeps_registered_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#287：改声明源后走真实 ``reconcile_governance()`` → 报告冲突，仍按 known 旧源恢复、不降级、不改写账本。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _plugin_root = _seed_home(tmp_path, skills=["lint"])
+    _write_settings(tmp_path / "cfg" / "a2c" / "settings.json", _DECLARED_MOVED)
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance()
+        assert [c.marketplace for c in report.marketplace_source_conflicts] == ["acme"]
+        conflict = report.marketplace_source_conflicts[0]
+        assert conflict.declared_source_display == "https://example.com/moved.git"
+        assert conflict.known_source_display == _SRC["url"]
+        # 行为不变：旧源能力照常恢复、不降级
+        assert "audit:lint" in report.restored_skills
+        assert report.failed_marketplaces == []
+        assert "audit:lint" in {ref["name"] for ref in comp.get_skills()}
+    # known 记录保持旧源（只诊断、不换源）
+    assert load_known_marketplaces(home=home)["marketplaces"]["acme"]["source"] == _SRC
+
+
+@pytest.mark.asyncio
+async def test_boot_no_conflict_when_declared_source_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """正对照：声明源与 known 源为同一 URL 字符串 → 无冲突、恢复照常。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _plugin_root = _seed_home(tmp_path, skills=["lint"])
+    _write_settings(
+        tmp_path / "cfg" / "a2c" / "settings.json",
+        {**_DECLARED_ENABLED, "extraKnownMarketplaces": {"acme": {"source": _SRC}}},
+    )
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance()
+        assert report.marketplace_source_conflicts == []
+        assert "audit:lint" in report.restored_skills
+        assert report.failed_marketplaces == []
+
+
+@pytest.mark.asyncio
+async def test_boot_up_summary_counts_declared_source_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    #287：``boot_up`` 的 recovery 汇总行纳入冲突数（仅诊断，不阻断启动）。
+
+    夹具刻意取「**零恢复** + 有冲突」的形态（plugin installed 但 disabled → 全惰性静止态）——若汇总条件
+    只看 ``restored_skills`` / ``failed_marketplaces``，本用例就**没有**任何汇总输出，冲突会静默无痕。
+    这同时钉住「全惰性零动作的市场也要被诊断」这一设计决定。
+    """
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _plugin_root = _seed_home(tmp_path, skills=["lint"])
+    _write_settings(
+        tmp_path / "cfg" / "a2c" / "settings.json",
+        {**_DECLARED_MOVED, "enabledPlugins": {"audit@acme": False}},
+    )
+
+    from a2c_smcp.computer import computer as computer_mod
+
+    # 项目 logger 关闭 propagate，直接挂 handler；取模块 logger（get_logger 会加包前缀，名字不可硬编码）。
+    computer_mod.logger.addHandler(caplog.handler)
+    try:
+        caplog.set_level(logging.INFO)
+        async with Computer(name="t", skill_home=home) as comp:
+            report = await comp.reconcile_governance()
+    finally:
+        computer_mod.logger.removeHandler(caplog.handler)
+
+    # 零恢复形态：无 SKILL 恢复、无降级，**只有**冲突——汇总行必须仍被打印
+    assert report.restored_skills == [] and report.failed_marketplaces == []
+    assert len(report.marketplace_source_conflicts) == 1
+    summaries = [r.getMessage() for r in caplog.records if "governance recovery:" in r.getMessage()]
+    assert any(
+        "0 skills restored" in message and "0 marketplaces degraded" in message and "1 declared-source conflicts" in message
+        for message in summaries
+    ), summaries
