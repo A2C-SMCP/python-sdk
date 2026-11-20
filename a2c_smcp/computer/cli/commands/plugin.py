@@ -119,8 +119,9 @@ def _plugin_error(e: PluginInstallError, *, json_output: bool) -> int:
     """
     把结构化 :class:`PluginInstallError` 翻成 CLI 错误输出 / Render a structured installer error.
 
-    ``error_code`` / ``details`` 由 installer 侧按需填写（如跨 marketplace 同名冲突 = ``validation`` +
-    ``conflictWith``）；未填写时 payload 仍是 ``{"error": "error", ...}``，既有契约不变（#257）。
+    ``error_code`` / ``details`` 由 installer 侧按需填写：跨 marketplace 同名冲突 = ``validation`` +
+    ``conflictWith``（``<plugin>@<marketplace>``），身份坍缩 = ``validation`` + ``bundleId``（裸 bundle_id，
+    #271）；未填写时 payload 仍是 ``{"error": "error", ...}``，既有契约不变（#257）。
     保留键先被过滤，再统一委托 :func:`_err`（决策 4：不另起一套 payload/退出码渲染）。
     """
     details = {key: value for key, value in e.details.items() if key not in _RESERVED_DETAIL_KEYS}

@@ -156,9 +156,49 @@ def entry_is_strict(entry: Mapping[str, Any]) -> bool:
     return val if isinstance(val, bool) else True
 
 
+def _json_truthy(value: object) -> bool:
+    """JSON 真值判据（对齐 rust ``json_truthy``）：``null``/``false``/``0``/``""``/``[]``/``{}`` 为假，其余为真。
+
+    **刻意私有**（#271）：本模块只对外暴露按字段名判定的 :func:`entry_declares_component`，不导出通用真值
+    函数——真值口径是「声明态判据」的内部细节，散出去的通用工具会被误用到非 JSON 来源的值上。
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):  # True 在此处恒真（False 已返回）
+        return True
+    if isinstance(value, (int, float)):
+        return value != 0
+    # 只覆盖 **JSON 的五种容器/标量**；``tuple`` 刻意不在列（JSON 无 tuple）——空 tuple 走末尾 fallback
+    # 取真，与 :func:`entry_declares_component` 的「非 JSON 类型一律 fail-closed」承诺一致（审查 🟡1）。
+    if isinstance(value, (str, list, dict)):
+        return len(value) > 0
+    return True
+
+
+def entry_declares_component(entry: Mapping[str, Any], key: str) -> bool:
+    """声明态判据的**唯一权威**：``entry[key]`` 按原始 JSON 真值是否算「已声明」（#271，镜像 rust
+    ``manifest.rs`` 的 ``entry_declares_component``）/ Single authority for "is this component declared?".
+
+    供 :func:`manifest_declared_components`（plugin.json 组件全集）与 installer 的 SKILL 声明判据共用，
+    避免两处各写一份真值口径——历史上它们一个用 Python 真值、一个用 JSON 真值，靠注释维系等价。
+
+    按**原始 JSON 真值**判而非「能归一出可用路径列表」：``skills: [123]`` / ``{"x": 1}`` 属「声明了但不可
+    投影」（应走失败路径），``skills: ""`` / ``[]`` 才算未声明。
+
+    **非 JSON 类型**（本仓不可达——调用方一律传 ``json.loads`` 结果）一律算「已声明」（fail-closed 取真），
+    见 :func:`_json_truthy` 的末尾 fallback。
+    """
+    return _json_truthy(entry.get(key))
+
+
 def manifest_declared_components(plugin_manifest: Mapping[str, Any]) -> list[str]:
-    """plugin.json 中**真值**组件字段名列表（空 / 缺 / falsy 不算声明）/ Truthy component fields declared in plugin.json。"""
-    return [f for f in COMPONENT_FIELDS if plugin_manifest.get(f)]
+    """plugin.json 中**真值**组件字段名列表（空 / 缺 / falsy 不算声明）/ Truthy component fields declared in plugin.json.
+
+    真值口径委托 :func:`entry_declares_component`（#271 单点）。对 **JSON 解码值**与旧实现
+    ``if plugin_manifest.get(f)`` 逐值等价；仅非 JSON falsy 类型（``set()`` / 自定义对象）由「未声明」
+    变为「已声明」——本仓调用方（installer / staging / validator）全部读 ``json.loads`` 结果，不可达。
+    """
+    return [f for f in COMPONENT_FIELDS if entry_declares_component(plugin_manifest, f)]
 
 
 def check_strict_conflict(entry: Mapping[str, Any], plugin_manifest: Mapping[str, Any]) -> None:

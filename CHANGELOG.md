@@ -662,6 +662,24 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `scope`；v0.2.x 账本在首次成功 boot 的治理恢复中通常已被整体重物化，窗口为「升级后未成功 boot + 库层 scoped
   卸载」。`gc_plugins` 的同款失败序不在本单范围（另案）。
 
+### Fixed（#271 enable 复审残留）
+
+- **identity collapse 的结构化细节改用 `bundleId` 键**：`plugin enable` 预检发现同一 `bundle_id` 对应不同安装根
+  （或同根不同配置）时报 `error_code=validation`，`details` 由 `{"conflictWith": <bundle_id>}` 改为
+  `{"bundleId": <bundle_id>}`。`conflictWith` 恢复其既有值域——只承载 `<plugin>@<marketplace>` pid（跨
+  marketplace 同名冲突）。**按 `conflictWith` 解析 pid 的调用方**若曾把身份坍缩一并处理，需改读 `bundleId`。
+- **身份坍缩文案分档**：同根异配置现在明确报 `different configs under the same install root` 并点出两个
+  **server 名**（此前只报 `(/a vs /a)` 两段相同路径，无从判断差异）；异根档文案不变。两档均**不**回显
+  `command` / `args` / `env` / `headers` 等配置体。
+- **`plugin enable` 的 SKILL 零注册兜底文案不再绝对化**：`enabledPlugins` 的回滚写是 best-effort（写失败只记
+  `enable rollback: failed to restore ...` WARNING），故消息由「was restored to its previous value」改为
+  「a restore ... was attempted but may not have succeeded」。
+- **声明态判据单点**：`skills/manifest.py` 新增 `entry_declares_component(entry, key)`（镜像 rust 同名函数），
+  `manifest_declared_components` 与 installer 的 SKILL 声明判据共用；JSON 真值函数保持私有、不对外导出。
+  对 **JSON 解码值**逐值等价（纯结构收口）；唯一差异在非 JSON falsy 类型（如 `set()` / 自定义对象）——
+  现按「已声明」处理（fail-closed），而旧的 Python 真值按「未声明」。本仓调用方全部读 `json.loads` 结果，
+  该差异不可达；嵌入宿主若自行构造非 JSON 值需注意。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

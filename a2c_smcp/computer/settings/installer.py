@@ -112,6 +112,7 @@ from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
     check_strict_conflict,
+    entry_declares_component,
     entry_is_strict,
     find_plugin_entry,
     load_bundled_servers,
@@ -151,9 +152,12 @@ class PluginInstallError(Exception):
       保持不变，残留 clone 仍有索引可重试；调用方（CLI / marketplace_remove）必须按失败上报，不得当作 no-op。
 
     **结构化类别**（#257）：可选 ``error_code``（机读类别，如跨 marketplace 同名冲突的 ``"validation"``）与
-    ``details``（附加 JSON 字段，如 ``{"conflictWith": "alpha@mp-a"}``）。缺省均为空 → CLI 输出形态与既有
-    契约一致（``{"error": "error", ...}``）。与 ``InputResolutionError.error_code`` 同姿态：只在已能判定
-    类别的位置填值，不在异常体系上另立新机制。
+    ``details``（附加 JSON 字段）。缺省均为空 → CLI 输出形态与既有契约一致（``{"error": "error", ...}``）。
+    与 ``InputResolutionError.error_code`` 同姿态：只在已能判定类别的位置填值，不在异常体系上另立新机制。
+
+    ``details`` 的键**按语义分工、不得混用**（#271）：``conflictWith`` 只承载 ``<plugin>@<marketplace>``
+    pid（跨 marketplace 同名冲突）；身份坍缩（同 bundle_id 对应不同安装根 / 配置）没有第二方 pid，
+    用 ``bundleId`` 承载裸 bundle_id。
     """
 
     def __init__(self, message: str, *, error_code: str | None = None, details: Mapping[str, Any] | None = None) -> None:
@@ -469,29 +473,11 @@ def _marketplace_entry_for(marketplace: str, plugin: str, home: Path) -> Mapping
     return find_plugin_entry(manifest, plugin)
 
 
-def _json_truthy(value: object) -> bool:
-    """JSON 真值判据（对齐 rust ``json_truthy``）：``null``/``false``/``0``/``""``/``[]``/``{}`` 为假，其余为真。
-
-    审查 🟡2：声明态判据必须按**原始 JSON 真值**判，而不是按「能归一出可用路径列表」判——否则
-    ``skills: [123]`` / ``{"x": 1}`` 在 rust 侧算「已声明且零投影 → 失败」，Python 侧却算「未声明 → 放行」；
-    ``skills: ""`` 则相反。畸形声明同样属于「声明了但不可投影」，应走失败路径。
-    """
-    if value is None or value is False:
-        return False
-    if isinstance(value, bool):  # True 在此处恒真（False 已返回）
-        return True
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, (str, list, tuple, dict)):
-        return len(value) > 0
-    return True
-
-
 def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[str, Any]) -> bool:
     """该 plugin 是否**声明**了 SKILL 内容（声明态判据，#259 架构师裁决）。
 
     声明源 = ``entry.skills``（恒取）+ ``plugin.json.skills``（仅 strict=true），**按 JSON 真值**判
-    （见 :func:`_json_truthy`，与 rust ``entry_declares_component`` 同口径）。
+    （见 :func:`~a2c_smcp.computer.skills.manifest.entry_declares_component`，与 rust 同口径、单一权威）。
 
     **约定 ``skills/`` 容器存在不算声明**（审查 🔴1）：MCP-only plugin 可能顺带提交 ``skills/README.md`` /
     ``.gitkeep`` / 空目录，把「容器在」当声明会让它在旧版本可启用、新版本永久不可启用且无命令可修。
@@ -501,9 +487,9 @@ def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[s
     「容器在但零 SKILL.md」不由此判据抓，而由 stage 返回值零注册的兜底（③.6）在**有文件被装载跳过**时抓。
     """
     strict = entry_is_strict(entry) if entry is not None else True
-    if _json_truthy((entry or {}).get("skills")):
+    if entry_declares_component(entry or {}, "skills"):
         return True
-    return strict and _json_truthy(plugin_manifest.get("skills"))
+    return strict and entry_declares_component(plugin_manifest, "skills")
 
 
 def _projectable_skill_count(
@@ -677,16 +663,28 @@ def _preflight_enable_content(
                 by_id[bundle_id] = (install_path, cfg)
             elif existing[0] != install_path or existing[1] != cfg:
                 identity_conflicts.append(bundle_id)
-                problems.append(
-                    f"bundle_id {bundle_id!r} collapses distinct identities ({existing[0]} vs {install_path}); "
-                    f"refusing to enable an ambiguous projection"
-                )
+                if existing[0] != install_path:
+                    problems.append(
+                        f"bundle_id {bundle_id!r} collapses distinct identities ({existing[0]} vs {install_path}); "
+                        f"refusing to enable an ambiguous projection"
+                    )
+                else:
+                    # 同根异配置（#271 🟡1）：两段路径相同，光报 `(/a vs /a)` 无从判断差异在哪。改报**区分字段**
+                    # ——server 名即文件 stem（`parse_bundled_server` 强制 `name == path.stem`，同根下必不相同）。
+                    # MUST NOT 回显 env / headers / command 等配置体（可能含凭据）。
+                    problems.append(
+                        f"bundle_id {bundle_id!r} collapses distinct identities under the same install root "
+                        f"({install_path}): servers {existing[1].name!r} and {cfg.name!r} declare different configs "
+                        f"under the same install root; refusing to enable an ambiguous projection"
+                    )
     if problems:
         raise PluginInstallError(
             _enable_content_error(plugin_id, problems),
-            # 身份坍缩属可判定的配置冲突类别（对齐既有 validation / conflictWith 约定，审查 🟡1）。
+            # 身份坍缩属可判定的配置冲突类别（对齐既有 validation 约定，审查 🟡1）。
+            # 键用 ``bundleId`` 而非 ``conflictWith``（#271 用户裁决）：后者是 `<plugin>@<marketplace>` pid 的
+            # 专属值域（跨 marketplace 同名冲突），坍缩场景没有第二方 pid，塞裸 bundle_id 会污染该键的类型。
             error_code="validation" if identity_conflicts else None,
-            details={"conflictWith": identity_conflicts[0]} if identity_conflicts else None,
+            details={"bundleId": identity_conflicts[0]} if identity_conflicts else None,
         )
     return _EnablePreflight(servers=[cfg for _root, cfg in by_id.values()], expects_skills=expects_skills)
 
@@ -1471,6 +1469,9 @@ async def enable_plugin(
     """
     启用单个 plugin（**原子激活**：skills 与 bundled server 一并入投影，失败回滚 ``installed_disabled``）/ Enable。
 
+    回滚是 **best-effort**：撤销本次新增的 skill / server 与恢复 ``enabledPlugins`` 各自独立尝试，任一失败只记
+    ``enable rollback: ...`` WARNING 而**不掩盖**最初那个异常（③.6 的消息也据此不承诺「一定已恢复」）。
+
     **依赖已满足 ⇒ 复用既有实例**（协议 §2.5-1，#153/D3）：声明的 ``bundle_id`` 若已在运行期活跃集里，
     **跳过 register**——既有实例（用户 mcp.json 声明的，或他 plugin 带入的）胜出，本 plugin 复用它而非覆盖。
     与 :meth:`Computer.reconcile_governance` 的「existing wins → skip」同姿态。
@@ -1565,8 +1566,9 @@ async def enable_plugin(
         if preflight.expects_skills and not staged:
             raise PluginInstallError(
                 f"plugin {plugin_id!r} ships SKILL packages but staging registered none (invalid SKILL.md "
-                f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); enabledPlugins was "
-                f"restored to its previous value. {_enable_recovery_hint(plugin_id)}"
+                f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); a restore of "
+                f"enabledPlugins to its previous value was attempted but may not have succeeded "
+                f"(check the logs for an 'enable rollback' warning). {_enable_recovery_hint(plugin_id)}"
             )
         # ④ 挂载依赖：仅挂**尚未满足**者；已满足 → 复用既有实例，不覆盖（§2.5-1）
         if register_server is not None:
