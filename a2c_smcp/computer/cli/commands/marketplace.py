@@ -120,7 +120,8 @@ def _identity_error(e: MarketplaceIdentityError, *, json_output: bool) -> int:
 
 
 def _ok(msg: str) -> int:
-    console.print(f"[green]✓ {msg}[/green]")
+    # 与 `_err` 同口径转义：成功行常内插**用户输入 / 账本键**（`[/]x` 之类会让 rich 抛 MarkupError）。
+    console.print(f"[green]✓ {escape(msg)}[/green]")
     return EXIT_OK
 
 
@@ -346,29 +347,34 @@ def _register_intent_only(
             "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
             json_output=json_output,
         )
+    except OSError:
+        return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
 
     final_name = outcome["existing"] or outcome["registered"]
     if final_name is None:  # 防御：mutator 既没判幂等、也没登记（不应发生）
         return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
+    # 展示名脱敏：`final_name` 可能是 `registered_name_for_source` 返回的**账本键原值**（可被手编成携带
+    # 凭据的串）；rich 面再 `escape()`（`[/]x` 之类会 MarkupError）。查找 / trust 仍用原值。
+    shown = escape(redact_ledger_key(final_name))
     record = _marketplaces(home, env).get(final_name) or {}
     try:
         _record_trust(final_name, env)
     except SettingsFileCorruptError as e:
         console_err.print(
-            f"[yellow]! marketplace {final_name!r} is registered but its trust entry could not be persisted: {e}[/yellow]"
+            f"[yellow]! marketplace {shown} is registered but its trust entry could not be persisted: {escape(str(e))}[/yellow]"
         )
     if json_output:
         console.print_json(
             data={
-                "registered": final_name,
+                "registered": redact_ledger_key(final_name),
                 "url": known_git_source_for_display(url),
                 "installLocation": record.get("installLocation"),
             }
         )
         return EXIT_OK
     if outcome["existing"] is not None:
-        return _ok(f"marketplace {final_name!r} is already registered (no clone needed)")
-    return _ok(f"registered marketplace {final_name!r} from the local clone (no clone)")
+        return _ok(f"marketplace {shown} is already registered (no clone needed)")
+    return _ok(f"registered marketplace {shown} from the local clone (no clone)")
 
 
 def _unresolvable_name_error() -> MarketplaceIdentityError:
@@ -462,6 +468,13 @@ async def marketplace_add(
             "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
             json_output=json_output,
         )
+    except OSError:
+        # 提交点的 `os.replace` 失败（Windows 文件占用 / 权限 / 磁盘异常）→ 结构化错误，不抛 traceback。
+        # 提交点自身已尽力回滚（新树删除、旧树复位），状态与提交前一致。
+        return _err(
+            f"failed to commit the marketplace registration for {_error_url_display(url)} (see logs)",
+            json_output=json_output,
+        )
 
     # 注册已提交 → 落 trust（失败仅 WARN，不回滚已成功的注册）。
     try:
@@ -490,6 +503,20 @@ async def marketplace_add(
         )
         return EXIT_OK
     return _ok(f"added {final_name!r} — cloned, {len(registered)} skill(s) found")
+
+
+def _redact_pid(pid: str) -> str:
+    """
+    plugin id 的展示值：只脱敏 ``<marketplace>`` 段，保留 ``<plugin>@`` 前缀 / Display-safe plugin id.
+
+    pid 形如 ``<plugin>@<marketplace>``；market 段就是账本键（可被手编成携带凭据的串）。整条 pid 交给
+    :func:`redact_ledger_key` 会因含 ``://`` 被判成 URL 而整串占位（丢 plugin 名），故按**第一个** ``@``
+    拆分（plugin 名是严格 kebab，不含 ``@``；market 段可能自带 ``@``，用 rpartition 会切错）后只脱敏 market 段。
+    """
+    plugin, sep, market = pid.partition("@")
+    if not sep:
+        return redact_ledger_key(pid)
+    return f"{plugin}@{redact_ledger_key(market)}"
 
 
 def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: bool = False) -> int:
@@ -523,8 +550,8 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         url = _display_source_url(rec) or ""
         sha = rec.get("commitSha") or ""
         table.add_row(
-            redact_ledger_key(nm),
-            url,
+            escape(redact_ledger_key(nm)),
+            escape(url),
             "✓" if nm in trusted else "—",
             "on" if rec.get("autoUpdate") else "off",
             str(rec.get("lastUpdated") or "—"),
@@ -551,7 +578,8 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
         "autoUpdate": bool(rec.get("autoUpdate", False)),
         "trusted": name in _load_trusted(env),  # 信任按 name 判定（§5.3.1）
         "lastUpdated": rec.get("lastUpdated"),
-        "installedPlugins": plugins,
+        # pid = `<plugin>@<marketplace>`：market 段就是账本键，可被手编成携带凭据的串 → 展示面脱敏。
+        "installedPlugins": [_redact_pid(pid) for pid in plugins],
     }
     if json_output:
         console.print_json(data=info)
@@ -562,7 +590,7 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
         # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
         table.add_row(k, "" if info[k] is None else str(info[k]))
-    table.add_row("installedPlugins", ", ".join(escape(redact_ledger_key(pid)) for pid in plugins) if plugins else "—")
+    table.add_row("installedPlugins", ", ".join(escape(_redact_pid(pid)) for pid in plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK
 

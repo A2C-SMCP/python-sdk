@@ -1406,13 +1406,18 @@ def _seed_credential_ledger(home: Path, env: dict[str, str]) -> None:
 
 @pytest.mark.asyncio
 async def test_refresh_display_redacts_credential_ledger_key(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """终审 🔴：`refresh --json` 行与 rich 汇总表都不回显账本键里的凭据；干净 kebab 名仍可读。"""
     from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
 
     env, home = _env(tmp_path), _home(tmp_path)
     _seed_credential_ledger(home, env)
+
+    async def _noop_stage(*_args: object, **_kwargs: object) -> list[str]:
+        return []  # 脱敏与 clone 无关：替换 staging 避免真跑网络
+
+    monkeypatch.setattr(marketplace_mod, "stage_marketplace_skills", _noop_stage)
 
     assert await marketplace_refresh(SkillRegistry(), home, env, "all", json_output=True) == 0
     out = capsys.readouterr().out
@@ -1488,3 +1493,154 @@ def test_stable_text_bounded_on_wide_and_cyclic_metadata() -> None:
     cyclic: dict[str, object] = {"x": 1}
     cyclic["self"] = cyclic
     assert len(_stable_text(cyclic)) < 10_000
+
+
+@pytest.mark.asyncio
+async def test_no_clone_intent_display_redacts_ledger_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """终审 🔴1：`--no-clone` 幂等意图的 JSON / rich 输出不得外泄账本键里的凭据。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_credential_ledger(home, env)
+    url = "https://example.com/r.git"  # 与 seeded 凭据键的 source 同源
+
+    code = await marketplace_add(
+        SkillRegistry(), home, env, url, trust=True, no_clone=True, json_output=True
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert json.loads(out)["registered"] == REDACTED_GIT_SOURCE
+
+    code = await marketplace_add(SkillRegistry(), home, env, url, trust=True, no_clone=True)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "PW_LEAK" not in out and "alice" not in out
+
+
+@pytest.mark.asyncio
+async def test_no_clone_intent_display_escapes_markup(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """终审 🔴1（rich MarkupError 面）：账本键含 `[/]` 时不得抛 MarkupError。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    source = {"type": "git", "url": "https://example.com/markup.git"}
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"[/]x": {"source": source, "installLocation": ""}}},
+        home,
+        env,
+    )
+
+    code = await marketplace_add(
+        SkillRegistry(), home, env, "https://example.com/markup.git", trust=True, no_clone=True
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[/]x" in out
+
+
+def test_info_json_redacts_installed_plugin_market_segment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """终审 🔴2：`info --json` 的 `installedPlugins`（pid 的 market 段 = 账本键）同样脱敏。"""
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_credential_ledger(home, env)
+    save_installed_plugins(
+        {"version": 1, "plugins": {f"audit@{_CRED_KEY}": [{"scope": "user", "installPath": str(home)}]}},
+        home,
+        env,
+    )
+
+    assert marketplace_info(home, env, _CRED_KEY, json_output=True) == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert "PW_LEAK" not in out and "alice" not in out
+    assert payload["installedPlugins"] == [f"audit@{REDACTED_GIT_SOURCE}"]
+
+
+def test_list_table_escapes_markup_in_name_and_url(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """终审 🟡4：`list` 表格的 name / url 单元格含 rich 标记时不得抛 MarkupError。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "[/]x": {"source": {"type": "git", "url": "https://example.com/[/]repo.git"}, "installLocation": ""}
+            },
+        },
+        home,
+        env,
+    )
+
+    assert marketplace_list(home, env) == 0
+    out = capsys.readouterr().out
+    assert "[/]x" in out
+
+
+@pytest.mark.asyncio
+async def test_refresh_spinner_description_is_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终审 🟡3：spinner 描述同样属展示面（pytest 下 `is_terminal=False`，需直接记录入参）。"""
+    from contextlib import contextmanager
+
+    from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
+
+    env, home = _env(tmp_path), _home(tmp_path)
+    _seed_credential_ledger(home, env)
+    seen: list[str] = []
+
+    @contextmanager
+    def _spy(description: str, *, enabled: bool = True):  # type: ignore[no-untyped-def]
+        seen.append(description)
+        yield
+
+    async def _noop_stage(*_args: object, **_kwargs: object) -> list[str]:
+        return []
+
+    monkeypatch.setattr(marketplace_mod, "clone_spinner", _spy)
+    monkeypatch.setattr(marketplace_mod, "stage_marketplace_skills", _noop_stage)
+
+    await marketplace_refresh(SkillRegistry(), home, env, "all", json_output=True)
+    capsys.readouterr()
+
+    joined = " ".join(seen)
+    assert REDACTED_GIT_SOURCE in joined
+    assert "PW_LEAK" not in joined and "alice" not in joined
+
+
+@pytest.mark.asyncio
+async def test_add_commit_oserror_returns_structured_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终审 🟡1：提交点 `os.replace` 失败（Windows 占用 / 权限）→ 结构化错误，不抛 traceback。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+
+    async def _replace_fails(*_args: object, **_kwargs: object) -> str:
+        raise PermissionError("file in use")
+
+    monkeypatch.setattr(marketplace_mod, "add_marketplace_source", _replace_fails)
+
+    code = await marketplace_add(SkillRegistry(), home, env, "https://example.com/a.git", trust=True, json_output=True)
+    assert code == 1
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["error"] == "error"
+    assert "failed to commit the marketplace registration" in payload["message"]
+
+
+def test_ok_message_escapes_markup(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """终审 🔴 同类硬化：`_ok` 成功行常内插用户输入 / 账本键，rich 标记必须转义（不得 MarkupError）。"""
+    env, home = _env(tmp_path), _home(tmp_path)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"[/]x": {"source": {"type": "git", "url": "https://example.com/x.git"}, "installLocation": ""}}},
+        home,
+        env,
+    )
+    assert marketplace_set(home, env, "[/]x", "auto-update", "true") == 0
+    out = capsys.readouterr().out
+    assert "[/]x" in out
