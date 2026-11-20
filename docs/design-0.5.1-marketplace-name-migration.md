@@ -101,6 +101,8 @@
   `reconciler.reconcile` 按它做 additive-only 对账（`reconciler.py:299-398`）；
 - 本设计对它的处置：**只报告，不改写**。理由：声明是用户/仓库的显式意图，SDK 单方面改写 project 文件违反 D6；
   且与 #260 裁决 2 一致（声明式换源一律 `validation`、需显式 remove/re-add）。
+- 声明源与已注册源**不一致**时的处置见 #287（[`design-0.5.1-boot-recovery-source-diagnostics.md`](design-0.5.1-boot-recovery-source-diagnostics.md)）：
+  boot 只诊断、不换源；迁移**不管**这条路径，二者互不替代。
 
 **已知后果（必须写进 dry-run 告警）**：`reconcile` 的 missing 分支会按声明**重新 clone `<home>/marketplace/<old>`
 并把 `known[old]` 写回**（`reconciler.py:332-390`）。本仓内没有 `reconcile` 调用点（boot 走的是
