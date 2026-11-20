@@ -125,7 +125,7 @@ from a2c_smcp.computer.skills.manifest import (
 )
 from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
-from a2c_smcp.computer.skills.sources import SkillSourceError, safe_exception_text
+from a2c_smcp.computer.skills.sources import LocalPluginSource, SkillSourceError, resolve_plugin_source, safe_exception_text
 from a2c_smcp.computer.skills.staging import (
     DEFAULT_GIT_TIMEOUT,
     SKILL_MD,
@@ -1041,6 +1041,53 @@ async def materialize_plugin(
     return record
 
 
+# ``staging.locate_plugin_root`` 的「plugin 根缺失」公开文案前缀。迁移文档 §2 让用户正是照这句话对照症状，
+# 故它事实上是公开契约；本模块据此区分「相对源根缺失」与同一分支里的其它 staging 失败（越界 / clone 失败）。
+_LOCAL_ROOT_MISSING_PREFIX = "plugin root not found after resolve"
+
+
+def _install_recovery_tail(
+    plugin_id: str, entry: Mapping[str, Any], manifest: Mapping[str, Any], error: BaseException
+) -> str:
+    """
+    install 失败的恢复指引尾段 / Recovery tail appended to install failures（#278）。
+
+    0.5.0 的 ``plugin uninstall`` / ``plugin gc`` 会删掉 marketplace **共享 clone 内**的相对源子树，此后
+    ``plugin install`` 报「根缺失」。这种损坏最可靠的恢复是「``marketplace remove`` → ``add`` 重 clone → 重装」
+    （0.5.1 的 ``marketplace refresh`` 会重新 clone，也能还原上游仍存在的被删文件，但本地与上游一致时无变化，
+    故不作首选），**仅对相对源的根缺失**附完整指引（复用 enable 路径的 :func:`_enable_recovery_hint`），
+    并在其后补齐共享指引未覆盖的三件事：先确认上游确有该路径、先记录 source URL / 注册名、remove 的级联代价
+    与 add 的 ``--trust``。
+
+    其余情形一律**不给指引**（与 rust-sdk 同单一致）：
+    - 独占 clone（``url`` / ``github`` / ``cnb`` / ``git-subdir``）：``marketplace remove`` 会**级联卸载**该
+      marketplace 的全部插件并撤销 trust，却修不好「plugin 自己的 clone / 上游 subdir / 网络」问题；而
+      ``plugin uninstall`` 在此处是死路——安装失败不写账本，:func:`uninstall_plugin` 无记录即 no-op 返回
+      ``False``（CLI 退出码 1 且不删残留 clone），随后 ``install`` 复用同一坏 clone 复现同一错误；
+    - 相对源的**越界声明**（根并非缺失）：重 clone 拿到的还是同一份坏清单。
+
+    **绝不二次抛出**（except 内的错误转换自身不得可抛）：source 解析失败按「不给 remove/add」处理，只影响这段
+    附加文案，绝不顶替主错误。
+    """
+    # 同一 ``plugin_id`` 已在 :func:`install_plugin` 入口经 ``_split_plugin_id`` 校验，此处不会抛。
+    _plugin, marketplace = _split_plugin_id(plugin_id)
+    try:
+        resolved = resolve_plugin_source(entry.get("source"), plugin_root=plugin_root_base(manifest))
+    except Exception:  # noqa: BLE001 - 诊断辅助：判定失败退回通用文案，绝不影响主错误
+        return ""
+    if isinstance(resolved, LocalPluginSource) and str(error).startswith(_LOCAL_ROOT_MISSING_PREFIX):
+        return (
+            f"\n{_enable_recovery_hint(plugin_id)} "
+            f"Before 'marketplace remove': confirm the plugin path still exists in the upstream repository (the local "
+            f"clone is the damaged copy, so looking at it is misleading), and record the marketplace source URL and "
+            f"registered name ('marketplace info {marketplace}' works before removal). 'marketplace remove' cascades "
+            f"— it uninstalls EVERY plugin of that marketplace and revokes its trust; do not pass '--keep-plugins' "
+            f"(it leaves orphan records). When re-adding non-interactively, pass '--trust'. "
+            f"Install does not activate: after a successful reinstall run 'plugin enable {plugin_id}'."
+        )
+    return ""
+
+
 async def install_plugin(
     plugin_id: str,
     registry: SkillRegistry,  # noqa: ARG001 - 签名与 uninstall/enable/disable 对称；v0.3.0 install 不再触碰 Registry
@@ -1089,7 +1136,8 @@ async def install_plugin(
             f"marketplace {marketplace!r} manifest invalid: "
             f"{safe_exception_text(e)}"
         ) from None
-    if find_plugin_entry(manifest, plugin) is None:
+    entry = find_plugin_entry(manifest, plugin)
+    if entry is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
 
     # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——
@@ -1133,9 +1181,11 @@ async def install_plugin(
                 f"marketplace {marketplace!r} source invalid: {safe_exception_text(e)}"
             ) from None
         if isinstance(e, SkillStagingError):
+            # #278：附恢复指引——但**只有相对源的根缺失**（0.5.0 旧卸载删了共享 catalog 子树）才劝 remove/add，
+            # 判据与措辞见 :func:`_install_recovery_tail`；source / manifest 分支不附。
             raise PluginInstallError(
                 f"marketplace {marketplace!r} plugin staging failed: "
-                f"{safe_exception_text(e)}"
+                f"{safe_exception_text(e)}{_install_recovery_tail(plugin_id, entry, manifest, e)}"
             ) from None
         if isinstance(e, PluginManifestError):
             raise PluginInstallError(
