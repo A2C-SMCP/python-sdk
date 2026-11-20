@@ -1053,8 +1053,11 @@ def _install_recovery_tail(
     install 失败的恢复指引尾段 / Recovery tail appended to install failures（#278）。
 
     0.5.0 的 ``plugin uninstall`` / ``plugin gc`` 会删掉 marketplace **共享 clone 内**的相对源子树，此后
-    ``plugin install`` 报「根缺失」。这种损坏只能靠「``marketplace remove`` → ``add`` 重 clone → 重装」恢复，
-    故**仅对相对源的根缺失**附完整指引（复用 enable 路径的 :func:`_enable_recovery_hint`）。
+    ``plugin install`` 报「根缺失」。这种损坏最可靠的恢复是「``marketplace remove`` → ``add`` 重 clone → 重装」
+    （0.5.1 的 ``marketplace refresh`` 会重新 clone，也能还原上游仍存在的被删文件，但本地与上游一致时无变化，
+    故不作首选），**仅对相对源的根缺失**附完整指引（复用 enable 路径的 :func:`_enable_recovery_hint`），
+    并在其后补齐共享指引未覆盖的三件事：先确认上游确有该路径、先记录 source URL / 注册名、remove 的级联代价
+    与 add 的 ``--trust``。
 
     其余情形一律**不给指引**（与 rust-sdk 同单一致）：
     - 独占 clone（``url`` / ``github`` / ``cnb`` / ``git-subdir``）：``marketplace remove`` 会**级联卸载**该
@@ -1066,6 +1069,8 @@ def _install_recovery_tail(
     **绝不二次抛出**（except 内的错误转换自身不得可抛）：source 解析失败按「不给 remove/add」处理，只影响这段
     附加文案，绝不顶替主错误。
     """
+    # 同一 ``plugin_id`` 已在 :func:`install_plugin` 入口经 ``_split_plugin_id`` 校验，此处不会抛。
+    _plugin, marketplace = _split_plugin_id(plugin_id)
     try:
         resolved = resolve_plugin_source(entry.get("source"), plugin_root=plugin_root_base(manifest))
     except Exception:  # noqa: BLE001 - 诊断辅助：判定失败退回通用文案，绝不影响主错误
@@ -1073,6 +1078,11 @@ def _install_recovery_tail(
     if isinstance(resolved, LocalPluginSource) and str(error).startswith(_LOCAL_ROOT_MISSING_PREFIX):
         return (
             f"\n{_enable_recovery_hint(plugin_id)} "
+            f"Before 'marketplace remove': confirm the plugin path still exists in the upstream repository (the local "
+            f"clone is the damaged copy, so looking at it is misleading), and record the marketplace source URL and "
+            f"registered name ('marketplace info {marketplace}' works before removal). 'marketplace remove' cascades "
+            f"— it uninstalls EVERY plugin of that marketplace and revokes its trust; do not pass '--keep-plugins' "
+            f"(it leaves orphan records). When re-adding non-interactively, pass '--trust'. "
             f"Install does not activate: after a successful reinstall run 'plugin enable {plugin_id}'."
         )
     return ""

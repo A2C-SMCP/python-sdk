@@ -1079,8 +1079,14 @@ async def test_install_missing_catalog_subtree_exits1_with_recovery_hint(
     assert "pluginrootnotfoundafterresolve" in out  # 根因仍点名
     assert "Recovery:" in out
     assert "marketplaceremoveacme" in out  # 第 1 步：移除重 clone
-    assert "marketplaceadd<source>" in out  # 第 2 步：重新 add（缺这步恢复链就断了）
-    assert "plugininstallaudit@acme" in out  # 第 3 步：重装
+    # 第 2/3 步断言**邻接串**：#278 复审 🟡4——共享指引的 own-clone 半句也含 "plugin install audit@acme"，
+    # 只断言单句会被那一半满足，删掉 catalog 子句的重装步骤仍全绿。
+    assert "'marketplaceadd<source>',then'plugininstallaudit@acme'" in out
+    # 新尾段补齐共享指引没覆盖的三件事（复审 🟡1/🟡2）
+    assert "upstreamrepository" in out  # 先确认上游确有该路径
+    assert "--trust" in out  # 非交互 add 必带
+    assert "cascades" in out  # remove 的级联代价
+    assert "--keep-plugins" in out  # 禁令
     assert "pluginenableaudit@acme" in out  # install 不激活 ⇒ 恢复后须 enable
     # 原子回滚：**意图**（user settings 的 installedPlugins）被撤销。账本 installed_plugins.json 在物化成功前
     # 根本不会被写，拿它断言是恒真的空转（复审 🟡3）。
@@ -1105,9 +1111,37 @@ async def test_install_missing_catalog_subtree_json_error_has_recovery_hint(
     message = _flat(payload["message"])
     assert "pluginrootnotfoundafterresolve" in message
     assert "marketplaceremoveacme" in message
-    assert "marketplaceadd<source>" in message
-    assert "plugininstallaudit@acme" in message
+    # 邻接串（复审 🟡4）：own-clone 半句也含 "plugin install audit@acme"，单句断言锁不住 catalog 链的重装步骤
+    assert "'marketplaceadd<source>',then'plugininstallaudit@acme'" in message
+    assert "--trust" in message
     assert "pluginenableaudit@acme" in message
+
+
+@pytest.mark.asyncio
+async def test_install_git_source_root_missing_gets_no_remove_add_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278 负向锁（复审 🟡3）：**git 源 + 根缺失文案**同样不给 remove/add。
+
+    与「clone 失败」用例互补——那例靠文案前缀就能排除，单独删 `isinstance(LocalPluginSource)` 半段仍全绿；
+    本例文案与相对源根缺失**逐字相同**，只由 source 类型区分。
+    """
+    from a2c_smcp.computer.skills.staging import SkillStagingError
+
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    _seed_bad_source_catalog(home, source={"source": "git-subdir", "url": "https://example.com/r.git", "path": "plugins/audit"})
+
+    async def boom(*args: object, **kwargs: object) -> tuple[Path, str | None]:
+        raise SkillStagingError("plugin root not found after resolve: plugins/audit")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.locate_plugin_root", boom)
+    code = await plugin_cmd.plugin_install(reg, home, env, "audit@acme")
+    out = _flat(capsys.readouterr().out)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    assert "pluginrootnotfoundafterresolve" in out  # 症状与目标场景逐字相同
+    assert "marketplaceremove" not in out  # 但 source 是独占 clone ⇒ 不给 remove/add
+    assert "pluginuninstall" not in out and "plugininstall" not in out
 
 
 @pytest.mark.asyncio
