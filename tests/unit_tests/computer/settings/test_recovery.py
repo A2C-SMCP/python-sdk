@@ -685,6 +685,38 @@ async def test_recover_skips_conflict_for_marketplace_without_install_intent(tmp
 
 
 @pytest.mark.asyncio
+async def test_recover_no_conflict_when_known_record_has_no_source(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """
+    known 记录在、但 ``source`` 缺失/非 Mapping ⇒ **没有可用的已注册源**：不报冲突（交 ``failed_marketplaces``）。
+
+    与 stage 循环的可用性判据同源（``not isinstance(source, Mapping)`` → degraded）。否则同一次恢复会同时打
+    「沿用已注册源」与「已降级」两条互斥诊断。
+    """
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"], seed_known=False)
+    save_known_marketplaces(
+        {"version": 1, "marketplaces": {"acme": {"installLocation": str(root.parent.resolve())}}},
+        home=home,
+    )
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    declared = _with_declarations(_intent_only("audit", "acme"), ("acme", "https://example.com/other.git"))
+
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    recovery_mod.logger.addHandler(caplog.handler)
+    try:
+        caplog.set_level(logging.WARNING)
+        report = await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
+    finally:
+        recovery_mod.logger.removeHandler(caplog.handler)
+
+    assert report.marketplace_source_conflicts == []
+    assert report.failed_marketplaces == ["acme"]
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "keeping the registered source" not in text, "无可用已注册源时不得声称沿用已注册源"
+
+
+@pytest.mark.asyncio
 async def test_recover_no_conflict_when_known_record_absent(tmp_path: Path) -> None:
     """无 known 记录 → 无可比对的「已注册源」，不报冲突（仍走既有 ``failed_marketplaces`` 降级）。"""
     home = _home(tmp_path)
@@ -765,7 +797,12 @@ async def test_recover_source_conflict_diagnostics_are_redacted(tmp_path: Path, 
         assert secret not in conflict.known_source_display and secret not in conflict.declared_source_display
         assert secret not in text, f"report / 日志不得回显 {secret}"
     # 正对照：确实走到了冲突诊断分支（WARN 汇总 + 逐条 DEBUG）
-    assert any(r.levelno == logging.WARNING and "different source" in r.getMessage() for r in caplog.records)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("different source" in message for message in warnings)
+    # 汇总行带得出「该处理哪个市场」（默认 INFO 级别下逐条 DEBUG 看不见），但**不含两侧 URL**
+    summary = next(message for message in warnings if "different source" in message)
+    assert "acme" in summary
+    assert "https://" not in summary
     assert any(r.levelno == logging.DEBUG and "acme" in r.getMessage() for r in caplog.records)
 
 

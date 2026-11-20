@@ -166,8 +166,9 @@ def detect_marketplace_source_conflicts(
 
     - **只看传进来的 marketplace**——调用方只传 ``installedPlugins`` 意图涉及的集合，无意图项不检测。
     - 无声明（``extraKnownMarketplaces`` 缺该键 / 条目非映射）→ 跳过：没有可比的"声明源"。
-    - 无 ``known_marketplaces`` 记录 → 跳过：没有可比的"已注册源"，该情形由既有
-      ``failed_marketplaces`` 降级路径报告，不在此重复。
+    - 无 ``known_marketplaces`` 记录，或记录在但 ``source`` 缺失/非映射 → 跳过：没有可比的"已注册源"，
+      该情形由 ``failed_marketplaces`` 降级路径报告，不在此重复（与 stage 循环**同一可用性判据**，
+      否则同一次恢复会同时打「沿用已注册源」与「已降级」两条互斥诊断）。
     - **同源判据 = :func:`~a2c_smcp.computer.skills.marketplace_identity.same_source`**（SDK 单一权威，与
       ``reconciler.reconcile`` 同一函数）：只做字符串级比较，``ssh://`` / ``https://`` / scp-like / ``.git``
       后缀等等价写法**不归一** → 视为不同源（§5.14「无法确定时 MUST fail-closed」）。
@@ -180,7 +181,7 @@ def detect_marketplace_source_conflicts(
        ``_validate_extra_marketplaces``（``settings/schema.py``）会把 ``source`` 缺失 / 非 ``git`` / URL 畸形
        的声明**整条丢弃**——此时本函数看到的是「无声明」，既不报冲突也无从诊断（校验错误在
        :attr:`ResolvedSettings.errors`，``Computer`` 当前不呈现它）。已知边界，见
-       ``docs/design-0.5.1-boot-recovery-source-diagnostics.md`` §6。
+       ``docs/design-0.5.1-boot-recovery-source-diagnostics.md`` §7。
 
     :param marketplaces: 待检测的 marketplace 名（调用方保证 = 安装意图涉及集）。
     :param declared: 合并声明视图（取 ``extraKnownMarketplaces``）。
@@ -198,6 +199,10 @@ def detect_marketplace_source_conflicts(
         if not isinstance(record, Mapping):
             continue
         known_source = record.get("source")
+        if not isinstance(known_source, Mapping):
+            # 与 stage 循环**同一可用性判据**：没有可用的「已注册源」⇒ 该市场走 ``failed_marketplaces``
+            # 降级路径。此处若仍报冲突，同一次恢复会同时打「沿用已注册源」与「已降级」两条互斥诊断。
+            continue
         declared_source = decl.get("source")
         if same_source(known_source, declared_source):
             continue
@@ -225,11 +230,14 @@ def _log_marketplace_source_conflicts(conflicts: Sequence[MarketplaceSourceConfl
             conflict.declared_source_display,
             conflict.known_source_display,
         )
+    # 汇总行**带脱敏后的 marketplace 名**：默认日志级别是 INFO、CLI 展示面留 follow-up，只给计数的话用户
+    # 根本不知道该处理哪一个。两侧 URL 仍只在逐条 DEBUG 里（同为脱敏展示值）。
     logger.warning(
-        "governance recovery: %d marketplace(s) are declared from a different source than their registration; "
+        "governance recovery: %d marketplace(s) are declared from a different source than their registration (%s); "
         "keeping the registered source and its existing capabilities (declared-source changes are diagnostic only "
         "— switch by explicit marketplace remove / add, runtime-contract §5.14)",
         len(conflicts),
+        ", ".join(conflict.marketplace for conflict in conflicts),
     )
 
 
