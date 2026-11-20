@@ -24,9 +24,9 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
-from unicodedata import normalize
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
+from rich.markup import escape
 from rich.table import Table
 
 from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
@@ -48,19 +48,50 @@ from a2c_smcp.computer.settings.schema import (
 )
 from a2c_smcp.computer.settings.scope import apply_write, load_settings_file, user_settings_path
 from a2c_smcp.computer.settings.store import (
+    SettingsLockError,
     atomic_write_json,
     file_lock,
     load_installed_plugins,
     load_known_marketplaces,
     update_known_marketplaces,
 )
+from a2c_smcp.computer.skills.home import marketplace_skill_dir
+from a2c_smcp.computer.skills.marketplace_identity import (
+    REASON_INVALID_NAME,
+    REASON_INVALID_SOURCE,
+    REASON_NAME_CONFLICT,
+    REASON_UNRESOLVABLE_NAME,
+    MarketplaceIdentityError,
+    MarketplaceNameChangeError,
+    read_manifest_marketplace_name,
+    redact_ledger_key,
+    registered_name_for_source,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
-from a2c_smcp.computer.skills.sources import GITHUB_HOST, SkillSourceError, normalize_repo_shorthand
-from a2c_smcp.computer.skills.staging import stage_marketplace_skills
-from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, git_url_for_display, known_git_source_for_display
+from a2c_smcp.computer.skills.sources import (
+    GITHUB_HOST,
+    SkillSourceError,
+    normalize_repo_shorthand,
+    safe_exception_text,
+)
+from a2c_smcp.computer.skills.staging import (
+    SkillStagingError,
+    add_marketplace_source,
+    registration_violation,
+    stage_marketplace_skills,
+)
+from a2c_smcp.utils.git_url import (
+    REDACTED_GIT_SOURCE,
+    credential_like_text,
+    diagnostic_url_for_display,
+    known_git_source_for_display,
+)
+from a2c_smcp.utils.logger import get_logger
 
 # trust 确认回调：接收待信任源（url/name）→ 返回是否继续 / Trust confirm callback。
 ConfirmFn = Callable[[str], Awaitable[bool]]
+
+logger = get_logger(__name__)
 
 # 退出码语义（§4.6）/ Exit code semantics。
 EXIT_OK = 0
@@ -69,16 +100,37 @@ EXIT_NETWORK_ERROR = 2
 
 
 # ── 输出辅助 / output helpers ─────────────────────────────────────────────────
-def _err(msg: str, *, json_output: bool, code: int = EXIT_USER_ERROR) -> int:
+# ``details`` 中与 :func:`_err` 保留字段同名的键：展开前过滤，避免覆盖类别码 / 人读文案（#257 先例）。
+# 注：退出码参数叫 ``exit_code``（不是 ``code``）——后者留给结构化 payload 之外的历史调用面；
+# 机器码统一走 ``reason`` 键（:meth:`MarketplaceIdentityError.payload_details`），不在保留集内。
+_RESERVED_DETAIL_KEYS = frozenset({"error", "message", "msg", "exit_code", "error_code"})
+
+
+def _err(msg: str, *, json_output: bool, exit_code: int = EXIT_USER_ERROR, error_code: str | None = None, **extra: Any) -> int:
+    """
+    错误输出（结构化 ``validation`` 可选）/ Error output with an optional structured category.
+
+    ``error_code`` 非空时输出 ``{"error": <category>, "message": …, **diagnostics}``（对齐
+    ``cli/commands/plugin.py:102`` 的 #257/PR #266 先例）；为空保持既有 ``{"error": <文案>}`` 形态。
+    非 JSON 输出经 ``escape()``——文案可含不可信 source 文本，rich 标记会把「结构化错误」变成 traceback（#263）。
+    """
     if json_output:
-        console.print_json(data={"error": msg})
+        details = {key: value for key, value in extra.items() if key not in _RESERVED_DETAIL_KEYS}
+        payload: dict[str, Any] = {"error": error_code or "error", "message": msg, **details}
+        console.print_json(data=payload)
     else:
-        console.print(f"[red]✗ {msg}[/red]")
-    return code
+        console.print(f"[red]✗ {escape(msg)}[/red]")
+    return exit_code
+
+
+def _identity_error(e: MarketplaceIdentityError, *, json_output: bool) -> int:
+    """把 :class:`MarketplaceIdentityError` 翻成结构化 CLI 错误（``validation`` + reason/诊断）/ Render it."""
+    return _err(str(e), json_output=json_output, error_code=e.error_code, **e.payload_details())
 
 
 def _ok(msg: str) -> int:
-    console.print(f"[green]✓ {msg}[/green]")
+    # 与 `_err` 同口径转义：成功行常内插**用户输入 / 账本键**（`[/]x` 之类会让 rich 抛 MarkupError）。
+    console.print(f"[green]✓ {escape(msg)}[/green]")
     return EXIT_OK
 
 
@@ -116,81 +168,32 @@ def normalize_marketplace_url(raw: str) -> str | None:
         return None
 
 
-# 凭据样判据的**硬上界**解码轮数（每轮 = 判残形 ``%`` → percent-decode → NFKC）/ Hard cap on decode rounds.
-# **#282**：由固定 3 轮改为**不动点循环**（见 :func:`_credential_like`）。轮数**不承担**多层编码的覆盖面
-# ——那由「残形 ``%`` 即 fail-closed」保证（与 rust #285 同口径），故 ``%25253A`` / ``%2525253A`` 之流
-# 在**第一轮**就返回 True，与层数无关。轮数真正承担的是「NFKC 归一后再看 ``%`` / ``：`` / ``＠``」：
-# 全角 ``％３Ａ`` 要**两轮**才现出 ASCII ``%``（故上界不可退化为 1），其余输入一轮即达不动点。
-# 上界本身只保证终止。
-_MAX_DECODE_ROUNDS = 10
-
-
+# 凭据样判据 / URL 诊断展示：**单一权威**在 :mod:`a2c_smcp.utils.git_url`（#260 上移，供注册身份诊断复用）。
+# 本模块保留同名薄包装：①`default_marketplace_name` / add 失败文案既有调用面不变（#270/#282 行为与回归锁
+# 保持）；②外部（测试 / 其他命令）按既有符号引用。
 def _credential_like(text: str) -> bool:
-    """
-    文本是否含凭据样文本（userinfo ``@`` / 密码段 ``:`` / 残形 percent 转义）/
-    Whether text carries credential-like text.
-
-    **#270**：做「percent-decode → NFKC」迭代——挡住 ``alice%3APW%40host``、percent-encoded 全角
-    ``%EF%BC%9A``/``%EF%BC%A0``、双重/三重编码 ``%253A``/``%25253A``，以及**全角百分号**
-    ``alice％３ＡPW``（NFKC 会先把它归一成 ``%3A``，下一轮才 decode；单轮「decode 后归一」会漏）。
-
-    **#282**：① **残形 percent 转义一律 fail-closed**——任一解码轮里出现 ``%`` 即判可疑
-    （对齐 rust-sdk#285 ``seg.contains([':', '@', '%'])``）：percent 转义本身说明来源被编码过（还能再解
-    一层，或本就不该出现在注册名 / 来源里），故四层 ``alice%2525253APW_LEAK`` 与解码后本可干净的
-    ``repo%20name`` 一并拒。**这一条让覆盖面不依赖解码深度**（>N 层不再有漏判残余）。
-    ② 解码为**不动点循环**（本轮结果与上轮相同即提前退出）：轮次仍承担①——全角 ``％`` 要经一轮 NFKC
-    才现出 ASCII ``%``；``@`` / ``:`` 也在 NFKC 归一（全角 ``：`` / ``＠``）+ decode 之后判定。
-    ``_MAX_DECODE_ROUNDS`` **只保证终止**（``unquote`` 只减不增，NFKC 幂等，有变化的轮次有限；
-    **不**宣称「每轮严格缩短」——NFKC 存在 1→2 兼容展开，如 ``ﬁ``→``fi``）。轮次实际承担的是
-    「NFKC 归一后再看 ``%``」：全角 ``％３Ａ`` 类输入要**两轮**（第一轮才把 ``％`` 归一成 ``%``），
-    故上界不能退化为 1；更深的编码由 ① 的 ``%`` 判据兜住，与轮数无关。
-    """
-    probe = text
-    for _ in range(_MAX_DECODE_ROUNDS):
-        # ① 残形 percent 转义 ⇒ 不可判定（含上一轮 NFKC 从全角 ``％`` 归一出来的 ``%``）
-        if "%" in probe:
-            return True
-        decoded = normalize("NFKC", unquote(probe))
-        if decoded == probe:  # 不动点：再迭代也不变
-            break
-        probe = decoded
-    return "@" in probe or ":" in probe
+    """文本是否含凭据样文本（userinfo ``@`` / 密码段 ``:`` / 残形 percent 转义）/ Credential-like text."""
+    return credential_like_text(text)
 
 
 def _error_url_display(raw: str) -> str:
     """
     ``marketplace add`` **失败文案**里的 URL 展示 / Display-safe URL in add-failure messages.
 
-    在 #261 展示脱敏（去 userinfo / query / fragment）之上，再挡住 **path 任意段**携带的凭据样文本——
-    ``ssh://-/alice:PW_LEAK@example.com``、``https://host/team/alice:PW@example.com/repo``（中间段）、
-    ``.../alice:PW@example.com/``（尾斜杠）的展示值都仍保留 path，直接回显会把凭据写进 stdout /
-    ``--json``。空 path 或解析失败同样 fail-closed。
-    判定对象是**原始 source** 的 path 段（渲染才用展示串）：展示层会把空格 / 非 ASCII ``quote()`` 成
-    ``%XX``，「残形 ``%`` 即拒」若跑在展示串上会把干净 URL 误打码。
-    **范围**：仅 add 失败文案；``list`` / ``info`` / confirm 提示 / 成功 ``--json`` 的 ``url`` 仍按 #261
-    的 known-source 契约保留 path（见 CHANGELOG 的范围说明）。
+    委托 :func:`~a2c_smcp.utils.git_url.diagnostic_url_for_display`（去 userinfo/query/fragment +
+    **path 任意段**凭据样文本 fail-closed）；判据跑在**原始 source** 上（展示层 ``quote()`` 的 ``%xx``
+    不得误伤干净 URL，#282 复核）。
     """
-    shown = git_url_for_display(raw)
-    if shown == REDACTED_GIT_SOURCE:
-        return shown
-    # 判据取**原始 source** 的 path 段，不取展示串：展示层会对空格 / 非 ASCII / ``|`` / ``\`` 等做
-    # ``quote()``（``my team``→``my%20team``、``团队``→``%E5%9B%A2%E9%98%9F``），拿展示串跑「残形 ``%``
-    # 即拒」会把**源里根本没有编码**的干净 URL 整条打码（#282 审查 🟡）。
-    try:
-        path = urlsplit(raw).path
-    except ValueError:
-        return REDACTED_GIT_SOURCE
-    segments = [seg for seg in path.split("/") if seg]
-    if not segments:  # 无 path：无法判定来源内容 → fail-closed
-        return REDACTED_GIT_SOURCE
-    if any(_credential_like(seg) for seg in segments):
-        return REDACTED_GIT_SOURCE
-    return shown
+    return diagnostic_url_for_display(raw)
 
 
 def default_marketplace_name(url: str) -> str | None:
     """
     从 git URL **解析后 path 的末段**派生严格-kebab marketplace 名 / Derive a kebab name from the URL path。
+
+    .. deprecated:: 0.5.1
+       **#260 起 `marketplace add` 不再调用本函数**——注册名取清单顶层 ``name``（D1）。本函数保留仅为
+       兼容既有调用方/测试；存量 URL 派生名的迁移由 #268 负责，**不要**用它推断「旧名是否合法」。
 
     **#270**：URL 解析式派生——userinfo / query / fragment 不参与命名
     （``https://host/repo?token=SECRET`` → ``repo``，此前是 ``repo-token-secret``；
@@ -269,6 +272,132 @@ def _revoke_trust(name: str, env: Mapping[str, str] | None) -> None:
         atomic_write_json(path, apply_write(existing, {FIELD_TRUSTED_MARKETPLACES: current}))
 
 
+def _precheck_trust_write(env: Mapping[str, str] | None) -> None:
+    """
+    trust 落盘前的**只读**预检（#246 破坏半径）/ Read-only pre-check before any clone happens.
+
+    注册成功后才写 trust（#260），但「settings 损坏 ⇒ add 失败且不 clone」这条 #246 语义必须保住：
+    在 clone 前把**将要写**的目标键形状验一遍，corrupt / 非数组 → :class:`SettingsFileCorruptError`
+    （CLI 退出码 1、零副作用）。
+    """
+    path = user_settings_path(env)
+    existing = read_raw_object(path) or {}
+    list_field_or_empty(existing, FIELD_TRUSTED_MARKETPLACES, path=path)
+
+
+def _register_intent_only(
+    home: Path,
+    env: Mapping[str, str] | None,
+    url: str,
+    name: str | None,
+    *,
+    auto_update: bool,
+    json_output: bool,
+) -> int:
+    """
+    ``--no-clone``：只登记意图（D5：无 pending、无临时派生名）/ Register intent only (no clone).
+
+    允许的两种形态（其余一律 ``validation``——无法在注册前确定名称）：
+
+    1. **已以该 source 注册**（任意名）→ 幂等意图，保留既有 ``installLocation``（绝不用空值覆盖有效记录）；
+    2. ``--name N`` 且本地缓存 ``<home>/marketplace/N`` 已存在、其清单名 == ``N`` → 以缓存确定名称并登记意图。
+
+    两种形态都在 ``update_known_marketplaces`` 的**锁内**过一遍与 add 相同的身份判定
+    （:func:`~a2c_smcp.computer.skills.staging.registration_violation`）：同名不同源 / 断链引用一律
+    ``validation``，**不得**绕过提交点静默改写既有注册的 source。
+    """
+    source = {"type": "git", "url": url}
+    outcome: dict[str, Any] = {"existing": None, "registered": None}
+
+    def _mutate(current: Any) -> None:
+        known = current["marketplaces"]
+        existing_name = registered_name_for_source(known, source)
+        if existing_name is not None:
+            outcome["existing"] = existing_name  # 幂等：不新建、不覆盖
+            return None
+        if name is None:
+            raise _unresolvable_name_error()
+        clone_dir = marketplace_skill_dir(home, name)
+        observed: str | None = None
+        if clone_dir.is_dir():
+            try:
+                observed = read_manifest_marketplace_name(clone_dir)
+            except MarketplaceIdentityError:
+                observed = None
+        if observed != name:
+            raise _unresolvable_name_error()
+        prior = known.get(name)
+        violation = registration_violation(name, source, prior, known, name, env=env)
+        if violation is not None:
+            raise violation  # 同名不同源 / 断链引用（fail-closed）
+        if prior is not None:
+            # 不可达：同名同源已在入口被 `registered_name_for_source` 认作幂等早返回，同名异源由上面的
+            # `registration_violation` 抛出。留显式拒绝（而非静默覆盖）作为纵深防御。
+            raise MarketplaceIdentityError(
+                f"marketplace {name!r} is already registered; refusing to overwrite its record from --no-clone",
+                reason=REASON_NAME_CONFLICT,
+                details={"name": name},
+            )
+        known[name] = {
+            "source": dict(source),
+            "installLocation": str(clone_dir.resolve()),
+            "autoUpdate": bool(auto_update),
+            "manifestNameBaseline": name,
+        }
+        outcome["registered"] = name
+        return None
+
+    try:
+        update_known_marketplaces(_mutate, home, env)
+    except MarketplaceIdentityError as e:
+        return _identity_error(e, json_output=json_output)
+    except SettingsLockError:
+        return _err(
+            "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
+            json_output=json_output,
+        )
+    except OSError as e:
+        logger.error("marketplace intent registration failed: %s", safe_exception_text(e))
+        return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
+
+    final_name = outcome["existing"] or outcome["registered"]
+    if final_name is None:  # 防御：mutator 既没判幂等、也没登记（不应发生）
+        return _err("failed to register the marketplace intent (see logs)", json_output=json_output)
+    # 展示名脱敏：`final_name` 可能是 `registered_name_for_source` 返回的**账本键原值**（可被手编成携带
+    # 凭据的串）。**只脱敏、不在此处 escape**——`_ok` 内部统一转义，双重转义会输出 `\[/]x`。
+    # 查找 / trust 仍用原值。
+    redacted = redact_ledger_key(final_name)
+    record = _marketplaces(home, env).get(final_name) or {}
+    try:
+        _record_trust(final_name, env)
+    except (SettingsFileCorruptError, OSError) as e:
+        console_err.print(
+            f"[yellow]! marketplace {escape(redacted)} is registered but its trust entry could not be persisted: {escape(str(e))}[/yellow]"
+        )
+    if json_output:
+        console.print_json(
+            data={
+                "registered": redacted,
+                "url": known_git_source_for_display(url),
+                "installLocation": record.get("installLocation"),
+            }
+        )
+        return EXIT_OK
+    if outcome["existing"] is not None:
+        return _ok(f"marketplace {redacted!r} is already registered (no clone needed)")
+    return _ok(f"registered marketplace {redacted!r} from the local clone (no clone)")
+
+
+def _unresolvable_name_error() -> MarketplaceIdentityError:
+    """``--no-clone`` 无法确定名称时的结构化错误（D5）/ Structured error for an unresolvable name."""
+    return MarketplaceIdentityError(
+        "cannot determine the marketplace name without cloning: --no-clone only works for an already "
+        "registered source, or with --name pointing at an existing local clone whose manifest declares that name. "
+        "Run without --no-clone to clone and read the manifest name.",
+        reason=REASON_UNRESOLVABLE_NAME,
+    )
+
+
 # ── handlers ──────────────────────────────────────────────────────────────────
 async def marketplace_add(
     registry: SkillRegistry,
@@ -283,80 +412,129 @@ async def marketplace_add(
     confirm: ConfirmFn | None = None,
     json_output: bool = False,
 ) -> int:
-    """添加新 marketplace（首次 trust y/N，默认 eager clone）/ Add a marketplace (trust on first add, eager clone)。"""
+    """
+    添加新 marketplace（D1 注册名取清单 ``name``；首次 trust y/N，默认 eager clone）/
+    Add a marketplace: the registration name is the manifest's top-level ``name``.
+
+    **D6 B**：``--name`` 只作**期望清单名**校验，不再是别名（不符即 ``validation``，不覆盖）。
+
+    trust 门（§10.5/#95/#260）：
+    - 非交互（``confirm is None``）：``--trust`` 无条件强制；
+    - 交互（REPL）：**一律**弹确认——``trustedMarketplaces`` 不再豁免 prompt（#260 裁决：``--name`` 已不
+      命名任何东西，拿它当免提示开关与其语义不一致，且会绕过确认）。trust 在**注册成功后**才落盘，
+      注册失败零残留。
+    """
     url = normalize_marketplace_url(git_url)
     if url is None:
         return _err(
             f"not a well-formed git url or owner/repo shorthand: {_error_url_display(git_url)}",
             json_output=json_output,
+            error_code="validation",
+            reason=REASON_INVALID_SOURCE,
         )
-    mp_name = name or default_marketplace_name(url)
-    if not mp_name or not is_valid_marketplace_name(mp_name):
+    if name is not None and not is_valid_marketplace_name(name):
+        # ``--name`` 现在是「期望清单名」，先按同一语法契约快速拒绝（避免白跑一次 clone）。
         return _err(
-            f"cannot derive a valid marketplace name from {_error_url_display(url)}; pass --name",
+            f"--name {name!r} is not a valid marketplace name (strict kebab-case, 1-64); pass the manifest's name",
             json_output=json_output,
+            error_code="validation",
+            reason=REASON_INVALID_NAME,
         )
 
-    if mp_name in _marketplaces(home, env):
-        return _err(f"marketplace name conflict: {mp_name!r} already exists", json_output=json_output)
+    # #246：写前**只读**预检（corrupt → 退出码 1 且**不 clone**），保持既有 fail-closed 破坏半径。
+    try:
+        _precheck_trust_write(env)
+    except SettingsFileCorruptError as e:
+        return _err(str(e), json_output=json_output)
 
-    # trust 门（§10.5/§11，#95 收紧）/ trust gate:
-    #   - 非交互（confirm is None）：``--trust`` **无条件**强制（契约「非交互须 --trust」）。持久化的
-    #     user-scope trust **不豁免**——能走到「已 trusted 但不在 known_marketplaces」的只有 desync/
-    #     泄漏态（remove 未撤销 / clone 失败 orphan / 跨 A2C_SKILL_HOME；trust 落全局 user settings、
-    #     与 home 解耦），陈旧 trust 不得静默授权一次全新的远端 clone+注册。
-    #   - 交互（confirm 非空，REPL）：已 trusted 的 name 跳过重复 prompt；否则弹 confirm。该跳过
-    #     **仅 desync 态可达**——line 160 同名拦截保证走到此处 name 必不在 known_marketplaces，故"已
-    #     trusted"⇒desync；保留是为避免 clone 失败后重试同一 URL 时重复弹窗。残留：trust 按 name 键控，
-    #     <新URL> 套 <旧trusted名> 会跳过 confirm 不再展示 url——交互态由在场真人把关，威胁模型有意接受
-    #     （§10.5；回归守卫 test_add_pretrusted_name_interactive_skips_prompt）。
-    # 门控/落盘按 **name**（§5.3.1），prompt 仍展示 url 供用户判断来源。
     if not trust:
         if confirm is None:
             return _err(
-                f"untrusted marketplace {mp_name!r} ({_error_url_display(url)}); "
-                "pass --trust to confirm non-interactively",
+                f"untrusted source ({_error_url_display(url)}); pass --trust to confirm non-interactively",
                 json_output=json_output,
             )
         # 确认提示是 known-source 展示面（#261）：scp-like → host:path，去 userinfo/query/fragment。
-        if mp_name not in _load_trusted(env) and not await confirm(known_git_source_for_display(url)):
+        if not await confirm(known_git_source_for_display(url)):
             return _err("aborted by user (untrusted)", json_output=json_output)
-    try:
-        _record_trust(mp_name, env)
-    except SettingsFileCorruptError as e:
-        # fail-closed：trust 是后续 clone+注册的前置条件；写不进去就不继续（#246）。
-        return _err(str(e), json_output=json_output)
 
     if no_clone:
-        # 仅注册意图（不推荐，§4.2 debug 用）：记 known_marketplaces 但不 clone/stage。
-        update_known_marketplaces(
-            lambda f: f["marketplaces"].__setitem__(  # type: ignore[func-returns-value]
-                mp_name, {"source": {"type": "git", "url": url}, "installLocation": "", "autoUpdate": auto_update}
-            )
-            or f,
-            home,
-            env,
-        )
-        return _ok(f"registered marketplace intent {mp_name!r} (no clone)")
+        return _register_intent_only(home, env, url, name, auto_update=auto_update, json_output=json_output)
 
     source = {"type": "git", "url": url}
-    with clone_spinner(f"Cloning {mp_name}...", enabled=not json_output):
-        registered = await stage_marketplace_skills(mp_name, source, registry, home, auto_update=auto_update, env=env)
+    try:
+        with clone_spinner("Cloning marketplace...", enabled=not json_output):
+            final_name = await add_marketplace_source(source, home, expected_name=name, auto_update=auto_update, env=env)
+    except MarketplaceIdentityError as e:
+        return _identity_error(e, json_output=json_output)
+    except (SkillStagingError, SkillSourceError):
+        # 不插值 e：git 失败文本含 argv（原始 URL，可能是带凭据的形态），失败文案只走脱敏展示面。
+        return _err(
+            f"clone failed for {_error_url_display(url)} (see logs)",
+            json_output=json_output,
+            exit_code=EXIT_NETWORK_ERROR,
+        )
+    except SettingsLockError:
+        # 并发写账本的锁被占满（退避约 6s）→ 干净报错（提交点已回滚，无残留）；用户稍后重试即可。
+        return _err(
+            "could not acquire the marketplace ledger lock (another a2c-computer is writing it); retry in a moment",
+            json_output=json_output,
+        )
+    except OSError as e:
+        # `os.replace` 失败（Windows 文件占用 / 权限 / 磁盘异常）→ 结构化错误，不抛 traceback。提交点自身
+        # 已尽力回滚（新树删除、旧树复位），状态与提交前一致。文案保持泛化：OSSerror 也可能来自 clone 前的
+        # 目录操作，不宜断言「commit 失败」。
+        logger.error("marketplace registration failed: %s", safe_exception_text(e))
+        return _err(
+            f"failed to register the marketplace (see logs): {_error_url_display(url)}",
+            json_output=json_output,
+        )
 
-    # 成功判定：stage 失败降级（不抛、返回空 + 不写 known_marketplaces）；据物化记录是否落盘判定。
-    if mp_name not in _marketplaces(home, env):
+    # 注册已提交 → 落 trust（失败仅 WARN，不回滚已成功的注册）。`file_lock` / `os.replace` 也可能抛
+    # OSError（只读 / 磁盘满 / 权限），一并降级为 WARN 而不是 traceback（#260 七审 🟡3）。
+    try:
+        _record_trust(final_name, env)
+    except (SettingsFileCorruptError, OSError) as e:
+        console_err.print(
+            f"[yellow]! added {escape(final_name)!r} but failed to persist its trust entry: {escape(str(e))}[/yellow]"
+        )
+
+    try:
+        with clone_spinner(f"Staging {final_name}...", enabled=not json_output):
+            registered = await stage_marketplace_skills(final_name, source, registry, home, auto_update=auto_update, env=env)
+    except MarketplaceNameChangeError as e:
+        # 防御：提交后的复用路径不观测清单名，此处理论不可达；真发生也不得 traceback（注册已提交）。
+        return _identity_error(e, json_output=json_output)
+
+    # 成功判定：注册提交点已写账本；此处再确认一次，避免 stage 的并发 remove 把记录抹掉后误报成功。
+    if final_name not in _marketplaces(home, env):
         return _err(
             f"clone/refresh failed for {_error_url_display(url)} (see logs)",
             json_output=json_output,
-            code=EXIT_NETWORK_ERROR,
+            exit_code=EXIT_NETWORK_ERROR,
         )
 
     if json_output:
         console.print_json(
-            data={"added": mp_name, "url": known_git_source_for_display(url), "skills": len(registered)}
+            data={"added": final_name, "url": known_git_source_for_display(url), "skills": len(registered)}
         )
         return EXIT_OK
-    return _ok(f"added {mp_name!r} — cloned, {len(registered)} skill(s) found")
+    return _ok(f"added {final_name!r} — cloned, {len(registered)} skill(s) found")
+
+
+def _redact_pid(pid: str) -> str:
+    """
+    plugin id 的展示值：只脱敏 ``<marketplace>`` 段，保留 ``<plugin>@`` 前缀 / Display-safe plugin id.
+
+    pid 形如 ``<plugin>@<marketplace>``；market 段就是账本键（可被手编成携带凭据的串）。整条 pid 交给
+    :func:`redact_ledger_key` 会因含 ``://`` 被判成 URL 而整串占位（丢 plugin 名），故按**第一个** ``@``
+    拆分（plugin 名是严格 kebab，不含 ``@``；market 段可能自带 ``@``，用 rpartition 会切错）后只脱敏 market 段。
+    """
+    plugin, sep, market = pid.partition("@")
+    if not sep:
+        return redact_ledger_key(pid)
+    # 机器写入路径两段均为严格 kebab；**手编**账本可把凭据样文本塞进 plugin 段 → 同样 fail-closed。
+    shown_plugin = REDACTED_GIT_SOURCE if credential_like_text(plugin) else plugin
+    return f"{shown_plugin}@{redact_ledger_key(market)}"
 
 
 def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: bool = False) -> int:
@@ -368,7 +546,7 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         console.print_json(
             data=[
                 {
-                    "name": nm,
+                    "name": redact_ledger_key(nm),
                     "url": _display_source_url(rec),
                     "trusted": nm in trusted,  # 信任按 name 判定（§5.3.1）
                     "autoUpdate": bool(rec.get("autoUpdate", False)),
@@ -388,14 +566,15 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
         table.add_column(col)
     for nm, rec in mps.items():
         url = _display_source_url(rec) or ""
-        sha = rec.get("commitSha") or ""
+        # 手编账本可把 `commitSha` 写成非 str → 先 `str()` 再截断（旧实现 `sha[:10]` 会 TypeError）。
+        sha = str(rec.get("commitSha") or "")
         table.add_row(
-            nm,
-            url,
+            escape(redact_ledger_key(nm)),
+            escape(url),
             "✓" if nm in trusted else "—",
             "on" if rec.get("autoUpdate") else "off",
-            str(rec.get("lastUpdated") or "—"),
-            sha[:10] if sha else "—",
+            escape(str(rec.get("lastUpdated") or "—")),
+            escape(sha[:10]) if sha else "—",
         )
     console.print(table)
     return EXIT_OK
@@ -411,25 +590,27 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     plugins = [pid for pid in installed if pid.endswith(f"@{name}")]
     url = _display_source_url(rec)
     info: dict[str, Any] = {
-        "name": name,
+        "name": redact_ledger_key(name),
         "url": url,
         "installLocation": rec.get("installLocation"),
         "commitSha": rec.get("commitSha"),
         "autoUpdate": bool(rec.get("autoUpdate", False)),
         "trusted": name in _load_trusted(env),  # 信任按 name 判定（§5.3.1）
         "lastUpdated": rec.get("lastUpdated"),
-        "installedPlugins": plugins,
+        # pid = `<plugin>@<marketplace>`：market 段就是账本键，可被手编成携带凭据的串 → 展示面脱敏。
+        "installedPlugins": [_redact_pid(pid) for pid in plugins],
     }
     if json_output:
         console.print_json(data=info)
         return EXIT_OK
-    table = Table(title=f"Marketplace · {name}", show_header=False)
+    table = Table(title=f"Marketplace · {escape(redact_ledger_key(name))}", show_header=False)
     table.add_column("Field", style="bold cyan")
     table.add_column("Value")
     for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
         # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
-        table.add_row(k, "" if info[k] is None else str(info[k]))
-    table.add_row("installedPlugins", ", ".join(plugins) if plugins else "—")
+        # 值可能来自**手编**账本（或 URL path）→ rich 单元格必须 escape（#260 七审 🔴1）。
+        table.add_row(k, "" if info[k] is None else escape(str(info[k])))
+    table.add_row("installedPlugins", ", ".join(escape(_redact_pid(pid)) for pid in plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK
 
@@ -507,33 +688,49 @@ async def marketplace_refresh(
     *,
     json_output: bool = False,
 ) -> int:
-    """``git pull`` 失败则全量重 clone；与缓存 plugin 集合对账 + 失败汇总（§10.4）/ Refresh marketplaces。"""
+    """
+    重新 clone 并原子换入（拒绝时旧内容保留）；与缓存 plugin 集合对账 + 失败汇总（§10.4）/
+    Refresh marketplaces by re-cloning into staging and atomically swapping.
+
+    **#260 / §5.14**：清单改名 → 该行 ``status="validation"``（结构化、带 reason 与诊断），**不得**报
+    ``updated`` / ``unchanged``；旧内容、账本与既有运行时能力保持不动。其余 marketplace 继续刷新。
+    """
     mps = _marketplaces(home, env)
     names = list(mps) if target == "all" else [target]
 
     rows: list[dict[str, Any]] = []
+    exit_code = EXIT_OK
     for nm in names:
+        # 展示名统一脱敏（账本键可被手编成携带凭据的串）；内部查找 / staging 仍用原值。
+        shown = redact_ledger_key(nm)
         rec = mps.get(nm)
         if rec is None:
-            rows.append({"name": nm, "status": "missing"})
+            rows.append({"name": shown, "status": "missing"})
             continue
         before = rec.get("commitSha")
-        with clone_spinner(f"Refreshing {nm}...", enabled=not json_output):
-            registered = await stage_marketplace_skills(
-                nm, rec.get("source") or {}, registry, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=True, env=env
-            )
+        try:
+            with clone_spinner(f"Refreshing {shown}...", enabled=not json_output):
+                registered = await stage_marketplace_skills(
+                    nm, rec.get("source") or {}, registry, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=True, env=env
+                )
+        except MarketplaceNameChangeError as e:
+            # 改名拒绝：结构化 outcome，非 updated/unchanged；旧注册与旧能力原样保留。
+            rows.append({"name": shown, "status": "validation", "message": str(e), **e.payload_details()})
+            exit_code = EXIT_USER_ERROR
+            continue
         after = _marketplaces(home, env).get(nm) or {}
         status = "updated" if after.get("commitSha") != before else "unchanged"
-        rows.append({"name": nm, "status": status, "skills": len(registered)})
+        rows.append({"name": shown, "status": status, "skills": len(registered)})
 
     if json_output:
         console.print_json(data=rows)
-        return EXIT_OK
+        return exit_code
     console.print(refresh_summary_table(rows))
     updated = sum(1 for r in rows if r["status"] == "updated")
     failed = sum(1 for r in rows if r["status"] == "missing")
-    console.print(f"[dim]{len(rows)} marketplace(s) · {updated} updated · {failed} failed[/dim]")
-    return EXIT_OK
+    rejected = sum(1 for r in rows if r["status"] == "validation")
+    console.print(f"[dim]{len(rows)} marketplace(s) · {updated} updated · {failed} failed · {rejected} validation[/dim]")
+    return exit_code
 
 
 def marketplace_set(
@@ -555,6 +752,152 @@ def marketplace_set(
         console.print_json(data={"name": name, "autoUpdate": val})
         return EXIT_OK
     return _ok(f"{name!r} auto-update set to {val}")
+
+
+# 指纹覆盖 `A2CSkillRef` **全部**协议字段（含可选），逐项显式取值 + 安全定型——不序列化整个 ref：
+# frontmatter 的 `skill_metadata` / `tags` 是不可信结构（YAML 允许非 str 键 → `json.dumps(sort_keys=True)`
+# 抛 TypeError；自引用环 → Circular reference），在 refresh 之前抛会把整个 REPL 命令打挂
+# （#260 终审 🟡1 / 🟡3）。
+_FINGERPRINT_FIELDS = (
+    "name",
+    "source",
+    "uri",
+    "path",
+    "description",
+    "license",
+    "compatibility",
+    "allowed_tools",
+    "tags",
+    "version",
+    "skill_metadata",
+)
+
+_STABLE_MAX_DEPTH = 6
+# 单字段的**节点预算**：`skill_metadata` 是 frontmatter 原样透传，YAML alias 可把结构放大到指数级
+# （#260 终审 🟡3：261B 输入 → 1.42MB/0.09s，分支 50 时节点数 ~1.5e10）。预算耗尽即截断，保证
+# `_registry_fingerprints` 在 async 处理器里的同步开销有界。
+_STABLE_NODE_BUDGET = 512
+_TRUNCATED = "<truncated>"
+
+
+class _StableBudget:
+    """一次深度遍历的共享预算 + 环检测（同一对象在多分支出现属 DAG，允许复用）。"""
+
+    __slots__ = ("remaining", "active")
+
+    def __init__(self) -> None:
+        self.remaining = _STABLE_NODE_BUDGET
+        self.active: set[int] = set()
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _stable_text(value: Any, budget: _StableBudget | None = None, _depth: int = 0) -> str:
+    """
+    任意 JSON-ish 值的**稳定且可判别**字符串化 / Stable, discriminating text for arbitrary values.
+
+    #260 终审 🟡2–3：早期实现用 ``str()`` 序列化容器，**非单射**——``["a,b"]`` 与 ``["a","b"]``、
+    ``None`` 与 ``"None"``、``1`` 与 ``"1"``、``{"a":1}`` 与 ``{"a":"1"}`` 都会碰撞（漏标脏）。现在：
+
+    - 标量带**类型前缀**（``s`` + ``repr`` / ``int:`` / ``float:`` / ``bool:`` / ``null``）；
+    - 容器带**类型标签 + 元素数 + 定界符**，映射键按序列化结果排序（非 str 键安全）；
+    - 深度与**节点预算**双封顶（:data:`_STABLE_MAX_DEPTH` / :data:`_STABLE_NODE_BUDGET`），并用
+      ``id()`` 活动集做环检测 → alias bomb / 自引用都有界；
+    - 集合按序列化结果排序（无序容器也稳定）。
+    """
+    budget = budget if budget is not None else _StableBudget()
+    if _depth >= _STABLE_MAX_DEPTH or not budget.take():
+        return _TRUNCATED
+    if isinstance(value, str):
+        return "s" + repr(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool:1" if value else "bool:0"
+    if isinstance(value, int):
+        return "int:" + str(value)
+    if isinstance(value, float):
+        return "float:" + repr(value)
+    if isinstance(value, Mapping):
+        if id(value) in budget.active:
+            return "<cycle>"
+        budget.active.add(id(value))
+        try:
+            rendered: list[str] = []
+            truncated = False
+            for key, item in value.items():
+                if budget.remaining <= 0:
+                    truncated = True
+                    break
+                rendered.append(
+                    _stable_text(key, budget, _depth + 1) + "=" + _stable_text(item, budget, _depth + 1)
+                )
+        finally:
+            budget.active.discard(id(value))
+        body = ";".join(sorted(rendered))
+        if truncated:
+            body = f"{body};{_TRUNCATED}" if body else _TRUNCATED
+        return f"map[{len(value)}]{{{body}}}"
+    if isinstance(value, (list, tuple)):
+        if id(value) in budget.active:
+            return "<cycle>"
+        budget.active.add(id(value))
+        try:
+            rendered = []
+            truncated = False
+            for item in value:
+                if budget.remaining <= 0:
+                    truncated = True
+                    break
+                rendered.append(_stable_text(item, budget, _depth + 1))
+        finally:
+            budget.active.discard(id(value))
+        body = ";".join(rendered)
+        if truncated:
+            body = f"{body};{_TRUNCATED}" if body else _TRUNCATED
+        tag = "list" if isinstance(value, list) else "tuple"
+        return f"{tag}[{len(value)}]{{{body}}}"
+    if isinstance(value, (set, frozenset)):
+        if id(value) in budget.active:
+            return "<cycle>"
+        budget.active.add(id(value))
+        try:
+            rendered = []
+            truncated = False
+            for item in value:
+                if budget.remaining <= 0:
+                    truncated = True
+                    break
+                rendered.append(_stable_text(item, budget, _depth + 1))
+        finally:
+            budget.active.discard(id(value))
+        body = ";".join(sorted(rendered))
+        if truncated:
+            body = f"{body};{_TRUNCATED}" if body else _TRUNCATED
+        tag = "set" if isinstance(value, set) else "frozenset"
+        return f"{tag}[{len(value)}]{{{body}}}"
+    return "obj:" + type(value).__name__
+
+
+def _registry_fingerprints(registry: SkillRegistry) -> frozenset[tuple[tuple[str, str], ...]]:
+    """
+    registry 条目的**完整指纹**（`A2CSkillRef` 全字段 + 孤儿标志）/ Full fingerprints of the registry refs.
+
+    #260 独立审查 🟡4 / 终审 🟡1–3：REPL `marketplace refresh` 原先只比 SKILL **名字集合**——「A 内容更新
+    （version/uri/tags 变）+ B 改名被拒」时名字集相同，退出码为 1 但不会标脏，已连接 Agent 继续看到旧投影。
+
+    指纹 = 全部协议字段（经 :func:`_stable_text` 定型）的 ``(键, 值)`` 元组 + **``orphaned`` 标志**：
+    `plugin disable` 置孤儿后 refresh 重扫会把 ``orphaned`` 翻回 False 而 ref 内容不变——不纳入孤儿标志
+    就同样漏标脏。
+    """
+    return frozenset(
+        tuple((field, _stable_text(ref.get(field))) for field in _FINGERPRINT_FIELDS) + (("orphaned", str(orphaned)),)
+        for ref, orphaned in registry.all_refs()
+    )
 
 
 # ── REPL dispatcher（绑定 Computer 的活跃 registry / home / session）/ REPL adapter ──
@@ -611,8 +954,12 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             comp.mark_skills_dirty()
     elif sub == "refresh":
         target = pos[0] if pos else "all"
+        # #260：部分源刷新成功 + 部分 validation 时退出码为 1，但 registry 已变——不能只看退出码，
+        # 否则已连接 Agent 继续看到旧投影。
+        before_state = _registry_fingerprints(comp.skill_registry)
         code = await marketplace_refresh(registry, home, env, target, json_output=json_output)
-        if code == EXIT_OK:
+        after_state = _registry_fingerprints(comp.skill_registry)
+        if code == EXIT_OK or before_state != after_state:
             comp.mark_skills_dirty()
     elif sub == "set":
         # marketplace set <name> auto-update=<bool>

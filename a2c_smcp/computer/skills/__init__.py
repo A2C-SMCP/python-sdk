@@ -43,6 +43,10 @@ from a2c_smcp.computer.skills.home import (
     user_dropin_root,
     user_skill_dir,
 )
+from a2c_smcp.computer.skills.marketplace_identity import (
+    MarketplaceIdentityError,
+    MarketplaceNameChangeError,
+)
 from a2c_smcp.computer.skills.naming import (
     MCP_SEGMENT,
     ParsedSkillName,
@@ -81,6 +85,7 @@ from a2c_smcp.computer.skills.sources import (
 )
 from a2c_smcp.computer.skills.staging import (
     SkillStagingError,
+    add_marketplace_source,
     parse_skill_frontmatter,
     stage_marketplace_skills,
     stage_mcp_skills,
@@ -143,8 +148,12 @@ __all__ = [
     "marketplace_clone_url",
     "normalize_repo_shorthand",
     "resolve_plugin_source",
+    # marketplace identity（#260：`stage_marketplace_skills` 的改名拒绝在此公开面内可捕获）
+    "MarketplaceIdentityError",
+    "MarketplaceNameChangeError",
     # staging
     "SkillStagingError",
+    "add_marketplace_source",
     "parse_skill_frontmatter",
     "stage_marketplace_skills",
     "stage_mcp_skills",

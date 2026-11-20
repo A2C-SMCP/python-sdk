@@ -95,6 +95,10 @@ class MarketplaceRecord(TypedDict):
     lastUpdated: NotRequired[str]  # ISO-8601 UTC
     commitSha: NotRequired[str]
     autoUpdate: NotRequired[bool]
+    # 该注册**锚定**的清单顶层 `name`（#260；与 rust-sdk#289 提案同名）。缺省 = 旧账本 / legacy。
+    # 写入点：注册提交（add / 首次 clone）必写；legacy 记录首次成功 clone/refresh 补写；已有**永不改写**。
+    # refresh 观测到 ≠ 该值 ⇒ `validation` 改名拒绝（runtime-contract §5.14）。
+    manifestNameBaseline: NotRequired[str]
 
 
 class KnownMarketplacesFile(TypedDict):

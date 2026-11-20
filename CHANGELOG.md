@@ -22,12 +22,38 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - 恢复路径：`a2c-computer marketplace remove <name>`（默认级联卸载其下所有已安装插件并撤销 trust）→
   `a2c-computer marketplace add <git-url> --trust` → 逐个 `plugin install <plugin>@<name>` + `plugin enable <plugin>@<name>`。
 - **不要使用 `marketplace remove --keep-plugins`**：它保留 installed 状态与账本，留下指向已删 clone 的孤儿记录。
-- `marketplace refresh`（`refresh=true`）**不能**可靠自愈：上游未变时 `git pull --ff-only` 不会还原本地已删文件；
-  `plugin install` 与 boot 重物化都复用既有 clone。
+- `marketplace refresh`（`refresh=true`）**会**还原上游仍存在的被删文件（#260 起为「重新 clone 到 staging + 原子换入」，
+  不再原地 `git pull`）；但上游本身已删的路径、以及本地 clone 与上游一致时仍无变化。`plugin install` 与 boot 重物化
+  都复用既有 clone。
 - 详见 [`docs/upgrade-0.5.1-marketplace-catalog-recovery.md`](docs/upgrade-0.5.1-marketplace-catalog-recovery.md)。
 
 ### Breaking Changes
 
+- **marketplace 注册名改为清单 `name`（#260，镜像 rust-sdk#272）**：协议 `runtime-contract §5.14` 只约束
+  「名称唯一性 / 禁静默改名」（派生算法属 SDK 自治，protocol#79）。行为变更：
+  - **`marketplace add` 的注册名取 `marketplace.json` 顶层 `name`**，不再从 URL 末段派生，也与 `--name` 无关。
+    `<plugin>@<marketplace>` 中的 `<marketplace>` 随之取清单名——仓库名与清单名不同时，插件 id 会改变。
+  - **`--name` 不再是别名**（D6 B）：只作「期望清单名」校验，与清单不符即 `validation` 失败。
+  - **`--no-clone` 对新源一律 `validation`**（D5：无 pending、无临时派生名）；仅对已注册源或可确认的本地
+    缓存生效。
+  - **交互式 `marketplace add` 一律弹 trust 确认**：`trustedMarketplaces` 不再豁免 prompt；trust 在**注册成功后**
+    才写入 user settings（注册失败零残留，settings 损坏仍在 clone 前 fail-closed）。非交互恒需 `--trust`（不变）。
+  - **同名不同源 → `validation` 拒绝**（不替换、不自动后缀）；同名同源重复 add 幂等；同一 source 已以旧名注册时
+    新名 add → `validation`（诊断给旧名与处置）；remove（含 `--keep-plugins`）后 re-add 且仍有
+    `<plugin>@<name>` 意图引用 → 拒绝（登记已删、无法证同源，同源 re-add 亦 fail-closed）。
+  - **`marketplace refresh` 遇清单改名 → `validation` 结构化失败**（不再报 updated/unchanged），旧内容 / 账本 /
+    运行时能力保留；legacy 注册（账本无 `manifestNameBaseline`）首次成功 clone/refresh 记 baseline、保留旧名、
+    不报改名拒绝，仅 baseline 之后再改名才拒绝。refresh 改为「重新 clone + 原子换入」，不再原地 `git pull`。
+  - **declared 换源拒绝**：`extraKnownMarketplaces` 中同名 source 变更 → `validation`，**不** wipe / 重 clone；
+    换源需显式 remove / re-add。
+  - **`--json` 错误载荷形状变更（breaking）**：此前为 `{"error": "<人读文案>"}`；现在统一为
+    `{"error": "<类别>", "message": "<人读文案>", …诊断}`，机读原因在 **`reason`** 键（`error` 为
+    `validation` / `error`）。类别与 reason 取值：`validation` × {`manifest-name-invalid` /
+    `manifest-name-changed` / `name-conflict` / `source-conflict` / `expected-name-mismatch` /
+    `dangling-references` / `unresolvable-name` / `invalid-name` / `invalid-source`}。
+    消费方需改为读 `message`/`reason`（旧的「整个 `error` 就是文案」读法不再成立）。
+  - **存量迁移不在本版**：已有 URL 派生名 / `--name` 别名的注册**不追溯改名**，由 #268 的
+    `marketplace migrate` 处理（账本字段 `manifestNameBaseline` 已就位供其消费）。
 - **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer
   ⇒ 一个 Agent 同一时刻至多连一台 Computer。无新事件、无能力字段（随 0.5 MINOR 握手生效）。
   - **第二台 Computer 入房被拒 `4101`**（此前允许任意多台）：不替换、不驱逐已在房的 Computer；同名与否都一样。

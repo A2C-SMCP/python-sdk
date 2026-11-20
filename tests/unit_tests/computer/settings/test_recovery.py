@@ -509,3 +509,34 @@ async def test_recover_rematerialize_failure_log_is_redacted(
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "re-materialize" in text  # 正对照：确实走到了该分支
     assert "token=SECRET_BOOT" not in text
+
+
+@pytest.mark.asyncio
+async def test_recover_degrades_on_manifest_rename_without_touching_capabilities(tmp_path: Path, monkeypatch) -> None:
+    """
+    #260/§5.14：恢复路径观测到清单改名 → **WARN 降级**（不阻断 boot、不影响其余 marketplace）。
+
+    断言三者同时成立（不只断言日志）：未恢复该源（``restored_*`` 为空）、既有**能力保留**（上一轮恢复的 SKILL
+    仍在活跃集）、且降级被记账（``failed_marketplaces``）。
+    """
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+
+    home = _home(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {"audit@acme": [_record(root)]})
+    reg = SkillRegistry()
+    declared = {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}}
+    # 先跑一次成功恢复，建立「既有能力」基线
+    await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+    assert reg.resolve("audit:lint") is not None
+
+    async def _rename(*_args: object, **_kwargs: object) -> list[str]:
+        raise MarketplaceNameChangeError("manifest renamed upstream")
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.recovery.stage_marketplace_skills", _rename)
+
+    report = await recover_marketplace_skills(reg, home, declared, env=_env(tmp_path))
+
+    assert report.failed_marketplaces == ["acme"]
+    assert report.restored_skills == [] and report.restored_plugins == []
+    assert reg.resolve("audit:lint") is not None, "降级不得摘掉既有能力"

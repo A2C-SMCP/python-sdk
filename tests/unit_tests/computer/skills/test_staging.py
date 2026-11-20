@@ -1154,14 +1154,22 @@ async def test_marketplace_clone_passes_raw_url(tmp_path: Path, monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_marketplace_refresh_pull_failure_log_redacts(
+async def test_marketplace_refresh_clone_failure_keeps_old_clone_and_redacts(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
 ) -> None:
-    """refresh 腿（git pull 失败 → 全量重 clone）：WARN/ERROR 均不得含凭据（rust 同款边界）。"""
+    """
+    refresh 腿（#260 起为「重新 clone 到 staging」而非原地 pull）：clone 失败时
+
+    1. **旧 clone 原样保留**（旧内容零损伤——这是 §5.14「拒绝时保留旧内容」的实现基础）；
+    2. 日志不得含凭据（rust 同款边界）；
+    3. 失败按既有降级铁律**不抛**。
+    """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     clone_dir = staging_mod.marketplace_skill_dir(home, "demo")
     clone_dir.mkdir(parents=True)
+    marker = clone_dir / "KEEP.txt"
+    marker.write_text("old content", encoding="utf-8")
     _git_identity = ["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false"]
     subprocess.run(["git", "init", "-q"], cwd=str(clone_dir), check=True, capture_output=True)
     subprocess.run(
@@ -1181,11 +1189,12 @@ async def test_marketplace_refresh_pull_failure_log_redacts(
         "demo", {"type": "git", "url": _CRED_CLONE_URL}, SkillRegistry(), home, refresh=True, timeout=10
     )
     assert names == []
+    assert marker.read_text(encoding="utf-8") == "old content", "刷新失败不得动既有 clone"
     text = _no_secret(staging_logs.records)
     assert "FAKE_TOKEN" not in text
-    warnings = [r for r in staging_logs.records if r.levelno == logging.WARNING]
-    assert warnings, text
-    assert any("pull" in r.getMessage() for r in warnings)
+    errors = [r for r in staging_logs.records if r.levelno == logging.ERROR]
+    assert errors, text
+    assert any("clone/refresh failed" in r.getMessage() for r in errors)
 
 
 @pytest.mark.asyncio
@@ -1284,7 +1293,7 @@ async def test_plugin_source_errors_log_redacts_all_vectors(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        """{"plugins":[
+        """{"name":"acme","plugins":[
             {"name":"ftp","source":{"source":"url","url":"ftp://cnb:FAKE_TOKEN@example.com/org/repo.git?token=QUERY#FRAGMENT"}},
             {"name":"prefix","source":"key=https://user:PW_PREFIX@example.com/org/repo.git"},
             {"name":"scp","source":{"source":"github","repo":"git@example.com:org/repo.git"}},
@@ -1327,7 +1336,7 @@ async def test_plugin_entry_missing_name_with_credentials_is_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        '{"plugins":[{"source":{"source":"url","url":"https://alice:PW_ENTRY@example.com/r.git"}}]}',
+        '{"name":"acme","plugins":[{"source":{"source":"url","url":"https://alice:PW_ENTRY@example.com/r.git"}}]}',
         encoding="utf-8",
     )
     _git(repo, "init", "-q")
@@ -1393,7 +1402,7 @@ async def test_non_object_plugin_entry_log_is_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        '{"plugins":["https://alice:PW_ENTRY_RAW@example.com/r.git"]}', encoding="utf-8"
+        '{"name":"acme","plugins":["https://alice:PW_ENTRY_RAW@example.com/r.git"]}', encoding="utf-8"
     )
     _git(repo, "init", "-q")
     _git(repo, "add", "-A")
@@ -1432,7 +1441,7 @@ async def test_traversal_entry_name_cannot_delete_outside_dir(
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     # 名字从 `<home>/marketplace/.plugins/acme/` 上跳四级正好落到 `tmp_path`，指向下面的 sentinel 目录。
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        '{"plugins":[{"name":"../../../../sentinel","source":{"source":"url","url":"https://example.com/r.git"}}]}',
+        '{"name":"acme","plugins":[{"name":"../../../../sentinel","source":{"source":"url","url":"https://example.com/r.git"}}]}',
         encoding="utf-8",
     )
     _git(repo, "init", "-q")
@@ -1498,7 +1507,7 @@ async def test_bare_token_entry_is_not_echoed(
     """非对象 entry 只记类型名：裸 token（非 URL 形态）无从脱敏，因此根本不回显整值。"""
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
-    (repo / ".tfrobot-plugin" / "marketplace.json").write_text('{"plugins":["glpat-SECRET_TOKEN"]}', encoding="utf-8")
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text('{"name":"acme","plugins":["glpat-SECRET_TOKEN"]}', encoding="utf-8")
     _git(repo, "init", "-q")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "init")
@@ -1523,7 +1532,7 @@ async def test_traversal_entry_name_never_reaches_clone(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        '{"plugins":[{"name":"../../../../sentinel","source":{"source":"url","url":"https://example.com/r.git"}}]}',
+        '{"name":"acme","plugins":[{"name":"../../../../sentinel","source":{"source":"url","url":"https://example.com/r.git"}}]}',
         encoding="utf-8",
     )
     _git(repo, "init", "-q")
@@ -1555,7 +1564,7 @@ async def test_unexpected_staging_error_traceback_is_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        '{"plugins":[{"name":"audit","source":{"source":"url","url":"https://example.com/r.git"}}]}', encoding="utf-8"
+        '{"name":"acme","plugins":[{"name":"audit","source":{"source":"url","url":"https://example.com/r.git"}}]}', encoding="utf-8"
     )
     _git(repo, "init", "-q")
     _git(repo, "add", "-A")
@@ -1641,7 +1650,7 @@ async def test_plugin_source_skill_md_unreadable_log_is_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": f"./plugins/{bad}"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": f"./plugins/{bad}"}]}), encoding="utf-8"
     )
     skill_md = repo / "plugins" / bad / "skills" / "etl" / "SKILL.md"
     skill_md.parent.mkdir(parents=True)
@@ -1786,7 +1795,7 @@ async def test_scp_like_source_unreadable_log_is_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": f"./plugins/{bad}"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": f"./plugins/{bad}"}]}), encoding="utf-8"
     )
     skill_md = repo / "plugins" / bad / "skills" / "etl" / "SKILL.md"
     skill_md.parent.mkdir(parents=True)
@@ -1922,7 +1931,7 @@ async def test_marketplace_plugin_non_utf8_skill_is_isolated(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     skills = repo / "plugins" / "audit" / "skills"
     (skills / "bad").mkdir(parents=True)
@@ -1957,7 +1966,7 @@ async def test_marketplace_synthesis_failed_skill_dir_name_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     for bad in ("alice:pw@host", "foo?token=SECRET_Q"):
         bad_dir = repo / "plugins" / "audit" / "skills" / bad
@@ -1989,7 +1998,7 @@ async def test_marketplace_skill_dir_name_credential_like_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     bad_dir = repo / "plugins" / "audit" / "skills" / "deploy-token@example.com:org"
     bad_dir.mkdir(parents=True)
@@ -2019,7 +2028,7 @@ async def test_marketplace_skill_dir_name_query_tail_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     bad_dir = repo / "plugins" / "audit" / "skills" / "foo?token=SECRET_Q"
     bad_dir.mkdir(parents=True)
@@ -2053,7 +2062,7 @@ async def test_marketplace_skill_md_unreadable_dir_name_redacted(
     repo = tmp_path / "repo"
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
-        json.dumps({"plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
+        json.dumps({"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/audit"}]}), encoding="utf-8"
     )
     bad_dir = repo / "plugins" / "audit" / "skills" / "foo?token=SECRET_Q"
     bad_dir.mkdir(parents=True)
@@ -2085,7 +2094,7 @@ async def test_marketplace_duplicate_skill_dir_path_redacted(
     (repo / ".tfrobot-plugin").mkdir(parents=True)
     (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
         json.dumps(
-            {"plugins": [{"name": "audit", "source": "./plugins/a"}, {"name": "audit", "source": "./plugins/b"}]}
+            {"name": "acme", "plugins": [{"name": "audit", "source": "./plugins/a"}, {"name": "audit", "source": "./plugins/b"}]}
         ),
         encoding="utf-8",
     )
@@ -2108,3 +2117,44 @@ async def test_marketplace_duplicate_skill_dir_path_redacted(
     assert "duplicate marketplace SKILL name" in text  # 正对照：确实走了该分支
     assert "deploy-token" not in text and "example.com:org" not in text
     assert "<redacted-git-source>" in text
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_name_log_redacts_path_credentials(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """
+    终审 🔴 回归锁：非法 name 的账本键是含 **path 段凭据** 的 URL 时，日志也必须遮蔽（散文脱敏只去
+    userinfo、保留 path，旧实现照原样打 `alice:PW_LEAK@example.com`）。
+    """
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "https://host/team/alice:PW_LEAK@example.com/repo.git",
+        {"type": "git", "url": "https://example.com/r.git"},
+        SkillRegistry(),
+        home,
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "PW_LEAK" not in text and "alice" not in text
+    assert any(r.levelno >= logging.ERROR for r in staging_logs.records)
+
+
+@pytest.mark.asyncio
+async def test_marketplace_invalid_source_log_hits_source_branch(
+    tmp_path: Path, staging_logs: pytest.LogCaptureFixture
+) -> None:
+    """
+    覆盖率锁（`:1744` 非法 source 分支）：**合法 kebab name** + 非法 source 才能真正走到该分支——
+    用凭据样 name 会被前面的 `is_valid_marketplace_name` 先拒，永远到不了这里（旧用例是盲的）。
+    该分支的 name 已过严格 kebab 校验，故不含凭据样文本。
+    """
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": ""}, SkillRegistry(), home
+    )
+    assert names == []
+    text = _no_secret(staging_logs.records)
+    assert "has invalid source" in text, "必须命中非法 source 分支（而非 name 校验分支）"

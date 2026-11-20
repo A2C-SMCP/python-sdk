@@ -48,11 +48,14 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("inputs value list|get|set|rm|clear", "inputs 缓存值增删改查 / CRUD cached input values"),
     ],
     "marketplace": [
-        ("marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]", "添加 marketplace（首次 y/N trust）/ add"),
+        (
+            "marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]",
+            "添加 marketplace（注册名取清单 name；交互需 y/N）/ add",
+        ),
         ("marketplace list [--json]", "列出已知 marketplace / list known marketplaces"),
         ("marketplace info <name> [--json]", "marketplace 详情 / marketplace detail"),
         ("marketplace remove <name> [--keep-plugins]", "移除（默认级联卸载 plugin）/ remove (cascade)"),
-        ("marketplace refresh [<name>|all]", "git pull / 重 clone + 对账 / refresh"),
+        ("marketplace refresh [<name>|all]", "重 clone 换入 + 对账（改名拒绝）/ refresh"),
         ("marketplace set <name> auto-update=<bool>", "设置 per-source auto-update / set flag"),
     ],
     "plugin": [

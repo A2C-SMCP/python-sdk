@@ -1267,3 +1267,36 @@ async def test_enable_register_without_existing_names_raises(tmp_path: Path) -> 
     mcp = _FakeMCP()
     with pytest.raises(PluginInstallError, match="existing_bundle_ids is required"):
         await enable_plugin("audit@acme", SkillRegistry(), home, env=_env(tmp_path), register_server=mcp.register)
+
+
+async def test_enable_converts_manifest_rename_rejection_to_structured_error(tmp_path: Path, monkeypatch) -> None:
+    """
+    #260 终审 🟡4 端到端锁：`enable_plugin` 里 `MarketplaceNameChangeError → PluginInstallError` 的转换
+    必须真被执行（删掉转换会变成裸异常 traceback），且回滚已还原 `enabledPlugins`。
+    """
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_catalog(home, "acme", "audit", servers=[])
+    audit_path = str(marketplace_skill_dir(home, "acme") / "plugins" / "audit")
+    _seed_installed(home, {"audit@acme": [{"scope": "user", "installPath": audit_path}]})
+
+    async def _renamed(*_args: object, **_kwargs: object):
+        raise MarketplaceNameChangeError(
+            "manifest renamed upstream",
+            details={"name": "acme", "manifestName": "acme-renamed", "baselineManifestName": "acme"},
+        )
+
+    monkeypatch.setattr(_STAGE, _renamed)
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin("audit@acme", SkillRegistry(), home, env=env)
+
+    err = ei.value
+    assert err.error_code == "validation"
+    assert err.details["reason"] == "manifest-name-changed"
+    assert err.details["manifestName"] == "acme-renamed"
+    # 回滚：enabledPlugins 不得留下 True
+    settings = json.loads(user_settings_path(env).read_text(encoding="utf-8")) if user_settings_path(env).exists() else {}
+    assert (settings.get("enabledPlugins") or {}).get("audit@acme") is not True

@@ -62,6 +62,7 @@ from a2c_smcp.computer.settings.store import (
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
@@ -313,9 +314,17 @@ async def recover_marketplace_skills(
         # ① 保证 catalog 物化（空 filter = 仅 clone、零 SKILL 注册）——重物化与 skills stage 的共同前置。
         #    降级代理判定（rust 同构）：stage 失败降级不抛；事后 clone 树仍缺 = 源不可达且无本地物化。
         if not marketplace_skill_dir(home, marketplace).is_dir():
-            await stage_marketplace_skills(
-                marketplace, source, registry, home, plugin_filter=set(), refresh=False, timeout=timeout, env=env,
-            )
+            try:
+                await stage_marketplace_skills(
+                    marketplace, source, registry, home, plugin_filter=set(), refresh=False, timeout=timeout, env=env,
+                )
+            except MarketplaceNameChangeError as e:
+                # §5.14 改名拒绝：重建被拒 → 该源降级（能力本已缺失），不阻断其余 marketplace、不影响 boot。
+                logger.warning(
+                    "governance recovery: marketplace %r rebuild rejected (%s); degraded", marketplace, e.reason,
+                )
+                report.failed_marketplaces.append(marketplace)
+                continue
             if not marketplace_skill_dir(home, marketplace).is_dir():
                 logger.warning("governance recovery: marketplace %r clone missing and rebuild failed, degraded", marketplace)
                 report.failed_marketplaces.append(marketplace)
@@ -358,16 +367,24 @@ async def recover_marketplace_skills(
 
         # ③ stage skills（仅活跃且物化完好的 plugin）
         if active_plugins:
-            names = await stage_marketplace_skills(
-                marketplace,
-                source,
-                registry,
-                home,
-                plugin_filter=active_plugins,
-                refresh=False,  # 离线优先：clone 在则零 git / offline-first
-                timeout=timeout,
-                env=env,
-            )
+            try:
+                names = await stage_marketplace_skills(
+                    marketplace,
+                    source,
+                    registry,
+                    home,
+                    plugin_filter=active_plugins,
+                    refresh=False,  # 离线优先：clone 在则零 git / offline-first
+                    timeout=timeout,
+                    env=env,
+                )
+            except MarketplaceNameChangeError as e:
+                # #260/§5.14：恢复路径观测到清单改名 → 拒绝且**不换内容**；该源本轮不恢复，其余继续。
+                logger.warning(
+                    "governance recovery: marketplace %r skill restore rejected (%s); degraded", marketplace, e.reason,
+                )
+                report.failed_marketplaces.append(marketplace)
+                continue
             report.restored_skills.extend(names)
             report.restored_plugins.extend(sorted(f"{plugin}@{marketplace}" for plugin in active_plugins))
 

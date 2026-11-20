@@ -44,6 +44,7 @@ import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_valid_marketplace_name
 from a2c_smcp.computer.settings.store import (
@@ -61,6 +62,7 @@ from a2c_smcp.computer.skills.manifest import (
     load_bundled_servers,
     read_marketplace_manifest,
 )
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError, display_source, same_source
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
@@ -78,20 +80,41 @@ logger = get_logger(__name__)
 # 对账报告 / Reconcile report
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
+class ReconcileRejection:
+    """
+    一次 ``validation`` 拒绝（#260 / runtime-contract §5.14）/ One validation rejection.
+
+    **结构化到可判别**：``reason`` 是机器码（``manifest-name-changed`` = 刷新改名拒绝 /
+    ``source-conflict`` = 声明式换源拒绝），``details`` 携带脱敏后的诊断（如 ``manifestName`` /
+    ``baselineManifestName`` / 两侧 source 展示值）。调用方据此区分「改名拒绝」与普通失败，
+    **不要**只按名字列表猜。
+
+    .. note::
+       ``details`` 只放**脱敏值**：账本键 / source 一律过展示原语；不得直接回显原始 URL。
+    """
+
+    reason: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ReconcileReport:
     """
     一次 :func:`reconcile` 的结果（镜像 CC reconcile 返回值；**无 removed** —— additive-only）。
     The result of one :func:`reconcile` run (mirrors CC's return shape; **no removed** — additive-only)。
 
-    各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / skipped 之一；
+    各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / validation / skipped 之一；
     ``registered_skills`` 汇总本次成功注册 / 刷新的全部 SKILL 名（供 watcher / emit diff）。
     """
 
     installed: list[str] = field(default_factory=list)  # 本次新 clone 的 marketplace
-    updated: list[str] = field(default_factory=list)  # autoUpdate pull / sourceChanged 重 clone
+    updated: list[str] = field(default_factory=list)  # autoUpdate refresh（#260 起重 clone + 原子换入）
     up_to_date: list[str] = field(default_factory=list)  # 声明且已在、未刷新
     failed: list[str] = field(default_factory=list)  # 声明但 stage 后 clone 树仍缺失（clone 失败，已降级）
     skipped: list[str] = field(default_factory=list)  # 预留（trust 门控落 #68 / strict 延后 #80）
+    # #260 / §5.14：`validation` 拒绝（name → :class:`ReconcileRejection`）。声明式换源与 refresh 改名
+    # 都 MUST 拒绝且**不** wipe——旧注册与旧能力保持 active，故**不**归 `failed`（那是降级桶）。
+    validation: dict[str, ReconcileRejection] = field(default_factory=dict)
     registered_skills: list[str] = field(default_factory=list)
 
 
@@ -168,7 +191,9 @@ def _safe_rmtree(path: Path, home: Path) -> bool:
     **本函数不抛**；删除失败 → 记 WARN（不阻断后续清理）。
 
     :return: ``True`` 表示目标已不存在（删除成功或本来就不存在）；``False`` 表示拒删 / 删除失败（目标可能仍在）。
-        调用方需要区分「已清空」与「静默失败」时（如 reconcile 的 sourceChanged 换源）必须检查返回值。
+        调用方需要区分「已清空」与「静默失败」时必须检查返回值。消费方：``prune_marketplaces``（marketplace 级）与
+        ``remove_plugin_install_path``（plugin 独占 clone，uninstall/gc 路径）；#260 起 reconcile 的换源分支已**不再**
+        wipe。
     """
     if path.is_symlink():
         logger.warning("reconcile: refusing to remove symlink %s", path)
@@ -240,8 +265,8 @@ def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str,
 
     - 相对源（``source: "./plugins/x"``）的 ``installPath`` 落在**共享 catalog clone** ``<home>/marketplace/<mp>/…``
       ——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，归 ``marketplace remove`` /
-      ``prune``（reconcile 仅在 ``sourceChanged`` 整树重 clone 时清理）清理，``uninstall`` / plugin-gc MUST NOT
-      删除（#258 方案 A）；
+      ``prune`` 清理（#260 起 reconcile 对声明换源一律 ``validation`` 拒绝，不再 wipe 重 clone），
+      ``uninstall`` / plugin-gc MUST NOT 删除（#258 方案 A）；
     - 空 / 相对 ``installPath``、非法 marketplace / plugin 名 → 无法识别归属，保守保留；
     - ext root（或 ``.plugins/<mp>`` 段）被符号链接重定向 → 拒删：``_safe_rmtree`` 按 canonicalize 后的路径
       ``rmtree``，跟随软链会误删链接目标（可指向 Home 内共享 catalog，令 #258 破坏经 symlink 复活）。
@@ -310,9 +335,10 @@ async def reconcile(
 
     四分支（§7.1 step 3）/ Four branches:
     - **missing**（declared∖materialized）→ clone（``stage_marketplace_skills`` 缺失即 clone）。
-    - **sourceChanged**（``record.source != decl.source``）→ 先 ``rmtree`` 旧 clone 树（含外部 plugin 树）
-      再重 clone（**reconciler 兜底**：:func:`stage_marketplace_skills` 仅 pull 不换库）。
-    - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ ``git pull``。
+    - **sourceChanged**（``not same_source(record.source, decl.source)``）→ **`validation` 拒绝**：不 wipe、
+      不重 clone、不 stage，旧注册/旧内容/旧能力原样保留（协议 §5.14 同名不同源 MUST 拒绝；换源只能经
+      显式 remove / re-add）。记入 :attr:`ReconcileReport.validation`，其余 source 继续。
+    - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ 重 clone + 原子换入（#260）。
     - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 :func:`prune_marketplaces` 显式清）。
 
     每个 declared marketplace 物化其**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0）plugin 的
@@ -338,50 +364,63 @@ async def reconcile(
     updated: list[str] = []
     up_to_date: list[str] = []
     failed: list[str] = []
+    rejected: dict[str, ReconcileRejection] = {}
     registered_skills: list[str] = []
 
-    ext_root = home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS
     for name, decl in declared_mps.items():
         source = decl.get("source")
         record = materialized.get(name)
-        source_changed = record is not None and record.get("source") != source
+        # #260 / §5.14：同源判定走 SDK 单一权威 `same_source`（不做 ssh/https 归一，无法确定即不同源）。
+        source_changed = record is not None and not same_source(record.get("source"), source)
         clone_dir = marketplace_skill_dir(home, name)
 
         if source_changed:
-            # 源已变更：旧 clone 是「别的仓库」，必须 wipe 后重 clone（stage 只 pull 不换库）。
-            logger.info("reconcile: marketplace %r source changed, wiping stale clone for re-clone", name)
-            # 未能真正清空旧树（软链路径 / 删除失败）→ 必须记 failed：否则 stage 复用旧树、把新源覆写成
-            # 「updated」的静默假成功（#258 复审 🟡3）。注销 SKILL 必须在 wipe 成功之后——失败分支无回滚，
-            # 先注销会让 live registry 永久缺失该源能力（#258 复审 🟡4）。
-            clone_cleared = _safe_rmtree(clone_dir, home)
-            ext_cleared = _safe_rmtree(ext_root / name, home)
-            if not (clone_cleared and ext_cleared):
-                logger.error("reconcile: marketplace %r source change could not wipe old clone; marking failed", name)
-                failed.append(name)
-                continue
-            _unregister_marketplace_skills(registry, name)
+            # §5.14：声明式换源 MUST 以 `validation` 拒绝——**不 wipe、不重 clone**，旧内容与旧能力原样保留；
+            # 换源只经显式 remove / re-add。此前「wipe + 重 clone」会静默把既有注册绑到新仓库。
+            logger.error(
+                "reconcile: marketplace %r is declared from a source different from its registration; refused "
+                "(remove it explicitly to switch the source, runtime-contract §5.14)",
+                name,
+            )
+            rejected[name] = ReconcileRejection(
+                reason="source-conflict",
+                details={
+                    "existingSource": display_source(record.get("source") if isinstance(record, Mapping) else None),
+                    "declaredSource": display_source(source),
+                },
+            )
+            continue
 
         present_before = clone_dir.exists()
         do_refresh = bool(decl.get("autoUpdate")) or refresh
         plugin_filter = _enabled_plugin_names_for(name, declared)
 
-        names = await stage_marketplace_skills(
-            name,
-            source if isinstance(source, Mapping) else {},
-            registry,
-            home,
-            plugin_filter=plugin_filter,
-            auto_update=bool(decl.get("autoUpdate")),
-            refresh=do_refresh,
-            timeout=timeout,
-            env=env,
-        )
+        try:
+            names = await stage_marketplace_skills(
+                name,
+                source if isinstance(source, Mapping) else {},
+                registry,
+                home,
+                plugin_filter=plugin_filter,
+                auto_update=bool(decl.get("autoUpdate")),
+                refresh=do_refresh,
+                timeout=timeout,
+                env=env,
+            )
+        except MarketplaceNameChangeError as e:
+            # §5.14 refresh 改名拒绝：**不进入 degraded**（协议明文「返回 validation，旧注册的既有能力保持
+            # active」），故归 ``validation`` 而非 ``failed``——后者在调用方眼里等于「能力已降级 / 需回收」。
+            logger.error(
+                "reconcile: marketplace %r refresh rejected (%s); keeping the existing registration and skills",
+                name,
+                e.reason,
+            )
+            rejected[name] = ReconcileRejection(reason=e.reason, details=dict(e.details))
+            continue
         registered_skills.extend(names)
 
         if not clone_dir.exists():
             failed.append(name)
-        elif source_changed:
-            updated.append(name)
         elif not present_before:
             installed.append(name)
         elif do_refresh:
@@ -394,6 +433,7 @@ async def reconcile(
         updated=updated,
         up_to_date=up_to_date,
         failed=failed,
+        validation=rejected,
         registered_skills=registered_skills,
     )
 

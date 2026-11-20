@@ -107,6 +107,62 @@ def known_git_source_for_display(raw: object) -> str:
     return git_url_for_display(raw)
 
 
+# 凭据样判据的**硬上界**解码轮数（每轮 = 判残形 ``%`` → percent-decode → NFKC）/ Hard cap on decode rounds.
+# **#282**：不动点循环；覆盖面由「残形 ``%`` 即 fail-closed」保证（与 rust-sdk#285 同口径，``%25253A`` /
+# ``%2525253A`` 在第一轮即命中，与层数无关）。轮数只承担「NFKC 归一后再看 ``%``」：全角 ``％３Ａ`` 要两轮
+# 才现出 ASCII ``%``，故上界不可退化为 1；上界本身只保证终止。
+_MAX_CREDENTIAL_DECODE_ROUNDS = 10
+
+
+def credential_like_text(text: str) -> bool:
+    """
+    文本是否含凭据样文本（userinfo ``@`` / 密码段 ``:`` / 残形 percent 转义）/ Credential-like text predicate.
+
+    **#270 / #282**：①任一解码轮出现残形 ``%`` 即 fail-closed（percent 转义本身说明来源被编码过）；
+    ②「percent-decode → NFKC」不动点迭代（全角 ``％３Ａ`` 需先 NFKC 再 decode），轮数以
+    :data:`_MAX_CREDENTIAL_DECODE_ROUNDS` 封顶（只保证终止）；③判定 ``@`` / ``:``。
+
+    这是「错误 / 诊断面」URL 判据的**单一权威**（#260 起由 :func:`diagnostic_url_for_display` 与其调用方
+    共用）；注册名派生（``cli.commands.marketplace.default_marketplace_name``）委托同一判据。
+    """
+    probe = text
+    for _ in range(_MAX_CREDENTIAL_DECODE_ROUNDS):
+        if "%" in probe:
+            return True
+        decoded = unicodedata.normalize("NFKC", unquote(probe))
+        if decoded == probe:  # 不动点：再迭代也不变
+            break
+        probe = decoded
+    return "@" in probe or ":" in probe
+
+
+def diagnostic_url_for_display(raw: object) -> str:
+    """
+    **错误 / 诊断面**的 URL 展示值（#260 单一权威）/ Display-safe URL for errors and diagnostics.
+
+    在 :func:`git_url_for_display`（去 userinfo / query / fragment、严格 fail-closed）之上，再挡住
+    **path 任意段**携带的凭据样文本——``ssh://-/alice:PW@example.com``、``https://host/team/alice:PW@example.com/repo``
+    的展示值仍保留 path，直接回显会把凭据写进 stdout / ``--json`` / 响应 details。空 path 或解析失败同样
+    fail-closed（无法判定）。判据跑在**原始 source** 的 path 段上（#282 复核：展示层会 ``quote()`` 造出
+    ``%xx``，拿展示串判定会把干净 URL 误打码）。
+    """
+    if not isinstance(raw, str):
+        return REDACTED_GIT_SOURCE
+    shown = git_url_for_display(raw)
+    if shown == REDACTED_GIT_SOURCE:
+        return shown
+    try:
+        path = urlsplit(raw).path
+    except ValueError:
+        return REDACTED_GIT_SOURCE
+    segments = [seg for seg in path.split("/") if seg]
+    if not segments:  # 无 path：无法判定来源内容 → fail-closed
+        return REDACTED_GIT_SOURCE
+    if any(credential_like_text(seg) for seg in segments):
+        return REDACTED_GIT_SOURCE
+    return shown
+
+
 def git_url_for_display(raw: object) -> str:
     """
     严格 fail-closed 展示值（错误 / 诊断 / 日志）/ Strict display for errors, diagnostics and logs.
