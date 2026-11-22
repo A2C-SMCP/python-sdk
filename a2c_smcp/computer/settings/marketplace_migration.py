@@ -693,8 +693,29 @@ def _plugin_root_offline(item: MigrationItem, plugin: str, home: Path, catalog_d
     return None
 
 
+def _raw_password_hint(entry: object) -> bool:
+    """原始条目是否**可能**声明了 password（宽松 JSON：True / "true" / 1 …）。"""
+    if not isinstance(entry, Mapping):
+        return False
+    value = entry.get("password")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
+
+
 def _read_input_defs(root: Path) -> list[dict[str, Any]] | None:
-    """读 plugin 的 ``mcp-servers/inputs.json``；缺失 → ``[]``；不可读/畸形 → ``None``。"""
+    """
+    读 plugin 的 ``mcp-servers/inputs.json``（逐条校验）/ Read & per-entry validate input defs.
+
+    缺失 → ``[]``；**可证明不可能承载 secret** 的畸形条目（``pickString`` / ``command``，或未声明
+    password 的 ``promptString``）按运行时 loader 同姿态跳过；只有「可能声明了 password / 类型未知」的
+    畸形条目才返回 ``None``（整文件视为不可读 → 已装 plugin 保守 abort）。文件不可读 / JSON 畸形 /
+    ``inputs`` 非数组 → ``None``。
+    """
     path = root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
     if not path.is_file():
         return []
@@ -711,7 +732,11 @@ def _read_input_defs(root: Path) -> list[dict[str, Any]] | None:
         try:
             parsed = adapter.validate_python(entry)
         except ValidationError:
-            # 畸形 input 定义：运行时 loader 会跳过，但迁移无法据此证明没有 secret → 保守按不可读处理。
+            if _raw_password_hint(entry):
+                return None
+            raw_type = entry.get("type") if isinstance(entry, Mapping) else None
+            if raw_type in {"pickString", "command", "promptString", None}:
+                continue  # 可证明非密钥（password 只有 promptString 有；promptString 无 password 提示）
             return None
         is_password = isinstance(parsed, MCPServerPromptStringInput) and bool(parsed.password)
         out.append({"id": parsed.id, "password": is_password})
@@ -750,6 +775,11 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
             return REASON_PLUGIN_ROOT_UNREADABLE if plugin in ledger_plugins else None
         defs = _read_input_defs(root)
         if defs is None:
+            item.warnings.append(
+                f"plugin {plugin!r} has unreadable or ambiguous input definitions at "
+                f"{sanitize_path_for_diagnostics(str(root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME))}; "
+                "cannot prove it has no secret"
+            )
             return REASON_SECRET_INPUTS_UNREADABLE if plugin in ledger_plugins else None
         for definition in defs:
             candidates.append((plugin, definition["id"], bool(definition["password"])))
@@ -1000,8 +1030,9 @@ def build_plan(
     try:
         for item in items:
             if item.action == ACTION_RENAME:
-                _attach_references(item, state, env)
+                # 顺序承重：actions 的 trust/blocked 列由 rewrite 旗派生，必须先算 scope 面。
                 _attach_scope_surfaces(item, state, env, update_declarations)
+                _attach_references(item, state, env)
         plan.conflicts = _detect_conflicts(items, state, home, env)
     except SettingsFileCorruptError as exc:
         plan.corrupt.append(_corrupt_entry(Path(exc.path), exc))
@@ -1012,7 +1043,8 @@ def build_plan(
         unknown = sorted({name for name in names if name not in known_names})
         if unknown:
             plan.errors.append(
-                "unknown marketplace name(s) for --name: " + ", ".join(repr(name) for name in unknown)
+                "unknown marketplace name(s) for --name: "
+                + ", ".join(sanitize_text_for_diagnostics(repr(name)) for name in unknown)
             )
         selected = {name for name in names if name in known_names}
     else:
@@ -1085,7 +1117,7 @@ def plan_payload(plan: MigrationPlan) -> dict[str, Any]:
             }
             for entry in plan.corrupt
         ],
-        "errors": list(plan.errors),
+        "errors": [sanitize_text_for_diagnostics(message) for message in plan.errors],
     }
 
 
@@ -1215,7 +1247,7 @@ def _precheck_claim(item: MigrationItem, known_map: Mapping[str, Any], home: Pat
     candidates = _claim_candidates(home, probe, item.old, item.new)
     if len(candidates) == 1:
         return
-    item.action = ACTION_BLOCKED
+    item.action = ACTION_UNRESOLVED
     if not candidates:
         item.reason = REASON_CATALOG_LOST
         item.warnings.append("no claimable catalog directory for the new registration")

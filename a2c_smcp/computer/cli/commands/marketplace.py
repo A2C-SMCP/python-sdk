@@ -34,6 +34,7 @@ from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
 from a2c_smcp.computer.settings.marketplace_migration import (
+    ACTION_ABORTED,
     ACTION_RENAME,
     MigrationPlan,
     blocking_conflicts,
@@ -715,6 +716,11 @@ def _flag_values(args: Sequence[str], flag: str) -> list[str]:
     return values
 
 
+def _display_actions(item: Any) -> dict[str, Any]:
+    """人读表格的 actions 抑制口径（与 ``serializable()`` 同判据）/ Actions shown in the human table."""
+    return item.actions if item.action in {ACTION_RENAME, ACTION_ABORTED} else {}
+
+
 def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
     """人读形态（§6）/ Human-readable migration report."""
     if plan.corrupt:
@@ -727,7 +733,7 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
         return
     if plan.errors:
         for message in plan.errors:
-            console_err.print(f"[red]✗ {escape(message)}[/red]")
+            console_err.print(f"[red]✗ {escape(sanitize_text_for_diagnostics(message))}[/red]")
         return
     if plan.corrupt or plan.errors or blocking_conflicts(plan):
         title = "Marketplace name migration aborted (nothing was written)"
@@ -739,15 +745,15 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
     for column in ("Old", "New", "Action", "Plugins", "Trust", "Blocked", "Inputs", "Catalog", "Follow-ups"):
         table.add_column(column)
     for item in plan.items:
-        actions = item.actions or {}
+        actions = _display_actions(item)
         table.add_row(
             escape(redact_ledger_key(item.old)),
             escape(redact_ledger_key(item.new)) if item.new else "—",
             escape(item.action + (f" ({item.reason})" if item.reason else "")),
-            str(actions.get("installedPlugins", 0)),
+            str(actions.get("installedPlugins", "—")),
             str(actions.get("trustedMarketplaces", "—")),
             str(actions.get("blockedMarketplaces", "—")),
-            str(actions.get("inputValues", 0)),
+            str(actions.get("inputValues", "—")),
             str(actions.get("catalog", "—")),
             str(len(item.follow_ups)),
         )
