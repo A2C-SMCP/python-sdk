@@ -34,8 +34,8 @@ from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
 from a2c_smcp.computer.settings.marketplace_migration import (
-    ACTION_ABORTED,
     ACTION_RENAME,
+    MigrationItem,
     MigrationPlan,
     blocking_conflicts,
     build_plan,
@@ -716,9 +716,9 @@ def _flag_values(args: Sequence[str], flag: str) -> list[str]:
     return values
 
 
-def _display_actions(item: Any) -> dict[str, Any]:
-    """人读表格的 actions 抑制口径（与 ``serializable()`` 同判据）/ Actions shown in the human table."""
-    return item.actions if item.action in {ACTION_RENAME, ACTION_ABORTED} else {}
+def _display_actions(item: MigrationItem) -> dict[str, Any]:
+    """人读表格的 actions 展示（单一权威在 ``MigrationItem.visible_actions``）/ Actions shown in the table."""
+    return item.visible_actions()
 
 
 def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:

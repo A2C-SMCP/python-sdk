@@ -189,6 +189,14 @@ class MigrationItem:
     # 迁移本身完成，但有插件未能重建（旧账本保留）→ 退出码 3，不报「全绿」。
     incomplete: bool = False
 
+    def visible_actions(self) -> dict[str, Any]:
+        """可展示的执行面计数（#268 单一权威）/ Execution-surface counters shown in reports.
+
+        只有真正会写盘的动作（rename）或**已尝试执行**的 aborted 才展示；blocked / unresolved /
+        not-selected 一律空，避免被误读为「会执行」。JSON 与人读表格共用本方法。
+        """
+        return dict(self.actions) if self.action in {ACTION_RENAME, ACTION_ABORTED} else {}
+
     def serializable(self) -> dict[str, Any]:
         """
         JSON 形态（§5.3）/ JSON payload（§5.3）.
@@ -214,8 +222,7 @@ class MigrationItem:
                 }
                 for plugin in self.plugins
             ],
-            # 非 RENAME（blocked/unresolved/not-selected）不展示执行面计数，避免误读为「会执行」。
-            "actions": dict(self.actions) if self.action in {ACTION_RENAME, ACTION_ABORTED} else {},
+            "actions": self.visible_actions(),
             "warnings": [sanitize_text_for_diagnostics(w) for w in self.warnings],
             "followUps": [
                 {
@@ -693,18 +700,25 @@ def _plugin_root_offline(item: MigrationItem, plugin: str, home: Path, catalog_d
     return None
 
 
+_BOOL_ADAPTER: TypeAdapter[bool] = TypeAdapter(bool)
+
+
 def _raw_password_hint(entry: object) -> bool:
-    """原始条目是否**可能**声明了 password（宽松 JSON：True / "true" / 1 …）。"""
-    if not isinstance(entry, Mapping):
+    """
+    原始条目是否**可能**声明了 password（与运行时 pydantic 同口径）/ Whether it may declare a password.
+
+    ``"on"`` / ``"y"`` / ``1.0`` 等运行时会被解析为 True 的形态也算「可能」；**无法解析**（dict/list 等）
+    同样按「可能」处理——宁可保守 abort，也不能把可能是密钥的条目当非密钥跳过。
+    """
+    if not isinstance(entry, Mapping) or "password" not in entry:
         return False
-    value = entry.get("password")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes"}
-    return False
+    value = entry["password"]
+    if value is None:
+        return False
+    try:
+        return bool(_BOOL_ADAPTER.validate_python(value))
+    except ValidationError:
+        return True
 
 
 def _read_input_defs(root: Path) -> list[dict[str, Any]] | None:
@@ -735,7 +749,8 @@ def _read_input_defs(root: Path) -> list[dict[str, Any]] | None:
             if _raw_password_hint(entry):
                 return None
             raw_type = entry.get("type") if isinstance(entry, Mapping) else None
-            if raw_type in {"pickString", "command", "promptString", None}:
+            # `type` 来自不可信 manifest，可能是 list/dict（不可哈希）——先判类型再比对，绝不直接放集合里。
+            if raw_type is None or (isinstance(raw_type, str) and raw_type in {"pickString", "command", "promptString"}):
                 continue  # 可证明非密钥（password 只有 promptString 有；promptString 无 password 提示）
             return None
         is_password = isinstance(parsed, MCPServerPromptStringInput) and bool(parsed.password)
@@ -1232,7 +1247,7 @@ def _precheck_claim(item: MigrationItem, known_map: Mapping[str, Any], home: Pat
     计划期预判「可认领目录」（§7.4）：dry-run 的退出码必须 == apply 会得到的退出码。
 
     P2 会先写 ``known[new]``，因此这里把 ``new`` 预置进 known 视图后复用同一候选判据；0 个 →
-    ``catalog-lost``，多个 → ``ambiguous-catalog``（都标 blocked，dry-run 即 exit 3、零写入）。
+    ``catalog-lost``，多个 → ``ambiguous-catalog``（都标 **unresolved**，§7.4；dry-run 即 exit 3、零写入）。
     """
     if item.already_renamed or not item.new:
         return
