@@ -2468,23 +2468,24 @@ class Computer(BaseComputer[PromptSession]):
         :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
         :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
         :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；#287 起另**只读**
-            ``extraKnownMarketplaces`` 作声明源诊断——override 时省略该键会让冲突诊断静默失效、report 恒空；
-            ``None`` = 现算 user/project/local/policy）。
+            ``extraKnownMarketplaces`` 作声明源诊断——override 时省略该键会让冲突诊断静默失效、report 恒空）。
 
             **#293 起接受三种形态**（契约，供 #294 消费）：
 
-            - ``None`` —— 现算五层视图，report 的
+            - ``None`` —— 现算 user/project/local/**flag**/policy 五层视图；report 的
               :attr:`~a2c_smcp.computer.settings.recovery.GovernanceRecoveryReport.marketplace_declaration_errors`
-              取自同一次解析的 ``ResolvedSettings.errors``；
+              取自同一次解析的 ``ResolvedSettings.errors``；``per_scope_layers`` 同样取自该次解析，故
+              #159 Option B 信任门（``enabled_origin``）在默认 boot 路径**照常生效**；
             - :class:`~a2c_smcp.computer.settings.scope.ResolvedSettings` —— **推荐的外部 override 形态**：
               ``.settings`` 作声明视图、``.errors`` 作声明错误来源。类型即载体，调用方不可能「只传视图忘传
               错误」——那正是 #293 要消灭的静默形态（如 CLI ``run_governance_remount`` 传
-              ``resolved_settings_with_errors(...)`` 整对象）；
+              ``resolved_settings_with_errors(...)`` 整对象）；**刻意不取** ``.per_scope_layers``；
             - 裸 ``Mapping`` —— 遗留形态，**不携带 settings 校验错误**（report 该字段恒空）。需要声明诊断的
-              调用方 MUST 改传 ``ResolvedSettings``。
+              调用方 MUST 改传 ``ResolvedSettings``；同样**不取** per-scope 层。
 
-            三者均**不**改变 ``per_scope_layers``（恒 ``None``，``enabled_origin=None``）——显式 override 路径
-            冻结的向后兼容契约（#159 Option B 信任门不动；rust 已另行收紧，见设计文档 §6）。
+            两种**显式 override** 形态都置 ``per_scope_layers = None``（``enabled_origin=None``）——冻结的向后
+            兼容契约：#159 Option B 信任门在这条路径上不触发（rust 已另行收紧为总是取，见设计文档 §6.1；
+            python 是否跟进另开单）。
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
         # 运行时导入：本模块只在 TYPE_CHECKING 下引入该类型（无环，只为不拉重）。

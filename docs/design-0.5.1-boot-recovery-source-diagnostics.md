@@ -156,7 +156,7 @@ rust 侧的逐条结构化 `WARN` 带 `reason` 码，适合被日志检索/告�
 ### 6.1 非法声明（#293）的对拍差异
 
 字段与 DTO 形状**逐字镜像** rust（`MarketplaceDeclarationError`：`scope` / `marketplace` / `field` /
-`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），三处实现口径不同，均属有意的
+`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），四处实现口径不同，均属有意的
 SDK 自治差异：
 
 | 维度 | rust（`settings/schema.rs` + `computer.rs`） | python（本仓） | 理由 |

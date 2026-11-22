@@ -781,6 +781,11 @@ async def test_boot_up_summary_counts_declaration_errors_when_zero_recovery(
 
     from a2c_smcp.computer import computer as computer_mod
 
+    # 包级 logger 等级由 `A2C_SMCP_LOG_LEVEL` 在 import 时固定（默认 INFO）——显式钉住，避免宿主设成
+    # error/warning 时本用例假红（那时 `logger.info` 连 record 都不生成）。
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.INFO)
     computer_mod.logger.addHandler(caplog.handler)
     try:
         caplog.set_level(logging.INFO)
@@ -788,6 +793,7 @@ async def test_boot_up_summary_counts_declaration_errors_when_zero_recovery(
             report = await comp.reconcile_governance()
     finally:
         computer_mod.logger.removeHandler(caplog.handler)
+        a2c_logger.setLevel(prev_level)
 
     assert report.restored_skills == [] and report.failed_marketplaces == []
     assert report.marketplace_source_conflicts == []
@@ -813,6 +819,9 @@ async def test_boot_up_summary_not_triggered_by_unrelated_settings_error(
 
     from a2c_smcp.computer import computer as computer_mod
 
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.INFO)  # 同上：钉住 ambient 级别
     computer_mod.logger.addHandler(caplog.handler)
     try:
         caplog.set_level(logging.INFO)
@@ -820,6 +829,7 @@ async def test_boot_up_summary_not_triggered_by_unrelated_settings_error(
             report = await comp.reconcile_governance()
     finally:
         computer_mod.logger.removeHandler(caplog.handler)
+        a2c_logger.setLevel(prev_level)
 
     assert report.marketplace_declaration_errors == []
     assert report.restored_skills == [] and report.failed_marketplaces == []

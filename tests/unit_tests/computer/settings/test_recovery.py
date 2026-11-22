@@ -988,31 +988,47 @@ def test_marketplace_declaration_errors_filters_other_fields_and_preserves_order
 
 
 def test_marketplace_declaration_errors_redacts_and_scrubs() -> None:
-    """凭据形态市场名 / 带凭据的 reason / 控制字符：report 三字段全部脱敏（#295 只管 settings show）。"""
+    """
+    凭据形态市场名 / 带凭据的 reason / 控制字符：report 四字段全部脱敏（#295 只管 settings show）。
+
+    **path 段凭据**是关键判别输入：散文脱敏（`redact_git_urls_in_text`）对它只去 userinfo、保留 path，
+    只有段漏斗（`redact_ledger_key`）才 fail-closed。名字段若误用散文脱敏，本用例必须转红。
+    """
     evil_name = f"{_SECRET_URL}"
+    path_cred_name = "https://host/team/alice:PW@example.com/repo.git"
+    dirty_path = "/tmp/ev‮il/settings\x1b[31m.json"
     errors = [
         _verr(
             f"extraKnownMarketplaces.{evil_name}",
             "marketplace name must be strict kebab (1-64)",
             SettingsScope.PROJECT,
-            source_path="/tmp/settings.json",
+            source_path=dirty_path,
+        ),
+        _verr(
+            f"extraKnownMarketplaces.{path_cred_name}",
+            "marketplace name must be strict kebab (1-64)",
         ),
         # 控制字符 / 方向覆写 / 行分隔：手工构造（schema 当前不会产出），纵深防御。
         _verr("extraKnownMarketplaces.evil‮gnp.exe FAKE", "expected object, got array\nFAKE_LINE\x1b[31m‮REV"),
     ]
     got = marketplace_declaration_errors(errors)
-    assert len(got) == 2
-    # 正对照：原始错误里确实带凭据 / 控制字符
+    assert len(got) == 3
+    # 正对照：原始错误里确实带凭据（userinfo / path 段）与控制字符
     assert "t0ken" in errors[0].field
-    assert "‮" in errors[1].field and "\n" in errors[1].reason
+    assert "PW" in errors[1].field and "alice" in errors[1].field
+    assert "‮" in errors[2].field and "\n" in errors[2].reason
 
-    first, second = got
-    assert "t0ken" not in first.marketplace and "bob" not in first.marketplace
-    assert "t0ken" not in first.field
-    assert first.source_path == "/tmp/settings.json"
-    for error in (first, second):
+    userinfo, path_cred, scrubbed = got
+    assert "t0ken" not in userinfo.marketplace and "bob" not in userinfo.marketplace
+    assert "t0ken" not in userinfo.field
+    # 段漏斗 fail-closed：path 段凭据整值占位，绝不回显
+    assert path_cred.marketplace == "<redacted-git-source>"
+    assert "PW" not in path_cred.field and "alice" not in path_cred.field
+    # source_path 只做字符清洗（不做 URL 脱敏），控制字符 / 方向覆写仍须清掉
+    assert userinfo.source_path == "/tmp/ev il/settings [31m.json"
+    for error in got:
         for blob in (error.marketplace or "", error.field, error.reason, error.source_path or ""):
-            for needle in ("‮", " ", "\n", "\x1b", "t0ken"):
+            for needle in ("‮", " ", "\n", "\x1b", "t0ken", "PW"):
                 assert needle not in blob, (needle, blob)
 
 
@@ -1036,11 +1052,18 @@ def test_attach_marketplace_declaration_errors_logs_summary_at_default_info() ->
             captured.append(record)
 
     sink = _Sink(level=logging.DEBUG)
+    # 逐条诊断是 DEBUG：包级 logger 的**有效级别**由 `A2C_SMCP_LOG_LEVEL` 在 import 时固定（默认 INFO），
+    # INFO 下 `logger.debug` 连 record 都不生成。必须显式放开，否则本机（父目录 gitignored `.env` 设了
+    # debug）绿、CI 干净 checkout 红。
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.DEBUG)
     recovery_mod.logger.addHandler(sink)
     try:
         attach_marketplace_declaration_errors(report, errors)
     finally:
         recovery_mod.logger.removeHandler(sink)
+        a2c_logger.setLevel(prev_level)
 
     assert len(report.marketplace_declaration_errors) == 2
     warnings = [r.getMessage() for r in captured if r.levelno == logging.WARNING]
