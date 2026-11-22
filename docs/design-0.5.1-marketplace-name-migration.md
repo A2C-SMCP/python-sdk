@@ -403,6 +403,8 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
   "command": "marketplace migrate",
   "dryRun": true,
   "status": "planned",            // planned | applied | aborted(conflict/state-corrupt) | partial
+  "applyRequested": false,        // 是否传了 --apply（aborted 时区分「dry-run」与「apply 被拦下」）
+  "applied": false,               // 是否真的执行过写入
   "exitCode": 0,                  // 0 / 1 / 3（与进程退出码一致，便于脚本判定）
   "updateDeclarations": false,
   "items": [
@@ -418,6 +420,7 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
         "catalog": "rename", "externalTrees": 1, "ledger": "rebuild"
       },
       "warnings": ["plugin 'x' not present in the new manifest"],
+      "incomplete": false,        // 迁移完成但插件未重建（旧账本保留）→ true，最终退出码 3
       "followUps": [
         {"file": "/repo/.tfrobot/settings.json", "pointer": "/enabledPlugins/x@acme",
          "effect": "will-be-inactive", "suggested": "…"},
@@ -427,6 +430,7 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
     }
   ],
   "conflicts": [{"code": "duplicate-target", "names": ["a", "b"], "target": "acme-skills"}],
+  // 冲突的 involves 是内部阻塞判据，不序列化；names/target 一律脱敏展示值
   "corrupt": []                   // strict 只读预检发现的损坏状态文件（非空 → status=aborted、exit 3）
 }
 ```
@@ -589,11 +593,13 @@ if len(candidates) >  1: unresolved / ambiguous-catalog（不猜，列出候选�
 （`update_known_marketplaces` / `update_installed_plugins`，`store.py:562/591`）各自持旁车锁做 RMW，但**跨文件的顺序
 一致性没有锁**。因此：
 
-- 命令启动时用 `file_lock(..., retries=0)` 做一次**瞬时探测**（拿到就立刻释放）——只用于提示「另一个 a2c 进程正在写物化文件」；
+- 命令启动时做一次**只读**并发探测（P1 实现取舍）：对**既有**旁车 `.lock` 尝试非阻塞 `flock`
+  （拿到即释放）——只用于提示「另一个 a2c 进程正在写物化文件」。**不创建**锁文件（dry-run 必须零写入）；
+  `flock` 成功本身即「没有进程在写」的证据，因此不会把「锁文件存在」误读成活性信号。
   **不得**常驻持有：现有写原语会在内部再次 `file_lock` 同一旁车文件，同进程重入会退避后抛 `SettingsLockError`
-  （`store.py:209-260`、`:525-528` 的显式警告）；
-- 探测**不是**活性信号：旁车 `.lock` 文件创建后不删除（`store.py:231` 只 `O_CREAT`，无 unlink），
-  它的存在**只**代表「曾经写过」，不能据此判断有没有进程在跑。文档与提示文案都必须写清这一点，避免制造恒真告警。
+  （`store.py:209-260`、`:525-528` 的显式警告）；win32 跳过（best-effort）。
+- 探测**不是**「锁文件存在即有进程」：旁车 `.lock` 创建后不删除（`store.py:231` 只 `O_CREAT`，无 unlink），
+  只有**实际抢锁失败**才提示；文档与提示文案都必须写清这一点，避免制造恒真告警。
 - `--apply` 在写入前**重新检测 + 重新预检**（§7.2），因此即使 dry-run 与分析之间发生外部改动，也不会按陈旧计划写盘；
   写入期间若检测到目标键/文件形状与预检不符（如目标 pid 突然存在）→ 该项 abort（exit 3），不强行覆盖。
 
@@ -895,4 +901,5 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |
+| 2026-11-22 | **P1 独立审查整改**：修 5 项阻塞（外树已搬窗口的候选根 / P3 后 secret 清理保护 / known[old] 删除移到 P3+P4 之后 / `--json` 全量脱敏 / 迁移禁 clone）+ 加固（merge 双外树冲突、strict 字段形状、corrupt 守卫、非对象声明、重建失败 exit 3、认领排除 `.staging-*`、只读并发探测、JSON 契约）；补 14 例回归与变异复核 |
 | 2026-11-22 | **P1 实现期澄清（不改语义）**：F5 明确 P1 加新键 / P3 删旧键（与 §7.1 一致）；F6 第 4 条明确「未安装且无根」的清单内 plugin 不计候选（架构师确认）；`aborted` 补入 JSON action 枚举 |
