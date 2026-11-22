@@ -1,0 +1,1336 @@
+# -*- coding: utf-8 -*-
+# filename: marketplace_migration.py
+# @Time    : 2026/11/22
+# @Author  : JQQ
+# @Email   : jqq1716@gmail.com
+# @Software: PyCharm
+"""
+Marketplace 存量注册名迁移（#268 / D3）/ Legacy marketplace registration-name migration.
+
+设计依据 / Design: ``docs/design-0.5.1-marketplace-name-migration.md``（P0 已按 2026-11-22 裁决回填）。
+
+职责边界 / Scope:
+- **检测 / 计划 / 项级预检 / 执行**全部在本模块（单一权威）；CLI 只做参数解析与展示。
+- 权威面（改写）：user ``installedPlugins`` / user ``enabledPlugins`` / ``trustedMarketplaces`` /
+  ``blockedMarketplaces`` / ``extraKnownMarketplaces``（仅 ``--update-declarations``）/ plugin-scoped input 值 /
+  keyring secret。project/local 一律**只报告**。
+- 派生面（重建 / 搬迁）：``known_marketplaces`` 新记录、catalog clone、``.plugins`` 外树、账本记录。
+
+硬约束 / Hard rules:
+- 默认 dry-run：检测/计划/项级预检**零写入**；strict 只读（损坏即抛、不 rename、不降级）。
+- 冲突（涉及任一选中项）→ **整体 abort、零写入、退出码 1**；项级失败（keyring 不可用 / 目标键异值 /
+  rename 失败）→ 该项不继续写、其余继续、退出码 3。
+- forward-only：无 journal / 备份 / ``--rollback``；崩溃后靠状态自描述 + 重跑续做（§7.2/§7.4）。
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
+from a2c_smcp.computer.inputs.secret_store import SecretStore, keyring_available
+from a2c_smcp.computer.inputs.value_store import ValueStore, resolve_value_store_path
+from a2c_smcp.computer.settings import store
+from a2c_smcp.computer.settings.installer import (
+    _bare_name_clash_pids,
+    _write_enabled_plugin,
+    _write_installed_plugin,
+    materialize_plugin,
+)
+from a2c_smcp.computer.settings.raw import (
+    SettingsFileCorruptError,
+    list_field_or_empty,
+    mapping_field_or_empty,
+    read_raw_object,
+)
+from a2c_smcp.computer.settings.schema import (
+    FIELD_BLOCKED_MARKETPLACES,
+    FIELD_ENABLED_PLUGINS,
+    FIELD_EXTRA_KNOWN_MARKETPLACES,
+    FIELD_INSTALLED_PLUGINS,
+    FIELD_TRUSTED_MARKETPLACES,
+    is_valid_enabled_plugin_key,
+    is_valid_marketplace_name,
+)
+from a2c_smcp.computer.settings.scope import (
+    DELETE,
+    apply_write,
+    user_settings_path,
+    workdir_local_settings_path,
+    workdir_project_settings_path,
+)
+from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
+from a2c_smcp.computer.skills.manifest import (
+    MCP_INPUTS_FILENAME,
+    MCP_SERVERS_SUBDIR,
+    find_plugin_entry,
+    iter_plugin_entries,
+    plugin_root_base,
+    read_marketplace_manifest,
+)
+from a2c_smcp.computer.skills.marketplace_identity import (
+    MANIFEST_NAME_BASELINE_FIELD,
+    MarketplaceIdentityError,
+    display_source,
+    manifest_marketplace_name,
+    read_manifest_marketplace_name,
+    same_source,
+)
+from a2c_smcp.computer.skills.sources import GitCloneSpec, LocalPluginSource, resolve_plugin_source
+from a2c_smcp.computer.skills.staging import external_plugin_dir, external_plugins_dir
+from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.path import is_within
+
+logger = get_logger(__name__)
+
+# 迁移项状态 / Migration item actions.
+ACTION_RENAME = "rename"
+ACTION_NOOP = "noop"
+ACTION_UNRESOLVED = "unresolved"
+ACTION_BLOCKED = "blocked"
+ACTION_ABORTED = "aborted"
+ACTION_NOT_SELECTED = "not-selected"
+
+# 机器可读原因码 / Machine-readable reasons（§3.3 / §4.2 / §5.2）.
+REASON_INVALID_RECORD = "invalid-record"
+REASON_CATALOG_MISSING = "catalog-missing"
+REASON_MANIFEST_UNREADABLE = "manifest-unreadable"
+REASON_INVALID_MANIFEST_NAME = "invalid-manifest-name"
+REASON_UNSAFE_OLD_NAME = "unsafe-old-name"
+REASON_SYMLINK_CATALOG = "symlink-catalog"
+REASON_BASELINE_MISMATCH = "baseline-mismatch"
+REASON_CATALOG_LOST = "catalog-lost"
+REASON_AMBIGUOUS_CATALOG = "ambiguous-catalog"
+REASON_TARGET_DIR_EXISTS = "target-dir-exists"
+REASON_TARGET_EXTERNAL_TREE_EXISTS = "target-external-tree-exists"
+REASON_KEYRING_UNAVAILABLE = "keyring-unavailable"
+REASON_SECRET_INPUTS_UNREADABLE = "secret-inputs-unreadable"
+REASON_PLUGIN_ROOT_UNREADABLE = "plugin-root-unreadable"
+REASON_SECRET_TARGET_CONFLICT = "secret-target-conflict"
+REASON_VALUE_TARGET_CONFLICT = "value-target-conflict"
+REASON_VALUE_STORE_CORRUPT = "value-store-corrupt"
+REASON_RENAME_FAILED = "rename-failed"
+REASON_LEDGER_REBUILD_FAILED = "ledger-rebuild-failed"
+
+# follow-up 效应码 / Follow-up effect codes（§9）.
+EFFECT_WILL_BE_INACTIVE = "will-be-inactive"
+EFFECT_STALE_TRUST = "stale-trust"
+EFFECT_BLOCKED_INVALID = "blocked-reference-invalid"
+EFFECT_DECLARATION_RESURRECT = "reconcile-will-resurrect"
+
+# 退出码 / Exit codes（与 CLI 层的 0/1/3 对齐；模块层不依赖 CLI 以免反向 import）.
+EXIT_OK = 0
+EXIT_CONFLICT = 1
+EXIT_PARTIAL = 3
+
+# 冲突涉及项的通配符（进程内语义）/ Marker used when a conflict is command-wide.
+_CONFLICT_ALL = "*"
+
+
+class _ItemFailure(RuntimeError):
+    """项级执行失败（被 :func:`execute_plan` 捕获，不跨项传播）/ Single-item failure."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class SecretRekey:
+    """一条 secret 重键计划 / One secret rekey plan."""
+
+    old_key: str
+    new_key: str
+    value: str
+
+
+@dataclass
+class MigrationItem:
+    """单个 marketplace 的迁移计划/结果 / One marketplace's migration plan & result."""
+
+    old: str
+    new: str | None = None
+    action: str = ACTION_NOOP
+    reason: str | None = None
+    source: str | None = None
+    plugins: list[str] = field(default_factory=list)
+    actions: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    follow_ups: list[dict[str, Any]] = field(default_factory=list)
+    selected: bool = True
+
+    # ── 内部状态（不序列化）/ internal (not serialized) ──
+    manifest: dict[str, Any] = field(default_factory=dict, repr=False)
+    old_dir: Path | None = field(default=None, repr=False)
+    already_renamed: bool = False
+    merge: bool = False
+    # 计划面
+    installed_add: list[str] = field(default_factory=list)
+    installed_remove: list[str] = field(default_factory=list)
+    enabled_set: dict[str, bool] = field(default_factory=dict)
+    enabled_remove: list[str] = field(default_factory=list)
+    trust_rewrite: bool = False
+    blocked_rewrite: bool = False
+    declarations_rewrite: bool = False
+    value_pairs: list[tuple[str, str, Any]] = field(default_factory=list)
+    value_remove: list[str] = field(default_factory=list)
+    secret_pairs: list[SecretRekey] = field(default_factory=list)
+    secret_remove: list[str] = field(default_factory=list)
+    secret_cleanup: list[str] = field(default_factory=list)
+    ledger_rebuild: list[tuple[str, str, str | None]] = field(default_factory=list)
+
+    def serializable(self) -> dict[str, Any]:
+        """JSON 形态（§5.3）/ JSON payload（§5.3）."""
+        return {
+            "old": self.old,
+            "new": self.new,
+            "action": self.action,
+            "reason": self.reason,
+            "source": self.source,
+            "plugins": list(self.plugins),
+            "actions": dict(self.actions),
+            "warnings": list(self.warnings),
+            "followUps": list(self.follow_ups),
+        }
+
+
+@dataclass
+class MigrationPlan:
+    """一次迁移的完整计划/报告 / Full plan & report for one migration run."""
+
+    items: list[MigrationItem] = field(default_factory=list)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+    corrupt: list[dict[str, str]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    update_declarations: bool = False
+    applied: bool = False
+
+
+# ---------------------------------------------------------------------------
+# 状态加载（strict 只读）/ Strict read-only state loading
+# ---------------------------------------------------------------------------
+@dataclass
+class _State:
+    """检测所需的全量只读快照 / Read-only snapshot used by detection."""
+
+    known: store.KnownMarketplacesFile
+    installed: store.InstalledPluginsFile
+    user: dict[str, Any]
+    layers: list[tuple[str, Path, dict[str, Any]]]
+    values: dict[str, Any]
+    values_path: Path
+    corrupt: list[dict[str, str]]
+
+
+def _empty_state() -> _State:
+    return _State(
+        known=store.empty_known_marketplaces(),
+        installed=store.empty_installed_plugins(),
+        user={},
+        layers=[],
+        values={},
+        values_path=Path(),
+        corrupt=[],
+    )
+
+
+def _corrupt_entry(path: Path, exc: BaseException) -> dict[str, str]:
+    return {"path": str(path), "reason": str(exc)}
+
+
+def _load_state(home: Path, env: Mapping[str, str] | None, cwd: Path | None) -> _State:
+    """
+    严格只读加载全部将被读/写的状态（D13）/ Strictly load every state file the migration may rewrite.
+
+    任一文件损坏 → 收集到 ``corrupt``（命令级 abort、零写入），**绝不**走容错 loader（后者会 rename）。
+    """
+    state = _empty_state()
+    try:
+        state.known = store.load_known_marketplaces_strict(home, env)
+    except SettingsFileCorruptError as exc:
+        state.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+    try:
+        state.installed = store.load_installed_plugins_strict(home, env)
+    except SettingsFileCorruptError as exc:
+        state.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+
+    user_path = user_settings_path(env)
+    try:
+        state.user = read_raw_object(user_path) or {}
+    except SettingsFileCorruptError as exc:
+        state.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+
+    anchors = {Path(cwd) if cwd is not None else Path.cwd()}
+    for records in state.installed.get("plugins", {}).values():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if isinstance(record, Mapping):
+                project_path = record.get("projectPath")
+                if isinstance(project_path, str) and project_path:
+                    anchors.add(Path(project_path))
+    for anchor in sorted(anchors):
+        for scope_name, path in (
+            ("project", workdir_project_settings_path(anchor)),
+            ("local", workdir_local_settings_path(anchor)),
+        ):
+            if not path.exists():
+                continue
+            try:
+                state.layers.append((scope_name, path, read_raw_object(path) or {}))
+            except SettingsFileCorruptError as exc:
+                state.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+
+    state.values_path = resolve_value_store_path(env)
+    try:
+        raw_values = store.read_jsonc_strict(state.values_path)
+    except SettingsFileCorruptError as exc:
+        state.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+        raw_values = None
+    state.values = dict(raw_values) if isinstance(raw_values, dict) else {}
+    return state
+
+
+# ---------------------------------------------------------------------------
+# 引用与插件集 / References & plugin sets
+# ---------------------------------------------------------------------------
+def _pid_parts(pid: str) -> tuple[str, str] | None:
+    """``<plugin>@<marketplace>`` → ``(plugin, marketplace)``；非法 → ``None``。"""
+    if not isinstance(pid, str) or not is_valid_enabled_plugin_key(pid):
+        return None
+    plugin, _, marketplace = pid.partition("@")
+    return plugin, marketplace
+
+
+def _string_list(obj: Mapping[str, Any], key: str, *, path: Path) -> list[Any]:
+    """容错取数组字段（形状不符抛 :class:`SettingsFileCorruptError`；元素不过滤）。"""
+    return list_field_or_empty(obj, key, path=path)
+
+
+def _string_map(obj: Mapping[str, Any], key: str, *, path: Path) -> dict[str, Any]:
+    """容错取对象字段（形状不符抛 :class:`SettingsFileCorruptError`）。"""
+    return mapping_field_or_empty(obj, key, path=path)
+
+
+def _declared_pids(state: _State) -> set[str]:
+    """全部 layer 的安装意图 pid 并集（读语义数组拼接去重）/ Union of every layer's install intents."""
+    out: set[str] = set()
+    layers = [state.user, *(data for _scope, _path, data in state.layers)]
+    for data in layers:
+        raw = data.get(FIELD_INSTALLED_PLUGINS)
+        if isinstance(raw, list):
+            out.update(item for item in raw if isinstance(item, str) and is_valid_enabled_plugin_key(item))
+    return out
+
+
+def _ledger_pids(state: _State) -> set[str]:
+    return {pid for pid in state.installed.get("plugins", {}) if isinstance(pid, str) and is_valid_enabled_plugin_key(pid)}
+
+
+def _user_enabled(state: _State, env: Mapping[str, str] | None) -> dict[str, bool]:
+    """user 层 ``enabledPlugins``（形状不符抛错）/ User-layer enabled map."""
+    return {
+        key: value
+        for key, value in _string_map(state.user, FIELD_ENABLED_PLUGINS, path=user_settings_path(env)).items()
+        if isinstance(value, bool)
+    }
+
+
+def _user_string_array(state: _State, env: Mapping[str, str] | None, key: str) -> list[Any]:
+    return _string_list(state.user, key, path=user_settings_path(env))
+
+
+# ---------------------------------------------------------------------------
+# 检测 / Detection
+# ---------------------------------------------------------------------------
+def _is_safe_path_segment(name: str) -> bool:
+    """旧名能否安全地作为目录段 / Whether the old name is safe as a path segment."""
+    if not name or name in {".", ".."} or name.startswith("."):
+        return False
+    return not any(ch in name for ch in ("/", "\\", "\x00"))
+
+
+def _find_renamed_target(known: Mapping[str, Any], old: str, source: object, home: Path) -> list[str]:
+    """同源且清单名 == 注册名的其它键（崩溃恢复的「已改名」判据）/ Same-source already-renamed keys."""
+    matches: list[str] = []
+    for name, record in known.items():
+        if name == old or not isinstance(record, Mapping):
+            continue
+        if not same_source(record.get("source"), source):
+            continue
+        clone_dir = marketplace_skill_dir(home, name)
+        if not clone_dir.is_dir() or clone_dir.is_symlink():
+            continue
+        try:
+            manifest_name = read_manifest_marketplace_name(clone_dir)
+        except MarketplaceIdentityError:
+            continue
+        if manifest_name == name:
+            matches.append(name)
+    return sorted(matches)
+
+
+def _classify(old: str, record: object, known: Mapping[str, Any], home: Path) -> MigrationItem:
+    """把一条 ``known_marketplaces`` 注册归类（§3）/ Classify one registration."""
+    item = MigrationItem(old=old)
+    if not isinstance(record, Mapping):
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_INVALID_RECORD
+        return item
+    source = record.get("source")
+    item.source = display_source(source)
+    if not _is_safe_path_segment(old):
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_UNSAFE_OLD_NAME
+        return item
+
+    old_dir = marketplace_skill_dir(home, old)
+    item.old_dir = old_dir
+    if old_dir.is_symlink():
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_SYMLINK_CATALOG
+        return item
+    if not old_dir.is_dir():
+        # P2 中断的反向窗口：内容已在同源的新名下、旧键还没删 → 收敛收尾（§7.3）。
+        renamed = _find_renamed_target(known, old, source, home)
+        if len(renamed) == 1:
+            new_dir = marketplace_skill_dir(home, renamed[0])
+            try:
+                item.manifest = read_marketplace_manifest(new_dir)
+            except Exception:  # noqa: BLE001 - 清单不可读 → 保持 unresolved（下方统一处理）
+                item.manifest = {}
+            if item.manifest:
+                item.new = renamed[0]
+                item.action = ACTION_RENAME
+                item.already_renamed = True
+                item.warnings.append(
+                    f"directory already at {renamed[0]!r} but the old registration is still present; "
+                    "the remaining references will be migrated (crash-recovery convergence)"
+                )
+                return item
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_CATALOG_MISSING
+        return item
+
+    try:
+        manifest = read_marketplace_manifest(old_dir)
+    except Exception:  # noqa: BLE001 - 清单缺失/畸形统一归不可读
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_MANIFEST_UNREADABLE
+        return item
+    try:
+        manifest_name = manifest_marketplace_name(manifest)
+    except MarketplaceIdentityError:
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_INVALID_MANIFEST_NAME
+        return item
+
+    item.manifest = manifest
+    baseline = record.get(MANIFEST_NAME_BASELINE_FIELD)
+    if isinstance(baseline, str) and baseline and baseline != manifest_name:
+        # #260 §5.14：refresh 本就拒绝的改名，迁移不得隐式接受。
+        item.action = ACTION_BLOCKED
+        item.reason = REASON_BASELINE_MISMATCH
+        return item
+    if manifest_name == old:
+        item.action = ACTION_NOOP
+        return item
+    if not is_valid_marketplace_name(manifest_name):  # manifest_marketplace_name 已校验，防御纵深
+        item.action = ACTION_UNRESOLVED
+        item.reason = REASON_INVALID_MANIFEST_NAME
+        return item
+    item.new = manifest_name
+    item.action = ACTION_RENAME
+    return item
+
+
+def _pid_plugin(pid: str) -> str | None:
+    parts = _pid_parts(pid)
+    return parts[0] if parts else None
+
+
+def _pid_marketplace(pid: str) -> str | None:
+    parts = _pid_parts(pid)
+    return parts[1] if parts else None
+
+
+def _pids_for(pids: Iterable[str], marketplace: str) -> list[str]:
+    """筛出 ``@<marketplace>`` 结尾的合法 pid（升序）/ Valid pids belonging to one marketplace."""
+    return sorted(pid for pid in pids if _pid_marketplace(pid) == marketplace)
+
+
+def _attach_references(item: MigrationItem, state: _State, env: Mapping[str, str] | None) -> None:
+    """计算一条迁移的引用面（pid / 启用键 / trust / blocked / 声明）/ Compute its reference surfaces."""
+    declared = _declared_pids(state)
+    ledger = _ledger_pids(state)
+    pids = set(_pids_for(declared | ledger, item.old))
+    item.plugins = sorted({plugin for plugin in (_pid_plugin(pid) for pid in pids) if plugin})
+
+    user_installed = _pids_for(_declared_pids_of_layer(state.user), item.old)
+    user_enabled = _user_enabled(state, env)
+    item.installed_add = sorted(f"{_pid_plugin(pid)}@{item.new}" for pid in user_installed if _pid_plugin(pid))
+    item.installed_remove = sorted(user_installed)
+    item.enabled_set = {
+        f"{_pid_plugin(pid)}@{item.new}": value
+        for pid, value in user_enabled.items()
+        if _pid_marketplace(pid) == item.old and _pid_plugin(pid)
+    }
+    item.enabled_remove = sorted(pid for pid in user_enabled if _pid_marketplace(pid) == item.old)
+    item.actions = {
+        "installedPlugins": len(item.installed_add),
+        "enabledPlugins": len(item.enabled_set),
+        "trustedMarketplaces": "add+remove",
+        "blockedMarketplaces": "add+remove",
+        "extraKnownMarketplaces": "report",
+        "inputValues": 0,
+        "secrets": 0,
+        "catalog": "rename",
+        "externalTrees": 0,
+        "ledger": len(_pids_for(ledger, item.old)),
+    }
+
+
+def _declared_pids_of_layer(obj: Mapping[str, Any]) -> set[str]:
+    raw = obj.get(FIELD_INSTALLED_PLUGINS)
+    if not isinstance(raw, list):
+        return set()
+    return {item for item in raw if isinstance(item, str) and is_valid_enabled_plugin_key(item)}
+
+
+def _attach_scope_surfaces(item: MigrationItem, state: _State, env: Mapping[str, str] | None, update_declarations: bool) -> None:
+    """trust / blocked / 声明的改写面（仅 user scope）/ User-scope trust/blocked/declaration surfaces."""
+    user_path = user_settings_path(env)
+    trusted = _user_string_array(state, env, FIELD_TRUSTED_MARKETPLACES)
+    blocked = _user_string_array(state, env, FIELD_BLOCKED_MARKETPLACES)
+    item.trust_rewrite = any(entry == item.old for entry in trusted)
+    item.blocked_rewrite = any(entry == item.old for entry in blocked)
+    declarations = _string_map(state.user, FIELD_EXTRA_KNOWN_MARKETPLACES, path=user_path)
+    item.declarations_rewrite = bool(update_declarations and item.old in declarations)
+
+
+# ---------------------------------------------------------------------------
+# 冲突检测（§5.1）/ Conflict detection
+# ---------------------------------------------------------------------------
+def _conflict(code: str, *, names: Sequence[str], target: str, involves: Sequence[str]) -> dict[str, Any]:
+    return {"code": code, "names": list(names), "target": target, "involves": list(involves)}
+
+
+def _merge_scenario(item: MigrationItem, known: Mapping[str, Any], home: Path) -> bool:
+    """目标名已由**同源**注册且目录内容一致 → 合并场景（不是冲突）/ Same-source merge scenario."""
+    existing = known.get(item.new) if item.new else None
+    old_record = known.get(item.old)
+    if not isinstance(existing, Mapping) or not isinstance(old_record, Mapping):
+        return False
+    if not same_source(existing.get("source"), old_record.get("source")):
+        return False
+    new_dir = marketplace_skill_dir(home, item.new or "")
+    if not new_dir.is_dir() or new_dir.is_symlink():
+        return False
+    try:
+        return read_manifest_marketplace_name(new_dir) == item.new
+    except MarketplaceIdentityError:
+        return False
+
+
+def _detect_conflicts(items: list[MigrationItem], state: _State, home: Path, env: Mapping[str, str] | None) -> list[dict[str, Any]]:
+    """C1–C9 预检（全量 legacy 集上判定，不看 ``--name`` 过滤）/ Plan-level conflicts over the full set."""
+    conflicts: list[dict[str, Any]] = []
+    renames = [item for item in items if item.action == ACTION_RENAME and item.new]
+
+    by_target: dict[str, list[str]] = {}
+    for item in renames:
+        by_target.setdefault(item.new or "", []).append(item.old)
+    for target, olds in by_target.items():
+        if len(olds) > 1:
+            conflicts.append(_conflict("duplicate-target", names=sorted(olds), target=target, involves=sorted(olds)))
+
+    declared = _declared_pids(state)
+    ledger = _ledger_pids(state)
+    user_enabled = _user_enabled(state, env)
+    scan_pids = declared | ledger
+    source_pids = {f"{plugin}@{item.old}" for item in renames for plugin in item.plugins}
+    candidates = scan_pids - source_pids
+
+    extra_declared: dict[str, Any] = {}
+    if state.user:
+        try:
+            extra_declared = _string_map(state.user, FIELD_EXTRA_KNOWN_MARKETPLACES, path=user_settings_path(env))
+        except SettingsFileCorruptError:
+            extra_declared = {}
+
+    for item in renames:
+        new = item.new or ""
+        existing = state.known["marketplaces"].get(new)
+        old_record = state.known["marketplaces"].get(item.old)
+        old_source = old_record.get("source") if isinstance(old_record, Mapping) else None
+        if existing is not None and not same_source(existing.get("source") if isinstance(existing, Mapping) else None, old_source):
+            conflicts.append(_conflict("name-taken-by-other-source", names=[item.old, new], target=new, involves=[item.old]))
+        elif existing is not None and _merge_scenario(item, state.known["marketplaces"], home):
+            item.merge = True
+            item.warnings.append(f"target name {new!r} is already registered from the same source; merging references")
+
+        new_dir = marketplace_skill_dir(home, new)
+        if new_dir.exists() or new_dir.is_symlink():
+            if not item.merge:
+                conflicts.append(_conflict("target-dir-exists", names=[item.old, new], target=new, involves=[item.old]))
+        if external_plugins_dir(home, new).exists() and not item.merge:
+            conflicts.append(
+                _conflict("target-external-tree-exists", names=[item.old, new], target=new, involves=[item.old])
+            )
+
+        for plugin in item.plugins:
+            old_pid = f"{plugin}@{item.old}"
+            new_pid = f"{plugin}@{new}"
+            if old_pid in user_enabled and new_pid in user_enabled and user_enabled[old_pid] != user_enabled[new_pid]:
+                conflicts.append(_conflict("enabled-state-conflict", names=[old_pid, new_pid], target=new_pid, involves=[item.old]))
+            clashes = _bare_name_clash_pids(new_pid, candidates)
+            if clashes:
+                conflicts.append(_conflict("bare-name-clash", names=[new_pid, *clashes], target=new_pid, involves=[item.old]))
+
+        if item.declarations_rewrite:
+            old_decl = extra_declared.get(item.old)
+            new_decl = extra_declared.get(new)
+            if isinstance(new_decl, Mapping) and isinstance(old_decl, Mapping):
+                if not same_source(new_decl.get("source"), old_decl.get("source")):
+                    conflicts.append(
+                        _conflict("extra-known-target-conflict", names=[item.old, new], target=new, involves=[item.old])
+                    )
+            elif isinstance(new_decl, Mapping) and old_decl is None:
+                item.declarations_rewrite = False  # 无旧声明可迁：不新建
+    return conflicts
+
+
+def blocking_conflicts(plan: MigrationPlan) -> list[dict[str, Any]]:
+    """涉及任一选中项的冲突（整体 abort 的判据）/ Conflicts involving a selected item."""
+    selected = {item.old for item in plan.items if item.selected}
+    return [
+        conflict
+        for conflict in plan.conflicts
+        if any(name in selected for name in conflict.get("involves", []))
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 项级预检（P0.5，零写入）/ Per-item preflight
+# ---------------------------------------------------------------------------
+def _plugin_root_offline(item: MigrationItem, plugin: str, home: Path, catalog_dir: Path) -> Path | None:
+    """按清单条目离线定位 plugin 根（不 clone）；无法定位 → ``None``。"""
+    entry = find_plugin_entry(item.manifest, plugin)
+    if entry is None:
+        return None
+    try:
+        resolved = resolve_plugin_source(entry.get("source"), plugin_root=plugin_root_base(item.manifest))
+    except Exception:  # noqa: BLE001 - source 畸形 → 视为不可定位（候选派生失败交由调用方处置）
+        return None
+    if isinstance(resolved, LocalPluginSource):
+        root = (catalog_dir / resolved.rel_path).resolve()
+        return root if is_within(root, catalog_dir.resolve()) else None
+    if isinstance(resolved, GitCloneSpec):
+        ext = external_plugin_dir(home, item.old, plugin)
+        return ext / resolved.subdir if resolved.subdir else ext
+    return None
+
+
+def _read_input_defs(root: Path) -> list[dict[str, Any]] | None:
+    """读 plugin 的 ``mcp-servers/inputs.json``；缺失 → ``[]``；不可读/畸形 → ``None``。"""
+    path = root / MCP_SERVERS_SUBDIR / MCP_INPUTS_FILENAME
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    defs = data.get("inputs", []) if isinstance(data, Mapping) else data
+    if not isinstance(defs, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for entry in defs:
+        if isinstance(entry, Mapping) and isinstance(entry.get("id"), str) and entry["id"]:
+            out.append({"id": entry["id"], "password": entry.get("password") is True})
+    return out
+
+
+def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[list[tuple[str, str, bool]], str | None]:
+    """
+    派生 input 候选（D14）/ Derive input candidates from manifest + ledger roots.
+
+    :return: ``(candidates, blocked_reason)``；``blocked_reason`` 非空 → 该项 abort/blocked（零写入）。
+    """
+    if item.already_renamed and item.new:
+        catalog_dir = marketplace_skill_dir(home, item.new)
+    else:
+        catalog_dir = item.old_dir or marketplace_skill_dir(home, item.old)
+    ledger = state.installed.get("plugins", {})
+    ledger_plugins = {
+        plugin
+        for pid in ledger
+        if isinstance(pid, str) and _pid_marketplace(pid) == item.old and (plugin := _pid_plugin(pid))
+    }
+    manifest_plugins = {entry.get("name") for entry in iter_plugin_entries(item.manifest) if isinstance(entry.get("name"), str)}
+    candidates: list[tuple[str, str, bool]] = []
+    seen_roots: set[str] = set()
+
+    def _collect(plugin: str, root: Path) -> str | None:
+        if not root.is_dir():
+            return REASON_PLUGIN_ROOT_UNREADABLE if plugin in ledger_plugins else None
+        defs = _read_input_defs(root)
+        if defs is None:
+            return REASON_SECRET_INPUTS_UNREADABLE if plugin in ledger_plugins else None
+        for definition in defs:
+            candidates.append((plugin, definition["id"], bool(definition["password"])))
+        return None
+
+    for plugin in sorted(p for p in manifest_plugins if isinstance(p, str)):
+        root = _plugin_root_offline(item, plugin, home, catalog_dir)
+        if root is None:
+            # 相对源越界 / source 畸形：清单内条目不可定位。已安装 → 保守 abort；未安装 → 不计候选。
+            if plugin in ledger_plugins:
+                return [], REASON_PLUGIN_ROOT_UNREADABLE
+            item.warnings.append(f"plugin {plugin!r} in the new manifest has no resolvable local root; skipped for inputs")
+            continue
+        seen_roots.add(str(root.resolve()))
+        blocked = _collect(plugin, root)
+        if blocked:
+            return [], blocked
+
+    # 已装但已从新清单移除/改名的 plugin：按账本 installPath 定位（D14 第 2 条）。
+    for pid, records in ledger.items():
+        parts = _pid_parts(pid) if isinstance(pid, str) else None
+        if not parts or parts[1] != item.old:
+            continue
+        plugin = parts[0]
+        if plugin in manifest_plugins:
+            continue
+        if not isinstance(records, list):
+            return [], REASON_SECRET_INPUTS_UNREADABLE
+        located = False
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            install_path = record.get("installPath")
+            if not isinstance(install_path, str) or not install_path:
+                continue
+            root = Path(install_path)
+            if item.already_renamed:
+                root = _map_install_path(root, home, item.old, item.new or "")
+            if str(root.resolve()) in seen_roots:
+                located = True
+                continue
+            seen_roots.add(str(root.resolve()))
+            blocked = _collect(plugin, root)
+            if blocked:
+                return [], blocked
+            located = True
+        if not located:
+            return [], REASON_PLUGIN_ROOT_UNREADABLE
+    return candidates, None
+
+
+def _map_install_path(path: Path, home: Path, old: str, new: str) -> Path:
+    """把旧名根下的 installPath 映射到新名根（目录搬迁后的真实位置）/ Map an installPath across the rename."""
+    mappings = (
+        (marketplace_skill_dir(home, old).resolve(), marketplace_skill_dir(home, new).resolve()),
+        (external_plugins_dir(home, old).resolve(), external_plugins_dir(home, new).resolve()),
+    )
+    for old_root, new_root in mappings:
+        try:
+            return new_root / path.relative_to(old_root)
+        except ValueError:
+            continue
+    return path
+
+
+def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping[str, str] | None, store_secrets: SecretStore) -> None:
+    """P0.5：secret 候选派生 / keyring 可用性 / 目标键冲突（全部零写入）。"""
+    if item.action != ACTION_RENAME or not item.new:
+        return
+    candidates, blocked = _candidate_inputs(item, state, home)
+    if blocked:
+        item.action = ACTION_BLOCKED
+        item.reason = blocked
+        return
+
+    values = state.values
+    accounts: dict[str, int] = {"inputValues": 0, "secrets": 0}
+    secret_candidates: list[tuple[str, str]] = []
+    for plugin, input_id, is_password in candidates:
+        old_key = prefix_input_id(plugin, item.old, input_id)
+        new_key = prefix_input_id(plugin, item.new, input_id)
+        if is_password:
+            secret_candidates.append((old_key, new_key))
+            continue
+        if old_key not in values:
+            continue
+        old_value = values[old_key]
+        if new_key in values:
+            if values[new_key] != old_value:
+                item.action = ACTION_BLOCKED
+                item.reason = REASON_VALUE_TARGET_CONFLICT
+                item.warnings.append(f"target input value key {new_key!r} already exists with a different value")
+                return
+            item.value_remove.append(old_key)
+            continue
+        item.value_pairs.append((old_key, new_key, old_value))
+        item.value_remove.append(old_key)
+        accounts["inputValues"] += 1
+
+    if secret_candidates:
+        if not keyring_available():
+            item.action = ACTION_BLOCKED
+            item.reason = REASON_KEYRING_UNAVAILABLE
+            item.warnings.append(
+                "keyring is unavailable and this marketplace has password inputs; cannot prove no old secret exists"
+            )
+            return
+        for old_key, new_key in secret_candidates:
+            value = store_secrets.get(old_key)
+            if value is None:
+                continue
+            existing = store_secrets.get(new_key)
+            if existing is not None:
+                if existing != value:
+                    item.action = ACTION_BLOCKED
+                    item.reason = REASON_SECRET_TARGET_CONFLICT
+                    item.warnings.append(f"target secret key {new_key!r} already exists with a different value")
+                    return
+                item.secret_remove.append(old_key)
+                continue
+            item.secret_pairs.append(SecretRekey(old_key=old_key, new_key=new_key, value=value))
+            item.secret_remove.append(old_key)
+            accounts["secrets"] += 1
+
+    item.actions.update(accounts)
+    ext_old = external_plugins_dir(home, item.old)
+    if ext_old.is_dir():
+        item.actions["externalTrees"] = sum(1 for child in ext_old.iterdir() if child.is_dir())
+    if item.already_renamed:
+        item.actions["catalog"] = "noop"
+
+
+# ---------------------------------------------------------------------------
+# 报告面（project/local、声明、env）/ Report-only surfaces
+# ---------------------------------------------------------------------------
+def _collect_follow_ups(item: MigrationItem, state: _State, env: Mapping[str, str] | None, update_declarations: bool) -> None:
+    """把 project/local 的旧名引用与 user 未迁移声明写进 followUps（§9）。"""
+    if item.action != ACTION_RENAME or not item.new:
+        return
+    for scope_name, path, data in state.layers:
+        try:
+            enabled = _string_map(data, FIELD_ENABLED_PLUGINS, path=path)
+        except SettingsFileCorruptError:
+            enabled = {}
+        for pid, value in enabled.items():
+            parts = _pid_parts(pid) if isinstance(pid, str) else None
+            if parts and parts[1] == item.old:
+                new_pid = f"{parts[0]}@{item.new}"
+                effect = EFFECT_WILL_BE_INACTIVE if value else "will-stay-disabled"
+                item.follow_ups.append(
+                    {
+                        "file": str(path),
+                        "pointer": f"/{FIELD_ENABLED_PLUGINS}/{pid}",
+                        "effect": effect,
+                        "suggested": f"add \"{FIELD_ENABLED_PLUGINS}\": {{\"{new_pid}\": {str(value).lower()}}} (scope: {scope_name})",
+                    }
+                )
+        for key, effect in (
+            (FIELD_TRUSTED_MARKETPLACES, EFFECT_STALE_TRUST),
+            (FIELD_BLOCKED_MARKETPLACES, EFFECT_BLOCKED_INVALID),
+        ):
+            try:
+                members = _string_list(data, key, path=path)
+            except SettingsFileCorruptError:
+                members = []
+            if any(entry == item.old for entry in members):
+                item.follow_ups.append(
+                    {
+                        "file": str(path),
+                        "pointer": f"/{key}/{item.old}",
+                        "effect": effect,
+                        "suggested": f"replace {item.old!r} with {item.new!r} in {key} (scope: {scope_name})",
+                    }
+                )
+        for key in (FIELD_INSTALLED_PLUGINS,):
+            try:
+                members = _string_list(data, key, path=path)
+            except SettingsFileCorruptError:
+                members = []
+            for pid in members:
+                parts = _pid_parts(pid) if isinstance(pid, str) else None
+                if parts and parts[1] == item.old:
+                    item.follow_ups.append(
+                        {
+                            "file": str(path),
+                            "pointer": f"/{key}/{pid}",
+                            "effect": EFFECT_WILL_BE_INACTIVE,
+                            "suggested": f"replace {pid!r} with {parts[0]}@{item.new} (scope: {scope_name})",
+                        }
+                    )
+        try:
+            declarations = _string_map(data, FIELD_EXTRA_KNOWN_MARKETPLACES, path=path)
+        except SettingsFileCorruptError:
+            declarations = {}
+        if item.old in declarations:
+            item.follow_ups.append(
+                {
+                    "file": str(path),
+                    "pointer": f"/{FIELD_EXTRA_KNOWN_MARKETPLACES}/{item.old}",
+                    "effect": EFFECT_DECLARATION_RESURRECT,
+                    "suggested": f"rename the declaration key {item.old!r} → {item.new!r} (scope: {scope_name})",
+                }
+            )
+
+    user_path = user_settings_path(env)
+    try:
+        user_declarations = _string_map(state.user, FIELD_EXTRA_KNOWN_MARKETPLACES, path=user_path)
+    except SettingsFileCorruptError:
+        user_declarations = {}
+    if item.old in user_declarations and not (update_declarations and item.declarations_rewrite):
+        item.follow_ups.append(
+            {
+                "file": str(user_path),
+                "pointer": f"/{FIELD_EXTRA_KNOWN_MARKETPLACES}/{item.old}",
+                "effect": EFFECT_DECLARATION_RESURRECT,
+                "suggested": f"rename the declaration key {item.old!r} → {item.new!r}, or rerun with --update-declarations",
+            }
+        )
+    item.actions["extraKnownMarketplaces"] = "rewrite(user)" if item.declarations_rewrite else "report"
+
+
+# ---------------------------------------------------------------------------
+# 计划构建 / Plan building
+# ---------------------------------------------------------------------------
+def build_plan(
+    home: Path,
+    env: Mapping[str, str] | None = None,
+    *,
+    names: Sequence[str] | None = None,
+    update_declarations: bool = False,
+    cwd: Path | None = None,
+) -> MigrationPlan:
+    """严格只读地构建迁移计划（dry-run 与 apply 共用；apply 前会重新调用）/ Build the plan strictly read-only."""
+    state = _load_state(home, env, cwd)
+    plan = MigrationPlan(update_declarations=update_declarations)
+    plan.corrupt = state.corrupt
+    if state.corrupt:
+        return plan
+
+    known_map = state.known["marketplaces"]
+    items = [_classify(old, record, known_map, home) for old, record in sorted(known_map.items())]
+    try:
+        for item in items:
+            if item.action in {ACTION_RENAME, ACTION_BLOCKED}:
+                _attach_references(item, state, env)
+                _attach_scope_surfaces(item, state, env, update_declarations)
+    except SettingsFileCorruptError as exc:
+        plan.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+        return plan
+    plan.items = items
+    plan.conflicts = _detect_conflicts(items, state, home, env)
+
+    known_names = set(known_map)
+    if names:
+        unknown = sorted({name for name in names if name not in known_names})
+        if unknown:
+            plan.errors.append(
+                "unknown marketplace name(s) for --name: " + ", ".join(repr(name) for name in unknown)
+            )
+        selected = {name for name in names if name in known_names}
+    else:
+        selected = known_names
+    for item in items:
+        item.selected = item.old in selected
+        if not item.selected and item.action != ACTION_NOOP:
+            item.action = ACTION_NOT_SELECTED
+
+    store_secrets = SecretStore()
+    for item in items:
+        if item.selected and item.action == ACTION_RENAME:
+            _item_preflight(item, state, home, env, store_secrets)
+            _collect_follow_ups(item, state, env, update_declarations)
+    return plan
+
+
+def plan_exit_code(plan: MigrationPlan) -> int:
+    """计划/结果对应的退出码（0/1/3）/ Exit code for the plan or the post-apply result."""
+    if plan.corrupt:
+        return EXIT_PARTIAL
+    if plan.errors or blocking_conflicts(plan):
+        return EXIT_CONFLICT
+    if any(item.selected and item.action in {ACTION_UNRESOLVED, ACTION_BLOCKED, ACTION_ABORTED} for item in plan.items):
+        return EXIT_PARTIAL
+    if any(item.selected and item.follow_ups for item in plan.items):
+        return EXIT_PARTIAL
+    return EXIT_OK
+
+
+def plan_payload(plan: MigrationPlan) -> dict[str, Any]:
+    """JSON 输出形态（§5.3）/ JSON payload（§5.3）."""
+    exit_code = plan_exit_code(plan)
+    if plan.corrupt or blocking_conflicts(plan) or plan.errors:
+        status = "aborted"
+    elif plan.applied:
+        status = "partial" if exit_code == EXIT_PARTIAL else "applied"
+    else:
+        status = "planned"
+    return {
+        "command": "marketplace migrate",
+        "dryRun": not plan.applied,
+        "status": status,
+        "exitCode": exit_code,
+        "updateDeclarations": plan.update_declarations,
+        "items": [item.serializable() for item in plan.items],
+        "conflicts": list(plan.conflicts),
+        "corrupt": list(plan.corrupt),
+        "errors": list(plan.errors),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 执行 / Execution（P1 → P2 → P3 → P4）
+# ---------------------------------------------------------------------------
+def _update_user_scope(
+    env: Mapping[str, str] | None,
+    mutator: Callable[[dict[str, Any], Path], dict[str, Any]],
+) -> None:
+    """user settings 单次 raw RMW（raw 保真、形状不符抛错；无变更则不写）/ One raw RMW over user settings."""
+    path = user_settings_path(env)
+    with store.file_lock(path):
+        existing = read_raw_object(path) or {}
+        updates = mutator(existing, path)
+        if not updates:
+            return
+        store.atomic_write_json(path, apply_write(existing, updates))
+
+
+def _add_user_references(item: MigrationItem, env: Mapping[str, str] | None) -> None:
+    """P1：user 侧 trust / blocked / 声明**加新名**（旧名保持）/ Additive user-scope references."""
+
+    new_name = item.new
+    if not new_name:
+        raise _ItemFailure(REASON_INVALID_RECORD, "internal: rename item without a target name")
+
+    def _mutate(existing: dict[str, Any], path: Path) -> dict[str, Any]:
+        updates: dict[str, Any] = {}
+        if item.trust_rewrite:
+            trusted = _string_list(existing, FIELD_TRUSTED_MARKETPLACES, path=path)
+            if item.new not in trusted:
+                updates[FIELD_TRUSTED_MARKETPLACES] = [*trusted, item.new]
+        if item.blocked_rewrite:
+            blocked = _string_list(existing, FIELD_BLOCKED_MARKETPLACES, path=path)
+            if item.new not in blocked:
+                updates[FIELD_BLOCKED_MARKETPLACES] = [*blocked, item.new]
+        if item.declarations_rewrite:
+            declarations = _string_map(existing, FIELD_EXTRA_KNOWN_MARKETPLACES, path=path)
+            old_entry = declarations.get(item.old)
+            if isinstance(old_entry, Mapping):
+                current = declarations.get(new_name)
+                if not isinstance(current, Mapping):
+                    updates[FIELD_EXTRA_KNOWN_MARKETPLACES] = {new_name: dict(old_entry)}
+                elif not same_source(current.get("source"), old_entry.get("source")):
+                    raise _ItemFailure(REASON_TARGET_DIR_EXISTS, "extraKnownMarketplaces target conflict")
+        return updates
+
+    _update_user_scope(env, _mutate)
+
+
+def _remove_user_references(item: MigrationItem, env: Mapping[str, str] | None) -> None:
+    """P3：user 侧删除旧名引用（trust / blocked / 声明）/ Remove old user-scope references."""
+
+    new_name = item.new
+    if not new_name:
+        raise _ItemFailure(REASON_INVALID_RECORD, "internal: rename item without a target name")
+
+    def _mutate(existing: dict[str, Any], path: Path) -> dict[str, Any]:
+        updates: dict[str, Any] = {}
+        if item.trust_rewrite:
+            trusted = [entry for entry in _string_list(existing, FIELD_TRUSTED_MARKETPLACES, path=path) if entry != item.old]
+            updates[FIELD_TRUSTED_MARKETPLACES] = trusted
+        if item.blocked_rewrite:
+            blocked = [entry for entry in _string_list(existing, FIELD_BLOCKED_MARKETPLACES, path=path) if entry != item.old]
+            updates[FIELD_BLOCKED_MARKETPLACES] = blocked
+        if item.declarations_rewrite:
+            declarations = _string_map(existing, FIELD_EXTRA_KNOWN_MARKETPLACES, path=path)
+            if item.old in declarations:
+                updates[FIELD_EXTRA_KNOWN_MARKETPLACES] = {item.old: DELETE}
+        return updates
+
+    _update_user_scope(env, _mutate)
+
+
+def _write_known_new(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
+    """P2 第一步：写 ``known[new]``（baseline = new；旧键暂留）/ Write the new record (baseline reset)."""
+
+    def _mutate(data: store.KnownMarketplacesFile) -> None:
+        marketplaces = data["marketplaces"]
+        old_record = marketplaces.get(item.old)
+        if not isinstance(old_record, Mapping):
+            raise _ItemFailure(REASON_INVALID_RECORD, f"registration {item.old!r} disappeared during the migration")
+        merged: dict[str, Any] = dict(old_record)
+        existing = marketplaces.get(item.new or "")
+        if isinstance(existing, Mapping) and same_source(existing.get("source"), old_record.get("source")):
+            for key, value in existing.items():
+                merged.setdefault(key, value)
+        merged["installLocation"] = str(marketplace_skill_dir(home, item.new or "").resolve())
+        merged[MANIFEST_NAME_BASELINE_FIELD] = item.new
+        marketplaces[item.new or ""] = merged  # type: ignore[assignment]
+
+    store.update_known_marketplaces_strict(_mutate, home, env)
+
+
+def _delete_known_old(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
+    """P2 收尾：删 ``known[old]``（仅在目录搬迁 + 重建完成之后）/ Drop the old record after convergence."""
+
+    def _mutate(data: store.KnownMarketplacesFile) -> None:
+        data["marketplaces"].pop(item.old, None)
+
+    store.update_known_marketplaces_strict(_mutate, home, env)
+
+
+def _claim_candidates(home: Path, known: Mapping[str, Any], old: str, new: str) -> list[Path]:
+    """§7.4 可认领目录（修正判据：允许 ``D.name == old``）/ Claimable directories (§7.4)."""
+    root = home / SOURCE_MARKETPLACE
+    if not root.is_dir():
+        return []
+    known_names = set(known)
+    out: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if child.name == ".plugins" or not child.is_dir() or child.is_symlink():
+            continue
+        if not (child.name == old or child.name not in known_names):
+            continue
+        try:
+            if read_manifest_marketplace_name(child) != new:
+                continue
+        except MarketplaceIdentityError:
+            continue
+        out.append(child)
+    return out
+
+
+def _rename_catalog(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
+    """
+    P2：``dir(old) → dir(new)``（§7.4 认领判据是**主路径**，不是兜底）/ Rename the catalog via the claim predicate.
+
+    ``_write_known_new`` 已先写 ``known[new]``（同源），因此这里按 §7.4 搜「可认领目录」：
+    **允许 ``D.name == old``**（崩溃主窗口里目录还叫旧名）+ 清单名 == new + 非 symlink；恰好 1 个才搬，
+    0 个 → ``catalog-lost``，多个 → ``ambiguous-catalog``（不猜）。``known[new]`` 意外缺失时才退回
+    「逐个验证旧目录」的保守分支。
+    """
+    new_dir = marketplace_skill_dir(home, item.new or "")
+    old_dir = marketplace_skill_dir(home, item.old)
+    if new_dir.exists() or new_dir.is_symlink():
+        if item.merge:
+            return
+        known = store.load_known_marketplaces_strict(home, env)["marketplaces"]
+        if _merge_scenario(item, known, home):
+            item.merge = True
+            return
+        raise _ItemFailure(REASON_TARGET_DIR_EXISTS, f"target catalog directory {new_dir} already exists")
+
+    known = store.load_known_marketplaces_strict(home, env)["marketplaces"]
+    new_record = known.get(item.new or "")
+    old_record = known.get(item.old)
+    if (
+        isinstance(new_record, Mapping)
+        and isinstance(old_record, Mapping)
+        and same_source(new_record.get("source"), old_record.get("source"))
+    ):
+        candidates = _claim_candidates(home, known, item.old, item.new or "")
+        if len(candidates) == 1:
+            candidates[0].rename(new_dir)
+            return
+        if not candidates:
+            raise _ItemFailure(REASON_CATALOG_LOST, "no claimable catalog directory for the new registration")
+        raise _ItemFailure(REASON_AMBIGUOUS_CATALOG, f"claimable catalog directories: {[str(c) for c in candidates]}")
+
+    # known[new] 意外缺失（外部改动 / 记录被删）：只接受「旧目录 + 清单名 == 目标名」这一确定形态。
+    if old_dir.is_dir() and not old_dir.is_symlink():
+        try:
+            manifest_name = read_manifest_marketplace_name(old_dir)
+        except MarketplaceIdentityError as exc:
+            raise _ItemFailure(REASON_MANIFEST_UNREADABLE, str(exc)) from exc
+        if manifest_name != item.new:
+            raise _ItemFailure(REASON_MANIFEST_UNREADABLE, "catalog manifest changed during the migration")
+        old_dir.rename(new_dir)
+        return
+    raise _ItemFailure(REASON_CATALOG_LOST, "catalog directory is missing and cannot be attributed")
+
+
+def _rename_external(item: MigrationItem, home: Path) -> None:
+    """P2：``.plugins/<old> → .plugins/<new>``（缺失则跳过）/ Rename the external plugin tree."""
+    old_ext = external_plugins_dir(home, item.old)
+    new_ext = external_plugins_dir(home, item.new or "")
+    if new_ext.exists():
+        if item.merge and not old_ext.exists():
+            return
+        raise _ItemFailure(REASON_TARGET_EXTERNAL_TREE_EXISTS, f"target external tree {new_ext} already exists")
+    if old_ext.is_dir():
+        old_ext.rename(new_ext)
+
+
+async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
+    """P2：以新 pid 重建账本记录（成功者才在 P4 删旧）/ Rebuild ledger records under the new pid."""
+    installed = store.load_installed_plugins_strict(home, env)["plugins"]
+    for pid, records in sorted(installed.items()):
+        parts = _pid_parts(pid) if isinstance(pid, str) else None
+        if not parts or parts[1] != item.old or not isinstance(records, list):
+            continue
+        plugin = parts[0]
+        new_pid = f"{plugin}@{item.new}"
+        if find_plugin_entry(item.manifest, plugin) is None:
+            item.warnings.append(f"plugin {plugin!r} not present in the new manifest; keeping its old ledger record")
+            continue
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            install_path = record.get("installPath")
+            if not isinstance(install_path, str) or not install_path:
+                item.warnings.append(f"plugin {plugin!r} ledger record has no installPath; keeping it untouched")
+                continue
+            mapped = _map_install_path(Path(install_path), home, item.old, item.new or "")
+            if not mapped.is_dir():
+                item.warnings.append(
+                    f"plugin {plugin!r} install root is missing ({install_path}); keeping its old ledger record"
+                )
+                continue
+            scope = str(record.get("scope") or "user")
+            project_path = record.get("projectPath")
+            version = record.get("version")
+            try:
+                await materialize_plugin(
+                    new_pid,
+                    home,
+                    scope=scope,
+                    project_path=project_path if isinstance(project_path, str) else None,
+                    version=version if isinstance(version, str) else None,
+                    env=env,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单条重建失败 → 保留旧记录（F10）
+                item.warnings.append(
+                    f"plugin {plugin!r} could not be re-materialized ({type(exc).__name__}); "
+                    "keeping its old ledger record"
+                )
+                continue
+            item.ledger_rebuild.append((pid, scope, project_path if isinstance(project_path, str) else None))
+
+
+def _drop_old_ledger(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
+    """P4：只删「重建成功」对应的旧账本记录（F10）/ Drop only the rebuilt old ledger records."""
+
+    def _mutate(data: store.InstalledPluginsFile) -> None:
+        plugins = data["plugins"]
+        for old_pid, scope, project_path in item.ledger_rebuild:
+            records = plugins.get(old_pid)
+            if not isinstance(records, list):
+                continue
+            kept = [
+                record
+                for record in records
+                if not (
+                    isinstance(record, Mapping)
+                    and record.get("scope") == scope
+                    and record.get("projectPath") == project_path
+                )
+            ]
+            if kept:
+                plugins[old_pid] = kept
+            else:
+                plugins.pop(old_pid, None)
+
+    store.update_installed_plugins_strict(_mutate, home, env)
+
+
+def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_new: bool) -> None:
+    """input 值单次原子写：P1 只加新键；P3 只删旧键（§4.1 F5 + §7.1）/ One atomic write per phase."""
+    path = resolve_value_store_path(env)
+    current = store.read_jsonc_strict(path)
+    data: dict[str, Any] = dict(current) if isinstance(current, Mapping) else {}
+    changed = False
+    if write_new:
+        for _old_key, new_key, value in item.value_pairs:
+            if new_key not in data:
+                data[new_key] = value
+                changed = True
+    else:
+        for old_key in item.value_remove:
+            if old_key in data:
+                data.pop(old_key, None)
+                changed = True
+    if changed:
+        ValueStore(env).replace_all(data)
+
+
+def _rekey_secrets(item: MigrationItem, store_secrets: SecretStore, *, write_new: bool) -> None:
+    """secret 重键：P1 写新并回读；P3 删旧（§4.2 F6）/ Keyring rekey across phases."""
+    if write_new:
+        for pair in item.secret_pairs:
+            if not store_secrets.set(pair.new_key, pair.value):
+                raise _ItemFailure(REASON_KEYRING_UNAVAILABLE, "failed to write the new secret key")
+            if store_secrets.get(pair.new_key) != pair.value:
+                raise _ItemFailure(REASON_KEYRING_UNAVAILABLE, "the new secret key did not read back")
+            item.secret_cleanup.append(pair.new_key)
+    else:
+        for old_key in item.secret_remove:
+            if not store_secrets.delete(old_key):
+                item.warnings.append(f"old secret key {old_key!r} could not be deleted (new key is in place)")
+
+
+async def _apply_item(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
+    """执行单项 P1 → P2 → P3 → P4（任何失败都抛 :class:`_ItemFailure`）。"""
+    secrets = SecretStore()
+    try:
+        # ── P1：新侧权威面（旧侧保持）──
+        for pid in item.installed_add:
+            _write_installed_plugin(pid, True, env)
+        for pid, value in item.enabled_set.items():
+            _write_enabled_plugin(pid, value, "user", None, env)
+        _add_user_references(item, env)
+        _rekey_values(item, env, write_new=True)
+        _rekey_secrets(item, secrets, write_new=True)
+
+        # ── P2：账本新记录 → 目录搬迁 → 账本重建 ──
+        _write_known_new(item, home, env)
+        _rename_catalog(item, home, env)
+        _rename_external(item, home)
+        await _rebuild_ledger(item, home, env)
+        _delete_known_old(item, home, env)
+
+        # ── P3：撤旧侧 ──
+        for pid in item.installed_remove:
+            _write_installed_plugin(pid, False, env)
+        for pid in item.enabled_remove:
+            _write_enabled_plugin(pid, None, "user", None, env)
+        _remove_user_references(item, env)
+        _rekey_values(item, env, write_new=False)
+        _rekey_secrets(item, secrets, write_new=False)
+
+        # ── P4：删旧账本记录（仅重建成功者）──
+        _drop_old_ledger(item, home, env)
+    except Exception:
+        # 本次已写的新 secret 尽力清理（避免制造新孤儿）；已写的文件保持（forward-only，不逐项回滚）。
+        for new_key in item.secret_cleanup:
+            secrets.delete(new_key)
+        raise
+
+
+async def execute_plan(plan: MigrationPlan, home: Path, env: Mapping[str, str] | None = None) -> MigrationPlan:
+    """执行计划（调用方必须先确认无 corrupt / 无阻塞冲突）/ Execute the plan (caller ensures no command-level abort)."""
+    for item in plan.items:
+        if not item.selected or item.action != ACTION_RENAME:
+            continue
+        try:
+            await _apply_item(item, home, env)
+        except _ItemFailure as exc:
+            item.action = ACTION_ABORTED
+            item.reason = exc.reason
+            item.warnings.append(str(exc))
+        except Exception as exc:  # noqa: BLE001 - 项级失败不跨项传播
+            item.action = ACTION_ABORTED
+            item.reason = REASON_RENAME_FAILED
+            item.warnings.append(f"unexpected failure: {type(exc).__name__}: {exc}")
+    plan.applied = True
+    return plan
