@@ -1285,3 +1285,65 @@ def test_ambiguous_password_input_definition_blocks_with_warning(tmp_path: Path,
     assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_SECRET_INPUTS_UNREADABLE
     assert any("unreadable or ambiguous input definitions" in warning for warning in item.warnings)
     _assert_unchanged(before, tmp_path)
+
+
+def test_unhashable_input_type_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """不可信 manifest 的 `type` 可为 list/dict：必须保守 abort，绝不以 TypeError 崩掉整次迁移。"""
+    env, home, work, _fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={"figma": [{"id": "token", "description": "t", "password": True}]},
+    )
+    _write_json(
+        marketplace_skill_dir(home, "acme") / "plugins" / "figma" / "mcp-servers" / "inputs.json",
+        {"inputs": [{"id": "tok", "type": ["promptString"]}]},
+    )
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_SECRET_INPUTS_UNREADABLE
+    assert any("unreadable or ambiguous input definitions" in warning for warning in item.warnings)
+    assert asyncio.run(marketplace_migrate(home, env, apply=True, json_output=True)) == mm.EXIT_PARTIAL
+
+
+@pytest.mark.parametrize("raw_password", ["on", "y", 1.0])
+def test_loose_password_truthiness_is_treated_as_maybe_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_password: Any
+) -> None:
+    """pydantic 会把 "on"/"y"/1.0 解析为 True：畸形条目不得被当成非密钥跳过。"""
+    env, home, work, _fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={"figma": [{"id": "token", "description": "t", "password": True}]},
+    )
+    _write_json(
+        marketplace_skill_dir(home, "acme") / "plugins" / "figma" / "mcp-servers" / "inputs.json",
+        {"inputs": [{"id": "token", "type": "promptString", "password": raw_password}]},
+    )
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_BLOCKED
+    assert plan.items[0].reason == mm.REASON_SECRET_INPUTS_UNREADABLE
+
+
+def test_render_migration_rows_assertion(capsys: pytest.CaptureFixture[str]) -> None:
+    from a2c_smcp.computer.cli.commands.marketplace import _render_migration, console
+
+    actions = {"catalog": "rename", "installedPlugins": 1, "trustedMarketplaces": "add+remove"}
+    blocked = mm.MigrationItem(
+        old="aaa", new="aaa-new", action=mm.ACTION_BLOCKED, reason="baseline-mismatch", actions=dict(actions)
+    )
+    renamed = mm.MigrationItem(old="bbb", new="bbb-new", action=mm.ACTION_RENAME, actions=dict(actions))
+    plan = mm.MigrationPlan(items=[blocked, renamed])
+    old_width = console.width
+    console.width = 220
+    try:
+        _render_migration(plan, applied=False)
+    finally:
+        console.width = old_width
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if "aaa" in line or "bbb" in line]
+    blocked_line = next(line for line in lines if "aaa" in line)
+    renamed_line = next(line for line in lines if "bbb" in line)
+    assert "rename" not in blocked_line and "add+remove" not in blocked_line
+    assert "rename" in renamed_line and "add+remove" in renamed_line
