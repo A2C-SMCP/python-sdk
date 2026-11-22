@@ -164,8 +164,6 @@ SKILL_MD = "SKILL.md"
 SKILL_URI_PREFIX = "skill://"
 _MCP_SOURCE_MODES = frozenset({"mounted", "archive", "resources"})
 
-# marketplace 布局常量 / marketplace layout constants（marketplace.json/plugin.json 解析见 :mod:`skills.manifest`）。
-# ``SKILLS_SUBDIR`` 单一权威在 :mod:`skills.manifest`（#271 单点），此处保留 import 绑定供既有消费方。
 # 独立 clone 的 plugin（url/github/cnb/git-subdir）落点命名空间——置于 marketplace/ 下以 "." 起首的目录，
 # 与 catalog clone（<home>/marketplace/<mp>/）物理隔离、且不与 kebab marketplace 名冲突。
 _EXTERNAL_PLUGINS_NS = ".plugins"

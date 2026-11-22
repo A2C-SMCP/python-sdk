@@ -33,7 +33,7 @@ skills.staging (which now imports this module, so a back-edge would be a real cy
 **SKILL 发现容器集单一权威**（#271）：约定 ``skills/`` + 声明覆写的合成由
 :func:`plugin_skill_container_dirs` 单点承载，staging（装载扫描）与 installer（enable 预检计数）共同消费。
 :mod:`~a2c_smcp.computer.skills.validator` **刻意不复用**——它要对每项覆写产出 file/loc 级 error（越界 / 缺失），
-而装载路径是 WARN 跳过，二者语义不同（见该模块对应注释）。
+而装载路径只记日志后跳过（越界 ERROR / 非目录 WARNING，均无 file/loc 诊断），二者语义不同（见该模块对应注释）。
 """
 
 from __future__ import annotations
@@ -307,8 +307,11 @@ def plugin_skill_container_dirs(
     （§4.3）。与 rust ``plugin_skill_container_dirs`` 同构，供 staging（装载扫描）与 installer（enable 预检
     计数）共同消费，避免两套口径漂移（#271）。
 
-    **不去重、不校验约定容器存在性**：去重由消费方按 resolve 后路径做（约定径与覆写径可能同径），存在性由
-    各自扫描 / 计数路径决定（:mod:`~a2c_smcp.computer.skills.validator` 另有逐项诊断，不走本函数）。
+    **不跨容器去重、不校验约定容器存在性**：覆写项内部的越界 / 缺失 / 重复由
+    :func:`resolve_skill_override_dirs` 过滤（越界记 ERROR 跳过、非目录记 WARNING 跳过、重复静默跳过——这也是
+    escape 防线的**唯一**位置，消费方不再复查）；跨容器去重（约定径与覆写径可能同径）由消费方按 resolve 后
+    路径做；约定容器存在性由各自扫描 / 计数路径决定（:mod:`~a2c_smcp.computer.skills.validator` 另有逐项诊断，
+    不走本函数）。
     """
     return [
         plugin_root / SKILLS_SUBDIR,

@@ -363,3 +363,27 @@ def test_plugin_skill_container_dirs_entry_always_plugin_json_only_when_strict(t
         tmp_path / "skills",
         (tmp_path / "entry-skills").resolve(),
     ]
+
+
+def test_plugin_skill_container_dirs_override_escape_excluded(tmp_path: Path) -> None:
+    """覆写越界（目标真实存在）被过滤——escape 防线在单点内（消费方不再复查）。"""
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (tmp_path / "outside").mkdir()  # 越界目标真实存在：排除只能来自 is_within，而非「目录不存在」
+    out = plugin_skill_container_dirs({"skills": "../outside"}, {}, plugin_root, strict=True)
+    assert out == [plugin_root / "skills"]
+
+
+def test_plugin_skill_container_dirs_override_missing_dir_excluded(tmp_path: Path) -> None:
+    """声明但不存在的覆写目录被过滤（装载侧只记 WARNING 跳过，不进入容器集）。"""
+    out = plugin_skill_container_dirs({"skills": "no-such-dir"}, {}, tmp_path, strict=True)
+    assert out == [tmp_path / "skills"]
+
+
+def test_plugin_skill_container_dirs_override_path_resolved(tmp_path: Path) -> None:
+    """覆写按 resolve 后路径返回：``sub/../extra`` 归一为 ``extra``（未 resolve 的直连实现会转红）。"""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "extra").mkdir()
+    out = plugin_skill_container_dirs({"skills": "sub/../extra"}, {}, tmp_path, strict=True)
+    assert out[1] == (tmp_path / "extra").resolve()
+    assert out[1] != tmp_path / "sub" / ".." / "extra"  # 字面 join 与归一后路径不相等（防同值致盲）
