@@ -103,6 +103,15 @@ class ValueStore:
         self._atomic_write(data)
         return True
 
+    def replace_all(self, data: Mapping[str, Any]) -> None:
+        """
+        整表替换（单次原子写 + ``0600``，供迁移批量重键）/ Replace the whole map in one atomic write.
+
+        #268：批量重键必须一次落盘（两次 ``set`` 之间的半态在崩溃时会让部分键留在旧名下），且调用方
+        已用 strict 读面校验过原文件，故这里只负责「一次写好」。**不**改变既有 ``set`` / ``delete`` 语义。
+        """
+        self._atomic_write(data)
+
     def _atomic_write(self, data: Mapping[str, Any]) -> None:
         # 原子写（复用共享原语）后立即 chmod 0600——value store 虽仅存非密钥，仍按最小可见性硬化。
         # Atomic write (shared primitive) then chmod 0600 — defense-in-depth even for non-secret values.

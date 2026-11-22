@@ -1071,6 +1071,16 @@ def external_plugin_dir(home: Path, marketplace: str, plugin: str) -> Path:
     return home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS / marketplace / plugin
 
 
+def external_plugins_dir(home: Path, marketplace: str) -> Path:
+    """
+    某 marketplace 的**外树根** ``<home>/marketplace/.plugins/<mp>/``（#268 迁移重命名用）/ External-tree root。
+
+    路径段格式的单一权威仍是 :func:`external_plugin_dir`；本函数只把它的 marketplace 级父目录暴露出来，
+    迁移（F9：``.plugins/<old>`` → ``.plugins/<new>``）与候选派生共用，不复制字面量。
+    """
+    return external_plugin_dir(home, marketplace, "")
+
+
 def _build_marketplace_ref(name: str, marketplace: str, frontmatter: dict[str, Any], version: str | None, skill_dir: Path) -> A2CSkillRef:
     """
     组装 marketplace 源 A2CSkillRef / Assemble a marketplace-source A2CSkillRef。
