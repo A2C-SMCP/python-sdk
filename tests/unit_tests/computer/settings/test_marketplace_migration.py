@@ -196,7 +196,7 @@ def _legacy_setup(
     work.mkdir(parents=True)
 
     manifest = _manifest(new)
-    _catalog(home, old, manifest, inputs=inputs if inputs is not None else {"figma": [{"id": "region"}]})
+    _catalog(home, old, manifest, inputs=inputs if inputs is not None else {"figma": [{"id": "region", "description": "r"}]})
     record: dict[str, Any] = {
         "source": _known_source(),
         "installLocation": str(marketplace_skill_dir(home, old)),
@@ -274,7 +274,7 @@ def test_apply_migrates_authority_and_derived_surfaces(tmp_path: Path, monkeypat
         monkeypatch,
         values={"figma@acme/region": "eu"},
         secrets={"figma@acme/token": "s3cret"},
-        inputs={"figma": [{"id": "region"}, {"id": "token", "password": True}]},
+        inputs={"figma": [{"id": "region", "description": "r"}, {"id": "token", "description": "t", "password": True}]},
     )
     user = _user(env)
     user["extraKnownMarketplaces"] = {"acme": {"source": _known_source()}}
@@ -348,7 +348,7 @@ def test_keyring_unavailable_aborts_item_with_zero_writes(tmp_path: Path, monkey
         tmp_path,
         monkeypatch,
         available=False,
-        inputs={"figma": [{"id": "token", "password": True}]},
+        inputs={"figma": [{"id": "token", "description": "t", "password": True}]},
     )
     before = _snapshot(tmp_path)
 
@@ -367,7 +367,7 @@ def test_keyring_unavailable_without_password_inputs_proceeds(tmp_path: Path, mo
         tmp_path,
         monkeypatch,
         available=False,
-        inputs={"figma": [{"id": "region"}]},
+        inputs={"figma": [{"id": "region", "description": "r"}]},
     )
     plan = mm.build_plan(home, env, cwd=work)
     assert plan.items[0].action == mm.ACTION_RENAME
@@ -377,12 +377,12 @@ def test_keyring_unavailable_without_password_inputs_proceeds(tmp_path: Path, mo
 
 def test_uninstalled_rootless_external_plugin_does_not_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """架构师钉住项：从未安装且无根的外源 plugin 不计 secret 候选，不导致 abort。"""
-    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, inputs={"figma": [{"id": "region"}]})
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, inputs={"figma": [{"id": "region", "description": "r"}]})
     manifest = _manifest("acme-skills", plugins=[
         {"name": "figma", "source": "figma"},
         {"name": "remote", "source": {"source": "url", "url": "https://example.com/remote.git"}},
     ])
-    _catalog(home, "acme", manifest, inputs={"figma": [{"id": "region"}]})
+    _catalog(home, "acme", manifest, inputs={"figma": [{"id": "region", "description": "r"}]})
 
     plan = mm.build_plan(home, env, cwd=work)
     assert plan.items[0].action == mm.ACTION_RENAME
@@ -395,7 +395,7 @@ def test_secret_and_value_target_conflicts_abort_item(tmp_path: Path, monkeypatc
         monkeypatch,
         values={"figma@acme/region": "eu", "figma@acme-skills/region": "us"},
         secrets={"figma@acme/token": "old"},
-        inputs={"figma": [{"id": "region"}, {"id": "token", "password": True}]},
+        inputs={"figma": [{"id": "region", "description": "r"}, {"id": "token", "description": "t", "password": True}]},
     )
     before = _snapshot(tmp_path)
 
@@ -643,7 +643,7 @@ def test_external_tree_is_renamed(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
     manifest = _manifest("acme-skills", plugins=[{"name": "remote", "source": {"source": "url", "url": "https://example.com/r.git"}}])
     _catalog(home, "acme", manifest)
-    ext_root = _external_tree(home, "acme", "remote", [{"id": "region"}])
+    ext_root = _external_tree(home, "acme", "remote", [{"id": "region", "description": "r"}])
     _write_ledger(
         home,
         env,
@@ -792,7 +792,7 @@ def test_new_secret_is_written_before_old_is_deleted(tmp_path: Path, monkeypatch
         tmp_path,
         monkeypatch,
         secrets={"figma@acme/token": "s3cret"},
-        inputs={"figma": [{"id": "token", "password": True}]},
+        inputs={"figma": [{"id": "token", "description": "t", "password": True}]},
     )
     plan = mm.build_plan(home, env, cwd=work)
     _apply(plan, home, env)
@@ -811,7 +811,7 @@ def test_external_tree_already_renamed_window_converges(tmp_path: Path, monkeypa
         plugins=[{"name": "remote", "source": {"source": "url", "url": "https://example.com/r.git"}}],
     )
     _catalog(home, "acme", manifest)
-    old_ext = _external_tree(home, "acme", "remote", [{"id": "region"}])
+    old_ext = _external_tree(home, "acme", "remote", [{"id": "region", "description": "r"}])
     record = {"scope": "user", "installPath": str(old_ext), "installedAt": "t", "lastUpdated": "t", "mcpServers": []}
     _write_ledger(home, env, {"remote@acme": [record]})
     _write_user(env, {"installedPlugins": ["remote@acme"], "enabledPlugins": {"remote@acme": True}})
@@ -843,7 +843,7 @@ def test_p4_failure_keeps_the_only_secret_copy(tmp_path: Path, monkeypatch: pyte
         tmp_path,
         monkeypatch,
         secrets={"figma@acme/token": "s3cret"},
-        inputs={"figma": [{"id": "token", "password": True}]},
+        inputs={"figma": [{"id": "token", "description": "t", "password": True}]},
     )
 
     def boom(*_a: Any, **_k: Any) -> None:
@@ -863,7 +863,7 @@ def test_p2_failure_cleans_new_secret_and_keeps_old(tmp_path: Path, monkeypatch:
         tmp_path,
         monkeypatch,
         secrets={"figma@acme/token": "s3cret"},
-        inputs={"figma": [{"id": "token", "password": True}]},
+        inputs={"figma": [{"id": "token", "description": "t", "password": True}]},
     )
 
     def boom(*_a: Any, **_k: Any) -> None:
@@ -1063,3 +1063,155 @@ def test_trust_writes_are_additive_before_old_is_removed(tmp_path: Path, monkeyp
     assert len(value_writes) == 2, value_writes
     assert "figma@acme/region" in value_writes[0] and "figma@acme-skills/region" in value_writes[0]
     assert "figma@acme/region" not in value_writes[1]
+
+
+# ── 第二轮复核整改回归（2026-11-22）───────────────────────────────────────
+def test_removed_external_plugin_window_migrates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """外树窗口的 removed-plugin 变体：外树仍在 <old>，catalog 已搬 → 预检须能定位、apply 须补搬外树。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    initial = _manifest(
+        "acme-skills",
+        plugins=[{"name": "remote", "source": {"source": "url", "url": "https://example.com/r.git"}}],
+    )
+    _catalog(home, "acme", initial)
+    ext_old = _external_tree(home, "acme", "remote", [{"id": "region", "description": "r"}])
+    record = {"scope": "user", "installPath": str(ext_old), "installedAt": "t", "lastUpdated": "t", "mcpServers": []}
+    _write_ledger(home, env, {"remote@acme": [record]})
+    _write_user(env, {"installedPlugins": ["remote@acme"], "enabledPlugins": {"remote@acme": True}})
+
+    # catalog 已搬、外树未搬；新清单**移除**了 remote。
+    marketplace_skill_dir(home, "acme").rename(marketplace_skill_dir(home, "acme-skills"))
+    _catalog(home, "acme-skills", _manifest("acme-skills", plugins=[]))
+    known = store.load_known_marketplaces(home, env)["marketplaces"]
+    known["acme-skills"] = {
+        "source": _known_source(),
+        "installLocation": str(marketplace_skill_dir(home, "acme-skills")),
+        "manifestNameBaseline": "acme-skills",
+    }
+    _write_known(home, env, known)
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = next(i for i in plan.items if i.old == "acme")
+    assert item.action == mm.ACTION_RENAME and item.already_renamed
+    _apply(plan, home, env)
+
+    assert (home / "marketplace" / ".plugins" / "acme-skills" / "remote").is_dir()
+    assert not (home / "marketplace" / ".plugins" / "acme").exists()
+    assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
+    assert _user(env)["installedPlugins"] == ["remote@acme-skills"]
+    assert item.incomplete is True  # plugin 已出清单：旧账本保留、exit 3
+
+
+def test_strict_loader_rejects_null_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    _write_json(store.known_marketplaces_path(home, env), {"version": 1, "marketplaces": None})
+    before = _snapshot(tmp_path)
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.corrupt
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _assert_unchanged(before, tmp_path)
+
+
+def test_password_string_values_are_normalized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`password: "true"`（手编/宽松 JSON）按运行时口径归一为 True，必须重键 secret。"""
+    env, home, work, fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={"figma": [{"id": "token", "description": "t", "password": "true"}]},
+    )
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_RENAME
+    _apply(plan, home, env)
+    assert fake.data == {"figma@acme-skills/token": "s3cret"}
+
+
+def test_payload_and_human_redact_corrupt_and_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from a2c_smcp.computer.cli.commands.marketplace import _render_migration
+
+    plan = mm.MigrationPlan()
+    plan.corrupt = [{"path": "/tmp/https://u:pw@host/x", "reason": "bad https://u:pw@host/y"}]
+    payload = mm.plan_payload(plan)
+    assert "pw@host" not in json.dumps(payload)
+    _render_migration(plan, applied=False)
+    assert "pw@host" not in capsys.readouterr().err
+
+    item = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_RENAME)
+    item.warnings.append("see https://u:pw@host/z")
+    plan2 = mm.MigrationPlan(items=[item])
+    assert "pw@host" not in json.dumps(mm.plan_payload(plan2))
+    _render_migration(plan2, applied=False)
+    assert "pw@host" not in capsys.readouterr().err
+
+
+def test_install_plugin_forwards_allow_clone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from a2c_smcp.computer.settings import installer as installer_mod
+
+    env, home, _work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_materialize(plugin_id: str, home_: Path, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(installer_mod, "materialize_plugin", fake_materialize)
+    with pytest.raises(Exception):
+        asyncio.run(installer_mod.install_plugin("figma@acme", None, home, allow_clone=False, env=env))
+    assert captured.get("allow_clone") is False
+
+
+def test_blocked_item_payload_has_no_execution_actions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, baseline="acme")
+    plan = mm.build_plan(home, env, cwd=work)
+    payload = mm.plan_payload(plan)
+    assert payload["items"][0]["action"] == mm.ACTION_BLOCKED
+    assert payload["items"][0]["actions"] == {}
+    assert payload["items"][0]["plugins"] == []
+
+
+def test_ambiguous_claim_is_detected_in_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    _catalog(home, "stray", _manifest("acme-skills"))
+    before = _snapshot(tmp_path)
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_AMBIGUOUS_CATALOG
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    code = asyncio.run(marketplace_migrate(home, env, apply=True, json_output=True))
+    assert code == mm.EXIT_PARTIAL
+    _assert_unchanged(before, tmp_path)
+
+
+def test_secret_material_never_in_repr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    item = mm.MigrationItem(
+        old="acme",
+        new="acme-skills",
+        action=mm.ACTION_RENAME,
+        secret_pairs=[mm.SecretRekey(old_key="a", new_key="b", value="s3cret")],
+    )
+    item.secret_cleanup.append(mm.SecretRekey(old_key="a", new_key="b", value="s3cret"))
+    assert "s3cret" not in repr(item)
+    assert "s3cret" not in repr(item.secret_pairs[0])
+
+
+def test_non_list_ledger_records_mark_incomplete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    _write_ledger(home, env, {"figma@acme": {"not": "a list"}})  # type: ignore[dict-item]
+    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+    assert plan.items[0].incomplete is True
+    assert plan.items[0].reason == mm.REASON_LEDGER_REBUILD_FAILED
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+
+
+def test_help_and_completer_include_migrate() -> None:
+    from a2c_smcp.computer.cli import completer
+    from a2c_smcp.computer.cli.help import FLAGS, NAMESPACE_COMMANDS, SUBCOMMANDS
+
+    assert any("marketplace migrate" in row[0] for row in NAMESPACE_COMMANDS["marketplace"])
+    assert "migrate" in SUBCOMMANDS["marketplace"]
+    assert FLAGS[("marketplace", "migrate")] == ["--name", "--apply", "--update-declarations", "--json"]
+    assert ("marketplace", "migrate") in completer._DYNAMIC_MARKETPLACE

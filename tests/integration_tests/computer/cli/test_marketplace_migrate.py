@@ -58,7 +58,7 @@ def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, conflict: bool = 
     manifest = _manifest("acme-skills") if not conflict else _manifest("shared")
     catalog = marketplace_skill_dir(home, "acme")
     _write_json(catalog / ".tfrobot-plugin" / "marketplace.json", manifest)
-    _write_json(catalog / "plugins" / "figma" / "mcp-servers" / "inputs.json", {"inputs": [{"id": "region"}]})
+    _write_json(catalog / "plugins" / "figma" / "mcp-servers" / "inputs.json", {"inputs": [{"id": "region", "description": "r"}]})
     if conflict:
         other = marketplace_skill_dir(home, "other")
         _write_json(other / ".tfrobot-plugin" / "marketplace.json", _manifest("shared"))
@@ -141,7 +141,10 @@ def test_typer_migrate_conflict_exits_1_with_zero_writes(tmp_path: Path, monkeyp
 def test_typer_migrate_keyring_unavailable_exits_3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home, _work = _setup(tmp_path, monkeypatch)
     catalog = marketplace_skill_dir(home, "acme")
-    _write_json(catalog / "plugins" / "figma" / "mcp-servers" / "inputs.json", {"inputs": [{"id": "token", "password": True}]})
+    _write_json(
+        catalog / "plugins" / "figma" / "mcp-servers" / "inputs.json",
+        {"inputs": [{"id": "token", "description": "t", "password": True}]},
+    )
     monkeypatch.setattr(mm, "keyring_available", lambda: False)
     before = store.known_marketplaces_path(home).read_bytes()
 
@@ -201,3 +204,63 @@ def test_read_only_lock_probe_detects_existing_holder(tmp_path: Path, monkeypatc
         assert marketplace_mod._probe_concurrent_writer(home, None) is False
     finally:
         os.close(fd)
+
+
+def test_dry_run_does_not_create_skill_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认 dry-run 零写入：home 不存在时也不得 mkdir。"""
+    home = tmp_path / "never-created"
+    monkeypatch.setenv("A2C_SKILL_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli_main.app, ["marketplace", "migrate", "--json"])
+    assert result.exit_code == 0, result.output
+    assert not home.exists()
+
+
+def test_human_summary_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _work = _setup(tmp_path, monkeypatch)
+    dry = CliRunner().invoke(cli_main.app, ["marketplace", "migrate"])
+    assert dry.exit_code == 0, dry.output
+    assert "can be migrated" in dry.output
+
+    applied = CliRunner().invoke(cli_main.app, ["marketplace", "migrate", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert "Migrated 1" in applied.output
+    assert "No marketplace name migration needed" not in applied.output
+
+    noop = CliRunner().invoke(cli_main.app, ["marketplace", "migrate"])
+    assert noop.exit_code == 0
+    assert "No marketplace name migration needed" in noop.output
+
+
+def test_nonblocking_conflict_wording(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "skill-home"
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("A2C_SKILL_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.chdir(work)
+    env = {"A2C_SKILL_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "state")}
+    for name, target in (("aa", "shared"), ("bb", "shared"), ("cc", "cc-new")):
+        catalog = marketplace_skill_dir(home, name)
+        _write_json(catalog / ".tfrobot-plugin" / "marketplace.json", _manifest(target))
+    _write_json(
+        store.known_marketplaces_path(home, env),
+        {
+            "version": 1,
+            "marketplaces": {
+                name: {
+                    "source": {"type": "git", "url": f"https://example.com/{name}.git"},
+                    "installLocation": str(marketplace_skill_dir(home, name)),
+                }
+                for name in ("aa", "bb", "cc")
+            },
+        },
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": [], "enabledPlugins": {}})
+    result = CliRunner().invoke(cli_main.app, ["marketplace", "migrate", "--name", "cc"])
+    assert result.exit_code == 0, result.output
+    assert "not blocking" in result.output
+    assert "command aborts" not in result.output
