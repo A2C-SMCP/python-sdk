@@ -523,6 +523,35 @@ def _mp_refresh(
     raise typer.Exit(code)
 
 
+@marketplace_app.command("migrate")
+def _mp_migrate(
+    name: list[str] | None = typer.Option(  # noqa: B008 - Typer 要求 OptionInfo 作为默认值
+        None,
+        "--name",
+        help="只迁移指定旧名（可重复）/ migrate only these legacy names",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="真正写盘（缺省 dry-run）/ write changes (default: dry-run)"),
+    update_declarations: bool = typer.Option(
+        False,
+        "--update-declarations",
+        help="同时改写 user scope 的 extraKnownMarketplaces / update user-scope declarations",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
+) -> None:
+    """迁移存量 marketplace 注册名（默认 dry-run）/ Migrate legacy marketplace names (dry-run by default)."""
+    code = asyncio.run(
+        mp_cmd.marketplace_migrate(
+            ensure_skill_home(),
+            os.environ,
+            names=name,
+            apply=apply,
+            update_declarations=update_declarations,
+            json_output=json_output,
+        )
+    )
+    raise typer.Exit(code)
+
+
 @marketplace_app.command("set")
 def _mp_set(
     name: str = typer.Argument(...),

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +33,14 @@ from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_b
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
+from a2c_smcp.computer.settings.marketplace_migration import (
+    MigrationPlan,
+    blocking_conflicts,
+    build_plan,
+    execute_plan,
+    plan_exit_code,
+    plan_payload,
+)
 from a2c_smcp.computer.settings.raw import (
     SettingsFileCorruptError,
     list_field_or_empty,
@@ -56,6 +64,7 @@ from a2c_smcp.computer.settings.store import (
     update_known_marketplaces,
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
+from a2c_smcp.computer.skills.manifest import PluginManifestError, read_marketplace_manifest
 from a2c_smcp.computer.skills.marketplace_identity import (
     REASON_INVALID_NAME,
     REASON_INVALID_SOURCE,
@@ -63,6 +72,7 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     REASON_UNRESOLVABLE_NAME,
     MarketplaceIdentityError,
     MarketplaceNameChangeError,
+    manifest_marketplace_name,
     read_manifest_marketplace_name,
     redact_ledger_key,
     registered_name_for_source,
@@ -97,6 +107,7 @@ logger = get_logger(__name__)
 EXIT_OK = 0
 EXIT_USER_ERROR = 1
 EXIT_NETWORK_ERROR = 2
+EXIT_PARTIAL = 3  # 仅 marketplace migrate（D12）：部分完成（unresolved/blocked/keyring-abort/follow-up）
 
 
 # ── 输出辅助 / output helpers ─────────────────────────────────────────────────
@@ -580,6 +591,26 @@ def marketplace_list(home: Path, env: Mapping[str, str] | None, *, json_output: 
     return EXIT_OK
 
 
+def _manifest_name_for_display(home: Path, name: str) -> tuple[str | None, bool]:
+    """
+    ``marketplace info`` 的清单名展示值（§10.4，Q9）/ Manifest name for display (read-only, redacted).
+
+    清单内容来自 git 源、属不可信输入：只有**合法严格 kebab** 才原样展示；清单不可读 → ``(None, False)``；
+    可读但名字非法（可能携带凭据样文本）→ ``(None, True)``，**绝不回显原值**（演示规则同 ``redact_ledger_key``）。
+    """
+    clone_dir = marketplace_skill_dir(home, name)
+    if not clone_dir.is_dir() or clone_dir.is_symlink():
+        return None, False
+    try:
+        manifest = read_marketplace_manifest(clone_dir)
+    except PluginManifestError:
+        return None, False
+    try:
+        return manifest_marketplace_name(manifest), False
+    except MarketplaceIdentityError:
+        return None, True
+
+
 def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, json_output: bool = False) -> int:
     """marketplace 详情：URL / clone 路径 / commit / plugins[]（含 installed 状态）/ auto_update / trusted。"""
     rec = _marketplaces(home, env).get(name)
@@ -589,6 +620,7 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     installed = load_installed_plugins(home, env).get("plugins") or {}
     plugins = [pid for pid in installed if pid.endswith(f"@{name}")]
     url = _display_source_url(rec)
+    manifest_name, manifest_name_invalid = _manifest_name_for_display(home, name)
     info: dict[str, Any] = {
         "name": redact_ledger_key(name),
         "url": url,
@@ -597,6 +629,10 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
         "autoUpdate": bool(rec.get("autoUpdate", False)),
         "trusted": name in _load_trusted(env),  # 信任按 name 判定（§5.3.1）
         "lastUpdated": rec.get("lastUpdated"),
+        # §10.4 / Q9：只读派生，供自查 legacy；非法/不可读清单名绝不回显原值。
+        "manifestName": manifest_name,
+        "manifestNameInvalid": manifest_name_invalid,
+        "legacyName": manifest_name is not None and manifest_name != name,
         # pid = `<plugin>@<marketplace>`：market 段就是账本键，可被手编成携带凭据的串 → 展示面脱敏。
         "installedPlugins": [_redact_pid(pid) for pid in plugins],
     }
@@ -606,13 +642,122 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     table = Table(title=f"Marketplace · {escape(redact_ledger_key(name))}", show_header=False)
     table.add_column("Field", style="bold cyan")
     table.add_column("Value")
-    for k in ("url", "installLocation", "commitSha", "autoUpdate", "trusted", "lastUpdated"):
+    for k in (
+        "url",
+        "installLocation",
+        "commitSha",
+        "autoUpdate",
+        "trusted",
+        "lastUpdated",
+        "manifestName",
+        "legacyName",
+    ):
+        value: Any = info[k]
+        if k == "manifestName" and info["manifestNameInvalid"]:
+            value = "<invalid>"
         # 缺失字段留空（与 docstring / JSON null 语义一致），不渲染字面 "None"（#261 复审 🟡）。
         # 值可能来自**手编**账本（或 URL path）→ rich 单元格必须 escape（#260 七审 🔴1）。
-        table.add_row(k, "" if info[k] is None else escape(str(info[k])))
+        table.add_row(k, "" if value is None else escape(str(value)))
     table.add_row("installedPlugins", ", ".join(escape(_redact_pid(pid)) for pid in plugins) if plugins else "—")
     console.print(table)
     return EXIT_OK
+
+
+def _flag_values(args: Sequence[str], flag: str) -> list[str]:
+    """解析可重复 flag（``--name a --name=b``）/ Parse a repeatable flag."""
+    values: list[str] = []
+    for idx, token in enumerate(args):
+        if token == flag and idx + 1 < len(args):
+            values.append(args[idx + 1])
+        elif token.startswith(f"{flag}="):
+            values.append(token.split("=", 1)[1])
+    return values
+
+
+def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
+    """人读形态（§6）/ Human-readable migration report."""
+    if plan.corrupt:
+        console_err.print("[red]✗ aborted: corrupt state file(s); nothing was written[/red]")
+        for entry in plan.corrupt:
+            console_err.print(f"  [red]{escape(entry.get('path', ''))}[/red]: {escape(entry.get('reason', ''))}")
+        return
+    if plan.errors:
+        for message in plan.errors:
+            console_err.print(f"[red]✗ {escape(message)}[/red]")
+        return
+    title = (
+        "Marketplace name migration (applied)"
+        if applied
+        else "Marketplace name migration plan (dry run; run with --apply to execute)"
+    )
+    table = Table(title=title, header_style="bold magenta")
+    for column in ("Old", "New", "Action", "Plugins", "Trust", "Blocked", "Inputs", "Catalog", "Follow-ups"):
+        table.add_column(column)
+    for item in plan.items:
+        actions = item.actions or {}
+        table.add_row(
+            escape(redact_ledger_key(item.old)),
+            escape(redact_ledger_key(item.new)) if item.new else "—",
+            escape(item.action + (f" ({item.reason})" if item.reason else "")),
+            str(actions.get("installedPlugins", 0)),
+            str(actions.get("trustedMarketplaces", "—")),
+            str(actions.get("blockedMarketplaces", "—")),
+            str(actions.get("inputValues", 0)),
+            str(actions.get("catalog", "—")),
+            str(len(item.follow_ups)),
+        )
+    console.print(table)
+    if plan.conflicts:
+        console.print("[red]Conflicts (command aborts; nothing is written):[/red]")
+        for conflict in plan.conflicts:
+            names = ", ".join(str(name) for name in conflict.get("names", []))
+            console.print(
+                f"  [red]{escape(str(conflict.get('code', 'conflict')))}[/red]: "
+                f"{escape(names)} → {escape(str(conflict.get('target', '')))}"
+            )
+    for item in plan.items:
+        for warning in item.warnings:
+            console_err.print(f"[yellow]![/yellow] {escape(redact_ledger_key(item.old))}: {escape(warning)}")
+        for follow in item.follow_ups:
+            console_err.print(
+                f"[yellow]![/yellow] {escape(str(follow.get('file', '')))} "
+                f"{escape(str(follow.get('pointer', '')))}: {escape(str(follow.get('effect', '')))} — "
+                f"{escape(str(follow.get('suggested', '')))}"
+            )
+    code = plan_exit_code(plan)
+    if code == EXIT_OK:
+        console.print("[green]No marketplace name migration needed.[/green]")
+    elif code == EXIT_USER_ERROR:
+        console_err.print("[red]Aborted by conflict; nothing was written. Fix the conflicts and rerun.[/red]")
+    elif code == EXIT_PARTIAL:
+        console_err.print(
+            "[yellow]Partial: some items need attention (see warnings/follow-ups). Rerun after fixing.[/yellow]"
+        )
+
+
+async def marketplace_migrate(
+    home: Path,
+    env: Mapping[str, str] | None,
+    *,
+    names: Sequence[str] | None = None,
+    apply: bool = False,
+    update_declarations: bool = False,
+    json_output: bool = False,
+) -> int:
+    """
+    ``marketplace migrate`` handler（#268 / D12）/ Legacy registration-name migration.
+
+    默认 dry-run（零写入）：检测、计划、项级预检全部走 strict 只读面；``apply=True`` 才写盘。
+    冲突涉及任一选中项 → 整体 abort、零写入、退出码 1；项级失败 → 其余继续、退出码 3。
+    """
+    plan = build_plan(home, env, names=names, update_declarations=update_declarations)
+    if apply and not plan.corrupt and not plan.errors and not blocking_conflicts(plan):
+        await execute_plan(plan, home, env)
+    if json_output:
+        console.print_json(data=plan_payload(plan))
+    else:
+        _render_migration(plan, applied=apply)
+    return plan_exit_code(plan)
 
 
 async def marketplace_remove(
@@ -961,6 +1106,22 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         after_state = _registry_fingerprints(comp.skill_registry)
         if code == EXIT_OK or before_state != after_state:
             comp.mark_skills_dirty()
+    elif sub == "migrate":
+        # 事务性迁移不进 REPL（D12）：只允许 dry-run；--apply 提示到 shell 执行。
+        if "--apply" in args:
+            console.print(
+                "[yellow]marketplace migrate --apply must be run in a shell: "
+                "a2c-computer marketplace migrate --apply[/yellow]"
+            )
+            return
+        await marketplace_migrate(
+            home,
+            env,
+            names=_flag_values(args, "--name") or None,
+            apply=False,
+            update_declarations="--update-declarations" in args,
+            json_output=json_output,
+        )
     elif sub == "set":
         # marketplace set <name> auto-update=<bool>
         if len(pos) < 2 or "=" not in pos[1]:
