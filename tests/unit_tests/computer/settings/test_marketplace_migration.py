@@ -1177,7 +1177,7 @@ def test_ambiguous_claim_is_detected_in_dry_run(tmp_path: Path, monkeypatch: pyt
     before = _snapshot(tmp_path)
     plan = mm.build_plan(home, env, cwd=work)
     item = plan.items[0]
-    assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_AMBIGUOUS_CATALOG
+    assert item.action == mm.ACTION_UNRESOLVED and item.reason == mm.REASON_AMBIGUOUS_CATALOG
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
     code = asyncio.run(marketplace_migrate(home, env, apply=True, json_output=True))
     assert code == mm.EXIT_PARTIAL
@@ -1215,3 +1215,73 @@ def test_help_and_completer_include_migrate() -> None:
     assert "migrate" in SUBCOMMANDS["marketplace"]
     assert FLAGS[("marketplace", "migrate")] == ["--name", "--apply", "--update-declarations", "--json"]
     assert ("marketplace", "migrate") in completer._DYNAMIC_MARKETPLACE
+
+
+def test_actions_report_trust_and_blocked_rewrites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """trust/blocked 的实际改写必须在 actions 里体现（不能是 noop）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    plan = mm.build_plan(home, env, cwd=work)
+    actions = mm.plan_payload(plan)["items"][0]["actions"]
+    assert actions["trustedMarketplaces"] == "add+remove"
+    assert actions["blockedMarketplaces"] == "add+remove"
+
+
+def test_human_table_suppresses_actions_for_non_executed_items() -> None:
+    from a2c_smcp.computer.cli.commands.marketplace import _display_actions
+
+    actions = {"catalog": "rename", "installedPlugins": 3, "trustedMarketplaces": "add+remove"}
+    hidden = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_NOT_SELECTED, selected=False, actions=dict(actions))
+    blocked = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_BLOCKED, actions=dict(actions))
+    renamed = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_RENAME, actions=dict(actions))
+    aborted = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_ABORTED, actions=dict(actions))
+
+    assert _display_actions(hidden) == {}
+    assert _display_actions(blocked) == {}
+    # 正对照：实际执行面（rename / aborted）必须展示。
+    assert _display_actions(renamed)["catalog"] == "rename"
+    assert _display_actions(aborted)["trustedMarketplaces"] == "add+remove"
+
+
+def test_unknown_name_errors_are_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env, home, _work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    secret = "https://alice:s3cret@example.com/x.git"
+    assert asyncio.run(marketplace_migrate(home, env, names=[secret], json_output=True)) == mm.EXIT_CONFLICT
+    out = capsys.readouterr().out
+    assert "s3cret" not in out
+    assert "s3cret" not in json.dumps(mm.plan_payload(mm.build_plan(home, env, names=[secret])))
+
+
+def test_partially_malformed_inputs_still_rekey_passwords(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """废弃 pickString 条目（options 为旧字符串数组）可证明非密钥 → 跳过，不影响 token 重键。"""
+    env, home, work, fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={
+            "figma": [
+                {"id": "token", "description": "t", "password": True},
+                {"type": "pickString", "description": "p", "options": ["a", "b"]},
+            ]
+        },
+    )
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_RENAME
+    _apply(plan, home, env)
+    assert fake.data == {"figma@acme-skills/token": "s3cret"}
+
+
+def test_ambiguous_password_input_definition_blocks_with_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={"figma": [{"id": "token", "type": "promptString", "password": "true"}]},  # 缺 description
+    )
+    before = _snapshot(tmp_path)
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_SECRET_INPUTS_UNREADABLE
+    assert any("unreadable or ambiguous input definitions" in warning for warning in item.warnings)
+    _assert_unchanged(before, tmp_path)
