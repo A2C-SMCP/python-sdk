@@ -444,7 +444,12 @@ def _validate_plugin(
             src_file = mfile_of_entry(c, entry_loc)
             c.add(CODE_STRICT_CONFLICT, src_file, f"{entry_loc}.strict", str(e))
 
-    # skills 容器集：约定 skills/（装载恒扫，staging.py:1079 同源）+ 显式覆写（§4.3）。
+    # skills 容器集：约定 skills/ + 显式覆写（§4.3）。**刻意不复用**装载侧单点
+    # :func:`~a2c_smcp.computer.skills.manifest.plugin_skill_container_dirs` / resolve_skill_override_dirs：
+    # 后者对非法覆写只记日志后跳过（越界 ERROR / 非目录 WARNING），**不产出 file/loc 诊断**；而 validator 必须
+    # 逐项产出 error（见下分支）。这里只把「通过校验」的覆写目录并入容器集（#271 保持逐项诊断口径）。
+    # 注意：下方判定谓词（resolve / is_within / is_dir）须与 resolve_skill_override_dirs 保持同步——该处新增
+    # 判据时本处要跟随，否则会出现装载拒绝而 validator 放行的口径漂移。
     strict = entry_is_strict(entry) if entry is not None else True
     containers: list[Path] = [plugin_root / SKILLS_SUBDIR]
     raw_overrides = skill_override_raw_paths(entry or {}, plugin_manifest, strict=strict)

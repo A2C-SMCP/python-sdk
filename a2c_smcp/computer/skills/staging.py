@@ -32,9 +32,11 @@ marketplace + 解析 plugin source + 扫描 skills + 注册」原语）：
 ``installed_plugins.json`` 写入、``enabledPlugins`` 过滤、bundled MCP server 注册**不在本模块**（归 #62 /
 plugin install / #53）；``plugin_filter`` 形参供 #62 注入 ``enabledPlugins ∩ installed``。
 
-**不在本模块（显式延后，见 #80）**：marketplace 条目 / plugin.json 的 ``skills`` 组件路径**覆写**
-（protocol-v1 §4.3）与 **strict mode 冲突检测**（§4.4：``strict=false`` + plugin.json 声明组件 → 硬错误）。
-本模块只按约定扫 ``<plugin 根>/skills/<skill>/SKILL.md``（主流场景），strict 语义随组件加载层（#53）跟进。
+**覆写 / strict（已落地，#80）**：marketplace 条目 / plugin.json 的 ``skills`` 组件路径**覆写**（protocol-v1 §4.3）
+与约定 ``skills/`` 的容器集合成由
+:func:`~a2c_smcp.computer.skills.manifest.plugin_skill_container_dirs` 单点承载（#271，装载扫描与 enable 预检共用）；
+**strict mode 冲突检测**（§4.4：``strict=false`` + plugin.json 声明组件 → 硬错误）由
+:func:`~a2c_smcp.computer.skills.manifest.check_strict_conflict` 在 :func:`_stage_one_plugin` 内执行。
 
 mcp 流程 / mcp flow：
 1. 经 ``manager.list_skill_resources`` 完整消费 cursor 拿到 server 全量 ``skill://`` 资源；
@@ -96,13 +98,14 @@ from a2c_smcp.computer.skills.home import (
     user_dropin_root,
 )
 from a2c_smcp.computer.skills.manifest import (
+    SKILLS_SUBDIR,
     PluginManifestError,
     check_strict_conflict,
     entry_is_strict,
+    plugin_skill_container_dirs,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
-    resolve_skill_override_dirs,
 )
 from a2c_smcp.computer.skills.manifest import (
     plugin_root_base as resolve_plugin_root_base,
@@ -163,8 +166,6 @@ SKILL_MD = "SKILL.md"
 SKILL_URI_PREFIX = "skill://"
 _MCP_SOURCE_MODES = frozenset({"mounted", "archive", "resources"})
 
-# marketplace 布局常量 / marketplace layout constants（marketplace.json/plugin.json 解析见 :mod:`skills.manifest`）。
-SKILLS_SUBDIR = "skills"  # plugin 内 SKILL 子树约定目录（SKILL 协议 §2）
 # 独立 clone 的 plugin（url/github/cnb/git-subdir）落点命名空间——置于 marketplace/ 下以 "." 起首的目录，
 # 与 catalog clone（<home>/marketplace/<mp>/）物理隔离、且不与 kebab marketplace 名冲突。
 _EXTERNAL_PLUGINS_NS = ".plugins"
@@ -1280,9 +1281,9 @@ async def _stage_one_plugin(
     # per-plugin 循环捕获降级（该 plugin 不入册、不阻断其余，符 #61 失败降级铁律）。
     check_strict_conflict(entry, plugin_manifest)
     version = resolve_plugin_version(entry, plugin_manifest, version_fallback)
-    # 扫描容器 = 约定 skills/ + entry.skills / plugin.json.skills 覆写（§4.3，strict=true 追加合并）。
-    override_dirs = resolve_skill_override_dirs(entry, plugin_manifest, plugin_root, strict=entry_is_strict(entry))
-    skill_dirs = [plugin_root / SKILLS_SUBDIR, *override_dirs]
+    # 扫描容器 = 约定 skills/ + entry.skills / plugin.json.skills 覆写（§4.3，strict=true 追加合并；
+    # 容器集合成单一权威见 :func:`~a2c_smcp.computer.skills.manifest.plugin_skill_container_dirs`，#271）。
+    skill_dirs = plugin_skill_container_dirs(entry, plugin_manifest, plugin_root, strict=entry_is_strict(entry))
     return _scan_and_register_plugin_skills(marketplace, plugin_name, skill_dirs, version, registry, seen)
 
 

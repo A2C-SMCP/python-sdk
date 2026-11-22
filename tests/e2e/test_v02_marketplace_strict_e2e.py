@@ -15,7 +15,8 @@ English: Real-process e2e for v0.2.2 marketplace strict mode + entry.skills over
   Agent's ``client:get_skills`` discovery. Zero network (local bare git repo as a ``file://`` source).
 
 协议依据 / Protocol: tfrobot-marketplace protocol-v1 §4.3（entry.skills override）/ §4.4（strict 冲突）；
-  SDK staging ``a2c_smcp/computer/skills/staging.py``（``stage_marketplace_skills`` / ``resolve_skill_override_dirs``）。
+  SDK staging ``a2c_smcp/computer/skills/staging.py``（``stage_marketplace_skills``）与
+  ``a2c_smcp/computer/skills/manifest.py``（``plugin_skill_container_dirs`` / ``resolve_skill_override_dirs``）。
 """
 
 from __future__ import annotations
