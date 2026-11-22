@@ -494,7 +494,8 @@ def test_baseline_mismatch_is_blocked(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_new_known_record_resets_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, baseline="acme-skills")
+    # 旧记录**没有** baseline（pre-#260 legacy）：新记录必须补写为 new，而不是沿用/省略。
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, baseline=_MISSING)
     plan = mm.build_plan(home, env, cwd=work)
     _apply(plan, home, env)
     record = store.load_known_marketplaces(home, env)["marketplaces"]["acme-skills"]
@@ -599,6 +600,8 @@ def test_plugin_missing_from_new_manifest_keeps_old_ledger(tmp_path: Path, monke
     ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
     assert "ghost@acme" in ledger and "ghost@acme-skills" not in ledger
     assert any("not present in the new manifest" in warning for warning in plan.items[0].warnings)
+    assert plan.items[0].incomplete is True
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL  # 不静默报全绿
 
 
 def test_invalid_manifest_name_is_unresolved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -725,10 +728,16 @@ def test_cli_json_payload_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     assert payload["command"] == "marketplace migrate"
     assert payload["dryRun"] is True and payload["status"] == "planned" and payload["exitCode"] == 0
     assert payload["items"][0]["old"] == "acme" and payload["items"][0]["action"] == "rename"
+    assert payload["items"][0]["plugins"][0] == {
+        "id": "figma@acme",
+        "newId": "figma@acme-skills",
+        "action": "move",
+    }
+    assert payload["applied"] is False
 
     assert asyncio.run(marketplace_migrate(home, env, apply=True, json_output=True)) == mm.EXIT_OK
     applied = json.loads(capsys.readouterr().out)
-    assert applied["dryRun"] is False and applied["status"] == "applied"
+    assert applied["dryRun"] is False and applied["status"] == "applied" and applied["applied"] is True
 
 
 def test_project_trust_and_blocked_are_report_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -791,3 +800,266 @@ def test_new_secret_is_written_before_old_is_deleted(tmp_path: Path, monkeypatch
     set_idx = fake.ops.index(("set", "figma@acme-skills/token"))
     delete_idx = fake.ops.index(("delete", "figma@acme/token"))
     assert set_idx < delete_idx
+
+
+# ── 审查整改回归（2026-11-22 独立审查）────────────────────────────────────
+def test_external_tree_already_renamed_window_converges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """窗口 4：目录与外树都已搬到新名、known[old] 未删 → 预检必须找到新名下的外树（不得误 blocked）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    manifest = _manifest(
+        "acme-skills",
+        plugins=[{"name": "remote", "source": {"source": "url", "url": "https://example.com/r.git"}}],
+    )
+    _catalog(home, "acme", manifest)
+    old_ext = _external_tree(home, "acme", "remote", [{"id": "region"}])
+    record = {"scope": "user", "installPath": str(old_ext), "installedAt": "t", "lastUpdated": "t", "mcpServers": []}
+    _write_ledger(home, env, {"remote@acme": [record]})
+    _write_user(env, {"installedPlugins": ["remote@acme"], "enabledPlugins": {"remote@acme": True}})
+
+    marketplace_skill_dir(home, "acme").rename(marketplace_skill_dir(home, "acme-skills"))
+    old_ext.parent.rename(home / "marketplace" / ".plugins" / "acme-skills")
+    known = store.load_known_marketplaces(home, env)["marketplaces"]
+    known["acme-skills"] = {
+        "source": _known_source(),
+        "installLocation": str(marketplace_skill_dir(home, "acme-skills")),
+        "manifestNameBaseline": "acme-skills",
+    }
+    _write_known(home, env, known)
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = next(i for i in plan.items if i.old == "acme")
+    assert item.already_renamed and item.action == mm.ACTION_RENAME
+    _apply(plan, home, env)
+
+    assert item.action == mm.ACTION_RENAME, item.warnings
+    ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
+    assert "remote@acme-skills" in ledger and "remote@acme" not in ledger
+    assert (home / "marketplace" / ".plugins" / "acme-skills" / "remote").is_dir()
+
+
+def test_p4_failure_keeps_the_only_secret_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3 已删旧 secret 后 P4 失败：清理不得删掉新键（否则两份都没了）。"""
+    env, home, work, fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={"figma": [{"id": "token", "password": True}]},
+    )
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mm, "_drop_old_ledger", boom)
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+
+    assert plan.items[0].action == mm.ACTION_ABORTED
+    assert fake.data == {"figma@acme-skills/token": "s3cret"}, fake.data
+
+
+def test_p2_failure_cleans_new_secret_and_keeps_old(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3 之前失败：旧键仍在 → 清理本次新键，旧值不丢。"""
+    env, home, work, fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        secrets={"figma@acme/token": "s3cret"},
+        inputs={"figma": [{"id": "token", "password": True}]},
+    )
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise OSError("rename failed")
+
+    monkeypatch.setattr(mm, "_rename_catalog", boom)
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+
+    assert plan.items[0].action == mm.ACTION_ABORTED
+    assert fake.data == {"figma@acme/token": "s3cret"}, fake.data
+
+
+def test_p3_failure_window_resumes_on_rerun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """known[old] 必须留到 P3/P4 之后：P3 中断后重跑要能续做而不是报 noop。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    real_installed = mm._write_installed_plugin
+    state = {"failed": False}
+
+    def flaky(pid: str, present: bool, env: Any, **kwargs: Any) -> bool:
+        if not present and pid == "figma@acme" and not state["failed"]:
+            state["failed"] = True
+            raise OSError("settings write failed")
+        return real_installed(pid, present, env, **kwargs)
+
+    monkeypatch.setattr(mm, "_write_installed_plugin", flaky)
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+    assert plan.items[0].action == mm.ACTION_ABORTED
+    assert "acme" in store.load_known_marketplaces(home, env)["marketplaces"]
+
+    monkeypatch.setattr(mm, "_write_installed_plugin", real_installed)
+    replan = mm.build_plan(home, env, cwd=work)
+    item = next(i for i in replan.items if i.old == "acme")
+    assert item.already_renamed
+    _apply(replan, home, env)
+
+    assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
+    assert _user(env)["installedPlugins"] == ["figma@acme-skills"]
+    assert _user(env)["enabledPlugins"] == {"figma@acme-skills": True}
+
+
+def test_payload_redacts_credential_like_ledger_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--json 的自由文本必须走脱敏：手编账本键里的凭据不得进 items/conflicts。"""
+    env = _env(tmp_path)
+    home = _home(env)
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    bad = "https://alice:s3cret@example.com/x.git"
+    _write_known(home, env, {bad: {"source": _known_source(), "installLocation": str(home / "marketplace" / "x")}})
+    _write_user(env, {"installedPlugins": [], "enabledPlugins": {}})
+    _patch_keyring(monkeypatch, _FakeSecrets())
+    plan = mm.build_plan(home, env, cwd=work)
+    payload = mm.plan_payload(plan)
+    dumped = json.dumps(payload)
+    assert "s3cret" not in dumped
+    assert payload["items"][0]["old"] != bad
+
+
+def test_merge_with_both_external_trees_is_a_plan_conflict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge 场景下两棵外树并存 → 计划期冲突（避免 dry-run 0 / apply 3 的永久 wedge）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    manifest = _manifest(
+        "acme-skills",
+        plugins=[{"name": "remote", "source": {"source": "url", "url": "https://example.com/r.git"}}],
+    )
+    _catalog(home, "acme", manifest)
+    _catalog(home, "acme-skills", manifest)
+    _external_tree(home, "acme", "remote", None)
+    _external_tree(home, "acme-skills", "remote", None)
+    known = store.load_known_marketplaces(home, env)["marketplaces"]
+    known["acme-skills"] = {
+        "source": _known_source(),
+        "installLocation": str(marketplace_skill_dir(home, "acme-skills")),
+    }
+    _write_known(home, env, known)
+    _write_user(env, {"installedPlugins": [], "enabledPlugins": {}})
+
+    plan = mm.build_plan(home, env, cwd=work)
+    assert "target-external-tree-exists" in [conflict["code"] for conflict in plan.conflicts]
+    assert mm.plan_exit_code(plan) == mm.EXIT_CONFLICT
+
+
+def test_strict_loader_rejects_wrong_shaped_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    _write_json(store.known_marketplaces_path(home, env), {"version": 1, "marketplaces": []})
+    before = _snapshot(tmp_path)
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.corrupt
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _assert_unchanged(before, tmp_path)
+
+
+def test_malformed_enabled_plugins_is_structured_corrupt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    # 全合规项（清单名 == 注册名），只让 user settings 的 enabledPlugins 畸形。
+    _catalog(home, "acme", _manifest("acme"))
+    _write_user(env, {"enabledPlugins": None})
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.corrupt
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+
+
+def test_non_mapping_declaration_left_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    user = _user(env)
+    user["extraKnownMarketplaces"] = {"acme": "https://example.com/acme.git"}
+    _write_user(env, user)
+    plan = mm.build_plan(home, env, cwd=work, update_declarations=True)
+    assert plan.items[0].declarations_rewrite is False
+    _apply(plan, home, env)
+    assert _user(env)["extraKnownMarketplaces"] == {"acme": "https://example.com/acme.git"}
+
+
+def test_non_mapping_target_declaration_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    user = _user(env)
+    user["extraKnownMarketplaces"] = {"acme": {"source": _known_source()}, "acme-skills": "shorthand"}
+    _write_user(env, user)
+    plan = mm.build_plan(home, env, cwd=work, update_declarations=True)
+    assert "extra-known-target-conflict" in [conflict["code"] for conflict in plan.conflicts]
+    assert mm.plan_exit_code(plan) == mm.EXIT_CONFLICT
+
+
+def test_claim_ignores_staging_and_trash_temp_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
+    staging = home / "marketplace" / ".staging-deadbeef"
+    _catalog(home, ".staging-deadbeef", _manifest("acme-skills"))
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+    assert staging.is_dir(), "staging 临时树不得被认领/搬走"
+    assert marketplace_skill_dir(home, "acme-skills").is_dir()
+
+
+def test_rebuild_never_clones_offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sha 锁版本 + 本地 HEAD 不符：迁移必须跳过重建（保留旧账本 + exit 3），绝不 rmtree/重 clone。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    manifest = _manifest(
+        "acme-skills",
+        plugins=[{"name": "remote", "source": {"source": "url", "url": "file:///nonexistent/r.git", "sha": "a" * 40}}],
+    )
+    _catalog(home, "acme", manifest)
+    ext = _external_tree(home, "acme", "remote", None)
+    _write_ledger(
+        home,
+        env,
+        {"remote@acme": [{"scope": "user", "installPath": str(ext), "installedAt": "t", "lastUpdated": "t", "mcpServers": []}]},
+    )
+    _write_user(env, {"installedPlugins": ["remote@acme"], "enabledPlugins": {"remote@acme": True}})
+
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+
+    moved = home / "marketplace" / ".plugins" / "acme-skills" / "remote"
+    assert moved.is_dir(), "外树不得因重建失败被删除"
+    assert plan.items[0].incomplete is True
+    assert plan.items[0].reason == mm.REASON_LEDGER_REBUILD_FAILED
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+
+
+def test_trust_writes_are_additive_before_old_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """trust/blocked/声明与 value store：P1 先加、P3 后删（不能合并成一次写）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, values={"figma@acme/region": "eu"})
+    user = _user(env)
+    user["extraKnownMarketplaces"] = {"acme": {"source": _known_source()}}
+    _write_user(env, user)
+
+    settings_writes: list[dict[str, Any]] = []
+    real_write = store.atomic_write_json
+
+    def spy_write(path: Path, obj: Any, **kwargs: Any) -> None:
+        if str(path) == str(user_settings_path(env)):
+            settings_writes.append(json.loads(json.dumps(obj)))
+        return real_write(path, obj, **kwargs)
+
+    monkeypatch.setattr(mm.store, "atomic_write_json", spy_write)
+
+    value_writes: list[dict[str, Any]] = []
+    real_replace = mm.ValueStore.replace_all
+
+    def spy_replace(self: Any, data: Any) -> None:
+        value_writes.append(dict(data))
+        return real_replace(self, data)
+
+    monkeypatch.setattr(mm.ValueStore, "replace_all", spy_replace)
+
+    plan = mm.build_plan(home, env, cwd=work, update_declarations=True)
+    _apply(plan, home, env)
+
+    assert any(
+        "acme" in write.get("trustedMarketplaces", []) and "acme-skills" in write.get("trustedMarketplaces", [])
+        for write in settings_writes
+    ), "P1 必须在新键就绪时仍保留旧名（避免崩溃窗口熄灯）"
+    assert settings_writes[-1]["trustedMarketplaces"] == ["acme-skills"]
+    assert any("acme" in write.get("extraKnownMarketplaces", {}) for write in settings_writes)
+
+    assert len(value_writes) == 2, value_writes
+    assert "figma@acme/region" in value_writes[0] and "figma@acme-skills/region" in value_writes[0]
+    assert "figma@acme/region" not in value_writes[1]

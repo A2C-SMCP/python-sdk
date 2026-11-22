@@ -23,6 +23,7 @@ import pytest
 from typer.testing import CliRunner
 
 import a2c_smcp.computer.cli.main as cli_main
+from a2c_smcp.computer.cli.commands import marketplace as marketplace_mod
 from a2c_smcp.computer.cli.commands.marketplace import repl_dispatch
 from a2c_smcp.computer.settings import marketplace_migration as mm
 from a2c_smcp.computer.settings import store
@@ -126,9 +127,15 @@ def test_typer_migrate_conflict_exits_1_with_zero_writes(tmp_path: Path, monkeyp
     before = store.known_marketplaces_path(home).read_bytes()
     result = CliRunner().invoke(cli_main.app, ["marketplace", "migrate", "--apply", "--json"])
     assert result.exit_code == 1, result.output
-    assert json.loads(result.output)["status"] == "aborted"
+    payload = json.loads(result.output)
+    assert payload["status"] == "aborted"
+    assert payload["dryRun"] is False and payload["applied"] is False
     assert store.known_marketplaces_path(home).read_bytes() == before
     assert marketplace_skill_dir(home, "acme").is_dir()
+
+    human = CliRunner().invoke(cli_main.app, ["marketplace", "migrate", "--apply"])
+    assert human.exit_code == 1
+    assert "aborted" in human.output.lower()
 
 
 def test_typer_migrate_keyring_unavailable_exits_3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,3 +179,25 @@ def test_repl_migrate_apply_is_rejected(capsys: pytest.CaptureFixture[str], tmp_
     assert "must be run in a shell" in (out.out + out.err)
     assert store.known_marketplaces_path(home).read_bytes() == before
     assert marketplace_skill_dir(home, "acme").is_dir()
+
+
+def test_read_only_lock_probe_detects_existing_holder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """启动探测：既有旁车锁被持有 → True；不创建锁文件（dry-run 零写入）。"""
+    import fcntl
+    import os
+
+    home, _work = _setup(tmp_path, monkeypatch)
+    lock_path = store.known_marketplaces_path(home).with_name("known_marketplaces.json.lock")
+    assert not lock_path.exists()
+    assert marketplace_mod._probe_concurrent_writer(home, None) is False
+    assert not lock_path.exists()
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        assert marketplace_mod._probe_concurrent_writer(home, None) is True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        assert marketplace_mod._probe_concurrent_writer(home, None) is False
+    finally:
+        os.close(fd)
