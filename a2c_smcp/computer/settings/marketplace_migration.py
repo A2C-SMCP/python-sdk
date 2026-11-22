@@ -85,6 +85,7 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     read_manifest_marketplace_name,
     redact_ledger_key,
     same_source,
+    source_identity,
 )
 from a2c_smcp.computer.skills.sources import GitCloneSpec, LocalPluginSource, resolve_plugin_source
 from a2c_smcp.computer.skills.staging import external_plugin_dir, external_plugins_dir
@@ -413,6 +414,9 @@ def _find_renamed_target(known: Mapping[str, Any], old: str, source: object, hom
         try:
             manifest_name = read_manifest_marketplace_name(clone_dir)
         except MarketplaceIdentityError:
+            # 清单不可读时的次选证据：记录自身的 baseline 锚定在该名字上（baseline_derived 崩溃窗口）。
+            if record.get(MANIFEST_NAME_BASELINE_FIELD) == name:
+                matches.append(name)
             continue
         if manifest_name == name:
             matches.append(name)
@@ -447,12 +451,17 @@ def _classify(old: str, record: object, known: Mapping[str, Any], home: Path) ->
             new_dir = marketplace_skill_dir(home, renamed[0])
             try:
                 item.manifest = read_marketplace_manifest(new_dir)
-            except Exception:  # noqa: BLE001 - 清单不可读 → 保持 unresolved（下方统一处理）
+            except Exception:  # noqa: BLE001 - 清单不可读 → 只能接受 baseline 次选证据
                 item.manifest = {}
-            if item.manifest:
+            baseline_evidence = isinstance(record.get(MANIFEST_NAME_BASELINE_FIELD), str) and (
+                record.get(MANIFEST_NAME_BASELINE_FIELD) == renamed[0]
+            )
+            if item.manifest or baseline_evidence:
                 item.new = renamed[0]
                 item.action = ACTION_RENAME
                 item.already_renamed = True
+                if not item.manifest:
+                    item.baseline_derived = True
                 item.warnings.append(
                     f"directory already at {renamed[0]!r} but the old registration is still present; "
                     "the remaining references will be migrated (crash-recovery convergence)"
@@ -563,7 +572,7 @@ def _attach_references(item: MigrationItem, state: _State, env: Mapping[str, str
         "inputValues": 0,
         "secrets": 0,
         "catalog": "rename",
-        "externalTrees": _external_tree_count(home, item),
+        "externalTrees": 0,  # 冲突检测后统一计算（merge 与否在 attach 时未知）
         "ledger": "rebuild" if _pids_for(ledger, item.old) else "noop",
     }
 
@@ -652,6 +661,9 @@ def _detect_conflicts(items: list[MigrationItem], state: _State, home: Path, env
         elif existing is not None and _merge_scenario(item, state.known["marketplaces"], home):
             item.merge = True
             item.warnings.append(f"target name {new!r} is already registered from the same source; merging references")
+        elif item.already_renamed and item.baseline_derived and existing is not None:
+            # 清单不可读 → _merge_scenario 跑不了；§3.4 证据已确认「同源 + 目录已在新名」→ 视为 merge。
+            item.merge = True
 
         new_dir = marketplace_skill_dir(home, new)
         if new_dir.exists() or new_dir.is_symlink():
@@ -962,9 +974,6 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
             accounts["secrets"] += 1
 
     item.actions.update(accounts)
-    ext_old = external_plugins_dir(home, item.old)
-    if ext_old.is_dir():
-        item.actions["externalTrees"] = sum(1 for child in ext_old.iterdir() if child.is_dir())
     if item.already_renamed:
         item.actions["catalog"] = "noop"
 
@@ -1087,10 +1096,11 @@ def build_plan(
                 _attach_references(item, state, env, home)
         plan.conflicts = _detect_conflicts(items, state, home, env)
         for item in items:
-            if item.merge and item.action == ACTION_RENAME:
+            if item.action != ACTION_RENAME:
+                continue
+            if item.merge:
                 item.actions["catalog"] = "noop"
-                if external_plugins_dir(home, item.new or "").is_dir():
-                    item.actions["externalTrees"] = 0
+            item.actions["externalTrees"] = _external_tree_count(home, item)
     except SettingsFileCorruptError as exc:
         plan.corrupt.append(_corrupt_entry(Path(exc.path), exc))
         return plan
@@ -1255,6 +1265,21 @@ def _remove_user_references(item: MigrationItem, env: Mapping[str, str] | None) 
     _update_user_scope(env, _mutate)
 
 
+def _source_unchanged(planned: object, current: object) -> bool:
+    """
+    旧注册的 source 是否与**计划快照**相同（#298 终审 🟡2）/ Whether the source is unchanged from the plan.
+
+    不能用 ``same_source``：它要求可证明同源，``{"type":"git"}`` 缺 url / 裸字符串等不可识别形态会恒 False，
+    把「未变但不可识别」误判成换源。这里：两侧都可识别 → 规范化相等；两侧都不可识别 → **原值相等**；
+    一侧可识别另一侧不可 → 视为变化（fail-closed）。
+    """
+    planned_id = source_identity(planned)
+    current_id = source_identity(current)
+    if planned_id is None or current_id is None:
+        return planned_id is None and current_id is None and planned == current
+    return planned_id == current_id
+
+
 def _write_known_new(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
     """
     P2 第一步：写 ``known[new]``（baseline = new；旧键暂留）/ Write the new record (baseline reset).
@@ -1268,7 +1293,7 @@ def _write_known_new(item: MigrationItem, home: Path, env: Mapping[str, str] | N
     old_record = current.get(item.old)
     if not isinstance(old_record, Mapping):
         raise _ItemFailure(REASON_INVALID_RECORD, f"registration {item.old!r} disappeared during the migration")
-    if item.old_source is not None and not same_source(old_record.get("source"), item.old_source):
+    if item.old_source is not None and not _source_unchanged(item.old_source, old_record.get("source")):
         raise _ItemFailure(REASON_NAME_TAKEN, "the old registration source changed during the migration")
     existing = current.get(new_name)
     if isinstance(existing, Mapping):
@@ -1319,7 +1344,14 @@ def _precheck_claim(item: MigrationItem, known_map: Mapping[str, Any], home: Pat
     P2 会先写 ``known[new]``，因此这里把 ``new`` 预置进 known 视图后复用同一候选判据；0 个 →
     ``catalog-lost``，多个 → ``ambiguous-catalog``（都标 **unresolved**，§7.4；dry-run 即 exit 3、零写入）。
     """
-    if item.already_renamed or item.baseline_derived or not item.new:
+    if item.already_renamed or not item.new:
+        return
+    if item.baseline_derived:
+        old_dir = marketplace_skill_dir(home, item.old)
+        if not old_dir.is_dir() or old_dir.is_symlink():
+            item.action = ACTION_UNRESOLVED
+            item.reason = REASON_CATALOG_MISSING
+            item.warnings.append("baseline-derived migration requires the registered clone directory; none found")
         return
     new_dir = marketplace_skill_dir(home, item.new)
     if new_dir.exists() or new_dir.is_symlink():
@@ -1376,13 +1408,20 @@ def _rename_catalog(item: MigrationItem, home: Path, env: Mapping[str, str] | No
     new_dir = marketplace_skill_dir(home, item.new or "")
     old_dir = marketplace_skill_dir(home, item.old)
     if new_dir.exists() or new_dir.is_symlink():
-        if item.merge:
+        if item.merge or (item.baseline_derived and item.already_renamed):
             return
         known = store.load_known_marketplaces_strict(home, env)["marketplaces"]
         if _merge_scenario(item, known, home):
             item.merge = True
             return
         raise _ItemFailure(REASON_TARGET_DIR_EXISTS, f"target catalog directory {new_dir} already exists")
+
+    if item.baseline_derived:
+        # 清单不可读 → 旧目录不构成 §7.4 候选；**先**无条件搬注册的旧目录，绝不按清单名搬游离目录。
+        if not old_dir.is_dir() or old_dir.is_symlink():
+            raise _ItemFailure(REASON_CATALOG_LOST, "registered clone directory is missing or is a symlink")
+        old_dir.rename(new_dir)
+        return
 
     known = store.load_known_marketplaces_strict(home, env)["marketplaces"]
     new_record = known.get(item.new or "")
@@ -1395,10 +1434,6 @@ def _rename_catalog(item: MigrationItem, home: Path, env: Mapping[str, str] | No
         candidates = _claim_candidates(home, known, item.old, item.new or "")
         if len(candidates) == 1:
             candidates[0].rename(new_dir)
-            return
-        if not candidates and item.baseline_derived and old_dir.is_dir() and not old_dir.is_symlink():
-            # 清单不可读时无法按清单名认领；baseline 是唯一次选判据，搬登记的旧目录本身（不猜别的目录）。
-            old_dir.rename(new_dir)
             return
         if not candidates:
             raise _ItemFailure(REASON_CATALOG_LOST, "no claimable catalog directory for the new registration")
@@ -1430,8 +1465,9 @@ def _rename_external(item: MigrationItem, home: Path) -> None:
 
 
 def _norm_ledger_scope(record: Mapping[str, Any]) -> str:
-    """账本记录的 scope 归一（缺省 / 非 str → user，与 materialize 写入口径一致）。"""
-    return str(record.get("scope") or "user")
+    """账本记录的 scope 归一（缺省 / 非 str / 空 → user，与 materialize 写入口径一致）。"""
+    value = record.get("scope")
+    return value if isinstance(value, str) and value else "user"
 
 
 def _norm_project_path(record: Mapping[str, Any]) -> str | None:
@@ -1474,6 +1510,11 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
                 continue
             scope = _norm_ledger_scope(record)
             project_path = _norm_project_path(record)
+            if scope in {"project", "local"} and not project_path:
+                raise _ItemFailure(
+                    REASON_LEDGER_REBUILD_FAILED,
+                    f"plugin {plugin!r} has a {scope} ledger record without a valid projectPath",
+                )
             # 崩溃重跑：目标记录已完整物化 → 跳过重建（不改写 installedAt、不因瞬态失败误判为 incomplete）。
             already = [
                 existing
@@ -1572,7 +1613,12 @@ def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_n
     data: dict[str, Any] = dict(current) if isinstance(current, Mapping) else {}
     changed = False
     if write_new:
-        for _old_key, new_key, value in item.value_pairs:
+        for old_key, new_key, value in item.value_pairs:
+            if data.get(old_key) != value:
+                raise _ItemFailure(
+                    REASON_VALUE_TARGET_CONFLICT,
+                    f"source input value {old_key!r} changed during the migration; aborting before writing the new key",
+                )
             if new_key in data:
                 if data[new_key] != value:
                     raise _ItemFailure(
@@ -1588,6 +1634,11 @@ def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_n
                 raise _ItemFailure(
                     REASON_VALUE_TARGET_CONFLICT,
                     f"target input value {new_key!r} is missing or changed; keeping the old key",
+                )
+            if data.get(old_key) != value:
+                raise _ItemFailure(
+                    REASON_VALUE_TARGET_CONFLICT,
+                    f"source input value {old_key!r} changed during the migration; keeping the old key",
                 )
             if old_key in data:
                 data.pop(old_key, None)
@@ -1607,6 +1658,11 @@ def _rekey_secrets(item: MigrationItem, store_secrets: SecretStore, *, write_new
 
     if write_new:
         for pair in item.secret_pairs:
+            if _strict_get(pair.old_key) != pair.value:
+                raise _ItemFailure(
+                    REASON_SECRET_TARGET_CONFLICT,
+                    f"source secret {pair.old_key!r} changed during the migration; aborting before writing the new key",
+                )
             existing = _strict_get(pair.new_key)
             if existing is not None:
                 if existing != pair.value:
@@ -1626,6 +1682,11 @@ def _rekey_secrets(item: MigrationItem, store_secrets: SecretStore, *, write_new
                 raise _ItemFailure(
                     REASON_SECRET_TARGET_CONFLICT,
                     f"target secret key {pair.new_key!r} is missing or changed; keeping the old key",
+                )
+            if _strict_get(pair.old_key) != pair.value:
+                raise _ItemFailure(
+                    REASON_SECRET_TARGET_CONFLICT,
+                    f"source secret {pair.old_key!r} changed during the migration; keeping the old key",
                 )
             if not store_secrets.delete(pair.old_key):
                 item.warnings.append(f"old secret key {pair.old_key!r} could not be deleted (new key is in place)")
