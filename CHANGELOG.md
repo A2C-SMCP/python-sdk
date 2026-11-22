@@ -341,11 +341,16 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `enabled_origin` 恒 `None`，project-scope 激活的 bundled MCP server **绕过** #159 Option B 的
     PENDING 审批门被自动挂载。现与 `declared=None` 路径同门（与 rust 一致）：这类 server 落
     `pending_bundled_servers` 等用户批准，不再静默挂载。裸 `Mapping` 调用方无 per-scope 信息，
-    行为不变。
+    行为不变。**已知边界**：CLI 目前对 bundled PENDING 只打 INFO 日志、**没有批准入口**
+    （`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担，批准 UI 另开单跟踪
+    （见设计文档 §7）。
   - **脱敏**：`field` 的市场名段走 `redact_ledger_key`（段漏斗，比散文脱敏更严），`reason` 走散文脱敏，
-    两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗。`settings show` 的凭据回显仍是
-    [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。
-  - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度）见
+    两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗；`source_path` 走**路径轴**
+    （`sanitize_path_for_diagnostics`），并在**呈 userinfo 形态**时整值 fail-closed——覆盖四类会让路径轴
+    原语漏值的形态（干净 userinfo / 控制字符紧邻分隔符 / 段内空白 / percent-encoded），否则路径段凭据会
+    回显（详见设计文档 §6.1）。正常路径（Windows、`alice@corp`、普通 `%`、`?` 尾部）照常展示。
+    `settings show` 的凭据回显仍是 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。
+  - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度 / `source_path` 脱敏强度）见
     [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md) §6.1。
 - **Computer 停机卡死 + 外部取消信号被吞（#211）**：`_keep_alive_task` 拆除窗口内服务端消息到达时
   `aclose()` 抛 `ExceptionGroup`，跳过关闭信号 ⇒ `Computer.shutdown()` 永不返回。关闭信号与状态清理改为

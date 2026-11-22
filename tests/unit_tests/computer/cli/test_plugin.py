@@ -1312,3 +1312,37 @@ async def test_run_governance_remount_flag_declaration_error_scope_is_flag(
         report = await plugin_cmd.run_governance_remount(comp, settings_flag_path=flag_file)
 
     assert [(e.marketplace, e.scope) for e in report.marketplace_declaration_errors] == [("acme", SettingsScope.FLAG)]
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_holds_project_enabled_bundled_server_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #293（用户裁决）：project-scope 激活的 bundled server 经 CLI 重挂路径落 **PENDING**、不自动挂载。
+
+    触发序列：仓库提交 ``.tfrobot/settings.json`` 且 ``enabledPlugins={"audit@acme": true}``（入 git、随仓库
+    分发）→ ``run_mcp_approval`` 不覆盖 bundled 声明面（无批准框）→ 本路径必须靠 #159 Option B 的信任层
+    拦住，否则仓库作者一句 enable 就能让 bundled server 免批准直连。
+    判别力：不取 ``.per_scope_layers`` 时 ``recorded == [FIGMA_NAME]``（被挂载）、pending 为空，本用例转红。
+    """
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
+    _write_json(tmp_path / ".tfrobot" / "settings.json", {"enabledPlugins": {"audit@acme": True}})
+
+    async with Computer(name="t", skill_home=home) as comp:
+        recorded: list[str] = []
+
+        async def fake_register(server: Any, **kwargs: Any) -> None:
+            recorded.append(server.name)
+
+        # 即使门失守也**不真起 node 子进程**（否则用例要等 120s 连接超时）
+        monkeypatch.setattr(comp, "amount_server", fake_register)
+        report = await plugin_cmd.run_governance_remount(comp)
+
+    assert recorded == []
+    assert [r.plugin_id for r in report.pending_bundled_servers] == ["audit@acme"]
+    assert report.pending_bundled_servers[0].enabled_origin is SettingsScope.PROJECT

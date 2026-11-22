@@ -82,8 +82,8 @@ userinfo / query / fragment，path 段含凭据样文本一律占位符）。日
 
 `marketplace_declaration_errors` 的五个字段同样是展示值：`field` 保留 `extraKnownMarketplaces.` 前缀便于
 定位，其后的名字段按 `redact_ledger_key`（**段漏斗**，比散文脱敏更严）展示，`reason` 走
-`redact_git_urls_in_text`（散文，保留句式）+ 控制/方向覆写字符清洗，`source_path` 只做字符清洗（路径按
-路径对待，不做 URL 脱敏）。
+`redact_git_urls_in_text`（散文，保留句式）+ 控制/方向覆写字符清洗，`source_path` 走**路径轴**脱敏，
+并在呈 userinfo 形态时整值 fail-closed（详见 §6.1）。
 
 ### 3.4 非法声明（#293）
 
@@ -156,7 +156,7 @@ rust 侧的逐条结构化 `WARN` 带 `reason` 码，适合被日志检索/告�
 ### 6.1 非法声明（#293）的对拍差异
 
 字段与 DTO 形状**逐字镜像** rust（`MarketplaceDeclarationError`：`scope` / `marketplace` / `field` /
-`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），三处实现口径不同，均属有意的
+`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），四处实现口径不同，均属有意的
 SDK 自治差异：
 
 | 维度 | rust（`settings/schema.rs` + `computer.rs`） | python（本仓） | 理由 |
@@ -164,9 +164,25 @@ SDK 自治差异：
 | 脱敏落点 | **`validate_settings` 出口**统一脱敏，所有 `SettingsValidationError` 消费者（CLI 文本 / 报告 / 诊断）拿到同一安全值 | 只在**采集处**（`sanitized_marketplace_error`）脱敏；`format_settings_errors` 行为不变 | `settings show` 的凭据回显是独立安全单 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，用户裁决本单不提前改其行为。#295 落地时可直接复用该函数 |
 | Flag scope | **从 report 字段过滤掉**（其 CLI 启动边界另有打印 + `include_marketplace_declaration_errors` 抑制开关），WARN 仍记全量 | **不过滤**，`scope == flag` 照常进报告 | 用户裁决「报告**所有**前缀错误」，且已接受同次启动多条同义提示；python 没有 rust 那套抑制开关，过滤会让 flag 层错误从 report 消失（库宿主无处可见） |
 | 名字脱敏强度 | 名字与 reason 同走散文脱敏（`redact_git_urls_in_text`，只去 userinfo、保留 path） | 名字走**段漏斗**（`redact_ledger_key`），reason 才走散文脱敏 | 名字是**单个不可信值**：path 段里的 `alice:PW@example.com` 会被散文脱敏原样放出（#261 已定的口径） |
+| `source_path` 脱敏 | 只 `scrub_diagnostic_chars`（其测试 `test_extra_marketplaces_error_source_path_scrubbed_not_url_redacted` 明确断言 Windows 路径原样保留、不做 URL 脱敏）⇒ 路径段里的 `alice:pw@…` **会回显** | 路径轴 `sanitize_path_for_diagnostics` + **userinfo 形态整值 fail-closed** 守卫；正常路径（Windows / `alice@corp` / 普通 `%` / `?` 尾部）照常展示 | 诊断面同样不该回显路径段凭据；`/` 与 `\` 双段边界避免 scp-like 脱敏器把 Windows 路径整条吞掉（#263 四轮）。python 此处比 rust 严 |
 
-`source_path` 两端都按**路径轴**脱敏（段边界 ``/`` 与 ``\``、段内普通 `@` 保留），与名字/URL 轴不同——
-这是 #263 四轮复审定下的路径原语，Windows 路径与 `alice@corp` 不会被 scp-like 脱敏器整条吞掉。
+`source_path` 的 fail-closed 守卫覆盖**四类**「路径轴原语必漏」的 userinfo 形态（均已实测回显密码）：
+
+1. **干净 userinfo**（`/home/alice:pw@example.com/...`）——原语本可处理，但为口径单一也整值占位；
+2. **控制 / 方向覆写字符紧邻分隔符**——`scrub_diagnostic_chars` 把控制字符换成**空格**（userinfo 正则要求
+   `:` 前非空白），`sanitize_path_for_diagnostics` 又在匹配**之前**把 ESC 转义成含反斜杠的 `\x1b`
+   （反斜杠本身是段边界），两者都把 userinfo 拆开；
+3. **段内空白**（`alice:my pw pass@example.com`）——原语正则 `[^\s/\\:@]+:[^\s/\\@]+@` 直接失配；
+4. **percent-encoded**（`alice%3Apw%40example.com`）——原串无字面 `@`，原语在
+   `if not any(marker in escaped for marker in ("@", "?", "#"))` 处**提前返回**、根本不做脱敏。
+
+判据是「任一路径段里 `@` 之前出现过 `:`」（`_looks_like_userinfo`），对**原串**与其**逐轮 percent-decode
+形态**（封顶 3 轮，与 #282 同口径）各判一次；命中即整值占位。负对照：只含控制字符、无 userinfo 形态的路径
+仍按字符清洗保留可读性；Windows 路径（`alice@corp`）、普通 `%` 路径、`?`/`#` 尾部照常由路径轴原语处理，
+不会被整条遮蔽。
+
+根因在共享原语 `utils/git_url.py::sanitize_path_for_diagnostics`（先 escape 再判段、且要求字面标记），
+修它会波及 #236 / 路径 resolver 等全部调用方，故本单**不改共享原语**，只在采集处 fail-closed。
 
 **`reason` 的散文脱敏不对 path 段 fail-closed**（与名字段不对称）：`redact_git_urls_in_text` 只去 userinfo、
 保留 path。当前**不可达**——`_validate_extra_marketplaces` 的 reason 全是静态文案（`malformed git url` /
@@ -196,6 +212,8 @@ validator 把值拼进 reason）。若将来有 reason 携带用户值，应改�
 | `settings.json` 整文件不可解析时只记一条 `<file>` 错误，不含 marketplace 子树 | 既有行为（§5.6 容错），不在本设计范围 |
 | CLI 三类展示（声明错误 / 源冲突 / failed）未接线 | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) |
 | `reason` 的散文脱敏不对 path 段 fail-closed（当前 reason 全静态、不可达） | §6.1；reason 若引入用户值时改走段漏斗 |
+| `sanitize_path_for_diagnostics` 的「先 escape 再判段 + 要求字面 `@`/`?`/`#`」在**其他**调用方仍可能漏 path 段凭据（控制字符邻接 / 段内空白 / percent-encoded 三类） | 共享原语问题，不在本单；本单只在 `source_path` 采集处 fail-closed |
+| project-origin bundled server 落 PENDING 后，CLI 只打 INFO 日志、**没有批准入口**（`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担（参考 client 未来补线索） | follow-up（架构师开跟踪 issue，不在 #293/#294 实现） |
 
 ## 8. 不做
 

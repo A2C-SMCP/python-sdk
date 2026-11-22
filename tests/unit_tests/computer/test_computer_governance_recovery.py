@@ -483,6 +483,11 @@ async def test_boot_up_summary_counts_declared_source_conflicts(
     from a2c_smcp.computer import computer as computer_mod
 
     # 项目 logger 关闭 propagate，直接挂 handler；取模块 logger（get_logger 会加包前缀，名字不可硬编码）。
+    # 并钉住 ambient 级别（`A2C_SMCP_LOG_LEVEL` 可在 import 时把它设成 error/warning）——否则宿主环境一变
+    # `logger.info` 连 record 都不生成，本用例会假红。
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.INFO)
     computer_mod.logger.addHandler(caplog.handler)
     try:
         caplog.set_level(logging.INFO)
@@ -490,6 +495,7 @@ async def test_boot_up_summary_counts_declared_source_conflicts(
             report = await comp.reconcile_governance()
     finally:
         computer_mod.logger.removeHandler(caplog.handler)
+        a2c_logger.setLevel(prev_level)
 
     # 零恢复形态：无 SKILL 恢复、无降级，**只有**冲突——汇总行必须仍被打印
     assert report.restored_skills == [] and report.failed_marketplaces == []
@@ -891,3 +897,40 @@ async def test_boot_up_summary_not_triggered_by_unrelated_settings_error(
     assert report.marketplace_source_conflicts == []
     summaries = [r.getMessage() for r in caplog.records if "skills restored" in r.getMessage()]
     assert summaries == [], summaries
+
+
+@pytest.mark.asyncio
+async def test_reconcile_governance_hand_rolled_resolved_settings_without_layers_skips_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #293 契约（已文档化）：手搓 ``ResolvedSettings`` 且 ``per_scope_layers`` 为空（默认值）⇒ 等同无 per-scope
+    信息 ⇒ 信任门**不触发**（与裸 ``Mapping`` 同语义）。
+
+    这不是「project-origin 免审批」的漏洞开关：``ResolvedSettings`` 是 ``resolve_settings`` 的产物，手搓它本就
+    离契约；需要门控的宿主 MUST 传真实解析结果。本用例把该语义钉死，防止有人「顺手」改成对空 layers 也
+    落 PENDING——那会让 user-scope 启用的 bundled server 在宿主手搓载体时被无端拦住。
+    """
+    from a2c_smcp.computer.settings.scope import ResolvedSettings
+
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, servers=[FIGMA_NAME])
+    hand_rolled = ResolvedSettings(
+        settings={"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}},
+    )
+    assert hand_rolled.per_scope_layers == {}  # 默认值即空
+
+    mounted: list[str] = []
+
+    async def register(cfg, record: BundledServerRecord) -> None:
+        mounted.append(cfg.name)
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance(
+            existing_bundle_ids=lambda: set(),
+            register_server=register,
+            declared=hand_rolled,
+        )
+
+    assert mounted == [FIGMA_NAME]
+    assert report.pending_bundled_servers == []

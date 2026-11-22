@@ -2486,6 +2486,13 @@ class Computer(BaseComputer[PromptSession]):
 
             ``per_scope_layers`` 的唯一来源是「内部解析」或「传入的 ``ResolvedSettings``」；裸 ``Mapping``
             是其结构性缺席（协议 §2.5-5 明许 scope 纯推导与挂载时标记行为等价）。
+
+            ⚠️ **手搓的 ``ResolvedSettings`` 若 ``per_scope_layers`` 为空**（该字段的默认值）**等同无
+            per-scope 信息** ⇒ ``enabled_origin is None`` ⇒ **按 user/unknown 处理**（#159 Option B 信任门
+            **不触发**，与裸 ``Mapping`` 同语义）。这**不是**「project-origin 免审批」的漏洞开关——它只对
+            「宿主自己编了一个 ``ResolvedSettings``」成立；需要门控的宿主 MUST 传
+            :func:`~a2c_smcp.computer.settings.scope.resolve_settings` 的产物（其 layers 恒为真实逐层视图）。
+            该语义由 ``test_reconcile_governance_hand_rolled_resolved_settings_without_layers_skips_gate`` 钉住。
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
         # 运行时导入：本模块只在 TYPE_CHECKING 下引入该类型（无环，只为不拉重）。

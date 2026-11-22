@@ -20,10 +20,11 @@ installed ∧ ``enabledPlugins[pid] is True``，缺省翻转）:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -513,11 +514,16 @@ async def test_recover_rematerialize_failure_log_is_redacted(
     from a2c_smcp.computer.settings import recovery as recovery_mod
 
     recovery_logger = recovery_mod.logger
+    # 钉住 ambient 级别：WARN 在宿主把 `A2C_SMCP_LOG_LEVEL` 设成 error 时不会生成 record。
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.WARNING)
     recovery_logger.addHandler(caplog.handler)  # 项目 logger 关闭 propagate，直接挂 handler
     try:
         await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
     finally:
         recovery_logger.removeHandler(caplog.handler)
+        a2c_logger.setLevel(prev_level)
 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "re-materialize" in text  # 正对照：确实走到了该分支
@@ -918,6 +924,35 @@ def _verr(field: str, reason: str, scope: SettingsScope = SettingsScope.USER, so
     return SettingsValidationError(scope=scope, field=field, reason=reason, source_path=source_path)
 
 
+@contextlib.contextmanager
+def _capture_recovery_logs(level: int) -> Iterator[list[logging.LogRecord]]:
+    """
+    捕获 recovery logger 的记录，**显式钉住包级 logger 等级**并在 finally 还原。
+
+    包级 logger 的有效级别由 ``A2C_SMCP_LOG_LEVEL`` 在 import 时固定（默认 INFO）——不钉住的话，
+    断言 DEBUG 记录会在 CI（INFO）假红、在本机（父目录 gitignored ``.env`` 设 debug）假绿。
+    项目 logger ``propagate=False``，故直接挂 handler 而非用 caplog 的默认路径。
+    """
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(level)
+    sink = _Sink(level=level)
+    recovery_mod.logger.addHandler(sink)
+    try:
+        yield records
+    finally:
+        recovery_mod.logger.removeHandler(sink)
+        a2c_logger.setLevel(prev_level)
+
+
 def test_sanitize_marketplace_name_uses_segment_funnel() -> None:
     """市场名是**单个不可信值**：走段漏斗（path 段里的凭据也挡），比散文脱敏更严（#261 口径）。"""
     assert sanitize_marketplace_name(_SECRET_URL) == "https://example.com/repo.git"
@@ -1024,7 +1059,7 @@ def test_marketplace_declaration_errors_redacts_and_scrubs() -> None:
     # 段漏斗 fail-closed：path 段凭据整值占位，绝不回显
     assert path_cred.marketplace == "<redacted-git-source>"
     assert "PW" not in path_cred.field and "alice" not in path_cred.field
-    # source_path 只做字符清洗（不做 URL 脱敏），控制字符 / 方向覆写仍须清掉
+    # source_path：非 userinfo 形态 ⇒ 路径轴处理（控制字符 / 方向覆写仍须清掉，路径保持可读）
     assert userinfo.source_path == "/tmp/ev il/settings [31m.json"
     for error in got:
         for blob in (error.marketplace or "", error.field, error.reason, error.source_path or ""):
@@ -1043,27 +1078,8 @@ def test_attach_marketplace_declaration_errors_logs_summary_at_default_info() ->
         _verr(f"extraKnownMarketplaces.{_SECRET_URL}.source.url", f"malformed git url: {_SECRET_URL}"),
         _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.LOCAL),
     ]
-    from a2c_smcp.computer.settings import recovery as recovery_mod
-
-    captured: list[logging.LogRecord] = []
-
-    class _Sink(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            captured.append(record)
-
-    sink = _Sink(level=logging.DEBUG)
-    # 逐条诊断是 DEBUG：包级 logger 的**有效级别**由 `A2C_SMCP_LOG_LEVEL` 在 import 时固定（默认 INFO），
-    # INFO 下 `logger.debug` 连 record 都不生成。必须显式放开，否则本机（父目录 gitignored `.env` 设了
-    # debug）绿、CI 干净 checkout 红。
-    a2c_logger = logging.getLogger("a2c_smcp")
-    prev_level = a2c_logger.level
-    a2c_logger.setLevel(logging.DEBUG)
-    recovery_mod.logger.addHandler(sink)
-    try:
+    with _capture_recovery_logs(logging.DEBUG) as captured:
         attach_marketplace_declaration_errors(report, errors)
-    finally:
-        recovery_mod.logger.removeHandler(sink)
-        a2c_logger.setLevel(prev_level)
 
     assert len(report.marketplace_declaration_errors) == 2
     warnings = [r.getMessage() for r in captured if r.levelno == logging.WARNING]
@@ -1086,24 +1102,8 @@ def test_attach_marketplace_declaration_errors_dedups_names_in_summary() -> None
         _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.USER),
         _verr("extraKnownMarketplaces.acme.source.url", "malformed git url", SettingsScope.LOCAL),
     ]
-    from a2c_smcp.computer.settings import recovery as recovery_mod
-
-    captured: list[logging.LogRecord] = []
-
-    class _Sink(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            captured.append(record)
-
-    a2c_logger = logging.getLogger("a2c_smcp")
-    prev_level = a2c_logger.level
-    a2c_logger.setLevel(logging.DEBUG)
-    sink = _Sink(level=logging.DEBUG)
-    recovery_mod.logger.addHandler(sink)
-    try:
+    with _capture_recovery_logs(logging.DEBUG) as captured:
         attach_marketplace_declaration_errors(report, errors)
-    finally:
-        recovery_mod.logger.removeHandler(sink)
-        a2c_logger.setLevel(prev_level)
 
     assert [e.scope for e in report.marketplace_declaration_errors] == [SettingsScope.USER, SettingsScope.LOCAL]
     summary = next(r.getMessage() for r in captured if r.levelno == logging.WARNING)
@@ -1114,37 +1114,63 @@ def test_attach_marketplace_declaration_errors_dedups_names_in_summary() -> None
 def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> None:
     """负对照：无错误 ⇒ 报告空、零日志（不得每次 boot 都刷一条「0 条错误」）。"""
     report = GovernanceRecoveryReport()
-    from a2c_smcp.computer.settings import recovery as recovery_mod
-
-    captured: list[logging.LogRecord] = []
-
-    class _Sink(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            captured.append(record)
-
-    sink = _Sink(level=logging.DEBUG)
-    recovery_mod.logger.addHandler(sink)
-    try:
+    with _capture_recovery_logs(logging.DEBUG) as captured:
         attach_marketplace_declaration_errors(report, [])
-    finally:
-        recovery_mod.logger.removeHandler(sink)
 
     assert report.marketplace_declaration_errors == []
     assert captured == []
 
 
-def test_source_path_uses_path_axis_redaction() -> None:
+def test_source_path_keeps_readable_paths() -> None:
     """
-    ``source_path`` 走**路径轴**脱敏（`sanitize_path_for_diagnostics`），不是 URL / scp-like 脱敏器：
+    ``source_path`` 的负对照（防过度遮蔽）：不含 userinfo 形态的正常路径**逐字保留**，不做整值占位。
 
-    - 携凭据的路径**段**（``alice:pw@example.com``）整段占位；
-    - 普通 Windows 路径与段内 ``alice@corp`` **逐字保留**（scp-like 脱敏器会把它整条吞掉，那正是不能用它的原因）。
+    - 普通 Windows 路径与段内 ``alice@corp``（scp-like 脱敏器会把它整条吞掉，那正是不能用它的原因）；
+    - 普通含 ``%`` 的路径（不得因为「看起来像编码」就误遮）；
+    - ``?``/``#`` 尾部仍由路径轴原语遮蔽（非整值占位）。
     """
-    dirty = "/home/alice:pw@example.com/a2c/settings.json"
-    assert "pw" in dirty  # 正对照：原始路径确实带凭据
-    (redacted,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
-    assert redacted.source_path == "/home/<redacted-source>/a2c/settings.json"
-
     windows = "C:\\repos\\alice@corp\\settings.json"
     (kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=windows)])
     assert kept.source_path == windows
+
+    pct = "/home/100%25done/settings.json"
+    (also_kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=pct)])
+    assert also_kept.source_path == pct
+
+    query = "/srv/x/settings.json?token=SECRET"
+    (masked,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=query)])
+    assert masked.source_path == "/srv/x/settings.json<redacted-source>"
+    assert "SECRET" not in masked.source_path
+
+
+@pytest.mark.parametrize(
+    "dirty",
+    [
+        # 四类「路径轴原语必漏」的 userinfo 形态：
+        "/home/alice:pw@example.com/settings.json",  # (1) 干净 userinfo（统一口径：整值占位）
+        "/home/alice\u202e:pw@example.com/settings.json",  # (2) 控制/方向覆写紧邻 `:` → scrub 换空格
+        "/home/alice:pw\u202e@example.com/settings.json",
+        "/home/alice\x1b:pw@example.com/settings.json",  # (3) ESC → escape 引入反斜杠段边界
+        "/home/alice:pw\x1b@example.com/settings.json",
+        "/home/alice:my pw pass@example.com/settings.json",  # (4) 段内空白 → 原语正则失配
+        "/home/alice%3Apw%40example.com/settings.json",  # (5) percent-encoded：原串无字面 `@`，原语早退
+        "/home/alice%253Apw%2540example.com/settings.json",  # 双层编码
+    ],
+)
+def test_source_path_fails_closed_on_userinfo_shape(dirty: str) -> None:
+    """
+    ``source_path`` 的 fail-closed 守卫：任一路径段呈 ``user:secret@host`` 形态 ⇒ 整值占位。
+
+    判别力：去掉守卫后 (2)–(5) 全部回显 ``pw``（实测）；守卫不能被换成「先 sanitize 再 scrub」——
+    ``alice:pw\\x1b@…`` 仍漏（原语在匹配前就 escape 了），(5) 则根本不进脱敏分支。
+    """
+    assert "pw" in dirty.lower()  # 正对照：原始路径确实带凭据
+    (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
+    assert out.source_path == "<redacted-git-source>"
+
+
+def test_source_path_with_control_chars_but_no_userinfo_is_still_scrubbed() -> None:
+    """负对照（防过度遮蔽）：只含控制字符、无 ``@`` 的路径仍按字符清洗保留可读性，不做整值占位。"""
+    dirty = "/tmp/ev\u202eil/settings\x1b[31m.json"
+    (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
+    assert out.source_path == "/tmp/ev il/settings [31m.json"

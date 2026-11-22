@@ -28,7 +28,9 @@ inputs 注入 Computer 池。
 
 **MCP 批准框（#69 Group B，§9.2）**：:func:`run_mcp_approval` 在 REPL 启动期跑——解析 ``.tfrobot/mcp.json``
 定义层、套门控、对 ``PENDING`` server 弹 y/a/n（写 local scope）；非交互无 TTY → skip+WARN（``--approve-all-mcp``
-可全批、仅本次不落盘）。bundled / user-flag-policy origin 免批准（门控已判 ENABLED）。
+可全批、仅本次不落盘）。user/local/flag/policy origin 免批准（门控已判 ENABLED）；**bundled server 不在本
+门内**（它由 :func:`run_governance_remount` 的 #159 Option B 信任层把关：受信 scope 免批准，project-origin
+落 PENDING）。
 """
 
 from __future__ import annotations
@@ -236,7 +238,10 @@ async def run_governance_remount(
     - ``existing_bundle_ids`` **必传**（#153：取 :func:`build_mcp_callbacks` 装配的**运行期权威**集，
       **不是** ``comp.mcp_servers`` 构造期快照——后者 CLI 下恒空，会把已挂的用户 server 判成不存在、
       令 bundled server 覆盖它）：同 bundle_id 已有 = 依赖已满足 → reconcile_governance 内部 skip（用户配置胜）；
-      bundled **免批准**（§5.10 不走 project 信任门），单点失败不阻断。
+      **仅受信 scope origin（user/local/flag/policy）免信任层**；project-origin 激活的 bundled server 走
+      #159 Option B 的 PENDING 审批门、**不自动挂载**（§5.10 的免批准只覆盖受信来源；#293 起本路径取
+      ``ResolvedSettings.per_scope_layers`` ⇒ 与 ``declared=None`` 路径同门，见
+      :meth:`Computer.reconcile_governance`）。单点失败不阻断。
     - #293：declared 传**整对象** ``ResolvedSettings``（``resolved_settings_with_errors``）而非裸
       ``.settings`` dict——其中被 settings 校验整条丢弃的非法 ``extraKnownMarketplaces`` 声明必须进入
       :attr:`~a2c_smcp.computer.settings.recovery.GovernanceRecoveryReport.marketplace_declaration_errors`，

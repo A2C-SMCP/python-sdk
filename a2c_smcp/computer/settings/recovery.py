@@ -35,10 +35,12 @@ ownership; process materialization stays with the client (#93).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.installer import materialize_plugin
@@ -80,7 +82,7 @@ from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
-from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_path_for_diagnostics
+from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, redact_git_urls_in_text, sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -185,7 +187,8 @@ class MarketplaceDeclarationError:
     ``field`` / ``reason`` / ``source_path`` 均已经过脱敏与控制字符清洗（见
     :func:`sanitized_marketplace_error`）：``field`` 保留 ``extraKnownMarketplaces.`` 前缀便于定位，
     其后的市场名段按 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key` 口径展示
-    （市场名是不可信手编值，可含凭据形态 URL）。**三字段与 ``marketplace`` 全是展示值**，不可用于任何
+    （市场名是不可信手编值，可含凭据形态 URL）；``source_path`` 走**路径轴**展示，呈 userinfo 形态时整值
+    fail-closed（见 :func:`sanitize_source_path`）。**三字段与 ``marketplace`` 全是展示值**，不可用于任何
     再克隆 / 比较 / 去重。
     """
 
@@ -229,6 +232,67 @@ def sanitize_marketplace_text(text: str) -> str:
     return scrub_diagnostic_chars(redact_git_urls_in_text(text))
 
 
+def _looks_like_userinfo(text: str) -> bool:
+    """
+    任一路径段是否形如 ``user:secret@host``（#293 的 fail-closed 判据）/ Any segment shaped like userinfo.
+
+    判据刻意**宽于** :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 的凭据正则
+    （``[^\\s/\\\\:@]+:[^\\s/\\\\@]+@``）：只要某段里 ``@`` 之前出现过 ``:`` 就算命中。理由是**判别**与
+    **遮蔽**的目标不同——这里只需要回答「这段像不像 userinfo」，任何无法证明不是的情况都应 fail-closed。
+    例：``alice:my pass@example.com``（段内空白）与 ``alice<U+202E>:pw@example.com``（控制字符）都让
+    那条严格正则失配，但显然都是凭据形态。
+    """
+    for segment in re.split(r"[/\\]", text):
+        at = segment.find("@")
+        if at > 0 and ":" in segment[:at]:
+            return True
+    return False
+
+
+def _percent_decoded_forms(text: str, *, max_rounds: int = 3) -> list[str]:
+    """
+    逐轮 percent-decode 的中间形态（不含原文）/ Successive percent-decoded forms (excluding the input).
+
+    ``%3A`` / ``%40`` 形态的 userinfo 在原串里既没有 ``:`` 也没有 ``@``，只解一轮不够（``%253A`` 要两轮）。
+    与 #282 同口径封顶轮数，只用于**判别**，不用于任何落盘 / 比较。
+    """
+    forms: list[str] = []
+    current = text
+    for _ in range(max_rounds):
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        forms.append(decoded)
+        current = decoded
+    return forms
+
+
+def sanitize_source_path(path: str) -> str:
+    """
+    ``source_path`` 的诊断展示值：userinfo 形态整值 fail-closed + 其余走路径轴脱敏（#293）/
+    Display-safe settings-file path.
+
+    1. **fail-closed 守卫**：原串、或用其逐轮 percent-decode 形态，存在形如 ``user:secret@host`` 的段
+       （见 :func:`_looks_like_userinfo`）时，整值替换为
+       :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`。为什么要绕过路径轴原语：
+       - :func:`~a2c_smcp.computer.settings.schema.scrub_diagnostic_chars` 把控制字符换成**空格**，
+         userinfo 正则要求 ``:`` 前非空白 ⇒ 拆开后漏出密码；
+       - :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 在匹配**前**先
+         ``escape_unsafe_chars``，把 ESC 变成含反斜杠的 ``\\x1b``，而反斜杠本身是它的段边界 ⇒ 同样拆开；
+       - 它还要求**字面** ``@`` / ``?`` / ``#`` 才进入脱敏分支，``alice%3Apw%40example.com`` 直接原样返回。
+
+       三类都实测可泄漏，故一旦判定为凭据形态就整值占位（宁可少给诊断信息，不可漏值）。
+    2. 否则走 :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：``/`` 与 ``\\``
+       都当段边界、段内普通 ``@`` 保留、authority 位置的 ``TOKEN@host`` 与 ``?``/``#`` 尾部整段遮蔽）。
+       它**不是** URL / scp-like 脱敏器，Windows 路径与 ``alice@corp`` 不会被整条吞掉。
+
+    :param path: :attr:`SettingsValidationError.source_path`（不可信：可由 ``--settings <file>`` 指定）。
+    """
+    if _looks_like_userinfo(path) or any(_looks_like_userinfo(form) for form in _percent_decoded_forms(path)):
+        return REDACTED_GIT_SOURCE
+    return sanitize_path_for_diagnostics(scrub_diagnostic_chars(path))
+
+
 def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDeclarationError | None:
     """
     单条 settings 校验错误 → 脱敏 :class:`MarketplaceDeclarationError`；非 marketplace 子树返回 ``None``。
@@ -254,13 +318,7 @@ def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDe
         marketplace=declaration_marketplace(field, reason),
         field=field,
         reason=reason,
-        # 路径按**路径轴**脱敏：先清控制 / 方向覆写字符，再走
-        # :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：`/` 与 `\` 都当段边界、
-        # 段内普通 `@` 保留、authority 位置的 `TOKEN@host` 与 `?`/`#` 尾部整段遮蔽）——它**不是** URL /
-        # scp-like 脱敏器，Windows 路径与 `alice@corp` 不会像后者那样被整条吞掉。
-        source_path=None
-        if error.source_path is None
-        else sanitize_path_for_diagnostics(scrub_diagnostic_chars(error.source_path)),
+        source_path=None if error.source_path is None else sanitize_source_path(error.source_path),
     )
 
 
