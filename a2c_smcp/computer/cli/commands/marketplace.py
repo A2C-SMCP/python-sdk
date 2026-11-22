@@ -75,6 +75,7 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     REASON_UNRESOLVABLE_NAME,
     MarketplaceIdentityError,
     MarketplaceNameChangeError,
+    is_safe_registration_path_segment,
     manifest_marketplace_name,
     read_manifest_marketplace_name,
     redact_ledger_key,
@@ -603,6 +604,9 @@ def _manifest_name_for_display(home: Path, name: str) -> tuple[str | None, bool]
     清单内容来自 git 源、属不可信输入：只有**合法严格 kebab** 才原样展示；清单不可读 → ``(None, False)``；
     可读但名字非法（可能携带凭据样文本）→ ``(None, True)``，**绝不回显原值**（演示规则同 ``redact_ledger_key``）。
     """
+    # 手编账本键可含 ``../`` / 分隔符：先过与迁移检测同一路径段守卫，绝不按任意键拼路径读盘。
+    if not is_safe_registration_path_segment(name):
+        return None, False
     clone_dir = marketplace_skill_dir(home, name)
     if not clone_dir.is_dir() or clone_dir.is_symlink():
         return None, False
