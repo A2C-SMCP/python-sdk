@@ -241,7 +241,7 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
 | F2 | user `enabledPlugins` | 权威 | 键以 `@<old>` 结尾 | 新键 = 旧值（`true`/`false` 都照抄），再删旧键 | fail-closed |
 | F3 | project / local `enabledPlugins`、以及 project/local 的 `installedPlugins` 声明 | 权威（**只报告**） | 同 F2；扫描面 = `os.getcwd()` ∪ 账本 `projectPath` | **不改**，输出文件 + 点路径 + 建议片段；**并显式告警「迁移后该插件将处于未启用态」** | 不适用（该告警不阻塞执行，但令退出码为 3，且写入汇总与 `--json`） |
 | F4 | `trustedMarketplaces` | 权威 | 元素 ∈ 旧名集 | 加新名 → 删旧名 | 加失败 fail-closed；删失败 WARN（残留只是陈旧标记，见 §4.2 F4） |
-| F5 | plugin input 值 | 权威 | 键前缀 `<plugin>@<old>/`（**按克隆/外树 `inputs.json` 派生候选**，非按键前缀全表扫） | 单次原子写：新键 ← 旧值，删旧键 | **目标键已存在且值不同 → 该项 abort（零写入）**；其余 fail-closed（**先写后删**，中途失败不丢值） |
+| F5 | plugin input 值 | 权威 | 键前缀 `<plugin>@<old>/`（**按克隆/外树 `inputs.json` 派生候选**，非按键前缀全表扫） | **P1 单次原子写加新键；P3 单次原子写删旧键**（对齐 §7.1 分阶段） | **目标键已存在且值不同 → 该项 abort（零写入）**；其余 fail-closed（**先写后删**，中途失败不丢值） |
 | F6 | plugin secret | 权威 | **从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选**（D14）；已从清单移除的 plugin 经账本 `installPath` 定位 | keyring：写新 → 回读验证 → 删旧 | **旧 secret 存在且 keyring 不可用 → 该项 abort（零写入）、其余继续、退出码 3**；**目标键已存在且值不同 → abort**；本次已 set 的新键在失败时清理；绝不落明文 |
 | F7 | `known_marketplaces[<old>]` | 派生 | — | 先写 `known[new]`（`installLocation` 重算、`manifestNameBaseline = new`），待搬迁与重建完成后删 `known[old]` | 失败 → 保留旧条目（可重建） |
 | F8 | catalog clone | 派生 | 目录存在性 | `<home>/marketplace/<old>` → `<new>` rename | 失败 → 该项 abort（保留旧状态）；不做重 clone，恢复交 `marketplace add/refresh` |
@@ -277,8 +277,9 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
   **迁移层不复用它们**——迁移把 `trustedMarketplaces` 与 `blockedMarketplaces` 合并进**一次** user-scope raw RMW
   （§4.1 F13a），避免 N 次锁写与中间态。删除旧名失败降级 WARN（沿用 `marketplace_remove` 的既有姿态）。
 
-**F5 —— value store 单次原子写 + 目标键冲突**：`input-values.json` 是整文件 map（`value_store.py:55`），一次
-`ValueStore.set` 等价于「读-改-写整文件」。迁移把「写新 + 删旧」合并成**一次**原子写，避免两次写之间的半态。
+**F5 —— value store 分阶段单次原子写 + 目标键冲突**：`input-values.json` 是整文件 map（`value_store.py:55`），
+一次 `ValueStore.replace_all` 等价于「读-改-写整文件」。**P1 只加新键（一次原子写）**、**P3 只删旧键（一次原子写）**：
+与 §7.1「P1 新侧就绪、P3 撤旧侧」一致——若 P1 就删旧键，P2 失败会让旧注册的 input 值凭空消失。
 写前检查目标键：已存在且值不同 → **该项 abort（零写入）**；同值 → 视为已迁移（幂等 no-op）。
 文件本身不可读 / 非法 JSON → **命令级 abort（strict loader，exit 3）**，绝不把它「修复」成空 map。
 
@@ -290,7 +291,9 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
    （已不在清单、也已卸载的 plugin 见下方「已知边界」）
 2. 已装但**已从清单移除/改名**的 plugin：按账本 `installPath` 定位其 `inputs.json`（键名 plugin 段取 pid 前缀）；
 3. 既无清单条目又无可用 `installPath` → **无法证明无旧 secret** → 该项 abort（零写入，exit 3）；
-4. 候选 `inputs.json` 缺失 / 畸形 / plugin 根不可读 → 该项 abort（保守，不猜）。
+4. **已安装** plugin 的 `inputs.json` 畸形 / 根不可读 → 该项 abort（保守，不猜）；
+   **从未安装且无根**的清单内 plugin **不计候选**（不存在可被写入的 scoped secret，2026-11-22 架构师确认）；
+   `inputs.json` 缺失本身不是错误（该 plugin 无 inputs）。
 
 写序：`get(old)` → `set(new)` → 回读校验；仅当 `set` 成功且 `get(new)` 与旧值相等才 `delete(old)`。
 **目标键已存在且值不同 → abort（不覆盖既有 secret）**；`delete(old)` 失败只告警（新键已可读，值不丢）。
@@ -404,7 +407,7 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
   "updateDeclarations": false,
   "items": [
     {
-      "old": "acme", "new": "acme-skills", "action": "rename",   // rename | noop | unresolved | blocked | not-selected
+      "old": "acme", "new": "acme-skills", "action": "rename",   // rename | noop | unresolved | blocked | aborted | not-selected
       "reason": null,                                            // unresolved/blocked 的机器码（§3.3）
       "source": "https://…(脱敏展示)",
       "plugins": [{"id": "figma@acme", "newId": "figma@acme-skills", "action": "move"}],
@@ -892,3 +895,4 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |
+| 2026-11-22 | **P1 实现期澄清（不改语义）**：F5 明确 P1 加新键 / P3 删旧键（与 §7.1 一致）；F6 第 4 条明确「未安装且无根」的清单内 plugin 不计候选（架构师确认）；`aborted` 补入 JSON action 枚举 |

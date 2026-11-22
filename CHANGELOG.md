@@ -164,6 +164,23 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 
+- **`marketplace migrate`：存量 marketplace 注册名迁移（#268 / D3）**：把 0.5.1 之前以 URL 派生名 /
+  显式 `--name` 别名注册的 marketplace 迁移到清单顶层 `name`，并同步改写全部引用面：
+  - 权威面（user scope）：`installedPlugins` / `enabledPlugins`（含显式 `false`）/ `trustedMarketplaces` /
+    `blockedMarketplaces` / plugin-scoped input 值（`input-values.json`）/ keyring secret；`extraKnownMarketplaces`
+    默认只报告，`--update-declarations` 才改写 user scope。project/local 一律**只报告不改**（输出文件、JSON 指针、
+    建议值与后果）。
+  - 派生面：`known_marketplaces.json` 新记录（`installLocation` 重算、`manifestNameBaseline` 重置为新名）、
+    catalog clone 与 `.plugins` 外树搬迁、账本记录按新 pid 重建（重建成功才删旧记录）。
+  - **默认 dry-run、零写入**（`--apply` 才写盘）；迁移全程离线。
+  - 退出码：`0` 成功 / `1` 冲突**整体 abort**（零写入）/ `3` 部分完成（unresolved / blocked /
+    keyring 不可用 / project-local 手动引用）。REPL 只允许 dry-run。
+  - 幂等可续（无 journal / 备份 / 回滚）：崩溃后重跑会自动认领「`known[new]` 已写、目录未搬」与
+    「目录已搬、旧键未删」两个窗口；无法归因的孤儿目录不会被认领。
+  - 详见 [`docs/upgrade-0.5.1-marketplace-name-migration.md`](docs/upgrade-0.5.1-marketplace-name-migration.md)
+    与 [`docs/design-0.5.1-marketplace-name-migration.md`](docs/design-0.5.1-marketplace-name-migration.md)。
+- **`marketplace info` 新增 `manifestName` / `manifestNameInvalid` / `legacyName`（#268 / §10.4）**：
+  自查注册名是否为 legacy；清单名属不可信输入，非法 / 疑似凭据一律不原值回显。
 - **boot 治理恢复诊断声明源变化（#287，语义镜像 rust-sdk#295；检测范围按 2026-11-20 用户裁决收窄）**：
   此前 boot 只按 `known_marketplaces.json` 的已注册源恢复，用户改了
   `extraKnownMarketplaces[name].source` 后**静默沿用旧源**、无诊断。现在：
