@@ -123,6 +123,7 @@ REASON_LEDGER_REBUILD_FAILED = "ledger-rebuild-failed"
 REASON_EXTRA_KNOWN_TARGET_CONFLICT = "extra-known-target-conflict"
 REASON_NAME_TAKEN = "name-taken-by-other-source"
 REASON_SECRET_READ_FAILED = "secret-read-failed"
+REASON_PROJECT_PATH_MISSING = "project-path-missing"
 
 # follow-up 效应码 / Follow-up effect codes（§9）.
 EFFECT_WILL_BE_INACTIVE = "will-be-inactive"
@@ -913,6 +914,24 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
     """P0.5：secret 候选派生 / keyring 可用性 / 目标键冲突（全部零写入）。"""
     if item.action != ACTION_RENAME or not item.new:
         return
+    # project/local 记录缺合法 projectPath 无法安全重建：**预检期** blocked（dry-run 即 exit 3、零写入），
+    # 而不是等到 P2 才 abort（那时 known[new]/目录已写，成半迁移）。
+    for pid, records in state.installed.get("plugins", {}).items():
+        parts = _pid_parts(pid) if isinstance(pid, str) else None
+        if not parts or parts[1] != item.old or not isinstance(records, list):
+            continue
+        for record in records:
+            if isinstance(record, Mapping):
+                scope = _norm_ledger_scope(record)
+                if scope in {"project", "local"} and not _norm_project_path(record):
+                    item.action = ACTION_BLOCKED
+                    item.reason = REASON_PROJECT_PATH_MISSING
+                    item.warnings.append(
+                        f"plugin {parts[0]!r} has a {scope} ledger record without a valid projectPath; "
+                        "fix or remove that record before migrating"
+                    )
+                    return
+
     candidates, blocked = _candidate_inputs(item, state, home)
     if blocked:
         item.action = ACTION_BLOCKED
@@ -1293,7 +1312,7 @@ def _write_known_new(item: MigrationItem, home: Path, env: Mapping[str, str] | N
     old_record = current.get(item.old)
     if not isinstance(old_record, Mapping):
         raise _ItemFailure(REASON_INVALID_RECORD, f"registration {item.old!r} disappeared during the migration")
-    if item.old_source is not None and not _source_unchanged(item.old_source, old_record.get("source")):
+    if not _source_unchanged(item.old_source, old_record.get("source")):
         raise _ItemFailure(REASON_NAME_TAKEN, "the old registration source changed during the migration")
     existing = current.get(new_name)
     if isinstance(existing, Mapping):
@@ -1614,7 +1633,7 @@ def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_n
     changed = False
     if write_new:
         for old_key, new_key, value in item.value_pairs:
-            if data.get(old_key) != value:
+            if old_key not in data or data[old_key] != value:
                 raise _ItemFailure(
                     REASON_VALUE_TARGET_CONFLICT,
                     f"source input value {old_key!r} changed during the migration; aborting before writing the new key",
@@ -1635,7 +1654,7 @@ def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_n
                     REASON_VALUE_TARGET_CONFLICT,
                     f"target input value {new_key!r} is missing or changed; keeping the old key",
                 )
-            if data.get(old_key) != value:
+            if old_key not in data or data[old_key] != value:
                 raise _ItemFailure(
                     REASON_VALUE_TARGET_CONFLICT,
                     f"source input value {old_key!r} changed during the migration; keeping the old key",
