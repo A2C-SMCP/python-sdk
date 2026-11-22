@@ -948,6 +948,7 @@ async def materialize_plugin(
     project_path: str | None = None,
     version: str | None = None,
     refresh: bool = False,
+    allow_clone: bool = True,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     existing_bundle_ids: ExistingBundleIds | None = None,
@@ -972,6 +973,7 @@ async def materialize_plugin(
 
     :param scope: 物化记录 scope（``managed|user|project|local``，默认 ``user``）。
     :param version: 记录版本覆盖（``--version``）；缺省按 entry > plugin.json > commitSha 解析。
+    :param allow_clone: ``False``（#268 迁移）→ 禁止任何 clone / 不删既有外树；根不可复用即抛。
     :return: 写入的 :class:`InstalledPluginRecord`。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
@@ -996,6 +998,7 @@ async def materialize_plugin(
         home,
         commit_sha,
         refresh=refresh,
+        allow_clone=allow_clone,
         timeout=timeout,
         env=env,
     )
@@ -1094,6 +1097,7 @@ async def install_plugin(
     project_path: str | None = None,
     version: str | None = None,
     refresh: bool = False,
+    allow_clone: bool = True,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     existing_bundle_ids: ExistingBundleIds | None = None,

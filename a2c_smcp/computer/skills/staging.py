@@ -1199,6 +1199,7 @@ async def locate_plugin_root(
     catalog_sha: str | None,
     *,
     refresh: bool = False,
+    allow_clone: bool = True,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
 ) -> tuple[Path, str | None]:
@@ -1215,6 +1216,9 @@ async def locate_plugin_root(
     - 独立 clone（:class:`GitCloneSpec`）：落 ``<home>/marketplace/.plugins/<mp>/<plugin>/``；复用条件——
       sha 锁版本既有 HEAD==pin 则复用、pin 变更则重 clone；非 sha 仅 ``refresh=False`` 复用。
       ``version_fallback = HEAD``。
+
+    :param allow_clone: ``False`` 时**禁止任何 clone**（离线迁移 #268）：复用条件不满足 → 抛
+        :class:`SkillStagingError`，**绝不**走 ``rmtree(dest) + git clone`` 破坏既有树。
 
     clone / source 解析失败 → :class:`SkillStagingError` / :class:`SkillSourceError`（上抛，调用方据失败降级）。
     """
@@ -1246,6 +1250,11 @@ async def locate_plugin_root(
         #  - 非 sha：仅 refresh=False 复用；refresh=True 重 clone 拉最新。
         reuse = ext_dir.exists() and (head == resolved.sha if resolved.sha else not refresh)
         if not reuse:
+            if not allow_clone:
+                raise SkillStagingError(
+                    "plugin root requires a clone, but cloning is disabled (offline migration); "
+                    "run 'plugin install' / 'marketplace refresh' explicitly to fetch it"
+                )
             await _git_clone_plugin(resolved, ext_dir, timeout=timeout, env=env)
             head = await _git_head_sha(ext_dir, timeout=timeout, env=env)
         plugin_root = (ext_dir / resolved.subdir) if resolved.subdir else ext_dir

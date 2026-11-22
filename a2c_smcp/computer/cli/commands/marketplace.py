@@ -59,6 +59,7 @@ from a2c_smcp.computer.settings.store import (
     SettingsLockError,
     atomic_write_json,
     file_lock,
+    known_marketplaces_path,
     load_installed_plugins,
     load_known_marketplaces,
     update_known_marketplaces,
@@ -663,6 +664,43 @@ def marketplace_info(home: Path, env: Mapping[str, str] | None, name: str, *, js
     return EXIT_OK
 
 
+def _display_conflict_name(name: str) -> str:
+    """冲突名展示：pid 走 ``_redact_pid``（只脱敏 marketplace 段），其余走 ``redact_ledger_key``。"""
+    return _redact_pid(name) if "@" in name else redact_ledger_key(name)
+
+
+def _probe_concurrent_writer(home: Path, env: Mapping[str, str] | None) -> bool:
+    """
+    启动时的**只读**并发探测（#268 §7.5）/ Read-only best-effort lock probe.
+
+    对既有旁车 ``.lock`` 尝试非阻塞 ``flock``：**不创建**锁文件（dry-run 必须零写入），因此
+    「锁文件存在」本身不被当作活性信号——能拿到锁就说明没有进程在写。命中 → 只提示、不阻断。
+    win32 跳过（best-effort，与 ``file_lock`` 的 win32 姿态一致）。
+    """
+    import sys
+
+    if sys.platform == "win32":  # pragma: no cover - POSIX 是 CI/主用平台
+        return False
+    import fcntl
+
+    lock_path = known_marketplaces_path(home, env).with_name(known_marketplaces_path(home, env).name + ".lock")
+    if not lock_path.exists():
+        return False
+    try:
+        fd = os.open(lock_path, os.O_RDONLY)
+    except OSError:  # pragma: no cover - 权限等
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _flag_values(args: Sequence[str], flag: str) -> list[str]:
     """解析可重复 flag（``--name a --name=b``）/ Parse a repeatable flag."""
     values: list[str] = []
@@ -685,11 +723,12 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
         for message in plan.errors:
             console_err.print(f"[red]✗ {escape(message)}[/red]")
         return
-    title = (
-        "Marketplace name migration (applied)"
-        if applied
-        else "Marketplace name migration plan (dry run; run with --apply to execute)"
-    )
+    if plan.corrupt or plan.errors or blocking_conflicts(plan):
+        title = "Marketplace name migration aborted (nothing was written)"
+    elif applied:
+        title = "Marketplace name migration (applied)"
+    else:
+        title = "Marketplace name migration plan (dry run; run with --apply to execute)"
     table = Table(title=title, header_style="bold magenta")
     for column in ("Old", "New", "Action", "Plugins", "Trust", "Blocked", "Inputs", "Catalog", "Follow-ups"):
         table.add_column(column)
@@ -710,10 +749,10 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
     if plan.conflicts:
         console.print("[red]Conflicts (command aborts; nothing is written):[/red]")
         for conflict in plan.conflicts:
-            names = ", ".join(str(name) for name in conflict.get("names", []))
+            names = ", ".join(_display_conflict_name(str(name)) for name in conflict.get("names", []))
             console.print(
                 f"  [red]{escape(str(conflict.get('code', 'conflict')))}[/red]: "
-                f"{escape(names)} → {escape(str(conflict.get('target', '')))}"
+                f"{escape(names)} → {escape(_display_conflict_name(str(conflict.get('target', ''))))}"
             )
     for item in plan.items:
         for warning in item.warnings:
@@ -750,7 +789,13 @@ async def marketplace_migrate(
     默认 dry-run（零写入）：检测、计划、项级预检全部走 strict 只读面；``apply=True`` 才写盘。
     冲突涉及任一选中项 → 整体 abort、零写入、退出码 1；项级失败 → 其余继续、退出码 3。
     """
+    if _probe_concurrent_writer(home, env):
+        console_err.print(
+            "[yellow]! another a2c-computer process appears to be writing the marketplace ledger; "
+            "stop other instances before running --apply[/yellow]"
+        )
     plan = build_plan(home, env, names=names, update_declarations=update_declarations)
+    plan.apply_requested = apply
     if apply and not plan.corrupt and not plan.errors and not blocking_conflicts(plan):
         await execute_plan(plan, home, env)
     if json_output:

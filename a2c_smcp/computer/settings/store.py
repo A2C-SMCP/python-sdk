@@ -644,6 +644,18 @@ def read_jsonc_strict(path: Path) -> dict[str, Any] | None:
     return data
 
 
+def _require_strict_object_field(data: Mapping[str, Any], key: str, path: Path) -> None:
+    """
+    strict 读面的**字段级**形状校验（#268 审查 🟡7）/ Field-level strict shape check.
+
+    根是对象还不够：``marketplaces`` / ``plugins`` 若是数组等错误形状，容错规整会 WARN 后按空处理——
+    迁移据此算计划等于「按空账本给出无操作」，正是 D13 要防的灾难性误判。strict 通道必须抛。
+    """
+    value = data.get(key)
+    if value is not None and not isinstance(value, dict):
+        raise SettingsFileCorruptError(path, f"{key!r} must be a JSON object, got {type(value).__name__}")
+
+
 def load_known_marketplaces_strict(home: Path | None = None, env: Mapping[str, str] | None = None) -> KnownMarketplacesFile:
     """
     :func:`load_known_marketplaces` 的**严格只读**变体（#268）/ Strict read-only variant.
@@ -654,6 +666,7 @@ def load_known_marketplaces_strict(home: Path | None = None, env: Mapping[str, s
     data = read_jsonc_strict(path)
     if data is None:
         return empty_known_marketplaces()
+    _require_strict_object_field(data, "marketplaces", path)
     return _coerce_known_marketplaces(data, path)
 
 
@@ -675,6 +688,7 @@ def load_installed_plugins_strict(
     data = read_jsonc_strict(path)
     if data is None:
         return empty_installed_plugins()
+    _require_strict_object_field(data, "plugins", path)
     return _coerce_installed_plugins(data, path, drop_legacy=drop_legacy)
 
 
@@ -692,6 +706,8 @@ def update_known_marketplaces_strict(
     path = known_marketplaces_path(home, env)
     with file_lock(path):
         raw = read_jsonc_strict(path)
+        if raw is not None:
+            _require_strict_object_field(raw, "marketplaces", path)
         current = empty_known_marketplaces() if raw is None else _coerce_known_marketplaces(raw, path)
         result = mutator(current)
         to_save: dict[str, Any] = dict(result if result is not None else current)
@@ -711,6 +727,8 @@ def update_installed_plugins_strict(
     path = installed_plugins_path(home, env)
     with file_lock(path):
         raw = read_jsonc_strict(path)
+        if raw is not None:
+            _require_strict_object_field(raw, "plugins", path)
         current = empty_installed_plugins() if raw is None else _coerce_installed_plugins(raw, path, drop_legacy=drop_legacy)
         result = mutator(current)
         to_save: dict[str, Any] = dict(result if result is not None else current)

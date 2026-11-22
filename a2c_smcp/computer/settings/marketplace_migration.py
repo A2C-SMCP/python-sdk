@@ -78,14 +78,13 @@ from a2c_smcp.computer.skills.marketplace_identity import (
     display_source,
     manifest_marketplace_name,
     read_manifest_marketplace_name,
+    redact_ledger_key,
     same_source,
 )
 from a2c_smcp.computer.skills.sources import GitCloneSpec, LocalPluginSource, resolve_plugin_source
 from a2c_smcp.computer.skills.staging import external_plugin_dir, external_plugins_dir
-from a2c_smcp.utils.logger import get_logger
+from a2c_smcp.utils.git_url import sanitize_path_for_diagnostics, sanitize_text_for_diagnostics
 from a2c_smcp.utils.path import is_within
-
-logger = get_logger(__name__)
 
 # 迁移项状态 / Migration item actions.
 ACTION_RENAME = "rename"
@@ -115,6 +114,7 @@ REASON_VALUE_TARGET_CONFLICT = "value-target-conflict"
 REASON_VALUE_STORE_CORRUPT = "value-store-corrupt"
 REASON_RENAME_FAILED = "rename-failed"
 REASON_LEDGER_REBUILD_FAILED = "ledger-rebuild-failed"
+REASON_EXTRA_KNOWN_TARGET_CONFLICT = "extra-known-target-conflict"
 
 # follow-up 效应码 / Follow-up effect codes（§9）.
 EFFECT_WILL_BE_INACTIVE = "will-be-inactive"
@@ -180,21 +180,44 @@ class MigrationItem:
     value_remove: list[str] = field(default_factory=list)
     secret_pairs: list[SecretRekey] = field(default_factory=list)
     secret_remove: list[str] = field(default_factory=list)
-    secret_cleanup: list[str] = field(default_factory=list)
+    secret_cleanup: list[SecretRekey] = field(default_factory=list)
     ledger_rebuild: list[tuple[str, str, str | None]] = field(default_factory=list)
+    declarations_migrated: bool = False
+    # 迁移本身完成，但有插件未能重建（旧账本保留）→ 退出码 3，不报「全绿」。
+    incomplete: bool = False
 
     def serializable(self) -> dict[str, Any]:
-        """JSON 形态（§5.3）/ JSON payload（§5.3）."""
+        """
+        JSON 形态（§5.3）/ JSON payload（§5.3）.
+
+        **所有自由文本走脱敏原语**（账本键可能被手编成携带凭据的串）：old/new 走 ``redact_ledger_key``，
+        warning / suggested 走散文漏斗，路径走 ``sanitize_path_for_diagnostics``；指针在构建时已用
+        脱敏名（见 :func:`_collect_follow_ups`）。
+        """
+        shown_old = redact_ledger_key(self.old)
+        shown_new = redact_ledger_key(self.new) if self.new else None
         return {
-            "old": self.old,
-            "new": self.new,
+            "old": shown_old,
+            "new": shown_new,
             "action": self.action,
             "reason": self.reason,
             "source": self.source,
-            "plugins": list(self.plugins),
+            "plugins": [
+                {"id": f"{plugin}@{shown_old}", "newId": f"{plugin}@{shown_new}" if shown_new else None, "action": "move"}
+                for plugin in self.plugins
+            ],
             "actions": dict(self.actions),
-            "warnings": list(self.warnings),
-            "followUps": list(self.follow_ups),
+            "warnings": [sanitize_text_for_diagnostics(w) for w in self.warnings],
+            "followUps": [
+                {
+                    "file": sanitize_path_for_diagnostics(str(follow.get("file", ""))),
+                    "pointer": sanitize_text_for_diagnostics(str(follow.get("pointer", ""))),
+                    "effect": follow.get("effect"),
+                    "suggested": sanitize_text_for_diagnostics(str(follow.get("suggested", ""))),
+                }
+                for follow in self.follow_ups
+            ],
+            "incomplete": self.incomplete,
         }
 
 
@@ -208,6 +231,7 @@ class MigrationPlan:
     errors: list[str] = field(default_factory=list)
     update_declarations: bool = False
     applied: bool = False
+    apply_requested: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +384,8 @@ def _find_renamed_target(known: Mapping[str, Any], old: str, source: object, hom
     for name, record in known.items():
         if name == old or not isinstance(record, Mapping):
             continue
+        if not _is_safe_path_segment(name):
+            continue
         if not same_source(record.get("source"), source):
             continue
         clone_dir = marketplace_skill_dir(home, name)
@@ -490,7 +516,7 @@ def _attach_references(item: MigrationItem, state: _State, env: Mapping[str, str
         "secrets": 0,
         "catalog": "rename",
         "externalTrees": 0,
-        "ledger": len(_pids_for(ledger, item.old)),
+        "ledger": "rebuild" if _pids_for(ledger, item.old) else "noop",
     }
 
 
@@ -509,7 +535,13 @@ def _attach_scope_surfaces(item: MigrationItem, state: _State, env: Mapping[str,
     item.trust_rewrite = any(entry == item.old for entry in trusted)
     item.blocked_rewrite = any(entry == item.old for entry in blocked)
     declarations = _string_map(state.user, FIELD_EXTRA_KNOWN_MARKETPLACES, path=user_path)
-    item.declarations_rewrite = bool(update_declarations and item.old in declarations)
+    declared_old = declarations.get(item.old)
+    item.declarations_rewrite = bool(update_declarations and isinstance(declared_old, Mapping))
+    if update_declarations and item.old in declarations and not isinstance(declared_old, Mapping):
+        # 手编声明不是对象：既不迁移也不删除（无声删除用户声明是不可接受的）。
+        item.warnings.append(
+            f"extraKnownMarketplaces[{item.old!r}] is not an object; the declaration is left untouched"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +609,11 @@ def _detect_conflicts(items: list[MigrationItem], state: _State, home: Path, env
         if new_dir.exists() or new_dir.is_symlink():
             if not item.merge:
                 conflicts.append(_conflict("target-dir-exists", names=[item.old, new], target=new, involves=[item.old]))
-        if external_plugins_dir(home, new).exists() and not item.merge:
+        external_new = external_plugins_dir(home, new)
+        external_old = external_plugins_dir(home, item.old)
+        if external_new.exists() and (not item.merge or external_old.exists()):
+            # merge 场景下两棵外树同时存在无法合并（rename 不能覆盖）→ 计划期就 abort，避免
+            # dry-run exit 0 / apply exit 3 的永久 wedge。
             conflicts.append(
                 _conflict("target-external-tree-exists", names=[item.old, new], target=new, involves=[item.old])
             )
@@ -594,7 +630,12 @@ def _detect_conflicts(items: list[MigrationItem], state: _State, home: Path, env
         if item.declarations_rewrite:
             old_decl = extra_declared.get(item.old)
             new_decl = extra_declared.get(new)
-            if isinstance(new_decl, Mapping) and isinstance(old_decl, Mapping):
+            if new_decl is not None and not isinstance(new_decl, Mapping):
+                # 目标键存在但不是对象 → 不覆盖手编内容，计划期 abort。
+                conflicts.append(
+                    _conflict("extra-known-target-conflict", names=[item.old, new], target=new, involves=[item.old])
+                )
+            elif isinstance(new_decl, Mapping) and isinstance(old_decl, Mapping):
                 if not same_source(new_decl.get("source"), old_decl.get("source")):
                     conflicts.append(
                         _conflict("extra-known-target-conflict", names=[item.old, new], target=new, involves=[item.old])
@@ -630,8 +671,16 @@ def _plugin_root_offline(item: MigrationItem, plugin: str, home: Path, catalog_d
         root = (catalog_dir / resolved.rel_path).resolve()
         return root if is_within(root, catalog_dir.resolve()) else None
     if isinstance(resolved, GitCloneSpec):
-        ext = external_plugin_dir(home, item.old, plugin)
-        return ext / resolved.subdir if resolved.subdir else ext
+        # 崩溃恢复窗口 4：catalog 已搬、外树也已搬（`_rename_external` 之后被杀）时，根在 `<new>` 下；
+        # 反之在 `<old>` 下。两处都探测，取实际存在的那个（都不存在则返回旧路径，由调用方判 blocked/skip）。
+        roots = [external_plugin_dir(home, item.old, plugin)]
+        if item.new:
+            roots.append(external_plugin_dir(home, item.new, plugin))
+        for base in roots:
+            root = base / resolved.subdir if resolved.subdir else base
+            if root.is_dir():
+                return root
+        return roots[0] / resolved.subdir if resolved.subdir else roots[0]
     return None
 
 
@@ -670,7 +719,14 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
         for pid in ledger
         if isinstance(pid, str) and _pid_marketplace(pid) == item.old and (plugin := _pid_plugin(pid))
     }
-    manifest_plugins = {entry.get("name") for entry in iter_plugin_entries(item.manifest) if isinstance(entry.get("name"), str)}
+    manifest_plugins: set[str] = set()
+    for entry in iter_plugin_entries(item.manifest):
+        name = entry.get("name")
+        if isinstance(name, str) and is_valid_marketplace_name(name):
+            manifest_plugins.add(name)
+        elif name is not None:
+            # 清单条目名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
+            item.warnings.append("a plugin entry in the new manifest has an invalid name; skipped for inputs")
     candidates: list[tuple[str, str, bool]] = []
     seen_roots: set[str] = set()
 
@@ -920,16 +976,16 @@ def build_plan(
 
     known_map = state.known["marketplaces"]
     items = [_classify(old, record, known_map, home) for old, record in sorted(known_map.items())]
+    plan.items = items
     try:
         for item in items:
             if item.action in {ACTION_RENAME, ACTION_BLOCKED}:
                 _attach_references(item, state, env)
                 _attach_scope_surfaces(item, state, env, update_declarations)
+        plan.conflicts = _detect_conflicts(items, state, home, env)
     except SettingsFileCorruptError as exc:
         plan.corrupt.append(_corrupt_entry(Path(exc.path), exc))
         return plan
-    plan.items = items
-    plan.conflicts = _detect_conflicts(items, state, home, env)
 
     known_names = set(known_map)
     if names:
@@ -947,10 +1003,14 @@ def build_plan(
             item.action = ACTION_NOT_SELECTED
 
     store_secrets = SecretStore()
-    for item in items:
-        if item.selected and item.action == ACTION_RENAME:
-            _item_preflight(item, state, home, env, store_secrets)
-            _collect_follow_ups(item, state, env, update_declarations)
+    try:
+        for item in items:
+            if item.selected and item.action == ACTION_RENAME:
+                _item_preflight(item, state, home, env, store_secrets)
+                _collect_follow_ups(item, state, env, update_declarations)
+    except SettingsFileCorruptError as exc:
+        plan.corrupt.append(_corrupt_entry(Path(exc.path), exc))
+        return plan
     return plan
 
 
@@ -961,6 +1021,9 @@ def plan_exit_code(plan: MigrationPlan) -> int:
     if plan.errors or blocking_conflicts(plan):
         return EXIT_CONFLICT
     if any(item.selected and item.action in {ACTION_UNRESOLVED, ACTION_BLOCKED, ACTION_ABORTED} for item in plan.items):
+        return EXIT_PARTIAL
+    if any(item.selected and item.incomplete for item in plan.items):
+        # 迁移完成但插件未重建（旧账本保留）：不能报「全绿」。
         return EXIT_PARTIAL
     if any(item.selected and item.follow_ups for item in plan.items):
         return EXIT_PARTIAL
@@ -978,12 +1041,21 @@ def plan_payload(plan: MigrationPlan) -> dict[str, Any]:
         status = "planned"
     return {
         "command": "marketplace migrate",
-        "dryRun": not plan.applied,
+        "dryRun": not plan.apply_requested,
+        "applyRequested": plan.apply_requested,
+        "applied": plan.applied,
         "status": status,
         "exitCode": exit_code,
         "updateDeclarations": plan.update_declarations,
         "items": [item.serializable() for item in plan.items],
-        "conflicts": list(plan.conflicts),
+        "conflicts": [
+            {
+                "code": conflict.get("code"),
+                "names": [redact_ledger_key(name) for name in conflict.get("names", [])],
+                "target": redact_ledger_key(conflict.get("target", "")),
+            }
+            for conflict in plan.conflicts
+        ],
         "corrupt": list(plan.corrupt),
         "errors": list(plan.errors),
     }
@@ -1028,10 +1100,15 @@ def _add_user_references(item: MigrationItem, env: Mapping[str, str] | None) -> 
             old_entry = declarations.get(item.old)
             if isinstance(old_entry, Mapping):
                 current = declarations.get(new_name)
-                if not isinstance(current, Mapping):
+                if current is None:
                     updates[FIELD_EXTRA_KNOWN_MARKETPLACES] = {new_name: dict(old_entry)}
+                    item.declarations_migrated = True
+                elif not isinstance(current, Mapping):
+                    raise _ItemFailure(REASON_EXTRA_KNOWN_TARGET_CONFLICT, "extraKnownMarketplaces target is not an object")
                 elif not same_source(current.get("source"), old_entry.get("source")):
-                    raise _ItemFailure(REASON_TARGET_DIR_EXISTS, "extraKnownMarketplaces target conflict")
+                    raise _ItemFailure(REASON_EXTRA_KNOWN_TARGET_CONFLICT, "extraKnownMarketplaces target conflict")
+                else:
+                    item.declarations_migrated = True
         return updates
 
     _update_user_scope(env, _mutate)
@@ -1052,7 +1129,7 @@ def _remove_user_references(item: MigrationItem, env: Mapping[str, str] | None) 
         if item.blocked_rewrite:
             blocked = [entry for entry in _string_list(existing, FIELD_BLOCKED_MARKETPLACES, path=path) if entry != item.old]
             updates[FIELD_BLOCKED_MARKETPLACES] = blocked
-        if item.declarations_rewrite:
+        if item.declarations_rewrite and item.declarations_migrated:
             declarations = _string_map(existing, FIELD_EXTRA_KNOWN_MARKETPLACES, path=path)
             if item.old in declarations:
                 updates[FIELD_EXTRA_KNOWN_MARKETPLACES] = {item.old: DELETE}
@@ -1098,7 +1175,9 @@ def _claim_candidates(home: Path, known: Mapping[str, Any], old: str, new: str) 
     known_names = set(known)
     out: list[Path] = []
     for child in sorted(root.iterdir()):
-        if child.name == ".plugins" or not child.is_dir() or child.is_symlink():
+        # 跳过所有点前缀目录：`.plugins`（外树命名空间）+ `.staging-*` / `.trash-*`（refresh 临时树，
+        # 内容与清单名都可能与目标一致；把它们当正主 rename 或计为歧义候选都会误判）。
+        if child.name.startswith(".") or not child.is_dir() or child.is_symlink():
             continue
         if not (child.name == old or child.name not in known_names):
             continue
@@ -1183,19 +1262,26 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
         new_pid = f"{plugin}@{item.new}"
         if find_plugin_entry(item.manifest, plugin) is None:
             item.warnings.append(f"plugin {plugin!r} not present in the new manifest; keeping its old ledger record")
+            item.incomplete = True
+            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
             continue
         for record in records:
             if not isinstance(record, Mapping):
+                item.incomplete = True
                 continue
             install_path = record.get("installPath")
             if not isinstance(install_path, str) or not install_path:
                 item.warnings.append(f"plugin {plugin!r} ledger record has no installPath; keeping it untouched")
+                item.incomplete = True
+                item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
                 continue
             mapped = _map_install_path(Path(install_path), home, item.old, item.new or "")
             if not mapped.is_dir():
                 item.warnings.append(
                     f"plugin {plugin!r} install root is missing ({install_path}); keeping its old ledger record"
                 )
+                item.incomplete = True
+                item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
                 continue
             scope = str(record.get("scope") or "user")
             project_path = record.get("projectPath")
@@ -1208,12 +1294,15 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
                     project_path=project_path if isinstance(project_path, str) else None,
                     version=version if isinstance(version, str) else None,
                     env=env,
+                    allow_clone=False,  # 迁移全程离线：定位失败 → 跳过并保留旧账本（绝不 rmtree/重 clone）
                 )
             except Exception as exc:  # noqa: BLE001 - 单条重建失败 → 保留旧记录（F10）
                 item.warnings.append(
                     f"plugin {plugin!r} could not be re-materialized ({type(exc).__name__}); "
                     "keeping its old ledger record"
                 )
+                item.incomplete = True
+                item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
                 continue
             item.ledger_rebuild.append((pid, scope, project_path if isinstance(project_path, str) else None))
 
@@ -1247,7 +1336,10 @@ def _drop_old_ledger(item: MigrationItem, home: Path, env: Mapping[str, str] | N
 def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_new: bool) -> None:
     """input 值单次原子写：P1 只加新键；P3 只删旧键（§4.1 F5 + §7.1）/ One atomic write per phase."""
     path = resolve_value_store_path(env)
-    current = store.read_jsonc_strict(path)
+    try:
+        current = store.read_jsonc_strict(path)
+    except SettingsFileCorruptError as exc:
+        raise _ItemFailure(REASON_VALUE_STORE_CORRUPT, str(exc)) from exc
     data: dict[str, Any] = dict(current) if isinstance(current, Mapping) else {}
     changed = False
     if write_new:
@@ -1270,9 +1362,9 @@ def _rekey_secrets(item: MigrationItem, store_secrets: SecretStore, *, write_new
         for pair in item.secret_pairs:
             if not store_secrets.set(pair.new_key, pair.value):
                 raise _ItemFailure(REASON_KEYRING_UNAVAILABLE, "failed to write the new secret key")
+            item.secret_cleanup.append(pair)
             if store_secrets.get(pair.new_key) != pair.value:
                 raise _ItemFailure(REASON_KEYRING_UNAVAILABLE, "the new secret key did not read back")
-            item.secret_cleanup.append(pair.new_key)
     else:
         for old_key in item.secret_remove:
             if not store_secrets.delete(old_key):
@@ -1297,9 +1389,9 @@ async def _apply_item(item: MigrationItem, home: Path, env: Mapping[str, str] | 
         _rename_catalog(item, home, env)
         _rename_external(item, home)
         await _rebuild_ledger(item, home, env)
-        _delete_known_old(item, home, env)
 
-        # ── P3：撤旧侧 ──
+        # ── P3：撤旧侧（known[old] 必须留到 P3/P4 之后：否则 P3 中断后重跑只见 known[new] 报 noop，
+        #    旧引用再无入口归因——§7.3「P3 中 → 重跑 P3 补齐」）──
         for pid in item.installed_remove:
             _write_installed_plugin(pid, False, env)
         for pid in item.enabled_remove:
@@ -1310,10 +1402,15 @@ async def _apply_item(item: MigrationItem, home: Path, env: Mapping[str, str] | 
 
         # ── P4：删旧账本记录（仅重建成功者）──
         _drop_old_ledger(item, home, env)
+
+        # P2 收尾：搬迁 + 重建 + 撤旧全部完成，才删 known[old]（F7）。
+        _delete_known_old(item, home, env)
     except Exception:
-        # 本次已写的新 secret 尽力清理（避免制造新孤儿）；已写的文件保持（forward-only，不逐项回滚）。
-        for new_key in item.secret_cleanup:
-            secrets.delete(new_key)
+        # 本次已写的新 secret 尽力清理——**仅当旧键仍在**（P3 已删旧键时，新键是唯一副本，
+        # 绝不能因 P4 失败而销毁）。已写的文件保持（forward-only，不逐项回滚）。
+        for pair in item.secret_cleanup:
+            if secrets.get(pair.old_key) is not None:
+                secrets.delete(pair.new_key)
         raise
 
 

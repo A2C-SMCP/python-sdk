@@ -12,7 +12,8 @@ Linux Secret Service（libsecret）。``keyring`` 是**可选依赖**（``pip in
 故在此**惰性 import**：缺失不破坏模块导入，仅令 :func:`keyring_available` 返回 ``False``，由
 :mod:`resolver` 走 headless 降级（env）或硬错误（**绝不写明文**，§9.3）。
 
-键空间：service=``a2c-computer``、key=**全局 ``<id>``**（与模型「Input id 全局唯一」一致）。
+键空间：service=``a2c-computer``、key=**plugin-scoped id** ``<plugin>@<marketplace>/<id>``（#268 订正：
+此前注释写「全局 ``<id>``」是陈旧说法；``resolver`` 实际以 ``prefix_input_id`` 计算并以此键存取）。
 """
 
 from __future__ import annotations
