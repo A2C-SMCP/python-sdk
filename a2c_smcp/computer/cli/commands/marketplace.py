@@ -34,6 +34,7 @@ from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
 from a2c_smcp.computer.settings.marketplace_migration import (
+    ACTION_RENAME,
     MigrationPlan,
     blocking_conflicts,
     build_plan,
@@ -96,6 +97,8 @@ from a2c_smcp.utils.git_url import (
     credential_like_text,
     diagnostic_url_for_display,
     known_git_source_for_display,
+    sanitize_path_for_diagnostics,
+    sanitize_text_for_diagnostics,
 )
 from a2c_smcp.utils.logger import get_logger
 
@@ -717,7 +720,10 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
     if plan.corrupt:
         console_err.print("[red]✗ aborted: corrupt state file(s); nothing was written[/red]")
         for entry in plan.corrupt:
-            console_err.print(f"  [red]{escape(entry.get('path', ''))}[/red]: {escape(entry.get('reason', ''))}")
+            console_err.print(
+                f"  [red]{escape(sanitize_path_for_diagnostics(str(entry.get('path', ''))))}[/red]: "
+                f"{escape(sanitize_text_for_diagnostics(str(entry.get('reason', ''))))}"
+            )
         return
     if plan.errors:
         for message in plan.errors:
@@ -747,7 +753,10 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
         )
     console.print(table)
     if plan.conflicts:
-        console.print("[red]Conflicts (command aborts; nothing is written):[/red]")
+        if blocking_conflicts(plan):
+            console.print("[red]Conflicts (command aborts; nothing is written):[/red]")
+        else:
+            console.print("[yellow]Conflicts reported (only between unselected items; not blocking):[/yellow]")
         for conflict in plan.conflicts:
             names = ", ".join(_display_conflict_name(str(name)) for name in conflict.get("names", []))
             console.print(
@@ -756,16 +765,28 @@ def _render_migration(plan: MigrationPlan, *, applied: bool) -> None:
             )
     for item in plan.items:
         for warning in item.warnings:
-            console_err.print(f"[yellow]![/yellow] {escape(redact_ledger_key(item.old))}: {escape(warning)}")
+            console_err.print(
+                f"[yellow]![/yellow] {escape(redact_ledger_key(item.old))}: "
+                f"{escape(sanitize_text_for_diagnostics(warning))}"
+            )
         for follow in item.follow_ups:
             console_err.print(
-                f"[yellow]![/yellow] {escape(str(follow.get('file', '')))} "
-                f"{escape(str(follow.get('pointer', '')))}: {escape(str(follow.get('effect', '')))} — "
-                f"{escape(str(follow.get('suggested', '')))}"
+                f"[yellow]![/yellow] {escape(sanitize_path_for_diagnostics(str(follow.get('file', ''))))} "
+                f"{escape(sanitize_text_for_diagnostics(str(follow.get('pointer', ''))))}: "
+                f"{escape(str(follow.get('effect', '')))} — "
+                f"{escape(sanitize_text_for_diagnostics(str(follow.get('suggested', ''))))}"
             )
     code = plan_exit_code(plan)
+    migrating = [item for item in plan.items if item.selected and item.action == ACTION_RENAME]
     if code == EXIT_OK:
-        console.print("[green]No marketplace name migration needed.[/green]")
+        if plan.applied and migrating:
+            console.print(f"[green]Migrated {len(migrating)} marketplace(s).[/green]")
+        elif migrating:
+            console.print(
+                f"[green]{len(migrating)} marketplace(s) can be migrated; run with --apply to write.[/green]"
+            )
+        else:
+            console.print("[green]No marketplace name migration needed.[/green]")
     elif code == EXIT_USER_ERROR:
         console_err.print("[red]Aborted by conflict; nothing was written. Fix the conflicts and rerun.[/red]")
     elif code == EXIT_PARTIAL:

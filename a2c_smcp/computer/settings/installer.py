@@ -1165,6 +1165,7 @@ async def install_plugin(
             project_path=project_path,
             version=version,
             refresh=refresh,
+            allow_clone=allow_clone,
             timeout=timeout,
             env=env,
             existing_bundle_ids=existing_bundle_ids,

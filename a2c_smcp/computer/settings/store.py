@@ -49,7 +49,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, TypeVar
 
 from a2c_smcp.computer.settings.raw import SettingsFileCorruptError
 from a2c_smcp.computer.settings.schema import GitSource
@@ -557,6 +557,46 @@ def save_installed_plugins(
     return path
 
 
+_RmwT = TypeVar("_RmwT", bound=Mapping[str, Any])
+
+
+def _locked_jsonc_rmw(
+    path: Path,
+    read: Callable[[Path], dict[str, Any] | None],
+    empty: Callable[[], _RmwT],
+    coerce: Callable[[Mapping[str, Any], Path], _RmwT],
+    mutator: Callable[[_RmwT], _RmwT | None],
+) -> _RmwT:
+    """
+    持锁 JSONC 读-改-写的**单点实现**（tolerant / strict 仅注入不同 loader）/ Single locked RMW.
+
+    #268 审查：tolerant 与 strict 两份 RMW 逐行重复会在后续语义变更时漂移（dry-run 与写入视图分叉），
+    统一到本函数；``read`` 决定容错（``read_jsonc_with_recovery``）或严格（``read_jsonc_strict`` + 形状校验）。
+    """
+    with file_lock(path):
+        raw = read(path)
+        current = empty() if raw is None else coerce(raw, path)
+        result = mutator(current)
+        to_save: dict[str, Any] = dict(result if result is not None else current)
+        to_save.setdefault("version", MATERIALIZED_VERSION)
+        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
+    return coerce(to_save, path)
+
+
+def _read_known_strict(path: Path) -> dict[str, Any] | None:
+    raw = read_jsonc_strict(path)
+    if raw is not None:
+        _require_strict_object_field(raw, "marketplaces", path)
+    return raw
+
+
+def _read_installed_strict(path: Path) -> dict[str, Any] | None:
+    raw = read_jsonc_strict(path)
+    if raw is not None:
+        _require_strict_object_field(raw, "plugins", path)
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # 持锁原子读-改-写 / Locked atomic read-modify-write（供 reconciler #62 等）
 # ---------------------------------------------------------------------------
@@ -566,27 +606,18 @@ def update_known_marketplaces(
     env: Mapping[str, str] | None = None,
 ) -> KnownMarketplacesFile:
     """
-    持锁原子读-改-写 ``known_marketplaces.json``（§6.3）/ Locked atomic read-modify-write。
+    持锁原子读-改-写 ``known_marketplaces.json``（§6.3）/ Locked atomic read-modify-write.
 
-    **单把锁**覆盖 load→mutate→save，杜绝并发进程间的丢更新窗口——供 reconciler（#62）等 RMW 场景。
-    ``mutator`` 收到当前（已规整；缺失 / 损坏则为空）结构，可**就地改并返回 ``None``**，或返回新结构；
-    二者皆补齐 ``version`` 后原子落盘。返回最终写入的结构。
-    A single lock spans load→mutate→save (no lost-update window) — for the reconciler etc. The
-    mutator may mutate in place and return ``None``, or return a new structure; either way
-    ``version`` is backfilled and atomically written. Returns the final written structure.
-
-    这是「持锁 RMW」的推荐入口；**不要**自行 ``with file_lock(p): ...; save_*(...)``（save_* 会再次
-    加锁 → :class:`SettingsLockError`，见 :func:`save_known_marketplaces`）。
+    容错视图：缺失 / 损坏 → 空配置（损坏先备份，见 :func:`read_jsonc_with_recovery`）。
     """
     path = known_marketplaces_path(home, env)
-    with file_lock(path):
-        raw = read_jsonc_with_recovery(path)
-        current = empty_known_marketplaces() if raw is None else _coerce_known_marketplaces(raw, path)
-        result = mutator(current)
-        to_save: dict[str, Any] = dict(result if result is not None else current)
-        to_save.setdefault("version", MATERIALIZED_VERSION)
-        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
-    return _coerce_known_marketplaces(to_save, path)
+    return _locked_jsonc_rmw(
+        path,
+        read_jsonc_with_recovery,
+        empty_known_marketplaces,
+        _coerce_known_marketplaces,
+        mutator,
+    )
 
 
 def update_installed_plugins(
@@ -594,26 +625,57 @@ def update_installed_plugins(
     home: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> InstalledPluginsFile:
-    """持锁原子读-改-写 ``installed_plugins.json``（语义同 :func:`update_known_marketplaces`）/ Locked atomic RMW。"""
+    """持锁原子读-改-写 ``installed_plugins.json``（语义同 :func:`update_known_marketplaces`）/ Locked atomic RMW."""
     path = installed_plugins_path(home, env)
-    with file_lock(path):
-        raw = read_jsonc_with_recovery(path)
-        current = empty_installed_plugins() if raw is None else _coerce_installed_plugins(raw, path)
-        result = mutator(current)
-        to_save: dict[str, Any] = dict(result if result is not None else current)
-        to_save.setdefault("version", MATERIALIZED_VERSION)
-        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
-    return _coerce_installed_plugins(to_save, path)
+    return _locked_jsonc_rmw(
+        path,
+        read_jsonc_with_recovery,
+        empty_installed_plugins,
+        _coerce_installed_plugins,
+        mutator,
+    )
+
+
+def update_known_marketplaces_strict(
+    mutator: Callable[[KnownMarketplacesFile], KnownMarketplacesFile | None],
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> KnownMarketplacesFile:
+    """strict RMW（#268）：锁内严格读，损坏/形状不符即抛、不备份、不降级。"""
+    path = known_marketplaces_path(home, env)
+    return _locked_jsonc_rmw(
+        path,
+        _read_known_strict,
+        empty_known_marketplaces,
+        _coerce_known_marketplaces,
+        mutator,
+    )
+
+
+def update_installed_plugins_strict(
+    mutator: Callable[[InstalledPluginsFile], InstalledPluginsFile | None],
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    drop_legacy: bool = False,
+) -> InstalledPluginsFile:
+    """strict RMW ``installed_plugins.json``（语义同 :func:`update_known_marketplaces_strict`）。"""
+    path = installed_plugins_path(home, env)
+    return _locked_jsonc_rmw(
+        path,
+        _read_installed_strict,
+        empty_installed_plugins,
+        lambda data, p: _coerce_installed_plugins(data, p, drop_legacy=drop_legacy),
+        mutator,
+    )
 
 
 # ---------------------------------------------------------------------------
-# strict 只读变体 + strict RMW（#268 迁移专用）/ Strict read-only + strict RMW
+# strict 只读通道（#268 迁移专用）/ Strict read-only channel
 # ---------------------------------------------------------------------------
 # 背景（#268 / D13）：日常 ``load_*`` 走 :func:`read_jsonc_with_recovery`——损坏文件会被**改名**为
 # ``.corrupt-<ts>.bak`` 后按空配置继续。迁移的 dry-run 要求**零写入**，且按「空账本」计算计划会造成
 # 灾难性误判；因此迁移另立 strict 通道：损坏即抛、不 rename、不降级。既有容错 loader 语义**不变**。
-# The migration needs a read-only strict channel: corrupt -> raise, never rename/degrade. The tolerant
-# loaders above keep their exact semantics.
 def read_jsonc_strict(path: Path) -> dict[str, Any] | None:
     """
     严格只读 JSONC 物化文件（不备份、不降级）/ Read a materialized file strictly (no backup, no degrade).
@@ -648,19 +710,18 @@ def _require_strict_object_field(data: Mapping[str, Any], key: str, path: Path) 
     """
     strict 读面的**字段级**形状校验（#268 审查 🟡7）/ Field-level strict shape check.
 
-    根是对象还不够：``marketplaces`` / ``plugins`` 若是数组等错误形状，容错规整会 WARN 后按空处理——
-    迁移据此算计划等于「按空账本给出无操作」，正是 D13 要防的灾难性误判。strict 通道必须抛。
+    根是对象还不够：``marketplaces`` / ``plugins`` 若存在但形状错误（含显式 ``null``），容错规整会 WARN 后
+    按空处理——迁移据此算计划等于「按空账本给出无操作」，正是 D13 要防的灾难性误判。strict 通道必须抛。
     """
-    value = data.get(key)
-    if value is not None and not isinstance(value, dict):
-        raise SettingsFileCorruptError(path, f"{key!r} must be a JSON object, got {type(value).__name__}")
+    if key in data and not isinstance(data[key], dict):
+        raise SettingsFileCorruptError(path, f"{key!r} must be a JSON object, got {type(data[key]).__name__}")
 
 
 def load_known_marketplaces_strict(home: Path | None = None, env: Mapping[str, str] | None = None) -> KnownMarketplacesFile:
     """
     :func:`load_known_marketplaces` 的**严格只读**变体（#268）/ Strict read-only variant.
 
-    :raises SettingsFileCorruptError: 文件存在但不可读 / 畸形 / 根非对象（不备份、不降级）。
+    :raises SettingsFileCorruptError: 文件存在但不可读 / 畸形 / 根或字段形状错误（不备份、不降级）。
     """
     path = known_marketplaces_path(home, env)
     data = read_jsonc_strict(path)
@@ -690,48 +751,3 @@ def load_installed_plugins_strict(
         return empty_installed_plugins()
     _require_strict_object_field(data, "plugins", path)
     return _coerce_installed_plugins(data, path, drop_legacy=drop_legacy)
-
-
-def update_known_marketplaces_strict(
-    mutator: Callable[[KnownMarketplacesFile], KnownMarketplacesFile | None],
-    home: Path | None = None,
-    env: Mapping[str, str] | None = None,
-) -> KnownMarketplacesFile:
-    """
-    :func:`update_known_marketplaces` 的**strict** 版本（#268）：锁内严格读，损坏即抛、不备份。
-
-    供迁移在「预检已确认文件完好」之后做写回；避免预检→写入窗口内文件变坏时，容错 RMW 把损坏文件
-    rename 掉再以空账本为基底写入（会丢用户数据）。
-    """
-    path = known_marketplaces_path(home, env)
-    with file_lock(path):
-        raw = read_jsonc_strict(path)
-        if raw is not None:
-            _require_strict_object_field(raw, "marketplaces", path)
-        current = empty_known_marketplaces() if raw is None else _coerce_known_marketplaces(raw, path)
-        result = mutator(current)
-        to_save: dict[str, Any] = dict(result if result is not None else current)
-        to_save.setdefault("version", MATERIALIZED_VERSION)
-        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
-    return _coerce_known_marketplaces(to_save, path)
-
-
-def update_installed_plugins_strict(
-    mutator: Callable[[InstalledPluginsFile], InstalledPluginsFile | None],
-    home: Path | None = None,
-    env: Mapping[str, str] | None = None,
-    *,
-    drop_legacy: bool = False,
-) -> InstalledPluginsFile:
-    """持锁严格 RMW ``installed_plugins.json``（语义同 :func:`update_known_marketplaces_strict`）。"""
-    path = installed_plugins_path(home, env)
-    with file_lock(path):
-        raw = read_jsonc_strict(path)
-        if raw is not None:
-            _require_strict_object_field(raw, "plugins", path)
-        current = empty_installed_plugins() if raw is None else _coerce_installed_plugins(raw, path, drop_legacy=drop_legacy)
-        result = mutator(current)
-        to_save: dict[str, Any] = dict(result if result is not None else current)
-        to_save.setdefault("version", MATERIALIZED_VERSION)
-        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
-    return _coerce_installed_plugins(to_save, path, drop_legacy=drop_legacy)

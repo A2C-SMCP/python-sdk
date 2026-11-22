@@ -57,6 +57,10 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("marketplace remove <name> [--keep-plugins]", "移除（默认级联卸载 plugin）/ remove (cascade)"),
         ("marketplace refresh [<name>|all]", "重 clone 换入 + 对账（改名拒绝）/ refresh"),
         ("marketplace set <name> auto-update=<bool>", "设置 per-source auto-update / set flag"),
+        (
+            "marketplace migrate [--name N]... [--apply] [--update-declarations] [--json]",
+            "迁移存量注册名到清单 name（默认 dry-run）/ migrate legacy registration names (dry-run)",
+        ),
     ],
     "plugin": [
         ("plugin install <plugin>@<mp> [--version V] [--scope S]", "安装 plugin（外来 MCP 同名硬抛）/ install (name conflict aborts)"),
@@ -102,7 +106,7 @@ NAMESPACE_COMMANDS: dict[str, list[tuple[str, str]]] = {
 SUBCOMMANDS: dict[str, list[str]] = {
     "server": ["add", "rm", "remove"],
     "inputs": ["load", "add", "update", "rm", "remove", "get", "list", "value"],
-    "marketplace": ["add", "list", "info", "remove", "refresh", "set"],
+    "marketplace": ["add", "list", "info", "remove", "refresh", "set", "migrate"],
     "plugin": ["install", "uninstall", "enable", "disable", "list", "info"],
     "skill": ["list", "info"],
     "socket": ["connect", "join", "leave"],
@@ -124,6 +128,7 @@ FLAGS: dict[tuple[str, str], list[str]] = {
     ("marketplace", "remove"): ["--keep-plugins", "--json"],
     ("marketplace", "refresh"): ["--json"],
     ("marketplace", "set"): ["--json"],
+    ("marketplace", "migrate"): ["--name", "--apply", "--update-declarations", "--json"],
     ("skill", "list"): ["--source", "--json"],
     ("skill", "info"): ["--json"],
     ("plugin", "install"): ["--version", "--scope", "--json"],

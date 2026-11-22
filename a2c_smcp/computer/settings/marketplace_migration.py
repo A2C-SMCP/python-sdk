@@ -31,9 +31,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from a2c_smcp.computer.inputs.plugin_pool import prefix_input_id
 from a2c_smcp.computer.inputs.secret_store import SecretStore, keyring_available
 from a2c_smcp.computer.inputs.value_store import ValueStore, resolve_value_store_path
+from a2c_smcp.computer.mcp_clients.model import MCPServerInput, MCPServerPromptStringInput
 from a2c_smcp.computer.settings import store
 from a2c_smcp.computer.settings.installer import (
     _bare_name_clash_pids,
@@ -145,7 +148,7 @@ class SecretRekey:
 
     old_key: str
     new_key: str
-    value: str
+    value: str = field(repr=False)  # 明文 secret 绝不进 repr（print(plan) / 断言失败 dump）
 
 
 @dataclass
@@ -178,9 +181,9 @@ class MigrationItem:
     declarations_rewrite: bool = False
     value_pairs: list[tuple[str, str, Any]] = field(default_factory=list)
     value_remove: list[str] = field(default_factory=list)
-    secret_pairs: list[SecretRekey] = field(default_factory=list)
-    secret_remove: list[str] = field(default_factory=list)
-    secret_cleanup: list[SecretRekey] = field(default_factory=list)
+    secret_pairs: list[SecretRekey] = field(default_factory=list, repr=False)
+    secret_remove: list[str] = field(default_factory=list, repr=False)
+    secret_cleanup: list[SecretRekey] = field(default_factory=list, repr=False)
     ledger_rebuild: list[tuple[str, str, str | None]] = field(default_factory=list)
     declarations_migrated: bool = False
     # 迁移本身完成，但有插件未能重建（旧账本保留）→ 退出码 3，不报「全绿」。
@@ -196,6 +199,7 @@ class MigrationItem:
         """
         shown_old = redact_ledger_key(self.old)
         shown_new = redact_ledger_key(self.new) if self.new else None
+        renaming = self.action == ACTION_RENAME and self.selected
         return {
             "old": shown_old,
             "new": shown_new,
@@ -203,10 +207,15 @@ class MigrationItem:
             "reason": self.reason,
             "source": self.source,
             "plugins": [
-                {"id": f"{plugin}@{shown_old}", "newId": f"{plugin}@{shown_new}" if shown_new else None, "action": "move"}
+                {
+                    "id": f"{plugin}@{shown_old}",
+                    "newId": f"{plugin}@{shown_new}" if (renaming and shown_new) else None,
+                    "action": "move" if renaming else "none",
+                }
                 for plugin in self.plugins
             ],
-            "actions": dict(self.actions),
+            # 非 RENAME（blocked/unresolved/not-selected）不展示执行面计数，避免误读为「会执行」。
+            "actions": dict(self.actions) if self.action in {ACTION_RENAME, ACTION_ABORTED} else {},
             "warnings": [sanitize_text_for_diagnostics(w) for w in self.warnings],
             "followUps": [
                 {
@@ -509,8 +518,8 @@ def _attach_references(item: MigrationItem, state: _State, env: Mapping[str, str
     item.actions = {
         "installedPlugins": len(item.installed_add),
         "enabledPlugins": len(item.enabled_set),
-        "trustedMarketplaces": "add+remove",
-        "blockedMarketplaces": "add+remove",
+        "trustedMarketplaces": "add+remove" if item.trust_rewrite else "noop",
+        "blockedMarketplaces": "add+remove" if item.blocked_rewrite else "noop",
         "extraKnownMarketplaces": "report",
         "inputValues": 0,
         "secrets": 0,
@@ -697,9 +706,15 @@ def _read_input_defs(root: Path) -> list[dict[str, Any]] | None:
     if not isinstance(defs, list):
         return None
     out: list[dict[str, Any]] = []
+    adapter: TypeAdapter[MCPServerInput] = TypeAdapter(MCPServerInput)
     for entry in defs:
-        if isinstance(entry, Mapping) and isinstance(entry.get("id"), str) and entry["id"]:
-            out.append({"id": entry["id"], "password": entry.get("password") is True})
+        try:
+            parsed = adapter.validate_python(entry)
+        except ValidationError:
+            # 畸形 input 定义：运行时 loader 会跳过，但迁移无法据此证明没有 secret → 保守按不可读处理。
+            return None
+        is_password = isinstance(parsed, MCPServerPromptStringInput) and bool(parsed.password)
+        out.append({"id": parsed.id, "password": is_password})
     return out
 
 
@@ -770,9 +785,13 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
             install_path = record.get("installPath")
             if not isinstance(install_path, str) or not install_path:
                 continue
-            root = Path(install_path)
-            if item.already_renamed:
-                root = _map_install_path(root, home, item.old, item.new or "")
+            raw_root = Path(install_path)
+            roots = [raw_root]
+            if item.new:
+                mapped = _map_install_path(raw_root, home, item.old, item.new)
+                if mapped != raw_root:
+                    roots.append(mapped)
+            root = next((candidate for candidate in roots if candidate.is_dir()), roots[0])
             if str(root.resolve()) in seen_roots:
                 located = True
                 continue
@@ -792,9 +811,10 @@ def _map_install_path(path: Path, home: Path, old: str, new: str) -> Path:
         (marketplace_skill_dir(home, old).resolve(), marketplace_skill_dir(home, new).resolve()),
         (external_plugins_dir(home, old).resolve(), external_plugins_dir(home, new).resolve()),
     )
+    resolved = path.resolve()
     for old_root, new_root in mappings:
         try:
-            return new_root / path.relative_to(old_root)
+            return new_root / resolved.relative_to(old_root)
         except ValueError:
             continue
     return path
@@ -979,7 +999,7 @@ def build_plan(
     plan.items = items
     try:
         for item in items:
-            if item.action in {ACTION_RENAME, ACTION_BLOCKED}:
+            if item.action == ACTION_RENAME:
                 _attach_references(item, state, env)
                 _attach_scope_surfaces(item, state, env, update_declarations)
         plan.conflicts = _detect_conflicts(items, state, home, env)
@@ -1006,8 +1026,10 @@ def build_plan(
     try:
         for item in items:
             if item.selected and item.action == ACTION_RENAME:
-                _item_preflight(item, state, home, env, store_secrets)
-                _collect_follow_ups(item, state, env, update_declarations)
+                _precheck_claim(item, known_map, home)
+                if item.action == ACTION_RENAME:
+                    _item_preflight(item, state, home, env, store_secrets)
+                    _collect_follow_ups(item, state, env, update_declarations)
     except SettingsFileCorruptError as exc:
         plan.corrupt.append(_corrupt_entry(Path(exc.path), exc))
         return plan
@@ -1056,7 +1078,13 @@ def plan_payload(plan: MigrationPlan) -> dict[str, Any]:
             }
             for conflict in plan.conflicts
         ],
-        "corrupt": list(plan.corrupt),
+        "corrupt": [
+            {
+                "path": sanitize_path_for_diagnostics(str(entry.get("path", ""))),
+                "reason": sanitize_text_for_diagnostics(str(entry.get("reason", ""))),
+            }
+            for entry in plan.corrupt
+        ],
         "errors": list(plan.errors),
     }
 
@@ -1167,6 +1195,35 @@ def _delete_known_old(item: MigrationItem, home: Path, env: Mapping[str, str] | 
     store.update_known_marketplaces_strict(_mutate, home, env)
 
 
+def _precheck_claim(item: MigrationItem, known_map: Mapping[str, Any], home: Path) -> None:
+    """
+    计划期预判「可认领目录」（§7.4）：dry-run 的退出码必须 == apply 会得到的退出码。
+
+    P2 会先写 ``known[new]``，因此这里把 ``new`` 预置进 known 视图后复用同一候选判据；0 个 →
+    ``catalog-lost``，多个 → ``ambiguous-catalog``（都标 blocked，dry-run 即 exit 3、零写入）。
+    """
+    if item.already_renamed or not item.new:
+        return
+    new_dir = marketplace_skill_dir(home, item.new)
+    if new_dir.exists() or new_dir.is_symlink():
+        return
+    old_record = known_map.get(item.old)
+    if not isinstance(old_record, Mapping):
+        return
+    probe: dict[str, Any] = dict(known_map)
+    probe.setdefault(item.new, {"source": old_record.get("source")})
+    candidates = _claim_candidates(home, probe, item.old, item.new)
+    if len(candidates) == 1:
+        return
+    item.action = ACTION_BLOCKED
+    if not candidates:
+        item.reason = REASON_CATALOG_LOST
+        item.warnings.append("no claimable catalog directory for the new registration")
+    else:
+        item.reason = REASON_AMBIGUOUS_CATALOG
+        item.warnings.append(f"ambiguous claimable catalog directories: {[str(c) for c in candidates]}")
+
+
 def _claim_candidates(home: Path, known: Mapping[str, Any], old: str, new: str) -> list[Path]:
     """§7.4 可认领目录（修正判据：允许 ``D.name == old``）/ Claimable directories (§7.4)."""
     root = home / SOURCE_MARKETPLACE
@@ -1256,7 +1313,12 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
     installed = store.load_installed_plugins_strict(home, env)["plugins"]
     for pid, records in sorted(installed.items()):
         parts = _pid_parts(pid) if isinstance(pid, str) else None
-        if not parts or parts[1] != item.old or not isinstance(records, list):
+        if not parts or parts[1] != item.old:
+            continue
+        if not isinstance(records, list):
+            item.warnings.append(f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
+            item.incomplete = True
+            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
             continue
         plugin = parts[0]
         new_pid = f"{plugin}@{item.new}"
