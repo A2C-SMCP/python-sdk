@@ -29,6 +29,11 @@ skills.staging (which now imports this module, so a back-edge would be a real cy
 :func:`entry_is_strict` / :func:`check_strict_conflict` / :func:`resolve_skill_override_dirs` 承载，供 staging
 （marketplace 注册）与 installer（plugin install 硬失败）共同消费。本 SDK 仅消费 ``skills`` + ``mcp-servers``，
 冲突检测仍按规范判**全六组件字段**（:data:`COMPONENT_FIELDS`），但覆写**路径扫描仅 ``skills``**。
+
+**SKILL 发现容器集单一权威**（#271）：约定 ``skills/`` + 声明覆写的合成由
+:func:`plugin_skill_container_dirs` 单点承载，staging（装载扫描）与 installer（enable 预检计数）共同消费。
+:mod:`~a2c_smcp.computer.skills.validator` **刻意不复用**——它要对每项覆写产出 file/loc 级 error（越界 / 缺失），
+而装载路径是 WARN 跳过，二者语义不同（见该模块对应注释）。
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ MARKETPLACE_MANIFEST = "marketplace.json"  # 仓库级 manifest
 PLUGIN_MANIFEST = "plugin.json"  # plugin 级 manifest（仅元数据）
 MCP_SERVERS_SUBDIR = "mcp-servers"  # plugin 携带 MCP server 的文件式子树（§3.3）
 MCP_INPUTS_FILENAME = "inputs.json"  # plugin 范围 inputs 池定义（枚举 server 时排除；入池归 #65）
+SKILLS_SUBDIR = "skills"  # plugin 内 SKILL 子树约定目录（SKILL 协议 §2；单一权威，staging 再导出）
 
 # 单点构造校验入口：dict → MCPServerConfig union（按 type 分型，pydantic v2）/ Single dict→config adapter.
 _MCP_SERVER_ADAPTER: TypeAdapter[MCPServerConfig] = TypeAdapter(MCPServerConfig)
@@ -286,6 +292,28 @@ def resolve_skill_override_dirs(
         seen_paths.add(cand)
         out.append(cand)
     return out
+
+
+def plugin_skill_container_dirs(
+    entry: Mapping[str, Any],
+    plugin_manifest: Mapping[str, Any],
+    plugin_root: Path,
+    *,
+    strict: bool,
+) -> list[Path]:
+    """SKILL 发现容器集（单一权威）/ SKILL discovery container dirs — single authority.
+
+    约定 ``<plugin 根>/skills`` 恒在首位，其后追加 :func:`resolve_skill_override_dirs` 解析出的声明覆写容器
+    （§4.3）。与 rust ``plugin_skill_container_dirs`` 同构，供 staging（装载扫描）与 installer（enable 预检
+    计数）共同消费，避免两套口径漂移（#271）。
+
+    **不去重、不校验约定容器存在性**：去重由消费方按 resolve 后路径做（约定径与覆写径可能同径），存在性由
+    各自扫描 / 计数路径决定（:mod:`~a2c_smcp.computer.skills.validator` 另有逐项诊断，不走本函数）。
+    """
+    return [
+        plugin_root / SKILLS_SUBDIR,
+        *resolve_skill_override_dirs(entry, plugin_manifest, plugin_root, strict=strict),
+    ]
 
 
 # ── mcp-servers/<n>.json（plugin 携带 MCP server，文件式）/ bundled MCP server files ──────────

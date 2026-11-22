@@ -1956,6 +1956,41 @@ async def test_marketplace_plugin_non_utf8_skill_is_isolated(
 
 
 @pytest.mark.asyncio
+async def test_marketplace_entry_skills_override_container_registered(tmp_path: Path) -> None:
+    """#271-B 回归锁：声明覆写容器（entry.skills）与约定 ``skills/`` 一样被扫描注册。
+
+    纯行为断言——删单点的覆写分支、或 staging 绕过单点（只扫约定 / 只扫覆写）均转红。
+    """
+    repo = tmp_path / "repo"
+    (repo / ".tfrobot-plugin").mkdir(parents=True)
+    (repo / ".tfrobot-plugin" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "acme",
+                "plugins": [{"name": "audit", "source": "./plugins/audit", "skills": "extra-skills"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    conv = repo / "plugins" / "audit" / "skills" / "conv"
+    conv.mkdir(parents=True)
+    (conv / "SKILL.md").write_text(_skill_md(name="conv"), encoding="utf-8")
+    ext = repo / "plugins" / "audit" / "extra-skills" / "ext"
+    ext.mkdir(parents=True)
+    (ext / "SKILL.md").write_text(_skill_md(name="ext"), encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    names = await staging_mod.stage_marketplace_skills(
+        "acme", {"type": "git", "url": f"file://{repo}"}, SkillRegistry(), home, timeout=30
+    )
+    assert names == ["audit:conv", "audit:ext"]
+
+
+@pytest.mark.asyncio
 async def test_marketplace_synthesis_failed_skill_dir_name_redacted(
     tmp_path: Path, staging_logs: pytest.LogCaptureFixture
 ) -> None:

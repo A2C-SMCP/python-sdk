@@ -37,6 +37,7 @@ from a2c_smcp.computer.skills.manifest import (
     manifest_declared_components,
     parse_bundled_server,
     plugin_root_base,
+    plugin_skill_container_dirs,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
@@ -333,3 +334,32 @@ def test_resolve_skill_override_dirs_traversal_and_non_dir_skipped(tmp_path: Pat
         strict=True,
     )
     assert out == [(tmp_path / "ok").resolve()]  # 越界 ../escape 跳过、非目录 afile 跳过、不存在跳过
+
+
+# ── SKILL 发现容器集单点（#271）/ single-point container set ─────────────────────
+def test_plugin_skill_container_dirs_convention_first_then_overrides(tmp_path: Path) -> None:
+    """约定 ``skills/`` 恒在首位，其后按序追加声明覆写容器（覆写为 resolve 后路径）。"""
+    (tmp_path / "extra").mkdir()
+    out = plugin_skill_container_dirs({"skills": ["extra"]}, {}, tmp_path, strict=True)
+    assert out == [tmp_path / "skills", (tmp_path / "extra").resolve()]
+
+
+def test_plugin_skill_container_dirs_convention_not_validated(tmp_path: Path) -> None:
+    """约定容器不存在也照列——单点只做集合成，存在性归消费方（staging WARNING / enable 预检计数）。"""
+    assert plugin_skill_container_dirs({}, {}, tmp_path, strict=True) == [tmp_path / "skills"]
+
+
+def test_plugin_skill_container_dirs_entry_always_plugin_json_only_when_strict(tmp_path: Path) -> None:
+    """entry.skills 恒取；plugin.json.skills 仅 strict=true 追加（与 resolve_skill_override_dirs 同口径）。"""
+    (tmp_path / "entry-skills").mkdir()
+    (tmp_path / "pj-skills").mkdir()
+    args = ({"skills": "entry-skills"}, {"skills": "pj-skills"}, tmp_path)
+    assert plugin_skill_container_dirs(*args, strict=True) == [
+        tmp_path / "skills",
+        (tmp_path / "entry-skills").resolve(),
+        (tmp_path / "pj-skills").resolve(),
+    ]
+    assert plugin_skill_container_dirs(*args, strict=False) == [
+        tmp_path / "skills",
+        (tmp_path / "entry-skills").resolve(),
+    ]

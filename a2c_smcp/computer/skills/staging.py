@@ -96,13 +96,14 @@ from a2c_smcp.computer.skills.home import (
     user_dropin_root,
 )
 from a2c_smcp.computer.skills.manifest import (
+    SKILLS_SUBDIR,
     PluginManifestError,
     check_strict_conflict,
     entry_is_strict,
+    plugin_skill_container_dirs,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
-    resolve_skill_override_dirs,
 )
 from a2c_smcp.computer.skills.manifest import (
     plugin_root_base as resolve_plugin_root_base,
@@ -164,7 +165,7 @@ SKILL_URI_PREFIX = "skill://"
 _MCP_SOURCE_MODES = frozenset({"mounted", "archive", "resources"})
 
 # marketplace 布局常量 / marketplace layout constants（marketplace.json/plugin.json 解析见 :mod:`skills.manifest`）。
-SKILLS_SUBDIR = "skills"  # plugin 内 SKILL 子树约定目录（SKILL 协议 §2）
+# ``SKILLS_SUBDIR`` 单一权威在 :mod:`skills.manifest`（#271 单点），此处保留 import 绑定供既有消费方。
 # 独立 clone 的 plugin（url/github/cnb/git-subdir）落点命名空间——置于 marketplace/ 下以 "." 起首的目录，
 # 与 catalog clone（<home>/marketplace/<mp>/）物理隔离、且不与 kebab marketplace 名冲突。
 _EXTERNAL_PLUGINS_NS = ".plugins"
@@ -1280,9 +1281,9 @@ async def _stage_one_plugin(
     # per-plugin 循环捕获降级（该 plugin 不入册、不阻断其余，符 #61 失败降级铁律）。
     check_strict_conflict(entry, plugin_manifest)
     version = resolve_plugin_version(entry, plugin_manifest, version_fallback)
-    # 扫描容器 = 约定 skills/ + entry.skills / plugin.json.skills 覆写（§4.3，strict=true 追加合并）。
-    override_dirs = resolve_skill_override_dirs(entry, plugin_manifest, plugin_root, strict=entry_is_strict(entry))
-    skill_dirs = [plugin_root / SKILLS_SUBDIR, *override_dirs]
+    # 扫描容器 = 约定 skills/ + entry.skills / plugin.json.skills 覆写（§4.3，strict=true 追加合并；
+    # 容器集合成单一权威见 :func:`~a2c_smcp.computer.skills.manifest.plugin_skill_container_dirs`，#271）。
+    skill_dirs = plugin_skill_container_dirs(entry, plugin_manifest, plugin_root, strict=entry_is_strict(entry))
     return _scan_and_register_plugin_skills(marketplace, plugin_name, skill_dirs, version, registry, seen)
 
 

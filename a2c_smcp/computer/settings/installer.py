@@ -118,10 +118,10 @@ from a2c_smcp.computer.skills.manifest import (
     load_bundled_servers,
     manifest_declared_components,
     plugin_root_base,
+    plugin_skill_container_dirs,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
-    resolve_skill_override_dirs,
 )
 from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
 from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
@@ -497,15 +497,12 @@ def _projectable_skill_count(
 ) -> int:
     """可投影 SKILL 包数：容器（约定 ``skills/`` + 声明覆写）内 ``<skill>/SKILL.md`` 的个数。
 
-    与装载同源（:func:`~a2c_smcp.computer.skills.manifest.resolve_skill_override_dirs` + 一级目录扫描）。
+    与装载同源（:func:`~a2c_smcp.computer.skills.manifest.plugin_skill_container_dirs` + 一级目录扫描）。
     任何文件系统异常（权限 / 软链环 / 非法路径）→ 记 WARNING 并计 0（fail-closed，不静默放行；审查 🟡9）。
     """
     strict = entry_is_strict(entry) if entry is not None else True
     try:
-        containers = [
-            plugin_root / SKILLS_SUBDIR,
-            *resolve_skill_override_dirs(entry or {}, plugin_manifest, plugin_root, strict=strict),
-        ]
+        containers = plugin_skill_container_dirs(entry or {}, plugin_manifest, plugin_root, strict=strict)
     except (OSError, RuntimeError, ValueError) as e:
         logger.warning("enable preflight: cannot resolve SKILL containers under %s, counted as empty: %s", plugin_root, e)
         return 0
