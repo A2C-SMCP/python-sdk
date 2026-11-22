@@ -1247,3 +1247,64 @@ def test_plugin_error_keeps_machine_reason(capsys: pytest.CaptureFixture[str]) -
     assert payload["error"] == "validation"
     assert payload["reason"] == "manifest-name-changed"
     assert payload["name"] == "acme"
+
+
+# ── #293：run_governance_remount 携带声明校验错误（CLI 展示归 #294）─────────────
+@pytest.mark.asyncio
+async def test_run_governance_remount_carries_declaration_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #293：CLI 的显式 ``declared=`` 路径必须携带 settings 校验错误。
+
+    判别力：改回 ``resolved_settings(...)``（只取 ``.settings``）会让 report 的该字段恒空——#294 的展示
+    面就会永远拿到空列表，而单测仍绿（这正是要防的假绿形态）。
+    """
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
+    _write_json(
+        user_settings_path({"XDG_CONFIG_HOME": str(tmp_path / "cfg")}),
+        {
+            "installedPlugins": ["audit@acme"],
+            "enabledPlugins": {"audit@acme": True},
+            "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": "owner/repo"}}},
+        },
+    )
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await plugin_cmd.run_governance_remount(comp)
+
+    assert [(e.marketplace, e.scope) for e in report.marketplace_declaration_errors] == [("acme", SettingsScope.USER)]
+    # 恢复行为不变（声明错误只是观测）
+    assert report.restored_skills == ["audit:lint"]
+    assert report.failed_marketplaces == []
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_flag_declaration_error_scope_is_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #293：``--settings`` flag 层的非法声明**照样上报**（``scope == FLAG``）。
+
+    有意差异（设计文档 §6）：rust 把 Flag 从 report 字段过滤掉（其 CLI 启动边界另有一处打印 + 抑制开关）；
+    python 的报告口径是「全部声明错误」（用户 2026-11-22 裁决），且已接受同一次启动出现多条同义提示。
+    """
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
+    flag_file = tmp_path / "flag-settings.json"
+    flag_file.write_text(
+        json.dumps({"extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": "owner/repo"}}}}),
+        encoding="utf-8",
+    )
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await plugin_cmd.run_governance_remount(comp, settings_flag_path=flag_file)
+
+    assert [(e.marketplace, e.scope) for e in report.marketplace_declaration_errors] == [("acme", SettingsScope.FLAG)]

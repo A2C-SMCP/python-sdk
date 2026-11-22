@@ -32,9 +32,11 @@ from a2c_smcp.computer.settings.schema import (
     STRING_ARRAY_FIELDS,
     TRUSTED_SCOPE_ONLY_FIELDS,
     SettingsScope,
+    is_marketplace_declaration_field,
     is_valid_enabled_plugin_key,
     is_valid_git_url,
     is_valid_marketplace_name,
+    scrub_diagnostic_chars,
     validate_settings,
 )
 
@@ -400,3 +402,56 @@ class TestLandingRoot:
         cleaned, errors = validate_settings({"landingRoot": "/srv/landing"}, scope)
         assert cleaned["landingRoot"] == "/srv/landing"
         assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# #293：声明子树谓词 + 诊断字符清洗 / declaration-subtree predicate + scrub
+# ---------------------------------------------------------------------------
+class TestIsMarketplaceDeclarationField:
+    """``extraKnownMarketplaces`` 子树判定（镜像 rust ``is_marketplace_declaration_field``）。"""
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "extraKnownMarketplaces",  # 整字段类型错
+            "extraKnownMarketplaces.acme",
+            "extraKnownMarketplaces.acme.source",
+            "extraKnownMarketplaces.acme.source.url",
+            "extraKnownMarketplaces.acme.source.type",
+            "extraKnownMarketplaces.acme.autoUpdate",
+        ],
+    )
+    def test_hits_prefix_and_subtree(self, field: str) -> None:
+        assert is_marketplace_declaration_field(field) is True
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            # 裸 startswith 会把这两个误收进来——`.` 边界承重。
+            "extraKnownMarketplacesBackup.acme",
+            "extraKnownMarketplacesBackup",
+            "enabledPlugins.BAD KEY",
+            "installedPlugins[0]",
+            "",
+        ],
+    )
+    def test_misses_unrelated_fields(self, field: str) -> None:
+        assert is_marketplace_declaration_field(field) is False
+
+
+class TestScrubDiagnosticChars:
+    """控制 / 方向覆写字符 → 空格（终端行倒序显示与伪造换行的唯一止血点）。"""
+
+    def test_replaces_bidi_and_line_separators(self) -> None:
+        # 正对照：原串确实含这些字符，否则「输出干净」可能只是输入本就干净。
+        raw = "evil‮gnp.exe FAKE\nLINE\x1b[31m﻿"
+        for needle in ("‮", " ", "\n", "\x1b", "﻿"):
+            assert needle in raw
+        scrubbed = scrub_diagnostic_chars(raw)
+        for needle in ("‮", " ", "\n", "\x1b", "﻿"):
+            assert needle not in scrubbed
+        assert scrubbed.startswith("evil gnp.exe FAKE LINE ")
+
+    def test_clean_text_is_returned_unchanged(self) -> None:
+        """正/负对照：无危险字符时逐字不变（不得吞掉正常空白与标点）。"""
+        assert scrub_diagnostic_chars("acme.source.url — 普通文本") == "acme.source.url — 普通文本"

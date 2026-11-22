@@ -1,7 +1,9 @@
 # 设计文档：0.5.1 — boot 治理恢复对「声明源变化」只诊断、不换源
 
-> 状态：**已实现**（#287，镜像 rust-sdk#295）。
-> 关联：python-sdk#287（本单）/ rust-sdk#295（镜像）/ #260（marketplace 注册名与同名不同源语义）/
+> 状态：**已实现**（#287 声明源冲突诊断；**#293 非法声明可观测**，两者均已合入 develop）。
+> 关联：python-sdk#287（声明源冲突）/ **python-sdk#293（非法声明接入恢复报告）** / rust-sdk#295（#287 镜像）/
+> rust-sdk#267（rust 侧非法声明可观测性跟踪）/ #294（CLI 三类展示，消费本单 report 字段）/
+> #295（`settings show` 凭据回显，另案）/ #260（marketplace 注册名与同名不同源语义）/
 > #268（存量注册名迁移，D3）/ #261 / #263 / #281（source 与账本键展示脱敏口径）/
 > a2c-smcp-protocol Discussion [#81](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/81)（双端对齐留痕）。
 > 性质：**SDK 自治**（字段名与 API 形状由 SDK 决定，两端只要求语义一致）；**无 wire 变更**、无新事件、
@@ -68,13 +70,41 @@ scp-like / `.git` 后缀等等价写法**不归一**——协议明许 SDK 不�
 | 面 | 内容 |
 |----|------|
 | `GovernanceRecoveryReport.marketplace_source_conflicts` | `list[MarketplaceSourceConflict]`，条目含 `marketplace` / `declared_source_display` / `known_source_display` |
-| recovery 日志 | 1 条 `WARNING` 汇总（**冲突数 + 脱敏后的市场名列表**，不含 URL）+ 每市场 1 条 `DEBUG`（两侧脱敏 URL） |
-| `Computer.boot_up` 汇总行 | `... N declared-source conflicts`，且冲突数**单独即可触发**汇总行（否则「零恢复 + 有冲突」会静默无痕） |
-| CLI `run_governance_remount` | **不在本版**（follow-up [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)） |
+| `GovernanceRecoveryReport.marketplace_declaration_errors` | `list[MarketplaceDeclarationError]`（#293），条目含 `scope` / `marketplace` / `field` / `reason` / `source_path` |
+| recovery 日志（冲突） | 1 条 `WARNING` 汇总（**冲突数 + 脱敏后的市场名列表**，不含 URL）+ 每市场 1 条 `DEBUG`（两侧脱敏 URL） |
+| recovery 日志（声明错误） | 1 条 `WARNING` 汇总（**条数 + 脱敏后的市场名列表**）+ 每条 1 条 `DEBUG`（scope / 脱敏 field / 脱敏 reason / source_path） |
+| `Computer.boot_up` 汇总行 | `... N declared-source conflicts, M marketplace declaration errors`；冲突数**与**声明错误数各自**单独即可触发**汇总行（否则「零恢复 + 有冲突/有错误」会静默无痕） |
+| CLI `run_governance_remount` | 本版**不加打印**，但已把 settings 错误带进 report（契约）；三类展示归 follow-up [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) |
 
-三个字段**全部是展示值**，不可用于任何再克隆或比较：`marketplace` 走 `redact_ledger_key`（账本键可手编，
-可能是携带凭据的 URL 残形），两侧 source 走 `display_source`（去 userinfo / query / fragment，path 段含
-凭据样文本一律占位符）。日志同样只用这三个字段。
+`marketplace_source_conflicts` 三字段**全部是展示值**，不可用于任何再克隆或比较：`marketplace` 走
+`redact_ledger_key`（账本键可手编，可能是携带凭据的 URL 残形），两侧 source 走 `display_source`（去
+userinfo / query / fragment，path 段含凭据样文本一律占位符）。日志同样只用这三个字段。
+
+`marketplace_declaration_errors` 的五个字段同样是展示值：`field` 保留 `extraKnownMarketplaces.` 前缀便于
+定位，其后的名字段按 `redact_ledger_key`（**段漏斗**，比散文脱敏更严）展示，`reason` 走
+`redact_git_urls_in_text`（散文，保留句式）+ 控制/方向覆写字符清洗，`source_path` 只做字符清洗（路径按
+路径对待，不做 URL 脱敏）。
+
+### 3.4 非法声明（#293）
+
+§3.1 的检测只覆盖**合法**声明。声明本身不合法时（漏 scheme、`owner/repo` 简写、非 `git`、缺 `source`），
+`_validate_extra_marketplaces` 会把它**整条丢弃**，于是 recovery 看到的是「无声明」——既不报冲突也无从
+提示，仍按旧源恢复。这与本设计要消灭的「静默」同型，只是根因在 settings 校验错误的**呈现通道**。
+
+#293 把它接进同一份报告：
+
+| 项 | 口径 |
+|---|---|
+| 采集范围 | **全部** `extraKnownMarketplaces` 前缀的 settings 校验错误（`field == 前缀` 或 `前缀 + "."`），**含无安装意图的市场**、**含 flag 层**；同层的 `enabledPlugins` / `installedPlugins` 非法键不并入（另案） |
+| 分层语义 | **逐条 + `scope`**，不聚合「该市场无声明」——user 层非法而 local 层合法时，合并视图仍有可用声明，该层错误单独报 |
+| 与冲突的关系 | **正交、不重复计数**：被丢弃的声明不在 `declared` 视图里，§3.1 的检测看不到它；同一市场名可在两个列表各出现一次（那是两条不同的事实，压制任一都会误导） |
+| 采集点 | `Computer.reconcile_governance`，**在** `recover_marketplace_skills` 返回后**无条件**回填——该函数拿到的 `declared` 已过校验、无处取错误；且空安装意图时它早退 |
+| 显式 `declared=` 契约 | 接受 `ResolvedSettings`（携带 `.errors`）与裸 `Mapping`（遗留形态、恒空）。**类型即载体**：调用方不可能「只传视图忘传错误」 |
+| 恢复行为 | **完全不变**：仍按已注册源 stage，`failed_marketplaces` / 降级 / 账本均不动 |
+
+名字解析（`declaration_marketplace`，镜像 rust）：名称型错误（`reason` 以 kebab 文案开头）时**整个剩余段
+就是名字**，不按后缀切分——非法名本身可能就是 `acme.source.url`；合法名的子字段错误才剥
+`.source.url` / `.source.type` / `.source` / `.autoUpdate`。
 
 ## 4. 怎么换源
 
@@ -107,11 +137,11 @@ boot 不会替你做这件事——重启多少次都只是重复同一条诊断
 两端**语义一致**（同名不同源 → 只诊断、不换源、旧能力保留、不降级），但三处实现口径不同，均属有意的 SDK
 自治差异，**不是漂移**：
 
-| 维度 | rust-sdk#295（PR rust-sdk#298） | python-sdk#287（本单） |
+| 维度 | rust-sdk#295（PR rust-sdk#298） | python-sdk#287（冲突诊断） |
 |------|-------------------------------|----------------------|
 | 检测范围 | `declared ∩ known` **全量**（含已注册但从未安装的市场） | **`installedPlugins` 意图涉及**的市场（2026-11-20 用户裁决收窄） |
 | 日志形态 | 逐条结构化 `WARN`（`reason=marketplace_source_conflict`） | 一条 `WARN` 汇总（**含脱敏后的市场名**，不含 URL）+ 逐条 `DEBUG`（含两侧脱敏 URL） |
-| CLI 展示 | `marketplace_source_conflict_line` 纯函数提示（只展示注册名） | **follow-up**（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)；本版仅日志 + report 字段） |
+| CLI 展示 | `marketplace_source_conflict_line` 纯函数提示（只展示注册名） | **follow-up**（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)） |
 
 差异 1 的理由：用户裁决只看「有安装意图、真会被恢复」的市场，避免对从未安装的声明噪音告警；若未来要与
 rust 对齐为全量，需在两端同时改并重新裁决。
@@ -123,25 +153,44 @@ rust 侧的逐条结构化 `WARN` 带 `reason` 码，适合被日志检索/告�
 差异 3 的理由：python 的 CLI 展示面另开 follow-up（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)），
 本版先保证 `GovernanceRecoveryReport` 与日志可观测。
 
+### 6.1 非法声明（#293）的对拍差异
+
+字段与 DTO 形状**逐字镜像** rust（`MarketplaceDeclarationError`：`scope` / `marketplace` / `field` /
+`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），三处实现口径不同，均属有意的
+SDK 自治差异：
+
+| 维度 | rust（`settings/schema.rs` + `computer.rs`） | python（本仓） | 理由 |
+|------|---------------------------------------------|----------------|------|
+| 脱敏落点 | **`validate_settings` 出口**统一脱敏，所有 `SettingsValidationError` 消费者（CLI 文本 / 报告 / 诊断）拿到同一安全值 | 只在**采集处**（`sanitized_marketplace_error`）脱敏；`format_settings_errors` 行为不变 | `settings show` 的凭据回显是独立安全单 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，用户裁决本单不提前改其行为。#295 落地时可直接复用该函数 |
+| Flag scope | **从 report 字段过滤掉**（其 CLI 启动边界另有打印 + `include_marketplace_declaration_errors` 抑制开关），WARN 仍记全量 | **不过滤**，`scope == flag` 照常进报告 | 用户裁决「报告**所有**前缀错误」，且已接受同次启动多条同义提示；python 没有 rust 那套抑制开关，过滤会让 flag 层错误从 report 消失（库宿主无处可见） |
+| 名字脱敏强度 | 名字与 reason 同走散文脱敏（`redact_git_urls_in_text`，只去 userinfo、保留 path） | 名字走**段漏斗**（`redact_ledger_key`），reason 才走散文脱敏 | 名字是**单个不可信值**：path 段里的 `alice:PW@example.com` 会被散文脱敏原样放出（#261 已定的口径） |
+| `per_scope_layers` | `reconcile_governance` **总是**从内部解析取 per-scope 层（显式收紧，见其 `#267 审查 🟡1` 注释） | 显式 `declared=` 路径仍置 `None`（`enabled_origin=None`，冻结向后兼容） | 取它会改变 #159 Option B 信任门行为（project-origin bundled server 改落 PENDING），超出 #293 范围；是否收紧另开单 |
+
 两端共同点（对拍口径）：报告字段只放脱敏展示值；声明源变化**永不**导致换源；换源只经显式 remove → re-add。
 
 ## 7. 已知边界
 
-**声明本身不合法时，boot 不会诊断。** `declared` 在生产路径来自 `resolve_settings`，其
-`_validate_extra_marketplaces`（`a2c_smcp/computer/settings/schema.py`）会把 `source` 缺失 / 非 `git` /
-URL 畸形的声明**整条丢弃**（错误记进 `ResolvedSettings.errors`，`Computer` 当前不读取该字段）。于是用户把
-声明 URL 改出 typo（缺 scheme、多余空格等）后重启：recovery 看到的只是「无声明」，既不报冲突也无从提示，
-仍按旧源恢复。
+**（已由 #293 收口）声明本身不合法时曾经不诊断。** 历史形态：`_validate_extra_marketplaces` 把 `source`
+缺失 / 非 `git` / URL 畸形的声明**整条丢弃**，错误只进 `ResolvedSettings.errors`，而 `Computer` 不读该字段
+⇒ 用户把声明 URL 改出 typo 后重启，recovery 只看到「无声明」，既不报冲突也无从提示。现由 §3.4 接进
+`GovernanceRecoveryReport.marketplace_declaration_errors` + WARN 汇总 + boot 计数。
 
-这与本单要消灭的「静默」是**同型**问题，但根因在 settings 校验错误的呈现通道，不属于 #287 定义的检测范围
-（#287 只比对**合法**声明与已注册源）。要让 boot 也 fail-closed 地提示，需要把 `ResolvedSettings.errors`
-里 marketplace 相关的条目接进恢复报告——见 follow-up [#293](https://github.com/A2C-SMCP/python-sdk/issues/293)，本版不做。
+仍存在的相邻边界（各有归属，不在本设计范围）：
+
+| 边界 | 归属 |
+|------|------|
+| `settings show` / `format_settings_errors` 对非法 marketplace 名仍回显原始凭据形态 | [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)（可复用本设计的 `sanitized_marketplace_error`） |
+| `installedPlugins` / `enabledPlugins` 的同类 invalid key 仍静默（不进本报告） | 另案评估（用户裁决 5） |
+| `settings.json` 整文件不可解析时只记一条 `<file>` 错误，不含 marketplace 子树 | 既有行为（§5.6 容错），不在本设计范围 |
+| CLI 三类展示（声明错误 / 源冲突 / failed）未接线 | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) |
+| 显式 `declared=` 路径不取 `per_scope_layers`（与 rust 有意分叉） | §6.1；收紧另开单 |
 
 ## 8. 不做
 
 - 不在 boot 自动换源 / 自动 remove-re-add；
 - 不改 `failed_marketplaces`、不降级、不阻断 boot；
 - 不动 `reconcile`（声明式对账）的 `validation` 拒绝语义（#260）；
-- 不在 CLI `run_governance_remount` 展示冲突（follow-up [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)）；
-- 不接入 `ResolvedSettings.errors`（见 §7，follow-up [#293](https://github.com/A2C-SMCP/python-sdk/issues/293)）；
+- 不改 `validate_settings` / `_validate_extra_marketplaces` 的校验与丢弃语义（非法条目照旧丢弃）；
+- 不把声明错误计入 `marketplace_source_conflicts` 或 `failed_marketplaces`（三者正交，不重复计数）；
+- 不在 CLI `run_governance_remount` 打印（三类展示归 [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)）；
 - 不动协议仓、不新增 wire 事件 / 错误码 / 一致性向量。

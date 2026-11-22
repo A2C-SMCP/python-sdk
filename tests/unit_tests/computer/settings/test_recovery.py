@@ -29,13 +29,20 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.settings.recovery import (
+    GovernanceRecoveryReport,
+    MarketplaceDeclarationError,
     MarketplaceSourceConflict,
     _plugin_enable_origin,
+    attach_marketplace_declaration_errors,
     collect_enabled_bundled_servers,
+    declaration_marketplace,
     detect_marketplace_source_conflicts,
+    marketplace_declaration_errors,
     recover_marketplace_skills,
+    sanitize_marketplace_name,
+    sanitize_marketplace_text,
 )
-from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
+from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope, SettingsValidationError
 from a2c_smcp.computer.settings.store import (
     load_known_marketplaces,
     save_installed_plugins,
@@ -901,3 +908,171 @@ def test_detect_conflicts_fail_closed_on_malformed_declared_source(decl: dict) -
     assert conflicts[0].marketplace == "acme"
     assert conflicts[0].known_source_display == "https://example.com/acme.git"
     assert conflicts[0].declared_source_display == "<redacted-git-source>"
+
+
+# ── #293：被 settings 校验丢弃的非法声明 / dropped invalid declarations ───────
+_SECRET_URL = "https://bob:t0ken@example.com/repo.git"
+
+
+def _verr(field: str, reason: str, scope: SettingsScope = SettingsScope.USER, source_path: str | None = None) -> SettingsValidationError:
+    return SettingsValidationError(scope=scope, field=field, reason=reason, source_path=source_path)
+
+
+def test_sanitize_marketplace_name_uses_segment_funnel() -> None:
+    """市场名是**单个不可信值**：走段漏斗（path 段里的凭据也挡），比散文脱敏更严（#261 口径）。"""
+    assert sanitize_marketplace_name(_SECRET_URL) == "https://example.com/repo.git"
+    # path 段携凭据 —— 散文脱敏只去 userinfo、会保留 path，段漏斗 fail-closed
+    assert sanitize_marketplace_name("https://host/team/alice:PW@example.com/repo.git") == "<redacted-git-source>"
+    # 合法 kebab 名逐字不变（负对照：不得把正常名字改成占位符）
+    assert sanitize_marketplace_name("acme") == "acme"
+
+
+def test_sanitize_marketplace_text_keeps_prose_shape() -> None:
+    """``reason`` 是散文：逐 token 脱敏，保留句式（不得整句替换成占位符）。"""
+    got = sanitize_marketplace_text(f"malformed git url: {_SECRET_URL}")
+    assert got == "malformed git url: https://example.com/repo.git"
+    assert "t0ken" not in got and "bob" not in got
+
+
+def test_declaration_marketplace_keeps_whole_rest_for_name_errors() -> None:
+    """
+    名称型错误：``<name>`` 之后没有子字段，**整个剩余段**就是名字——不能按后缀启发式切。
+
+    ``acme.source.url`` 作为**非法市场名**时，其 field 与「合法名 acme 的 .source.url 子字段错误」逐字相同；
+    区分二者的唯一判据是 reason（与 rust ``declaration_marketplace`` 同款）。
+    """
+    assert declaration_marketplace(
+        "extraKnownMarketplaces.acme.source.url", "marketplace name must be strict kebab (1-64)",
+    ) == "acme.source.url"
+    assert declaration_marketplace("extraKnownMarketplaces.acme.source.url", "malformed git url") == "acme"
+
+
+@pytest.mark.parametrize(
+    "field,reason,expected_marketplace,expected_field",
+    [
+        ("extraKnownMarketplaces", "expected object, got str", None, "extraKnownMarketplaces"),
+        ("extraKnownMarketplaces.acme", "entry must be object, got list", "acme", "extraKnownMarketplaces.acme"),
+        ("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", "acme", "extraKnownMarketplaces.acme.source"),
+        (
+            "extraKnownMarketplaces.acme.source.type",
+            "only source.type == 'git' is supported",
+            "acme",
+            "extraKnownMarketplaces.acme.source.type",
+        ),
+        ("extraKnownMarketplaces.acme.source.url", "malformed git url", "acme", "extraKnownMarketplaces.acme.source.url"),
+        ("extraKnownMarketplaces.acme.autoUpdate", "must be bool, got str", "acme", "extraKnownMarketplaces.acme.autoUpdate"),
+    ],
+)
+def test_marketplace_declaration_errors_shapes(
+    field: str, reason: str, expected_marketplace: str | None, expected_field: str,
+) -> None:
+    """四形态 + 顶层整字段：1 error → 1 entry，scope 保真，``marketplace`` 供 #294 免解析 ``field``。"""
+    got = marketplace_declaration_errors([_verr(field, reason)])
+    assert got == [
+        MarketplaceDeclarationError(
+            scope=SettingsScope.USER, marketplace=expected_marketplace, field=expected_field, reason=reason, source_path=None,
+        ),
+    ]
+
+
+def test_marketplace_declaration_errors_filters_other_fields_and_preserves_order() -> None:
+    """只收 ``extraKnownMarketplaces`` 子树（含 ``.`` 边界）；保序、不聚合——同市场跨层各一条。"""
+    errors = [
+        _verr("enabledPlugins.BAD KEY", "key must be '<plugin>@<marketplace>' (strict kebab)"),
+        _verr("extraKnownMarketplacesBackup.acme", "unrelated"),  # 裸 startswith 会误收，这里必须被挡
+        _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.USER),
+        _verr("extraKnownMarketplaces.acme.source.url", "malformed git url", SettingsScope.LOCAL),
+    ]
+    got = marketplace_declaration_errors(errors)
+    assert [(e.marketplace, e.scope) for e in got] == [("acme", SettingsScope.USER), ("acme", SettingsScope.LOCAL)]
+
+
+def test_marketplace_declaration_errors_redacts_and_scrubs() -> None:
+    """凭据形态市场名 / 带凭据的 reason / 控制字符：report 三字段全部脱敏（#295 只管 settings show）。"""
+    evil_name = f"{_SECRET_URL}"
+    errors = [
+        _verr(
+            f"extraKnownMarketplaces.{evil_name}",
+            "marketplace name must be strict kebab (1-64)",
+            SettingsScope.PROJECT,
+            source_path="/tmp/settings.json",
+        ),
+        # 控制字符 / 方向覆写 / 行分隔：手工构造（schema 当前不会产出），纵深防御。
+        _verr("extraKnownMarketplaces.evil‮gnp.exe FAKE", "expected object, got array\nFAKE_LINE\x1b[31m‮REV"),
+    ]
+    got = marketplace_declaration_errors(errors)
+    assert len(got) == 2
+    # 正对照：原始错误里确实带凭据 / 控制字符
+    assert "t0ken" in errors[0].field
+    assert "‮" in errors[1].field and "\n" in errors[1].reason
+
+    first, second = got
+    assert "t0ken" not in first.marketplace and "bob" not in first.marketplace
+    assert "t0ken" not in first.field
+    assert first.source_path == "/tmp/settings.json"
+    for error in (first, second):
+        for blob in (error.marketplace or "", error.field, error.reason, error.source_path or ""):
+            for needle in ("‮", " ", "\n", "\x1b", "t0ken"):
+                assert needle not in blob, (needle, blob)
+
+
+def test_attach_marketplace_declaration_errors_logs_summary_at_default_info() -> None:
+    """
+    WARN 汇总（带脱敏市场名）+ 逐条 DEBUG。
+
+    默认日志级别是 INFO ⇒ 汇总必须落在 WARNING，否则用户看不见（#293 验收「默认 INFO 可见」）。
+    """
+    report = GovernanceRecoveryReport()
+    errors = [
+        _verr(f"extraKnownMarketplaces.{_SECRET_URL}.source.url", f"malformed git url: {_SECRET_URL}"),
+        _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.LOCAL),
+    ]
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    captured: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    sink = _Sink(level=logging.DEBUG)
+    recovery_mod.logger.addHandler(sink)
+    try:
+        attach_marketplace_declaration_errors(report, errors)
+    finally:
+        recovery_mod.logger.removeHandler(sink)
+
+    assert len(report.marketplace_declaration_errors) == 2
+    warnings = [r.getMessage() for r in captured if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    summary = warnings[0]
+    assert "2 invalid marketplace declaration(s)" in summary
+    assert "https://example.com/repo.git" in summary  # 脱敏后的市场名被点名
+    assert "acme" in summary
+    assert "t0ken" not in summary and "bob" not in summary
+    # 逐条 DEBUG
+    debug_lines = [r.getMessage() for r in captured if r.levelno == logging.DEBUG]
+    assert len(debug_lines) == 2, debug_lines
+    assert all("t0ken" not in line and "bob" not in line for line in debug_lines), debug_lines
+
+
+def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> None:
+    """负对照：无错误 ⇒ 报告空、零日志（不得每次 boot 都刷一条「0 条错误」）。"""
+    report = GovernanceRecoveryReport()
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    captured: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    sink = _Sink(level=logging.DEBUG)
+    recovery_mod.logger.addHandler(sink)
+    try:
+        attach_marketplace_declaration_errors(report, [])
+    finally:
+        recovery_mod.logger.removeHandler(sink)
+
+    assert report.marketplace_declaration_errors == []
+    assert captured == []

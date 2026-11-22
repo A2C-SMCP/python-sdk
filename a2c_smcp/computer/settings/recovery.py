@@ -47,7 +47,14 @@ from a2c_smcp.computer.settings.reconciler import (
     ledger_entry_fully_materialized,
     ledger_record_materialized,
 )
-from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
+from a2c_smcp.computer.settings.schema import (
+    FIELD_EXTRA_KNOWN_MARKETPLACES,
+    SCOPE_ORDER,
+    SettingsScope,
+    SettingsValidationError,
+    is_marketplace_declaration_field,
+    scrub_diagnostic_chars,
+)
 from a2c_smcp.computer.settings.scope import (
     load_settings_file,
     user_settings_path,
@@ -73,6 +80,7 @@ from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.git_url import redact_git_urls_in_text
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -96,6 +104,12 @@ class GovernanceRecoveryReport:
       server 记录（#159 Option B / 协议 §2.2）；client 据此展示审批 UI。
     - ``marketplace_source_conflicts``：**声明源 ≠ 已注册源**的 marketplace（#287 / §5.14，**只诊断不换源**）。
       本报告是观测信号而非降级信号——冲突项照常按 known 旧源恢复，**不**进 ``failed_marketplaces``。
+    - ``marketplace_declaration_errors``：settings 校验阶段**被整条丢弃**的非法 ``extraKnownMarketplaces``
+      声明（#293，镜像 rust 同名同义字段）。与 ``marketplace_source_conflicts`` **正交、不重复计数**：后者
+      比对的是**合法**声明与已注册源，本字段是声明**自身不可用**（typo / 缺 ``source`` / 非 git URL）——
+      被校验丢弃后连「可比声明」都不存在，故两个列表不可能对同一事实各记一次。恢复源 / 降级语义均不变。
+      仅由 :meth:`Computer.reconcile_governance` 从 ``ResolvedSettings.errors`` 填充；直接调用
+      :func:`recover_marketplace_skills` 时恒空（该入口拿到的 ``declared`` 已过校验）。
     """
 
     restored_plugins: list[str] = field(default_factory=list)
@@ -107,6 +121,7 @@ class GovernanceRecoveryReport:
     scope_normalized: list[str] = field(default_factory=list)
     pending_bundled_servers: list[BundledServerRecord] = field(default_factory=list)
     marketplace_source_conflicts: list[MarketplaceSourceConflict] = field(default_factory=list)
+    marketplace_declaration_errors: list[MarketplaceDeclarationError] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +170,187 @@ class MarketplaceSourceConflict:
     known_source_display: str
 
 
+@dataclass(frozen=True, slots=True)
+class MarketplaceDeclarationError:
+    """
+    被 settings 校验**整条丢弃**的非法 ``extraKnownMarketplaces`` 声明（#293，镜像 rust 同名同字段）/
+    An invalid ``extraKnownMarketplaces`` declaration dropped by settings validation.
+
+    校验语义**不变**（非法条目照旧逐条丢弃、不阻断启动）；本结构只让「有声明但非法」在恢复报告里可见。
+    与 :class:`MarketplaceSourceConflict` **正交**：后者是**合法声明**与已注册源不一致（只诊断不换源）；
+    本结构是声明**自身不可用**（漏 scheme / ``owner/repo`` 简写 / 非 git / 缺 ``source``）。被丢弃的声明
+    根本不在 ``declared`` 视图里，故 :func:`detect_marketplace_source_conflicts` 看不到它——两个列表对同一
+    事实不可能各记一次。
+
+    ``field`` / ``reason`` / ``source_path`` 均已经过脱敏与控制字符清洗（见
+    :func:`sanitized_marketplace_error`）：``field`` 保留 ``extraKnownMarketplaces.`` 前缀便于定位，
+    其后的市场名段按 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key` 口径展示
+    （市场名是不可信手编值，可含凭据形态 URL）。**三字段与 ``marketplace`` 全是展示值**，不可用于任何
+    再克隆 / 比较 / 去重。
+    """
+
+    scope: SettingsScope
+    marketplace: str | None
+    field: str
+    reason: str
+    source_path: str | None = None
+
+
+def sanitize_marketplace_name(name: str) -> str:
+    """
+    单个不可信**名字**（市场名段 / 子字段残段）→ 诊断展示值（#293）/
+    A single untrusted name → display-safe diagnostics value.
+
+    走 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key`（#261/#263/#281 单一
+    权威：含 ``://`` 走 :func:`~a2c_smcp.utils.git_url.diagnostic_url_for_display`，其余走
+    :func:`~a2c_smcp.utils.git_url.sanitize_segment_for_diagnostics`）。该原语只转义 Cc/Cs，
+    Cf（方向覆写 / 行分隔）原样透出，故再叠
+    :func:`~a2c_smcp.computer.settings.schema.scrub_diagnostic_chars`。
+
+    **比 rust 更严是有意的**：rust 对名字也用散文脱敏（``redact_git_urls_in_text``，只去 userinfo、
+    保留 path），而账本键/市场名是**单个不可信值**，path 段里的 ``alice:PW@example.com`` 会照原样回显
+    （#261 的口径）。名字走段漏斗，散文（``reason``）才走散文脱敏。
+
+    刻意**不**改 ``utils.git_url`` 的 ``_UNSAFE_CHAR_CATEGORIES``：那是全仓展示面的转义器，口径已冻结
+    （「Cf 与 rust 口径一致不处理」指 ``escape_unsafe_chars``），本函数只服务 settings 诊断面。
+    """
+    return scrub_diagnostic_chars(redact_ledger_key(name))
+
+
+def sanitize_marketplace_text(text: str) -> str:
+    """
+    诊断**散文**（``reason``）→ 展示值：Git URL token 级脱敏 + 控制 / 方向覆写字符清洗（#293）/
+    Prose (``reason``) → display-safe value.
+
+    与 rust ``sanitize_marketplace_text`` 同语义（rust 走 ``redact_git_urls_in_text``）：
+    :func:`~a2c_smcp.utils.git_url.redact_git_urls_in_text` 逐 token 脱敏、保留散文结构（不会像段漏斗
+    那样把整句替换成一个占位符），再经 ``scrub_diagnostic_chars`` 清掉 Cf 族。
+    """
+    return scrub_diagnostic_chars(redact_git_urls_in_text(text))
+
+
+def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDeclarationError | None:
+    """
+    单条 settings 校验错误 → 脱敏 :class:`MarketplaceDeclarationError`；非 marketplace 子树返回 ``None``。
+
+    .. note::
+       与 rust 的**落点差异**（有意，见设计文档 §6）：rust 在 ``validate_settings`` 出口即脱敏，顺带修好了
+       ``settings show``；本仓 `settings show` 的凭据回显是独立安全单
+       [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，故本函数**只**在采集处调用，
+       ``validate_settings`` 出口与原 ``format_settings_errors`` 行为不变。``#295`` 落地时可直接复用本函数。
+    """
+    if not is_marketplace_declaration_field(error.field):
+        return None
+    # field 保留前缀：前缀本身含 `.`，整段喂给 URL 脱敏器会被误判为 scheme 的一部分（与 rust 同因）。
+    prefix = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}."
+    if error.field.startswith(prefix):
+        field = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}.{sanitize_marketplace_name(error.field[len(prefix):])}"
+    else:
+        # 无法剥离前缀（整字段错误）→ 整段脱敏（fail-safe，与 rust 同）。
+        field = sanitize_marketplace_text(error.field)
+    reason = sanitize_marketplace_text(error.reason)
+    return MarketplaceDeclarationError(
+        scope=error.scope,
+        marketplace=declaration_marketplace(field, reason),
+        field=field,
+        reason=reason,
+        # 路径按路径对待：只清洗控制 / 方向覆写字符，**不**走 URL 脱敏（否则 Windows
+        # ``…\alice@corp\…`` 这类 scp-like 形态路径会被整段替换成占位符）。
+        source_path=None if error.source_path is None else scrub_diagnostic_chars(error.source_path),
+    )
+
+
+def declaration_marketplace(field: str, reason: str) -> str | None:
+    """
+    从（已脱敏的）字段路径解析 marketplace 名 / Parse the marketplace name out of the dotted field.
+
+    ``extraKnownMarketplaces.<name>[.source[.type|.url]|.autoUpdate]``：
+
+    - **名称非法**时校验器只记到 ``<name>``，此时**整个剩余段就是名称**——不能按后缀启发式切分，
+      因为非法名本身可能就是 ``acme.source.url``。判据与 rust 同：``reason`` 以 kebab 文案开头。
+    - 合法名 + 子字段错误 → 剥最长已知后缀。
+    - 顶层字段类型错误（无 ``<name>`` 段）→ ``None``。
+
+    已知边界：名字型错误之外的非法名若本身以这些后缀结尾，展示名会被截短——只**少显示**字符，
+    不会多显示，故无泄漏面。
+
+    :param field: **已脱敏**的点路径（据此解析，保证 ``marketplace`` 与 ``field`` 同源）。
+    :param reason: **已清洗**的校验原因（用于名称型分支判定）。
+    """
+    prefix = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}."
+    if not field.startswith(prefix):
+        return None
+    rest = field[len(prefix):]
+    if not rest:
+        return None
+    if reason.startswith("marketplace name must be strict kebab"):
+        return rest
+    for suffix in (".source.url", ".source.type", ".source", ".autoUpdate"):
+        if rest.endswith(suffix):
+            return rest[: -len(suffix)] or None
+    return rest
+
+
+def marketplace_declaration_errors(
+    errors: Iterable[SettingsValidationError],
+) -> list[MarketplaceDeclarationError]:
+    """
+    从 settings 校验错误中筛出 ``extraKnownMarketplaces`` 声明错误并脱敏（纯函数、保序、1:1）/
+    Filter + sanitize the ``extraKnownMarketplaces`` declaration errors.
+
+    **不聚合**：一条错误 → 一条报告（同一个市场在 user / local 两层各错一条即两条）——分层语义是用户
+    2026-11-22 裁决的硬要求：user 层非法、local 层合法时，合并视图仍有可用声明，聚合成「该市场无声明」
+    会误导。**不改**校验 / 丢弃语义。
+
+    :param errors: :attr:`~a2c_smcp.computer.settings.scope.ResolvedSettings.errors`。
+    """
+    collected: list[MarketplaceDeclarationError] = []
+    for error in errors:
+        sanitized = sanitized_marketplace_error(error)
+        if sanitized is not None:
+            collected.append(sanitized)
+    return collected
+
+
+def attach_marketplace_declaration_errors(
+    report: GovernanceRecoveryReport,
+    errors: Iterable[SettingsValidationError],
+) -> None:
+    """
+    把 settings 校验错误接入恢复报告并打诊断日志（#293 的**单一接线点**）/
+    Attach the settings validation errors to the recovery report and log them.
+
+    编排方（:meth:`Computer.reconcile_governance`）在阶段一返回后**无条件**调用——空安装意图时
+    :func:`recover_marketplace_skills` 会早退，故该回填不能放进它里面。
+    """
+    report.marketplace_declaration_errors = marketplace_declaration_errors(errors)
+    _log_marketplace_declaration_errors(report.marketplace_declaration_errors)
+
+
+def _log_marketplace_declaration_errors(errors: Sequence[MarketplaceDeclarationError]) -> None:
+    """声明错误日志：WARN 汇总（带脱敏市场名）+ 逐条 DEBUG / Summary WARN + per-item DEBUG."""
+    if not errors:
+        return
+    for error in errors:
+        logger.debug(
+            "governance recovery: invalid marketplace declaration at scope %s (%s): %s [%s]",
+            error.scope.value,
+            error.field,
+            error.reason,
+            error.source_path or "<unknown>",
+        )
+    names = sorted({error.marketplace for error in errors if error.marketplace})
+    # 汇总行**带脱敏后的市场名**：默认日志级别是 INFO，只给计数的话用户不知道该修哪一个
+    # （与 `_log_marketplace_source_conflicts` 同口径）。
+    logger.warning(
+        "governance recovery: %d invalid marketplace declaration(s) in settings were dropped by validation and did "
+        "NOT participate in recovery (%s); existing registrations are kept unchanged — fix the declaration to change "
+        "the source (invalid declarations are never silently substituted, runtime-contract §5.14)",
+        len(errors),
+        ", ".join(names) if names else "no marketplace name resolved",
+    )
+
+
 def detect_marketplace_source_conflicts(
     marketplaces: Iterable[str],
     declared: Mapping[str, Any],
@@ -183,9 +379,12 @@ def detect_marketplace_source_conflicts(
        上面这条 fail-closed 只在调用方传入**未经 schema 校验**的 ``declared`` 时可达。boot 生产路径的
        ``declared`` 来自 :func:`~a2c_smcp.computer.settings.scope.resolve_settings`，其
        ``_validate_extra_marketplaces``（``settings/schema.py``）会把 ``source`` 缺失 / 非 ``git`` / URL 畸形
-       的声明**整条丢弃**——此时本函数看到的是「无声明」，既不报冲突也无从诊断（校验错误在
-       :attr:`ResolvedSettings.errors`，``Computer`` 当前不呈现它）。已知边界，见
-       ``docs/design-0.5.1-boot-recovery-source-diagnostics.md`` §7。
+       的声明**整条丢弃**——此时本函数看到的是「无声明」，既不报冲突也无从诊断。
+
+       该静默已由 #293 收口：被丢弃的声明进入
+       :attr:`GovernanceRecoveryReport.marketplace_declaration_errors`（见
+       :func:`marketplace_declaration_errors`），与冲突列表**分开计数**。本函数**只**比对合法声明，
+       不改。
 
     :param marketplaces: 待检测的 marketplace 名（调用方保证 = 安装意图涉及集）。
     :param declared: 合并声明视图（取 ``extraKnownMarketplaces``）。
@@ -397,6 +596,9 @@ async def recover_marketplace_skills(
     :param home: SKILL Home 绝对根。
     :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控；#287 起**另只读**
         ``extraKnownMarketplaces`` 作声明源诊断，缺该键 ⇒ 不产生 ``marketplace_source_conflicts``）。
+        本函数拿到的视图**已过 settings 校验**，非法声明已被丢弃、错误只存在于
+        :attr:`ResolvedSettings.errors`——因此 #293 的 ``marketplace_declaration_errors`` **不在此填充**，
+        由 :meth:`Computer.reconcile_governance` 无条件回填（镜像 rust；直接调用本函数时该字段恒空）。
     :param env: 环境映射（账本路径解析 + git 子进程），默认 ``os.environ``。
     :param timeout: 单次 git 操作超时（仅 clone 缺失重建时可能触发）。
     """

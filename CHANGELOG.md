@@ -203,9 +203,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     boot 自动换源即 §5.14 禁止的「静默替换」；换源只经显式 `marketplace remove` → `add`。与 #268 的迁移
     模型互不替代——该迁移**仅由显式 `marketplace migrate` 触发**（boot 不执行它，也不跑 `reconciler.reconcile`），
     且不改 `extraKnownMarketplaces`。
-  - **已知边界**：声明本身**不合法**（`source` 缺失 / 非 `git` / URL 畸形，如少写 scheme）时，settings 校验会
-    把该声明整条丢弃，boot 只看到「无声明」⇒ 仍静默用旧源、无诊断。补救见 follow-up
-    [#293](https://github.com/A2C-SMCP/python-sdk/issues/293)。
+  - **已知边界（已由 [#293](https://github.com/A2C-SMCP/python-sdk/issues/293) 收口）**：当时若声明本身
+    **不合法**（`source` 缺失 / 非 `git` / URL 畸形，如少写 scheme），settings 校验会把该声明整条丢弃，
+    boot 只看到「无声明」⇒ 仍静默用旧源、无诊断。#293 起这类声明进入
+    `GovernanceRecoveryReport.marketplace_declaration_errors` 并打 WARN 汇总（见 `### Fixed`）。
     详见 [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md)。
 - **按路径读取 `client:resolve_path` + `readRoots` 授权（#236，protocol#65）**：新增事件
   `client:resolve_path`（`ResolvePathReq` / `ResolvePathRet`）与错误码 `4020 Path Not Accessible`
@@ -320,6 +321,27 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Fixed
 
+- **非法 marketplace 声明被静默丢弃（#293）**：`extraKnownMarketplaces` 的声明若不合 schema（漏 scheme、
+  `owner/repo` 简写、`source.type` 非 `git`、缺 `source`），`validate_settings` 会把它**整条丢弃**，而
+  `Computer` 从不读 `ResolvedSettings.errors` ⇒ 用户把声明 URL 改出 typo 后重启，boot 只看到「无声明」，
+  既不报冲突也不报错，仍静默按旧源恢复。
+  - 新增 `GovernanceRecoveryReport.marketplace_declaration_errors: list[MarketplaceDeclarationError]`
+    （字段 `scope` / `marketplace` / `field` / `reason` / `source_path`，**逐条 + scope**，不聚合
+    「该市场无声明」；**含无安装意图的市场与 flag 层**），镜像 rust 同名 DTO。
+  - 与 `marketplace_source_conflicts` **正交、不重复计数**：被丢弃的声明不在 `declared` 视图里，冲突检测
+    看不到它；恢复源 / `failed_marketplaces` / 降级语义 / 账本**完全不变**。
+  - 可见面：recovery `WARNING` 汇总（条数 + **脱敏后的市场名列表**）+ 逐条 `DEBUG`；
+    `Computer.boot_up` 汇总行新增 `M marketplace declaration errors`，且该计数**单独即可触发**汇总行
+    （「零恢复 + 有错误」不再静默）。
+  - **显式 `declared=` 契约**：`Computer.reconcile_governance(declared=...)` 现接受
+    `ResolvedSettings`（携带 `.errors`）与裸 `Mapping`（遗留形态、恒空，docstring 已注明）；
+    CLI `run_governance_remount` 改传整对象并**返回** report（additive），供
+    [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 的三类展示消费。
+  - **脱敏**：`field` 的市场名段走 `redact_ledger_key`（段漏斗，比散文脱敏更严），`reason` 走散文脱敏，
+    两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗。`settings show` 的凭据回显仍是
+    [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。
+  - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度 / `per_scope_layers`）见
+    [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md) §6.1。
 - **Computer 停机卡死 + 外部取消信号被吞（#211）**：`_keep_alive_task` 拆除窗口内服务端消息到达时
   `aclose()` 抛 `ExceptionGroup`，跳过关闭信号 ⇒ `Computer.shutdown()` 永不返回。关闭信号与状态清理改为
   无条件执行，断开等待加上界（超时强杀子进程）。
