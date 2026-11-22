@@ -1170,6 +1170,12 @@ def test_blocked_item_payload_has_no_execution_actions(tmp_path: Path, monkeypat
     assert payload["items"][0]["actions"] == {}
     assert payload["items"][0]["plugins"] == []
 
+    # 非空 actions + blocked：serializable() 必须抑制（避免「同值致盲」，夹具本身 actions 为空也算不出）。
+    manual = mm.MigrationItem(
+        old="acme", new="acme-skills", action=mm.ACTION_BLOCKED, actions={"catalog": "rename"}
+    )
+    assert manual.serializable()["actions"] == {}
+
 
 def test_ambiguous_claim_is_detected_in_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch)
@@ -1235,8 +1241,12 @@ def test_human_table_suppresses_actions_for_non_executed_items() -> None:
     renamed = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_RENAME, actions=dict(actions))
     aborted = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_ABORTED, actions=dict(actions))
 
+    unresolved = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_UNRESOLVED, actions=dict(actions))
+    noop = mm.MigrationItem(old="acme", action=mm.ACTION_NOOP, actions=dict(actions))
     assert _display_actions(hidden) == {}
     assert _display_actions(blocked) == {}
+    assert _display_actions(unresolved) == {}
+    assert _display_actions(noop) == {}
     # 正对照：实际执行面（rename / aborted）必须展示。
     assert _display_actions(renamed)["catalog"] == "rename"
     assert _display_actions(aborted)["trustedMarketplaces"] == "add+remove"
@@ -1321,29 +1331,39 @@ def test_loose_password_truthiness_is_treated_as_maybe_secret(
         marketplace_skill_dir(home, "acme") / "plugins" / "figma" / "mcp-servers" / "inputs.json",
         {"inputs": [{"id": "token", "type": "promptString", "password": raw_password}]},
     )
+    before = _snapshot(tmp_path)
     plan = mm.build_plan(home, env, cwd=work)
     assert plan.items[0].action == mm.ACTION_BLOCKED
     assert plan.items[0].reason == mm.REASON_SECRET_INPUTS_UNREADABLE
+    assert any("unreadable or ambiguous input definitions" in warning for warning in plan.items[0].warnings)
+    _assert_unchanged(before, tmp_path)
 
 
-def test_render_migration_rows_assertion(capsys: pytest.CaptureFixture[str]) -> None:
-    from a2c_smcp.computer.cli.commands.marketplace import _render_migration, console
+def test_render_migration_rows_assertion(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rich.console import Console
+
+    from a2c_smcp.computer.cli.commands import marketplace as marketplace_cli
+    from a2c_smcp.computer.cli.commands.marketplace import _render_migration
 
     actions = {"catalog": "rename", "installedPlugins": 1, "trustedMarketplaces": "add+remove"}
     blocked = mm.MigrationItem(
         old="aaa", new="aaa-new", action=mm.ACTION_BLOCKED, reason="baseline-mismatch", actions=dict(actions)
     )
+    unresolved = mm.MigrationItem(
+        old="ccc", new="ccc-new", action=mm.ACTION_UNRESOLVED, reason="ambiguous-catalog", actions=dict(actions)
+    )
     renamed = mm.MigrationItem(old="bbb", new="bbb-new", action=mm.ACTION_RENAME, actions=dict(actions))
-    plan = mm.MigrationPlan(items=[blocked, renamed])
-    old_width = console.width
-    console.width = 220
-    try:
-        _render_migration(plan, applied=False)
-    finally:
-        console.width = old_width
+    plan = mm.MigrationPlan(items=[blocked, unresolved, renamed])
+    # 不修改全局 console 的 _width（Rich getter 会把计算宽度永久钉住）；换局部实例。
+    monkeypatch.setattr(marketplace_cli, "console", Console(width=220))
+    _render_migration(plan, applied=False)
     out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if "aaa" in line or "bbb" in line]
+    lines = [line for line in out.splitlines() if "aaa" in line or "bbb" in line or "ccc" in line]
     blocked_line = next(line for line in lines if "aaa" in line)
+    unresolved_line = next(line for line in lines if "ccc" in line)
     renamed_line = next(line for line in lines if "bbb" in line)
     assert "rename" not in blocked_line and "add+remove" not in blocked_line
+    assert "rename" not in unresolved_line and "add+remove" not in unresolved_line
     assert "rename" in renamed_line and "add+remove" in renamed_line
