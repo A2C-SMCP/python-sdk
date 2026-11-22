@@ -580,6 +580,47 @@ async def test_reconcile_governance_reports_invalid_declaration_without_install_
 
 
 @pytest.mark.asyncio
+async def test_reconcile_governance_reports_whole_field_type_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #293：``extraKnownMarketplaces`` **整字段**类型错（非 object）→ 仍产生一条报告、``marketplace is None``、
+    不崩（无人可归到具体市场；#294 据此决定不带名展示）。
+    """
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, skills=["lint"])
+    _write_settings(
+        _user_settings_path(tmp_path),
+        {**_DECLARED_ENABLED, "extraKnownMarketplaces": "not-an-object"},
+    )
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance()
+
+    assert len(report.marketplace_declaration_errors) == 1
+    error = report.marketplace_declaration_errors[0]
+    assert error.marketplace is None
+    assert error.field == "extraKnownMarketplaces"
+    assert error.scope is SettingsScope.USER
+    # 整字段判废不影响恢复
+    assert "audit:lint" in report.restored_skills
+    assert report.marketplace_source_conflicts == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_governance_rejects_unsupported_declared_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#293 契约：``declared=`` 只接受 ``None`` / ``Mapping`` / ``ResolvedSettings``；其余显式 ``TypeError``。"""
+    _isolate_declared_env(tmp_path, monkeypatch)
+    home, _ = _seed_home(tmp_path, skills=["lint"])
+
+    async with Computer(name="t", skill_home=home) as comp:
+        with pytest.raises(TypeError, match="ResolvedSettings"):
+            await comp.reconcile_governance(declared=object())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_governance_user_invalid_local_valid_is_not_aggregated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -672,21 +713,22 @@ async def test_reconcile_governance_explicit_resolved_settings_carries_errors(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_governance_explicit_resolved_settings_keeps_per_scope_layers_disabled(
+async def test_reconcile_governance_explicit_resolved_settings_applies_project_trust_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    #293：显式 ``ResolvedSettings`` **只**取 ``.settings`` / ``.errors``，**不**取 ``.per_scope_layers``。
+    #293（用户 2026-11-22 裁决）：显式 ``ResolvedSettings`` **也**取 ``.per_scope_layers``。
 
-    冻结的向后兼容契约：取 per-scope 层会让 ``enabled_origin`` 从 ``None`` 变成 ``PROJECT``，
-    project-origin bundled server 改落 PENDING 审批门（#159 Option B）——超出本单范围。
-    判别力：若顺带取 ``.per_scope_layers``，``mounted`` 会变空、``pending_bundled_servers`` 会有一项。
+    丢弃它会让 ``enabled_origin`` 恒 ``None`` ⇒ project-scope 激活的 bundled server **绕过** #159 Option B
+    的 PENDING 信任门、被自动挂载（仓库入 git 的共享声明不得免批准）。传 ``.per_scope_layers`` 后与
+    ``declared=None`` 路径同门（rust 早已如此）。
+    判别力：若改回不取 per-scope 层，``mounted`` 会变成 ``[FIGMA_NAME]``、``pending_bundled_servers`` 为空。
     """
     from a2c_smcp.computer.settings.scope import resolve_settings
 
     _isolate_declared_env(tmp_path, monkeypatch)
     home, _ = _seed_home(tmp_path, servers=[FIGMA_NAME])
-    # user：安装意图 + 非法声明；project：声明启用（会进 per_scope_layers，但显式路径必须忽略它）
+    # user：安装意图 + 非法声明；project：声明启用 → 必须落 PENDING 而非直挂
     _write_settings(
         _user_settings_path(tmp_path),
         {"installedPlugins": ["audit@acme"], "extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": "owner/repo"}}}},
@@ -707,9 +749,11 @@ async def test_reconcile_governance_explicit_resolved_settings_keeps_per_scope_l
             declared=resolved,
         )
 
-    assert mounted == [FIGMA_NAME]
-    assert report.pending_bundled_servers == []
-    assert report.remounted_servers == [FIGMA_BID]
+    # project-origin → PENDING 审批门 → 不挂载
+    assert mounted == []
+    assert report.remounted_servers == []
+    assert [r.plugin_id for r in report.pending_bundled_servers] == ["audit@acme"]
+    assert report.pending_bundled_servers[0].enabled_origin is SettingsScope.PROJECT
     # 同一次调用里声明错误照样被带出来
     assert [e.marketplace for e in report.marketplace_declaration_errors] == ["acme"]
 
@@ -737,12 +781,17 @@ async def test_reconcile_governance_redacts_credential_marketplace_name(
             captured.append(record.getMessage())
 
     sink = _Sink(level=logging.DEBUG)
+    # 钉住 ambient 级别：汇总/逐条分别是 WARNING / DEBUG，宿主设 A2C_SMCP_LOG_LEVEL=error 时都收不到。
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.DEBUG)
     recovery_mod.logger.addHandler(sink)
     try:
         async with Computer(name="t", skill_home=home) as comp:
             report = await comp.reconcile_governance()
     finally:
         recovery_mod.logger.removeHandler(sink)
+        a2c_logger.setLevel(prev_level)
 
     # 正对照：落盘文件里确实是凭据形态的 key
     assert "t0ken" in settings_path.read_text(encoding="utf-8")
@@ -816,6 +865,12 @@ async def test_boot_up_summary_not_triggered_by_unrelated_settings_error(
         _user_settings_path(tmp_path),
         {**_DECLARED_ENABLED, "enabledPlugins": {"audit@acme": False, "BAD KEY": True}},
     )
+    # 正对照：夹具确实产出了一条**非** marketplace 子树的 settings 校验错误（否则「无汇总」可能只是因为
+    # 压根没有错误，本用例就成了空转）。
+    from a2c_smcp.computer.settings.scope import resolve_settings
+
+    fixture_errors = [e.field for e in resolve_settings(cwd=tmp_path).errors]
+    assert fixture_errors == ["enabledPlugins.BAD KEY"], fixture_errors
 
     from a2c_smcp.computer import computer as computer_mod
 

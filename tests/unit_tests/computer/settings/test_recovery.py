@@ -1079,6 +1079,38 @@ def test_attach_marketplace_declaration_errors_logs_summary_at_default_info() ->
     assert all("t0ken" not in line and "bob" not in line for line in debug_lines), debug_lines
 
 
+def test_attach_marketplace_declaration_errors_dedups_names_in_summary() -> None:
+    """同市场跨层两条错误：**逐条计数 2**，但 WARN 汇总的市场名去重（只点一次名）。"""
+    report = GovernanceRecoveryReport()
+    errors = [
+        _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.USER),
+        _verr("extraKnownMarketplaces.acme.source.url", "malformed git url", SettingsScope.LOCAL),
+    ]
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    captured: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.DEBUG)
+    sink = _Sink(level=logging.DEBUG)
+    recovery_mod.logger.addHandler(sink)
+    try:
+        attach_marketplace_declaration_errors(report, errors)
+    finally:
+        recovery_mod.logger.removeHandler(sink)
+        a2c_logger.setLevel(prev_level)
+
+    assert [e.scope for e in report.marketplace_declaration_errors] == [SettingsScope.USER, SettingsScope.LOCAL]
+    summary = next(r.getMessage() for r in captured if r.levelno == logging.WARNING)
+    assert "2 invalid marketplace declaration(s)" in summary
+    assert summary.count("acme") == 1, summary  # 名字去重，不重复点名
+
+
 def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> None:
     """负对照：无错误 ⇒ 报告空、零日志（不得每次 boot 都刷一条「0 条错误」）。"""
     report = GovernanceRecoveryReport()
@@ -1099,3 +1131,20 @@ def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> Non
 
     assert report.marketplace_declaration_errors == []
     assert captured == []
+
+
+def test_source_path_uses_path_axis_redaction() -> None:
+    """
+    ``source_path`` 走**路径轴**脱敏（`sanitize_path_for_diagnostics`），不是 URL / scp-like 脱敏器：
+
+    - 携凭据的路径**段**（``alice:pw@example.com``）整段占位；
+    - 普通 Windows 路径与段内 ``alice@corp`` **逐字保留**（scp-like 脱敏器会把它整条吞掉，那正是不能用它的原因）。
+    """
+    dirty = "/home/alice:pw@example.com/a2c/settings.json"
+    assert "pw" in dirty  # 正对照：原始路径确实带凭据
+    (redacted,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
+    assert redacted.source_path == "/home/<redacted-source>/a2c/settings.json"
+
+    windows = "C:\\repos\\alice@corp\\settings.json"
+    (kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=windows)])
+    assert kept.source_path == windows

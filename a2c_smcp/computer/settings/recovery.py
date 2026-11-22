@@ -80,7 +80,7 @@ from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
-from a2c_smcp.utils.git_url import redact_git_urls_in_text
+from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -254,9 +254,13 @@ def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDe
         marketplace=declaration_marketplace(field, reason),
         field=field,
         reason=reason,
-        # 路径按路径对待：只清洗控制 / 方向覆写字符，**不**走 URL 脱敏（否则 Windows
-        # ``…\alice@corp\…`` 这类 scp-like 形态路径会被整段替换成占位符）。
-        source_path=None if error.source_path is None else scrub_diagnostic_chars(error.source_path),
+        # 路径按**路径轴**脱敏：先清控制 / 方向覆写字符，再走
+        # :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：`/` 与 `\` 都当段边界、
+        # 段内普通 `@` 保留、authority 位置的 `TOKEN@host` 与 `?`/`#` 尾部整段遮蔽）——它**不是** URL /
+        # scp-like 脱敏器，Windows 路径与 `alice@corp` 不会像后者那样被整条吞掉。
+        source_path=None
+        if error.source_path is None
+        else sanitize_path_for_diagnostics(scrub_diagnostic_chars(error.source_path)),
     )
 
 

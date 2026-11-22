@@ -1259,12 +1259,15 @@ async def test_run_governance_remount_carries_declaration_errors(
 
     判别力：改回 ``resolved_settings(...)``（只取 ``.settings``）会让 report 的该字段恒空——#294 的展示
     面就会永远拿到空列表，而单测仍绿（这正是要防的假绿形态）。
+
+    **刻意不预置 bundled server**：本用例只断言 report 与 skills，预置 server 会让 ``amount_server`` 真起
+    ``node`` 子进程（各用例 ~120s 连接超时），既不 hermetic 又拖垮 unit suite。
     """
     from a2c_smcp.computer.settings.schema import SettingsScope
 
     _isolate_env(tmp_path, monkeypatch)
     home = _home(tmp_path)
-    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
+    _seed_recovery_home(home, servers=[], skills=["lint"])
     _write_json(
         user_settings_path({"XDG_CONFIG_HOME": str(tmp_path / "cfg")}),
         {
@@ -1292,12 +1295,13 @@ async def test_run_governance_remount_flag_declaration_error_scope_is_flag(
 
     有意差异（设计文档 §6）：rust 把 Flag 从 report 字段过滤掉（其 CLI 启动边界另有一处打印 + 抑制开关）；
     python 的报告口径是「全部声明错误」（用户 2026-11-22 裁决），且已接受同一次启动出现多条同义提示。
+    同 ``carries_declaration_errors``：不预置 bundled server（避免真起 ``node`` 子进程）。
     """
     from a2c_smcp.computer.settings.schema import SettingsScope
 
     _isolate_env(tmp_path, monkeypatch)
     home = _home(tmp_path)
-    _seed_recovery_home(home, servers=[FIGMA_NAME], skills=["lint"])
+    _seed_recovery_home(home, servers=[], skills=["lint"])
     flag_file = tmp_path / "flag-settings.json"
     flag_file.write_text(
         json.dumps({"extraKnownMarketplaces": {"acme": {"source": {"type": "git", "url": "owner/repo"}}}}),

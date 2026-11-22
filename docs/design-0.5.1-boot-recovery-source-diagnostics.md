@@ -156,7 +156,7 @@ rust 侧的逐条结构化 `WARN` 带 `reason` 码，适合被日志检索/告�
 ### 6.1 非法声明（#293）的对拍差异
 
 字段与 DTO 形状**逐字镜像** rust（`MarketplaceDeclarationError`：`scope` / `marketplace` / `field` /
-`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），四处实现口径不同，均属有意的
+`reason` / `source_path`；report 字段 `marketplace_declaration_errors`），三处实现口径不同，均属有意的
 SDK 自治差异：
 
 | 维度 | rust（`settings/schema.rs` + `computer.rs`） | python（本仓） | 理由 |
@@ -164,7 +164,19 @@ SDK 自治差异：
 | 脱敏落点 | **`validate_settings` 出口**统一脱敏，所有 `SettingsValidationError` 消费者（CLI 文本 / 报告 / 诊断）拿到同一安全值 | 只在**采集处**（`sanitized_marketplace_error`）脱敏；`format_settings_errors` 行为不变 | `settings show` 的凭据回显是独立安全单 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，用户裁决本单不提前改其行为。#295 落地时可直接复用该函数 |
 | Flag scope | **从 report 字段过滤掉**（其 CLI 启动边界另有打印 + `include_marketplace_declaration_errors` 抑制开关），WARN 仍记全量 | **不过滤**，`scope == flag` 照常进报告 | 用户裁决「报告**所有**前缀错误」，且已接受同次启动多条同义提示；python 没有 rust 那套抑制开关，过滤会让 flag 层错误从 report 消失（库宿主无处可见） |
 | 名字脱敏强度 | 名字与 reason 同走散文脱敏（`redact_git_urls_in_text`，只去 userinfo、保留 path） | 名字走**段漏斗**（`redact_ledger_key`），reason 才走散文脱敏 | 名字是**单个不可信值**：path 段里的 `alice:PW@example.com` 会被散文脱敏原样放出（#261 已定的口径） |
-| `per_scope_layers` | `reconcile_governance` **总是**从内部解析取 per-scope 层（显式收紧，见其 `#267 审查 🟡1` 注释） | 显式 `declared=` 路径仍置 `None`（`enabled_origin=None`，冻结向后兼容） | 取它会改变 #159 Option B 信任门行为（project-origin bundled server 改落 PENDING），超出 #293 范围；是否收紧另开单 |
+
+`source_path` 两端都按**路径轴**脱敏（段边界 ``/`` 与 ``\``、段内普通 `@` 保留），与名字/URL 轴不同——
+这是 #263 四轮复审定下的路径原语，Windows 路径与 `alice@corp` 不会被 scp-like 脱敏器整条吞掉。
+
+**`reason` 的散文脱敏不对 path 段 fail-closed**（与名字段不对称）：`redact_git_urls_in_text` 只去 userinfo、
+保留 path。当前**不可达**——`_validate_extra_marketplaces` 的 reason 全是静态文案（`malformed git url` /
+`missing or non-object 'source'` / `only source.type == 'git' is supported` / `marketplace name must be strict
+kebab (1-64)` / `must be bool, got <type>`），不含任何用户值；本模块的 reason 脱敏是纵深防御（防未来某个
+validator 把值拼进 reason）。若将来有 reason 携带用户值，应改走段漏斗。
+
+`per_scope_layers` 已**对齐** rust：显式 `declared=ResolvedSettings` 也取其 `.per_scope_layers`（用户
+2026-11-22 裁决，本单范围），故 project-origin bundled server 在两条路径上都过 #159 Option B 的 PENDING
+信任门；裸 `Mapping` 是其结构性缺席（无 per-scope 信息可用，协议 §2.5-5 明许行为等价）。
 
 两端共同点（对拍口径）：报告字段只放脱敏展示值；声明源变化**永不**导致换源；换源只经显式 remove → re-add。
 
@@ -183,7 +195,7 @@ SDK 自治差异：
 | `installedPlugins` / `enabledPlugins` 的同类 invalid key 仍静默（不进本报告） | 另案评估（用户裁决 5） |
 | `settings.json` 整文件不可解析时只记一条 `<file>` 错误，不含 marketplace 子树 | 既有行为（§5.6 容错），不在本设计范围 |
 | CLI 三类展示（声明错误 / 源冲突 / failed）未接线 | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) |
-| 显式 `declared=` 路径不取 `per_scope_layers`（与 rust 有意分叉） | §6.1；收紧另开单 |
+| `reason` 的散文脱敏不对 path 段 fail-closed（当前 reason 全静态、不可达） | §6.1；reason 若引入用户值时改走段漏斗 |
 
 ## 8. 不做
 

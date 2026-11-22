@@ -334,13 +334,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `Computer.boot_up` 汇总行新增 `M marketplace declaration errors`，且该计数**单独即可触发**汇总行
     （「零恢复 + 有错误」不再静默）。
   - **显式 `declared=` 契约**：`Computer.reconcile_governance(declared=...)` 现接受
-    `ResolvedSettings`（携带 `.errors`）与裸 `Mapping`（遗留形态、恒空，docstring 已注明）；
-    CLI `run_governance_remount` 改传整对象并**返回** report（additive），供
-    [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 的三类展示消费。
+    `ResolvedSettings`（携带 `.errors`，并取其 `.per_scope_layers`）与裸 `Mapping`（遗留形态、
+    无错误、无 per-scope 层，docstring 已注明）；CLI `run_governance_remount` 改传整对象并**返回**
+    report（additive），供 [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 的三类展示消费。
+  - **行为变化（修正）**：显式 `declared=ResolvedSettings` 路径此前丢弃 `.per_scope_layers` ⇒
+    `enabled_origin` 恒 `None`，project-scope 激活的 bundled MCP server **绕过** #159 Option B 的
+    PENDING 审批门被自动挂载。现与 `declared=None` 路径同门（与 rust 一致）：这类 server 落
+    `pending_bundled_servers` 等用户批准，不再静默挂载。裸 `Mapping` 调用方无 per-scope 信息，
+    行为不变。
   - **脱敏**：`field` 的市场名段走 `redact_ledger_key`（段漏斗，比散文脱敏更严），`reason` 走散文脱敏，
     两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗。`settings show` 的凭据回显仍是
     [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。
-  - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度 / `per_scope_layers`）见
+  - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度）见
     [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md) §6.1。
 - **Computer 停机卡死 + 外部取消信号被吞（#211）**：`_keep_alive_task` 拆除窗口内服务端消息到达时
   `aclose()` 抛 `ExceptionGroup`，跳过关闭信号 ⇒ `Computer.shutdown()` 永不返回。关闭信号与状态清理改为

@@ -2477,15 +2477,15 @@ class Computer(BaseComputer[PromptSession]):
               取自同一次解析的 ``ResolvedSettings.errors``；``per_scope_layers`` 同样取自该次解析，故
               #159 Option B 信任门（``enabled_origin``）在默认 boot 路径**照常生效**；
             - :class:`~a2c_smcp.computer.settings.scope.ResolvedSettings` —— **推荐的外部 override 形态**：
-              ``.settings`` 作声明视图、``.errors`` 作声明错误来源。类型即载体，调用方不可能「只传视图忘传
-              错误」——那正是 #293 要消灭的静默形态（如 CLI ``run_governance_remount`` 传
-              ``resolved_settings_with_errors(...)`` 整对象）；**刻意不取** ``.per_scope_layers``；
-            - 裸 ``Mapping`` —— 遗留形态，**不携带 settings 校验错误**（report 该字段恒空）。需要声明诊断的
-              调用方 MUST 改传 ``ResolvedSettings``；同样**不取** per-scope 层。
+              ``.settings`` 作声明视图、``.errors`` 作声明错误来源、``.per_scope_layers`` 作 #159 Option B
+              的 ``enabled_origin`` 判据。类型即载体，调用方不可能「只传视图忘传错误」——那正是 #293 要消灭
+              的静默形态（如 CLI ``run_governance_remount`` 传 ``resolved_settings_with_errors(...)`` 整对象）；
+            - 裸 ``Mapping`` —— 遗留形态，**不携带 settings 校验错误**（report 该字段恒空），也**没有**
+              per-scope 层（``enabled_origin=None`` ⇒ 信任门不触发）。需要声明诊断或 project-origin 判据的
+              调用方 MUST 改传 ``ResolvedSettings``。
 
-            两种**显式 override** 形态都置 ``per_scope_layers = None``（``enabled_origin=None``）——冻结的向后
-            兼容契约：#159 Option B 信任门在这条路径上不触发（rust 已另行收紧为总是取，见设计文档 §6.1；
-            python 是否跟进另开单）。
+            ``per_scope_layers`` 的唯一来源是「内部解析」或「传入的 ``ResolvedSettings``」；裸 ``Mapping``
+            是其结构性缺席（协议 §2.5-5 明许 scope 纯推导与挂载时标记行为等价）。
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
         # 运行时导入：本模块只在 TYPE_CHECKING 下引入该类型（无环，只为不拉重）。
@@ -2500,9 +2500,12 @@ class Computer(BaseComputer[PromptSession]):
             per_scope_layers = resolved.per_scope_layers
             settings_errors = resolved.errors
         elif isinstance(declared, ResolvedSettings):
+            # 用户 2026-11-22 裁决（架构师转达，本单范围内）：显式 ResolvedSettings **也取** per-scope 层。
+            # 丢弃它会让 ``enabled_origin`` 恒 None ⇒ project-scope 激活的 bundled server 绕过 #159 Option B
+            # 的 PENDING 信任门、被自动挂载（未决的工作区共享声明不该免批准）。rust 早已如此取。
             settings_errors = declared.errors
+            per_scope_layers = declared.per_scope_layers
             declared = declared.settings
-            per_scope_layers = None
         elif isinstance(declared, Mapping):
             per_scope_layers = None
         else:
