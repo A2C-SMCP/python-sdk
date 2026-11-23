@@ -164,6 +164,27 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 
+- **CLI 治理恢复分三类展示（#294）**：`a2c-computer` REPL 启动期的 `run_governance_remount` 此前只打印
+  `failed_marketplaces`，另外两类信号只在日志里（日志级别调高 / `A2C_SMCP_LOG_SILENT` 时不可见）。现在
+  **只消费 `GovernanceRecoveryReport` 字段**（不重新检测、不重新解析 settings），分三类各打一行，文案锚点
+  各不相同、不合并计数：
+  - **声明错误**（配置错误，**未参与**恢复）：`⚠ settings.json[<scope>]: <field> — <reason> (declaration ignored; existing registration unchanged)`；
+  - **源冲突**（声明源 ≠ 已注册源，仍按**旧源**恢复）：`⚠ marketplace '<name>': declared source differs from, or cannot be proven equivalent to, the registered source; …`；
+  - **降级**（`failed_marketplaces`）：`⚠ marketplace '<name>' degraded during governance recovery (skills/servers not restored)`（沿用 #287 起的既有文案）。
+  - 冲突与降级**只展示脱敏后的市场名**（name-only，两侧 source 明细仍只在 recovery 的逐条 `DEBUG` 里）。
+    文案与顺序均对拍 rust `cli/commands/mod.rs`：**降级 → 源冲突 → 声明错误**，文本逐字一致（仅引号风格不同：
+    python `!r` 给 `'acme'`、rust `{:?}` 给 `"acme"`）。rust 只有前两条是同名纯函数（降级行内联），python 侧
+    三条都提成纯函数以便单测钉措辞。
+  - **每条记录一行**（0 条不打、n 条 n 行），三类不合并计数。
+  - 行文本一律经 `rich.markup.escape()`。这不是纯粹的防崩溃：rich 会把 `settings.json[<scope>]` 里的
+    `[<scope>]` 当样式标签**吞掉**（实测未转义时只剩 `settings.json:`，scope 信息丢失），`field` 里的
+    `[/]` / `[bold]` 同样会消失；形状不巧时还会抛 `MarkupError`。可达的注入点是**声明行的 `field`**——
+    校验器用原始 JSON 键拼点路径，而 `sanitize_marketplace_name` 保留 `[`/`]` ⇒ 手编 settings 键即可注入。
+    **既有降级行此前没有转义，本版一并修掉**。
+  - **不提供 `--json`**：`run_governance_remount` 是 REPL 启动路径的内部函数（非 Typer 子命令），root `--json`
+    不覆盖该路径，输出仅面向人类。
+  - 同一次启动可能出现 2–3 条同义提示（boot `WARN` + 重挂 `WARN` + 新 CLI 行）——`WARN` 是库契约，本版不回收
+    （用户 2026-11-22 裁决）。
 - **`marketplace migrate`：存量 marketplace 注册名迁移（#268 / D3）**：把 0.5.1 之前以 URL 派生名 /
   显式 `--name` 别名注册的 marketplace 迁移到清单顶层 `name`，并同步改写全部引用面：
   - 权威面（user scope）：`installedPlugins` / `enabledPlugins`（含显式 `false`）/ `trustedMarketplaces` /
@@ -196,9 +217,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `ssh://` / `https://` / scp-like / `.git` 后缀等等价写法**不归一**，任一侧面目不可识别即视为不同源
     ——协议 §5.14「无法确定时 MUST fail-closed」。
   - 可见面：recovery `WARNING` 汇总（冲突数 + **脱敏后的市场名列表**，不含 URL）+ 逐条 `DEBUG`（两侧脱敏
-    URL）；`Computer.boot_up` 的恢复汇总行纳入冲突数。CLI `run_governance_remount` 的展示留 follow-up
-    [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)（这是与 rust-sdk#295 的两处有意差异之一，
-    见设计文档 §6）。
+    URL）；`Computer.boot_up` 的恢复汇总行纳入冲突数。CLI `run_governance_remount` 的展示当时留 follow-up
+    [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)——**已由 #294 实现**（见同段 `### Added`；
+    这是与 rust-sdk#295 的两处有意差异之一，见设计文档 §6）。
   - **只诊断、不换源**：恢复仍用已注册源 stage，旧能力保留，`failed_marketplaces` 与降级语义**不变**。
     boot 自动换源即 §5.14 禁止的「静默替换」；换源只经显式 `marketplace remove` → `add`。与 #268 的迁移
     模型互不替代——该迁移**仅由显式 `marketplace migrate` 触发**（boot 不执行它，也不跑 `reconciler.reconcile`），

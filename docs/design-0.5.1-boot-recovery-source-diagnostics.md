@@ -2,7 +2,7 @@
 
 > 状态：**已实现**（#287 声明源冲突诊断；**#293 非法声明可观测**，两者均已合入 develop）。
 > 关联：python-sdk#287（声明源冲突）/ **python-sdk#293（非法声明接入恢复报告）** / rust-sdk#295（#287 镜像）/
-> rust-sdk#267（rust 侧非法声明可观测性跟踪）/ #294（CLI 三类展示，消费本单 report 字段）/
+> rust-sdk#267（rust 侧非法声明可观测性跟踪）/ #294（CLI 三类展示，消费本单 report 字段，**已实现**）/
 > #295（`settings show` 凭据回显，另案）/ #260（marketplace 注册名与同名不同源语义）/
 > #268（存量注册名迁移，D3）/ #261 / #263 / #281（source 与账本键展示脱敏口径）/
 > a2c-smcp-protocol Discussion [#81](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/81)（双端对齐留痕）。
@@ -74,7 +74,7 @@ scp-like / `.git` 后缀等等价写法**不归一**——协议明许 SDK 不�
 | recovery 日志（冲突） | 1 条 `WARNING` 汇总（**冲突数 + 脱敏后的市场名列表**，不含 URL）+ 每市场 1 条 `DEBUG`（两侧脱敏 URL） |
 | recovery 日志（声明错误） | 1 条 `WARNING` 汇总（**条数 + 脱敏后的市场名列表**）+ 每条 1 条 `DEBUG`（scope / 脱敏 field / 脱敏 reason / source_path） |
 | `Computer.boot_up` 汇总行 | `... N declared-source conflicts, M marketplace declaration errors`；冲突数**与**声明错误数各自**单独即可触发**汇总行（否则「零恢复 + 有冲突/有错误」会静默无痕） |
-| CLI `run_governance_remount` | 本版**不加打印**，但已把 settings 错误带进 report（契约）；三类展示归 follow-up [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) |
+| CLI `run_governance_remount` | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 起**分三类打印**（声明错误 → 源冲突 → 降级），文案锚点各不相同：`settings.json[<scope>]` / `declared source differs` / `degraded during`；冲突与降级**只展示脱敏市场名**（两侧 source 仍只在 DEBUG）；无 `--json`（REPL 启动路径内部函数） |
 
 `marketplace_source_conflicts` 三字段**全部是展示值**，不可用于任何再克隆或比较：`marketplace` 走
 `redact_ledger_key`（账本键可手编，可能是携带凭据的 URL 残形），两侧 source 走 `display_source`（去
@@ -141,16 +141,18 @@ boot 不会替你做这件事——重启多少次都只是重复同一条诊断
 |------|-------------------------------|----------------------|
 | 检测范围 | `declared ∩ known` **全量**（含已注册但从未安装的市场） | **`installedPlugins` 意图涉及**的市场（2026-11-20 用户裁决收窄） |
 | 日志形态 | 逐条结构化 `WARN`（`reason=marketplace_source_conflict`） | 一条 `WARN` 汇总（**含脱敏后的市场名**，不含 URL）+ 逐条 `DEBUG`（含两侧脱敏 URL） |
-| CLI 展示 | `marketplace_source_conflict_line` 纯函数提示（只展示注册名） | **follow-up**（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)） |
+| CLI 展示 | `marketplace_source_conflict_line` 纯函数提示（只展示注册名） | 同类纯函数 `marketplace_source_conflict_line` / `marketplace_declaration_error_line` / `marketplace_degraded_line`（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 已落地，文案对拍 rust） |
 
 差异 1 的理由：用户裁决只看「有安装意图、真会被恢复」的市场，避免对从未安装的声明噪音告警；若未来要与
 rust 对齐为全量，需在两端同时改并重新裁决。
 
-差异 2 的理由：python 默认日志级别是 `INFO`、且 CLI 展示面在本版未接线 ⇒ 若只逐条打 `WARN`，用户要么被
-N 条重复告警淹没、要么（降为 DEBUG 时）完全看不见；故改为「一条汇总点名 + 逐条 DEBUG 给 URL 明细」。
-rust 侧的逐条结构化 `WARN` 带 `reason` 码，适合被日志检索/告警规则消费——两端面向的消费方式不同。
+差异 2 的理由：python 默认日志级别是 `INFO`；若只逐条打 `WARN`，用户要么被 N 条重复告警淹没、要么（降为
+DEBUG 时）完全看不见；故日志侧改为「一条汇总点名 + 逐条 DEBUG 给 URL 明细」。rust 侧的逐条结构化 `WARN`
+带 `reason` 码，适合被日志检索/告警规则消费——两端面向的消费方式不同。**CLI 展示面已由
+[#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 接线**（不再依赖日志级别），故「日志形态不同」
+不影响用户能否看见。
 
-差异 3 的理由：python 的 CLI 展示面另开 follow-up（[#294](https://github.com/A2C-SMCP/python-sdk/issues/294)），
+差异 3 的理由（**已由 [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 收口**，当前仅剩文案资产差异：python 侧三类都做成纯函数以便单测钉措辞）：python 的 CLI 展示面曾另开 follow-up，
 本版先保证 `GovernanceRecoveryReport` 与日志可观测。
 
 ### 6.1 非法声明（#293）的对拍差异
@@ -207,6 +209,10 @@ validator 把值拼进 reason）。若将来有 reason 携带用户值，应改�
 2026-11-22 裁决，本单范围），故 project-origin bundled server 在两条路径上都过 #159 Option B 的 PENDING
 信任门；裸 `Mapping` 是其结构性缺席（无 per-scope 信息可用，协议 §2.5-5 明许行为等价）。
 
+CLI 行**顺序与 rust 对拍**：降级 → 源冲突 → 声明错误；三条文案逐字一致（仅引号风格不同：python `!r`
+给 `'acme'`、rust `{:?}` 给 `"acme"`，与 python 既有降级行一致）。python 侧把降级行也提成纯函数
+（rust 是内联的），便于单测钉措辞。
+
 两端共同点（对拍口径）：报告字段只放脱敏展示值；声明源变化**永不**导致换源；换源只经显式 remove → re-add。
 
 ## 7. 已知边界
@@ -223,9 +229,9 @@ validator 把值拼进 reason）。若将来有 reason 携带用户值，应改�
 | `settings show` / `format_settings_errors` 对非法 marketplace 名仍回显原始凭据形态 | [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)（可复用本设计的 `sanitized_marketplace_error`） |
 | `installedPlugins` / `enabledPlugins` 的同类 invalid key 仍静默（不进本报告） | 另案评估（用户裁决 5） |
 | `settings.json` 整文件不可解析时只记一条 `<file>` 错误，不含 marketplace 子树 | 既有行为（§5.6 容错），不在本设计范围 |
-| CLI 三类展示（声明错误 / 源冲突 / failed）未接线 | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) |
 | `reason` 的散文脱敏不对 path 段 fail-closed（当前 reason 全静态、不可达） | §6.1；reason 若引入用户值时改走段漏斗 |
 | `sanitize_path_for_diagnostics` 的「先 escape 再判段 + 要求字面 `@`/`?`/`#`」在**其他**调用方仍可能漏 path 段凭据（控制字符邻接 / 段内空白 / percent-encoded 三类） | 共享原语问题，不在本单；本单只在 `source_path` 采集处 fail-closed |
+| 当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时，同一份非法声明会在同一次启动出现**两条** CLI 行（`run_mcp_approval` 的 `format_settings_errors` + 本单的声明行），叠加 boot/重挂两条 `WARN` ≈ 4 条同义提示 | 已知边界：用户 2026-11-22 裁决接受同义提示；`format_settings_errors` 的措辞与脱敏归 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)。**不**为去重而重新解析 settings（违反「只消费 report 字段」） |
 | project-origin bundled server 落 PENDING 后，CLI 只打 INFO 日志、**没有批准入口**（`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担（参考 client 未来补线索） | follow-up（架构师开跟踪 issue，不在 #293/#294 实现） |
 
 ## 8. 不做
@@ -235,5 +241,4 @@ validator 把值拼进 reason）。若将来有 reason 携带用户值，应改�
 - 不动 `reconcile`（声明式对账）的 `validation` 拒绝语义（#260）；
 - 不改 `validate_settings` / `_validate_extra_marketplaces` 的校验与丢弃语义（非法条目照旧丢弃）；
 - 不把声明错误计入 `marketplace_source_conflicts` 或 `failed_marketplaces`（三者正交，不重复计数）；
-- 不在 CLI `run_governance_remount` 打印（三类展示归 [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)）；
 - 不动协议仓、不新增 wire 事件 / 错误码 / 一致性向量。

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -1346,3 +1347,270 @@ async def test_run_governance_remount_holds_project_enabled_bundled_server_pendi
     assert recorded == []
     assert [r.plugin_id for r in report.pending_bundled_servers] == ["audit@acme"]
     assert report.pending_bundled_servers[0].enabled_origin is SettingsScope.PROJECT
+
+
+# ── #294：治理恢复三类信号的 CLI 展示 ────────────────────────────────────────
+_DECL_SCOPE_ANCHOR = "settings.json["
+_CONFLICT_ANCHOR = "declared source differs"
+_DEGRADED_ANCHOR = "degraded during"
+_RECOVERY_WARN_ANCHOR = "governance recovery:"
+
+
+def _decl_error(scope: str = "user") -> Any:
+    from a2c_smcp.computer.settings.recovery import MarketplaceDeclarationError
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    return MarketplaceDeclarationError(
+        scope=SettingsScope(scope),
+        marketplace="acme",
+        field="extraKnownMarketplaces.acme.source",
+        reason="missing or non-object 'source'",
+    )
+
+
+def _conflict() -> Any:
+    from a2c_smcp.computer.settings.recovery import MarketplaceSourceConflict
+
+    return MarketplaceSourceConflict(
+        marketplace="acme",
+        declared_source_display="https://bob:t0ken@example.com/other.git",
+        known_source_display="https://example.com/acme.git",
+    )
+
+
+def test_marketplace_declaration_error_line_pins_wording() -> None:
+    """
+    #294 声明错误行：``settings.json[<scope>]`` 锚点 + field/reason 原样（#293 已脱敏）。
+
+    **scope 用非默认值**（``flag``）：python 有意不过滤 flag 层声明错误（设计 §6.1），把该分支也在
+    CLI 行上钉住；否则把 ``error.scope.value`` 写死成 ``"user"`` 的变异无人能杀。
+    """
+    line = plugin_cmd.marketplace_declaration_error_line(_decl_error("flag"))
+    assert line == (
+        "⚠ settings.json[flag]: extraKnownMarketplaces.acme.source — missing or non-object 'source' "
+        "(declaration ignored; existing registration unchanged)"
+    )
+    assert "https://" not in line  # 不带声明源 URL
+
+
+def test_marketplace_source_conflict_line_is_name_only() -> None:
+    """
+    #294 冲突行**只展示脱敏市场名**（name-only，与 rust 对拍）。
+
+    判别力：夹具的两侧 display 都**带凭据形态**——若实现改成打印 source，本用例立刻看到 `t0ken` / `https://`。
+    """
+    conflict = _conflict()
+    assert "t0ken" in conflict.declared_source_display  # 正对照：夹具确实带凭据
+    line = plugin_cmd.marketplace_source_conflict_line(conflict)
+    assert "acme" in line and _CONFLICT_ANCHOR in line
+    assert "t0ken" not in line
+    assert "https://" not in line
+
+
+def test_marketplace_degraded_line_keeps_existing_wording() -> None:
+    """#294 降级行沿用 #287 起既有文案（回归锁：改写会打破用户已习惯的提示）。"""
+    line = plugin_cmd.marketplace_degraded_line("acme")
+    assert line == "⚠ marketplace 'acme' degraded during governance recovery (skills/servers not restored)"
+
+
+def _report_with(*, decl: bool = False, conflict: bool = False, failed: bool = False) -> Any:
+    from a2c_smcp.computer.settings.recovery import GovernanceRecoveryReport
+
+    report = GovernanceRecoveryReport()
+    if decl:
+        report.marketplace_declaration_errors = [_decl_error()]
+    if conflict:
+        report.marketplace_source_conflicts = [_conflict()]
+    if failed:
+        report.failed_marketplaces = ["acme"]
+    return report
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_prints_three_categories_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#294：三类同时出现时按 **rust 同序**（降级 → 源冲突 → 声明错误）各打一行，锚点互不相同、不合并。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[], skills=["lint"])
+    report = _report_with(decl=True, conflict=True, failed=True)
+
+    async with Computer(name="t", skill_home=home) as comp:
+        async def fake_reconcile(**kwargs: Any) -> Any:
+            return report
+
+        monkeypatch.setattr(comp, "reconcile_governance", fake_reconcile)
+        returned = await plugin_cmd.run_governance_remount(comp)
+
+    assert returned is report
+    out = capsys.readouterr().out
+    # 折行无关断言（复用本文件 `_flat()` 约定）：rich 会按终端宽度折行，长 token 甚至会被从中间折断，
+    # 故**不得**依赖物理行/换行位置。用 `⚠` 出现次数计条数（续行不含该字符），锚点在去空白文本上比对。
+    assert out.count("⚠") == 3, out
+    flat = _flat(out)
+    # 锚点自身也含空格 ⇒ 与 `_flat` 同归一后再比（否则 "degradedduring" 永远找不到）
+    positions = [flat.find(_flat(anchor)) for anchor in (_DEGRADED_ANCHOR, _CONFLICT_ANCHOR, _DECL_SCOPE_ANCHOR)]
+    assert all(pos >= 0 for pos in positions), positions  # 三类都在（各一次，由上面的 ⚠ 计数保证）
+    assert positions == sorted(positions), positions  # 顺序 = rust：降级 → 源冲突 → 声明错误
+    # name-only：CLI 行不得出现任何来源 URL
+    assert "https://" not in out
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_silent_when_no_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#294 零回归：三类皆空时**不**新增任何输出（不得每启动刷空提示）。"""
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[], skills=["lint"])
+
+    async with Computer(name="t", skill_home=home) as comp:
+        async def fake_reconcile(**kwargs: Any) -> Any:
+            return _report_with()
+
+        monkeypatch.setattr(comp, "reconcile_governance", fake_reconcile)
+        await plugin_cmd.run_governance_remount(comp)
+
+    out = capsys.readouterr().out
+    for anchor in (_DECL_SCOPE_ANCHOR, _CONFLICT_ANCHOR, _DEGRADED_ANCHOR):
+        assert anchor not in out
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_escapes_markup_on_reachable_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    #294：`escape()` 是**承重的**——rich 会把 `[<...>]` 当样式标签吞掉，未转义时**文字会消失**。
+
+    可达的注入点是**声明行**：`_validate_extra_marketplaces` 用原始 JSON 键拼 `field`，而
+    `sanitize_marketplace_name` 保留 `[` / `]`（实测 `evil[/]name` 原样通过），故手编 settings 键即可注入。
+    两条断言各钉一件事（去掉 `escape()` 都会转红，且**不是**靠崩溃而是靠文本保真）：
+      ① `settings.json[user]` 里的 `[user]` 不会被当标签吃掉；
+      ② `field` 里的 `[/]` 原样保留（未转义时渲染成 `evilname`）。
+
+    另外两条行（冲突名 / 降级名）**当前生产路径不可达** `[`（分别经严格 kebab / `redact_ledger_key` 过滤），
+    但 `run_governance_remount` 的契约是「消费任意 report」——显示层必须对 report 里的值稳健，故同样钉住；
+    这属于纵深防御，注释里不谎称它们可达。
+    """
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[], skills=["lint"])
+    report = _report_with()
+    from a2c_smcp.computer.settings.recovery import MarketplaceDeclarationError, MarketplaceSourceConflict
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    report.marketplace_declaration_errors = [
+        MarketplaceDeclarationError(
+            scope=SettingsScope.USER,
+            marketplace=None,
+            field="extraKnownMarketplaces.evil[/]name",
+            reason="missing or non-object 'source'",
+        ),
+    ]
+    report.marketplace_source_conflicts = [
+        MarketplaceSourceConflict(
+            marketplace="conflict[bold]mp",
+            declared_source_display="https://example.com/other.git",
+            known_source_display="https://example.com/acme.git",
+        ),
+    ]
+    report.failed_marketplaces = ["degraded[/]mp"]
+
+    async with Computer(name="t", skill_home=home) as comp:
+        async def fake_reconcile(**kwargs: Any) -> Any:
+            return report
+
+        monkeypatch.setattr(comp, "reconcile_governance", fake_reconcile)
+        await plugin_cmd.run_governance_remount(comp)  # 未转义时 rich 不会抛、但会吞字
+
+    out = _flat(capsys.readouterr().out)  # rich 会把长 token 从中间折断 ⇒ 去空白后再比
+    assert "settings.json[user]" in out  # ① 声明行：scope 文本没被当标签吃掉
+    assert "evil[/]name" in out  # ② 声明行：field 原文逐字可见
+    assert "conflict[bold]mp" in out  # ③ 冲突行（纵深防御：契约允任意 report）
+    assert "degraded[/]mp" in out  # ④ 降级行（同上）
+
+
+@pytest.mark.asyncio
+async def test_run_governance_remount_real_settings_prints_signals_distinct_from_recovery_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    #294：真实落盘 settings 走完整链路，且 **CLI 行与 recovery WARN 可按文案区分**。
+
+    夹具同时制造两类信号：
+    - `badmp` 声明写成 `owner/repo` 简写 → settings 校验整条丢弃（#293 进 report）⇒ 声明错误行；
+    - `acme` 声明合法但源与已注册源不同 ⇒ 冲突行（恢复仍按旧源）。
+
+    渠道事实（实测）：项目 logger 的 `StreamHandler(sys.stdout)` 在 **import 时**绑定 stdout，而 rich
+    `Console` 每次打印动态取 `sys.stdout` ⇒ `capsys` 能拿到 **CLI 打印**、**拿不到库日志**。故
+    「capsys 里没有 `governance recovery:`」近乎恒真，**真正的判别力**是 `⚠` 计数（把 CLI 行改回
+    `logger.warning` 时子弹行消失）；库 WARN 的存在性另由挂在 recovery logger 上的 `_Sink` 正对照钉住。
+    """
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[], skills=["lint"])
+    _write_json(
+        user_settings_path({"XDG_CONFIG_HOME": str(tmp_path / "cfg")}),
+        {
+            "installedPlugins": ["audit@acme"],
+            "enabledPlugins": {"audit@acme": True},
+            "extraKnownMarketplaces": {
+                "acme": {"source": {"type": "git", "url": "https://example.com/other.git"}},
+                "badmp": {"source": {"type": "git", "url": "owner/repo"}},
+            },
+        },
+    )
+
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    warn_records: list[str] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.WARNING:
+                warn_records.append(record.getMessage())
+
+    sink = _Sink(level=logging.WARNING)
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.WARNING)
+    try:
+        async with Computer(name="t", skill_home=home) as comp:
+            # sink 必须在 `__aenter__`（boot_up 也会跑一次 reconcile_governance 并打同样的汇总 WARN）
+            # **之后**再挂——否则正对照被 boot 的 WARN 满足，无法证明「重挂路径的 WARN 仍在」。
+            warn_records.clear()
+            recovery_mod.logger.addHandler(sink)
+            try:
+                report = await plugin_cmd.run_governance_remount(comp)
+            finally:
+                recovery_mod.logger.removeHandler(sink)
+    finally:
+        a2c_logger.setLevel(prev_level)
+
+    # 报告侧（接线确实把真实 settings 的错误/冲突带出来了）
+    assert [e.marketplace for e in report.marketplace_declaration_errors] == ["badmp"]
+    assert [c.marketplace for c in report.marketplace_source_conflicts] == ["acme"]
+
+    out = capsys.readouterr().out
+    assert out.count("⚠") == 2, out
+    flat = _flat(out)
+    assert _flat(_CONFLICT_ANCHOR) in flat  # 冲突行
+    assert _flat(_DECL_SCOPE_ANCHOR) in flat  # 声明错误行
+    assert flat.find(_flat(_CONFLICT_ANCHOR)) < flat.find(_flat(_DECL_SCOPE_ANCHOR))  # rust 同序
+    assert "badmp" in flat  # 声明错误点名到具体市场名
+    # name-only：CLI 行不得出现来源 URL（两侧 source 只在 recovery 的 DEBUG 里）
+    assert "https://" not in out
+    # 渠道事实：库日志不经 capsys（见 docstring）——这条是结构性的，保留作「CLI 行没被改回日志」的显式断言。
+    assert _RECOVERY_WARN_ANCHOR not in out
+
+    # 双向渠道区分之②（正对照）：库 WARN **仍然存在**（#294 不回收 WARN，用户接受同次启动多条同义提示），
+    # 且它的文案里不含任何 CLI 锚点 —— 两套文案锚点互不重叠，任何人都能一眼分辨来源。
+    assert warn_records, "recovery WARN 应仍在（本单不回收日志渠道）"
+    assert any(_RECOVERY_WARN_ANCHOR in msg and "acme" in msg for msg in warn_records), warn_records
+    for msg in warn_records:
+        assert _DECL_SCOPE_ANCHOR not in msg
+        assert _CONFLICT_ANCHOR not in msg
+        assert _DEGRADED_ANCHOR not in msg

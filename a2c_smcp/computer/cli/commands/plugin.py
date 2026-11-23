@@ -85,7 +85,11 @@ from a2c_smcp.computer.settings.reconciler import (
     list_dangling_plugin_intents,
     list_orphan_plugins,
 )
-from a2c_smcp.computer.settings.recovery import GovernanceRecoveryReport
+from a2c_smcp.computer.settings.recovery import (
+    GovernanceRecoveryReport,
+    MarketplaceDeclarationError,
+    MarketplaceSourceConflict,
+)
 from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -221,6 +225,42 @@ def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> Inject
     return _inject
 
 
+# ── #294：治理恢复三类信号的 CLI 展示行（纯格式化，供单测钉住措辞）─────────────
+#
+# 三类**文案锚点各不相同**，既给用户分档信号，也让测试能区分「CLI 行」与 recovery 的 WARN/DEBUG 渠道：
+#   · 声明错误（配置错误，**未参与**恢复）  → ``settings.json[<scope>]``
+#   · 源冲突（仍按**旧源**恢复）           → ``declared source differs``
+#   · 降级（``failed_marketplaces``）      → ``degraded during``
+# 文案对拍 rust ``cli/commands/mod.rs`` 的 ``marketplace_declaration_error_line`` / ``marketplace_source_conflict_line``
+# （rust 的降级行是内联的，python 侧把它也提成纯函数以便单测）：冲突与降级**只展示脱敏后的市场名**，
+# 两侧 source 明细仍只在 recovery 的逐条 DEBUG 里（用户 2026-11-22 裁决）。**每条记录一行**（n 条即 n 行）。
+def marketplace_declaration_error_line(error: MarketplaceDeclarationError) -> str:
+    """非法 ``extraKnownMarketplaces`` 声明被 settings 校验丢弃的提示行（#294）/ Declaration-error line."""
+    return (
+        f"⚠ settings.json[{error.scope.value}]: {error.field} — {error.reason} "
+        f"(declaration ignored; existing registration unchanged)"
+    )
+
+
+def marketplace_source_conflict_line(conflict: MarketplaceSourceConflict) -> str:
+    """
+    声明源与已注册源不一致的提示行（#294，**name-only**）/ Source-conflict line.
+
+    判据是「声明的 source ≠ 已注册 source」，既覆盖确实不同源、也覆盖无法证明等价（scp vs https 等写法
+    差异 → fail-closed），故文案写 ``differs from, or cannot be proven equivalent to`` 而非断言不同。
+    """
+    return (
+        f"⚠ marketplace {conflict.marketplace!r}: declared source differs from, or cannot be proven "
+        f"equivalent to, the registered source; declaration rejected (keeping the registered source; "
+        f"remove + re-add the marketplace to switch sources)"
+    )
+
+
+def marketplace_degraded_line(marketplace: str) -> str:
+    """marketplace 源不可达 / clone 重建失败的降级提示行（#287 起既有行为，#294 收归纯函数）/ Degraded line."""
+    return f"⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)"
+
+
 async def run_governance_remount(
     comp: Any, *, settings_flag_path: Path | None = None,
 ) -> GovernanceRecoveryReport:
@@ -245,7 +285,13 @@ async def run_governance_remount(
     - #293：declared 传**整对象** ``ResolvedSettings``（``resolved_settings_with_errors``）而非裸
       ``.settings`` dict——其中被 settings 校验整条丢弃的非法 ``extraKnownMarketplaces`` 声明必须进入
       :attr:`~a2c_smcp.computer.settings.recovery.GovernanceRecoveryReport.marketplace_declaration_errors`，
-      否则 CLI 展示面（#294）拿到的是空列表。**本函数不打印该字段**（展示归 #294）。
+      否则 CLI 展示面拿到的是空列表。**#294 起本函数分档打印三类信号**（见下）。
+    - #294 展示：按 rust 同序（降级 → 源冲突 → 声明错误）把三类信号各打一行，文案锚点各不相同、不合并
+      计数、**每条记录一行**：``failed_marketplaces``（降级，能力未恢复）/
+      ``marketplace_source_conflicts``（声明源 ≠ 已注册源，仍按旧源恢复）/
+      ``marketplace_declaration_errors``（settings 校验丢弃的非法声明，未参与恢复）。冲突与降级**只展示
+      脱敏市场名**（name-only，两侧 source 仍只在 recovery 的 DEBUG 里）；无 ``--json``（REPL 启动路径的
+      内部函数，root ``--json`` 不覆盖）。
 
     :return: 本次恢复报告（供调用方 / #294 消费；历史调用方可忽略返回值）。
     """
@@ -269,8 +315,20 @@ async def run_governance_remount(
         inject_inputs=_inject,
         declared=declared,
     )
+    # #294：三类信号分档展示，**顺序与 rust 对拍**（降级 → 源冲突 → 声明错误）。**只消费 report 字段**，
+    # 不重新检测、不重新解析 settings。与 recovery 的 WARN/DEBUG 是两个渠道：日志级别调高或
+    # `A2C_SMCP_LOG_SILENT` 时 CLI 行仍可见（用户 2026-11-22 裁决接受同次启动出现多条同义提示）。
+    #
+    # `escape()` 在这里是**承重的、且不是防崩溃那么简单**：rich 会把 `settings.json[<scope>]` 里的
+    # `[<scope>]` 当成样式标签**吞掉**（实测未转义时输出只剩 `settings.json:`，scope 信息丢失），
+    # `field` / 市场名里的 `[/]`、`[bold]` 同样会被吃掉；形状不巧时（无开标签配对的 `[/]`）还会抛
+    # MarkupError（#260 复审同族）。故三条行一律整行转义。
     for marketplace in report.failed_marketplaces:
-        console.print(f"[yellow]⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)[/yellow]")
+        console.print(f"[yellow]{escape(marketplace_degraded_line(marketplace))}[/yellow]")
+    for conflict in report.marketplace_source_conflicts:
+        console.print(f"[yellow]{escape(marketplace_source_conflict_line(conflict))}[/yellow]")
+    for error in report.marketplace_declaration_errors:
+        console.print(f"[yellow]{escape(marketplace_declaration_error_line(error))}[/yellow]")
     return report
 
 
