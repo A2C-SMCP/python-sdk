@@ -318,7 +318,9 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     sub = parts[1].lower()
     args = parts[2:]
     home = comp.skill_home
-    env = os.environ
+    # #296：与 ``marketplace`` 分派器对齐——读写跟随 **本实例** env（``None`` = ambient），
+    # 否则注入 env 的宿主里 ``settings set enabledPlugins`` 写 ambient、marketplace 守卫读实例，引用可逃逸。
+    env = getattr(comp, "env", None)
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     scope = flag_value(args, "--scope")

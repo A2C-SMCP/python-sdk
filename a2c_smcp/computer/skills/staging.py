@@ -1444,11 +1444,17 @@ def registration_violation(
     observed_manifest_name: str,
     *,
     env: Mapping[str, str] | None,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> MarketplaceIdentityError | None:
     """
     注册提交点的身份判定（**唯一**权威）/ The single identity predicate of the registration commit point.
 
-    读取 ``known``（锁内刚读到的账本 ``marketplaces`` 快照）与 merged settings 引用，返回违约对象（无违约 → ``None``）：
+    读取 ``known``（锁内刚读到的账本 ``marketplaces`` 快照）与 merged settings 引用，返回违约对象（无违约 → ``None``）。
+    引用视图的原始轴（``env`` / ``cwd`` / ``flag_settings_path`` / ``policy_settings``，#296）由调用方注入并原样
+    透传给 :func:`~a2c_smcp.computer.skills.marketplace_identity.intent_reference_pids`；``policy_settings=None``
+    由下游按 ``env`` 现解析 ambient policy（显式 ``{}`` = 无 policy），其余轴 ``None`` = 该层既有回退：
 
     | 场景 | 判定 |
     |---|---|
@@ -1479,7 +1485,13 @@ def registration_violation(
                     "remedy": f"marketplace remove {shown_existing}",
                 },
             )
-        references = intent_reference_pids(name, env=env)
+        references = intent_reference_pids(
+            name,
+            env=env,
+            cwd=cwd,
+            flag_settings_path=flag_settings_path,
+            policy_settings=policy_settings,
+        )
         if references:
             shown_refs = references[:5]
             suffix = "…" if len(references) > len(shown_refs) else ""
@@ -1562,6 +1574,9 @@ def commit_marketplace_registration(
     env: Mapping[str, str] | None,
     strict: bool,
     allow_replace: bool,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> MarketplaceCommit:
     """
     **唯一**的注册提交点：锁内身份复核 → 原子换入 clone → 写账本 / The single, locked registration commit.
@@ -1582,6 +1597,15 @@ def commit_marketplace_registration(
     ``idempotent=True``）；同名同源但 clone 缺失 → 照常换入（修复路径）。``allow_replace=True``（refresh /
     缺失重建）→ 总是换入。
 
+    引用判定使用调用方注入的 settings 原始轴（``cwd`` / ``flag_settings_path`` / ``policy_settings``，#296）；
+    ``policy_settings=None`` 由 :func:`registration_violation` 下游按 ``env`` 现解析 ambient policy
+    （与 rust#300 同口径；显式 ``{}`` = 无 policy），其余轴 ``None`` = 该层既有回退。尚未接线的复用路径
+    （reconcile / recovery / installer）因此**仍会**读到机器 policy，不会再漏掉该层引用。
+
+    .. note::
+       引用解析在账本锁内进行（既有设计：判定与写入须同一快照）。settings 文件读取不取账本锁、无死锁；
+       flag / policy 层接入会略延长临界区，把解析迁出锁外属后续跟进（对齐 rust 的锁外解析）。
+
     :return: :class:`MarketplaceCommit`；``trash`` 非空时调用方须**在锁外**删除（锁内 rmtree 会阻塞事件循环
         并放大锁竞争）。
     :raises MarketplaceIdentityError: ``strict`` 下的身份违约；:class:`MarketplaceNameChangeError`（任何路径）。
@@ -1599,7 +1623,17 @@ def commit_marketplace_registration(
             # 同名同源重复 add / reconcile：幂等——丢弃 pending、不换不写（不刷新 lastUpdated/commitSha）。
             outcome.update(committed=True, idempotent=True)
             return None
-        violation = registration_violation(name, source, prior, marketplaces, observed_manifest_name, env=env)
+        violation = registration_violation(
+            name,
+            source,
+            prior,
+            marketplaces,
+            observed_manifest_name,
+            env=env,
+            cwd=cwd,
+            flag_settings_path=flag_settings_path,
+            policy_settings=policy_settings,
+        )
         if violation is not None:
             if strict or isinstance(violation, MarketplaceNameChangeError):
                 raise violation
@@ -1663,6 +1697,9 @@ async def add_marketplace_source(
     auto_update: bool = False,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> str:
     """
     ``marketplace add`` 的注册事务：staging clone → 读清单名 → 严格提交 / Register one marketplace from a source.
@@ -1672,6 +1709,9 @@ async def add_marketplace_source(
     staging 目录在 ``finally`` 清理（零残留）。
 
     :param expected_name: ``--name``（D6 B：**期望清单名**，不是别名）；不符即 ``expected-name-mismatch``。
+    :param cwd: 引用守卫的 project/local 锚点（#296）；``None`` = 进程 cwd。
+    :param flag_settings_path: 引用守卫的 flag 层文件（#296）；``None`` = 无 flag 层。
+    :param policy_settings: 引用守卫的 policy 层视图（#296）；``None`` = 按 ``env`` 现解析，``{}`` = 无 policy。
     :return: 最终注册名（= 清单顶层 ``name``）。
     """
     if expected_name is not None and not is_valid_marketplace_name(expected_name):
@@ -1709,6 +1749,9 @@ async def add_marketplace_source(
             env=env,
             strict=True,
             allow_replace=False,
+            cwd=cwd,
+            flag_settings_path=flag_settings_path,
+            policy_settings=policy_settings,
         )
         if outcome.trash is not None:
             shutil.rmtree(outcome.trash, ignore_errors=True)  # 锁外删旧树
@@ -1729,6 +1772,9 @@ async def stage_marketplace_skills(
     refresh: bool = False,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """
     clone/refresh **单个** marketplace 并物化其 plugin SKILL → 注册进 Registry / Stage one marketplace's SKILLs。
@@ -1746,6 +1792,9 @@ async def stage_marketplace_skills(
     :param refresh: ``True`` → 重新 clone 到 staging（**不再原地 ``git pull``**）并通过提交点原子换入；独立
         plugin 亦重 clone（sha 锁版本例外：仅在既有 HEAD ≠ pin 时重 clone，等于 pin 则复用）；``False`` →
         缺失才 clone、已存在则就地复用（重扫）。
+    :param cwd: 引用守卫的 project/local 锚点（#296），仅作用于 clone / refresh 的提交点；纯复用路径不读引用。
+    :param flag_settings_path: 引用守卫的 flag 层文件（#296），同上。
+    :param policy_settings: 引用守卫的 policy 层视图（#296），同上；``None`` = 按 ``env`` 现解析，``{}`` = 无 policy。
 
     :raises MarketplaceNameChangeError: **唯一**新增抛点——本次实际 clone/refresh 观测到的清单名与账本
         ``manifestNameBaseline`` 不符（§5.14 改名拒绝）。调用方 MUST 捕获并**区分于普通失败**（refresh 报
@@ -1835,6 +1884,9 @@ async def stage_marketplace_skills(
                     env=env,
                     strict=False,
                     allow_replace=True,
+                    cwd=cwd,
+                    flag_settings_path=flag_settings_path,
+                    policy_settings=policy_settings,
                 )
             except (SettingsLockError, OSError) as e:
                 # 账本锁被占满 / 写盘失败：按既有降级铁律记 ERROR 返回空（本函数只放行改名拒绝这一个抛点），

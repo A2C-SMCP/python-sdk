@@ -870,12 +870,16 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     args = parts[2:]
     registry = comp.skill_registry
     home = comp.skill_home
-    env = os.environ
+    # #296：与本进程其它 REPL 分派器（marketplace / settings）对齐——读写跟随 **本实例** env
+    # （``None`` = ambient），否则注入 env 的宿主里各面会读写不同 settings 根。
+    env = getattr(comp, "env", None)
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     cbs = build_mcp_callbacks(comp)
-    # #116：project/local scope 的 project_path 锚定进程 cwd（仅 install 分支消费；enable/disable 从 ledger 读 projectPath）。
-    project_path = os.getcwd()
+    # #116：project/local scope 的 project_path 锚定实例 cwd（``Computer._resolve_cwd()``；fake / 未注入时
+    # 回退进程 cwd）。仅 install 分支消费；enable/disable 从 ledger 读 projectPath。
+    _resolve_cwd = getattr(comp, "_resolve_cwd", None)
+    project_path = str((_resolve_cwd() if callable(_resolve_cwd) else None) or os.getcwd())
 
     if sub == "install":
         if not pos:

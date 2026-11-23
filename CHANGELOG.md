@@ -54,6 +54,22 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     消费方需改为读 `message`/`reason`（旧的「整个 `error` 就是文案」读法不再成立）。
   - **存量迁移不在本版**：已有 URL 派生名 / `--name` 别名的注册**不追溯改名**，由 #268 的
     `marketplace migrate` 处理（账本字段 `manifestNameBaseline` 已就位供其消费）。
+- **flag / policy 层的 `<plugin>@<name>` 引用纳入 §5.14 re-add 守卫（#296，镜像 rust-sdk#267 item 3）**：
+  此前 `intent_reference_pids` 只读 user/project/local，`--settings` flag 层、policy 层与实例 cwd 轴不在视图内
+  ⇒「policy/flag 有引用 → `marketplace remove` → 同名不同源 re-add」可绕过 §5.14 的 MUST 拒绝。现在：
+  - 非交互 CLI 的**根级** `--settings`（flag 层）参与守卫；policy 层由库层按 `env` 现解析。REPL 的
+    marketplace / settings / plugin 三个分派器统一跟随运行中 Computer 实例的 env（marketplace 另含
+    cwd / flag / policy 轴），不再各自读 ambient `os.environ`。
+  - **行为变化**：此前能成功的同名不同源 re-add，在 flag/policy 仍存在引用时现在以 `validation` +
+    `reason: dangling-references` 失败（`details` 仍为 `{"name","references","referenceCount"}`，不新增层来源）。
+  - **库层默认对齐 rust#300**：`policy_settings=None` 时按 `env` 现解析 ambient policy（`resolve_policy_settings`）
+    ——`add_marketplace_source` / `commit_marketplace_registration` 的公开调用方即使不显式接线也不会漏掉 policy 层；
+    显式传入 mapping 覆盖，`{}` = 显式「无 policy」（测试与嵌入式宿主的 hermetic 开关）。
+  - 范围：显式 `marketplace add` 与 `--no-clone` 两处守卫完成 cwd / flag / policy 接线；复用路径
+    （`_record_known_marketplace`）与 reconcile / recovery / installer 的 **cwd / flag 接线**、错误 details
+    层来源为后续跟进。注意 `policy_settings=None` 的库层默认值使**所有**提交路径都会读到 policy 层。
+    迁移（#268）不绕过守卫，也不追溯改写 flag/policy 旧引用——见
+    [`docs/upgrade-0.5.1-marketplace-name-migration.md`](docs/upgrade-0.5.1-marketplace-name-migration.md) §6.5。
 - **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer
   ⇒ 一个 Agent 同一时刻至多连一台 Computer。无新事件、无能力字段（随 0.5 MINOR 握手生效）。
   - **第二台 Computer 入房被拒 `4101`**（此前允许任意多台）：不替换、不驱逐已在房的 Computer；同名与否都一样。
@@ -792,6 +808,24 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   不新增机读码（`--json` 仍是 `{"error": "error", "message": …}`）。
 - **迁移文档 §2 口径订正**：`docs/upgrade-0.5.1-marketplace-catalog-recovery.md` 不再写「可能以未处理异常、
   带堆栈的形式打印」，改为 0.5.1 的实际行为（结构化错误 + 恢复指引，`--json` 形态），保留 remove/add/重装步骤。
+
+### Fixed（#296 marketplace 引用守卫纳入 flag/policy 层）
+
+- `intent_reference_pids` / `registration_violation` / `commit_marketplace_registration` /
+  `add_marketplace_source` / `stage_marketplace_skills` 增可选原始轴 `cwd` / `flag_settings_path` /
+  `policy_settings`，与 `env` 一起透传给 `resolve_settings`。`policy_settings=None` 时由
+  `intent_reference_pids` 按 `env` 现解析 ambient policy（与 rust#300 / `Computer._settings_axes` 同口径）；
+  显式 mapping 覆盖，`{}` = 显式无 policy（hermetic 测试与嵌入式宿主的开关）。
+- **两处守卫调用点共用同一五层视图**：注册提交点（`marketplace add` / clone 缺失修复）与 `--no-clone`
+  意图注册（`_register_intent_only`）。
+- 新增 `Computer._settings_axes()`（`SettingsAxes` 扁平原始轴），`_resolve_declared_settings` 与 REPL
+  marketplace 守卫同源。
+- **REPL 三面同源（marketplace / settings / plugin）**：三个分派器的 env 统一跟随实例 `comp.env`
+  （`None` = ambient），plugin 的 project/local `project_path` 跟随实例 cwd（`Computer._resolve_cwd()`）。
+  仅改 `marketplace` 一面会让「`settings set enabledPlugins` 写 ambient、守卫读实例」在注入 env 的
+  `--computer-factory` 宿主里互相看不见，引用可被静默重绑；三面同源后该缺口关闭。
+- 引用语义不变：`installedPlugins` ∪ `enabledPlugins` 键、`@<name>` 后缀匹配、true/false 均算、层并集去重；
+  不新增错误码。
 
 ## [0.4.0] - 2026-08-25
 

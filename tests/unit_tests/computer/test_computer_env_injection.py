@@ -332,3 +332,65 @@ def test_flag_settings_path_default_none_no_flag_layer(tmp_path: Path):
     resolved = c._resolve_declared_settings()
     enabled = resolved.settings.get("enabledPlugins", {})
     assert enabled.get("user-plugin@acme") is True
+
+
+# ── AC6（#296）：settings 原始轴单一来源 / single source for raw settings axes ──
+
+def test_settings_axes_expose_env_project_root_flag_and_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_settings_axes()`` 暴露与 ``_resolve_declared_settings`` 同源的 env/cwd/flag/policy。"""
+    from a2c_smcp.computer.settings import policy as policy_mod
+
+    monkeypatch.setattr(
+        policy_mod, "resolve_policy_settings", lambda **_kw: {"enabledPlugins": {"audit@acme": True}}
+    )
+    project_root = tmp_path / "project"
+    flag = tmp_path / "flag.json"
+    _write_json(flag, {"enabledPlugins": {"from-flag@acme": False}})
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "xdg"), "HOME": str(tmp_path / "fake-home")}
+
+    c = Computer(name="test", env=env, project_root=project_root, flag_settings_path=flag)
+    axes = c._settings_axes()
+
+    assert dict(axes.env or {}) == env  # 只读 MappingProxyType，按值比较
+    assert axes.cwd == project_root
+    assert axes.flag_settings_path == flag
+    assert axes.policy_settings == {"enabledPlugins": {"audit@acme": True}}
+
+
+def test_settings_axes_match_resolve_declared_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_resolve_declared_settings`` 必须由同一组轴派生（#296「同源」锁）。"""
+    from a2c_smcp.computer.settings.policy import resolve_policy_settings
+    from a2c_smcp.computer.settings.scope import resolve_settings
+
+    monkeypatch.setattr(
+        "a2c_smcp.computer.settings.policy.resolve_policy_settings", lambda **_kw: {}
+    )
+    xdg = _make_config_home(tmp_path / "xdg")
+    _write_settings(xdg, {"enabledPlugins": {"user@acme": True}})
+    project_root = tmp_path / "project"
+    _write_project_settings(project_root, {"enabledPlugins": {"proj@acme": False}})
+    flag = tmp_path / "flag.json"
+    _write_json(flag, {"enabledPlugins": {"flag@acme": True}})
+    env = {"XDG_CONFIG_HOME": str(xdg.parent), "HOME": str(tmp_path / "fake-home")}
+
+    c = Computer(name="test", env=env, project_root=project_root, flag_settings_path=flag)
+    axes = c._settings_axes()
+    direct = resolve_settings(
+        env=axes.env,
+        cwd=axes.cwd,
+        flag_settings_path=axes.flag_settings_path,
+        policy_settings=axes.policy_settings,
+    ).settings
+    resolved = c._resolve_declared_settings()
+    assert resolved.settings == direct
+    assert resolved.settings["enabledPlugins"] == {
+        "user@acme": True,
+        "proj@acme": False,
+        "flag@acme": True,
+    }
+    # ``resolve_policy_settings`` 被两处共用；这里只锁同源，不重复断言 policy（AC6 上一条覆盖）。
+    assert isinstance(resolve_policy_settings(env=env), dict)
