@@ -44,7 +44,7 @@ from a2c_smcp.computer.inputs.resolver import InputResolver
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput as MCPServerInputModel,
 )
-from a2c_smcp.computer.skills.home import ensure_skill_home
+from a2c_smcp.computer.skills.home import ensure_skill_home, resolve_skill_home
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.computer.utils import console as console_util
@@ -519,6 +519,37 @@ def _mp_refresh(
     """刷新 marketplace（重 clone + 原子换入；改名拒绝 → validation）/ Refresh marketplaces."""
     code = asyncio.run(
         mp_cmd.marketplace_refresh(SkillRegistry(), ensure_skill_home(), os.environ, target, json_output=json_output),
+    )
+    raise typer.Exit(code)
+
+
+@marketplace_app.command("migrate")
+def _mp_migrate(
+    name: list[str] | None = typer.Option(  # noqa: B008 - Typer 要求 OptionInfo 作为默认值
+        None,
+        "--name",
+        help="只迁移指定旧名（可重复）/ migrate only these legacy names",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="真正写盘（缺省 dry-run）/ write changes (default: dry-run)"),
+    update_declarations: bool = typer.Option(
+        False,
+        "--update-declarations",
+        help="同时改写 user scope 的 extraKnownMarketplaces / update user-scope declarations",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
+) -> None:
+    """迁移存量 marketplace 注册名（默认 dry-run）/ Migrate legacy marketplace names (dry-run by default)."""
+    # dry-run 必须零写入：home 不存在时不得 mkdir（`ensure_skill_home` 仅 --apply 才用）。
+    home = ensure_skill_home() if apply else resolve_skill_home()
+    code = asyncio.run(
+        mp_cmd.marketplace_migrate(
+            home,
+            os.environ,
+            names=name,
+            apply=apply,
+            update_declarations=update_declarations,
+            json_output=json_output,
+        )
     )
     raise typer.Exit(code)
 

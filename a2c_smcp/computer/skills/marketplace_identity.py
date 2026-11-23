@@ -186,6 +186,18 @@ def display_source(source: object) -> str:
     return diagnostic_url_for_display(url)
 
 
+def is_safe_registration_path_segment(name: str) -> bool:
+    """
+    账本键能否安全地作为目录段（#268 单一权威）/ Whether a ledger key is safe as a path segment.
+
+    手编账本键可包含 ``/`` / ``\\`` / NUL / ``..`` / 前导 ``.``；任何用键拼 ``<home>/marketplace/<key>``
+    的读/搬路径都必须先过本判据（迁移检测、`marketplace info` 的清单名自查共用）。
+    """
+    if not isinstance(name, str) or not name or name in {".", ".."} or name.startswith("."):
+        return False
+    return not any(ch in name for ch in ("/", "\\", "\x00"))
+
+
 def redact_ledger_key(key: object) -> str:
     """
     账本键的**诊断展示值**（#261 口径的两段式）/ Display-safe ledger key for diagnostics.

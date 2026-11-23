@@ -12,7 +12,8 @@ Linux Secret Service（libsecret）。``keyring`` 是**可选依赖**（``pip in
 故在此**惰性 import**：缺失不破坏模块导入，仅令 :func:`keyring_available` 返回 ``False``，由
 :mod:`resolver` 走 headless 降级（env）或硬错误（**绝不写明文**，§9.3）。
 
-键空间：service=``a2c-computer``、key=**全局 ``<id>``**（与模型「Input id 全局唯一」一致）。
+键空间：service=``a2c-computer``、key=**plugin-scoped id** ``<plugin>@<marketplace>/<id>``（#268 订正：
+此前注释写「全局 ``<id>``」是陈旧说法；``resolver`` 实际以 ``prefix_input_id`` 计算并以此键存取）。
 """
 
 from __future__ import annotations
@@ -66,6 +67,14 @@ def keyring_available(*, force_recheck: bool = False) -> bool:
     return _available
 
 
+class SecretStoreError(RuntimeError):
+    """keyring 后端**读取失败**（区别于「键不存在」）/ Keyring backend read failure (distinct from absent).
+
+    ``SecretStore.get`` 为运行期解析刻意降级（后端异常 → ``None``）；迁移（#268）必须区分「没有 secret」
+    与「读不出来」——后者若被当成前者，旧键会被当成不存在、迁移后成为孤儿。
+    """
+
+
 class SecretStore:
     """
     中文: ``password:true`` input 值的 OS keyring 存取；keyring 不可用时为安全降级（get→None / set→False）。
@@ -92,6 +101,24 @@ class SecretStore:
         except Exception as e:  # pragma: no cover - keyring 运行期异常
             logger.warning(f"keyring 读取失败 / keyring get failed for {input_id}: {e}")
             return None
+
+    def get_strict(self, input_id: str) -> str | None:
+        """
+        严格读取（迁移用，**不吞后端异常**）/ Strict get for migration (backend errors are not swallowed).
+
+        :raises SecretStoreError: keyring 不可用或后端读取异常。
+        :return: 密钥；键不存在 → ``None``。
+        """
+        if not keyring_available():
+            raise SecretStoreError("keyring is unavailable")
+        kr = _load_keyring()
+        if kr is None:  # pragma: no cover - available 已保证 kr 非空
+            raise SecretStoreError("keyring backend is unavailable")
+        try:
+            secret: str | None = kr.get_password(self._service, input_id)
+            return secret
+        except Exception as e:
+            raise SecretStoreError(f"keyring read failed: {e}") from e
 
     def set(self, input_id: str, value: str) -> bool:
         """写密钥进 keyring，返回是否成功；不可用 → ``False``（**绝不**降级落明文）/ Store secret; ``False`` if unavailable。"""

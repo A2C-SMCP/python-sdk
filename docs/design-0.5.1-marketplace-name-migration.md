@@ -241,7 +241,7 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
 | F2 | user `enabledPlugins` | 权威 | 键以 `@<old>` 结尾 | 新键 = 旧值（`true`/`false` 都照抄），再删旧键 | fail-closed |
 | F3 | project / local `enabledPlugins`、以及 project/local 的 `installedPlugins` 声明 | 权威（**只报告**） | 同 F2；扫描面 = `os.getcwd()` ∪ 账本 `projectPath` | **不改**，输出文件 + 点路径 + 建议片段；**并显式告警「迁移后该插件将处于未启用态」** | 不适用（该告警不阻塞执行，但令退出码为 3，且写入汇总与 `--json`） |
 | F4 | `trustedMarketplaces` | 权威 | 元素 ∈ 旧名集 | 加新名 → 删旧名 | 加失败 fail-closed；删失败 WARN（残留只是陈旧标记，见 §4.2 F4） |
-| F5 | plugin input 值 | 权威 | 键前缀 `<plugin>@<old>/`（**按克隆/外树 `inputs.json` 派生候选**，非按键前缀全表扫） | 单次原子写：新键 ← 旧值，删旧键 | **目标键已存在且值不同 → 该项 abort（零写入）**；其余 fail-closed（**先写后删**，中途失败不丢值） |
+| F5 | plugin input 值 | 权威 | 键前缀 `<plugin>@<old>/`（**按克隆/外树 `inputs.json` 派生候选**，非按键前缀全表扫） | **P1 单次原子写加新键；P3 单次原子写删旧键**（对齐 §7.1 分阶段） | **目标键已存在且值不同 → 该项 abort（零写入）**；其余 fail-closed（**先写后删**，中途失败不丢值） |
 | F6 | plugin secret | 权威 | **从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选**（D14）；已从清单移除的 plugin 经账本 `installPath` 定位 | keyring：写新 → 回读验证 → 删旧 | **旧 secret 存在且 keyring 不可用 → 该项 abort（零写入）、其余继续、退出码 3**；**目标键已存在且值不同 → abort**；本次已 set 的新键在失败时清理；绝不落明文 |
 | F7 | `known_marketplaces[<old>]` | 派生 | — | 先写 `known[new]`（`installLocation` 重算、`manifestNameBaseline = new`），待搬迁与重建完成后删 `known[old]` | 失败 → 保留旧条目（可重建） |
 | F8 | catalog clone | 派生 | 目录存在性 | `<home>/marketplace/<old>` → `<new>` rename | 失败 → 该项 abort（保留旧状态）；不做重 clone，恢复交 `marketplace add/refresh` |
@@ -277,8 +277,9 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
   **迁移层不复用它们**——迁移把 `trustedMarketplaces` 与 `blockedMarketplaces` 合并进**一次** user-scope raw RMW
   （§4.1 F13a），避免 N 次锁写与中间态。删除旧名失败降级 WARN（沿用 `marketplace_remove` 的既有姿态）。
 
-**F5 —— value store 单次原子写 + 目标键冲突**：`input-values.json` 是整文件 map（`value_store.py:55`），一次
-`ValueStore.set` 等价于「读-改-写整文件」。迁移把「写新 + 删旧」合并成**一次**原子写，避免两次写之间的半态。
+**F5 —— value store 分阶段单次原子写 + 目标键冲突**：`input-values.json` 是整文件 map（`value_store.py:55`），
+一次 `ValueStore.replace_all` 等价于「读-改-写整文件」。**P1 只加新键（一次原子写）**、**P3 只删旧键（一次原子写）**：
+与 §7.1「P1 新侧就绪、P3 撤旧侧」一致——若 P1 就删旧键，P2 失败会让旧注册的 input 值凭空消失。
 写前检查目标键：已存在且值不同 → **该项 abort（零写入）**；同值 → 视为已迁移（幂等 no-op）。
 文件本身不可读 / 非法 JSON → **命令级 abort（strict loader，exit 3）**，绝不把它「修复」成空 map。
 
@@ -290,7 +291,9 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
    （已不在清单、也已卸载的 plugin 见下方「已知边界」）
 2. 已装但**已从清单移除/改名**的 plugin：按账本 `installPath` 定位其 `inputs.json`（键名 plugin 段取 pid 前缀）；
 3. 既无清单条目又无可用 `installPath` → **无法证明无旧 secret** → 该项 abort（零写入，exit 3）；
-4. 候选 `inputs.json` 缺失 / 畸形 / plugin 根不可读 → 该项 abort（保守，不猜）。
+4. **已安装** plugin 的 `inputs.json` 畸形 / 根不可读 → 该项 abort（保守，不猜）；
+   **从未安装且无根**的清单内 plugin **不计候选**（不存在可被写入的 scoped secret，2026-11-22 架构师确认）；
+   `inputs.json` 缺失本身不是错误（该 plugin 无 inputs）。
 
 写序：`get(old)` → `set(new)` → 回读校验；仅当 `set` 成功且 `get(new)` 与旧值相等才 `delete(old)`。
 **目标键已存在且值不同 → abort（不覆盖既有 secret）**；`delete(old)` 失败只告警（新键已可读，值不丢）。
@@ -400,11 +403,13 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
   "command": "marketplace migrate",
   "dryRun": true,
   "status": "planned",            // planned | applied | aborted(conflict/state-corrupt) | partial
+  "applyRequested": false,        // 是否传了 --apply（aborted 时区分「dry-run」与「apply 被拦下」）
+  "applied": false,               // 是否真的执行过写入
   "exitCode": 0,                  // 0 / 1 / 3（与进程退出码一致，便于脚本判定）
   "updateDeclarations": false,
   "items": [
     {
-      "old": "acme", "new": "acme-skills", "action": "rename",   // rename | noop | unresolved | blocked | not-selected
+      "old": "acme", "new": "acme-skills", "action": "rename",   // rename | noop | unresolved | blocked | aborted | not-selected
       "reason": null,                                            // unresolved/blocked 的机器码（§3.3）
       "source": "https://…(脱敏展示)",
       "plugins": [{"id": "figma@acme", "newId": "figma@acme-skills", "action": "move"}],
@@ -415,6 +420,7 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
         "catalog": "rename", "externalTrees": 1, "ledger": "rebuild"
       },
       "warnings": ["plugin 'x' not present in the new manifest"],
+      "incomplete": false,        // 迁移完成但插件未重建（旧账本保留）→ true，最终退出码 3
       "followUps": [
         {"file": "/repo/.tfrobot/settings.json", "pointer": "/enabledPlugins/x@acme",
          "effect": "will-be-inactive", "suggested": "…"},
@@ -424,6 +430,7 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
     }
   ],
   "conflicts": [{"code": "duplicate-target", "names": ["a", "b"], "target": "acme-skills"}],
+  // 冲突的 involves 是内部阻塞判据，不序列化；names/target 一律脱敏展示值
   "corrupt": []                   // strict 只读预检发现的损坏状态文件（非空 → status=aborted、exit 3）
 }
 ```
@@ -586,11 +593,13 @@ if len(candidates) >  1: unresolved / ambiguous-catalog（不猜，列出候选�
 （`update_known_marketplaces` / `update_installed_plugins`，`store.py:562/591`）各自持旁车锁做 RMW，但**跨文件的顺序
 一致性没有锁**。因此：
 
-- 命令启动时用 `file_lock(..., retries=0)` 做一次**瞬时探测**（拿到就立刻释放）——只用于提示「另一个 a2c 进程正在写物化文件」；
+- 命令启动时做一次**只读**并发探测（P1 实现取舍）：对**既有**旁车 `.lock` 尝试非阻塞 `flock`
+  （拿到即释放）——只用于提示「另一个 a2c 进程正在写物化文件」。**不创建**锁文件（dry-run 必须零写入）；
+  `flock` 成功本身即「没有进程在写」的证据，因此不会把「锁文件存在」误读成活性信号。
   **不得**常驻持有：现有写原语会在内部再次 `file_lock` 同一旁车文件，同进程重入会退避后抛 `SettingsLockError`
-  （`store.py:209-260`、`:525-528` 的显式警告）；
-- 探测**不是**活性信号：旁车 `.lock` 文件创建后不删除（`store.py:231` 只 `O_CREAT`，无 unlink），
-  它的存在**只**代表「曾经写过」，不能据此判断有没有进程在跑。文档与提示文案都必须写清这一点，避免制造恒真告警。
+  （`store.py:209-260`、`:525-528` 的显式警告）；win32 跳过（best-effort）。
+- 探测**不是**「锁文件存在即有进程」：旁车 `.lock` 创建后不删除（`store.py:231` 只 `O_CREAT`，无 unlink），
+  只有**实际抢锁失败**才提示；文档与提示文案都必须写清这一点，避免制造恒真告警。
 - `--apply` 在写入前**重新检测 + 重新预检**（§7.2），因此即使 dry-run 与分析之间发生外部改动，也不会按陈旧计划写盘；
   写入期间若检测到目标键/文件形状与预检不符（如目标 pid 突然存在）→ 该项 abort（exit 3），不强行覆盖。
 
@@ -892,3 +901,11 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |
+| 2026-11-23 | **PR #298 终轮 delta 整改**：project/local 缺 projectPath 判据前移到 P0.5（dry-run 同口径 exit 3、零写入）；去掉 `old_source is not None` 守卫（None→source 并发补充也 abort）；旧 value 复检改 `old_key not in data`（null 值并发删键也能识别）；补 P3 目标异值/合法 projectPath 保留/空 scope/source 规范化/baseline 负向门用例；新增可复现变异脚本 `scripts/mutation_marketplace_migration.py`（33/33 KILLED） |
+| 2026-11-23 | **PR #298 delta 复审整改**：baseline 次选路径改为**先直搬注册旧目录**（不参与游离目录认领），并支持清单不可读时的崩溃续跑（known[new].manifestNameBaseline 证据）；旧侧 value/secret 在 P1/P3 复读比对；旧注册 source 与计划快照比较（不可识别形态不再误判换源）；scope 归一修正 + project/local 缺 projectPath abort；externalTrees 单一计算；SecretStore.get_strict 三态测试 |
+| 2026-11-23 | **架构师 PR #298 审查整改**：写入期目标键/known 源复检（并发异值 abort，不覆盖）、`execute_plan` 写入前重新检测+预检（含 cwd）、merge 保留目标记录元数据且 actions.catalog=noop、keyring `get_strict` 区分读失败、P4 scope 归一、§3.4 baseline 次选判据、`info` 路径段守卫、P4/RMW 无变化不落盘、账本已物化跳过、迁移文档补 keyring 孤儿边界 |
+| 2026-11-22 | **P1 第四轮短复核整改**：不可哈希 `type` 守卫（恶意/畸形 inputs.json 不再 TypeError 崩整次迁移）、password 真值判断改用 pydantic bool（"on"/"y"/1.0 与运行时同口径）、`visible_actions()` 单一权威（human/JSON 共用）、渲染级回归锁 |
+| 2026-11-22 | **P1 第三轮定向复核整改**：修 trust/blocked actions 读取顺序（_attach_scope_surfaces 先于 _attach_references）、人读表格对 blocked/not-selected 抑制执行面、`plan.errors` 脱敏、inputs.json 逐条容错（可证明非密钥的畸形条目跳过、仅可能含 password 的畸形条目 abort 并带 warning）、认领失败 action 改 unresolved |
+| 2026-11-22 | **P1 第二轮复核整改**：修外树窗口的 removed-plugin 变体（候选根 raw/mapped 双探测）、strict 字段 `null` 形状、`password` 运行时归一、human/corrupt 脱敏、`install_plugin` 透传 `allow_clone`、dry-run 不建 home、成功摘要/非阻塞冲突措辞、blocked/未选项 actions、help/completer 登记、计划期歧义认领、secret repr、非数组账本记录；抽 `_locked_jsonc_rmw` 单点 |
+| 2026-11-22 | **P1 独立审查整改**：修 5 项阻塞（外树已搬窗口的候选根 / P3 后 secret 清理保护 / known[old] 删除移到 P3+P4 之后 / `--json` 全量脱敏 / 迁移禁 clone）+ 加固（merge 双外树冲突、strict 字段形状、corrupt 守卫、非对象声明、重建失败 exit 3、认领排除 `.staging-*`、只读并发探测、JSON 契约）；补 14 例回归与变异复核 |
+| 2026-11-22 | **P1 实现期澄清（不改语义）**：F5 明确 P1 加新键 / P3 删旧键（与 §7.1 一致）；F6 第 4 条明确「未安装且无根」的清单内 plugin 不计候选（架构师确认）；`aborted` 补入 JSON action 枚举 |
