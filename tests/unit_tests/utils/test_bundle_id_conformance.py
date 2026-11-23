@@ -9,7 +9,9 @@ BundleID 缺省生成**跨 SDK 一致性对拍**（P0 硬门槛）/ Cross-SDK co
 
 夹具来源 / Fixture source（唯一权威）：
     a2c-smcp-protocol ``docs/specification/fixtures/bundle_id_conformance_vectors.json``
-    @ develop ``57c2f9f``（PR #16 首版 14 条 + #17 raw 决策补 2 条 ``${input:*}`` 占位向量 = 16 条）。
+    @ develop ``e811757``（PR #16 首版 14 条 + #17 raw 决策补 2 条 ``${input:*}`` 占位 = 16 条；
+    protocol#78〔protocol PR #85〕补 9 条 = 25 条：首尾 ``-`` 裁剪 3、显式 bundle_id 原样 2、args 保序 2、
+    replace→折叠顺序 1、非 ASCII TLV 字节长度 1）。
     本文件旁的 ``fixtures/bundle_id_conformance_vectors.json`` 为该规范文件的**逐字节 vendored 副本**——
     协议仓更新向量时须重新同步（``git show origin/develop:docs/specification/fixtures/... > fixtures/...``）。
 
@@ -75,12 +77,12 @@ _VECTORS: list[dict[str, Any]] = _load()["vectors"]
 
 
 def test_fixture_integrity() -> None:
-    """守卫 vendored 副本未被截断/损坏（14 条向量 + algorithm 段）。"""
+    """守卫 vendored 副本未被截断/损坏（25 条向量 + algorithm 段）。"""
     data = _load()
     assert "algorithm" in data
-    # #17 raw 决策：algorithm 段须声明 input_state=raw；向量数 16（14 首版 + 2 条 ${input:*} 占位）。
+    # #17 raw 决策：algorithm 段须声明 input_state=raw；向量数 25（16 首版 + #78 补 9 条）。
     assert "raw" in data["algorithm"].get("input_state", "")
-    assert len(data["vectors"]) == 16
+    assert len(data["vectors"]) == 25
     for v in _VECTORS:
         assert {"name", "config", "expected_bundle_id"} <= v.keys()
 
