@@ -149,3 +149,37 @@ async def test_reconcile_governance_keeps_registered_source_on_declared_change(
         assert report.failed_marketplaces == []
     # known 记录保持旧源（只诊断、不换源）
     assert load_known_marketplaces(home=home)["marketplaces"][_MP]["source"] == {"type": "git", "url": _url(old_repo)}
+
+
+# ── #293：非法声明被丢弃，恢复仍按已注册源 ────────────────────────────────────
+@requires_git
+@pytest.mark.asyncio
+async def test_reconcile_governance_invalid_declaration_restores_registered_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #293：``extraKnownMarketplaces`` 声明写坏（``owner/repo`` 简写）→ 报告声明错误，但恢复**仍按已注册源**。
+
+    判别力：非法声明被 settings 校验整条丢弃后，若实现把它当成「用户想换源」去服用，克隆内容会取自
+    声明（这里根本没有可解析的 URL，会直接降级）；用两个内容不同的裸仓 + 断言只有注册源的 skill 在，
+    即可让「按声明源恢复」的变异转红。
+    """
+    _isolate(tmp_path, monkeypatch)
+    registered_repo = _make_bare(tmp_path, "repo1", _one_plugin_files(_PLUGIN, "old-skill"))
+    home = _seed_home(tmp_path, _url(registered_repo))
+    # 声明写成 owner/repo 简写（校验必然判 malformed git url 并整条丢弃）
+    (tmp_path / "cfg" / "a2c").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "cfg" / "a2c" / "settings.json").write_text(
+        json.dumps({**_declared(_url(registered_repo)), "extraKnownMarketplaces": {_MP: {"source": {"type": "git", "url": "owner/repo"}}}}),
+        encoding="utf-8",
+    )
+
+    async with Computer(name="t", skill_home=home) as comp:
+        report = await comp.reconcile_governance()
+
+    assert [(e.marketplace, e.scope.value) for e in report.marketplace_declaration_errors] == [(_MP, "user")]
+    assert report.marketplace_source_conflicts == []  # 无可比声明源，不是冲突
+    # 恢复取自**已注册**源
+    assert f"{_PLUGIN}:old-skill" in report.restored_skills
+    assert report.failed_marketplaces == []
+    assert load_known_marketplaces(home=home)["marketplaces"][_MP]["source"] == {"type": "git", "url": _url(registered_repo)}

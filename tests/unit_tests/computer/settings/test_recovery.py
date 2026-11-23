@@ -20,22 +20,30 @@ installed ∧ ``enabledPlugins[pid] is True``，缺省翻转）:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
 from a2c_smcp.computer.settings.recovery import (
+    GovernanceRecoveryReport,
+    MarketplaceDeclarationError,
     MarketplaceSourceConflict,
     _plugin_enable_origin,
+    attach_marketplace_declaration_errors,
     collect_enabled_bundled_servers,
+    declaration_marketplace,
     detect_marketplace_source_conflicts,
+    marketplace_declaration_errors,
     recover_marketplace_skills,
+    sanitize_marketplace_name,
+    sanitize_marketplace_text,
 )
-from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
+from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope, SettingsValidationError
 from a2c_smcp.computer.settings.store import (
     load_known_marketplaces,
     save_installed_plugins,
@@ -506,11 +514,16 @@ async def test_recover_rematerialize_failure_log_is_redacted(
     from a2c_smcp.computer.settings import recovery as recovery_mod
 
     recovery_logger = recovery_mod.logger
+    # 钉住 ambient 级别：WARN 在宿主把 `A2C_SMCP_LOG_LEVEL` 设成 error 时不会生成 record。
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(logging.WARNING)
     recovery_logger.addHandler(caplog.handler)  # 项目 logger 关闭 propagate，直接挂 handler
     try:
         await recover_marketplace_skills(SkillRegistry(), home, declared, env=_env(tmp_path))
     finally:
         recovery_logger.removeHandler(caplog.handler)
+        a2c_logger.setLevel(prev_level)
 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "re-materialize" in text  # 正对照：确实走到了该分支
@@ -901,3 +914,303 @@ def test_detect_conflicts_fail_closed_on_malformed_declared_source(decl: dict) -
     assert conflicts[0].marketplace == "acme"
     assert conflicts[0].known_source_display == "https://example.com/acme.git"
     assert conflicts[0].declared_source_display == "<redacted-git-source>"
+
+
+# ── #293：被 settings 校验丢弃的非法声明 / dropped invalid declarations ───────
+_SECRET_URL = "https://bob:t0ken@example.com/repo.git"
+
+
+def _verr(field: str, reason: str, scope: SettingsScope = SettingsScope.USER, source_path: str | None = None) -> SettingsValidationError:
+    return SettingsValidationError(scope=scope, field=field, reason=reason, source_path=source_path)
+
+
+@contextlib.contextmanager
+def _capture_recovery_logs(level: int) -> Iterator[list[logging.LogRecord]]:
+    """
+    捕获 recovery logger 的记录，**显式钉住包级 logger 等级**并在 finally 还原。
+
+    包级 logger 的有效级别由 ``A2C_SMCP_LOG_LEVEL`` 在 import 时固定（默认 INFO）——不钉住的话，
+    断言 DEBUG 记录会在 CI（INFO）假红、在本机（父目录 gitignored ``.env`` 设 debug）假绿。
+    项目 logger ``propagate=False``，故直接挂 handler 而非用 caplog 的默认路径。
+    """
+    from a2c_smcp.computer.settings import recovery as recovery_mod
+
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    a2c_logger = logging.getLogger("a2c_smcp")
+    prev_level = a2c_logger.level
+    a2c_logger.setLevel(level)
+    sink = _Sink(level=level)
+    recovery_mod.logger.addHandler(sink)
+    try:
+        yield records
+    finally:
+        recovery_mod.logger.removeHandler(sink)
+        a2c_logger.setLevel(prev_level)
+
+
+def test_sanitize_marketplace_name_uses_segment_funnel() -> None:
+    """市场名是**单个不可信值**：走段漏斗（path 段里的凭据也挡），比散文脱敏更严（#261 口径）。"""
+    assert sanitize_marketplace_name(_SECRET_URL) == "https://example.com/repo.git"
+    # path 段携凭据 —— 散文脱敏只去 userinfo、会保留 path，段漏斗 fail-closed
+    assert sanitize_marketplace_name("https://host/team/alice:PW@example.com/repo.git") == "<redacted-git-source>"
+    # 合法 kebab 名逐字不变（负对照：不得把正常名字改成占位符）
+    assert sanitize_marketplace_name("acme") == "acme"
+
+
+def test_sanitize_marketplace_text_keeps_prose_shape() -> None:
+    """``reason`` 是散文：逐 token 脱敏，保留句式（不得整句替换成占位符）。"""
+    got = sanitize_marketplace_text(f"malformed git url: {_SECRET_URL}")
+    assert got == "malformed git url: https://example.com/repo.git"
+    assert "t0ken" not in got and "bob" not in got
+
+
+def test_declaration_marketplace_keeps_whole_rest_for_name_errors() -> None:
+    """
+    名称型错误：``<name>`` 之后没有子字段，**整个剩余段**就是名字——不能按后缀启发式切。
+
+    ``acme.source.url`` 作为**非法市场名**时，其 field 与「合法名 acme 的 .source.url 子字段错误」逐字相同；
+    区分二者的唯一判据是 reason（与 rust ``declaration_marketplace`` 同款）。
+    """
+    assert declaration_marketplace(
+        "extraKnownMarketplaces.acme.source.url", "marketplace name must be strict kebab (1-64)",
+    ) == "acme.source.url"
+    assert declaration_marketplace("extraKnownMarketplaces.acme.source.url", "malformed git url") == "acme"
+
+
+@pytest.mark.parametrize(
+    "field,reason,expected_marketplace,expected_field",
+    [
+        ("extraKnownMarketplaces", "expected object, got str", None, "extraKnownMarketplaces"),
+        ("extraKnownMarketplaces.acme", "entry must be object, got list", "acme", "extraKnownMarketplaces.acme"),
+        ("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", "acme", "extraKnownMarketplaces.acme.source"),
+        (
+            "extraKnownMarketplaces.acme.source.type",
+            "only source.type == 'git' is supported",
+            "acme",
+            "extraKnownMarketplaces.acme.source.type",
+        ),
+        ("extraKnownMarketplaces.acme.source.url", "malformed git url", "acme", "extraKnownMarketplaces.acme.source.url"),
+        ("extraKnownMarketplaces.acme.autoUpdate", "must be bool, got str", "acme", "extraKnownMarketplaces.acme.autoUpdate"),
+    ],
+)
+def test_marketplace_declaration_errors_shapes(
+    field: str, reason: str, expected_marketplace: str | None, expected_field: str,
+) -> None:
+    """四形态 + 顶层整字段：1 error → 1 entry，scope 保真，``marketplace`` 供 #294 免解析 ``field``。"""
+    got = marketplace_declaration_errors([_verr(field, reason)])
+    assert got == [
+        MarketplaceDeclarationError(
+            scope=SettingsScope.USER, marketplace=expected_marketplace, field=expected_field, reason=reason, source_path=None,
+        ),
+    ]
+
+
+def test_marketplace_declaration_errors_filters_other_fields_and_preserves_order() -> None:
+    """只收 ``extraKnownMarketplaces`` 子树（含 ``.`` 边界）；保序、不聚合——同市场跨层各一条。"""
+    errors = [
+        _verr("enabledPlugins.BAD KEY", "key must be '<plugin>@<marketplace>' (strict kebab)"),
+        _verr("extraKnownMarketplacesBackup.acme", "unrelated"),  # 裸 startswith 会误收，这里必须被挡
+        _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.USER),
+        _verr("extraKnownMarketplaces.acme.source.url", "malformed git url", SettingsScope.LOCAL),
+    ]
+    got = marketplace_declaration_errors(errors)
+    assert [(e.marketplace, e.scope) for e in got] == [("acme", SettingsScope.USER), ("acme", SettingsScope.LOCAL)]
+
+
+def test_marketplace_declaration_errors_redacts_and_scrubs() -> None:
+    """
+    凭据形态市场名 / 带凭据的 reason / 控制字符：report 四字段全部脱敏（#295 只管 settings show）。
+
+    **path 段凭据**是关键判别输入：散文脱敏（`redact_git_urls_in_text`）对它只去 userinfo、保留 path，
+    只有段漏斗（`redact_ledger_key`）才 fail-closed。名字段若误用散文脱敏，本用例必须转红。
+    """
+    evil_name = f"{_SECRET_URL}"
+    path_cred_name = "https://host/team/alice:PW@example.com/repo.git"
+    dirty_path = "/tmp/ev‮il/settings\x1b[31m.json"
+    errors = [
+        _verr(
+            f"extraKnownMarketplaces.{evil_name}",
+            "marketplace name must be strict kebab (1-64)",
+            SettingsScope.PROJECT,
+            source_path=dirty_path,
+        ),
+        _verr(
+            f"extraKnownMarketplaces.{path_cred_name}",
+            "marketplace name must be strict kebab (1-64)",
+        ),
+        # 控制字符 / 方向覆写 / 行分隔：手工构造（schema 当前不会产出），纵深防御。
+        _verr("extraKnownMarketplaces.evil‮gnp.exe FAKE", "expected object, got array\nFAKE_LINE\x1b[31m‮REV"),
+    ]
+    got = marketplace_declaration_errors(errors)
+    assert len(got) == 3
+    # 正对照：原始错误里确实带凭据（userinfo / path 段）与控制字符
+    assert "t0ken" in errors[0].field
+    assert "PW" in errors[1].field and "alice" in errors[1].field
+    assert "‮" in errors[2].field and "\n" in errors[2].reason
+
+    userinfo, path_cred, scrubbed = got
+    assert "t0ken" not in userinfo.marketplace and "bob" not in userinfo.marketplace
+    assert "t0ken" not in userinfo.field
+    # 段漏斗 fail-closed：path 段凭据整值占位，绝不回显
+    assert path_cred.marketplace == "<redacted-git-source>"
+    assert "PW" not in path_cred.field and "alice" not in path_cred.field
+    # source_path：非 userinfo 形态 ⇒ 路径轴处理（控制字符 / 方向覆写仍须清掉，路径保持可读）
+    assert userinfo.source_path == "/tmp/ev il/settings [31m.json"
+    for error in got:
+        for blob in (error.marketplace or "", error.field, error.reason, error.source_path or ""):
+            for needle in ("‮", " ", "\n", "\x1b", "t0ken", "PW"):
+                assert needle not in blob, (needle, blob)
+
+
+def test_attach_marketplace_declaration_errors_logs_summary_at_default_info() -> None:
+    """
+    WARN 汇总（带脱敏市场名）+ 逐条 DEBUG。
+
+    默认日志级别是 INFO ⇒ 汇总必须落在 WARNING，否则用户看不见（#293 验收「默认 INFO 可见」）。
+    """
+    report = GovernanceRecoveryReport()
+    errors = [
+        _verr(f"extraKnownMarketplaces.{_SECRET_URL}.source.url", f"malformed git url: {_SECRET_URL}"),
+        _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.LOCAL),
+    ]
+    with _capture_recovery_logs(logging.DEBUG) as captured:
+        attach_marketplace_declaration_errors(report, errors)
+
+    assert len(report.marketplace_declaration_errors) == 2
+    warnings = [r.getMessage() for r in captured if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    summary = warnings[0]
+    assert "2 invalid marketplace declaration(s)" in summary
+    assert "https://example.com/repo.git" in summary  # 脱敏后的市场名被点名
+    assert "acme" in summary
+    assert "t0ken" not in summary and "bob" not in summary
+    # 逐条 DEBUG
+    debug_lines = [r.getMessage() for r in captured if r.levelno == logging.DEBUG]
+    assert len(debug_lines) == 2, debug_lines
+    assert all("t0ken" not in line and "bob" not in line for line in debug_lines), debug_lines
+
+
+def test_attach_marketplace_declaration_errors_dedups_names_in_summary() -> None:
+    """同市场跨层两条错误：**逐条计数 2**，但 WARN 汇总的市场名去重（只点一次名）。"""
+    report = GovernanceRecoveryReport()
+    errors = [
+        _verr("extraKnownMarketplaces.acme.source", "missing or non-object 'source'", SettingsScope.USER),
+        _verr("extraKnownMarketplaces.acme.source.url", "malformed git url", SettingsScope.LOCAL),
+    ]
+    with _capture_recovery_logs(logging.DEBUG) as captured:
+        attach_marketplace_declaration_errors(report, errors)
+
+    assert [e.scope for e in report.marketplace_declaration_errors] == [SettingsScope.USER, SettingsScope.LOCAL]
+    summary = next(r.getMessage() for r in captured if r.levelno == logging.WARNING)
+    assert "2 invalid marketplace declaration(s)" in summary
+    assert summary.count("acme") == 1, summary  # 名字去重，不重复点名
+
+
+def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> None:
+    """负对照：无错误 ⇒ 报告空、零日志（不得每次 boot 都刷一条「0 条错误」）。"""
+    report = GovernanceRecoveryReport()
+    with _capture_recovery_logs(logging.DEBUG) as captured:
+        attach_marketplace_declaration_errors(report, [])
+
+    assert report.marketplace_declaration_errors == []
+    assert captured == []
+
+
+def test_source_path_keeps_readable_paths() -> None:
+    """
+    ``source_path`` 负对照（防过度遮蔽）：**无法排除 userinfo** 的路径才整值占位，其余保留可读性。
+
+    这三条都是**架构师点名的负对照**：Windows 盘符（`C:` 不是 userinfo 分隔符）、普通 `%` 路径、
+    `?` 尾部（由路径轴原语遮蔽而非整值占位）。另加「段内有 `@` 但冒号在其后」的普通路径。
+    """
+    windows = "C:\\repos\\alice@corp\\settings.json"
+    (kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=windows)])
+    assert kept.source_path == windows
+
+    pct = "/home/100%25done/settings.json"
+    (also_kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=pct)])
+    assert also_kept.source_path == pct
+
+    drive_relative = "C:repos\\alice@corp\\settings.json"
+    (relative_kept,) = marketplace_declaration_errors(
+        [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=drive_relative)],
+    )
+    assert relative_kept.source_path == drive_relative
+
+    device_prefixed = "\\\\?\\C:\\repos\\alice@corp\\settings.json"
+    (device_kept,) = marketplace_declaration_errors(
+        [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=device_prefixed)],
+    )
+    assert device_kept.source_path == device_prefixed
+
+    colon_after_at = "/home/alice@corp/notes:2024/x"
+    (still_kept,) = marketplace_declaration_errors(
+        [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=colon_after_at)],
+    )
+    assert still_kept.source_path == colon_after_at
+
+    query = "/srv/x/settings.json?token=SECRET"
+    (masked,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=query)])
+    assert masked.source_path == "/srv/x/settings.json<redacted-source>"
+    assert "SECRET" not in masked.source_path
+
+
+@pytest.mark.parametrize(
+    "dirty,secret",
+    [
+        # 干净 userinfo（架构师裁决：containing userinfo 即整值占位，诊断可读性只对无 userinfo 路径保留）
+        ("/home/alice:pw@example.com/a2c/settings.json", "pw"),
+        # 控制 / 方向覆写字符穿插：scrub 换空格 / escape 造 `\` 段边界
+        ("/home/alice‮:pw@example.com/settings.json", "pw"),
+        ("/home/alice:pw‮@example.com/settings.json", "pw"),
+        ("/home/alice\x1b:pw@example.com/settings.json", "pw"),
+        ("/home/alice:pw\x1b@example.com/settings.json", "pw"),
+        # 首个 `@` 在 `:` 之前（只看首个 @ 会漏）
+        ("/home/alice@corp:pw@example.com/settings.json", "pw"),
+        ("/home/alice@corp:pw\x1b@example.com/settings.json", "pw"),
+        # `#` / `?` 夹在 `:` 与 `@` 之间（原语把 `#`/`?` 之后当尾部）
+        ("/home/alice:my-secret#x@example.com/settings.json", "my-secret"),
+        ("/home/alice:my-secret?x@example.com/settings.json", "my-secret"),
+        # 段内空白：原语正则要求 `:` 前非空白
+        ("/home/alice:my pw pass@example.com/settings.json", "my pw pass"),
+        # 冒号选择（find vs rfind）：密码含空白 + 末尾端口 ⇒ 最后一个 `:` 在 `@` 之后，只有 find 判得出
+        ("/home/alice:my pw@example.com:8080/settings.json", "my pw"),
+        # 凭据内的字面分隔符：逐段判定会被拆开
+        ("/home/alice:pw\\x@example.com/settings.json", "pw"),
+        ("/home/alice:pw/x@example.com/settings.json", "pw"),
+        # percent-encoded（含编码出的分隔符 / 前导 `@`）
+        ("/home/alice:pw%2Fsecret%40example.com/settings.json", "pw"),
+        ("/home/alice:pw%5Csecret%40example.com/settings.json", "pw"),
+        ("/home/alice%40corp:pw%40example.com/settings.json", "pw"),
+        ("/home/alice%3Apw%40example.com/settings.json", "pw"),
+        ("/home/alice%253Apw%2540example.com/settings.json", "pw"),
+        # 四层编码（3 轮不够）
+        ("/home/alice%2525253Apw%25252540example.com/settings.json", "pw"),
+        # NFKC 全角
+        ("/home/alice：pw＠example.com/settings.json", "pw"),
+    ],
+)
+def test_source_path_fails_closed_on_userinfo_shape(dirty: str, secret: str) -> None:
+    """
+    ``source_path`` 的 fail-closed 判据：剥盘符后「最后一个 `@` 在第一个 `:` 之后」，在原文与每一轮
+    ``percent-decode → NFKC`` 形态上判一次；命中即整值占位。
+
+    判别力（逐项实测过）：只看首个 `@`、只判原文、不做 NFKC、逐段判定、只在原串上找字面 `:`/`@` ——
+    任一退化都会有对应向量转红。每条向量的 `secret` 既是正对照（原串确实带它）也是负断言（输出不得含它）。
+    """
+    assert secret in dirty  # 正对照：原始路径确实带该凭据片段
+    (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
+    assert out.source_path == "<redacted-git-source>"
+    assert secret not in out.source_path
+
+
+def test_source_path_with_control_chars_but_no_userinfo_is_still_scrubbed() -> None:
+    """负对照（防过度遮蔽）：无 `:`/`@` 关系的控制字符路径仍按字符清洗保留可读性，不做整值占位。"""
+    dirty = "/tmp/ev\u202eil/settings\x1b[31m.json"
+    (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
+    assert out.source_path == "/tmp/ev il/settings [31m.json"

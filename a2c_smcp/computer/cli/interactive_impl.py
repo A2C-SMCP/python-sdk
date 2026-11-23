@@ -333,7 +333,9 @@ async def interactive_loop(
 
     # #117 治理重挂（设计 Y client 接线）：boot 已恢复 bundled SKILL；CLI 作为参考 client 经公共 API
     # reconcile_governance(hooks) 重挂 enabled bundled MCP server。时序刻意在批准框之后——mcp.json 的
-    # 显式用户配置先挂先占名（同名 bundled 被 skip，用户配置胜）；bundled 免批准（§5.10）。
+    # 显式用户配置先挂先占名（同名 bundled 被 skip，用户配置胜）。bundled **仅在受信 scope
+    # （user/local/flag/policy）激活时免批准**——project-origin 激活的落 #159 Option B 的 PENDING 审批门、
+    # 不自动挂载（#293 起本路径取 per-scope 层，与 declared=None 同门）；其批准入口仍待接线（见 #294 邻域）。
     try:
         await plugin_cmd.run_governance_remount(comp, settings_flag_path=settings_flag_path)
     except Exception as e:  # pragma: no cover - 重挂失败不阻断进入 REPL

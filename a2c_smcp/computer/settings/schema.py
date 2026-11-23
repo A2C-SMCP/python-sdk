@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, NotRequired, TypedDict
@@ -133,6 +134,21 @@ FIELD_LANDING_ROOT = "landingRoot"
 # v0.5.0 新增（#236 / protocol#65）：client:resolve_path 按路径读取的授权读根（绝对路径数组）。
 # v0.5.0 added (#236 / protocol#65): authorized read roots for client:resolve_path (array of absolute paths).
 FIELD_READ_ROOTS = "readRoots"
+
+
+def is_marketplace_declaration_field(field: str) -> bool:
+    """
+    校验错误的 ``field`` 是否落在 ``extraKnownMarketplaces`` 子树（#293，镜像 rust 同名谓词）/
+    Whether the error ``field`` belongs to the ``extraKnownMarketplaces`` subtree.
+
+    **精确前缀判定必须带 ``.`` 边界**：裸 ``startswith("extraKnownMarketplaces")`` 会把
+    ``extraKnownMarketplacesBackup.x`` 这类无关字段误收进来。整字段类型错误（``field ==`` 前缀本身）
+    同属本子树。
+
+    :param field: :attr:`SettingsValidationError.field`（点路径）。
+    """
+    return field == FIELD_EXTRA_KNOWN_MARKETPLACES or field.startswith(f"{FIELD_EXTRA_KNOWN_MARKETPLACES}.")
+
 
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
@@ -366,6 +382,43 @@ class SettingsValidationError:
     field: str
     reason: str
     source_path: str | None = None
+
+
+# 展示面不安全字符的**显式码位集**（镜像 rust ``is_unsafe_display_char``）：Cc（``str.isprintable``
+# 之外的控制字符，含 ESC / 换行 / DEL）+ Cs（Python 专有的孤立代理项）+ 方向覆写与行分隔族
+# （U+061C ALM、U+200B–U+200F、U+2028–U+202E、U+2060–U+206F、U+FEFF）。后一族全是 Cf，正是
+# ``a2c_smcp.utils.git_url._UNSAFE_CHAR_CATEGORIES`` 明确**不处理**的那一类（那里是转义器，口径已冻结）；
+# 本函数只服务 settings 诊断面，替换为空格而非转义（与 rust 逐字一致）。
+_UNSAFE_DISPLAY_RANGES: tuple[tuple[int, int], ...] = (
+    (0x061C, 0x061C),
+    (0x200B, 0x200F),
+    (0x2028, 0x202E),
+    (0x2060, 0x206F),
+    (0xFEFF, 0xFEFF),
+)
+
+
+def _is_unsafe_display_char(ch: str) -> bool:
+    """字符是否会在终端 / 日志行里伪造视觉（控制、代理项、方向覆写、行分隔）/ Unsafe-to-display char."""
+    if unicodedata.category(ch) in ("Cc", "Cs"):
+        return True
+    code = ord(ch)
+    return any(low <= code <= high for low, high in _UNSAFE_DISPLAY_RANGES)
+
+
+def scrub_diagnostic_chars(text: str) -> str:
+    """
+    把不可见 / 方向覆写字符替换为空格（#293，镜像 rust ``scrub_diagnostic_chars``）/
+    Replace invisible / bidi-control characters with spaces.
+
+    动机：不可信值里的 U+202E（RLO）能把终端与日志行**后半段倒序显示**，U+2028 伪造换行打断日志行。
+    ``sanitize_segment_for_diagnostics`` 只转义 Cc/Cs，Cf 族原样透出，故诊断面需要这一层。
+
+    :param text: 任意不可信文本（市场名残段 / 校验原因 / 路径）。
+    """
+    if not any(_is_unsafe_display_char(ch) for ch in text):
+        return text
+    return "".join(" " if _is_unsafe_display_char(ch) else ch for ch in text)
 
 
 # 哨兵：表示「整字段判废、回退默认」/ Sentinel: "drop the whole field, fall back to default".
