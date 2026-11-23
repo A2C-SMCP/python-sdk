@@ -338,6 +338,19 @@ def test_permissions_additional_directories_absolute_only() -> None:
     assert len(errors) == 2  # relative + 非 string
 
 
+def test_permissions_additional_directories_syntactic_predicate_unchanged() -> None:
+    """#304 item 3：``additionalDirectories`` **保持语法判据**（不做谓词合并、不按宿主平台过滤）.
+
+    盘符形态在 POSIX 宿主上照样保留（语法绝对即通过）；verbatim ``\\\\?\\`` / 前导空白被拒。
+    该字段运行期无消费者，故「外来平台形态」不会进入任何授权集合。
+    """
+    raw = {"permissions": {"additionalDirectories": ["D:\\data", "\\\\?\\C:\\x", "  /abs"]}}
+    cleaned, errors = validate_settings(raw, SettingsScope.USER)
+
+    assert cleaned["permissions"]["additionalDirectories"] == ["D:\\data"]
+    assert len(errors) == 2
+
+
 def test_source_path_backfilled_into_errors() -> None:
     _, errors = validate_settings({"strictKnownMarketplaces": 1}, SettingsScope.USER, source_path="/x/settings.json")
     assert errors[0].source_path == "/x/settings.json"
@@ -380,6 +393,37 @@ class TestLandingRoot:
         cleaned, errors = validate_settings({"landingRoot": "D:\\a2c\\landing"}, SettingsScope.USER)
         assert cleaned["landingRoot"] == "D:\\a2c\\landing"
         assert errors == []
+
+    def test_surrounding_whitespace_trimmed_and_activated(self) -> None:
+        """#304 item 3（对齐 rust ``trim()``）：首尾空白先 trim，存 trim 后的值.
+
+        行为变化：此前带首尾空白的配置**整字段判废**（静默失效、fail-closed）；现在按 trim 后的
+        绝对路径生效。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "  /srv/landing \t"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_whitespace_only_dropped(self) -> None:
+        """trim 后为空 → 仍按非绝对路径判废（不因 trim 放宽空值）。"""
+        cleaned, errors = validate_settings({"landingRoot": " \t\n "}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+
+    def test_syntactic_predicate_is_deliberately_not_merged(self) -> None:
+        """**刻意的不对称**（用户 2026-11-23 裁决：不做谓词合并）.
+
+        两半合起来才能钉住语法判据：① 盘符形态在 POSIX 宿主照样通过（``normalize_path`` 会拒）；
+        ② ``normalize_path`` 能接受的 verbatim ``\\\\?\\C:\\...`` 反而被拒。若后人「顺手」把
+        ``landingRoot`` 也改用 ``normalize_path``，① 立刻红。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "D:\\a2c\\landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "D:\\a2c\\landing"  # 语法绝对即通过，不按宿主平台过滤
+        assert errors == []
+
+        cleaned, errors = validate_settings({"landingRoot": "\\\\?\\C:\\a2c\\landing"}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned  # normalize 接受的形态反而被语法判据拒
+        assert len(errors) == 1
 
     @pytest.mark.parametrize("bad", ["relative/path", "./here", "", 123, True, ["/abs"]])
     def test_relative_or_non_string_dropped(self, bad: object) -> None:

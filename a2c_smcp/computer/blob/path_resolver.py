@@ -200,26 +200,30 @@ class _StatKey:
     ino: int
 
 
-def build_read_roots(raw: Sequence[str]) -> list[ReadRoot]:
+def build_read_roots(raw: Sequence[str], *, platform: PathPlatform | None = None) -> list[ReadRoot]:
     """把 settings ``readRoots`` 原始列表编译为双形态根列表.
 
     每项 MUST 为绝对路径且可 ``normalize_path``；非法项丢弃（配置诊断由接线层记录）。
     ``realpath`` / 归一失败的根只保留配置形态，``real`` 为 ``None``。
+
+    ``platform`` 为平台注入接缝（缺省取宿主平台，与 :func:`build_protected_paths` 同惯例）——
+    配置期 ``schema._validate_read_roots_for`` 与本函数必须共用**同一**判据；CI 只有 Linux，
+    故 Windows 形态的一致性对拍需要显式平台。
     """
-    platform = native_platform()
+    pf: PathPlatform = native_platform() if platform is None else platform
     roots: list[ReadRoot] = []
     for item in raw or ():
         if not isinstance(item, str) or not item:
             logger.warning("readRoots: 丢弃非字符串或空路径项 / dropping non-str or empty item: %r", item)
             continue
         try:
-            configured = normalize_path(item, platform)
+            configured = normalize_path(item, pf)
         except InvalidPathError as e:
             logger.warning("readRoots: 丢弃非法路径 / dropping invalid root %r: %s", item, e)
             continue
         real: str | None
         try:
-            real = normalize_path(realpath_nonstrict(configured, platform), platform)
+            real = normalize_path(realpath_nonstrict(configured, pf), pf)
         except (OSError, ValueError, InvalidPathError) as e:
             logger.warning("readRoots: realpath 失败，仅保留配置形态 / realpath failed for %r: %s", configured, e)
             real = None

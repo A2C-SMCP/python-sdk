@@ -254,7 +254,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   拉取期的撤权 / 删除仍走 `4018 forbidden` / `gone`，**`4018` 枚举不变**）。
   - **授权边界 = settings `readRoots`**（默认空 = 不可读，fail-closed）：仅受信 scope 可设，
     `project` scope 提供该键**整字段拒绝**；跨 scope 按数组语义拼接去重；逐项须为绝对路径且通过
-    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。
+    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。（0.5.1 起改为
+    `normalize_path` **单一判据**，见 `### Fixed（#304 item 3 …）`。）
   - **授权每请求现读、无进程内缓存**：拉取期 `get_blob` 按**当前** `readRoots` 与**当前文件系统状态**
     重施围栏（覆盖 resolve 后的撤权、root 符号链接换指向）；正确性不依赖宿主调用任何失效入口。
   - **固定拒绝集**（即便在 `readRoots` 内也拒绝）：`.skillenv`、SDK 配置/状态/凭据目录
@@ -836,6 +837,27 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `git -C` / clone 落点；ambient `GIT_SSH_COMMAND` 缺 `-oBatchMode=yes` 时自动追加，避免挂 tty 等待口令。
 - 引用语义不变：`installedPlugins` ∪ `enabledPlugins` 键、`@<name>` 后缀匹配、true/false 均算、层并集去重；
   不新增错误码。
+
+### Fixed（#304 item 3 settings 路径判据收尾）
+
+- **`readRoots` 改为单一判据（配置期 == 运行期）**：`_validate_read_roots` 去掉前置的「POSIX `/` 或
+  Windows 盘符」语法预判，只留 `normalize_path`（与运行期 `build_read_roots` 同源），并拆出
+  `_validate_read_roots_for(..., platform)` 平台显式接缝（与 rust `validate_read_roots_for` 同名同构，
+  CI 只有 Linux）。行为变化：**Windows verbatim 前缀 `\\?\C:\...` 在配置期不再被误拒**——
+  `normalize_path` 按协议向量 `win-verbatim-prefix` 接受并归一，此前「运行期读得了、配置期写不进」；
+  drive-relative `C:repos\` 两侧一致拒绝。相对路径项的诊断文案由 `must be an absolute path` 变为
+  `invalid path: …`（`settings show/get` 可见）。
+- **`landingRoot` 与 rust 对齐 `trim()`**：首尾空白先 trim，trim 后为空 / 非绝对 → 整字段判废，
+  通过则**存 trim 后的值**。行为变化：**带首尾空白的 `landingRoot` 从「整字段判废（静默失效）」
+  变为按 trim 值生效**——此前手编配置里的空格会令 `put_blob` 一直 `4019 forbidden`。
+- **判据边界文档化（不做谓词合并，2026-11-23 用户裁决）**：`landingRoot` / `permissions.additionalDirectories`
+  保持**语法**判据、不按宿主平台过滤，也不改用 `normalize_path`。由此的「外来平台形态」边界：
+  `readRoots` 运行期由 `build_read_roots` 丢弃外来形态；`additionalDirectories` 运行期无消费者；
+  **`landingRoot` 运行期不丢弃**——`Computer.landing_root` 直接 `Path(raw)`，POSIX 宿主上的
+  `D:\...` 是相对路径（落盘落在进程 cwd 下），且 `build_protected_paths` 会因 normalize 失败把它从
+  `.part` 拒绝集丢弃。该边界与 rust 同构，本版**只记录、不改语义**。
+- `build_read_roots` 增 keyword-only `platform` 注入接缝（缺省宿主平台），供「配置期/运行期同源」测试
+  在任意 OS 上对拍。
 
 ## [0.4.0] - 2026-08-25
 
