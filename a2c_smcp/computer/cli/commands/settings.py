@@ -28,6 +28,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
+
 from a2c_smcp.computer.cli.commands import (
     flag_value,
     format_settings_errors,
@@ -141,10 +143,13 @@ def _read_scope_with_errors(
 def _emit_errors(errors: list[SettingsValidationError]) -> None:
     """把 settings 校验错误打 **stderr**（#157）——stdout 恒为机读 JSON，``settings show | jq`` 须仍可用。
 
-    Diagnostics on stderr; stdout stays pure JSON.
+    整行经 :func:`rich.markup.escape`（#295）：``field`` 含原始 JSON 键，手编 ``evil[/]a[/]b`` 会让 rich 抛
+    ``MarkupError`` 并让 ``settings show`` / ``settings get`` 直接 traceback；未转义时 ``settings.json[user]``
+    的 scope 文本也会被当样式标签吞掉。脱敏在 :func:`format_settings_errors` 层做（本函数只负责安全呈现）。
+    Diagnostics on stderr; each line escaped so untrusted keys cannot break the markdown/markup parser.
     """
     for line in format_settings_errors(errors):
-        console_err.print(f"[yellow]{line}[/yellow]")
+        console_err.print(f"[yellow]{escape(line)}[/yellow]")
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────

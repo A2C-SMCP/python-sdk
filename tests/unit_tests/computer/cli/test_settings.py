@@ -224,6 +224,66 @@ def test_show_policy_valid_fields_silent(
     assert captured.err == ""
 
 
+# ── #295 展示面脱敏 / markup 安全 ───────────────────────────────────────────────
+_MARKETPLACE_SECRET_KEY = "https://alice:s3cret@example.com/repo.git"
+
+
+def _write_user_settings(env: dict[str, str], data: object) -> None:
+    path = user_settings_path(env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _no_ws(text: str) -> str:
+    """去掉全部空白：rich 按终端宽度折行，人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
+@pytest.mark.parametrize("command", ["show", "get"])
+def test_settings_commands_redact_marketplace_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    """#295：``settings show`` / ``settings get`` 的错误行不回显 marketplace 键里的 userinfo 凭据。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    _write_user_settings(env, {"extraKnownMarketplaces": {_MARKETPLACE_SECRET_KEY: {}}})
+    capsys.readouterr()
+
+    if command == "show":
+        assert settings_cmd.settings_show(home, env, scope="user", json_output=True) == 0
+    else:
+        assert settings_cmd.settings_get(home, env, "strictKnownMarketplaces", scope="user", json_output=True) == 1
+    captured = capsys.readouterr()
+
+    err = _no_ws(captured.err)
+    assert "s3cret" not in err  # 凭据不落 stderr
+    assert "https://example.com/repo.git" in err  # userinfo 剥离但名字仍可定位
+    if command == "show":
+        payload = json.loads(captured.out)  # stdout 仍是纯 JSON（诊断只走 stderr）
+        assert "s3cret" not in json.dumps(payload)  # 且 stdout 侧同样不落凭据
+
+
+@pytest.mark.parametrize("command", ["show", "get"])
+def test_settings_commands_escape_markup_in_error_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    """#295（可达崩溃）：手编键 ``evil[/]a[/]b`` 让错误行含 rich 结束标签——未 escape 时抛 MarkupError。
+
+    两条命令共用 :func:`_emit_errors`；本用例对两处调用点分别钉住「不抛 + 原文可见 + scope 文本不被吞」。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    _write_user_settings(env, {"extraKnownMarketplaces": {"evil[/]a[/]b": {}}})
+    capsys.readouterr()
+
+    if command == "show":
+        assert settings_cmd.settings_show(home, env, scope="user", json_output=True) == 0
+    else:
+        assert settings_cmd.settings_get(home, env, "strictKnownMarketplaces", scope="user", json_output=True) == 1
+    err = _no_ws(capsys.readouterr().err)
+
+    assert "settings.json[user]" in err  # scope 文本没被当标签吃掉
+    assert "evil[/]a[/]b" in err  # field 原文逐字可见
+
+
 # ── edit ──────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_edit_opens_editor_and_returns_reconcile_cb(tmp_path: Path) -> None:

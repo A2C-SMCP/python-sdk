@@ -311,6 +311,35 @@ async def test_settings_error_line_escapes_markup(
 
 
 @pytest.mark.asyncio
+async def test_settings_error_line_redacts_marketplace_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#295：`run_mcp_approval` 消费同一 `format_settings_errors`——错误行不得回显 marketplace 键里的凭据。
+
+    escape 由 #294 已加（同族用例见上），本用例钉**脱敏**轴：userinfo 剥离、结构仍可定位。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    _write_json(
+        Path(env["XDG_CONFIG_HOME"]) / "a2c" / "settings.json",
+        {"extraKnownMarketplaces": {"https://alice:s3cret@example.com/repo.git": {}}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "s3cret" not in out  # 凭据不落
+    assert "https://example.com/repo.git" in out  # userinfo 剥离但名字仍可定位
+
+
+@pytest.mark.asyncio
 async def test_mcp_json_error_line_escapes_markup(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

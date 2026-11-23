@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+#295 settings 校验错误展示面（脱敏 + markup 安全）的**可复现变异矩阵**（dev-only，不进 CI）。
+
+背景：验收要求「去脱敏 / 去 escape / 去 reason 脱敏」三轴都必须让定向用例转红。本脚本把每个不变量逐个
+注入为 mutation，运行对应定向用例，断言必须转红（KILLED）。全部 mutation 在 ``try/finally`` 内应用与
+还原，任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
+
+运行（不要用 ``uv run``，避免在 worktree 内重建环境；本脚本会临时改写源码，勿与编辑/并发 run 同时进行）::
+
+    python scripts/mutation_settings_display.py            # 应用变异并跑定向用例
+    python scripts/mutation_settings_display.py --check    # 只读：校验各 old 片段仍唯一定位
+
+备份目录按 PID 隔离（``mut295_<pid>_*``），结束逐文件 sha256 校验还原。
+
+退出码：全部 KILLED → 0；任一 SURVIVED / SETUP-FAIL → 1。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PY = sys.executable
+
+CLI_INIT = "a2c_smcp/computer/cli/commands/__init__.py"
+SETTINGS_CLI = "a2c_smcp/computer/cli/commands/settings.py"
+
+T_INIT = "tests/unit_tests/computer/cli/test_commands_init.py"
+T_SETTINGS = "tests/unit_tests/computer/cli/test_settings.py"
+T_APPROVAL = "tests/unit_tests/computer/cli/test_mcp_approval.py"
+
+_FIELD_AND_REASON = (
+    "        field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)"
+)
+
+
+@dataclass(frozen=True)
+class Mutation:
+    name: str
+    edits: tuple[tuple[str, str, str], ...]  # (file, old, new)
+    tests: tuple[str, ...]
+
+
+MUTATIONS: tuple[Mutation, ...] = (
+    Mutation(
+        "M1 去展示漏斗脱敏（format_settings_errors 直用未脱敏 field/reason）",
+        (
+            (
+                CLI_INIT,
+                "        sanitized = sanitized_marketplace_error(e)\n" + _FIELD_AND_REASON + "\n",
+                "        field, reason = e.field, e.reason\n",
+            ),
+        ),
+        (
+            T_INIT + "::test_format_settings_errors_sanitizes_marketplace_declaration_fields",
+            T_INIT + "::test_format_settings_errors_redacts_marketplace_name_shapes",
+            T_SETTINGS + "::test_settings_commands_redact_marketplace_credentials",
+            T_APPROVAL + "::test_settings_error_line_redacts_marketplace_credentials",
+        ),
+    ),
+    Mutation(
+        "M2 去 escape（_emit_errors 直接把整行当 markup 解析）",
+        (
+            (
+                SETTINGS_CLI,
+                'console_err.print(f"[yellow]{escape(line)}[/yellow]")',
+                'console_err.print(f"[yellow]{line}[/yellow]")',
+            ),
+        ),
+        (T_SETTINGS + "::test_settings_commands_escape_markup_in_error_lines",),
+    ),
+    Mutation(
+        "M3 只去 reason 脱敏（field 仍走段漏斗）",
+        (
+            (
+                CLI_INIT,
+                _FIELD_AND_REASON,
+                "        field, reason = (sanitized.field, e.reason) if sanitized is not None else (e.field, e.reason)",
+            ),
+        ),
+        (
+            T_INIT + "::test_format_settings_errors_sanitizes_marketplace_reason_text",
+            T_INIT + "::test_format_settings_errors_sanitizes_marketplace_declaration_fields",
+        ),
+    ),
+)
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_ACTIVE_BACKUPS: dict[str, tuple[str, Path]] = {}
+
+
+def _restore_active() -> None:
+    for rel, (digest, tmp) in list(_ACTIVE_BACKUPS.items()):
+        shutil.copy2(tmp, ROOT / rel)
+        assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+        _ACTIVE_BACKUPS.pop(rel, None)
+
+
+def _sig_handler(signum: int, _frame: object) -> None:
+    _restore_active()
+    raise SystemExit(128 + signum)
+
+
+def _classify(proc: subprocess.CompletedProcess[str], tests: tuple[str, ...]) -> tuple[str, str]:
+    """KILLED 判据：**仅** pytest 返回 1（有用例失败）且输出确实列出目标用例失败。
+
+    ``returncode != 0`` 不足以证明变异被杀死（解释器缺失 / 收集错误 / 超时都会非 0）；
+    目标用例名出现才说明是**该变异**打红了目标。
+    """
+    out = proc.stdout + proc.stderr
+    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    if proc.returncode == 0:
+        return "SURVIVED", tail
+    if proc.returncode == 1:
+        names = [t.rsplit("::", 1)[-1] for t in tests]
+        if all(name in out for name in names):
+            return "KILLED", tail
+        return "ERROR(目标用例未失败)", tail
+    return f"ERROR(rc={proc.returncode})", tail
+
+
+def check() -> int:
+    """只读校验：每条 mutation 的 ``old`` 片段仍能在当前源码中唯一定位。"""
+    ok = True
+    for mutation in MUTATIONS:
+        for rel, old, _new in mutation.edits:
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            count = text.count(old)
+            if count != 1:
+                print(f"{mutation.name}: CHECK-FAIL ({rel}: occurrence={count})")
+                ok = False
+    print("CHECK: OK" if ok else "CHECK: FAILED")
+    return 0 if ok else 1
+
+
+def main() -> int:
+    # 每次都先做锚点唯一性校验：源码漂移时立即失败，避免半途 SETUP-FAIL / 误改无关片段。
+    if check() != 0:
+        return 1
+    if "--check" in sys.argv[1:]:
+        return 0
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        print("pytest 不可用：请用项目 venv 运行（不要 uv run / 不要裸 python），否则变异会被误判。")
+        return 2
+
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
+    failures: list[str] = []
+    # 每次运行独立备份目录（per-PID）：并发 run / 并发 worktree 不互相覆盖；退出时整体清理。
+    backup_dir = Path(tempfile.mkdtemp(prefix=f"mut295_{os.getpid()}_"))
+    try:
+        for mutation in MUTATIONS:
+            backups: dict[str, tuple[str, Path]] = {}
+            try:
+                for rel, old, new in mutation.edits:
+                    path = ROOT / rel
+                    if rel not in backups:
+                        tmp = backup_dir / f"{len(backups)}_{path.name}.bak"
+                        shutil.copy2(path, tmp)
+                        backups[rel] = (_digest(path), tmp)
+                    text = path.read_text(encoding="utf-8")
+                    if old not in text:
+                        print(f"{mutation.name}: SETUP-FAIL ({rel})")
+                        failures.append(mutation.name)
+                        break
+                    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+                else:
+                    # 备份登记为「活跃」：子进程期间收到 SIGTERM/SIGINT 也能还原。
+                    _ACTIVE_BACKUPS.update(backups)
+                    proc = subprocess.run(
+                        [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
+                        cwd=ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    status, tail = _classify(proc, mutation.tests)
+                    print(f"{mutation.name}: {status} | {tail}")
+                    if status != "KILLED":
+                        failures.append(mutation.name)
+            finally:
+                for rel, (digest, tmp) in backups.items():
+                    shutil.copy2(tmp, ROOT / rel)
+                    assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+                    _ACTIVE_BACKUPS.pop(rel, None)
+    finally:
+        _restore_active()
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    print(f"\nSUMMARY: {len(MUTATIONS) - len(failures)}/{len(MUTATIONS)} KILLED")
+    return 0 if not failures else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

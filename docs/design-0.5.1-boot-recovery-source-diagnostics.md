@@ -163,7 +163,7 @@ SDK 自治差异：
 
 | 维度 | rust（`settings/schema.rs` + `computer.rs`） | python（本仓） | 理由 |
 |------|---------------------------------------------|----------------|------|
-| 脱敏落点 | **`validate_settings` 出口**统一脱敏，所有 `SettingsValidationError` 消费者（CLI 文本 / 报告 / 诊断）拿到同一安全值 | 只在**采集处**（`sanitized_marketplace_error`）脱敏；`format_settings_errors` 行为不变 | `settings show` 的凭据回显是独立安全单 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，用户裁决本单不提前改其行为。#295 落地时可直接复用该函数 |
+| 脱敏落点 | **`validate_settings` 出口**统一脱敏，所有 `SettingsValidationError` 消费者（CLI 文本 / 报告 / 诊断）拿到同一安全值 | `validate_settings` / `SettingsValidationError` **保留原值**；采集处（恢复报告）与展示漏斗（`format_settings_errors`，[#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 起）各自调用 `sanitized_marketplace_error`（幂等） | 校验器保留原值便于库宿主自行处置；两处消费同一函数，CLI 文本 / 报告 / 诊断的**展示值**口径一致，差异只在「错误对象本身是否带原值」 |
 | Flag scope | **从 report 字段过滤掉**（其 CLI 启动边界另有打印 + `include_marketplace_declaration_errors` 抑制开关），WARN 仍记全量 | **不过滤**，`scope == flag` 照常进报告 | 用户裁决「报告**所有**前缀错误」，且已接受同次启动多条同义提示；python 没有 rust 那套抑制开关，过滤会让 flag 层错误从 report 消失（库宿主无处可见） |
 | 名字脱敏强度 | 名字与 reason 同走散文脱敏（`redact_git_urls_in_text`，只去 userinfo、保留 path） | 名字走**段漏斗**（`redact_ledger_key`），reason 才走散文脱敏 | 名字是**单个不可信值**：path 段里的 `alice:PW@example.com` 会被散文脱敏原样放出（#261 已定的口径） |
 | `source_path` 脱敏 | 只 `scrub_diagnostic_chars`（其测试 `test_extra_marketplaces_error_source_path_scrubbed_not_url_redacted` 明确断言 Windows 路径原样保留、不做 URL 脱敏）⇒ 路径段里的 `alice:pw@…` **会回显** | 路径轴 `sanitize_path_for_diagnostics` + **「无法排除 userinfo 即整值占位」**；无 userinfo 的路径（Windows / `alice@corp` / 普通 `%` / `?` 尾部）照常展示 | 诊断面同样不该回显路径段凭据；`/` 与 `\` 双段边界避免 scp-like 脱敏器把 Windows 路径整条吞掉（#263 四轮）。python 此处比 rust 严 |
@@ -203,7 +203,8 @@ SDK 自治差异：
 保留 path。当前**不可达**——`_validate_extra_marketplaces` 的 reason 全是静态文案（`malformed git url` /
 `missing or non-object 'source'` / `only source.type == 'git' is supported` / `marketplace name must be strict
 kebab (1-64)` / `must be bool, got <type>`），不含任何用户值；本模块的 reason 脱敏是纵深防御（防未来某个
-validator 把值拼进 reason）。若将来有 reason 携带用户值，应改走段漏斗。
+validator 把值拼进 reason）。若将来有 reason 携带用户值，应改走段漏斗。#295 起该 reason 脱敏同样用于
+`format_settings_errors`（CLI 展示），纵深防御面随之覆盖 `settings show` / `settings get` / boot 批准流程。
 
 `per_scope_layers` 已**对齐** rust：显式 `declared=ResolvedSettings` 也取其 `.per_scope_layers`（用户
 2026-11-22 裁决，本单范围），故 project-origin bundled server 在两条路径上都过 #159 Option B 的 PENDING
@@ -222,16 +223,21 @@ CLI 行**顺序与 rust 对拍**：降级 → 源冲突 → 声明错误；三�
 ⇒ 用户把声明 URL 改出 typo 后重启，recovery 只看到「无声明」，既不报冲突也无从提示。现由 §3.4 接进
 `GovernanceRecoveryReport.marketplace_declaration_errors` + WARN 汇总 + boot 计数。
 
+**（已由 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口）`settings show` / `format_settings_errors`
+曾对非法 marketplace 名回显原始凭据形态。** 现展示漏斗逐条复用 `sanitized_marketplace_error`（与恢复报告同一
+口径，覆盖 `settings show` / `settings get` / boot 批准流程），并整行 `rich.markup.escape()`——手编
+`evil[/]a[/]b` 键不再让 `settings show` / `settings get` 抛 `MarkupError`。
+
 仍存在的相邻边界（各有归属，不在本设计范围）：
 
 | 边界 | 归属 |
 |------|------|
-| `settings show` / `format_settings_errors` 对非法 marketplace 名仍回显原始凭据形态 | [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)（可复用本设计的 `sanitized_marketplace_error`） |
+| `enabledPlugins` 非法键 / `mcp.json: {e}` 的 pydantic repr 仍回显原值（同一展示漏斗） | [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)（`enabledPlugins` 整值过名字漏斗；`mcp.json` 行改摘要 + DEBUG 明细） |
 | `installedPlugins` / `enabledPlugins` 的同类 invalid key 仍静默（不进本报告） | 另案评估（用户裁决 5） |
 | `settings.json` 整文件不可解析时只记一条 `<file>` 错误，不含 marketplace 子树 | 既有行为（§5.6 容错），不在本设计范围 |
 | `reason` 的散文脱敏不对 path 段 fail-closed（当前 reason 全静态、不可达） | §6.1；reason 若引入用户值时改走段漏斗 |
 | `sanitize_path_for_diagnostics` 的「先 escape 再判段 + 要求字面 `@`/`?`/`#`」在**其他**调用方仍可能漏 path 段凭据（控制字符邻接 / 段内空白 / percent-encoded 三类） | 共享原语问题，不在本单；本单只在 `source_path` 采集处 fail-closed |
-| 当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时，同一份非法声明会在同一次启动出现**两条** CLI 行（`run_mcp_approval` 的 `format_settings_errors` + 本单的声明行），叠加 boot/重挂两条 `WARN` ≈ 4 条同义提示 | 已知边界：用户 2026-11-22 裁决接受同义提示；`format_settings_errors` 的措辞与脱敏归 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)。**不**为去重而重新解析 settings（违反「只消费 report 字段」） |
+| 当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时，同一份非法声明会在同一次启动出现**两条** CLI 行（`run_mcp_approval` 的 `format_settings_errors` + 本单的声明行），叠加 boot/重挂两条 `WARN` ≈ 4 条同义提示 | 已知边界：用户 2026-11-22 裁决接受同义提示；`format_settings_errors` 的脱敏已由 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口（措辞差异保留）。**不**为去重而重新解析 settings（违反「只消费 report 字段」） |
 | project-origin bundled server 落 PENDING 后，CLI 只打 INFO 日志、**没有批准入口**（`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担（参考 client 未来补线索） | follow-up（架构师开跟踪 issue，不在 #293/#294 实现） |
 
 ## 8. 不做

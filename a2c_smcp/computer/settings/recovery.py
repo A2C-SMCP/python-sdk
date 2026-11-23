@@ -326,10 +326,11 @@ def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDe
     单条 settings 校验错误 → 脱敏 :class:`MarketplaceDeclarationError`；非 marketplace 子树返回 ``None``。
 
     .. note::
-       与 rust 的**落点差异**（有意，见设计文档 §6）：rust 在 ``validate_settings`` 出口即脱敏，顺带修好了
-       ``settings show``；本仓 `settings show` 的凭据回显是独立安全单
-       [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，故本函数**只**在采集处调用，
-       ``validate_settings`` 出口与原 ``format_settings_errors`` 行为不变。``#295`` 落地时可直接复用本函数。
+       与 rust 的**落点差异**（有意，见设计文档 §6.1）：rust 在 ``validate_settings`` 出口即脱敏，所有消费者
+       拿到同一安全值；本仓 ``validate_settings`` / :class:`SettingsValidationError` **保留原值**，由消费者
+       各自脱敏（幂等）。``#295`` 起 CLI 展示漏斗
+       :func:`~a2c_smcp.computer.cli.commands.format_settings_errors` 也复用本函数，故 ``settings show`` /
+       ``settings get`` / boot 批准流程与恢复报告**同一口径**。
     """
     if not is_marketplace_declaration_field(error.field):
         return None

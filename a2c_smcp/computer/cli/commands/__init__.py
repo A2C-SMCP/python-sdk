@@ -243,6 +243,22 @@ def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[st
     自称「经 ``settings show`` / 诊断命令呈现」）。抽为纯函数以便**单测文案与 scope/field 拼装**，杜绝未来
     重构把「呈现」半程静默回退成吞错误——呈现行为在 ``run_mcp_approval`` 这类 ``Session``-泛型异步副作用
     函数里无法直接断言。对拍 rust ``cli/commands/mod.rs::format_settings_errors``。
-    Pure function so the wording/assembly is unit-testable; the call sites are thin by design.
+
+    **#295：marketplace 声明错误在此统一脱敏**——``field`` 的市场名段是**原始 JSON 键**（校验器直接拼点路径），
+    可含 userinfo 凭据 / ``[`` ``]`` 等富文本标记。与恢复报告（:func:`~a2c_smcp.computer.settings.recovery.
+    marketplace_declaration_errors`）**同一脱敏口径**（段漏斗 + 散文脱敏 + Cf/Cc 清洗），覆盖本函数的全部
+    消费面（``settings show`` / ``settings get`` / boot 批准流程 ``run_mcp_approval``）。非 marketplace 子树原样保留
+    （本单不扩面，残余挂 #304）。``escape()`` 不在此层做：两个 sink 各自负责（``plugin.py`` 已做，``settings.py``
+    的 ``_emit_errors`` 同层转义），避免双重转义。
+    Marketplace declaration errors are redacted here, mirroring rust's ``format_settings_errors``.
     """
-    return [f"⚠ settings.json[{e.scope.value}]: {e.field} — {e.reason}" for e in errors]
+    # 函数内 lazy import 沿用本模块既有范式（见 :func:`resolved_settings_with_errors`）：settings.recovery
+    # 拉 mcp_clients.model / skills 等重依赖，不该让每个 import ``cli.commands`` 的命令模块都付这份成本。
+    from a2c_smcp.computer.settings.recovery import sanitized_marketplace_error
+
+    lines: list[str] = []
+    for e in errors:
+        sanitized = sanitized_marketplace_error(e)
+        field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)
+        lines.append(f"⚠ settings.json[{e.scope.value}]: {field} — {reason}")
+    return lines

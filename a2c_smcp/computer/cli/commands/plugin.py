@@ -793,7 +793,7 @@ async def run_mcp_approval(
     resolved_st = resolved_settings_with_errors(env, flag_path=settings_flag_path)
     # `escape()`：`format_settings_errors` 的 field/reason 来自不可信 settings（点路径用原始 JSON 键拼），
     # 手编 `extraKnownMarketplaces` 键即可注入 `[/]` —— 未转义时实测抛 MarkupError 并**跳过整个审批门**
-    # （#294 复审的可达崩溃；措辞与脱敏仍归 #295）。
+    # （#294 复审的可达崩溃；marketplace 子树的脱敏已由 #295 收口在 `format_settings_errors` 内）。
     for line in format_settings_errors(resolved_st.errors):
         console.print(f"[yellow]{escape(line)}[/yellow]")
     settings = resolved_st.settings

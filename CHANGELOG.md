@@ -202,8 +202,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     不覆盖该路径，输出仅面向人类。
   - 同一次启动可能出现多条同义提示——`WARN` 是库契约，本版不回收（用户 2026-11-22 裁决接受）。常见 2–3 条
     （boot `WARN` + 重挂 `WARN` + 新 CLI 行）；当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时还会多一条
-    `run_mcp_approval` 的 `format_settings_errors` 行（**第 4 条**，其措辞与脱敏由
-    [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 接管），合计约 4 条（见设计文档 §7 已知边界）。
+    `run_mcp_approval` 的 `format_settings_errors` 行（**第 4 条**，其脱敏已由
+    [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口，措辞差异保留），合计约 4 条（见设计文档 §7 已知边界）。
 - **`marketplace migrate`：存量 marketplace 注册名迁移（#268 / D3）**：把 0.5.1 之前以 URL 派生名 /
   显式 `--name` 别名注册的 marketplace 迁移到清单顶层 `name`，并同步改写全部引用面：
   - 权威面（user scope）：`installedPlugins` / `enabledPlugins`（含显式 `false`）/ `trustedMarketplaces` /
@@ -424,7 +424,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     `:` 之后」，在原文与每一轮 `percent-decode → NFKC` 形态上各判一次（覆盖控制字符穿插、`#`/`?` 夹在 `:` 与
     `@` 之间、段内空白、凭据内字面 `/` 与 `\`、percent-encoded、全角、多层编码）。负对照：Windows
     `alice@corp`、纯 `100%25done`、`?` 尾部照常展示（详见设计文档 §6.1）。
-    `settings show` 的凭据回显仍是 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。
+    `settings show` 的凭据回显已由 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口（展示漏斗
+    `format_settings_errors` 复用本函数脱敏，见下方 `### Fixed（#295 …）`）。
   - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度 / `source_path` 脱敏强度）见
     [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md) §6.1。
 - **Computer 停机卡死 + 外部取消信号被吞（#211）**：`_keep_alive_task` 拆除窗口内服务端消息到达时
@@ -913,6 +914,22 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `/C:/data` 归一同根，只保留首次出现。
 - `build_read_roots` 增 keyword-only `platform` 注入接缝（缺省宿主平台），供「配置期/运行期同源」测试
   在任意 OS 上对拍。
+### Fixed（#295 settings 校验错误展示面脱敏 + markup 安全）
+
+- **`settings show` / `settings get` 回显 marketplace 凭据（#295，镜像 rust PR #302）**：settings 校验错误的
+  `field` 用**原始 JSON 键**拼点路径，手编 `extraKnownMarketplaces` 键即可让诊断行回显
+  `https://alice:s3cret@example.com/repo.git`。现在 `format_settings_errors` 逐条复用
+  `recovery.sanitized_marketplace_error`（与恢复报告 `marketplace_declaration_errors` **同一口径**：名字走段
+  漏斗、reason 走散文脱敏、再清 Cf/Cc），覆盖 `settings show` / `settings get` / boot 批准流程；非
+  marketplace 子树的错误与 `validate_settings` 校验/丢弃语义**不变**（`ResolvedSettings.errors` 仍保留原值）。
+  - 脱敏口径：userinfo 剥离（`https://alice:s3cret@example.com/repo.git` → `https://example.com/repo.git`）、
+    path 段凭据 / 非 URL userinfo 整值 `<redacted-git-source>`、query/fragment 凭据丢弃；干净非法名
+    （`Bad_Name`、`repo@2.git`、`alice@corp`、`100%25done`）逐字保留。
+- **`settings show` / `settings get` 遇富文本标记抛 `MarkupError`（#295）**：手编键 `evil[/]a[/]b` 会让
+  `_emit_errors` 的 `console_err.print` 抛 `MarkupError`、命令 traceback。现整行经 `rich.markup.escape()`，
+  两条命令共用该函数一并修复；`settings.json[user]` 的 scope 文本也不再被当样式标签吞掉。
+- 残余挂账 [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)：`enabledPlugins` 非法键 / `mcp.json: {e}`
+  的 pydantic repr / drive 谓词一致性（同一展示漏斗，后续单处理）。
 
 ## [0.4.0] - 2026-08-25
 
