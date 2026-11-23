@@ -183,8 +183,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     **既有降级行此前没有转义，本版一并修掉**。
   - **不提供 `--json`**：`run_governance_remount` 是 REPL 启动路径的内部函数（非 Typer 子命令），root `--json`
     不覆盖该路径，输出仅面向人类。
-  - 同一次启动可能出现 2–3 条同义提示（boot `WARN` + 重挂 `WARN` + 新 CLI 行）——`WARN` 是库契约，本版不回收
-    （用户 2026-11-22 裁决）。
+  - 同一次启动可能出现多条同义提示——`WARN` 是库契约，本版不回收（用户 2026-11-22 裁决接受）。常见 2–3 条
+    （boot `WARN` + 重挂 `WARN` + 新 CLI 行）；当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时还会多一条
+    `run_mcp_approval` 的 `format_settings_errors` 行（**第 4 条**，其措辞与脱敏由
+    [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 接管），合计约 4 条（见设计文档 §7 已知边界）。
 - **`marketplace migrate`：存量 marketplace 注册名迁移（#268 / D3）**：把 0.5.1 之前以 URL 派生名 /
   显式 `--name` 别名注册的 marketplace 迁移到清单顶层 `name`，并同步改写全部引用面：
   - 权威面（user scope）：`installedPlugins` / `enabledPlugins`（含显式 `false`）/ `trustedMarketplaces` /

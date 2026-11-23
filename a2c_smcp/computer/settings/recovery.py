@@ -521,7 +521,7 @@ def _log_marketplace_source_conflicts(conflicts: Sequence[MarketplaceSourceConfl
             conflict.declared_source_display,
             conflict.known_source_display,
         )
-    # 汇总行**带脱敏后的 marketplace 名**：默认日志级别是 INFO、CLI 展示面留 follow-up，只给计数的话用户
+    # 汇总行**带脱敏后的 marketplace 名**：默认日志级别是 INFO（CLI 展示面已由 #294 接线），只给计数的话用户
     # 根本不知道该处理哪一个。两侧 URL 仍只在逐条 DEBUG 里（同为脱敏展示值）。
     logger.warning(
         "governance recovery: %d marketplace(s) are declared from a different source than their registration (%s); "

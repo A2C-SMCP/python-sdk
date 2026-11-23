@@ -74,7 +74,7 @@ scp-like / `.git` 后缀等等价写法**不归一**——协议明许 SDK 不�
 | recovery 日志（冲突） | 1 条 `WARNING` 汇总（**冲突数 + 脱敏后的市场名列表**，不含 URL）+ 每市场 1 条 `DEBUG`（两侧脱敏 URL） |
 | recovery 日志（声明错误） | 1 条 `WARNING` 汇总（**条数 + 脱敏后的市场名列表**）+ 每条 1 条 `DEBUG`（scope / 脱敏 field / 脱敏 reason / source_path） |
 | `Computer.boot_up` 汇总行 | `... N declared-source conflicts, M marketplace declaration errors`；冲突数**与**声明错误数各自**单独即可触发**汇总行（否则「零恢复 + 有冲突/有错误」会静默无痕） |
-| CLI `run_governance_remount` | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 起**分三类打印**（声明错误 → 源冲突 → 降级），文案锚点各不相同：`settings.json[<scope>]` / `declared source differs` / `degraded during`；冲突与降级**只展示脱敏市场名**（两侧 source 仍只在 DEBUG）；无 `--json`（REPL 启动路径内部函数） |
+| CLI `run_governance_remount` | [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 起**分三类打印**（降级 → 源冲突 → 声明错误，与 rust 同序），文案锚点各不相同：`settings.json[<scope>]` / `declared source differs` / `degraded during`；冲突与降级**只展示脱敏市场名**（两侧 source 仍只在 DEBUG）；无 `--json`（REPL 启动路径内部函数） |
 
 `marketplace_source_conflicts` 三字段**全部是展示值**，不可用于任何再克隆或比较：`marketplace` 走
 `redact_ledger_key`（账本键可手编，可能是携带凭据的 URL 残形），两侧 source 走 `display_source`（去

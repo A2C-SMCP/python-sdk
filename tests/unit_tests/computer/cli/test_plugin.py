@@ -1458,6 +1458,51 @@ async def test_run_governance_remount_prints_three_categories_in_order(
 
 
 @pytest.mark.asyncio
+async def test_run_governance_remount_prints_one_line_per_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    #294 契约「**每条记录一行**」：同一类塞 2 条 ⇒ `⚠` 计数 2 且两条文案都在（不合并/不聚合计数）。
+
+    判别力：若把循环改成只打首条、或把同类多条合并成一句计数，本用例转红。
+    """
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[], skills=["lint"])
+    report = _report_with()
+    from a2c_smcp.computer.settings.recovery import MarketplaceDeclarationError
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    report.marketplace_declaration_errors = [
+        MarketplaceDeclarationError(
+            scope=SettingsScope.USER,
+            marketplace=None,
+            field="extraKnownMarketplaces.alpha.source",
+            reason="missing or non-object 'source'",
+        ),
+        MarketplaceDeclarationError(
+            scope=SettingsScope.LOCAL,
+            marketplace=None,
+            field="extraKnownMarketplaces.beta.source.url",
+            reason="malformed git url",
+        ),
+    ]
+
+    async with Computer(name="t", skill_home=home) as comp:
+        async def fake_reconcile(**kwargs: Any) -> Any:
+            return report
+
+        monkeypatch.setattr(comp, "reconcile_governance", fake_reconcile)
+        await plugin_cmd.run_governance_remount(comp)
+
+    out = capsys.readouterr().out
+    assert out.count("⚠") == 2, out
+    flat = _flat(out)
+    assert "settings.json[user]" in flat and "extraKnownMarketplaces.alpha.source" in flat
+    assert "settings.json[local]" in flat and "extraKnownMarketplaces.beta.source.url" in flat
+
+
+@pytest.mark.asyncio
 async def test_run_governance_remount_silent_when_no_signals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1476,6 +1521,8 @@ async def test_run_governance_remount_silent_when_no_signals(
     out = capsys.readouterr().out
     for anchor in (_DECL_SCOPE_ANCHOR, _CONFLICT_ANCHOR, _DEGRADED_ANCHOR):
         assert anchor not in out
+    # 更强：夹具无 bundled server ⇒ 本路径唯一的 console 输出就是这三类信号；三类皆空时必须**完全无输出**
+    assert out.strip() == "", out
 
 
 @pytest.mark.asyncio

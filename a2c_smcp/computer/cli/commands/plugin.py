@@ -759,8 +759,10 @@ async def run_mcp_approval(
     resolved = comp.resolve_mcp_declarations(env=env)
 
     # 被 drop 的畸形 server/input 必须呈现（§5.6 / mcp_config 容错不静默，#69 Group B 风险 3）。
+    # `escape()`：错误文本含用户可编字段（server 名 / 点路径），未转义时 rich 会把 `[...]` 当标签吞掉
+    # 或在形状不巧时抛 MarkupError（#294 复审实证）。
     for e in resolved.errors:
-        console.print(f"[yellow]⚠ mcp.json: {e}[/yellow]")
+        console.print(f"[yellow]⚠ mcp.json: {escape(str(e))}[/yellow]")
 
     if not resolved.servers:
         return
@@ -768,8 +770,11 @@ async def run_mcp_approval(
     # #157：scope 越权被过滤的字段必须有解释——否则用户只看到莫名的批准框（协议 §2.1「响亮失败」）。
     # 典型：仓库的 project settings.json 携 enableAllProjectMcpServers → 被过滤 → 此处告知该挪去 local/user。
     resolved_st = resolved_settings_with_errors(env, flag_path=settings_flag_path)
+    # `escape()`：`format_settings_errors` 的 field/reason 来自不可信 settings（点路径用原始 JSON 键拼），
+    # 手编 `extraKnownMarketplaces` 键即可注入 `[/]` —— 未转义时实测抛 MarkupError 并**跳过整个审批门**
+    # （#294 复审的可达崩溃；措辞与脱敏仍归 #295）。
     for line in format_settings_errors(resolved_st.errors):
-        console.print(f"[yellow]{line}[/yellow]")
+        console.print(f"[yellow]{escape(line)}[/yellow]")
     settings = resolved_st.settings
     # #148/F8：审批门 MUST NOT 依赖账本 bundled 名集；plugin 声明**结构性**不入 resolve（无 plugin 入参 +
     # SettingsScope 无 PLUGIN 成员，见 schema.SCOPE_ORDER）⇒ 迭代物理上遇不到 plugin origin，无需过滤器
