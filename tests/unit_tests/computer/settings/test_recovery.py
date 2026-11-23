@@ -1123,12 +1123,17 @@ def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> Non
 
 def test_source_path_keeps_readable_paths() -> None:
     """
-    ``source_path`` 的负对照（防过度遮蔽）：不含 userinfo 形态的正常路径**逐字保留**，不做整值占位。
+    ``source_path`` 的**混合口径**负对照：不会被漏值、也不会过度遮蔽。
 
+    - **干净 userinfo** 交回路径轴原语 ⇒ 保留 ``/home/<redacted-source>/…`` 结构（诊断可定位到文件）；
     - 普通 Windows 路径与段内 ``alice@corp``（scp-like 脱敏器会把它整条吞掉，那正是不能用它的原因）；
     - 普通含 ``%`` 的路径（不得因为「看起来像编码」就误遮）；
     - ``?``/``#`` 尾部仍由路径轴原语遮蔽（非整值占位）。
     """
+    clean = "/home/alice:pw@example.com/a2c/settings.json"
+    (structured,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=clean)])
+    assert structured.source_path == "/home/<redacted-source>/a2c/settings.json"
+    assert "pw" not in structured.source_path
     windows = "C:\\repos\\alice@corp\\settings.json"
     (kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=windows)])
     assert kept.source_path == windows
@@ -1146,9 +1151,8 @@ def test_source_path_keeps_readable_paths() -> None:
 @pytest.mark.parametrize(
     "dirty",
     [
-        # 四类「路径轴原语必漏」的 userinfo 形态：
-        "/home/alice:pw@example.com/settings.json",  # (1) 干净 userinfo（统一口径：整值占位）
-        "/home/alice\u202e:pw@example.com/settings.json",  # (2) 控制/方向覆写紧邻 `:` → scrub 换空格
+        # 三类「路径轴原语必漏」的 userinfo 形态（干净 userinfo 不在此列——它交回原语、保留结构）：
+        "/home/alice\u202e:pw@example.com/settings.json",  # (1) 控制/方向覆写紧邻 `:` → scrub 换空格
         "/home/alice:pw\u202e@example.com/settings.json",
         "/home/alice\x1b:pw@example.com/settings.json",  # (3) ESC → escape 引入反斜杠段边界
         "/home/alice:pw\x1b@example.com/settings.json",
@@ -1159,10 +1163,12 @@ def test_source_path_keeps_readable_paths() -> None:
 )
 def test_source_path_fails_closed_on_userinfo_shape(dirty: str) -> None:
     """
-    ``source_path`` 的 fail-closed 守卫：任一路径段呈 ``user:secret@host`` 形态 ⇒ 整值占位。
+    ``source_path`` 的 fail-closed 守卫：userinfo 形态 **且** 原语会漏（控制字符 / 段内空白 / 编码形态）
+    ⇒ 整值占位。
 
-    判别力：去掉守卫后 (2)–(5) 全部回显 ``pw``（实测）；守卫不能被换成「先 sanitize 再 scrub」——
-    ``alice:pw\\x1b@…`` 仍漏（原语在匹配前就 escape 了），(5) 则根本不进脱敏分支。
+    判别力：去掉守卫后这些向量全部回显 ``pw``（实测）；守卫也不能退化成「一律交回原语」——控制字符邻接与
+    编码形态都会漏；同样不能退化成「凡 userinfo 形态就整值占位」，那会丢掉「哪个 settings 文件」的定位信息
+    （由 ``test_source_path_keeps_readable_paths`` 的干净 userinfo 正向断言钉住）。
     """
     assert "pw" in dirty.lower()  # 正对照：原始路径确实带凭据
     (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])

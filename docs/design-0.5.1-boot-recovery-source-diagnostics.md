@@ -82,8 +82,8 @@ userinfo / query / fragment，path 段含凭据样文本一律占位符）。日
 
 `marketplace_declaration_errors` 的五个字段同样是展示值：`field` 保留 `extraKnownMarketplaces.` 前缀便于
 定位，其后的名字段按 `redact_ledger_key`（**段漏斗**，比散文脱敏更严）展示，`reason` 走
-`redact_git_urls_in_text`（散文，保留句式）+ 控制/方向覆写字符清洗，`source_path` 走**路径轴**脱敏，
-并在呈 userinfo 形态时整值 fail-closed（详见 §6.1）。
+`redact_git_urls_in_text`（散文，保留句式）+ 控制/方向覆写字符清洗，`source_path` 走**混合口径**
+（路径轴脱敏 + 原语会漏值的三类整值 fail-closed，详见 §6.1）。
 
 ### 3.4 非法声明（#293）
 
@@ -164,22 +164,30 @@ SDK 自治差异：
 | 脱敏落点 | **`validate_settings` 出口**统一脱敏，所有 `SettingsValidationError` 消费者（CLI 文本 / 报告 / 诊断）拿到同一安全值 | 只在**采集处**（`sanitized_marketplace_error`）脱敏；`format_settings_errors` 行为不变 | `settings show` 的凭据回显是独立安全单 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，用户裁决本单不提前改其行为。#295 落地时可直接复用该函数 |
 | Flag scope | **从 report 字段过滤掉**（其 CLI 启动边界另有打印 + `include_marketplace_declaration_errors` 抑制开关），WARN 仍记全量 | **不过滤**，`scope == flag` 照常进报告 | 用户裁决「报告**所有**前缀错误」，且已接受同次启动多条同义提示；python 没有 rust 那套抑制开关，过滤会让 flag 层错误从 report 消失（库宿主无处可见） |
 | 名字脱敏强度 | 名字与 reason 同走散文脱敏（`redact_git_urls_in_text`，只去 userinfo、保留 path） | 名字走**段漏斗**（`redact_ledger_key`），reason 才走散文脱敏 | 名字是**单个不可信值**：path 段里的 `alice:PW@example.com` 会被散文脱敏原样放出（#261 已定的口径） |
-| `source_path` 脱敏 | 只 `scrub_diagnostic_chars`（其测试 `test_extra_marketplaces_error_source_path_scrubbed_not_url_redacted` 明确断言 Windows 路径原样保留、不做 URL 脱敏）⇒ 路径段里的 `alice:pw@…` **会回显** | 路径轴 `sanitize_path_for_diagnostics` + **userinfo 形态整值 fail-closed** 守卫；正常路径（Windows / `alice@corp` / 普通 `%` / `?` 尾部）照常展示 | 诊断面同样不该回显路径段凭据；`/` 与 `\` 双段边界避免 scp-like 脱敏器把 Windows 路径整条吞掉（#263 四轮）。python 此处比 rust 严 |
+| `source_path` 脱敏 | 只 `scrub_diagnostic_chars`（其测试 `test_extra_marketplaces_error_source_path_scrubbed_not_url_redacted` 明确断言 Windows 路径原样保留、不做 URL 脱敏）⇒ 路径段里的 `alice:pw@…` **会回显** | 路径轴 `sanitize_path_for_diagnostics` + **混合口径**（干净 userinfo 保留结构；控制字符 / 段内空白 / percent-encoded 三类整值 fail-closed）；正常路径（Windows / `alice@corp` / 普通 `%` / `?` 尾部）照常展示 | 诊断面同样不该回显路径段凭据；`/` 与 `\` 双段边界避免 scp-like 脱敏器把 Windows 路径整条吞掉（#263 四轮）。python 此处比 rust 严 |
 
-`source_path` 的 fail-closed 守卫覆盖**四类**「路径轴原语必漏」的 userinfo 形态（均已实测回显密码）：
+`source_path` 采用**混合口径**——它是**诊断路径**，用户要靠它定位「哪个 settings 文件出错」，所以能可靠脱敏
+时保留结构，只有原语会漏值时才整值占位：
 
-1. **干净 userinfo**（`/home/alice:pw@example.com/...`）——原语本可处理，但为口径单一也整值占位；
-2. **控制 / 方向覆写字符紧邻分隔符**——`scrub_diagnostic_chars` 把控制字符换成**空格**（userinfo 正则要求
-   `:` 前非空白），`sanitize_path_for_diagnostics` 又在匹配**之前**把 ESC 转义成含反斜杠的 `\x1b`
-   （反斜杠本身是段边界），两者都把 userinfo 拆开；
-3. **段内空白**（`alice:my pw pass@example.com`）——原语正则 `[^\s/\\:@]+:[^\s/\\@]+@` 直接失配；
-4. **percent-encoded**（`alice%3Apw%40example.com`）——原串无字面 `@`，原语在
-   `if not any(marker in escaped for marker in ("@", "?", "#"))` 处**提前返回**、根本不做脱敏。
+| 形态 | 判定 | 输出 |
+|------|------|------|
+| **干净 userinfo**（`/home/alice:pw@example.com/...`） | 原语可靠 | `/home/<redacted-source>/...`（保留结构） |
+| **控制 / 方向覆写字符紧邻分隔符** | 整值 fail-closed | `<redacted-git-source>` |
+| **段内空白**（`alice:my pw pass@example.com`） | 整值 fail-closed | `<redacted-git-source>` |
+| **percent-encoded**（`alice%3Apw%40example.com`，含双层 `%253A`） | 整值 fail-closed | `<redacted-git-source>` |
+| 无 userinfo 形态（Windows `alice@corp` / 普通 `%` / `?` 尾部） | 路径轴原语 | 逐字保留 / 尾部遮蔽 |
 
-判据是「任一路径段里 `@` 之前出现过 `:`」（`_looks_like_userinfo`），对**原串**与其**逐轮 percent-decode
-形态**（封顶 3 轮，与 #282 同口径）各判一次；命中即整值占位。负对照：只含控制字符、无 userinfo 形态的路径
-仍按字符清洗保留可读性；Windows 路径（`alice@corp`）、普通 `%` 路径、`?`/`#` 尾部照常由路径轴原语处理，
-不会被整条遮蔽。
+三类必须整值占位的根因（均实测回显密码）：
+
+- **控制字符**：`scrub_diagnostic_chars` 把它们换成**空格**（userinfo 正则要求 `:` 前非空白）；
+  `sanitize_path_for_diagnostics` 又在匹配**之前**把 ESC 转义成含反斜杠的 `\x1b`（反斜杠本身是段边界）
+  ——两条都把 userinfo 拆开；
+- **段内空白**：原语正则 `[^\s/\\:@]+:[^\s/\\@]+@` 直接失配；
+- **percent-encoded**：原串无字面 `@`/`?`/`#`，原语在
+  `if not any(marker in escaped for marker in ("@", "?", "#"))` 处**提前返回**、根本不做脱敏。
+
+判据 = 「任一路径段里 `@` 之前出现过 `:`」（`_userinfo_segments`），对**原串**与**逐轮 percent-decode 形态**
+（封顶 3 轮，与 #282 同口径）分别判定。
 
 根因在共享原语 `utils/git_url.py::sanitize_path_for_diagnostics`（先 escape 再判段、且要求字面标记），
 修它会波及 #236 / 路径 resolver 等全部调用方，故本单**不改共享原语**，只在采集处 fail-closed。

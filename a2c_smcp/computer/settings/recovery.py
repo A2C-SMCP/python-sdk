@@ -232,21 +232,20 @@ def sanitize_marketplace_text(text: str) -> str:
     return scrub_diagnostic_chars(redact_git_urls_in_text(text))
 
 
-def _looks_like_userinfo(text: str) -> bool:
+def _userinfo_segments(text: str) -> list[str]:
     """
-    任一路径段是否形如 ``user:secret@host``（#293 的 fail-closed 判据）/ Any segment shaped like userinfo.
+    呈 ``user:secret@host`` 形态的路径段（#293 判据）/ Segments shaped like userinfo.
 
     判据刻意**宽于** :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 的凭据正则
-    （``[^\\s/\\\\:@]+:[^\\s/\\\\@]+@``）：只要某段里 ``@`` 之前出现过 ``:`` 就算命中。理由是**判别**与
-    **遮蔽**的目标不同——这里只需要回答「这段像不像 userinfo」，任何无法证明不是的情况都应 fail-closed。
-    例：``alice:my pass@example.com``（段内空白）与 ``alice<U+202E>:pw@example.com``（控制字符）都让
-    那条严格正则失配，但显然都是凭据形态。
+    （``[^\\s/\\\\:@]+:[^\\s/\\\\@]+@``）：只要某段里 ``@`` 之前出现过 ``:`` 就算命中。判别与遮蔽的目标不同
+    ——这里只需要回答「这段像不像 userinfo」，无法证明不是的都按凭据形态处理。
     """
+    segments: list[str] = []
     for segment in re.split(r"[/\\]", text):
         at = segment.find("@")
         if at > 0 and ":" in segment[:at]:
-            return True
-    return False
+            segments.append(segment)
+    return segments
 
 
 def _percent_decoded_forms(text: str, *, max_rounds: int = 3) -> list[str]:
@@ -269,26 +268,39 @@ def _percent_decoded_forms(text: str, *, max_rounds: int = 3) -> list[str]:
 
 def sanitize_source_path(path: str) -> str:
     """
-    ``source_path`` 的诊断展示值：userinfo 形态整值 fail-closed + 其余走路径轴脱敏（#293）/
-    Display-safe settings-file path.
+    ``source_path`` 的诊断展示值：**混合口径**（#293）/ Display-safe settings-file path.
 
-    1. **fail-closed 守卫**：原串、或用其逐轮 percent-decode 形态，存在形如 ``user:secret@host`` 的段
-       （见 :func:`_looks_like_userinfo`）时，整值替换为
-       :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`。为什么要绕过路径轴原语：
-       - :func:`~a2c_smcp.computer.settings.schema.scrub_diagnostic_chars` 把控制字符换成**空格**，
-         userinfo 正则要求 ``:`` 前非空白 ⇒ 拆开后漏出密码；
-       - :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 在匹配**前**先
-         ``escape_unsafe_chars``，把 ESC 变成含反斜杠的 ``\\x1b``，而反斜杠本身是它的段边界 ⇒ 同样拆开；
-       - 它还要求**字面** ``@`` / ``?`` / ``#`` 才进入脱敏分支，``alice%3Apw%40example.com`` 直接原样返回。
+    ``source_path`` 是**诊断路径**——用户要靠它定位「登录哪个 settings 文件出了错」，所以能可靠脱敏时
+    应保留路径结构，只有原语会漏值时才整值占位：
 
-       三类都实测可泄漏，故一旦判定为凭据形态就整值占位（宁可少给诊断信息，不可漏值）。
-    2. 否则走 :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：``/`` 与 ``\\``
+    1. **整值 fail-closed**（→ :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`）：路径呈 userinfo 形态
+       （见 :func:`_userinfo_segments`）**且**命中下列任一「路径轴原语必漏」条件——
+       - **控制 / 方向覆写字符**：:func:`~a2c_smcp.computer.settings.schema.scrub_diagnostic_chars` 会把它们
+         换成**空格**（userinfo 正则要求 ``:`` 前非空白），
+         :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 又在匹配**前**把 ESC 转义成含反斜杠的
+         ``\\x1b``（反斜杠本身是它的段边界）——都会把 userinfo 拆开；
+       - **段内空白**：原语正则 ``[^\\s/\\\\:@]+:[^\\s/\\\\@]+@`` 直接失配；
+       - **percent-encoded**：原串无**字面** ``@`` / ``?`` / ``#``，原语在
+         ``if not any(marker in escaped for marker in ("@", "?", "#"))`` 处**提前返回**、根本不做脱敏
+         （对逐轮 decode 形态判一次，封顶 3 轮，防 ``%253A`` 双层）。
+
+       三者都实测会回显密码，故宁可不给路径。
+    2. **否则**走 :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：``/`` 与 ``\\``
        都当段边界、段内普通 ``@`` 保留、authority 位置的 ``TOKEN@host`` 与 ``?``/``#`` 尾部整段遮蔽）。
-       它**不是** URL / scp-like 脱敏器，Windows 路径与 ``alice@corp`` 不会被整条吞掉。
+       它**不是** URL / scp-like 脱敏器，Windows 路径与 ``alice@corp`` 不会被整条吞掉；**干净 userinfo**
+       （``/home/alice:pw@example.com/...``）在这个原语上可靠 ⇒ 保留 ``/home/<redacted-source>/...`` 结构。
 
     :param path: :attr:`SettingsValidationError.source_path`（不可信：可由 ``--settings <file>`` 指定）。
     """
-    if _looks_like_userinfo(path) or any(_looks_like_userinfo(form) for form in _percent_decoded_forms(path)):
+    segments = _userinfo_segments(path)
+    # 原串已呈 userinfo 形态但原语会漏：控制字符 / 段内空白
+    unreliable = bool(segments) and (
+        scrub_diagnostic_chars(path) != path
+        or any(any(ch.isspace() for ch in segment) for segment in segments)
+    )
+    # 编码形态：原串没有字面 `:`/`@`，原语根本进不了脱敏分支
+    encoded = any(_userinfo_segments(form) for form in _percent_decoded_forms(path))
+    if unreliable or encoded:
         return REDACTED_GIT_SOURCE
     return sanitize_path_for_diagnostics(scrub_diagnostic_chars(path))
 
