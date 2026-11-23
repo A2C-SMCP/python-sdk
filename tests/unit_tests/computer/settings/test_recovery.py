@@ -1123,17 +1123,11 @@ def test_attach_marketplace_declaration_errors_is_silent_without_errors() -> Non
 
 def test_source_path_keeps_readable_paths() -> None:
     """
-    ``source_path`` 的**混合口径**负对照：不会被漏值、也不会过度遮蔽。
+    ``source_path`` 负对照（防过度遮蔽）：**无法排除 userinfo** 的路径才整值占位，其余保留可读性。
 
-    - **干净 userinfo** 交回路径轴原语 ⇒ 保留 ``/home/<redacted-source>/…`` 结构（诊断可定位到文件）；
-    - 普通 Windows 路径与段内 ``alice@corp``（scp-like 脱敏器会把它整条吞掉，那正是不能用它的原因）；
-    - 普通含 ``%`` 的路径（不得因为「看起来像编码」就误遮）；
-    - ``?``/``#`` 尾部仍由路径轴原语遮蔽（非整值占位）。
+    这三条都是**架构师点名的负对照**：Windows 盘符（`C:` 不是 userinfo 分隔符）、普通 `%` 路径、
+    `?` 尾部（由路径轴原语遮蔽而非整值占位）。另加「段内有 `@` 但冒号在其后」的普通路径。
     """
-    clean = "/home/alice:pw@example.com/a2c/settings.json"
-    (structured,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=clean)])
-    assert structured.source_path == "/home/<redacted-source>/a2c/settings.json"
-    assert "pw" not in structured.source_path
     windows = "C:\\repos\\alice@corp\\settings.json"
     (kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=windows)])
     assert kept.source_path == windows
@@ -1142,6 +1136,12 @@ def test_source_path_keeps_readable_paths() -> None:
     (also_kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=pct)])
     assert also_kept.source_path == pct
 
+    colon_after_at = "/home/alice@corp/notes:2024/x"
+    (still_kept,) = marketplace_declaration_errors(
+        [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=colon_after_at)],
+    )
+    assert still_kept.source_path == colon_after_at
+
     query = "/srv/x/settings.json?token=SECRET"
     (masked,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=query)])
     assert masked.source_path == "/srv/x/settings.json<redacted-source>"
@@ -1149,34 +1149,56 @@ def test_source_path_keeps_readable_paths() -> None:
 
 
 @pytest.mark.parametrize(
-    "dirty",
+    "dirty,secret",
     [
-        # 三类「路径轴原语必漏」的 userinfo 形态（干净 userinfo 不在此列——它交回原语、保留结构）：
-        "/home/alice\u202e:pw@example.com/settings.json",  # (1) 控制/方向覆写紧邻 `:` → scrub 换空格
-        "/home/alice:pw\u202e@example.com/settings.json",
-        "/home/alice\x1b:pw@example.com/settings.json",  # (3) ESC → escape 引入反斜杠段边界
-        "/home/alice:pw\x1b@example.com/settings.json",
-        "/home/alice:my pw pass@example.com/settings.json",  # (4) 段内空白 → 原语正则失配
-        "/home/alice%3Apw%40example.com/settings.json",  # (5) percent-encoded：原串无字面 `@`，原语早退
-        "/home/alice%253Apw%2540example.com/settings.json",  # 双层编码
+        # 干净 userinfo（架构师裁决：containing userinfo 即整值占位，诊断可读性只对无 userinfo 路径保留）
+        ("/home/alice:pw@example.com/a2c/settings.json", "pw"),
+        # 控制 / 方向覆写字符穿插：scrub 换空格 / escape 造 `\` 段边界
+        ("/home/alice‮:pw@example.com/settings.json", "pw"),
+        ("/home/alice:pw‮@example.com/settings.json", "pw"),
+        ("/home/alice\x1b:pw@example.com/settings.json", "pw"),
+        ("/home/alice:pw\x1b@example.com/settings.json", "pw"),
+        # 首个 `@` 在 `:` 之前（只看首个 @ 会漏）
+        ("/home/alice@corp:pw@example.com/settings.json", "pw"),
+        ("/home/alice@corp:pw\x1b@example.com/settings.json", "pw"),
+        # `#` / `?` 夹在 `:` 与 `@` 之间（原语把 `#`/`?` 之后当尾部）
+        ("/home/alice:my-secret#x@example.com/settings.json", "my-secret"),
+        ("/home/alice:my-secret?x@example.com/settings.json", "my-secret"),
+        # 段内空白：原语正则要求 `:` 前非空白
+        ("/home/alice:my pw pass@example.com/settings.json", "my pw pass"),
+        # 凭据内的字面分隔符：逐段判定会被拆开
+        ("/home/alice:pw\\x@example.com/settings.json", "pw"),
+        ("/home/alice:pw/x@example.com/settings.json", "pw"),
+        # percent-encoded（含编码出的分隔符 / 前导 `@`）
+        ("/home/alice:pw%2Fsecret%40example.com/settings.json", "pw"),
+        ("/home/alice%40corp:pw%40example.com/settings.json", "pw"),
+        ("/home/alice%3Apw%40example.com/settings.json", "pw"),
+        ("/home/alice%253Apw%2540example.com/settings.json", "pw"),
+        # 四层编码（3 轮不够）
+        ("/home/alice%2525253Apw%25252540example.com/settings.json", "pw"),
+        # NFKC 全角
+        ("/home/alice：pw＠example.com/settings.json", "pw"),
     ],
 )
-def test_source_path_fails_closed_on_userinfo_shape(dirty: str) -> None:
+def test_source_path_fails_closed_on_userinfo_shape(dirty: str, secret: str) -> None:
     """
-    ``source_path`` 的 fail-closed 守卫：userinfo 形态 **且** 原语会漏（控制字符 / 段内空白 / 编码形态）
-    ⇒ 整值占位。
+    ``source_path`` 的 fail-closed 判据：剥盘符后「最后一个 `@` 在第一个 `:` 之后」，在原文与每一轮
+    ``NFKC → percent-decode`` 形态上判一次；命中即整值占位。
 
-    判别力：去掉守卫后这些向量全部回显 ``pw``（实测）；守卫也不能退化成「一律交回原语」——控制字符邻接与
-    编码形态都会漏；同样不能退化成「凡 userinfo 形态就整值占位」，那会丢掉「哪个 settings 文件」的定位信息
-    （由 ``test_source_path_keeps_readable_paths`` 的干净 userinfo 正向断言钉住）。
+    判别力（逐项实测过）：只看首个 `@`、只判原文、不做 NFKC、逐段判定、只在原串上找字面 `:`/`@` ——
+    任一退化都会有对应向量转红。每条向量的 `secret` 既是正对照（原串确实带它）也是负断言（输出不得含它）。
     """
-    assert "pw" in dirty.lower()  # 正对照：原始路径确实带凭据
+    assert secret in dirty  # 正对照：原始路径确实带该凭据片段
     (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
     assert out.source_path == "<redacted-git-source>"
+    assert secret not in out.source_path
 
 
 def test_source_path_with_control_chars_but_no_userinfo_is_still_scrubbed() -> None:
-    """负对照（防过度遮蔽）：只含控制字符、无 ``@`` 的路径仍按字符清洗保留可读性，不做整值占位。"""
+    """负对照（防过度遮蔽）：无 `:`/`@` 关系的控制字符路径仍按字符清洗保留可读性，不做整值占位。"""
+    dirty = "/tmp/ev\u202eil/settings\x1b[31m.json"
+    (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
+    assert out.source_path == "/tmp/ev il/settings [31m.json"
     dirty = "/tmp/ev\u202eil/settings\x1b[31m.json"
     (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
     assert out.source_path == "/tmp/ev il/settings [31m.json"

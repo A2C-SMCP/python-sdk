@@ -36,6 +36,7 @@ ownership; process materialization stays with the client (#93).
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,7 +83,12 @@ from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
-from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE, redact_git_urls_in_text, sanitize_path_for_diagnostics
+from a2c_smcp.utils.git_url import (
+    _MAX_CREDENTIAL_DECODE_ROUNDS,
+    REDACTED_GIT_SOURCE,
+    redact_git_urls_in_text,
+    sanitize_path_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -232,75 +238,75 @@ def sanitize_marketplace_text(text: str) -> str:
     return scrub_diagnostic_chars(redact_git_urls_in_text(text))
 
 
-def _userinfo_segments(text: str) -> list[str]:
-    """
-    呈 ``user:secret@host`` 形态的路径段（#293 判据）/ Segments shaped like userinfo.
-
-    判据刻意**宽于** :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 的凭据正则
-    （``[^\\s/\\\\:@]+:[^\\s/\\\\@]+@``）：只要某段里 ``@`` 之前出现过 ``:`` 就算命中。判别与遮蔽的目标不同
-    ——这里只需要回答「这段像不像 userinfo」，无法证明不是的都按凭据形态处理。
-    """
-    segments: list[str] = []
-    for segment in re.split(r"[/\\]", text):
-        at = segment.find("@")
-        if at > 0 and ":" in segment[:at]:
-            segments.append(segment)
-    return segments
+_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def _percent_decoded_forms(text: str, *, max_rounds: int = 3) -> list[str]:
+def _decode_chain(text: str) -> list[str]:
     """
-    逐轮 percent-decode 的中间形态（不含原文）/ Successive percent-decoded forms (excluding the input).
+    原文 + 逐轮 ``NFKC → percent-decode`` 的中间形态（#293；与 #282 同一解码链口径）/
+    Raw text plus each NFKC/percent-decode iteration.
 
-    ``%3A`` / ``%40`` 形态的 userinfo 在原串里既没有 ``:`` 也没有 ``@``，只解一轮不够（``%253A`` 要两轮）。
-    与 #282 同口径封顶轮数，只用于**判别**，不用于任何落盘 / 比较。
+    与 :func:`~a2c_smcp.utils.git_url.credential_like_text` **共用同一个轮数上界**
+    :data:`~a2c_smcp.utils.git_url._MAX_CREDENTIAL_DECODE_ROUNDS`（只保证终止；覆盖面由判据本身保证）。
+    NFKC 是必需的：全角 ``：`` / ``＠`` / ``％３A`` 不归一就判不出来。
     """
-    forms: list[str] = []
+    forms = [text]
     current = text
-    for _ in range(max_rounds):
-        decoded = unquote(current)
-        if decoded == current:
+    for _ in range(_MAX_CREDENTIAL_DECODE_ROUNDS):
+        decoded = unicodedata.normalize("NFKC", unquote(current))
+        if decoded == current:  # 不动点：再迭代也不变
             break
         forms.append(decoded)
         current = decoded
     return forms
 
 
+def _has_userinfo_shape(text: str) -> bool:
+    """
+    文本是否**无法排除** ``user:secret@host``（#293 的 fail-closed 判据）/ Cannot rule out userinfo.
+
+    判据：剥掉 Windows 盘符前缀后，**最后一个** ``@`` 出现在**第一个** ``:`` 之后。
+
+    - 用 ``rfind("@")`` 而非 ``find``：``alice@corp:pw@example.com`` 的首个 ``@`` 在 ``:`` 之前，
+      只看首个会漏（复审 2🔴）。
+    - 用**整条文本**而非逐段：凭据里的字面 ``\\`` / ``/``（``alice:pw/x@example.com``）会把一个 userinfo
+      拆成两段，逐段判定同样会漏（复审 3🟡）。
+    - 剥盘符：``C:\\repos\\alice@corp\\x`` 的 ``:`` 是盘符，不是 userinfo 分隔符；不剥会误遮 Windows 路径
+      （架构师点名的负对照）。
+
+    刻意**不用** :func:`~a2c_smcp.utils.git_url.credential_like_text`：该谓词对任意 ``@`` / ``:`` / 残留 ``%``
+    都返回 ``True``（``alice@corp``、``100%25done``、``repo@2.git`` 全命中），直接套用会把「普通路径」整条
+    遮蔽，打翻负对照。本判据只回答「能不能排除 userinfo」，更窄但可证明。
+    """
+    stripped = _WINDOWS_DRIVE_PREFIX_RE.sub("", text)
+    colon = stripped.find(":")
+    return stripped.rfind("@") > colon >= 0
+
+
 def sanitize_source_path(path: str) -> str:
     """
-    ``source_path`` 的诊断展示值：**混合口径**（#293）/ Display-safe settings-file path.
+    ``source_path`` 的诊断展示值：**无法排除 userinfo 即整值占位**，否则走路径轴脱敏（#293）/
+    Display-safe settings-file path: fail closed whenever userinfo cannot be ruled out.
 
-    ``source_path`` 是**诊断路径**——用户要靠它定位「登录哪个 settings 文件出了错」，所以能可靠脱敏时
-    应保留路径结构，只有原语会漏值时才整值占位：
+    ``source_path`` 是不可信值（``--settings <file>`` 由环境 / 用户给出），且要进报告与日志。规则：
 
-    1. **整值 fail-closed**（→ :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`）：路径呈 userinfo 形态
-       （见 :func:`_userinfo_segments`）**且**命中下列任一「路径轴原语必漏」条件——
-       - **控制 / 方向覆写字符**：:func:`~a2c_smcp.computer.settings.schema.scrub_diagnostic_chars` 会把它们
-         换成**空格**（userinfo 正则要求 ``:`` 前非空白），
-         :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics` 又在匹配**前**把 ESC 转义成含反斜杠的
-         ``\\x1b``（反斜杠本身是它的段边界）——都会把 userinfo 拆开；
-       - **段内空白**：原语正则 ``[^\\s/\\\\:@]+:[^\\s/\\\\@]+@`` 直接失配；
-       - **percent-encoded**：原串无**字面** ``@`` / ``?`` / ``#``，原语在
-         ``if not any(marker in escaped for marker in ("@", "?", "#"))`` 处**提前返回**、根本不做脱敏
-         （对逐轮 decode 形态判一次，封顶 3 轮，防 ``%253A`` 双层）。
-
-       三者都实测会回显密码，故宁可不给路径。
+    1. **整值 fail-closed**（→ :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`）：原文或任一
+       ``NFKC → percent-decode`` 形态让 :func:`_has_userinfo_shape` 为真。这一条覆盖全部「路径轴原语必漏」
+       的形态（均经复现实测）：
+       - 控制 / 方向覆写字符穿插（``alice<U+202E>:pw@…``）——scrub 换空格、escape 造反斜杠段边界；
+       - ``#`` / ``?`` 夹在 ``:`` 与 ``@`` 之间（``alice:secret#x@example.com``）——原语把 ``#`` 之后当尾部；
+       - 段内空白（``alice:my pw pass@example.com``）——原语正则要求 ``:` 前非空白；
+       - 凭据内的字面 ``\\`` / ``/``（``alice:pw/x@example.com``）——逐段判定会被拆开；
+       - percent-encoded（``alice:pw%2Fsecret%40…``、``alice%40corp:pw%40…``、四层 ``%2525253A``）；
+       - 全角 ``：`` / ``＠`` / ``％３A``（NFKC 后现形）。
     2. **否则**走 :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：``/`` 与 ``\\``
        都当段边界、段内普通 ``@`` 保留、authority 位置的 ``TOKEN@host`` 与 ``?``/``#`` 尾部整段遮蔽）。
-       它**不是** URL / scp-like 脱敏器，Windows 路径与 ``alice@corp`` 不会被整条吞掉；**干净 userinfo**
-       （``/home/alice:pw@example.com/...``）在这个原语上可靠 ⇒ 保留 ``/home/<redacted-source>/...`` 结构。
+       它**不是** URL / scp-like 脱敏器，Windows 路径与 ``alice@corp`` 不会被整条吞掉；含 userinfo 的路径
+       在上一步已整值占位，故此处只会看到「无 ``:`` 在 ``@`` 之前」的路径——结构可保留、可定位。
 
-    :param path: :attr:`SettingsValidationError.source_path`（不可信：可由 ``--settings <file>`` 指定）。
+    :param path: :attr:`SettingsValidationError.source_path`（不可信）。
     """
-    segments = _userinfo_segments(path)
-    # 原串已呈 userinfo 形态但原语会漏：控制字符 / 段内空白
-    unreliable = bool(segments) and (
-        scrub_diagnostic_chars(path) != path
-        or any(any(ch.isspace() for ch in segment) for segment in segments)
-    )
-    # 编码形态：原串没有字面 `:`/`@`，原语根本进不了脱敏分支
-    encoded = any(_userinfo_segments(form) for form in _percent_decoded_forms(path))
-    if unreliable or encoded:
+    if any(_has_userinfo_shape(form) for form in _decode_chain(path)):
         return REDACTED_GIT_SOURCE
     return sanitize_path_for_diagnostics(scrub_diagnostic_chars(path))
 

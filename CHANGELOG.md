@@ -345,10 +345,11 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
     （`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担，批准 UI 另开单跟踪
     （见设计文档 §7）。
   - **脱敏**：`field` 的市场名段走 `redact_ledger_key`（段漏斗，比散文脱敏更严），`reason` 走散文脱敏，
-    两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗；`source_path` 走**混合口径**：干净 userinfo 交回
-    路径轴原语（保留 `/home/<redacted-source>/…` 结构，便于定位是哪个 settings 文件），控制字符紧邻分隔符 /
-    段内空白 / percent-encoded（含双层）三类原语必漏的形态整值 fail-closed（详见设计文档 §6.1）。正常路径
-    （Windows、`alice@corp`、普通 `%`、`?` 尾部）照常展示。
+    两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗；`source_path` 的判据是「**能否排除 userinfo**」——
+    不能就整值 fail-closed，能则走路径轴脱敏保留结构。判据 = 剥掉 Windows 盘符后「最后一个 `@` 在第一个
+    `:` 之后」，在原文与每一轮 `NFKC → percent-decode` 形态上各判一次（覆盖控制字符穿插、`#`/`?` 夹在 `:` 与
+    `@` 之间、段内空白、凭据内字面 `/` 与 `\`、percent-encoded、全角、多层编码）。负对照：Windows
+    `alice@corp`、纯 `100%25done`、`?` 尾部照常展示（详见设计文档 §6.1）。
     `settings show` 的凭据回显仍是 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。
   - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度 / `source_path` 脱敏强度）见
     [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md) §6.1。
