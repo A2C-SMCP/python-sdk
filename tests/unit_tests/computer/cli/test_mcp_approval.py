@@ -270,3 +270,63 @@ async def test_project_self_approval_filtered_and_surfaced_at_boot(
     out = capsys.readouterr().out
     assert "enableAllProjectMcpServers" in out  # 越权字段被点名
     assert "settings.local.json" in out  # 且给出可操作去向
+
+
+# ── #294 复审：启动展示行的 markup 安全（可达崩溃）─────────────────────────────
+def _no_ws(text: str) -> str:
+    """去掉全部空白：rich 会按终端宽度折行，人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
+@pytest.mark.asyncio
+async def test_settings_error_line_escapes_markup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    #294 复审实证的**可达崩溃**：手编 `extraKnownMarketplaces` 键即可让 `format_settings_errors` 的
+    `field` 含 `[/]`；该行此前未 `escape()` ⇒ rich 抛 `MarkupError`，`run_mcp_approval` 直接中断
+    （**跳过整个审批门**）。本用例断言：不抛、且原文逐字可见、scope 文本不被当标签吞掉。
+
+    可达前提：`.tfrobot/mcp.json` 有 ≥1 个 server（否则 `run_mcp_approval` 早退）。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    _write_json(
+        Path(env["XDG_CONFIG_HOME"]) / "a2c" / "settings.json",
+        {"extraKnownMarketplaces": {"evil[/]a[/]b": {}}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛 MarkupError
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "settings.json[user]" in out  # scope 文本没被当标签吃掉
+    assert "evil[/]a[/]b" in out  # field 原文逐字可见
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_line_escapes_markup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同族兄弟行：`mcp.json` 的错误文本里含用户可编 server 名，同样必须 `escape()`。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"bad[/]name": {"server_parameters": {}}, "good": _stdio()})  # 缺 type → drop + error
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛 MarkupError
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "mcp.json" in out
+    assert "bad[/]name" in out  # 原文逐字可见
