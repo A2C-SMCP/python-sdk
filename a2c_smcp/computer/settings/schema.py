@@ -605,18 +605,21 @@ def _validate_read_roots_for(
 
 
 # Rust ``str::trim()`` 只剥 Unicode ``White_Space``；Python ``str.strip()`` 额外把 U+001C–U+001F
-# （信息分隔符：``str.isspace()`` 为真但 ``White_Space`` 为假）当空白。对写目标面逐字节对齐 rust
-# 必须排除这四个码位——否则同一份 settings.json 在 python 被启用、在 rust 被判废（fail-closed）。
-# Rust trims Unicode White_Space only; Python's str.strip() also strips U+001C–U+001F.
-_NON_WHITE_SPACE = frozenset("\x1c\x1d\x1e\x1f")
+# （信息分隔符：``str.isspace()`` 为真但 ``White_Space`` 为假）当空白——本集合就是这四个码位。
+# 对写目标面逐字节对齐 rust 必须排除它们，两个方向都要：**前导**分歧会让 py 启用 / rust 判废
+# （fail-closed，易察觉）；**尾随**分歧两侧都启用但写入根不同（静默分歧，更难察觉）。
+# Rust trims Unicode White_Space only; Python's str.strip() also strips U+001C–U+001F. Both the
+# leading and trailing directions must exclude them: leading diverges open-vs-dropped, trailing
+# diverges between two *different* write roots (silent).
+_PY_EXTRA_WHITESPACE = frozenset("\x1c\x1d\x1e\x1f")
 
 
 def _trim_like_rust(value: str) -> str:
     """``str::trim()`` 的逐字节等价（只剥 Unicode ``White_Space``）/ Byte-for-byte Rust ``trim()``."""
     start, end = 0, len(value)
-    while start < end and value[start].isspace() and value[start] not in _NON_WHITE_SPACE:
+    while start < end and value[start].isspace() and value[start] not in _PY_EXTRA_WHITESPACE:
         start += 1
-    while end > start and value[end - 1].isspace() and value[end - 1] not in _NON_WHITE_SPACE:
+    while end > start and value[end - 1].isspace() and value[end - 1] not in _PY_EXTRA_WHITESPACE:
         end -= 1
     return value[start:end]
 
@@ -627,11 +630,12 @@ def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[
     首尾空白先 trim（#304 item 3，逐字节等价 rust ``validate_landing_root`` 的 ``s.trim()``）：
     trim 后为空或非绝对 → 整字段判废（fail-closed）；通过则**存 trim 后的值**。
     行为变化（0.5.1 升级面，前导 / 尾随不对称）：**前导**空白此前令字段判废（`"/srv/x"` 前的空格让
-    ``startswith("/")`` 失败），现在被 trim 后生效；**尾随**空白此前原样生效（``"/srv/x "`` 通过语法判据，
-    写入根是带空格的目录），现在写入根**静默改为 trim 后的路径**。
+    ``startswith("/")`` 失败），现在被 trim 后生效；**尾随**空白此前原样生效——POSIX 上写入根就是带空格的
+    目录，Windows 上 Win32 会剥掉**非 verbatim** 路径分量末尾的空格/点（实际落在无空格目录），两平台现在都
+    **静默改为 trim 后的路径**（POSIX 旧空格目录里的产物不会迁移）。
     Trim first (byte-for-byte Rust); empty-after-trim or non-absolute → dropped; trimmed value stored.
-    Leading whitespace used to void the field; trailing whitespace used to take effect verbatim — both
-    now resolve to the trimmed path (trailing-space configs see their landing root silently retargeted).
+    Leading whitespace used to void the field; trailing whitespace used to take effect verbatim (on POSIX
+    under a spaced directory; on Windows Win32 silently stripped it) — both now resolve to the trimmed path.
 
     判据是**语法**的、不按宿主平台过滤——**刻意**与 ``readRoots`` 的 ``normalize_path`` 单一判据
     不同（用户 2026-11-23 裁决：**不做谓词合并**）。由此的「外来平台形态」边界（写实，勿美化）：

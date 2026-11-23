@@ -852,9 +852,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   非绝对 → 整字段判废，通过则**存 trim 后的值**。升级面（前导 / 尾随不对称，都**不是**简单的
   「从判废变为生效」）：
   - **前导**空白：此前整字段判废（`startswith("/")` 失败、静默失效），现在 trim 后生效；
-  - **尾随**空白：此前**原样生效**（写入根就是带空格的目录），现在写入根**静默改为 trim 后的路径**
-    （旧目录中的产物不会迁移、需手工搬移）；Windows 上 `"C:\\x "` 此前还会因 `normalize_path`
-    拒绝空格结尾而丢掉 `.part` 拒绝集条目，trim 后该缺口一并修复。
+  - **尾随**空白：此前**原样生效**——POSIX 上写入根就是带空格的目录（其中产物不会迁移），现在写入根
+    **静默改为 trim 后的路径**；Windows 上 Win32 本就会剥掉非 verbatim 路径分量末尾的空格/点（真实差异
+    是 `"C:\\x "` 此前因 `normalize_path` 拒绝空格结尾而丢掉 `.part` 拒绝集条目，trim 后该缺口一并修复）。
 - **判据边界文档化（不做谓词合并，2026-11-23 用户裁决）**：`landingRoot` / `permissions.additionalDirectories`
   保持**语法**判据、不按宿主平台过滤，也不改用 `normalize_path`。由此的「外来平台形态」边界：
   `readRoots` 运行期由 `build_read_roots` 丢弃外来形态；`additionalDirectories` 运行期无消费者；

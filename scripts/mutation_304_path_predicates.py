@@ -4,9 +4,9 @@
 #304 item 3 settings 路径判据（readRoots 单一判据 / landingRoot trim）的**可复现变异矩阵**（dev-only，不进 CI）。
 
 背景：验收要求「加回 `_is_absolute_path` / 去 trim / trim 用 `str.strip()` / 谓词合并 / 去 normalize /
-委托写死平台 / 运行期忽略平台 / 运行期接线写死平台」各轴都必须让定向用例转红。本脚本把每个不变量
-逐个注入为 mutation，运行对应定向用例，断言必须转红（KILLED）。全部 mutation 在 ``try/finally``
-内应用与还原，任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
+委托写死平台 / 运行期忽略平台 / 运行期接线写死平台（posix 与 windows 两向）」各轴都必须让定向用例
+转红。本脚本把每个不变量逐个注入为 mutation，运行对应定向用例，断言必须转红（KILLED）。全部 mutation
+在 ``try/finally`` 内应用与还原，任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
 
 运行（不要用 ``uv run``，避免在 worktree 内重建环境；本脚本会临时改写源码，勿与编辑/并发 run 同时进行）::
 
@@ -157,6 +157,17 @@ MUTATIONS: tuple[Mutation, ...] = (
                 COMPUTER,
                 "        compiled = build_read_roots(items)\n",
                 '        compiled = build_read_roots(items, platform="posix")\n',
+            ),
+        ),
+        (T_READ_ROOTS + "::test_read_roots_runtime_wiring_uses_host_platform",),
+    ),
+    Mutation(
+        "M9 运行期接线写死平台（`Computer._compile_read_roots` 传 windows）",
+        (
+            (
+                COMPUTER,
+                "        compiled = build_read_roots(items)\n",
+                '        compiled = build_read_roots(items, platform="windows")\n',
             ),
         ),
         (T_READ_ROOTS + "::test_read_roots_runtime_wiring_uses_host_platform",),

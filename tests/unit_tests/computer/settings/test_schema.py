@@ -397,32 +397,42 @@ class TestLandingRoot:
     def test_leading_whitespace_trimmed_and_activated(self) -> None:
         """#304 item 3（对齐 rust ``trim()``）：**前导**空白此前令字段整字段判废.
 
-        旧判据 ``_is_absolute_path`` 只认 ``startswith("/")``，前导空格使其失败；现在 trim 后生效。
+        旧判据 ``_is_absolute_path`` 对 ``/srv/...`` 这类 POSIX 路径用 ``startswith("/")``，
+        前导空格使其失败；现在 trim 后生效。
         """
         cleaned, errors = validate_settings({"landingRoot": "  /srv/landing"}, SettingsScope.USER)
         assert cleaned["landingRoot"] == "/srv/landing"
         assert errors == []
 
     def test_trailing_whitespace_retargets_to_trimmed_root(self) -> None:
-        """**尾随**空白此前**原样生效**（写入根是带空格的目录），现在写入根静默改为 trim 后的路径.
+        """**尾随**空白此前**原样生效**，现在写入根静默改为 trim 后的路径.
 
-        这是 0.5.1 的升级面：带尾随空白的配置不是「从判废变为生效」，而是写入目录被规范化
-        （带空格的旧目录里已有的产物不会迁移）。
+        这是 0.5.1 的升级面：带尾随空白的配置不是「从判废变为生效」，而是写入目录被规范化——
+        POSIX 上旧写入根是带空格的目录（其中产物不会迁移）；Windows 上 Win32 本就会剥掉分量末尾
+        空格/点（真实差异是 ``.part`` 拒绝集条目恢复）。
         """
         cleaned, errors = validate_settings({"landingRoot": "/srv/landing \t"}, SettingsScope.USER)
         assert cleaned["landingRoot"] == "/srv/landing"
         assert errors == []
 
-    def test_trim_matches_rust_white_space_set(self) -> None:
-        """trim 逐字节等价 rust ``str::trim()``：U+001C–U+001F **不**算空白.
+    @pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x1f"])
+    def test_trim_matches_rust_white_space_set(self, sep: str) -> None:
+        """trim 逐字节等价 rust ``str::trim()``：U+001C–U+001F **不**算空白（前导 + 尾随两个方向）.
 
         ``str.strip()`` 会剥这四个信息分隔符（``isspace()`` 为真、``White_Space`` 为假），而 Rust
-        ``trim()`` 不会——分歧会让同一份 settings.json 在 python 启用写入根、在 rust 判废（fail-closed）。
+        ``trim()`` 不会。两个方向都要钉：**前导**分歧是「python 启用 / rust 判废（fail-closed）」，
+        **尾随**分歧是「两侧都启用、写入根不同」（静默，更难察觉）。
         U+3000（IDEOGRAPHIC SPACE）属 ``White_Space``，两侧都剥。
         """
-        cleaned, errors = validate_settings({"landingRoot": "\x1c/srv/landing"}, SettingsScope.USER)
+        # 前导 SEP：不被 trim → 仍非绝对 → 整字段判废（rust 同）
+        cleaned, errors = validate_settings({"landingRoot": f"{sep}/srv/landing"}, SettingsScope.USER)
         assert "landingRoot" not in cleaned
         assert len(errors) == 1
+
+        # 尾随 SEP：不被 trim → 原样存值（`str.strip()` 变异会剥掉它，写入根静默变化）
+        cleaned, errors = validate_settings({"landingRoot": f"/srv/landing{sep}"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == f"/srv/landing{sep}"
+        assert errors == []
 
         cleaned, errors = validate_settings({"landingRoot": "\u3000/srv/landing\u3000"}, SettingsScope.USER)
         assert cleaned["landingRoot"] == "/srv/landing"

@@ -237,16 +237,18 @@ def test_read_roots_production_entry_delegates_to_seam() -> None:
     assert [(e.field, e.reason) for e in errors] == [(e.field, e.reason) for e in seam_errors]
 
 
-def test_read_roots_runtime_wiring_uses_host_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("platform", ["posix", "windows"])
+def test_read_roots_runtime_wiring_uses_host_platform(monkeypatch: pytest.MonkeyPatch, platform: PathPlatform) -> None:
     """运行期接线 ``Computer._compile_read_roots`` → ``build_read_roots(items)`` 取宿主平台.
 
-    钉住运行期默认平台来源：若在此写死 ``platform="posix"``，Linux CI 全绿，而 Windows 宿主会出现
+    双参数：钉住运行期默认平台来源——写死**任一**平台（``posix`` 或 ``windows``）都会在另一个
+    参数上红。若在此写死 ``platform="posix"``，Linux CI 会全绿，而 Windows 宿主会出现
     「配置期接受 ``C:\\...``、运行期丢弃」——正是本单要消灭的配置期/运行期分叉。
     """
-    monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver.native_platform", lambda: "windows")
+    monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver.native_platform", lambda: platform)
     computer = object.__new__(Computer)  # 只测编译逻辑，跳过 __init__ 的重资源构造
     resolved = ResolvedSettings(settings={FIELD_READ_ROOTS: ["\\\\?\\C:\\data"]})
 
     roots = computer._compile_read_roots(resolved)
 
-    assert [root.configured for root in roots] == ["/C:/data"]
+    assert [root.configured for root in roots] == (["/C:/data"] if platform == "windows" else [])
