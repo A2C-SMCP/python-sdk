@@ -52,6 +52,7 @@ from a2c_smcp.computer.settings.store import (
     update_known_marketplaces,
 )
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.staging import stage_marketplace_skills
 from a2c_smcp.utils.git_url import REDACTED_GIT_SOURCE
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="requires the git binary")
@@ -924,6 +925,34 @@ async def test_no_clone_rejected_by_flag_layer_reference(
         )
         == 0
     )
+
+
+@requires_git
+@pytest.mark.asyncio
+async def test_stage_unregistered_name_commit_uses_flag_layer_guard(tmp_path: Path) -> None:
+    """#296：``stage_marketplace_skills`` 的提交点（strict=False 降级路径）也接同一五层视图。
+
+    常规调用方（reconcile / refresh / recovery）都带既有注册（prior 非 None），dangling 判据不触发；
+    这里直接以「账本无记录 + clone 缺失」调公共 API，专门覆盖 stage → commit 的轴转发（否则该转发不可观测）。
+    """
+    bare = _make_bare(tmp_path, "acme", _marketplace_files())
+    env, home, reg = _env(tmp_path), _home(tmp_path), SkillRegistry()
+    flag = tmp_path / "flag.json"
+    flag.write_text(json.dumps({"enabledPlugins": {"audit@acme": False}}), encoding="utf-8")
+
+    names = await stage_marketplace_skills(
+        "acme",
+        {"type": "git", "url": f"file://{bare}"},
+        reg,
+        home,
+        env=env,
+        flag_settings_path=flag,
+        policy_settings={},
+    )
+
+    assert names == []
+    assert "acme" not in load_known_marketplaces(home, env)["marketplaces"], "拒绝不得写账本"
+    assert not (home / "marketplace" / "acme").exists(), "拒绝不得换入 clone"
 
 
 @pytest.mark.asyncio

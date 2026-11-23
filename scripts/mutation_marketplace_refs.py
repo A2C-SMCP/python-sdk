@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,10 +37,12 @@ STAGING = "a2c_smcp/computer/skills/staging.py"
 SCOPE = "a2c_smcp/computer/settings/scope.py"
 MP_CLI = "a2c_smcp/computer/cli/commands/marketplace.py"
 SETTINGS_CLI = "a2c_smcp/computer/cli/commands/settings.py"
+PLUGIN_CLI = "a2c_smcp/computer/cli/commands/plugin.py"
 CLI_MAIN = "a2c_smcp/computer/cli/main.py"
 
 T_ID = "tests/unit_tests/computer/skills/test_marketplace_identity.py"
 T_CLI = "tests/unit_tests/computer/cli/test_marketplace.py"
+T_PLUGIN = "tests/unit_tests/computer/cli/test_plugin.py"
 
 
 @dataclass(frozen=True)
@@ -143,8 +146,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         (T_CLI + "::test_cli_root_settings_flag_rejects_no_clone_readd",),
     ),
     Mutation(
-        "M9 marketplace REPL 偷用 ambient os.environ（不跟 comp.env）",
-        ((MP_CLI, '    env = getattr(comp, "env", None)\n', "    env = os.environ\n"),),
+        "M9 marketplace REPL 的守卫/账本 env 偷用 ambient（轴仍实例）",
+        ((MP_CLI, "            registry, home, axes.env, pos[0],", "            registry, home, os.environ, pos[0],"),),
         (T_CLI + "::test_repl_add_uses_instance_env_axis",),
     ),
     Mutation(
@@ -170,8 +173,53 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "M13 settings REPL 与 marketplace 分派器 env 不同源（跨面逃逸）",
-        ((SETTINGS_CLI, '    env = getattr(comp, "env", None)\n', "    env = os.environ\n"),),
+        ((SETTINGS_CLI, "    env = axes.env\n", "    env = os.environ\n"),),
         (T_CLI + "::test_repl_settings_set_flows_into_marketplace_guard",),
+    ),
+    Mutation(
+        "M14 显式 policy 注入被忽略（空 {} 不再覆盖 ambient）",
+        (
+            (
+                IDENT,
+                "        policy_settings=policy_settings if policy_settings is not None else resolve_policy_settings(env=env),",
+                "        policy_settings=resolve_policy_settings(env=env),",
+            ),
+        ),
+        (T_ID + "::test_intent_reference_pids_none_resolves_ambient_policy_and_explicit_overrides",),
+    ),
+    Mutation(
+        "M15 plugin REPL 偷用 ambient os.environ（install 写错 user settings）",
+        ((PLUGIN_CLI, '    env = getattr(comp, "env", None)\n', "    env = os.environ\n"),),
+        (T_PLUGIN + "::test_repl_install_user_scope_uses_instance_env",),
+    ),
+    Mutation(
+        "M16 plugin REPL project_path 退回进程 cwd",
+        (
+            (
+                PLUGIN_CLI,
+                "    project_path = str((_resolve_cwd() if callable(_resolve_cwd) else None) or os.getcwd())",
+                "    project_path = os.getcwd()",
+            ),
+        ),
+        (T_PLUGIN + "::test_repl_install_project_scope_uses_instance_cwd",),
+    ),
+    Mutation(
+        "M17 stage 提交点不转发轴（stage -> commit）",
+        (
+            (
+                STAGING,
+                """                    strict=False,
+                    allow_replace=True,
+                    cwd=cwd,
+                    flag_settings_path=flag_settings_path,
+                    policy_settings=policy_settings,
+""",
+                """                    strict=False,
+                    allow_replace=True,
+""",
+            ),
+        ),
+        (T_CLI + "::test_stage_unregistered_name_commit_uses_flag_layer_guard",),
     ),
 )
 
@@ -179,6 +227,40 @@ MUTATIONS: tuple[Mutation, ...] = (
 def _digest(path: Path) -> str:
     """文件字节摘要（还原校验用；避免「同文本不同编码」漏检）。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# 当前已应用的变异备份（SIGTERM / SIGINT 时据此还原，避免把 mutation 留在工作区）。
+_ACTIVE_BACKUPS: dict[str, tuple[str, Path]] = {}
+
+
+def _restore_active() -> None:
+    for rel, (digest, tmp) in list(_ACTIVE_BACKUPS.items()):
+        shutil.copy2(tmp, ROOT / rel)
+        assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+        _ACTIVE_BACKUPS.pop(rel, None)
+
+
+def _sig_handler(signum: int, _frame: object) -> None:
+    _restore_active()
+    raise SystemExit(128 + signum)
+
+
+def _classify(proc: subprocess.CompletedProcess[str], tests: tuple[str, ...]) -> tuple[str, str]:
+    """KILLED 判据：**仅** pytest 返回 1（有用例失败）且输出确实列出目标用例失败。
+
+    ``returncode != 0`` 不足以证明变异被杀死（解释器缺失 / 收集错误 / 超时都会非 0）；
+    目标用例名出现才说明是**该变异**打红了目标。
+    """
+    out = proc.stdout + proc.stderr
+    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    if proc.returncode == 0:
+        return "SURVIVED", tail
+    if proc.returncode == 1:
+        names = [t.rsplit("::", 1)[-1] for t in tests]
+        if all(name in out for name in names):
+            return "KILLED", tail
+        return "ERROR(目标用例未失败)", tail
+    return f"ERROR(rc={proc.returncode})", tail
 
 
 def check() -> int:
@@ -198,7 +280,14 @@ def check() -> int:
 def main() -> int:
     if "--check" in sys.argv[1:]:
         return check()
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        print("pytest 不可用：请用项目 venv 运行（不要 uv run / 不要裸 python），否则变异会被误判。")
+        return 2
 
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
     failures: list[str] = []
     # 每次运行独立备份目录（per-PID）：并发 run / 并发 worktree 不互相覆盖；退出时整体清理。
     backup_dir = Path(tempfile.mkdtemp(prefix=f"mut296_{os.getpid()}_"))
@@ -219,14 +308,15 @@ def main() -> int:
                         break
                     path.write_text(text.replace(old, new, 1), encoding="utf-8")
                 else:
+                    # 备份登记为「活跃」：子进程期间收到 SIGTERM/SIGINT 也能还原。
+                    _ACTIVE_BACKUPS.update(backups)
                     proc = subprocess.run(
                         [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
                         cwd=ROOT,
                         capture_output=True,
                         text=True,
                     )
-                    status = "KILLED" if proc.returncode != 0 else "SURVIVED"
-                    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+                    status, tail = _classify(proc, mutation.tests)
                     print(f"{mutation.name}: {status} | {tail}")
                     if status != "KILLED":
                         failures.append(mutation.name)
@@ -234,7 +324,9 @@ def main() -> int:
                 for rel, (digest, tmp) in backups.items():
                     shutil.copy2(tmp, ROOT / rel)
                     assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+                    _ACTIVE_BACKUPS.pop(rel, None)
     finally:
+        _restore_active()
         shutil.rmtree(backup_dir, ignore_errors=True)
     print(f"\nSUMMARY: {len(MUTATIONS) - len(failures)}/{len(MUTATIONS)} KILLED")
     return 0 if not failures else 1

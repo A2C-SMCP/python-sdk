@@ -819,9 +819,13 @@ def _git_env(env: Mapping[str, str] | None) -> dict[str, str]:
 
     强制 ``GIT_TERMINAL_PROMPT=0`` + ``GIT_ASKPASS=""`` 禁用凭证交互提示；``GIT_SSH_COMMAND`` 注入
     ``-oBatchMode=yes`` 让 SSH 在缺凭证时**立即失败**（而非挂起等待密码）——失败后由 :func:`_git_clone_with_fallback`
-    走 SSH→HTTPS 回退。基于传入 ``env``（默认 ``os.environ``）派生，不污染调用方环境。
+    走 SSH→HTTPS 回退。
+
+    #296：实例 ``env`` 可能是**部分**映射（只注入 XDG/HOME 等），子进程环境必须与 ambient 合并，否则 git
+    丢 ``PATH`` / ``SSH_AUTH_SOCK`` / ``HTTPS_PROXY`` 等；settings 解析仍只使用调用方给的那份 env。
+    基于 ``{**os.environ, **env}`` 派生，不污染调用方环境。
     """
-    base = dict(os.environ if env is None else env)
+    base = {**os.environ, **(env or {})}
     base["GIT_TERMINAL_PROMPT"] = "0"
     base["GIT_ASKPASS"] = ""
     base.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")

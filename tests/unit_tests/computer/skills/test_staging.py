@@ -2193,3 +2193,18 @@ async def test_marketplace_invalid_source_log_hits_source_branch(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "has invalid source" in text, "必须命中非法 source 分支（而非 name 校验分支）"
+
+
+# ── #296：git 子进程环境与 ambient 合并（实例 env 可为部分映射）────────────────
+def test_git_env_merges_partial_instance_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """实例 env 只注入 XDG/HOME 时，git 子进程仍须拿到 ambient 的 PATH / SSH_AUTH_SOCK / 代理等。"""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+
+    env = staging_mod._git_env({"XDG_CONFIG_HOME": "/tmp/instance-cfg"})
+
+    assert env["XDG_CONFIG_HOME"] == "/tmp/instance-cfg"  # 实例轴保留
+    assert env["PATH"] == "/usr/bin:/bin"  # ambient 透传
+    assert env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"  # 非交互强制项不变
+    assert env["GIT_ASKPASS"] == ""

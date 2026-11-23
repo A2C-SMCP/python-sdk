@@ -1204,12 +1204,13 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             console.print("[yellow]usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone][/yellow]")
             return
         name = flag_value(args, "--name")
-        # #296：与治理恢复同源的原始轴（env/cwd/flag/policy）；两处守卫调用点共用这一组值。
-        # 自定义 ``--computer-factory`` 若未提供该私有方法，退化为「仅 env 轴」（不静默丢弃已注入的 env）。
+        # #296：与治理恢复同源的原始轴（env/cwd/flag/policy），作为**单一来源**——账本 / trust 的 env
+        # 也取 ``axes.env``（而非外侧 ``comp.env``），避免自定义 factory 只实现 axes 时两处混源。
+        # 缺失该方法时退化为「仅 env 轴」（不静默丢弃已注入的 env）。
         _axes_fn = getattr(comp, "_settings_axes", None)
         axes = _axes_fn() if callable(_axes_fn) else SettingsAxes(env=env)
         code = await marketplace_add(
-            registry, home, env, pos[0],
+            registry, home, axes.env, pos[0],
             name=name, trust="--trust" in args, auto_update="--auto-update" in args,
             no_clone="--no-clone" in args, confirm=_confirm, json_output=json_output,
             cwd=axes.cwd, flag_settings_path=axes.flag_settings_path, policy_settings=axes.policy_settings,

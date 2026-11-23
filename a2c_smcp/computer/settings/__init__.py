@@ -58,6 +58,7 @@ from a2c_smcp.computer.settings.schema import (
 from a2c_smcp.computer.settings.scope import (
     DELETE,
     ResolvedSettings,
+    SettingsAxes,
     apply_write,
     load_settings_file,
     merge_layers,
@@ -121,6 +122,7 @@ __all__ = [
     # scope
     "DELETE",
     "ResolvedSettings",
+    "SettingsAxes",
     "apply_write",
     "load_settings_file",
     "merge_layers",

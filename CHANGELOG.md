@@ -58,8 +58,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   此前 `intent_reference_pids` 只读 user/project/local，`--settings` flag 层、policy 层与实例 cwd 轴不在视图内
   ⇒「policy/flag 有引用 → `marketplace remove` → 同名不同源 re-add」可绕过 §5.14 的 MUST 拒绝。现在：
   - 非交互 CLI 的**根级** `--settings`（flag 层）参与守卫；policy 层由库层按 `env` 现解析。REPL 的
-    marketplace / settings / plugin 三个分派器统一跟随运行中 Computer 实例的 env（marketplace 另含
-    cwd / flag / policy 轴），不再各自读 ambient `os.environ`。
+    marketplace / settings / plugin 三个分派器统一跟随运行中 Computer 实例的 env / cwd / flag
+    （marketplace 含 cwd / flag / policy 轴；settings 的 `show/get/set/edit` 也读取实例 `--settings` 与
+    实例 cwd），不再各自读 ambient `os.environ` / 进程 cwd。
   - **行为变化**：此前能成功的同名不同源 re-add，在 flag/policy 仍存在引用时现在以 `validation` +
     `reason: dangling-references` 失败（`details` 仍为 `{"name","references","referenceCount"}`，不新增层来源）。
   - **库层默认对齐 rust#300**：`policy_settings=None` 时按 `env` 现解析 ambient policy（`resolve_policy_settings`）
@@ -821,9 +822,13 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - 新增 `Computer._settings_axes()`（`SettingsAxes` 扁平原始轴），`_resolve_declared_settings` 与 REPL
   marketplace 守卫同源。
 - **REPL 三面同源（marketplace / settings / plugin）**：三个分派器的 env 统一跟随实例 `comp.env`
-  （`None` = ambient），plugin 的 project/local `project_path` 跟随实例 cwd（`Computer._resolve_cwd()`）。
-  仅改 `marketplace` 一面会让「`settings set enabledPlugins` 写 ambient、守卫读实例」在注入 env 的
+  （`None` = ambient）；`settings show/get/set/edit` 的 project/local cwd 与 flag 层、plugin 的
+  project/local `project_path` 也跟随实例 cwd / `--settings`（与 `marketplace` 守卫同源）。仅改
+  `marketplace` 一面会让「`settings set enabledPlugins` 写 ambient、守卫读实例」在注入 env 的
   `--computer-factory` 宿主里互相看不见，引用可被静默重绑；三面同源后该缺口关闭。
+- **子进程环境与 ambient 合并**：实例 env 可为部分映射（只注入 `XDG_CONFIG_HOME` / `HOME` 等）——git 子进程
+  （`_git_env`）与 `settings edit` 的 `$EDITOR` 子进程改用 `{**os.environ, **instance_env}`，避免丢
+  `PATH` / `SSH_AUTH_SOCK` / `HTTPS_PROXY` / `EDITOR`；settings 解析仍只用实例 env。
 - 引用语义不变：`installedPlugins` ∪ `enabledPlugins` 键、`@<name>` 后缀匹配、true/false 均算、层并集去重；
   不新增错误码。
 

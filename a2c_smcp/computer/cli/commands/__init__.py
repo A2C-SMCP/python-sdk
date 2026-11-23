@@ -129,6 +129,7 @@ def resolved_settings_with_errors(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
+    cwd: Path | None = None,
 ) -> ResolvedSettings:
     """五层合并 settings **连同校验错误**（含 policy first-source-wins；#116 锚 cwd）/ Merged settings **with errors**。
 
@@ -144,6 +145,7 @@ def resolved_settings_with_errors(
 
     return resolve_settings(
         env=env,
+        cwd=cwd,
         flag_settings_path=flag_path,
         policy_settings=resolve_policy_settings(env=env),
     )
@@ -153,6 +155,7 @@ def resolved_settings(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
+    cwd: Path | None = None,
 ) -> dict[str, Any]:
     """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
 
@@ -163,7 +166,7 @@ def resolved_settings(
     :func:`resolved_settings_with_errors` + :func:`format_settings_errors`（#157）。
     Drops validation errors; use the ``_with_errors`` variant where diagnostics must surface.
     """
-    return resolved_settings_with_errors(env, flag_path=flag_path).settings
+    return resolved_settings_with_errors(env, flag_path=flag_path, cwd=cwd).settings
 
 
 def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[str]:

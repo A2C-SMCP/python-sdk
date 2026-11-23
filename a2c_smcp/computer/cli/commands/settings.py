@@ -44,6 +44,7 @@ from a2c_smcp.computer.settings.schema import (
     validate_settings,
 )
 from a2c_smcp.computer.settings.scope import (
+    SettingsAxes,
     apply_write,
     load_settings_file,
     user_settings_path,
@@ -68,15 +69,18 @@ def _err(msg: str, *, json_output: bool) -> int:
     return EXIT_USER_ERROR
 
 
-def _writable_path(scope: str, env: Mapping[str, str] | None) -> tuple[Path, SettingsScope]:
-    """解析可写 scope 的 settings.json 路径 + enum（project/local 锚 cwd，#116）；flag/policy/unknown → ``ValueError``。"""
+def _writable_path(scope: str, env: Mapping[str, str] | None, *, cwd: Path | None = None) -> tuple[Path, SettingsScope]:
+    """解析可写 scope 的 settings.json 路径 + enum（project/local 锚 cwd，#116）；flag/policy/unknown → ``ValueError``。
+
+    #296：``cwd`` 由 REPL 传实例 cwd（``Computer._resolve_cwd()``），``None`` = 进程 cwd（CLI 非交互面不变）。
+    """
     if scope == "user":
         return user_settings_path(env), SettingsScope.USER
     if scope in ("project", "local"):
-        cwd = Path(os.getcwd())
+        resolved_cwd = cwd if cwd is not None else Path(os.getcwd())
         if scope == "project":
-            return workdir_project_settings_path(cwd), SettingsScope.PROJECT
-        return workdir_local_settings_path(cwd), SettingsScope.LOCAL
+            return workdir_project_settings_path(resolved_cwd), SettingsScope.PROJECT
+        return workdir_local_settings_path(resolved_cwd), SettingsScope.LOCAL
     raise ValueError(f"scope {scope!r} is read-only (writable: user|project|local)")
 
 
@@ -86,6 +90,7 @@ def _read_scope_with_errors(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None,
+    cwd: Path | None = None,
 ) -> tuple[dict[str, Any], list[SettingsValidationError]] | None:
     """读单 scope（或 merged）settings dict **连同校验错误**；scope 非法 → ``None``。project/local 锚 cwd（#116）。
 
@@ -96,13 +101,17 @@ def _read_scope_with_errors(
     Every scope carries its errors out; the callers surface them on stderr.
     """
     if scope == "merged":
-        resolved_st = resolved_settings_with_errors(env, flag_path=flag_path)
+        resolved_st = resolved_settings_with_errors(env, flag_path=flag_path, cwd=cwd)
         return resolved_st.settings, list(resolved_st.errors)
     if scope == "user":
         return load_settings_file(user_settings_path(env), SettingsScope.USER)
     if scope in ("project", "local"):
-        cwd = Path(os.getcwd())
-        path = workdir_project_settings_path(cwd) if scope == "project" else workdir_local_settings_path(cwd)
+        resolved_cwd = cwd if cwd is not None else Path(os.getcwd())
+        path = (
+            workdir_project_settings_path(resolved_cwd)
+            if scope == "project"
+            else workdir_local_settings_path(resolved_cwd)
+        )
         enum = SettingsScope.PROJECT if scope == "project" else SettingsScope.LOCAL
         return load_settings_file(path, enum)
     if scope == "flag":
@@ -135,12 +144,13 @@ def settings_show(
     *,
     scope: str = "merged",
     flag_path: Path | None = None,
+    cwd: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """展示某 scope 的 settings（默认 merged 合并视图）/ Show settings of a scope (default merged)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path)
+    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path, cwd=cwd)
     if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
     data, errors = read
@@ -156,12 +166,13 @@ def settings_get(
     *,
     scope: str = "merged",
     flag_path: Path | None = None,
+    cwd: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """读取单字段（默认 merged 视图）/ Read a single field (default merged view)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path)
+    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path, cwd=cwd)
     if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
     data, errors = read
@@ -213,6 +224,7 @@ def settings_set(
     value: str,
     *,
     scope: str = "user",
+    cwd: Path | None = None,
     json_output: bool = False,
 ) -> int:
     """写单字段（user|project|local；flag/policy 只读）/ Write a single field (flag/policy read-only)。
@@ -229,7 +241,7 @@ def settings_set(
     if scope not in _WRITABLE:
         return _err(f"scope {scope!r} is read-only (writable: {'|'.join(sorted(_WRITABLE))})", json_output=json_output)
     try:
-        path, enum = _writable_path(scope, env)
+        path, enum = _writable_path(scope, env, cwd=cwd)
     except ValueError as e:
         return _err(str(e), json_output=json_output)
 
@@ -284,6 +296,7 @@ def settings_edit(
     scope: str = "user",
     editor: str | None = None,
     reconcile_cb: Callable[[], Awaitable[None]] | None = None,
+    cwd: Path | None = None,
     json_output: bool = False,
 ) -> tuple[int, Callable[[], Awaitable[None]] | None]:
     """用 ``$EDITOR`` 打开该层 settings.json，保存后交回 reconcile 回调（由 dispatcher await）/ Open in $EDITOR。
@@ -294,7 +307,7 @@ def settings_edit(
     if scope not in _WRITABLE:
         return _err(f"scope {scope!r} is read-only (editable: {'|'.join(sorted(_WRITABLE))})", json_output=json_output), None
     try:
-        path, _enum = _writable_path(scope, env)
+        path, _enum = _writable_path(scope, env, cwd=cwd)
     except ValueError as e:
         return _err(str(e), json_output=json_output), None
 
@@ -302,9 +315,12 @@ def settings_edit(
     if not path.exists():
         path.write_text("{\n}\n", encoding="utf-8")  # 空骨架，便于编辑 / empty skeleton
 
-    edit_cmd = editor or (env or os.environ).get("EDITOR") or (env or os.environ).get("VISUAL") or "vi"
+    # #296：实例 env 可能是**部分**映射（只注入 XDG/HOME），子进程环境必须与 ambient 合并，
+    # 否则编辑器子进程丢 PATH / SSH_AUTH_SOCK / 代理等；settings 解析仍用实例 env。
+    sub_env: dict[str, str] = {**os.environ, **(env or {})}
+    edit_cmd = editor or sub_env.get("EDITOR") or sub_env.get("VISUAL") or "vi"
     try:
-        subprocess.run([*edit_cmd.split(), str(path)], check=True)  # noqa: S603 — $EDITOR 子进程（CLI 运行时，非沙箱）
+        subprocess.run([*edit_cmd.split(), str(path)], check=True, env=sub_env)  # noqa: S603 — $EDITOR 子进程（CLI 运行时，非沙箱）
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         return _err(f"editor failed: {e}", json_output=json_output), None
 
@@ -318,20 +334,24 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     sub = parts[1].lower()
     args = parts[2:]
     home = comp.skill_home
-    # #296：与 ``marketplace`` 分派器对齐——读写跟随 **本实例** env（``None`` = ambient），
-    # 否则注入 env 的宿主里 ``settings set enabledPlugins`` 写 ambient、marketplace 守卫读实例，引用可逃逸。
-    env = getattr(comp, "env", None)
+    # #296：与 ``marketplace`` 分派器对齐——env / cwd / flag 一律取 **本实例** 的 settings 轴
+    # （``None`` = ambient / 进程 cwd / 无 flag 层），否则注入 env 或 project_root 的宿主里各面读写不同根。
+    _axes_fn = getattr(comp, "_settings_axes", None)
+    axes = _axes_fn() if callable(_axes_fn) else SettingsAxes(env=getattr(comp, "env", None))
+    env = axes.env
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     scope = flag_value(args, "--scope")
 
     if sub == "show":
-        settings_show(home, env, scope=scope or "merged", json_output=json_output)
+        settings_show(home, env, scope=scope or "merged", flag_path=axes.flag_settings_path, cwd=axes.cwd, json_output=json_output)
     elif sub == "get":
         if not pos:
             console.print("[yellow]usage: settings get <key> [--scope user|project|local|flag|policy|merged][/yellow]")
             return
-        settings_get(home, env, pos[0], scope=scope or "merged", json_output=json_output)
+        settings_get(
+            home, env, pos[0], scope=scope or "merged", flag_path=axes.flag_settings_path, cwd=axes.cwd, json_output=json_output
+        )
     elif sub == "set":
         if len(pos) < 2:
             console.print("[yellow]usage: settings set <key> <value> [--scope user|project|local][/yellow]")
@@ -345,12 +365,14 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
                 break
             value_tokens.append(tok)
         value = " ".join(value_tokens)
-        code = settings_set(home, env, key, value, scope=scope or "user", json_output=json_output)
+        code = settings_set(home, env, key, value, scope=scope or "user", cwd=axes.cwd, json_output=json_output)
         _emit_keys = {"installedPlugins", "enabledPlugins", "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"}
         if code == EXIT_OK and key in _emit_keys:
             comp.mark_skills_dirty()
     elif sub == "edit":
-        code, post_save = settings_edit(home, env, scope=scope or "user", reconcile_cb=None, json_output=json_output)
+        code, post_save = settings_edit(
+            home, env, scope=scope or "user", reconcile_cb=None, cwd=axes.cwd, json_output=json_output
+        )
         if code == EXIT_OK:
             comp.mark_skills_dirty()  # 编辑可能改 enabledPlugins/MCP 字段 → 触发去抖 emit
             if post_save is not None:

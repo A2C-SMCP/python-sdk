@@ -363,7 +363,6 @@ def test_settings_axes_match_resolve_declared_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_resolve_declared_settings`` 必须由同一组轴派生（#296「同源」锁）。"""
-    from a2c_smcp.computer.settings.policy import resolve_policy_settings
     from a2c_smcp.computer.settings.scope import resolve_settings
 
     monkeypatch.setattr(
@@ -392,5 +391,6 @@ def test_settings_axes_match_resolve_declared_settings(
         "proj@acme": False,
         "flag@acme": True,
     }
-    # ``resolve_policy_settings`` 被两处共用；这里只锁同源，不重复断言 policy（AC6 上一条覆盖）。
-    assert isinstance(resolve_policy_settings(env=env), dict)
+    # policy 轴来自被 patch 的 resolver（空 dict）——证明 `_settings_axes` 走的是同一条现解析路径，
+    # 而非某个恒真断言（审查 🟡9）。
+    assert axes.policy_settings == {}

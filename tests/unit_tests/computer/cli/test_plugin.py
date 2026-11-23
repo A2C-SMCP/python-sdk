@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -529,7 +530,14 @@ class _ReplComp:
     前提固化为真，使读死快照的 bug 在测试里看起来是活的。
     """
 
-    def __init__(self, home: Path, registry: SkillRegistry) -> None:
+    def __init__(
+        self,
+        home: Path,
+        registry: SkillRegistry,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> None:
         self.skill_home = home
         self.skill_registry = registry
         self._registered_workdirs: tuple[Path, ...] = ()
@@ -537,6 +545,11 @@ class _ReplComp:
         self.dirty = 0
         self.mcp_manager = _FakeManager()
         self.injected: list[Any] = []
+        self.env = env
+        self._cwd = cwd
+
+    def _resolve_cwd(self) -> Path | None:
+        return self._cwd
 
     @property
     def mcp_servers(self) -> tuple[Any, ...]:
@@ -574,6 +587,49 @@ async def test_repl_install_is_lazy_no_mount_no_dirty(tmp_path: Path, monkeypatc
     assert "audit@acme" in load_installed_plugins(home=home)["plugins"]
     assert comp.mcp_manager.server_configs() == ()  # 不实时挂载（enable 才点亮）
     assert len(reg) == 0
+
+
+@pytest.mark.asyncio
+async def test_repl_install_project_scope_uses_instance_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#296：REPL ``plugin install --scope project`` 的 ``projectPath`` 取**实例 cwd**（非进程 cwd）。
+
+    install 的**安装意图恒写 user scope**（全局一次的事实），``scope``/``project_path`` 只进账本记录归档；
+    故此处断言账本 ``projectPath`` 与实例 cwd 同源（与 settings / marketplace 守卫的 cwd 轴一致）。
+    """
+    monkeypatch.chdir(tmp_path)  # 进程 cwd ≠ 实例 cwd
+    home, reg = _home(tmp_path), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=[])
+    monkeypatch.setattr(_STAGE, _fake_stage(register_skill=False))
+    project = tmp_path / "project"
+    comp = _ReplComp(home, reg, cwd=project)
+
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "install", "audit@acme", "--scope", "project"], session=None)
+
+    records = load_installed_plugins(home=home)["plugins"]["audit@acme"]
+    assert any(rec.get("projectPath") == str(project) for rec in records), records
+    assert all(rec.get("projectPath") != str(tmp_path) for rec in records), "不得用进程 cwd"
+
+
+@pytest.mark.asyncio
+async def test_repl_install_user_scope_uses_instance_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#296：REPL ``plugin install``（user scope）写**实例 env** 的 user settings，不写 ambient。"""
+    ambient_cfg = tmp_path / "ambient-cfg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(ambient_cfg))
+    instance_env = {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "instance-cfg")}
+    home, reg = _home(tmp_path), SkillRegistry()
+    _setup_catalog(home, "acme", "audit", servers=[])
+    monkeypatch.setattr(_STAGE, _fake_stage(register_skill=False))
+    comp = _ReplComp(home, reg, env=instance_env)
+
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "install", "audit@acme"], session=None)
+
+    data = json.loads(user_settings_path(instance_env).read_text(encoding="utf-8"))
+    assert data["installedPlugins"] == ["audit@acme"]
+    assert not user_settings_path(os.environ).exists(), "不得写 ambient user settings"
 
 
 @pytest.mark.asyncio
