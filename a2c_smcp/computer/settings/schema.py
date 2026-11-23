@@ -46,7 +46,7 @@ from typing import Any, NotRequired, TypedDict
 from urllib.parse import SplitResult, unquote, urlsplit
 
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.path_norm import InvalidPathError, native_platform, normalize_path
+from a2c_smcp.utils.path_norm import InvalidPathError, PathPlatform, native_platform, normalize_path
 
 logger = get_logger(__name__)
 
@@ -535,7 +535,10 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
                 if not isinstance(item, str):
                     errors.append(_err(scope, f"{key}.additionalDirectories[{idx}]", "expected string"))
                 elif not _is_absolute_path(item):
-                    # 须绝对路径（POSIX ``/`` 或 Windows 盘符）；相对路径判废（§5.3.1）。
+                    # 语法判据：POSIX ``/`` 或 Windows 盘符；相对路径判废（§5.3.1）。#304 item 3：
+                    # 与 ``landingRoot`` 同口径（不按宿主平台过滤、不 trim——**刻意**不与
+                    # ``readRoots`` 的 ``normalize_path`` 合并判据），且本字段运行期**无消费者**，
+                    # 故外来平台形态不会进入任何授权 / 落盘路径。
                     errors.append(_err(scope, f"{key}.additionalDirectories[{idx}]", "must be an absolute path"))
                 else:
                     dirs.append(item)
@@ -552,33 +555,46 @@ def _is_absolute_path(value: str) -> bool:
 
 
 def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
-    """``readRoots``（v0.5.0 #236 / protocol#65）：字符串数组，每项须为绝对路径。
+    """``readRoots``（v0.5.0 #236 / protocol#65）：字符串数组，每项经 ``normalize_path`` 校验。
 
+    **单一判据**（#304 item 3）：绝对性与形态都交给
+    :func:`~a2c_smcp.utils.path_norm.normalize_path`，与运行期
+    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` **同源**——不再前置
+    「``/`` 前缀或盘符」正则（那会把 ``normalize_path`` 接受的 Windows verbatim
+    ``\\\\?\\C:\\...`` 误拒，形成「读得了、写不进」的口径分叉）。
     非法项**逐条过滤**并记诊断（不整字段判废——其余授权根仍然生效）；空数组 = 不可读
     （fail-closed，语义由 resolve 管线保证）。**不做** ``~`` 展开：协议 ``normalize_path``
-    明确不展开 ``~``，含 ``~`` 的项在运行期按 ``invalid_path`` 处理，故此处不视为绝对路径。
-    绝对路径项再经 :func:`~a2c_smcp.utils.path_norm.normalize_path`（宿主平台）预判形态，
-    ``invalid_path`` 在**配置期**即记诊断。双形态（配置 / realpath）在运行期由
-    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` 编译。
-    Per-item filtering (one bad root never voids the others); empty = unreadable (fail-closed).
-    No ``~`` expansion: the protocol's ``normalize_path`` does not expand it either.
+    明确不展开 ``~``，含 ``~`` 的项按 ``invalid_path`` 丢弃。保留**原值**（不改写、不 trim、
+    不存归一结果）；双形态（配置 / realpath）在运行期编译。
+
+    Single predicate: ``normalize_path`` checks both absoluteness and shape, exactly as the
+    runtime ``build_read_roots`` does. Per-item filtering; empty = unreadable; raw items kept.
+    """
+    return _validate_read_roots_for(key, value, scope, native_platform())
+
+
+def _validate_read_roots_for(
+    key: str, value: Any, scope: SettingsScope, platform: PathPlatform
+) -> tuple[Any, list[SettingsValidationError]]:
+    """[:func:`_validate_read_roots`] 的平台显式版本（跨平台测试接缝；生产恒用宿主平台）.
+
+    Platform-explicit variant of :func:`_validate_read_roots` (cross-platform test seam;
+    production always passes the host platform). 与 rust
+    ``schema.rs::validate_read_roots_for`` 同名同构——CI 只有 Linux，Windows 形态必须经显式
+    平台在任意 OS 上对拍。
     """
     if not isinstance(value, list):
         return _DROP, [_err(scope, key, f"expected array, got {type(value).__name__}")]
     cleaned: list[str] = []
     errors: list[SettingsValidationError] = []
-    platform = native_platform()
     for idx, item in enumerate(value):
         field = f"{key}[{idx}]"
         if not isinstance(item, str):
             errors.append(_err(scope, field, f"expected string, got {type(item).__name__}"))
             continue
-        if not _is_absolute_path(item):
-            errors.append(_err(scope, field, "must be an absolute path"))
-            continue
-        # 形态与运行期同源：用协议 ``normalize_path``（宿主平台）预判 ``invalid_path``，
-        # 配置期即给出诊断，避免「写得进、读不了」。
-        # Same predicate as runtime: pre-validate with the protocol's normalize_path.
+        # 单一判据（与运行期 ``build_read_roots`` 同源）：``normalize_path`` 同时管绝对性与形态
+        # （含 Windows verbatim ``\\?\C:\...`` 的剥离、drive-relative 的拒绝）。
+        # Single predicate shared with the runtime — never re-add a second absoluteness check.
         try:
             normalize_path(item, platform)
         except InvalidPathError as exc:
@@ -588,19 +604,68 @@ def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[An
     return cleaned, errors
 
 
-def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
-    """``landingRoot``（v0.4.0 #196）：字符串 + 绝对路径（镜像 ``permissions.additionalDirectories``
-    的判据：POSIX ``/`` 或 Windows 盘符）；相对路径 / 非字符串 → 整字段判废（fail-closed）。
+# Rust ``str::trim()`` 只剥 Unicode ``White_Space``；Python ``str.strip()`` 额外把 U+001C–U+001F
+# （信息分隔符：``str.isspace()`` 为真但 ``White_Space`` 为假）当空白——本集合就是这四个码位。
+# 对写目标面逐字节对齐 rust 必须排除它们，两个方向都要：**前导**分歧会让 py 启用 / rust 判废
+# （fail-closed，易察觉）；**尾随**分歧两侧都启用但写入根不同（静默分歧，更难察觉）。
+# Rust trims Unicode White_Space only; Python's str.strip() also strips U+001C–U+001F. Both the
+# leading and trailing directions must exclude them: leading diverges open-vs-dropped, trailing
+# diverges between two *different* write roots (silent).
+_PY_EXTRA_WHITESPACE = frozenset("\x1c\x1d\x1e\x1f")
 
-    String + absolute path, mirroring the ``permissions.additionalDirectories`` predicate;
-    relative or non-string → dropped (fail-closed). 合并策略为顶层标量「高 scope 覆盖」
-    （:func:`a2c_smcp.computer.settings.scope.merge_read` 默认语义），无需分类注册。
+
+def _trim_like_rust(value: str) -> str:
+    """``str::trim()`` 的逐字节等价（只剥 Unicode ``White_Space``）/ Byte-for-byte Rust ``trim()``."""
+    start, end = 0, len(value)
+    while start < end and value[start].isspace() and value[start] not in _PY_EXTRA_WHITESPACE:
+        start += 1
+    while end > start and value[end - 1].isspace() and value[end - 1] not in _PY_EXTRA_WHITESPACE:
+        end -= 1
+    return value[start:end]
+
+
+def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
+    """``landingRoot``（v0.4.0 #196）：字符串 + **语法**绝对路径（POSIX ``/`` 或 Windows 盘符）.
+
+    首尾空白先 trim（#304 item 3，逐字节等价 rust ``validate_landing_root`` 的 ``s.trim()``）：
+    trim 后为空或非绝对 → 整字段判废（fail-closed）；通过则**存 trim 后的值**。
+    行为变化（0.5.1 升级面，前导 / 尾随不对称）：**前导**空白此前令字段判废（`"/srv/x"` 前的空格让
+    ``startswith("/")`` 失败），现在被 trim 后生效；**尾随**空白此前原样生效——POSIX 上写入根就是带空格的
+    目录，Windows 上 Win32 会剥掉**非 verbatim** 路径分量末尾的空格/点（实际落在无空格目录），两平台现在都
+    **静默改为 trim 后的路径**（POSIX 旧空格目录里的产物不会迁移）。
+    Trim first (byte-for-byte Rust); empty-after-trim or non-absolute → dropped; trimmed value stored.
+    Leading whitespace used to void the field; trailing whitespace used to take effect verbatim (on POSIX
+    under a spaced directory; on Windows Win32 silently stripped it) — both now resolve to the trimmed path.
+
+    判据是**语法**的、不按宿主平台过滤——**刻意**与 ``readRoots`` 的 ``normalize_path`` 单一判据
+    不同（用户 2026-11-23 裁决：**不做谓词合并**）。由此的「外来平台形态」边界（写实，勿美化）：
+    ``D:\\...`` 在 POSIX 宿主配置期接受，但运行期
+    :attr:`a2c_smcp.computer.computer.Computer.landing_root` 直接 ``Path(raw)``——POSIX 上它是
+    **相对路径**（``put_blob`` 落盘落在进程 cwd 下）；反方向（``/home/...`` 在 Windows）是
+    current-drive-rooted（``C:\\home\\...``，落在当前盘根而非 cwd）。两者都**不丢弃**，而
+    :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 会先按宿主 cwd 绝对化
+    再归一（镜像 rust ``std::path::absolute``），该实际落盘目录照常进 ``.part`` 拒绝集——
+    在途上传不会被 ``resolve_path`` 读出。
+    对照 ``readRoots``：运行期 ``build_read_roots`` 会按 ``normalize_path`` **丢弃**外来形态。
+
+    **已知边界（v0.4.0 起既有，非本单引入）**：含 U+0000 的绝对路径仍被接受；运行期
+    ``BlobUploadStore`` 的 ``mkdir`` / ``open`` 只捕获 ``OSError``，``ValueError``（embedded null
+    byte）会逃出 ``on_put_blob``（无 ``4019`` ack）。修复需与 rust 一起定口径（配置期拒 NUL vs
+    运行期把 ``ValueError`` 映射为 ``forbidden``），见 follow-up。
+
+    Cross-platform shapes pass the syntactic check at config time (deliberate asymmetry with
+    ``readRoots``); at runtime ``landing_root`` feeds ``Path(raw)`` as-is — POSIX treats ``D:\\...`` as
+    relative to the process cwd, Windows treats ``/home/...`` as rooted on the current drive. Neither is
+    dropped, and ``build_protected_paths`` absolutizes against the host cwd first (mirrors rust
+    ``std::path::absolute``) so the real write directory still enters the ``.part`` rejection set.
+    合并策略为顶层标量「高 scope 覆盖」（``scope.merge_read`` 默认语义）。
     """
     if not isinstance(value, str):
         return _DROP, [_err(scope, key, f"expected string, got {type(value).__name__}")]
-    if not _is_absolute_path(value):
+    trimmed = _trim_like_rust(value)
+    if not trimmed or not _is_absolute_path(trimmed):
         return _DROP, [_err(scope, key, "must be an absolute path")]
-    return value, []
+    return trimmed, []
 
 
 # 字段 → 校验器映射（缺席 = 未知字段，passthrough）/ field → validator map (absent = unknown, passthrough).

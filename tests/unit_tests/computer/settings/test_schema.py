@@ -338,6 +338,19 @@ def test_permissions_additional_directories_absolute_only() -> None:
     assert len(errors) == 2  # relative + 非 string
 
 
+def test_permissions_additional_directories_syntactic_predicate_unchanged() -> None:
+    """#304 item 3：``additionalDirectories`` **保持语法判据**（不做谓词合并、不按宿主平台过滤）.
+
+    盘符形态在 POSIX 宿主上照样保留（语法绝对即通过）；verbatim ``\\\\?\\`` / 前导空白被拒。
+    该字段运行期无消费者，故「外来平台形态」不会进入任何授权集合。
+    """
+    raw = {"permissions": {"additionalDirectories": ["D:\\data", "\\\\?\\C:\\x", "  /abs"]}}
+    cleaned, errors = validate_settings(raw, SettingsScope.USER)
+
+    assert cleaned["permissions"]["additionalDirectories"] == ["D:\\data"]
+    assert len(errors) == 2
+
+
 def test_source_path_backfilled_into_errors() -> None:
     _, errors = validate_settings({"strictKnownMarketplaces": 1}, SettingsScope.USER, source_path="/x/settings.json")
     assert errors[0].source_path == "/x/settings.json"
@@ -380,6 +393,71 @@ class TestLandingRoot:
         cleaned, errors = validate_settings({"landingRoot": "D:\\a2c\\landing"}, SettingsScope.USER)
         assert cleaned["landingRoot"] == "D:\\a2c\\landing"
         assert errors == []
+
+    def test_leading_whitespace_trimmed_and_activated(self) -> None:
+        """#304 item 3（对齐 rust ``trim()``）：**前导**空白此前令字段整字段判废.
+
+        旧判据 ``_is_absolute_path`` 对 ``/srv/...`` 这类 POSIX 路径用 ``startswith("/")``，
+        前导空格使其失败；现在 trim 后生效。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "  /srv/landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_trailing_whitespace_retargets_to_trimmed_root(self) -> None:
+        """**尾随**空白此前**原样生效**，现在写入根静默改为 trim 后的路径.
+
+        这是 0.5.1 的升级面：带尾随空白的配置不是「从判废变为生效」，而是写入目录被规范化——
+        POSIX 上旧写入根是带空格的目录（其中产物不会迁移）；Windows 上 Win32 本就会剥掉分量末尾
+        空格/点（真实差异是 ``.part`` 拒绝集条目恢复）。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "/srv/landing \t"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    @pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x1f"])
+    def test_trim_matches_rust_white_space_set(self, sep: str) -> None:
+        """trim 逐字节等价 rust ``str::trim()``：U+001C–U+001F **不**算空白（前导 + 尾随两个方向）.
+
+        ``str.strip()`` 会剥这四个信息分隔符（``isspace()`` 为真、``White_Space`` 为假），而 Rust
+        ``trim()`` 不会。两个方向都要钉：**前导**分歧是「python 启用 / rust 判废（fail-closed）」，
+        **尾随**分歧是「两侧都启用、写入根不同」（静默，更难察觉）。
+        U+3000（IDEOGRAPHIC SPACE）属 ``White_Space``，两侧都剥。
+        """
+        # 前导 SEP：不被 trim → 仍非绝对 → 整字段判废（rust 同）
+        cleaned, errors = validate_settings({"landingRoot": f"{sep}/srv/landing"}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+
+        # 尾随 SEP：不被 trim → 原样存值（`str.strip()` 变异会剥掉它，写入根静默变化）
+        cleaned, errors = validate_settings({"landingRoot": f"/srv/landing{sep}"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == f"/srv/landing{sep}"
+        assert errors == []
+
+        cleaned, errors = validate_settings({"landingRoot": "\u3000/srv/landing\u3000"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_whitespace_only_dropped(self) -> None:
+        """trim 后为空 → 仍按非绝对路径判废（不因 trim 放宽空值）。"""
+        cleaned, errors = validate_settings({"landingRoot": " \t\n "}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+
+    def test_syntactic_predicate_is_deliberately_not_merged(self) -> None:
+        """**刻意的不对称**（用户 2026-11-23 裁决：不做谓词合并）.
+
+        两半合起来才能钉住语法判据：① 盘符形态在 POSIX 宿主照样通过（``normalize_path`` 会拒）；
+        ② ``normalize_path`` 能接受的 verbatim ``\\\\?\\C:\\...`` 反而被拒。若后人「顺手」把
+        ``landingRoot`` 也改用 ``normalize_path``，① 立刻红。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "D:\\a2c\\landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "D:\\a2c\\landing"  # 语法绝对即通过，不按宿主平台过滤
+        assert errors == []
+
+        cleaned, errors = validate_settings({"landingRoot": "\\\\?\\C:\\a2c\\landing"}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned  # normalize 接受的形态反而被语法判据拒
+        assert len(errors) == 1
 
     @pytest.mark.parametrize("bad", ["relative/path", "./here", "", 123, True, ["/abs"]])
     def test_relative_or_non_string_dropped(self, bad: object) -> None:

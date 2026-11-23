@@ -200,26 +200,36 @@ class _StatKey:
     ino: int
 
 
-def build_read_roots(raw: Sequence[str]) -> list[ReadRoot]:
+def build_read_roots(raw: Sequence[str], *, platform: PathPlatform | None = None) -> list[ReadRoot]:
     """把 settings ``readRoots`` 原始列表编译为双形态根列表.
 
     每项 MUST 为绝对路径且可 ``normalize_path``；非法项丢弃（配置诊断由接线层记录）。
+    按**配置形态**去重（首次胜出，verbatim ``\\\\?\\C:\\data`` 与 canonical ``/C:/data`` 视为同一根）；
     ``realpath`` / 归一失败的根只保留配置形态，``real`` 为 ``None``。
+
+    ``platform`` 为平台注入接缝（缺省取宿主平台，与 :func:`build_protected_paths` 同惯例）——
+    配置期 ``schema._validate_read_roots_for`` 与本函数必须共用**同一**判据；CI 只有 Linux，
+    故 Windows 形态的一致性对拍需要显式平台。
     """
-    platform = native_platform()
+    pf: PathPlatform = native_platform() if platform is None else platform
     roots: list[ReadRoot] = []
     for item in raw or ():
         if not isinstance(item, str) or not item:
             logger.warning("readRoots: 丢弃非字符串或空路径项 / dropping non-str or empty item: %r", item)
             continue
         try:
-            configured = normalize_path(item, platform)
+            configured = normalize_path(item, pf)
         except InvalidPathError as e:
             logger.warning("readRoots: 丢弃非法路径 / dropping invalid root %r: %s", item, e)
             continue
+        # 按**配置形态**去重（镜像 rust `build_read_roots`）：`\\?\C:\data` 与 `/C:/data` 归一后是
+        # 同一个根，只保留首次出现（授权判定不变，只去掉重复围栏项）。
+        # Dedupe by configured form (matches rust): equivalent spellings collapse to the first root.
+        if any(root.configured == configured for root in roots):
+            continue
         real: str | None
         try:
-            real = normalize_path(realpath_nonstrict(configured, platform), platform)
+            real = normalize_path(realpath_nonstrict(configured, pf), pf)
         except (OSError, ValueError, InvalidPathError) as e:
             logger.warning("readRoots: realpath 失败，仅保留配置形态 / realpath failed for %r: %s", configured, e)
             real = None
@@ -313,6 +323,14 @@ def build_protected_paths(
     for candidate in candidates:
         if not candidate:
             continue
+        # 先按**宿主** cwd 绝对化再归一（镜像 rust `std::path::absolute`）：相对注入项（如
+        # `--mcp-config mcp.json`、调用方传入的相对 extra path）会被 normalize 判废而**静默绕过**
+        # 拒绝集 / would otherwise be silently dropped from the rejection set.
+        try:
+            candidate = os.path.abspath(os.fspath(candidate))
+        except (OSError, ValueError, TypeError) as e:  # pragma: no cover - 防御性
+            logger.warning("拒绝集: 无法绝对化路径 / cannot absolutize protected path %r: %s", candidate, e)
+            continue
         try:
             configured = normalize_path(candidate, pf)
         except (InvalidPathError, ValueError) as e:
@@ -341,12 +359,19 @@ def build_protected_paths(
     normalized_landing: str | None = None
     if landing_root:
         try:
-            configured_landing = normalize_path(str(landing_root), pf)
+            # 同候选：先按**宿主** cwd 绝对化再归一（镜像 rust `std::path::absolute`）。外来平台形态
+            # （POSIX 上的 `D:\\uploads`、Windows 上的 `/home/...`）在运行期是相对 / 盘根路径，
+            # `Computer.landing_root` 的 `Path(raw)` 实际就落盘在那里；不绝对化会因 normalize 失败
+            # 令 `.part` 规则**静默消失**，在途上传可被 `resolve_path` 读出。
+            # Absolutize first: a foreign-platform landingRoot really writes there (relative / drive-rooted),
+            # so the `.part` fence must protect that directory instead of being silently dropped.
+            absolute_landing = os.path.abspath(os.fspath(landing_root))
+            configured_landing = normalize_path(absolute_landing, pf)
             try:
                 normalized_landing = normalize_path(realpath_nonstrict(configured_landing, pf), pf)
             except (OSError, ValueError, InvalidPathError):
                 normalized_landing = configured_landing
-        except (InvalidPathError, ValueError) as e:
+        except (OSError, InvalidPathError, ValueError, TypeError) as e:
             logger.warning("拒绝集: 丢弃非法 landingRoot / dropping invalid landingRoot %r: %s", landing_root, e)
 
     return ProtectedPaths(paths=tuple(sorted(protected)), landing_root=normalized_landing, file_ids=frozenset(file_ids))

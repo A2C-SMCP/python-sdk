@@ -254,7 +254,8 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   拉取期的撤权 / 删除仍走 `4018 forbidden` / `gone`，**`4018` 枚举不变**）。
   - **授权边界 = settings `readRoots`**（默认空 = 不可读，fail-closed）：仅受信 scope 可设，
     `project` scope 提供该键**整字段拒绝**；跨 scope 按数组语义拼接去重；逐项须为绝对路径且通过
-    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。
+    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。（0.5.1 起改为
+    `normalize_path` **单一判据**，见 `### Fixed（#304 item 3 …）`。）
   - **授权每请求现读、无进程内缓存**：拉取期 `get_blob` 按**当前** `readRoots` 与**当前文件系统状态**
     重施围栏（覆盖 resolve 后的撤权、root 符号链接换指向）；正确性不依赖宿主调用任何失效入口。
   - **固定拒绝集**（即便在 `readRoots` 内也拒绝）：`.skillenv`、SDK 配置/状态/凭据目录
@@ -836,6 +837,38 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `git -C` / clone 落点；ambient `GIT_SSH_COMMAND` 缺 `-oBatchMode=yes` 时自动追加，避免挂 tty 等待口令。
 - 引用语义不变：`installedPlugins` ∪ `enabledPlugins` 键、`@<name>` 后缀匹配、true/false 均算、层并集去重；
   不新增错误码。
+
+### Fixed（#304 item 3 settings 路径判据收尾）
+
+- **`readRoots` 改为单一判据（配置期 == 运行期）**：`_validate_read_roots` 去掉前置的「POSIX `/` 或
+  Windows 盘符」语法预判，只留 `normalize_path`（与运行期 `build_read_roots` 同源），并拆出
+  `_validate_read_roots_for(..., platform)` 平台显式接缝（与 rust `validate_read_roots_for` 同名同构，
+  CI 只有 Linux）。行为变化：**Windows verbatim 前缀 `\\?\C:\...` 在配置期不再被误拒**——
+  `normalize_path` 按协议向量 `win-verbatim-prefix` 接受并归一，此前「运行期读得了、配置期写不进」；
+  drive-relative `C:repos\` 两侧一致拒绝。相对路径项的诊断文案由 `must be an absolute path` 变为
+  `invalid path: …`（`settings show/get` 可见）。
+- **`landingRoot` 与 rust 对齐 `trim()`**：先按 Unicode `White_Space` trim（逐字节等价 rust
+  `str::trim()`——**不**含 U+001C–U+001F 四个信息分隔符，Python `strip()` 会多剥），trim 后为空 /
+  非绝对 → 整字段判废，通过则**存 trim 后的值**。升级面（前导 / 尾随不对称，都**不是**简单的
+  「从判废变为生效」）：
+  - **前导**空白：此前整字段判废（`startswith("/")` 失败、静默失效），现在 trim 后生效；
+  - **尾随**空白：此前**原样生效**——POSIX 上写入根就是带空格的目录（其中产物不会迁移），现在写入根
+    **静默改为 trim 后的路径**；Windows 上 Win32 本就会剥掉非 verbatim 路径分量末尾的空格/点（真实差异
+    是 `"C:\\x "` 此前因 `normalize_path` 拒绝空格结尾而丢掉 `.part` 拒绝集条目，trim 后该缺口一并修复）。
+- **判据边界文档化（不做谓词合并，2026-11-23 用户裁决）**：`landingRoot` / `permissions.additionalDirectories`
+  保持**语法**判据、不按宿主平台过滤，也不改用 `normalize_path`。由此的「外来平台形态」边界：
+  `readRoots` 运行期由 `build_read_roots` 丢弃外来形态；`additionalDirectories` 运行期无消费者；
+  **`landingRoot` 运行期不丢弃**——`Computer.landing_root` 直接 `Path(raw)`（POSIX 上 `D:\...` 是
+  相对 cwd 的路径、Windows 上 `/home/...` 是 current-drive-rooted），该**实际落盘目录**仍进
+  `.part` 拒绝集（见下条）。
+- **拒绝集先绝对化再归一（镜像 rust `std::path::absolute`）**：`build_protected_paths` 对每个候选
+  （含 `extra_paths` 与 `landingRoot`）先按宿主 cwd `abspath` 再 `normalize_path`。修复外来平台
+  `landingRoot`（如 POSIX 宿主配 `D:\uploads`）此前因 normalize 失败**静默退出** `.part` 拒绝集、
+  令在途上传可被 `client:resolve_path` 读出的缺口；相对注入项也不再被静默丢弃。
+- **`build_read_roots` 按配置形态去重**（镜像 rust）：verbatim `\\?\C:\data` 与 canonical
+  `/C:/data` 归一同根，只保留首次出现。
+- `build_read_roots` 增 keyword-only `platform` 注入接缝（缺省宿主平台），供「配置期/运行期同源」测试
+  在任意 OS 上对拍。
 
 ## [0.4.0] - 2026-08-25
 
