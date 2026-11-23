@@ -91,6 +91,10 @@ a2c-computer plugin enable <plugin>@<new-name>   # project/local 手工处理后
 - **迁移期间请停止其他 Computer / REPL 实例**：`--apply` 写入前会重新检测 + 重新预检，并在写入时
   复核目标 input/secret 键；但跨文件顺序一致性没有全局锁，并发写入仍可能造成部分项 abort（exit 3）。
 - **`install_plugin` / 其他进程在迁移窗口内改账本**：无法完全避免；重跑即可续做。
+- **flag / policy 层引用不迁不改，且参与 §5.14 re-add 守卫（#296）**：迁移只改写 user scope 与显式
+  `--scope project|local`；`--settings`（flag）文件与 policy（MDM）层是只读面，不追溯改写。其中的
+  `<plugin>@<name>` 旧引用仍算意图引用——迁移后 `marketplace remove` + 同名不同源 re-add 会因这些残留引用
+  以 `validation` / `dangling-references` 被拒绝；需在声明这些引用的层里显式清理后再 re-add。
 
 ## 7. 失败与续跑
 

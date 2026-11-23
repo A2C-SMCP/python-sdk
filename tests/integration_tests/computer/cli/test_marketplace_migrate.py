@@ -167,6 +167,7 @@ class _Comp:
         self.skill_home = home
         self.skill_registry = None
         self.dirty = False
+        self.env = None  # #296：repl_dispatch 的账本/trust/settings 跟随实例 env（None = ambient）
 
     def mark_skills_dirty(self) -> None:
         self.dirty = True

@@ -2193,3 +2193,60 @@ async def test_marketplace_invalid_source_log_hits_source_branch(
     assert names == []
     text = _no_secret(staging_logs.records)
     assert "has invalid source" in text, "必须命中非法 source 分支（而非 name 校验分支）"
+
+
+# ── #296：git 子进程环境与 ambient 合并（实例 env 可为部分映射）────────────────
+def test_git_env_merges_partial_instance_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """实例 env 只注入 XDG/HOME 时，git 子进程仍须拿到 ambient 的 PATH / SSH_AUTH_SOCK / 代理等。"""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:3128")
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+
+    env = staging_mod._git_env({"XDG_CONFIG_HOME": "/tmp/instance-cfg"})
+
+    assert env["XDG_CONFIG_HOME"] == "/tmp/instance-cfg"  # 实例轴保留
+    assert env["PATH"] == "/usr/bin:/bin"  # ambient 透传
+    assert env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+    assert env["HTTPS_PROXY"] == "http://proxy.local:3128"
+    assert env["NO_PROXY"] == "localhost,127.0.0.1"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"  # 非交互强制项不变
+    assert env["GIT_ASKPASS"] == ""
+
+
+@pytest.mark.parametrize(
+    "var",
+    ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"],
+)
+def test_git_env_strips_ambient_repo_locators(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+    """宿主导出的仓库定位变量会覆盖 ``git -C`` / clone 落点 → 默认剥除（#296）。"""
+    monkeypatch.setenv(var, "/host/hook-repo")
+
+    env = staging_mod._git_env({"XDG_CONFIG_HOME": "/tmp/instance-cfg"})
+
+    assert var not in env, f"ambient {var} 必须剥除，否则 git 会操作宿主的 hook 仓库"
+
+
+def test_git_env_keeps_explicit_repo_locator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """实例 env **显式**提供仓库定位变量时保留（调用方负全责）。"""
+    monkeypatch.setenv("GIT_DIR", "/host/hook-repo")
+
+    env = staging_mod._git_env({"GIT_DIR": "/instance/repo.git"})
+
+    assert env["GIT_DIR"] == "/instance/repo.git"
+
+
+def test_git_env_forces_batch_mode_on_ambient_ssh_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ambient 的 ``GIT_SSH_COMMAND`` 若缺 BatchMode，会在 tty 上挂到超时 → 追加 ``-oBatchMode=yes``。"""
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /keys/id_rsa")
+
+    env = staging_mod._git_env({"XDG_CONFIG_HOME": "/tmp/instance-cfg"})
+
+    assert env["GIT_SSH_COMMAND"] == "ssh -i /keys/id_rsa -oBatchMode=yes"
+
+
+def test_git_env_does_not_duplicate_batch_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+
+    assert staging_mod._git_env({"XDG_CONFIG_HOME": "/tmp/x"})["GIT_SSH_COMMAND"] == "ssh -oBatchMode=yes"

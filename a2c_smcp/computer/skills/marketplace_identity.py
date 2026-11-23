@@ -233,23 +233,45 @@ def registered_name_for_source(known: Mapping[str, Any], source: object) -> str 
 
 
 # ── 意图引用 / intent references ─────────────────────────────────────────────
-def intent_reference_pids(name: str, *, env: Mapping[str, str] | None = None) -> list[str]:
+def intent_reference_pids(
+    name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
+) -> list[str]:
     """
     指向某 marketplace 名的**意图引用**（``<plugin>@<name>``）/ Intent references bound to a marketplace name.
 
-    数据源 = merged settings 的 ``installedPlugins`` ∪ ``enabledPlugins`` 键（user/project/local；与
+    数据源 = merged settings 的 ``installedPlugins`` ∪ ``enabledPlugins`` 键（与
     :func:`~a2c_smcp.computer.settings.reconciler.declared_installed_plugin_ids` 同一视图）。协议 §5.14
     「remove 后同名不同源 re-add」要求：仍存在这类引用时 MUST 拒绝，MUST NOT 静默重绑。
 
-    .. note::
-       已知边界：project/local 层按进程 ``cwd`` 锚定，**其他 workdir** 的声明不在本视图内（与 settings 其余
-       消费面同一边界，见 ``scope.resolve_settings``）。
+    **五层视图由调用方注入**（#296）：``env`` / ``cwd`` / ``flag_settings_path`` / ``policy_settings``
+    原样交给 :func:`~a2c_smcp.computer.settings.scope.resolve_settings`。缺省回退：``env`` → ambient、
+    ``cwd`` → 进程 cwd、``flag_settings_path`` → 无 flag 层；**``policy_settings=None`` → 按 ``env`` 现解析
+    ambient policy**（``resolve_policy_settings``，与 :meth:`Computer._settings_axes` /
+    rust#300 同口径），显式传入 mapping（含 ``{}`` = 显式「无 policy」，供 hermetic 测试）则覆盖。
+    这样库层调用方（``add_marketplace_source`` / ``commit_marketplace_registration``）即使不显式接线，
+    也不会绕过 §5.14 的 policy 层引用。CLI / REPL 的两处守卫调用点（注册提交点与 ``--no-clone`` 意图注册）
+    必须传入**同一组**轴，否则会出现层漏接。
+
+    :param cwd: project/local 层锚点；``None`` = 进程 cwd（#116）。
+    :param flag_settings_path: ``--settings`` flag 层文件（次高优先级）。
+    :param policy_settings: policy 层原始 dict（最高优先级）；``None`` = 按 ``env`` 现解析，``{}`` = 显式无 policy。
     """
+    from a2c_smcp.computer.settings.policy import resolve_policy_settings
     from a2c_smcp.computer.settings.reconciler import declared_installed_plugin_ids
     from a2c_smcp.computer.settings.schema import FIELD_ENABLED_PLUGINS
     from a2c_smcp.computer.settings.scope import resolve_settings
 
-    declared = resolve_settings(env=env).settings
+    declared = resolve_settings(
+        env=env,
+        cwd=cwd,
+        flag_settings_path=flag_settings_path,
+        policy_settings=policy_settings if policy_settings is not None else resolve_policy_settings(env=env),
+    ).settings
     pids = set(declared_installed_plugin_ids(declared))
     enabled = declared.get(FIELD_ENABLED_PLUGINS)
     if isinstance(enabled, Mapping):

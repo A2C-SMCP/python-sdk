@@ -35,6 +35,18 @@ def isolate_a2c_identity_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     yield xdg_home
 
 
+@pytest.fixture(autouse=True)
+def isolate_ambient_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#296：marketplace 引用守卫 / settings 轴默认按 ``env`` 现解析 ambient policy。
+
+    集成测试同样与宿主机 MDM policy 隔离（本机有、CI 无会让断言漂移）。只 patch 模块属性，函数内惰性导入
+    的消费方生效；需要真实 policy 的用例在用例体内再次 ``monkeypatch.setattr`` 覆盖（后写生效）。
+    """
+    from a2c_smcp.computer.settings import policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "resolve_policy_settings", lambda **_kw: {})
+
+
 @pytest.fixture
 def basic_server_port() -> int:
     """

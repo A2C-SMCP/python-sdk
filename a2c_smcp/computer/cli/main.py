@@ -458,6 +458,7 @@ identity_app = typer.Typer(help="Computer identity (reset)")
 
 @marketplace_app.command("add")
 def _mp_add(
+    ctx: typer.Context,
     git_url: str = typer.Argument(..., help="git URL 或 owner/repo 简写 / git URL or owner/repo shorthand"),
     name: str | None = typer.Option(
         None,
@@ -474,10 +475,15 @@ def _mp_add(
     json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
 ) -> None:
     """添加 marketplace（注册名 = 清单 name；非交互须 --trust）/ Add a marketplace (registered under the manifest name)."""
+    # #296：非交互入口必须把**根级** ``--settings``（flag 层）交给 re-add 引用守卫；此前
+    # ``ctx.obj.flag_path`` 只被 ``settings`` 子命令读取，``marketplace add`` 看不到 flag 层。
+    # policy 层由 `intent_reference_pids` 按 `env=os.environ` 现解析（与 rust#300 同口径），此处无需重复注入。
+    st = _root_state(ctx)
     code = asyncio.run(
         mp_cmd.marketplace_add(
             SkillRegistry(), ensure_skill_home(), os.environ, git_url,
             name=name, trust=trust, auto_update=auto_update, no_clone=no_clone, confirm=None, json_output=json_output,
+            flag_settings_path=st.flag_path,
         ),
     )
     raise typer.Exit(code)

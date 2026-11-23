@@ -159,7 +159,7 @@ if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
     from prompt_toolkit import PromptSession
 
-    from a2c_smcp.computer.settings.scope import ResolvedSettings
+    from a2c_smcp.computer.settings.scope import ResolvedSettings, SettingsAxes
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
 else:
     # 运行时占位（#226）：纯 core 安装不要求 cli extra。`PromptSession` 只用于类基类
@@ -2415,6 +2415,26 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._skill_debouncer.mark_dirty()
 
+    def _settings_axes(self) -> "SettingsAxes":
+        """本实例的 settings **原始轴**（#296，与 :meth:`_resolve_declared_settings` 同源）。
+
+        REPL 的 marketplace 引用守卫与治理恢复视图必须看到同一五层视图（user/project/local/flag/policy）；
+        两处各自拼装会重演 #296 的漂移（flag / policy 层漏接）。policy 在此按本实例 env 现解析
+        （与 :meth:`_resolve_declared_settings` 原有行为一致）。
+        The instance's raw settings axes (#296), the single source shared by governance recovery and the
+        REPL marketplace reference guard. Policy is resolved against this instance's env.
+        """
+        from a2c_smcp.computer.settings.policy import resolve_policy_settings
+        from a2c_smcp.computer.settings.scope import SettingsAxes
+
+        env = self._resolve_env()
+        return SettingsAxes(
+            env=env,
+            cwd=self._resolve_cwd(),
+            flag_settings_path=self._flag_settings_path,
+            policy_settings=resolve_policy_settings(env=env),
+        )
+
     def _resolve_declared_settings(self) -> "ResolvedSettings":
         """治理恢复的 declared 视图（含合并 settings + per-scope 层，供 #159 Option B 审批门分叉）。
 
@@ -2423,14 +2443,14 @@ class Computer(BaseComputer[PromptSession]):
         The declared view for governance recovery; ``flag_settings_path`` (CLI ``--settings``) is
         injected when set, ``None`` = no flag settings (backward compat). Fixed in #167 sub-issue 3.
         """
-        from a2c_smcp.computer.settings.policy import resolve_policy_settings
         from a2c_smcp.computer.settings.scope import resolve_settings
 
+        axes = self._settings_axes()
         return resolve_settings(
-            env=self._resolve_env(),
-            cwd=self._resolve_cwd(),
-            flag_settings_path=self._flag_settings_path,
-            policy_settings=resolve_policy_settings(env=self._resolve_env()),
+            env=axes.env,
+            cwd=axes.cwd,
+            flag_settings_path=axes.flag_settings_path,
+            policy_settings=axes.policy_settings,
         )
 
     async def reconcile_governance(

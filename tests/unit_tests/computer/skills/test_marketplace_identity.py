@@ -45,6 +45,34 @@ def _write_settings_with_references(env: dict[str, str], pids: list[str]) -> Non
     path.write_text(json.dumps({"installedPlugins": pids, "enabledPlugins": {pid: True for pid in pids}}), encoding="utf-8")
 
 
+# ── #296：flag / policy / cwd 轴（五层视图）/ flag & policy layers ─────────────
+def _empty_user_env(tmp_path: Path) -> dict[str, str]:
+    """隔离 user 层：只给 XDG_CONFIG_HOME，不继承 ambient（避免机器级 policy 干扰）。"""
+    return {"XDG_CONFIG_HOME": str(tmp_path / "empty-cfg")}
+
+
+def _write_user_settings(env: dict[str, str], payload: dict[str, object]) -> None:
+    path = user_settings_path(env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#296：守卫默认按 ``env`` 现解析 policy → 单测固定为空，避免宿主机 MDM policy 让断言漂移。
+
+    测 policy 层的用例在用例体内再次 monkeypatch 覆盖（后写生效）。
+    """
+    from a2c_smcp.computer.settings import policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "resolve_policy_settings", lambda **_kw: {})
+
+
 # ── 清单名 / manifest name ───────────────────────────────────────────────────
 @pytest.mark.parametrize(
     ("manifest", "expected"),
@@ -134,15 +162,93 @@ def test_registered_name_for_source() -> None:
 def test_intent_reference_pids_scans_installed_and_enabled(tmp_path: Path) -> None:
     env = _env(tmp_path)
     _write_settings_with_references(env, ["audit@acme", "fmt@acme", "audit@other"])
-    assert intent_reference_pids("acme", env=env) == ["audit@acme", "fmt@acme"]
-    assert intent_reference_pids("nobody", env=env) == []
+    assert intent_reference_pids("acme", env=env, policy_settings={}) == ["audit@acme", "fmt@acme"]
+    assert intent_reference_pids("nobody", env=env, policy_settings={}) == []
 
 
 def test_intent_reference_pids_ignores_bare_name_collisions(tmp_path: Path) -> None:
     """``@acme`` 后缀匹配，不得被 ``acme-extra`` / 裸同名 plugin 误伤。"""
     env = _env(tmp_path)
     _write_settings_with_references(env, ["audit@acme-extra", "audit"])
-    assert intent_reference_pids("acme", env=env) == []
+    assert intent_reference_pids("acme", env=env, policy_settings={}) == []
+
+
+def test_intent_reference_pids_includes_flag_layer(tmp_path: Path) -> None:
+    """#296：``--settings`` flag 层的 ``<plugin>@<name>`` 引用必须进入视图；不传该层则不可见。"""
+    env = _empty_user_env(tmp_path)
+    flag = tmp_path / "flag.json"
+    _write_json(flag, {"enabledPlugins": {"audit@acme": False}})
+
+    assert intent_reference_pids("acme", env=env, flag_settings_path=flag, policy_settings={}) == ["audit@acme"]
+    # 正对照：不传 flag 层 → 保持 #296 前行为（不可见）
+    assert intent_reference_pids("acme", env=env, policy_settings={}) == []
+
+
+@pytest.mark.parametrize("enabled_value", [True, False])
+def test_intent_reference_pids_policy_layer_true_and_false_both_count(
+    tmp_path: Path, enabled_value: bool
+) -> None:
+    """#296：policy 层可显式注入；``enabledPlugins`` 的 true / false 都算意图引用（协议 §5.14）。"""
+    env = _empty_user_env(tmp_path)
+    policy = {"enabledPlugins": {"audit@acme": enabled_value}}
+    assert intent_reference_pids("acme", env=env, policy_settings=policy) == ["audit@acme"]
+
+
+def test_intent_reference_pids_union_dedup_flag_and_policy(tmp_path: Path) -> None:
+    """#296：flag ∪ policy 并集去重，同一 pid 不重复计数。
+
+    低层引用**只放 ``enabledPlugins``**：若层合并退化为「高层整层覆盖」，user 层的 audit 会消失；
+    若放进 ``installedPlugins``，数组拼接会掩盖该回归（#296 变异矩阵 M3）。
+    """
+    env = _empty_user_env(tmp_path)
+    _write_user_settings(env, {"enabledPlugins": {"audit@acme": False}})
+    flag = tmp_path / "flag.json"
+    _write_json(flag, {"enabledPlugins": {"audit@acme": True, "fmt@acme": False}})
+    policy = {"enabledPlugins": {"lint@acme": False}}
+
+    assert intent_reference_pids(
+        "acme", env=env, flag_settings_path=flag, policy_settings=policy
+    ) == ["audit@acme", "fmt@acme", "lint@acme"]
+
+
+def test_intent_reference_pids_unions_installed_and_enabled(tmp_path: Path) -> None:
+    """#296 变异锁：``installedPlugins`` 与 ``enabledPlugins`` 两侧都要扫，不能只取一侧。"""
+    env = _empty_user_env(tmp_path)
+    _write_user_settings(env, {"installedPlugins": ["audit@acme"], "enabledPlugins": {"fmt@acme": False}})
+    assert intent_reference_pids("acme", env=env, policy_settings={}) == ["audit@acme", "fmt@acme"]
+
+
+def test_intent_reference_pids_project_and_local_layers_anchor_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#296：cwd 轴——project/local 真实文件经 chdir 锚定；显式 ``cwd`` 可指向别处（正对照）。"""
+    env = _empty_user_env(tmp_path)
+    project = tmp_path / "proj"
+    _write_json(project / ".tfrobot" / "settings.json", {"installedPlugins": ["proj@acme"]})
+    _write_json(project / ".tfrobot" / "settings.local.json", {"enabledPlugins": {"local@acme": False}})
+    monkeypatch.chdir(project)
+
+    assert intent_reference_pids("acme", env=env, policy_settings={}) == ["local@acme", "proj@acme"]
+
+    other = tmp_path / "other"
+    other.mkdir()
+    assert intent_reference_pids("acme", env=env, cwd=other, policy_settings={}) == []
+
+
+def test_intent_reference_pids_none_resolves_ambient_policy_and_explicit_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#296：``policy_settings=None`` → 按 ``env`` 现解析 ambient policy（对齐 rust#300，防库层绕过）；
+    显式 mapping（含 ``{}`` = 无 policy）覆盖，供 hermetic 测试。
+    """
+    from a2c_smcp.computer.settings import policy as policy_mod
+
+    monkeypatch.setattr(
+        policy_mod, "resolve_policy_settings", lambda **_kw: {"enabledPlugins": {"audit@acme": True}}
+    )
+    env = _empty_user_env(tmp_path)
+    assert intent_reference_pids("acme", env=env) == ["audit@acme"]
+    assert intent_reference_pids("acme", env=env, policy_settings={}) == []
 
 
 # ── 提交点判定矩阵 / registration commit predicate ───────────────────────────
@@ -154,7 +260,8 @@ def _violation(
     observed: str,
     env: dict[str, str] | None = None,
 ) -> MarketplaceIdentityError | None:
-    return registration_violation(name, source, prior, known, observed, env=env)
+    # 显式 ``{}``：这些矩阵用例不测 policy 层，避免机器级 ambient policy 让断言漂移（#296）。
+    return registration_violation(name, source, prior, known, observed, env=env, policy_settings={})
 
 
 def test_no_violation_for_fresh_registration() -> None:
@@ -183,6 +290,23 @@ def test_dangling_references_rejected_for_new_registration(tmp_path: Path) -> No
     v = _violation("acme", _GIT, None, {}, "acme", env=env)
     assert isinstance(v, MarketplaceIdentityError) and v.reason == "dangling-references"
     assert v.details["references"] == ["audit@acme"]
+
+
+def test_registration_violation_sees_flag_and_policy_references(tmp_path: Path) -> None:
+    """#296：提交点守卫的引用视图必须含 flag / policy 层（两处守卫共用同一五层视图）。"""
+    env = _empty_user_env(tmp_path)
+    flag = tmp_path / "flag.json"
+    _write_json(flag, {"enabledPlugins": {"audit@acme": False}})
+    policy = {"enabledPlugins": {"fmt@acme": True}}
+
+    v = registration_violation(
+        "acme", _GIT, None, {}, "acme", env=env, flag_settings_path=flag, policy_settings=policy
+    )
+    assert isinstance(v, MarketplaceIdentityError) and v.reason == "dangling-references"
+    assert v.details == {"name": "acme", "references": ["audit@acme", "fmt@acme"], "referenceCount": 2}
+
+    # 正对照：不传 flag / policy 层 → 无违约（沿用 #296 前行为）
+    assert registration_violation("acme", _GIT, None, {}, "acme", env=env, policy_settings={}) is None
 
 
 def test_name_conflict_for_same_name_different_source() -> None:

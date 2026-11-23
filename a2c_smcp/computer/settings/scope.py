@@ -224,6 +224,26 @@ def load_settings_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any]
 # 解析编排 / Resolution orchestration
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
+class SettingsAxes:
+    """
+    :func:`resolve_settings` 的**原始轴**（#296）/ Raw axes for :func:`resolve_settings`.
+
+    供需要「同一五层视图」的多个消费面共用（治理恢复的 ``_resolve_declared_settings`` 与 REPL 的
+    marketplace 引用守卫），避免两处各自拼装导致漂移。各字段语义与 :func:`resolve_settings`
+    同名参数一致；``None`` 保持既有回退（env → ambient、cwd → 进程 cwd、flag / policy → 空层）。
+
+    Raw axes shared by consumers that must see the same five-layer view (#296), so that governance
+    recovery and the REPL marketplace reference guard cannot drift apart. Field semantics match the
+    same-named ``resolve_settings`` parameters; ``None`` keeps the existing fallbacks.
+    """
+
+    env: Mapping[str, str] | None = None
+    cwd: Path | None = None
+    flag_settings_path: Path | None = None
+    policy_settings: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedSettings:
     """
     解析结果 / The resolved settings result。

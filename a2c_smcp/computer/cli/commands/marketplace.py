@@ -29,7 +29,12 @@ from urllib.parse import urlsplit
 from rich.markup import escape
 from rich.table import Table
 
-from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
+from a2c_smcp.computer.cli.commands import (
+    McpCallbacks,
+    files_only_non_plugin_bundle_ids,
+    flag_value,
+    settings_axes_of,
+)
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
@@ -310,6 +315,9 @@ def _register_intent_only(
     *,
     auto_update: bool,
     json_output: bool,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> int:
     """
     ``--no-clone``：只登记意图（D5：无 pending、无临时派生名）/ Register intent only (no clone).
@@ -322,6 +330,10 @@ def _register_intent_only(
     两种形态都在 ``update_known_marketplaces`` 的**锁内**过一遍与 add 相同的身份判定
     （:func:`~a2c_smcp.computer.skills.staging.registration_violation`）：同名不同源 / 断链引用一律
     ``validation``，**不得**绕过提交点静默改写既有注册的 source。
+
+    ``cwd`` / ``flag_settings_path`` / ``policy_settings`` 是引用守卫的原始 settings 轴（#296），原样透传给
+    :func:`registration_violation`；``policy_settings=None`` 由下游按 ``env`` 现解析 ambient policy，
+    显式 ``{}`` = 无 policy，其余轴 ``None`` = 该层既有回退。入口点（CLI / REPL）构造显式五层视图。
     """
     source = {"type": "git", "url": url}
     outcome: dict[str, Any] = {"existing": None, "registered": None}
@@ -344,7 +356,17 @@ def _register_intent_only(
         if observed != name:
             raise _unresolvable_name_error()
         prior = known.get(name)
-        violation = registration_violation(name, source, prior, known, name, env=env)
+        violation = registration_violation(
+            name,
+            source,
+            prior,
+            known,
+            name,
+            env=env,
+            cwd=cwd,
+            flag_settings_path=flag_settings_path,
+            policy_settings=policy_settings,
+        )
         if violation is not None:
             raise violation  # 同名不同源 / 断链引用（fail-closed）
         if prior is not None:
@@ -428,6 +450,9 @@ async def marketplace_add(
     no_clone: bool = False,
     confirm: ConfirmFn | None = None,
     json_output: bool = False,
+    cwd: Path | None = None,
+    flag_settings_path: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> int:
     """
     添加新 marketplace（D1 注册名取清单 ``name``；首次 trust y/N，默认 eager clone）/
@@ -440,6 +465,12 @@ async def marketplace_add(
     - 交互（REPL）：**一律**弹确认——``trustedMarketplaces`` 不再豁免 prompt（#260 裁决：``--name`` 已不
       命名任何东西，拿它当免提示开关与其语义不一致，且会绕过确认）。trust 在**注册成功后**才落盘，
       注册失败零残留。
+
+    **#296**：``cwd`` / ``flag_settings_path`` / ``policy_settings`` 是 re-add 引用守卫的原始 settings 轴，
+    与 ``env`` 一起原样透传给**两处**守卫调用点（注册提交点与 ``--no-clone`` 意图注册）。
+    ``policy_settings=None`` 由下游按 ``env`` 现解析 ambient policy（显式 ``{}`` = 无 policy），其余轴
+    ``None`` = 该层既有回退。入口点在此基础上构造完整视图（非交互 CLI：根级 ``--settings`` +
+    ``resolve_policy_settings(env)``；REPL：``Computer._settings_axes()``，与治理恢复同源）。
     """
     url = normalize_marketplace_url(git_url)
     if url is None:
@@ -475,12 +506,31 @@ async def marketplace_add(
             return _err("aborted by user (untrusted)", json_output=json_output)
 
     if no_clone:
-        return _register_intent_only(home, env, url, name, auto_update=auto_update, json_output=json_output)
+        return _register_intent_only(
+            home,
+            env,
+            url,
+            name,
+            auto_update=auto_update,
+            json_output=json_output,
+            cwd=cwd,
+            flag_settings_path=flag_settings_path,
+            policy_settings=policy_settings,
+        )
 
     source = {"type": "git", "url": url}
     try:
         with clone_spinner("Cloning marketplace...", enabled=not json_output):
-            final_name = await add_marketplace_source(source, home, expected_name=name, auto_update=auto_update, env=env)
+            final_name = await add_marketplace_source(
+                source,
+                home,
+                expected_name=name,
+                auto_update=auto_update,
+                env=env,
+                cwd=cwd,
+                flag_settings_path=flag_settings_path,
+                policy_settings=policy_settings,
+            )
     except MarketplaceIdentityError as e:
         return _identity_error(e, json_output=json_output)
     except (SkillStagingError, SkillSourceError):
@@ -517,7 +567,17 @@ async def marketplace_add(
 
     try:
         with clone_spinner(f"Staging {final_name}...", enabled=not json_output):
-            registered = await stage_marketplace_skills(final_name, source, registry, home, auto_update=auto_update, env=env)
+            registered = await stage_marketplace_skills(
+                final_name,
+                source,
+                registry,
+                home,
+                auto_update=auto_update,
+                env=env,
+                cwd=cwd,
+                flag_settings_path=flag_settings_path,
+                policy_settings=policy_settings,
+            )
     except MarketplaceNameChangeError as e:
         # 防御：提交后的复用路径不观测清单名，此处理论不可达；真发生也不得 traceback（注册已提交）。
         return _identity_error(e, json_output=json_output)
@@ -1123,12 +1183,20 @@ def _registry_fingerprints(registry: SkillRegistry) -> frozenset[tuple[tuple[str
 
 # ── REPL dispatcher（绑定 Computer 的活跃 registry / home / session）/ REPL adapter ──
 async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
-    """把 ``marketplace ...`` REPL 行解析为 flags → 调 handler；变更后触发去抖 emit / Parse a REPL line and dispatch。"""
+    """把 ``marketplace ...`` REPL 行解析为 flags → 调 handler；变更后触发去抖 emit / Parse a REPL line and dispatch。
+
+    ``comp`` 的最小鸭子类型协议：#296 起额外要求可选的 ``env``（``Mapping | None``，缺省 = ambient）与
+    ``_settings_axes()``（``Computer`` 提供；缺失时退化为「仅 env 轴」，与 #296 前可见面一致）。
+    """
     sub = parts[1].lower()
     args = parts[2:]
     registry = comp.skill_registry
     home = comp.skill_home
-    env = os.environ
+    # #296：**所有**子命令（add/list/info/remove/refresh/migrate/set）的账本 / trust / settings 统一取
+    # 本实例的 settings 轴（`settings_axes_of`，与治理恢复同源；``None`` = ambient）。只在 add 用轴会让
+    # 自定义 factory 的 add 与 list 读写不同账本。
+    axes = settings_axes_of(comp)
+    env = axes.env
 
     async def _confirm(target: str) -> bool:
         prompt = f"⚠ Untrusted source: {target}\n  Trust this source and continue? [y/N]: "
@@ -1143,10 +1211,12 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             console.print("[yellow]usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone][/yellow]")
             return
         name = flag_value(args, "--name")
+        # #296：两处守卫调用点共用同一组轴（env/cwd/flag/policy；`axes` 已在上方统一取得）。
         code = await marketplace_add(
             registry, home, env, pos[0],
             name=name, trust="--trust" in args, auto_update="--auto-update" in args,
             no_clone="--no-clone" in args, confirm=_confirm, json_output=json_output,
+            cwd=axes.cwd, flag_settings_path=axes.flag_settings_path, policy_settings=axes.policy_settings,
         )
         if code == EXIT_OK:  # 仅成功才标脏，避免失败/拒绝触发无意义 emit
             comp.mark_skills_dirty()
