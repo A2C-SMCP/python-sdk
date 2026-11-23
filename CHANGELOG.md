@@ -347,7 +347,7 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - **脱敏**：`field` 的市场名段走 `redact_ledger_key`（段漏斗，比散文脱敏更严），`reason` 走散文脱敏，
     两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗；`source_path` 的判据是「**能否排除 userinfo**」——
     不能就整值 fail-closed，能则走路径轴脱敏保留结构。判据 = 剥掉 Windows 盘符后「最后一个 `@` 在第一个
-    `:` 之后」，在原文与每一轮 `NFKC → percent-decode` 形态上各判一次（覆盖控制字符穿插、`#`/`?` 夹在 `:` 与
+    `:` 之后」，在原文与每一轮 `percent-decode → NFKC` 形态上各判一次（覆盖控制字符穿插、`#`/`?` 夹在 `:` 与
     `@` 之间、段内空白、凭据内字面 `/` 与 `\`、percent-encoded、全角、多层编码）。负对照：Windows
     `alice@corp`、纯 `100%25done`、`?` 尾部照常展示（详见设计文档 §6.1）。
     `settings show` 的凭据回显仍是 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295)，本版不改其行为。

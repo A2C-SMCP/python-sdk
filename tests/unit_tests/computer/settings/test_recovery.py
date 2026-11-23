@@ -1136,6 +1136,18 @@ def test_source_path_keeps_readable_paths() -> None:
     (also_kept,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=pct)])
     assert also_kept.source_path == pct
 
+    drive_relative = "C:repos\\alice@corp\\settings.json"
+    (relative_kept,) = marketplace_declaration_errors(
+        [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=drive_relative)],
+    )
+    assert relative_kept.source_path == drive_relative
+
+    device_prefixed = "\\\\?\\C:\\repos\\alice@corp\\settings.json"
+    (device_kept,) = marketplace_declaration_errors(
+        [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=device_prefixed)],
+    )
+    assert device_kept.source_path == device_prefixed
+
     colon_after_at = "/home/alice@corp/notes:2024/x"
     (still_kept,) = marketplace_declaration_errors(
         [_verr("extraKnownMarketplaces.acme.source", "boom", source_path=colon_after_at)],
@@ -1166,6 +1178,8 @@ def test_source_path_keeps_readable_paths() -> None:
         ("/home/alice:my-secret?x@example.com/settings.json", "my-secret"),
         # 段内空白：原语正则要求 `:` 前非空白
         ("/home/alice:my pw pass@example.com/settings.json", "my pw pass"),
+        # 冒号选择（find vs rfind）：密码含空白 + 末尾端口 ⇒ 最后一个 `:` 在 `@` 之后，只有 find 判得出
+        ("/home/alice:my pw@example.com:8080/settings.json", "my pw"),
         # 凭据内的字面分隔符：逐段判定会被拆开
         ("/home/alice:pw\\x@example.com/settings.json", "pw"),
         ("/home/alice:pw/x@example.com/settings.json", "pw"),
@@ -1184,7 +1198,7 @@ def test_source_path_keeps_readable_paths() -> None:
 def test_source_path_fails_closed_on_userinfo_shape(dirty: str, secret: str) -> None:
     """
     ``source_path`` 的 fail-closed 判据：剥盘符后「最后一个 `@` 在第一个 `:` 之后」，在原文与每一轮
-    ``NFKC → percent-decode`` 形态上判一次；命中即整值占位。
+    ``percent-decode → NFKC`` 形态上判一次；命中即整值占位。
 
     判别力（逐项实测过）：只看首个 `@`、只判原文、不做 NFKC、逐段判定、只在原串上找字面 `:`/`@` ——
     任一退化都会有对应向量转红。每条向量的 `secret` 既是正对照（原串确实带它）也是负断言（输出不得含它）。
@@ -1197,9 +1211,6 @@ def test_source_path_fails_closed_on_userinfo_shape(dirty: str, secret: str) -> 
 
 def test_source_path_with_control_chars_but_no_userinfo_is_still_scrubbed() -> None:
     """负对照（防过度遮蔽）：无 `:`/`@` 关系的控制字符路径仍按字符清洗保留可读性，不做整值占位。"""
-    dirty = "/tmp/ev\u202eil/settings\x1b[31m.json"
-    (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
-    assert out.source_path == "/tmp/ev il/settings [31m.json"
     dirty = "/tmp/ev\u202eil/settings\x1b[31m.json"
     (out,) = marketplace_declaration_errors([_verr("extraKnownMarketplaces.acme.source", "boom", source_path=dirty)])
     assert out.source_path == "/tmp/ev il/settings [31m.json"

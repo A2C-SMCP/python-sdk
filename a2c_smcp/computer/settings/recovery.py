@@ -238,14 +238,18 @@ def sanitize_marketplace_text(text: str) -> str:
     return scrub_diagnostic_chars(redact_git_urls_in_text(text))
 
 
-_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_WINDOWS_DEVICE_PREFIX_RE = re.compile(r"^\\\\[?.]\\")
+# 盘符**不要求后跟斜杠**：`C:repos\\x`（drive-relative）与 `C:\\repos\\x` 都必须剥；剥掉后剩余串仍要过
+# userinfo 判据，故不会掩盖 `c:alice:pw@host` 这类形态（`:` 仍在）。
+_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 
 
 def _decode_chain(text: str) -> list[str]:
     """
-    原文 + 逐轮 ``NFKC → percent-decode`` 的中间形态（#293；与 #282 同一解码链口径）/
-    Raw text plus each NFKC/percent-decode iteration.
+    原文 + 逐轮 ``percent-decode → NFKC`` 的中间形态（#293；与 #282 同一解码链口径）/
+    Raw text plus each percent-decode/NFKC iteration.
 
+    顺序是 **percent-decode → NFKC**（先解码再归一，全角 ``％３A`` 解码后才是 ``：``）。
     与 :func:`~a2c_smcp.utils.git_url.credential_like_text` **共用同一个轮数上界**
     :data:`~a2c_smcp.utils.git_url._MAX_CREDENTIAL_DECODE_ROUNDS`（只保证终止；覆盖面由判据本身保证）。
     NFKC 是必需的：全角 ``：`` / ``＠`` / ``％３A`` 不归一就判不出来。
@@ -271,14 +275,15 @@ def _has_userinfo_shape(text: str) -> bool:
       只看首个会漏（复审 2🔴）。
     - 用**整条文本**而非逐段：凭据里的字面 ``\\`` / ``/``（``alice:pw/x@example.com``）会把一个 userinfo
       拆成两段，逐段判定同样会漏（复审 3🟡）。
-    - 剥盘符：``C:\\repos\\alice@corp\\x`` 的 ``:`` 是盘符，不是 userinfo 分隔符；不剥会误遮 Windows 路径
-      （架构师点名的负对照）。
+    - 剥盘符 / 设备前缀：``C:\\repos\\alice@corp\\x``、``C:repos\\alice@corp\\x``（drive-relative）、
+      ``\\\\?\\C:\\repos\\...`` / ``\\\\.\\C:\\repos\\...`` 里的 ``:`` 是盘符，不是 userinfo 分隔符；
+      不剥会误遮 Windows 路径（架构师点名的负对照）。
 
     刻意**不用** :func:`~a2c_smcp.utils.git_url.credential_like_text`：该谓词对任意 ``@`` / ``:`` / 残留 ``%``
     都返回 ``True``（``alice@corp``、``100%25done``、``repo@2.git`` 全命中），直接套用会把「普通路径」整条
     遮蔽，打翻负对照。本判据只回答「能不能排除 userinfo」，更窄但可证明。
     """
-    stripped = _WINDOWS_DRIVE_PREFIX_RE.sub("", text)
+    stripped = _WINDOWS_DRIVE_PREFIX_RE.sub("", _WINDOWS_DEVICE_PREFIX_RE.sub("", text))
     colon = stripped.find(":")
     return stripped.rfind("@") > colon >= 0
 
@@ -291,7 +296,7 @@ def sanitize_source_path(path: str) -> str:
     ``source_path`` 是不可信值（``--settings <file>`` 由环境 / 用户给出），且要进报告与日志。规则：
 
     1. **整值 fail-closed**（→ :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`）：原文或任一
-       ``NFKC → percent-decode`` 形态让 :func:`_has_userinfo_shape` 为真。这一条覆盖全部「路径轴原语必漏」
+       ``percent-decode → NFKC`` 形态让 :func:`_has_userinfo_shape` 为真。这一条覆盖全部「路径轴原语必漏」
        的形态（均经复现实测）：
        - 控制 / 方向覆写字符穿插（``alice<U+202E>:pw@…``）——scrub 换空格、escape 造反斜杠段边界；
        - ``#`` / ``?`` 夹在 ``:`` 与 ``@`` 之间（``alice:secret#x@example.com``）——原语把 ``#`` 之后当尾部；
@@ -306,9 +311,14 @@ def sanitize_source_path(path: str) -> str:
 
     :param path: :attr:`SettingsValidationError.source_path`（不可信）。
     """
-    if any(_has_userinfo_shape(form) for form in _decode_chain(path)):
+    # 设备前缀（``\\?\`` / ``\\.\``）剥下来单独处置后拼回：其中的 ``?`` 会被路径轴原语当成 query 起点、
+    # 把后半个路径整段遮蔽——那是原语对 URL 的合理假设，但这里它是 Windows 长路径前缀，不该触发。
+    device = _WINDOWS_DEVICE_PREFIX_RE.match(path)
+    prefix = device.group(0) if device else ""
+    body = path[len(prefix):]
+    if any(_has_userinfo_shape(form) for form in _decode_chain(body)):
         return REDACTED_GIT_SOURCE
-    return sanitize_path_for_diagnostics(scrub_diagnostic_chars(path))
+    return prefix + sanitize_path_for_diagnostics(scrub_diagnostic_chars(body))
 
 
 def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDeclarationError | None:

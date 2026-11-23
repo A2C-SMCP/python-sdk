@@ -173,19 +173,20 @@ SDK 自治差异：
 否则：sanitize_path_for_diagnostics(scrub_diagnostic_chars(path))  ⇒  保留结构
 ```
 
-判据在**原文**与**每一轮 `NFKC → percent-decode`** 形态上各判一次（轮数上界与 #282 的
-`_MAX_CREDENTIAL_DECODE_ROUNDS` 共用同一常量）。三个细节都是复现出来的承重点：
+判据在**原文**与**每一轮 `percent-decode → NFKC`** 形态上各判一次（先解码再归一，全角 `％３A` 解码后
+才是 `：`；轮数上界与 #282 的
+`_MAX_CREDENTIAL_DECODE_ROUNDS` 共用同一常量）。四个细节都是复现出来的承重点：
 
 | 细节 | 为什么必须 | 退化后漏的向量 |
 |------|-----------|---------------|
-| `rfind("@")` 而非 `find` | `alice@corp:pw@example.com` 的首个 `@` 在 `:` 之前 | 该类整组泄漏 |
+| `rfind("@")` 而非 `find` / `find(":")` 而非 `rfind` | `alice@corp:pw@example.com` 的首个 `@` 在 `:` 之前；`alice:pw@host:8080` 的最后一个 `:` 在 `@` 之后 | 两类整组泄漏 |
 | 判**整条文本**而非逐段 | 凭据里的字面 `\` / `/`（`alice:pw/x@example.com`）会把 userinfo 拆成两段 | 段内分隔符类 |
-| 剥 Windows 盘符 | `C:\repos\alice@corp\…` 的 `:` 是盘符、不是 userinfo | Windows 负对照被误遮 |
+| 剥 Windows 设备前缀 + 盘符（含无斜杠的 `C:repos\…`） | 这些 `:` 是盘符、不是 userinfo；`\\?\` 里的 `?` 还会被路径轴原语当 query 起点 | Windows 三类负对照被误遮 |
 | NFKC + 多轮 decode | 全角 `：`/`＠`/`％３A`、四层 `%2525253A` | 全角类、深层编码类 |
 
 这样能覆盖全部「路径轴原语必漏」的形态（均经复现实测）：控制/方向覆写字符穿插、`#`/`?` 夹在 `:` 与 `@`
 之间、段内空白、凭据内字面 `/` 与 `\`、percent-encoded（含编码出的分隔符与前导 `@`）、全角、多层编码。
-**负对照**（同样实测）：Windows `C:\repos\alice@corp\settings.json` 逐字保留、纯 `100%25done` 路径保留、
+**负对照**（同样实测）：Windows `C:\repos\alice@corp\settings.json` / `C:repos\alice@corp\settings.json`（drive-relative）/ `\\?\C:\repos\alice@corp\settings.json` 逐字保留、纯 `100%25done` 路径保留、
 「`@` 在前 `:` 在后」的普通路径（`alice@corp/notes:2024`）保留、`?token=` 尾部仍由路径轴原语遮蔽、
 无 `:`/`@` 关系的控制字符路径仍按字符清洗。
 
