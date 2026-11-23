@@ -29,7 +29,12 @@ from urllib.parse import urlsplit
 from rich.markup import escape
 from rich.table import Table
 
-from a2c_smcp.computer.cli.commands import McpCallbacks, files_only_non_plugin_bundle_ids, flag_value
+from a2c_smcp.computer.cli.commands import (
+    McpCallbacks,
+    files_only_non_plugin_bundle_ids,
+    flag_value,
+    settings_axes_of,
+)
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
 from a2c_smcp.computer.cli.utils import console, console_err
 from a2c_smcp.computer.settings.installer import PluginInstallError, uninstall_plugin
@@ -56,7 +61,7 @@ from a2c_smcp.computer.settings.schema import (
     is_valid_git_url,
     is_valid_marketplace_name,
 )
-from a2c_smcp.computer.settings.scope import SettingsAxes, apply_write, load_settings_file, user_settings_path
+from a2c_smcp.computer.settings.scope import apply_write, load_settings_file, user_settings_path
 from a2c_smcp.computer.settings.store import (
     SettingsLockError,
     atomic_write_json,
@@ -1187,9 +1192,11 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     args = parts[2:]
     registry = comp.skill_registry
     home = comp.skill_home
-    # #296：账本 / trust / settings 使用 **本实例** env（``None`` = ambient，CLI 构造的 Computer 即如此），
-    # 不偷读 ``os.environ``——否则嵌入宿主注入 env 时账本与 settings 视图会混源。
-    env = getattr(comp, "env", None)
+    # #296：**所有**子命令（add/list/info/remove/refresh/migrate/set）的账本 / trust / settings 统一取
+    # 本实例的 settings 轴（`settings_axes_of`，与治理恢复同源；``None`` = ambient）。只在 add 用轴会让
+    # 自定义 factory 的 add 与 list 读写不同账本。
+    axes = settings_axes_of(comp)
+    env = axes.env
 
     async def _confirm(target: str) -> bool:
         prompt = f"⚠ Untrusted source: {target}\n  Trust this source and continue? [y/N]: "
@@ -1204,13 +1211,9 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             console.print("[yellow]usage: marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone][/yellow]")
             return
         name = flag_value(args, "--name")
-        # #296：与治理恢复同源的原始轴（env/cwd/flag/policy），作为**单一来源**——账本 / trust 的 env
-        # 也取 ``axes.env``（而非外侧 ``comp.env``），避免自定义 factory 只实现 axes 时两处混源。
-        # 缺失该方法时退化为「仅 env 轴」（不静默丢弃已注入的 env）。
-        _axes_fn = getattr(comp, "_settings_axes", None)
-        axes = _axes_fn() if callable(_axes_fn) else SettingsAxes(env=env)
+        # #296：两处守卫调用点共用同一组轴（env/cwd/flag/policy；`axes` 已在上方统一取得）。
         code = await marketplace_add(
-            registry, home, axes.env, pos[0],
+            registry, home, env, pos[0],
             name=name, trust="--trust" in args, auto_update="--auto-update" in args,
             no_clone="--no-clone" in args, confirm=_confirm, json_output=json_output,
             cwd=axes.cwd, flag_settings_path=axes.flag_settings_path, policy_settings=axes.policy_settings,

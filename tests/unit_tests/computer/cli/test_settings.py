@@ -178,11 +178,12 @@ def test_show_policy_surfaces_validation_errors(
     home, env = _home(tmp_path), _env(tmp_path)
     capsys.readouterr()
 
-    # 模拟 policy 返回含类型错的 dict：allowedMcpServers 应为 array，这里给 string
-    import a2c_smcp.computer.cli.commands.settings as settings_cmd_mod
+    # 模拟 policy 返回含类型错的 dict：allowedMcpServers 应为 array，这里给 string。
+    # #296：settings 读路径改为函数内惰性导入，patch 目标随之改为 policy 模块属性。
+    import a2c_smcp.computer.settings.policy as policy_mod
 
     monkeypatch.setattr(
-        settings_cmd_mod,
+        policy_mod,
         "resolve_policy_settings",
         lambda **kw: {"allowedMcpServers": "not-a-list", "trustedMarketplaces": ["mp"]},
     )
@@ -206,10 +207,10 @@ def test_show_policy_valid_fields_silent(
     home, env = _home(tmp_path), _env(tmp_path)
     capsys.readouterr()
 
-    import a2c_smcp.computer.cli.commands.settings as settings_cmd_mod
+    import a2c_smcp.computer.settings.policy as policy_mod
 
     monkeypatch.setattr(
-        settings_cmd_mod,
+        policy_mod,
         "resolve_policy_settings",
         lambda **kw: {"allowedMcpServers": ["a"], "trustedMarketplaces": ["mp"]},
     )
@@ -356,6 +357,70 @@ async def test_repl_settings_show_reads_instance_flag_layer(
     await settings_cmd.repl_dispatch(comp, ["settings", "get", "enabledPlugins", "--scope", "flag", "--json"], session=None)
 
     assert json.loads(capsys.readouterr().out) == {"enabledPlugins": {"audit@acme": False}}
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_show_project_and_local_scopes_use_instance_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：``show --scope project|local`` 读**实例 cwd** 的真实文件（进程 cwd 无声明）。"""
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "project"
+    (project / ".tfrobot").mkdir(parents=True)
+    (project / ".tfrobot" / "settings.json").write_text(json.dumps({"projKey": 1}), encoding="utf-8")
+    (project / ".tfrobot" / "settings.local.json").write_text(json.dumps({"localKey": 2}), encoding="utf-8")
+    comp = _FakeComp(tmp_path / "home", cwd=project)
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "project", "--json"], session=None)
+    assert json.loads(capsys.readouterr().out) == {"projKey": 1}
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "local", "--json"], session=None)
+    assert json.loads(capsys.readouterr().out) == {"localKey": 2}
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_show_flag_scope_reads_instance_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：``show --scope flag`` 读**实例** ``--settings`` 文件（与 marketplace 守卫同源）。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    flag = tmp_path / "flag.json"
+    flag.write_text(json.dumps({"fromFlag": True}), encoding="utf-8")
+    comp = _FakeComp(tmp_path / "home", flag_settings_path=flag)
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "flag", "--json"], session=None)
+
+    assert json.loads(capsys.readouterr().out) == {"fromFlag": True}
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_policy_scope_and_merged_use_instance_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：REPL 直接消费 ``axes.policy_settings``（与守卫同一视图），不从 env 重解析。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    # conftest autouse 把 resolver 固定为 {}；若 REPL 丢弃实例 policy，则读不到 True。
+    comp = _FakeComp(tmp_path / "home", policy_settings={"strictKnownMarketplaces": True})
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "policy", "--json"], session=None)
+    assert json.loads(capsys.readouterr().out) == {"strictKnownMarketplaces": True}
+    await settings_cmd.repl_dispatch(
+        comp, ["settings", "get", "strictKnownMarketplaces", "--json"], session=None
+    )
+    assert json.loads(capsys.readouterr().out) == {"strictKnownMarketplaces": True}
+
+
+def test_show_policy_scope_uses_lazy_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：settings 读路径的 policy 解析为**函数内惰性导入**——模块属性 patch 可覆盖（此前顶层导入不可）。"""
+    import a2c_smcp.computer.settings.policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "resolve_policy_settings", lambda **_kw: {"strictKnownMarketplaces": True})
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+    assert settings_cmd.settings_show(_home(tmp_path), env, scope="policy", json_output=True) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"strictKnownMarketplaces": True}
 
 
 def test_edit_subprocess_env_merges_ambient_with_partial_instance(

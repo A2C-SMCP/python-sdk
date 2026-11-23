@@ -58,9 +58,9 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   此前 `intent_reference_pids` 只读 user/project/local，`--settings` flag 层、policy 层与实例 cwd 轴不在视图内
   ⇒「policy/flag 有引用 → `marketplace remove` → 同名不同源 re-add」可绕过 §5.14 的 MUST 拒绝。现在：
   - 非交互 CLI 的**根级** `--settings`（flag 层）参与守卫；policy 层由库层按 `env` 现解析。REPL 的
-    marketplace / settings / plugin 三个分派器统一跟随运行中 Computer 实例的 env / cwd / flag
-    （marketplace 含 cwd / flag / policy 轴；settings 的 `show/get/set/edit` 也读取实例 `--settings` 与
-    实例 cwd），不再各自读 ambient `os.environ` / 进程 cwd。
+    marketplace / settings / plugin 三个分派器统一经 `settings_axes_of(comp)` 跟随运行中 Computer 实例的
+    env / cwd / flag / policy（settings 的 `show/get/set/edit` 也读取实例 `--settings`、实例 cwd 与实例
+    policy），不再各自读 ambient `os.environ` / 进程 cwd。
   - **行为变化**：此前能成功的同名不同源 re-add，在 flag/policy 仍存在引用时现在以 `validation` +
     `reason: dangling-references` 失败（`details` 仍为 `{"name","references","referenceCount"}`，不新增层来源）。
   - **库层默认对齐 rust#300**：`policy_settings=None` 时按 `env` 现解析 ambient policy（`resolve_policy_settings`）
@@ -821,14 +821,19 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   意图注册（`_register_intent_only`）。
 - 新增 `Computer._settings_axes()`（`SettingsAxes` 扁平原始轴），`_resolve_declared_settings` 与 REPL
   marketplace 守卫同源。
-- **REPL 三面同源（marketplace / settings / plugin）**：三个分派器的 env 统一跟随实例 `comp.env`
-  （`None` = ambient）；`settings show/get/set/edit` 的 project/local cwd 与 flag 层、plugin 的
-  project/local `project_path` 也跟随实例 cwd / `--settings`（与 `marketplace` 守卫同源）。仅改
-  `marketplace` 一面会让「`settings set enabledPlugins` 写 ambient、守卫读实例」在注入 env 的
-  `--computer-factory` 宿主里互相看不见，引用可被静默重绑；三面同源后该缺口关闭。
+- **REPL 三面同源（marketplace / settings / plugin）**：统一经 `settings_axes_of(comp)` 取轴（优先
+  `Computer._settings_axes()`，缺失时退化为 env/cwd/flag）——所有 marketplace 子命令（add/list/info/
+  remove/refresh/migrate/set）与 settings 的 `show/get/set/edit` 均用**同一**实例 env；`settings show/get`
+  的 project/local cwd、flag 层与 policy 层也取实例轴（policy 直接消费 `axes.policy_settings`，不再从 env
+  重解析），plugin 的 project/local `project_path` 跟随实例 cwd。仅改 `marketplace` 一面会让
+  「`settings set enabledPlugins` 写 ambient、守卫读实例」在注入 env 的 `--computer-factory` 宿主里互相
+  看不见，引用可被静默重绑；三面同源后该缺口关闭。
 - **子进程环境与 ambient 合并**：实例 env 可为部分映射（只注入 `XDG_CONFIG_HOME` / `HOME` 等）——git 子进程
   （`_git_env`）与 `settings edit` 的 `$EDITOR` 子进程改用 `{**os.environ, **instance_env}`，避免丢
-  `PATH` / `SSH_AUTH_SOCK` / `HTTPS_PROXY` / `EDITOR`；settings 解析仍只用实例 env。
+  `PATH` / `SSH_AUTH_SOCK` / `HTTPS_PROXY` / `EDITOR`；settings 解析仍只用实例 env。合并后**剥除 ambient 的
+  `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` /
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_NAMESPACE`**（实例 env 显式提供才保留），否则会覆盖
+  `git -C` / clone 落点；ambient `GIT_SSH_COMMAND` 缺 `-oBatchMode=yes` 时自动追加，避免挂 tty 等待口令。
 - 引用语义不变：`installedPlugins` ∪ `enabledPlugins` 键、`@<name>` 后缀匹配、true/false 均算、层并集去重；
   不新增错误码。
 

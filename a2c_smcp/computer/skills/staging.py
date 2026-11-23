@@ -813,22 +813,44 @@ def stage_user_skills(
 
 
 # ── marketplace 源 git staging（#61）/ marketplace-source git staging ──────────
+# 仓库定位变量（#296）：宿主导出它们会让 git 无视 argv 里的目标仓库（``git -C <dest>`` / clone 落点），
+# 把 hook 仓库的 HEAD 记成 marketplace commitSha，甚至操作错仓库。实例 env **显式**提供才保留。
+_GIT_REPO_LOCATING_VARS: tuple[str, ...] = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+
+
 def _git_env(env: Mapping[str, str] | None) -> dict[str, str]:
     """
     构造非交互 git 环境 / Build a non-interactive git environment（design §2.2）。
 
-    强制 ``GIT_TERMINAL_PROMPT=0`` + ``GIT_ASKPASS=""`` 禁用凭证交互提示；``GIT_SSH_COMMAND`` 注入
-    ``-oBatchMode=yes`` 让 SSH 在缺凭证时**立即失败**（而非挂起等待密码）——失败后由 :func:`_git_clone_with_fallback`
-    走 SSH→HTTPS 回退。
+    强制 ``GIT_TERMINAL_PROMPT=0`` + ``GIT_ASKPASS=""`` 禁用凭证交互提示；``GIT_SSH_COMMAND`` 确保带
+    ``-oBatchMode=yes`` 让 SSH 在缺凭证时**立即失败**（而非挂起等待密码）——失败后由
+    :func:`_git_clone_with_fallback` 走 SSH→HTTPS 回退。
 
     #296：实例 ``env`` 可能是**部分**映射（只注入 XDG/HOME 等），子进程环境必须与 ambient 合并，否则 git
     丢 ``PATH`` / ``SSH_AUTH_SOCK`` / ``HTTPS_PROXY`` 等；settings 解析仍只使用调用方给的那份 env。
-    基于 ``{**os.environ, **env}`` 派生，不污染调用方环境。
+    合并后**剥除 ambient 的仓库定位变量**（``GIT_DIR`` 等）——除非实例 env 显式提供；否则 ``git -C`` /
+    clone 目标会被 hook 仓库覆盖。基于 ``{**os.environ, **env}`` 派生，不污染调用方环境。
     """
-    base = {**os.environ, **(env or {})}
+    explicit = env or {}
+    base: dict[str, str] = {**os.environ, **explicit}
+    for var in _GIT_REPO_LOCATING_VARS:
+        if var in explicit:
+            base[var] = explicit[var]
+        else:
+            base.pop(var, None)
     base["GIT_TERMINAL_PROMPT"] = "0"
     base["GIT_ASKPASS"] = ""
-    base.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+    # ambient 自带的 GIT_SSH_COMMAND 可能配了 passphrase key 且无 BatchMode → 会挂在 tty 上直到超时。
+    ssh_cmd = base.get("GIT_SSH_COMMAND") or "ssh"
+    if "-oBatchMode=yes" not in ssh_cmd:
+        base["GIT_SSH_COMMAND"] = f"{ssh_cmd} -oBatchMode=yes"
     return base
 
 

@@ -25,6 +25,7 @@ import shutil
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -558,6 +559,22 @@ class _ReplComp:
         self.dirty += 1
 
 
+class _AxesOnlyComp:
+    """自定义 ``--computer-factory`` 形态：只实现 ``_settings_axes()``，**没有** ``.env`` 属性（#296）。"""
+
+    def __init__(self, home: Path, registry: SkillRegistry, axes: SettingsAxes) -> None:
+        self.skill_home = home
+        self.skill_registry = registry
+        self._axes = axes
+        self.dirty = 0
+
+    def _settings_axes(self) -> SettingsAxes:
+        return self._axes
+
+    def mark_skills_dirty(self) -> None:
+        self.dirty += 1
+
+
 class _ReplSession:
     """REPL confirm 最小替身：恒答 y。"""
 
@@ -610,7 +627,7 @@ def _repl_env(tmp_path: Path, home: Path, *, tag: str) -> dict[str, str]:
     return {**os.environ, "A2C_SKILL_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / f"{tag}-cfg")}
 
 
-async def _repl_add_no_clone(comp: _ReplComp) -> int:
+async def _repl_add_no_clone(comp: Any) -> int:
     before = comp.dirty
     await marketplace_mod.repl_dispatch(
         comp,
@@ -763,6 +780,54 @@ async def test_repl_list_reads_trust_from_instance_env(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["name"] == "acme" and payload[0]["trusted"] is True
+
+
+@pytest.mark.asyncio
+async def test_repl_axes_only_factory_list_reads_instance_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：自定义 factory 只实现 ``_settings_axes()``（无 ``.env``）时，list 也读实例 env。
+
+    只把 add 分支改成 axes 会让 list/info/remove 仍读 ambient——同一 REPL 内读写两个账本。
+    """
+    home = _home(tmp_path)
+    save_known_marketplaces(
+        {
+            "version": 1,
+            "marketplaces": {
+                "acme": {
+                    "source": {"type": "git", "url": "https://example.com/acme.git"},
+                    "installLocation": str(home / "marketplace" / "acme"),
+                }
+            },
+        },
+        home=home,
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ambient-cfg"))  # ambient 无 trust
+    instance_env = _repl_env(tmp_path, home, tag="instance")
+    _write_settings_file(instance_env, {"trustedMarketplaces": ["acme"]})
+    comp = _AxesOnlyComp(home, SkillRegistry(), SettingsAxes(env=instance_env, policy_settings={}))
+
+    await marketplace_mod.repl_dispatch(comp, ["marketplace", "list", "--json"], session=_ReplSession())
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["name"] == "acme" and payload[0]["trusted"] is True, "list 必须读实例 env"
+
+
+@pytest.mark.asyncio
+async def test_repl_axes_only_factory_add_reads_instance_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：axes-only factory 的 add 与 list 共用同一实例 env（引用可见 → 同名不同源 re-add 被拒）。"""
+    home = _home(tmp_path)
+    _seed_cached_marketplace(home)  # 账本无 acme（新注册，dangling 判据生效）
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ambient-cfg"))
+    instance_env = _repl_env(tmp_path, home, tag="instance")
+    _write_settings_file(instance_env, {"enabledPlugins": {"audit@acme": False}})
+    comp = _AxesOnlyComp(home, SkillRegistry(), SettingsAxes(env=instance_env, policy_settings={}))
+
+    assert await _repl_add_no_clone(comp) == 0, "add 必须读实例 env（引用可见 → 拒绝）"
+    assert json.loads(capsys.readouterr().out)["reason"] == "dangling-references"
 
 
 @requires_git
@@ -946,6 +1011,7 @@ async def test_stage_unregistered_name_commit_uses_flag_layer_guard(tmp_path: Pa
         reg,
         home,
         env=env,
+        cwd=tmp_path,  # 隔离进程 cwd 的 .tfrobot（单测可并行 / 不污染）
         flag_settings_path=flag,
         policy_settings={},
     )

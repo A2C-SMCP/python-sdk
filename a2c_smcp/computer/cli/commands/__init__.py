@@ -35,7 +35,7 @@ if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodg
     from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
     from a2c_smcp.computer.settings.installer import ExistingBundleIds, NonPluginBundleIds, RegisterServer, RemoveServer
     from a2c_smcp.computer.settings.schema import SettingsValidationError
-    from a2c_smcp.computer.settings.scope import ResolvedSettings
+    from a2c_smcp.computer.settings.scope import ResolvedSettings, SettingsAxes
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +113,28 @@ def files_only_non_plugin_bundle_ids(env: Mapping[str, str] | None = None) -> No
 
 
 # ── 跨命令解析 / 视图接缝（marketplace / skill / plugin / settings 共用）/ shared parse & view seams ──
+def settings_axes_of(comp: Any) -> SettingsAxes:
+    """取 Computer（或同形替身）的 settings 原始轴——**单一来源**（#296）/ Raw settings axes of a Computer-like object.
+
+    优先 ``_settings_axes()``（``Computer`` 提供，含 env/cwd/flag/policy，与治理恢复同源）；自定义
+    ``--computer-factory`` 未实现该方法时退化为 getattr 组合（env / cwd / flag，policy 由消费方按 env 现解析）。
+    REPL 全部分派器（marketplace / settings / plugin）统一经本函数取轴，避免同一 REPL 内 add 与
+    list/info/remove/refresh 读写不同账本。
+    """
+    from a2c_smcp.computer.settings.scope import SettingsAxes
+
+    axes_fn = getattr(comp, "_settings_axes", None)
+    if callable(axes_fn):
+        axes: SettingsAxes = axes_fn()
+        return axes
+    resolve_cwd = getattr(comp, "_resolve_cwd", None)
+    return SettingsAxes(
+        env=getattr(comp, "env", None),
+        cwd=resolve_cwd() if callable(resolve_cwd) else None,
+        flag_settings_path=getattr(comp, "_flag_settings_path", None),
+    )
+
+
 def flag_value(args: list[str], flag: str) -> str | None:
     """取 ``--flag value`` 形态的值（**不支持** ``--flag=value``，REPL 简化）/ Extract a ``--flag value`` pair。
 
@@ -130,6 +152,7 @@ def resolved_settings_with_errors(
     *,
     flag_path: Path | None = None,
     cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> ResolvedSettings:
     """五层合并 settings **连同校验错误**（含 policy first-source-wins；#116 锚 cwd）/ Merged settings **with errors**。
 
@@ -147,7 +170,8 @@ def resolved_settings_with_errors(
         env=env,
         cwd=cwd,
         flag_settings_path=flag_path,
-        policy_settings=resolve_policy_settings(env=env),
+        # #296：显式注入的 policy 视图（REPL 实例轴）优先；``None`` = 按 env 现解析（既有入口行为）。
+        policy_settings=policy_settings if policy_settings is not None else resolve_policy_settings(env=env),
     )
 
 
@@ -156,6 +180,7 @@ def resolved_settings(
     *,
     flag_path: Path | None = None,
     cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
 
@@ -166,7 +191,7 @@ def resolved_settings(
     :func:`resolved_settings_with_errors` + :func:`format_settings_errors`（#157）。
     Drops validation errors; use the ``_with_errors`` variant where diagnostics must surface.
     """
-    return resolved_settings_with_errors(env, flag_path=flag_path, cwd=cwd).settings
+    return resolved_settings_with_errors(env, flag_path=flag_path, cwd=cwd, policy_settings=policy_settings).settings
 
 
 def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[str]:

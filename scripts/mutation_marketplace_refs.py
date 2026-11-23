@@ -43,6 +43,8 @@ CLI_MAIN = "a2c_smcp/computer/cli/main.py"
 T_ID = "tests/unit_tests/computer/skills/test_marketplace_identity.py"
 T_CLI = "tests/unit_tests/computer/cli/test_marketplace.py"
 T_PLUGIN = "tests/unit_tests/computer/cli/test_plugin.py"
+T_SETTINGS = "tests/unit_tests/computer/cli/test_settings.py"
+T_STAGING = "tests/unit_tests/computer/skills/test_staging.py"
 
 
 @dataclass(frozen=True)
@@ -146,9 +148,19 @@ MUTATIONS: tuple[Mutation, ...] = (
         (T_CLI + "::test_cli_root_settings_flag_rejects_no_clone_readd",),
     ),
     Mutation(
-        "M9 marketplace REPL 的守卫/账本 env 偷用 ambient（轴仍实例）",
-        ((MP_CLI, "            registry, home, axes.env, pos[0],", "            registry, home, os.environ, pos[0],"),),
+        "M9 marketplace REPL 全分支环境偷用 ambient（不跟 axes.env）",
+        ((MP_CLI, "    env = axes.env\n", "    env = os.environ\n"),),
         (T_CLI + "::test_repl_add_uses_instance_env_axis",),
+    ),
+    Mutation(
+        "M18 marketplace REPL 只认 comp.env（axes-only factory 混源）",
+        ((MP_CLI, "    env = axes.env\n", '    env = getattr(comp, "env", None)\n'),),
+        (T_CLI + "::test_repl_axes_only_factory_list_reads_instance_env",),
+    ),
+    Mutation(
+        "M18b marketplace REPL add 只认 comp.env（axes-only factory 混源）",
+        ((MP_CLI, "    env = axes.env\n", '    env = getattr(comp, "env", None)\n'),),
+        (T_CLI + "::test_repl_axes_only_factory_add_reads_instance_env",),
     ),
     Mutation(
         "M10 REPL 不传 cwd 轴",
@@ -189,18 +201,12 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "M15 plugin REPL 偷用 ambient os.environ（install 写错 user settings）",
-        ((PLUGIN_CLI, '    env = getattr(comp, "env", None)\n', "    env = os.environ\n"),),
+        ((PLUGIN_CLI, "    env = axes.env\n", "    env = os.environ\n"),),
         (T_PLUGIN + "::test_repl_install_user_scope_uses_instance_env",),
     ),
     Mutation(
         "M16 plugin REPL project_path 退回进程 cwd",
-        (
-            (
-                PLUGIN_CLI,
-                "    project_path = str((_resolve_cwd() if callable(_resolve_cwd) else None) or os.getcwd())",
-                "    project_path = os.getcwd()",
-            ),
-        ),
+        ((PLUGIN_CLI, "    project_path = str(axes.cwd or os.getcwd())", "    project_path = os.getcwd()"),),
         (T_PLUGIN + "::test_repl_install_project_scope_uses_instance_cwd",),
     ),
     Mutation(
@@ -220,6 +226,46 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T_CLI + "::test_stage_unregistered_name_commit_uses_flag_layer_guard",),
+    ),
+    Mutation(
+        "M19 settings REPL 不传实例 cwd",
+        ((SETTINGS_CLI, "    cwd = axes.cwd\n", "    cwd = None\n"),),
+        (T_SETTINGS + "::test_repl_settings_show_project_and_local_scopes_use_instance_cwd",),
+    ),
+    Mutation(
+        "M20 settings REPL 不传实例 flag 层",
+        ((SETTINGS_CLI, "    flag_path = axes.flag_settings_path\n", "    flag_path = None\n"),),
+        (T_SETTINGS + "::test_repl_settings_show_flag_scope_reads_instance_flag",),
+    ),
+    Mutation(
+        "M21 settings REPL 丢弃实例 policy",
+        ((SETTINGS_CLI, "    policy_settings = axes.policy_settings\n", "    policy_settings = None\n"),),
+        (T_SETTINGS + "::test_repl_settings_policy_scope_and_merged_use_instance_policy",),
+    ),
+    Mutation(
+        "M22 settings 读路径忽略 cwd 参数",
+        (
+            (
+                SETTINGS_CLI,
+                """    if scope in ("project", "local"):
+        resolved_cwd = cwd if cwd is not None else Path(os.getcwd())
+        path = (""",
+                """    if scope in ("project", "local"):
+        resolved_cwd = Path(os.getcwd())
+        path = (""",
+            ),
+        ),
+        (T_SETTINGS + "::test_repl_settings_show_project_and_local_scopes_use_instance_cwd",),
+    ),
+    Mutation(
+        "M23 不剥除 ambient GIT_* 仓库定位变量",
+        ((STAGING, "            base.pop(var, None)", "            pass"),),
+        (T_STAGING + "::test_git_env_strips_ambient_repo_locators",),
+    ),
+    Mutation(
+        "M24 不强制 ambient GIT_SSH_COMMAND 的 BatchMode",
+        ((STAGING, '    if "-oBatchMode=yes" not in ssh_cmd:', "    if False:"),),
+        (T_STAGING + "::test_git_env_forces_batch_mode_on_ambient_ssh_command",),
     ),
 )
 
@@ -278,8 +324,11 @@ def check() -> int:
 
 
 def main() -> int:
+    # 每次都先做锚点唯一性校验：源码漂移时立即失败，避免半途 SETUP-FAIL / 误改无关片段。
+    if check() != 0:
+        return 1
     if "--check" in sys.argv[1:]:
-        return check()
+        return 0
     try:
         import pytest  # noqa: F401
     except ImportError:

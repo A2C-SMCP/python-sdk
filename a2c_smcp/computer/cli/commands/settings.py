@@ -28,9 +28,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from a2c_smcp.computer.cli.commands import flag_value, format_settings_errors, resolved_settings_with_errors
+from a2c_smcp.computer.cli.commands import (
+    flag_value,
+    format_settings_errors,
+    resolved_settings_with_errors,
+    settings_axes_of,
+)
 from a2c_smcp.computer.cli.utils import console, console_err
-from a2c_smcp.computer.settings.policy import resolve_policy_settings
 from a2c_smcp.computer.settings.raw import (
     SettingsFileCorruptError,
     read_raw_object,
@@ -44,7 +48,6 @@ from a2c_smcp.computer.settings.schema import (
     validate_settings,
 )
 from a2c_smcp.computer.settings.scope import (
-    SettingsAxes,
     apply_write,
     load_settings_file,
     user_settings_path,
@@ -91,6 +94,7 @@ def _read_scope_with_errors(
     *,
     flag_path: Path | None,
     cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[SettingsValidationError]] | None:
     """读单 scope（或 merged）settings dict **连同校验错误**；scope 非法 → ``None``。project/local 锚 cwd（#116）。
 
@@ -101,7 +105,9 @@ def _read_scope_with_errors(
     Every scope carries its errors out; the callers surface them on stderr.
     """
     if scope == "merged":
-        resolved_st = resolved_settings_with_errors(env, flag_path=flag_path, cwd=cwd)
+        resolved_st = resolved_settings_with_errors(
+            env, flag_path=flag_path, cwd=cwd, policy_settings=policy_settings
+        )
         return resolved_st.settings, list(resolved_st.errors)
     if scope == "user":
         return load_settings_file(user_settings_path(env), SettingsScope.USER)
@@ -123,7 +129,11 @@ def _read_scope_with_errors(
         # 做字段级容错校验（类型错等）。其他 scope 均经 load_settings_file → validate_settings 或
         # resolve_settings 内 validate_settings——policy 不能例外，否则 ``settings show --scope policy``
         # 对 type-error 字段零警告（企业白名单失效 = 安全事故）。对拍 rust 同构缺口（待跟修）。
-        raw = resolve_policy_settings(env=env)
+        # #296：REPL 传入实例 `axes.policy_settings` 时直接消费（与守卫同一视图、避免重复 MDM I/O）；
+        # 惰性导入使测试的 conftest patch 对 CLI 读路径同样生效。
+        from a2c_smcp.computer.settings.policy import resolve_policy_settings
+
+        raw = policy_settings if policy_settings is not None else resolve_policy_settings(env=env)
         return validate_settings(raw, SettingsScope.POLICY)
     return None
 
@@ -145,12 +155,15 @@ def settings_show(
     scope: str = "merged",
     flag_path: Path | None = None,
     cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
     json_output: bool = False,
 ) -> int:
     """展示某 scope 的 settings（默认 merged 合并视图）/ Show settings of a scope (default merged)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path, cwd=cwd)
+    read = _read_scope_with_errors(
+        scope, home, env, flag_path=flag_path, cwd=cwd, policy_settings=policy_settings
+    )
     if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
     data, errors = read
@@ -167,12 +180,15 @@ def settings_get(
     scope: str = "merged",
     flag_path: Path | None = None,
     cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
     json_output: bool = False,
 ) -> int:
     """读取单字段（默认 merged 视图）/ Read a single field (default merged view)。"""
     if scope not in _READABLE:
         return _err(f"unknown scope {scope!r} (expected {'|'.join(_READABLE)})", json_output=json_output)
-    read = _read_scope_with_errors(scope, home, env, flag_path=flag_path, cwd=cwd)
+    read = _read_scope_with_errors(
+        scope, home, env, flag_path=flag_path, cwd=cwd, policy_settings=policy_settings
+    )
     if read is None:  # 防御性：_READABLE 前置拦截后不可达（#116 起 project/local 锚 cwd 恒可读）
         return _err(f"unknown scope {scope!r}", json_output=json_output)
     data, errors = read
@@ -334,23 +350,41 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     sub = parts[1].lower()
     args = parts[2:]
     home = comp.skill_home
-    # #296：与 ``marketplace`` 分派器对齐——env / cwd / flag 一律取 **本实例** 的 settings 轴
-    # （``None`` = ambient / 进程 cwd / 无 flag 层），否则注入 env 或 project_root 的宿主里各面读写不同根。
-    _axes_fn = getattr(comp, "_settings_axes", None)
-    axes = _axes_fn() if callable(_axes_fn) else SettingsAxes(env=getattr(comp, "env", None))
+    # #296：与 ``marketplace`` / ``plugin`` 分派器对齐——env / cwd / flag / policy 一律取 **本实例** 的
+    # settings 轴（``None`` = ambient / 进程 cwd / 无 flag 层 / 按 env 现解析），否则注入 env、project_root
+    # 或自定义 policy 的宿主里各面会读写不同根。
+    axes = settings_axes_of(comp)
     env = axes.env
+    cwd = axes.cwd
+    flag_path = axes.flag_settings_path
+    policy_settings = axes.policy_settings
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     scope = flag_value(args, "--scope")
 
     if sub == "show":
-        settings_show(home, env, scope=scope or "merged", flag_path=axes.flag_settings_path, cwd=axes.cwd, json_output=json_output)
+        settings_show(
+            home,
+            env,
+            scope=scope or "merged",
+            flag_path=flag_path,
+            cwd=cwd,
+            policy_settings=policy_settings,
+            json_output=json_output,
+        )
     elif sub == "get":
         if not pos:
             console.print("[yellow]usage: settings get <key> [--scope user|project|local|flag|policy|merged][/yellow]")
             return
         settings_get(
-            home, env, pos[0], scope=scope or "merged", flag_path=axes.flag_settings_path, cwd=axes.cwd, json_output=json_output
+            home,
+            env,
+            pos[0],
+            scope=scope or "merged",
+            flag_path=flag_path,
+            cwd=cwd,
+            policy_settings=policy_settings,
+            json_output=json_output,
         )
     elif sub == "set":
         if len(pos) < 2:
