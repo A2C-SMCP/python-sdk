@@ -19,7 +19,8 @@ BundleID 缺省生成**跨 SDK 一致性对拍**（P0 硬门槛）/ Cross-SDK co
 方为合规。python 与 rust 逐字节一致是协议 §「MCP Tool 命名与路由（BundleID 模型）」的硬门槛（a2c-smcp-protocol#15）。
 
 **raw 语义（#17 已定）**：connection-identity 取 **raw / 未注入**配置——``${input:*}`` 占位**按字面**参与摘要
-（末 2 条向量钉住此点）。故本文件用字面占位值构造 config；真实注册链的 raw-derive 时机由 Computer
+（#17 补的第 15–16 条 ``${input:*}`` 向量钉住此点；**按序号引用，勿按「末尾」**——后续追加向量会让末条漂移）。
+故本文件用字面占位值构造 config；真实注册链的 raw-derive 时机由 Computer
 ``_arender_and_validate_server`` 在 ``ConfigRender.arender`` **之前**保证（见 Phase 3）。
 """
 
@@ -87,7 +88,8 @@ def test_fixture_integrity() -> None:
         assert {"name", "config", "expected_bundle_id"} <= v.keys()
 
 
-@pytest.mark.parametrize("vec", _VECTORS, ids=[v["expected_bundle_id"] for v in _VECTORS])
+# ids 带序号：不同向量可能产出同一 bundle_id（如 ``a__b`` 与 ``a!!b`` 均 → ``a_b``），仅用 expected 会重名。
+@pytest.mark.parametrize("vec", _VECTORS, ids=[f"{i:02d}-{v['expected_bundle_id']}" for i, v in enumerate(_VECTORS)])
 def test_bundle_id_conformance(vec: dict[str, Any]) -> None:
     """逐字节对拍：resolve_bundle_id(name, config) == expected_bundle_id（与 rust-sdk 一致）。"""
     cfg = _build_config(vec["name"], vec["config"])
