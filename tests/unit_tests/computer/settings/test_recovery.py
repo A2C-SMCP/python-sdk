@@ -1171,6 +1171,7 @@ def test_source_path_keeps_readable_paths() -> None:
         ("/home/alice:pw/x@example.com/settings.json", "pw"),
         # percent-encoded（含编码出的分隔符 / 前导 `@`）
         ("/home/alice:pw%2Fsecret%40example.com/settings.json", "pw"),
+        ("/home/alice:pw%5Csecret%40example.com/settings.json", "pw"),
         ("/home/alice%40corp:pw%40example.com/settings.json", "pw"),
         ("/home/alice%3Apw%40example.com/settings.json", "pw"),
         ("/home/alice%253Apw%2540example.com/settings.json", "pw"),
