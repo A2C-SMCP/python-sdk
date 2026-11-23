@@ -199,6 +199,10 @@ def _shared_subtree_files() -> dict[str, str]:
 
 # ── install 端到端 / end-to-end ──────────────────────────────────────────────
 @requires_git
+async def _noop_remove(_bundle_id: str) -> None:
+    return None
+
+
 async def test_install_end_to_end(tmp_path: Path) -> None:
     """v0.3.0：install 端到端 = 真 clone 物化 + 双账写入，零激活；enable 才点亮 skills + server。"""
     bare = _make_bare(tmp_path, "acme", _plugin_files())
@@ -222,7 +226,10 @@ async def test_install_end_to_end(tmp_path: Path) -> None:
     assert "enabledPlugins" not in settings
 
     # enable：真 staging 注册 skill + 重挂 server（原子点亮）
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
+    await enable_plugin(
+        "audit@acme-skills", reg, home, env=env,
+        existing_bundle_ids=lambda: set(), register_server=_register, remove_server=_noop_remove,
+    )
     assert reg.resolve("audit:lint") is not None
     assert captured == ["figma"]
 
@@ -279,7 +286,10 @@ async def test_uninstall_end_to_end(tmp_path: Path) -> None:
         removed.append(name)
 
     await install_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set())
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
+    await enable_plugin(
+        "audit@acme-skills", reg, home, env=env,
+        existing_bundle_ids=lambda: set(), register_server=_register, remove_server=_noop_remove,
+    )
     install_path = Path(load_installed_plugins(home=home)["plugins"]["audit@acme-skills"][0]["installPath"])
     assert install_path.exists() and reg.resolve("audit:lint") is not None
 
@@ -387,7 +397,10 @@ async def test_install_enable_disable_enable_no_reclone(tmp_path: Path) -> None:
         removed.append(name)
 
     await install_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set())
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
+    await enable_plugin(
+        "audit@acme-skills", reg, home, env=env,
+        existing_bundle_ids=lambda: set(), register_server=_register, remove_server=_noop_remove,
+    )
     assert reg.resolve("audit:lint") is not None
     captured.clear()
     # 哨兵：植入 catalog clone 内 plugin 根，用于检测 enable 是否误重 clone（重 clone 会 wipe）。
@@ -399,7 +412,10 @@ async def test_install_enable_disable_enable_no_reclone(tmp_path: Path) -> None:
     assert reg.is_orphan("audit:lint") and removed == ["figma"]
 
     # enable：复活 skill + 重挂 server，且不重 clone
-    await enable_plugin("audit@acme-skills", reg, home, env=env, existing_bundle_ids=lambda: set(), register_server=_register)
+    await enable_plugin(
+        "audit@acme-skills", reg, home, env=env,
+        existing_bundle_ids=lambda: set(), register_server=_register, remove_server=_noop_remove,
+    )
 
     assert sentinel.exists()  # 未重 clone（哨兵保留 → 复用既有 clone 树）
     assert reg.resolve("audit:lint") is not None  # 孤儿复活

@@ -47,6 +47,7 @@ from a2c_smcp.computer.settings.mcp_config import (
     security_layer_check,
     trust_layer_check,
     upsert_mcp_server,
+    user_mcp_config_path,
 )
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, MACOS_MANAGED_DIR, WINDOWS_MANAGED_DIR
 from a2c_smcp.computer.settings.schema import SettingsScope
@@ -778,3 +779,31 @@ def test_approval_writes_anchor_cwd_no_failfast(tmp_path: Path, monkeypatch: pyt
     assert settings["enabledMcpjsonServers"] == ["figma"]
     assert settings["disabledMcpjsonServers"] == ["sketchy"]
     assert settings["enableAllProjectMcpServers"] is True
+
+
+def test_resolve_mcp_config_validation_error_redacts_input_value(tmp_path: Path) -> None:
+    """#289 终审 🟡4：``SettingsValidationError.reason`` 不得回显 pydantic ``input_value``（settings show 会打它）。"""
+    env = {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+    user_file = user_mcp_config_path(env)
+    user_file.parent.mkdir(parents=True, exist_ok=True)
+    user_file.write_text(
+        json.dumps({"servers": {"leaky": {"type": "streamable-http", "server_parameters": {"url": "SECRET-SETTINGS"}}}}),
+        encoding="utf-8",
+    )
+
+    from pydantic import TypeAdapter, ValidationError
+
+    from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
+
+    with pytest.raises(ValidationError) as raw:
+        TypeAdapter(MCPServerConfig).validate_python(
+            {"name": "leaky", "type": "streamable-http", "server_parameters": {"url": "SECRET-SETTINGS"}},
+        )
+    assert "SECRET-SETTINGS" in str(raw.value)  # 前提：裸文本确实泄露（否则本用例无判别力）
+
+    resolved = resolve_mcp_config(env=env, cwd=tmp_path, managed_mcp_path=tmp_path / "none.json")
+
+    assert "leaky" not in resolved.servers, "畸形 server 被 drop"
+    reasons = [e.reason for e in resolved.errors]
+    assert reasons and all("SECRET-SETTINGS" not in reason for reason in reasons)
+    assert any("validation error(s) in [" in reason for reason in reasons)

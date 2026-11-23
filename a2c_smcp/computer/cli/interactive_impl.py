@@ -22,6 +22,7 @@ from typing import Any, Protocol, TypedDict
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer
 from pydantic import TypeAdapter
+from rich.markup import escape
 
 from a2c_smcp.computer.cli.banner import render_banner
 from a2c_smcp.computer.cli.commands import identity as identity_cmd
@@ -44,6 +45,7 @@ from a2c_smcp.smcp import MCPServerConfig as SMCPServerConfigDict
 from a2c_smcp.smcp import MCPServerInput as SMCPServerInputDict
 from a2c_smcp.smcp import ToolCallReq as SMCPToolCallReq
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.diagnostics import exception_text
 
 # 定义上下文管理器类型
 ContextManager = AbstractContextManager[None]
@@ -80,6 +82,17 @@ def _resolve_or_report(comp: Computer, token: str, *, settings_flag_path: Path |
     except TargetNotFoundError:
         console.print(f"[red]❌ 未找到服务器 '{token}' / Server '{token}' not found[/red]")
     return None
+
+
+def _repl_failure_line(exc: BaseException) -> str:
+    """
+    REPL 分发兜底的 Rich 文案：异常文本**先脱敏再转义** / Sanitized + escaped line for the REPL dispatch fallback.
+
+    #289 终审 🔴：本兜底覆盖 REPL 分发侧**预校验**异常（``server add`` / ``inputs`` 的 wire TypedDict 校验在内层
+    ``try`` 之外）——pydantic ``ValidationError`` 会回显整个 payload（env / options 值）。``escape`` 防 Rich
+    ``MarkupError``（pydantic ``loc`` 可携带用户可控 key，如 ``env.X[/red]``）。
+    """
+    return f"[red]执行失败 / Failed: {escape(exception_text(exc))}[/red]"
 
 
 def _resolve_lifecycle_target(comp: Computer, token: str, *, verb: str, settings_flag_path: Path | None) -> str | None:
@@ -339,7 +352,7 @@ async def interactive_loop(
     try:
         await plugin_cmd.run_governance_remount(comp, settings_flag_path=settings_flag_path)
     except Exception as e:  # pragma: no cover - 重挂失败不阻断进入 REPL
-        console.print(f"[yellow]⚠ 治理重挂失败 / governance remount failed: {e}[/yellow]")
+        console.print(f"[yellow]⚠ 治理重挂失败 / governance remount failed: {escape(exception_text(e))}[/yellow]")
 
     while True:
         try:
@@ -416,7 +429,7 @@ async def interactive_loop(
                         if smcp_client:
                             await smcp_client.emit_update_config()
                     except Exception as e:
-                        console.print(f"[red]❌ 添加/更新服务器失败 / Failed to add/update server: {e}[/red]")
+                        console.print(f"[red]❌ 添加/更新服务器失败 / Failed to add/update server: {escape(exception_text(e))}[/red]")
                 elif sub in {"rm", "remove"}:
                     if len(parts) < 3:
                         console.print("[yellow]用法: server rm <name|bundle_id>[/yellow]")
@@ -452,7 +465,10 @@ async def interactive_loop(
                                         console.print(f"[green]✅ {outcome.bundle_id} 已启动 / started[/green]")
                                     else:
                                         failed += 1
-                                        console.print(f"[red]❌ {outcome.bundle_id} 启动失败: {outcome.error}[/red]")
+                                        console.print(
+                                            f"[red]❌ {escape(outcome.bundle_id)} 启动失败: "
+                                            f"{escape(exception_text(outcome.error))}[/red]",
+                                        )
                                 if failed == 0:
                                     console.print("[green]✅ 所有服务器启动完成 / All servers started[/green]")
                                 else:
@@ -465,7 +481,7 @@ async def interactive_loop(
                                 await comp.mcp_manager.astart_client(bundle_id)
                                 console.print(f"[green]✅ 服务器 '{target}' 启动完成 / Server '{target}' started[/green]")
                     except Exception as e:
-                        console.print(f"[red]❌ 启动服务器失败 / Failed to start server: {e}[/red]")
+                        console.print(f"[red]❌ 启动服务器失败 / Failed to start server: {escape(exception_text(e))}[/red]")
 
             elif cmd == "stop" and len(parts) >= 2:
                 target = parts[1]
@@ -848,4 +864,4 @@ async def interactive_loop(
             else:
                 console.print("[yellow]未知命令 / Unknown command[/yellow]")
         except Exception as e:  # pragma: no cover
-            console.print(f"[red]执行失败 / Failed: {e}[/red]")
+            console.print(_repl_failure_line(e))

@@ -212,6 +212,10 @@ async def test_project_scope_intent_participates_in_conflict(tmp_path: Path) -> 
 
 
 # ── enable 防御：存量双装 fail-closed + 零副作用 ──────────────────────────────
+async def _noop_remove(_bundle_id: str) -> None:
+    return None
+
+
 @pytest.mark.parametrize("target", ["alpha@mp-a", "alpha@mp-b"])
 async def test_enable_rejected_before_side_effects_in_double_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str) -> None:
     """存量双装：enable 任一 pid 都被拒（fail-closed），enabledPlugins / stage / 挂载零副作用。"""
@@ -247,6 +251,7 @@ async def test_enable_rejected_before_side_effects_in_double_install(tmp_path: P
             env=env,
             existing_bundle_ids=lambda: set(),
             register_server=_register,
+            remove_server=_noop_remove,
         )
 
     assert ei.value.error_code == "validation"

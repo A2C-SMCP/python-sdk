@@ -19,12 +19,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -326,7 +328,8 @@ async def test_enable_reads_scope_from_ledger_writes_project_not_user(tmp_path: 
     )
     mcp = _FakeMCP()
     code = await plugin_cmd.plugin_enable(
-        reg, home, env, "audit@acme", existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register,
+        reg, home, env, "audit@acme", existing_bundle_ids=mcp.existing_bundle_ids,
+        register_server=mcp.register, remove_server=mcp.remove,
     )
     assert code == 0
     # enabledPlugins[audit@acme]=true 写 project scope（active workdir），user scope 不动
@@ -547,6 +550,10 @@ class _ReplComp:
         self.injected: list[Any] = []
         self.env = env
         self._cwd = cwd
+        self.declared_servers: dict[str, Any] = {}  # resolve_mcp_declarations 的声明面（#289 测试用）
+
+    def resolve_mcp_declarations(self) -> Any:
+        return SimpleNamespace(servers=self.declared_servers)
 
     def _resolve_cwd(self) -> Path | None:
         return self._cwd
@@ -1055,6 +1062,222 @@ async def test_enable_missing_install_path_exit1_with_recovery_hint(
     assert str(root) in payload["message"]  # 点名死路径
     assert "enabledPlugins is unchanged" in payload["message"]
     assert "marketplace remove acme" in payload["message"] and "plugin install audit@acme" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_enable_prior_true_failure_reports_retained_in_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#289：prior-true 再 enable 失败 → ``--json`` 明示 enabledStateRetained（人读消息同带 retained 后缀），
+    且 `enabledPlugins` 精确保持 true（协议 §2.4 / Discussion#82 裁决 C）。"""
+    monkeypatch.chdir(tmp_path)  # 诊断锚缺省 = runtime cwd；隔离仓库根的 .tfrobot（#289 审查 🟡7）
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(root), "mcpServers": []}]}},
+        home=home,
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    shutil.rmtree(root)  # 预检失败（零写）
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "audit@acme", json_output=True)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "error"  # 无新增 error_code（保留既有契约）
+    assert "existing enabled state retained" in payload["message"]
+    assert payload["enabledStateRetained"] is True
+    assert payload["reason"] == "enable-failed-retained"
+    assert json.loads(user_settings_path(env).read_text(encoding="utf-8"))["enabledPlugins"]["audit@acme"] is True
+
+
+@pytest.mark.asyncio
+async def test_plugin_enable_forwards_diagnostic_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#289 审查 🟡3：``plugin_enable`` 必须把注入的 provider 传给库层（锚点随 scope 记录传给 provider）。"""
+    from a2c_smcp.computer.settings.scope import resolve_settings
+
+    monkeypatch.chdir(tmp_path)
+    home, env, reg = _home(tmp_path), _env(tmp_path), SkillRegistry()
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(root), "mcpServers": []}]}},
+        home=home,
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"], "enabledPlugins": {"audit@acme": True}})
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    shutil.rmtree(root)
+    anchors: list[str | None] = []
+
+    def _provider(anchor: str | None) -> Mapping[str, Any]:
+        anchors.append(anchor)
+        return resolve_settings(env=env, cwd=Path(anchor) if anchor else None).settings
+
+    code = await plugin_cmd.plugin_enable(reg, home, env, "audit@acme", resolved_settings=_provider, json_output=True)
+
+    assert code == plugin_cmd.EXIT_USER_ERROR
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["enabledStateRetained"] is True
+    assert anchors == [None], "user scope 的诊断锚 = None（由 provider 绑定 runtime 缺省）"
+
+
+def test_resolved_settings_provider_of_uses_instance_axes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#289 审查 🟡3：provider 必须取**实例轴**（flag 层可见；None 锚 = 实例 cwd，不是进程 cwd）。"""
+    from a2c_smcp.computer.cli.commands import resolved_settings_provider_of
+    from a2c_smcp.computer.settings.scope import SettingsAxes
+
+    monkeypatch.chdir(tmp_path)  # 进程 cwd = 空白根（无 .tfrobot）
+    instance_cwd = tmp_path / "instance"
+    instance_cwd.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    env = _env(tmp_path)
+    flag = tmp_path / "flag-settings.json"
+    _write_json(user_settings_path(env), {"enabledPlugins": {"audit@acme": True}})
+    # flag 层（高于 project/local）独有 other@acme：证明 provider 取的是**实例轴**而非仅文件三层。
+    _write_json(flag, {"enabledPlugins": {"other@acme": True}})
+    _write_json(workdir_project_settings_path(instance_cwd), {"enabledPlugins": {"audit@acme": False}})
+    _write_json(workdir_project_settings_path(other), {"enabledPlugins": {"audit@acme": True}})
+
+    class _Comp:
+        def _settings_axes(self) -> SettingsAxes:
+            return SettingsAxes(env=env, cwd=instance_cwd, flag_settings_path=flag, policy_settings={})
+
+    provider = resolved_settings_provider_of(_Comp())
+
+    merged = provider(None)
+    assert merged["enabledPlugins"]["other@acme"] is True, "flag 层（实例轴）必须可见"
+    # None 锚 → 实例 cwd 的 project=false 压过 user=true；若错锚进程 cwd（无 project 层）会得到 user 的 true。
+    assert merged["enabledPlugins"]["audit@acme"] is False
+    # 显式锚 → 该路径的 project/local（#289 诊断锚 = 本次操作 path）。
+    assert provider(str(other))["enabledPlugins"]["audit@acme"] is True
+
+
+def test_resolved_settings_provider_of_applies_policy(tmp_path: Path) -> None:
+    """#289 审查 🟡8：policy 层必须进 provider 视图（admin 强停时不得误报 retained）。"""
+    from a2c_smcp.computer.cli.commands import resolved_settings_provider_of
+    from a2c_smcp.computer.settings.scope import SettingsAxes
+
+    env = _env(tmp_path)
+    _write_json(user_settings_path(env), {"enabledPlugins": {"audit@acme": True}})
+
+    class _Comp:
+        def _settings_axes(self) -> SettingsAxes:
+            return SettingsAxes(
+                env=env, cwd=None, flag_settings_path=None,
+                policy_settings={"enabledPlugins": {"audit@acme": False}},
+            )
+
+    merged = resolved_settings_provider_of(_Comp())(None)
+
+    assert merged["enabledPlugins"]["audit@acme"] is False, "policy（最高层）强停必须压过 user=true"
+
+
+def test_build_mcp_callbacks_remove_server_is_runtime_only() -> None:
+    """#289 审查 🟡10：``build_mcp_callbacks.remove_server`` 必须接**运行期** unmount（durable 删除会毁用户声明）。"""
+    from a2c_smcp.computer.cli.commands import build_mcp_callbacks
+
+    class _Comp:
+        mcp_manager = None
+        declared_servers: dict[str, Any] = {}
+
+        def __init__(self) -> None:
+            self.unmounted: list[str] = []
+            self.durable_removed: list[str] = []
+
+        def resolve_mcp_declarations(self) -> Any:
+            return SimpleNamespace(servers=self.declared_servers)
+
+        async def aunmount_server_by_id(self, bundle_id: str) -> None:
+            self.unmounted.append(bundle_id)
+
+        async def aremove_server(self, bundle_id: str) -> None:
+            self.durable_removed.append(bundle_id)  # durable 路径（写 mcp.json）——MUST NOT 被 enable 回滚使用
+
+    comp = _Comp()
+    cbs = build_mcp_callbacks(comp)
+
+    asyncio.run(cbs.remove_server("b1"))
+
+    assert comp.unmounted == ["b1"]
+    assert comp.durable_removed == [], "enable 回滚 STOP 在运行期 unmount；durable 声明不动"
+
+
+def test_one_shot_enable_reads_root_settings_flag_for_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#289 审查 🟡3：一次性 CLI 的根级 ``--settings`` 必须进 retained 判定（flag-only true → 报 retained）。
+
+    直呼 Typer 命令函数（而非 CliRunner）：rich Console 绑定导入期 stdout，CliRunner 捕不到 JSON；
+    函数体正是「根状态 → provider」的接线所在。
+    """
+    import typer
+
+    from a2c_smcp.computer.cli import main as cli_main
+
+    home, env = _home(tmp_path), _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    save_installed_plugins(
+        {"version": 1, "plugins": {"audit@acme": [{"scope": "user", "installPath": str(root), "mcpServers": []}]}},
+        home=home,
+    )
+    _write_json(user_settings_path(env), {"installedPlugins": ["audit@acme"]})  # user 层无 enabled 条目
+    flag = tmp_path / "flag-settings.json"
+    _write_json(flag, {"enabledPlugins": {"audit@acme": True}})  # 有效 enabled 只来自 flag 层
+    monkeypatch.setattr(_STAGE, _fake_stage())
+    monkeypatch.setenv("A2C_SKILL_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", env["XDG_CONFIG_HOME"])
+    shutil.rmtree(root)
+
+    ctx = SimpleNamespace(obj=cli_main._RootState(flag_path=flag))
+    with pytest.raises(typer.Exit) as ei:
+        cli_main._plugin_enable(ctx=ctx, plugin_id="audit@acme", json_output=True)
+
+    assert ei.value.exit_code == 1
+    lines = capsys.readouterr().out.splitlines()
+    # 日志也落在 stdout；``console.print_json`` 是**多行** pretty JSON → 从首个独立的 ``{`` 起整体解析。
+    start = next(i for i, line in enumerate(lines) if line.strip() == "{")
+    payload = json.loads("\n".join(lines[start:]))
+    assert payload["enabledStateRetained"] is True
+    assert payload["reason"] == "enable-failed-retained"
+
+
+@pytest.mark.asyncio
+async def test_repl_enable_passes_instance_axis_provider_and_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#289 审查 🟡3：REPL dispatcher 必须透传 non_plugin_bundle_ids + 实例轴 provider（删掉即红）。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    captured: dict[str, Any] = {}
+
+    async def _fake_enable(registry: Any, home: Any, env: Any, plugin_id: str, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        captured["plugin_id"] = plugin_id
+        return plugin_cmd.EXIT_OK
+
+    monkeypatch.setattr(plugin_cmd, "plugin_enable", _fake_enable)
+    comp = _ReplComp(_home(tmp_path), SkillRegistry(), env={"XDG_CONFIG_HOME": str(tmp_path / "cfg")}, cwd=tmp_path)
+    from mcp import StdioServerParameters
+
+    from a2c_smcp.computer.mcp_clients.model import StdioServerConfig
+
+    comp.declared_servers = {
+        "declared.mcp": SimpleNamespace(
+            config=StdioServerConfig(name="declared.mcp", server_parameters=StdioServerParameters(command="node")),
+        ),
+    }
+
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "enable", "audit@acme"], session=None)
+
+    assert captured["plugin_id"] == "audit@acme"
+    # 两个回调同为 ``Callable[[], set[str]]``，仅断言 callable 无法区分「交叉接错」——按数据源分别断言。
+    assert captured["non_plugin_bundle_ids"]() == {"declared_mcp"}, "must be the declaration surface (origin != plugin)"
+    assert captured["existing_bundle_ids"]() == set(), "must be the runtime mounted set (no servers mounted)"
+    provider = captured["resolved_settings"]
+    assert callable(provider), "实例轴 provider 必须透传"
+    assert isinstance(provider(None), Mapping)
 
 
 @pytest.mark.asyncio

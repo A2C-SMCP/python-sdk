@@ -81,6 +81,7 @@ from a2c_smcp.computer.settings.scope import (
 )
 from a2c_smcp.computer.settings.store import atomic_write_json, file_lock
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.diagnostics import pydantic_error_text
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -261,7 +262,7 @@ def _validate_server(
     try:
         cfg = _MCP_SERVER_ADAPTER.validate_python(body)
     except ValidationError as exc:
-        return None, [_err(scope, fld, f"invalid MCP server config: {exc}", source)]
+        return None, [_err(scope, fld, f"invalid MCP server config: {pydantic_error_text(exc)}", source)]
     # ext 以只读视图承载（frozen dataclass 不冻 dict 内容；下游 #65 只读消费）/ ext as a read-only view.
     server = ResolvedMcpServer(name=name, config=cfg, ext=MappingProxyType(ext), origin=scope, trusted_origin=scope in _TRUSTED_ORIGINS)
     return server, []
@@ -274,7 +275,7 @@ def _validate_input(idef: Any, scope: SettingsScope, source: str | None) -> tupl
     try:
         inp = _MCP_INPUT_ADAPTER.validate_python(idef)
     except ValidationError as exc:
-        return None, [_err(scope, fld, f"invalid input definition: {exc}", source)]
+        return None, [_err(scope, fld, f"invalid input definition: {pydantic_error_text(exc)}", source)]
     return inp, []
 
 

@@ -24,7 +24,7 @@ import typer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids
+from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids, make_settings_provider
 from a2c_smcp.computer.cli.commands import identity as identity_cmd
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
@@ -623,10 +623,23 @@ def _plugin_uninstall(
 
 
 @plugin_app.command("enable")
-def _plugin_enable(plugin_id: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+def _plugin_enable(
+    ctx: typer.Context,
+    plugin_id: str = typer.Argument(...),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
     """启用 plugin（非交互 ledger-only）/ Enable a plugin (ledger-only)."""
+    st = _root_state(ctx)
+    env = os.environ
+    # #289：与非交互 settings 面同源——根级 ``--settings`` 进 flag 层（policy 由共享工厂按 env 现解析）；
+    # 否则 retained 判定会与 ``settings show --scope merged`` / REPL 的实例轴视图分叉。
+    provider = make_settings_provider(env, flag_path=st.flag_path)
+
     code = asyncio.run(
-        plugin_cmd.plugin_enable(SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, json_output=json_output),
+        plugin_cmd.plugin_enable(
+            SkillRegistry(), ensure_skill_home(), env, plugin_id,
+            resolved_settings=provider, json_output=json_output,
+        ),
     )
     raise typer.Exit(code)
 

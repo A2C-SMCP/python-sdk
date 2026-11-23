@@ -362,6 +362,39 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Fixed
 
+- **enable 失败回滚未恢复「操作前状态」，且失败不结构化（#289，对齐 [protocol#83](https://github.com/A2C-SMCP/a2c-smcp-protocol/issues/83) / [Discussion #82](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/82) 裁决 C，镜像 rust-sdk#306）**：
+  `plugin enable` 失败时此前只保证恢复本 scope 的 `enabledPlugins` raw 值，不判定合并视图、不清理 register
+  失败的 server、且 register / staging 阶段的裸异常会以 traceback 逃出 CLI。现按 runtime-contract §2.4 对齐：
+  - **预检失败零写**：被写 scope 的 raw pre-state 保持（absent 不写 `false`、`false` / `true` 精确保持）；
+    有效 prior-true 时既有 skills / server / 能力不动。
+  - **写后失败**：本 scope `enabledPlugins` 精确恢复调用前原值（absent → 删键）；本次 stage 的 SKILL 撤销、
+    操作前既有 orphan / 活跃条目保持 pre-state；只清理**本次 attempt 新挂**的 server（含 register 失败者
+    ——manager 先登记 config 再启动、启动失败不回滚登记，此前会留下「未启用却出现在运行期权威配置集」的
+    半态），按 §4.9.1-2 判据分类（可回收 / 只移除本 plugin 贡献；用户声明与他 plugin 依赖**折叠同档**，与 rust 一致）记日志。
+  - **结构化诊断**：回滚**前 ∧ 回滚后**合并视图（`user < project < local`）均 enabled → 抛
+    `EnableFailedRetainedError`（消息带 `existing enabled state retained`；`--json` 增
+    `enabledStateRetained: true`；`reason` 保留 #296 的源 reason 如 `manifest-name-changed`，源无自有 reason
+    或为通用归一值时给 `enable-failed-retained`）。其余 enable 失败统一为 `PluginInstallError`——裸异常
+    （register / staging 回调、宿主 `existing_bundle_ids` 等）归一时 `--json` 的 `reason` 为
+    **`enable-failed`**（新机读键值）；原异常保留在 `__cause__`，CLI 不再吐裸 traceback。异常文本先脱敏
+    （pydantic `ValidationError` 只报字段/条数，不透出 `input_value`——渲染后配置可能含已解析 secret）。
+  - **顺带修复 enable 挂载失败链路上的既有 secret 日志泄露**（不在本单原始范围，复审发现）：MCP client
+    连接/保活失败日志此前原样输出**渲染后**的 `server_parameters`（`env` / `headers` 值、`command` / `args`、
+    URL 的 userinfo/query/**path 段**都可能含已解析 `${input:secret}`）；`Computer` 渲染/校验失败、boot 初始化
+    失败、治理重挂失败、REPL 启动展示与**分发兜底**（`server add` / `inputs` 预校验）、`settings` 校验错误的
+    `reason`、plugin input 畸形告警、输入 resolver 失败，此前都可能原样带出 pydantic `ValidationError` 的
+    `input_value` / traceback。现统一走新增的 `a2c_smcp.utils.diagnostics`（`loggable_params` fail-closed
+    打码：保留字段名与 args 条数、URL 只留 `scheme://host[:port]`；`pydantic_error_text` / `exception_text`
+    只报字段/条数、自身不抛；REPL 文案另经 rich 转义），各落点均有 caplog / 断言回归锁。连接失败日志同时携带
+    **非 secret 的运行期身份**（bundle_id），避免打码后无法定位 server；DEBUG 级参数渲染改为惰性守卫。
+  - **回滚健壮性加固**：写 `enabledPlugins=true` 若在 `os.replace` 成功后收尾抛错，现无条件 best-effort 恢复
+    raw pre-state 再判定 retained；SKILL 回滚改为**逐条** best-effort（单条失败不放弃其余条目）。
+  - **retained 判定纳入 ambient policy**：库层缺省 provider 在 `user < project < local` 之上加进程级 policy
+    （admin 强停 `enabledPlugins: false` 时不再把「有效 disabled」反向误报成 `enabledStateRetained: true`）；
+    flag 层仍由宿主 / CLI 注入。一次性 CLI 与 REPL 共用 `commands.make_settings_provider`（单一实现，避免
+    #296 同款层组合漂移）。
+  - conformance：`conformance-tests.md` §5 的预检 ①②③ 与写后 ④/④b 四景新增 Python 映射用例（含跨 scope
+    `user=true / project absent` 失败后 bundled server verdict 回 `ENABLED`，并配 project-only `PENDING` 正对照）。
 - **非法 marketplace 声明被静默丢弃（#293）**：`extraKnownMarketplaces` 的声明若不合 schema（漏 scheme、
   `owner/repo` 简写、`source.type` 非 `git`、缺 `source`），`validate_settings` 会把它**整条丢弃**，而
   `Computer` 从不读 `ResolvedSettings.errors` ⇒ 用户把声明 URL 改出 typo 后重启，boot 只看到「无声明」，
@@ -439,6 +472,17 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Changed
 
+- **`enable_plugin` 注入回调成组 + 异常类型统一（#289，嵌入式宿主升级面）**：`register_server` 现要求同时提供
+  `existing_bundle_ids` **与** `remove_server`（写后失败必须能运行期摘除本次 attempt 新挂的 server；无摘除需求
+  请传 no-op），缺任一即 `PluginInstallError`；enable 阶段异常统一为 `PluginInstallError`（此前可能原样抛
+  `RuntimeError` / `SkillSourceError` / 回调自定义异常），按类型捕获的宿主需改捕 `PluginInstallError` 并从
+  `__cause__` 取原始异常。
+- **`enable_plugin` 的 `remove_server` 回调契约收窄为「运行期-only + 覆盖全部 attempt」（#289）**：写后失败时
+  对**本次 attempt** 的全部 server（含 register 失败者）调用，不再只对 §4.9.1-2 判定的可回收者；实现
+  **MUST** 仅做运行期 unmount，**MUST NOT** 删 durable 声明（`mcp.json` / settings / 账本）——用户声明或他
+  plugin 依赖的条目「只移除本 plugin 贡献、不回收条目本身」。仓内参考实现
+  `Computer.aunmount_server_by_id` 本就运行期-only；外部宿主若把该回调接到会删声明的实现，须改用运行期
+  unmount。`disable` / `uninstall` / `gc` 的回收调用语义不变。
 - **`SMCPComputerClient.update_config` 与 `emit_update_config` 收敛为同一实现（#223）**：`update_config`
   此前**无守卫**（无条件发送），与其孪生 `emit_update_config` 行为分叉；现委托后者（同判据、同补发）。
   宿主若曾在「未确认在房」时依赖它把包发上线，请改用其它通道——那个包本来也会被服务端丢弃。

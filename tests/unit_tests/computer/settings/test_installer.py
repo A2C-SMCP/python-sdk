@@ -1221,7 +1221,7 @@ async def test_enable_recovers_skills_and_remounts_servers(tmp_path: Path, monke
 
     await enable_plugin(
         "audit@acme", reg, home, env=env,
-        existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register,
+        existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
     )
 
     settings = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
@@ -1253,7 +1253,7 @@ async def test_enable_dependency_satisfied_reuses_and_succeeds(tmp_path: Path, m
 
     await enable_plugin(
         "audit@acme", SkillRegistry(), home, env=env,
-        existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register,
+        existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
     )
 
     assert mcp.registered == []  # 复用既有实例，MUST NOT 覆盖
@@ -1267,6 +1267,17 @@ async def test_enable_register_without_existing_names_raises(tmp_path: Path) -> 
     mcp = _FakeMCP()
     with pytest.raises(PluginInstallError, match="existing_bundle_ids is required"):
         await enable_plugin("audit@acme", SkillRegistry(), home, env=_env(tmp_path), register_server=mcp.register)
+
+
+async def test_enable_register_without_remove_server_raises(tmp_path: Path) -> None:
+    """护栏：enable 给了 register_server 但缺 remove_server → 抛（否则写后失败无法摘除本次 attempt，§2.4）。"""
+    home = _home(tmp_path)
+    mcp = _FakeMCP()
+    with pytest.raises(PluginInstallError, match="remove_server is required"):
+        await enable_plugin(
+            "audit@acme", SkillRegistry(), home, env=_env(tmp_path),
+            existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register,
+        )
 
 
 async def test_enable_converts_manifest_rename_rejection_to_structured_error(tmp_path: Path, monkeypatch) -> None:
@@ -1297,6 +1308,8 @@ async def test_enable_converts_manifest_rename_rejection_to_structured_error(tmp
     assert err.error_code == "validation"
     assert err.details["reason"] == "manifest-name-changed"
     assert err.details["manifestName"] == "acme-renamed"
+    # #289：转换经统一出口后原异常仍挂在 __cause__（不吞；prior absent → 不包装 retained）
+    assert isinstance(err.__cause__, MarketplaceNameChangeError)
     # 回滚：enabledPlugins 不得留下 True
     settings = json.loads(user_settings_path(env).read_text(encoding="utf-8")) if user_settings_path(env).exists() else {}
     assert (settings.get("enabledPlugins") or {}).get("audit@acme") is not True
