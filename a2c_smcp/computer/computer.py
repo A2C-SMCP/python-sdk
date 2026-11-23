@@ -49,7 +49,7 @@ from mcp.types import (
     TextContent,
     ToolListChangedNotification,
 )
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from a2c_smcp.computer.base import BaseComputer
 from a2c_smcp.computer.blob import (
@@ -144,6 +144,7 @@ from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.cancellation import restores_cancellation
+from a2c_smcp.utils.diagnostics import exception_text
 from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.env_segment import raise_on_env_name_collisions
 from a2c_smcp.utils.logger import get_logger, truncate
@@ -820,7 +821,11 @@ class Computer(BaseComputer[PromptSession]):
             try:
                 raw_cfg = self._validate_raw_shape(server_cfg)
             except Exception as e:
-                logger.error(f"配置校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
+                # #289 终审 🔴：ValidationError 的 str/追溯会回显 input_value（raw 配置可含字面凭据）→ 只报字段/条数。
+                if isinstance(e, ValidationError):
+                    logger.error("配置校验失败: %s - %s", getattr(server_cfg, "name", "unknown"), exception_text(e))
+                else:
+                    logger.error(f"配置校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 形状非法：无法派生 bundle_id 身份 → **跳过挂载**（不连坐上抛，对齐旧「非 InputResolution
                 # 渲染错误容错」精神；解析类错误推迟到实际启动 surface）。
                 continue
@@ -839,13 +844,20 @@ class Computer(BaseComputer[PromptSession]):
 
         try:
             await self.mcp_manager.ainitialize(raw_servers)
-        except Exception:
+        except Exception as e:
             # §5.13：auto-connect 的实际启动在 ainitialize 内 materialize——失败（Missing/InvalidSelection/
             # 连接错误等）时回滚已启动 client，保 #173 retry-safe（下次 boot 重建 manager，无残留）。
-            logger.error(
-                "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients",
-                exc_info=True,
-            )
+            # #289 终审 🔴：被渲染/校验脱敏的 ValidationError 在此**下游**不得再以 exc_info 原样记录。
+            if isinstance(e, ValidationError):
+                logger.error(
+                    "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients: %s",
+                    exception_text(e),
+                )
+            else:
+                logger.error(
+                    "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients",
+                    exc_info=True,
+                )
             await self.mcp_manager.aclose()
             raise
 
@@ -1508,7 +1520,12 @@ class Computer(BaseComputer[PromptSession]):
             )
         except Exception as e:
             name = (server.get("name") if isinstance(server, dict) else getattr(server, "name", "unknown")) or "unknown"
-            logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
+            if isinstance(e, ValidationError):
+                # #289 审查 🔴2：pydantic 的 str/追溯都会回显 `input_value`——此处校验的是**渲染后**配置
+                # （`${input:secret}` 已解析），原样落 ERROR 日志即泄密。只报字段/条数，且不带 traceback。
+                logger.error("动态渲染/校验MCP配置失败: %s - %s", name, exception_text(e))
+            else:
+                logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
             raise e
 
     # ════════════════════════════════════════════════════════════════════════════
@@ -2607,11 +2624,12 @@ class Computer(BaseComputer[PromptSession]):
                 # 统一收在循环之后，故治理校验 / input 注入 / 挂载全部完成后才批量启动。
                 await register_server(record.config, record)
             except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
+                # #289 终审 🔴：register 链上的渲染/校验失败可能是 ValidationError（input_value 含已解析 secret）→ 安全文本。
                 logger.warning(
                     "governance recovery: failed to remount bundled server %r (plugin %s): %s",
                     bundle_id,
                     record.plugin_id,
-                    e,
+                    exception_text(e),
                 )
                 continue
             existing.add(bundle_id)
@@ -2633,7 +2651,7 @@ class Computer(BaseComputer[PromptSession]):
                         "governance recovery: remounted server %r failed to start "
                         "(non-blocking; stays pending): %s",
                         outcome.bundle_id,
-                        outcome.error,
+                        exception_text(outcome.error),
                     )
         return report
 

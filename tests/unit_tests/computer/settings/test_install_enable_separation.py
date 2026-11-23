@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from a2c_smcp.computer.settings.installer import (
+    EnableFailedRetainedError,
     PluginInstallError,
     enable_plugin,
     install_plugin,
@@ -170,10 +171,13 @@ class _FakeMCP:
         return set(self.existing)
 
     async def register(self, cfg) -> None:
+        bundle_id = resolve_bundle_id(cfg)
         if self.fail_on is not None and cfg.name == self.fail_on:
+            # #289：模拟生产残留——manager 先登记 `_servers_config` 再启动，启动失败不回滚登记。
+            self.existing.add(bundle_id)
             raise RuntimeError(f"register {cfg.name} boom")
-        self.registered.append(resolve_bundle_id(cfg))
-        self.existing.add(resolve_bundle_id(cfg))
+        self.registered.append(bundle_id)
+        self.existing.add(bundle_id)
 
     async def remove(self, bundle_id: str) -> None:
         self.removed.append(bundle_id)
@@ -274,15 +278,18 @@ async def test_enable_mount_failure_rolls_back_to_installed_disabled(tmp_path: P
     mcp.fail_on = "beta"
     reg = SkillRegistry()
 
-    with pytest.raises(RuntimeError, match="beta"):
+    with pytest.raises(PluginInstallError, match="beta") as ei:
         await enable_plugin(
             _PID, reg, home, env=env,
             existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
+    # #289：非 PluginInstallError 的 enable 失败归一为结构化错误，原异常经 __cause__ 保留（不吞）。
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert not isinstance(ei.value, EnableFailedRetainedError)  # prior absent → 不得报 retained
     settings = _read_user_settings(env)
     assert _PID not in settings.get("enabledPlugins", {})  # 原 absent → 回滚删键
-    assert mcp.removed == ["alpha"]  # 已挂 alpha 撤销
+    assert mcp.removed == ["alpha", "beta"]  # 已挂 alpha 撤销 + 失败者 beta 登记残留清理
     assert reg.resolve("audit:lint") is None  # 本次 stage 的 skill 撤销
     assert settings.get("installedPlugins") == [_PID]  # installation 保留
 
@@ -299,12 +306,13 @@ async def test_enable_mount_failure_restores_previous_false(tmp_path: Path, monk
     mcp = _FakeMCP()
     mcp.fail_on = FIGMA_NAME
 
-    with pytest.raises(RuntimeError, match="figma"):
+    with pytest.raises(PluginInstallError, match="figma") as ei:
         await enable_plugin(
             _PID, SkillRegistry(), home, env=env,
             existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
+    assert not isinstance(ei.value, EnableFailedRetainedError)
     assert _read_user_settings(env)["enabledPlugins"][_PID] is False
 
 
@@ -576,7 +584,7 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monkeypatch) -> None:
-    """🟡#6：enable 失败且原值为显式 true（重复 enable / 另一 scope 已启用）→ 恢复 true，不误删。"""
+    """🟡#6 / #289 裁决 C：enable 失败且原值为显式 true → 保持 true，并明示「既有启用状态已保留」。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
     root = _setup_catalog(home, "acme", "audit", servers=["alpha", "beta"], skills=["lint"])
@@ -586,12 +594,17 @@ async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monke
     mcp = _FakeMCP()
     mcp.fail_on = "beta"
 
-    with pytest.raises(RuntimeError, match="beta"):
+    with pytest.raises(EnableFailedRetainedError, match="beta") as ei:
         await enable_plugin(
             _PID, SkillRegistry(), home, env=env,
             existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
+    assert "existing enabled state retained" in str(ei.value)
+    assert ei.value.details["enabledStateRetained"] is True
+    # 裸异常归一值 enable-failed 在 retained 语境下升级为专用码（否则按 reason 筛 retained 会漏这一半）
+    assert ei.value.details["reason"] == "enable-failed-retained"
+    assert isinstance(ei.value.__cause__, RuntimeError)
     assert _read_user_settings(env)["enabledPlugins"][_PID] is True
 
 
@@ -1420,6 +1433,8 @@ async def test_enable_staging_zero_registration_restore_write_failure_warns(
         installer_mod.logger.removeHandler(caplog.handler)
 
     assert writes == [True, None]  # 回滚确实尝试过恢复（prev absent → None）
+    # #289：回滚前 effective=false（prior absent）→ 即便回滚写失败留下 true，也不得包装成「既有状态已保留」
+    assert not isinstance(ei.value, EnableFailedRetainedError)
     assert "failed to restore enabledPlugins" in caplog.text  # best-effort 失败只告警
     assert "no space left on device" in caplog.text  # 原因入日志
     assert "staging registered none" in str(ei.value)  # 原异常未被 OSError 顶替
@@ -1499,7 +1514,7 @@ async def test_enable_bundle_id_identity_collapse_within_record_fails(tmp_path: 
 
     message = str(ei.value)
     assert ei.value.error_code == "validation"
-    assert ei.value.details == {"bundleId": "shared"}
+    assert ei.value.details == {"bundleId": "shared", "reason": "enable-failed"}  # 非 retained 出口补默认机读 reason
     assert "conflictWith" not in ei.value.details  # 该键专属 `<plugin>@<marketplace>` pid，不得混入 bundle_id
     assert "collapses distinct identities under the same install root" in message
     assert "different configs under the same install root" in message
@@ -1513,14 +1528,14 @@ async def test_enable_bundle_id_identity_collapse_within_record_fails(tmp_path: 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prior", [None, False], ids=["absent", "explicit-false"])
+@pytest.mark.parametrize("prior", [None, False, True], ids=["absent", "explicit-false", "prior-true"])
 async def test_enable_bundle_id_identity_collapse_across_roots_fails(
     tmp_path: Path, monkeypatch, prior: bool | None
 ) -> None:
-    """#259 复审 🟡1 + #271：异安装根的同 bundle_id（即使配置相同）也是身份坍缩 → 硬错，不静默首胜。
+    """#259 复审 🟡1 + #271 + #289：异安装根的同 bundle_id（即使配置相同）也是身份坍缩 → 硬错，不静默首胜。
 
-    #271 补齐与同记录兄弟用例对称的断言，并覆盖原始 ``enabledPlugins`` 的两档非 true 取值
-    ——prior-true 的回落语义另案 #289，本用例刻意不钉死。
+    #289 补 prior-true 档：预检零写 → key 保持 true，且诊断经 ``EnableFailedRetainedError`` 明示保留，
+    ``error_code`` / ``bundleId`` 原样透出（#296 的 reason/error_code 契约不受 retained 包装破坏）。
     """
     home = _home(tmp_path)
     env = _env(tmp_path)
@@ -1546,7 +1561,14 @@ async def test_enable_bundle_id_identity_collapse_across_roots_fails(
 
     message = str(ei.value)
     assert ei.value.error_code == "validation"
-    assert ei.value.details == {"bundleId": FIGMA_BID}
+    expected_details: dict = {"bundleId": FIGMA_BID, "reason": "enable-failed"}
+    if prior is True:
+        assert isinstance(ei.value, EnableFailedRetainedError)
+        assert "existing enabled state retained" in message
+        expected_details = {"bundleId": FIGMA_BID, "reason": "enable-failed-retained", "enabledStateRetained": True}
+    else:
+        assert not isinstance(ei.value, EnableFailedRetainedError)
+    assert ei.value.details == expected_details
     assert "conflictWith" not in ei.value.details
     assert "collapses distinct identities" in message
     assert str(root_a) in message and str(root_b) in message
@@ -1555,7 +1577,7 @@ async def test_enable_bundle_id_identity_collapse_across_roots_fails(
     if prior is None:
         assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
     else:
-        assert _read_user_settings(env)["enabledPlugins"][_PID] is False
+        assert _read_user_settings(env)["enabledPlugins"][_PID] is prior
 
 
 @pytest.mark.asyncio

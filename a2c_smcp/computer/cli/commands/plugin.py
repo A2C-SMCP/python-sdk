@@ -16,9 +16,10 @@ gc。MCP 注入回调（``existing_bundle_ids`` / ``register_server`` / ``remove
 REPL dispatcher 从活跃 ``Computer`` 装配后注入；Typer 非交互无 live Computer → 传 ``None``。
 
 **v0.3.0 语义（#123）**：``plugin install`` 只安装**不激活**（不挂 server、不投影 skills → ``installed_disabled``；
-仅传 ``existing_bundle_ids`` 做依赖预检）；``plugin enable`` 才原子点亮 skills + bundled server（挂载失败
-回滚 ``installed_disabled``，故 enable 也注入 ``remove_server``）。``plugin list`` 默认列出**全部已安装**
-（enabled 列呈现两态；install 后必须可见）。
+仅传 ``existing_bundle_ids`` 做依赖预检）；``plugin enable`` 才原子点亮 skills + bundled server（失败按协议 §2.4
+恢复**操作前状态**——预检零写、写后 raw 精确恢复 + 本次 attempt server 清理，可能保留既有 enabled 状态并给出
+retained 诊断；故 enable 注入 ``remove_server``）。``plugin list`` 默认列出**全部已安装**（enabled 列呈现两态；
+install 后必须可见）。
 
 **plugin 实时挂载 D2 上下文渲染（#69 Group A，§9.3 D2）**：plugin 的 ``mcp-servers/inputs.json`` 入池时 id
 前缀化为 ``<plugin>@<marketplace>/<id>``；enable 挂载 bundled server 时，``_plugin_register_cb`` 携
@@ -48,6 +49,7 @@ from a2c_smcp.computer.cli.commands import (
     flag_value,
     format_settings_errors,
     resolved_settings,
+    resolved_settings_provider_of,
     resolved_settings_with_errors,
     settings_axes_of,
 )
@@ -62,6 +64,7 @@ from a2c_smcp.computer.settings.installer import (
     PluginInstallError,
     RegisterServer,
     RemoveServer,
+    ResolvedSettingsProvider,
     disable_plugin,
     enable_plugin,
     install_plugin,
@@ -95,6 +98,7 @@ from a2c_smcp.computer.settings.schema import SettingsScope
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.diagnostics import exception_text
 from a2c_smcp.utils.env_segment import detect_env_name_collisions
 from a2c_smcp.utils.logger import get_logger
 
@@ -130,6 +134,9 @@ def _plugin_error(e: PluginInstallError, *, json_output: bool) -> int:
     ``error_code`` / ``details`` 由 installer 侧按需填写：跨 marketplace 同名冲突 = ``validation`` +
     ``conflictWith``（``<plugin>@<marketplace>``），身份坍缩 = ``validation`` + ``bundleId``（裸 bundle_id，
     #271）；未填写时 payload 仍是 ``{"error": "error", ...}``，既有契约不变（#257）。
+    #289 的 :class:`~a2c_smcp.computer.settings.installer.EnableFailedRetainedError` 是
+    ``PluginInstallError`` 子类且**继承**源的 ``error_code`` / ``details``，故无需剥壳——retained 的
+    ``enabledStateRetained: true`` 与源 ``reason`` 都自然进 ``--json`` payload。
     保留键先被过滤，再统一委托 :func:`_err`（决策 4：不另起一套 payload/退出码渲染）。
     """
     details = {key: value for key, value in e.details.items() if key not in _RESERVED_DETAIL_KEYS}
@@ -445,13 +452,21 @@ async def plugin_enable(
     register_server: RegisterServer | None = None,
     remove_server: RemoveServer | None = None,
     inject_inputs: InjectInputs | None = None,
+    non_plugin_bundle_ids: NonPluginBundleIds | None = None,
+    resolved_settings: ResolvedSettingsProvider | None = None,
     json_output: bool = False,
 ) -> int:
-    """启用单个 plugin（**原子激活**：skills 与 bundled server 一并点亮，失败回滚 installed_disabled）/ Enable。
+    """启用单个 plugin（**原子激活**：skills 与 bundled server 一并点亮，失败恢复操作前状态）/ Enable。
 
     **scope 契约**（installer §4.3）：从 ledger 逐 scope 读安装 scope 传入，绝不默认 ``user``，否则写错层、与 live
     态背离。多 scope 记录 → 逐 scope enable。挂载前先经 ``inject_inputs`` 把 plugin-scoped inputs 注入池（#69 Group A）；
-    ``remove_server`` 供挂载失败时回滚摘除本次新增 server（v0.3.0 §2.4 enable 原子性）。
+    ``remove_server`` 供写后失败时回滚停摘**本次 attempt 的全部** server（含 register 失败者；契约 = 运行期-only，
+    不删 durable 声明，见 :data:`~a2c_smcp.computer.settings.installer.RemoveServer`）。
+
+    **#289 失败诊断**：``non_plugin_bundle_ids`` / ``resolved_settings`` 透传给 :func:`enable_plugin`——
+    前者给本次 attempt 的 §4.9.1-2 分类，后者给 retained 判定（REPL 传实例轴 provider；一次性 CLI 经根级
+    ``--settings`` 传 flag 感知 provider；测试可省略）。retained 的 ``enabledStateRetained`` / ``reason`` 经
+    :func:`_plugin_error` 自然进 ``--json`` payload。
 
     「依赖已满足」提示 **MUST 在 enable 之前算**（协议 §2.5-1）：enable 会挂载未满足的依赖、改变活跃集，
     事后再算就分不清「本来就有」与「刚被自己挂上」——这与 install 路径（不挂载、事后算等价）不同。
@@ -459,7 +474,11 @@ async def plugin_enable(
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed (install it first)", json_output=json_output)
-    satisfied = _satisfied_deps(sorted({s for r in records for s in (r.get("mcpServers") or [])}), existing_bundle_ids)
+    try:
+        satisfied = _satisfied_deps(sorted({s for r in records for s in (r.get("mcpServers") or [])}), existing_bundle_ids)
+    except Exception as e:  # noqa: BLE001 - 纯提示性信息，宿主回调失败不得阻断 enable（#289 审查 🟡5）
+        logger.debug("plugin enable: cannot compute satisfied dependencies: %s", exception_text(e))
+        satisfied = []
     try:
         for rec in records:
             install_path = rec.get("installPath")
@@ -469,6 +488,7 @@ async def plugin_enable(
                 plugin_id, registry, home,
                 scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env,
                 existing_bundle_ids=existing_bundle_ids, register_server=register_server, remove_server=remove_server,
+                non_plugin_bundle_ids=non_plugin_bundle_ids, resolved_settings=resolved_settings,
             )
     except PluginInstallError as e:
         return _plugin_error(e, json_output=json_output)
@@ -925,6 +945,9 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             register_server=_plugin_register_cb(comp, plugin, marketplace),
             remove_server=cbs.remove_server,  # enable 失败回滚摘除本次新增 server（v0.3.0 原子性）
             inject_inputs=_plugin_inject_inputs_cb(comp, plugin, marketplace),
+            # #289：attempt 的 §4.9.1-2 分类 + retained 诊断（实例轴、flag/policy 感知）
+            non_plugin_bundle_ids=cbs.non_plugin_bundle_ids,
+            resolved_settings=resolved_settings_provider_of(comp),
             json_output=json_output,
         )
         if code == EXIT_OK:

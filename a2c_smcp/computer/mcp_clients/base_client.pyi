@@ -47,6 +47,7 @@ class MCPServerNotFoundError(Exception): ...
 
 class BaseMCPClient(ABC, Generic[ParamsT]):
     params: ParamsT
+    log_label: str
     _aexit_stack: AsyncExitStack
     machine: A2CAsyncMachine
     _async_session: ClientSession | None

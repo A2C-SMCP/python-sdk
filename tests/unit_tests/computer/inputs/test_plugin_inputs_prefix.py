@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from a2c_smcp.computer.inputs.plugin_pool import load_plugin_inputs, prefix_input_id
 
 
@@ -73,3 +75,30 @@ def test_two_plugins_same_id_no_collision(tmp_path: Path) -> None:
     assert a[0].id == "a@mp/token"
     assert b[0].id == "b@mp/token"
     assert a[0].id != b[0].id
+
+
+def test_plugin_input_validation_warning_redacts_input_value(tmp_path: Path, caplog) -> None:
+    """#289 终审 🟡4：畸形 input 定义的 WARN 不得回显 pydantic ``input_value``（旧 options 值可能是凭据）。"""
+    import logging
+
+    from pydantic import TypeAdapter, ValidationError
+
+    from a2c_smcp.computer.inputs import plugin_pool as plugin_pool_mod
+    from a2c_smcp.computer.mcp_clients.model import MCPServerInput
+
+    payload = {"id": "x", "type": "pickString", "options": ["SECRET-OPTION"]}
+    with pytest.raises(ValidationError) as raw:
+        TypeAdapter(MCPServerInput).validate_python(payload)
+    assert "SECRET-OPTION" in str(raw.value)  # 前提：裸文本确实泄露（否则本用例无判别力）
+
+    f = _write(tmp_path / "inputs.json", {"inputs": [payload]})
+    plugin_pool_mod.logger.addHandler(caplog.handler)
+    caplog.set_level(logging.WARNING, logger=plugin_pool_mod.logger.name)
+    try:
+        assert load_plugin_inputs(f, "p", "mp") == []
+    finally:
+        plugin_pool_mod.logger.removeHandler(caplog.handler)
+
+    assert "plugin input 定义畸形" in caplog.text
+    assert "SECRET-OPTION" not in caplog.text
+    assert "validation error(s) in [" in caplog.text

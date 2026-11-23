@@ -23,7 +23,7 @@ so they unit-test in isolation. Only the cross-command seam lives here: :func:`b
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,7 +54,8 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
 
     - ``existing_bundle_ids``：当前**运行期活跃** server 的 bundle_id 集（依赖预检用）；
     - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / 治理重挂用）；
-    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 回收用）；
+    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 按 §4.9.1-2 回收；enable
+      写后失败对**本次 attempt 全部** server 调用，含 register 失败者）。实现只做运行期 unmount，不删 durable 声明；
     - ``non_plugin_bundle_ids``：**声明面**中 ``origin != plugin`` 的 bundle_id 集（§4.9.1-2 回收判据的
       「X 非用户声明」项，#164）——与 ``existing_bundle_ids`` **判然不同**，勿混用：前者是「谁被声明了（且非 plugin
       带入）」，后者是「谁挂起来了」。协议**明禁**用裸活跃集判回收（无 origin ⇒ flag/embed/plugin 三条挂载路径
@@ -132,6 +133,46 @@ def settings_axes_of(comp: Any) -> SettingsAxes:
         env=getattr(comp, "env", None),
         cwd=resolve_cwd() if callable(resolve_cwd) else None,
         flag_settings_path=getattr(comp, "_flag_settings_path", None),
+    )
+
+
+def make_settings_provider(
+    env: Mapping[str, str] | None,
+    *,
+    flag_path: Path | None = None,
+    cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
+) -> Callable[[str | None], Mapping[str, Any]]:
+    """
+    #289：enable 失败诊断的合并 settings provider 工厂（单一实现，REPL / 一次性 CLI 共用）/ Shared diagnostic provider.
+
+    ``enable_plugin`` 用它在写前与回滚写后各现算一次合并视图，判定「回滚前后是否均 enabled」并给出 retained
+    诊断。参数 = **诊断锚点**（本次操作 scope 的 project/local 路径；``None`` = user scope 操作 → ``cwd``，
+    REPL 传实例 cwd、一次性 CLI 传进程 cwd）。与写锚（settings 文件路径）分离；provider 只读，不驱动任何
+    破坏性动作。``policy_settings=None`` = 按 env 现解析（:func:`resolved_settings` 既有语义）。
+    """
+
+    def _provider(anchor: str | None) -> Mapping[str, Any]:
+        return resolved_settings(
+            env,
+            flag_path=flag_path,
+            cwd=Path(anchor) if anchor else cwd,
+            policy_settings=policy_settings,
+        )
+
+    return _provider
+
+
+def resolved_settings_provider_of(comp: Any) -> Callable[[str | None], Mapping[str, Any]]:
+    """
+    #289：enable 失败诊断 provider（**实例轴**，flag/policy 感知）/ Instance-axis diagnostic provider.
+
+    与 :func:`settings_axes_of` 同源（#296）：REPL 的 marketplace / settings / plugin 各面必须看到同一五层视图。
+    层组合统一委托 :func:`make_settings_provider`（勿在此另写副本）。
+    """
+    axes = settings_axes_of(comp)
+    return make_settings_provider(
+        axes.env, flag_path=axes.flag_settings_path, cwd=axes.cwd, policy_settings=axes.policy_settings,
     )
 
 

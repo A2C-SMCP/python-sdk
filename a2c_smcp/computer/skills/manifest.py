@@ -47,11 +47,8 @@ from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT, safe_exception_text
-from a2c_smcp.utils.git_url import (
-    escape_unsafe_chars,
-    redact_git_urls_in_text,
-    sanitize_path_for_diagnostics,
-)
+from a2c_smcp.utils.diagnostics import pydantic_error_text
+from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -344,15 +341,10 @@ def parse_bundled_server(path: Path) -> MCPServerConfig:
     try:
         cfg = _MCP_SERVER_ADAPTER.validate_python(data)
     except ValidationError as e:
-        # #263 复审：pydantic 默认 str 会带 `input_value=…`（env / headers 里可能是 token）→ 只报字段与条数。
-        details = e.errors(include_input=False, include_url=False)
-        fields = ", ".join(
-            f"{escape_unsafe_chars('.'.join(str(part) for part in err.get('loc', ())) or '<root>')}:{err.get('type', 'invalid')}"
-            for err in details
-        )
+        # #263 复审 / #289：pydantic 默认 str 带 `input_value=…`（env / headers 里可能是 token）→ 由共享
+        # 安全出口只报字段与条数（单一权威，勿在本处另写副本）。
         raise PluginManifestError(
-            f"invalid MCP server config at {sanitize_path_for_diagnostics(str(path))}: "
-            f"{len(details)} validation error(s) in [{fields}]"
+            f"invalid MCP server config at {sanitize_path_for_diagnostics(str(path))}: {pydantic_error_text(e)}"
         ) from e
     if cfg.name != path.stem:
         raise PluginManifestError(

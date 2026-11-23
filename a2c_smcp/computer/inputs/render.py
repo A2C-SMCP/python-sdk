@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from a2c_smcp.computer.inputs.resolver import InputResolutionError
+from a2c_smcp.utils.diagnostics import exception_text
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("computer")
@@ -164,7 +165,8 @@ class ConfigRender:
                 # 之前显式放行，否则会被其吞成字面保留。
                 raise
             except Exception as e:  # pragma: no cover
-                logger.error(f"解析输入失败: {input_id}, 错误: {e}", exc_info=True)
+                # #289 终审 🟡9：自定义 resolver 的异常消息可能携带输入值 → 安全文本，且不附 raw traceback。
+                logger.error("解析输入失败: %s, 错误: %s", input_id, exception_text(e))
                 return False, None
         if token.startswith("env:"):
             var = token[len("env:") :]
