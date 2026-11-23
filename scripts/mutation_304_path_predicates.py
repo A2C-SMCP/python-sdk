@@ -4,9 +4,10 @@
 #304 item 3 settings 路径判据（readRoots 单一判据 / landingRoot trim）的**可复现变异矩阵**（dev-only，不进 CI）。
 
 背景：验收要求「加回 `_is_absolute_path` / 去 trim / trim 用 `str.strip()` / 谓词合并 / 去 normalize /
-委托写死平台 / 运行期忽略平台 / 运行期接线写死平台（posix 与 windows 两向）」各轴都必须让定向用例
-转红。本脚本把每个不变量逐个注入为 mutation，运行对应定向用例，断言必须转红（KILLED）。全部 mutation
-在 ``try/finally`` 内应用与还原，任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
+委托写死平台 / 运行期忽略平台 / 运行期接线写死平台（posix 与 windows 两向）/ 拒绝集不绝对化
+（landingRoot 与候选两向）/ readRoots 不去重」各轴都必须让定向用例转红。本脚本把每个不变量逐个
+注入为 mutation，运行对应定向用例，断言必须转红（KILLED）。全部 mutation 在 ``try/finally`` 内应用
+与还原，任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
 
 运行（不要用 ``uv run``，避免在 worktree 内重建环境；本脚本会临时改写源码，勿与编辑/并发 run 同时进行）::
 
@@ -39,6 +40,7 @@ COMPUTER = "a2c_smcp/computer/computer.py"
 
 T_READ_ROOTS = "tests/unit_tests/computer/settings/test_read_roots.py"
 T_SCHEMA = "tests/unit_tests/computer/settings/test_schema.py"
+T_PATH_RESOLVER = "tests/unit_tests/computer/blob/test_path_resolver.py"
 
 _NORMALIZE_CALL = "        try:\n            normalize_path(item, platform)\n"
 _TRIM_CALL = "    trimmed = _trim_like_rust(value)\n"
@@ -171,6 +173,40 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T_READ_ROOTS + "::test_read_roots_runtime_wiring_uses_host_platform",),
+    ),
+    Mutation(
+        "M10 拒绝集 landingRoot 不绝对化（外来平台形态静默退出 `.part` 拒绝集）",
+        (
+            (
+                RESOLVER,
+                "            absolute_landing = os.path.abspath(os.fspath(landing_root))\n",
+                "            absolute_landing = os.fspath(landing_root)\n",
+            ),
+        ),
+        (T_PATH_RESOLVER + "::TestFixedRejectionSet::test_foreign_platform_landing_root_still_protects_part",),
+    ),
+    Mutation(
+        "M11 拒绝集候选不绝对化（相对注入项静默绕过拒绝集）",
+        (
+            (
+                RESOLVER,
+                "            candidate = os.path.abspath(os.fspath(candidate))\n",
+                "            candidate = os.fspath(candidate)\n",
+            ),
+        ),
+        (T_PATH_RESOLVER + "::TestFixedRejectionSet::test_relative_extra_path_is_absolutized_not_dropped",),
+    ),
+    Mutation(
+        "M12 readRoots 不按配置形态去重（verbatim 与 canonical 重复围栏）",
+        (
+            (
+                RESOLVER,
+                "        if any(root.configured == configured for root in roots):\n"
+                "            continue\n",
+                "",
+            ),
+        ),
+        (T_READ_ROOTS + "::test_read_roots_dedupes_equivalent_configured_forms",),
     ),
 )
 

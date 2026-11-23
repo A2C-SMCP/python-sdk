@@ -18,6 +18,8 @@ Unit tests for the ``readRoots`` settings key: field validation + cross-scope me
 - 跨 scope 读合并 = **拼接去重**（低 scope 在前；授权只增不减，高 scope 不遮蔽低 scope）
 - 缺省缺席 = 不可读（fail-closed 的配置侧half；运行期由 resolve 管线保证）
 - ``~`` 不展开（协议 ``normalize_path`` 同样不展开），故不算绝对路径
+- CI 只有 Linux：新用例经 ``_validate_read_roots_for`` / ``build_read_roots(platform=...)`` 显式平台对拍；
+  少量既有用例仍按宿主分支（``native_platform()``），未在 Windows 实机跑过（follow-up）
 """
 
 import pytest
@@ -195,6 +197,13 @@ def test_read_roots_accepts_windows_verbatim_prefix() -> None:
     cleaned, errors = _validate_read_roots_for(FIELD_READ_ROOTS, raw, SettingsScope.USER, "posix")
     assert cleaned == []
     assert len(errors) == len(raw)
+
+
+def test_read_roots_dedupes_equivalent_configured_forms() -> None:
+    """按**配置形态**去重（镜像 rust ``build_read_roots``）：verbatim 与 canonical 归一同根，只留首次."""
+    roots = build_read_roots(["\\\\?\\C:\\data", "/C:/data"], platform="windows")
+
+    assert [root.configured for root in roots] == ["/C:/data"]
 
 
 def test_read_roots_rejects_drive_relative_on_windows() -> None:

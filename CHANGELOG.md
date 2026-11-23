@@ -858,9 +858,15 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **判据边界文档化（不做谓词合并，2026-11-23 用户裁决）**：`landingRoot` / `permissions.additionalDirectories`
   保持**语法**判据、不按宿主平台过滤，也不改用 `normalize_path`。由此的「外来平台形态」边界：
   `readRoots` 运行期由 `build_read_roots` 丢弃外来形态；`additionalDirectories` 运行期无消费者；
-  **`landingRoot` 运行期不丢弃**——`Computer.landing_root` 直接 `Path(raw)`，POSIX 宿主上的
-  `D:\...` 是相对路径（落盘落在进程 cwd 下），且 `build_protected_paths` 会因 normalize 失败把它从
-  `.part` 拒绝集丢弃。该边界与 rust 同构，本版**只记录、不改语义**。
+  **`landingRoot` 运行期不丢弃**——`Computer.landing_root` 直接 `Path(raw)`（POSIX 上 `D:\...` 是
+  相对 cwd 的路径、Windows 上 `/home/...` 是 current-drive-rooted），该**实际落盘目录**仍进
+  `.part` 拒绝集（见下条）。
+- **拒绝集先绝对化再归一（镜像 rust `std::path::absolute`）**：`build_protected_paths` 对每个候选
+  （含 `extra_paths` 与 `landingRoot`）先按宿主 cwd `abspath` 再 `normalize_path`。修复外来平台
+  `landingRoot`（如 POSIX 宿主配 `D:\uploads`）此前因 normalize 失败**静默退出** `.part` 拒绝集、
+  令在途上传可被 `client:resolve_path` 读出的缺口；相对注入项也不再被静默丢弃。
+- **`build_read_roots` 按配置形态去重**（镜像 rust）：verbatim `\\?\C:\data` 与 canonical
+  `/C:/data` 归一同根，只保留首次出现。
 - `build_read_roots` 增 keyword-only `platform` 注入接缝（缺省宿主平台），供「配置期/运行期同源」测试
   在任意 OS 上对拍。
 

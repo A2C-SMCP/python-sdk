@@ -641,18 +641,24 @@ def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[
     不同（用户 2026-11-23 裁决：**不做谓词合并**）。由此的「外来平台形态」边界（写实，勿美化）：
     ``D:\\...`` 在 POSIX 宿主配置期接受，但运行期
     :attr:`a2c_smcp.computer.computer.Computer.landing_root` 直接 ``Path(raw)``——POSIX 上它是
-    **相对路径**（``put_blob`` 落盘落在进程 cwd 下），且
-    :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 会因 ``normalize_path``
-    失败把该根从 ``.part`` 拒绝集**丢弃**。反方向（``/home/...`` 在 Windows）**不**是同一种失效：
-    单前导斜杠在 Windows 是 current-drive-rooted（``C:\\home\\...``，落在当前盘根而非 cwd），
-    同样不是配置者预期的 POSIX 路径。对照 ``readRoots``：运行期 ``build_read_roots`` 会按
-    ``normalize_path`` **丢弃**外来形态。
+    **相对路径**（``put_blob`` 落盘落在进程 cwd 下）；反方向（``/home/...`` 在 Windows）是
+    current-drive-rooted（``C:\\home\\...``，落在当前盘根而非 cwd）。两者都**不丢弃**，而
+    :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 会先按宿主 cwd 绝对化
+    再归一（镜像 rust ``std::path::absolute``），该实际落盘目录照常进 ``.part`` 拒绝集——
+    在途上传不会被 ``resolve_path`` 读出。
+    对照 ``readRoots``：运行期 ``build_read_roots`` 会按 ``normalize_path`` **丢弃**外来形态。
+
+    **已知边界（v0.4.0 起既有，非本单引入）**：含 U+0000 的绝对路径仍被接受；运行期
+    ``BlobUploadStore`` 的 ``mkdir`` / ``open`` 只捕获 ``OSError``，``ValueError``（embedded null
+    byte）会逃出 ``on_put_blob``（无 ``4019`` ack）。修复需与 rust 一起定口径（配置期拒 NUL vs
+    运行期把 ``ValueError`` 映射为 ``forbidden``），见 follow-up。
 
     Cross-platform shapes pass the syntactic check at config time (deliberate asymmetry with
     ``readRoots``); at runtime ``landing_root`` feeds ``Path(raw)`` as-is — POSIX treats ``D:\\...`` as
-    relative to the process cwd, Windows treats ``/home/...`` as rooted on the current drive (neither
-    is dropped; both drop out of the ``.part`` rejection set). 合并策略为顶层标量「高 scope 覆盖」
-    （``scope.merge_read`` 默认语义）。
+    relative to the process cwd, Windows treats ``/home/...`` as rooted on the current drive. Neither is
+    dropped, and ``build_protected_paths`` absolutizes against the host cwd first (mirrors rust
+    ``std::path::absolute``) so the real write directory still enters the ``.part`` rejection set.
+    合并策略为顶层标量「高 scope 覆盖」（``scope.merge_read`` 默认语义）。
     """
     if not isinstance(value, str):
         return _DROP, [_err(scope, key, f"expected string, got {type(value).__name__}")]
