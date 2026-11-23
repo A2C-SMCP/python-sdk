@@ -847,9 +847,14 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   `normalize_path` 按协议向量 `win-verbatim-prefix` 接受并归一，此前「运行期读得了、配置期写不进」；
   drive-relative `C:repos\` 两侧一致拒绝。相对路径项的诊断文案由 `must be an absolute path` 变为
   `invalid path: …`（`settings show/get` 可见）。
-- **`landingRoot` 与 rust 对齐 `trim()`**：首尾空白先 trim，trim 后为空 / 非绝对 → 整字段判废，
-  通过则**存 trim 后的值**。行为变化：**带首尾空白的 `landingRoot` 从「整字段判废（静默失效）」
-  变为按 trim 值生效**——此前手编配置里的空格会令 `put_blob` 一直 `4019 forbidden`。
+- **`landingRoot` 与 rust 对齐 `trim()`**：先按 Unicode `White_Space` trim（逐字节等价 rust
+  `str::trim()`——**不**含 U+001C–U+001F 四个信息分隔符，Python `strip()` 会多剥），trim 后为空 /
+  非绝对 → 整字段判废，通过则**存 trim 后的值**。升级面（前导 / 尾随不对称，都**不是**简单的
+  「从判废变为生效」）：
+  - **前导**空白：此前整字段判废（`startswith("/")` 失败、静默失效），现在 trim 后生效；
+  - **尾随**空白：此前**原样生效**（写入根就是带空格的目录），现在写入根**静默改为 trim 后的路径**
+    （旧目录中的产物不会迁移、需手工搬移）；Windows 上 `"C:\\x "` 此前还会因 `normalize_path`
+    拒绝空格结尾而丢掉 `.part` 拒绝集条目，trim 后该缺口一并修复。
 - **判据边界文档化（不做谓词合并，2026-11-23 用户裁决）**：`landingRoot` / `permissions.additionalDirectories`
   保持**语法**判据、不按宿主平台过滤，也不改用 `normalize_path`。由此的「外来平台形态」边界：
   `readRoots` 运行期由 `build_read_roots` 丢弃外来形态；`additionalDirectories` 运行期无消费者；

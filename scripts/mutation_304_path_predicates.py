@@ -3,10 +3,10 @@
 """
 #304 item 3 settings 路径判据（readRoots 单一判据 / landingRoot trim）的**可复现变异矩阵**（dev-only，不进 CI）。
 
-背景：验收要求「加回 `_is_absolute_path` / 去 trim / 谓词合并 / 去 normalize / 委托写死平台 /
-运行期忽略平台」各轴都必须让定向用例转红。本脚本把每个不变量逐个注入为 mutation，运行对应定向用例，
-断言必须转红（KILLED）。全部 mutation 在 ``try/finally`` 内应用与还原，任何中断都会把源文件恢复原样；
-结束前逐字节校验还原成功。
+背景：验收要求「加回 `_is_absolute_path` / 去 trim / trim 用 `str.strip()` / 谓词合并 / 去 normalize /
+委托写死平台 / 运行期忽略平台 / 运行期接线写死平台」各轴都必须让定向用例转红。本脚本把每个不变量
+逐个注入为 mutation，运行对应定向用例，断言必须转红（KILLED）。全部 mutation 在 ``try/finally``
+内应用与还原，任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
 
 运行（不要用 ``uv run``，避免在 worktree 内重建环境；本脚本会临时改写源码，勿与编辑/并发 run 同时进行）::
 
@@ -35,14 +35,15 @@ PY = sys.executable
 
 SCHEMA = "a2c_smcp/computer/settings/schema.py"
 RESOLVER = "a2c_smcp/computer/blob/path_resolver.py"
+COMPUTER = "a2c_smcp/computer/computer.py"
 
 T_READ_ROOTS = "tests/unit_tests/computer/settings/test_read_roots.py"
 T_SCHEMA = "tests/unit_tests/computer/settings/test_schema.py"
 
 _NORMALIZE_CALL = "        try:\n            normalize_path(item, platform)\n"
+_TRIM_CALL = "    trimmed = _trim_like_rust(value)\n"
 _LANDING_ROOT_PREDICATE = (
-    "    trimmed = value.strip()\n"
-    '    if not trimmed or not _is_absolute_path(trimmed):\n'
+    _TRIM_CALL + '    if not trimmed or not _is_absolute_path(trimmed):\n'
     '        return _DROP, [_err(scope, key, "must be an absolute path")]\n'
     "    return trimmed, []"
 )
@@ -74,9 +75,12 @@ MUTATIONS: tuple[Mutation, ...] = (
         ),
     ),
     Mutation(
-        "M2 去 landingRoot trim（带首尾空白的配置重新失效）",
-        ((SCHEMA, "    trimmed = value.strip()\n", "    trimmed = value\n"),),
-        (T_SCHEMA + "::TestLandingRoot::test_surrounding_whitespace_trimmed_and_activated",),
+        "M2 去 landingRoot trim（带前后空白的配置恢复旧行为）",
+        ((SCHEMA, _TRIM_CALL, "    trimmed = value\n"),),
+        (
+            T_SCHEMA + "::TestLandingRoot::test_leading_whitespace_trimmed_and_activated",
+            T_SCHEMA + "::TestLandingRoot::test_trailing_whitespace_retargets_to_trimmed_root",
+        ),
     ),
     Mutation(
         "M3 谓词合并（landingRoot 改用 normalize_path）",
@@ -140,6 +144,22 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T_READ_ROOTS + "::test_read_roots_config_time_and_runtime_share_one_predicate",),
+    ),
+    Mutation(
+        "M7 trim 改用 Python `str.strip()`（U+001C–U+001F 与 rust 不逐字节等价）",
+        ((SCHEMA, _TRIM_CALL, "    trimmed = value.strip()\n"),),
+        (T_SCHEMA + "::TestLandingRoot::test_trim_matches_rust_white_space_set",),
+    ),
+    Mutation(
+        "M8 运行期接线写死平台（`Computer._compile_read_roots` 传 posix）",
+        (
+            (
+                COMPUTER,
+                "        compiled = build_read_roots(items)\n",
+                '        compiled = build_read_roots(items, platform="posix")\n',
+            ),
+        ),
+        (T_READ_ROOTS + "::test_read_roots_runtime_wiring_uses_host_platform",),
     ),
 )
 

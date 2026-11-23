@@ -23,13 +23,14 @@ Unit tests for the ``readRoots`` settings key: field validation + cross-scope me
 import pytest
 
 from a2c_smcp.computer.blob.path_resolver import build_read_roots
+from a2c_smcp.computer.computer import Computer
 from a2c_smcp.computer.settings.schema import (
     FIELD_READ_ROOTS,
     SettingsScope,
     _validate_read_roots_for,
     validate_settings,
 )
-from a2c_smcp.computer.settings.scope import merge_layers
+from a2c_smcp.computer.settings.scope import ResolvedSettings, merge_layers
 from a2c_smcp.utils.path_norm import PathPlatform, native_platform, normalize_path
 
 
@@ -154,11 +155,14 @@ def test_read_roots_merge_is_union_not_override() -> None:
 _READ_ROOTS_PREDICATE_VECTORS = [
     "/x",
     "C:\\ok",
-    "\\\\?\\C:\\data\\share",
     "C:repos\\",
+    "\\\\?\\C:\\data\\share",
     "\\\\?\\UNC\\server\\share\\a.txt",
+    "\\\\server\\share",
     "\\\\.\\C:\\x",
-    " /x ",
+    "",
+    "/x ",  # POSIX 合法（尾随空格是普通字符）、Windows 非法——两侧各自一致即可
+    " /x ",  # 前导空白：两侧都非法（readRoots **不** trim）
 ]
 
 
@@ -179,17 +183,18 @@ def test_read_roots_config_time_and_runtime_share_one_predicate(platform: PathPl
 def test_read_roots_accepts_windows_verbatim_prefix() -> None:
     """Windows verbatim ``\\\\?\\C:\\...``：``normalize_path`` 接受并剥前缀，配置期须放行（#304）。
 
-    对照：同一输入按 POSIX 平台非法（非 ``/`` 开头）→ 丢弃 + 诊断。
+    对照：同一输入按 POSIX 平台非法（非 ``/`` 开头）→ 丢弃 + 诊断；盘符绝对形态 ``C:\\ok``
+    在 Windows 下同样必须放行（正向锚——防止 ``normalize_path`` 回归时两侧同向丢弃而「同源」仍绿）。
     """
-    raw = ["\\\\?\\C:\\data\\share"]
+    raw = ["\\\\?\\C:\\data\\share", "C:\\ok"]
 
     cleaned, errors = _validate_read_roots_for(FIELD_READ_ROOTS, raw, SettingsScope.USER, "windows")
-    assert cleaned == raw, "verbatim 形态应保留原值（不在配置期改写）"
+    assert cleaned == raw, "verbatim / 盘符形态应保留原值（不在配置期改写）"
     assert errors == []
 
     cleaned, errors = _validate_read_roots_for(FIELD_READ_ROOTS, raw, SettingsScope.USER, "posix")
     assert cleaned == []
-    assert len(errors) == 1
+    assert len(errors) == len(raw)
 
 
 def test_read_roots_rejects_drive_relative_on_windows() -> None:
@@ -201,23 +206,24 @@ def test_read_roots_rejects_drive_relative_on_windows() -> None:
     assert "invalid path" in errors[0].reason
 
 
-def test_read_roots_production_entry_uses_host_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("platform", ["posix", "windows"])
+def test_read_roots_production_entry_uses_host_platform(monkeypatch: pytest.MonkeyPatch, platform: PathPlatform) -> None:
     """生产入口取 ``native_platform()``，不得写死平台.
 
-    把 ``schema.native_platform`` 换成**相反**平台后 verbatim 形态的判定随之翻转——钉住
-    「生产入口 → 接缝」的委托**参数来源**（CI 只有 Linux，只比对宿主平台会被写死 ``"posix"`` 蒙混）。
+    逐个把 ``schema.native_platform`` 换成 ``posix`` / ``windows``，判定必须随翻——
+    **任一宿主**上写死任一平台的变异都会在另一参数上红（只测「相反平台」在 Windows 宿主上
+    会与「写死 posix」的变异重合而恒真）。
     """
-    other: PathPlatform = "windows" if native_platform() == "posix" else "posix"
-    monkeypatch.setattr("a2c_smcp.computer.settings.schema.native_platform", lambda: other)
+    monkeypatch.setattr("a2c_smcp.computer.settings.schema.native_platform", lambda: platform)
 
     raw = ["\\\\?\\C:\\data"]
     cleaned, errors = validate_settings({FIELD_READ_ROOTS: raw}, SettingsScope.USER)
-    seam_cleaned, seam_errors = _validate_read_roots_for(FIELD_READ_ROOTS, raw, SettingsScope.USER, other)
+    seam_cleaned, seam_errors = _validate_read_roots_for(FIELD_READ_ROOTS, raw, SettingsScope.USER, platform)
 
     assert cleaned[FIELD_READ_ROOTS] == seam_cleaned
     assert [(e.field, e.reason) for e in errors] == [(e.field, e.reason) for e in seam_errors]
-    # 正对照：相反平台下 verbatim 形态的判定必须真的翻转（否则上面的比对可能两边都空）
-    assert cleaned[FIELD_READ_ROOTS] == (raw if other == "windows" else [])
+    # 正对照：两个平台的判定必须真的不同（否则「写死任一平台」都能蒙混）
+    assert cleaned[FIELD_READ_ROOTS] == (raw if platform == "windows" else [])
 
 
 def test_read_roots_production_entry_delegates_to_seam() -> None:
@@ -229,3 +235,18 @@ def test_read_roots_production_entry_delegates_to_seam() -> None:
 
     assert cleaned[FIELD_READ_ROOTS] == seam_cleaned
     assert [(e.field, e.reason) for e in errors] == [(e.field, e.reason) for e in seam_errors]
+
+
+def test_read_roots_runtime_wiring_uses_host_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """运行期接线 ``Computer._compile_read_roots`` → ``build_read_roots(items)`` 取宿主平台.
+
+    钉住运行期默认平台来源：若在此写死 ``platform="posix"``，Linux CI 全绿，而 Windows 宿主会出现
+    「配置期接受 ``C:\\...``、运行期丢弃」——正是本单要消灭的配置期/运行期分叉。
+    """
+    monkeypatch.setattr("a2c_smcp.computer.blob.path_resolver.native_platform", lambda: "windows")
+    computer = object.__new__(Computer)  # 只测编译逻辑，跳过 __init__ 的重资源构造
+    resolved = ResolvedSettings(settings={FIELD_READ_ROOTS: ["\\\\?\\C:\\data"]})
+
+    roots = computer._compile_read_roots(resolved)
+
+    assert [root.configured for root in roots] == ["/C:/data"]

@@ -604,12 +604,34 @@ def _validate_read_roots_for(
     return cleaned, errors
 
 
+# Rust ``str::trim()`` 只剥 Unicode ``White_Space``；Python ``str.strip()`` 额外把 U+001C–U+001F
+# （信息分隔符：``str.isspace()`` 为真但 ``White_Space`` 为假）当空白。对写目标面逐字节对齐 rust
+# 必须排除这四个码位——否则同一份 settings.json 在 python 被启用、在 rust 被判废（fail-closed）。
+# Rust trims Unicode White_Space only; Python's str.strip() also strips U+001C–U+001F.
+_NON_WHITE_SPACE = frozenset("\x1c\x1d\x1e\x1f")
+
+
+def _trim_like_rust(value: str) -> str:
+    """``str::trim()`` 的逐字节等价（只剥 Unicode ``White_Space``）/ Byte-for-byte Rust ``trim()``."""
+    start, end = 0, len(value)
+    while start < end and value[start].isspace() and value[start] not in _NON_WHITE_SPACE:
+        start += 1
+    while end > start and value[end - 1].isspace() and value[end - 1] not in _NON_WHITE_SPACE:
+        end -= 1
+    return value[start:end]
+
+
 def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
     """``landingRoot``（v0.4.0 #196）：字符串 + **语法**绝对路径（POSIX ``/`` 或 Windows 盘符）.
 
-    首尾空白先 ``trim()``（#304 item 3，对齐 rust ``validate_landing_root``）：trim 后为空或
-    非绝对 → 整字段判废（fail-closed）；通过则**存 trim 后的值**（此前带空白的配置被整字段判废）。
-    Trim first (matches rust); empty-after-trim or non-absolute → dropped; the trimmed value is stored.
+    首尾空白先 trim（#304 item 3，逐字节等价 rust ``validate_landing_root`` 的 ``s.trim()``）：
+    trim 后为空或非绝对 → 整字段判废（fail-closed）；通过则**存 trim 后的值**。
+    行为变化（0.5.1 升级面，前导 / 尾随不对称）：**前导**空白此前令字段判废（`"/srv/x"` 前的空格让
+    ``startswith("/")`` 失败），现在被 trim 后生效；**尾随**空白此前原样生效（``"/srv/x "`` 通过语法判据，
+    写入根是带空格的目录），现在写入根**静默改为 trim 后的路径**。
+    Trim first (byte-for-byte Rust); empty-after-trim or non-absolute → dropped; trimmed value stored.
+    Leading whitespace used to void the field; trailing whitespace used to take effect verbatim — both
+    now resolve to the trimmed path (trailing-space configs see their landing root silently retargeted).
 
     判据是**语法**的、不按宿主平台过滤——**刻意**与 ``readRoots`` 的 ``normalize_path`` 单一判据
     不同（用户 2026-11-23 裁决：**不做谓词合并**）。由此的「外来平台形态」边界（写实，勿美化）：
@@ -617,17 +639,20 @@ def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[
     :attr:`a2c_smcp.computer.computer.Computer.landing_root` 直接 ``Path(raw)``——POSIX 上它是
     **相对路径**（``put_blob`` 落盘落在进程 cwd 下），且
     :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 会因 ``normalize_path``
-    失败把该根从 ``.part`` 拒绝集**丢弃**；反方向（``/home/...`` 在 Windows）同理。
-    对照 ``readRoots``：运行期 ``build_read_roots`` 会按 ``normalize_path`` **丢弃**外来形态。
+    失败把该根从 ``.part`` 拒绝集**丢弃**。反方向（``/home/...`` 在 Windows）**不**是同一种失效：
+    单前导斜杠在 Windows 是 current-drive-rooted（``C:\\home\\...``，落在当前盘根而非 cwd），
+    同样不是配置者预期的 POSIX 路径。对照 ``readRoots``：运行期 ``build_read_roots`` 会按
+    ``normalize_path`` **丢弃**外来形态。
 
     Cross-platform shapes pass the syntactic check at config time (deliberate asymmetry with
-    ``readRoots``); at runtime ``landing_root`` feeds ``Path(raw)`` as-is, so a foreign-platform
-    value is interpreted as a *relative* path on the host (and drops out of the ``.part``
-    rejection set). 合并策略为顶层标量「高 scope 覆盖」（``scope.merge_read`` 默认语义）。
+    ``readRoots``); at runtime ``landing_root`` feeds ``Path(raw)`` as-is — POSIX treats ``D:\\...`` as
+    relative to the process cwd, Windows treats ``/home/...`` as rooted on the current drive (neither
+    is dropped; both drop out of the ``.part`` rejection set). 合并策略为顶层标量「高 scope 覆盖」
+    （``scope.merge_read`` 默认语义）。
     """
     if not isinstance(value, str):
         return _DROP, [_err(scope, key, f"expected string, got {type(value).__name__}")]
-    trimmed = value.strip()
+    trimmed = _trim_like_rust(value)
     if not trimmed or not _is_absolute_path(trimmed):
         return _DROP, [_err(scope, key, "must be an absolute path")]
     return trimmed, []

@@ -394,13 +394,37 @@ class TestLandingRoot:
         assert cleaned["landingRoot"] == "D:\\a2c\\landing"
         assert errors == []
 
-    def test_surrounding_whitespace_trimmed_and_activated(self) -> None:
-        """#304 item 3（对齐 rust ``trim()``）：首尾空白先 trim，存 trim 后的值.
+    def test_leading_whitespace_trimmed_and_activated(self) -> None:
+        """#304 item 3（对齐 rust ``trim()``）：**前导**空白此前令字段整字段判废.
 
-        行为变化：此前带首尾空白的配置**整字段判废**（静默失效、fail-closed）；现在按 trim 后的
-        绝对路径生效。
+        旧判据 ``_is_absolute_path`` 只认 ``startswith("/")``，前导空格使其失败；现在 trim 后生效。
         """
-        cleaned, errors = validate_settings({"landingRoot": "  /srv/landing \t"}, SettingsScope.USER)
+        cleaned, errors = validate_settings({"landingRoot": "  /srv/landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_trailing_whitespace_retargets_to_trimmed_root(self) -> None:
+        """**尾随**空白此前**原样生效**（写入根是带空格的目录），现在写入根静默改为 trim 后的路径.
+
+        这是 0.5.1 的升级面：带尾随空白的配置不是「从判废变为生效」，而是写入目录被规范化
+        （带空格的旧目录里已有的产物不会迁移）。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "/srv/landing \t"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_trim_matches_rust_white_space_set(self) -> None:
+        """trim 逐字节等价 rust ``str::trim()``：U+001C–U+001F **不**算空白.
+
+        ``str.strip()`` 会剥这四个信息分隔符（``isspace()`` 为真、``White_Space`` 为假），而 Rust
+        ``trim()`` 不会——分歧会让同一份 settings.json 在 python 启用写入根、在 rust 判废（fail-closed）。
+        U+3000（IDEOGRAPHIC SPACE）属 ``White_Space``，两侧都剥。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "\x1c/srv/landing"}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+
+        cleaned, errors = validate_settings({"landingRoot": "\u3000/srv/landing\u3000"}, SettingsScope.USER)
         assert cleaned["landingRoot"] == "/srv/landing"
         assert errors == []
 
