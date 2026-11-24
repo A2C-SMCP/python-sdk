@@ -218,6 +218,7 @@ def test_print_degraded_escapes_markup(capsys: pytest.CaptureFixture[str]) -> No
 
     out = "".join(capsys.readouterr().out.split())
     assert "[/]" in out  # 异常原文可见，且打印本身不抛
+    assert "\\[" not in out  # 无双重转义（字面 \[/] 也算失败；与其他 escape 用例同口径）
 
 
 @pytest.mark.asyncio
@@ -245,6 +246,10 @@ async def test_interactive_degradations_route_to_safe_helper(monkeypatch: pytest
     monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_governance_remount", _boom)
     monkeypatch.setattr("a2c_smcp.computer.cli.commands.settings.repl_dispatch", _boom)
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["settings get x"]))
+    # 与文件内其余 `_interactive_loop` 用例一致：禁用真 `patch_stdout`。prompt_toolkit 的
+    # `AppSession.output` 是**进程级单例**且首次访问时急切绑定当时的 `sys.stdout`——真用它会把 Output
+    # 永久绑到本用例的 pytest 捕获流，污染后续任何真 `patch_stdout` 用例（隔离审查第四轮 🟡1）。
+    monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
     comp = Computer(name="test_im_deg", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     await _interactive_loop(comp)  # 三处兜底均不得抛出

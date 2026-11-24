@@ -271,28 +271,29 @@ def check() -> int:
 
 
 def baseline() -> int:
-    """变异前先跑一遍全部目标用例：**必须全绿**，否则任何「失败」都证明不了是变异造成的。
+    """变异前**按每条变异的用例子集**各跑一遍：**必须全绿**，否则任何「失败」都证明不了是变异造成的。
 
     与 #211 的 M3 假杀死同型教训：目标用例若因无关原因（import/env 漂移、夹具坏）本就为红，``_classify``
-    会把它误判成 KILLED。基线不为绿直接终止，不进入变异循环。
+    会把它误判成 KILLED。**必须按子集而非并集**：并集里绿、单跑为红（顺序/状态依赖）的用例仍会让该条变异
+    的独立运行被误判（第四轮审查 🟡2）。任一子集不为绿即终止，不进入变异循环。
     """
-    tests = sorted({t for mutation in MUTATIONS for t in mutation.tests})
-    try:
-        proc = subprocess.run(
-            [PY, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=_PYTEST_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"BASELINE: ERROR(timeout>{_PYTEST_TIMEOUT_S}s)")
-        return 1
-    if proc.returncode != 0:
-        tail = proc.stdout.strip().splitlines()[-1:] or [""]
-        print(f"BASELINE: FAIL（目标用例变异前即为红，变异判据不可信）| {tail[0]}")
-        return 1
-    print(f"BASELINE: OK（{len(tests)} 个目标用例全绿）")
+    for mutation in MUTATIONS:
+        try:
+            proc = subprocess.run(
+                [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=_PYTEST_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"BASELINE: ERROR(timeout>{_PYTEST_TIMEOUT_S}s) — {mutation.name}")
+            return 1
+        if proc.returncode != 0:
+            tail = proc.stdout.strip().splitlines()[-1:] or [""]
+            print(f"BASELINE: FAIL（{mutation.name} 的目标用例变异前即为红）| {tail[0]}")
+            return 1
+    print(f"BASELINE: OK（{len(MUTATIONS)} 条变异的目标用例子集各自全绿）")
     return 0
 
 
