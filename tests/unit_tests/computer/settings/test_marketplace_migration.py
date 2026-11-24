@@ -2037,3 +2037,113 @@ def test_baseline_evidence_requires_old_record_to_match(tmp_path: Path, monkeypa
     item = next(i for i in plan.items if i.old == "acme")
     assert item.action == mm.ACTION_UNRESOLVED
     assert item.reason in {mm.REASON_CATALOG_MISSING, mm.REASON_MANIFEST_UNREADABLE}
+
+
+# ── #301 P0.5 窄对齐 / 竞态纵深防御（2026-11-24 裁决）────────────────────────
+def test_project_record_without_project_path_for_removed_plugin_keeps_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """plugin 已移出新清单：按 F10 保留旧账本、迁移其余、exit 3，不得整 marketplace 阻断（#301 item 1）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    root = marketplace_skill_dir(home, "acme") / "plugins" / "ghost"
+    root.mkdir(parents=True)
+    _write_ledger(home, env, {"ghost@acme": [{"scope": "project", "installPath": str(root), "mcpServers": []}]})
+    _write_user(env, {"installedPlugins": ["ghost@acme"], "enabledPlugins": {"ghost@acme": True}})
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_RENAME  # 不再整项 blocked
+    assert item.incomplete is True  # manifest 固定 ⇒ 计划期即可确定（dry-run 与 apply 同码）
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    assert any("not present in the new manifest" in warning for warning in item.warnings)
+
+    _apply(plan, home, env)
+    ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
+    assert "ghost@acme" in ledger and "ghost@acme-skills" not in ledger
+    assert marketplace_skill_dir(home, "acme-skills").is_dir()
+    assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+
+
+def test_project_record_without_project_path_for_baseline_derived_keeps_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """baseline_derived（清单不可读 ⇒ 全部 plugin 视为已出清单）：同样按 F10 保留旧账本、迁移其余、exit 3。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, baseline="acme-skills", with_ledger=False)
+    root = marketplace_skill_dir(home, "acme") / "plugins" / "figma"
+    _write_ledger(home, env, {"figma@acme": [{"scope": "local", "installPath": str(root), "mcpServers": []}]})
+    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    (marketplace_skill_dir(home, "acme") / ".tfrobot-plugin" / "marketplace.json").write_text("{broken", encoding="utf-8")
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.baseline_derived and item.action == mm.ACTION_RENAME
+    assert item.incomplete is True
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _apply(plan, home, env)
+
+    ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
+    assert "figma@acme" in ledger and "figma@acme-skills" not in ledger
+    assert marketplace_skill_dir(home, "acme-skills").is_dir()
+    assert not marketplace_skill_dir(home, "acme").exists()
+
+
+def test_project_record_without_project_path_and_install_path_keeps_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """plugin 仍在清单但记录缺 installPath：P2 只保留旧记录、不 raise ⇒ 预检不得阻断（谓词第二半）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    _write_ledger(home, env, {"figma@acme": [{"scope": "project", "mcpServers": []}]})
+    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_RENAME
+    _apply(plan, home, env)
+
+    ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
+    assert "figma@acme" in ledger and "figma@acme-skills" not in ledger
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    assert any("has no installPath" in warning for warning in plan.items[0].warnings)
+
+
+def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一 marketplace：已出清单的 plugin 按 F10 记账，但不能掩盖「仍在清单却缺 projectPath」的整项阻断。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    ghost_root = marketplace_skill_dir(home, "acme") / "plugins" / "ghost"
+    ghost_root.mkdir(parents=True)
+    figma_root = marketplace_skill_dir(home, "acme") / "plugins" / "figma"
+    _write_ledger(
+        home,
+        env,
+        {
+            "ghost@acme": [{"scope": "project", "installPath": str(ghost_root), "mcpServers": []}],
+            "figma@acme": [{"scope": "project", "installPath": str(figma_root), "mcpServers": []}],
+        },
+    )
+    _write_user(env, {"installedPlugins": ["ghost@acme", "figma@acme"], "enabledPlugins": {}})
+    before = _snapshot(tmp_path)
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_PROJECT_PATH_MISSING
+    assert any("not present in the new manifest" in warning for warning in item.warnings)
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _apply(plan, home, env)
+    _assert_unchanged(before, tmp_path)
+
+
+def test_rebuild_ledger_race_project_path_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P0.5 已同判据前置；`_rebuild_ledger` 的 raise 保留为**竞态**纵深防御（#301 item 9 裁决）。"""
+    env, home, _work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    root = marketplace_skill_dir(home, "acme") / "plugins" / "figma"
+    _write_ledger(home, env, {"figma@acme": [{"scope": "project", "installPath": str(root), "mcpServers": []}]})
+    ledger_path = store.installed_plugins_path(home, env)
+    before = ledger_path.read_bytes()
+    item = mm.MigrationItem(old="acme", new="acme-skills", action=mm.ACTION_RENAME, manifest=_manifest("acme-skills"))
+
+    with pytest.raises(mm._ItemFailure) as excinfo:
+        asyncio.run(mm._rebuild_ledger(item, home, env))
+    assert excinfo.value.reason == mm.REASON_LEDGER_REBUILD_FAILED
+    assert ledger_path.read_bytes() == before

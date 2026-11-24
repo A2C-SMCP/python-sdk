@@ -916,21 +916,25 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
         return
     # project/local 记录缺合法 projectPath 无法安全重建：**预检期** blocked（dry-run 即 exit 3、零写入），
     # 而不是等到 P2 才 abort（那时 known[new]/目录已写，成半迁移）。
+    # 窄对齐（#301 item 1）：只有 `_rebuild_ledger` **真会重建**的记录才阻断——plugin 已移出新清单 /
+    # baseline_derived（manifest 未知）/ 记录缺 installPath 时 P2 只保留旧账本（F10），不得把整个
+    # marketplace 阻断；判据与 P2 共用 `_record_needs_project_path`，两侧不可漂移。
     for pid, records in state.installed.get("plugins", {}).items():
         parts = _pid_parts(pid) if isinstance(pid, str) else None
         if not parts or parts[1] != item.old or not isinstance(records, list):
             continue
+        if find_plugin_entry(item.manifest, parts[0]) is None:
+            _note_kept_ledger_record(item, parts[0])
+            continue
         for record in records:
-            if isinstance(record, Mapping):
-                scope = _norm_ledger_scope(record)
-                if scope in {"project", "local"} and not _norm_project_path(record):
-                    item.action = ACTION_BLOCKED
-                    item.reason = REASON_PROJECT_PATH_MISSING
-                    item.warnings.append(
-                        f"plugin {parts[0]!r} has a {scope} ledger record without a valid projectPath; "
-                        "fix or remove that record before migrating"
-                    )
-                    return
+            if _record_needs_project_path(record):
+                item.action = ACTION_BLOCKED
+                item.reason = REASON_PROJECT_PATH_MISSING
+                item.warnings.append(
+                    f"plugin {parts[0]!r} has a {_norm_ledger_scope(record)} ledger record without a valid projectPath; "
+                    "fix or remove that record before migrating"
+                )
+                return
 
     candidates, blocked = _candidate_inputs(item, state, home)
     if blocked:
@@ -1495,6 +1499,39 @@ def _norm_project_path(record: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _record_needs_project_path(record: object) -> bool:
+    """
+    该记录是否会在 P2 重建时因缺 projectPath 触发 abort（P0.5 与 P2 共用的**单一判据**，#301 item 1）/
+    Whether rebuilding this record would hit the projectPath abort.
+
+    只判记录自身；「plugin 是否仍在新清单」由调用方前置判定。成立集合刻意**精确等于**
+    :func:`_rebuild_ledger` 中 raise 的可达集合：``records`` 是数组 → plugin 在清单 → 记录是 Mapping →
+    ``installPath`` 为非空字符串 → ``scope`` ∈ {project, local} 且缺 ``projectPath``。记录的
+    ``installPath`` 指向的目录不存在时 P2 只保留旧账本并标 ``incomplete``（不 raise），故不在此列。
+    """
+    if not isinstance(record, Mapping):
+        return False
+    install_path = record.get("installPath")
+    if not isinstance(install_path, str) or not install_path:
+        return False
+    return _norm_ledger_scope(record) in {"project", "local"} and not _norm_project_path(record)
+
+
+def _note_kept_ledger_record(item: MigrationItem, plugin: str) -> None:
+    """
+    plugin 不在新清单 → F10 保留旧账本（P0.5 与 P2 共用，幂等去重）/ Record a kept old ledger record (F10).
+
+    manifest 在 classify 后不再变化，故「不在新清单」是**计划期即可确定**的事实：P0.5 也据此置
+    ``incomplete`` 并给出同一 warning，使 dry-run 的退出码与 apply 一致（设计 §12.2 / §4.2 F10）。
+    P2 的 :func:`_rebuild_ledger` 复用同一函数，重复调用不会产生重复 warning。
+    """
+    message = f"plugin {plugin!r} not present in the new manifest; keeping its old ledger record"
+    if message not in item.warnings:
+        item.warnings.append(message)
+    item.incomplete = True
+    item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
+
+
 async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
     """P2：以新 pid 重建账本记录（成功者才在 P4 删旧）/ Rebuild ledger records under the new pid."""
     installed = store.load_installed_plugins_strict(home, env)["plugins"]
@@ -1513,9 +1550,7 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
         plugin = parts[0]
         new_pid = f"{plugin}@{item.new}"
         if find_plugin_entry(item.manifest, plugin) is None:
-            item.warnings.append(f"plugin {plugin!r} not present in the new manifest; keeping its old ledger record")
-            item.incomplete = True
-            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
+            _note_kept_ledger_record(item, plugin)
             continue
         for record in records:
             if not isinstance(record, Mapping):
@@ -1529,7 +1564,9 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
                 continue
             scope = _norm_ledger_scope(record)
             project_path = _norm_project_path(record)
-            if scope in {"project", "local"} and not project_path:
+            # P0.5 已用同一判据前置（`_record_needs_project_path`）；这里只有**竞态**才可达
+            # （预检之后账本被并发写入这样的记录）——保留为纵深防御（#301 item 9 裁决）。
+            if _record_needs_project_path(record):
                 raise _ItemFailure(
                     REASON_LEDGER_REBUILD_FAILED,
                     f"plugin {plugin!r} has a {scope} ledger record without a valid projectPath",
