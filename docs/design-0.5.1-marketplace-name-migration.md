@@ -324,7 +324,8 @@ manifest 校验 + 依赖解析，失败即抛。删掉旧记录而新记录没�
 **不把它当作迁移失败**——F1 照常把意图迁到新 pid，F10 保留旧账本记录，dry-run/实跑都产出
 `warn: plugin '<p>' not in the new manifest` 并给出处置建议（`plugin uninstall <p>@<new>` 或等待上游恢复）。
 清单在 classify 后固定，故 P0.5 在**计划期**即置 `incomplete`（`ledger-rebuild-failed`）：dry-run 的退出码
-与实跑一致（3），不再等到 P2 才体现。
+与实跑一致（3），不再等到 P2 才体现。该 plugin 的 plugin-scoped input 值与 secret **不重键**（无 rename
+目标，D14 carve-out，见 §12.2）——旧键在改名后成为孤儿，但不会被任何新 pid 读取。
 理由：上游删插件是外部事实，拿它阻断整个 marketplace 的改名代价过大；而保留旧记录保证依赖信息不丢。
 
 **F11 —— 重启提示**：`A2CSkillRef.source` 是内存派生（`staging.py` `_build_marketplace_ref`），迁移命令不触碰 Registry；
@@ -395,8 +396,10 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
 - 最终退出码 **3**（部分完成）。
 
 > 「plugin 不在新清单 / `baseline_derived`（F10 保留旧账本）」**不是**执行期失败：项仍是 `rename`、只置
-> `incomplete`（`ledger-rebuild-failed`），其余面照常迁移，退出码 3（详见 §7.1）。`aborted` 仅用于
-> 「预检后账本被并发写坏」的竞态 raise。
+> `incomplete`（`ledger-rebuild-failed`），其余面照常迁移，退出码 3（详见 §7.1）。三条限定：①该 plugin 的
+> plugin-scoped input 值 / secret 不重键（D14 carve-out，§12.2）；②plugin **仍在新清单**但根 / `inputs.json`
+> 不可读时 D14 原样整项 `blocked`（`plugin-root-unreadable`）、零写入；③`aborted` 仅用于「预检后账本被
+> 并发写坏」的竞态 raise。
 
 与 D7 的区别：**冲突是命令级**（整体 abort、exit 1、任何项都不写）；**执行期失败是项级**（其余项照常、exit 3）；
 **forward-only 不做项内回滚**（python 与 rust 的已接受差异）。
@@ -497,14 +500,18 @@ P4  ledger cleanup  重建成功的 pid 才删旧账本记录（F10）
 P5  report          汇总 + 依赖告警（project/local、extraKnown、blocked、env）
 ```
 
-**P0.5 的账本 projectPath 前置条件（#301 item 1，窄对齐）**：project/local 账本记录缺合法 `projectPath` 时，
-**仅当该记录在 P2 真的会被重建**才判该项 `blocked` / `project-path-missing`（dry-run 即 exit 3、零写入）。
-「真会重建」与 `_rebuild_ledger` 的 raise 共用同一谓词 `_record_needs_project_path`：plugin 仍在新清单 +
-`installPath` 为非空字符串 + scope ∈ {project, local} 且缺 `projectPath`。plugin 已从新清单移除 /
-`baseline_derived`（清单不可读）/ 记录缺 `installPath` 时按 F10 **保留旧账本、迁移其余**：计划期（P0.5）
-即置 `incomplete` + `ledger-rebuild-failed` 并产出同一 warn，dry-run 与 apply 的退出码同为 3；项本身仍是
-`rename`，**不得**把整个 marketplace 阻断。只有「预检之后账本被并发写入这样的记录」的竞态才会走到
-`_rebuild_ledger` 的 raise（`aborted` + `ledger-rebuild-failed`），该 raise 保留为纵深防御。
+**P0.5 的账本前置条件（#301 item 1 窄对齐 + 裁决②）**：判据与 `_rebuild_ledger` **逐条同构**，静态可知的
+「保留旧账本」形态一律在计划期置 `incomplete` + `ledger-rebuild-failed`，使 dry-run 与 apply 的退出码同为 3：
+1. **projectPath**：project/local 记录缺合法 `projectPath` ⇒ 仅当该记录在 P2 真会被重建（plugin 仍在新清单 +
+   `installPath` 为非空字符串）才 `blocked` / `project-path-missing`（dry-run 即 exit 3、零写入）；
+2. **plugin 不在新清单 / `baseline_derived`** ⇒ 保留旧账本、迁移其余（F10），项仍是 `rename`，**不得**把整个
+   marketplace 阻断；其 plugin-scoped input 值 / secret 不重键（D14 carve-out，§12.2）；
+3. **records 非数组 / 记录非对象 / 记录缺 `installPath`** ⇒ 同样计划期预告（P2 只 keep、不 raise）。
+
+只有「预检之后账本被并发写入这样的记录」的竞态才会走到 `_rebuild_ledger` 的 raise（`aborted` +
+`ledger-rebuild-failed`），该 raise 保留为纵深防御。**例外（不窄化）**：plugin **仍在新清单**但根 / `inputs.json`
+不可读时，D14 原样 fail-closed ⇒ 整项 `blocked` / `plugin-root-unreadable`、零写入（「迁移其余」不适用，
+因为项根本没有执行）。
 
 **为什么有 P-1（strict 只读 loader）**：现有 `load_known_marketplaces` / `load_installed_plugins` 走
 `read_jsonc_with_recovery`——损坏文件会被**改名**成 `.corrupt-<ts>.bak` 后按空配置继续（`store.py:283-327`）。
@@ -794,7 +801,7 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 | project/local 不改写 | 五个面各含旧名 → 文件字节不变 + `followUps[]` 有对应 `effect`；退出码 3 |
 | **project scope 安装仍启用** | `plugin install <pid> --scope project` + `enable` 后迁移 → 合并视图活跃判据**不劣化**（不静默熄灯）；同上 local 两例 |
 | secret 重键 | fake keyring：新键写入后旧键删除；**keyring 不可用且旧 secret 存在 → 该项零写入、其余项迁移、退出码 3**（变异：把 abort 改成 skipped → 断言「零写入」的用例转红） |
-| secret 候选派生（D14） | 已从新清单移除的 plugin（有账本 installPath）→ 旧 secret 仍被重键；无法定位的 plugin → 该项 abort、零写入 |
+| secret 候选派生（D14） | **carve-out（#301 裁决）**：**不在新清单**的 plugin（含 `baseline_derived` 全部账本 plugin）无 rename 目标 ⇒ 不枚举、不重键、不阻断，旧值/secret 原样保留；**新清单内** plugin 根/inputs 不可读 → 该项 abort、零写入 |
 | 目标 secret / input 值键异值 | 预置 `new` 键不同值 → 该项 abort、旧值不动、退出码 3；同值 → 幂等 no-op |
 | 离线 grandfather | 删掉 clone / 破坏清单 → `unresolved`，零写入，退出码 3 |
 | strict loader 零写入 | 把 `known_marketplaces.json` / `installed_plugins.json` / settings / `input-values.json` 各写坏一份 → dry-run 与 `--apply` 都：退出码 3、**不产生 `.corrupt-*.bak`**、所有文件字节不变 |
@@ -915,6 +922,8 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 |---|------|------|------|
 | Q17 | P0.5 的 projectPath 判据是否硬阻断整个 marketplace | **窄对齐**：只有「plugin 仍在新清单 + `installPath` 合法（非空字符串）」的记录才 `blocked` / `project-path-missing`；plugin 已移除 / `baseline_derived` 按 F10 保留旧账本、迁移其余、exit 3（计划期即置 `incomplete`，dry-run 与 apply 同码） | ✅ 已裁决 |
 | Q18 | `_rebuild_ledger` 的 projectPath raise 是否保留 | **保留**为竞态纵深防御（P0.5 已用同一谓词前置），加直调用例钉住 | ✅ 已裁决 |
+| Q19 | 「plugin 不在新清单」时 D14 secret fail-closed 与 F10 冲突 | **carve-out**：无 rename 目标的 plugin（不在新清单 / `baseline_derived`）不枚举、不重键、不阻断（旧值/secret 原样保留）；**新清单内**根 / `inputs.json` 不可读仍整项 abort、零写入（正对照变异钉住） | ✅ 已裁决 |
+| Q20 | 静态可知的 P2-only `incomplete`（缺 `installPath` / 记录非对象 / records 非数组） | **计划期一并预告**，dry-run 与 apply 同码（§12.2）；目录存在性属运行期事实，不预告 | ✅ 已裁决 |
 
 ---
 
@@ -922,7 +931,7 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 
 | 日期 | 变更 |
 |------|------|
-| 2026-11-24 | **#301 终审残留**：P0.5 projectPath 判据窄对齐（谓词 `_record_needs_project_path` 与 `_rebuild_ledger` 共用；plugin 移除 / `baseline_derived` 计划期即置 `incomplete`，dry-run 与 apply 退出码一致）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 超时 / 字节还原（33 → 38 条） |
+| 2026-11-24 | **#301 终审残留**：P0.5 判据与 `_rebuild_ledger` 逐条同构（谓词 `_record_needs_project_path` 共用；`projectPath` 窄对齐；plugin 移除 / `baseline_derived` / 缺 `installPath` / 记录非对象 / records 非数组一律**计划期**置 `incomplete`，dry-run 与 apply 退出码一致）；**D14 carve-out**（无 rename 目标的 plugin 不枚举、不重键、不阻断；新清单内根缺失仍整项 abort）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 语法校验 / 超时 / raise 式字节还原 / 锚点演进校验（33 → 40 条） |
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |

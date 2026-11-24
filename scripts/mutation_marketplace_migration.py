@@ -9,7 +9,10 @@
   其余（收集错误 / 解释器缺失 / 超时）→ ERROR——`returncode != 0` 本身不足以证明变异被杀死；
 - **语法校验**：每条 mutation 应用后先 `ast.parse`，避免「改坏了」被误读成「变异未被杀死」；
 - **超时**：每条 mutation 的 pytest 有硬超时（`TIMEOUT` 秒），`TimeoutExpired` → ERROR；
-- **还原自证**：备份按 PID 隔离，结束（含 SIGINT/SIGTERM）以 sha256 **逐字节**校验还原。
+- **还原自证**：备份按 PID 隔离，结束（含 SIGINT/SIGTERM）以 sha256 **逐字节**校验还原；还原失败
+  **raise**（不变量不用 `assert`，`python -O` 会剥离）。
+- **锚点演进校验**：每次替换前对**当前**文本再断言 `count == 1`（`--check` 只校验原始文件；若前一条
+  edit 注入了后一条的锚点，只有这一步能发现）。
 
 运行（不要用会重建环境的裸 ``uv run``；``uv run --no-sync`` 或项目 venv 的 python。
 本脚本会临时改写源码，勿与编辑 / 并发 run 同时进行）::
@@ -17,7 +20,8 @@
     python scripts/mutation_marketplace_migration.py            # 基线 + 应用变异并跑定向用例
     python scripts/mutation_marketplace_migration.py --check    # 只读：校验各 old 片段仍唯一定位
 
-退出码：基线绿且全部 KILLED → 0；任一 SURVIVED / SETUP-FAIL / ERROR / 基线红 → 1。
+退出码：基线绿且全部 KILLED → 0；任一 SURVIVED / SETUP-FAIL / ERROR / 基线红 → 1；
+pytest / 解释器不可用 → 2。
 """
 
 from __future__ import annotations
@@ -412,8 +416,7 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 MOD,
-                """        for record in records:
-            if _record_needs_project_path(record):
+                """            if _record_needs_project_path(record):
                 item.action = ACTION_BLOCKED
                 item.reason = REASON_PROJECT_PATH_MISSING
                 item.warnings.append(
@@ -421,7 +424,7 @@ MUTATIONS: tuple[Mutation, ...] = (
                     "fix or remove that record before migrating"
                 )
                 return""",
-                "        for record in records:\n            pass",
+                "            pass",
             ),
         ),
         (T + "::test_project_record_without_project_path_blocks_in_dry_run",),
@@ -432,7 +435,7 @@ MUTATIONS: tuple[Mutation, ...] = (
             (
                 MOD,
                 """        if find_plugin_entry(item.manifest, parts[0]) is None:
-            _note_kept_ledger_record(item, parts[0])
+            kept_plugins.append(parts[0])
             continue
 """,
                 "",
@@ -448,14 +451,15 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 MOD,
-                """    install_path = record.get("installPath")
-    if not isinstance(install_path, str) or not install_path:
+                """    if _ledger_install_path(record) is None:
         return False
     return _norm_ledger_scope(record) in {"project", "local"} and not _norm_project_path(record)""",
                 """    return _norm_ledger_scope(record) in {"project", "local"} and not _norm_project_path(record)""",
             ),
         ),
-        (T + "::test_project_record_without_project_path_and_install_path_keeps_ledger",),
+        # 调用方已前置 `_ledger_install_path(...) is None`，该守卫的承重目标是**谓词自足性**直调用例
+        # （账本场景用例在变异下仍绿，故不入列表）。
+        (T + "::test_record_needs_project_path_predicate_contract",),
     ),
     Mutation(
         "4f 删 _rebuild_ledger 的 projectPath raise（竞态守护失效）",
@@ -474,6 +478,56 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T + "::test_rebuild_ledger_race_project_path_raise",),
+    ),
+    Mutation(
+        "4g P0.5 不预告静态 keep（缺 installPath / 记录非对象 / records 非数组）",
+        (
+            (
+                MOD,
+                """        if not isinstance(records, list):
+            _note_ledger_record_kept(
+                item, f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched"
+            )
+            continue
+        if find_plugin_entry(item.manifest, parts[0]) is None:""",
+                """        if not isinstance(records, list):
+            continue
+        if find_plugin_entry(item.manifest, parts[0]) is None:""",
+            ),
+            (
+                MOD,
+                """            if not isinstance(record, Mapping):
+                _note_ledger_record_kept(item, None)
+                continue
+            if _ledger_install_path(record) is None:
+                _note_ledger_record_kept(
+                    item, f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched"
+                )
+                continue""",
+                """            if not isinstance(record, Mapping):
+                continue
+            if _ledger_install_path(record) is None:
+                continue""",
+            ),
+        ),
+        (
+            T + "::test_non_list_ledger_records_mark_incomplete",
+            T + "::test_non_mapping_ledger_record_is_predicted_in_dry_run",
+            T + "::test_project_record_without_project_path_and_install_path_keeps_ledger",
+        ),
+    ),
+    Mutation(
+        "4h carve-out 扩大：新清单内根缺失不再阻断（D14 失效）",
+        (
+            (
+                MOD,
+                """        if not root.is_dir():
+            return REASON_PLUGIN_ROOT_UNREADABLE if plugin in ledger_plugins else None""",
+                """        if not root.is_dir():
+            return None""",
+            ),
+        ),
+        (T + "::test_in_manifest_plugin_missing_root_still_blocks",),
     ),
     Mutation(
         "4a rebuild 传 projectPath（project/local 记录保留 projectPath）",
@@ -630,10 +684,16 @@ def _digest(path: Path) -> str:
 _ACTIVE_BACKUPS: dict[str, tuple[str, Path]] = {}
 
 
+def _restore(rel: str, digest: str, tmp: Path) -> None:
+    shutil.copy2(tmp, ROOT / rel)
+    actual = _digest(ROOT / rel)
+    if actual != digest:  # 不变量用 raise（assert 会被 python -O 剥离）
+        raise RuntimeError(f"restore failed: {rel} ({actual} != {digest})")
+
+
 def _restore_active() -> None:
     for rel, (digest, tmp) in list(_ACTIVE_BACKUPS.items()):
-        shutil.copy2(tmp, ROOT / rel)
-        assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+        _restore(rel, digest, tmp)
         _ACTIVE_BACKUPS.pop(rel, None)
 
 
@@ -728,8 +788,9 @@ def main() -> int:
                         shutil.copy2(path, tmp)
                         backups[rel] = (_digest(path), tmp)
                     text = path.read_text(encoding="utf-8")
-                    if old not in text:
-                        print(f"{mutation.name}: SETUP-FAIL ({rel})")
+                    count = text.count(old)
+                    if count != 1:  # 演进中的文本也须唯一（前一条 edit 可能注入后一条的锚点）
+                        print(f"{mutation.name}: SETUP-FAIL ({rel}: occurrence={count})")
                         failures.append(mutation.name)
                         break
                     path.write_text(text.replace(old, new, 1), encoding="utf-8")
@@ -757,8 +818,7 @@ def main() -> int:
                         failures.append(mutation.name)
             finally:
                 for rel, (digest, tmp) in backups.items():
-                    shutil.copy2(tmp, ROOT / rel)
-                    assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+                    _restore(rel, digest, tmp)
                     _ACTIVE_BACKUPS.pop(rel, None)
     finally:
         _restore_active()

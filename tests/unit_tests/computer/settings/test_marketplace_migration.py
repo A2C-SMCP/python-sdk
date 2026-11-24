@@ -1219,10 +1219,15 @@ def test_non_list_ledger_records_mark_incomplete(tmp_path: Path, monkeypatch: py
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
     _write_ledger(home, env, {"figma@acme": {"not": "a list"}})  # type: ignore[dict-item]
     _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    before = _snapshot(tmp_path)
     plan = mm.build_plan(home, env, cwd=work)
-    _apply(plan, home, env)
+    # records 非数组同属静态可知的 keep 形态：计划期即预告（dry-run 与 apply 同码）
     assert plan.items[0].incomplete is True
     assert plan.items[0].reason == mm.REASON_LEDGER_REBUILD_FAILED
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _assert_unchanged(before, tmp_path)
+    _apply(plan, home, env)
+    assert plan.items[0].incomplete is True
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
 
 
@@ -2051,7 +2056,16 @@ def test_project_record_without_project_path_for_removed_plugin_keeps_ledger(
     root = marketplace_skill_dir(home, "acme") / "plugins" / "ghost"
     root.mkdir(parents=True)
     _write_ledger(home, env, {"ghost@acme": [{"scope": "project", "installPath": str(root), "mcpServers": []}]})
-    _write_user(env, {"installedPlugins": ["ghost@acme"], "enabledPlugins": {"ghost@acme": True}})
+    _write_user(
+        env,
+        {
+            "installedPlugins": ["ghost@acme"],
+            "enabledPlugins": {"ghost@acme": True},
+            "trustedMarketplaces": ["acme"],
+            "blockedMarketplaces": ["acme"],
+        },
+    )
+    before = _snapshot(tmp_path)
 
     plan = mm.build_plan(home, env, cwd=work)
     item = plan.items[0]
@@ -2059,12 +2073,19 @@ def test_project_record_without_project_path_for_removed_plugin_keeps_ledger(
     assert item.incomplete is True  # manifest 固定 ⇒ 计划期即可确定（dry-run 与 apply 同码）
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
     assert any("not present in the new manifest" in warning for warning in item.warnings)
+    _assert_unchanged(before, tmp_path)  # dry-run 零写入
 
     _apply(plan, home, env)
     ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
     assert "ghost@acme" in ledger and "ghost@acme-skills" not in ledger
     assert marketplace_skill_dir(home, "acme-skills").is_dir()
     assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
+    # 「迁移其余」= settings 四个引用面都改指新名（不只账本保留）
+    user = _user(env)
+    assert user["installedPlugins"] == ["ghost@acme-skills"]
+    assert user["enabledPlugins"] == {"ghost@acme-skills": True}
+    assert user["trustedMarketplaces"] == ["acme-skills"]
+    assert user["blockedMarketplaces"] == ["acme-skills"]
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
 
 
@@ -2075,20 +2096,35 @@ def test_project_record_without_project_path_for_baseline_derived_keeps_ledger(
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, baseline="acme-skills", with_ledger=False)
     root = marketplace_skill_dir(home, "acme") / "plugins" / "figma"
     _write_ledger(home, env, {"figma@acme": [{"scope": "local", "installPath": str(root), "mcpServers": []}]})
-    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    _write_user(
+        env,
+        {
+            "installedPlugins": ["figma@acme"],
+            "enabledPlugins": {"figma@acme": True},
+            "trustedMarketplaces": ["acme"],
+            "blockedMarketplaces": ["acme"],
+        },
+    )
     (marketplace_skill_dir(home, "acme") / ".tfrobot-plugin" / "marketplace.json").write_text("{broken", encoding="utf-8")
+    before = _snapshot(tmp_path)
 
     plan = mm.build_plan(home, env, cwd=work)
     item = plan.items[0]
     assert item.baseline_derived and item.action == mm.ACTION_RENAME
     assert item.incomplete is True
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _assert_unchanged(before, tmp_path)  # dry-run 零写入
     _apply(plan, home, env)
 
     ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
     assert "figma@acme" in ledger and "figma@acme-skills" not in ledger
     assert marketplace_skill_dir(home, "acme-skills").is_dir()
     assert not marketplace_skill_dir(home, "acme").exists()
+    user = _user(env)  # 「迁移其余」：引用面照常改指新名
+    assert user["installedPlugins"] == ["figma@acme-skills"]
+    assert user["enabledPlugins"] == {"figma@acme-skills": True}
+    assert user["trustedMarketplaces"] == ["acme-skills"]
+    assert user["blockedMarketplaces"] == ["acme-skills"]
 
 
 def test_project_record_without_project_path_and_install_path_keeps_ledger(
@@ -2098,15 +2134,99 @@ def test_project_record_without_project_path_and_install_path_keeps_ledger(
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
     _write_ledger(home, env, {"figma@acme": [{"scope": "project", "mcpServers": []}]})
     _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    before = _snapshot(tmp_path)
 
     plan = mm.build_plan(home, env, cwd=work)
     assert plan.items[0].action == mm.ACTION_RENAME
+    # 静态可知的 keep 形态在计划期即预告：dry-run 退出码与 apply 一致（§12.2 / #301 裁决②）
+    assert plan.items[0].incomplete is True
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    assert any("has no installPath" in warning for warning in plan.items[0].warnings)
+    _assert_unchanged(before, tmp_path)
     _apply(plan, home, env)
 
     ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
     assert "figma@acme" in ledger and "figma@acme-skills" not in ledger
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
-    assert any("has no installPath" in warning for warning in plan.items[0].warnings)
+
+
+def test_non_mapping_ledger_record_is_predicted_in_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """记录非对象：P2 只保留、不 raise ⇒ 计划期即置 incomplete（dry-run 与 apply 同码）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    _write_ledger(home, env, {"figma@acme": ["not-a-record"]})  # type: ignore[list-item]
+    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    before = _snapshot(tmp_path)
+
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_RENAME
+    assert plan.items[0].incomplete is True
+    assert plan.items[0].reason == mm.REASON_LEDGER_REBUILD_FAILED
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _assert_unchanged(before, tmp_path)
+
+    _apply(plan, home, env)
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+
+
+def test_removed_plugin_inputs_and_secret_are_not_rekeyed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D14 carve-out（#301 裁决）：已移出新清单的 plugin 无 rename 目标 ⇒ 不枚举/不重键/不阻断。"""
+    env, home, work, fake = _legacy_setup(
+        tmp_path,
+        monkeypatch,
+        with_ledger=False,
+        inputs={
+            "figma": [{"id": "region", "description": "r"}],
+            "ghost": [
+                {"id": "region", "description": "r"},
+                {"id": "token", "description": "t", "password": True},
+            ],
+        },
+        values={"figma@acme/region": "eu", "ghost@acme/region": "gz"},
+        secrets={"ghost@acme/token": "s3cret"},
+    )
+    _write_ledger(home, env, {"ghost@acme": [_record(home, "acme", "ghost")]})
+    _write_user(
+        env,
+        {
+            "installedPlugins": ["ghost@acme", "figma@acme"],
+            "enabledPlugins": {"ghost@acme": True, "figma@acme": True},
+        },
+    )
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_RENAME
+    assert any("left unchanged" in warning for warning in item.warnings)
+    _apply(plan, home, env)
+
+    # 已移除 plugin：旧 secret 键/值原样保留，keyring 无任何写/删
+    assert fake.data == {"ghost@acme/token": "s3cret"}
+    assert fake.ops == []
+    # 它的 input 值也不重键
+    values = _read_values(env)
+    assert values["ghost@acme/region"] == "gz" and "ghost@acme-skills/region" not in values
+    # 清单内 plugin 正常迁移
+    assert values["figma@acme-skills/region"] == "eu" and "figma@acme/region" not in values
+    ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
+    assert "ghost@acme" in ledger and "ghost@acme-skills" not in ledger
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+
+
+def test_in_manifest_plugin_missing_root_still_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D14 正对照：plugin 仍在新清单但根不可定位 ⇒ 整项 blocked、零写入（carve-out 不得扩大）。"""
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False, inputs={})
+    missing = marketplace_skill_dir(home, "acme") / "plugins" / "figma"
+    _write_ledger(home, env, {"figma@acme": [{"scope": "user", "installPath": str(missing), "mcpServers": []}]})
+    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    before = _snapshot(tmp_path)
+
+    plan = mm.build_plan(home, env, cwd=work)
+    item = plan.items[0]
+    assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_PLUGIN_ROOT_UNREADABLE
+    assert not any("keeping its old ledger record" in warning for warning in item.warnings)
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
+    _apply(plan, home, env)
+    _assert_unchanged(before, tmp_path)
 
 
 def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
@@ -2131,7 +2251,8 @@ def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
     plan = mm.build_plan(home, env, cwd=work)
     item = plan.items[0]
     assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_PROJECT_PATH_MISSING
-    assert any("not present in the new manifest" in warning for warning in item.warnings)
+    # 整项被阻断 ⇒ 不执行、也未保留任何账本：不得留下 keep 诊断（诊断只属于真正 keep 的 rename 项）
+    assert not any("keeping its old ledger record" in warning for warning in item.warnings)
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
     _apply(plan, home, env)
     _assert_unchanged(before, tmp_path)
@@ -2150,6 +2271,14 @@ def test_rebuild_ledger_race_project_path_raise(tmp_path: Path, monkeypatch: pyt
         asyncio.run(mm._rebuild_ledger(item, home, env))
     assert excinfo.value.reason == mm.REASON_LEDGER_REBUILD_FAILED
     assert ledger_path.read_bytes() == before
+
+
+def test_record_needs_project_path_predicate_contract() -> None:
+    """谓词自足性：缺/空 `installPath` 一律 False——P0.5 与 P2 共用的单一判据自己守边界（#301 item 1）。"""
+    assert mm._record_needs_project_path({"scope": "project"}) is False
+    assert mm._record_needs_project_path({"scope": "project", "installPath": "", "projectPath": ""}) is False
+    assert mm._record_needs_project_path({"scope": "project", "installPath": "/p"}) is True
+    assert mm._record_needs_project_path({"scope": "project", "installPath": "/p", "projectPath": "/w"}) is False
 
 
 # ── #301 item 2 / 5 / 7：P3 null、无 source 正路、死分支 ─────────────────────
@@ -2207,7 +2336,8 @@ def test_missing_source_key_plans_and_applies(tmp_path: Path, monkeypatch: pytes
 
 
 def test_missing_source_key_with_ledger_keeps_old_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """无 source 的 known 记录无法驱动重物化：F10 保留旧账本、其余照迁、exit 3（item 5 × F10 交互）。"""
+    """无 `source` 的 known 记录无法驱动重物化（`_resolve_marketplace_source` 要求映射）：落通用重建失败
+    分支 → 保留旧账本、其余照迁、exit 3（item 5 × F10 交互）——不是「plugin 不在清单」那条 F10 分支。"""
     env = _env(tmp_path)
     home = _home(env)
     work = tmp_path / "work"
@@ -2225,4 +2355,6 @@ def test_missing_source_key_with_ledger_keeps_old_record(tmp_path: Path, monkeyp
     assert "figma@acme" in ledger and "figma@acme-skills" not in ledger
     assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
     assert plan.items[0].incomplete is True
+    assert plan.items[0].reason == mm.REASON_LEDGER_REBUILD_FAILED
+    assert any("could not be re-materialized" in warning for warning in plan.items[0].warnings)
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
