@@ -35,10 +35,12 @@ PY = sys.executable
 CLI_INIT = "a2c_smcp/computer/cli/commands/__init__.py"
 SETTINGS_CLI = "a2c_smcp/computer/cli/commands/settings.py"
 PLUGIN_CLI = "a2c_smcp/computer/cli/commands/plugin.py"
+INTERACTIVE = "a2c_smcp/computer/cli/interactive_impl.py"
 
 T_INIT = "tests/unit_tests/computer/cli/test_commands_init.py"
 T_SETTINGS = "tests/unit_tests/computer/cli/test_settings.py"
 T_APPROVAL = "tests/unit_tests/computer/cli/test_mcp_approval.py"
+T_INTERACTIVE = "tests/unit_tests/computer/cli/test_interactive_more.py"
 
 _FIELD_AND_REASON = (
     "        field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)"
@@ -124,6 +126,55 @@ MUTATIONS: tuple[Mutation, ...] = (
             T_SETTINGS + "::test_settings_get_markup_key_reports_without_crash",
             T_SETTINGS + "::test_settings_set_markup_key_writes_then_reports",
         ),
+    ),
+    Mutation(
+        "M6 去审批门挂载/摘除失败行的异常 escape",
+        (
+            (
+                PLUGIN_CLI,
+                "✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
+                "✗ failed to mount MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
+            ),
+            (
+                PLUGIN_CLI,
+                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
+                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
+            ),
+        ),
+        (T_APPROVAL + "::test_approval_mount_failure_line_escapes_markup_exception",),
+    ),
+    Mutation(
+        "M7 去审批门 input 冲突行的 id detail escape",
+        (
+            (
+                PLUGIN_CLI,
+                '        detail = f"{escape(\', \'.join(repr(i) for i in now))}（本次跳过 / skipped）"',
+                '        detail = f"{\', \'.join(repr(i) for i in now)}（本次跳过 / skipped）"',
+            ),
+        ),
+        (T_APPROVAL + "::test_input_collision_line_escapes_markup_ids",),
+    ),
+    Mutation(
+        "M8 去 REPL 顶层降级兜底的 escape",
+        (
+            (
+                INTERACTIVE,
+                'console.print(f"[{style}]{escape(message)}: {escape(str(exc))}[/{style}]")',
+                'console.print(f"[{style}]{message}: {str(exc)}[/{style}]")',
+            ),
+        ),
+        (T_INTERACTIVE + "::test_print_degraded_escapes_markup",),
+    ),
+    Mutation(
+        "M9 去未知子命令提示的 escape",
+        (
+            (
+                CLI_INIT,
+                'console_util.console.print(f"[yellow]unknown {escape(kind)} subcommand: {escape(sub)}[/yellow]")',
+                'console_util.console.print(f"[yellow]unknown {kind} subcommand: {sub}[/yellow]")',
+            ),
+        ),
+        (T_INIT + "::test_print_unknown_subcommand_escapes_markup",),
     ),
 )
 

@@ -936,7 +936,16 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   prompt 未转义——`{"servers": {"evil[/]x": …}}` 这类**合法**配置即可让 rich 抛 `MarkupError`，而
   `interactive_impl` 的 `except Exception` 会把**整个审批门**降级为一行 WARN（恶意名之后的 server 不再
   挂载/摘除/提示，与 #294 同族）。现 server 名统一走 `escape(repr(name))`、异常文本走 `escape(str(exc))`，
-  prompt 改用 `{name!r}`（干净名渲染不变）。本项**不重开 #294 决策**，#304 的三项挂账不变。
+  prompt 改用 `{name!r}`（不含引号/反斜杠的普通名渲染不变；含引号或控制字符时按 repr 转义，刻意如此）。
+  本项**不重开 #294 决策**，#304 的三项挂账不变。
+  - 同函数内**同族残余**一并收口：`_inject_inputs_collision_safe` 的 input id 冲突行（`mcp.json` 可声明
+    两个 `[/]` 形态 id，`env_segment` 坍缩到同一环境变量名，冲突行在审批门循环**之前**执行——未转义同样让
+    整门跳过）；id / env 名 / source 逐段 `escape`。
+- **REPL 顶层兜底与未知子命令提示的 markup 安全（#295）**：`interactive_impl` 的三个 catch-all 降级行
+  （批准门控初始化失败 / 治理重挂失败 / 执行失败）此前把异常文本直接拼进 markup——`MarkupError` 正文自带
+  `[/]`，兜底自身会二次抛出、令 REPL 直接 traceback 退出。现经 `_print_degraded` 统一 `escape`。
+  四个 REPL 分派器（settings / plugin / skill / marketplace）的未知子命令提示同步改用共享的
+  `print_unknown_subcommand`（此前只修了 settings 一处）。
 - **脱敏边界（写入口径，非新行为）**：本版只脱敏**错误行**；`settings show` / `settings get` 对**合法**的
   marketplace 声明值（如 `source.url` 里用户自己写的带凭据 URL）仍**忠实展示**——那是查看器语义，不是诊断回显。
 - 残余挂账 [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)：`enabledPlugins` 非法键 / `mcp.json: {e}`

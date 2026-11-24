@@ -48,6 +48,7 @@ from a2c_smcp.computer.cli.commands import (
     build_mcp_callbacks,
     flag_value,
     format_settings_errors,
+    print_unknown_subcommand,
     resolved_settings,
     resolved_settings_provider_of,
     resolved_settings_with_errors,
@@ -205,12 +206,14 @@ def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, so
         # 据实分述，且不写死「两者」——坍缩组可 >2 个成员（如 a-b / a.b / a@b / a_b 四者同名）。
         now = sorted(i for i in ids if i in candidates)
         kept = sorted(i for i in ids if i not in candidates)
-        detail = f"{', '.join(repr(i) for i in now)}（本次跳过 / skipped）"
+        # id / name / source 全是不可信值（mcp.json 可随仓库分发；plugin 名来自账本）：逐段 escape，否则
+        # 两个 `[/]` 形态 id 坍缩到同一 env 名时 rich 抛 MarkupError，异常逸出 `run_mcp_approval` ⇒ 整门跳过。
+        detail = f"{escape(', '.join(repr(i) for i in now))}（本次跳过 / skipped）"
         if kept:
-            detail += f"；{', '.join(repr(i) for i in kept)}（池内既有，未受影响 / already in pool, untouched）"
+            detail += f"；{escape(', '.join(repr(i) for i in kept))}（池内既有，未受影响 / already in pool, untouched）"
         console.print(
-            f"[red]❌ {source}: 以下 input id 均映射到同一环境变量名 {name!r} —— {detail}。请改 id 消歧 / "
-            f"input ids collide on one env var name; rename to disambiguate[/red]",
+            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name))} —— {detail}。"
+            "请改 id 消歧 / input ids collide on one env var name; rename to disambiguate[/red]",
         )
     for inp in inputs:
         if inp.id in skipped:
@@ -884,8 +887,8 @@ async def run_mcp_approval(
                 continue
             srv = resolved.servers[name]
             prompt = (
-                # `{name!r}`（#295）：干净名渲染与旧 `'{name}'` 逐字一致；控制字符 / 换行被转义，
-                # 仓库分发的 mcp.json 不能借 server 名伪造审批提示行。
+                # `{name!r}`（#295）：不含引号/反斜杠的普通名与旧 `'{name}'` 渲染一致；含引号 / 控制字符时
+                # 按 repr 转义（刻意如此），仓库分发的 mcp.json 不能借 server 名伪造审批提示行。
                 f"⚠ Unapproved workspace MCP server {name!r} (origin={srv.origin})\n"
                 "  [y]es this server · [a]ll project servers · [n]o (deny): "
             )
@@ -1002,7 +1005,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if code == EXIT_OK:
             comp.mark_skills_dirty()
     else:
-        console.print(f"[yellow]unknown plugin subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("plugin", sub)
 
 
 def _batch_teardown(remove_server: RemoveServer) -> Callable[[list[str]], Awaitable[None]]:

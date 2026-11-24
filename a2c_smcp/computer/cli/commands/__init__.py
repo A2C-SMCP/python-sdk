@@ -263,3 +263,18 @@ def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[st
         field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)
         lines.append(f"⚠ settings.json[{e.scope.value}]: {field} — {reason}")
     return lines
+
+
+def print_unknown_subcommand(kind: str, sub: str) -> None:
+    """REPL 未知子命令提示（#295）：``sub`` 是用户**原样输入**，必须 ``escape``。
+
+    未转义时 rich 抛 ``MarkupError``；REPL 顶层兜底（``interactive_impl`` 的 ``except Exception``）若也未转义
+    就会二次抛出，令交互模式直接 traceback 退出。四个分派器（settings / plugin / skill / marketplace）共用本
+    函数——新增分派器同样走它，避免再漏一处。
+    """
+    # 函数内惰性导入：``commands`` 是每个命令模块都会 import 的包 init，不应把 rich / console 拉进所有导入链。
+    from rich.markup import escape
+
+    from a2c_smcp.computer.utils import console as console_util
+
+    console_util.console.print(f"[yellow]unknown {escape(kind)} subcommand: {escape(sub)}[/yellow]")

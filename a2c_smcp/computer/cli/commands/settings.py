@@ -33,6 +33,7 @@ from rich.markup import escape
 from a2c_smcp.computer.cli.commands import (
     flag_value,
     format_settings_errors,
+    print_unknown_subcommand,
     resolved_settings_with_errors,
     settings_axes_of,
 )
@@ -419,4 +420,4 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             if post_save is not None:
                 await post_save()
     else:
-        console.print(f"[yellow]unknown settings subcommand: {escape(sub)}[/yellow]")
+        print_unknown_subcommand("settings", sub)

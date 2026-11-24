@@ -399,6 +399,111 @@ async def test_approval_prompt_shows_repr_server_name(
 
 
 @pytest.mark.asyncio
+async def test_input_collision_line_escapes_markup_ids(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🔴：`_inject_inputs_collision_safe` 的 id 冲突行在**审批门循环之前**执行。
+
+    `.tfrobot/mcp.json` 可声明两个 `[/]` 形态 id——`env_segment` 把它们坍缩到同一环境变量名，冲突行的
+    `detail` 含两处 `[/]`：未转义时 rich 抛 `MarkupError` ⇒ 异常逸出 `run_mcp_approval` ⇒ 整门跳过。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _write_json(
+        wd / ".tfrobot" / "mcp.json",
+        {
+            "servers": {"good": _stdio()},
+            "inputs": [
+                {"id": "evil[/]a-b", "description": "x"},
+                {"id": "evil[/]a_b", "description": "y"},
+            ],
+        },
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]a-b" in out and "evil[/]a_b" in out  # 冲突双方原文可见
+    assert "'good'" in out  # 后续 server 仍被处理（整门未中断）
+
+
+@pytest.mark.asyncio
+async def test_approval_mount_failure_line_escapes_markup_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡：挂载失败行的 `{exc}` 若含 markup，未 escape 时兜底打印自身再抛（`except` 内不得可抛）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    async def _boom(_cfg: Any, session: Any = None) -> None:
+        raise RuntimeError("boom[/]x")
+
+    monkeypatch.setattr(comp, "amount_server", _boom)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "boom[/]x" in out  # 异常原文可见
+
+
+@pytest.mark.asyncio
+async def test_approval_prompt_escapes_control_chars(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡：prompt 的 `{name!r}` 须把换行/控制字符转义成字面 `\\n`，不能伪造提示行。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil\nx": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    sess = _Session(["y"])
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, sess, approve_all=False, settings_flag_path=None)
+
+    prompt = sess.prompts[0]
+    assert "evil\\nx" in prompt  # repr 形态：字面反斜杠 + n
+    assert "evil\nx" not in prompt  # 裸换行不得出现在提示文本里
+
+
+@pytest.mark.asyncio
+async def test_approval_deny_line_escapes_markup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡：deny 分支的展示行同样须 escape（此前无覆盖）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil[/]x": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, _Session(["n"]), approve_all=False, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "deniedMCPserver'evil[/]x'" in out  # 文案与文字均可见
+
+
+@pytest.mark.asyncio
 async def test_mcp_json_error_line_escapes_markup(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -202,3 +202,19 @@ async def test_server_rm_and_start_stop_single_with_errors(monkeypatch: pytest.M
     comp.mcp_manager.__class__ = BadMgr  # type: ignore[attr-defined]
 
     await _interactive_loop(comp)
+
+
+def test_print_degraded_escapes_markup(capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（复审 🟡）：降级兜底自身不得因 markup 再抛（``except`` 内的错误转换不得可抛）。
+
+    ``MarkupError`` 的正文本身就含 ``[/]``——未转义时「批准门控初始化失败」这行会二次抛出，
+    逸出到 ``_interactive_loop`` 外层（``main`` 无捕获）令 REPL 直接 traceback 退出。
+    """
+    from rich.errors import MarkupError
+
+    from a2c_smcp.computer.cli.interactive_impl import _print_degraded
+
+    _print_degraded("MCP 批准门控初始化失败 / approval init failed", MarkupError("closing tag '[/]' doesn't match any open tag"))
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "[/]" in out  # 异常原文可见，且打印本身不抛

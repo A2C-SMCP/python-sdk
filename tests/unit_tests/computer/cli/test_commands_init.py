@@ -143,3 +143,13 @@ def test_format_settings_errors_preserves_clean_invalid_marketplace_names(name: 
     assert lines == [
         f"⚠ settings.json[user]: extraKnownMarketplaces.{name} — marketplace name must be strict kebab (1-64)"
     ]
+
+
+def test_print_unknown_subcommand_escapes_markup(capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（复审 🟡）：REPL 未知子命令提示的 ``sub`` 是用户原样输入——四个分派器共用同一转义点。"""
+    from a2c_smcp.computer.cli.commands import print_unknown_subcommand
+
+    print_unknown_subcommand("plugin", "evil[/]x")  # 不得抛 MarkupError
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "unknownpluginsubcommand:evil[/]x" in out

@@ -23,7 +23,7 @@ from typing import Any
 
 from rich.markup import escape
 
-from a2c_smcp.computer.cli.commands import flag_value
+from a2c_smcp.computer.cli.commands import flag_value, print_unknown_subcommand
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, SOURCE_MCP, SOURCE_USER
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -143,4 +143,4 @@ def repl_dispatch(comp: Any, parts: list[str]) -> None:
             return
         skill_info(registry, pos[0], json_output=json_output)
     else:
-        console.print(f"[yellow]unknown skill subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("skill", sub)
