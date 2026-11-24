@@ -311,6 +311,234 @@ async def test_settings_error_line_escapes_markup(
 
 
 @pytest.mark.asyncio
+async def test_settings_error_line_redacts_marketplace_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#295：`run_mcp_approval` 消费同一 `format_settings_errors`——错误行不得回显 marketplace 键里的凭据。
+
+    escape 由 #294 已加（同族用例见上），本用例钉**脱敏**轴：userinfo 剥离、结构仍可定位。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    _write_json(
+        Path(env["XDG_CONFIG_HOME"]) / "a2c" / "settings.json",
+        {"extraKnownMarketplaces": {"https://alice:s3cret@example.com/repo.git": {}}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "s3cret" not in out  # 凭据不落
+    assert "https://example.com/repo.git" in out  # userinfo 剥离但名字仍可定位
+
+
+# ── #295 隔离审查 🔴：审批门 server 名展示行的 markup 安全（既存缺陷，非本单引入）──────────
+@pytest.mark.parametrize("mode", ["approve_all", "non_tty", "disabled"])
+@pytest.mark.asyncio
+async def test_approval_lines_escape_markup_in_server_names(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """
+    既存缺陷（非本单引入）：`.tfrobot/mcp.json` 的 server 名是裸 `str`（无字符集约束），仓库可分发
+    `evil[/]x` 令审批门在展示行抛 `MarkupError`；`interactive_impl` 的 `except Exception` 会把**整门**
+    降级为一行 WARN ⇒ 恶意名之后的 server 不再挂载/摘除/提示。
+
+    三景分别钉住：`--approve-all-mcp` 的 mounted 行、非 TTY 的 skipped 行、DISABLED 的 skipped 行。
+    恶意名刻意排在字典首位——若中断，`'good'` 不会出现在输出里。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil[/]x": _stdio(), "good": _stdio()})
+    if mode == "disabled":
+        _write_json(workdir_local_settings_path(wd), {"disabledMcpjsonServers": ["evil[/]x"]})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=mode == "approve_all", settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]x" in out  # 原文逐字可见
+    assert "'good'" in out  # 恶意名之后仍继续处理（整门未被中断）
+    if mode == "approve_all":
+        assert "evil[/]x" in _mounted_names(comp)
+
+
+@pytest.mark.parametrize("name", ["evil[/]x", "shared"])
+@pytest.mark.asyncio
+async def test_approval_prompt_shows_repr_server_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    """#295：审批 prompt 改用 `{name!r}`——干净名渲染与旧 `'{name}'` 逐字一致，控制字符不再可伪造提示行。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {name: _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    sess = _Session(["y"])
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, sess, approve_all=False, settings_flag_path=None)
+
+    assert sess.prompts[0].startswith("⚠ Unapproved workspace MCP server ")
+    assert f"'{name}'" in sess.prompts[0]  # repr 形态：干净名与旧写法一致，markup 名不被解析
+    assert name in _mounted_names(comp)  # [y] 后挂载成功（mounted 展示行同样不抛）
+
+
+@pytest.mark.asyncio
+async def test_input_collision_line_escapes_markup_ids(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🔴：`_inject_inputs_collision_safe` 的 id 冲突行在**审批门循环之前**执行。
+
+    `.tfrobot/mcp.json` 可声明两个 `[/]` 形态 id——`env_segment` 把它们坍缩到同一环境变量名，冲突行的
+    `detail` 含两处 `[/]`：未转义时 rich 抛 `MarkupError` ⇒ 异常逸出 `run_mcp_approval` ⇒ 整门跳过。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _write_json(
+        wd / ".tfrobot" / "mcp.json",
+        {
+            "servers": {"good": _stdio()},
+            "inputs": [
+                {"id": "evil[/]a-b", "description": "x"},
+                {"id": "evil[/]a_b", "description": "y"},
+            ],
+        },
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]a-b" in out and "evil[/]a_b" in out  # 冲突双方原文可见
+    assert "'good'" in out  # 后续 server 仍被处理（整门未中断）
+
+
+@pytest.mark.asyncio
+async def test_approval_mount_failure_line_escapes_markup_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡：挂载失败行的 `{exc}` 若含 markup，未 escape 时兜底打印自身再抛（`except` 内不得可抛）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    async def _boom(_cfg: Any, session: Any = None) -> None:
+        raise RuntimeError("boom[/]x")
+
+    monkeypatch.setattr(comp, "amount_server", _boom)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "boom[/]x" in out  # 异常原文可见
+
+
+@pytest.mark.asyncio
+async def test_approval_unmount_failure_line_escapes_markup_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡3：DISABLED 分支的摘除失败行同样有 `{exc}` 插值——此前只有 mount 行被锁。
+
+    构造：server 已在活跃集（`mcp_manager.server_configs()` 含其 config）且 local 声明 disabled ⇒
+    `_ensure_unmounted` 走摘除分支；`aunmount_server_by_id` 抛含 markup 的异常。
+    """
+    import unittest.mock as _m
+    from types import SimpleNamespace
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil[/]x": _stdio(), "good": _stdio()})
+    _write_json(workdir_local_settings_path(wd), {"disabledMcpjsonServers": ["evil[/]x"]})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    async def _boom(_bid: str) -> None:
+        raise RuntimeError("boom[/]x")
+
+    monkeypatch.setattr(comp, "aunmount_server_by_id", _boom)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        decl = comp.resolve_mcp_declarations(env=env)
+        comp.mcp_manager = SimpleNamespace(server_configs=lambda: [decl.servers["evil[/]x"].config])
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "boom[/]x" in out  # 异常原文可见
+    assert "\\[" not in out  # 无双重转义残留（escape 只做一次，rich 已还原）
+
+
+@pytest.mark.asyncio
+async def test_approval_prompt_escapes_control_chars(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡：prompt 的 `{name!r}` 须把换行/控制字符转义成字面 `\\n`，不能伪造提示行。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil\nx": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    sess = _Session(["y"])
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, sess, approve_all=False, settings_flag_path=None)
+
+    prompt = sess.prompts[0]
+    assert "evil\\nx" in prompt  # repr 形态：字面反斜杠 + n
+    assert "evil\nx" not in prompt  # 裸换行不得出现在提示文本里
+
+
+@pytest.mark.asyncio
+async def test_approval_deny_line_escapes_markup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡：deny 分支的展示行同样须 escape（此前无覆盖）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil[/]x": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, _Session(["n"]), approve_all=False, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "deniedMCPserver'evil[/]x'" in out  # 文案与文字均可见
+
+
+@pytest.mark.asyncio
 async def test_mcp_json_error_line_escapes_markup(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -330,3 +558,44 @@ async def test_mcp_json_error_line_escapes_markup(
     out = _no_ws(capsys.readouterr().out)
     assert "mcp.json" in out
     assert "bad[/]name" in out  # 原文逐字可见
+
+
+@pytest.mark.asyncio
+async def test_approval_mount_failure_line_redacts_pydantic_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#289 + #295 合并面：失败行的异常文本走 `exception_text`——pydantic `input_value`（渲染后 secret）
+    不得回显（独立审查 🟡2）。"""
+    import unittest.mock as _m
+
+    from pydantic import BaseModel
+
+    class _Payload(BaseModel):
+        token: int  # 传字符串触发 int_parsing，input_value 就是 secret
+
+    def _validation_error() -> BaseException:
+        try:
+            _Payload(token="SUPER_SECRET_TOKEN")  # type: ignore[arg-type]
+        except Exception as exc:
+            return exc
+        raise AssertionError("expected ValidationError")
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    exc = _validation_error()
+
+    async def _boom(_cfg: Any, session: Any = None) -> None:
+        raise exc
+
+    monkeypatch.setattr(comp, "amount_server", _boom)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "SUPER_SECRET_TOKEN" not in out  # input_value 不回显
+    assert "validationerror(s)in[token:int_parsing]" in out  # 仍有可定位的摘要（exception_text 形态）

@@ -28,9 +28,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
+
 from a2c_smcp.computer.cli.commands import (
     flag_value,
     format_settings_errors,
+    print_unknown_subcommand,
     resolved_settings_with_errors,
     settings_axes_of,
 )
@@ -65,10 +68,12 @@ _WRITABLE = {"user", "project", "local"}
 
 
 def _err(msg: str, *, json_output: bool) -> int:
+    """错误呈现（**人读分支经 escape**，#295）：``msg`` 会嵌入不可信键名 / scope / 路径 / 异常文本，
+    未转义时 rich 抛 ``MarkupError``（``settings get 'evil[/]a[/]b'`` 实测可复现）。JSON 分支是数据，不转义。"""
     if json_output:
         console.print_json(data={"error": msg})
     else:
-        console.print(f"[red]✗ {msg}[/red]")
+        console.print(f"[red]✗ {escape(msg)}[/red]")
     return EXIT_USER_ERROR
 
 
@@ -141,10 +146,13 @@ def _read_scope_with_errors(
 def _emit_errors(errors: list[SettingsValidationError]) -> None:
     """把 settings 校验错误打 **stderr**（#157）——stdout 恒为机读 JSON，``settings show | jq`` 须仍可用。
 
-    Diagnostics on stderr; stdout stays pure JSON.
+    整行经 :func:`rich.markup.escape`（#295）：``field`` 含原始 JSON 键，手编 ``evil[/]a[/]b`` 会让 rich 抛
+    ``MarkupError`` 并让 ``settings show`` / ``settings get`` 直接 traceback；未转义时 ``settings.json[user]``
+    的 scope 文本也会被当样式标签吞掉。脱敏在 :func:`format_settings_errors` 层做（本函数只负责安全呈现）。
+    Diagnostics on stderr; each line escaped so untrusted keys cannot break the markdown/markup parser.
     """
     for line in format_settings_errors(errors):
-        console_err.print(f"[yellow]{line}[/yellow]")
+        console_err.print(f"[yellow]{escape(line)}[/yellow]")
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
@@ -278,7 +286,7 @@ def settings_set(
         if json_output:
             console.print_json(data={"scope": scope, "key": key, "ignored": True, "reason": reason})
             return EXIT_OK
-        console.print(f"[yellow]✓ ignored {key} in {scope} scope (not written)[/yellow]")
+        console.print(f"[yellow]✓ ignored {escape(key)} in {escape(scope)} scope (not written)[/yellow]")
         return EXIT_OK
 
     try:
@@ -301,7 +309,7 @@ def settings_set(
     if json_output:
         console.print_json(data={"scope": scope, "key": key, "value": parsed})
         return EXIT_OK
-    console.print(f"[green]✓ set {key} in {scope} scope[/green]")
+    console.print(f"[green]✓ set {escape(key)} in {escape(scope)} scope[/green]")
     return EXIT_OK
 
 
@@ -340,7 +348,7 @@ def settings_edit(
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         return _err(f"editor failed: {e}", json_output=json_output), None
 
-    console.print(f"[green]✓ edited {scope} settings ({path})[/green]")
+    console.print(f"[green]✓ edited {escape(scope)} settings ({escape(str(path))})[/green]")
     return EXIT_OK, reconcile_cb
 
 
@@ -412,4 +420,4 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             if post_save is not None:
                 await post_save()
     else:
-        console.print(f"[yellow]unknown settings subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("settings", sub)

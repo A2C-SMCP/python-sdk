@@ -1024,7 +1024,8 @@ def test_marketplace_declaration_errors_filters_other_fields_and_preserves_order
 
 def test_marketplace_declaration_errors_redacts_and_scrubs() -> None:
     """
-    凭据形态市场名 / 带凭据的 reason / 控制字符：report 四字段全部脱敏（#295 只管 settings show）。
+    凭据形态市场名 / 带凭据的 reason / 控制字符：report 四字段全部脱敏（#295 起同一漏斗也接在
+    ``format_settings_errors`` 上，见 ``tests/unit_tests/computer/cli/test_commands_init.py``）。
 
     **path 段凭据**是关键判别输入：散文脱敏（`redact_git_urls_in_text`）对它只去 userinfo、保留 path，
     只有段漏斗（`redact_ledger_key`）才 fail-closed。名字段若误用散文脱敏，本用例必须转红。

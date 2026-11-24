@@ -1940,3 +1940,53 @@ async def test_run_governance_remount_real_settings_prints_signals_distinct_from
         assert _DECL_SCOPE_ANCHOR not in msg
         assert _CONFLICT_ANCHOR not in msg
         assert _DEGRADED_ANCHOR not in msg
+
+
+# ── #295 复审 🟡1：治理重挂成功行的 bundled server 名 markup 安全 ─────────────────
+@pytest.mark.asyncio
+async def test_run_governance_remount_register_line_escapes_markup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """marketplace 可分发 `mcp-servers/evil[/]x.json`（`name` 同为 `evil[/]x`，stem==name 校验通过）。
+
+    `_register` 的成功行未 escape 时抛 `MarkupError`，被 `reconcile_governance` 的 per-server 兜底吞成
+    WARN——server 已挂（start=False）却**永不批量启动**。本用例走真实回调：不抛 + 成功行原文可见。
+    """
+    from types import SimpleNamespace
+
+    _isolate_env(tmp_path, monkeypatch)
+    home = _home(tmp_path)
+    _seed_recovery_home(home, servers=[], skills=["lint"])
+    report = _report_with()
+
+    async with Computer(name="t", skill_home=home) as comp:
+        async def _noop_amount(*_a: Any, **_k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(comp, "amount_server", _noop_amount)
+
+        async def fake_reconcile(**kwargs: Any) -> Any:
+            cfg = SimpleNamespace(name="evil[/]x")
+            record = SimpleNamespace(plugin="p", marketplace="m", plugin_id="evil[/]x@p@m", install_path=home)
+            await kwargs["register_server"](cfg, record)  # 不得抛 MarkupError
+            return report
+
+        monkeypatch.setattr(comp, "reconcile_governance", fake_reconcile)
+        await plugin_cmd.run_governance_remount(comp)
+
+    flat = _flat(capsys.readouterr().out)
+    assert "restoredbundledMCPserver'evil[/]x'" in flat
+    assert "evil[/]x@p@m" in flat
+
+
+@pytest.mark.asyncio
+async def test_repl_unknown_subcommand_escapes_markup(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（复审 🟡5）：plugin 分派器的未知子命令提示走共享转义点（此前只测过干净 `bogus`）。"""
+    from types import SimpleNamespace
+
+    comp = SimpleNamespace(skill_home=tmp_path, skill_registry=None, mcp_manager=None)
+
+    await plugin_cmd.repl_dispatch(comp, ["plugin", "evil[/]x"], session=None)  # 不得抛
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "unknownpluginsubcommand:evil[/]x" in out

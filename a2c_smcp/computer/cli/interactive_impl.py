@@ -47,6 +47,17 @@ from a2c_smcp.smcp import ToolCallReq as SMCPToolCallReq
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.diagnostics import exception_text
 
+
+def _print_degraded(message: str, exc: BaseException, *, style: str = "yellow") -> None:
+    """降级提示（#295）：异常文本**必须** ``escape``—— ``except`` 内的错误转换自身不得可抛。
+
+    ``MarkupError`` 的正文本身就含 ``[/]``：未转义时「批准门控初始化失败」这类兜底行会二次抛出，逸出到
+    ``main``（无外层捕获）令 CLI 直接 traceback 退出，把「降级不阻断」变成「崩溃」。
+    Notice text (including the exception) is escaped so the fallback itself can never raise.
+    """
+    console.print(f"[{style}]{escape(message)}: {escape(exception_text(exc))}[/{style}]")
+
+
 # 定义上下文管理器类型
 ContextManager = AbstractContextManager[None]
 
@@ -342,7 +353,7 @@ async def interactive_loop(
         approval_session = session if sys.stdin.isatty() else None
         await plugin_cmd.run_mcp_approval(comp, approval_session, approve_all=approve_all_mcp, settings_flag_path=settings_flag_path)
     except Exception as e:  # pragma: no cover - 批准框失败不阻断进入 REPL
-        console.print(f"[yellow]⚠ MCP 批准门控初始化失败 / MCP approval init failed: {e}[/yellow]")
+        _print_degraded("⚠ MCP 批准门控初始化失败 / MCP approval init failed", e)
 
     # #117 治理重挂（设计 Y client 接线）：boot 已恢复 bundled SKILL；CLI 作为参考 client 经公共 API
     # reconcile_governance(hooks) 重挂 enabled bundled MCP server。时序刻意在批准框之后——mcp.json 的

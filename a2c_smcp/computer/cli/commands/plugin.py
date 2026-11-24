@@ -48,6 +48,7 @@ from a2c_smcp.computer.cli.commands import (
     build_mcp_callbacks,
     flag_value,
     format_settings_errors,
+    print_unknown_subcommand,
     resolved_settings,
     resolved_settings_provider_of,
     resolved_settings_with_errors,
@@ -205,12 +206,14 @@ def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, so
         # 据实分述，且不写死「两者」——坍缩组可 >2 个成员（如 a-b / a.b / a@b / a_b 四者同名）。
         now = sorted(i for i in ids if i in candidates)
         kept = sorted(i for i in ids if i not in candidates)
-        detail = f"{', '.join(repr(i) for i in now)}（本次跳过 / skipped）"
+        # id / name / source 全是不可信值（mcp.json 可随仓库分发；plugin 名来自账本）：逐段 escape，否则
+        # 两个 `[/]` 形态 id 坍缩到同一 env 名时 rich 抛 MarkupError，异常逸出 `run_mcp_approval` ⇒ 整门跳过。
+        detail = f"{escape(', '.join(repr(i) for i in now))}（本次跳过 / skipped）"
         if kept:
-            detail += f"；{', '.join(repr(i) for i in kept)}（池内既有，未受影响 / already in pool, untouched）"
+            detail += f"；{escape(', '.join(repr(i) for i in kept))}（池内既有，未受影响 / already in pool, untouched）"
         console.print(
-            f"[red]❌ {source}: 以下 input id 均映射到同一环境变量名 {name!r} —— {detail}。请改 id 消歧 / "
-            f"input ids collide on one env var name; rename to disambiguate[/red]",
+            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name))} —— {detail}。"
+            "请改 id 消歧 / input ids collide on one env var name; rename to disambiguate[/red]",
         )
     for inp in inputs:
         if inp.id in skipped:
@@ -311,7 +314,13 @@ async def run_governance_remount(
         # #208：``start=False`` —— 本回调**只挂载**；启动统一收在挂载循环之后，经批量启动器走同一
         # Computer 级并发上限（否则 mount 与 start 仍在循环内融合，上限被前 N 个绕过）。
         await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace, start=False)
-        console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
+        # 名称来自 **marketplace 分发内容**（`mcp-servers/<name>.json`，裸 str）：不转义时该行抛 MarkupError，
+        # 被 `reconcile_governance` 的 per-server 兜底吞成 WARN——server 已挂（start=False）却永不批量启动，
+        # 且成功行丢失（复审 🟡1，同为既存缺陷）。
+        console.print(
+            f"[green]✓ restored bundled MCP server {escape(repr(cfg.name))} "
+            f"(plugin {escape(str(record.plugin_id))})[/green]",
+        )
 
     async def _inject(record: Any) -> None:
         _inject_plugin_inputs(comp, record.install_path, record.plugin, record.marketplace)
@@ -744,6 +753,18 @@ def _mount_dict(srv: Any) -> dict[str, Any]:
     return {**srv.config.model_dump(mode="json"), **dict(srv.ext)}
 
 
+def _server_name_for_display(name: str) -> str:
+    """MCP server 名的**展示值**（#295）：``repr`` 让控制字符/换行可见，``escape`` 中和 rich markup。
+
+    ``.tfrobot/mcp.json`` 的 server 名是**裸 str、无字符集约束**（``resolve_mcp_config`` 不校验）且可随仓库
+    分发：``evil[/]x`` 这类名字未转义时会让 rich 抛 ``MarkupError``，而 ``run_mcp_approval`` 的唯一调用方
+    （``interactive_impl``）会 ``except Exception`` 降级 —— **整个审批门被静默放弃**（恶意名之后的 server 不再
+    挂载/摘除/提示）。干净名与旧 ``{name!r}`` 的渲染逐字一致。
+    Display-safe server name: repr keeps control chars visible, escape neutralizes rich markup.
+    """
+    return escape(repr(name))
+
+
 async def run_mcp_approval(
     comp: Any,
     session: Any | None,
@@ -793,7 +814,7 @@ async def run_mcp_approval(
     resolved_st = resolved_settings_with_errors(env, flag_path=settings_flag_path)
     # `escape()`：`format_settings_errors` 的 field/reason 来自不可信 settings（点路径用原始 JSON 键拼），
     # 手编 `extraKnownMarketplaces` 键即可注入 `[/]` —— 未转义时实测抛 MarkupError 并**跳过整个审批门**
-    # （#294 复审的可达崩溃；措辞与脱敏仍归 #295）。
+    # （#294 复审的可达崩溃；marketplace 子树的脱敏已由 #295 收口在 `format_settings_errors` 内）。
     for line in format_settings_errors(resolved_st.errors):
         console.print(f"[yellow]{escape(line)}[/yellow]")
     settings = resolved_st.settings
@@ -831,14 +852,17 @@ async def run_mcp_approval(
             # origin 判据直接表达意图，不受二者影响。守卫见
             # ``test_higher_layer_beats_embed_at_mount_time`` + ``test_embed_with_placeholder_is_not_remounted...``。
             if srv.origin is SettingsScope.EMBED and resolve_bundle_id(srv.config) in _active_bundle_ids():
-                console.print(f"[dim]· MCP server {name!r} already mounted from the embed layer (winner), left as is[/dim]")
+                console.print(
+                    f"[dim]· MCP server {_server_name_for_display(name)} already mounted from the embed layer "
+                    "(winner), left as is[/dim]",
+                )
                 return
             # #137 ③：boot 读**已声明** mcp.json 挂载 = 投影（盘上已是真相），走 transient amount_server，不回写
             # （否则每 boot 重复回写用户声明层 / scope 漂移，见 #138）。
             await comp.amount_server(_mount_dict(srv), session=session)
-            console.print(f"[green]✓ mounted MCP server {name!r}[/green]")
+            console.print(f"[green]✓ mounted MCP server {_server_name_for_display(name)}[/green]")
         except Exception as exc:  # 单个 server 挂载失败不阻断其余 / one failure must not block the rest
-            console.print(f"[red]✗ failed to mount MCP server {name!r}: {exc}[/red]")
+            console.print(f"[red]✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(exception_text(exc))}[/red]")
 
     async def _ensure_unmounted(name: str) -> None:
         """DISABLED ⇒ 真的摘掉：embed 已被 boot_up 无门挂起，只打印不摘会让 policy 拒绝名单沦为装饰品。"""
@@ -847,15 +871,18 @@ async def run_mcp_approval(
             if bid not in _active_bundle_ids():
                 return  # 从未挂过（文件来源恒走此分支）→ 幂等 no-op，行为不变
             await comp.aunmount_server_by_id(bid)
-            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied) → unmounted[/dim]")
+            console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied) → unmounted[/dim]")
         except Exception as exc:
-            console.print(f"[red]✗ failed to unmount disabled MCP server {name!r}: {exc}[/red]")
+            console.print(
+                f"[red]✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: "
+                f"{escape(exception_text(exc))}[/red]",
+            )
 
     for name, status in statuses.items():
         if status == McpApprovalStatus.ENABLED:
             await _ensure_mounted(name)
         elif status == McpApprovalStatus.DISABLED:
-            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied), skipped[/dim]")
+            console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied), skipped[/dim]")
             await _ensure_unmounted(name)
         else:  # PENDING
             if approved_all_session:
@@ -863,12 +890,15 @@ async def run_mcp_approval(
                 continue
             if session is None:  # 非 TTY 且未 --approve-all-mcp → skip + WARN
                 console.print(
-                    f"[yellow]⚠ skipped pending MCP server {name!r} (no TTY); approve in REPL or pass --approve-all-mcp[/yellow]",
+                    f"[yellow]⚠ skipped pending MCP server {_server_name_for_display(name)} (no TTY); "
+                    "approve in REPL or pass --approve-all-mcp[/yellow]",
                 )
                 continue
             srv = resolved.servers[name]
             prompt = (
-                f"⚠ Unapproved workspace MCP server '{name}' (origin={srv.origin})\n"
+                # `{name!r}`（#295）：不含引号/反斜杠的普通名与旧 `'{name}'` 渲染一致；含引号 / 控制字符时
+                # 按 repr 转义（刻意如此），仓库分发的 mcp.json 不能借 server 名伪造审批提示行。
+                f"⚠ Unapproved workspace MCP server {name!r} (origin={srv.origin})\n"
                 "  [y]es this server · [a]ll project servers · [n]o (deny): "
             )
             ans = (await session.prompt_async(prompt)).strip().lower()
@@ -881,7 +911,7 @@ async def run_mcp_approval(
                 await _ensure_mounted(name)
             else:
                 deny_mcp_server(name)
-                console.print(f"[dim]· denied MCP server {name!r} (written to local scope)[/dim]")
+                console.print(f"[dim]· denied MCP server {_server_name_for_display(name)} (written to local scope)[/dim]")
 
 
 # ── REPL dispatcher（绑定 Computer 的活跃 registry / home / session）/ REPL adapter ──
@@ -984,7 +1014,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if code == EXIT_OK:
             comp.mark_skills_dirty()
     else:
-        console.print(f"[yellow]unknown plugin subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("plugin", sub)
 
 
 def _batch_teardown(remove_server: RemoveServer) -> Callable[[list[str]], Awaitable[None]]:

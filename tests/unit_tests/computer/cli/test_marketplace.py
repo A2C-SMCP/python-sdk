@@ -2329,3 +2329,16 @@ async def test_intent_trust_persist_oserror_is_warn_not_traceback(
     assert code == 0
     assert "acme" in (load_known_marketplaces(home, env).get("marketplaces") or {})
     assert "could not be persisted" in captured.out + captured.err  # WARN 面可感（intent 路径）
+
+
+@pytest.mark.asyncio
+async def test_repl_unknown_subcommand_escapes_markup(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（复审 🟡5）：marketplace 分派器的未知子命令提示走共享转义点。"""
+    from types import SimpleNamespace
+
+    comp = SimpleNamespace(skill_home=tmp_path / "home", skill_registry=None, mcp_manager=None)
+
+    await marketplace_mod.repl_dispatch(comp, ["marketplace", "evil[/]x"], session=None)  # 不得抛
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "unknownmarketplacesubcommand:evil[/]x" in out

@@ -81,3 +81,26 @@ def test_info_found_and_orphan(tmp_path: Path, capsys: pytest.CaptureFixture[str
 
 def test_info_not_found(tmp_path: Path) -> None:
     assert skill_info(_registry(tmp_path), "no-such-skill") == 1
+
+
+def test_repl_unknown_subcommand_escapes_markup(capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（复审 🟡5）：skill 分派器的未知子命令提示走共享转义点——`evil[/]x` 不得抛 MarkupError。"""
+    from types import SimpleNamespace
+
+    import a2c_smcp.computer.cli.commands.skill as skill_mod
+
+    skill_mod.repl_dispatch(SimpleNamespace(skill_registry=None), ["skill", "evil[/]x"])  # 不得抛
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "unknownskillsubcommand:evil[/]x" in out
+
+
+def test_skill_info_unknown_markup_name_escapes(capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（独立审查 🟡3）：`skill info` 的未知名提示是裸插值——`a2c-computer skill info 'evil[/]x'` 曾抛
+    `MarkupError`（一次性 CLI 无 REPL 顶层兜底 ⇒ 直接 traceback）。现 `escape(repr(name))`。"""
+    reg = SkillRegistry()
+
+    assert skill_info(reg, "evil[/]x", json_output=False) == 1  # 不得抛
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "unknownskill:'evil[/]x'" in out

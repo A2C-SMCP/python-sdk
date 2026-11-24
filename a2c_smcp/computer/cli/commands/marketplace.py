@@ -33,6 +33,7 @@ from a2c_smcp.computer.cli.commands import (
     McpCallbacks,
     files_only_non_plugin_bundle_ids,
     flag_value,
+    print_unknown_subcommand,
     settings_axes_of,
 )
 from a2c_smcp.computer.cli.progress import clone_spinner, refresh_summary_table
@@ -1276,4 +1277,4 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         key, _, value = pos[1].partition("=")
         marketplace_set(home, env, pos[0], key, value, json_output=json_output)
     else:
-        console.print(f"[yellow]unknown marketplace subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("marketplace", sub)
