@@ -2230,25 +2230,33 @@ def test_in_manifest_plugin_missing_root_still_blocks(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.parametrize(
-    "ghost_records",
+    ("ghost_records", "ghost_in_manifest"),
     [
-        {"not": "a list"},
-        ["not-a-record"],
-        [{"scope": "project", "mcpServers": []}],
+        # 前三条必须让 ghost **在清单内**，才会走到 `_rebuild_ledger` 同构的记录循环（否则先被
+        # 「不在新清单」分支吃掉，标签与真实分支不符——#309 终审 🟡2）。
+        ({"not": "a list"}, True),
+        (["not-a-record"], True),
+        ([{"scope": "project", "mcpServers": []}], True),
+        # 保留一条 not-in-manifest 形态覆盖 kept_plugins 分支。
+        ([{"scope": "project", "installPath": "/nonexistent", "mcpServers": []}], False),
     ],
-    ids=["records-not-array", "record-not-object", "record-missing-installPath"],
+    ids=["records-not-array", "record-not-object", "record-missing-installPath", "plugin-not-in-manifest"],
 )
-def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ghost_records: object
+def test_blocked_item_never_emits_keep_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ghost_records: object, ghost_in_manifest: bool
 ) -> None:
-    """同一 marketplace：不可重建的 plugin 只登记 keep，但整项被阻断时不得落任何「keeping」诊断（🟡2）。"""
+    """整项被阻断时，任何 keep 诊断（文案或 incomplete）都必须推迟到阻断预检之后（🟡2）。"""
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    plugins = [{"name": "figma", "source": "figma"}]
+    if ghost_in_manifest:
+        plugins.append({"name": "ghost", "source": "ghost"})
+    _catalog(home, "acme", _manifest("acme-skills", plugins=plugins))
     figma_root = marketplace_skill_dir(home, "acme") / "plugins" / "figma"
     _write_ledger(
         home,
         env,
         {
-            "ghost@acme": ghost_records,  # type: ignore[dict-item]  # 已出清单 + 三种静态 keep 形态
+            "ghost@acme": ghost_records,  # type: ignore[dict-item]
             "figma@acme": [{"scope": "project", "installPath": str(figma_root), "mcpServers": []}],
         },
     )
@@ -2258,8 +2266,10 @@ def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
     plan = mm.build_plan(home, env, cwd=work)
     item = plan.items[0]
     assert item.action == mm.ACTION_BLOCKED and item.reason == mm.REASON_PROJECT_PATH_MISSING
-    # 整项被阻断 ⇒ 不执行、也未保留任何账本：所有「keep」诊断都必须推迟到阻断预检之后（此处一条都不落）
+    # 整项被阻断 ⇒ 不执行、也未保留任何账本：任何 keep 文案都不得出现；无文案的分支（记录非对象）
+    # 由 incomplete 断言兜住（in-loop 应用会置位）。
     assert not any("keeping" in warning for warning in item.warnings)
+    assert item.incomplete is False
     assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
     _apply(plan, home, env)
     _assert_unchanged(before, tmp_path)

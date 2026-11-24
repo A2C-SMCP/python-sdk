@@ -582,6 +582,36 @@ MUTATIONS: tuple[Mutation, ...] = (
         (T + "::test_manifest_entry_traversal_never_reads_outside_home",),
     ),
     Mutation(
+        "4l 静态 keep 诊断回到循环内（阻断项留 keep 文案/incomplete）",
+        (
+            (
+                MOD,
+                """        if not isinstance(records, list):
+            kept_notes.append(f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
+            continue""",
+                """        if not isinstance(records, list):
+            _note_ledger_record_kept(item, f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
+            continue""",
+            ),
+            (
+                MOD,
+                """            if not isinstance(record, Mapping):
+                kept_notes.append(None)
+                continue
+            if _ledger_install_path(record) is None:
+                kept_notes.append(f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched")
+                continue""",
+                """            if not isinstance(record, Mapping):
+                _note_ledger_record_kept(item, None)
+                continue
+            if _ledger_install_path(record) is None:
+                _note_ledger_record_kept(item, f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched")
+                continue""",
+            ),
+        ),
+        (T + "::test_blocked_item_never_emits_keep_diagnostics",),
+    ),
+    Mutation(
         "4a rebuild 传 projectPath（project/local 记录保留 projectPath）",
         ((MOD, "                    project_path=project_path,\n", ""),),
         (T + "::test_project_record_rebuild_preserves_project_path",),

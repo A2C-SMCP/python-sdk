@@ -983,10 +983,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   的 plan+apply 正路（含与 F10 的交互）、P3 目标 value/secret 不被覆盖断言、`_rekey_values` P3 死分支清理。
 - 变异脚本自证（`scripts/mutation_marketplace_migration.py`）：基线绿跑 + 严格 KILLED 判定（仅
   `rc == 1` 且 short summary 的 `FAILED`/`ERROR` 行列出全部目标用例，**禁止裸子串匹配**）+ 语法校验 +
-  单次超时 + sha256 逐字节还原（raise 式，不依赖 `assert`）+ 锚点演进校验；矩阵 33 → 43 条（补 P0.5
+  单次超时 + sha256 逐字节还原（raise 式，不依赖 `assert`）+ 锚点演进校验；矩阵 33 → 44 条（补 P0.5
   skip / 谓词守卫 / D14 carve-out 正对照 / 静态 keep 预告 / 裸字符串 source 预告 / 枚举集 strip+合法名 /
-  路径穿越两层同时拆 / `_rebuild_ledger` raise / `_rebuild_ledger` 无 source 正路），并在严格判据下收紧
-  既有变异的目标用例列表（其原列表含未被该变异打红的用例）。
+  路径穿越两层同时拆 / keep 诊断「阻断项不得即时落」/ `_rebuild_ledger` raise / `_rebuild_ledger` 无
+  source 正路），并在严格判据下收紧既有变异的目标用例列表（其原列表含未被该变异打红的用例）。
 
 ## [0.4.0] - 2026-08-25
 

@@ -391,9 +391,9 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
 
 项内部的失败（settings 写失败 / rename 失败 / 目标键碰撞）**不**改冲突分类，也**不**跨项传播：
 
-- **P0.5 预检发现**的问题（keyring 不可用、目标键异值、secret 候选不可枚举、project/local 账本记录缺合法
-  `projectPath` 且该记录在 P2 会被重建）：该项标 `aborted`/`blocked`，**该项零写入**——预检先于任何写入，
-  天然满足；
+- **P0.5 预检发现**的问题（keyring 不可用、目标键异值、secret 候选不可枚举〔**已装且仍在新清单**〕、
+  project/local 账本记录缺合法 `projectPath` 且该记录在 P2 会被重建）：该项标 `aborted`/`blocked`，
+  **该项零写入**——预检先于任何写入，天然满足；
 - **P1 之后**的写失败：该项标 `aborted`，**停止对该项继续写**；已写步骤**保留**（forward-only，不逐项回滚，
   §7.6），重跑按 §7.2/§7.4 续做；
 - 其余项继续执行；
@@ -935,7 +935,7 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 
 | 日期 | 变更 |
 |------|------|
-| 2026-11-24 | **#301 终审残留**：P0.5 判据与 `_rebuild_ledger` 逐条同构（谓词 `_record_needs_project_path` 共用；`projectPath` 窄对齐；plugin 移除 / `baseline_derived` / 缺 `installPath` / 记录非对象 / records 非数组一律**计划期**置 `incomplete`，dry-run 与 apply 退出码一致）；**D14 carve-out**（无 rename 目标的 plugin 不枚举、不重键、不阻断；新清单内根缺失仍整项 abort）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 语法校验 / 超时 / raise 式字节还原 / 锚点演进校验（33 → 43 条，KILLED 只认 short summary 的 `FAILED`/`ERROR` 行）；补裸字符串 source 的「计划期预告」判据与枚举集「strip+合法名 / GitCloneSpec home 边界」路径穿越加固（#309 复审） |
+| 2026-11-24 | **#301 终审残留**：P0.5 判据与 `_rebuild_ledger` 逐条同构（谓词 `_record_needs_project_path` 共用；`projectPath` 窄对齐；plugin 移除 / `baseline_derived` / 缺 `installPath` / 记录非对象 / records 非数组一律**计划期**置 `incomplete`，dry-run 与 apply 退出码一致）；**D14 carve-out**（无 rename 目标的 plugin 不枚举、不重键、不阻断；新清单内根缺失仍整项 abort）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 语法校验 / 超时 / raise 式字节还原 / 锚点演进校验（33 → 44 条，KILLED 只认 short summary 的 `FAILED`/`ERROR` 行）；补裸字符串 source 的「计划期预告」判据、枚举集「strip+合法名 / GitCloneSpec home 边界」路径穿越加固、keep 诊断「阻断项不得即时落」负向锁（#309 终审） |
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |
