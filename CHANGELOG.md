@@ -959,6 +959,25 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - 残余挂账 [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)：`enabledPlugins` 非法键 / `mcp.json: {e}`
   的 pydantic repr / drive 谓词一致性（同一展示漏斗，后续单处理）。
 
+### Fixed（#301 marketplace 迁移终审残留）
+
+- **P0.5 `projectPath` 判据窄对齐（行为修正）**：仅「plugin 仍在新清单 + 账本记录 `installPath` 为合法
+  非空字符串」的 project/local 记录缺 `projectPath` 才 `blocked` / `project-path-missing`（dry-run 即
+  exit 3、零写入）。plugin 已从新清单移除 / `baseline_derived`（清单不可读）/ 记录缺 `installPath` 时
+  改按 F10 **保留旧账本、迁移其余**，不再把整个 marketplace 阻断——此前这些形态被预检整体阻断且重跑
+  不收敛。判据与 P2 重建共用 `_record_needs_project_path`，两侧不可漂移。
+- **计划期即报「plugin 已出清单」的 `incomplete`**：manifest 在 classify 后固定，故 dry-run 与 apply
+  的退出码一致（均为 3）并产出同一条 warn——顺带对齐设计 §12.2 / §4.2 F10 早已承诺的「dry-run 也产出
+  该 warn」（既有文档/实现不一致）。
+- `_rebuild_ledger` 的 `projectPath` raise 保留为**竞态**纵深防御（预检之后账本被并发写坏），与 P0.5
+  共用同一谓词，并加直调用例钉住。
+- 证据补强：P3「目标键为 null + 旧键缺失」abort 与「双 null 同值」正向用例、known 记录完全缺 `source`
+  的 plan+apply 正路（含与 F10 的交互）、P3 目标 value/secret 不被覆盖断言、`_rekey_values` P3 死分支清理。
+- 变异脚本自证（`scripts/mutation_marketplace_migration.py`）：基线绿跑 + 严格 KILLED 判定（仅
+  `rc == 1` 且输出列出全部目标用例）+ 语法校验 + 单次超时 + sha256 逐字节还原；矩阵 33 → 38 条
+  （补 P0.5 skip / 谓词 `installPath` 守卫 / `_rebuild_ledger` raise / 无 source 正路），并在严格判据下
+  收紧两条既有变异的目标用例列表。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

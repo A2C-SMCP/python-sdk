@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-#268 marketplace 迁移的**可复现变异矩阵**（dev-only，不进 CI）/ Reproducible mutation matrix.
+#268 / #301 marketplace 迁移的**可复现变异矩阵**（dev-only，不进 CI）/ Reproducible mutation matrix.
 
-背景：PR #298 多轮审查都要求「变异数字可复现」。本脚本把关键不变量逐个注入为 mutation，
-运行对应的定向用例，断言必须转红（KILLED）。全部 mutation 在 ``try/finally`` 内应用与还原，
-任何中断都会把源文件恢复原样；结束前逐字节校验还原成功。
+背景：PR #298 多轮审查要求「变异数字可复现」；#301 终审要求脚本**自证**：
+- **基线绿跑**：全部目标用例先去重并集跑一次，rc 必须 0，否则 `BASELINE-FAIL` 直接退出；
+- **严格 KILLED**：仅 `rc == 1`（有用例失败）**且**输出列出全部目标用例 → KILLED；`rc == 0` → SURVIVED；
+  其余（收集错误 / 解释器缺失 / 超时）→ ERROR——`returncode != 0` 本身不足以证明变异被杀死；
+- **语法校验**：每条 mutation 应用后先 `ast.parse`，避免「改坏了」被误读成「变异未被杀死」；
+- **超时**：每条 mutation 的 pytest 有硬超时（`TIMEOUT` 秒），`TimeoutExpired` → ERROR；
+- **还原自证**：备份按 PID 隔离，结束（含 SIGINT/SIGTERM）以 sha256 **逐字节**校验还原。
 
-运行（不要用 ``uv run``，避免在 worktree 内重建环境）::
+运行（不要用会重建环境的裸 ``uv run``；``uv run --no-sync`` 或项目 venv 的 python。
+本脚本会临时改写源码，勿与编辑 / 并发 run 同时进行）::
 
-    python scripts/mutation_marketplace_migration.py
+    python scripts/mutation_marketplace_migration.py            # 基线 + 应用变异并跑定向用例
+    python scripts/mutation_marketplace_migration.py --check    # 只读：校验各 old 片段仍唯一定位
 
-退出码：全部 KILLED → 0；任一 SURVIVED / SETUP-FAIL → 1。
+退出码：基线绿且全部 KILLED → 0；任一 SURVIVED / SETUP-FAIL / ERROR / 基线红 → 1。
 """
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,14 +37,14 @@ ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
 
 MOD = "a2c_smcp/computer/settings/marketplace_migration.py"
-STORE = "a2c_smcp/computer/settings/store.py"
 SECRET = "a2c_smcp/computer/inputs/secret_store.py"
 CLI = "a2c_smcp/computer/cli/commands/marketplace.py"
-HELP = "a2c_smcp/computer/cli/help.py"
 
 T = "tests/unit_tests/computer/settings/test_marketplace_migration.py"
 S = "tests/unit_tests/computer/inputs/test_secret_store.py"
 IT = "tests/integration_tests/computer/cli/test_marketplace_migrate.py"
+
+TIMEOUT = 600  # 秒：单次 pytest 硬超时（挂起 = ERROR，不是 KILLED）
 
 
 @dataclass(frozen=True)
@@ -73,9 +84,20 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         "先写新 secret 再删旧",
         (
-            (MOD, "_rekey_secrets(item, secrets, write_new=True)", "_rekey_secrets(item, secrets, write_new=SWAP)"),
-            (MOD, "_rekey_secrets(item, secrets, write_new=False)", "_rekey_secrets(item, secrets, write_new=True)"),
-            (MOD, "_rekey_secrets(item, secrets, write_new=SWAP)", "_rekey_secrets(item, secrets, write_new=False)"),
+            (
+                MOD,
+                """        _rekey_values(item, env, write_new=True)
+        _rekey_secrets(item, secrets, write_new=True)""",
+                """        _rekey_values(item, env, write_new=True)
+        _rekey_secrets(item, secrets, write_new=False)""",
+            ),
+            (
+                MOD,
+                """        _rekey_values(item, env, write_new=False)
+        _rekey_secrets(item, secrets, write_new=False)""",
+                """        _rekey_values(item, env, write_new=False)
+        _rekey_secrets(item, secrets, write_new=True)""",
+            ),
         ),
         (T + "::test_new_secret_is_written_before_old_is_deleted",),
     ),
@@ -84,15 +106,13 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 MOD,
-                """            item.incomplete = True
-            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
-            continue
-        for record in records:""",
-                """            item.ledger_rebuild.append((pid, "user", None))
-            item.incomplete = True
-            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
-            continue
-        for record in records:""",
+                """        if find_plugin_entry(item.manifest, plugin) is None:
+            _note_kept_ledger_record(item, plugin)
+            continue""",
+                """        if find_plugin_entry(item.manifest, plugin) is None:
+            item.ledger_rebuild.append((pid, "user", None))
+            _note_kept_ledger_record(item, plugin)
+            continue""",
             ),
         ),
         (T + "::test_plugin_missing_from_new_manifest_keeps_old_ledger",),
@@ -109,7 +129,13 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
     Mutation(
         "strict 只读 loader",
-        ((MOD, "store.load_known_marketplaces_strict(home, env)", "store.load_known_marketplaces(home, env)"),),
+        (
+            (
+                MOD,
+                "        state.known = store.load_known_marketplaces_strict(home, env)",
+                "        state.known = store.load_known_marketplaces(home, env)",
+            ),
+        ),
         (T + "::test_strict_loader_corrupt_never_renames",),
     ),
     Mutation(
@@ -206,7 +232,10 @@ MUTATIONS: tuple[Mutation, ...] = (
                 "",
             ),
         ),
-        (T + "::test_old_value_changed_before_p3_aborts",),
+        (
+            T + "::test_old_value_changed_before_p3_aborts",
+            T + "::test_p3_null_old_value_missing_aborts",
+        ),
     ),
     Mutation(
         "目标 value P1 异值不复写",
@@ -311,6 +340,17 @@ MUTATIONS: tuple[Mutation, ...] = (
         (T + "::test_unrecognizable_source_unchanged_still_migrates", T + "::test_source_added_after_plan_aborts"),
     ),
     Mutation(
+        "item5 planned None 即 abort（无 source 正路误伤）",
+        (
+            (
+                MOD,
+                '    if not _source_unchanged(item.old_source, old_record.get("source")):',
+                '    if item.old_source is None or not _source_unchanged(item.old_source, old_record.get("source")):',
+            ),
+        ),
+        (T + "::test_missing_source_key_plans_and_applies",),
+    ),
+    Mutation(
         "merge 保留目标记录元数据",
         (
             (
@@ -352,34 +392,93 @@ MUTATIONS: tuple[Mutation, ...] = (
                 "        return self.get(input_id)",
             ),
         ),
-        (S + "::test_get_strict_backend_error_raises", S + "::test_get_strict_unavailable_raises"),
+        # 只打「后端读失败」这一半：keyring 不可用由 `keyring_available()` 前置守卫钉住，
+        # 不在本变异（替换 try/except 体）的可达面内（#301 item 3 严格判据暴露）。
+        (S + "::test_get_strict_backend_error_raises",),
     ),
     Mutation(
-        "scope 归一（非 str/空 → user）",
+        "scope 归一（忠实形态：非 str / 空串不归一为 user）",
         (
             (
                 MOD,
-                """    value = record.get("scope")
-    return value if isinstance(value, str) and value else "user\"""",
-                """    return str(record.get("scope") or "user")""",
+                '    return value if isinstance(value, str) and value else "user"',
+                '    return record.get("scope", "user")',
             ),
         ),
         (T + "::test_invalid_scope_is_normalized_to_user", T + "::test_empty_scope_is_normalized_to_user"),
     ),
     Mutation(
-        "project/local 缺 projectPath 预检 blocked",
+        "4b P0.5 projectPath 守卫删整段 if（预检不再 blocked）",
         (
             (
                 MOD,
-                """                if scope in {"project", "local"} and not _norm_project_path(record):
-                    item.action = ACTION_BLOCKED
-                    item.reason = REASON_PROJECT_PATH_MISSING""",
-                """                if scope in {"project", "local"} and not _norm_project_path(record):
-                    pass
-                    item.reason = REASON_PROJECT_PATH_MISSING""",
+                """        for record in records:
+            if _record_needs_project_path(record):
+                item.action = ACTION_BLOCKED
+                item.reason = REASON_PROJECT_PATH_MISSING
+                item.warnings.append(
+                    f"plugin {parts[0]!r} has a {_norm_ledger_scope(record)} ledger record without a valid projectPath; "
+                    "fix or remove that record before migrating"
+                )
+                return""",
+                "        for record in records:\n            pass",
             ),
         ),
         (T + "::test_project_record_without_project_path_blocks_in_dry_run",),
+    ),
+    Mutation(
+        "4d P0.5 不跳过「plugin 已出清单」组（回退宽判据）",
+        (
+            (
+                MOD,
+                """        if find_plugin_entry(item.manifest, parts[0]) is None:
+            _note_kept_ledger_record(item, parts[0])
+            continue
+""",
+                "",
+            ),
+        ),
+        (
+            T + "::test_project_record_without_project_path_for_removed_plugin_keeps_ledger",
+            T + "::test_project_record_without_project_path_for_baseline_derived_keeps_ledger",
+        ),
+    ),
+    Mutation(
+        "4e 谓词去掉 installPath 守卫（缺路径记录被误 blocked）",
+        (
+            (
+                MOD,
+                """    install_path = record.get("installPath")
+    if not isinstance(install_path, str) or not install_path:
+        return False
+    return _norm_ledger_scope(record) in {"project", "local"} and not _norm_project_path(record)""",
+                """    return _norm_ledger_scope(record) in {"project", "local"} and not _norm_project_path(record)""",
+            ),
+        ),
+        (T + "::test_project_record_without_project_path_and_install_path_keeps_ledger",),
+    ),
+    Mutation(
+        "4f 删 _rebuild_ledger 的 projectPath raise（竞态守护失效）",
+        (
+            (
+                MOD,
+                """            # P0.5 已用同一判据前置（`_record_needs_project_path`）；这里只有**竞态**才可达
+            # （预检之后账本被并发写入这样的记录）——保留为纵深防御（#301 item 9 裁决）。
+            if _record_needs_project_path(record):
+                raise _ItemFailure(
+                    REASON_LEDGER_REBUILD_FAILED,
+                    f"plugin {plugin!r} has a {scope} ledger record without a valid projectPath",
+                )
+""",
+                "",
+            ),
+        ),
+        (T + "::test_rebuild_ledger_race_project_path_raise",),
+    ),
+    Mutation(
+        "4a rebuild 传 projectPath（project/local 记录保留 projectPath）",
+        ((MOD, "                    project_path=project_path,\n", ""),),
+        (T + "::test_project_record_rebuild_preserves_project_path",),
     ),
     Mutation(
         "baseline 次选先直搬注册旧目录",
@@ -440,7 +539,9 @@ MUTATIONS: tuple[Mutation, ...] = (
                 item.actions["catalog"] = "noop\"""",
             ),
         ),
-        (T + "::test_external_tree_is_renamed", T + "::test_merge_keeps_target_record_metadata"),
+        # merge 用例的期望值恰为默认 0（不搬），删掉赋值后仍通过；只留 externalTrees == 1 的用例
+        # （#301 item 3 严格判据暴露）。
+        (T + "::test_external_tree_is_renamed",),
     ),
     Mutation(
         "info 清单名路径段守卫",
@@ -519,42 +620,160 @@ MUTATIONS: tuple[Mutation, ...] = (
     ),
 )
 
+BASELINE_TESTS: tuple[str, ...] = tuple(sorted({test for mutation in MUTATIONS for test in mutation.tests}))
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_ACTIVE_BACKUPS: dict[str, tuple[str, Path]] = {}
+
+
+def _restore_active() -> None:
+    for rel, (digest, tmp) in list(_ACTIVE_BACKUPS.items()):
+        shutil.copy2(tmp, ROOT / rel)
+        assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+        _ACTIVE_BACKUPS.pop(rel, None)
+
+
+def _sig_handler(signum: int, _frame: object) -> None:
+    _restore_active()
+    raise SystemExit(128 + signum)
+
+
+def _classify(proc: subprocess.CompletedProcess[str], tests: tuple[str, ...]) -> tuple[str, str]:
+    """KILLED 判据：**仅** pytest 返回 1（有用例失败）且输出确实列出全部目标用例失败。
+
+    ``returncode != 0`` 不足以证明变异被杀死（解释器缺失 / 收集错误都会非 0）；目标用例名全部出现
+    才说明是**该变异**打红了目标。
+    """
+    out = proc.stdout + proc.stderr
+    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    if proc.returncode == 0:
+        return "SURVIVED", tail
+    if proc.returncode == 1:
+        names = [t.rsplit("::", 1)[-1] for t in tests]
+        if all(name in out for name in names):
+            return "KILLED", tail
+        return "ERROR(目标用例未失败)", tail
+    return f"ERROR(rc={proc.returncode})", tail
+
+
+def check() -> int:
+    """只读校验：每条 mutation 的 ``old`` 片段仍能在当前源码中唯一定位。"""
+    ok = True
+    for mutation in MUTATIONS:
+        for rel, old, _new in mutation.edits:
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            count = text.count(old)
+            if count != 1:
+                print(f"{mutation.name}: CHECK-FAIL ({rel}: occurrence={count})")
+                ok = False
+    print(f"CHECK: {'OK' if ok else 'FAILED'} ({len(MUTATIONS)} mutations, {len(BASELINE_TESTS)} target tests)")
+    return 0 if ok else 1
+
+
+def _baseline() -> bool:
+    """基线绿跑：全部目标用例先去重并集跑一次，rc 必须 0（否则变异结果无意义）。"""
+    try:
+        proc = subprocess.run(
+            [PY, "-m", "pytest", *BASELINE_TESTS, "-q", "-p", "no:cacheprovider"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"BASELINE-FAIL: timeout (>{TIMEOUT}s)")
+        return False
+    if proc.returncode != 0:
+        print(f"BASELINE-FAIL: rc={proc.returncode}")
+        for line in (proc.stdout or "").strip().splitlines()[-20:]:
+            print(f"  {line}")
+        return False
+    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    print(f"BASELINE: OK ({len(BASELINE_TESTS)} target tests) | {tail}")
+    return True
+
 
 def main() -> int:
+    # 每次都先做锚点唯一性校验：源码漂移时立即失败，避免半途 SETUP-FAIL / 误改无关片段。
+    if check() != 0:
+        return 1
+    if "--check" in sys.argv[1:]:
+        return 0
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        print("pytest 不可用：请用项目 venv 运行（不要裸 python），否则变异会被误判。")
+        return 2
+    if not _baseline():
+        return 1
+
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
     failures: list[str] = []
-    for mutation in MUTATIONS:
-        backups: dict[str, tuple[str, str]] = {}
-        try:
-            for rel, old, new in mutation.edits:
-                path = ROOT / rel
-                if rel not in backups:
-                    tmp = f"/tmp/mut268_{path.name}.bak"
-                    shutil.copy2(path, tmp)
-                    backups[rel] = (path.read_text(encoding="utf-8"), tmp)
-                text = path.read_text(encoding="utf-8")
-                if old not in text:
-                    print(f"{mutation.name}: SETUP-FAIL ({rel})")
-                    failures.append(mutation.name)
-                    break
-                path.write_text(text.replace(old, new, 1), encoding="utf-8")
-            else:
-                proc = subprocess.run(
-                    [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                status = "KILLED" if proc.returncode != 0 else "SURVIVED"
-                tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-                print(f"{mutation.name}: {status} | {tail}")
-                if status != "KILLED":
-                    failures.append(mutation.name)
-        finally:
-            for rel, (original, tmp) in backups.items():
-                shutil.copy2(tmp, ROOT / rel)
-                assert (ROOT / rel).read_text(encoding="utf-8") == original, f"restore failed: {rel}"
+    # 每次运行独立备份目录（per-PID）：并发 run / 并发 worktree 不互相覆盖；退出时整体清理。
+    backup_dir = Path(tempfile.mkdtemp(prefix=f"mut301_{os.getpid()}_"))
+    try:
+        for mutation in MUTATIONS:
+            backups: dict[str, tuple[str, Path]] = {}
+            status = "SETUP-FAIL"
+            try:
+                for rel, old, new in mutation.edits:
+                    path = ROOT / rel
+                    if rel not in backups:
+                        tmp = backup_dir / f"{len(backups)}_{path.name}.bak"
+                        shutil.copy2(path, tmp)
+                        backups[rel] = (_digest(path), tmp)
+                    text = path.read_text(encoding="utf-8")
+                    if old not in text:
+                        print(f"{mutation.name}: SETUP-FAIL ({rel})")
+                        failures.append(mutation.name)
+                        break
+                    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+                else:
+                    broken = [rel for rel in backups if not _syntax_ok(rel)]
+                    if broken:
+                        status, tail = f"ERROR(SYNTAX: {', '.join(broken)})", ""
+                    else:
+                        # 备份登记为「活跃」：子进程期间收到 SIGTERM/SIGINT 也能还原。
+                        _ACTIVE_BACKUPS.update(backups)
+                        try:
+                            proc = subprocess.run(
+                                [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
+                                cwd=ROOT,
+                                capture_output=True,
+                                text=True,
+                                timeout=TIMEOUT,
+                            )
+                        except subprocess.TimeoutExpired:
+                            status, tail = f"ERROR(timeout>{TIMEOUT}s)", ""
+                        else:
+                            status, tail = _classify(proc, mutation.tests)
+                    print(f"{mutation.name}: {status} | {tail}")
+                    if status != "KILLED":
+                        failures.append(mutation.name)
+            finally:
+                for rel, (digest, tmp) in backups.items():
+                    shutil.copy2(tmp, ROOT / rel)
+                    assert _digest(ROOT / rel) == digest, f"restore failed: {rel}"
+                    _ACTIVE_BACKUPS.pop(rel, None)
+    finally:
+        _restore_active()
+        shutil.rmtree(backup_dir, ignore_errors=True)
     print(f"\nSUMMARY: {len(MUTATIONS) - len(failures)}/{len(MUTATIONS)} KILLED")
     return 0 if not failures else 1
+
+
+def _syntax_ok(rel: str) -> bool:
+    try:
+        ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        print(f"  SYNTAX-ERROR {rel}: {exc}")
+        return False
+    return True
 
 
 if __name__ == "__main__":

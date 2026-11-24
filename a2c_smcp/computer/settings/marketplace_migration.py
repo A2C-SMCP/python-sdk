@@ -1696,9 +1696,9 @@ def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_n
                     REASON_VALUE_TARGET_CONFLICT,
                     f"source input value {old_key!r} changed during the migration; keeping the old key",
                 )
-            if old_key in data:
-                data.pop(old_key, None)
-                changed = True
+            # 上面的复检已保证 old_key 存在（含 null 值）——不再重复判定（#301 item 7）。
+            data.pop(old_key, None)
+            changed = True
     if changed:
         ValueStore(env).replace_all(data)
 

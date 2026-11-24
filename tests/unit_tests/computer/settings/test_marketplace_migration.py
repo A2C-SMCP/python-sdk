@@ -1950,6 +1950,8 @@ def test_p3_target_value_exists_but_differs_aborts(tmp_path: Path) -> None:
     with pytest.raises(mm._ItemFailure):
         mm._rekey_values(item, env, write_new=False)
     assert _read_values(env)["figma@acme/region"] == "eu"
+    # 目标键也不得被覆盖（#301 item 8）：P3 只删旧，绝不改目标。
+    assert _read_values(env)["figma@acme-skills/region"] == "DIFFERENT"
 
 
 def test_p3_target_secret_exists_but_differs_aborts() -> None:
@@ -1963,6 +1965,7 @@ def test_p3_target_secret_exists_but_differs_aborts() -> None:
     with pytest.raises(mm._ItemFailure):
         mm._rekey_secrets(item, fake, write_new=False)
     assert fake.data["old/token"] == "expected"
+    assert fake.data["new/token"] == "DIFFERENT"  # 目标 secret 同样不得被覆盖（#301 item 8）
 
 
 def test_project_record_rebuild_preserves_project_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2147,3 +2150,79 @@ def test_rebuild_ledger_race_project_path_raise(tmp_path: Path, monkeypatch: pyt
         asyncio.run(mm._rebuild_ledger(item, home, env))
     assert excinfo.value.reason == mm.REASON_LEDGER_REBUILD_FAILED
     assert ledger_path.read_bytes() == before
+
+
+# ── #301 item 2 / 5 / 7：P3 null、无 source 正路、死分支 ─────────────────────
+def test_p3_null_old_value_missing_aborts(tmp_path: Path) -> None:
+    """P3：计划值为 null 且旧键缺失 → 不得被 `data.get(old) == None` 当成「未变」（#301 item 2）。"""
+    env = _env(tmp_path)
+    _write_values(env, {"figma@acme-skills/region": None})
+    path = resolve_value_store_path(env)
+    before = path.read_bytes()
+    item = mm.MigrationItem(
+        old="acme",
+        new="acme-skills",
+        action=mm.ACTION_RENAME,
+        value_pairs=[("figma@acme/region", "figma@acme-skills/region", None)],
+    )
+    with pytest.raises(mm._ItemFailure) as excinfo:
+        mm._rekey_values(item, env, write_new=False)
+    assert excinfo.value.reason == mm.REASON_VALUE_TARGET_CONFLICT
+    assert path.read_bytes() == before
+
+
+def test_p3_null_value_equal_deletes_old(tmp_path: Path) -> None:
+    """P3 正向：目标与旧键同为 null → 视为同值，删旧键、保留目标（item 7 去死分支后仍成立）。"""
+    env = _env(tmp_path)
+    _write_values(env, {"figma@acme/region": None, "figma@acme-skills/region": None})
+    item = mm.MigrationItem(
+        old="acme",
+        new="acme-skills",
+        action=mm.ACTION_RENAME,
+        value_pairs=[("figma@acme/region", "figma@acme-skills/region", None)],
+    )
+    mm._rekey_values(item, env, write_new=False)
+    data = _read_values(env)
+    assert "figma@acme/region" not in data
+    assert "figma@acme-skills/region" in data and data["figma@acme-skills/region"] is None
+
+
+def test_missing_source_key_plans_and_applies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """known 记录完全无 `source` 键：plan+apply 正常改名（防「planned is None 即 abort」误伤，item 5）。"""
+    env = _env(tmp_path)
+    home = _home(env)
+    work = tmp_path / "work"
+    work.mkdir()
+    _catalog(home, "acme", _manifest("acme-skills"))
+    _write_known(home, env, {"acme": {"installLocation": str(marketplace_skill_dir(home, "acme"))}})
+    _write_user(env, {"installedPlugins": [], "enabledPlugins": {}})
+    _patch_keyring(monkeypatch, _FakeSecrets())
+
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_RENAME
+    _apply(plan, home, env)
+    assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
+    assert marketplace_skill_dir(home, "acme-skills").is_dir()
+    assert mm.plan_exit_code(plan) == mm.EXIT_OK
+
+
+def test_missing_source_key_with_ledger_keeps_old_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """无 source 的 known 记录无法驱动重物化：F10 保留旧账本、其余照迁、exit 3（item 5 × F10 交互）。"""
+    env = _env(tmp_path)
+    home = _home(env)
+    work = tmp_path / "work"
+    work.mkdir()
+    _catalog(home, "acme", _manifest("acme-skills"))
+    (marketplace_skill_dir(home, "acme") / "plugins" / "figma").mkdir(parents=True)
+    _write_ledger(home, env, {"figma@acme": [_record(home, "acme", "figma")]})
+    _write_known(home, env, {"acme": {"installLocation": str(marketplace_skill_dir(home, "acme"))}})
+    _write_user(env, {"installedPlugins": ["figma@acme"], "enabledPlugins": {"figma@acme": True}})
+    _patch_keyring(monkeypatch, _FakeSecrets())
+
+    plan = mm.build_plan(home, env, cwd=work)
+    _apply(plan, home, env)
+    ledger = store.load_installed_plugins(home, env, drop_legacy=False)["plugins"]
+    assert "figma@acme" in ledger and "figma@acme-skills" not in ledger
+    assert set(store.load_known_marketplaces(home, env)["marketplaces"]) == {"acme-skills"}
+    assert plan.items[0].incomplete is True
+    assert mm.plan_exit_code(plan) == mm.EXIT_PARTIAL
