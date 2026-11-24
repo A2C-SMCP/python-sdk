@@ -2229,8 +2229,17 @@ def test_in_manifest_plugin_missing_root_still_blocks(tmp_path: Path, monkeypatc
     _assert_unchanged(before, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "ghost_records",
+    [
+        {"not": "a list"},
+        ["not-a-record"],
+        [{"scope": "project", "mcpServers": []}],
+    ],
+    ids=["records-not-array", "record-not-object", "record-missing-installPath"],
+)
 def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ghost_records: object
 ) -> None:
     """同一 marketplace：不可重建的 plugin 只登记 keep，但整项被阻断时不得落任何「keeping」诊断（🟡2）。"""
     env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
@@ -2239,7 +2248,7 @@ def test_removed_plugin_does_not_mask_in_manifest_project_path_block(
         home,
         env,
         {
-            "ghost@acme": {"not": "a list"},  # type: ignore[dict-item]  # 已出清单 + records 非数组
+            "ghost@acme": ghost_records,  # type: ignore[dict-item]  # 已出清单 + 三种静态 keep 形态
             "figma@acme": [{"scope": "project", "installPath": str(figma_root), "mcpServers": []}],
         },
     )
@@ -2305,6 +2314,39 @@ def test_whitespace_manifest_entry_is_enumerated_as_in_manifest(
     assert ("set", "figma@acme-skills/token") in fake.ops
     assert ("delete", "figma@acme/token") in fake.ops
     assert fake.data == {"figma@acme-skills/token": "s3cret"}
+
+
+@pytest.mark.parametrize("kind", ["dotdot", "absolute"], ids=["dotdot", "absolute"])
+def test_manifest_entry_traversal_never_reads_outside_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """不可信清单条目名（`../` / 绝对路径）不得进入枚举：不读 home 外 inputs.json、keyring 零写删（#309 🔴N1）。"""
+    evil_dir = tmp_path / "evil"
+    _write_json(
+        evil_dir / "mcp-servers" / "inputs.json",
+        {"inputs": [{"id": "token", "description": "t", "password": True}]},
+    )
+    bad_name = "../../../../evil" if kind == "dotdot" else str(evil_dir)
+    env, home, work, _fake = _legacy_setup(tmp_path, monkeypatch, with_ledger=False)
+    _catalog(
+        home,
+        "acme",
+        _manifest(
+            "acme-skills",
+            plugins=[{"name": bad_name, "source": {"source": "url", "url": "https://example.com/e.git"}}],
+        ),
+    )
+    _write_user(env, {"installedPlugins": [], "enabledPlugins": {}})
+    fake = _FakeSecrets({f"{bad_name}@acme/token": "s3cret"})  # 若被枚举，就会读旧值并重键
+    _patch_keyring(monkeypatch, fake)
+
+    plan = mm.build_plan(home, env, cwd=work)
+    assert plan.items[0].action == mm.ACTION_RENAME
+    _apply(plan, home, env)
+
+    # 恶意名未进入枚举 ⇒ 不读 home 外 inputs.json ⇒ keyring 零 set/delete、旧 secret 原样
+    assert fake.ops == []
+    assert fake.data == {f"{bad_name}@acme/token": "s3cret"}
 
 
 def test_bare_string_source_ledger_keep_predicted_in_dry_run(

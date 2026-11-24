@@ -551,13 +551,35 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 MOD,
-                """        if isinstance(name, str) and name.strip():
+                """        if isinstance(name, str) and is_valid_marketplace_name(name.strip()):
             manifest_plugins.add(name.strip())""",
                 """        if isinstance(name, str) and is_valid_marketplace_name(name):
             manifest_plugins.add(name)""",
             ),
         ),
         (T + "::test_whitespace_manifest_entry_is_enumerated_as_in_manifest",),
+    ),
+    Mutation(
+        "4k 枚举集接受任意非空串 + 去掉 home 边界（两层同时拆才可达路径穿越）",
+        (
+            (
+                MOD,
+                """        if isinstance(name, str) and is_valid_marketplace_name(name.strip()):
+            manifest_plugins.add(name.strip())""",
+                """        if isinstance(name, str) and name.strip():
+            manifest_plugins.add(name.strip())""",
+            ),
+            (
+                MOD,
+                """        def _within_home(candidate: Path) -> Path | None:
+            # 纵深防御（#309 🔴N1）：名字与 subdir 都源自不可信 manifest，解析后必须仍在 home 内。
+            resolved_candidate = candidate.resolve()
+            return resolved_candidate if is_within(resolved_candidate, home_root) else None""",
+                """        def _within_home(candidate: Path) -> Path | None:
+            return candidate.resolve()""",
+            ),
+        ),
+        (T + "::test_manifest_entry_traversal_never_reads_outside_home",),
     ),
     Mutation(
         "4a rebuild 传 projectPath（project/local 记录保留 projectPath）",

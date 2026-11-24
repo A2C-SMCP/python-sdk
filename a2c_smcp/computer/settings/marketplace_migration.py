@@ -737,11 +737,22 @@ def _plugin_root_offline(item: MigrationItem, plugin: str, home: Path, catalog_d
         roots = [external_plugin_dir(home, item.old, plugin)]
         if item.new:
             roots.append(external_plugin_dir(home, item.new, plugin))
+        home_root = home.resolve()
+
+        def _within_home(candidate: Path) -> Path | None:
+            # 纵深防御（#309 🔴N1）：名字与 subdir 都源自不可信 manifest，解析后必须仍在 home 内。
+            resolved_candidate = candidate.resolve()
+            return resolved_candidate if is_within(resolved_candidate, home_root) else None
+
         for base in roots:
             root = base / resolved.subdir if resolved.subdir else base
-            if root.is_dir():
-                return root
-        return roots[0] / resolved.subdir if resolved.subdir else roots[0]
+            if not root.is_dir():
+                continue
+            inside = _within_home(root)
+            if inside is not None:
+                return inside
+        fallback = roots[0] / resolved.subdir if resolved.subdir else roots[0]
+        return _within_home(fallback)
     return None
 
 
@@ -809,8 +820,9 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
 
     **D14 carve-out（#301 裁决）**：**不在新清单**的 plugin（含 ``baseline_derived`` 下全部账本 plugin）
     没有 rename 目标 ⇒ 不枚举、不重键、不阻断——其旧 input 值 / secret 原样保留（旧键在改名后成为孤儿，
-    但不会被任何新 pid 读取），F10 全量适用。plugin **仍在新清单**但根 / ``inputs.json`` 不可读时
-    D14 原样 fail-closed（无法证明无 password input ⇒ 整项 abort、零写入）。
+    但不会被任何新 pid 读取），F10 全量适用。plugin **已装（账本有记录）且仍在新清单**但根 /
+    ``inputs.json`` 不可读时 D14 原样 fail-closed（无法证明无 password input ⇒ 整项 abort、零写入）；
+    **未安装**的清单内 plugin 不可定位只告警、不阻断。
 
     :return: ``(candidates, blocked_reason)``；``blocked_reason`` 非空 → 该项 abort/blocked（零写入）。
     """
@@ -824,16 +836,17 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
         for pid in ledger
         if isinstance(pid, str) and _pid_marketplace(pid) == item.old and (plugin := _pid_plugin(pid))
     }
-    # 身份口径与 P2 / P0.5 统一：`find_plugin_entry` 按 strip 后匹配，候选名同样以 strip 收集；是否
-    # 「在清单」一律由 `find_plugin_entry` 判定（#309 🔴1：显式 kebab 校验会让带空白的条目在 carve-out
-    # 与重建判据之间分叉，静默漏迁 secret）。
+    # 枚举集：**strip 后**仍须是合法 plugin 名（严格 kebab）。`find_plugin_entry` 按 strip 匹配，故带空白的
+    # 合法条目按在清单处理；**任意非空串**（绝对路径 / `../`）不得进入枚举——否则 `_plugin_root_offline`
+    # 的 GitCloneSpec 分支会把不可信名拼进 `external_plugin_dir` 并读到 home 外（#272 路径穿越不变量，
+    # #309 🔴N1）。「在清单」的最终判定仍由 `find_plugin_entry` 负责（carve-out 侧同口径）。
     manifest_plugins: set[str] = set()
     for entry in iter_plugin_entries(item.manifest):
         name = entry.get("name")
-        if isinstance(name, str) and name.strip():
+        if isinstance(name, str) and is_valid_marketplace_name(name.strip()):
             manifest_plugins.add(name.strip())
         elif name is not None:
-            # 空名 / 非字符串名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
+            # 空名 / 非字符串名 / 非法名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
             item.warnings.append("a plugin entry in the new manifest has an invalid name; skipped for inputs")
     candidates: list[tuple[str, str, bool]] = []
 

@@ -975,15 +975,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   但不会被任何新 pid 读取）；**已装且仍在新清单**的 plugin 根不可读（`plugin-root-unreadable`）/ `inputs.json`
   畸形（`secret-inputs-unreadable`）时 D14 原样 fail-closed（整项 `blocked`、零写入）；未安装的清单内 plugin
   维持「告警不阻断」。正对照由变异「carve-out 扩大」钉住。
+- **枚举集路径穿越加固（#272 不变量）**：候选枚举只收 strip 后仍合法的 kebab 名（绝对路径 / `../` 等
+  不可信条目名不参与枚举），GitCloneSpec 分支另加「解析后必须仍在 home 内」的纵深边界；反证用例覆盖
+  `../` 与绝对路径两形态（真实 plan/apply 路径，keyring 零 set/delete）。
 - `_rebuild_ledger` 的 `projectPath` raise 保留为**竞态**纵深防御（预检之后账本被并发写坏），并加直调用例。
 - 证据补强：P3「目标键为 null + 旧键缺失」abort 与「双 null 同值」正向用例、known 记录完全缺 `source`
   的 plan+apply 正路（含与 F10 的交互）、P3 目标 value/secret 不被覆盖断言、`_rekey_values` P3 死分支清理。
 - 变异脚本自证（`scripts/mutation_marketplace_migration.py`）：基线绿跑 + 严格 KILLED 判定（仅
   `rc == 1` 且 short summary 的 `FAILED`/`ERROR` 行列出全部目标用例，**禁止裸子串匹配**）+ 语法校验 +
-  单次超时 + sha256 逐字节还原（raise 式，不依赖 `assert`）+ 锚点演进校验；矩阵 33 → 42 条（补 P0.5
-  skip / 谓词守卫 / D14 carve-out 正对照 / 静态 keep 预告 / 裸字符串 source 预告 / `_rebuild_ledger` raise /
-  `_rebuild_ledger` 无 source 正路），并在严格判据下收紧既有变异的目标用例列表（其原列表含未被该变异
-  打红的用例）。
+  单次超时 + sha256 逐字节还原（raise 式，不依赖 `assert`）+ 锚点演进校验；矩阵 33 → 43 条（补 P0.5
+  skip / 谓词守卫 / D14 carve-out 正对照 / 静态 keep 预告 / 裸字符串 source 预告 / 枚举集 strip+合法名 /
+  路径穿越两层同时拆 / `_rebuild_ledger` raise / `_rebuild_ledger` 无 source 正路），并在严格判据下收紧
+  既有变异的目标用例列表（其原列表含未被该变异打红的用例）。
 
 ## [0.4.0] - 2026-08-25
 

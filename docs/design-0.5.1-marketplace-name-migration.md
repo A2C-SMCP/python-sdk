@@ -242,7 +242,7 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
 | F3 | project / local `enabledPlugins`、以及 project/local 的 `installedPlugins` 声明 | 权威（**只报告**） | 同 F2；扫描面 = `os.getcwd()` ∪ 账本 `projectPath` | **不改**，输出文件 + 点路径 + 建议片段；**并显式告警「迁移后该插件将处于未启用态」** | 不适用（该告警不阻塞执行，但令退出码为 3，且写入汇总与 `--json`） |
 | F4 | `trustedMarketplaces` | 权威 | 元素 ∈ 旧名集 | 加新名 → 删旧名 | 加失败 fail-closed；删失败 WARN（残留只是陈旧标记，见 §4.2 F4） |
 | F5 | plugin input 值 | 权威 | 键前缀 `<plugin>@<old>/`（**按克隆/外树 `inputs.json` 派生候选**，非按键前缀全表扫） | **P1 单次原子写加新键；P3 单次原子写删旧键**（对齐 §7.1 分阶段） | **目标键已存在且值不同 → 该项 abort（零写入）**；其余 fail-closed（**先写后删**，中途失败不丢值） |
-| F6 | plugin secret | 权威 | **从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选**（D14）；已从清单移除的 plugin 经账本 `installPath` 定位 | keyring：写新 → 回读验证 → 删旧 | **旧 secret 存在且 keyring 不可用 → 该项 abort（零写入）、其余继续、退出码 3**；**目标键已存在且值不同 → abort**；本次已 set 的新键在失败时清理；绝不落明文 |
+| F6 | plugin secret | 权威 | **从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选**（D14，仅**仍在新清单**的 plugin）；**不在新清单**（含已安装但已出清单 / `baseline_derived`）⇒ carve-out：不枚举、不重键、不阻断；**已装且仍在新清单**的根 / inputs 不可读 ⇒ 该项 abort | keyring：写新 → 回读验证 → 删旧 | **旧 secret 存在且 keyring 不可用 → 该项 abort（零写入）、其余继续、退出码 3**；**目标键已存在且值不同 → abort**；本次已 set 的新键在失败时清理；绝不落明文 |
 | F7 | `known_marketplaces[<old>]` | 派生 | — | 先写 `known[new]`（`installLocation` 重算、`manifestNameBaseline = new`），待搬迁与重建完成后删 `known[old]` | 失败 → 保留旧条目（可重建） |
 | F8 | catalog clone | 派生 | 目录存在性 | `<home>/marketplace/<old>` → `<new>` rename | 失败 → 该项 abort（保留旧状态）；不做重 clone，恢复交 `marketplace add/refresh` |
 | F9 | 外部 plugin 树 | 派生 | 目录存在性 | `<home>/marketplace/.plugins/<old>` → `<new>` rename（与 F8 同阶段，紧跟 F8） | 失败 → 该项 abort（F8 的可重入性保证重跑安全） |
@@ -288,7 +288,9 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
 
 1. 枚举新清单内**全部 plugin**（含未安装的清单内 plugin——它们历史上装过、可能在 keyring 留值）的
    `<clone>/<plugin>/mcp-servers/inputs.json`，收集 `password: true` 的 input id → 拼 `<plugin>@<old>/<id>`；
-   「在清单」判定与 P2 同一身份口径（`find_plugin_entry`，strip 后匹配——条目名带空白也按在清单处理）；
+   「在清单」判定与 P2 同一身份口径（`find_plugin_entry`，strip 后匹配——条目名带空白也按在清单处理），
+   但**枚举集只收 strip 后仍合法的 kebab 名**（绝对路径 / `../` 等不可信名不参与枚举，#272 路径穿越
+   不变量）；GitCloneSpec 分支另加「解析后必须仍在 home 内」的纵深边界；
 2. **carve-out（#301 裁决）**：**不在新清单**（含 `baseline_derived` 清单不可读）的 plugin 没有 rename
    目标 ⇒ **不枚举、不重键、不阻断**；其旧 input 值 / secret 原样保留（旧键成为孤儿，但不会被任何新
    pid 读取）。**已安装但已从清单移除**的 plugin 同样适用——无 rename 目标即无重绑定语义；
@@ -654,7 +656,7 @@ plugin-scoped input/secret 变成新名下的孤儿键（旧键已删）。**物
 | 独立源 plugin 的外树 rename 失败 | 同上 |
 | keyring 不可用且**存在**旧 secret | 该项 abort、**零写入**、其余项继续、退出码 3（D10）；报告里明确「需手工重录」 |
 | keyring 不可用且**无**旧 secret | 无 secret 可重键 → 照常迁移（不因后端缺失误伤无密钥项） |
-| secret 候选不可枚举（`inputs.json` 缺失/畸形、plugin 根不可读） | 该项 abort（无法证明无旧 secret），退出码 3 |
+| secret 候选不可枚举（`inputs.json` 缺失/畸形、plugin 根不可读，**已装且仍在新清单**） | 该项 abort（无法证明无旧 secret），退出码 3；未安装的清单内 plugin 只告警不阻断 |
 | `input-values.json` / 状态文件损坏 | **命令级 abort（strict loader）**：零写入、不 rename 损坏文件、退出码 3 |
 | 网络 | **完全不使用**（无 `--reclone` 开关） |
 
@@ -933,7 +935,7 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 
 | 日期 | 变更 |
 |------|------|
-| 2026-11-24 | **#301 终审残留**：P0.5 判据与 `_rebuild_ledger` 逐条同构（谓词 `_record_needs_project_path` 共用；`projectPath` 窄对齐；plugin 移除 / `baseline_derived` / 缺 `installPath` / 记录非对象 / records 非数组一律**计划期**置 `incomplete`，dry-run 与 apply 退出码一致）；**D14 carve-out**（无 rename 目标的 plugin 不枚举、不重键、不阻断；新清单内根缺失仍整项 abort）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 语法校验 / 超时 / raise 式字节还原 / 锚点演进校验（33 → 42 条，KILLED 只认 short summary 的 `FAILED`/`ERROR` 行）；补裸字符串 source 的「计划期预告」判据（#309 复审） |
+| 2026-11-24 | **#301 终审残留**：P0.5 判据与 `_rebuild_ledger` 逐条同构（谓词 `_record_needs_project_path` 共用；`projectPath` 窄对齐；plugin 移除 / `baseline_derived` / 缺 `installPath` / 记录非对象 / records 非数组一律**计划期**置 `incomplete`，dry-run 与 apply 退出码一致）；**D14 carve-out**（无 rename 目标的 plugin 不枚举、不重键、不阻断；新清单内根缺失仍整项 abort）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 语法校验 / 超时 / raise 式字节还原 / 锚点演进校验（33 → 43 条，KILLED 只认 short summary 的 `FAILED`/`ERROR` 行）；补裸字符串 source 的「计划期预告」判据与枚举集「strip+合法名 / GitCloneSpec home 边界」路径穿越加固（#309 复审） |
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |
