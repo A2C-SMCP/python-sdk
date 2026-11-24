@@ -862,7 +862,7 @@ async def run_mcp_approval(
             await comp.amount_server(_mount_dict(srv), session=session)
             console.print(f"[green]✓ mounted MCP server {_server_name_for_display(name)}[/green]")
         except Exception as exc:  # 单个 server 挂载失败不阻断其余 / one failure must not block the rest
-            console.print(f"[red]✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]")
+            console.print(f"[red]✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(exception_text(exc))}[/red]")
 
     async def _ensure_unmounted(name: str) -> None:
         """DISABLED ⇒ 真的摘掉：embed 已被 boot_up 无门挂起，只打印不摘会让 policy 拒绝名单沦为装饰品。"""
@@ -873,7 +873,10 @@ async def run_mcp_approval(
             await comp.aunmount_server_by_id(bid)
             console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied) → unmounted[/dim]")
         except Exception as exc:
-            console.print(f"[red]✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]")
+            console.print(
+                f"[red]✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: "
+                f"{escape(exception_text(exc))}[/red]",
+            )
 
     for name, status in statuses.items():
         if status == McpApprovalStatus.ENABLED:

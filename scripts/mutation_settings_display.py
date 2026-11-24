@@ -133,8 +133,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 PLUGIN_CLI,
-                "✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
-                "✗ failed to mount MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
+                "✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(exception_text(exc))}[/red]",
+                "✗ failed to mount MCP server {_server_name_for_display(name)}: {exception_text(exc)}[/red]",
             ),
         ),
         (T_APPROVAL + "::test_approval_mount_failure_line_escapes_markup_exception",),
@@ -155,8 +155,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 INTERACTIVE,
-                'console.print(f"[{style}]{escape(message)}: {escape(str(exc))}[/{style}]")',
-                'console.print(f"[{style}]{message}: {str(exc)}[/{style}]")',
+                'console.print(f"[{style}]{escape(message)}: {escape(exception_text(exc))}[/{style}]")',
+                'console.print(f"[{style}]{message}: {exception_text(exc)}[/{style}]")',
             ),
         ),
         (T_INTERACTIVE + "::test_print_degraded_escapes_markup",),
@@ -177,8 +177,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 PLUGIN_CLI,
-                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
-                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
+                '                f"{escape(exception_text(exc))}[/red]",',
+                '                f"{exception_text(exc)}[/red]",',
             ),
         ),
         (T_APPROVAL + "::test_approval_unmount_failure_line_escapes_markup_exception",),
@@ -214,7 +214,18 @@ MUTATIONS: tuple[Mutation, ...] = (
                 'console.print(f"[yellow]⚠ MCP 批准门控初始化失败 / MCP approval init failed: {e}[/yellow]")',
             ),
         ),
-        (T_INTERACTIVE + "::test_interactive_degradations_route_to_safe_helper",),
+        (T_INTERACTIVE + "::test_interactive_degradations_escape_markup_and_redact",),
+    ),
+    Mutation(
+        "M14 挂载失败行回退为 str(exc)（丢 #289 exception_text 脱敏）",
+        (
+            (
+                PLUGIN_CLI,
+                "✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(exception_text(exc))}[/red]",
+                "✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
+            ),
+        ),
+        (T_APPROVAL + "::test_approval_mount_failure_line_redacts_pydantic_payload",),
     ),
 )
 

@@ -221,44 +221,57 @@ def test_print_degraded_escapes_markup(capsys: pytest.CaptureFixture[str]) -> No
     assert "\\[" not in out  # 无双重转义（字面 \[/] 也算失败；与其他 escape 用例同口径）
 
 
-@pytest.mark.asyncio
-async def test_interactive_degradations_route_to_safe_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    """#295（复审 🟡4）：三处 catch-all 兜底的**接线**——必须走 `_print_degraded`（其自身 escape 由 helper 单测钉住）。
+def _validation_error_with_secret(secret: str) -> Exception:
+    """构造带 ``input_value=<secret>`` 的 pydantic ValidationError（模拟 #289 的泄露形态）。"""
+    from pydantic import BaseModel
 
-    `MarkupError` 正文自带 `[/]`：兜底行若改回裸 `console.print(f"...{e}")` 会再抛，逸出 `_interactive_loop`
-    （`main` 无捕获）令交互模式 traceback 退出。本用例走真实调用点：审批门控 / 治理重挂 / 命中命令各抛一次。
+    class _Payload(BaseModel):
+        token: int  # 传字符串即触发 int_parsing，input_value 就是那个 secret
+
+    try:
+        _Payload(token=secret)  # type: ignore[arg-type]
+    except Exception as exc:  # ValidationError
+        return exc
+    raise AssertionError("expected ValidationError")
+
+
+@pytest.mark.asyncio
+async def test_interactive_degradations_escape_markup_and_redact(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#295 + #289 合并面：三处 catch-all 的**真实调用点**都要 markup 安全且不回显 pydantic payload。
+
+    - 审批门控 → :func:`_print_degraded`（`escape(exception_text(exc))`）；
+    - 治理重挂 → develop 的内联 `escape(exception_text(e))`；
+    - 命中命令 → `_repl_failure_line(e)`。
+    任何一处写回裸 ``console.print(f"...{e}")`` 都会让 `MarkupError` 二次抛出、REPL traceback；
+    任何一处写回 ``escape(str(e))`` 则会把 pydantic ``input_value``（渲染后 secret）回显（#289 🔴 回归）。
     """
     from rich.errors import MarkupError
 
-    import a2c_smcp.computer.cli.interactive_impl as interactive_impl
-
-    seen: list[tuple[str, str, str]] = []
-
-    def _record(message: str, exc: BaseException, *, style: str = "yellow") -> None:
-        seen.append((message, style, type(exc).__name__))
-
-    monkeypatch.setattr(interactive_impl, "_print_degraded", _record)
-
-    async def _boom(*_a: Any, **_k: Any) -> None:
+    async def _markup_boom(*_a: Any, **_k: Any) -> None:
         raise MarkupError("closing tag '[/]' at position 0 doesn't match any open tag")
 
-    monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_mcp_approval", _boom)
-    monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_governance_remount", _boom)
-    monkeypatch.setattr("a2c_smcp.computer.cli.commands.settings.repl_dispatch", _boom)
+    async def _dispatch_boom(*_a: Any, **_k: Any) -> None:
+        raise _validation_error_with_secret("SUPER_SECRET_TOKEN")
+
+    monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_mcp_approval", _markup_boom)
+    # 治理重挂抛 pydantic：覆盖 develop 内联行的 `exception_text` 脱敏（不能回显 input_value）。
+    monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_governance_remount", _dispatch_boom)
+    # 命中命令抛 pydantic：覆盖 `_repl_failure_line` 的脱敏 + escape。
+    monkeypatch.setattr("a2c_smcp.computer.cli.commands.settings.repl_dispatch", _dispatch_boom)
     monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["settings get x"]))
-    # 与文件内其余 `_interactive_loop` 用例一致：禁用真 `patch_stdout`。prompt_toolkit 的
-    # `AppSession.output` 是**进程级单例**且首次访问时急切绑定当时的 `sys.stdout`——真用它会把 Output
-    # 永久绑到本用例的 pytest 捕获流，污染后续任何真 `patch_stdout` 用例（隔离审查第四轮 🟡1）。
+    # 与文件内其余 `_interactive_loop` 用例一致：禁用真 `patch_stdout`（prompt_toolkit 进程级
+    # `AppSession.output` 会永久绑定本用例的捕获流，污染后续真 `patch_stdout` 用例）。
     monkeypatch.setattr(cli_main, "patch_stdout", lambda raw: no_patch_stdout())
     comp = Computer(name="test_im_deg", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
 
     await _interactive_loop(comp)  # 三处兜底均不得抛出
 
-    # 断言接线的**语义**（消息文本 + style + 被捕获异常类型），而非仅次数。
-    assert [message for message, _style, _type in seen] == [
-        "⚠ MCP 批准门控初始化失败 / MCP approval init failed",
-        "⚠ 治理重挂失败 / governance remount failed",
-        "执行失败 / Failed",
-    ]
-    assert [style for _message, style, _type in seen] == ["yellow", "yellow", "red"]
-    assert all(exc_type == "MarkupError" for _message, _style, exc_type in seen)
+    out = "".join(capsys.readouterr().out.split())
+    assert "MCP批准门控初始化失败" in out
+    assert "治理重挂失败" in out
+    assert "执行失败" in out
+    assert "[/]" in out  # MarkupError 原文可见（rich 已还原转义）
+    assert "\\[" not in out  # 无双重转义
+    assert "SUPER_SECRET_TOKEN" not in out  # #289：两处 pydantic 兜底均不回显 input_value

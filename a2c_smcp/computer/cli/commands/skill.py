@@ -81,7 +81,7 @@ def skill_info(registry: SkillRegistry, name: str, *, json_output: bool = False)
         if json_output:
             console.print_json(data={"error": f"unknown skill: {name}"})
         else:
-            console.print(f"[red]✗ unknown skill: {name!r}[/red]")
+            console.print(f"[red]✗ unknown skill: {escape(repr(name))}[/red]")
         return 1
     found["orphan"] = orphaned
     found["enabled"] = not orphaned

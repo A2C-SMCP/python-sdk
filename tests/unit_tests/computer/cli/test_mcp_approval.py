@@ -558,3 +558,44 @@ async def test_mcp_json_error_line_escapes_markup(
     out = _no_ws(capsys.readouterr().out)
     assert "mcp.json" in out
     assert "bad[/]name" in out  # 原文逐字可见
+
+
+@pytest.mark.asyncio
+async def test_approval_mount_failure_line_redacts_pydantic_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#289 + #295 合并面：失败行的异常文本走 `exception_text`——pydantic `input_value`（渲染后 secret）
+    不得回显（独立审查 🟡2）。"""
+    import unittest.mock as _m
+
+    from pydantic import BaseModel
+
+    class _Payload(BaseModel):
+        token: int  # 传字符串触发 int_parsing，input_value 就是 secret
+
+    def _validation_error() -> BaseException:
+        try:
+            _Payload(token="SUPER_SECRET_TOKEN")  # type: ignore[arg-type]
+        except Exception as exc:
+            return exc
+        raise AssertionError("expected ValidationError")
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    exc = _validation_error()
+
+    async def _boom(_cfg: Any, session: Any = None) -> None:
+        raise exc
+
+    monkeypatch.setattr(comp, "amount_server", _boom)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "SUPER_SECRET_TOKEN" not in out  # input_value 不回显
+    assert "validationerror(s)in[token:int_parsing]" in out  # 仍有可定位的摘要（exception_text 形态）

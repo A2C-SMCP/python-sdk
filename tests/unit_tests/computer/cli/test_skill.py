@@ -93,3 +93,14 @@ def test_repl_unknown_subcommand_escapes_markup(capsys: pytest.CaptureFixture[st
 
     out = "".join(capsys.readouterr().out.split())
     assert "unknownskillsubcommand:evil[/]x" in out
+
+
+def test_skill_info_unknown_markup_name_escapes(capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（独立审查 🟡3）：`skill info` 的未知名提示是裸插值——`a2c-computer skill info 'evil[/]x'` 曾抛
+    `MarkupError`（一次性 CLI 无 REPL 顶层兜底 ⇒ 直接 traceback）。现 `escape(repr(name))`。"""
+    reg = SkillRegistry()
+
+    assert skill_info(reg, "evil[/]x", json_output=False) == 1  # 不得抛
+
+    out = "".join(capsys.readouterr().out.split())
+    assert "unknownskill:'evil[/]x'" in out
