@@ -41,6 +41,7 @@ T_INIT = "tests/unit_tests/computer/cli/test_commands_init.py"
 T_SETTINGS = "tests/unit_tests/computer/cli/test_settings.py"
 T_APPROVAL = "tests/unit_tests/computer/cli/test_mcp_approval.py"
 T_INTERACTIVE = "tests/unit_tests/computer/cli/test_interactive_more.py"
+T_PLUGIN = "tests/unit_tests/computer/cli/test_plugin.py"
 
 _FIELD_AND_REASON = (
     "        field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)"
@@ -128,17 +129,12 @@ MUTATIONS: tuple[Mutation, ...] = (
         ),
     ),
     Mutation(
-        "M6 去审批门挂载/摘除失败行的异常 escape",
+        "M6 去审批门挂载失败行的异常 escape",
         (
             (
                 PLUGIN_CLI,
                 "✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
                 "✗ failed to mount MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
-            ),
-            (
-                PLUGIN_CLI,
-                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
-                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
             ),
         ),
         (T_APPROVAL + "::test_approval_mount_failure_line_escapes_markup_exception",),
@@ -175,6 +171,50 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T_INIT + "::test_print_unknown_subcommand_escapes_markup",),
+    ),
+    Mutation(
+        "M10 去审批门摘除失败行的异常 escape",
+        (
+            (
+                PLUGIN_CLI,
+                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]",
+                "✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {str(exc)}[/red]",
+            ),
+        ),
+        (T_APPROVAL + "::test_approval_unmount_failure_line_escapes_markup_exception",),
+    ),
+    Mutation(
+        "M11 去治理重挂成功行的 escape",
+        (
+            (
+                PLUGIN_CLI,
+                'f"[green]✓ restored bundled MCP server {escape(repr(cfg.name))} "',
+                'f"[green]✓ restored bundled MCP server {cfg.name!r} "',
+            ),
+        ),
+        (T_PLUGIN + "::test_run_governance_remount_register_line_escapes_markup",),
+    ),
+    Mutation(
+        "M12 去 plugin 分派器接线（回退为未转义的直排）",
+        (
+            (
+                PLUGIN_CLI,
+                '        print_unknown_subcommand("plugin", sub)',
+                '        console.print(f"[yellow]unknown plugin subcommand: {sub}[/yellow]")',
+            ),
+        ),
+        (T_PLUGIN + "::test_repl_unknown_subcommand_escapes_markup",),
+    ),
+    Mutation(
+        "M13 去交互循环审批兜底的接线（回退为未转义直排）",
+        (
+            (
+                INTERACTIVE,
+                '_print_degraded("⚠ MCP 批准门控初始化失败 / MCP approval init failed", e)',
+                'console.print(f"[yellow]⚠ MCP 批准门控初始化失败 / MCP approval init failed: {e}[/yellow]")',
+            ),
+        ),
+        (T_INTERACTIVE + "::test_interactive_degradations_route_to_safe_helper",),
     ),
 )
 
@@ -230,6 +270,32 @@ def check() -> int:
     return 0 if ok else 1
 
 
+def baseline() -> int:
+    """变异前先跑一遍全部目标用例：**必须全绿**，否则任何「失败」都证明不了是变异造成的。
+
+    与 #211 的 M3 假杀死同型教训：目标用例若因无关原因（import/env 漂移、夹具坏）本就为红，``_classify``
+    会把它误判成 KILLED。基线不为绿直接终止，不进入变异循环。
+    """
+    tests = sorted({t for mutation in MUTATIONS for t in mutation.tests})
+    try:
+        proc = subprocess.run(
+            [PY, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=_PYTEST_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"BASELINE: ERROR(timeout>{_PYTEST_TIMEOUT_S}s)")
+        return 1
+    if proc.returncode != 0:
+        tail = proc.stdout.strip().splitlines()[-1:] or [""]
+        print(f"BASELINE: FAIL（目标用例变异前即为红，变异判据不可信）| {tail[0]}")
+        return 1
+    print(f"BASELINE: OK（{len(tests)} 个目标用例全绿）")
+    return 0
+
+
 def main() -> int:
     # 每次都先做锚点唯一性校验：源码漂移时立即失败，避免半途 SETUP-FAIL / 误改无关片段。
     if check() != 0:
@@ -241,6 +307,8 @@ def main() -> int:
     except ImportError:
         print("pytest 不可用：请用项目 venv 运行（不要 uv run / 不要裸 python），否则变异会被误判。")
         return 2
+    if baseline() != 0:
+        return 1
 
     signal.signal(signal.SIGTERM, _sig_handler)
     signal.signal(signal.SIGINT, _sig_handler)

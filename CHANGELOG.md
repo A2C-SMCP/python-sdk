@@ -941,6 +941,10 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 同函数内**同族残余**一并收口：`_inject_inputs_collision_safe` 的 input id 冲突行（`mcp.json` 可声明
     两个 `[/]` 形态 id，`env_segment` 坍缩到同一环境变量名，冲突行在审批门循环**之前**执行——未转义同样让
     整门跳过）；id / env 名 / source 逐段 `escape`。
+  - **启动路径同族残余**：`run_governance_remount` 的 `✓ restored bundled MCP server …` 行同样插值
+    marketplace 分发的 bundled server 名（`mcp-servers/<name>.json`，裸 str）——未转义时该行抛 `MarkupError`
+    被 `reconcile_governance` 的 per-server 兜底吞成 WARN，**server 已挂载（`start=False`）却永不批量启动**。
+    现经 `escape(repr(name))` / `escape(plugin_id)` 收口。
 - **REPL 顶层兜底与未知子命令提示的 markup 安全（#295）**：`interactive_impl` 的三个 catch-all 降级行
   （批准门控初始化失败 / 治理重挂失败 / 执行失败）此前把异常文本直接拼进 markup——`MarkupError` 正文自带
   `[/]`，兜底自身会二次抛出、令 REPL 直接 traceback 退出。现经 `_print_degraded` 统一 `escape`。

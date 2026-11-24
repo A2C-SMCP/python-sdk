@@ -460,6 +460,41 @@ async def test_approval_mount_failure_line_escapes_markup_exception(
 
 
 @pytest.mark.asyncio
+async def test_approval_unmount_failure_line_escapes_markup_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复审 🟡3：DISABLED 分支的摘除失败行同样有 `{exc}` 插值——此前只有 mount 行被锁。
+
+    构造：server 已在活跃集（`mcp_manager.server_configs()` 含其 config）且 local 声明 disabled ⇒
+    `_ensure_unmounted` 走摘除分支；`aunmount_server_by_id` 抛含 markup 的异常。
+    """
+    import unittest.mock as _m
+    from types import SimpleNamespace
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil[/]x": _stdio(), "good": _stdio()})
+    _write_json(workdir_local_settings_path(wd), {"disabledMcpjsonServers": ["evil[/]x"]})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    async def _boom(_bid: str) -> None:
+        raise RuntimeError("boom[/]x")
+
+    monkeypatch.setattr(comp, "aunmount_server_by_id", _boom)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        decl = comp.resolve_mcp_declarations(env=env)
+        comp.mcp_manager = SimpleNamespace(server_configs=lambda: [decl.servers["evil[/]x"].config])
+        await run_mcp_approval(comp, None, approve_all=False, settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "boom[/]x" in out  # 异常原文可见
+    assert "\\[" not in out  # 无双重转义残留（escape 只做一次，rich 已还原）
+
+
+@pytest.mark.asyncio
 async def test_approval_prompt_escapes_control_chars(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

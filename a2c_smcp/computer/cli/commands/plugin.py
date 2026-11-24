@@ -314,7 +314,13 @@ async def run_governance_remount(
         # #208：``start=False`` —— 本回调**只挂载**；启动统一收在挂载循环之后，经批量启动器走同一
         # Computer 级并发上限（否则 mount 与 start 仍在循环内融合，上限被前 N 个绕过）。
         await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace, start=False)
-        console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
+        # 名称来自 **marketplace 分发内容**（`mcp-servers/<name>.json`，裸 str）：不转义时该行抛 MarkupError，
+        # 被 `reconcile_governance` 的 per-server 兜底吞成 WARN——server 已挂（start=False）却永不批量启动，
+        # 且成功行丢失（复审 🟡1，同为既存缺陷）。
+        console.print(
+            f"[green]✓ restored bundled MCP server {escape(repr(cfg.name))} "
+            f"(plugin {escape(str(record.plugin_id))})[/green]",
+        )
 
     async def _inject(record: Any) -> None:
         _inject_plugin_inputs(comp, record.install_path, record.plugin, record.marketplace)

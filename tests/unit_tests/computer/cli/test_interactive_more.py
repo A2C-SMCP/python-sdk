@@ -218,3 +218,42 @@ def test_print_degraded_escapes_markup(capsys: pytest.CaptureFixture[str]) -> No
 
     out = "".join(capsys.readouterr().out.split())
     assert "[/]" in out  # 异常原文可见，且打印本身不抛
+
+
+@pytest.mark.asyncio
+async def test_interactive_degradations_route_to_safe_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#295（复审 🟡4）：三处 catch-all 兜底的**接线**——必须走 `_print_degraded`（其自身 escape 由 helper 单测钉住）。
+
+    `MarkupError` 正文自带 `[/]`：兜底行若改回裸 `console.print(f"...{e}")` 会再抛，逸出 `_interactive_loop`
+    （`main` 无捕获）令交互模式 traceback 退出。本用例走真实调用点：审批门控 / 治理重挂 / 命中命令各抛一次。
+    """
+    from rich.errors import MarkupError
+
+    import a2c_smcp.computer.cli.interactive_impl as interactive_impl
+
+    seen: list[tuple[str, str, str]] = []
+
+    def _record(message: str, exc: BaseException, *, style: str = "yellow") -> None:
+        seen.append((message, style, type(exc).__name__))
+
+    monkeypatch.setattr(interactive_impl, "_print_degraded", _record)
+
+    async def _boom(*_a: Any, **_k: Any) -> None:
+        raise MarkupError("closing tag '[/]' at position 0 doesn't match any open tag")
+
+    monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_mcp_approval", _boom)
+    monkeypatch.setattr("a2c_smcp.computer.cli.commands.plugin.run_governance_remount", _boom)
+    monkeypatch.setattr("a2c_smcp.computer.cli.commands.settings.repl_dispatch", _boom)
+    monkeypatch.setattr(cli_main, "PromptSession", lambda: FakePromptSession(["settings get x"]))
+    comp = Computer(name="test_im_deg", inputs=set(), mcp_servers=set(), auto_connect=False, auto_reconnect=False)
+
+    await _interactive_loop(comp)  # 三处兜底均不得抛出
+
+    # 断言接线的**语义**（消息文本 + style + 被捕获异常类型），而非仅次数。
+    assert [message for message, _style, _type in seen] == [
+        "⚠ MCP 批准门控初始化失败 / MCP approval init failed",
+        "⚠ 治理重挂失败 / governance remount failed",
+        "执行失败 / Failed",
+    ]
+    assert [style for _message, style, _type in seen] == ["yellow", "yellow", "red"]
+    assert all(exc_type == "MarkupError" for _message, _style, exc_type in seen)
