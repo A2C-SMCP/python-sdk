@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -485,9 +486,7 @@ MUTATIONS: tuple[Mutation, ...] = (
             (
                 MOD,
                 """        if not isinstance(records, list):
-            _note_ledger_record_kept(
-                item, f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched"
-            )
+            kept_notes.append(f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
             continue
         if find_plugin_entry(item.manifest, parts[0]) is None:""",
                 """        if not isinstance(records, list):
@@ -497,12 +496,10 @@ MUTATIONS: tuple[Mutation, ...] = (
             (
                 MOD,
                 """            if not isinstance(record, Mapping):
-                _note_ledger_record_kept(item, None)
+                kept_notes.append(None)
                 continue
             if _ledger_install_path(record) is None:
-                _note_ledger_record_kept(
-                    item, f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched"
-                )
+                kept_notes.append(f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched")
                 continue""",
                 """            if not isinstance(record, Mapping):
                 continue
@@ -528,6 +525,39 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T + "::test_in_manifest_plugin_missing_root_still_blocks",),
+    ),
+    Mutation(
+        "4i P0.5 不预告 source 非映射的 keep（dry-run 退化）",
+        (
+            (
+                MOD,
+                """    if (
+        has_ledger_records
+        and not isinstance(item.old_source, Mapping)
+        and not isinstance(state.known.get("marketplaces", {}).get(item.new or ""), Mapping)
+    ):
+        _note_ledger_record_kept(
+            item,
+            "registration source is not an object; plugin ledger records cannot be re-materialized",
+        )
+""",
+                "",
+            ),
+        ),
+        (T + "::test_bare_string_source_ledger_keep_predicted_in_dry_run",),
+    ),
+    Mutation(
+        "4j 枚举集回退 kebab 校验（strip 口径与 carve-out 分叉）",
+        (
+            (
+                MOD,
+                """        if isinstance(name, str) and name.strip():
+            manifest_plugins.add(name.strip())""",
+                """        if isinstance(name, str) and is_valid_marketplace_name(name):
+            manifest_plugins.add(name)""",
+            ),
+        ),
+        (T + "::test_whitespace_manifest_entry_is_enumerated_as_in_manifest",),
     ),
     Mutation(
         "4a rebuild 传 projectPath（project/local 记录保留 projectPath）",
@@ -702,19 +732,38 @@ def _sig_handler(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)
 
 
-def _classify(proc: subprocess.CompletedProcess[str], tests: tuple[str, ...]) -> tuple[str, str]:
-    """KILLED 判据：**仅** pytest 返回 1（有用例失败）且输出确实列出全部目标用例失败。
+_FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)")
 
-    ``returncode != 0`` 不足以证明变异被杀死（解释器缺失 / 收集错误都会非 0）；目标用例名全部出现
-    才说明是**该变异**打红了目标。
+
+def _failed_nodes(out: str) -> set[str]:
+    """pytest short summary 中失败的 node id（`FAILED` / `ERROR` 行；参数化后缀原样保留）。"""
+    nodes: set[str] = set()
+    for line in out.splitlines():
+        match = _FAILED_LINE.match(line)
+        if match:
+            nodes.add(match.group(1))
+    return nodes
+
+
+def _target_failed(node: str, failed: set[str]) -> bool:
+    """目标 node id 是否真的失败（允许 `[param]` 后缀；**禁止裸子串匹配**——traceback 里的用例名不算）。"""
+    return any(entry == node or entry.startswith(node + "[") for entry in failed)
+
+
+def _classify(proc: subprocess.CompletedProcess[str], tests: tuple[str, ...]) -> tuple[str, str]:
+    """KILLED 判据：**仅** pytest 返回 1（有用例失败）且 short summary 的 ``FAILED``/``ERROR`` 行
+    确实列出全部目标用例。
+
+    ``returncode != 0`` 不足以证明变异被杀死（解释器缺失 / 收集错误都会非 0）；裸子串匹配也不够
+    （目标名可能只出现在 traceback / 别的用例输出里）。#309 🟡7 裁决：只认 short summary 的失败行。
     """
     out = proc.stdout + proc.stderr
     tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
     if proc.returncode == 0:
         return "SURVIVED", tail
     if proc.returncode == 1:
-        names = [t.rsplit("::", 1)[-1] for t in tests]
-        if all(name in out for name in names):
+        failed = _failed_nodes(out)
+        if all(_target_failed(test, failed) for test in tests):
             return "KILLED", tail
         return "ERROR(目标用例未失败)", tail
     return f"ERROR(rc={proc.returncode})", tail

@@ -86,8 +86,10 @@ a2c-computer plugin enable <plugin>@<new-name>   # project/local 手工处理后
 
 ## 6.5 已知边界
 
-- **keyring 无跨平台列举 API**：已卸载且已从清单移除的 plugin，其旧 secret 无法被发现/重键，会留在
-  keyring 中成为孤儿（不影响运行，只是残留）；可重录或手工清理。
+- **keyring 无跨平台列举 API**：**已从新清单移除**的 plugin（无论是否仍安装）其旧 secret 不会被重键
+  （#301 D14 carve-out：无 rename 目标即不重绑），会留在 keyring 中成为孤儿（不影响运行，只是残留）；
+  可重录或手工清理。**仍在新清单**但根 / `inputs.json` 不可读的已安装 plugin 会整项 abort（退出码 3），
+  修复根或 inputs 后重跑即可续做。
 - **迁移期间请停止其他 Computer / REPL 实例**：`--apply` 写入前会重新检测 + 重新预检，并在写入时
   复核目标 input/secret 键；但跨文件顺序一致性没有全局锁，并发写入仍可能造成部分项 abort（exit 3）。
 - **`install_plugin` / 其他进程在迁移窗口内改账本**：无法完全避免；重跑即可续做。

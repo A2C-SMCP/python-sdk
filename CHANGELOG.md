@@ -965,22 +965,25 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - **`projectPath` 窄对齐**：仅「plugin 仍在新清单 + 账本记录 `installPath` 为非空字符串」的 project/local
     记录缺 `projectPath` 才 `blocked` / `project-path-missing`（dry-run 即 exit 3、零写入）。
   - **静态可知的 keep 形态计划期即预告**：plugin 不在新清单（含 `baseline_derived`）/ 记录缺 `installPath` /
-    记录非对象 / records 非数组 → 项仍是 `rename`、只置 `incomplete`（`ledger-rebuild-failed`），其余面
-    照常迁移；dry-run 与 apply 的退出码一致（均为 3）并给出同一诊断——此前这些形态在 dry-run 报 0
-    （违反设计 §12.2「dry-run 退出码 = apply 会得到的码」），或干脆被预检整体阻断且重跑不收敛。
+    记录非对象 / records 非数组 / 旧 source 非映射且无可合并的映射 `known[new]` → 项仍是 `rename`、只置
+    `incomplete`（`ledger-rebuild-failed`），其余面照常迁移；dry-run 与 apply 的退出码一致（均为 3）并给出
+    同一诊断——此前这些形态在 dry-run 报 0（违反设计 §12.2「dry-run 退出码 = apply 会得到的码」），或干脆
+    被预检整体阻断且重跑不收敛。诊断只在项仍为 `rename` 时落：整项被阻断时不留任何「keeping」文案。
   - 判据与 `_rebuild_ledger` 共用 `_record_needs_project_path` / `_note_ledger_record_kept`，两侧不可漂移。
-- **D14 carve-out（secret 候选派生）**：**不在新清单**的 plugin（含 `baseline_derived`）没有 rename 目标
-  ⇒ 跳过 secret/input 枚举、不重键、不阻断，旧值与既有 secret 原样保留（旧键成为孤儿，但不会被任何新 pid
-  读取）；plugin **仍在新清单**但根 / `inputs.json` 不可读时 D14 原样 fail-closed（整项 `blocked` /
-  `plugin-root-unreadable`、零写入）。正对照由变异「carve-out 扩大」钉住。
+- **D14 carve-out（secret 候选派生）**：**不在新清单**的 plugin（**含已安装但已出清单**、含 `baseline_derived`）
+  没有 rename 目标 ⇒ 跳过 secret/input 枚举、不重键、不阻断，旧值与既有 secret 原样保留（旧键成为孤儿，
+  但不会被任何新 pid 读取）；**已装且仍在新清单**的 plugin 根不可读（`plugin-root-unreadable`）/ `inputs.json`
+  畸形（`secret-inputs-unreadable`）时 D14 原样 fail-closed（整项 `blocked`、零写入）；未安装的清单内 plugin
+  维持「告警不阻断」。正对照由变异「carve-out 扩大」钉住。
 - `_rebuild_ledger` 的 `projectPath` raise 保留为**竞态**纵深防御（预检之后账本被并发写坏），并加直调用例。
 - 证据补强：P3「目标键为 null + 旧键缺失」abort 与「双 null 同值」正向用例、known 记录完全缺 `source`
   的 plan+apply 正路（含与 F10 的交互）、P3 目标 value/secret 不被覆盖断言、`_rekey_values` P3 死分支清理。
 - 变异脚本自证（`scripts/mutation_marketplace_migration.py`）：基线绿跑 + 严格 KILLED 判定（仅
-  `rc == 1` 且输出列出全部目标用例）+ 语法校验 + 单次超时 + sha256 逐字节还原（raise 式，不依赖
-  `assert`）+ 锚点演进校验；矩阵 33 → 40 条（补 P0.5 skip / 谓词守卫 / D14 carve-out 正对照 /
-  静态 keep 预告 / `_rebuild_ledger` raise / 无 source 正路），并在严格判据下收紧既有变异的目标用例
-  列表（其原列表含未被该变异打红的用例）。
+  `rc == 1` 且 short summary 的 `FAILED`/`ERROR` 行列出全部目标用例，**禁止裸子串匹配**）+ 语法校验 +
+  单次超时 + sha256 逐字节还原（raise 式，不依赖 `assert`）+ 锚点演进校验；矩阵 33 → 42 条（补 P0.5
+  skip / 谓词守卫 / D14 carve-out 正对照 / 静态 keep 预告 / 裸字符串 source 预告 / `_rebuild_ledger` raise /
+  `_rebuild_ledger` 无 source 正路），并在严格判据下收紧既有变异的目标用例列表（其原列表含未被该变异
+  打红的用例）。
 
 ## [0.4.0] - 2026-08-25
 

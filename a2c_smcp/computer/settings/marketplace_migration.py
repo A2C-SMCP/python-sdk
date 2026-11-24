@@ -824,13 +824,16 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
         for pid in ledger
         if isinstance(pid, str) and _pid_marketplace(pid) == item.old and (plugin := _pid_plugin(pid))
     }
+    # 身份口径与 P2 / P0.5 统一：`find_plugin_entry` 按 strip 后匹配，候选名同样以 strip 收集；是否
+    # 「在清单」一律由 `find_plugin_entry` 判定（#309 🔴1：显式 kebab 校验会让带空白的条目在 carve-out
+    # 与重建判据之间分叉，静默漏迁 secret）。
     manifest_plugins: set[str] = set()
     for entry in iter_plugin_entries(item.manifest):
         name = entry.get("name")
-        if isinstance(name, str) and is_valid_marketplace_name(name):
-            manifest_plugins.add(name)
+        if isinstance(name, str) and name.strip():
+            manifest_plugins.add(name.strip())
         elif name is not None:
-            # 清单条目名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
+            # 空名 / 非字符串名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
             item.warnings.append("a plugin entry in the new manifest has an invalid name; skipped for inputs")
     candidates: list[tuple[str, str, bool]] = []
 
@@ -865,7 +868,9 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
     # 只登记一条诊断（幂等），其旧 input 值 / secret 原样保留。
     for pid in ledger:
         parts = _pid_parts(pid) if isinstance(pid, str) else None
-        if not parts or parts[1] != item.old or parts[0] in manifest_plugins:
+        if not parts or parts[1] != item.old:
+            continue
+        if find_plugin_entry(item.manifest, parts[0]) is not None:
             continue
         message = (
             f"plugin {parts[0]!r} is not present in the new manifest; its plugin-scoped input values/secrets "
@@ -900,32 +905,32 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
     # 窄对齐（#301 item 1）：只有 `_rebuild_ledger` **真会重建**的记录才阻断——plugin 已移出新清单 /
     # baseline_derived（manifest 未知）/ 记录缺 installPath 时 P2 只保留旧账本（F10），不得把整个
     # marketplace 阻断；判据与 P2 共用 `_record_needs_project_path`，两侧不可漂移。
-    # 「plugin 不在新清单」先只**登记**，等所有会整项阻断的预检通过后再落 keep 诊断：D14 的 secret
-    # 候选派生仍可能因根不可定位而整项 blocked（无法证明无 secret），那时并未保留任何东西，报告里
-    # 不能留下自相矛盾的「keeping its old ledger record」。
+    # 所有「保留旧账本」诊断先只**登记**，等所有会整项阻断的预检通过后再落：D14 的 secret 候选派生
+    # 仍可能整项 blocked（无法证明无 secret）、projectPath 预检也可能 blocked——那时并未保留任何东西，
+    # 报告里不能留下自相矛盾的「keeping」文案（#309 🟡2）。
     kept_plugins: list[str] = []
+    kept_notes: list[str | None] = []
+    has_ledger_records = False
     for pid, records in state.installed.get("plugins", {}).items():
         parts = _pid_parts(pid) if isinstance(pid, str) else None
         if not parts or parts[1] != item.old:
             continue
+        if records:
+            has_ledger_records = True
         # 以下判据与 `_rebuild_ledger` **逐条同构**（#301 裁决②）：静态可知的「保留旧账本」形态在计划期
         # 即置 incomplete，使 dry-run 退出码 == apply（§12.2）。目录存在性属运行期事实，不在此列。
         if not isinstance(records, list):
-            _note_ledger_record_kept(
-                item, f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched"
-            )
+            kept_notes.append(f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
             continue
         if find_plugin_entry(item.manifest, parts[0]) is None:
             kept_plugins.append(parts[0])
             continue
         for record in records:
             if not isinstance(record, Mapping):
-                _note_ledger_record_kept(item, None)
+                kept_notes.append(None)
                 continue
             if _ledger_install_path(record) is None:
-                _note_ledger_record_kept(
-                    item, f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched"
-                )
+                kept_notes.append(f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched")
                 continue
             if _record_needs_project_path(record):
                 item.action = ACTION_BLOCKED
@@ -998,6 +1003,19 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
 
     for plugin in kept_plugins:
         _note_kept_ledger_record(item, plugin)
+    for message in kept_notes:
+        _note_ledger_record_kept(item, message)
+    # 账本有记录、旧注册 source 非映射、且没有可合并的 known[new] 映射记录 ⇒ P2 的 `materialize_plugin`
+    # 必因 source 形态失败并保留旧记录（#309 🟡3 裁决）：计划期即预告，dry-run 与 apply 同判。
+    if (
+        has_ledger_records
+        and not isinstance(item.old_source, Mapping)
+        and not isinstance(state.known.get("marketplaces", {}).get(item.new or ""), Mapping)
+    ):
+        _note_ledger_record_kept(
+            item,
+            "registration source is not an object; plugin ledger records cannot be re-materialized",
+        )
     item.actions.update(accounts)
     if item.already_renamed:
         item.actions["catalog"] = "noop"
@@ -1515,9 +1533,10 @@ def _record_needs_project_path(record: object) -> bool:
     Whether rebuilding this record would hit the projectPath abort.
 
     只判记录自身；「plugin 是否仍在新清单」由调用方前置判定。成立集合刻意**精确等于**
-    :func:`_rebuild_ledger` 中 raise 的可达集合：``records`` 是数组 → plugin 在清单 → 记录是 Mapping →
-    ``installPath`` 为非空字符串 → ``scope`` ∈ {project, local} 且缺 ``projectPath``。记录的
-    ``installPath`` 指向的目录不存在时 P2 只保留旧账本并标 ``incomplete``（不 raise），故不在此列。
+    :func:`_rebuild_ledger` 中 raise 的可达集合（按代码顺序：``records`` 是数组 → plugin 在清单 → 记录是
+    Mapping → ``installPath`` 为非空字符串 → ``scope`` ∈ {project, local} 且缺 ``projectPath``）。
+    目录是否存在属**运行期**事实，且 P2 在 raise **之后**才检查它——谓词刻意不看目录（否则两处判据会随
+    运行期状态漂移）；``installPath`` 目录缺失的记录同样命中本谓词，由随后的 raise / keep 分支决定。
     """
     if not isinstance(record, Mapping):
         return False
