@@ -67,10 +67,12 @@ _WRITABLE = {"user", "project", "local"}
 
 
 def _err(msg: str, *, json_output: bool) -> int:
+    """错误呈现（**人读分支经 escape**，#295）：``msg`` 会嵌入不可信键名 / scope / 路径 / 异常文本，
+    未转义时 rich 抛 ``MarkupError``（``settings get 'evil[/]a[/]b'`` 实测可复现）。JSON 分支是数据，不转义。"""
     if json_output:
         console.print_json(data={"error": msg})
     else:
-        console.print(f"[red]✗ {msg}[/red]")
+        console.print(f"[red]✗ {escape(msg)}[/red]")
     return EXIT_USER_ERROR
 
 
@@ -283,7 +285,7 @@ def settings_set(
         if json_output:
             console.print_json(data={"scope": scope, "key": key, "ignored": True, "reason": reason})
             return EXIT_OK
-        console.print(f"[yellow]✓ ignored {key} in {scope} scope (not written)[/yellow]")
+        console.print(f"[yellow]✓ ignored {escape(key)} in {escape(scope)} scope (not written)[/yellow]")
         return EXIT_OK
 
     try:
@@ -306,7 +308,7 @@ def settings_set(
     if json_output:
         console.print_json(data={"scope": scope, "key": key, "value": parsed})
         return EXIT_OK
-    console.print(f"[green]✓ set {key} in {scope} scope[/green]")
+    console.print(f"[green]✓ set {escape(key)} in {escape(scope)} scope[/green]")
     return EXIT_OK
 
 
@@ -345,7 +347,7 @@ def settings_edit(
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         return _err(f"editor failed: {e}", json_output=json_output), None
 
-    console.print(f"[green]✓ edited {scope} settings ({path})[/green]")
+    console.print(f"[green]✓ edited {escape(scope)} settings ({escape(str(path))})[/green]")
     return EXIT_OK, reconcile_cb
 
 
@@ -417,4 +419,4 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             if post_save is not None:
                 await post_save()
     else:
-        console.print(f"[yellow]unknown settings subcommand: {sub}[/yellow]")
+        console.print(f"[yellow]unknown settings subcommand: {escape(sub)}[/yellow]")

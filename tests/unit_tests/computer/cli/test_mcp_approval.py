@@ -339,6 +339,65 @@ async def test_settings_error_line_redacts_marketplace_credentials(
     assert "https://example.com/repo.git" in out  # userinfo 剥离但名字仍可定位
 
 
+# ── #295 隔离审查 🔴：审批门 server 名展示行的 markup 安全（既存缺陷，非本单引入）──────────
+@pytest.mark.parametrize("mode", ["approve_all", "non_tty", "disabled"])
+@pytest.mark.asyncio
+async def test_approval_lines_escape_markup_in_server_names(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """
+    既存缺陷（非本单引入）：`.tfrobot/mcp.json` 的 server 名是裸 `str`（无字符集约束），仓库可分发
+    `evil[/]x` 令审批门在展示行抛 `MarkupError`；`interactive_impl` 的 `except Exception` 会把**整门**
+    降级为一行 WARN ⇒ 恶意名之后的 server 不再挂载/摘除/提示。
+
+    三景分别钉住：`--approve-all-mcp` 的 mounted 行、非 TTY 的 skipped 行、DISABLED 的 skipped 行。
+    恶意名刻意排在字典首位——若中断，`'good'` 不会出现在输出里。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"evil[/]x": _stdio(), "good": _stdio()})
+    if mode == "disabled":
+        _write_json(workdir_local_settings_path(wd), {"disabledMcpjsonServers": ["evil[/]x"]})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=mode == "approve_all", settings_flag_path=None)  # 不得抛
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]x" in out  # 原文逐字可见
+    assert "'good'" in out  # 恶意名之后仍继续处理（整门未被中断）
+    if mode == "approve_all":
+        assert "evil[/]x" in _mounted_names(comp)
+
+
+@pytest.mark.parametrize("name", ["evil[/]x", "shared"])
+@pytest.mark.asyncio
+async def test_approval_prompt_shows_repr_server_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    """#295：审批 prompt 改用 `{name!r}`——干净名渲染与旧 `'{name}'` 逐字一致，控制字符不再可伪造提示行。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {name: _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+    sess = _Session(["y"])
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, sess, approve_all=False, settings_flag_path=None)
+
+    assert sess.prompts[0].startswith("⚠ Unapproved workspace MCP server ")
+    assert f"'{name}'" in sess.prompts[0]  # repr 形态：干净名与旧写法一致，markup 名不被解析
+    assert name in _mounted_names(comp)  # [y] 后挂载成功（mounted 展示行同样不抛）
+
+
 @pytest.mark.asyncio
 async def test_mcp_json_error_line_escapes_markup(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,

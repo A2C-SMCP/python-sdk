@@ -744,6 +744,18 @@ def _mount_dict(srv: Any) -> dict[str, Any]:
     return {**srv.config.model_dump(mode="json"), **dict(srv.ext)}
 
 
+def _server_name_for_display(name: str) -> str:
+    """MCP server 名的**展示值**（#295）：``repr`` 让控制字符/换行可见，``escape`` 中和 rich markup。
+
+    ``.tfrobot/mcp.json`` 的 server 名是**裸 str、无字符集约束**（``resolve_mcp_config`` 不校验）且可随仓库
+    分发：``evil[/]x`` 这类名字未转义时会让 rich 抛 ``MarkupError``，而 ``run_mcp_approval`` 的唯一调用方
+    （``interactive_impl``）会 ``except Exception`` 降级 —— **整个审批门被静默放弃**（恶意名之后的 server 不再
+    挂载/摘除/提示）。干净名与旧 ``{name!r}`` 的渲染逐字一致。
+    Display-safe server name: repr keeps control chars visible, escape neutralizes rich markup.
+    """
+    return escape(repr(name))
+
+
 async def run_mcp_approval(
     comp: Any,
     session: Any | None,
@@ -831,14 +843,17 @@ async def run_mcp_approval(
             # origin 判据直接表达意图，不受二者影响。守卫见
             # ``test_higher_layer_beats_embed_at_mount_time`` + ``test_embed_with_placeholder_is_not_remounted...``。
             if srv.origin is SettingsScope.EMBED and resolve_bundle_id(srv.config) in _active_bundle_ids():
-                console.print(f"[dim]· MCP server {name!r} already mounted from the embed layer (winner), left as is[/dim]")
+                console.print(
+                    f"[dim]· MCP server {_server_name_for_display(name)} already mounted from the embed layer "
+                    "(winner), left as is[/dim]",
+                )
                 return
             # #137 ③：boot 读**已声明** mcp.json 挂载 = 投影（盘上已是真相），走 transient amount_server，不回写
             # （否则每 boot 重复回写用户声明层 / scope 漂移，见 #138）。
             await comp.amount_server(_mount_dict(srv), session=session)
-            console.print(f"[green]✓ mounted MCP server {name!r}[/green]")
+            console.print(f"[green]✓ mounted MCP server {_server_name_for_display(name)}[/green]")
         except Exception as exc:  # 单个 server 挂载失败不阻断其余 / one failure must not block the rest
-            console.print(f"[red]✗ failed to mount MCP server {name!r}: {exc}[/red]")
+            console.print(f"[red]✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]")
 
     async def _ensure_unmounted(name: str) -> None:
         """DISABLED ⇒ 真的摘掉：embed 已被 boot_up 无门挂起，只打印不摘会让 policy 拒绝名单沦为装饰品。"""
@@ -847,15 +862,15 @@ async def run_mcp_approval(
             if bid not in _active_bundle_ids():
                 return  # 从未挂过（文件来源恒走此分支）→ 幂等 no-op，行为不变
             await comp.aunmount_server_by_id(bid)
-            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied) → unmounted[/dim]")
+            console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied) → unmounted[/dim]")
         except Exception as exc:
-            console.print(f"[red]✗ failed to unmount disabled MCP server {name!r}: {exc}[/red]")
+            console.print(f"[red]✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: {escape(str(exc))}[/red]")
 
     for name, status in statuses.items():
         if status == McpApprovalStatus.ENABLED:
             await _ensure_mounted(name)
         elif status == McpApprovalStatus.DISABLED:
-            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied), skipped[/dim]")
+            console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied), skipped[/dim]")
             await _ensure_unmounted(name)
         else:  # PENDING
             if approved_all_session:
@@ -863,12 +878,15 @@ async def run_mcp_approval(
                 continue
             if session is None:  # 非 TTY 且未 --approve-all-mcp → skip + WARN
                 console.print(
-                    f"[yellow]⚠ skipped pending MCP server {name!r} (no TTY); approve in REPL or pass --approve-all-mcp[/yellow]",
+                    f"[yellow]⚠ skipped pending MCP server {_server_name_for_display(name)} (no TTY); "
+                    "approve in REPL or pass --approve-all-mcp[/yellow]",
                 )
                 continue
             srv = resolved.servers[name]
             prompt = (
-                f"⚠ Unapproved workspace MCP server '{name}' (origin={srv.origin})\n"
+                # `{name!r}`（#295）：干净名渲染与旧 `'{name}'` 逐字一致；控制字符 / 换行被转义，
+                # 仓库分发的 mcp.json 不能借 server 名伪造审批提示行。
+                f"⚠ Unapproved workspace MCP server {name!r} (origin={srv.origin})\n"
                 "  [y]es this server · [a]ll project servers · [n]o (deny): "
             )
             ans = (await session.prompt_async(prompt)).strip().lower()
@@ -881,7 +899,7 @@ async def run_mcp_approval(
                 await _ensure_mounted(name)
             else:
                 deny_mcp_server(name)
-                console.print(f"[dim]· denied MCP server {name!r} (written to local scope)[/dim]")
+                console.print(f"[dim]· denied MCP server {_server_name_for_display(name)} (written to local scope)[/dim]")
 
 
 # ── REPL dispatcher（绑定 Computer 的活跃 registry / home / session）/ REPL adapter ──

@@ -928,6 +928,17 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **`settings show` / `settings get` 遇富文本标记抛 `MarkupError`（#295）**：手编键 `evil[/]a[/]b` 会让
   `_emit_errors` 的 `console_err.print` 抛 `MarkupError`、命令 traceback。现整行经 `rich.markup.escape()`，
   两条命令共用该函数一并修复；`settings.json[user]` 的 scope 文本也不再被当样式标签吞掉。
+  - 同族一并收口（`settings.py` 其余插值 print）：`_err` 的错误行、`✓ set <key>`、`✓ ignored <key>`、
+    `✓ edited … (<path>)`、REPL 未知子命令提示。此前 `settings set 'evil[/]a[/]b' 1` 会**先写盘、再在成功行
+    崩溃**（用户以为没写成功，实际文件已改）。
+- **审批门展示行的 server 名 markup 安全（#295；既存缺陷，非本单引入）**：`.tfrobot/mcp.json` 的 server
+  名是裸 `str`（无字符集约束、可随仓库分发），`run_mcp_approval` 的 mounted / skipped / denied 行与审批
+  prompt 未转义——`{"servers": {"evil[/]x": …}}` 这类**合法**配置即可让 rich 抛 `MarkupError`，而
+  `interactive_impl` 的 `except Exception` 会把**整个审批门**降级为一行 WARN（恶意名之后的 server 不再
+  挂载/摘除/提示，与 #294 同族）。现 server 名统一走 `escape(repr(name))`、异常文本走 `escape(str(exc))`，
+  prompt 改用 `{name!r}`（干净名渲染不变）。本项**不重开 #294 决策**，#304 的三项挂账不变。
+- **脱敏边界（写入口径，非新行为）**：本版只脱敏**错误行**；`settings show` / `settings get` 对**合法**的
+  marketplace 声明值（如 `source.url` 里用户自己写的带凭据 URL）仍**忠实展示**——那是查看器语义，不是诊断回显。
 - 残余挂账 [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)：`enabledPlugins` 非法键 / `mcp.json: {e}`
   的 pydantic repr / drive 谓词一致性（同一展示漏斗，后续单处理）。
 

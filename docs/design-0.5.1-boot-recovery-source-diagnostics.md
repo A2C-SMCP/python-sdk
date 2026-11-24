@@ -3,7 +3,8 @@
 > 状态：**已实现**（#287 声明源冲突诊断；**#293 非法声明可观测**，两者均已合入 develop）。
 > 关联：python-sdk#287（声明源冲突）/ **python-sdk#293（非法声明接入恢复报告）** / rust-sdk#295（#287 镜像）/
 > rust-sdk#267（rust 侧非法声明可观测性跟踪）/ #294（CLI 三类展示，消费本单 report 字段，**已实现**）/
-> #295（`settings show` 凭据回显，另案）/ #260（marketplace 注册名与同名不同源语义）/
+> #295（`settings show` 凭据回显，**已收口**：展示漏斗复用本设计的 `sanitized_marketplace_error`）/
+> #260（marketplace 注册名与同名不同源语义）/
 > #268（存量注册名迁移，D3）/ #261 / #263 / #281（source 与账本键展示脱敏口径）/
 > a2c-smcp-protocol Discussion [#81](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/81)（双端对齐留痕）。
 > 性质：**SDK 自治**（字段名与 API 形状由 SDK 决定，两端只要求语义一致）；**无 wire 变更**、无新事件、

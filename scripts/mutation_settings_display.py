@@ -34,6 +34,7 @@ PY = sys.executable
 
 CLI_INIT = "a2c_smcp/computer/cli/commands/__init__.py"
 SETTINGS_CLI = "a2c_smcp/computer/cli/commands/settings.py"
+PLUGIN_CLI = "a2c_smcp/computer/cli/commands/plugin.py"
 
 T_INIT = "tests/unit_tests/computer/cli/test_commands_init.py"
 T_SETTINGS = "tests/unit_tests/computer/cli/test_settings.py"
@@ -42,6 +43,7 @@ T_APPROVAL = "tests/unit_tests/computer/cli/test_mcp_approval.py"
 _FIELD_AND_REASON = (
     "        field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)"
 )
+_PYTEST_TIMEOUT_S = 300  # 子进程硬超时：挂起时不得让父进程抱着**变异态**源码一起挂死
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,36 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             T_INIT + "::test_format_settings_errors_sanitizes_marketplace_reason_text",
             T_INIT + "::test_format_settings_errors_sanitizes_marketplace_declaration_fields",
+        ),
+    ),
+    Mutation(
+        "M4 去审批门 server 名 escape（展示值退回裸 repr）",
+        (
+            (
+                PLUGIN_CLI,
+                "    return escape(repr(name))",
+                "    return repr(name)",
+            ),
+        ),
+        (T_APPROVAL + "::test_approval_lines_escape_markup_in_server_names",),
+    ),
+    Mutation(
+        "M5 去 settings.py 插值 escape（_err 与成功行）",
+        (
+            (
+                SETTINGS_CLI,
+                'console.print(f"[red]✗ {escape(msg)}[/red]")',
+                'console.print(f"[red]✗ {msg}[/red]")',
+            ),
+            (
+                SETTINGS_CLI,
+                'console.print(f"[green]✓ set {escape(key)} in {escape(scope)} scope[/green]")',
+                'console.print(f"[green]✓ set {key} in {scope} scope[/green]")',
+            ),
+        ),
+        (
+            T_SETTINGS + "::test_settings_get_markup_key_reports_without_crash",
+            T_SETTINGS + "::test_settings_set_markup_key_writes_then_reports",
         ),
     ),
 )
@@ -183,16 +215,23 @@ def main() -> int:
                 else:
                     # 备份登记为「活跃」：子进程期间收到 SIGTERM/SIGINT 也能还原。
                     _ACTIVE_BACKUPS.update(backups)
-                    proc = subprocess.run(
-                        [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
-                        cwd=ROOT,
-                        capture_output=True,
-                        text=True,
-                    )
-                    status, tail = _classify(proc, mutation.tests)
-                    print(f"{mutation.name}: {status} | {tail}")
-                    if status != "KILLED":
+                    try:
+                        proc = subprocess.run(
+                            [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=_PYTEST_TIMEOUT_S,
+                        )
+                    except subprocess.TimeoutExpired:
+                        # 挂起不是 KILLED：目标用例没证明失败，且这是基础设施故障。
+                        print(f"{mutation.name}: ERROR(timeout>{_PYTEST_TIMEOUT_S}s)")
                         failures.append(mutation.name)
+                    else:
+                        status, tail = _classify(proc, mutation.tests)
+                        print(f"{mutation.name}: {status} | {tail}")
+                        if status != "KILLED":
+                            failures.append(mutation.name)
             finally:
                 for rel, (digest, tmp) in backups.items():
                     shutil.copy2(tmp, ROOT / rel)

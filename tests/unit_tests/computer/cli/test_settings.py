@@ -258,8 +258,9 @@ def test_settings_commands_redact_marketplace_credentials(
     assert "s3cret" not in err  # 凭据不落 stderr
     assert "https://example.com/repo.git" in err  # userinfo 剥离但名字仍可定位
     if command == "show":
-        payload = json.loads(captured.out)  # stdout 仍是纯 JSON（诊断只走 stderr）
-        assert "s3cret" not in json.dumps(payload)  # 且 stdout 侧同样不落凭据
+        # stdout 是**忠实展示**、不是脱敏面：非法声明已被校验整条丢弃，只剩空对象（诊断只走 stderr）。
+        # 钉住这个结构形态——若 `settings show` 开始把原始错误/被丢弃的键塞回 stdout，此断言转红。
+        assert json.loads(captured.out) == {"extraKnownMarketplaces": {}}
 
 
 @pytest.mark.parametrize("command", ["show", "get"])
@@ -282,6 +283,53 @@ def test_settings_commands_escape_markup_in_error_lines(
 
     assert "settings.json[user]" in err  # scope 文本没被当标签吃掉
     assert "evil[/]a[/]b" in err  # field 原文逐字可见
+
+
+def test_settings_get_markup_key_reports_without_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#295（隔离审查 🟡）：``_err`` 的 ``key!r`` 未 escape 时，``settings get 'evil[/]a[/]b'`` 抛 MarkupError。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    capsys.readouterr()
+
+    assert settings_cmd.settings_get(home, env, "evil[/]a[/]b", scope="user") == 1  # 不得在 _err 处崩溃
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]a[/]b" in out  # 原文逐字可见（非 --json 分支的错误行走 stdout）
+
+
+def test_settings_set_markup_key_writes_then_reports(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（隔离审查 🟡）：``settings set`` 的 markup 键**先写盘、后在成功行崩溃**——修后写盘成功且不抛。
+
+    这是最坏形态：用户看到 traceback 会以为没写成功，实际文件已改；回归锁须同时断言「文件已写」与「成功行可见」。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    capsys.readouterr()
+
+    assert settings_cmd.settings_set(home, env, "evil[/]a[/]b", "1", scope="user") == 0
+
+    data = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert data["evil[/]a[/]b"] == 1  # 写盘成功
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]a[/]b" in out  # 成功行原文可见（未崩溃）
+
+
+def test_settings_edit_markup_path_reports_without_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#295（隔离审查 🟡）：``✓ edited … ({path})`` 的 path 来自 env——含 rich 标签形态时不得被吞。
+
+    ``cfg[bold]`` 是合法目录名；未 escape 时 rich 把 ``[bold]`` 当样式标签**吞掉**（实测），路径不可见。
+    """
+    cfg = tmp_path / "cfg[bold]"
+    env = {**os.environ, "XDG_CONFIG_HOME": str(cfg)}
+    capsys.readouterr()
+
+    code, _ = settings_cmd.settings_edit(_home(tmp_path), env, scope="user", editor="true")
+
+    assert code == 0
+    out = _no_ws(capsys.readouterr().out)
+    assert "cfg[bold]" in out  # path 原文可见（未被当标签吞掉）
 
 
 # ── edit ──────────────────────────────────────────────────────────────────────
@@ -378,9 +426,10 @@ async def test_repl_set_emit_key_marks_dirty(tmp_path: Path, monkeypatch: pytest
 async def test_repl_get_and_unknown_subcommand_no_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     comp = _FakeComp(tmp_path / "home")
-    # 缺失键 get（退出码 1，不抛）+ 未知子命令（no-op，不抛）
+    # 缺失键 get（退出码 1，不抛）+ 未知子命令（no-op，不抛）+ markup 形态子命令（#295：提示行不得抛 MarkupError）
     await settings_cmd.repl_dispatch(comp, ["settings", "get", "neverset"], session=None)
     await settings_cmd.repl_dispatch(comp, ["settings", "bogus"], session=None)
+    await settings_cmd.repl_dispatch(comp, ["settings", "evil[/]x"], session=None)
     assert comp.dirty == 0
 
 

@@ -248,8 +248,9 @@ def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[st
     可含 userinfo 凭据 / ``[`` ``]`` 等富文本标记。与恢复报告（:func:`~a2c_smcp.computer.settings.recovery.
     marketplace_declaration_errors`）**同一脱敏口径**（段漏斗 + 散文脱敏 + Cf/Cc 清洗），覆盖本函数的全部
     消费面（``settings show`` / ``settings get`` / boot 批准流程 ``run_mcp_approval``）。非 marketplace 子树原样保留
-    （本单不扩面，残余挂 #304）。``escape()`` 不在此层做：两个 sink 各自负责（``plugin.py`` 已做，``settings.py``
-    的 ``_emit_errors`` 同层转义），避免双重转义。
+    （本单不扩面，残余挂 #304）。``escape()`` 不在此层做：**每个 sink 自己在打印处转义**（``plugin.py`` 的
+    ``run_mcp_approval`` 与 ``settings.py`` 的 ``_emit_errors`` 均已转义），避免双重转义——新增 sink 必须自带
+    ``escape()``。
     Marketplace declaration errors are redacted here, mirroring rust's ``format_settings_errors``.
     """
     # 函数内 lazy import 沿用本模块既有范式（见 :func:`resolved_settings_with_errors`）：settings.recovery
