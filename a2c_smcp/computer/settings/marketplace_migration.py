@@ -737,11 +737,22 @@ def _plugin_root_offline(item: MigrationItem, plugin: str, home: Path, catalog_d
         roots = [external_plugin_dir(home, item.old, plugin)]
         if item.new:
             roots.append(external_plugin_dir(home, item.new, plugin))
+        home_root = home.resolve()
+
+        def _within_home(candidate: Path) -> Path | None:
+            # 纵深防御（#309 🔴N1）：名字与 subdir 都源自不可信 manifest，解析后必须仍在 home 内。
+            resolved_candidate = candidate.resolve()
+            return resolved_candidate if is_within(resolved_candidate, home_root) else None
+
         for base in roots:
             root = base / resolved.subdir if resolved.subdir else base
-            if root.is_dir():
-                return root
-        return roots[0] / resolved.subdir if resolved.subdir else roots[0]
+            if not root.is_dir():
+                continue
+            inside = _within_home(root)
+            if inside is not None:
+                return inside
+        fallback = roots[0] / resolved.subdir if resolved.subdir else roots[0]
+        return _within_home(fallback)
     return None
 
 
@@ -807,6 +818,12 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
     """
     派生 input 候选（D14）/ Derive input candidates from manifest + ledger roots.
 
+    **D14 carve-out（#301 裁决）**：**不在新清单**的 plugin（含 ``baseline_derived`` 下全部账本 plugin）
+    没有 rename 目标 ⇒ 不枚举、不重键、不阻断——其旧 input 值 / secret 原样保留（旧键在改名后成为孤儿，
+    但不会被任何新 pid 读取），F10 全量适用。plugin **已装（账本有记录）且仍在新清单**但根 /
+    ``inputs.json`` 不可读时 D14 原样 fail-closed（无法证明无 password input ⇒ 整项 abort、零写入）；
+    **未安装**的清单内 plugin 不可定位只告警、不阻断。
+
     :return: ``(candidates, blocked_reason)``；``blocked_reason`` 非空 → 该项 abort/blocked（零写入）。
     """
     if item.already_renamed and item.new:
@@ -819,16 +836,19 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
         for pid in ledger
         if isinstance(pid, str) and _pid_marketplace(pid) == item.old and (plugin := _pid_plugin(pid))
     }
+    # 枚举集：**strip 后**仍须是合法 plugin 名（严格 kebab）。`find_plugin_entry` 按 strip 匹配，故带空白的
+    # 合法条目按在清单处理；**任意非空串**（绝对路径 / `../`）不得进入枚举——否则 `_plugin_root_offline`
+    # 的 GitCloneSpec 分支会把不可信名拼进 `external_plugin_dir` 并读到 home 外（#272 路径穿越不变量，
+    # #309 🔴N1）。「在清单」的最终判定仍由 `find_plugin_entry` 负责（carve-out 侧同口径）。
     manifest_plugins: set[str] = set()
     for entry in iter_plugin_entries(item.manifest):
         name = entry.get("name")
-        if isinstance(name, str) and is_valid_marketplace_name(name):
-            manifest_plugins.add(name)
+        if isinstance(name, str) and is_valid_marketplace_name(name.strip()):
+            manifest_plugins.add(name.strip())
         elif name is not None:
-            # 清单条目名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
+            # 空名 / 非字符串名 / 非法名不可信：只给固定文案，不回显原值（与 staging 的 entry name 校验同口径）。
             item.warnings.append("a plugin entry in the new manifest has an invalid name; skipped for inputs")
     candidates: list[tuple[str, str, bool]] = []
-    seen_roots: set[str] = set()
 
     def _collect(plugin: str, root: Path) -> str | None:
         if not root.is_dir():
@@ -853,45 +873,24 @@ def _candidate_inputs(item: MigrationItem, state: _State, home: Path) -> tuple[l
                 return [], REASON_PLUGIN_ROOT_UNREADABLE
             item.warnings.append(f"plugin {plugin!r} in the new manifest has no resolvable local root; skipped for inputs")
             continue
-        seen_roots.add(str(root.resolve()))
         blocked = _collect(plugin, root)
         if blocked:
             return [], blocked
 
-    # 已装但已从新清单移除/改名的 plugin：按账本 installPath 定位（D14 第 2 条）。
-    for pid, records in ledger.items():
+    # D14 carve-out（#301 裁决）：不在新清单的 plugin 没有 rename 目标 ⇒ 不枚举、不重键、不阻断。
+    # 只登记一条诊断（幂等），其旧 input 值 / secret 原样保留。
+    for pid in ledger:
         parts = _pid_parts(pid) if isinstance(pid, str) else None
         if not parts or parts[1] != item.old:
             continue
-        plugin = parts[0]
-        if plugin in manifest_plugins:
+        if find_plugin_entry(item.manifest, parts[0]) is not None:
             continue
-        if not isinstance(records, list):
-            return [], REASON_SECRET_INPUTS_UNREADABLE
-        located = False
-        for record in records:
-            if not isinstance(record, Mapping):
-                continue
-            install_path = record.get("installPath")
-            if not isinstance(install_path, str) or not install_path:
-                continue
-            raw_root = Path(install_path)
-            roots = [raw_root]
-            if item.new:
-                mapped = _map_install_path(raw_root, home, item.old, item.new)
-                if mapped != raw_root:
-                    roots.append(mapped)
-            root = next((candidate for candidate in roots if candidate.is_dir()), roots[0])
-            if str(root.resolve()) in seen_roots:
-                located = True
-                continue
-            seen_roots.add(str(root.resolve()))
-            blocked = _collect(plugin, root)
-            if blocked:
-                return [], blocked
-            located = True
-        if not located:
-            return [], REASON_PLUGIN_ROOT_UNREADABLE
+        message = (
+            f"plugin {parts[0]!r} is not present in the new manifest; its plugin-scoped input values/secrets "
+            "are left unchanged"
+        )
+        if message not in item.warnings:
+            item.warnings.append(message)
     return candidates, None
 
 
@@ -916,21 +915,44 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
         return
     # project/local 记录缺合法 projectPath 无法安全重建：**预检期** blocked（dry-run 即 exit 3、零写入），
     # 而不是等到 P2 才 abort（那时 known[new]/目录已写，成半迁移）。
+    # 窄对齐（#301 item 1）：只有 `_rebuild_ledger` **真会重建**的记录才阻断——plugin 已移出新清单 /
+    # baseline_derived（manifest 未知）/ 记录缺 installPath 时 P2 只保留旧账本（F10），不得把整个
+    # marketplace 阻断；判据与 P2 共用 `_record_needs_project_path`，两侧不可漂移。
+    # 所有「保留旧账本」诊断先只**登记**，等所有会整项阻断的预检通过后再落：D14 的 secret 候选派生
+    # 仍可能整项 blocked（无法证明无 secret）、projectPath 预检也可能 blocked——那时并未保留任何东西，
+    # 报告里不能留下自相矛盾的「keeping」文案（#309 🟡2）。
+    kept_plugins: list[str] = []
+    kept_notes: list[str | None] = []
+    has_ledger_records = False
     for pid, records in state.installed.get("plugins", {}).items():
         parts = _pid_parts(pid) if isinstance(pid, str) else None
-        if not parts or parts[1] != item.old or not isinstance(records, list):
+        if not parts or parts[1] != item.old:
+            continue
+        if records:
+            has_ledger_records = True
+        # 以下判据与 `_rebuild_ledger` **逐条同构**（#301 裁决②）：静态可知的「保留旧账本」形态在计划期
+        # 即置 incomplete，使 dry-run 退出码 == apply（§12.2）。目录存在性属运行期事实，不在此列。
+        if not isinstance(records, list):
+            kept_notes.append(f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
+            continue
+        if find_plugin_entry(item.manifest, parts[0]) is None:
+            kept_plugins.append(parts[0])
             continue
         for record in records:
-            if isinstance(record, Mapping):
-                scope = _norm_ledger_scope(record)
-                if scope in {"project", "local"} and not _norm_project_path(record):
-                    item.action = ACTION_BLOCKED
-                    item.reason = REASON_PROJECT_PATH_MISSING
-                    item.warnings.append(
-                        f"plugin {parts[0]!r} has a {scope} ledger record without a valid projectPath; "
-                        "fix or remove that record before migrating"
-                    )
-                    return
+            if not isinstance(record, Mapping):
+                kept_notes.append(None)
+                continue
+            if _ledger_install_path(record) is None:
+                kept_notes.append(f"plugin {parts[0]!r} ledger record has no installPath; keeping it untouched")
+                continue
+            if _record_needs_project_path(record):
+                item.action = ACTION_BLOCKED
+                item.reason = REASON_PROJECT_PATH_MISSING
+                item.warnings.append(
+                    f"plugin {parts[0]!r} has a {_norm_ledger_scope(record)} ledger record without a valid projectPath; "
+                    "fix or remove that record before migrating"
+                )
+                return
 
     candidates, blocked = _candidate_inputs(item, state, home)
     if blocked:
@@ -992,6 +1014,21 @@ def _item_preflight(item: MigrationItem, state: _State, home: Path, env: Mapping
             item.secret_pairs.append(SecretRekey(old_key=old_key, new_key=new_key, value=value))
             accounts["secrets"] += 1
 
+    for plugin in kept_plugins:
+        _note_kept_ledger_record(item, plugin)
+    for message in kept_notes:
+        _note_ledger_record_kept(item, message)
+    # 账本有记录、旧注册 source 非映射、且没有可合并的 known[new] 映射记录 ⇒ P2 的 `materialize_plugin`
+    # 必因 source 形态失败并保留旧记录（#309 🟡3 裁决）：计划期即预告，dry-run 与 apply 同判。
+    if (
+        has_ledger_records
+        and not isinstance(item.old_source, Mapping)
+        and not isinstance(state.known.get("marketplaces", {}).get(item.new or ""), Mapping)
+    ):
+        _note_ledger_record_kept(
+            item,
+            "registration source is not an object; plugin ledger records cannot be re-materialized",
+        )
     item.actions.update(accounts)
     if item.already_renamed:
         item.actions["catalog"] = "noop"
@@ -1495,6 +1532,51 @@ def _norm_project_path(record: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _ledger_install_path(record: object) -> str | None:
+    """账本记录的合法 ``installPath``（非 str / 空 → ``None``；P2 重建前置，P0.5 用同一判据）。"""
+    if not isinstance(record, Mapping):
+        return None
+    value = record.get("installPath")
+    return value if isinstance(value, str) and value else None
+
+
+def _record_needs_project_path(record: object) -> bool:
+    """
+    该记录是否会在 P2 重建时因缺 projectPath 触发 abort（P0.5 与 P2 共用的**单一判据**，#301 item 1）/
+    Whether rebuilding this record would hit the projectPath abort.
+
+    只判记录自身；「plugin 是否仍在新清单」由调用方前置判定。成立集合刻意**精确等于**
+    :func:`_rebuild_ledger` 中 raise 的可达集合（按代码顺序：``records`` 是数组 → plugin 在清单 → 记录是
+    Mapping → ``installPath`` 为非空字符串 → ``scope`` ∈ {project, local} 且缺 ``projectPath``）。
+    目录是否存在属**运行期**事实，且 P2 在 raise **之后**才检查它——谓词刻意不看目录（否则两处判据会随
+    运行期状态漂移）；``installPath`` 目录缺失的记录同样命中本谓词，由随后的 raise / keep 分支决定。
+    """
+    if not isinstance(record, Mapping):
+        return False
+    if _ledger_install_path(record) is None:
+        return False
+    return _norm_ledger_scope(record) in {"project", "local"} and not _norm_project_path(record)
+
+
+def _note_ledger_record_kept(item: MigrationItem, message: str | None) -> None:
+    """
+    保留旧账本记录的统一诊断（P0.5 计划期预告 + P2 实作共用，幂等去重）/ Record a kept ledger entry.
+
+    这些形态（plugin 出清单 / records 非数组 / 记录非对象 / 缺 installPath）在**计划期即可确定**，
+    故 P0.5 也据置 ``incomplete``：dry-run 的退出码与 apply 一致（设计 §12.2 / §4.2 F10）。
+    ``message=None`` 仅置位（P2 对该分支本就不产 warning）。
+    """
+    if message is not None and message not in item.warnings:
+        item.warnings.append(message)
+    item.incomplete = True
+    item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
+
+
+def _note_kept_ledger_record(item: MigrationItem, plugin: str) -> None:
+    """plugin 不在新清单 → F10 保留旧账本（P0.5 与 P2 共用）。"""
+    _note_ledger_record_kept(item, f"plugin {plugin!r} not present in the new manifest; keeping its old ledger record")
+
+
 async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str] | None) -> None:
     """P2：以新 pid 重建账本记录（成功者才在 P4 删旧）/ Rebuild ledger records under the new pid."""
     installed = store.load_installed_plugins_strict(home, env)["plugins"]
@@ -1506,30 +1588,30 @@ async def _rebuild_ledger(item: MigrationItem, home: Path, env: Mapping[str, str
         if not parts or parts[1] != item.old:
             continue
         if not isinstance(records, list):
-            item.warnings.append(f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched")
-            item.incomplete = True
-            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
+            _note_ledger_record_kept(
+                item, f"plugin {parts[0]!r} ledger records are not an array; keeping them untouched"
+            )
             continue
         plugin = parts[0]
         new_pid = f"{plugin}@{item.new}"
         if find_plugin_entry(item.manifest, plugin) is None:
-            item.warnings.append(f"plugin {plugin!r} not present in the new manifest; keeping its old ledger record")
-            item.incomplete = True
-            item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
+            _note_kept_ledger_record(item, plugin)
             continue
         for record in records:
             if not isinstance(record, Mapping):
-                item.incomplete = True
+                _note_ledger_record_kept(item, None)
                 continue
-            install_path = record.get("installPath")
-            if not isinstance(install_path, str) or not install_path:
-                item.warnings.append(f"plugin {plugin!r} ledger record has no installPath; keeping it untouched")
-                item.incomplete = True
-                item.reason = item.reason or REASON_LEDGER_REBUILD_FAILED
+            install_path = _ledger_install_path(record)
+            if install_path is None:
+                _note_ledger_record_kept(
+                    item, f"plugin {plugin!r} ledger record has no installPath; keeping it untouched"
+                )
                 continue
             scope = _norm_ledger_scope(record)
             project_path = _norm_project_path(record)
-            if scope in {"project", "local"} and not project_path:
+            # P0.5 已用同一判据前置（`_record_needs_project_path`）；这里只有**竞态**才可达
+            # （预检之后账本被并发写入这样的记录）——保留为纵深防御（#301 item 9 裁决）。
+            if _record_needs_project_path(record):
                 raise _ItemFailure(
                     REASON_LEDGER_REBUILD_FAILED,
                     f"plugin {plugin!r} has a {scope} ledger record without a valid projectPath",
@@ -1659,9 +1741,9 @@ def _rekey_values(item: MigrationItem, env: Mapping[str, str] | None, *, write_n
                     REASON_VALUE_TARGET_CONFLICT,
                     f"source input value {old_key!r} changed during the migration; keeping the old key",
                 )
-            if old_key in data:
-                data.pop(old_key, None)
-                changed = True
+            # 上面的复检已保证 old_key 存在（含 null 值）——不再重复判定（#301 item 7）。
+            data.pop(old_key, None)
+            changed = True
     if changed:
         ValueStore(env).replace_all(data)
 

@@ -30,7 +30,7 @@
 | D11 | 跨 SDK | 迁移语义**各自实现**；python 只处理自己的键空间（两侧键空间实际同构，但实现与发布互不阻塞，见 §2.4）。rust#289/PR#299 **已实现**（含 journal/备份/`--rollback`，为已接受差异） |
 | D12 | 命令形态 | `a2c-computer marketplace migrate [--name <old>]... [--apply] [--update-declarations] [--json]`；**默认 dry-run**（零写入），`--apply` 才写；**删除 `--yes` / `--reclone`**；退出码 **0 / 1 / 3**；REPL **只允许 dry-run** |
 | D13 | 只读预检 | dry-run 与 apply 的预检一律走 **strict 只读 loader**：状态文件损坏 → **命令级 abort（退出码 3）、零写入、不 rename 损坏文件**（不走 `.corrupt-*.bak` 恢复路径） |
-| D14 | secret 候选派生 | **不按键前缀枚举 keyring**（无跨平台列举 API）；从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选，已从清单移除的 plugin 经账本 `installPath` 定位；无法证明无旧 secret → 按 marketplace abort |
+| D14 | secret 候选派生 | **不按键前缀枚举 keyring**（无跨平台列举 API）；从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选（仅**仍在新清单**的 plugin）；**不在新清单**（含 `baseline_derived`）的 plugin 无 rename 目标 → 不枚举 / 不重键 / 不阻断（carve-out，#301 裁决）；**已装**且在新清单但根 / inputs 不可读 → 无法证明无旧 secret → 按 marketplace abort |
 
 ---
 
@@ -242,7 +242,7 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
 | F3 | project / local `enabledPlugins`、以及 project/local 的 `installedPlugins` 声明 | 权威（**只报告**） | 同 F2；扫描面 = `os.getcwd()` ∪ 账本 `projectPath` | **不改**，输出文件 + 点路径 + 建议片段；**并显式告警「迁移后该插件将处于未启用态」** | 不适用（该告警不阻塞执行，但令退出码为 3，且写入汇总与 `--json`） |
 | F4 | `trustedMarketplaces` | 权威 | 元素 ∈ 旧名集 | 加新名 → 删旧名 | 加失败 fail-closed；删失败 WARN（残留只是陈旧标记，见 §4.2 F4） |
 | F5 | plugin input 值 | 权威 | 键前缀 `<plugin>@<old>/`（**按克隆/外树 `inputs.json` 派生候选**，非按键前缀全表扫） | **P1 单次原子写加新键；P3 单次原子写删旧键**（对齐 §7.1 分阶段） | **目标键已存在且值不同 → 该项 abort（零写入）**；其余 fail-closed（**先写后删**，中途失败不丢值） |
-| F6 | plugin secret | 权威 | **从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选**（D14）；已从清单移除的 plugin 经账本 `installPath` 定位 | keyring：写新 → 回读验证 → 删旧 | **旧 secret 存在且 keyring 不可用 → 该项 abort（零写入）、其余继续、退出码 3**；**目标键已存在且值不同 → abort**；本次已 set 的新键在失败时清理；绝不落明文 |
+| F6 | plugin secret | 权威 | **从 catalog clone / 外树的 `mcp-servers/inputs.json` 枚举 `password: true` 候选**（D14，仅**仍在新清单**的 plugin）；**不在新清单**（含已安装但已出清单 / `baseline_derived`）⇒ carve-out：不枚举、不重键、不阻断；**已装且仍在新清单**的根 / inputs 不可读 ⇒ 该项 abort | keyring：写新 → 回读验证 → 删旧 | **旧 secret 存在且 keyring 不可用 → 该项 abort（零写入）、其余继续、退出码 3**；**目标键已存在且值不同 → abort**；本次已 set 的新键在失败时清理；绝不落明文 |
 | F7 | `known_marketplaces[<old>]` | 派生 | — | 先写 `known[new]`（`installLocation` 重算、`manifestNameBaseline = new`），待搬迁与重建完成后删 `known[old]` | 失败 → 保留旧条目（可重建） |
 | F8 | catalog clone | 派生 | 目录存在性 | `<home>/marketplace/<old>` → `<new>` rename | 失败 → 该项 abort（保留旧状态）；不做重 clone，恢复交 `marketplace add/refresh` |
 | F9 | 外部 plugin 树 | 派生 | 目录存在性 | `<home>/marketplace/.plugins/<old>` → `<new>` rename（与 F8 同阶段，紧跟 F8） | 失败 → 该项 abort（F8 的可重入性保证重跑安全） |
@@ -288,12 +288,16 @@ Issue 要求覆盖「旧名来源识别」。本设计的答案是：**两种来
 
 1. 枚举新清单内**全部 plugin**（含未安装的清单内 plugin——它们历史上装过、可能在 keyring 留值）的
    `<clone>/<plugin>/mcp-servers/inputs.json`，收集 `password: true` 的 input id → 拼 `<plugin>@<old>/<id>`；
-   （已不在清单、也已卸载的 plugin 见下方「已知边界」）
-2. 已装但**已从清单移除/改名**的 plugin：按账本 `installPath` 定位其 `inputs.json`（键名 plugin 段取 pid 前缀）；
-3. 既无清单条目又无可用 `installPath` → **无法证明无旧 secret** → 该项 abort（零写入，exit 3）；
-4. **已安装** plugin 的 `inputs.json` 畸形 / 根不可读 → 该项 abort（保守，不猜）；
-   **从未安装且无根**的清单内 plugin **不计候选**（不存在可被写入的 scoped secret，2026-11-22 架构师确认）；
-   `inputs.json` 缺失本身不是错误（该 plugin 无 inputs）。
+   「在清单」判定与 P2 同一身份口径（`find_plugin_entry`，strip 后匹配——条目名带空白也按在清单处理），
+   但**枚举集只收 strip 后仍合法的 kebab 名**（绝对路径 / `../` 等不可信名不参与枚举，#272 路径穿越
+   不变量）；GitCloneSpec 分支另加「解析后必须仍在 home 内」的纵深边界；
+2. **carve-out（#301 裁决）**：**不在新清单**（含 `baseline_derived` 清单不可读）的 plugin 没有 rename
+   目标 ⇒ **不枚举、不重键、不阻断**；其旧 input 值 / secret 原样保留（旧键成为孤儿，但不会被任何新
+   pid 读取）。**已安装但已从清单移除**的 plugin 同样适用——无 rename 目标即无重绑定语义；
+3. **已装**且仍在新清单的 plugin：根不可读 → `plugin-root-unreadable`；`inputs.json` 畸形 / 不可读 →
+   `secret-inputs-unreadable`——两者都**无法证明无旧 secret** → 该项 abort（零写入，exit 3）；
+   **从未安装且无根**的清单内 plugin **不计候选、不阻断**（不存在可被写入的 scoped secret，2026-11-22
+   架构师确认）；`inputs.json` 缺失本身不是错误（该 plugin 无 inputs）。
 
 写序：`get(old)` → `set(new)` → 回读校验；仅当 `set` 成功且 `get(new)` 与旧值相等才 `delete(old)`。
 **目标键已存在且值不同 → abort（不覆盖既有 secret）**；`delete(old)` 失败只告警（新键已可读，值不丢）。
@@ -323,6 +327,9 @@ manifest 校验 + 依赖解析，失败即抛。删掉旧记录而新记录没�
 **F10 —— plugin 不在新清单里怎么办**：`find_plugin_entry`（`manifest.py:102`）找不到时 `materialize_plugin` 会抛。策略：
 **不把它当作迁移失败**——F1 照常把意图迁到新 pid，F10 保留旧账本记录，dry-run/实跑都产出
 `warn: plugin '<p>' not in the new manifest` 并给出处置建议（`plugin uninstall <p>@<new>` 或等待上游恢复）。
+清单在 classify 后固定，故 P0.5 在**计划期**即置 `incomplete`（`ledger-rebuild-failed`）：dry-run 的退出码
+与实跑一致（3），不再等到 P2 才体现。该 plugin 的 plugin-scoped input 值与 secret **不重键**（无 rename
+目标，D14 carve-out，见 §12.2）——旧键在改名后成为孤儿，但不会被任何新 pid 读取。
 理由：上游删插件是外部事实，拿它阻断整个 marketplace 的改名代价过大；而保留旧记录保证依赖信息不丢。
 
 **F11 —— 重启提示**：`A2CSkillRef.source` 是内存派生（`staging.py` `_build_marketplace_ref`），迁移命令不触碰 Registry；
@@ -384,12 +391,19 @@ shell 执行后由下次 REPL/boot 重扫（与既有 `marketplace add/remove/re
 
 项内部的失败（settings 写失败 / rename 失败 / 目标键碰撞）**不**改冲突分类，也**不**跨项传播：
 
-- **P0.5 预检发现**的问题（keyring 不可用、目标键异值、secret 候选不可枚举）：该项标 `aborted`/`blocked`，
+- **P0.5 预检发现**的问题（keyring 不可用、目标键异值、secret 候选不可枚举〔**已装且仍在新清单**〕、
+  project/local 账本记录缺合法 `projectPath` 且该记录在 P2 会被重建）：该项标 `aborted`/`blocked`，
   **该项零写入**——预检先于任何写入，天然满足；
 - **P1 之后**的写失败：该项标 `aborted`，**停止对该项继续写**；已写步骤**保留**（forward-only，不逐项回滚，
   §7.6），重跑按 §7.2/§7.4 续做；
 - 其余项继续执行；
 - 最终退出码 **3**（部分完成）。
+
+> 「plugin 不在新清单 / `baseline_derived`（F10 保留旧账本）」**不是**执行期失败：项仍是 `rename`、只置
+> `incomplete`（`ledger-rebuild-failed`），其余面照常迁移，退出码 3（详见 §7.1）。三条限定：①该 plugin 的
+> plugin-scoped input 值 / secret 不重键（D14 carve-out，§12.2）；②plugin **仍在新清单**但根 / `inputs.json`
+> 不可读时 D14 原样整项 `blocked`（`plugin-root-unreadable`）、零写入；③`aborted` 仅用于「预检后账本被
+> 并发写坏」的竞态 raise。
 
 与 D7 的区别：**冲突是命令级**（整体 abort、exit 1、任何项都不写）；**执行期失败是项级**（其余项照常、exit 3）；
 **forward-only 不做项内回滚**（python 与 rust 的已接受差异）。
@@ -478,7 +492,8 @@ dry-run 也按同一口径返回「apply 会得到的退出码」，便于 CI �
 P-1 strict load     strict 只读加载全部将被改写的状态文件        零写入；损坏 → 命令级 abort（exit 3），不 rename 损坏文件
 P0  preflight       计算计划、冲突检测（命令级）                  零写入（P-1/P0/P0.5 都是零变更退出的阶段）
 P0.5 item preflight 项级：secret 候选派生 + keyring 可用性 +     零写入；不通过 → 该项 abort/blocked（exit 3），
-                    目标 input/secret 键冲突检查                  其余项继续
+                    目标 input/secret 键冲突检查 + 账本            其余项继续
+                    project/local projectPath 前置条件
 P1  additive(new)   新名侧权威面全部写入（旧名侧保持）           installedPlugins / enabledPlugins(user) / trust /
                                                                 blocked / extraKnown(user, --update-declarations) /
                                                                 input 值 / secret
@@ -488,6 +503,19 @@ P3  switch-off      旧名侧权威面删除                             enabled
 P4  ledger cleanup  重建成功的 pid 才删旧账本记录（F10）
 P5  report          汇总 + 依赖告警（project/local、extraKnown、blocked、env）
 ```
+
+**P0.5 的账本前置条件（#301 item 1 窄对齐 + 裁决②）**：判据与 `_rebuild_ledger` **逐条同构**，静态可知的
+「保留旧账本」形态一律在计划期置 `incomplete` + `ledger-rebuild-failed`，使 dry-run 与 apply 的退出码同为 3：
+1. **projectPath**：project/local 记录缺合法 `projectPath` ⇒ 仅当该记录在 P2 真会被重建（plugin 仍在新清单 +
+   `installPath` 为非空字符串）才 `blocked` / `project-path-missing`（dry-run 即 exit 3、零写入）；
+2. **plugin 不在新清单 / `baseline_derived`** ⇒ 保留旧账本、迁移其余（F10），项仍是 `rename`，**不得**把整个
+   marketplace 阻断；其 plugin-scoped input 值 / secret 不重键（D14 carve-out，§12.2）；
+3. **records 非数组 / 记录非对象 / 记录缺 `installPath`** ⇒ 同样计划期预告（P2 只 keep、不 raise）。
+
+只有「预检之后账本被并发写入这样的记录」的竞态才会走到 `_rebuild_ledger` 的 raise（`aborted` +
+`ledger-rebuild-failed`），该 raise 保留为纵深防御。**例外（不窄化）**：plugin **仍在新清单**但根 / `inputs.json`
+不可读时，D14 原样 fail-closed ⇒ 整项 `blocked` / `plugin-root-unreadable`、零写入（「迁移其余」不适用，
+因为项根本没有执行）。
 
 **为什么有 P-1（strict 只读 loader）**：现有 `load_known_marketplaces` / `load_installed_plugins` 走
 `read_jsonc_with_recovery`——损坏文件会被**改名**成 `.corrupt-<ts>.bak` 后按空配置继续（`store.py:283-327`）。
@@ -628,7 +656,7 @@ plugin-scoped input/secret 变成新名下的孤儿键（旧键已删）。**物
 | 独立源 plugin 的外树 rename 失败 | 同上 |
 | keyring 不可用且**存在**旧 secret | 该项 abort、**零写入**、其余项继续、退出码 3（D10）；报告里明确「需手工重录」 |
 | keyring 不可用且**无**旧 secret | 无 secret 可重键 → 照常迁移（不因后端缺失误伤无密钥项） |
-| secret 候选不可枚举（`inputs.json` 缺失/畸形、plugin 根不可读） | 该项 abort（无法证明无旧 secret），退出码 3 |
+| secret 候选不可枚举（`inputs.json` 缺失/畸形、plugin 根不可读，**已装且仍在新清单**） | 该项 abort（无法证明无旧 secret），退出码 3；未安装的清单内 plugin 只告警不阻断 |
 | `input-values.json` / 状态文件损坏 | **命令级 abort（strict loader）**：零写入、不 rename 损坏文件、退出码 3 |
 | 网络 | **完全不使用**（无 `--reclone` 开关） |
 
@@ -777,7 +805,7 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 | project/local 不改写 | 五个面各含旧名 → 文件字节不变 + `followUps[]` 有对应 `effect`；退出码 3 |
 | **project scope 安装仍启用** | `plugin install <pid> --scope project` + `enable` 后迁移 → 合并视图活跃判据**不劣化**（不静默熄灯）；同上 local 两例 |
 | secret 重键 | fake keyring：新键写入后旧键删除；**keyring 不可用且旧 secret 存在 → 该项零写入、其余项迁移、退出码 3**（变异：把 abort 改成 skipped → 断言「零写入」的用例转红） |
-| secret 候选派生（D14） | 已从新清单移除的 plugin（有账本 installPath）→ 旧 secret 仍被重键；无法定位的 plugin → 该项 abort、零写入 |
+| secret 候选派生（D14） | **carve-out（#301 裁决）**：**不在新清单**的 plugin（含 `baseline_derived` 全部账本 plugin）无 rename 目标 ⇒ 不枚举、不重键、不阻断，旧值/secret 原样保留；**新清单内** plugin 根/inputs 不可读 → 该项 abort、零写入 |
 | 目标 secret / input 值键异值 | 预置 `new` 键不同值 → 该项 abort、旧值不动、退出码 3；同值 → 幂等 no-op |
 | 离线 grandfather | 删掉 clone / 破坏清单 → `unresolved`，零写入，退出码 3 |
 | strict loader 零写入 | 把 `known_marketplaces.json` / `installed_plugins.json` / settings / `input-values.json` 各写坏一份 → dry-run 与 `--apply` 都：退出码 3、**不产生 `.corrupt-*.bak`**、所有文件字节不变 |
@@ -892,12 +920,22 @@ legacy 夹具必须**直接构造 pre-#260 磁盘状态**（与真实存量用�
 | Q15 | 加固项（全部纳入 P1） | strict 只读 loader（dry-run 零写入、损坏不 rename）；keyring 候选派生（枚举 `inputs.json` 的 `password:true`，不按键前缀枚举）；目标 input/secret 键异值 → abort；`info.manifestName` 脱敏；新 `known[new]` 不沿用旧 `manifestNameBaseline` | ✅ 已裁决 |
 | Q16 | 夹具与 origin 验收 | 夹具**不得用 `add` 构造 legacy**（#260 后 add 取清单名、`--name` 仅期望校验）→ 直接构造 pre-#260 known/clone/settings；验收「两种旧名来源路径等价」，不要求 origin 标签 | ✅ 已裁决 |
 
+### 15.3 2026-11-24 #301 终审残留裁决（v0.5.2）
+
+| # | 问题 | 结论 | 状态 |
+|---|------|------|------|
+| Q17 | P0.5 的 projectPath 判据是否硬阻断整个 marketplace | **窄对齐**：只有「plugin 仍在新清单 + `installPath` 合法（非空字符串）」的记录才 `blocked` / `project-path-missing`；plugin 已移除 / `baseline_derived` 按 F10 保留旧账本、迁移其余、exit 3（计划期即置 `incomplete`，dry-run 与 apply 同码） | ✅ 已裁决 |
+| Q18 | `_rebuild_ledger` 的 projectPath raise 是否保留 | **保留**为竞态纵深防御（P0.5 已用同一谓词前置），加直调用例钉住 | ✅ 已裁决 |
+| Q19 | 「plugin 不在新清单」时 D14 secret fail-closed 与 F10 冲突 | **carve-out**：无 rename 目标的 plugin（不在新清单，**含已安装但已出清单**；含 `baseline_derived`）不枚举、不重键、不阻断（旧值/secret 原样保留）；**已装且仍在新清单**的根 / `inputs.json` 不可读 → `plugin-root-unreadable` / `secret-inputs-unreadable` 整项 abort、零写入（正对照变异钉住） | ✅ 已裁决 |
+| Q20 | 静态可知的 P2-only `incomplete`（缺 `installPath` / 记录非对象 / records 非数组） | **计划期一并预告**，dry-run 与 apply 同码（§12.2）；目录存在性属运行期事实，不预告 | ✅ 已裁决 |
+
 ---
 
 ## 16. 变更记录
 
 | 日期 | 变更 |
 |------|------|
+| 2026-11-24 | **#301 终审残留**：P0.5 判据与 `_rebuild_ledger` 逐条同构（谓词 `_record_needs_project_path` 共用；`projectPath` 窄对齐；plugin 移除 / `baseline_derived` / 缺 `installPath` / 记录非对象 / records 非数组一律**计划期**置 `incomplete`，dry-run 与 apply 退出码一致）；**D14 carve-out**（无 rename 目标的 plugin 不枚举、不重键、不阻断；新清单内根缺失仍整项 abort）；`_rebuild_ledger` 的 raise 保留为竞态纵深防御并加直调用例；补 P3 null 用例、无 `source` 正路用例、P3 目标值不被覆盖断言；死分支清理；变异脚本加基线绿跑 / 严格 KILLED / 语法校验 / 超时 / raise 式字节还原 / 锚点演进校验（33 → 44 条，KILLED 只认 short summary 的 `FAILED`/`ERROR` 行）；补裸字符串 source 的「计划期预告」判据、枚举集「strip+合法名 / GitCloneSpec home 边界」路径穿越加固、keep 诊断「阻断项不得即时落」负向锁（#309 终审） |
 | 2026-11-17 | Phase 1 初稿（Issue #268）；隔离审查后修订 7🔴+8🟡（阶段顺序重排、可认领目录判据、C4 源 pid 排除、F13 拆分、`installedAt` 不可沿用、外树纳入 P2 等） |
 | 2026-11-17 | 架构师审查通过；落定 Q1–Q6（批准）、Q7/Q9（用户裁决）、Q8（Discussion#81 已订正）；新增 §10.4 `manifestName` 面 |
 | 2026-11-22 | **P0：按 2026-11-22 用户裁决回填**（Q10–Q16）——D7 冲突整体 abort、D10 keyring 按项 abort + exit 3、D12 默认 dry-run + `--apply` + 删除 `--yes/--reclone` + exit 0/1/3 + REPL 只 dry-run、`extraKnown` 默认只报告 + `--update-declarations` 仅 user、`blocked` user 改写、§7.4 认领判据修正（允许 `D.name == old`）、新增 strict loader / keyring 候选派生 / 目标键异值 abort / `info.manifestName` 脱敏 / baseline 不复制、夹具改为直接构造 pre-#260 状态、文档订正（#260 baseline 已交付、rust#289/PR#299 已实现、trust 原语分层与过时理由、secret 注释两侧同型）；**docs-only，无代码改动** |
