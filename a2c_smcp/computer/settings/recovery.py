@@ -357,7 +357,9 @@ def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDe
     # field 保留前缀：前缀本身含 `.`，整段喂给 URL 脱敏器会被误判为 scheme 的一部分（与 rust 同因）。
     prefix = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}."
     if error.field.startswith(prefix):
-        field = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}.{sanitize_marketplace_name(error.field[len(prefix):])}"
+        # #304：#304 起段漏斗**唯一权威**是 :func:`sanitize_prefixed_name_field`（与 enabledPlugins /
+        # servers / inputs 的展示路径共用同一实现，消除双权威）。
+        field = sanitize_prefixed_name_field(error.field, prefixes=(FIELD_EXTRA_KNOWN_MARKETPLACES,))
     else:
         # 无法剥离前缀（整字段错误）→ 整段脱敏（fail-safe，与 rust 同）。
         field = sanitize_marketplace_text(error.field)

@@ -1006,10 +1006,15 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   「被空白劈开」的凭据（`alice:my pw@corp`）。故构造处改为：name 值走段漏斗
   （`_sanitize_declaration_name`）、`pydantic_error_text(..., sanitize_segment=...)` 逐段脱敏、
   `<file>` 只留 `strerror`（路径由脱敏 `source_path` 承载）。
-- **边界**：`_inject_inputs_collision_safe` 的 input-id 行、`mcp_config` / `scope` 的 load 期 WARNING 路径、
-  `format_settings_errors` 其它字段的 reason 回显仍为既有行为，另单处理；名字轴对 **percent-encoded**
-  userinfo（`alice%3Apw%40mp`）继承 `sanitize_marketplace_name` 共享原语的既有缺口（字面形态已收口），
-  随共享原语另案。与 rust 的展示差异见 v0.5.2 镜像单。
+- **load 期 WARNING 同步脱敏**（审查 🔴）：`mcp_config` / `scope` 的读文件失败 WARNING 此前把**原始路径与
+  原始异常**直接写终端（默认 INFO 下 `a2c_smcp` 的 StreamHandler 走 stdout）；现路径走 `sanitize_source_path`、
+  异常侧只留 `strerror`（非 `OSError` 走 `exception_text`），与 `<file>` reason 同源，且转换自身不可抛。
+- **`_inject_inputs_collision_safe` 的 id / env 名过名字漏斗**：input-id 坍缩行不再回显 `alice:pw@mp` 这类
+  userinfo 形态 id（干净 id 仍可读）。
+- **边界（另单 [`#313`](https://github.com/A2C-SMCP/python-sdk/issues/313)，v0.5.2）**：`format_settings_errors`
+  对非 marketplace 字段的 reason 仍原值透传；名字轴（`sanitize_marketplace_name`）只判**字面** `@`/`?`/`#`，
+  **percent-encoded**（`alice%3Apw%40mp`）与 **NFKC 全角**（`ａｌｉｃｅ：ｐｗ＠ｍｐ`）形态仍逐字回显。
+  与 rust 的展示差异同随该单对齐。
 
 ## [0.4.0] - 2026-08-25
 

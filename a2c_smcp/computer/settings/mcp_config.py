@@ -236,11 +236,19 @@ def load_mcp_config_file(path: Path, scope: SettingsScope) -> tuple[dict[str, An
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         # 同 :func:`~a2c_smcp.computer.settings.scope.load_settings_file`：``UnicodeDecodeError`` 不是
         # ``OSError`` 子类，漏捕会让非 UTF-8 的 mcp.json 在解析处崩溃而非「容错 + 记错、留盘」。
-        # #304 item 2：OSError 文本内嵌文件路径（路径可含 userinfo 形态，且散文漏斗按空白分词回收不了
-        # 「被空白劈开」的凭据）→ 构造处只留 ``strerror``；定位由 ``source_path`` 字段承载（展示侧
-        # 经 ``sanitize_source_path``）。JSON / Unicode 解码错误文本不含路径，原样保留位置信息。
-        detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
-        logger.warning("MCP config %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
+        # #304 item 2（审查 🔴）：OSError 文本内嵌文件路径，且 **WARNING 本身也会上屏**——默认 INFO 下
+        # ``a2c_smcp`` 的 StreamHandler 直接写 stdout。路径走 ``sanitize_source_path``（函数内 lazy import
+        # 避开 settings 子模块环），异常侧只留 ``strerror``（非 OSError 走 ``exception_text``）；定位由
+        # ``source_path`` 字段承载。**转换本身不得可抛**（在 except 内运行，二次抛出会顶替原异常）。
+        try:
+            from a2c_smcp.computer.settings.recovery import sanitize_source_path
+            from a2c_smcp.utils.diagnostics import exception_text
+
+            safe_src = sanitize_source_path(src)
+            detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exception_text(exc)
+        except Exception:  # noqa: BLE001 - 错误转换自身不得可抛
+            safe_src, detail = "<redacted-source>", "<unprintable>"
+        logger.warning("MCP config %s unreadable/corrupt, ignored (kept on disk): %s", safe_src, detail)
         return dict(empty), [_err(scope, "<file>", f"unreadable or corrupt JSON: {detail}", src)]
     if not isinstance(raw, dict):
         return dict(empty), [_err(scope, "<root>", "mcp config root must be an object", src)]

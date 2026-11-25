@@ -95,6 +95,7 @@ from a2c_smcp.computer.settings.recovery import (
     GovernanceRecoveryReport,
     MarketplaceDeclarationError,
     MarketplaceSourceConflict,
+    sanitize_marketplace_name,
     sanitize_marketplace_text,
     sanitize_prefixed_name_field,
     sanitize_source_path,
@@ -212,11 +213,15 @@ def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, so
         kept = sorted(i for i in ids if i not in candidates)
         # id / name / source 全是不可信值（mcp.json 可随仓库分发；plugin 名来自账本）：逐段 escape，否则
         # 两个 `[/]` 形态 id 坍缩到同一 env 名时 rich 抛 MarkupError，异常逸出 `run_mcp_approval` ⇒ 整门跳过。
-        detail = f"{escape(', '.join(repr(i) for i in now))}（本次跳过 / skipped）"
+        # #304 item 2：id / env 名同样走**名字漏斗**（整值）——`alice:pw@mp` 这类 id 会回显 userinfo。
+        now_safe = [sanitize_marketplace_name(i) for i in now]
+        kept_safe = [sanitize_marketplace_name(i) for i in kept]
+        name_safe = sanitize_marketplace_name(name)
+        detail = f"{escape(', '.join(repr(i) for i in now_safe))}（本次跳过 / skipped）"
         if kept:
-            detail += f"；{escape(', '.join(repr(i) for i in kept))}（池内既有，未受影响 / already in pool, untouched）"
+            detail += f"；{escape(', '.join(repr(i) for i in kept_safe))}（池内既有，未受影响 / already in pool, untouched）"
         console.print(
-            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name))} —— {detail}。"
+            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name_safe))} —— {detail}。"
             "请改 id 消歧 / input ids collide on one env var name; rename to disambiguate[/red]",
         )
     for inp in inputs:

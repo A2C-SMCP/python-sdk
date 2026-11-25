@@ -45,6 +45,7 @@ MCP_CONFIG = "a2c_smcp/computer/settings/mcp_config.py"
 T_INIT = "tests/unit_tests/computer/cli/test_commands_init.py"
 T_APPROVAL = "tests/unit_tests/computer/cli/test_mcp_approval.py"
 T_SETTINGS = "tests/unit_tests/computer/cli/test_settings.py"
+T_SCOPE = "tests/unit_tests/computer/settings/test_scope.py"
 
 _ENABLED_PLUGINS_STEP = "        field = sanitize_prefixed_name_field(field, prefixes=(FIELD_ENABLED_PLUGINS,))\n"
 _MCP_LINE_REASON = (
@@ -225,6 +226,39 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T_APPROVAL + "::test_mcp_json_error_non_string_name_value_not_echoed",),
+    ),
+    Mutation(
+        "M16 load 期 WARNING 回显原始 mcp.json 路径（mcp_config）",
+        (
+            (
+                MCP_CONFIG,
+                "            safe_src = sanitize_source_path(src)\n",
+                "            safe_src = src\n",
+            ),
+        ),
+        (T_APPROVAL + "::test_mcp_json_error_file_reason_omits_path",),
+    ),
+    Mutation(
+        "M17 input-id 坍缩行回退原始 id（不改名字漏斗）",
+        (
+            (
+                PLUGIN,
+                "        now_safe = [sanitize_marketplace_name(i) for i in now]\n",
+                "        now_safe = list(now)\n",
+            ),
+        ),
+        (T_APPROVAL + "::test_input_id_collision_line_redacts_credentials",),
+    ),
+    Mutation(
+        "M18 load 期 WARNING 回显原始 settings 路径（scope）",
+        (
+            (
+                "a2c_smcp/computer/settings/scope.py",
+                "            safe_src = sanitize_source_path(str(p))\n",
+                "            safe_src = str(p)\n",
+            ),
+        ),
+        (T_SCOPE + "::test_load_settings_file_does_not_echo_credential_path",),
     ),
 )
 

@@ -232,3 +232,26 @@ def test_format_settings_errors_scrubs_bidi_in_enabled_plugin_key() -> None:
     )
 
     assert "\u202e" not in lines[0]
+
+
+@pytest.mark.parametrize(
+    ("key", "forbidden"),
+    [
+        # #304 验收点名的四类形态：URL / scp-like / path / 被空白劈开；外加 query-fragment。
+        ("https://alice:s3cret@example.com/repo.git@mp", ("alice:", "s3cret")),
+        ("alice:pw@host:repo.git@mp", ("alice:", "pw@")),
+        ("/home/alice:pw@host/repo@mp", ("alice:", "pw@")),
+        ("alice:my pw@corp", ("alice:my", "pw@corp")),
+        ("https://example.com/repo.git?token=abc123#frag@mp", ("token=", "abc123", "frag")),
+    ],
+)
+def test_format_settings_errors_redacts_enabled_plugin_credential_shapes(
+    key: str, forbidden: tuple[str, ...],
+) -> None:
+    """#304 item 1 验收向量：凭据形态非法键的 userinfo / query / fragment 均不出现在展示行。"""
+    line = format_settings_errors(
+        [SettingsValidationError(scope=SettingsScope.USER, field=f"enabledPlugins.{key}", reason=_ENABLED_PLUGINS_REASON)]
+    )[0]
+
+    for needle in forbidden:
+        assert needle not in line, f"未遮蔽 {needle!r}: {line}"
