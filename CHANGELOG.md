@@ -998,12 +998,18 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **`mcp.json` 行改摘要 + DEBUG 明细（#304 item 2）**：`run_mcp_approval` 不再把整条
   `SettingsValidationError` dataclass repr（含原始 `source_path`）顶到终端——终端只留
   `⚠ mcp.json[<scope>]: <field> — <reason>` 摘要，完整明细（scope / field / reason / 脱敏 source_path）
-  降 DEBUG 日志。`field` 的 `servers.<name>` / `inputs.<id>` 残段整值过名字漏斗，`reason` 过散文漏斗
-  （覆盖 name-mismatch 文案内嵌的原始 `name` 值），`source_path` 走 `sanitize_source_path`（userinfo 形态
+  降 DEBUG 日志。`field` 的 `servers.<name>` / `inputs.<id>` 残段整值过名字漏斗（前缀常量
+  `MCP_DECLARATION_FIELD_PREFIXES` 与校验器同源），`source_path` 走 `sanitize_source_path`（userinfo 形态
   整值 fail-closed）；控制字符 / 方向覆写清洗保持。
-- **边界（不在本单扩面）**：`_inject_inputs_collision_safe` 的 input-id 行、`mcp_config` / `scope` 的
-  load 期 WARNING 路径、`format_settings_errors` 其它字段的 reason 回显仍为既有行为，另单处理。
-  与 rust 的展示差异见 v0.5.2 镜像单。
+- **`reason` 的用户值在构造处脱敏**：`mcp_config` 的 name-mismatch 文案内嵌原始 `name` / map key、
+  pydantic `loc` 含手编 extra key、`<file>` 的 `OSError` 文本内嵌文件路径——散文漏斗按空白分词，回收不了
+  「被空白劈开」的凭据（`alice:my pw@corp`）。故构造处改为：name 值走段漏斗
+  （`_sanitize_declaration_name`）、`pydantic_error_text(..., sanitize_segment=...)` 逐段脱敏、
+  `<file>` 只留 `strerror`（路径由脱敏 `source_path` 承载）。
+- **边界**：`_inject_inputs_collision_safe` 的 input-id 行、`mcp_config` / `scope` 的 load 期 WARNING 路径、
+  `format_settings_errors` 其它字段的 reason 回显仍为既有行为，另单处理；名字轴对 **percent-encoded**
+  userinfo（`alice%3Apw%40mp`）继承 `sanitize_marketplace_name` 共享原语的既有缺口（字面形态已收口），
+  随共享原语另案。与 rust 的展示差异见 v0.5.2 镜像单。
 
 ## [0.4.0] - 2026-08-25
 

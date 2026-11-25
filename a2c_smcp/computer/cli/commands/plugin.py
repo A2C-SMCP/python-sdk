@@ -73,6 +73,7 @@ from a2c_smcp.computer.settings.installer import (
     uninstall_plugin,
 )
 from a2c_smcp.computer.settings.mcp_config import (
+    MCP_DECLARATION_FIELD_PREFIXES,
     McpApprovalStatus,
     approve_all_project_mcp,
     approve_mcp_server,
@@ -285,7 +286,7 @@ def mcp_declaration_error_line(error: SettingsValidationError) -> str:
     ``source_path`` **不进摘要**——完整明细见 :func:`mcp_declaration_error_detail`（DEBUG 渠道）。
     控制字符 / Cf 由两个漏斗 scrub，sink 仍须自带 ``escape()``。
     """
-    field = sanitize_prefixed_name_field(error.field, prefixes=("servers", "inputs"))
+    field = sanitize_prefixed_name_field(error.field, prefixes=MCP_DECLARATION_FIELD_PREFIXES)
     return f"⚠ mcp.json[{error.scope.value}]: {field} — {sanitize_marketplace_text(error.reason)}"
 
 
@@ -297,7 +298,7 @@ def mcp_declaration_error_detail(error: SettingsValidationError) -> str:
     ``source_path``（路径轴 fail-closed，None → ``<unknown>``）；控制字符 / 方向覆写已被各漏斗 scrub。
     **只供日志阅读**，不得用于再解析 / 比较 / 去重。
     """
-    field = sanitize_prefixed_name_field(error.field, prefixes=("servers", "inputs"))
+    field = sanitize_prefixed_name_field(error.field, prefixes=MCP_DECLARATION_FIELD_PREFIXES)
     source = "<unknown>" if error.source_path is None else sanitize_source_path(error.source_path)
     return (
         f"scope={error.scope.value} field={field} reason={sanitize_marketplace_text(error.reason)} "

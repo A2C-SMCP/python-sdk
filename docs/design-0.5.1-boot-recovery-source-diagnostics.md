@@ -233,11 +233,11 @@ CLI 行**顺序与 rust 对拍**：降级 → 源冲突 → 声明错误；三�
 
 | 边界 | 归属 |
 |------|------|
-| `enabledPlugins` 非法键 / `mcp.json: {e}` 的 pydantic repr 仍回显原值（同一展示漏斗） | [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)（`enabledPlugins` 整值过名字漏斗；`mcp.json` 行改摘要 + DEBUG 明细） |
+| ~~`enabledPlugins` 非法键 / `mcp.json: {e}` 的 pydantic repr 回显原值~~ **已由 [#304](https://github.com/A2C-SMCP/python-sdk/issues/304) items 1/2 收口**：`enabledPlugins` 键整值过名字漏斗；`mcp.json` 行改摘要 + DEBUG 明细，field/reason/source_path 三轴脱敏 | 已收口 |
 | `installedPlugins` / `enabledPlugins` 的同类 invalid key 仍静默（不进本报告） | 另案评估（用户裁决 5） |
 | `settings.json` 整文件不可解析时只记一条 `<file>` 错误，不含 marketplace 子树 | 既有行为（§5.6 容错），不在本设计范围 |
-| `reason` 的散文脱敏不对 path 段 fail-closed（当前 reason 全静态、不可达） | §6.1；reason 若引入用户值时改走段漏斗 |
-| `sanitize_path_for_diagnostics` 的「先 escape 再判段 + 要求字面 `@`/`?`/`#`」在**其他**调用方仍可能漏 path 段凭据（控制字符邻接 / 段内空白 / percent-encoded 三类） | 共享原语问题，不在本单；本单只在 `source_path` 采集处 fail-closed |
+| `reason` 会内嵌用户值（`mcp_config` 的 name-mismatch 文案、pydantic `loc` 的手编 extra key、`<file>` 的 OSError 文本）；散文漏斗对「被空白劈开」的凭据（`alice:my pw@corp`）不 fail-closed | **已收口（#304 item 2）**：在 `mcp_config` **构造处**走段漏斗（`_sanitize_declaration_name`）/ `pydantic_error_text(sanitize_segment=...)` 逐段脱敏 / `<file>` 只留 `strerror`（路径由脱敏 `source_path` 承载） |
+| `sanitize_path_for_diagnostics` 的「先 escape 再判段 + 要求字面 `@`/`?`/`#`」在**其他**调用方仍可能漏 path 段凭据（控制字符邻接 / 段内空白 / percent-encoded 三类）。**名字轴**（`sanitize_marketplace_name`）继承同一 percent-encoded 缺口：`alice%3Apw%40mp` 逐字回显 | 共享原语问题，不在本单；本单只在 `source_path` 采集处 fail-closed；#304 items 1/2 的新 sink（`enabledPlugins` / `servers` / `inputs`）按**字面**形态收口，percent-encoded 形态随共享原语另案 |
 | 当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时，同一份非法声明会在同一次启动出现**两条** CLI 行（`run_mcp_approval` 的 `format_settings_errors` + 本单的声明行），叠加 boot/重挂两条 `WARN` ≈ 4 条同义提示 | 已知边界：用户 2026-11-22 裁决接受同义提示；`format_settings_errors` 的脱敏已由 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口（措辞差异保留）。**不**为去重而重新解析 settings（违反「只消费 report 字段」） |
 | project-origin bundled server 落 PENDING 后，CLI 只打 INFO 日志、**没有批准入口**（`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担（参考 client 未来补线索） | follow-up（架构师开跟踪 issue，不在 #293/#294 实现） |
 

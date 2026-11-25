@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -38,16 +38,30 @@ SECRET_PARAM_SEQUENCE_KEYS = frozenset({"args"})
 REDACTED_VALUE = "***"
 
 
-def pydantic_error_text(exc: ValidationError) -> str:
+def pydantic_error_text(
+    exc: ValidationError,
+    *,
+    sanitize_segment: Callable[[str], str] | None = None,
+) -> str:
     """
     pydantic 校验失败的安全诊断文本（**不含** ``input_value`` / ``url``）/ Safe text for a ValidationError.
 
     与 #263 在 ``parse_bundled_server`` 的修法同源：``errors(include_input=False, include_url=False)`` 后只
     拼「loc:type」。``loc`` 段过 :func:`~a2c_smcp.utils.git_url.escape_unsafe_chars`（控制字符 / 孤立代理项）。
+
+    ``sanitize_segment``（#304 item 2）：``loc`` 段可能来自**手编 JSON 的 key**（如 ``extra_forbidden`` 的
+    额外键），可含 userinfo 形态凭据——调用方可注入**段漏斗**（如
+    :func:`~a2c_smcp.computer.settings.recovery.sanitize_marketplace_name`）逐段 fail-closed；缺省不注入
+    （保持既有调用方行为）。散文漏斗按空白分词，无法回收「被空白劈开」的凭据，故须在段级处理。
     """
     errors = exc.errors(include_input=False, include_url=False)
+
+    def _segment(part: object) -> str:
+        text = str(part)
+        return text if sanitize_segment is None else sanitize_segment(text)
+
     fields = ", ".join(
-        f"{escape_unsafe_chars('.'.join(str(part) for part in err.get('loc', ())) or '<root>')}:{err.get('type', 'invalid')}"
+        f"{escape_unsafe_chars('.'.join(_segment(part) for part in err.get('loc', ())) or '<root>')}:{err.get('type', 'invalid')}"
         for err in errors
     )
     return f"{len(errors)} validation error(s) in [{fields}]"
