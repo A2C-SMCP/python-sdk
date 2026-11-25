@@ -20,6 +20,7 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §5.0 / 
 """
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -240,3 +241,34 @@ def test_extra_known_marketplaces_deep_merge_at_cwd(tmp_path: Path, monkeypatch:
     resolved = resolve_settings(env=_empty_user_env(tmp_path))
     assert set(resolved.settings["extraKnownMarketplaces"]) == {"mp1", "mp2"}  # 深合并键并集
     assert resolved.settings["extraKnownMarketplaces"]["mp1"]["source"]["url"] == "git@h:a.git"
+
+
+def test_load_settings_file_does_not_echo_credential_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#304 审查 🔴：settings 文件的 load 期 WARNING 与 ``<file>`` reason 都不回显凭据形态路径."""
+    import a2c_smcp.computer.settings.scope as scope_mod
+    from a2c_smcp.computer.settings.schema import SettingsScope
+
+    d = tmp_path / "alice:pw@host" / "settings.json"
+    d.mkdir(parents=True)  # 目录 → IsADirectoryError
+
+    src = scope_mod.logger
+    prev_level = src.level
+    src.setLevel(logging.INFO)
+    src.addHandler(caplog.handler)
+    try:
+        data, errors = scope_mod.load_settings_file(d, SettingsScope.USER)
+    finally:
+        src.removeHandler(caplog.handler)
+        src.setLevel(prev_level)
+
+    assert data == {}
+    assert len(errors) == 1 and errors[0].field == "<file>"
+    assert "alice:" not in errors[0].reason and "pw@" not in errors[0].reason
+
+    warns = [r.getMessage() for r in caplog.records if "unreadable/corrupt" in r.getMessage()]
+    assert warns, "load 期 WARNING 必须仍在（正对照）"
+    joined = "".join("\n".join(warns).split())
+    assert "<redacted-git-source>" in joined
+    assert "alice:" not in joined and "pw@" not in joined

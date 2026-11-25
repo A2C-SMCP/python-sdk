@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ import pytest
 import a2c_smcp.computer.cli.commands.plugin as plugin_cmd
 from a2c_smcp.computer.cli.commands.plugin import run_mcp_approval
 from a2c_smcp.computer.settings.mcp_config import resolve_mcp_config
+from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError
 from a2c_smcp.computer.settings.scope import user_settings_path, workdir_local_settings_path
 
 
@@ -599,3 +601,458 @@ async def test_approval_mount_failure_line_redacts_pydantic_payload(
     out = _no_ws(capsys.readouterr().out)
     assert "SUPER_SECRET_TOKEN" not in out  # input_value 不回显
     assert "validationerror(s)in[token:int_parsing]" in out  # 仍有可定位的摘要（exception_text 形态）
+
+
+# ── #304 item 2：mcp.json 摘要行 / DEBUG 明细 ──────────────────────────────────
+_MCP_MISMATCH_REASON = (
+    "server 'name' field 'alice:pw@mp' != map key 'clean' (the map key is the canonical identity)"
+)
+
+
+def test_mcp_declaration_error_line_redacts_server_name_credentials() -> None:
+    """摘要行的 field 残段**整值**过名字漏斗；source 字段不进摘要。"""
+    line = plugin_cmd.mcp_declaration_error_line(
+        SettingsValidationError(
+            scope=SettingsScope.PROJECT,
+            field="servers.alice:pw@mp",
+            reason="server definition must be an object",
+            source_path="/proj/.tfrobot/mcp.json",
+        )
+    )
+
+    assert line == "⚠ mcp.json[project]: servers.<redacted-git-source> — server definition must be an object"
+    assert "alice:" not in line
+    assert "source_path" not in line
+
+
+def test_mcp_declaration_error_line_redacts_name_embedded_in_reason() -> None:
+    """reason 里的原始 ``name`` 值（``mcp_config`` 的 name-mismatch 文案）也必须过散文漏斗。"""
+    line = plugin_cmd.mcp_declaration_error_line(
+        SettingsValidationError(scope=SettingsScope.PROJECT, field="servers.clean", reason=_MCP_MISMATCH_REASON)
+    )
+
+    assert "alice:" not in line and "pw@mp" not in line
+    assert "<redacted-git-source>" in line
+    assert "servers.clean" in line  # 干净 map key 仍可定位
+
+
+def test_mcp_declaration_error_line_preserves_clean_server_name() -> None:
+    line = plugin_cmd.mcp_declaration_error_line(
+        SettingsValidationError(
+            scope=SettingsScope.PROJECT, field="servers.bad[/]name", reason="server definition must be an object"
+        )
+    )
+
+    assert line == "⚠ mcp.json[project]: servers.bad[/]name — server definition must be an object"
+
+
+def test_mcp_declaration_error_line_keeps_constant_field() -> None:
+    line = plugin_cmd.mcp_declaration_error_line(
+        SettingsValidationError(scope=SettingsScope.USER, field="<file>", reason="unreadable or corrupt JSON: x")
+    )
+
+    assert line.startswith("⚠ mcp.json[user]: <file> — ")
+
+
+def test_mcp_declaration_error_detail_sanitizes_all_four_segments() -> None:
+    detail = plugin_cmd.mcp_declaration_error_detail(
+        SettingsValidationError(
+            scope=SettingsScope.USER,
+            field="servers.alice:pw@mp",
+            reason=_MCP_MISMATCH_REASON,
+            source_path="alice%3Apw%40host-mcp.json",
+        )
+    )
+
+    assert "scope=user" in detail
+    assert "servers.<redacted-git-source>" in detail
+    assert "source_path=<redacted-git-source>" in detail
+    assert "alice%3A" not in detail
+    assert "pw@mp" not in detail
+
+
+def test_mcp_declaration_error_detail_scrubs_bidi_and_marks_missing_source() -> None:
+    detail = plugin_cmd.mcp_declaration_error_detail(
+        SettingsValidationError(
+            scope=SettingsScope.USER,
+            field="servers.good\u202emp",
+            reason="server definition must be an object",
+            source_path=None,
+        )
+    )
+
+    assert "\u202e" not in detail
+    assert "source_path=<unknown>" in detail
+
+
+# ── #304 item 2：真实 sink（console 摘要 + DEBUG 明细） ────────────────────────
+@pytest.mark.asyncio
+async def test_mcp_json_error_line_redacts_server_name_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"alice:pw@mp": {"server_parameters": {}}, "good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "mcp.json[project]" in out
+    assert "alice:" not in out and "pw@mp" not in out
+    assert "servers.<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_reason_redacts_name_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reason 轴：map key 干净、server 体 ``name`` 是凭据形态 → name-mismatch 文案里的原始值被掩蔽。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(
+        wd,
+        {"clean": {"type": "stdio", "server_parameters": {"command": "node"}, "name": "alice:pw@mp"}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "clean" in out
+    assert "alice:" not in out and "pw@mp" not in out
+    assert "<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_never_echoes_credential_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """apiKey / env / args 秘值既不进摘要行、也不进 DEBUG 明细（钉 ``pydantic_error_text`` 不回归）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(
+        wd,
+        {
+            "evil": {
+                "type": "stdio",
+                "command": "npx",
+                "args": ["ARG_SECRET_X"],
+                "env": {"API_KEY": "ENV_SECRET_X"},
+                "apiKey": "APIKEY_SECRET_X",
+            }
+        },
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    src = plugin_cmd.logger
+    prev_level = src.level
+    src.setLevel(logging.DEBUG)
+    src.addHandler(caplog.handler)
+    try:
+        with _m.patch.dict(os.environ, env, clear=False):
+            await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+    finally:
+        src.removeHandler(caplog.handler)
+        src.setLevel(prev_level)
+
+    combined = capsys.readouterr().out + caplog.text
+    for secret in ("ARG_SECRET_X", "ENV_SECRET_X", "APIKEY_SECRET_X"):
+        assert secret not in combined, f"凭据外泄: {secret}"
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_detail_is_logged_at_debug(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """完整明细（scope / field / reason / 脱敏 source）走 DEBUG，且 console 只留摘要。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"bad": {"server_parameters": {}}, "good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    src = plugin_cmd.logger
+    prev_level = src.level
+    src.setLevel(logging.DEBUG)
+    src.addHandler(caplog.handler)
+    try:
+        with _m.patch.dict(os.environ, env, clear=False):
+            await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+    finally:
+        src.removeHandler(caplog.handler)
+        src.setLevel(prev_level)
+
+    details = [r.getMessage() for r in caplog.records if "mcp.json declaration error detail" in r.getMessage()]
+    assert len(details) == 1
+    assert "scope=project" in details[0]
+    assert "field=servers.bad" in details[0]
+    assert ".tfrobot/mcp.json" in details[0]  # 干净 source 可定位（脱敏后原样）
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_detail_stays_off_console_at_info_level(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """INFO 级对照：明细**不得**产出任何日志记录（杀 debug→info 变异）。
+
+    项目 logger 的 console handler 在 import 时绑定原始 ``sys.stdout``，``capsys`` 看不到它的输出——
+    故不能断言 stdout，直接把 ``caplog.handler`` 挂到模块 logger，在 INFO 级别下断言零条明细记录。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(wd, {"bad": {"server_parameters": {}}, "good": _stdio()})
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    src = plugin_cmd.logger
+    prev_level = src.level
+    src.setLevel(logging.INFO)
+    src.addHandler(caplog.handler)
+    try:
+        with _m.patch.dict(os.environ, env, clear=False):
+            await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+    finally:
+        src.removeHandler(caplog.handler)
+        src.setLevel(prev_level)
+
+    details = [r for r in caplog.records if "mcp.json declaration error detail" in r.getMessage()]
+    assert details == []
+    captured = capsys.readouterr()
+    out = _no_ws(captured.out)
+    # debug→console.print(/console_err.print) 变异：详情会直接写终端——摘要行不含 `source_path=`，出现即上屏。
+    assert "source_path=" not in out
+    assert "source_path=" not in _no_ws(captured.err)
+    assert "mcp.json[project]" in out  # 摘要行仍在（正对照）
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_reason_redacts_whitespace_split_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#304 审查 🔴：name-mismatch 内嵌的原始值即使**被空白劈开**（``alice:my pw@corp``）也必须 fail-closed.
+
+    散文漏斗按空白分词，两半都不命中 userinfo 形态；修法在 ``mcp_config`` **构造 reason 处**走段漏斗。
+    """
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(
+        wd,
+        {"clean": {"type": "stdio", "server_parameters": {"command": "node"}, "name": "alice:my pw@corp"}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "alice:my" not in out and "pw@corp" not in out
+    assert "<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_loc_redacts_whitespace_split_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pydantic ``extra_forbidden`` 的 loc 段含手编 key → 摘要里的 loc 逐段过名字漏斗（同被空白劈开的向量）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(
+        wd,
+        {"evil": {"type": "stdio", "server_parameters": {"command": "node"}, "alice:my pw@corp": 1}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "alice:my" not in out and "pw@corp" not in out
+    assert "<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_line_redacts_input_id_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``inputs.<id>`` 轴的 field 残段同样过名字漏斗（钉 ``MCP_DECLARATION_FIELD_PREFIXES`` 覆盖 inputs）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _write_json(
+        wd / ".tfrobot" / "mcp.json",
+        {"servers": {"good": _stdio()}, "inputs": [{"id": "alice:pw@mp"}]},  # 缺必填字段 → invalid
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "alice:" not in out and "pw@mp" not in out
+    assert "inputs.<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_file_reason_omits_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``<file>`` 的 OSError 文案与 **load 期 WARNING** 都不回显凭据形态路径（#304 审查 🔴）.
+
+    路径可由 env / cwd 控制，展示侧的散文漏斗回收不了「被空白劈开」的凭据；故在 ``mcp_config``
+    **构造处**只留 ``strerror``、WARNING 的路径走 ``sanitize_source_path``。``capsys`` 看不到 logging
+    handler 的输出（import 时绑定 stdout），必须以 ``caplog.handler`` 直挂模块 logger 断言。
+    """
+    import unittest.mock as _m
+
+    from a2c_smcp.computer.settings import mcp_config as mcp_config_mod
+
+    # 用**被空白劈开**的凭据形态：字面 userinfo 会被散文漏斗兜住，只有这种形态能钉住「构造处」脱敏。
+    wd, home, env = tmp_path / "alice:my pw@corp" / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir(parents=True)
+    home.mkdir()
+    (wd / ".tfrobot" / "mcp.json").mkdir(parents=True)  # 目录 → IsADirectoryError
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    src = mcp_config_mod.logger
+    prev_level = src.level
+    src.setLevel(logging.INFO)
+    src.addHandler(caplog.handler)
+    try:
+        with _m.patch.dict(os.environ, env, clear=False):
+            await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+    finally:
+        src.removeHandler(caplog.handler)
+        src.setLevel(prev_level)
+
+    out = _no_ws(capsys.readouterr().out)
+    # 平台无关：仅断言 reason 前缀在场、且凭据形态路径不回显（Windows 上对目录 read_text 抛 PermissionError）。
+    assert "unreadableorcorruptJSON:" in out
+    assert "alice:my" not in out and "pw@corp" not in out
+
+    warns = [r.getMessage() for r in caplog.records if "unreadable/corrupt" in r.getMessage()]
+    assert warns, "load 期 WARNING 必须仍在（正对照）"
+    joined = _no_ws("\n".join(warns))
+    assert "<redacted-git-source>" in joined  # 路径经 sanitize_source_path（整值 fail-closed）
+    assert "alice:my" not in joined and "pw@corp" not in joined
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_input_loc_redacts_extra_key_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_validate_input`` 的 pydantic loc 同样逐段过名字漏斗（inputs 额外键向量）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _write_json(
+        wd / ".tfrobot" / "mcp.json",
+        {
+            "servers": {"good": _stdio()},
+            "inputs": [{"id": "ok", "type": "promptString", "description": "d", "alice:my pw@corp": 1}],
+        },
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "alice:my" not in out and "pw@corp" not in out
+    assert "<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_non_string_name_value_not_echoed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非字符串 ``name``（如 ``{"token": ...}``）不 echo 值——嵌套裸 token 不在名字漏斗可识别形态内。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(
+        wd,
+        {"clean": {"type": "stdio", "server_parameters": {"command": "node"}, "name": {"token": "ghp_SECRET"}}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "ghp_SECRET" not in out
+    assert "<non-string>" in out
+
+
+@pytest.mark.asyncio
+async def test_input_id_collision_line_redacts_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#304 item 2：input-id 坍缩行里的 id / env 名同样过名字漏斗（`alice:pw@mp` 不回显 userinfo）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _write_json(
+        wd / ".tfrobot" / "mcp.json",
+        {
+            "servers": {"good": _stdio()},
+            "inputs": [
+                {"id": "alice:pw@mp", "type": "promptString", "description": "d"},
+                {"id": "alice_pw_mp", "type": "promptString", "description": "d"},  # 同 env 名 → 坍缩
+            ],
+        },
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "alice:" not in out and "pw@mp" not in out
+    assert "<redacted-git-source>" in out
+    assert "alice_pw_mp" in out  # 干净 id 可读（负对照）

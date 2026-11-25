@@ -73,6 +73,7 @@ from a2c_smcp.computer.settings.installer import (
     uninstall_plugin,
 )
 from a2c_smcp.computer.settings.mcp_config import (
+    MCP_DECLARATION_FIELD_PREFIXES,
     McpApprovalStatus,
     approve_all_project_mcp,
     approve_mcp_server,
@@ -94,8 +95,12 @@ from a2c_smcp.computer.settings.recovery import (
     GovernanceRecoveryReport,
     MarketplaceDeclarationError,
     MarketplaceSourceConflict,
+    sanitize_marketplace_name,
+    sanitize_marketplace_text,
+    sanitize_prefixed_name_field,
+    sanitize_source_path,
 )
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
@@ -208,11 +213,15 @@ def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, so
         kept = sorted(i for i in ids if i not in candidates)
         # id / name / source 全是不可信值（mcp.json 可随仓库分发；plugin 名来自账本）：逐段 escape，否则
         # 两个 `[/]` 形态 id 坍缩到同一 env 名时 rich 抛 MarkupError，异常逸出 `run_mcp_approval` ⇒ 整门跳过。
-        detail = f"{escape(', '.join(repr(i) for i in now))}（本次跳过 / skipped）"
+        # #304 item 2：id / env 名同样走**名字漏斗**（整值）——`alice:pw@mp` 这类 id 会回显 userinfo。
+        now_safe = [sanitize_marketplace_name(i) for i in now]
+        kept_safe = [sanitize_marketplace_name(i) for i in kept]
+        name_safe = sanitize_marketplace_name(name)
+        detail = f"{escape(', '.join(repr(i) for i in now_safe))}（本次跳过 / skipped）"
         if kept:
-            detail += f"；{escape(', '.join(repr(i) for i in kept))}（池内既有，未受影响 / already in pool, untouched）"
+            detail += f"；{escape(', '.join(repr(i) for i in kept_safe))}（池内既有，未受影响 / already in pool, untouched）"
         console.print(
-            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name))} —— {detail}。"
+            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name_safe))} —— {detail}。"
             "请改 id 消歧 / input ids collide on one env var name; rename to disambiguate[/red]",
         )
     for inp in inputs:
@@ -270,6 +279,36 @@ def marketplace_source_conflict_line(conflict: MarketplaceSourceConflict) -> str
 def marketplace_degraded_line(marketplace: str) -> str:
     """marketplace 源不可达 / clone 重建失败的降级提示行（#287 起既有行为，#294 收归纯函数）/ Degraded line."""
     return f"⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)"
+
+
+def mcp_declaration_error_line(error: SettingsValidationError) -> str:
+    """
+    ``mcp.json`` 声明校验错误的**单行展示摘要**（#304 item 2，展示安全）/ One display-safe summary line.
+
+    旧行为把整条 dataclass repr（``scope`` / ``field`` / ``reason`` / ``source_path``）顶到终端；
+    本函数只留三段：``field`` 的 ``servers.`` / ``inputs.`` 残段是手编 map key（可含 userinfo），
+    **整值**过名字漏斗；``reason`` 走散文漏斗（name-mismatch 文案内嵌原始 ``name`` 值）；
+    ``source_path`` **不进摘要**——完整明细见 :func:`mcp_declaration_error_detail`（DEBUG 渠道）。
+    控制字符 / Cf 由两个漏斗 scrub，sink 仍须自带 ``escape()``。
+    """
+    field = sanitize_prefixed_name_field(error.field, prefixes=MCP_DECLARATION_FIELD_PREFIXES)
+    return f"⚠ mcp.json[{error.scope.value}]: {field} — {sanitize_marketplace_text(error.reason)}"
+
+
+def mcp_declaration_error_detail(error: SettingsValidationError) -> str:
+    """
+    ``mcp.json`` 声明错误的**完整明细**（#304 item 2；只进 DEBUG 日志）/ Full detail for DEBUG logs.
+
+    四段全部走展示漏斗：``field``（名字段）/ ``reason``（散文，可内嵌原始 ``name``）/
+    ``source_path``（路径轴 fail-closed，None → ``<unknown>``）；控制字符 / 方向覆写已被各漏斗 scrub。
+    **只供日志阅读**，不得用于再解析 / 比较 / 去重。
+    """
+    field = sanitize_prefixed_name_field(error.field, prefixes=MCP_DECLARATION_FIELD_PREFIXES)
+    source = "<unknown>" if error.source_path is None else sanitize_source_path(error.source_path)
+    return (
+        f"scope={error.scope.value} field={field} reason={sanitize_marketplace_text(error.reason)} "
+        f"source_path={source}"
+    )
 
 
 async def run_governance_remount(
@@ -801,10 +840,12 @@ async def run_mcp_approval(
     resolved = comp.resolve_mcp_declarations(env=env)
 
     # 被 drop 的畸形 server/input 必须呈现（§5.6 / mcp_config 容错不静默，#69 Group B 风险 3）。
-    # `escape()`：错误文本含用户可编字段（server 名 / 点路径），未转义时 rich 会把 `[...]` 当标签吞掉
-    # 或在形状不巧时抛 MarkupError（#294 复审实证）。
+    # #304 item 2：终端只留**摘要**（scope + 脱敏 field/reason），完整明细降 DEBUG——旧行为把整条
+    # dataclass repr 与原始 source_path 顶到终端。field/reason/source_path 均经展示漏斗（含 Cf/Cc scrub），
+    # 故 `escape()` 只需负责 rich markup；logger 用 `%s` 惰性格式化，绝不附异常对象。
     for e in resolved.errors:
-        console.print(f"[yellow]⚠ mcp.json: {escape(str(e))}[/yellow]")
+        logger.debug("mcp.json declaration error detail: %s", mcp_declaration_error_detail(e))
+        console.print(f"[yellow]{escape(mcp_declaration_error_line(e))}[/yellow]")
 
     if not resolved.servers:
         return

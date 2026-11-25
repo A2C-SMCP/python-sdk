@@ -144,8 +144,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         (
             (
                 PLUGIN_CLI,
-                '        detail = f"{escape(\', \'.join(repr(i) for i in now))}（本次跳过 / skipped）"',
-                '        detail = f"{\', \'.join(repr(i) for i in now)}（本次跳过 / skipped）"',
+                '        detail = f"{escape(\', \'.join(repr(i) for i in now_safe))}（本次跳过 / skipped）"',
+                '        detail = f"{\', \'.join(repr(i) for i in now_safe)}（本次跳过 / skipped）"',
             ),
         ),
         (T_APPROVAL + "::test_input_collision_line_escapes_markup_ids",),

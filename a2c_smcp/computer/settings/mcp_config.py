@@ -93,6 +93,13 @@ MCP_CONFIG_FILENAME = "mcp.json"  # user / project scope（§9.1）
 MCP_LOCAL_CONFIG_FILENAME = "mcp.local.json"  # active workdir local scope（不入 git）
 MANAGED_MCP_FILENAME = "managed-mcp.json"  # policy scope（企业下发）
 
+# mcp.json 声明错误的点路径前缀（#304 item 2）：`servers.<name>` / `inputs.<id>` 的残段是手编 map key，
+# 展示侧按**单个不可信名字**脱敏。常量在此定义，展示层（`cli/commands/plugin.py`）导入复用，避免两处字面量漂移。
+# Dotted-field prefixes for mcp.json declaration errors; the segment after the dot is an untrusted map key.
+MCP_SERVERS_FIELD = "servers"
+MCP_INPUTS_FIELD = "inputs"
+MCP_DECLARATION_FIELD_PREFIXES: tuple[str, str] = (MCP_SERVERS_FIELD, MCP_INPUTS_FIELD)
+
 # server 定义里的 VS Code 风格扩展字段：非 A2C ``MCPServerConfig`` 字段（其 ``extra="forbid"``），校验前
 # 剥离、原样保留交 #65 渲染消费 / VS Code-style extension keys, stripped before validation, kept for #65.
 _VSCODE_EXT_KEYS: frozenset[str] = frozenset({"envFile"})
@@ -197,6 +204,19 @@ def _err(scope: SettingsScope, fld: str, reason: str, source: str | None) -> Set
     return SettingsValidationError(scope=scope, field=fld, reason=reason, source_path=source)
 
 
+def _sanitize_declaration_name(value: str) -> str:
+    """
+    手编 map key / server ``name`` 值的展示脱敏（#304 item 2）/ Display-safe untrusted declaration name.
+
+    reason 内嵌这些**值**时必须在**构造处**过**段漏斗**：散文漏斗按空白分词，回收不了「被空白劈开」的
+    凭据（``alice:my pw@corp`` 两半各自不成 userinfo 形态）。函数内 lazy import：``settings.recovery``
+    拉 installer / skills 等重依赖，且与 ``mcp_config`` 属同层兄弟，模块级导入会放大导入面。
+    """
+    from a2c_smcp.computer.settings.recovery import sanitize_marketplace_name
+
+    return sanitize_marketplace_name(value)
+
+
 def load_mcp_config_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any], list[SettingsValidationError]]:
     """
     读取并容错规整单个 ``mcp.json`` 文件为 ``{servers:{}, inputs:[]}`` / Load + tolerantly coerce one mcp.json。
@@ -216,8 +236,20 @@ def load_mcp_config_file(path: Path, scope: SettingsScope) -> tuple[dict[str, An
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         # 同 :func:`~a2c_smcp.computer.settings.scope.load_settings_file`：``UnicodeDecodeError`` 不是
         # ``OSError`` 子类，漏捕会让非 UTF-8 的 mcp.json 在解析处崩溃而非「容错 + 记错、留盘」。
-        logger.warning("MCP config %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
-        return dict(empty), [_err(scope, "<file>", f"unreadable or corrupt JSON: {exc}", src)]
+        # #304 item 2（审查 🔴）：OSError 文本内嵌文件路径，且 **WARNING 本身也会上屏**——默认 INFO 下
+        # ``a2c_smcp`` 的 StreamHandler 直接写 stdout。路径走 ``sanitize_source_path``（函数内 lazy import
+        # 避开 settings 子模块环），异常侧只留 ``strerror``（非 OSError 走 ``exception_text``）；定位由
+        # ``source_path`` 字段承载。**转换本身不得可抛**（在 except 内运行，二次抛出会顶替原异常）。
+        try:
+            from a2c_smcp.computer.settings.recovery import sanitize_source_path
+            from a2c_smcp.utils.diagnostics import exception_text
+
+            safe_src = sanitize_source_path(src)
+            detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exception_text(exc)
+        except Exception:  # noqa: BLE001 - 错误转换自身不得可抛
+            safe_src, detail = "<redacted-source>", "<unprintable>"
+        logger.warning("MCP config %s unreadable/corrupt, ignored (kept on disk): %s", safe_src, detail)
+        return dict(empty), [_err(scope, "<file>", f"unreadable or corrupt JSON: {detail}", src)]
     if not isinstance(raw, dict):
         return dict(empty), [_err(scope, "<root>", "mcp config root must be an object", src)]
 
@@ -225,12 +257,12 @@ def load_mcp_config_file(path: Path, scope: SettingsScope) -> tuple[dict[str, An
     servers = raw.get("servers")
     if not isinstance(servers, dict):
         if servers is not None:
-            errors.append(_err(scope, "servers", "'servers' must be an object", src))
+            errors.append(_err(scope, MCP_SERVERS_FIELD, "'servers' must be an object", src))
         servers = {}
     inputs = raw.get("inputs")
     if not isinstance(inputs, list):
         if inputs is not None:
-            errors.append(_err(scope, "inputs", "'inputs' must be an array", src))
+            errors.append(_err(scope, MCP_INPUTS_FIELD, "'inputs' must be an array", src))
         inputs = []
     return {"servers": servers, "inputs": inputs}, errors
 
@@ -250,19 +282,35 @@ def _validate_server(
     map **key 即 server 身份**（VS Code/CC 风格）：注入 ``name=<key>``；若 ``sdef`` 内显式 ``name`` 与 key
     冲突 → 判废。剥离 :data:`_VSCODE_EXT_KEYS` 入 ``ext``（交 #65），其余校验为 ``MCPServerConfig``。
     """
-    fld = f"servers.{name}"
+    fld = f"{MCP_SERVERS_FIELD}.{name}"
     if not isinstance(sdef, Mapping):
         return None, [_err(scope, fld, "server definition must be an object", source)]
     ext = {k: v for k, v in sdef.items() if k in _VSCODE_EXT_KEYS}
     body = {k: v for k, v in sdef.items() if k not in _VSCODE_EXT_KEYS}
     if "name" in body and body["name"] != name:
-        reason = f"server 'name' field {body['name']!r} != map key {name!r} (the map key is the canonical identity)"
+        # #304 item 2：reason 内嵌两个**原始值**（显式 name / map key，均可为凭据形态）→ 构造处过段漏斗；
+        # 展示侧的散文漏斗回收不了被空白劈开的凭据。**非字符串 name 不 echo 值**——嵌套结构里的裸 token
+        # 不在名字漏斗可识别形态内（`{"token": "..."}` 会原样回显），只报类型（name 本就应为 str）。
+        raw_name = body["name"]
+        shown = _sanitize_declaration_name(raw_name) if isinstance(raw_name, str) else "<non-string>"
+        reason = (
+            f"server 'name' field {shown!r} != map key "
+            f"{_sanitize_declaration_name(name)!r} (the map key is the canonical identity)"
+        )
         return None, [_err(scope, fld, reason, source)]
     body["name"] = name  # key 即身份 / the map key is the identity.
     try:
         cfg = _MCP_SERVER_ADAPTER.validate_python(body)
     except ValidationError as exc:
-        return None, [_err(scope, fld, f"invalid MCP server config: {pydantic_error_text(exc)}", source)]
+        # loc 段含手编 extra key（pydantic `extra_forbidden`）→ 逐段过名字漏斗（#304 item 2）。
+        return None, [
+            _err(
+                scope,
+                fld,
+                f"invalid MCP server config: {pydantic_error_text(exc, sanitize_segment=_sanitize_declaration_name)}",
+                source,
+            )
+        ]
     # ext 以只读视图承载（frozen dataclass 不冻 dict 内容；下游 #65 只读消费）/ ext as a read-only view.
     server = ResolvedMcpServer(name=name, config=cfg, ext=MappingProxyType(ext), origin=scope, trusted_origin=scope in _TRUSTED_ORIGINS)
     return server, []
@@ -271,11 +319,18 @@ def _validate_server(
 def _validate_input(idef: Any, scope: SettingsScope, source: str | None) -> tuple[MCPServerInput | None, list[SettingsValidationError]]:
     """校验单个 input 定义 → :class:`MCPServerInput`（畸形 → ``None`` + 错误，**不抛**）/ Validate one input def。"""
     raw_id = idef.get("id") if isinstance(idef, Mapping) else None
-    fld = f"inputs.{raw_id}" if isinstance(raw_id, str) else "inputs.<unknown>"
+    fld = f"{MCP_INPUTS_FIELD}.{raw_id}" if isinstance(raw_id, str) else f"{MCP_INPUTS_FIELD}.<unknown>"
     try:
         inp = _MCP_INPUT_ADAPTER.validate_python(idef)
     except ValidationError as exc:
-        return None, [_err(scope, fld, f"invalid input definition: {pydantic_error_text(exc)}", source)]
+        return None, [
+            _err(
+                scope,
+                fld,
+                f"invalid input definition: {pydantic_error_text(exc, sanitize_segment=_sanitize_declaration_name)}",
+                source,
+            )
+        ]
     return inp, []
 
 

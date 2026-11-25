@@ -988,6 +988,34 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   路径穿越两层同时拆 / keep 诊断「阻断项不得即时落」/ `_rebuild_ledger` raise / `_rebuild_ledger` 无
   source 正路），并在严格判据下收紧既有变异的目标用例列表（其原列表含未被该变异打红的用例）。
 
+### Fixed（#304 item 1/2 settings 展示面脱敏残余）
+
+- **`enabledPlugins` 非法键脱敏（#304 item 1）**：`format_settings_errors` 对 `enabledPlugins.<key>` 的
+  map key **整值**过既有名字漏斗（`sanitize_prefixed_name_field` → `sanitize_marketplace_name`）——
+  非法键与值非 bool 两处错误共用同一形状，故一并覆盖。用户 2026-11-23 裁决：**不拆分**、不改「含 `:` 即遮」；
+  `alice:pw@mp` / `alice:pw@example.com@mp` 掩为 `<redacted-git-source>`，干净非法键（`Bad_Name@mp` /
+  `alice@corp@mp` / `evil[/]a[/]b`）仍逐字可读，控制字符 / Cf 族由漏斗清洗。
+- **`mcp.json` 行改摘要 + DEBUG 明细（#304 item 2）**：`run_mcp_approval` 不再把整条
+  `SettingsValidationError` dataclass repr（含原始 `source_path`）顶到终端——终端只留
+  `⚠ mcp.json[<scope>]: <field> — <reason>` 摘要，完整明细（scope / field / reason / 脱敏 source_path）
+  降 DEBUG 日志。`field` 的 `servers.<name>` / `inputs.<id>` 残段整值过名字漏斗（前缀常量
+  `MCP_DECLARATION_FIELD_PREFIXES` 与校验器同源），`source_path` 走 `sanitize_source_path`（userinfo 形态
+  整值 fail-closed）；控制字符 / 方向覆写清洗保持。
+- **`reason` 的用户值在构造处脱敏**：`mcp_config` 的 name-mismatch 文案内嵌原始 `name` / map key、
+  pydantic `loc` 含手编 extra key、`<file>` 的 `OSError` 文本内嵌文件路径——散文漏斗按空白分词，回收不了
+  「被空白劈开」的凭据（`alice:my pw@corp`）。故构造处改为：name 值走段漏斗
+  （`_sanitize_declaration_name`）、`pydantic_error_text(..., sanitize_segment=...)` 逐段脱敏、
+  `<file>` 只留 `strerror`（路径由脱敏 `source_path` 承载）。
+- **load 期 WARNING 同步脱敏**（审查 🔴）：`mcp_config` / `scope` 的读文件失败 WARNING 此前把**原始路径与
+  原始异常**直接写终端（默认 INFO 下 `a2c_smcp` 的 StreamHandler 走 stdout）；现路径走 `sanitize_source_path`、
+  异常侧只留 `strerror`（非 `OSError` 走 `exception_text`），与 `<file>` reason 同源，且转换自身不可抛。
+- **`_inject_inputs_collision_safe` 的 id / env 名过名字漏斗**：input-id 坍缩行不再回显 `alice:pw@mp` 这类
+  userinfo 形态 id（干净 id 仍可读）。
+- **边界（另单 [`#313`](https://github.com/A2C-SMCP/python-sdk/issues/313)，v0.5.2）**：`format_settings_errors`
+  对其它字段的 reason 仍原值透传（如 `readRoots[i]` 回显 `invalid path: ... 'alice:pw@mp'`；`<file>` 已由本单收口）；名字轴（`sanitize_marketplace_name`）只判**字面** `@`/`?`/`#`，
+  **percent-encoded**（`alice%3Apw%40mp`）与 **NFKC 全角**（`ａｌｉｃｅ：ｐｗ＠ｍｐ`）形态仍逐字回显。
+  与 rust 的展示差异同随该单对齐。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

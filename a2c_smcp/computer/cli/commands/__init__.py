@@ -247,20 +247,28 @@ def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[st
     **#295：marketplace 声明错误在此统一脱敏**——``field`` 的市场名段是**原始 JSON 键**（校验器直接拼点路径），
     可含 userinfo 凭据 / ``[`` ``]`` 等富文本标记。与恢复报告（:func:`~a2c_smcp.computer.settings.recovery.
     marketplace_declaration_errors`）**同一脱敏口径**（段漏斗 + 散文脱敏 + Cf/Cc 清洗），覆盖本函数的全部
-    消费面（``settings show`` / ``settings get`` / boot 批准流程 ``run_mcp_approval``）。非 marketplace 子树原样保留
-    （本单不扩面，残余挂 #304）。``escape()`` 不在此层做：**每个 sink 自己在打印处转义**（``plugin.py`` 的
-    ``run_mcp_approval`` 与 ``settings.py`` 的 ``_emit_errors`` 均已转义），避免双重转义——新增 sink 必须自带
-    ``escape()``。
-    Marketplace declaration errors are redacted here, mirroring rust's ``format_settings_errors``.
+    消费面（``settings show`` / ``settings get`` / boot 批准流程 ``run_mcp_approval``）。
+    **#304 item 1：``enabledPlugins`` 的 map key 同样在此脱敏**（非法键与值非 bool 两处错误共用
+    ``enabledPlugins.<key>`` 形状）——**整值**当单一不可信名字过同一名字漏斗（用户 2026-11-23 裁决：
+    不拆分、不改「含 ``:`` 即遮」）；干净非法键（``Bad_Name@mp`` / ``alice@corp@mp``）仍逐字可读。
+    其余非 marketplace 子树仍原样保留（不扩面）。``escape()`` 不在此层做：**每个 sink 自己在打印处转义**
+    （``plugin.py`` 的 ``run_mcp_approval`` 与 ``settings.py`` 的 ``_emit_errors`` 均已转义），避免双重转义
+    ——新增 sink 必须自带 ``escape()``。
+    Marketplace declaration errors are redacted here, mirroring rust's ``format_settings_errors``;
+    untrusted ``enabledPlugins`` map keys go through the same name funnel (#304 item 1).
     """
     # 函数内 lazy import 沿用本模块既有范式（见 :func:`resolved_settings_with_errors`）：settings.recovery
     # 拉 mcp_clients.model / skills 等重依赖，不该让每个 import ``cli.commands`` 的命令模块都付这份成本。
-    from a2c_smcp.computer.settings.recovery import sanitized_marketplace_error
+    from a2c_smcp.computer.settings.recovery import sanitize_prefixed_name_field, sanitized_marketplace_error
+    from a2c_smcp.computer.settings.schema import FIELD_ENABLED_PLUGINS
 
     lines: list[str] = []
     for e in errors:
         sanitized = sanitized_marketplace_error(e)
         field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)
+        # #304 item 1：``enabledPlugins`` 的 map key 是手编不可信值（可含 userinfo 形态凭据），
+        # **整值**当单一名字过既有名字漏斗——不拆分、不「含 `:` 即遮」；干净非法键仍逐字可读。
+        field = sanitize_prefixed_name_field(field, prefixes=(FIELD_ENABLED_PLUGINS,))
         lines.append(f"⚠ settings.json[{e.scope.value}]: {field} — {reason}")
     return lines
 

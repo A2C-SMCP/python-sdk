@@ -238,6 +238,26 @@ def sanitize_marketplace_text(text: str) -> str:
     return scrub_diagnostic_chars(redact_git_urls_in_text(text))
 
 
+def sanitize_prefixed_name_field(field: str, *, prefixes: tuple[str, ...]) -> str:
+    """
+    ``<prefix>.<rest>`` 的点路径 → 把 ``rest`` 当**单个不可信名字**整值脱敏（#304 item 1）/ Redact the
+    untrusted name segment of a prefixed dotted field.
+
+    校验器把手编 map key 直接拼进点路径（``enabledPlugins.<key>`` / ``servers.<name>`` /
+    ``inputs.<id>``），键可含 userinfo 形态凭据。口径：**整段**过 :func:`sanitize_marketplace_name`
+    （名字段漏斗 + Cf/Cc 清洗），**不**再按 ``.`` / ``:`` / ``@`` 二次拆分——name 本身可含点
+    （如 ``figma.mcp``），切了会漏出残段。非匹配前缀（``<file>`` / ``<root>`` 等常数项）原样返回。
+    """
+    for prefix in prefixes:
+        head = f"{prefix}."
+        if field.startswith(head):
+            rest = field[len(head):]
+            if not rest:
+                return field
+            return f"{head}{sanitize_marketplace_name(rest)}"
+    return field
+
+
 _WINDOWS_DEVICE_PREFIX_RE = re.compile(r"^\\\\[?.]\\")
 # 盘符**不要求后跟斜杠**：`C:repos\\x`（drive-relative）与 `C:\\repos\\x` 都必须剥；剥掉后剩余串仍要过
 # userinfo 判据，故不会掩盖 `c:alice:pw@host` 这类形态（`:` 仍在）。
@@ -337,7 +357,9 @@ def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDe
     # field 保留前缀：前缀本身含 `.`，整段喂给 URL 脱敏器会被误判为 scheme 的一部分（与 rust 同因）。
     prefix = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}."
     if error.field.startswith(prefix):
-        field = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}.{sanitize_marketplace_name(error.field[len(prefix):])}"
+        # #304：#304 起段漏斗**唯一权威**是 :func:`sanitize_prefixed_name_field`（与 enabledPlugins /
+        # servers / inputs 的展示路径共用同一实现，消除双权威）。
+        field = sanitize_prefixed_name_field(error.field, prefixes=(FIELD_EXTRA_KNOWN_MARKETPLACES,))
     else:
         # 无法剥离前缀（整字段错误）→ 整段脱敏（fail-safe，与 rust 同）。
         field = sanitize_marketplace_text(error.field)

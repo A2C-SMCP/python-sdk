@@ -215,8 +215,24 @@ def load_settings_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any]
         # ``UnicodeDecodeError`` 是 ``ValueError`` 子类而非 ``OSError``：原样漏捕会让非 UTF-8 的 settings.json
         # （如 Windows 记事本存成 UTF-16LE）在启动解析处直接崩溃，而不是按文档契约「容错 + 记错、留盘」。
         # #246 独立审查 🔴1 同族问题（写侧已在 ``settings/raw.py`` 归入 fail-closed）。
-        logger.warning("Settings file %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
-        return {}, [SettingsValidationError(scope=scope, field="<file>", reason=f"unreadable or corrupt JSON: {exc}", source_path=str(p))]
+        # #304 item 2（审查 🔴）：WARNING 与 reason 均不得回显原始路径 / 原始异常——默认 INFO 下
+        # ``a2c_smcp`` 的 StreamHandler 直接写 stdout。路径走 ``sanitize_source_path``（lazy import 避开
+        # ``scope ↔ recovery`` 环），异常侧只留 ``strerror``（非 OSError 走 ``exception_text``）；
+        # **转换本身不得可抛**（在 except 内运行）。
+        try:
+            from a2c_smcp.computer.settings.recovery import sanitize_source_path
+            from a2c_smcp.utils.diagnostics import exception_text
+
+            safe_src = sanitize_source_path(str(p))
+            detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exception_text(exc)
+        except Exception:  # noqa: BLE001 - 错误转换自身不得可抛
+            safe_src, detail = "<redacted-source>", "<unprintable>"
+        logger.warning("Settings file %s unreadable/corrupt, ignored (kept on disk): %s", safe_src, detail)
+        return {}, [
+            SettingsValidationError(
+                scope=scope, field="<file>", reason=f"unreadable or corrupt JSON: {detail}", source_path=str(p)
+            )
+        ]
     return validate_settings(raw, scope, source_path=str(p))
 
 
