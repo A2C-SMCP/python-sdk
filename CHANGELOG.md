@@ -988,6 +988,23 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   路径穿越两层同时拆 / keep 诊断「阻断项不得即时落」/ `_rebuild_ledger` raise / `_rebuild_ledger` 无
   source 正路），并在严格判据下收紧既有变异的目标用例列表（其原列表含未被该变异打红的用例）。
 
+### Fixed（#304 item 1/2 settings 展示面脱敏残余）
+
+- **`enabledPlugins` 非法键脱敏（#304 item 1）**：`format_settings_errors` 对 `enabledPlugins.<key>` 的
+  map key **整值**过既有名字漏斗（`sanitize_prefixed_name_field` → `sanitize_marketplace_name`）——
+  非法键与值非 bool 两处错误共用同一形状，故一并覆盖。用户 2026-11-23 裁决：**不拆分**、不改「含 `:` 即遮」；
+  `alice:pw@mp` / `alice:pw@example.com@mp` 掩为 `<redacted-git-source>`，干净非法键（`Bad_Name@mp` /
+  `alice@corp@mp` / `evil[/]a[/]b`）仍逐字可读，控制字符 / Cf 族由漏斗清洗。
+- **`mcp.json` 行改摘要 + DEBUG 明细（#304 item 2）**：`run_mcp_approval` 不再把整条
+  `SettingsValidationError` dataclass repr（含原始 `source_path`）顶到终端——终端只留
+  `⚠ mcp.json[<scope>]: <field> — <reason>` 摘要，完整明细（scope / field / reason / 脱敏 source_path）
+  降 DEBUG 日志。`field` 的 `servers.<name>` / `inputs.<id>` 残段整值过名字漏斗，`reason` 过散文漏斗
+  （覆盖 name-mismatch 文案内嵌的原始 `name` 值），`source_path` 走 `sanitize_source_path`（userinfo 形态
+  整值 fail-closed）；控制字符 / 方向覆写清洗保持。
+- **边界（不在本单扩面）**：`_inject_inputs_collision_safe` 的 input-id 行、`mcp_config` / `scope` 的
+  load 期 WARNING 路径、`format_settings_errors` 其它字段的 reason 回显仍为既有行为，另单处理。
+  与 rust 的展示差异见 v0.5.2 镜像单。
+
 ## [0.4.0] - 2026-08-25
 
 > **A2C-SMCP 协议 v0.4.0 GA 实现**。SDK 包版本 `0.4.0`，`PROTOCOL_VERSION` 同步为 `0.4.0`。

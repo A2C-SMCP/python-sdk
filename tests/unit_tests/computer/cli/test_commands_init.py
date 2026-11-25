@@ -153,3 +153,82 @@ def test_print_unknown_subcommand_escapes_markup(capsys: pytest.CaptureFixture[s
 
     out = "".join(capsys.readouterr().out.split())
     assert "unknownpluginsubcommand:evil[/]x" in out
+
+
+# ── #304 item 1：enabledPlugins 非法键的整值名字漏斗 ───────────────────────────
+_ENABLED_PLUGINS_REASON = "key must be '<plugin>@<marketplace>' (strict kebab)"
+
+
+@pytest.mark.parametrize(
+    ("key", "forbidden"),
+    [
+        # 字面 userinfo（单 / 双 `@`）→ 整值 fail-closed。
+        ("alice:pw@mp", ("alice:", "pw@mp")),
+        ("alice:pw@example.com@mp", ("alice:", "pw@")),
+        # 带点号：**整段**过漏斗，禁止按 `.` / `:` / `@` 二次拆分（拆了就会漏出半段）。
+        ("a.alice:pw@mp", ("alice:", "pw@mp")),
+        ("alice:pw@mp.extra", ("alice:", "pw@mp")),
+    ],
+)
+def test_format_settings_errors_redacts_enabled_plugins_credentials(
+    key: str, forbidden: tuple[str, ...],
+) -> None:
+    """#304 item 1：非法键**整值**当单一不可信名字过 userinfo 漏斗（不拆分、不「含 `:` 即遮」）。"""
+    lines = format_settings_errors(
+        [
+            SettingsValidationError(
+                scope=SettingsScope.USER,
+                field=f"enabledPlugins.{key}",
+                reason=_ENABLED_PLUGINS_REASON,
+            )
+        ]
+    )
+
+    assert lines == [
+        f"⚠ settings.json[user]: enabledPlugins.<redacted-git-source> — {_ENABLED_PLUGINS_REASON}"
+    ]
+    for needle in forbidden:
+        assert needle not in lines[0], f"未遮蔽 {needle!r}: {lines[0]}"
+
+
+@pytest.mark.parametrize("key", ["Bad_Name@mp", "alice@corp@mp", "evil[/]a[/]b", "clean-plugin@clean-mp"])
+def test_format_settings_errors_preserves_clean_enabled_plugin_keys(key: str) -> None:
+    """干净非法键逐字可读——负对照，反「一律遮蔽」的过度矫正。"""
+    lines = format_settings_errors(
+        [SettingsValidationError(scope=SettingsScope.USER, field=f"enabledPlugins.{key}", reason=_ENABLED_PLUGINS_REASON)]
+    )
+
+    assert lines == [f"⚠ settings.json[user]: enabledPlugins.{key} — {_ENABLED_PLUGINS_REASON}"]
+
+
+def test_format_settings_errors_redacts_enabled_plugin_key_on_value_error() -> None:
+    """值非 bool 分支同样走漏斗（**构造型**：真实校验器的合法键是 strict kebab、产不出凭据形态，
+    此用例只钉「两处错误共用同一漏斗」的代码形状）。"""
+    lines = format_settings_errors(
+        [
+            SettingsValidationError(
+                scope=SettingsScope.USER,
+                field="enabledPlugins.alice:pw@mp",
+                reason="value must be bool, got str",
+            )
+        ]
+    )
+
+    assert "alice:" not in lines[0]
+    assert "<redacted-git-source>" in lines[0]
+
+
+def test_format_settings_errors_scrubs_bidi_in_enabled_plugin_key() -> None:
+    """名字漏斗自带 Cf 清洗：U+202E（方向覆写）不得透传到展示行（ESC 会被段漏斗转义成 `\\x1b`，
+    杀不死去 scrub 的变异，故用 Cf 族）。"""
+    lines = format_settings_errors(
+        [
+            SettingsValidationError(
+                scope=SettingsScope.USER,
+                field="enabledPlugins.good\u202emp",
+                reason=_ENABLED_PLUGINS_REASON,
+            )
+        ]
+    )
+
+    assert "\u202e" not in lines[0]

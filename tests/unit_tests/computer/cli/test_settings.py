@@ -555,3 +555,30 @@ def test_edit_subprocess_env_merges_ambient_with_partial_instance(
     assert sub_env["XDG_CONFIG_HOME"] == str(tmp_path / "cfg")  # 实例轴保留
     assert sub_env["PATH"] == "/usr/bin:/bin"  # ambient 透传（git / 编辑器可用）
     assert captured["argv"][0] == "true"  # $EDITOR 取自合并后环境
+
+
+@pytest.mark.parametrize("command", ["show", "get"])
+def test_settings_commands_redact_enabled_plugins_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    """#304 item 1：``settings show`` / ``settings get`` 的错误行不回显 enabledPlugins 键里的凭据。
+
+    负对照：干净非法键（``Bad_Name@mp``）仍逐字可见，反「一律遮蔽」。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    _write_user_settings(env, {"enabledPlugins": {"alice:pw@mp": True, "Bad_Name@mp": True}})
+    capsys.readouterr()
+
+    if command == "show":
+        assert settings_cmd.settings_show(home, env, scope="user", json_output=True) == 0
+    else:
+        assert settings_cmd.settings_get(home, env, "strictKnownMarketplaces", scope="user", json_output=True) == 1
+    captured = capsys.readouterr()
+
+    err = _no_ws(captured.err)
+    assert "alice:" not in err and "pw@mp" not in err  # 凭据不落 stderr
+    assert "enabledPlugins.<redacted-git-source>" in err
+    assert "enabledPlugins.Bad_Name@mp" in err  # 干净键仍可定位
+    if command == "show":
+        # stdout 是忠实展示：非法键已被校验丢弃，只剩空对象。
+        assert json.loads(captured.out) == {"enabledPlugins": {}}
