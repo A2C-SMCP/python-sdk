@@ -947,5 +947,60 @@ async def test_mcp_json_error_file_reason_omits_path(
         await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
 
     out = _no_ws(capsys.readouterr().out)
-    assert "unreadableorcorruptJSON:Isadirectory" in out
+    # 平台无关：仅断言 reason 前缀在场、且路径不回显（Windows 上对目录 read_text 抛 PermissionError，
+    # 不该把 POSIX 专有的 "Is a directory" 文案写进断言）。
+    assert "unreadableorcorruptJSON:" in out
     assert _no_ws(str(wd)) not in out  # 路径不进 reason（source 只进 DEBUG 且已脱敏）
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_input_loc_redacts_extra_key_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_validate_input`` 的 pydantic loc 同样逐段过名字漏斗（inputs 额外键向量）。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _write_json(
+        wd / ".tfrobot" / "mcp.json",
+        {
+            "servers": {"good": _stdio()},
+            "inputs": [{"id": "ok", "type": "promptString", "description": "d", "alice:my pw@corp": 1}],
+        },
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "alice:my" not in out and "pw@corp" not in out
+    assert "<redacted-git-source>" in out
+
+
+@pytest.mark.asyncio
+async def test_mcp_json_error_non_string_name_value_not_echoed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非字符串 ``name``（如 ``{"token": ...}``）不 echo 值——嵌套裸 token 不在名字漏斗可识别形态内。"""
+    import unittest.mock as _m
+
+    wd, home, env = tmp_path / "proj", tmp_path / "home", _env(tmp_path)
+    wd.mkdir()
+    home.mkdir()
+    _project_mcp(
+        wd,
+        {"clean": {"type": "stdio", "server_parameters": {"command": "node"}, "name": {"token": "ghp_SECRET"}}},
+    )
+    monkeypatch.chdir(wd)
+    comp = _FakeComp(home)
+
+    with _m.patch.dict(os.environ, env, clear=False):
+        await run_mcp_approval(comp, None, approve_all=True, settings_flag_path=None)
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "ghp_SECRET" not in out
+    assert "<non-string>" in out

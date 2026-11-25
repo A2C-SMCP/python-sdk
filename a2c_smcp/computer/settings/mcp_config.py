@@ -281,9 +281,12 @@ def _validate_server(
     body = {k: v for k, v in sdef.items() if k not in _VSCODE_EXT_KEYS}
     if "name" in body and body["name"] != name:
         # #304 item 2：reason 内嵌两个**原始值**（显式 name / map key，均可为凭据形态）→ 构造处过段漏斗；
-        # 展示侧的散文漏斗回收不了被空白劈开的凭据。
+        # 展示侧的散文漏斗回收不了被空白劈开的凭据。**非字符串 name 不 echo 值**——嵌套结构里的裸 token
+        # 不在名字漏斗可识别形态内（`{"token": "..."}` 会原样回显），只报类型（name 本就应为 str）。
+        raw_name = body["name"]
+        shown = _sanitize_declaration_name(raw_name) if isinstance(raw_name, str) else "<non-string>"
         reason = (
-            f"server 'name' field {_sanitize_declaration_name(str(body['name']))!r} != map key "
+            f"server 'name' field {shown!r} != map key "
             f"{_sanitize_declaration_name(name)!r} (the map key is the canonical identity)"
         )
         return None, [_err(scope, fld, reason, source)]

@@ -155,7 +155,7 @@ MUTATIONS: tuple[Mutation, ...] = (
             (
                 MCP_CONFIG,
                 """        reason = (
-            f"server 'name' field {_sanitize_declaration_name(str(body['name']))!r} != map key "
+            f"server 'name' field {shown!r} != map key "
             f"{_sanitize_declaration_name(name)!r} (the map key is the canonical identity)"
         )""",
                 '''        reason = f"server 'name' field {body['name']!r} != map key {name!r} (the map key is the canonical identity)"''',
@@ -171,8 +171,16 @@ MUTATIONS: tuple[Mutation, ...] = (
                 "f\"invalid MCP server config: {pydantic_error_text(exc, sanitize_segment=_sanitize_declaration_name)}\"",
                 'f"invalid MCP server config: {pydantic_error_text(exc)}"',
             ),
+            (
+                MCP_CONFIG,
+                "f\"invalid input definition: {pydantic_error_text(exc, sanitize_segment=_sanitize_declaration_name)}\"",
+                'f"invalid input definition: {pydantic_error_text(exc)}"',
+            ),
         ),
-        (T_APPROVAL + "::test_mcp_json_error_loc_redacts_whitespace_split_credentials",),
+        (
+            T_APPROVAL + "::test_mcp_json_error_loc_redacts_whitespace_split_credentials",
+            T_APPROVAL + "::test_mcp_json_error_input_loc_redacts_extra_key_credentials",
+        ),
     ),
     Mutation(
         "M12 声明字段前缀去掉 inputs（inputs.<id> 泄漏）",
@@ -195,6 +203,28 @@ MUTATIONS: tuple[Mutation, ...] = (
             ),
         ),
         (T_APPROVAL + "::test_mcp_json_error_file_reason_omits_path",),
+    ),
+    Mutation(
+        "M14 DEBUG 明细改 logger.info（默认 INFO 级顶到终端）",
+        (
+            (
+                PLUGIN,
+                _DEBUG_LINE,
+                '        logger.info("mcp.json declaration error detail: %s", mcp_declaration_error_detail(e))\n',
+            ),
+        ),
+        (T_APPROVAL + "::test_mcp_json_error_detail_stays_off_console_at_info_level",),
+    ),
+    Mutation(
+        "M15 非字符串 name 回退 str()（嵌套裸 token 上屏）",
+        (
+            (
+                MCP_CONFIG,
+                '        shown = _sanitize_declaration_name(raw_name) if isinstance(raw_name, str) else "<non-string>"',
+                "        shown = _sanitize_declaration_name(raw_name) if isinstance(raw_name, str) else str(raw_name)",
+            ),
+        ),
+        (T_APPROVAL + "::test_mcp_json_error_non_string_name_value_not_echoed",),
     ),
 )
 
@@ -315,13 +345,19 @@ def main() -> int:
                 else:
                     # 备份登记为「活跃」：子进程期间收到 SIGTERM/SIGINT 也能还原。
                     _ACTIVE_BACKUPS.update(backups)
-                    proc = subprocess.run(
-                        [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
-                        cwd=ROOT,
-                        capture_output=True,
-                        text=True,
-                        timeout=_PYTEST_TIMEOUT_S,
-                    )
+                    try:
+                        proc = subprocess.run(
+                            [PY, "-m", "pytest", *mutation.tests, "-q", "-p", "no:cacheprovider"],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=_PYTEST_TIMEOUT_S,
+                        )
+                    except subprocess.TimeoutExpired:
+                        # 挂起不是 KILLED：记 ERROR 并继续下一条（源码由 finally 还原）。
+                        print(f"{mutation.name}: ERROR(timeout>{_PYTEST_TIMEOUT_S}s)")
+                        failures.append(mutation.name)
+                        continue
                     status, tail = _classify(proc, mutation.tests)
                     print(f"{mutation.name}: {status} | {tail}")
                     if status != "KILLED":
