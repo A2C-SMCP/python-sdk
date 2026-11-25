@@ -253,5 +253,7 @@ def test_format_settings_errors_redacts_enabled_plugin_credential_shapes(
         [SettingsValidationError(scope=SettingsScope.USER, field=f"enabledPlugins.{key}", reason=_ENABLED_PLUGINS_REASON)]
     )[0]
 
+    # 正向控制：整行不得退化成空壳（前缀 + 字段名仍须在场）。
+    assert line.startswith("⚠ settings.json[user]: enabledPlugins.")
     for needle in forbidden:
         assert needle not in line, f"未遮蔽 {needle!r}: {line}"

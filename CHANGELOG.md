@@ -1012,7 +1012,7 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 - **`_inject_inputs_collision_safe` 的 id / env 名过名字漏斗**：input-id 坍缩行不再回显 `alice:pw@mp` 这类
   userinfo 形态 id（干净 id 仍可读）。
 - **边界（另单 [`#313`](https://github.com/A2C-SMCP/python-sdk/issues/313)，v0.5.2）**：`format_settings_errors`
-  对非 marketplace 字段的 reason 仍原值透传；名字轴（`sanitize_marketplace_name`）只判**字面** `@`/`?`/`#`，
+  对其它字段的 reason 仍原值透传（如 `readRoots[i]` 回显 `invalid path: ... 'alice:pw@mp'`；`<file>` 已由本单收口）；名字轴（`sanitize_marketplace_name`）只判**字面** `@`/`?`/`#`，
   **percent-encoded**（`alice%3Apw%40mp`）与 **NFKC 全角**（`ａｌｉｃｅ：ｐｗ＠ｍｐ`）形态仍逐字回显。
   与 rust 的展示差异同随该单对齐。
 
