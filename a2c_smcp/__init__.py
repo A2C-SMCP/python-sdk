@@ -4,7 +4,7 @@
 # @Author  : JQQ
 # @Email   : jqq1716@gmail.com
 # @Software: PyCharm
-__version__: str = "0.5.0"
+__version__: str = "0.5.1"
 
 # A2C-SMCP 协议版本号 / A2C-SMCP protocol version.
 # 与 SDK 包版本（__version__）独立：MAJOR.MINOR 锁定协议 MAJOR.MINOR，PATCH 自由。
@@ -15,4 +15,7 @@ __version__: str = "0.5.0"
 # MINOR；v0.x 下 MINOR **严格匹配**，抬位后握手层才会正确拒绝 0.4.x 对端。
 # 0.4.0 → 0.5.0 (#214): the room-event failure acks changed shape — a breaking wire change that MUST
 # bump MINOR; under v0.x MINOR is matched strictly, so this is what makes the handshake reject 0.4.x.
-PROTOCOL_VERSION: str = "0.5.0"
+#
+# 0.5.0 → 0.5.1（协议 v0.5.1，#79/#83/#78）：**无 wire 变更**，仅对齐协议发布版本（PATCH 位）。
+# 0.5.0 → 0.5.1 (protocol v0.5.1, #79/#83/#78): no wire change; aligned to the protocol release (PATCH).
+PROTOCOL_VERSION: str = "0.5.1"
