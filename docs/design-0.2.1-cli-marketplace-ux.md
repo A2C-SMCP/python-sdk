@@ -59,7 +59,7 @@
 3. **意图层文件**：`settings.json` 格式 + 多级 scope 合并（#154：与 `mcp.json` **同序**，flag 次高）；flag scope 的文件对 = `--settings` + `--mcp-config`。
 4. **Reconciler**：启动时声明 vs 物化对账；自动 clone 缺失、自动清理废弃。
 5. **事件触发链**：CLI 动作 → 缓存失效 → debounce 300ms → emit_update_skills；与文件 watcher 同节奏。
-6. **Trust 流程**：首次 add 弹 y/N；持久化进 `known_marketplaces.json`。
+6. **Trust 流程**：交互式 add 一律弹 y/N（#260 起 `trustedMarketplaces` 不再豁免 prompt）；应答在**注册成功后**写入 user scope `settings.json` 的 `trustedMarketplaces`（**不**落 `known_marketplaces.json`），注册失败零残留。
 
 ### 1.2 不在范围
 
@@ -278,12 +278,18 @@ MCP server 走 **`<plugin>/mcp-servers/<name>.json`** 文件式（mcp-servers �
 
 | 命令 | 行为 |
 |---|---|
-| `marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]` | 添加新 marketplace。首次需 `y/N` 确认 trust；`--trust` 跳过。默认 eager clone。`--no-clone` 仅注册意图（不推荐，与 #39 §2.2 eager add 决策冲突，仅 debug 用）。冲突 name → 报错。 |
+| `marketplace add <git-url> [--name N] [--trust] [--auto-update] [--no-clone]` | 添加新 marketplace。**注册名 = 清单顶层 `name`**（#260/D1；URL 只是定位符），先 clone 到 staging 读清单名、再原子换入，失败零残留。交互式一律 `y/N` 确认 trust（`--trust` 跳过；非交互恒需 `--trust`），trust 在注册成功后才落盘。同名不同源 → `validation` 拒绝；同名同源重复 add 幂等；同一 source 已以旧名注册 → `validation`（诊断给旧名）。`--name` 仅作**期望清单名**校验（D6 B，不再是别名）。`--no-clone` 仅对已注册源/可确认的本地缓存生效，**新源无法确定名称即 `validation`**（D5，无 pending）。 |
 | `marketplace list [--json]` | 列出所有已知 marketplace（trusted/clone 状态、上次刷新时间、auto_update 旗）。 |
 | `marketplace info <name>` | 详情：URL、clone 路径、commit SHA、plugins[] 列表（含 installed 状态）、auto_update、trusted、上次刷新。 |
 | `marketplace remove <name> [--keep-plugins]` | 移除 marketplace。**默认级联**：卸载其下所有 installed plugin（含其携带的 MCP server）。`--keep-plugins` 保留 installed 状态但标记为 orphaned（Registry 仍可解析但 marketplace clone 树被删）。需 `y/N` 确认。 |
-| `marketplace refresh [<name>|all]` | git pull 失败则全量重 clone；与缓存 plugin 集合对账；emit_update_skills。Rich 进度条 + 失败汇总表。 |
+| `marketplace refresh [<name>|all]` | 重新 clone 到 staging 并**原子换入**（不再原地 `git pull`）；与缓存 plugin 集合对账；emit_update_skills。Rich 进度条 + 汇总表。**清单改名 → 该行 `validation`**（结构化、带 reason；不得报 updated/unchanged），旧内容/账本/运行时能力保留（#260/§5.14）。 |
 | `marketplace set <name> auto-update=<bool>` | 设置 per-source `auto_update` 旗。 |
+
+**URL 展示语义（#261，单一权威 `a2c_smcp/utils/git_url.py`）**：`list` / `info` / `add` 的表格、JSON、
+确认提示中的 `url` 是**展示值**——去掉 userinfo（用户名与密码 / token）、query、fragment；scp-like
+`user@host:path` 显示 `host:path`（不保留 `user@`）。**展示值只用于识别，不可用于 re-clone**；
+`known_marketplaces.json` 存储与 git clone/pull 入参始终是原始 URL。错误 / 诊断 / 日志走严格模式
+（`git_url_for_display`）：不可解析 / host 缺失 / scp-like → `<redacted-git-source>`，其余去凭据后展示。
 
 ### 4.3 Plugin 命令
 
@@ -549,13 +555,15 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
       "installLocation": "/home/user/.local/share/a2c/skills/marketplace/my-team-skills",
       "lastUpdated": "2026-05-21T10:30:00Z",
       "commitSha": "abc1234",
-      "autoUpdate": true
+      "autoUpdate": true,
+      "manifestNameBaseline": "my-team-skills"
     }
   }
 }
 ```
 
-- key = marketplace.json 里的 `name`（不是用户输入的 alias）。
+- key = marketplace.json 里的 `name`（不是用户输入的 alias；#260 起由 SDK 从清单读取，见 §10.6）。
+- `manifestNameBaseline`（#260，可选）：该注册**锚定**的清单名。add / 首次 clone 必写（= 注册名）；legacy 记录（无该键 = 旧账本）首次成功 clone/refresh 补写并保留旧名；**已有永不改写**。refresh 观测到 ≠ 该值 → `validation` 改名拒绝。键与注册名不同即 #268 的 legacy 判据之一。
 - `installLocation` 是绝对路径。
 - **无 `trusted` 字段**（校正自 CC 问询）：信任不落物化文件，由 settings.json 的 `strictKnownMarketplaces`/`trustedMarketplaces`/`blockedMarketplaces` 在 load 时计算。首次 `marketplace add` 的 y/N 应答会写进**对应 scope 的 settings.json**（追加 `trustedMarketplaces`），而非这里。
 
@@ -620,8 +628,8 @@ settings.json（意图/治理层）独立按 §5.1/§5.4 合并。
 2. 读 known_marketplaces.json（物化）
 3. reconcileMarketplaces()  ← additive-only:
    - declared∖materialized（missing） → git clone --depth 1（SSH→HTTPS fallback），写 known_marketplaces.json
-   - source 变了（sourceChanged）     → 重 clone 覆盖
-   - autoUpdate=true                  → git pull
+   - source 变了（sourceChanged）     → **validation 拒绝**（不 wipe / 不重 clone；#260/§5.14，需显式 remove+add）
+   - autoUpdate=true                  → 重 clone 到 staging + 原子换入（#260；不再原地 git pull）
    - materialized∖declared            → **不动**（不清理；孤儿留存，靠 §7.3 显式清）
 4. 读 installed_plugins.json
 5. 加载 plugin（按 enabledPlugins × installed_plugins.json 交集）
@@ -708,7 +716,7 @@ class SkillEventDebouncer:
 **为什么 clone 树不上 watcher**（与 CC `getWatchablePaths()` 一致——CC 的 `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/skills/` 也不在监控列表）：
 
 1. **变更只经操作发生**：clone 树是 CLI 自有，唯一改动入口是 `marketplace add/refresh/remove` 与 `plugin install/uninstall/enable/disable`，这些操作自己已调 `mark_dirty()`/缓存失效（§8.1 第二条线，对应 CC `clearAllCaches()`），无需 watcher 重复探测。
-2. **避免 git pull 雪崩**：一次 `git pull`/重 clone 会写入几十~上百文件，若监控 clone 树则每个文件触发 watcher——即便 300ms debounce 也会和「显式 refresh 末尾一次 emit」语义打架（变成假 emit 叠加）。
+2. **避免重 clone 雪崩**：一次重 clone + 整树换入会写入几十~上百文件，若监控 clone 树则每个文件触发 watcher——即便 300ms debounce 也会和「显式 refresh 末尾一次 emit」语义打架（变成假 emit 叠加）。
 3. **守住意图/物化两层边界**：clone 树是物化产物，监控它等于让物化层自己产生「变更意图」，破坏 reconciler 的单向同步模型。
 
 **已知副作用与开发期姿势**：手工 `cd` 进 `$A2C_SKILL_HOME/marketplace/<mp>/` 直接编辑 SKILL.md **不会被实时检测**，须等下次 `marketplace refresh` 或重启（CC 同样接受此取舍——clone 树不应被手编）。若需对某个 marketplace skill 做本地快速迭代，正确做法是把它 symlink/copy 到 `$CWD/.tfrobot/skills/`（被监控的 project 源）开发，定稿后回推 marketplace 仓库。
@@ -940,7 +948,7 @@ a2c> marketplace add git@github.com:team/skills.git
   Source: git@github.com:team/skills.git
   Trust this source and continue? [y/N]: y
 
-  ✓ Trusted (saved to known_marketplaces.json)
+  ✓ Trusted (saved to user settings.json trustedMarketplaces)
   Cloning... ⠋
   ✓ Cloned (5 plugins found)
 
@@ -956,16 +964,15 @@ a2c> marketplace add git@github.com:team/skills.git
 > 经 `XDG_CONFIG_HOME` 解析），与 per-`A2C_SKILL_HOME` 的 `known_marketplaces` 解耦；陈旧/跨 home 的
 > trust 残留（remove 未撤销 / clone 失败 orphan / 换 home）不得静默授权一次全新的远端 clone+注册。
 >
-> **交互态信任跳过 = 有意 UX 取舍（非 bug，#95 / UAT M-06 复盘）**：交互（REPL，`confirm` 非空）下，
-> 已在 `trustedMarketplaces` 的 name 跳过重复 prompt。该短路**仅在 desync 态可达**——`marketplace_add`
-> 入口的同名冲突拦截（`if mp_name in known_marketplaces → name conflict`）保证：能走到 trust 门的 name
-> **必不在** `known_marketplaces`，故"已 trusted"⇒"trusted 但未物化" = desync（clone 失败 orphan /
-> remove 未撤销 / 跨 home）；正常已同步流程里此短路**不可达**。保留它是为避免 clone 失败后重试**同一
-> URL** 时重复弹 prompt。残留面：trust 按 **name** 键控（§6.1、§5.3.1），故 `marketplace add <新URL>
-> --name <旧trusted名>` 会跳过 confirm 直接 clone、不再展示 URL 供来源判断（且因 desync 态 `known_marketplaces`
-> 里无原始记录、trust 又只存 name 不存 URL，无可比对的来源 URL，"加 URL 比对"在 name-keyed 模型下不可行）。
-> **威胁模型有意只收紧非交互路径、放过交互 desync**：交互 add 必由在场真人敲入命令+URL，风险与非交互无人
-> 值守脚本不可同日而语，desync 由人把关。回归守卫见 `test_add_pretrusted_name_interactive_skips_prompt`。
+> **#260 起：交互式 add 一律弹确认，`trustedMarketplaces` 不再豁免 prompt。** 注册名改为从清单读取后，
+> add 在 clone 之前**无法知道**将要注册的名字，按 name 查 trust 跳过的短路不再成立；同时 `--name` 已降级为
+> 「期望清单名校验」（D6 B），若继续让「name 已 trusted」跳过 prompt，就等于把 `--name` 变成一个免提示开关
+> ——与其语义不符且会绕过确认。故交互态统一弹确认，`trustedMarketplaces` 退为 `list/info` 展示与 policy
+> 判定面。回归守卫见 `test_add_interactive_always_prompts_even_if_name_trusted`。
+>
+> **trust 时序（#260）**：clone 前做一次**只读**预检（user settings 的 `trustedMarketplaces` 键形状；
+> 文件损坏 / 非数组 → 退出码 1、**不 clone**，保持 #246 的破坏半径）；信任条目在**注册成功后**才写入，
+> 注册失败零残留（写失败仅 WARN，不回滚已成功的注册）。
 
 ### 10.6 Plugin MCP 依赖已满足（提示、不拒绝）
 
@@ -994,6 +1001,30 @@ a2c> plugin install frontend-design@my-team-skills
 - **卸载不连坐**：见 §6.2 回收判据。
 
 ---
+
+### 10.7 Marketplace 注册名派生与唯一性（#260）
+
+**派生规则（SDK 自治，protocol#79）**：注册名 = 本地 clone 内 `.tfrobot-plugin/marketplace.json` **顶层 `name`**，
+用于展示、注册与 `<plugin>@<marketplace>` 引用；git URL 仅作定位符，**不**参与命名。名称须严格 kebab-case
+（`[a-z0-9-]`，1–64）——清单名缺失 / 非法 → `validation`（`manifest-name-invalid`，文案不回显原值）。
+
+**唯一性 / 禁静默改名（协议管辖，runtime-contract §5.14）**：
+
+| 场景 | 行为 |
+|---|---|
+| add 新源 | clone 到 staging → 读清单名 → 提交点锁内复核 → 原子换入；失败零残留 |
+| 同名不同源 | `validation`（`name-conflict`），诊断给旧源与 `marketplace remove <name>` |
+| 同名同源重复 add | **幂等**：不产生第二个注册、不刷新既有记录 |
+| 同一 source 已以旧名注册，新名 add | `validation`（`source-conflict`），诊断给旧名与处置 |
+| remove（含 `--keep-plugins`）后 re-add，且仍有 `<plugin>@<name>` 引用 | `validation`（`dangling-references`）——登记已删除、**无法证明 source 未变**，故同源 re-add 同样 fail-closed；先清掉这些 plugin 引用 |
+| refresh 清单改名 | `validation`（`manifest-name-changed`）；旧内容 / 账本 / 能力保留，不报 updated/unchanged |
+| declared 换源（`extraKnownMarketplaces`） | `validation`；不 wipe / 不重 clone，需显式 remove / re-add |
+| `--no-clone` 新源 | `validation`（`unresolvable-name`）；仅已注册源或可确认的本地缓存可登记意图 |
+| 同源判定 | **只做字符串级比较**（`type == "git"` 且 url 去空白后相等）；ssh/https 等写法差异**不归一**，无法确定即视为不同源（fail-closed） |
+
+**legacy refresh baseline**：账本记录内的 `manifestNameBaseline`（§6.1）锚定清单名。legacy 注册
+（无该键）首次成功 clone/refresh 补写并**保留旧名**、不报改名拒绝；仅 baseline 之后再改名才拒绝。存量
+注册不追溯改名——统一迁移由 #268 的 `marketplace migrate` 负责。
 
 ## 11. JSON 输出（`--json` 全局 flag）
 
@@ -1086,7 +1117,7 @@ a2c_smcp/computer/
 
 - `settings/scope.py`：**读/写两套 merge 语义**——读时 object **递归深合并** + array 拼接去重（低先）；写时 array **整体替换**、`undefined` 删 key（§5.4）。`project=true`+`local=false`→false。
 - `settings/policy.py`：policy scope 四子源 first-source-wins（不合并）。
-- `settings/reconciler.py`：**additive-only**——missing→clone、sourceChanged→重 clone、`materialized∖declared`→**不动**（断言不删）；失败降级；`plugin gc` 列孤儿。
+- `settings/reconciler.py`：**additive-only**——missing→clone、sourceChanged→**validation 拒绝（不 wipe）**、autoUpdate→重 clone+换入、`materialized∖declared`→**不动**（断言不删）；失败降级；`plugin gc` 列孤儿。
 - `settings/mcp_config.py`：`.tfrobot/mcp.json` 多 scope 加载优先级；门控 `pending`/`enabled`/`disabled` 判定；plugin-bundled 免批准。
 - `inputs/secret_store.py`：keyring 可用→存取 password；keyring 不可用→降级 env、无 env 无 TTY→硬错误（**不写明文**）。
 - `inputs/render.py`：`${env:}`/`${input:}`/`${workspaceFolder}` 替换；`envFile` 加载 + 显式 env 覆盖。

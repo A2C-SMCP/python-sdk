@@ -35,10 +35,13 @@ ownership; process materialization stays with the client (#93).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+import re
+import unicodedata
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.installer import materialize_plugin
@@ -47,7 +50,14 @@ from a2c_smcp.computer.settings.reconciler import (
     ledger_entry_fully_materialized,
     ledger_record_materialized,
 )
-from a2c_smcp.computer.settings.schema import SCOPE_ORDER, SettingsScope
+from a2c_smcp.computer.settings.schema import (
+    FIELD_EXTRA_KNOWN_MARKETPLACES,
+    SCOPE_ORDER,
+    SettingsScope,
+    SettingsValidationError,
+    is_marketplace_declaration_field,
+    scrub_diagnostic_chars,
+)
 from a2c_smcp.computer.settings.scope import (
     load_settings_file,
     user_settings_path,
@@ -56,15 +66,29 @@ from a2c_smcp.computer.settings.scope import (
 )
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
+    known_marketplace_source,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
 )
 from a2c_smcp.computer.skills.home import marketplace_skill_dir
 from a2c_smcp.computer.skills.manifest import PluginManifestError, load_bundled_servers
+from a2c_smcp.computer.skills.marketplace_identity import (
+    MarketplaceNameChangeError,
+    display_source,
+    redact_ledger_key,
+    same_source,
+)
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.sources import safe_exception_text
 from a2c_smcp.computer.skills.staging import DEFAULT_GIT_TIMEOUT, stage_marketplace_skills
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.git_url import (
+    _MAX_CREDENTIAL_DECODE_ROUNDS,
+    REDACTED_GIT_SOURCE,
+    redact_git_urls_in_text,
+    sanitize_path_for_diagnostics,
+)
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -86,6 +110,14 @@ class GovernanceRecoveryReport:
       有线索时经 :func:`_infer_record_scopes` 推回原 scope，不入此列）。
     - ``pending_bundled_servers``：project scope enabledPlugins 激活 → 回落审批门 PENDING 的 bundled
       server 记录（#159 Option B / 协议 §2.2）；client 据此展示审批 UI。
+    - ``marketplace_source_conflicts``：**声明源 ≠ 已注册源**的 marketplace（#287 / §5.14，**只诊断不换源**）。
+      本报告是观测信号而非降级信号——冲突项照常按 known 旧源恢复，**不**进 ``failed_marketplaces``。
+    - ``marketplace_declaration_errors``：settings 校验阶段**被整条丢弃**的非法 ``extraKnownMarketplaces``
+      声明（#293，镜像 rust 同名同义字段）。与 ``marketplace_source_conflicts`` **正交、不重复计数**：后者
+      比对的是**合法**声明与已注册源，本字段是声明**自身不可用**（typo / 缺 ``source`` / 非 git URL）——
+      被校验丢弃后连「可比声明」都不存在，故两个列表不可能对同一事实各记一次。恢复源 / 降级语义均不变。
+      仅由 :meth:`Computer.reconcile_governance` 从 ``ResolvedSettings.errors`` 填充；直接调用
+      :func:`recover_marketplace_skills` 时恒空（该入口拿到的 ``declared`` 已过校验）。
     """
 
     restored_plugins: list[str] = field(default_factory=list)
@@ -96,6 +128,8 @@ class GovernanceRecoveryReport:
     rematerialized: list[str] = field(default_factory=list)
     scope_normalized: list[str] = field(default_factory=list)
     pending_bundled_servers: list[BundledServerRecord] = field(default_factory=list)
+    marketplace_source_conflicts: list[MarketplaceSourceConflict] = field(default_factory=list)
+    marketplace_declaration_errors: list[MarketplaceDeclarationError] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +153,406 @@ class BundledServerRecord:
 # 阶段二重挂回调：携归属记录（供 client 带 plugin/marketplace 上下文注册，D2 ${input:} 前缀回退解析）。
 # Phase-2 remount callback carrying ownership context (unlike installer's context-free RegisterServer).
 RegisterBundledServer = Callable[[MCPServerConfig, BundledServerRecord], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class MarketplaceSourceConflict:
+    """
+    声明源与已注册源不一致（#287，镜像 rust-sdk#295）/ Declared-vs-registered marketplace source mismatch.
+
+    **只诊断、不换源**（runtime-contract §2.3 派生方向 + §5.14「MUST NOT 静默替换」）：boot 仍按
+    ``known_marketplaces.json`` 的**已注册源**恢复，本记录只让用户看见不一致。换源唯一的合法路径是显式
+    ``marketplace remove`` → ``add``。
+
+    三个字段**全部是展示值**，不可用于任何再克隆 / 比较：
+
+    - ``marketplace``：账本键经 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key`
+      （known 键可手编，可能是携带凭据的 URL 残形，#261/#263/#281 同口径）。
+    - ``declared_source_display`` / ``known_source_display``：两侧 ``source`` 经
+      :func:`~a2c_smcp.computer.skills.marketplace_identity.display_source`（去 userinfo / query / fragment，
+      path 段含凭据样文本一律占位符）。
+    """
+
+    marketplace: str
+    declared_source_display: str
+    known_source_display: str
+
+
+@dataclass(frozen=True, slots=True)
+class MarketplaceDeclarationError:
+    """
+    被 settings 校验**整条丢弃**的非法 ``extraKnownMarketplaces`` 声明（#293，镜像 rust 同名同字段）/
+    An invalid ``extraKnownMarketplaces`` declaration dropped by settings validation.
+
+    校验语义**不变**（非法条目照旧逐条丢弃、不阻断启动）；本结构只让「有声明但非法」在恢复报告里可见。
+    与 :class:`MarketplaceSourceConflict` **正交**：后者是**合法声明**与已注册源不一致（只诊断不换源）；
+    本结构是声明**自身不可用**（漏 scheme / ``owner/repo`` 简写 / 非 git / 缺 ``source``）。被丢弃的声明
+    根本不在 ``declared`` 视图里，故 :func:`detect_marketplace_source_conflicts` 看不到它——两个列表对同一
+    事实不可能各记一次。
+
+    ``field`` / ``reason`` / ``source_path`` 均已经过脱敏与控制字符清洗（见
+    :func:`sanitized_marketplace_error`）：``field`` 保留 ``extraKnownMarketplaces.`` 前缀便于定位，
+    其后的市场名段按 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key` 口径展示
+    （市场名是不可信手编值，可含凭据形态 URL）；``source_path`` 走**路径轴**展示，呈 userinfo 形态时整值
+    fail-closed（见 :func:`sanitize_source_path`）。**三字段与 ``marketplace`` 全是展示值**，不可用于任何
+    再克隆 / 比较 / 去重。
+    """
+
+    scope: SettingsScope
+    marketplace: str | None
+    field: str
+    reason: str
+    source_path: str | None = None
+
+
+def sanitize_marketplace_name(name: str) -> str:
+    """
+    单个不可信**名字**（市场名段 / 子字段残段）→ 诊断展示值（#293）/
+    A single untrusted name → display-safe diagnostics value.
+
+    走 :func:`~a2c_smcp.computer.skills.marketplace_identity.redact_ledger_key`（#261/#263/#281 单一
+    权威：含 ``://`` 走 :func:`~a2c_smcp.utils.git_url.diagnostic_url_for_display`，其余走
+    :func:`~a2c_smcp.utils.git_url.sanitize_segment_for_diagnostics`）。该原语只转义 Cc/Cs，
+    Cf（方向覆写 / 行分隔）原样透出，故再叠
+    :func:`~a2c_smcp.computer.settings.schema.scrub_diagnostic_chars`。
+
+    **比 rust 更严是有意的**：rust 对名字也用散文脱敏（``redact_git_urls_in_text``，只去 userinfo、
+    保留 path），而账本键/市场名是**单个不可信值**，path 段里的 ``alice:PW@example.com`` 会照原样回显
+    （#261 的口径）。名字走段漏斗，散文（``reason``）才走散文脱敏。
+
+    刻意**不**改 ``utils.git_url`` 的 ``_UNSAFE_CHAR_CATEGORIES``：那是全仓展示面的转义器，口径已冻结
+    （「Cf 与 rust 口径一致不处理」指 ``escape_unsafe_chars``），本函数只服务 settings 诊断面。
+    """
+    return scrub_diagnostic_chars(redact_ledger_key(name))
+
+
+def sanitize_marketplace_text(text: str) -> str:
+    """
+    诊断**散文**（``reason``）→ 展示值：Git URL token 级脱敏 + 控制 / 方向覆写字符清洗（#293）/
+    Prose (``reason``) → display-safe value.
+
+    与 rust ``sanitize_marketplace_text`` 同语义（rust 走 ``redact_git_urls_in_text``）：
+    :func:`~a2c_smcp.utils.git_url.redact_git_urls_in_text` 逐 token 脱敏、保留散文结构（不会像段漏斗
+    那样把整句替换成一个占位符），再经 ``scrub_diagnostic_chars`` 清掉 Cf 族。
+    """
+    return scrub_diagnostic_chars(redact_git_urls_in_text(text))
+
+
+def sanitize_prefixed_name_field(field: str, *, prefixes: tuple[str, ...]) -> str:
+    """
+    ``<prefix>.<rest>`` 的点路径 → 把 ``rest`` 当**单个不可信名字**整值脱敏（#304 item 1）/ Redact the
+    untrusted name segment of a prefixed dotted field.
+
+    校验器把手编 map key 直接拼进点路径（``enabledPlugins.<key>`` / ``servers.<name>`` /
+    ``inputs.<id>``），键可含 userinfo 形态凭据。口径：**整段**过 :func:`sanitize_marketplace_name`
+    （名字段漏斗 + Cf/Cc 清洗），**不**再按 ``.`` / ``:`` / ``@`` 二次拆分——name 本身可含点
+    （如 ``figma.mcp``），切了会漏出残段。非匹配前缀（``<file>`` / ``<root>`` 等常数项）原样返回。
+    """
+    for prefix in prefixes:
+        head = f"{prefix}."
+        if field.startswith(head):
+            rest = field[len(head):]
+            if not rest:
+                return field
+            return f"{head}{sanitize_marketplace_name(rest)}"
+    return field
+
+
+_WINDOWS_DEVICE_PREFIX_RE = re.compile(r"^\\\\[?.]\\")
+# 盘符**不要求后跟斜杠**：`C:repos\\x`（drive-relative）与 `C:\\repos\\x` 都必须剥；剥掉后剩余串仍要过
+# userinfo 判据，故不会掩盖 `c:alice:pw@host` 这类形态（`:` 仍在）。
+_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _decode_chain(text: str) -> list[str]:
+    """
+    原文 + 逐轮 ``percent-decode → NFKC`` 的中间形态（#293；与 #282 同一解码链口径）/
+    Raw text plus each percent-decode/NFKC iteration.
+
+    顺序是 **percent-decode → NFKC**（先解码再归一，全角 ``％３A`` 解码后才是 ``：``）。
+    与 :func:`~a2c_smcp.utils.git_url.credential_like_text` **共用同一个轮数上界**
+    :data:`~a2c_smcp.utils.git_url._MAX_CREDENTIAL_DECODE_ROUNDS`（只保证终止；覆盖面由判据本身保证）。
+    NFKC 是必需的：全角 ``：`` / ``＠`` / ``％３A`` 不归一就判不出来。
+    """
+    forms = [text]
+    current = text
+    for _ in range(_MAX_CREDENTIAL_DECODE_ROUNDS):
+        decoded = unicodedata.normalize("NFKC", unquote(current))
+        if decoded == current:  # 不动点：再迭代也不变
+            break
+        forms.append(decoded)
+        current = decoded
+    return forms
+
+
+def _has_userinfo_shape(text: str) -> bool:
+    """
+    文本是否**无法排除** ``user:secret@host``（#293 的 fail-closed 判据）/ Cannot rule out userinfo.
+
+    判据：剥掉 Windows 盘符前缀后，**最后一个** ``@`` 出现在**第一个** ``:`` 之后。
+
+    - 用 ``rfind("@")`` 而非 ``find``：``alice@corp:pw@example.com`` 的首个 ``@`` 在 ``:`` 之前，
+      只看首个会漏（复审 2🔴）。
+    - 用**整条文本**而非逐段：凭据里的字面 ``\\`` / ``/``（``alice:pw/x@example.com``）会把一个 userinfo
+      拆成两段，逐段判定同样会漏（复审 3🟡）。
+    - 剥盘符 / 设备前缀：``C:\\repos\\alice@corp\\x``、``C:repos\\alice@corp\\x``（drive-relative）、
+      ``\\\\?\\C:\\repos\\...`` / ``\\\\.\\C:\\repos\\...`` 里的 ``:`` 是盘符，不是 userinfo 分隔符；
+      不剥会误遮 Windows 路径（架构师点名的负对照）。
+
+    刻意**不用** :func:`~a2c_smcp.utils.git_url.credential_like_text`：该谓词对任意 ``@`` / ``:`` / 残留 ``%``
+    都返回 ``True``（``alice@corp``、``100%25done``、``repo@2.git`` 全命中），直接套用会把「普通路径」整条
+    遮蔽，打翻负对照。本判据只回答「能不能排除 userinfo」，更窄但可证明。
+    """
+    stripped = _WINDOWS_DRIVE_PREFIX_RE.sub("", _WINDOWS_DEVICE_PREFIX_RE.sub("", text))
+    colon = stripped.find(":")
+    return stripped.rfind("@") > colon >= 0
+
+
+def sanitize_source_path(path: str) -> str:
+    """
+    ``source_path`` 的诊断展示值：**无法排除 userinfo 即整值占位**，否则走路径轴脱敏（#293）/
+    Display-safe settings-file path: fail closed whenever userinfo cannot be ruled out.
+
+    ``source_path`` 是不可信值（``--settings <file>`` 由环境 / 用户给出），且要进报告与日志。规则：
+
+    1. **整值 fail-closed**（→ :data:`~a2c_smcp.utils.git_url.REDACTED_GIT_SOURCE`）：原文或任一
+       ``percent-decode → NFKC`` 形态让 :func:`_has_userinfo_shape` 为真。这一条覆盖全部「路径轴原语必漏」
+       的形态（均经复现实测）：
+       - 控制 / 方向覆写字符穿插（``alice<U+202E>:pw@…``）——scrub 换空格、escape 造反斜杠段边界；
+       - ``#`` / ``?`` 夹在 ``:`` 与 ``@`` 之间（``alice:secret#x@example.com``）——原语把 ``#`` 之后当尾部；
+       - 段内空白（``alice:my pw pass@example.com``）——原语正则要求 ``:` 前非空白；
+       - 凭据内的字面 ``\\`` / ``/``（``alice:pw/x@example.com``）——逐段判定会被拆开；
+       - percent-encoded（``alice:pw%2Fsecret%40…``、``alice%40corp:pw%40…``、四层 ``%2525253A``）；
+       - 全角 ``：`` / ``＠`` / ``％３A``（NFKC 后现形）。
+    2. **否则**走 :func:`~a2c_smcp.utils.git_url.sanitize_path_for_diagnostics`（#263 四轮：``/`` 与 ``\\``
+       都当段边界、段内普通 ``@`` 保留、authority 位置的 ``TOKEN@host`` 与 ``?``/``#`` 尾部整段遮蔽）。
+       它**不是** URL / scp-like 脱敏器，Windows 路径与 ``alice@corp`` 不会被整条吞掉；含 userinfo 的路径
+       在上一步已整值占位，故此处只会看到「无 ``:`` 在 ``@`` 之前」的路径——结构可保留、可定位。
+
+    :param path: :attr:`SettingsValidationError.source_path`（不可信）。
+    """
+    # 设备前缀（``\\?\`` / ``\\.\``）剥下来单独处置后拼回：其中的 ``?`` 会被路径轴原语当成 query 起点、
+    # 把后半个路径整段遮蔽——那是原语对 URL 的合理假设，但这里它是 Windows 长路径前缀，不该触发。
+    device = _WINDOWS_DEVICE_PREFIX_RE.match(path)
+    prefix = device.group(0) if device else ""
+    body = path[len(prefix):]
+    if any(_has_userinfo_shape(form) for form in _decode_chain(body)):
+        return REDACTED_GIT_SOURCE
+    return prefix + sanitize_path_for_diagnostics(scrub_diagnostic_chars(body))
+
+
+def sanitized_marketplace_error(error: SettingsValidationError) -> MarketplaceDeclarationError | None:
+    """
+    单条 settings 校验错误 → 脱敏 :class:`MarketplaceDeclarationError`；非 marketplace 子树返回 ``None``。
+
+    .. note::
+       与 rust 的**落点差异**（有意，见设计文档 §6.1）：rust 在 ``validate_settings`` 出口即脱敏，所有消费者
+       拿到同一安全值；本仓 ``validate_settings`` / :class:`SettingsValidationError` **保留原值**，由消费者
+       各自脱敏（幂等）。``#295`` 起 CLI 展示漏斗
+       :func:`~a2c_smcp.computer.cli.commands.format_settings_errors` 也复用本函数，故 ``settings show`` /
+       ``settings get`` / boot 批准流程与恢复报告**同一口径**。
+    """
+    if not is_marketplace_declaration_field(error.field):
+        return None
+    # field 保留前缀：前缀本身含 `.`，整段喂给 URL 脱敏器会被误判为 scheme 的一部分（与 rust 同因）。
+    prefix = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}."
+    if error.field.startswith(prefix):
+        # #304：#304 起段漏斗**唯一权威**是 :func:`sanitize_prefixed_name_field`（与 enabledPlugins /
+        # servers / inputs 的展示路径共用同一实现，消除双权威）。
+        field = sanitize_prefixed_name_field(error.field, prefixes=(FIELD_EXTRA_KNOWN_MARKETPLACES,))
+    else:
+        # 无法剥离前缀（整字段错误）→ 整段脱敏（fail-safe，与 rust 同）。
+        field = sanitize_marketplace_text(error.field)
+    reason = sanitize_marketplace_text(error.reason)
+    return MarketplaceDeclarationError(
+        scope=error.scope,
+        marketplace=declaration_marketplace(field, reason),
+        field=field,
+        reason=reason,
+        source_path=None if error.source_path is None else sanitize_source_path(error.source_path),
+    )
+
+
+def declaration_marketplace(field: str, reason: str) -> str | None:
+    """
+    从（已脱敏的）字段路径解析 marketplace 名 / Parse the marketplace name out of the dotted field.
+
+    ``extraKnownMarketplaces.<name>[.source[.type|.url]|.autoUpdate]``：
+
+    - **名称非法**时校验器只记到 ``<name>``，此时**整个剩余段就是名称**——不能按后缀启发式切分，
+      因为非法名本身可能就是 ``acme.source.url``。判据与 rust 同：``reason`` 以 kebab 文案开头。
+    - 合法名 + 子字段错误 → 剥最长已知后缀。
+    - 顶层字段类型错误（无 ``<name>`` 段）→ ``None``。
+
+    已知边界：名字型错误之外的非法名若本身以这些后缀结尾，展示名会被截短——只**少显示**字符，
+    不会多显示，故无泄漏面。
+
+    :param field: **已脱敏**的点路径（据此解析，保证 ``marketplace`` 与 ``field`` 同源）。
+    :param reason: **已清洗**的校验原因（用于名称型分支判定）。
+    """
+    prefix = f"{FIELD_EXTRA_KNOWN_MARKETPLACES}."
+    if not field.startswith(prefix):
+        return None
+    rest = field[len(prefix):]
+    if not rest:
+        return None
+    if reason.startswith("marketplace name must be strict kebab"):
+        return rest
+    for suffix in (".source.url", ".source.type", ".source", ".autoUpdate"):
+        if rest.endswith(suffix):
+            return rest[: -len(suffix)] or None
+    return rest
+
+
+def marketplace_declaration_errors(
+    errors: Iterable[SettingsValidationError],
+) -> list[MarketplaceDeclarationError]:
+    """
+    从 settings 校验错误中筛出 ``extraKnownMarketplaces`` 声明错误并脱敏（纯函数、保序、1:1）/
+    Filter + sanitize the ``extraKnownMarketplaces`` declaration errors.
+
+    **不聚合**：一条错误 → 一条报告（同一个市场在 user / local 两层各错一条即两条）——分层语义是用户
+    2026-11-22 裁决的硬要求：user 层非法、local 层合法时，合并视图仍有可用声明，聚合成「该市场无声明」
+    会误导。**不改**校验 / 丢弃语义。
+
+    :param errors: :attr:`~a2c_smcp.computer.settings.scope.ResolvedSettings.errors`。
+    """
+    collected: list[MarketplaceDeclarationError] = []
+    for error in errors:
+        sanitized = sanitized_marketplace_error(error)
+        if sanitized is not None:
+            collected.append(sanitized)
+    return collected
+
+
+def attach_marketplace_declaration_errors(
+    report: GovernanceRecoveryReport,
+    errors: Iterable[SettingsValidationError],
+) -> None:
+    """
+    把 settings 校验错误接入恢复报告并打诊断日志（#293 的**单一接线点**）/
+    Attach the settings validation errors to the recovery report and log them.
+
+    编排方（:meth:`Computer.reconcile_governance`）在阶段一返回后**无条件**调用——空安装意图时
+    :func:`recover_marketplace_skills` 会早退，故该回填不能放进它里面。
+    """
+    report.marketplace_declaration_errors = marketplace_declaration_errors(errors)
+    _log_marketplace_declaration_errors(report.marketplace_declaration_errors)
+
+
+def _log_marketplace_declaration_errors(errors: Sequence[MarketplaceDeclarationError]) -> None:
+    """声明错误日志：WARN 汇总（带脱敏市场名）+ 逐条 DEBUG / Summary WARN + per-item DEBUG."""
+    if not errors:
+        return
+    for error in errors:
+        logger.debug(
+            "governance recovery: invalid marketplace declaration at scope %s (%s): %s [%s]",
+            error.scope.value,
+            error.field,
+            error.reason,
+            error.source_path or "<unknown>",
+        )
+    names = sorted({error.marketplace for error in errors if error.marketplace})
+    # 汇总行**带脱敏后的市场名**：默认日志级别是 INFO，只给计数的话用户不知道该修哪一个
+    # （与 `_log_marketplace_source_conflicts` 同口径）。
+    logger.warning(
+        "governance recovery: %d invalid marketplace declaration(s) in settings were dropped by validation and did "
+        "NOT participate in recovery (%s); existing registrations are kept unchanged — fix the declaration to change "
+        "the source (invalid declarations are never silently substituted, runtime-contract §5.14)",
+        len(errors),
+        ", ".join(names) if names else "no marketplace name resolved",
+    )
+
+
+def detect_marketplace_source_conflicts(
+    marketplaces: Iterable[str],
+    declared: Mapping[str, Any],
+    known: Mapping[str, Any],
+) -> list[MarketplaceSourceConflict]:
+    """
+    比对声明源与已注册源，列出不一致的 marketplace（纯函数、零 IO）/ Detect declared-vs-registered mismatches.
+
+    判定口径（#287 用户裁决 2026-11-20）：
+
+    - **只看传进来的 marketplace**——调用方只传 ``installedPlugins`` 意图涉及的集合，无意图项不检测。
+    - 无声明（``extraKnownMarketplaces`` 缺该键 / 条目非映射）→ 跳过：没有可比的"声明源"。
+    - 无**可用**的 ``known_marketplaces`` 记录（记录缺失 / 记录非映射 / ``source`` 缺失或非映射）→ 跳过：
+      没有可比的"已注册源"。该情形**不由本函数报告**——非惰性市场由 stage 循环记入 ``failed_marketplaces``
+      （降级）；**全惰性市场**（``installed_disabled`` ∧ 账本完好）在 stage 循环里先 ``continue`` 零动作，
+      因此两处报告都不出现。判据与 stage 循环共用
+      :func:`~a2c_smcp.computer.settings.store.known_marketplace_source`，否则同一次恢复会同时打
+      「沿用已注册源」与「已降级」两条互斥诊断。
+    - **同源判据 = :func:`~a2c_smcp.computer.skills.marketplace_identity.same_source`**（SDK 单一权威，与
+      ``reconciler.reconcile`` 同一函数）：只做字符串级比较，``ssh://`` / ``https://`` / scp-like / ``.git``
+      后缀等等价写法**不归一** → 视为不同源（§5.14「无法确定时 MUST fail-closed」）。
+    - 声明条目存在但 ``source`` 缺失/畸形 → ``same_source`` 返回 ``False`` → 同样报冲突（fail-closed，
+      与 ``reconcile`` 的 ``sourceChanged`` 分支同姿态）。
+
+    .. note::
+       上面这条 fail-closed 只在调用方传入**未经 schema 校验**的 ``declared`` 时可达。boot 生产路径的
+       ``declared`` 来自 :func:`~a2c_smcp.computer.settings.scope.resolve_settings`，其
+       ``_validate_extra_marketplaces``（``settings/schema.py``）会把 ``source`` 缺失 / 非 ``git`` / URL 畸形
+       的声明**整条丢弃**——此时本函数看到的是「无声明」，既不报冲突也无从诊断。
+
+       该静默已由 #293 收口：被丢弃的声明进入
+       :attr:`GovernanceRecoveryReport.marketplace_declaration_errors`（见
+       :func:`marketplace_declaration_errors`），与冲突列表**分开计数**。本函数**只**比对合法声明，
+       不改。
+
+    :param marketplaces: 待检测的 marketplace 名（调用方保证 = 安装意图涉及集）。
+    :param declared: 合并声明视图（取 ``extraKnownMarketplaces``）。
+    :param known: ``known_marketplaces.json`` 的 ``marketplaces`` 映射。
+    :return: 按 marketplace 名稳定排序的冲突列表（字段均为脱敏展示值）。
+    """
+    raw = declared.get("extraKnownMarketplaces")
+    declarations: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    conflicts: list[MarketplaceSourceConflict] = []
+    for marketplace in sorted(set(marketplaces)):
+        decl = declarations.get(marketplace)
+        if not isinstance(decl, Mapping):
+            continue
+        known_source = known_marketplace_source(known, marketplace)
+        if known_source is None:
+            # 与 stage 循环**同一可用性判据**（:func:`~a2c_smcp.computer.settings.store.known_marketplace_source`）：
+            # 没有可用的「已注册源」⇒ 该市场走 ``failed_marketplaces`` 降级路径。此处若仍报冲突，同一次恢复会
+            # 同时打「沿用已注册源」与「已降级」两条互斥诊断。
+            continue
+        declared_source = decl.get("source")
+        if same_source(known_source, declared_source):
+            continue
+        # marketplace 走账本键脱敏：进入本函数的名字上游已过 `is_valid_enabled_plugin_key`（严格 kebab）⇒
+        # 当前恒为恒等映射，保留它是与 #261/#263/#281 展示口径一致 + 纵深防御（不把账本键当可信值）。
+        conflicts.append(
+            MarketplaceSourceConflict(
+                marketplace=redact_ledger_key(marketplace),
+                declared_source_display=display_source(declared_source),
+                known_source_display=display_source(known_source),
+            ),
+        )
+    return conflicts
+
+
+def _log_marketplace_source_conflicts(conflicts: Sequence[MarketplaceSourceConflict]) -> None:
+    """冲突诊断日志：WARN 汇总（不带不可信值）+ 逐条 DEBUG（脱敏展示值）/ Summary WARN + per-item DEBUG."""
+    if not conflicts:
+        return
+    for conflict in conflicts:
+        logger.debug(
+            "governance recovery: marketplace %r is declared from a different source "
+            "(declared %s, registered %s); keeping the registered source",
+            conflict.marketplace,
+            conflict.declared_source_display,
+            conflict.known_source_display,
+        )
+    # 汇总行**带脱敏后的 marketplace 名**：默认日志级别是 INFO（CLI 展示面已由 #294 接线），只给计数的话用户
+    # 根本不知道该处理哪一个。两侧 URL 仍只在逐条 DEBUG 里（同为脱敏展示值）。
+    logger.warning(
+        "governance recovery: %d marketplace(s) are declared from a different source than their registration (%s); "
+        "keeping the registered source and its existing capabilities (declared-source changes are diagnostic only "
+        "— switch by explicit marketplace remove / add, runtime-contract §5.14)",
+        len(conflicts),
+        ", ".join(conflict.marketplace for conflict in conflicts),
+    )
 
 
 def _plugin_boot_active(declared: Mapping[str, Any], pid: str) -> bool:
@@ -251,7 +685,15 @@ async def recover_marketplace_skills(
     对账本缺失/installPath 全失效的 installed pid（含 installed_disabled）经
     :func:`~a2c_smcp.computer.settings.installer.materialize_plugin` 重物化（§4.9 删除无损；失败 WARN 跳过）。
     降级判定与 rust 同构：stage 内部吞错，事后 clone 树仍缺 → 该 marketplace 入 ``failed_marketplaces``；
-    known_marketplaces 缺记录 → 同样降级。**绝不抛、不阻断其余**。
+    known_marketplaces 无**可用**记录（缺失 / 记录非映射 / ``source`` 非映射）→ 同样降级。**绝不抛、不阻断其余**。
+    注意「全惰性市场」（无活跃 plugin ∧ 账本完好）在查 known **之前**就 ``continue``（零动作是设计）——它们
+    既不入 ``failed_marketplaces`` 也不产生声明源冲突。
+
+    声明源诊断（#287，镜像 rust-sdk#295）：对 ``installedPlugins`` 意图涉及的每个 marketplace，比对
+    ``declared["extraKnownMarketplaces"][name]["source"]`` 与 ``known_marketplaces[name]["source"]``——
+    不同则记入 :attr:`GovernanceRecoveryReport.marketplace_source_conflicts`（展示值脱敏）+ WARN 汇总 +
+    逐条 DEBUG。**只诊断**：恢复仍用已知的**已注册源**，``failed_marketplaces`` 与降级语义不变。理由：
+    boot 自动换源即 §5.14 禁止的"静默替换"；换源只经显式 ``marketplace remove`` → ``add``。
 
     scope 推回（#125 任务 1）：重物化前经 :func:`_infer_record_scopes` 扫描 user / cwd 锚定 project/local
     三层的 ``enabledPlugins`` 条目（及 project/local 的 ``installedPlugins`` 声明）作 scope 线索——
@@ -265,7 +707,11 @@ async def recover_marketplace_skills(
 
     :param registry: 目标 :class:`SkillRegistry`（恢复注册进当前活跃集）。
     :param home: SKILL Home 绝对根。
-    :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控）。
+    :param declared: 合并声明视图（取 ``installedPlugins`` + ``enabledPlugins`` 两键作权威门控；#287 起**另只读**
+        ``extraKnownMarketplaces`` 作声明源诊断，缺该键 ⇒ 不产生 ``marketplace_source_conflicts``）。
+        本函数拿到的视图**已过 settings 校验**，非法声明已被丢弃、错误只存在于
+        :attr:`ResolvedSettings.errors`——因此 #293 的 ``marketplace_declaration_errors`` **不在此填充**，
+        由 :meth:`Computer.reconcile_governance` 无条件回填（镜像 rust；直接调用本函数时该字段恒空）。
     :param env: 环境映射（账本路径解析 + git 子进程），默认 ``os.environ``。
     :param timeout: 单次 git 操作超时（仅 clone 缺失重建时可能触发）。
     """
@@ -290,6 +736,12 @@ async def recover_marketplace_skills(
         plugin, marketplace = split
         by_marketplace.setdefault(marketplace, {})[plugin] = active
 
+    # #287：声明源 vs 已注册源诊断。放在 stage 循环**外**——循环内降级分支多且会 ``continue``，而「全惰性
+    # 零动作」的市场同样应被诊断（口径 = 意图涉及即检测）。**只读**：不改 ``source`` / ``failed_marketplaces``，
+    # 恢复仍按 known 旧源（§2.3 派生方向 + §5.14 MUST NOT 静默替换）。
+    report.marketplace_source_conflicts = detect_marketplace_source_conflicts(by_marketplace, declared, known)
+    _log_marketplace_source_conflicts(report.marketplace_source_conflicts)
+
     for marketplace, plugins in sorted(by_marketplace.items()):
         active_plugins = {p for p, is_active in plugins.items() if is_active}
         # ∀ 语义（fully）：混合健康度（一条健康 + 一条损坏/死路径）也触发重物化——健康 scope 幂等重建、
@@ -298,11 +750,13 @@ async def recover_marketplace_skills(
         if not active_plugins and not needs_materialize:
             continue  # 全惰性且账本完好 → 零动作（installed_disabled 静止态）
 
-        record = known.get(marketplace)
-        source = record.get("source") if isinstance(record, Mapping) else None
-        if not isinstance(source, Mapping):
+        source = known_marketplace_source(known, marketplace)
+        if source is None:
+            # 记录缺失 / 记录非映射 / source 非映射 同属「无可用已注册源」（与 :func:`detect_marketplace_source_conflicts`
+            # 同一判据）——文案不再断言「记录缺失」，账本可被手编成半形。
             logger.warning(
-                "governance recovery: marketplace %r has no known_marketplaces record; its plugins %s degraded (not restored)",
+                "governance recovery: marketplace %r has no usable known_marketplaces record (missing or malformed "
+                "source); its plugins %s degraded (not restored)",
                 marketplace,
                 sorted(plugins),
             )
@@ -312,9 +766,17 @@ async def recover_marketplace_skills(
         # ① 保证 catalog 物化（空 filter = 仅 clone、零 SKILL 注册）——重物化与 skills stage 的共同前置。
         #    降级代理判定（rust 同构）：stage 失败降级不抛；事后 clone 树仍缺 = 源不可达且无本地物化。
         if not marketplace_skill_dir(home, marketplace).is_dir():
-            await stage_marketplace_skills(
-                marketplace, source, registry, home, plugin_filter=set(), refresh=False, timeout=timeout, env=env,
-            )
+            try:
+                await stage_marketplace_skills(
+                    marketplace, source, registry, home, plugin_filter=set(), refresh=False, timeout=timeout, env=env,
+                )
+            except MarketplaceNameChangeError as e:
+                # §5.14 改名拒绝：重建被拒 → 该源降级（能力本已缺失），不阻断其余 marketplace、不影响 boot。
+                logger.warning(
+                    "governance recovery: marketplace %r rebuild rejected (%s); degraded", marketplace, e.reason,
+                )
+                report.failed_marketplaces.append(marketplace)
+                continue
             if not marketplace_skill_dir(home, marketplace).is_dir():
                 logger.warning("governance recovery: marketplace %r clone missing and rebuild failed, degraded", marketplace)
                 report.failed_marketplaces.append(marketplace)
@@ -339,7 +801,11 @@ async def recover_marketplace_skills(
                     )
                 report.rematerialized.append(pid)
             except Exception as e:  # noqa: BLE001 - 失败降级铁律：WARN 跳过，不阻断 boot
-                logger.warning("governance recovery: re-materialize %r failed; kept installed_disabled (skills not staged): %s", pid, e)
+                logger.warning(
+                    "governance recovery: re-materialize %r failed; kept installed_disabled (skills not staged): %s",
+                    pid,
+                    safe_exception_text(e),
+                )
                 active_plugins.discard(plugin)
                 continue
             if normalized:
@@ -353,16 +819,24 @@ async def recover_marketplace_skills(
 
         # ③ stage skills（仅活跃且物化完好的 plugin）
         if active_plugins:
-            names = await stage_marketplace_skills(
-                marketplace,
-                source,
-                registry,
-                home,
-                plugin_filter=active_plugins,
-                refresh=False,  # 离线优先：clone 在则零 git / offline-first
-                timeout=timeout,
-                env=env,
-            )
+            try:
+                names = await stage_marketplace_skills(
+                    marketplace,
+                    source,
+                    registry,
+                    home,
+                    plugin_filter=active_plugins,
+                    refresh=False,  # 离线优先：clone 在则零 git / offline-first
+                    timeout=timeout,
+                    env=env,
+                )
+            except MarketplaceNameChangeError as e:
+                # #260/§5.14：恢复路径观测到清单改名 → 拒绝且**不换内容**；该源本轮不恢复，其余继续。
+                logger.warning(
+                    "governance recovery: marketplace %r skill restore rejected (%s); degraded", marketplace, e.reason,
+                )
+                report.failed_marketplaces.append(marketplace)
+                continue
             report.restored_skills.extend(names)
             report.restored_plugins.extend(sorted(f"{plugin}@{marketplace}" for plugin in active_plugins))
 

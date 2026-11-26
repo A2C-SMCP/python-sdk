@@ -50,7 +50,7 @@ from a2c_smcp.computer.blob.path_resolver import (
 )
 from a2c_smcp.computer.inputs.value_store import ValueStore
 from a2c_smcp.computer.settings.policy import LINUX_MANAGED_DIR, WINDOWS_MANAGED_DIR
-from a2c_smcp.utils.path_norm import PathPlatform
+from a2c_smcp.utils.path_norm import PathPlatform, native_platform
 
 _CONTENT = b"hello path blob\n"
 
@@ -451,6 +451,50 @@ class TestFixedRejectionSet:
         # landing root 之外的 .part 不在拒绝集 / ``.part`` outside landing root is allowed.
         result = resolve_path(str(outside_part), _root(root), protected=protected)
         assert result.total_size == len(b"not landing")
+
+    def test_foreign_platform_landing_root_still_protects_part(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#304 审查 🔴：外来平台形态的 landingRoot 仍须进 ``.part`` 拒绝集（镜像 rust absolute）.
+
+        POSIX 宿主上 ``landingRoot="D:\\uploads"`` 是**相对 cwd** 路径——``put_blob`` 实际写到
+        ``<cwd>/D:\\uploads``。若拒绝集在 normalize 处静默丢弃该根，在途 ``.part`` 会被
+        ``resolve_path`` 读出（rust ``build_protected_paths`` 先 ``std::path::absolute`` 正是为此）。
+        """
+        if native_platform() != "posix":
+            pytest.skip("POSIX 相对路径语义专用：Windows 上 D:\\ 是绝对盘符路径")
+
+        monkeypatch.chdir(tmp_path)
+        landing_literal = tmp_path / "D:\\uploads"
+        part = _write(landing_literal / ".a2c-upload" / "upload.part", b"partial")
+
+        protected = build_protected_paths(landing_root="D:\\uploads")
+
+        assert protected.landing_root is not None, "外来平台 landingRoot 不得从拒绝集静默消失"
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(part), _root(tmp_path), protected=protected)
+        assert _reason(exc_info) == "forbidden"
+
+    def test_relative_extra_path_is_absolutized_not_dropped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """相对注入项按宿主 cwd 绝对化后再归一（镜像 rust ``std::path::absolute``）.
+
+        否则 ``extra_paths=["mcp.json"]`` 会在 normalize 处判废而**静默绕过**拒绝集——该文件里的
+        凭据仍可被 ``resolve_path`` + ``get_blob`` 读出。
+        """
+        monkeypatch.chdir(tmp_path)
+        target = _write(tmp_path / "mcp.json", b"{}")
+
+        protected = build_protected_paths(extra_paths=["mcp.json"])
+
+        with pytest.raises(PathResolveError) as exc_info:
+            resolve_path(str(target), _root(tmp_path), protected=protected)
+        assert _reason(exc_info) == "forbidden"
 
     def test_case_variant_skillenv_forbidden_on_macos_host(
         self,

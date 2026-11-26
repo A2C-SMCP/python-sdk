@@ -32,3 +32,17 @@ def isolate_a2c_identity_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     xdg_home.mkdir()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
     yield xdg_home
+
+
+@pytest.fixture(autouse=True)
+def isolate_ambient_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#296：`intent_reference_pids` / `Computer._settings_axes` 默认按 ``env`` 现解析 ambient policy。
+
+    单元测试必须与宿主机 MDM policy（macOS plist / Windows 注册表 / managed-settings）隔离，否则
+    「本机有 policy、CI 没有」会让断言漂移（本仓已有同型前科）。只 patch 模块属性——**函数内惰性导入**
+    的消费方（守卫 / settings 轴）生效；直接 ``from ... import`` 的 policy 单测不受影响。
+    需要真实 policy 的用例在用例体内再次 ``monkeypatch.setattr`` 覆盖（后写生效）。
+    """
+    from a2c_smcp.computer.settings import policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "resolve_policy_settings", lambda **_kw: {})

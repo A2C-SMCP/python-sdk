@@ -42,7 +42,7 @@ def _git(cwd: Path, *args: str) -> None:
 def _make_bare(tmp_path: Path) -> Path:
     """裸仓：marketplace ``acme`` → plugin ``audit``（带 1 skill + bundled MCP server ``figma-mcp``）。"""
     manifest = {
-        "name": "acme-skills",
+        "name": "acme",
         "owner": {"name": "Acme"},
         "metadata": {"pluginRoot": "./plugins"},
         "plugins": [{"name": "audit", "source": "audit", "version": "1.0.0"}],

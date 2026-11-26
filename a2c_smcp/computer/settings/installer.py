@@ -16,7 +16,8 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §3.3 / 
 ``enabledPlugins``（per-scope 启用意图，**仅显式 ``true`` 激活**，absent/false 均不活跃）。
 ``install`` 只 config-first 写 ``installedPlugins`` + 物化（:func:`materialize_plugin`：clone/账本/manifest
 校验/冲突预检），**不激活**（不 stage SKILL、不写 ``enabledPlugins``）→ ``installed_disabled``；
-``enable`` 才把 skills 与 bundled server **原子**并入投影（挂载失败回滚 ``installed_disabled``）；
+``enable`` 才把 skills 与 bundled server **原子**并入投影（失败按 §2.4 / Discussion#82 裁决 C 恢复**操作前
+状态**：预检零写；写后 raw 精确恢复 + 合并视图重算 + 本次 attempt server 清理）；
 ``uninstall`` 删意图 + 清 ``enabledPlugins`` 条目 + teardown。物化账本 ``installed_plugins.json``
 是可从 ``installedPlugins`` 重建的**纯派生缓存**（boot 重物化见 recovery，§4.9 删除无损）。
 
@@ -49,9 +50,13 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
   自动重建；bundled MCP server 重挂由 client 显式经 ``Computer.reconcile_governance(hooks)`` 触发
   （#93 client owns MCP config；CLI 启动序列即参考接线）。
 - disable 的 skill orphan 为**内存态**（Registry 不落盘），同会话廉价复原；跨重启由治理恢复按
-  ``enabledPlugins`` 门控重建（仅显式 true 激活）。uninstall 仅注销**活跃** SKILL（与
-  :func:`_unregister_marketplace_skills` 同限）；先 disable（orphan）再 uninstall 会残留内存孤儿条目，
-  进程重启即清。
+  ``enabledPlugins`` 门控重建（仅显式 true 激活）。**uninstall 连孤儿一并注销**（#257：``include_orphans=True``；
+  **限该 pid 账本记录全部移除时**——#262：有 retained 记录则 registry 不动；retained 只计**写盘后仍在账本中的
+  记录**，#275 起剔除被 §4.9.1-4 sweep 的 legacy 记录），
+  :func:`_unregister_marketplace_skills`（marketplace remove / gc / prune）同样遍历含孤儿的全量条目——
+  否则残留孤儿会被注册点跨 source 守卫当作「先到者」，令换源 **enable** 在本进程内永久失败
+  （install 侧另有 :func:`_bare_name_conflicts` 的裸名预检，与本条无关）。
+  enable 失败回滚以含孤儿的快照为基线：调用前已存在的孤儿回孤儿态，本次新增者才注销。
 - :func:`enable_plugin` 不校验 ``installedPlugins`` 意图成员资格（以账本记录为"可启用"依据）：手编移除意图
   而账本未 gc 的窗口里 live enable 仍可点亮，但重启后 boot 门控（installed ∧ enabled）不会恢复，交由
   reconcile 收敛。
@@ -59,11 +64,11 @@ v0.3.0 起 install 不再收挂载回调（不激活）。
 
 from __future__ import annotations
 
-import shutil
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
 from a2c_smcp.computer.settings.raw import (
@@ -73,10 +78,16 @@ from a2c_smcp.computer.settings.raw import (
     read_raw_object,
 )
 from a2c_smcp.computer.settings.reconciler import (
+    InstallPathRemovalError,
     NonPluginBundleIds,
+    declared_installed_plugin_ids,
+    is_external_plugin_install_path,
+    ledger_entry_fully_materialized,
     ledger_mcp_deps_of,
+    ledger_record_materialized,
     other_plugin_mcp_deps,
     reclaimable_mcp_deps,
+    remove_plugin_install_path,
 )
 from a2c_smcp.computer.settings.schema import SettingsScope, is_valid_enabled_plugin_key
 from a2c_smcp.computer.settings.scope import (
@@ -93,6 +104,7 @@ from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
     atomic_write_json,
     file_lock,
+    is_legacy_ledger_record,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
@@ -101,22 +113,32 @@ from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_
 from a2c_smcp.computer.skills.manifest import (
     PluginManifestError,
     check_strict_conflict,
+    entry_declares_component,
+    entry_is_strict,
     find_plugin_entry,
     load_bundled_servers,
+    manifest_declared_components,
     plugin_root_base,
+    plugin_skill_container_dirs,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
 )
-from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
+from a2c_smcp.computer.skills.registry import SkillRegistry, SourceConflict
+from a2c_smcp.computer.skills.sources import LocalPluginSource, SkillSourceError, resolve_plugin_source, safe_exception_text
 from a2c_smcp.computer.skills.staging import (
     DEFAULT_GIT_TIMEOUT,
+    SKILL_MD,
+    SKILLS_SUBDIR,
+    SkillStagingError,
     locate_plugin_root,
     stage_marketplace_skills,
 )
+from a2c_smcp.smcp import A2CSkillRef
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.diagnostics import exception_text
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.path import is_within
 
 logger = get_logger(__name__)
 
@@ -125,7 +147,60 @@ logger = get_logger(__name__)
 # 异常 / Exceptions（模块内本地异常，仿 ToolNameDuplicatedError / SkillStagingError 惯例）
 # ---------------------------------------------------------------------------
 class PluginInstallError(Exception):
-    """plugin install/enable 前置失败（marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope）。"""
+    """
+    plugin install / enable / uninstall 编排失败。
+
+    - install/enable 前置失败：marketplace 未添加 / catalog 未 clone / entry 缺失 / 非法 scope；
+    - uninstall 删除**独占外部 clone** 失败（软链重定向 / resolve 异常 / rmtree 失败）——此时账本与安装意图
+      保持不变，残留 clone 仍有索引可重试；调用方（CLI / marketplace_remove）必须按失败上报，不得当作 no-op。
+
+    **结构化类别**（#257）：可选 ``error_code``（机读类别，如跨 marketplace 同名冲突的 ``"validation"``）与
+    ``details``（附加 JSON 字段）。缺省均为空 → CLI 输出形态与既有契约一致（``{"error": "error", ...}``）。
+    与 ``InputResolutionError.error_code`` 同姿态：只在已能判定类别的位置填值，不在异常体系上另立新机制。
+
+    ``details`` 的键**按语义分工、不得混用**（#271）：``conflictWith`` 只承载 ``<plugin>@<marketplace>``
+    pid（跨 marketplace 同名冲突）；身份坍缩（同 bundle_id 对应不同安装根 / 配置）没有第二方 pid，
+    用 ``bundleId`` 承载裸 bundle_id。
+
+    ``reason`` 为机读原因码（#296；与 :mod:`.skills.marketplace_identity` 同名键同语义）；enable 失败另加
+    ``enabledStateRetained: true``（#289，见 :class:`EnableFailedRetainedError`）。
+    """
+
+    def __init__(self, message: str, *, error_code: str | None = None, details: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.details: dict[str, Any] = dict(details or {})
+
+
+# enable 失败的结构化原因码（#289 / Discussion#82 裁决 C）：非 retained 的任意失败 / retained 且源无自有 reason。
+REASON_ENABLE_FAILED = "enable-failed"
+REASON_ENABLE_FAILED_RETAINED = "enable-failed-retained"
+
+
+class EnableFailedRetainedError(PluginInstallError):
+    """
+    enable 失败，但**回滚前与回滚后的合并视图均为 enabled**（协议 runtime-contract §2.4 / Discussion#82 裁决 C）。
+
+    语义：仅补充「既有启用状态已被保留」的诊断，不改变任何状态；原异常经 ``__cause__`` 完整保留（不吞），
+    结构化源错误挂在 :attr:`source`。``error_code`` 与 ``details`` 从源错误继承，因此 #296 的
+    ``reason: manifest-name-changed`` 等信号不会被包装遮住；源 ``reason`` 缺失或为通用归一值
+    （:data:`REASON_ENABLE_FAILED`）时改写为 :data:`REASON_ENABLE_FAILED_RETAINED`，并恒加
+    ``enabledStateRetained: true``。
+    """
+
+    def __init__(self, source: PluginInstallError) -> None:
+        details = {**source.details}
+        # 通用归一留给源的 `enable-failed` 在 retained 语境下升级为专用码（否则机器端按 reason 筛 retained
+        # 会漏掉「裸异常 + prior-true」这一半）；源自有 reason（如 #296 的 manifest-name-changed）保持不动。
+        if details.get("reason") in (None, REASON_ENABLE_FAILED):
+            details["reason"] = REASON_ENABLE_FAILED_RETAINED
+        details["enabledStateRetained"] = True
+        super().__init__(
+            f"{source} (enable failed; existing enabled state retained)",
+            error_code=source.error_code,
+            details=details,
+        )
+        self.source = source
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +217,10 @@ ExistingBundleIds = Callable[[], set[str]]
 # ``${input:}`` 渲染；治理投影不回写 mcp.json——依赖声明的真相在 ledger）。
 RegisterServer = Callable[[MCPServerConfig], Awaitable[None]]
 # 运行期停摘一个 server（异步，入参 **bundle_id**；CLI 包 transient ``Computer.aunmount_server_by_id``，
-# 停进程不删声明）。仅对经 §4.9.1-2 回收判据判定**可回收**者调用。
+# 停进程不删声明）。**契约（#289）**：``enable_plugin`` 写后失败会对**本次 attempt 的全部** server 调用
+# （含 register 失败者——manager 先登记 config 再启动，失败不回滚登记）；``disable/uninstall/gc`` 仍只对
+# §4.9.1-2 判定的**可回收**者调用。实现 MUST 仅做运行期 unmount，**MUST NOT** 删 durable 声明
+# （mcp.json / settings / 账本）——「用户声明 / 他 plugin 依赖的条目只移除本 plugin 贡献、不回收条目本身」。
 RemoveServer = Callable[[str], Awaitable[None]]
 # ``NonPluginBundleIds``（§4.9.1-2 回收判据「X 非用户声明」项的数据源，#164）定义在 :mod:`.reconciler`
 # ——判据本体 ``reclaimable_mcp_deps`` 的所在地，且本模块**导入** reconciler（反向导入会成环）。此处仅转导出，
@@ -150,6 +228,10 @@ RemoveServer = Callable[[str], Awaitable[None]]
 # 注入 plugin-scoped inputs 入池（异步；入参 plugin_root；CLI 包 ``load_plugin_inputs`` → ``Computer.add_or_update_input``）。
 # 在 register（→render bundled server 的 ${input:}）之前调，使裸 id 可经 D2 前缀回退解析（#69 Group A，§9.3 D2）。
 InjectInputs = Callable[[Path], Awaitable[None]]
+# enable 失败诊断的合并 settings 视图 provider（同步；入参 = 诊断锚点）。``None`` 锚 = 调用方的 runtime 缺省
+# （REPL 为实例 cwd；库缺省回退进程 cwd）。返回 ``resolve_settings(...).settings`` 形态的合并映射。
+# 诊断只用它判定「回滚前后合并视图是否均 enabled」，不驱动任何破坏性动作。
+ResolvedSettingsProvider = Callable[[str | None], Mapping[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -163,18 +245,92 @@ def _split_plugin_id(plugin_id: str) -> tuple[str, str]:
     return plugin, marketplace
 
 
-def _safe_rmtree(path: Path, home: Path) -> None:
-    """仅当 ``path`` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ Guarded rmtree within SKILL Home（同 reconciler 语义）。"""
-    rp = path.resolve()
-    if not is_within(rp, home.resolve()):
-        logger.error("installer: refusing to remove %s outside SKILL Home %s", rp, home)
-        return
-    if not rp.exists():
-        return
-    try:
-        shutil.rmtree(rp)
-    except OSError as e:  # 失败降级：删除受阻不阻断后续
-        logger.warning("installer: failed to remove %s: %s", rp, e)
+def _bare_name_conflicts(
+    plugin_id: str,
+    *,
+    facts: _InstallFacts,
+    allow_if_installed: bool = False,
+) -> list[str]:
+    """
+    跨 marketplace 裸名唯一性扫描（skill.md §1.2 note / §1.5；#257）/ Cross-marketplace bare-name scan.
+
+    Scans merged ``installedPlugins`` (user/project/local via :func:`resolve_settings`) ∪ materialization-ledger
+    pids and returns the installed pids sharing the bare name from **another** marketplace (sorted, self excluded).
+
+    扫描面 = merged ``installedPlugins``（user/project/local，经 :func:`resolve_settings`）∪ 物化账本
+    ``installed_plugins.json`` 的 pid 键；返回**同名不同 marketplace** 的已安装 pid（升序、排除自身）。
+
+    ``allow_if_installed``（install 用）：目标 pid 自身已在**物化账本**时直接放行——同一 pid 重装不改安装集、
+    不新增第二个 ``<plugin>``，属决策 1 的幂等情形（存量双装 home 里也须可重装/重钉版本）。carve-out
+    **只认账本，不认 merged 声明集**：project/local 的纯声明不是安装事实（否则声明一个从未安装的 pid 就能
+    把同名第二个装进来）。enable 侧保持 fail-closed（决策 2）。
+
+    ``drop_legacy=False`` 是**承重墙**：账本默认视图会整条丢弃旧格式（``bundledMcpServers``）记录，令
+    v0.2.x 存量 home 的 ``alpha@mp-a`` 对检查隐身——安装随后才由 :func:`migrate_legacy_installs` 从账本
+    回填意图，正好形成「先绕过、后出现」的旁路。故此处与迁移路径读**同一视图**（只读 pid 键，不碰旧格式值）。
+
+    ``facts`` **必填**：预检与 :func:`_bare_name_conflict_error` 的诊断分档必须共用同一次读取，避免并发
+    窗口里「判定用旧快照、文案用新快照」的漂移（#257 复审 🟡3）。不自读 fallback——调用方先算一次再传。
+    """
+    # 幂等 carve-out 只认**账本记录**（真重装 / 存量双装）。project/local 的纯声明不是安装事实——拿 merged
+    # 意图放行等于「声明一个从未安装的 `<plugin>@<mp>` 就能把同名第二个装进来」（#257 复审 🔴3）。
+    if allow_if_installed and plugin_id in facts.ledger_pids:
+        return []
+    return _bare_name_clash_pids(plugin_id, facts.installed_pids)
+
+
+def _bare_name_clash_pids(plugin_id: str, pids: Iterable[str]) -> list[str]:
+    """
+    给定 pid 集合，取与 ``plugin_id`` **同裸名、不同 marketplace** 的 pid（升序、排除自身）/
+    Bare-name clashes of ``plugin_id`` within ``pids``.
+
+    预检与 in-lock 复核的**唯一判据**（#257 复审 🟡1：两处曾各自实现，锁内漏了账本 carve-out）。
+    The single clash predicate shared by the unlocked pre-check and the in-lock recheck.
+    """
+    plugin, _marketplace = _split_plugin_id(plugin_id)
+    return sorted(pid for pid in pids if pid != plugin_id and pid.partition("@")[0] == plugin)
+
+
+def _bare_name_conflict_error(
+    plugin_id: str,
+    conflicts: list[str],
+    *,
+    action: str,
+    ledger_pids: frozenset[str],
+) -> PluginInstallError:
+    """
+    构造跨 marketplace 同名冲突的结构化错误（``validation`` + 可判诊断；#257 决策 4/6）/
+    Build the structured conflict error.
+
+    **补救按账本分档**（#257 架构师审查 🟡2）：「已安装」以**账本**为准——有物化记录 → ``plugin uninstall``
+    有效；无物化记录（project/local 声明、残留意图，或并发窗口里刚写入的意向）→ 删对应 settings 条目 /
+    等其完成，``plugin uninstall`` 对这类条目恒为 no-op。
+    Remedies are split by ledger presence; a pid without a materialization record cannot be cleared by uninstall.
+
+    :param ledger_pids: 调用方已算出的账本 pid 快照，**必填**——与判定冲突的 `facts` 同源，避免分档时
+        重读导致漂移（并发窗口）与持锁期间多余 I/O（#257 复审 🟡3）。不自读 fallback。
+    """
+    plugin, marketplace = _split_plugin_id(plugin_id)
+    materialized = [pid for pid in conflicts if pid in ledger_pids]
+    declared_only = [pid for pid in conflicts if pid not in ledger_pids]
+    existing = ", ".join(repr(pid) for pid in conflicts)
+    remedies: list[str] = []
+    if materialized:
+        uninstall = " / ".join(f"'plugin uninstall {pid}'" for pid in materialized)
+        remedies.append(f"Uninstall the materialized plugin(s) first ({uninstall})")
+    if declared_only:
+        declared = " / ".join(repr(pid) for pid in declared_only)
+        remedies.append(
+            f"{declared} has no materialization record (a user-scope stale intent, a project/local settings "
+            f"declaration, or an install still in flight) — remove that settings entry (or retry once the other "
+            f"install completes); 'plugin uninstall' cannot clear a declaration"
+        )
+    message = (
+        f"plugin {plugin!r} is already installed or declared from another marketplace ({existing}); a plugin name "
+        f"MUST be unique across marketplaces (skill.md §1.5), so {action} of {plugin_id!r} is refused. "
+        f"{'; '.join(remedies)}. Or rename the plugin in marketplace {marketplace!r}."
+    )
+    return PluginInstallError(message, error_code="validation", details={"conflictWith": conflicts[0]})
 
 
 def _settings_path_for_scope(scope: str, project_path: str | None, env: Mapping[str, str] | None) -> tuple[Path, SettingsScope]:
@@ -239,8 +395,9 @@ def _clear_enabled_entries_visible_layers(plugin_id: str, project_paths: set[str
     会 ``mkdir(parents=True)`` 建父目录 + 建 ``.lock``，而 :func:`_write_enabled_plugin` 的 no-op 短路在锁后——
     无守卫会在无 ``.tfrobot/`` 的 cwd 制造垃圾目录。managed/policy 只读层不触碰；清失败 WARN 不阻断（best-effort）。
 
-    **user 层也在 best-effort 之内**（#246 独立审查 🔴B）：本函数在 uninstall **已删树/注销 skill/摘 server/删账本
-    之后**才被调用，user 层若抛 :class:`PluginInstallError` 会把整个卸载打断在半途，留下 project/local 残留。
+    **user 层也在 best-effort 之内**（#246 独立审查 🔴B）：本函数在 uninstall **已删树/摘 server/注销 skill/删账本
+    之后**才被调用（顺序的单点权威见 :func:`uninstall_plugin` 的 docstring，勿在此另立副本；#275 起 skills 注销在
+    摘 server 之后），user 层若抛 :class:`PluginInstallError` 会把整个卸载打断在半途，留下 project/local 残留。
     故三层同姿态——失败只 WARN。真正的「目标键畸形」已由 :func:`_precheck_settings_writes` 在任何破坏性动作
     **之前**拦下，这里只是纵深防御。
     """
@@ -270,8 +427,9 @@ def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | 
     uninstall 的**破坏性动作之前**预检所有待写 settings 文件的目板键形状（#246 独立审查 🟡1）
     Validate every settings file that uninstall will write **before** the irreversible steps.
 
-    为什么必须前置：uninstall 的顺序是「删树 → 注销 skill → 摘 server → 删账本 → 写意图」。若意图写在**最后**
-    才因目标键畸形 fail-closed，此时安装已被不可逆删除，而重试又会因账本已空走 no-op——**永远清不干净**。
+    为什么必须前置：uninstall 的顺序是「删树 → 摘 server → 注销 skill → 删账本 → 写意图」（顺序的**单点权威**
+    见 :func:`uninstall_plugin` 的 docstring，勿在此另立副本；#275 起 skills 注销在摘 server 之后）。若意图写在
+    **最后**才因目标键畸形 fail-closed，此时安装已被不可逆删除，而重试又会因账本已空走 no-op——**永远清不干净**。
     故在任何删除之前把**本次真的会写**的目标键形状验一遍：畸形即 :class:`PluginInstallError` 且**零副作用**。
 
     **检查范围按层收窄**（勿放宽）：``_write_installed_plugin`` 只写 **user** 层，project/local 只经
@@ -301,13 +459,302 @@ def _precheck_settings_writes(project_paths: set[str], env: Mapping[str, str] | 
         raise PluginInstallError(str(e)) from e
 
 
-def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str] | None) -> bool:
+# ---------------------------------------------------------------------------
+# enable 内容预检（#259）/ Enable content preflight
+# ---------------------------------------------------------------------------
+def _enable_recovery_hint(plugin_id: str) -> str:
+    """
+    #259 失败消息的恢复指引 / Recovery guidance for #259 failures。
+
+    措辞须与真实行为一致（审查 🟡3 / #260）：``marketplace refresh`` 现为「重新 clone 到 staging + 原子
+    换入」，**会**还原上游仍存在的被删文件（本地与上游一致时仍无变化）；``plugin install`` 复用既有 clone
+    （``refresh=False``）；boot 重物化仅在记录的 ``installPath`` **根**缺失 / 不可解析时触发，且同样复用
+    clone——后两者修不好「根在、文件被删」。故首选仍是**从干净副本重建**：
+    外部独占 clone 走 uninstall+install（uninstall 删树 → install 重 clone）；catalog 相对源走
+    marketplace remove+add（重 clone catalog）。
+    """
+    _plugin, marketplace = _split_plugin_id(plugin_id)
+    return (
+        f"Recovery: re-materialize from a clean copy, then retry. Plugin fetched into its own clone: run "
+        f"'plugin uninstall {plugin_id}' then 'plugin install {plugin_id}'. Plugin shipped by the marketplace "
+        f"catalog: run 'marketplace remove {marketplace}', 'marketplace add <source>', then 'plugin install "
+        f"{plugin_id}'. 'marketplace refresh {marketplace}' only helps when the upstream repo still has the files; "
+        f"a restart only re-materializes records whose recorded install root is missing or unparsable (it reuses "
+        f"the existing clone, so deleted files are not restored)."
+    )
+
+
+def _describe_dead_record(rec: object) -> str:
+    """失效账本记录 → 「点名路径 + 原因」短语（判定权威是 reconciler 判据，此处只做分档展示）/ Dead-record detail。"""
+    if not isinstance(rec, Mapping):
+        return f"ledger record is not an object ({type(rec).__name__})"
+    scope = rec.get("scope")
+    scope_hint = f" (scope={scope})" if isinstance(scope, str) and scope else ""
+    install_path = rec.get("installPath")
+    if not (isinstance(install_path, str) and install_path):
+        return f"ledger record has no installPath{scope_hint}"
+    if not Path(install_path).is_dir():
+        return f"installPath {install_path}{scope_hint}: directory does not exist"
+    # 判据已排除「installPath 缺失」与「目录不存在」两个分支 ⇒ 剩余唯一原因是 bundled JSON 不可解析。
+    return f"installPath {install_path}{scope_hint}: bundled server JSON is unparsable"
+
+
+def _marketplace_entry_for(marketplace: str, plugin: str, home: Path) -> Mapping[str, Any] | None:
+    """读 marketplace 条目；catalog 清单缺失/损坏 → ``None``（声明面不可判定）。
+
+    注意（审查 🟡3/🟡7）：stage **不会**因 catalog 清单损坏而抛错——:func:`stage_marketplace_skills` 对
+    marketplace 级失败同样走「记 ERROR + 返回空」的静默降级。声明面不可判定时只跳过声明态判据；上述
+    SKILL 容器（约定 ``skills/`` 或声明覆写）内确有 ``SKILL.md`` 时，仍由 stage 返回值为空的零注册兜底
+    （③.6）捕获——容器之外散落的 ``SKILL.md`` 两个判据都不扫描（与装载同源）。
+    """
+    try:
+        manifest = read_marketplace_manifest(marketplace_skill_dir(home, marketplace))
+    except PluginManifestError as e:
+        logger.warning(
+            "enable preflight: marketplace %r manifest unreadable, content declaration unknown: %s", marketplace, e,
+        )
+        return None
+    return find_plugin_entry(manifest, plugin)
+
+
+def _declares_skills(entry: Mapping[str, Any] | None, plugin_manifest: Mapping[str, Any]) -> bool:
+    """该 plugin 是否**声明**了 SKILL 内容（声明态判据，#259 架构师裁决）。
+
+    声明源 = ``entry.skills``（恒取）+ ``plugin.json.skills``（仅 strict=true），**按 JSON 真值**判
+    （见 :func:`~a2c_smcp.computer.skills.manifest.entry_declares_component`，与 rust 同口径、单一权威）。
+
+    **约定 ``skills/`` 容器存在不算声明**（审查 🔴1）：MCP-only plugin 可能顺带提交 ``skills/README.md`` /
+    ``.gitkeep`` / 空目录，把「容器在」当声明会让它在旧版本可启用、新版本永久不可启用且无命令可修。
+
+    **已知边界**（审查 🟡3，与 rust 对齐）：convention-only plugin（entry / plugin.json 均无 skills 声明、
+    只有约定 ``skills/`` 目录）在 SKILL.md 被全部删除后 **enable 仍成功**——无从判定「曾经有过」。
+    「容器在但零 SKILL.md」不由此判据抓，而由 stage 返回值零注册的兜底（③.6）在**有文件被装载跳过**时抓。
+    """
+    strict = entry_is_strict(entry) if entry is not None else True
+    if entry_declares_component(entry or {}, "skills"):
+        return True
+    return strict and entry_declares_component(plugin_manifest, "skills")
+
+
+def _projectable_skill_count(
+    plugin_root: Path, entry: Mapping[str, Any] | None, plugin_manifest: Mapping[str, Any],
+) -> int:
+    """可投影 SKILL 包数：容器（约定 ``skills/`` + 声明覆写）内 ``<skill>/SKILL.md`` 的个数。
+
+    与装载同源（:func:`~a2c_smcp.computer.skills.manifest.plugin_skill_container_dirs` + 一级目录扫描）。
+    任何文件系统异常（权限 / 软链环 / 非法路径）→ 记 WARNING 并计 0（fail-closed，不静默放行；审查 🟡9）。
+    """
+    strict = entry_is_strict(entry) if entry is not None else True
+    try:
+        containers = plugin_skill_container_dirs(entry or {}, plugin_manifest, plugin_root, strict=strict)
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.warning("enable preflight: cannot resolve SKILL containers under %s, counted as empty: %s", plugin_root, e)
+        return 0
+    seen: set[Path] = set()
+    total = 0
+    for container in containers:
+        try:
+            resolved = container.resolve()
+            if resolved in seen or not container.is_dir():
+                continue
+            seen.add(resolved)
+            total += sum(1 for child in container.iterdir() if child.is_dir() and (child / SKILL_MD).is_file())
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning("enable preflight: cannot list SKILL container %s, counted as empty: %s", container, e)
+    return total
+
+
+@dataclass(frozen=True)
+class _EnablePreflight:
+    """enable 内容预检结果 / Enable content preflight outcome。"""
+
+    servers: list[MCPServerConfig]
+    # installPath 内确实存在 ``<skill>/SKILL.md`` 包 → stage 后必须为该 plugin 注册到非空技能集
+    # （真实装载还会因 frontmatter / 名字 / catalog 清单问题跳过，见 #259 审查 🔴2）。
+    expects_skills: bool
+
+
+def _enable_content_error(plugin_id: str, problems: Sequence[str]) -> str:
+    """组装 #259 的公开诊断（点名死路径 + 零变更事实 + 恢复指引）/ Public diagnostic message。
+
+    措辞不得断言 ``installed_disabled``（审查 🟡7）：``enabledPlugins`` 可能原本就是显式 true，本命令只是
+    **未改动**它——如实陈述「no changes」并给出当原值为 true 时的补救。
+    """
+    details = "\n  - ".join(problems)
+    return (
+        f"cannot enable plugin {plugin_id!r}: its installed content is missing or unusable, so its declared skills / "
+        f"bundled servers cannot be projected. This command made no changes (enabledPlugins is unchanged; if it is "
+        f"already true for this scope, run 'plugin disable {plugin_id}' first).\n  - {details}\n"
+        f"{_enable_recovery_hint(plugin_id)}"
+    )
+
+
+def _preflight_enable_content(
+    plugin_id: str,
+    plugin: str,
+    marketplace: str,
+    home: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> _EnablePreflight:
+    """
+    enable 内容预检（#259）：账本记录必须仍有效物化，且**声明的内容**必须完整可投影 / Enable content preflight。
+
+    为什么必须前置：旧实现从记录 ``installPath`` 裸读 bundled servers（缺失目录 → 空集）、随后 re-stage 的
+    失败又被 :func:`~a2c_smcp.computer.skills.staging.stage_marketplace_skills` 的逐 plugin 降级吞掉，于是写出
+    ``enabledPlugins=true`` 而零技能零 server——协议 runtime-contract §2.4 明令禁止的「enabled 但不可用」半态。
+    预检在**任何持久化变更之前**失败，且本命令不写任何状态；本函数**不**重物化（重物化归重装 / boot）。
+
+    三条判据：
+    1. **物化**：复用 :func:`~a2c_smcp.computer.settings.reconciler.ledger_record_materialized`
+       （``installPath`` 目录存在 ∧ bundled JSON 可解析）；多 scope 取 **∀**
+       （:func:`~a2c_smcp.computer.settings.reconciler.ledger_entry_fully_materialized`）——与 boot 重物化判据
+       同源，任一记录失效即整体失败，不启用健康子集。
+    2. **声明面一致**：记录 ``mcpServers``（声明依赖的 bundle_id，经
+       :func:`~a2c_smcp.computer.settings.reconciler.ledger_mcp_deps_of` 取值域守卫）必须全部可从该
+       ``installPath`` 重新解析，防「根在、部分 bundled 文件被删」静默少挂。
+    3. **声明态可投影**（#259 架构师裁决）：manifest/entry 声明了 SKILL 内容（见 :func:`_declares_skills`）
+       却零 ``<skill>/SKILL.md`` → 失败；**真正未声明任何内容**的空 plugin 仍允许启用（正对照）。
+
+    预检只做「文件存在」层判定；装载层的更严判据（frontmatter / 重名 / catalog 清单）由 stage 后的
+    零注册兜底收口（``_EnablePreflight.expects_skills`` → :func:`enable_plugin` ③.6）。
+
+    :return: 聚合的 bundled servers（供依赖预检与挂载复用，避免二次解析）+ 是否期望 SKILL 投影。
+    :raises PluginInstallError: 任一记录不可物化 / 声明 server 不可解析 / 声明 SKILL 零投影。
+
+    .. note::
+       声明面取自**活 catalog**（``entry``），内容取自账本 pin 的 ``installPath``。对 sha pin 的外部源，若 catalog
+       的 ``skills`` 声明已变而克隆仍钉旧提交，预检会要求先 ``plugin install`` 重装对齐——这是刻意的 fail-fast，
+       不是误报（审查 🟢11 记边界）。
+    """
+    problems: list[str] = []
+    try:
+        fully_materialized = ledger_entry_fully_materialized(records)
+    except OSError as e:
+        # 权限等文件系统异常不得裸逸出（审查 🟡7）：归一为结构化错误。
+        raise PluginInstallError(
+            _enable_content_error(plugin_id, [f"cannot inspect recorded install paths: {e}"]),
+        ) from e
+    if not fully_materialized:
+        for rec in records:
+            try:
+                if not ledger_record_materialized(rec):
+                    problems.append(_describe_dead_record(rec))
+            except OSError as e:
+                problems.append(f"cannot inspect recorded install path ({rec!r}): {e}")
+        if not problems:  # 防御：判据说失效却逐条都通过（不应发生）→ 仍须失败，不得静默放行
+            problems.append("no usable ledger record")
+        raise PluginInstallError(_enable_content_error(plugin_id, problems))
+
+    entry = _marketplace_entry_for(marketplace, plugin, home)
+    # bundle_id → (安装根, 配置)（首次出现顺序）。多 scope **同根同配置**记录重复声明同一 server 时去重；
+    # 异根 / 异配置 = identity collapse，硬错（对齐 rust#274；审查 🟡1）。
+    by_id: dict[str, tuple[Path, MCPServerConfig]] = {}
+    identity_conflicts: list[str] = []
+    expects_skills = False
+    for rec in records:
+        install_path = Path(str(rec.get("installPath")))
+        try:
+            parsed = load_bundled_servers(install_path)
+        except PluginManifestError as e:  # 判据刚通过后文件又被改坏（TOCTOU）→ 仍按失败处理
+            problems.append(f"installPath {install_path}: bundled server JSON is unparsable ({e})")
+            continue
+        except OSError as e:  # iterdir 权限等（审查 🟡7）
+            problems.append(f"installPath {install_path}: bundled servers cannot be read ({e})")
+            continue
+        missing = sorted(ledger_mcp_deps_of([rec]) - {resolve_bundle_id(cfg) for cfg in parsed})
+        if missing:
+            problems.append(
+                f"installPath {install_path}: declared bundled server(s) {', '.join(repr(m) for m in missing)} "
+                "cannot be resolved (the install tree is stale; see the recovery steps below)"
+            )
+        plugin_manifest = read_plugin_metadata(install_path)
+        try:
+            if entry is not None:
+                # strict=false + plugin.json 声明组件 → staging 会**整体拒绝**该 plugin（审查 🟡6）；预检先转结构化错误。
+                check_strict_conflict(entry, plugin_manifest)
+            declares_skills = _declares_skills(entry, plugin_manifest)
+            skill_count = _projectable_skill_count(install_path, entry, plugin_manifest)
+        except PluginManifestError as e:
+            problems.append(f"installPath {install_path}: plugin manifests conflict ({e})")
+            continue
+        except (OSError, RuntimeError, ValueError) as e:
+            problems.append(f"installPath {install_path}: cannot inspect SKILL packages: {e}")
+            continue
+        expects_skills = expects_skills or skill_count > 0
+        if declares_skills and skill_count == 0:
+            problems.append(
+                f"installPath {install_path}: declares SKILL packages but none are projectable "
+                f"(no <skill>/{SKILL_MD} under the conventional {SKILLS_SUBDIR}/ dir or declared overrides)"
+            )
+        # 声明了 bundled servers（账本 mcpServers，或 strict plugin.json 的 mcpServers 组件）却零投影 → 失败
+        # （架构师审查 🔴1，与 rust#274 `declared_components.contains("mcpServers")` 同口径）。
+        strict = entry_is_strict(entry) if entry is not None else True
+        declares_servers = bool(ledger_mcp_deps_of([rec])) or (
+            strict and "mcpServers" in manifest_declared_components(plugin_manifest)
+        )
+        if declares_servers and not parsed:
+            problems.append(
+                f"installPath {install_path}: declares bundled MCP servers but none are projectable "
+                f"(no mcp-servers/*.json under the install path)"
+            )
+        for cfg in parsed:
+            bundle_id = resolve_bundle_id(cfg)
+            existing = by_id.get(bundle_id)
+            if existing is None:
+                by_id[bundle_id] = (install_path, cfg)
+            elif existing[0] != install_path or existing[1] != cfg:
+                identity_conflicts.append(bundle_id)
+                if existing[0] != install_path:
+                    problems.append(
+                        f"bundle_id {bundle_id!r} collapses distinct identities ({existing[0]} vs {install_path}); "
+                        f"refusing to enable an ambiguous projection"
+                    )
+                else:
+                    # 同根异配置（#271 🟡1）：两段路径相同，光报 `(/a vs /a)` 无从判断差异在哪。改报**区分字段**
+                    # ——server 名即文件 stem（`parse_bundled_server` 强制 `name == path.stem`，同根下必不相同）。
+                    # MUST NOT 回显 env / headers / command 等配置体（可能含凭据）。
+                    problems.append(
+                        f"bundle_id {bundle_id!r} collapses distinct identities under the same install root "
+                        f"({install_path}): servers {existing[1].name!r} and {cfg.name!r} declare different configs "
+                        f"under the same install root; refusing to enable an ambiguous projection"
+                    )
+    if problems:
+        raise PluginInstallError(
+            _enable_content_error(plugin_id, problems),
+            # 身份坍缩属可判定的配置冲突类别（对齐既有 validation 约定，审查 🟡1）。
+            # 键用 ``bundleId`` 而非 ``conflictWith``（#271 用户裁决）：后者是 `<plugin>@<marketplace>` pid 的
+            # 专属值域（跨 marketplace 同名冲突），坍缩场景没有第二方 pid，塞裸 bundle_id 会污染该键的类型。
+            error_code="validation" if identity_conflicts else None,
+            details={"bundleId": identity_conflicts[0]} if identity_conflicts else None,
+        )
+    return _EnablePreflight(servers=[cfg for _root, cfg in by_id.values()], expects_skills=expects_skills)
+
+
+def _write_installed_plugin(
+    plugin_id: str,
+    present: bool,
+    env: Mapping[str, str] | None,
+    *,
+    home: Path | None = None,
+    guard_bare_name: bool = False,
+) -> bool:
     """
     user scope ``installedPlugins`` 数组的持锁 RMW（增/删一个条目）；返回**写前**是否已含该条目 / RMW the install intent。
 
     安装是全局一次的事实（协议 v0.3.0 §2.1/§2.4「plugin_installation」）→ 意图固定落 **user** settings.json
     （#123 决策：不随 ``--scope`` 泄漏进可提交的 project 文件）；读取侧由 :func:`resolve_settings` merged
     并集承担（project/local 声明亦被认可，支持声明式复现）。数组写回整体替换（§5.4 写语义），保序去重。
+
+    **锁内裸名复核**（``guard_bare_name=True``，install 专用；#257 架构师审查 🔴1）：install 的预检
+    （:func:`_bare_name_conflicts`）是无锁读，与本次写入之间隔着迁移等步骤——两个进程可各自通过预检后再
+    先后持锁追加，造出「同名双装」。故在**同一把锁内**、``append`` 之前用刚读到的 ``entries``（已含并发
+    进程刚写入的 pid）∪ 账本 pid 复核一次；冲突则抛 :class:`PluginInstallError`（文件未写）。
+    **与预检同款 carve-out**：目标 pid 已在账本 = 真重装（不改变安装集），整段复核跳过——勿把它当漏检「修掉」，
+    否则会误拒预检刻意放行的重装（#257 复审 🟡1）。
+    **不得在外层再包一层 ``file_lock``**：锁基于旁车文件的新 fd，同进程二次获取会退避后抛 ``SettingsLockError``。
+
+    :raises ValueError: ``guard_bare_name=True`` 但未传 ``home``（无法读账本做跨进程兜底；安全守卫不得静默
+        fail-open，生产调用点恒传 ``home``，此错仅防未来误用）。
 
     **#246**：raw 保真 RMW——只改 ``installedPlugins``，其余字段（含 policy-only 越权字段 / 未知键）逐字保留。
     目标文件 corrupt / ``installedPlugins`` 非数组 → fail-closed（抛 :class:`PluginInstallError`，原文件不动）。
@@ -319,6 +766,18 @@ def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str
             entries: list[Any] = list_field_or_empty(existing, "installedPlugins", path=path)
             was_present = plugin_id in entries
             if present and not was_present:
+                if guard_bare_name:
+                    if home is None:
+                        # 安全守卫不得静默 fail-open（#257 复审 🟡6）：缺 home 就无法做跨进程兜底，直接报错。
+                        raise ValueError("_write_installed_plugin(guard_bare_name=True) requires home for the ledger recheck")
+                    ledger = frozenset(_ledger_pids(home=home, env=env))
+                    # 与预检**同一 carve-out**（#257 复审 🟡1）：目标 pid 已有物化记录 = 真重装（不改安装集）。
+                    # 抢跑窗口里目标 pid 尚未入账本，复核照旧触发，不削弱并发闭合。
+                    if plugin_id not in ledger:
+                        candidates = {e for e in entries if isinstance(e, str) and is_valid_enabled_plugin_key(e)}
+                        clashes = _bare_name_clash_pids(plugin_id, candidates | ledger)
+                        if clashes:
+                            raise _bare_name_conflict_error(plugin_id, clashes, action="install", ledger_pids=ledger)
                 entries.append(plugin_id)
             elif not present and was_present:
                 entries = [e for e in entries if e != plugin_id]
@@ -328,23 +787,147 @@ def _write_installed_plugin(plugin_id: str, present: bool, env: Mapping[str, str
         raise PluginInstallError(str(e)) from e
 
 
-def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str) -> list[str]:
-    """
-    某 plugin 当前**活跃**的 marketplace SKILL name / A plugin's currently-active marketplace SKILL names。
+def _ledger_pids(*, home: Path, env: Mapping[str, str] | None) -> set[str]:
+    """物化账本中的 pid 键 / Materialization-ledger plugin ids（``drop_legacy=False``：旧格式记录也是安装事实）。"""
+    return {
+        pid
+        for pid in load_installed_plugins(home=home, env=env, drop_legacy=False).get("plugins", {})
+        if is_valid_enabled_plugin_key(pid)
+    }
 
-    过滤 ``A2CSkillRef.source == "marketplace:<mp>"`` 且 ``name`` 以 ``<plugin>:`` 起（marketplace name = ``<plugin>:<skill>``）。
-    仅枚举活跃集（:meth:`SkillRegistry.active_refs` 排除孤儿）——同 :func:`_unregister_marketplace_skills`。
+
+@dataclass(frozen=True, slots=True)
+class _InstallFacts:
+    """安装事实集 / Install facts：merged 意图 pid 与物化账本 pid（#257 架构师审查 🟡4 的单一权威）。"""
+
+    declared_pids: frozenset[str]
+    ledger_pids: frozenset[str]
+
+    @property
+    def installed_pids(self) -> frozenset[str]:
+        """安装集 = 声明意图 ∪ 账本 / Declared intents ∪ ledger."""
+        return self.declared_pids | self.ledger_pids
+
+
+def _install_facts(*, home: Path, env: Mapping[str, str] | None) -> _InstallFacts:
+    """
+    安装事实集的**单一权威**：merged ``installedPlugins``（user/project/local）∪ 物化账本 pid /
+    Single authority for install facts.
+
+    ``drop_legacy=False``（见 :func:`_ledger_pids`）：旧格式记录也是安装事实，默认视图会让 v0.2.x 存量
+    在检查时隐身。install/enable 的预检与冲突诊断分档共用本函数，避免两处各自拼同一并集而漂移。
+
+    .. note::
+       install 的**锁内复核**刻意不走本函数：它必须用锁内刚读到的 ``entries`` 快照（含并发进程刚写入的
+       user 意图）∪ 账本 pid，而非另一时刻的 merged 视图——两处共享的是 :func:`_bare_name_clash_pids`
+       判据与账本 carve-out，不是同一份快照。
+    """
+    declared = resolve_settings(env=env).settings
+    return _InstallFacts(
+        declared_pids=frozenset(declared_installed_plugin_ids(declared)),
+        ledger_pids=frozenset(_ledger_pids(home=home, env=env)),
+    )
+
+
+def _plugin_skill_state(registry: SkillRegistry, marketplace: str, plugin: str) -> dict[str, tuple[A2CSkillRef, bool]]:
+    """
+    本 plugin 名下条目的 ``name → (ref 快照, orphaned)``（**含孤儿**）/ Snapshot name→(ref, orphaned) including orphans.
+
+    Rollback baseline for a failed enable (#257 review 🟡5): an active-only baseline would treat a
+    *pre-existing* orphan as "newly added" and ``unregister`` it, so the failed command would not be a no-op.
+
+    enable 失败回滚的基线（#257 复审 🟡5）：只用活跃集做基线会把「调用前就存在的孤儿」当成本次新增而
+    ``unregister``，令失败命令的净效果不为零（少一条既有条目）。
+
+    #289 审查 🟡6：同时快照 **ref 内容**——本次 stage 经 ``register_or_update`` 可能改写既有条目的
+    path / description / version，只恢复「名字 + 孤儿标志」会让失败后的 ``client:get_skills`` 与操作前不一致。
     """
     want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
     prefix = f"{plugin}:"
+    out: dict[str, tuple[A2CSkillRef, bool]] = {}
+    for ref, orphaned in registry.all_refs():
+        name = ref.get("name")
+        if isinstance(name, str) and ref.get("source") == want_source and name.startswith(prefix):
+            out[name] = (ref, orphaned)
+    return out
+
+
+def _plugin_skill_names(registry: SkillRegistry, marketplace: str, plugin: str, *, include_orphans: bool = False) -> list[str]:
+    """
+    某 plugin 名下的 marketplace SKILL name / A plugin's marketplace SKILL names。
+
+    过滤 ``A2CSkillRef.source == "marketplace:<mp>"`` 且 ``name`` 以 ``<plugin>:`` 起（marketplace name = ``<plugin>:<skill>``）。
+    默认仅枚举活跃集（:meth:`SkillRegistry.active_refs` 排除孤儿）；``include_orphans=True`` 时连孤儿一并返回
+    （uninstall 用：孤儿残留会被跨 source 守卫当作「先到者」永久拒绝新 source，必须一并清掉，#257 审查 🔴2）。
+    **#262**：uninstall **仅在该 pid 账本记录全部移除时**才以 ``include_orphans=True`` 调用；有 retained 记录时
+    registry 完全不动——新增卸载路径切勿照抄「必须清孤儿」而无此门控。
+    """
+    want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
+    prefix = f"{plugin}:"
+    refs = [ref for ref, _orphaned in registry.all_refs()] if include_orphans else registry.active_refs()
     names: list[str] = []
-    for ref in registry.active_refs():
+    for ref in refs:
         if ref.get("source") != want_source:
             continue
         name = ref.get("name")
         if isinstance(name, str) and name.startswith(prefix):
             names.append(name)
     return names
+
+
+def _source_conflict_error(
+    plugin_id: str,
+    conflicts: Sequence[SourceConflict],
+    *,
+    home: Path,
+    env: Mapping[str, str] | None,
+) -> PluginInstallError:
+    """
+    把「本次 staging 真正被拒的跨 source ref」转成结构化错误（#257 复审 🔴2）/ Turn refused refs into a structured error.
+
+    ``plugin uninstall`` only works on an **installed** conflicting plugin; when enable reaches here the
+    same-name installed pid has already been rejected by the pre-check, so the owner is usually **not
+    installed** (an in-memory registration left by ``marketplace add``'s full staging) — the remedy must be
+    chosen accordingly, otherwise it is a permanent no-op.
+
+    ``plugin uninstall`` 只对**已安装**的冲突方有效；而 enable 走到本分支时，同名的已安装 pid 已被前置检查
+    拦下，冲突方通常是**未安装**的（``marketplace add`` 全量 stage 留下的内存注册）——文案必须据此分档，
+    否则给出的是永远 no-op 的补救。
+    """
+    plugin, marketplace = _split_plugin_id(plugin_id)
+    source_prefix = f"{SOURCE_MARKETPLACE}:"
+    owners = sorted(
+        {
+            src[len(source_prefix):]
+            for conflict in conflicts
+            for src in (conflict.existing_source,)
+            if isinstance(src, str) and src.startswith(source_prefix)
+        }
+    )
+    names = ", ".join(repr(conflict.name) for conflict in conflicts)
+    if not owners:
+        message = (
+            f"skills of plugin {plugin!r} ({names}) are registered by another source; refusing to enable {plugin_id!r}. "
+            f"Remove the shadowing source registration (or restart the Computer), then retry."
+        )
+        return PluginInstallError(message, error_code="validation")
+    installed = _install_facts(home=home, env=env).installed_pids
+    hints: list[str] = []
+    for owner in owners:
+        pid = f"{plugin}@{owner}"
+        if pid in installed:
+            hints.append(f"'plugin uninstall {pid}'")
+        else:
+            hints.append(
+                f"'marketplace remove {owner}' (removes that marketplace's other plugins too), or restart the "
+                f"Computer (stale in-memory registrations of a marketplace that is not installed)"
+            )
+    message = (
+        f"skills of plugin {plugin!r} ({names}) are currently registered from another marketplace "
+        f"({', '.join(repr(owner) for owner in owners)}), refusing to enable {plugin_id!r}. Resolve by: "
+        f"{'; '.join(hints)}. Then retry 'plugin enable {plugin_id}' to adopt the copy from {marketplace!r}."
+    )
+    return PluginInstallError(message, error_code="validation", details={"conflictWith": f"{plugin}@{owners[0]}"})
 
 
 def _resolve_marketplace_source(marketplace: str, home: Path, env: Mapping[str, str] | None) -> tuple[Mapping[str, Any], str | None]:
@@ -383,21 +966,34 @@ def _log_satisfied_deps(servers: list[MCPServerConfig], existing: set[str]) -> N
             )
 
 
-def _require_existing_ids_guard(
+def _require_enable_callbacks_guard(
     existing_bundle_ids: ExistingBundleIds | None,
     register_server: RegisterServer | None,
+    remove_server: RemoveServer | None,
 ) -> None:
     """
-    护栏：给了 ``register_server`` 就**必须**给 ``existing_bundle_ids`` / Guard: register implies existing-ids。
+    护栏：三个 enable 注入回调「**齐备或全无**」/ Guard: the three enable callbacks come as a set.
 
-    D3 后 ``existing`` 不再是「拒绝闸门」而是 **skip-or-register 的判据**（§2.5-1「依赖已满足 → 复用既有实例」）：
-    缺它则以 ``existing=∅`` 运行 ⇒ 全量 register ⇒ 把用户既有的同 bundle_id server **静默覆盖**（manager 对同
-    bundle_id 是覆盖更新、不抛）。三注入回调应「齐备或全无」，此处强制 register→existing。
+    - ``register`` ⇒ 必须给 ``existing_bundle_ids``：``existing`` 是 **skip-or-register 的判据**（§2.5-1「依赖已
+      满足 → 复用既有实例」）；缺它则以 ``existing=∅`` 运行 ⇒ 全量 register ⇒ 把用户既有的同 bundle_id server
+      **静默覆盖**（manager 对同 bundle_id 是覆盖更新、不抛）。
+    - ``register`` ⇒ 必须给 ``remove_server``：写后失败必须能运行期摘除**本次 attempt**新挂的 server；缺它则
+      manager 已登记的 config（先登记后启动）在失败后残留，形成「未启用却在运行期权威配置集可见」的半态
+      （#289 审查 🟡1 / 协议 §2.4）。确无摘除需求时传 no-op 实现即可。
     """
-    if register_server is not None and existing_bundle_ids is None:
+    if register_server is None:
+        return
+    if existing_bundle_ids is None:
         raise PluginInstallError(
             "existing_bundle_ids is required when register_server is given "
             "(else a dependency-satisfied server would be silently overwritten instead of reused; protocol §2.5-1)",
+        )
+    if remove_server is None:
+        raise PluginInstallError(
+            "remove_server is required when register_server is given "
+            "(else a failed enable cannot unmount the attempt servers it just registered — the manager keeps their "
+            "config and they stay visible in the runtime authority set; pass a no-op if unmount is truly not wanted; "
+            "protocol §2.4)",
         )
 
 
@@ -412,6 +1008,7 @@ async def materialize_plugin(
     project_path: str | None = None,
     version: str | None = None,
     refresh: bool = False,
+    allow_clone: bool = True,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     existing_bundle_ids: ExistingBundleIds | None = None,
@@ -436,6 +1033,7 @@ async def materialize_plugin(
 
     :param scope: 物化记录 scope（``managed|user|project|local``，默认 ``user``）。
     :param version: 记录版本覆盖（``--version``）；缺省按 entry > plugin.json > commitSha 解析。
+    :param allow_clone: ``False``（#268 迁移）→ 禁止任何 clone / 不删既有外树；根不可复用即抛。
     :return: 写入的 :class:`InstalledPluginRecord`。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
@@ -460,6 +1058,7 @@ async def materialize_plugin(
         home,
         commit_sha,
         refresh=refresh,
+        allow_clone=allow_clone,
         timeout=timeout,
         env=env,
     )
@@ -502,6 +1101,53 @@ async def materialize_plugin(
     return record
 
 
+# ``staging.locate_plugin_root`` 的「plugin 根缺失」公开文案前缀。迁移文档 §2 让用户正是照这句话对照症状，
+# 故它事实上是公开契约；本模块据此区分「相对源根缺失」与同一分支里的其它 staging 失败（越界 / clone 失败）。
+_LOCAL_ROOT_MISSING_PREFIX = "plugin root not found after resolve"
+
+
+def _install_recovery_tail(
+    plugin_id: str, entry: Mapping[str, Any], manifest: Mapping[str, Any], error: BaseException
+) -> str:
+    """
+    install 失败的恢复指引尾段 / Recovery tail appended to install failures（#278）。
+
+    0.5.0 的 ``plugin uninstall`` / ``plugin gc`` 会删掉 marketplace **共享 clone 内**的相对源子树，此后
+    ``plugin install`` 报「根缺失」。这种损坏最可靠的恢复是「``marketplace remove`` → ``add`` 重 clone → 重装」
+    （0.5.1 的 ``marketplace refresh`` 会重新 clone，也能还原上游仍存在的被删文件，但本地与上游一致时无变化，
+    故不作首选），**仅对相对源的根缺失**附完整指引（复用 enable 路径的 :func:`_enable_recovery_hint`），
+    并在其后补齐共享指引未覆盖的三件事：先确认上游确有该路径、先记录 source URL / 注册名、remove 的级联代价
+    与 add 的 ``--trust``。
+
+    其余情形一律**不给指引**（与 rust-sdk 同单一致）：
+    - 独占 clone（``url`` / ``github`` / ``cnb`` / ``git-subdir``）：``marketplace remove`` 会**级联卸载**该
+      marketplace 的全部插件并撤销 trust，却修不好「plugin 自己的 clone / 上游 subdir / 网络」问题；而
+      ``plugin uninstall`` 在此处是死路——安装失败不写账本，:func:`uninstall_plugin` 无记录即 no-op 返回
+      ``False``（CLI 退出码 1 且不删残留 clone），随后 ``install`` 复用同一坏 clone 复现同一错误；
+    - 相对源的**越界声明**（根并非缺失）：重 clone 拿到的还是同一份坏清单。
+
+    **绝不二次抛出**（except 内的错误转换自身不得可抛）：source 解析失败按「不给 remove/add」处理，只影响这段
+    附加文案，绝不顶替主错误。
+    """
+    # 同一 ``plugin_id`` 已在 :func:`install_plugin` 入口经 ``_split_plugin_id`` 校验，此处不会抛。
+    _plugin, marketplace = _split_plugin_id(plugin_id)
+    try:
+        resolved = resolve_plugin_source(entry.get("source"), plugin_root=plugin_root_base(manifest))
+    except Exception:  # noqa: BLE001 - 诊断辅助：判定失败退回通用文案，绝不影响主错误
+        return ""
+    if isinstance(resolved, LocalPluginSource) and str(error).startswith(_LOCAL_ROOT_MISSING_PREFIX):
+        return (
+            f"\n{_enable_recovery_hint(plugin_id)} "
+            f"Before 'marketplace remove': confirm the plugin path still exists in the upstream repository (the local "
+            f"clone is the damaged copy, so looking at it is misleading), and record the marketplace source URL and "
+            f"registered name ('marketplace info {marketplace}' works before removal). 'marketplace remove' cascades "
+            f"— it uninstalls EVERY plugin of that marketplace and revokes its trust; do not pass '--keep-plugins' "
+            f"(it leaves orphan records). When re-adding non-interactively, pass '--trust'. "
+            f"Install does not activate: after a successful reinstall run 'plugin enable {plugin_id}'."
+        )
+    return ""
+
+
 async def install_plugin(
     plugin_id: str,
     registry: SkillRegistry,  # noqa: ARG001 - 签名与 uninstall/enable/disable 对称；v0.3.0 install 不再触碰 Registry
@@ -511,6 +1157,7 @@ async def install_plugin(
     project_path: str | None = None,
     version: str | None = None,
     refresh: bool = False,
+    allow_clone: bool = True,
     timeout: float = DEFAULT_GIT_TIMEOUT,
     env: Mapping[str, str] | None = None,
     existing_bundle_ids: ExistingBundleIds | None = None,
@@ -542,8 +1189,24 @@ async def install_plugin(
     catalog_dir = marketplace_skill_dir(home, marketplace)
     if not catalog_dir.is_dir():
         raise PluginInstallError(f"marketplace {marketplace!r} catalog not cloned at {catalog_dir} (run 'marketplace add/refresh' first)")
-    if find_plugin_entry(read_marketplace_manifest(catalog_dir), plugin) is None:
+    try:
+        manifest = read_marketplace_manifest(catalog_dir)
+    except PluginManifestError as e:
+        # #263 四轮：catalog 的 marketplace.json 损坏/缺失同属本地配置问题 → 结构化错误（不 traceback）。
+        raise PluginInstallError(
+            f"marketplace {marketplace!r} manifest invalid: "
+            f"{safe_exception_text(e)}"
+        ) from None
+    entry = find_plugin_entry(manifest, plugin)
+    if entry is None:
         raise PluginInstallError(f"plugin {plugin!r} not found in marketplace {marketplace!r} manifest")
+
+    # 1.4：跨 marketplace 裸名唯一性（skill.md §1.5；#257 / conformance §5）。必须早于下面任何写盘——
+    #      含 :func:`migrate_legacy_installs` 的迁移标记键（那时才从账本回填意图的存量插件才会「冒出来」）。
+    facts = _install_facts(home=home, env=env)
+    conflicts = _bare_name_conflicts(plugin_id, facts=facts, allow_if_installed=True)
+    if conflicts:
+        raise _bare_name_conflict_error(plugin_id, conflicts, action="install", ledger_pids=facts.ledger_pids)
 
     # 1.5：预检过后、写意图键之前，先跑一次性迁移（幂等、标记键短路）。install 会写 installedPlugins 键——
     #      若迁移尚未发生（如升级后未经 boot 的 headless CLI install），先写键会把迁移标记误置为"已迁移"，
@@ -551,7 +1214,7 @@ async def install_plugin(
     migrate_legacy_installs(home, env=env)
 
     # 2：config-first 写全局安装意图（快照写前状态供原子回滚：重装时原已在 → 失败不误删）
-    was_present = _write_installed_plugin(plugin_id, True, env)
+    was_present = _write_installed_plugin(plugin_id, True, env, home=home, guard_bare_name=True)
 
     # 3-4：物化；失败回滚意图（best-effort，不掩盖原异常）
     try:
@@ -562,16 +1225,35 @@ async def install_plugin(
             project_path=project_path,
             version=version,
             refresh=refresh,
+            allow_clone=allow_clone,
             timeout=timeout,
             env=env,
             existing_bundle_ids=existing_bundle_ids,
         )
-    except Exception:
+    except Exception as e:
         if not was_present:
             try:
                 _write_installed_plugin(plugin_id, False, env)
-            except Exception as e:  # noqa: BLE001 - 回滚 best-effort
-                logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, e)
+            except Exception as rollback_exc:  # noqa: BLE001 - 回滚 best-effort
+                logger.warning("install rollback: failed to revert installedPlugins entry %r: %s", plugin_id, rollback_exc)
+        # #263：source / staging / manifest 非法属本地配置问题（非崩溃）→ 结构化错误上抛，
+        # CLI 经 _plugin_error 输出（无 traceback）。消息只取各异常**已脱敏**的文本，不在此重新拼接原始值。
+        if isinstance(e, SkillSourceError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} source invalid: {safe_exception_text(e)}"
+            ) from None
+        if isinstance(e, SkillStagingError):
+            # #278：附恢复指引——但**只有相对源的根缺失**（0.5.0 旧卸载删了共享 catalog 子树）才劝 remove/add，
+            # 判据与措辞见 :func:`_install_recovery_tail`；source / manifest 分支不附。
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} plugin staging failed: "
+                f"{safe_exception_text(e)}{_install_recovery_tail(plugin_id, entry, manifest, e)}"
+            ) from None
+        if isinstance(e, PluginManifestError):
+            raise PluginInstallError(
+                f"marketplace {marketplace!r} plugin manifest invalid: "
+                f"{safe_exception_text(e)}"
+            ) from None
         raise
 
     logger.info(
@@ -594,7 +1276,8 @@ async def uninstall_plugin(
     remove_server: RemoveServer | None = None,
 ) -> bool:
     """
-    卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据回收** MCP 依赖 + 删账本记录）/ Uninstall。
+    卸载单个 plugin（删 plugin 独占外部 clone + 注销 skills（**仅账本记录全部移除时**）+ **按判据回收** MCP 依赖
+    + 删账本记录）/ Uninstall。
 
     **MCP 依赖回收**（协议 §4.9.1-2，#153/D3+F1）：plugin 声明依赖的 server **不是**它的所有物，故卸载
     **不无条件收回**——逐个过 :func:`~a2c_smcp.computer.settings.reconciler.reclaimable_mcp_deps`：
@@ -607,18 +1290,46 @@ async def uninstall_plugin(
     一并 best-effort——managed/policy 只读层不触碰）。指定 ``scope`` 仅删该 scope 记录且其余 scope 仍在 →
     意图与 enabled 条目保留（安装事实未消失）。
 
+    **skills 拆除（#262 裁决 A）**：与文件（#258）和 server（``retained_records``）**同源于 ``retained`` 记录集合，
+    但粒度不同**——文件看「retained 的 installPath 是否仍引用该 clone」、server 看「retained 声明的依赖」、
+    skills 看「是否还有 retained 记录」。故 retained 记录 installPath 缺失/损坏时文件侧会删 clone 而 skills 仍保留，
+    是**有意分叉**（#262 验收用例固化），勿把一侧改成另一侧。
+    仅当该 pid 的账本记录**全部移除**时才注销其全部 skills（含孤儿）；指定 ``scope`` 卸载且其余 scope 记录仍在
+    → registry **完全不动**（活跃与孤儿原样）。判据是「有无 retained 记录」，**不是**「是否指定了 ``scope``」：
+    只装了一个 scope 时指定该 scope 卸载，记录即全部移除，照常注销。
+    ``retained`` 只计**本次写盘后仍在账本中的记录**——旧格式（``bundledMcpServers``）记录按 §4.9.1-4 会被
+    sweep，**不算存活**（#275；判据来自 :func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`，
+    clone 门控 / server 回收 / skills 注销三个消费者共用**这一份** ``retained`` 定义）。其补集 ``doomed``
+    （= ``targeted`` ∪ 非目标 legacy）是**删除/回收候选**：删 clone、回收 server、清 enabled 三面都按它取——
+    只按 ``targeted`` 取会在「目标 scope 指向共享 catalog、非目标 legacy 指向唯一独占 clone」时漏删（#275 复审 🔴），
+    在被 sweep 的 legacy 记录带来 project 层 ``enabledPlugins`` 时漏清（🟡1），在唯一声明者被 sweep 时漏回收（🟡2）。
+
+    **失败序（#275 / §5.5）**：② 删树 → ③ 回收依赖（``remove_server``，唯一可达的可抛外部调用）→ ④ 注销 skills
+    → ⑤ 删账本记录 + 清意图/enabled。③ 抛错时账本、意图、技能**一律原样**，重试可自愈（已删的 clone 按
+    「缺失即视为已删除」收敛）；**不做 best-effort teardown**——吞掉停摘失败再提交账本会把「plugin 已卸但
+    server 仍可调用」写死。
+
     :func:`gc_plugins` 的显式单 plugin 对应物。``--keep-servers`` 跳过 server 摘除（保留 config）。
     ``scope=None`` 删该 id 全部记录；指定 scope 仅删该 scope 记录（其余 scope 保留）。未安装 → ``False``（no-op）。
 
+    :raises PluginInstallError: 独占外部 clone 删除失败（软链重定向 / OSError）——账本与安装意图保持不变，
+        残留 clone 仍有索引可重试；调用方 MUST NOT 当作 no-op。
+
     .. note::
-       **相对源 plugin**（``source`` 为相对路径）的 ``installPath`` 位于**共享 catalog clone 内**
-       （``<home>/marketplace/<mp>/plugins/<plugin>``），:func:`_safe_rmtree` 删的是该 marketplace 共享 git
-       工作树的子目录——此行为与兄弟 :func:`gc_plugins` 一致（同一 ``_safe_rmtree`` 语义、非本工单新引入）；
-       后续 ``marketplace refresh`` 遇脏树会 fallback 全量重 clone 干净恢复。「仅删外部 ``.plugins/`` 树、跳过
-       catalog 内子树」的行为收敛是 installer + gc 的**跨切 follow-up**（须两处一致，避免与 #62 的 gc 分叉）。
+       **文件归属（#258 方案 A，对齐 rust-sdk#271）**：只有 **plugin 独占的外部 clone**
+       ``<home>/marketplace/.plugins/<mp>/<plugin>`` 会被删除（:func:`remove_plugin_install_path`；``git-subdir``
+       删整个 clone 根），且仅在**没有 retained 记录**（指定 scope 之外的其余 scope）的 ``installPath`` 仍引用该
+       clone 时删除。相对源（``source: "./plugins/x"``）的 ``installPath`` 位于**共享 catalog clone**
+       ``<home>/marketplace/<mp>/…``——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，
+       MUST NOT 在此删除；该树的清理**只**归 ``marketplace remove`` / ``prune``（#260 起 reconcile 对声明换源
+       一律 ``validation`` 拒绝，**不再** wipe 重 clone）。``marketplace refresh``（#260 起为「重新 clone 到
+       staging + 原子换入」）**会**还原上游仍存在的被删路径——本地 clone 与上游一致时仍无变化（没有可恢复的
+       内容），彻底重建请 ``marketplace remove`` + ``add``。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    installed = load_installed_plugins(home=home, env=env)
+    # ``drop_legacy=False``（#257 审查 🔴3）：v0.2.x 旧格式账本记录在默认视图里被整条丢弃 → 早返回 no-op，
+    # 令冲突诊断给出的 ``plugin uninstall`` 补救在 headless CLI 上永远无效（migrate 在早返回之后）。
+    installed = load_installed_plugins(home=home, env=env, drop_legacy=False)
     records = installed.get("plugins", {}).get(plugin_id)
     if not records:
         logger.info("uninstall: plugin %r not installed (no-op)", plugin_id)
@@ -634,10 +1345,22 @@ async def uninstall_plugin(
     migrate_legacy_installs(home, env=env)
 
     # ① 停摘候选 + 回收判定，**先于任何删除**取得（§4.9.1-3：名单 MUST 在账本记录移除之前取得，且 MUST 仅依赖
-    #    账本自身字段——``installPath`` 指向的树在下面就被删了，「从 install_path 重解析」在本路径恒不成立）。
-    #    ``retained``：scoped uninstall 时本 pid 其余 scope 的记录仍声明依赖 ⇒ 仍算依赖者，不可回收。
-    deps = sorted(ledger_mcp_deps_of(targeted))
-    retained = [r for r in records if r not in targeted]
+    #    账本自身字段——与 installPath 指向的树是否删除无关；#258 起 catalog 内的树不再被本函数删除）。
+    #    ``retained`` = **存活记录**（本次操作的写盘完成后仍在账本中的记录），三消费者共用同一份定义：
+    #    clone 门控 / server 回收 / skills 注销。**必须**剔除 legacy 记录（#275，协议 §4.9.1-4）：
+    #    ``records`` 取自 ``drop_legacy=False`` 原始视图（#257 审查 🔴3 承重墙），而 ⑤ 的
+    #    ``update_installed_plugins`` 落盘时按默认视图把旧格式记录整条 sweep——若把 legacy 记录算作存活，
+    #    scoped uninstall 会留下「账本/意图/enabled 全清、registry 仍有技能、独占 clone 无人引用（泄漏）」的
+    #    自相矛盾终态。判据与 sweep 本体同源（:func:`~a2c_smcp.computer.settings.store.is_legacy_ledger_record`）。
+    retained = [r for r in records if r not in targeted and not is_legacy_ledger_record(r)]
+    #    ``doomed`` = 本次写盘后**不再存在**的记录 = targeted ∪ 非目标 legacy（落盘时被 §4.9.1-4 sweep）。
+    #    三面都按它取而非按 ``targeted``（#275 复审 🔴）：删 clone 候选、server 回收候选、enabled 清理面。
+    #    只取 ``targeted`` 会漏掉「目标 scope 指向共享 catalog、非目标 legacy 指向唯一独占 clone」形态——
+    #    ``retained`` 门控说可删，删除循环却拿不到那条 legacy 记录的 installPath ⇒ clone 永久留盘
+    #    （账本已空 ⇒ 再 uninstall 是 no-op、gc 只遍历账本 pid）。删除侧自带归属校验
+    #    （:func:`remove_plugin_install_path` 仅删 plugin 独占 clone，共享 catalog 返回 ``None``），纳入安全。
+    doomed = [r for r in records if r in targeted or is_legacy_ledger_record(r)]
+    deps = sorted(ledger_mcp_deps_of(doomed))
     ledger_plugins = installed.get("plugins", {})
     reclaim = reclaimable_mcp_deps(
         deps,
@@ -647,23 +1370,61 @@ async def uninstall_plugin(
 
     # ①.5 破坏性动作之前预检待写 settings 的目标键形状（#246 审查 🟡1）：畸形 → 零副作用 fail-closed，
     #      否则会在「已删树」之后才抛错，而重试因账本已空走 no-op → 永远清不干净。
+    #      预检面 = 后续**真的会清**的 enabled 层，且门控与末段严格同源：末段仅在 ``not retained``（账本记录
+    #      全部移除、回 available）时才清 project/local 层。故 ``retained`` 非空时按 ``targeted`` 预检（既有口径），
+    #      **不得**把被 sweep 的 legacy 记录 projectPath 纳入——那会为一个根本不会写的层 fail-closed，把增量前
+    #      能成功的卸载变成失败且重试不自愈（#275 复审 🟡1）。
+    precheck_paths = targeted if retained else doomed
     _precheck_settings_writes(
-        {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p},
+        {p for r in precheck_paths if isinstance(p := r.get("projectPath"), str) and p},
         env,
     )
 
-    # ② 删树 → ③ 注销 skills → ④ 回收依赖 → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3）
-    for rec in targeted:
-        install_path = rec.get("installPath")
-        if isinstance(install_path, str) and install_path:
-            _safe_rmtree(Path(install_path), home)
+    # #258：按「引用」判定而非记录数——仅当**没有 retained 记录**的 installPath 落在该 plugin 独占外部 clone
+    # 内时才删除。跨 scope 源类型变化（user=Git 源 / project=相对源）按记录数门控会在先卸 user 时误保留 clone，
+    # 随后卸 project 又不再命中 → 永久泄漏（对齐 rust-sdk#271 复审终版；多 scope 的 skills/servers 拆除另案 #262）。
+    # 口径与 rust 终版一致：缺 / 空 / 非 str / 损坏或相对路径的 retain 记录**不**算引用（删除侧另有 canonicalize
+    # + Home 守卫兜底）；归属判定本身纯词法，不解析 installPath 链上的软链。
+    ext_clone_still_referenced = any(
+        is_external_plugin_install_path(Path(ip), home, marketplace, plugin)
+        for r in retained
+        if isinstance(ip := r.get("installPath"), str) and ip
+    )
 
-    for name in _plugin_skill_names(registry, marketplace, plugin):
-        registry.unregister(name)
+    # ② 删树 → ③ 回收依赖 → ④ 注销 skills → ⑤ 删账本记录（⑤ 恒在末位，勿前移，见 §4.9.1-3；③ 先于 ④ 见 #275）
+    if not ext_clone_still_referenced:
+        for rec in doomed:  # #275 复审 🔴：候选 = 写盘后不再存在的记录，非仅 targeted（见 ① 的 ``doomed``）
+            install_path = rec.get("installPath")
+            if isinstance(install_path, str) and install_path:
+                # 只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
+                try:
+                    remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                except InstallPathRemovalError as e:
+                    # 删除失败（软链重定向 / resolve 异常 / rmtree OSError）→ 抛错并保持账本与意图不变；
+                    # 布尔 ``False`` 的公开契约仍只表示「未安装 no-op」，避免调用方误报 not installed。
+                    raise PluginInstallError(
+                        f"failed to remove exclusive clone for {plugin_id!r}: {e}; ledger and intent preserved",
+                    ) from e
 
+    # ③ 回收 MCP 依赖——**先于 skills 注销**（#275 失败序）：``remove_server`` 是本函数唯一可达的可抛外部
+    #    调用（``McpStartGateClosed`` 关闸 / 状态机 / 传输异常；``KeyError`` 经 ``Computer.aunmount_server_by_id``
+    #    的成员预检不可达，仅并发 TOCTOU）。先注销技能再停摘，它一抛就是「账本说已安装、技能已丢」半态；
+    #    反序则失败时账本/意图/技能一律原样，重试可自愈（已删 clone 的重试按「缺失即视为已删除」收敛）。
+    #    **不选 best-effort teardown**：吞掉失败再提交账本会把「plugin 已卸但 server 仍可调用」写死（§5.5）。
     if not keep_servers and remove_server is not None:
         for bundle_id in reclaim:
             await remove_server(bundle_id)
+
+    # ④ 注销 skills——**仅当该 pid 账本记录全部移除**（#262 裁决 A）：``retained`` 非空（指定 scope 卸载、其余
+    #    scope 仍在）时 registry 不动。判据与文件（#258 的 retained 引用）、server（``retained_records``）同源，
+    #    且判据是「有无 retained 记录」而**非**「是否指定了 scope」；否则同进程内技能消失、重启 boot 又按保留
+    #    记录重 stage——同一操作前后矛盾。
+    #    全部记录移除时连孤儿一并注销（#257 审查 🔴2）：``disable → uninstall`` 的残留孤儿会被跨 source 守卫
+    #    当作「先到者」，令后续换源 install/enable 永久失败且本进程内无命令可清。uninstall 是「该 plugin 彻底消失」，
+    #    含孤儿才闭环。
+    if not retained:
+        for name in _plugin_skill_names(registry, marketplace, plugin, include_orphans=True):
+            registry.unregister(name)
 
     def _drop(data: InstalledPluginsFile, _pid: str = plugin_id, _scope: str | None = scope) -> None:
         plugins = data["plugins"]
@@ -683,7 +1444,9 @@ async def uninstall_plugin(
     remaining = load_installed_plugins(home=home, env=env).get("plugins", {}).get(plugin_id)
     if not remaining:
         _write_installed_plugin(plugin_id, False, env)
-        project_paths = {p for r in targeted if isinstance(p := r.get("projectPath"), str) and p}
+        # #275 复审 🟡1：取 ``doomed`` 而非 ``targeted``——被 sweep 的非目标 legacy 记录若带 ``projectPath``，
+        # 其 project/local 层的 ``enabledPlugins[id]=true`` 同样必须清掉，否则重装即激活（违反 §2.4 install 不激活）。
+        project_paths = {p for r in doomed if isinstance(p := r.get("projectPath"), str) and p}
         _clear_enabled_entries_visible_layers(plugin_id, project_paths, env)
     logger.info(
         "uninstalled plugin %r (scope=%s, MCP deps declared=%s, reclaimed=%s)",
@@ -802,6 +1565,186 @@ async def disable_plugin(
     logger.info("disabled plugin %r (scope=%s, MCP deps reclaimed=%s, skills orphaned)", plugin_id, scope, reclaim or "none")
 
 
+# ── enable 失败回滚：诊断 + §4.9.1-2 attempt 分类（#289）/ rollback diagnostics ──
+def _default_settings_provider(env: Mapping[str, str] | None) -> ResolvedSettingsProvider:
+    """
+    缺省合并视图 provider：``user < project < local`` + **ambient policy**（进程级可得）。
+
+    flag 层仍不可知（宿主实例轴才能提供）→ REPL / 一次性 CLI 注入 flag-aware provider。policy 必须纳入：
+    admin 强停（``enabledPlugins: false``，协议 §5 item 10）会令「user=true」的有效态变 disabled，漏读会把
+    反向误报成 retained（不是少报，是报反）。``anchor=None``（user scope 操作）回退进程 cwd。
+    """
+
+    def _provider(anchor: str | None) -> Mapping[str, Any]:
+        # 延迟导入：policy 解析在进程内按 env 现算（与 Computer._settings_axes / CLI 同源），避免模块级开销。
+        from a2c_smcp.computer.settings.policy import resolve_policy_settings
+
+        return resolve_settings(
+            env=env, cwd=Path(anchor) if anchor else None, policy_settings=resolve_policy_settings(env=env),
+        ).settings
+
+    return _provider
+
+
+def _effective_enabled(plugin_id: str, provider: ResolvedSettingsProvider, anchor: str | None) -> bool | None:
+    """
+    合并视图里 ``enabledPlugins[pid] is True`` 是否为真（诊断用，不驱动破坏性动作）。
+
+    **必须现算**（写前 / 回滚写后各一次）：复用同一快照会把「prior-absent + 回滚写失败」误报成 retained。
+    求值失败 → ``None``（诊断降级为「未 retained」），**绝不在错误路径二次抛**。
+    """
+    try:
+        merged = provider(anchor)
+        enabled = merged.get("enabledPlugins") if isinstance(merged, Mapping) else None
+        return isinstance(enabled, Mapping) and enabled.get(plugin_id) is True
+    except Exception as e:  # noqa: BLE001 - 诊断不得顶替原异常
+        logger.debug("enable diagnostic: cannot resolve merged settings at anchor %r: %s", anchor, exception_text(e))
+        return None
+
+
+def _enable_failure_error(exc: BaseException) -> PluginInstallError:
+    """
+    enable 阶段任意异常 → 结构化 :class:`PluginInstallError`（协议 §2.4「失败 MUST 返回结构化诊断」）。
+
+    ``MarketplaceNameChangeError`` 的转换（#296）保持不变（``error_code`` / ``details`` 含 ``reason``）；
+    已是 ``PluginInstallError`` 者原样返回；其余（register / staging 回调的裸异常等）归一为
+    ``reason=enable-failed``，**文本先脱敏**（:func:`~a2c_smcp.utils.diagnostics.exception_text`）。原异常由上抛处的
+    ``raise ... from exc`` 保留，不吞。
+    """
+    if isinstance(exc, MarketplaceNameChangeError):
+        return PluginInstallError(str(exc), error_code=exc.error_code, details=exc.payload_details())
+    if isinstance(exc, PluginInstallError):
+        return exc
+    text = exception_text(exc)
+    logger.debug("enable failed with unexpected %s; normalizing to PluginInstallError: %s", type(exc).__name__, text)
+    return PluginInstallError(text, details={"reason": REASON_ENABLE_FAILED})
+
+
+def _raise_enable_failure(exc: BaseException, *, retained: bool, plugin_id: str, scope: str) -> NoReturn:
+    """
+    enable 失败的统一出口：可选 retained 包装后上抛（原异常经 ``__cause__`` 保留）。
+
+    ``retained`` 须由调用方按**回滚前 ∧ 回滚后**合并视图现算——只判回滚后会误报（见 ``_effective_enabled``）。
+    """
+    base = _enable_failure_error(exc)
+    if retained:
+        # 日志同样只落脱敏文本（裸 ``exc`` 可能是带渲染 secret 的 pydantic ValidationError）。
+        logger.warning(
+            "enable failed; existing enabled state retained (plugin=%s, scope=%s): %s",
+            plugin_id,
+            scope,
+            exception_text(exc) if not isinstance(exc, PluginInstallError) else str(exc),
+        )
+        raise EnableFailedRetainedError(base) from exc
+    # 非 retained 出口也保证机读 `reason`（源自有 reason 如 #296 的 manifest-name-changed 优先保留）。
+    base.details.setdefault("reason", REASON_ENABLE_FAILED)
+    if base is exc:
+        raise exc
+    raise base from exc
+
+
+def _attempt_server_modes(
+    attempted: Iterable[str],
+    *,
+    ledger_plugins: Mapping[str, object],
+    plugin_id: str,
+    user_declared: set[str] | None,
+) -> dict[str, str]:
+    """
+    本次 attempt 的 server 清理模式（§4.9.1-2 三档）/ Cleanup mode of this enable attempt's servers.
+
+    判据与 disable/uninstall 同源（:func:`reclaimable_mcp_deps`），但**输入是本次 attempt 的 bundle_id 集**
+    ——操作前已挂载者不在此集合（existing-wins skip），因此不连坐既有实例。“其他 plugin”取账本记录
+    （含 disabled，§4.9.1-2 字面「声明依赖」）；``user_declared=None`` ⇒ 无法判定归属，按
+    ``remove_plugin_contribution_unknown_owner`` 处理。
+
+    **三档动作相同**（运行期 unmount；durable 声明不动）：``remove_server`` 契约要求实现只做运行期停摘，
+    「回收条目」在 Python 侧没有额外 durable 动作可做（plugin 声明在 manifest / 账本记录里，不随 unmount 删）。
+    模式只作结构化日志分类，不驱动破坏性动作。
+    """
+    bundle_ids = list(dict.fromkeys(attempted))
+    if user_declared is None:
+        return {bundle_id: "remove_plugin_contribution_unknown_owner" for bundle_id in bundle_ids}
+    reclaimable = set(
+        reclaimable_mcp_deps(
+            bundle_ids,
+            other_deps=other_plugin_mcp_deps(ledger_plugins, exclude_pid=plugin_id),
+            user_declared=user_declared,
+        ),
+    )
+    return {bundle_id: ("reclaim" if bundle_id in reclaimable else "remove_plugin_contribution") for bundle_id in bundle_ids}
+
+
+def _rollback_enable_skills(
+    registry: SkillRegistry,
+    marketplace: str,
+    plugin: str,
+    skills_before: Mapping[str, tuple[A2CSkillRef, bool]],
+) -> None:
+    """
+    enable 失败后回滚 SKILL 投影（回滚基线 = 操作前快照）/ Restore the SKILL projection to its pre-operation state.
+
+    本次新增 → unregister；调用前已存在的条目 → 按快照**回填 ref 内容**（同 source 走 ``register_or_update``
+    的 update 分支，恢复 path / description / version），调用前是孤儿的再回孤儿态（不是本次新增，不注销）；
+    既有活跃条目内容也一并复原。best-effort：失败只 WARN，绝不顶替原始 enable 失败。
+    """
+    try:
+        names = _plugin_skill_names(registry, marketplace, plugin, include_orphans=True)
+    except Exception as e:  # noqa: BLE001 - 回滚 best-effort，不得顶替原异常
+        logger.warning("enable rollback: enumerating SKILL projection failed: %s", exception_text(e))
+        return
+    for name in names:
+        # 逐 name 自守卫：单条恢复失败不得放弃其余条目（否则正是本分支要消除的「投影半态」）。
+        try:
+            before = skills_before.get(name)
+            if before is None:
+                registry.unregister(name)
+                continue
+            ref, was_orphan = before
+            registry.register_or_update(ref)  # 同 source → update：恢复操作前 ref 内容
+            if was_orphan:
+                registry.mark_orphan(name)
+        except Exception as e:  # noqa: BLE001 - 逐项 best-effort
+            logger.warning("enable rollback: restoring SKILL %r failed: %s", name, exception_text(e))
+
+
+async def _rollback_enable_servers(
+    attempted: Sequence[str],
+    *,
+    ledger_plugins: Mapping[str, object],
+    plugin_id: str,
+    non_plugin_bundle_ids: NonPluginBundleIds | None,
+    remove_server: RemoveServer | None,
+) -> None:
+    """
+    写后失败：清理**本次 attempt** 新挂的 server（§2.4 写后失败 / §4.9.1-2）。
+
+    ``attempted`` 已在 register **之前**登记，含 register 失败者（manager 先登记 config 再启动，失败不回滚
+    登记 ⇒ 必须显式停摘，否则「未启用却出现在运行期权威配置集」的半态残留）。既有实例不在集合内。
+    分类回调 / 停摘自身失败都只降级（WARN / unknown_owner），不阻断 raw 恢复、不顶替原异常。
+    """
+    if remove_server is None or not attempted:
+        return
+    user_declared: set[str] | None = None
+    if non_plugin_bundle_ids is not None:
+        try:
+            user_declared = set(non_plugin_bundle_ids())
+        except Exception as e:  # noqa: BLE001 - 分类降级 unknown_owner
+            logger.warning("enable rollback: non_plugin_bundle_ids() failed; server ownership unknown: %s", exception_text(e))
+    modes = _attempt_server_modes(
+        attempted, ledger_plugins=ledger_plugins, plugin_id=plugin_id, user_declared=user_declared,
+    )
+    for bundle_id in dict.fromkeys(attempted):
+        try:
+            await remove_server(bundle_id)
+        except Exception as e:  # noqa: BLE001 - 回滚 best-effort
+            logger.warning(
+                "enable rollback: remove_server(%r) failed (mode=%s): %s", bundle_id, modes[bundle_id], exception_text(e),
+            )
+        else:
+            logger.info("enable rollback: attempt server %r cleaned (mode=%s; runtime unmount only)", bundle_id, modes[bundle_id])
+
+
 async def enable_plugin(
     plugin_id: str,
     registry: SkillRegistry,
@@ -814,9 +1757,30 @@ async def enable_plugin(
     existing_bundle_ids: ExistingBundleIds | None = None,
     register_server: RegisterServer | None = None,
     remove_server: RemoveServer | None = None,
+    non_plugin_bundle_ids: NonPluginBundleIds | None = None,
+    resolved_settings: ResolvedSettingsProvider | None = None,
 ) -> None:
     """
-    启用单个 plugin（**原子激活**：skills 与 bundled server 一并入投影，失败回滚 ``installed_disabled``）/ Enable。
+    启用单个 plugin（**原子激活**：skills 与 bundled server 一并入投影）/ Enable a plugin atomically.
+
+    **失败回滚按 runtime-contract §2.4 / Discussion#82 裁决 C（#289）——目标是恢复「操作前状态」，不是一律
+    回 ``installed_disabled``**：
+
+    - **预检失败（零写）**：不写 settings、不动 registry / hook。被写 scope 的 raw pre-state 保持（absent 不写
+      false、false / true 精确保持）；有效 prior-true 时既有 skills / server / 能力全部不动。
+    - **写后失败**：本 scope 的 ``enabledPlugins`` **精确恢复**调用前原值（absent → 删键，不升级成显式 false；
+      true / false 原样写回）；本次 stage 的 SKILL 撤销，**操作前已存在的 orphan / 活跃条目保持 pre-state**；
+      只清理**本次 attempt 新挂**的 server（含 register 失败者——manager 先登记 config 再启动，失败不回滚登记），
+      按 §4.9.1-2 三档分类记日志（动作一律运行期 unmount，durable 声明不动）。
+    - **诊断**：回滚**前 ∧ 回滚后**的合并视图（``user < project < local`` + **ambient policy**；flag 层由
+      调用方 provider 注入，缺省不可知）均为 enabled → 抛 :class:`EnableFailedRetainedError` 明示「既有启用
+      状态已保留」；其余失败统一为 :class:`PluginInstallError`（原异常经 ``__cause__`` 保留，不吞）。
+      前置错误（非法 id / 未安装 / 非法 scope / 缺 projectPath）不包装。
+    - **已知边界（与 rust 一致）**：raw pre-state 取**校验后视图**——``enabledPlugins[pid]`` 为非 bool 畸形值
+      （如 ``"yes"``）时按 absent 处理；协议 §2.4 只定义 ``true`` / ``false`` / absent 三态。
+
+    **回滚是 best-effort**：撤销本次新增的 skill / server 与恢复 ``enabledPlugins`` 各自独立尝试，任一失败只记
+    ``enable rollback: ...`` WARNING 而**不掩盖**最初那个异常（③.6 的消息也据此不承诺「一定已恢复」）。
 
     **依赖已满足 ⇒ 复用既有实例**（协议 §2.5-1，#153/D3）：声明的 ``bundle_id`` 若已在运行期活跃集里，
     **跳过 register**——既有实例（用户 mcp.json 声明的，或他 plugin 带入的）胜出，本 plugin 复用它而非覆盖。
@@ -830,31 +1794,61 @@ async def enable_plugin(
     ``collect_enabled_bundled_servers``（plugin 集内 first-wins、不与用户声明比对）**同姿态**，parity 保持；
     且协议 §5 item 10 明定 plugin 声明 MUST NOT 进审批门，故门控结果本就不该反向决定 plugin 基线。
 
-    v0.3.0 §2.4「enable 原子性」：顺序 ① 从物化记录的 ``installPath`` 重解析 bundled servers →
-    **依赖预检（先于 settings 写）**；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills →
-    写 ``enabledPlugins[id]=true``；③ 复活 skills——re-stage（:func:`stage_marketplace_skills` 的
-    :meth:`register_or_update` 把孤儿同名翻 ``orphaned=False``，``refresh=False`` 复用既有 clone）；
-    ④ 重挂 servers。③/④ 任一失败 → **回滚**：注销本次新增 skill、摘除本次新增 server（经 ``remove_server``）、
-    ``enabledPlugins`` 恢复原值（原 absent → 删条目）→ 上抛，净效果回 ``installed_disabled``。
-    未安装 → :class:`PluginInstallError`（须先 install）。
+    顺序：① 裸名冲突防御 + **内容预检**（:func:`_preflight_enable_content`，#259，零持久化变更前）→
+    依赖预检；② 快照该 scope ``enabledPlugins`` 原值 + 本 plugin 已活跃 skills → 写 ``enabledPlugins[id]=true``；
+    ③ 复活 skills（re-stage：孤儿同名翻活，``refresh=False`` 复用既有 clone）；④ 重挂尚未满足的 servers。
+
+    :param non_plugin_bundle_ids: §2.5-5 带 origin 的**声明面**中 ``origin != plugin`` 的 bundle_id 集（同步回调，
+        每次现算）。仅用于写后失败时对本次 attempt 做 §4.9.1-2 三档**分类日志**；``None`` ⇒ 按
+        ``remove_plugin_contribution_unknown_owner`` 处理（动作相同）。回调抛错只降级、不阻断回滚。
+    :param resolved_settings: 合并 settings 视图 provider（入参 = 诊断锚点：project/local 操作为该路径，
+        user 操作为 ``None``）。仅用于 retained 诊断；``None`` ⇒ 用 :func:`_default_settings_provider`
+        （``user < project < local`` + ambient policy；``None`` 锚回退进程 cwd）。
+
+    :raises PluginInstallError: 未安装；内容预检失败（#259——账本记录 ``installPath`` 缺失 / bundled JSON 不可解析 /
+        声明 server 不可解析 / 声明 SKILL 零投影），在**任何持久化变更之前**抛出并保持操作前状态；或写后失败
+        （原异常经 ``__cause__`` 保留）。回滚前 ∧ 回滚后合并视图均 enabled 时抛其子类
+        :class:`EnableFailedRetainedError`。
 
     ⚠️ **scope 契约**：同 :func:`disable_plugin`——``scope`` 须与安装 scope 一致（调用方 / #69 从上下文传），否则
     ``enabledPlugins[id]=true`` 写错层、与 live 态背离。
     """
     plugin, marketplace = _split_plugin_id(plugin_id)
-    _require_existing_ids_guard(existing_bundle_ids, register_server)
+    _require_enable_callbacks_guard(existing_bundle_ids, register_server, remove_server)
     installed = load_installed_plugins(home=home, env=env)
     records = installed.get("plugins", {}).get(plugin_id)
     if not records:
         raise PluginInstallError(f"plugin {plugin_id!r} not installed; cannot enable (run 'plugin install' first)")
 
-    # ① 重解析 bundled servers（不重 clone，从记录 installPath 读）+ 依赖预检（零持久化变更前）
-    servers: list[MCPServerConfig] = []
-    for rec in records:
-        install_path = rec.get("installPath")
-        if isinstance(install_path, str) and install_path:
-            servers.extend(load_bundled_servers(Path(install_path)))
-    existing = existing_bundle_ids() if existing_bundle_ids is not None else set()
+    # #289：诊断锚与写锚分离——写锚是本次 scope 的 settings 文件；诊断锚是**本次操作**的 project/local 路径
+    # （user 操作为 None，由 provider 决定 runtime 缺省）。prior 必须在任何写/预检之前现算。
+    diagnostic_anchor = project_path if scope in ("project", "local") else None
+    provider = resolved_settings if resolved_settings is not None else _default_settings_provider(env)
+    prior_effective = _effective_enabled(plugin_id, provider, diagnostic_anchor)
+
+    # 0：跨 marketplace 裸名防御（#257 决策 2）——先于 enabledPlugins 写 / stage / 挂 server。存量双装
+    #    （升级前两 marketplace 均已 install）升级后只能先 uninstall 被遮蔽的一方，不得靠 enable 触发覆盖。
+    #    零写失败：按 prior 决定是否明示 retained。
+    try:
+        facts = _install_facts(home=home, env=env)
+        conflicts = _bare_name_conflicts(plugin_id, facts=facts)
+        if conflicts:
+            raise _bare_name_conflict_error(plugin_id, conflicts, action="enable", ledger_pids=facts.ledger_pids)
+    except Exception as exc:
+        _raise_enable_failure(exc, retained=prior_effective is True, plugin_id=plugin_id, scope=scope)
+
+    # ① 内容预检（#259，零持久化变更前）：记录仍有效物化 + 声明内容可完整投影 + 拒绝半态
+    #    （判据复用 reconciler；不重物化、不重 clone）→ 聚合 bundled servers 供依赖预检与挂载复用。
+    try:
+        preflight = _preflight_enable_content(plugin_id, plugin, marketplace, home, records)
+    except Exception as exc:
+        _raise_enable_failure(exc, retained=prior_effective is True, plugin_id=plugin_id, scope=scope)
+    servers = preflight.servers
+    try:
+        # 宿主回调：失败也属「enable 阶段任意异常」，统一归一为结构化诊断（零写，retained 只看 prior）。
+        existing = existing_bundle_ids() if existing_bundle_ids is not None else set()
+    except Exception as exc:
+        _raise_enable_failure(exc, retained=prior_effective is True, plugin_id=plugin_id, scope=scope)
     _log_satisfied_deps(servers, existing)
 
     # ② 快照回滚基线（该 scope 文件的原值：True/False/None=absent；本 plugin 已活跃 skill 集）→ 写 true
@@ -862,14 +1856,32 @@ async def enable_plugin(
     prior_settings, _errors = load_settings_file(settings_path, scope_enum)
     prior_enabled = prior_settings.get("enabledPlugins")
     prev_value: bool | None = prior_enabled.get(plugin_id) if isinstance(prior_enabled, Mapping) else None
-    skills_before = set(_plugin_skill_names(registry, marketplace, plugin))
-    _write_enabled_plugin(plugin_id, True, scope, project_path, env)
+    skills_before = _plugin_skill_state(registry, marketplace, plugin)
+    try:
+        _write_enabled_plugin(plugin_id, True, scope, project_path, env)
+    except Exception as exc:
+        # 写 true 可能已落盘（`os.replace` 成功、收尾 `os.close` 抛错等）→ 无条件 best-effort 恢复 pre-state
+        # （幂等但**会重写文件**：bool 分支恒走 `atomic_write_json`，仅 `value=None` 且键缺失才短路），
+        # 再按**回滚后**合并视图判定 retained（#289 终审 🟡5）。
+        try:
+            _write_enabled_plugin(plugin_id, prev_value, scope, project_path, env)
+        except Exception as e:  # noqa: BLE001 - 回滚 best-effort
+            logger.warning(
+                "enable rollback: failed to restore enabledPlugins[%s]=%r: %s", plugin_id, prev_value, exception_text(e),
+            )
+        post_effective = _effective_enabled(plugin_id, provider, diagnostic_anchor)
+        _raise_enable_failure(
+            exc, retained=prior_effective is True and post_effective is True, plugin_id=plugin_id, scope=scope,
+        )
 
-    registered: list[str] = []
+    # 本次 attempt 新挂的 server（register **之前**登记：register 可能已让 manager 登记 config 后失败，
+    # 那份残留必须由回滚显式停摘，否则「未启用却出现在运行期权威配置集」半态残留；既有实例已在 ④ skip）。
+    attempted: list[str] = []
     try:
         # ③ 复活 skills（re-stage：register_or_update 翻活孤儿；复用既有 clone）
+        registry.drain_source_conflicts()  # 清掉此前无关流程（如 marketplace add）留下的跨源记录
         source, _commit_sha = _resolve_marketplace_source(marketplace, home, env)
-        await stage_marketplace_skills(
+        staged = await stage_marketplace_skills(
             marketplace,
             source,
             registry,
@@ -879,31 +1891,63 @@ async def enable_plugin(
             timeout=timeout,
             env=env,
         )
+        # ③.5 跨 source 复核（#257 复审 🔴1/🔴2）：staging 对同名异源条目的拒绝是静默的（记 ERROR、不抛），
+        #     若不复核，enable 会「假成功」——enabledPlugins=true、server 已挂，但 get_skills 里是别的
+        #     marketplace 的技能。**只认本次 staging 真正被拒的 name**（drain 记录）——按 plugin 前缀猜会把
+        #     「同 plugin、skill 名不同」的正常注册误判成冲突（把可用路径打死）。转结构化错误 → 走既有回滚。
+        want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
+        refused = [
+            conflict
+            for conflict in registry.drain_source_conflicts()
+            if conflict.name.startswith(f"{plugin}:") and conflict.refused_source == want_source
+        ]
+        if refused:
+            raise _source_conflict_error(plugin_id, refused, home=home, env=env)
+        # ③.6 stage 零注册兜底（#259 审查 🔴2 / 架构师复审 🟡2）：预检只按「SKILL.md 存在」判可投影，而真实
+        #     装载还会因 frontmatter 缺 description / 名字非法 / catalog 清单不可读而**静默跳过**（staging 的逐
+        #     plugin 降级不抛）。判据必须取**本次** stage 的返回值（`register_or_update` 对既有同源条目也返回 True，
+        #     `staged` 非空即「本次装载工作正常」）——查 registry 里的旧活跃集会被旧投影掩盖本次失败。
+        #     installPath 内确有 SKILL.md 包、却零注册 → 不得报「启用成功」；转结构化错误走既有回滚。
+        #     **不改** staging 的全局降级（recovery/reconciler 依赖它），只收口 enable 调用方。
+        if preflight.expects_skills and not staged:
+            raise PluginInstallError(
+                f"plugin {plugin_id!r} ships SKILL packages but staging registered none (invalid SKILL.md "
+                f"frontmatter, duplicate SKILL names, or an unreadable marketplace manifest); a restore of "
+                f"enabledPlugins to its previous value was attempted but may not have succeeded "
+                f"(check the logs for an 'enable rollback' warning). {_enable_recovery_hint(plugin_id)}"
+            )
         # ④ 挂载依赖：仅挂**尚未满足**者；已满足 → 复用既有实例，不覆盖（§2.5-1）
         if register_server is not None:
             for cfg in servers:
                 bundle_id = resolve_bundle_id(cfg)
                 if bundle_id in existing:
                     continue
+                attempted.append(bundle_id)  # 身份 = bundle_id：按 name 记会在「同名异 id」时回滚摘错对象
                 await register_server(cfg)
-                registered.append(bundle_id)  # 身份 = bundle_id：按 name 记会在「同名异 id」时回滚摘错对象
-    except Exception:
-        # 回滚（逆序，best-effort 不掩盖原异常）：撤销本次新增 skill / server，enabledPlugins 恢复原值。
-        # ``registered`` 只含本次真正挂上的（依赖已满足者已在 ④ skip），故此处无需再判「是否本来就在」。
-        for name in _plugin_skill_names(registry, marketplace, plugin):
-            if name not in skills_before:
-                registry.unregister(name)
-        if remove_server is not None:
-            for bundle_id in registered:
-                try:
-                    await remove_server(bundle_id)
-                except Exception as e:  # noqa: BLE001 - 回滚 best-effort
-                    logger.warning("enable rollback: remove_server(%r) failed: %s", bundle_id, e)
+    except Exception as exc:
+        # 回滚（既有顺序不变：skills → attempt servers → raw；各段自守卫，原异常永不被回滚步骤顶替）。
+        _rollback_enable_skills(registry, marketplace, plugin, skills_before)
+        await _rollback_enable_servers(
+            attempted,
+            ledger_plugins=installed.get("plugins", {}),
+            plugin_id=plugin_id,
+            non_plugin_bundle_ids=non_plugin_bundle_ids,
+            remove_server=remove_server,
+        )
         try:
             _write_enabled_plugin(plugin_id, prev_value, scope, project_path, env)
         except Exception as e:  # noqa: BLE001 - 回滚 best-effort
-            logger.warning("enable rollback: failed to restore enabledPlugins[%s]=%r: %s", plugin_id, prev_value, e)
-        raise
+            logger.warning(
+                "enable rollback: failed to restore enabledPlugins[%s]=%r: %s", plugin_id, prev_value, exception_text(e),
+            )
+        # retained 判据 = 回滚**前 ∧ 后**合并视图均 enabled（**回滚写之后现算**，不得复用 prior 快照）。
+        post_effective = _effective_enabled(plugin_id, provider, diagnostic_anchor)
+        _raise_enable_failure(
+            exc,
+            retained=prior_effective is True and post_effective is True,
+            plugin_id=plugin_id,
+            scope=scope,
+        )
     logger.info("enabled plugin %r (scope=%s, skills recovered, servers remounted)", plugin_id, scope)
 
 

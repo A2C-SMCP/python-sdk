@@ -16,9 +16,10 @@ gc。MCP 注入回调（``existing_bundle_ids`` / ``register_server`` / ``remove
 REPL dispatcher 从活跃 ``Computer`` 装配后注入；Typer 非交互无 live Computer → 传 ``None``。
 
 **v0.3.0 语义（#123）**：``plugin install`` 只安装**不激活**（不挂 server、不投影 skills → ``installed_disabled``；
-仅传 ``existing_bundle_ids`` 做依赖预检）；``plugin enable`` 才原子点亮 skills + bundled server（挂载失败
-回滚 ``installed_disabled``，故 enable 也注入 ``remove_server``）。``plugin list`` 默认列出**全部已安装**
-（enabled 列呈现两态；install 后必须可见）。
+仅传 ``existing_bundle_ids`` 做依赖预检）；``plugin enable`` 才原子点亮 skills + bundled server（失败按协议 §2.4
+恢复**操作前状态**——预检零写、写后 raw 精确恢复 + 本次 attempt server 清理，可能保留既有 enabled 状态并给出
+retained 诊断；故 enable 注入 ``remove_server``）。``plugin list`` 默认列出**全部已安装**（enabled 列呈现两态；
+install 后必须可见）。
 
 **plugin 实时挂载 D2 上下文渲染（#69 Group A，§9.3 D2）**：plugin 的 ``mcp-servers/inputs.json`` 入池时 id
 前缀化为 ``<plugin>@<marketplace>/<id>``；enable 挂载 bundled server 时，``_plugin_register_cb`` 携
@@ -28,7 +29,9 @@ inputs 注入 Computer 池。
 
 **MCP 批准框（#69 Group B，§9.2）**：:func:`run_mcp_approval` 在 REPL 启动期跑——解析 ``.tfrobot/mcp.json``
 定义层、套门控、对 ``PENDING`` server 弹 y/a/n（写 local scope）；非交互无 TTY → skip+WARN（``--approve-all-mcp``
-可全批、仅本次不落盘）。bundled / user-flag-policy origin 免批准（门控已判 ENABLED）。
+可全批、仅本次不落盘）。user/local/flag/policy origin 免批准（门控已判 ENABLED）；**bundled server 不在本
+门内**（它由 :func:`run_governance_remount` 的 #159 Option B 信任层把关：受信 scope 免批准，project-origin
+落 PENDING）。
 """
 
 from __future__ import annotations
@@ -38,14 +41,18 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from rich.table import Table
 
 from a2c_smcp.computer.cli.commands import (
     build_mcp_callbacks,
     flag_value,
     format_settings_errors,
+    print_unknown_subcommand,
     resolved_settings,
+    resolved_settings_provider_of,
     resolved_settings_with_errors,
+    settings_axes_of,
 )
 from a2c_smcp.computer.cli.progress import clone_spinner
 from a2c_smcp.computer.cli.utils import console
@@ -58,6 +65,7 @@ from a2c_smcp.computer.settings.installer import (
     PluginInstallError,
     RegisterServer,
     RemoveServer,
+    ResolvedSettingsProvider,
     disable_plugin,
     enable_plugin,
     install_plugin,
@@ -65,6 +73,7 @@ from a2c_smcp.computer.settings.installer import (
     uninstall_plugin,
 )
 from a2c_smcp.computer.settings.mcp_config import (
+    MCP_DECLARATION_FIELD_PREFIXES,
     McpApprovalStatus,
     approve_all_project_mcp,
     approve_mcp_server,
@@ -82,10 +91,20 @@ from a2c_smcp.computer.settings.reconciler import (
     list_dangling_plugin_intents,
     list_orphan_plugins,
 )
-from a2c_smcp.computer.settings.schema import SettingsScope
+from a2c_smcp.computer.settings.recovery import (
+    GovernanceRecoveryReport,
+    MarketplaceDeclarationError,
+    MarketplaceSourceConflict,
+    sanitize_marketplace_name,
+    sanitize_marketplace_text,
+    sanitize_prefixed_name_field,
+    sanitize_source_path,
+)
+from a2c_smcp.computer.settings.schema import SettingsScope, SettingsValidationError
 from a2c_smcp.computer.skills.manifest import MCP_INPUTS_FILENAME, MCP_SERVERS_SUBDIR
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
+from a2c_smcp.utils.diagnostics import exception_text
 from a2c_smcp.utils.env_segment import detect_env_name_collisions
 from a2c_smcp.utils.logger import get_logger
 
@@ -103,8 +122,31 @@ def _err(msg: str, *, json_output: bool, code: int = EXIT_USER_ERROR, error_code
         payload: dict[str, Any] = {"error": error_code or "error", "message": msg, **extra}
         console.print_json(data=payload)
     else:
-        console.print(f"[red]✗ {msg}[/red]")
+        # #263：msg 可含不可信 source 文本（如 `[/red]`），必须转义 rich 标记——否则 MarkupError 会把
+        # 「结构化错误」重新变成 traceback（与 validate.py 的 `escape(issue.message)` 同一约定）。
+        console.print(f"[red]✗ {escape(msg)}[/red]")
     return code
+
+
+# ``details`` 中与 :func:`_err` 关键字参数 / payload 保留字段同名的键：展开前过滤，避免静默改退出码、
+# 在 ``except`` 内抛 ``TypeError``，或覆盖类别码与人读文案（#257 架构师审查 🟡3）。
+_RESERVED_DETAIL_KEYS = frozenset({"error", "message", "msg", "code", "json_output", "error_code"})
+
+
+def _plugin_error(e: PluginInstallError, *, json_output: bool) -> int:
+    """
+    把结构化 :class:`PluginInstallError` 翻成 CLI 错误输出 / Render a structured installer error.
+
+    ``error_code`` / ``details`` 由 installer 侧按需填写：跨 marketplace 同名冲突 = ``validation`` +
+    ``conflictWith``（``<plugin>@<marketplace>``），身份坍缩 = ``validation`` + ``bundleId``（裸 bundle_id，
+    #271）；未填写时 payload 仍是 ``{"error": "error", ...}``，既有契约不变（#257）。
+    #289 的 :class:`~a2c_smcp.computer.settings.installer.EnableFailedRetainedError` 是
+    ``PluginInstallError`` 子类且**继承**源的 ``error_code`` / ``details``，故无需剥壳——retained 的
+    ``enabledStateRetained: true`` 与源 ``reason`` 都自然进 ``--json`` payload。
+    保留键先被过滤，再统一委托 :func:`_err`（决策 4：不另起一套 payload/退出码渲染）。
+    """
+    details = {key: value for key, value in e.details.items() if key not in _RESERVED_DETAIL_KEYS}
+    return _err(str(e), json_output=json_output, error_code=e.error_code, **details)
 
 
 def _ok(msg: str) -> int:
@@ -169,12 +211,18 @@ def _inject_inputs_collision_safe(comp: Any, inputs: list[MCPServerInput], *, so
         # 据实分述，且不写死「两者」——坍缩组可 >2 个成员（如 a-b / a.b / a@b / a_b 四者同名）。
         now = sorted(i for i in ids if i in candidates)
         kept = sorted(i for i in ids if i not in candidates)
-        detail = f"{', '.join(repr(i) for i in now)}（本次跳过 / skipped）"
+        # id / name / source 全是不可信值（mcp.json 可随仓库分发；plugin 名来自账本）：逐段 escape，否则
+        # 两个 `[/]` 形态 id 坍缩到同一 env 名时 rich 抛 MarkupError，异常逸出 `run_mcp_approval` ⇒ 整门跳过。
+        # #304 item 2：id / env 名同样走**名字漏斗**（整值）——`alice:pw@mp` 这类 id 会回显 userinfo。
+        now_safe = [sanitize_marketplace_name(i) for i in now]
+        kept_safe = [sanitize_marketplace_name(i) for i in kept]
+        name_safe = sanitize_marketplace_name(name)
+        detail = f"{escape(', '.join(repr(i) for i in now_safe))}（本次跳过 / skipped）"
         if kept:
-            detail += f"；{', '.join(repr(i) for i in kept)}（池内既有，未受影响 / already in pool, untouched）"
+            detail += f"；{escape(', '.join(repr(i) for i in kept_safe))}（池内既有，未受影响 / already in pool, untouched）"
         console.print(
-            f"[red]❌ {source}: 以下 input id 均映射到同一环境变量名 {name!r} —— {detail}。请改 id 消歧 / "
-            f"input ids collide on one env var name; rename to disambiguate[/red]",
+            f"[red]❌ {escape(source)}: 以下 input id 均映射到同一环境变量名 {escape(repr(name_safe))} —— {detail}。"
+            "请改 id 消歧 / input ids collide on one env var name; rename to disambiguate[/red]",
         )
     for inp in inputs:
         if inp.id in skipped:
@@ -197,7 +245,75 @@ def _plugin_inject_inputs_cb(comp: Any, plugin: str, marketplace: str) -> Inject
     return _inject
 
 
-async def run_governance_remount(comp: Any, *, settings_flag_path: Path | None = None) -> None:
+# ── #294：治理恢复三类信号的 CLI 展示行（纯格式化，供单测钉住措辞）─────────────
+#
+# 三类**文案锚点各不相同**，既给用户分档信号，也让测试能区分「CLI 行」与 recovery 的 WARN/DEBUG 渠道：
+#   · 声明错误（配置错误，**未参与**恢复）  → ``settings.json[<scope>]``
+#   · 源冲突（仍按**旧源**恢复）           → ``declared source differs``
+#   · 降级（``failed_marketplaces``）      → ``degraded during``
+# 文案对拍 rust ``cli/commands/mod.rs`` 的 ``marketplace_declaration_error_line`` / ``marketplace_source_conflict_line``
+# （rust 的降级行是内联的，python 侧把它也提成纯函数以便单测）：冲突与降级**只展示脱敏后的市场名**，
+# 两侧 source 明细仍只在 recovery 的逐条 DEBUG 里（用户 2026-11-22 裁决）。**每条记录一行**（n 条即 n 行）。
+def marketplace_declaration_error_line(error: MarketplaceDeclarationError) -> str:
+    """非法 ``extraKnownMarketplaces`` 声明被 settings 校验丢弃的提示行（#294）/ Declaration-error line."""
+    return (
+        f"⚠ settings.json[{error.scope.value}]: {error.field} — {error.reason} "
+        f"(declaration ignored; existing registration unchanged)"
+    )
+
+
+def marketplace_source_conflict_line(conflict: MarketplaceSourceConflict) -> str:
+    """
+    声明源与已注册源不一致的提示行（#294，**name-only**）/ Source-conflict line.
+
+    判据是「声明的 source ≠ 已注册 source」，既覆盖确实不同源、也覆盖无法证明等价（scp vs https 等写法
+    差异 → fail-closed），故文案写 ``differs from, or cannot be proven equivalent to`` 而非断言不同。
+    """
+    return (
+        f"⚠ marketplace {conflict.marketplace!r}: declared source differs from, or cannot be proven "
+        f"equivalent to, the registered source; declaration rejected (keeping the registered source; "
+        f"remove + re-add the marketplace to switch sources)"
+    )
+
+
+def marketplace_degraded_line(marketplace: str) -> str:
+    """marketplace 源不可达 / clone 重建失败的降级提示行（#287 起既有行为，#294 收归纯函数）/ Degraded line."""
+    return f"⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)"
+
+
+def mcp_declaration_error_line(error: SettingsValidationError) -> str:
+    """
+    ``mcp.json`` 声明校验错误的**单行展示摘要**（#304 item 2，展示安全）/ One display-safe summary line.
+
+    旧行为把整条 dataclass repr（``scope`` / ``field`` / ``reason`` / ``source_path``）顶到终端；
+    本函数只留三段：``field`` 的 ``servers.`` / ``inputs.`` 残段是手编 map key（可含 userinfo），
+    **整值**过名字漏斗；``reason`` 走散文漏斗（name-mismatch 文案内嵌原始 ``name`` 值）；
+    ``source_path`` **不进摘要**——完整明细见 :func:`mcp_declaration_error_detail`（DEBUG 渠道）。
+    控制字符 / Cf 由两个漏斗 scrub，sink 仍须自带 ``escape()``。
+    """
+    field = sanitize_prefixed_name_field(error.field, prefixes=MCP_DECLARATION_FIELD_PREFIXES)
+    return f"⚠ mcp.json[{error.scope.value}]: {field} — {sanitize_marketplace_text(error.reason)}"
+
+
+def mcp_declaration_error_detail(error: SettingsValidationError) -> str:
+    """
+    ``mcp.json`` 声明错误的**完整明细**（#304 item 2；只进 DEBUG 日志）/ Full detail for DEBUG logs.
+
+    四段全部走展示漏斗：``field``（名字段）/ ``reason``（散文，可内嵌原始 ``name``）/
+    ``source_path``（路径轴 fail-closed，None → ``<unknown>``）；控制字符 / 方向覆写已被各漏斗 scrub。
+    **只供日志阅读**，不得用于再解析 / 比较 / 去重。
+    """
+    field = sanitize_prefixed_name_field(error.field, prefixes=MCP_DECLARATION_FIELD_PREFIXES)
+    source = "<unknown>" if error.source_path is None else sanitize_source_path(error.source_path)
+    return (
+        f"scope={error.scope.value} field={field} reason={sanitize_marketplace_text(error.reason)} "
+        f"source_path={source}"
+    )
+
+
+async def run_governance_remount(
+    comp: Any, *, settings_flag_path: Path | None = None,
+) -> GovernanceRecoveryReport:
     """
     启动期治理重挂（#117 设计 Y 的 client 接线参考实现）/ Boot-time governance remount (reference client wiring)。
 
@@ -212,29 +328,64 @@ async def run_governance_remount(comp: Any, *, settings_flag_path: Path | None =
     - ``existing_bundle_ids`` **必传**（#153：取 :func:`build_mcp_callbacks` 装配的**运行期权威**集，
       **不是** ``comp.mcp_servers`` 构造期快照——后者 CLI 下恒空，会把已挂的用户 server 判成不存在、
       令 bundled server 覆盖它）：同 bundle_id 已有 = 依赖已满足 → reconcile_governance 内部 skip（用户配置胜）；
-      bundled **免批准**（§5.10 不走 project 信任门），单点失败不阻断。
+      **仅受信 scope origin（user/local/flag/policy）免信任层**；project-origin 激活的 bundled server 走
+      #159 Option B 的 PENDING 审批门、**不自动挂载**（§5.10 的免批准只覆盖受信来源；#293 起本路径取
+      ``ResolvedSettings.per_scope_layers`` ⇒ 与 ``declared=None`` 路径同门，见
+      :meth:`Computer.reconcile_governance`）。单点失败不阻断。
+    - #293：declared 传**整对象** ``ResolvedSettings``（``resolved_settings_with_errors``）而非裸
+      ``.settings`` dict——其中被 settings 校验整条丢弃的非法 ``extraKnownMarketplaces`` 声明必须进入
+      :attr:`~a2c_smcp.computer.settings.recovery.GovernanceRecoveryReport.marketplace_declaration_errors`，
+      否则 CLI 展示面拿到的是空列表。**#294 起本函数分档打印三类信号**（见下）。
+    - #294 展示：按 rust 同序（降级 → 源冲突 → 声明错误）把三类信号各打一行，文案锚点各不相同、不合并
+      计数、**每条记录一行**：``failed_marketplaces``（降级，能力未恢复）/
+      ``marketplace_source_conflicts``（声明源 ≠ 已注册源，仍按旧源恢复）/
+      ``marketplace_declaration_errors``（settings 校验丢弃的非法声明，未参与恢复）。冲突与降级**只展示
+      脱敏市场名**（name-only，两侧 source 仍只在 recovery 的 DEBUG 里）；无 ``--json``（REPL 启动路径的
+      内部函数，root ``--json`` 不覆盖）。
+
+    :return: 本次恢复报告（供调用方 / #294 消费；历史调用方可忽略返回值）。
     """
     env = os.environ
-    declared = resolved_settings(env, flag_path=settings_flag_path)
+    declared = resolved_settings_with_errors(env, flag_path=settings_flag_path)
 
     async def _register(cfg: Any, record: Any) -> None:
         # #137 ③：治理重挂 = 投影（ledger 是真相），走 transient amount_server，不回写 mcp.json。
         # #208：``start=False`` —— 本回调**只挂载**；启动统一收在挂载循环之后，经批量启动器走同一
         # Computer 级并发上限（否则 mount 与 start 仍在循环内融合，上限被前 N 个绕过）。
         await comp.amount_server(cfg, plugin=record.plugin, marketplace=record.marketplace, start=False)
-        console.print(f"[green]✓ restored bundled MCP server {cfg.name!r} (plugin {record.plugin_id})[/green]")
+        # 名称来自 **marketplace 分发内容**（`mcp-servers/<name>.json`，裸 str）：不转义时该行抛 MarkupError，
+        # 被 `reconcile_governance` 的 per-server 兜底吞成 WARN——server 已挂（start=False）却永不批量启动，
+        # 且成功行丢失（复审 🟡1，同为既存缺陷）。
+        console.print(
+            f"[green]✓ restored bundled MCP server {escape(repr(cfg.name))} "
+            f"(plugin {escape(str(record.plugin_id))})[/green]",
+        )
 
     async def _inject(record: Any) -> None:
         _inject_plugin_inputs(comp, record.install_path, record.plugin, record.marketplace)
 
-    report = await comp.reconcile_governance(
+    # ``comp`` 是 ``Any``（CLI 对 Computer 鸭子类型）⇒ 显式标注返回值，避免 ``no-any-return``。
+    report: GovernanceRecoveryReport = await comp.reconcile_governance(
         existing_bundle_ids=build_mcp_callbacks(comp).existing_bundle_ids,
         register_server=_register,
         inject_inputs=_inject,
         declared=declared,
     )
+    # #294：三类信号分档展示，**顺序与 rust 对拍**（降级 → 源冲突 → 声明错误）。**只消费 report 字段**，
+    # 不重新检测、不重新解析 settings。与 recovery 的 WARN/DEBUG 是两个渠道：日志级别调高或
+    # `A2C_SMCP_LOG_SILENT` 时 CLI 行仍可见（用户 2026-11-22 裁决接受同次启动出现多条同义提示）。
+    #
+    # `escape()` 在这里是**承重的、且不是防崩溃那么简单**：rich 会把 `settings.json[<scope>]` 里的
+    # `[<scope>]` 当成样式标签**吞掉**（实测未转义时输出只剩 `settings.json:`，scope 信息丢失），
+    # `field` / 市场名里的 `[/]`、`[bold]` 同样会被吃掉；形状不巧时（无开标签配对的 `[/]`）还会抛
+    # MarkupError（#260 复审同族）。故三条行一律整行转义。
     for marketplace in report.failed_marketplaces:
-        console.print(f"[yellow]⚠ marketplace {marketplace!r} degraded during governance recovery (skills/servers not restored)[/yellow]")
+        console.print(f"[yellow]{escape(marketplace_degraded_line(marketplace))}[/yellow]")
+    for conflict in report.marketplace_source_conflicts:
+        console.print(f"[yellow]{escape(marketplace_source_conflict_line(conflict))}[/yellow]")
+    for error in report.marketplace_declaration_errors:
+        console.print(f"[yellow]{escape(marketplace_declaration_error_line(error))}[/yellow]")
+    return report
 
 
 def _satisfied_deps(deps: list[str], existing_bundle_ids: ExistingBundleIds | None) -> list[str]:
@@ -287,7 +438,7 @@ async def plugin_install(
                 existing_bundle_ids=existing_bundle_ids,
             )
     except PluginInstallError as e:
-        return _err(str(e), json_output=json_output)
+        return _plugin_error(e, json_output=json_output)
 
     deps = record.get("mcpServers") or []
     if json_output:
@@ -313,7 +464,8 @@ async def plugin_uninstall(
     json_output: bool = False,
 ) -> int:
     """
-    卸载单个 plugin（删 installPath 树 + 注销 skills + **按判据**回收 bundled server + 删账本）/ Uninstall a plugin。
+    卸载单个 plugin（删 plugin 独占外部 clone，共享 catalog 保留 + 注销 skills + **按判据**回收 bundled server +
+    删账本）/ Uninstall a plugin。
 
     :class:`PluginInstallError` → ``_err`` 退出码 1（#246 审查 🔴A）：settings raw 写入 fail-closed 后本命令可抛
     （目标键畸形 / 文件 corrupt），不翻译就会以未捕获异常逃成 traceback。
@@ -329,7 +481,7 @@ async def plugin_uninstall(
             remove_server=remove_server,
         )
     except PluginInstallError as e:
-        return _err(str(e), json_output=json_output)
+        return _plugin_error(e, json_output=json_output)
     if not ok:
         return _err(f"plugin {plugin_id!r} not installed (no-op)", json_output=json_output)
     if json_output:
@@ -348,13 +500,21 @@ async def plugin_enable(
     register_server: RegisterServer | None = None,
     remove_server: RemoveServer | None = None,
     inject_inputs: InjectInputs | None = None,
+    non_plugin_bundle_ids: NonPluginBundleIds | None = None,
+    resolved_settings: ResolvedSettingsProvider | None = None,
     json_output: bool = False,
 ) -> int:
-    """启用单个 plugin（**原子激活**：skills 与 bundled server 一并点亮，失败回滚 installed_disabled）/ Enable。
+    """启用单个 plugin（**原子激活**：skills 与 bundled server 一并点亮，失败恢复操作前状态）/ Enable。
 
     **scope 契约**（installer §4.3）：从 ledger 逐 scope 读安装 scope 传入，绝不默认 ``user``，否则写错层、与 live
     态背离。多 scope 记录 → 逐 scope enable。挂载前先经 ``inject_inputs`` 把 plugin-scoped inputs 注入池（#69 Group A）；
-    ``remove_server`` 供挂载失败时回滚摘除本次新增 server（v0.3.0 §2.4 enable 原子性）。
+    ``remove_server`` 供写后失败时回滚停摘**本次 attempt 的全部** server（含 register 失败者；契约 = 运行期-only，
+    不删 durable 声明，见 :data:`~a2c_smcp.computer.settings.installer.RemoveServer`）。
+
+    **#289 失败诊断**：``non_plugin_bundle_ids`` / ``resolved_settings`` 透传给 :func:`enable_plugin`——
+    前者给本次 attempt 的 §4.9.1-2 分类，后者给 retained 判定（REPL 传实例轴 provider；一次性 CLI 经根级
+    ``--settings`` 传 flag 感知 provider；测试可省略）。retained 的 ``enabledStateRetained`` / ``reason`` 经
+    :func:`_plugin_error` 自然进 ``--json`` payload。
 
     「依赖已满足」提示 **MUST 在 enable 之前算**（协议 §2.5-1）：enable 会挂载未满足的依赖、改变活跃集，
     事后再算就分不清「本来就有」与「刚被自己挂上」——这与 install 路径（不挂载、事后算等价）不同。
@@ -362,7 +522,11 @@ async def plugin_enable(
     records = _installed_records(home, env, plugin_id)
     if not records:
         return _err(f"plugin {plugin_id!r} not installed (install it first)", json_output=json_output)
-    satisfied = _satisfied_deps(sorted({s for r in records for s in (r.get("mcpServers") or [])}), existing_bundle_ids)
+    try:
+        satisfied = _satisfied_deps(sorted({s for r in records for s in (r.get("mcpServers") or [])}), existing_bundle_ids)
+    except Exception as e:  # noqa: BLE001 - 纯提示性信息，宿主回调失败不得阻断 enable（#289 审查 🟡5）
+        logger.debug("plugin enable: cannot compute satisfied dependencies: %s", exception_text(e))
+        satisfied = []
     try:
         for rec in records:
             install_path = rec.get("installPath")
@@ -372,9 +536,10 @@ async def plugin_enable(
                 plugin_id, registry, home,
                 scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env,
                 existing_bundle_ids=existing_bundle_ids, register_server=register_server, remove_server=remove_server,
+                non_plugin_bundle_ids=non_plugin_bundle_ids, resolved_settings=resolved_settings,
             )
     except PluginInstallError as e:
-        return _err(str(e), json_output=json_output)
+        return _plugin_error(e, json_output=json_output)
     if json_output:
         console.print_json(data={"enabled": plugin_id, "scopes": [r.get("scope") for r in records]})
         return EXIT_OK
@@ -409,7 +574,7 @@ async def plugin_disable(
                 scope=str(rec.get("scope", "user")), project_path=rec.get("projectPath"), env=env, remove_server=remove_server,
             )
     except PluginInstallError as e:
-        return _err(str(e), json_output=json_output)
+        return _plugin_error(e, json_output=json_output)
     if json_output:
         console.print_json(data={"disabled": plugin_id, "scopes": [r.get("scope") for r in records]})
         return EXIT_OK
@@ -627,6 +792,18 @@ def _mount_dict(srv: Any) -> dict[str, Any]:
     return {**srv.config.model_dump(mode="json"), **dict(srv.ext)}
 
 
+def _server_name_for_display(name: str) -> str:
+    """MCP server 名的**展示值**（#295）：``repr`` 让控制字符/换行可见，``escape`` 中和 rich markup。
+
+    ``.tfrobot/mcp.json`` 的 server 名是**裸 str、无字符集约束**（``resolve_mcp_config`` 不校验）且可随仓库
+    分发：``evil[/]x`` 这类名字未转义时会让 rich 抛 ``MarkupError``，而 ``run_mcp_approval`` 的唯一调用方
+    （``interactive_impl``）会 ``except Exception`` 降级 —— **整个审批门被静默放弃**（恶意名之后的 server 不再
+    挂载/摘除/提示）。干净名与旧 ``{name!r}`` 的渲染逐字一致。
+    Display-safe server name: repr keeps control chars visible, escape neutralizes rich markup.
+    """
+    return escape(repr(name))
+
+
 async def run_mcp_approval(
     comp: Any,
     session: Any | None,
@@ -663,8 +840,12 @@ async def run_mcp_approval(
     resolved = comp.resolve_mcp_declarations(env=env)
 
     # 被 drop 的畸形 server/input 必须呈现（§5.6 / mcp_config 容错不静默，#69 Group B 风险 3）。
+    # #304 item 2：终端只留**摘要**（scope + 脱敏 field/reason），完整明细降 DEBUG——旧行为把整条
+    # dataclass repr 与原始 source_path 顶到终端。field/reason/source_path 均经展示漏斗（含 Cf/Cc scrub），
+    # 故 `escape()` 只需负责 rich markup；logger 用 `%s` 惰性格式化，绝不附异常对象。
     for e in resolved.errors:
-        console.print(f"[yellow]⚠ mcp.json: {e}[/yellow]")
+        logger.debug("mcp.json declaration error detail: %s", mcp_declaration_error_detail(e))
+        console.print(f"[yellow]{escape(mcp_declaration_error_line(e))}[/yellow]")
 
     if not resolved.servers:
         return
@@ -672,8 +853,11 @@ async def run_mcp_approval(
     # #157：scope 越权被过滤的字段必须有解释——否则用户只看到莫名的批准框（协议 §2.1「响亮失败」）。
     # 典型：仓库的 project settings.json 携 enableAllProjectMcpServers → 被过滤 → 此处告知该挪去 local/user。
     resolved_st = resolved_settings_with_errors(env, flag_path=settings_flag_path)
+    # `escape()`：`format_settings_errors` 的 field/reason 来自不可信 settings（点路径用原始 JSON 键拼），
+    # 手编 `extraKnownMarketplaces` 键即可注入 `[/]` —— 未转义时实测抛 MarkupError 并**跳过整个审批门**
+    # （#294 复审的可达崩溃；marketplace 子树的脱敏已由 #295 收口在 `format_settings_errors` 内）。
     for line in format_settings_errors(resolved_st.errors):
-        console.print(f"[yellow]{line}[/yellow]")
+        console.print(f"[yellow]{escape(line)}[/yellow]")
     settings = resolved_st.settings
     # #148/F8：审批门 MUST NOT 依赖账本 bundled 名集；plugin 声明**结构性**不入 resolve（无 plugin 入参 +
     # SettingsScope 无 PLUGIN 成员，见 schema.SCOPE_ORDER）⇒ 迭代物理上遇不到 plugin origin，无需过滤器
@@ -709,14 +893,17 @@ async def run_mcp_approval(
             # origin 判据直接表达意图，不受二者影响。守卫见
             # ``test_higher_layer_beats_embed_at_mount_time`` + ``test_embed_with_placeholder_is_not_remounted...``。
             if srv.origin is SettingsScope.EMBED and resolve_bundle_id(srv.config) in _active_bundle_ids():
-                console.print(f"[dim]· MCP server {name!r} already mounted from the embed layer (winner), left as is[/dim]")
+                console.print(
+                    f"[dim]· MCP server {_server_name_for_display(name)} already mounted from the embed layer "
+                    "(winner), left as is[/dim]",
+                )
                 return
             # #137 ③：boot 读**已声明** mcp.json 挂载 = 投影（盘上已是真相），走 transient amount_server，不回写
             # （否则每 boot 重复回写用户声明层 / scope 漂移，见 #138）。
             await comp.amount_server(_mount_dict(srv), session=session)
-            console.print(f"[green]✓ mounted MCP server {name!r}[/green]")
+            console.print(f"[green]✓ mounted MCP server {_server_name_for_display(name)}[/green]")
         except Exception as exc:  # 单个 server 挂载失败不阻断其余 / one failure must not block the rest
-            console.print(f"[red]✗ failed to mount MCP server {name!r}: {exc}[/red]")
+            console.print(f"[red]✗ failed to mount MCP server {_server_name_for_display(name)}: {escape(exception_text(exc))}[/red]")
 
     async def _ensure_unmounted(name: str) -> None:
         """DISABLED ⇒ 真的摘掉：embed 已被 boot_up 无门挂起，只打印不摘会让 policy 拒绝名单沦为装饰品。"""
@@ -725,15 +912,18 @@ async def run_mcp_approval(
             if bid not in _active_bundle_ids():
                 return  # 从未挂过（文件来源恒走此分支）→ 幂等 no-op，行为不变
             await comp.aunmount_server_by_id(bid)
-            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied) → unmounted[/dim]")
+            console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied) → unmounted[/dim]")
         except Exception as exc:
-            console.print(f"[red]✗ failed to unmount disabled MCP server {name!r}: {exc}[/red]")
+            console.print(
+                f"[red]✗ failed to unmount disabled MCP server {_server_name_for_display(name)}: "
+                f"{escape(exception_text(exc))}[/red]",
+            )
 
     for name, status in statuses.items():
         if status == McpApprovalStatus.ENABLED:
             await _ensure_mounted(name)
         elif status == McpApprovalStatus.DISABLED:
-            console.print(f"[dim]· MCP server {name!r} disabled (policy/denied), skipped[/dim]")
+            console.print(f"[dim]· MCP server {_server_name_for_display(name)} disabled (policy/denied), skipped[/dim]")
             await _ensure_unmounted(name)
         else:  # PENDING
             if approved_all_session:
@@ -741,12 +931,15 @@ async def run_mcp_approval(
                 continue
             if session is None:  # 非 TTY 且未 --approve-all-mcp → skip + WARN
                 console.print(
-                    f"[yellow]⚠ skipped pending MCP server {name!r} (no TTY); approve in REPL or pass --approve-all-mcp[/yellow]",
+                    f"[yellow]⚠ skipped pending MCP server {_server_name_for_display(name)} (no TTY); "
+                    "approve in REPL or pass --approve-all-mcp[/yellow]",
                 )
                 continue
             srv = resolved.servers[name]
             prompt = (
-                f"⚠ Unapproved workspace MCP server '{name}' (origin={srv.origin})\n"
+                # `{name!r}`（#295）：不含引号/反斜杠的普通名与旧 `'{name}'` 渲染一致；含引号 / 控制字符时
+                # 按 repr 转义（刻意如此），仓库分发的 mcp.json 不能借 server 名伪造审批提示行。
+                f"⚠ Unapproved workspace MCP server {name!r} (origin={srv.origin})\n"
                 "  [y]es this server · [a]ll project servers · [n]o (deny): "
             )
             ans = (await session.prompt_async(prompt)).strip().lower()
@@ -759,7 +952,7 @@ async def run_mcp_approval(
                 await _ensure_mounted(name)
             else:
                 deny_mcp_server(name)
-                console.print(f"[dim]· denied MCP server {name!r} (written to local scope)[/dim]")
+                console.print(f"[dim]· denied MCP server {_server_name_for_display(name)} (written to local scope)[/dim]")
 
 
 # ── REPL dispatcher（绑定 Computer 的活跃 registry / home / session）/ REPL adapter ──
@@ -769,12 +962,15 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
     args = parts[2:]
     registry = comp.skill_registry
     home = comp.skill_home
-    env = os.environ
+    # #296：与本进程其它 REPL 分派器（marketplace / settings）同源——env / cwd 统一取实例 settings 轴
+    # （``settings_axes_of``；``None`` = ambient / 进程 cwd），否则注入 env 的宿主里各面会读写不同根。
+    axes = settings_axes_of(comp)
+    env = axes.env
     json_output = "--json" in args
     pos = [a for a in args if not a.startswith("--")]
     cbs = build_mcp_callbacks(comp)
-    # #116：project/local scope 的 project_path 锚定进程 cwd（仅 install 分支消费；enable/disable 从 ledger 读 projectPath）。
-    project_path = os.getcwd()
+    # #116：project/local scope 的 project_path 锚定实例 cwd。仅 install 分支消费；enable/disable 从 ledger 读。
+    project_path = str(axes.cwd or os.getcwd())
 
     if sub == "install":
         if not pos:
@@ -820,6 +1016,9 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
             register_server=_plugin_register_cb(comp, plugin, marketplace),
             remove_server=cbs.remove_server,  # enable 失败回滚摘除本次新增 server（v0.3.0 原子性）
             inject_inputs=_plugin_inject_inputs_cb(comp, plugin, marketplace),
+            # #289：attempt 的 §4.9.1-2 分类 + retained 诊断（实例轴、flag/policy 感知）
+            non_plugin_bundle_ids=cbs.non_plugin_bundle_ids,
+            resolved_settings=resolved_settings_provider_of(comp),
             json_output=json_output,
         )
         if code == EXIT_OK:
@@ -856,7 +1055,7 @@ async def repl_dispatch(comp: Any, parts: list[str], *, session: Any) -> None:
         if code == EXIT_OK:
             comp.mark_skills_dirty()
     else:
-        console.print(f"[yellow]unknown plugin subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("plugin", sub)
 
 
 def _batch_teardown(remove_server: RemoveServer) -> Callable[[list[str]], Awaitable[None]]:

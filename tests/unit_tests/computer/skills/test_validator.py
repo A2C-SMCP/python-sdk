@@ -25,6 +25,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from a2c_smcp.computer.skills.validator import (
     CODE_DUPLICATE_PLUGIN_NAME,
     CODE_DUPLICATE_SKILL,
@@ -42,8 +44,10 @@ from a2c_smcp.computer.skills.validator import (
     CODE_REMOTE_SOURCE_SKIPPED,
     CODE_SKILL_DESC_MISSING,
     CODE_SKILL_MD_MISSING,
+    CODE_SKILL_MD_UNREADABLE,
     CODE_SKILL_NAME_INVALID,
     CODE_STRICT_CONFLICT,
+    CODE_UNREADABLE,
     validate_path,
 )
 
@@ -412,3 +416,276 @@ def test_override_from_plugin_json_strict_true(tmp_path: Path) -> None:
     r = validate_path(root)
     assert r.valid, [i.message for i in r.issues]
     assert "plugins/data-toolkit/alt-skills/report/SKILL.md" in r.checked
+
+
+# ── 诊断脱敏（#263）/ diagnostic redaction ─────────────────────────────────────
+# 校验结果的 message 会同时进 CLI 文本与 `--json`（validate.py 直接渲染 issue.message），
+# 因此断言 message 本身：不得含 userinfo / query / fragment 或内嵌凭据的名称。
+def _messages(result: Any) -> str:
+    return "\n".join(i.message for i in result.issues)
+
+
+def test_invalid_marketplace_name_with_credentials_is_redacted(tmp_path: Path) -> None:
+    root = _marketplace(tmp_path, {"name": "x=https://alice:PW_NAME@example.com/repo.git", "owner": {"name": "A"}, "plugins": []})
+    r = validate_path(root)
+    assert CODE_INVALID_NAME in _codes(r)
+    text = _messages(r)
+    assert "PW_NAME" not in text
+    assert "alice:" not in text
+    assert "https://example.com/repo.git" in text
+
+
+def test_invalid_plugin_source_with_credentials_is_redacted(tmp_path: Path) -> None:
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "bad", "source": "key=https://alice:PW_SRC@example.com/r.git"}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_INVALID_SOURCE in _codes(r)
+    text = _messages(r)
+    assert "PW_SRC" not in text
+    assert "alice:" not in text
+    assert "https://example.com/r.git" in text
+
+
+def test_remote_source_warning_redacts_url_credentials(tmp_path: Path) -> None:
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "remote", "source": {"source": "url", "url": "https://alice:PW_REMOTE@example.com/r.git"}}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_REMOTE_SOURCE_SKIPPED in _codes(r, "warning")
+    text = _messages(r)
+    assert "PW_REMOTE" not in text
+    assert "alice:" not in text
+    # strict 展示语义：保留 scheme/host/path
+    assert "https://example.com/r.git" in text
+
+
+def test_missing_local_source_redacts_embedded_credentials(tmp_path: Path) -> None:
+    """相对源路径内嵌凭据 URL（rust#154 向量⑤）：rel_path 与解析结果都不得回显凭据。"""
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "ghost", "source": "./x=https://alice:PW_LOCAL@example.com/repo.git"}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_PATH_MISSING in _codes(r)
+    text = _messages(r)
+    assert "PW_LOCAL" not in text
+    assert "alice:" not in text
+    assert "https://example.com/repo.git" in text
+
+
+# ── 复审 delta（#263 第二轮）：路径轴 / query-fragment / file 轴 ─────────────────
+def test_query_and_fragment_not_echoed_for_normalized_source(tmp_path: Path) -> None:
+    """source 归一后 ``://`` 坍缩成 ``:/``：query / fragment 不得借路径泄漏（用原始 source 回显）。"""
+    root = _marketplace(
+        tmp_path,
+        # 关键：不含 userinfo —— scp-like 兜底规则抓不到，只有原始 source 的 URL 规则才认得 query/fragment。
+        _mp_manifest(plugins=[{"name": "ghost", "source": "./x=https://example.com/r.git?token=QUERY#frag"}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    assert CODE_PATH_MISSING in _codes(r)
+    text = _messages(r)
+    for secret in ("token=QUERY", "#frag"):
+        assert secret not in text
+
+
+def test_issue_file_axis_redacts_credential_path(tmp_path: Path) -> None:
+    """`ValidationIssue.file`（--json 的 file 轴）：凭据形态的 source 目录名不得原样进 file。"""
+    bad = "x=https:.//alice:PW_FILE@example.com/repo.git"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    # 造出深检分支需要的目录（触发 plugin.json 缺失等以该路径为 file 的诊断）
+    (root / "plugins" / bad / "skills" / "etl").mkdir(parents=True)
+    (root / "plugins" / bad / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+    r = validate_path(root)
+    assert r.issues, "夹具应至少产出一条诊断"
+    for issue in r.issues:
+        assert "PW_FILE" not in issue.file
+        assert "alice:" not in issue.file
+        assert "PW_FILE" not in issue.message
+    for checked in r.checked:
+        assert "PW_FILE" not in checked
+
+
+# ── 复审第二轮：message 轴 + 正对照 ─────────────────────────────────────────────
+def test_issue_message_axis_redacts_path_from_deep_check(tmp_path: Path) -> None:
+    """深检报错（bundled server / plugin.json）的 message 内嵌路径时也不得带 query / fragment。"""
+    bad = "x=https:/h/r.git?token=SECRET#frag"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    p = root / "plugins" / bad
+    (p / ".tfrobot-plugin").mkdir(parents=True)
+    (p / ".tfrobot-plugin" / "plugin.json").write_text('{"name":"audit"}', encoding="utf-8")
+    (p / "mcp-servers").mkdir()
+    (p / "mcp-servers" / "bad.json").write_text("{ broken", encoding="utf-8")
+    (p / "skills" / "etl").mkdir(parents=True)
+    (p / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    r = validate_path(root)
+    text = _messages(r)
+    assert "token=SECRET" not in text
+    assert "#frag" not in text
+    # 正对照：确实产出了深检诊断（否则以上否定断言恒真）
+    assert any(i.code == CODE_INVALID_MCP_SERVER for i in r.issues), [i.code for i in r.issues]
+
+
+def test_file_and_checked_axis_positive_control(tmp_path: Path) -> None:
+    """正对照：file / checked 轴确实拿到了遮蔽值（否定断言不能靠「轴为空」蒙混）。"""
+    bad = "x=https:.//alice:PW_POS@example.com/repo.git"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    p = root / "plugins" / bad
+    (p / "skills" / "etl").mkdir(parents=True)
+    (p / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    r = validate_path(root)
+    assert r.checked, "夹具应至少检查过文件"
+    assert any("<redacted-source>" in i.file for i in r.issues), [i.file for i in r.issues]
+    assert any("<redacted-source>" in f for f in r.checked), list(r.checked)
+
+
+def test_collector_add_sanitizes_message_and_file(tmp_path: Path) -> None:
+    """`_Collector.add()` 是诊断三轴的兜底出口：新增诊断点即使直接塞归一化路径也不会泄漏。"""
+    from a2c_smcp.computer.skills.validator import _Collector
+
+    c = _Collector(tmp_path)
+    bad = "plugins/x=https:/h/r.git?token=SECRET#frag"
+    c.add("x-code", bad, bad, f"cannot read {bad}: boom")
+    issue = c.result.issues[0]
+    assert "token=SECRET" not in issue.message
+    assert "token=SECRET" not in issue.file
+    assert "token=SECRET" not in issue.location
+
+
+def test_manifest_error_message_redacts_credential_path(tmp_path: Path) -> None:
+    """manifest 层（PluginManifestError）自身的 message 也要遮蔽路径里的 query / fragment。"""
+    from a2c_smcp.computer.skills.manifest import PluginManifestError, parse_bundled_server
+
+    bad_dir = tmp_path / "x=https:/h/r.git?token=SECRET#frag"
+    bad_dir.mkdir(parents=True)
+    bad = bad_dir / "srv.json"
+    bad.write_text("{ broken", encoding="utf-8")
+    with pytest.raises(PluginManifestError) as ei:
+        parse_bundled_server(bad)
+    msg = str(ei.value)
+    assert "token=SECRET" not in msg
+    assert "#frag" not in msg
+
+
+def test_manifest_validation_message_hides_input_values(tmp_path: Path) -> None:
+    """#263 三轮复审：pydantic 诊断不得带 `input_value`（env / headers 里可能是 token）。"""
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": "audit"}]), plugins=())
+    p = root / "plugins" / "audit" / "mcp-servers"
+    p.mkdir(parents=True)
+    (p / "evil.json").write_text(
+        json.dumps({
+            "name": "evil",
+            "type": "stdio",
+            "server_parameters": {"command": "node", "env": {"TOKEN": "ghp_SUPERSECRET"}},
+            "unexpected_field": "ghp_SUPERSECRET",
+        }),
+        encoding="utf-8",
+    )
+    r = validate_path(root)
+    text = _messages(r)
+    assert "ghp_SUPERSECRET" not in text
+    assert "input_value" not in text
+
+
+def test_collector_add_preserves_prose_around_masked_path(tmp_path: Path) -> None:
+    """#263 三轮复审：message 轴只遮蔽路径 token——可读前缀、问号散文、换行必须保留。"""
+    from a2c_smcp.computer.skills.validator import _Collector
+
+    c = _Collector(tmp_path)
+    bad = "plugins/x=https:/h/r.git?token=SECRET#frag"
+    c.add("x-code", bad, ".", f"cannot read {bad}: why? oops\nsecond line")
+    msg = c.result.issues[0].message
+    assert "token=SECRET" not in msg
+    # 正对照：前缀 / prose 的 `?` / 换行都还在（不得整段吞掉或转义成 \x0a）
+    assert msg.startswith("cannot read plugins/x=https:/h/r.git")
+    assert msg.endswith("why? oops\nsecond line")
+
+
+def test_checked_axis_masks_userinfo_with_query(tmp_path: Path) -> None:
+    """#263 四轮：`file` / `checked` 轴在 userinfo + `?` 同段时也不得漏凭据头。"""
+    bad = "x=https:/alice:pw@host?token=SECRET"
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": f"./plugins/{bad}"}]), plugins=())
+    p = root / "plugins" / bad
+    (p / "skills" / "etl").mkdir(parents=True)
+    (p / "skills" / "etl" / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+
+    r = validate_path(root)
+    assert r.checked
+    blob = "\n".join([*(i.file for i in r.issues), *r.checked])
+    assert "pw@" not in blob and "token=SECRET" not in blob
+    assert "<redacted-source>" in blob
+
+
+# ── #263 五轮复审：非 UTF-8 / 对象源回显不再二次散文化 ──────────────────────────
+def test_non_utf8_manifest_is_reported_not_raised(tmp_path: Path) -> None:
+    """非 UTF-8 的 marketplace.json（UnicodeDecodeError）→ 记诊断，不得 traceback。"""
+    root = tmp_path / "mp-bytes"
+    path = root / ".tfrobot-plugin" / "marketplace.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe not utf-8")
+    r = validate_path(root)
+    assert any(i.code == CODE_UNREADABLE for i in r.issues), [i.code for i in r.issues]
+    # #281：固定文案正向断言（只有 code 断言时，文案漂移仍绿）。
+    msg = next(i.message for i in r.issues if i.code == CODE_UNREADABLE)
+    assert "<undecodable content (non-UTF-8)>" in msg
+
+
+def test_object_source_message_stays_readable(tmp_path: Path) -> None:
+    """对象源诊断不得被二次散文脱敏改写成 percent-encoded 乱码。"""
+    root = _marketplace(
+        tmp_path,
+        _mp_manifest(plugins=[{"name": "audit", "source": {"source": "url", "url": "https://alice:PW_OBJ@example.com/r.git", "ref": ""}}]),
+        plugins=(),
+    )
+    r = validate_path(root)
+    text = _messages(r)
+    assert "PW_OBJ" not in text
+    assert "%22" not in text and "%2C" not in text  # 没有 percent-encoded 的 JSON 标点
+    assert '"ref":""' in text  # 结构仍可读
+
+
+def test_manifest_reader_reports_non_utf8_as_manifest_error(tmp_path: Path) -> None:
+    """manifest 层 `_read_json_object` 也必须把非 UTF-8 归一成 PluginManifestError（install 预检同路径）。"""
+    from a2c_smcp.computer.skills.manifest import PluginManifestError, read_marketplace_manifest
+
+    root = tmp_path / "mp"
+    path = root / ".tfrobot-plugin" / "marketplace.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\xfe not utf-8")
+    with pytest.raises(PluginManifestError) as ei:
+        read_marketplace_manifest(root)
+    # 断言确实命中 UnicodeDecodeError 归一（不是别的分支）——避免「unreadable or invalid」近似恒真。
+    assert isinstance(ei.value.__cause__, UnicodeDecodeError)
+    assert "marketplace manifest" in str(ei.value)
+    # #281：固定文案正向断言（解码细节不外泄、也不得漂移）。
+    assert "<undecodable content (non-UTF-8)>" in str(ei.value)
+
+
+def test_non_utf8_skill_md_reported_as_unreadable(tmp_path: Path) -> None:
+    """#263 七轮：非 UTF-8 SKILL.md 深检归一为 skill-md-unreadable（不得 traceback、不得泄漏解码细节）。
+
+    #281：补固定文案正向断言 + 「好 SKILL 仍被 check」正对照（原用例只有坏 SKILL，无法区分「深检没跑」）。
+    """
+    root = _marketplace(tmp_path, _mp_manifest(plugins=[{"name": "audit", "source": "audit"}]), plugins=())
+    p = root / "plugins" / "audit" / "skills" / "bad"
+    p.mkdir(parents=True)
+    (p / "SKILL.md").write_bytes(b"\xff\xfe not utf-8")
+    good = root / "plugins" / "audit" / "skills" / "good"
+    good.mkdir(parents=True)
+    (good / "SKILL.md").write_text(_skill_md(), encoding="utf-8")
+    r = validate_path(root)
+    assert any(i.code == CODE_SKILL_MD_UNREADABLE for i in r.issues), [i.code for i in r.issues]
+    msg = next(i.message for i in r.issues if i.code == CODE_SKILL_MD_UNREADABLE)
+    assert "<undecodable content (non-UTF-8)>" in msg
+    assert "codec" not in msg
+    # 正对照：坏的不进 checked、好的仍进（证明深检确实遍历到了 skill dir 层）
+    assert not any("skills/bad/SKILL.md" in f for f in r.checked), r.checked
+    assert any("skills/good/SKILL.md" in f for f in r.checked), r.checked

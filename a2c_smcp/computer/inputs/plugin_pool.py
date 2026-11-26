@@ -26,6 +26,8 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerInput
+from a2c_smcp.utils.diagnostics import pydantic_error_text
+from a2c_smcp.utils.git_url import escape_unsafe_chars
 from a2c_smcp.utils.logger import get_logger
 
 logger = get_logger("computer")
@@ -77,7 +79,11 @@ def load_plugin_inputs(inputs_json: Path, plugin: str, marketplace: str) -> list
             inp = _MCP_INPUT_ADAPTER.validate_python(idef)
         except ValidationError as exc:
             raw_id = idef.get("id") if isinstance(idef, Mapping) else "<unknown>"
-            logger.warning(f"plugin input 定义畸形，跳过 / Invalid plugin input def, skip [{raw_id}]: {exc}")
+            logger.warning(
+                "plugin input 定义畸形，跳过 / Invalid plugin input def, skip [%s]: %s",
+                escape_unsafe_chars(str(raw_id)),  # 清单来自不可信 marketplace：控制字符须转义
+                pydantic_error_text(exc),
+            )
             continue
         prefixed = prefix_input_id(plugin, marketplace, inp.id)
         result.append(inp.model_copy(update={"id": prefixed}))

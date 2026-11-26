@@ -37,13 +37,16 @@ definitions / inputs (those live in ``.tfrobot/mcp.json``).
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, NotRequired, TypedDict
+from urllib.parse import SplitResult, unquote, urlsplit
 
 from a2c_smcp.utils.logger import get_logger
-from a2c_smcp.utils.path_norm import InvalidPathError, native_platform, normalize_path
+from a2c_smcp.utils.path_norm import InvalidPathError, PathPlatform, native_platform, normalize_path
 
 logger = get_logger(__name__)
 
@@ -132,6 +135,21 @@ FIELD_LANDING_ROOT = "landingRoot"
 # v0.5.0 added (#236 / protocol#65): authorized read roots for client:resolve_path (array of absolute paths).
 FIELD_READ_ROOTS = "readRoots"
 
+
+def is_marketplace_declaration_field(field: str) -> bool:
+    """
+    校验错误的 ``field`` 是否落在 ``extraKnownMarketplaces`` 子树（#293，镜像 rust 同名谓词）/
+    Whether the error ``field`` belongs to the ``extraKnownMarketplaces`` subtree.
+
+    **精确前缀判定必须带 ``.`` 边界**：裸 ``startswith("extraKnownMarketplaces")`` 会把
+    ``extraKnownMarketplacesBackup.x`` 这类无关字段误收进来。整字段类型错误（``field ==`` 前缀本身）
+    同属本子树。
+
+    :param field: :attr:`SettingsValidationError.field`（点路径）。
+    """
+    return field == FIELD_EXTRA_KNOWN_MARKETPLACES or field.startswith(f"{FIELD_EXTRA_KNOWN_MARKETPLACES}.")
+
+
 # policy-only 字段：出现在非 policy scope → 过滤 + 记错（§5.6）。
 # Policy-only fields: filtered + recorded if seen outside the policy scope.
 POLICY_ONLY_FIELDS: frozenset[str] = frozenset({FIELD_ALLOWED_MCP_SERVERS, FIELD_DENIED_MCP_SERVERS})
@@ -207,6 +225,12 @@ _PLUGIN_AT_MP_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+
 _GIT_SCP_LIKE_RE = re.compile(r"^[\w.+-]+@[\w.-]+:.+$")
 _GIT_URL_SCHEME_RE = re.compile(r"^(?:ssh|git|https?|file)://.+$")
 
+# host 形态（RFC 1123 宽松版：字母数字 / 下划线 / 点 / 连字符，且至少含一个字母数字）。
+# 目的不是校验 DNS 合法性，而是挡住「非 host 的占位串」——空白 / 控制字符 / 纯 `-` / `_` / `.` / `%20`
+# 这类占位会让 hostless 攻击串（`ssh:///alice:PW@x`）以「随便填个非空 junk」的方式复活凭据入名链路（#270）。
+# Loose RFC 1123 host shape; rejects placeholder strings that are not a host at all.
+_HOSTNAME_RE = re.compile(r"^(?=[A-Za-z0-9._-]*[A-Za-z0-9])[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?$")
+
 MAX_NAME_LEN = 64
 
 
@@ -223,11 +247,72 @@ def is_valid_enabled_plugin_key(key: str) -> bool:
     return len(plugin) <= MAX_NAME_LEN and len(marketplace) <= MAX_NAME_LEN
 
 
+def is_scp_like_git_url(url: str) -> bool:
+    """
+    是否 scp-like **形态** ``user@host:path`` / Whether the url has the scp-like shape.
+
+    仅形态分类，**不**校验 host 合法性、也不排除 path 内含 ``://``（如 ``git@h:r?x=://y``）——
+    合法性判定一律走 :func:`is_valid_git_url`。shape-only; use :func:`is_valid_git_url` for validity.
+    """
+    return isinstance(url, str) and _GIT_SCP_LIKE_RE.fullmatch(url) is not None
+
+
+def _has_valid_host(parts: SplitResult) -> bool:
+    """
+    host 是否形如主机名 / IPv6 字面量（非 host 形态一律 fail-closed）/ Whether host looks like a host.
+
+    **#270**：只判「非空」不够——``ssh:// /alice:PW@x``、``ssh://-/…``、``ssh://_/…``、``ssh://%20/…``
+    的 host 都非空但根本不是主机，凭据段会经 path 末段滑进 marketplace 注册名。IDN host 先经 IDNA 归一；
+    尾点 FQDN（``example.com.``）合法；IPv6 用 :mod:`ipaddress` 判定（含 zone-id ``[fe80::1%25eth0]``，
+    也避免旧补丁版 ``urlsplit`` 不校验 bracketed host 的缺口）。percent-encoded host 有意拒绝（fail-closed）。
+    """
+    host = parts.hostname or ""
+    if ":" in host:  # IPv6 字面量（urlsplit 已剥去方括号；zone-id 的 ``%25`` 需解码）
+        try:
+            ipaddress.IPv6Address(unquote(host))
+        except ValueError:
+            return False
+        return True
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return False
+    if host.endswith("."):  # 尾点 FQDN（RFC 3986 reg-name 允许）
+        host = host[:-1]
+    return _HOSTNAME_RE.match(host) is not None
+
+
 def is_valid_git_url(url: str) -> bool:
-    """git url 形态是否合规（scp-like 或 ssh/git/http(s)/file scheme）/ Whether a git url is well-formed."""
+    """
+    git url 形态是否合规（scp-like 或 ssh/git/http(s)/file scheme）/ Whether a git url is well-formed.
+
+    **#270 收紧**：ssh / git / http(s) 必须有**形如主机名的 host**——``ssh:///alice:PW@example.com``、
+    ``ssh://user@:22/path`` 这类 hostless 形态，以及把 host 槽位填成非主机占位串（空白 / ``-`` / ``_`` /
+    ``%20`` / 纯点）的变体，都会被下游 :func:`default_marketplace_name` 当成 path 取末段，把 userinfo 里的
+    凭据 slug 进 marketplace 注册名（trust / 账本 / ``A2CSkillRef.source`` 可见）。
+    ``file:`` 一律不要求 host（``file:///abs/path`` 与 ``file://host/path`` 均合法）；scp-like 形态不变。
+    非法端口 / 畸形 netloc 一并 fail-closed（比展示层 :func:`a2c_smcp.utils.git_url.git_url_for_display`
+    更严：展示层对 ``ssh://-/x`` 仍可展示，校验不认它）。
+    ssh/git/http(s) require a host-shaped authority; ``file:`` does not; malformed authorities fail closed.
+    """
     if not isinstance(url, str) or not url.strip():
         return False
-    return _GIT_URL_SCHEME_RE.match(url) is not None or _GIT_SCP_LIKE_RE.match(url) is not None
+    if is_scp_like_git_url(url):
+        return True
+    if _GIT_URL_SCHEME_RE.match(url) is None:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme == "file":  # file: 一律不要求 host；也不做端口形态校验（file://C:\repos\repo 历史合法）
+        return True
+    try:
+        _ = parts.port  # 非法端口（如 :abc / 越界）→ ValueError；此处仅为触发校验
+    except ValueError:
+        return False
+    return _has_valid_host(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +382,43 @@ class SettingsValidationError:
     field: str
     reason: str
     source_path: str | None = None
+
+
+# 展示面不安全字符的**显式码位集**（镜像 rust ``is_unsafe_display_char``）：Cc（``str.isprintable``
+# 之外的控制字符，含 ESC / 换行 / DEL）+ Cs（Python 专有的孤立代理项）+ 方向覆写与行分隔族
+# （U+061C ALM、U+200B–U+200F、U+2028–U+202E、U+2060–U+206F、U+FEFF）。后一族全是 Cf，正是
+# ``a2c_smcp.utils.git_url._UNSAFE_CHAR_CATEGORIES`` 明确**不处理**的那一类（那里是转义器，口径已冻结）；
+# 本函数只服务 settings 诊断面，替换为空格而非转义（与 rust 逐字一致）。
+_UNSAFE_DISPLAY_RANGES: tuple[tuple[int, int], ...] = (
+    (0x061C, 0x061C),
+    (0x200B, 0x200F),
+    (0x2028, 0x202E),
+    (0x2060, 0x206F),
+    (0xFEFF, 0xFEFF),
+)
+
+
+def _is_unsafe_display_char(ch: str) -> bool:
+    """字符是否会在终端 / 日志行里伪造视觉（控制、代理项、方向覆写、行分隔）/ Unsafe-to-display char."""
+    if unicodedata.category(ch) in ("Cc", "Cs"):
+        return True
+    code = ord(ch)
+    return any(low <= code <= high for low, high in _UNSAFE_DISPLAY_RANGES)
+
+
+def scrub_diagnostic_chars(text: str) -> str:
+    """
+    把不可见 / 方向覆写字符替换为空格（#293，镜像 rust ``scrub_diagnostic_chars``）/
+    Replace invisible / bidi-control characters with spaces.
+
+    动机：不可信值里的 U+202E（RLO）能把终端与日志行**后半段倒序显示**，U+2028 伪造换行打断日志行。
+    ``sanitize_segment_for_diagnostics`` 只转义 Cc/Cs，Cf 族原样透出，故诊断面需要这一层。
+
+    :param text: 任意不可信文本（市场名残段 / 校验原因 / 路径）。
+    """
+    if not any(_is_unsafe_display_char(ch) for ch in text):
+        return text
+    return "".join(" " if _is_unsafe_display_char(ch) else ch for ch in text)
 
 
 # 哨兵：表示「整字段判废、回退默认」/ Sentinel: "drop the whole field, fall back to default".
@@ -413,7 +535,10 @@ def _validate_permissions(key: str, value: Any, scope: SettingsScope) -> tuple[A
                 if not isinstance(item, str):
                     errors.append(_err(scope, f"{key}.additionalDirectories[{idx}]", "expected string"))
                 elif not _is_absolute_path(item):
-                    # 须绝对路径（POSIX ``/`` 或 Windows 盘符）；相对路径判废（§5.3.1）。
+                    # 语法判据：POSIX ``/`` 或 Windows 盘符；相对路径判废（§5.3.1）。#304 item 3：
+                    # 与 ``landingRoot`` 同口径（不按宿主平台过滤、不 trim——**刻意**不与
+                    # ``readRoots`` 的 ``normalize_path`` 合并判据），且本字段运行期**无消费者**，
+                    # 故外来平台形态不会进入任何授权 / 落盘路径。
                     errors.append(_err(scope, f"{key}.additionalDirectories[{idx}]", "must be an absolute path"))
                 else:
                     dirs.append(item)
@@ -430,33 +555,46 @@ def _is_absolute_path(value: str) -> bool:
 
 
 def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
-    """``readRoots``（v0.5.0 #236 / protocol#65）：字符串数组，每项须为绝对路径。
+    """``readRoots``（v0.5.0 #236 / protocol#65）：字符串数组，每项经 ``normalize_path`` 校验。
 
+    **单一判据**（#304 item 3）：绝对性与形态都交给
+    :func:`~a2c_smcp.utils.path_norm.normalize_path`，与运行期
+    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` **同源**——不再前置
+    「``/`` 前缀或盘符」正则（那会把 ``normalize_path`` 接受的 Windows verbatim
+    ``\\\\?\\C:\\...`` 误拒，形成「读得了、写不进」的口径分叉）。
     非法项**逐条过滤**并记诊断（不整字段判废——其余授权根仍然生效）；空数组 = 不可读
     （fail-closed，语义由 resolve 管线保证）。**不做** ``~`` 展开：协议 ``normalize_path``
-    明确不展开 ``~``，含 ``~`` 的项在运行期按 ``invalid_path`` 处理，故此处不视为绝对路径。
-    绝对路径项再经 :func:`~a2c_smcp.utils.path_norm.normalize_path`（宿主平台）预判形态，
-    ``invalid_path`` 在**配置期**即记诊断。双形态（配置 / realpath）在运行期由
-    :func:`a2c_smcp.computer.blob.path_resolver.build_read_roots` 编译。
-    Per-item filtering (one bad root never voids the others); empty = unreadable (fail-closed).
-    No ``~`` expansion: the protocol's ``normalize_path`` does not expand it either.
+    明确不展开 ``~``，含 ``~`` 的项按 ``invalid_path`` 丢弃。保留**原值**（不改写、不 trim、
+    不存归一结果）；双形态（配置 / realpath）在运行期编译。
+
+    Single predicate: ``normalize_path`` checks both absoluteness and shape, exactly as the
+    runtime ``build_read_roots`` does. Per-item filtering; empty = unreadable; raw items kept.
+    """
+    return _validate_read_roots_for(key, value, scope, native_platform())
+
+
+def _validate_read_roots_for(
+    key: str, value: Any, scope: SettingsScope, platform: PathPlatform
+) -> tuple[Any, list[SettingsValidationError]]:
+    """[:func:`_validate_read_roots`] 的平台显式版本（跨平台测试接缝；生产恒用宿主平台）.
+
+    Platform-explicit variant of :func:`_validate_read_roots` (cross-platform test seam;
+    production always passes the host platform). 与 rust
+    ``schema.rs::validate_read_roots_for`` 同名同构——CI 只有 Linux，Windows 形态必须经显式
+    平台在任意 OS 上对拍。
     """
     if not isinstance(value, list):
         return _DROP, [_err(scope, key, f"expected array, got {type(value).__name__}")]
     cleaned: list[str] = []
     errors: list[SettingsValidationError] = []
-    platform = native_platform()
     for idx, item in enumerate(value):
         field = f"{key}[{idx}]"
         if not isinstance(item, str):
             errors.append(_err(scope, field, f"expected string, got {type(item).__name__}"))
             continue
-        if not _is_absolute_path(item):
-            errors.append(_err(scope, field, "must be an absolute path"))
-            continue
-        # 形态与运行期同源：用协议 ``normalize_path``（宿主平台）预判 ``invalid_path``，
-        # 配置期即给出诊断，避免「写得进、读不了」。
-        # Same predicate as runtime: pre-validate with the protocol's normalize_path.
+        # 单一判据（与运行期 ``build_read_roots`` 同源）：``normalize_path`` 同时管绝对性与形态
+        # （含 Windows verbatim ``\\?\C:\...`` 的剥离、drive-relative 的拒绝）。
+        # Single predicate shared with the runtime — never re-add a second absoluteness check.
         try:
             normalize_path(item, platform)
         except InvalidPathError as exc:
@@ -466,19 +604,68 @@ def _validate_read_roots(key: str, value: Any, scope: SettingsScope) -> tuple[An
     return cleaned, errors
 
 
-def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
-    """``landingRoot``（v0.4.0 #196）：字符串 + 绝对路径（镜像 ``permissions.additionalDirectories``
-    的判据：POSIX ``/`` 或 Windows 盘符）；相对路径 / 非字符串 → 整字段判废（fail-closed）。
+# Rust ``str::trim()`` 只剥 Unicode ``White_Space``；Python ``str.strip()`` 额外把 U+001C–U+001F
+# （信息分隔符：``str.isspace()`` 为真但 ``White_Space`` 为假）当空白——本集合就是这四个码位。
+# 对写目标面逐字节对齐 rust 必须排除它们，两个方向都要：**前导**分歧会让 py 启用 / rust 判废
+# （fail-closed，易察觉）；**尾随**分歧两侧都启用但写入根不同（静默分歧，更难察觉）。
+# Rust trims Unicode White_Space only; Python's str.strip() also strips U+001C–U+001F. Both the
+# leading and trailing directions must exclude them: leading diverges open-vs-dropped, trailing
+# diverges between two *different* write roots (silent).
+_PY_EXTRA_WHITESPACE = frozenset("\x1c\x1d\x1e\x1f")
 
-    String + absolute path, mirroring the ``permissions.additionalDirectories`` predicate;
-    relative or non-string → dropped (fail-closed). 合并策略为顶层标量「高 scope 覆盖」
-    （:func:`a2c_smcp.computer.settings.scope.merge_read` 默认语义），无需分类注册。
+
+def _trim_like_rust(value: str) -> str:
+    """``str::trim()`` 的逐字节等价（只剥 Unicode ``White_Space``）/ Byte-for-byte Rust ``trim()``."""
+    start, end = 0, len(value)
+    while start < end and value[start].isspace() and value[start] not in _PY_EXTRA_WHITESPACE:
+        start += 1
+    while end > start and value[end - 1].isspace() and value[end - 1] not in _PY_EXTRA_WHITESPACE:
+        end -= 1
+    return value[start:end]
+
+
+def _validate_landing_root(key: str, value: Any, scope: SettingsScope) -> tuple[Any, list[SettingsValidationError]]:
+    """``landingRoot``（v0.4.0 #196）：字符串 + **语法**绝对路径（POSIX ``/`` 或 Windows 盘符）.
+
+    首尾空白先 trim（#304 item 3，逐字节等价 rust ``validate_landing_root`` 的 ``s.trim()``）：
+    trim 后为空或非绝对 → 整字段判废（fail-closed）；通过则**存 trim 后的值**。
+    行为变化（0.5.1 升级面，前导 / 尾随不对称）：**前导**空白此前令字段判废（`"/srv/x"` 前的空格让
+    ``startswith("/")`` 失败），现在被 trim 后生效；**尾随**空白此前原样生效——POSIX 上写入根就是带空格的
+    目录，Windows 上 Win32 会剥掉**非 verbatim** 路径分量末尾的空格/点（实际落在无空格目录），两平台现在都
+    **静默改为 trim 后的路径**（POSIX 旧空格目录里的产物不会迁移）。
+    Trim first (byte-for-byte Rust); empty-after-trim or non-absolute → dropped; trimmed value stored.
+    Leading whitespace used to void the field; trailing whitespace used to take effect verbatim (on POSIX
+    under a spaced directory; on Windows Win32 silently stripped it) — both now resolve to the trimmed path.
+
+    判据是**语法**的、不按宿主平台过滤——**刻意**与 ``readRoots`` 的 ``normalize_path`` 单一判据
+    不同（用户 2026-11-23 裁决：**不做谓词合并**）。由此的「外来平台形态」边界（写实，勿美化）：
+    ``D:\\...`` 在 POSIX 宿主配置期接受，但运行期
+    :attr:`a2c_smcp.computer.computer.Computer.landing_root` 直接 ``Path(raw)``——POSIX 上它是
+    **相对路径**（``put_blob`` 落盘落在进程 cwd 下）；反方向（``/home/...`` 在 Windows）是
+    current-drive-rooted（``C:\\home\\...``，落在当前盘根而非 cwd）。两者都**不丢弃**，而
+    :func:`~a2c_smcp.computer.blob.path_resolver.build_protected_paths` 会先按宿主 cwd 绝对化
+    再归一（镜像 rust ``std::path::absolute``），该实际落盘目录照常进 ``.part`` 拒绝集——
+    在途上传不会被 ``resolve_path`` 读出。
+    对照 ``readRoots``：运行期 ``build_read_roots`` 会按 ``normalize_path`` **丢弃**外来形态。
+
+    **已知边界（v0.4.0 起既有，非本单引入）**：含 U+0000 的绝对路径仍被接受；运行期
+    ``BlobUploadStore`` 的 ``mkdir`` / ``open`` 只捕获 ``OSError``，``ValueError``（embedded null
+    byte）会逃出 ``on_put_blob``（无 ``4019`` ack）。修复需与 rust 一起定口径（配置期拒 NUL vs
+    运行期把 ``ValueError`` 映射为 ``forbidden``），见 follow-up。
+
+    Cross-platform shapes pass the syntactic check at config time (deliberate asymmetry with
+    ``readRoots``); at runtime ``landing_root`` feeds ``Path(raw)`` as-is — POSIX treats ``D:\\...`` as
+    relative to the process cwd, Windows treats ``/home/...`` as rooted on the current drive. Neither is
+    dropped, and ``build_protected_paths`` absolutizes against the host cwd first (mirrors rust
+    ``std::path::absolute``) so the real write directory still enters the ``.part`` rejection set.
+    合并策略为顶层标量「高 scope 覆盖」（``scope.merge_read`` 默认语义）。
     """
     if not isinstance(value, str):
         return _DROP, [_err(scope, key, f"expected string, got {type(value).__name__}")]
-    if not _is_absolute_path(value):
+    trimmed = _trim_like_rust(value)
+    if not trimmed or not _is_absolute_path(trimmed):
         return _DROP, [_err(scope, key, "must be an absolute path")]
-    return value, []
+    return trimmed, []
 
 
 # 字段 → 校验器映射（缺席 = 未知字段，passthrough）/ field → validator map (absent = unknown, passthrough).

@@ -7,7 +7,8 @@
 ``normalize_path`` 数据向量一致性测试 / ``normalize_path`` conformance vectors.
 
 协议依据 / Protocol: a2c-smcp-protocol ``docs/specification/fixtures/canonical_path_conformance_vectors.json``
-（protocol#65，core-governance §6 数据向量）。本文件为协议仓向量的**逐字节 vendored 副本**；
+@ develop ``e811757``（protocol#65 首版 49 条 + protocol#78〔protocol PR #85〕补 7 条 = 56 条，
+core-governance §6 数据向量）。本文件为协议仓向量的**逐字节 vendored 副本**；
 任一 ``normalize_path(input, platform)`` MUST 对每条向量产出 ``expected``，或在向量给出 ``error``
 时以 ``invalid_path`` 失败。纯函数与宿主 OS 无关。
 """
@@ -31,11 +32,11 @@ _VECTORS: list[dict[str, Any]] = json.loads(_FIXTURE.read_text(encoding="utf-8")
 
 
 def test_vector_fixture_shape() -> None:
-    """向量集规模锁定：POSIX 18 + Windows 31 = 49，其中 21 条 invalid_path."""
-    assert len(_VECTORS) == 49
-    assert sum(1 for v in _VECTORS if v["platform"] == "posix") == 18
-    assert sum(1 for v in _VECTORS if v["platform"] == "windows") == 31
-    assert sum(1 for v in _VECTORS if "error" in v) == 21
+    """向量集规模锁定：POSIX 19 + Windows 37 = 56，其中 27 条 invalid_path."""
+    assert len(_VECTORS) == 56
+    assert sum(1 for v in _VECTORS if v["platform"] == "posix") == 19
+    assert sum(1 for v in _VECTORS if v["platform"] == "windows") == 37
+    assert sum(1 for v in _VECTORS if "error" in v) == 27
 
 
 @pytest.mark.parametrize("vector", _VECTORS, ids=[v["id"] for v in _VECTORS])

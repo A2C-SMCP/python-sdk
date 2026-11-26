@@ -32,7 +32,7 @@ import os
 import threading
 import weakref
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +49,7 @@ from mcp.types import (
     TextContent,
     ToolListChangedNotification,
 )
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from a2c_smcp.computer.base import BaseComputer
 from a2c_smcp.computer.blob import (
@@ -116,10 +116,16 @@ from a2c_smcp.computer.settings.recovery import (
     BundledServerRecord,
     GovernanceRecoveryReport,
     RegisterBundledServer,
+    attach_marketplace_declaration_errors,
     collect_enabled_bundled_servers,
     recover_marketplace_skills,
 )
-from a2c_smcp.computer.settings.schema import FIELD_LANDING_ROOT, FIELD_READ_ROOTS, SettingsScope
+from a2c_smcp.computer.settings.schema import (
+    FIELD_LANDING_ROOT,
+    FIELD_READ_ROOTS,
+    SettingsScope,
+    SettingsValidationError,
+)
 from a2c_smcp.computer.settings.scope import LOCAL_SETTINGS_FILENAME, PROJECT_SETTINGS_FILENAME, TFROBOT_DIRNAME
 from a2c_smcp.computer.skills import (
     SOURCE_USER,
@@ -138,6 +144,7 @@ from a2c_smcp.smcp import A2CSkillRef, Desktop, SMCPTool
 from a2c_smcp.types import AttributeValue
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 from a2c_smcp.utils.cancellation import restores_cancellation
+from a2c_smcp.utils.diagnostics import exception_text
 from a2c_smcp.utils.env import env_truthy
 from a2c_smcp.utils.env_segment import raise_on_env_name_collisions
 from a2c_smcp.utils.logger import get_logger, truncate
@@ -153,7 +160,7 @@ if TYPE_CHECKING:
     # 仅用于类型检查，避免运行时引入依赖/循环引用
     from prompt_toolkit import PromptSession
 
-    from a2c_smcp.computer.settings.scope import ResolvedSettings
+    from a2c_smcp.computer.settings.scope import ResolvedSettings, SettingsAxes
     from a2c_smcp.computer.socketio.client import SMCPComputerClient
 else:
     # 运行时占位（#226）：纯 core 安装不要求 cli extra。`PromptSession` 只用于类基类
@@ -838,7 +845,11 @@ class Computer(BaseComputer[PromptSession]):
             try:
                 raw_cfg = self._validate_raw_shape(server_cfg)
             except Exception as e:
-                logger.error(f"配置校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
+                # #289 终审 🔴：ValidationError 的 str/追溯会回显 input_value（raw 配置可含字面凭据）→ 只报字段/条数。
+                if isinstance(e, ValidationError):
+                    logger.error("配置校验失败: %s - %s", getattr(server_cfg, "name", "unknown"), exception_text(e))
+                else:
+                    logger.error(f"配置校验失败: {getattr(server_cfg, 'name', 'unknown')} - {e}", exc_info=True)
                 # 形状非法：无法派生 bundle_id 身份 → **跳过挂载**（不连坐上抛，对齐旧「非 InputResolution
                 # 渲染错误容错」精神；解析类错误推迟到实际启动 surface）。
                 continue
@@ -857,13 +868,20 @@ class Computer(BaseComputer[PromptSession]):
 
         try:
             await self.mcp_manager.ainitialize(raw_servers)
-        except Exception:
+        except Exception as e:
             # §5.13：auto-connect 的实际启动在 ainitialize 内 materialize——失败（Missing/InvalidSelection/
             # 连接错误等）时回滚已启动 client，保 #173 retry-safe（下次 boot 重建 manager，无残留）。
-            logger.error(
-                "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients",
-                exc_info=True,
-            )
+            # #289 终审 🔴：被渲染/校验脱敏的 ValidationError 在此**下游**不得再以 exc_info 原样记录。
+            if isinstance(e, ValidationError):
+                logger.error(
+                    "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients: %s",
+                    exception_text(e),
+                )
+            else:
+                logger.error(
+                    "boot 初始化失败，回滚已启动 client / boot init failed, rolling back started clients",
+                    exc_info=True,
+                )
             await self.mcp_manager.aclose()
             raise
 
@@ -891,12 +909,22 @@ class Computer(BaseComputer[PromptSession]):
                 logger.warning(f"v0.3.0 治理迁移失败（不阻断启动）/ governance migration failed (non-blocking): {e}")
             try:
                 recovery_report = await self.reconcile_governance()
-                if recovery_report.restored_skills or recovery_report.failed_marketplaces:
+                # #287 / #293：声明源冲突与非法声明都是**诊断**信号（不降级、不阻断），也纳入汇总条件——
+                # 否则「零恢复 + 有冲突/有非法声明」的启动会静默无输出，而它恰恰是最需要被看见的情形。
+                if (
+                    recovery_report.restored_skills
+                    or recovery_report.failed_marketplaces
+                    or recovery_report.marketplace_source_conflicts
+                    or recovery_report.marketplace_declaration_errors
+                ):
                     logger.info(
-                        "governance recovery: %d skills restored, %d plugins, %d marketplaces degraded",
+                        "governance recovery: %d skills restored, %d plugins, %d marketplaces degraded, "
+                        "%d declared-source conflicts, %d marketplace declaration errors",
                         len(recovery_report.restored_skills),
                         len(recovery_report.restored_plugins),
                         len(recovery_report.failed_marketplaces),
+                        len(recovery_report.marketplace_source_conflicts),
+                        len(recovery_report.marketplace_declaration_errors),
                     )
             except Exception as e:  # pragma: no cover — 防御性兜底（recovery 内部已各自降级）
                 logger.error(f"治理启动恢复失败（不阻断启动）/ governance recovery failed (non-blocking): {e}", exc_info=True)
@@ -1536,7 +1564,12 @@ class Computer(BaseComputer[PromptSession]):
             )
         except Exception as e:
             name = (server.get("name") if isinstance(server, dict) else getattr(server, "name", "unknown")) or "unknown"
-            logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
+            if isinstance(e, ValidationError):
+                # #289 审查 🔴2：pydantic 的 str/追溯都会回显 `input_value`——此处校验的是**渲染后**配置
+                # （`${input:secret}` 已解析），原样落 ERROR 日志即泄密。只报字段/条数，且不带 traceback。
+                logger.error("动态渲染/校验MCP配置失败: %s - %s", name, exception_text(e))
+            else:
+                logger.error(f"动态渲染/校验MCP配置失败: {name} - {e}", exc_info=True)
             raise e
 
     # ════════════════════════════════════════════════════════════════════════════
@@ -2446,6 +2479,26 @@ class Computer(BaseComputer[PromptSession]):
         """
         self._skill_debouncer.mark_dirty()
 
+    def _settings_axes(self) -> "SettingsAxes":
+        """本实例的 settings **原始轴**（#296，与 :meth:`_resolve_declared_settings` 同源）。
+
+        REPL 的 marketplace 引用守卫与治理恢复视图必须看到同一五层视图（user/project/local/flag/policy）；
+        两处各自拼装会重演 #296 的漂移（flag / policy 层漏接）。policy 在此按本实例 env 现解析
+        （与 :meth:`_resolve_declared_settings` 原有行为一致）。
+        The instance's raw settings axes (#296), the single source shared by governance recovery and the
+        REPL marketplace reference guard. Policy is resolved against this instance's env.
+        """
+        from a2c_smcp.computer.settings.policy import resolve_policy_settings
+        from a2c_smcp.computer.settings.scope import SettingsAxes
+
+        env = self._resolve_env()
+        return SettingsAxes(
+            env=env,
+            cwd=self._resolve_cwd(),
+            flag_settings_path=self._flag_settings_path,
+            policy_settings=resolve_policy_settings(env=env),
+        )
+
     def _resolve_declared_settings(self) -> "ResolvedSettings":
         """治理恢复的 declared 视图（含合并 settings + per-scope 层，供 #159 Option B 审批门分叉）。
 
@@ -2454,14 +2507,14 @@ class Computer(BaseComputer[PromptSession]):
         The declared view for governance recovery; ``flag_settings_path`` (CLI ``--settings``) is
         injected when set, ``None`` = no flag settings (backward compat). Fixed in #167 sub-issue 3.
         """
-        from a2c_smcp.computer.settings.policy import resolve_policy_settings
         from a2c_smcp.computer.settings.scope import resolve_settings
 
+        axes = self._settings_axes()
         return resolve_settings(
-            env=self._resolve_env(),
-            cwd=self._resolve_cwd(),
-            flag_settings_path=self._flag_settings_path,
-            policy_settings=resolve_policy_settings(env=self._resolve_env()),
+            env=axes.env,
+            cwd=axes.cwd,
+            flag_settings_path=axes.flag_settings_path,
+            policy_settings=axes.policy_settings,
         )
 
     async def reconcile_governance(
@@ -2470,7 +2523,9 @@ class Computer(BaseComputer[PromptSession]):
         existing_bundle_ids: Callable[[], set[str]] | None = None,
         register_server: RegisterBundledServer | None = None,
         inject_inputs: Callable[[BundledServerRecord], Awaitable[None]] | None = None,
-        declared: Mapping[str, Any] | None = None,
+        # 字符串注解：``ResolvedSettings`` 只在 TYPE_CHECKING 下导入（本模块无 ``from __future__ import
+        # annotations``，运行时求值会 NameError；既有 ``_resolve_declared_settings`` 同款）。
+        declared: "Mapping[str, Any] | ResolvedSettings | None" = None,
     ) -> GovernanceRecoveryReport:
         """
         治理启动恢复公共入口（#117/#123，协议 v0.3.0 §4.8；两 SDK 同构契约"设计 Y"）/ Governance recovery entry。
@@ -2496,23 +2551,68 @@ class Computer(BaseComputer[PromptSession]):
             重挂时**应当传入**，仅在明确无既有面的受控场景省略。
         :param register_server: 重挂回调 ``(config, record) -> Awaitable``；``None`` = skills-only。
         :param inject_inputs: plugin inputs 注入回调（入参含归属的 record）；每 plugin 根仅调一次。
-        :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；
-            ``None`` = 现算 user/project/local/policy）。
+        :param declared: 合并声明视图覆盖（``installedPlugins`` + ``enabledPlugins`` 两键权威；#287 起另**只读**
+            ``extraKnownMarketplaces`` 作声明源诊断——override 时省略该键会让冲突诊断静默失效、report 恒空）。
+
+            **#293 起接受三种形态**（契约，供 #294 消费）：
+
+            - ``None`` —— 现算 user/project/local/**flag**/policy 五层视图；report 的
+              :attr:`~a2c_smcp.computer.settings.recovery.GovernanceRecoveryReport.marketplace_declaration_errors`
+              取自同一次解析的 ``ResolvedSettings.errors``；``per_scope_layers`` 同样取自该次解析，故
+              #159 Option B 信任门（``enabled_origin``）在默认 boot 路径**照常生效**；
+            - :class:`~a2c_smcp.computer.settings.scope.ResolvedSettings` —— **推荐的外部 override 形态**：
+              ``.settings`` 作声明视图、``.errors`` 作声明错误来源、``.per_scope_layers`` 作 #159 Option B
+              的 ``enabled_origin`` 判据。类型即载体，调用方不可能「只传视图忘传错误」——那正是 #293 要消灭
+              的静默形态（如 CLI ``run_governance_remount`` 传 ``resolved_settings_with_errors(...)`` 整对象）；
+            - 裸 ``Mapping`` —— 遗留形态，**不携带 settings 校验错误**（report 该字段恒空），也**没有**
+              per-scope 层（``enabled_origin=None`` ⇒ 信任门不触发）。需要声明诊断或 project-origin 判据的
+              调用方 MUST 改传 ``ResolvedSettings``。
+
+            ``per_scope_layers`` 的唯一来源是「内部解析」或「传入的 ``ResolvedSettings``」；裸 ``Mapping``
+            是其结构性缺席（协议 §2.5-5 明许 scope 纯推导与挂载时标记行为等价）。
+
+            ⚠️ **手搓的 ``ResolvedSettings`` 若 ``per_scope_layers`` 为空**（该字段的默认值）**等同无
+            per-scope 信息** ⇒ ``enabled_origin is None`` ⇒ **按 user/unknown 处理**（#159 Option B 信任门
+            **不触发**，与裸 ``Mapping`` 同语义）。这**不是**「project-origin 免审批」的漏洞开关——它只对
+            「宿主自己编了一个 ``ResolvedSettings``」成立；需要门控的宿主 MUST 传
+            :func:`~a2c_smcp.computer.settings.scope.resolve_settings` 的产物（其 layers 恒为真实逐层视图）。
+            该语义由 ``test_reconcile_governance_hand_rolled_resolved_settings_without_layers_skips_gate`` 钉住。
         :return: :class:`GovernanceRecoveryReport`（``remounted_servers`` 仅阶段二填充）。
         """
+        # 运行时导入：本模块只在 TYPE_CHECKING 下引入该类型（无环，只为不拉重）。
+        from a2c_smcp.computer.settings.scope import ResolvedSettings
+
         home = self.skill_home
         per_scope_layers: Mapping[SettingsScope, Mapping[str, Any]] | None = None
+        settings_errors: Sequence[SettingsValidationError] = ()
         if declared is None:
             resolved = self._resolve_declared_settings()
             declared = resolved.settings
             per_scope_layers = resolved.per_scope_layers
-        else:
-            # 调用方显式传 declared 时通常不带 per-scope 层 → 保持向后兼容（enabled_origin=None）
+            settings_errors = resolved.errors
+        elif isinstance(declared, ResolvedSettings):
+            # 用户 2026-11-22 裁决（架构师转达，本单范围内）：显式 ResolvedSettings **也取** per-scope 层。
+            # 丢弃它会让 ``enabled_origin`` 恒 None ⇒ project-scope 激活的 bundled server 绕过 #159 Option B
+            # 的 PENDING 信任门、被自动挂载（未决的工作区共享声明不该免批准）。rust 早已如此取。
+            settings_errors = declared.errors
+            per_scope_layers = declared.per_scope_layers
+            declared = declared.settings
+        elif isinstance(declared, Mapping):
             per_scope_layers = None
+        else:
+            raise TypeError(
+                "reconcile_governance(declared=...) expects None, a Mapping, or "
+                f"ResolvedSettings (to carry settings validation errors); got {type(declared).__name__}",
+            )
 
         report = await recover_marketplace_skills(
             self._skill_registry, home, declared, env=self._resolve_env(), cwd=self._resolve_cwd(),
         )
+        # #293（镜像 rust）：非法 `extraKnownMarketplaces` 声明被 settings 校验整条丢弃，错误只在
+        # `ResolvedSettings.errors` 里。**无条件**回填——`recover_marketplace_skills` 拿到的 `declared`
+        # 已过校验、无处取错误；且空安装意图时它早退，放在那里会让「无意图市场也要报」失效。
+        # 与 `marketplace_source_conflicts` 正交：被丢弃的声明不在 declared 视图里，冲突检测看不到它。
+        attach_marketplace_declaration_errors(report, settings_errors)
         if report.restored_skills:
             self.mark_skills_dirty()
 
@@ -2571,11 +2671,12 @@ class Computer(BaseComputer[PromptSession]):
                 # 统一收在循环之后，故治理校验 / input 注入 / 挂载全部完成后才批量启动。
                 await register_server(record.config, record)
             except Exception as e:  # 单 server 失败隔离 / per-server failure isolation
+                # #289 终审 🔴：register 链上的渲染/校验失败可能是 ValidationError（input_value 含已解析 secret）→ 安全文本。
                 logger.warning(
                     "governance recovery: failed to remount bundled server %r (plugin %s): %s",
                     bundle_id,
                     record.plugin_id,
-                    e,
+                    exception_text(e),
                 )
                 continue
             existing.add(bundle_id)
@@ -2597,7 +2698,7 @@ class Computer(BaseComputer[PromptSession]):
                         "governance recovery: remounted server %r failed to start "
                         "(non-blocking; stays pending): %s",
                         outcome.bundle_id,
-                        outcome.error,
+                        exception_text(outcome.error),
                     )
         return report
 

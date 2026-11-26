@@ -29,7 +29,7 @@ from a2c_smcp.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 触发动态名补全的 (namespace, subcommand) / commands whose positional arg is a dynamic name。
-_DYNAMIC_MARKETPLACE = {("marketplace", s) for s in ("info", "remove", "refresh", "set")}
+_DYNAMIC_MARKETPLACE = {("marketplace", s) for s in ("info", "remove", "refresh", "set", "migrate")}
 _DYNAMIC_SKILL = {("skill", "info")}
 # plugin 位置参数补 installed plugin id（取 installed_plugins.json）；install 补 available 暂不实现（返 []）。
 _DYNAMIC_PLUGIN = {("plugin", s) for s in ("uninstall", "enable", "disable", "info")}

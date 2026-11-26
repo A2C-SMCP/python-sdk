@@ -24,7 +24,7 @@ import typer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids
+from a2c_smcp.computer.cli.commands import files_only_non_plugin_bundle_ids, make_settings_provider
 from a2c_smcp.computer.cli.commands import identity as identity_cmd
 from a2c_smcp.computer.cli.commands import marketplace as mp_cmd
 from a2c_smcp.computer.cli.commands import plugin as plugin_cmd
@@ -44,7 +44,7 @@ from a2c_smcp.computer.inputs.resolver import InputResolver
 from a2c_smcp.computer.mcp_clients.model import (
     MCPServerInput as MCPServerInputModel,
 )
-from a2c_smcp.computer.skills.home import ensure_skill_home
+from a2c_smcp.computer.skills.home import ensure_skill_home, resolve_skill_home
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.socketio.client import SMCPComputerClient
 from a2c_smcp.computer.utils import console as console_util
@@ -458,18 +458,32 @@ identity_app = typer.Typer(help="Computer identity (reset)")
 
 @marketplace_app.command("add")
 def _mp_add(
+    ctx: typer.Context,
     git_url: str = typer.Argument(..., help="git URL 或 owner/repo 简写 / git URL or owner/repo shorthand"),
-    name: str | None = typer.Option(None, "--name", help="marketplace 名（默认从 URL 派生）/ name (derived from URL by default)"),
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        help="期望的清单名（仅校验，不覆盖；注册名取 marketplace.json 顶层 name）/ expected manifest name (validated, never an alias)",
+    ),
     trust: bool = typer.Option(False, "--trust", help="跳过 trust 确认（非交互必需）/ skip trust prompt (required non-interactively)"),
     auto_update: bool = typer.Option(False, "--auto-update", help="启用 per-source 自动更新 / enable per-source auto-update"),
-    no_clone: bool = typer.Option(False, "--no-clone", help="仅注册意图、不 clone（debug）/ register intent only (debug)"),
+    no_clone: bool = typer.Option(
+        False,
+        "--no-clone",
+        help="仅注册意图；新源必须先 clone 才能确定清单名 / intent only; a new source needs a clone to resolve its manifest name",
+    ),
     json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
 ) -> None:
-    """添加 marketplace（非交互须 --trust）/ Add a marketplace (requires --trust non-interactively)."""
+    """添加 marketplace（注册名 = 清单 name；非交互须 --trust）/ Add a marketplace (registered under the manifest name)."""
+    # #296：非交互入口必须把**根级** ``--settings``（flag 层）交给 re-add 引用守卫；此前
+    # ``ctx.obj.flag_path`` 只被 ``settings`` 子命令读取，``marketplace add`` 看不到 flag 层。
+    # policy 层由 `intent_reference_pids` 按 `env=os.environ` 现解析（与 rust#300 同口径），此处无需重复注入。
+    st = _root_state(ctx)
     code = asyncio.run(
         mp_cmd.marketplace_add(
             SkillRegistry(), ensure_skill_home(), os.environ, git_url,
             name=name, trust=trust, auto_update=auto_update, no_clone=no_clone, confirm=None, json_output=json_output,
+            flag_settings_path=st.flag_path,
         ),
     )
     raise typer.Exit(code)
@@ -508,9 +522,40 @@ def _mp_refresh(
     target: str = typer.Argument("all", help="marketplace 名或 all / a name or 'all'"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """刷新 marketplace（git pull / 重 clone + 对账）/ Refresh marketplaces."""
+    """刷新 marketplace（重 clone + 原子换入；改名拒绝 → validation）/ Refresh marketplaces."""
     code = asyncio.run(
         mp_cmd.marketplace_refresh(SkillRegistry(), ensure_skill_home(), os.environ, target, json_output=json_output),
+    )
+    raise typer.Exit(code)
+
+
+@marketplace_app.command("migrate")
+def _mp_migrate(
+    name: list[str] | None = typer.Option(  # noqa: B008 - Typer 要求 OptionInfo 作为默认值
+        None,
+        "--name",
+        help="只迁移指定旧名（可重复）/ migrate only these legacy names",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="真正写盘（缺省 dry-run）/ write changes (default: dry-run)"),
+    update_declarations: bool = typer.Option(
+        False,
+        "--update-declarations",
+        help="同时改写 user scope 的 extraKnownMarketplaces / update user-scope declarations",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="JSON 输出 / JSON output"),
+) -> None:
+    """迁移存量 marketplace 注册名（默认 dry-run）/ Migrate legacy marketplace names (dry-run by default)."""
+    # dry-run 必须零写入：home 不存在时不得 mkdir（`ensure_skill_home` 仅 --apply 才用）。
+    home = ensure_skill_home() if apply else resolve_skill_home()
+    code = asyncio.run(
+        mp_cmd.marketplace_migrate(
+            home,
+            os.environ,
+            names=name,
+            apply=apply,
+            update_declarations=update_declarations,
+            json_output=json_output,
+        )
     )
     raise typer.Exit(code)
 
@@ -578,10 +623,23 @@ def _plugin_uninstall(
 
 
 @plugin_app.command("enable")
-def _plugin_enable(plugin_id: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+def _plugin_enable(
+    ctx: typer.Context,
+    plugin_id: str = typer.Argument(...),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
     """启用 plugin（非交互 ledger-only）/ Enable a plugin (ledger-only)."""
+    st = _root_state(ctx)
+    env = os.environ
+    # #289：与非交互 settings 面同源——根级 ``--settings`` 进 flag 层（policy 由共享工厂按 env 现解析）；
+    # 否则 retained 判定会与 ``settings show --scope merged`` / REPL 的实例轴视图分叉。
+    provider = make_settings_provider(env, flag_path=st.flag_path)
+
     code = asyncio.run(
-        plugin_cmd.plugin_enable(SkillRegistry(), ensure_skill_home(), os.environ, plugin_id, json_output=json_output),
+        plugin_cmd.plugin_enable(
+            SkillRegistry(), ensure_skill_home(), env, plugin_id,
+            resolved_settings=provider, json_output=json_output,
+        ),
     )
     raise typer.Exit(code)
 

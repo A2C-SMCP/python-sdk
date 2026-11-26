@@ -29,6 +29,11 @@ skills.staging (which now imports this module, so a back-edge would be a real cy
 :func:`entry_is_strict` / :func:`check_strict_conflict` / :func:`resolve_skill_override_dirs` 承载，供 staging
 （marketplace 注册）与 installer（plugin install 硬失败）共同消费。本 SDK 仅消费 ``skills`` + ``mcp-servers``，
 冲突检测仍按规范判**全六组件字段**（:data:`COMPONENT_FIELDS`），但覆写**路径扫描仅 ``skills``**。
+
+**SKILL 发现容器集单一权威**（#271）：约定 ``skills/`` + 声明覆写的合成由
+:func:`plugin_skill_container_dirs` 单点承载，staging（装载扫描）与 installer（enable 预检计数）共同消费。
+:mod:`~a2c_smcp.computer.skills.validator` **刻意不复用**——它要对每项覆写产出 file/loc 级 error（越界 / 缺失），
+而装载路径只记日志后跳过（越界 ERROR / 非目录 WARNING，均无 file/loc 诊断），二者语义不同（见该模块对应注释）。
 """
 
 from __future__ import annotations
@@ -41,7 +46,9 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
-from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT
+from a2c_smcp.computer.skills.sources import DEFAULT_PLUGIN_ROOT, safe_exception_text
+from a2c_smcp.utils.diagnostics import pydantic_error_text
+from a2c_smcp.utils.git_url import redact_git_urls_in_text, sanitize_path_for_diagnostics
 from a2c_smcp.utils.logger import get_logger
 from a2c_smcp.utils.path import is_within
 
@@ -53,6 +60,7 @@ MARKETPLACE_MANIFEST = "marketplace.json"  # 仓库级 manifest
 PLUGIN_MANIFEST = "plugin.json"  # plugin 级 manifest（仅元数据）
 MCP_SERVERS_SUBDIR = "mcp-servers"  # plugin 携带 MCP server 的文件式子树（§3.3）
 MCP_INPUTS_FILENAME = "inputs.json"  # plugin 范围 inputs 池定义（枚举 server 时排除；入池归 #65）
+SKILLS_SUBDIR = "skills"  # plugin 内 SKILL 子树约定目录（SKILL 协议 §2；单一权威，staging 再导出）
 
 # 单点构造校验入口：dict → MCPServerConfig union（按 type 分型，pydantic v2）/ Single dict→config adapter.
 _MCP_SERVER_ADAPTER: TypeAdapter[MCPServerConfig] = TypeAdapter(MCPServerConfig)
@@ -67,10 +75,13 @@ def _read_json_object(path: Path, *, what: str) -> dict[str, Any]:
     """读 JSON 文件并要求根为对象 / Read a JSON file requiring an object root（失败 → :class:`PluginManifestError`）。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise PluginManifestError(f"{what} unreadable/invalid at {path}: {e}") from e
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise PluginManifestError(
+            f"{what} unreadable/invalid at {sanitize_path_for_diagnostics(str(path))}: "
+            f"{safe_exception_text(e)}"
+        ) from e
     if not isinstance(data, dict):
-        raise PluginManifestError(f"{what} root is not an object: {path}")
+        raise PluginManifestError(f"{what} root is not an object: {sanitize_path_for_diagnostics(str(path))}")
     return data
 
 
@@ -79,7 +90,7 @@ def read_marketplace_manifest(catalog_dir: Path) -> dict[str, Any]:
     """读 ``<catalog>/.tfrobot-plugin/marketplace.json``（缺失/损坏 → 抛）/ Read the marketplace manifest (raise if absent)。"""
     path = catalog_dir / MARKETPLACE_MANIFEST_DIR / MARKETPLACE_MANIFEST
     if not path.is_file():
-        raise PluginManifestError(f"marketplace manifest not found: {path}")
+        raise PluginManifestError(f"marketplace manifest not found: {sanitize_path_for_diagnostics(str(path))}")
     return _read_json_object(path, what="marketplace manifest")
 
 
@@ -120,7 +131,7 @@ def read_plugin_metadata(plugin_root: Path) -> dict[str, Any]:
         return _read_json_object(path, what="plugin manifest")
     except PluginManifestError as e:
         # plugin.json 仅供 version / 显示名兜底，损坏不致命（SKILL/server 由路径推导）。
-        logger.warning("plugin manifest ignored (%s)", e)
+        logger.warning("plugin manifest ignored (%s)", safe_exception_text(e))
         return {}
 
 
@@ -148,9 +159,49 @@ def entry_is_strict(entry: Mapping[str, Any]) -> bool:
     return val if isinstance(val, bool) else True
 
 
+def _json_truthy(value: object) -> bool:
+    """JSON 真值判据（对齐 rust ``json_truthy``）：``null``/``false``/``0``/``""``/``[]``/``{}`` 为假，其余为真。
+
+    **刻意私有**（#271）：本模块只对外暴露按字段名判定的 :func:`entry_declares_component`，不导出通用真值
+    函数——真值口径是「声明态判据」的内部细节，散出去的通用工具会被误用到非 JSON 来源的值上。
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):  # True 在此处恒真（False 已返回）
+        return True
+    if isinstance(value, (int, float)):
+        return value != 0
+    # 只覆盖 **JSON 的五种容器/标量**；``tuple`` 刻意不在列（JSON 无 tuple）——空 tuple 走末尾 fallback
+    # 取真，与 :func:`entry_declares_component` 的「非 JSON 类型一律 fail-closed」承诺一致（审查 🟡1）。
+    if isinstance(value, (str, list, dict)):
+        return len(value) > 0
+    return True
+
+
+def entry_declares_component(entry: Mapping[str, Any], key: str) -> bool:
+    """声明态判据的**唯一权威**：``entry[key]`` 按原始 JSON 真值是否算「已声明」（#271，镜像 rust
+    ``manifest.rs`` 的 ``entry_declares_component``）/ Single authority for "is this component declared?".
+
+    供 :func:`manifest_declared_components`（plugin.json 组件全集）与 installer 的 SKILL 声明判据共用，
+    避免两处各写一份真值口径——历史上它们一个用 Python 真值、一个用 JSON 真值，靠注释维系等价。
+
+    按**原始 JSON 真值**判而非「能归一出可用路径列表」：``skills: [123]`` / ``{"x": 1}`` 属「声明了但不可
+    投影」（应走失败路径），``skills: ""`` / ``[]`` 才算未声明。
+
+    **非 JSON 类型**（本仓不可达——调用方一律传 ``json.loads`` 结果）一律算「已声明」（fail-closed 取真），
+    见 :func:`_json_truthy` 的末尾 fallback。
+    """
+    return _json_truthy(entry.get(key))
+
+
 def manifest_declared_components(plugin_manifest: Mapping[str, Any]) -> list[str]:
-    """plugin.json 中**真值**组件字段名列表（空 / 缺 / falsy 不算声明）/ Truthy component fields declared in plugin.json。"""
-    return [f for f in COMPONENT_FIELDS if plugin_manifest.get(f)]
+    """plugin.json 中**真值**组件字段名列表（空 / 缺 / falsy 不算声明）/ Truthy component fields declared in plugin.json.
+
+    真值口径委托 :func:`entry_declares_component`（#271 单点）。对 **JSON 解码值**与旧实现
+    ``if plugin_manifest.get(f)`` 逐值等价；仅非 JSON falsy 类型（``set()`` / 自定义对象）由「未声明」
+    变为「已声明」——本仓调用方（installer / staging / validator）全部读 ``json.loads`` 结果，不可达。
+    """
+    return [f for f in COMPONENT_FIELDS if entry_declares_component(plugin_manifest, f)]
 
 
 def check_strict_conflict(entry: Mapping[str, Any], plugin_manifest: Mapping[str, Any]) -> None:
@@ -220,16 +271,49 @@ def resolve_skill_override_dirs(
     for rel in raw:
         cand = (plugin_root / rel).resolve()
         if not is_within(cand, plugin_root_resolved):
-            logger.error("skills override path %r escapes plugin root %s, skipped", rel, plugin_root)
+            logger.error(
+                "skills override path %r escapes plugin root %s, skipped",
+                redact_git_urls_in_text(rel),
+                sanitize_path_for_diagnostics(str(plugin_root)),
+            )
             continue
         if cand in seen_paths:
             continue
         if not cand.is_dir():
-            logger.warning("skills override path %r is not a directory at %s, skipped", rel, cand)
+            logger.warning(
+                "skills override path %r is not a directory at %s, skipped",
+                redact_git_urls_in_text(rel),
+                sanitize_path_for_diagnostics(str(cand)),
+            )
             continue
         seen_paths.add(cand)
         out.append(cand)
     return out
+
+
+def plugin_skill_container_dirs(
+    entry: Mapping[str, Any],
+    plugin_manifest: Mapping[str, Any],
+    plugin_root: Path,
+    *,
+    strict: bool,
+) -> list[Path]:
+    """SKILL 发现容器集（单一权威）/ SKILL discovery container dirs — single authority.
+
+    约定 ``<plugin 根>/skills`` 恒在首位，其后追加 :func:`resolve_skill_override_dirs` 解析出的声明覆写容器
+    （§4.3）。与 rust ``plugin_skill_container_dirs`` 同构，供 staging（装载扫描）与 installer（enable 预检
+    计数）共同消费，避免两套口径漂移（#271）。
+
+    **不跨容器去重、不校验约定容器存在性**：覆写项内部的越界 / 缺失 / 重复由
+    :func:`resolve_skill_override_dirs` 过滤（越界记 ERROR 跳过、非目录记 WARNING 跳过、重复静默跳过——这也是
+    escape 防线的**唯一**位置，消费方不再复查）；跨容器去重（约定径与覆写径可能同径）由消费方按 resolve 后
+    路径做；约定容器存在性由各自扫描 / 计数路径决定（:mod:`~a2c_smcp.computer.skills.validator` 另有逐项诊断，
+    不走本函数）。
+    """
+    return [
+        plugin_root / SKILLS_SUBDIR,
+        *resolve_skill_override_dirs(entry, plugin_manifest, plugin_root, strict=strict),
+    ]
 
 
 # ── mcp-servers/<n>.json（plugin 携带 MCP server，文件式）/ bundled MCP server files ──────────
@@ -257,10 +341,16 @@ def parse_bundled_server(path: Path) -> MCPServerConfig:
     try:
         cfg = _MCP_SERVER_ADAPTER.validate_python(data)
     except ValidationError as e:
-        raise PluginManifestError(f"invalid MCP server config at {path}: {e}") from e
+        # #263 复审 / #289：pydantic 默认 str 带 `input_value=…`（env / headers 里可能是 token）→ 由共享
+        # 安全出口只报字段与条数（单一权威，勿在本处另写副本）。
+        raise PluginManifestError(
+            f"invalid MCP server config at {sanitize_path_for_diagnostics(str(path))}: {pydantic_error_text(e)}"
+        ) from e
     if cfg.name != path.stem:
         raise PluginManifestError(
-            f"bundled MCP server filename stem {path.stem!r} != config name {cfg.name!r} at {path} "
+            f"bundled MCP server filename stem {redact_git_urls_in_text(path.stem)!r} != "
+            f"config name {redact_git_urls_in_text(str(cfg.name))!r} "
+            f"at {sanitize_path_for_diagnostics(str(path))} "
             "(mcp-servers protocol §1: filename = server identity)",
         )
     return cfg

@@ -21,7 +21,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from a2c_smcp.computer.cli.commands import flag_value
+from rich.markup import escape
+
+from a2c_smcp.computer.cli.commands import flag_value, print_unknown_subcommand
 from a2c_smcp.computer.cli.utils import console
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, SOURCE_MCP, SOURCE_USER
 from a2c_smcp.computer.skills.registry import SkillRegistry
@@ -79,7 +81,7 @@ def skill_info(registry: SkillRegistry, name: str, *, json_output: bool = False)
         if json_output:
             console.print_json(data={"error": f"unknown skill: {name}"})
         else:
-            console.print(f"[red]✗ unknown skill: {name!r}[/red]")
+            console.print(f"[red]✗ unknown skill: {escape(repr(name))}[/red]")
         return 1
     found["orphan"] = orphaned
     found["enabled"] = not orphaned
@@ -106,14 +108,20 @@ async def rebuild_registry(home: Path, env: Mapping[str, str] | None) -> SkillRe
     就地发现重新注册。**mcp 源不在此**（需运行中 MCP 服务器，仅 REPL 可见）。
     """
     from a2c_smcp.computer.settings.store import load_known_marketplaces
+    from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError
     from a2c_smcp.computer.skills.staging import stage_marketplace_skills, stage_user_skills
 
     reg = SkillRegistry()
     mps = load_known_marketplaces(home, env).get("marketplaces") or {}
     for nm, rec in mps.items():
-        await stage_marketplace_skills(
-            nm, rec.get("source") or {}, reg, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=False, env=env
-        )
+        try:
+            await stage_marketplace_skills(
+                nm, rec.get("source") or {}, reg, home, auto_update=bool(rec.get("autoUpdate", False)), refresh=False, env=env
+            )
+        except MarketplaceNameChangeError as e:
+            # #260/§5.14：重建路径观测到清单改名 → 拒绝且不换内容；跳过该源（不阻断其余源的重建）。
+            # 账本键可被手编，rich 标记须转义（#263 教训：不可信文本进 console 会变 MarkupError）。
+            console.print(f"[yellow]! marketplace {escape(repr(nm))} skipped: {escape(e.reason)}[/yellow]")
     stage_user_skills(reg, home)
     return reg
 
@@ -135,4 +143,4 @@ def repl_dispatch(comp: Any, parts: list[str]) -> None:
             return
         skill_info(registry, pos[0], json_output=json_output)
     else:
-        console.print(f"[yellow]unknown skill subcommand: {sub}[/yellow]")
+        print_unknown_subcommand("skill", sub)

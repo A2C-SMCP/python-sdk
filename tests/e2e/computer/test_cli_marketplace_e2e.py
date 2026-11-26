@@ -44,7 +44,7 @@ def _git(cwd: Path, *args: str) -> None:
 
 def _make_bare(tmp_path: Path) -> Path:
     manifest = {
-        "name": "acme-skills",
+        "name": "acme",
         "owner": {"name": "Acme"},
         "metadata": {"pluginRoot": "./plugins"},
         "plugins": [{"name": "audit", "source": "audit", "version": "1.0.0"}],

@@ -25,8 +25,10 @@ import pytest
 
 from a2c_smcp.computer.mcp_clients.model import SseServerConfig, StdioServerConfig, StreamableHttpServerConfig
 from a2c_smcp.computer.skills.manifest import (
+    COMPONENT_FIELDS,
     PluginManifestError,
     check_strict_conflict,
+    entry_declares_component,
     entry_is_strict,
     enumerate_bundled_server_files,
     find_plugin_entry,
@@ -35,6 +37,7 @@ from a2c_smcp.computer.skills.manifest import (
     manifest_declared_components,
     parse_bundled_server,
     plugin_root_base,
+    plugin_skill_container_dirs,
     read_marketplace_manifest,
     read_plugin_metadata,
     resolve_plugin_version,
@@ -216,6 +219,60 @@ def test_manifest_declared_components() -> None:
     assert manifest_declared_components({"hooks": "h", "agents": "a", "lspServers": {"l": {}}}) == ["agents", "hooks", "lspServers"]
 
 
+def test_entry_declares_component_json_truth_table() -> None:
+    """#271：声明态判据的真值表（镜像 rust ``entry_declares_component``）。
+
+    **本用例钉的是文档化真值表，不宣称变异可杀**（Issue #271 裁决）：JSON 解码值域上 ``bool(value)`` 与本
+    判据同表，把实现换成 ``bool`` 仍会全绿——这是刻意接受的口径，因为两条路径在真实输入上等价。真正与
+    ``bool`` 分叉的只有**非 JSON 类型**（见下一条用例），而它在本仓不可达（调用方一律传 ``json.loads`` 结果）。
+    """
+    falsy = [None, False, 0, 0.0, "", [], {}]
+    for value in falsy:
+        assert entry_declares_component({"k": value}, "k") is False, value
+    truthy = [True, 1, -1, 0.5, "x", [123], [0], {"x": 1}, {"x": 0}]
+    for value in truthy:
+        assert entry_declares_component({"k": value}, "k") is True, value
+    assert entry_declares_component({}, "k") is False  # 缺键 = 未声明
+    assert entry_declares_component({"other": "v"}, "k") is False  # 只看指定键
+
+
+def test_entry_declares_component_non_json_fallback_is_fail_closed() -> None:
+    """#271 已知边界：非 JSON 类型一律算「已声明」（fail-closed 取真）。
+
+    ``bool()`` 对这些值可能为假（``set()`` / 自定义对象），本判据落到末尾 ``return True``——这是刻意的：
+    「判不准就当作已声明」让调用方走失败/诊断路径（strict 冲突报错、零投影失败），而不是静默放行。
+    **本仓不可达**（``read_plugin_metadata`` / ``read_marketplace_manifest`` 都返回 ``json.loads`` 结果），
+    但嵌入宿主可能自行构造，故把语义钉死，避免将来被当作 bug「修」成 fail-open。
+    """
+    for value in (set(), frozenset(), b"", object(), (), (1,), ("a",)):
+        assert entry_declares_component({"k": value}, "k") is True, value
+    # 空 tuple 是这条边界的**承重点**：``tuple`` 曾与 ``(str, list, dict)`` 同列走 ``len`` 分支 → ``()`` 判假，
+    # 与「非 JSON 取真」的承诺自相矛盾（审查 🟡1）。JSON 无 tuple，故它必须落到末尾 fallback。
+    assert entry_declares_component({"skills": ()}, "skills") is True
+
+
+def test_manifest_declared_components_shares_entry_declares_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#271：``manifest_declared_components`` 与 ``entry_declares_component`` **结构共用**（口径不漂移）。
+
+    只比输出不足以发现漂移——JSON 值上 Python 真值与 JSON 真值同表，退回旧写法
+    ``[f for f in COMPONENT_FIELDS if plugin_manifest.get(f)]`` 照样全绿（审查 🟡2）。故用 spy 断言
+    「每个字段各经一次单一权威判定」。
+    """
+    from a2c_smcp.computer.skills import manifest as manifest_mod
+
+    seen: list[str] = []
+    original = manifest_mod.entry_declares_component
+
+    def _spy(entry: dict, key: str) -> bool:
+        seen.append(key)
+        return original(entry, key)
+
+    monkeypatch.setattr(manifest_mod, "entry_declares_component", _spy)
+
+    assert manifest_declared_components({"skills": ["x"], "hooks": 0}) == ["skills"]
+    assert seen == list(COMPONENT_FIELDS)  # 六字段逐一委托，不是另写一套真值
+
+
 def test_check_strict_conflict_false_with_components_raises() -> None:
     # strict=false + plugin.json 声明组件 → 拒绝加载（红→绿核心）
     with pytest.raises(PluginManifestError, match="conflicting manifests"):
@@ -277,3 +334,56 @@ def test_resolve_skill_override_dirs_traversal_and_non_dir_skipped(tmp_path: Pat
         strict=True,
     )
     assert out == [(tmp_path / "ok").resolve()]  # 越界 ../escape 跳过、非目录 afile 跳过、不存在跳过
+
+
+# ── SKILL 发现容器集单点（#271）/ single-point container set ─────────────────────
+def test_plugin_skill_container_dirs_convention_first_then_overrides(tmp_path: Path) -> None:
+    """约定 ``skills/`` 恒在首位，其后按序追加声明覆写容器（覆写为 resolve 后路径）。"""
+    (tmp_path / "extra").mkdir()
+    out = plugin_skill_container_dirs({"skills": ["extra"]}, {}, tmp_path, strict=True)
+    assert out == [tmp_path / "skills", (tmp_path / "extra").resolve()]
+
+
+def test_plugin_skill_container_dirs_convention_not_validated(tmp_path: Path) -> None:
+    """约定容器不存在也照列——单点只做集合成，存在性归消费方（staging WARNING / enable 预检计数）。"""
+    assert plugin_skill_container_dirs({}, {}, tmp_path, strict=True) == [tmp_path / "skills"]
+
+
+def test_plugin_skill_container_dirs_entry_always_plugin_json_only_when_strict(tmp_path: Path) -> None:
+    """entry.skills 恒取；plugin.json.skills 仅 strict=true 追加（与 resolve_skill_override_dirs 同口径）。"""
+    (tmp_path / "entry-skills").mkdir()
+    (tmp_path / "pj-skills").mkdir()
+    args = ({"skills": "entry-skills"}, {"skills": "pj-skills"}, tmp_path)
+    assert plugin_skill_container_dirs(*args, strict=True) == [
+        tmp_path / "skills",
+        (tmp_path / "entry-skills").resolve(),
+        (tmp_path / "pj-skills").resolve(),
+    ]
+    assert plugin_skill_container_dirs(*args, strict=False) == [
+        tmp_path / "skills",
+        (tmp_path / "entry-skills").resolve(),
+    ]
+
+
+def test_plugin_skill_container_dirs_override_escape_excluded(tmp_path: Path) -> None:
+    """覆写越界（目标真实存在）被过滤——escape 防线在单点内（消费方不再复查）。"""
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (tmp_path / "outside").mkdir()  # 越界目标真实存在：排除只能来自 is_within，而非「目录不存在」
+    out = plugin_skill_container_dirs({"skills": "../outside"}, {}, plugin_root, strict=True)
+    assert out == [plugin_root / "skills"]
+
+
+def test_plugin_skill_container_dirs_override_missing_dir_excluded(tmp_path: Path) -> None:
+    """声明但不存在的覆写目录被过滤（装载侧只记 WARNING 跳过，不进入容器集）。"""
+    out = plugin_skill_container_dirs({"skills": "no-such-dir"}, {}, tmp_path, strict=True)
+    assert out == [tmp_path / "skills"]
+
+
+def test_plugin_skill_container_dirs_override_path_resolved(tmp_path: Path) -> None:
+    """覆写按 resolve 后路径返回：``sub/../extra`` 归一为 ``extra``（未 resolve 的直连实现会转红）。"""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "extra").mkdir()
+    out = plugin_skill_container_dirs({"skills": "sub/../extra"}, {}, tmp_path, strict=True)
+    assert out[1] == (tmp_path / "extra").resolve()
+    assert out[1] != tmp_path / "sub" / ".." / "extra"  # 字面 join 与归一后路径不相等（防同值致盲）

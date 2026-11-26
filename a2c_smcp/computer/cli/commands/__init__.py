@@ -23,7 +23,7 @@ so they unit-test in isolation. Only the cross-command seam lives here: :func:`b
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,7 +35,7 @@ if TYPE_CHECKING:  # 仅类型，避免运行时循环导入 / type-only to dodg
     from a2c_smcp.computer.mcp_clients.model import MCPServerConfig
     from a2c_smcp.computer.settings.installer import ExistingBundleIds, NonPluginBundleIds, RegisterServer, RemoveServer
     from a2c_smcp.computer.settings.schema import SettingsValidationError
-    from a2c_smcp.computer.settings.scope import ResolvedSettings
+    from a2c_smcp.computer.settings.scope import ResolvedSettings, SettingsAxes
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +54,8 @@ def build_mcp_callbacks(comp: Computer) -> McpCallbacks:
 
     - ``existing_bundle_ids``：当前**运行期活跃** server 的 bundle_id 集（依赖预检用）；
     - ``register_server``：**运行期挂载**一个 ``MCPServerConfig``（enable / 治理重挂用）；
-    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 回收用）；
+    - ``remove_server``：按 **bundle_id** 运行期停摘 server（disable / uninstall 按 §4.9.1-2 回收；enable
+      写后失败对**本次 attempt 全部** server 调用，含 register 失败者）。实现只做运行期 unmount，不删 durable 声明；
     - ``non_plugin_bundle_ids``：**声明面**中 ``origin != plugin`` 的 bundle_id 集（§4.9.1-2 回收判据的
       「X 非用户声明」项，#164）——与 ``existing_bundle_ids`` **判然不同**，勿混用：前者是「谁被声明了（且非 plugin
       带入）」，后者是「谁挂起来了」。协议**明禁**用裸活跃集判回收（无 origin ⇒ flag/embed/plugin 三条挂载路径
@@ -113,6 +114,68 @@ def files_only_non_plugin_bundle_ids(env: Mapping[str, str] | None = None) -> No
 
 
 # ── 跨命令解析 / 视图接缝（marketplace / skill / plugin / settings 共用）/ shared parse & view seams ──
+def settings_axes_of(comp: Any) -> SettingsAxes:
+    """取 Computer（或同形替身）的 settings 原始轴——**单一来源**（#296）/ Raw settings axes of a Computer-like object.
+
+    优先 ``_settings_axes()``（``Computer`` 提供，含 env/cwd/flag/policy，与治理恢复同源）；自定义
+    ``--computer-factory`` 未实现该方法时退化为 getattr 组合（env / cwd / flag，policy 由消费方按 env 现解析）。
+    REPL 全部分派器（marketplace / settings / plugin）统一经本函数取轴，避免同一 REPL 内 add 与
+    list/info/remove/refresh 读写不同账本。
+    """
+    from a2c_smcp.computer.settings.scope import SettingsAxes
+
+    axes_fn = getattr(comp, "_settings_axes", None)
+    if callable(axes_fn):
+        axes: SettingsAxes = axes_fn()
+        return axes
+    resolve_cwd = getattr(comp, "_resolve_cwd", None)
+    return SettingsAxes(
+        env=getattr(comp, "env", None),
+        cwd=resolve_cwd() if callable(resolve_cwd) else None,
+        flag_settings_path=getattr(comp, "_flag_settings_path", None),
+    )
+
+
+def make_settings_provider(
+    env: Mapping[str, str] | None,
+    *,
+    flag_path: Path | None = None,
+    cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
+) -> Callable[[str | None], Mapping[str, Any]]:
+    """
+    #289：enable 失败诊断的合并 settings provider 工厂（单一实现，REPL / 一次性 CLI 共用）/ Shared diagnostic provider.
+
+    ``enable_plugin`` 用它在写前与回滚写后各现算一次合并视图，判定「回滚前后是否均 enabled」并给出 retained
+    诊断。参数 = **诊断锚点**（本次操作 scope 的 project/local 路径；``None`` = user scope 操作 → ``cwd``，
+    REPL 传实例 cwd、一次性 CLI 传进程 cwd）。与写锚（settings 文件路径）分离；provider 只读，不驱动任何
+    破坏性动作。``policy_settings=None`` = 按 env 现解析（:func:`resolved_settings` 既有语义）。
+    """
+
+    def _provider(anchor: str | None) -> Mapping[str, Any]:
+        return resolved_settings(
+            env,
+            flag_path=flag_path,
+            cwd=Path(anchor) if anchor else cwd,
+            policy_settings=policy_settings,
+        )
+
+    return _provider
+
+
+def resolved_settings_provider_of(comp: Any) -> Callable[[str | None], Mapping[str, Any]]:
+    """
+    #289：enable 失败诊断 provider（**实例轴**，flag/policy 感知）/ Instance-axis diagnostic provider.
+
+    与 :func:`settings_axes_of` 同源（#296）：REPL 的 marketplace / settings / plugin 各面必须看到同一五层视图。
+    层组合统一委托 :func:`make_settings_provider`（勿在此另写副本）。
+    """
+    axes = settings_axes_of(comp)
+    return make_settings_provider(
+        axes.env, flag_path=axes.flag_settings_path, cwd=axes.cwd, policy_settings=axes.policy_settings,
+    )
+
+
 def flag_value(args: list[str], flag: str) -> str | None:
     """取 ``--flag value`` 形态的值（**不支持** ``--flag=value``，REPL 简化）/ Extract a ``--flag value`` pair。
 
@@ -129,6 +192,8 @@ def resolved_settings_with_errors(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
+    cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> ResolvedSettings:
     """五层合并 settings **连同校验错误**（含 policy first-source-wins；#116 锚 cwd）/ Merged settings **with errors**。
 
@@ -144,8 +209,10 @@ def resolved_settings_with_errors(
 
     return resolve_settings(
         env=env,
+        cwd=cwd,
         flag_settings_path=flag_path,
-        policy_settings=resolve_policy_settings(env=env),
+        # #296：显式注入的 policy 视图（REPL 实例轴）优先；``None`` = 按 env 现解析（既有入口行为）。
+        policy_settings=policy_settings if policy_settings is not None else resolve_policy_settings(env=env),
     )
 
 
@@ -153,6 +220,8 @@ def resolved_settings(
     env: Mapping[str, str] | None,
     *,
     flag_path: Path | None = None,
+    cwd: Path | None = None,
+    policy_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """五层合并 settings（含 policy first-source-wins；#116 project/local 锚定进程 cwd）/ Merged settings incl. policy。
 
@@ -163,7 +232,7 @@ def resolved_settings(
     :func:`resolved_settings_with_errors` + :func:`format_settings_errors`（#157）。
     Drops validation errors; use the ``_with_errors`` variant where diagnostics must surface.
     """
-    return resolved_settings_with_errors(env, flag_path=flag_path).settings
+    return resolved_settings_with_errors(env, flag_path=flag_path, cwd=cwd, policy_settings=policy_settings).settings
 
 
 def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[str]:
@@ -174,6 +243,46 @@ def format_settings_errors(errors: Sequence[SettingsValidationError]) -> list[st
     自称「经 ``settings show`` / 诊断命令呈现」）。抽为纯函数以便**单测文案与 scope/field 拼装**，杜绝未来
     重构把「呈现」半程静默回退成吞错误——呈现行为在 ``run_mcp_approval`` 这类 ``Session``-泛型异步副作用
     函数里无法直接断言。对拍 rust ``cli/commands/mod.rs::format_settings_errors``。
-    Pure function so the wording/assembly is unit-testable; the call sites are thin by design.
+
+    **#295：marketplace 声明错误在此统一脱敏**——``field`` 的市场名段是**原始 JSON 键**（校验器直接拼点路径），
+    可含 userinfo 凭据 / ``[`` ``]`` 等富文本标记。与恢复报告（:func:`~a2c_smcp.computer.settings.recovery.
+    marketplace_declaration_errors`）**同一脱敏口径**（段漏斗 + 散文脱敏 + Cf/Cc 清洗），覆盖本函数的全部
+    消费面（``settings show`` / ``settings get`` / boot 批准流程 ``run_mcp_approval``）。
+    **#304 item 1：``enabledPlugins`` 的 map key 同样在此脱敏**（非法键与值非 bool 两处错误共用
+    ``enabledPlugins.<key>`` 形状）——**整值**当单一不可信名字过同一名字漏斗（用户 2026-11-23 裁决：
+    不拆分、不改「含 ``:`` 即遮」）；干净非法键（``Bad_Name@mp`` / ``alice@corp@mp``）仍逐字可读。
+    其余非 marketplace 子树仍原样保留（不扩面）。``escape()`` 不在此层做：**每个 sink 自己在打印处转义**
+    （``plugin.py`` 的 ``run_mcp_approval`` 与 ``settings.py`` 的 ``_emit_errors`` 均已转义），避免双重转义
+    ——新增 sink 必须自带 ``escape()``。
+    Marketplace declaration errors are redacted here, mirroring rust's ``format_settings_errors``;
+    untrusted ``enabledPlugins`` map keys go through the same name funnel (#304 item 1).
     """
-    return [f"⚠ settings.json[{e.scope.value}]: {e.field} — {e.reason}" for e in errors]
+    # 函数内 lazy import 沿用本模块既有范式（见 :func:`resolved_settings_with_errors`）：settings.recovery
+    # 拉 mcp_clients.model / skills 等重依赖，不该让每个 import ``cli.commands`` 的命令模块都付这份成本。
+    from a2c_smcp.computer.settings.recovery import sanitize_prefixed_name_field, sanitized_marketplace_error
+    from a2c_smcp.computer.settings.schema import FIELD_ENABLED_PLUGINS
+
+    lines: list[str] = []
+    for e in errors:
+        sanitized = sanitized_marketplace_error(e)
+        field, reason = (sanitized.field, sanitized.reason) if sanitized is not None else (e.field, e.reason)
+        # #304 item 1：``enabledPlugins`` 的 map key 是手编不可信值（可含 userinfo 形态凭据），
+        # **整值**当单一名字过既有名字漏斗——不拆分、不「含 `:` 即遮」；干净非法键仍逐字可读。
+        field = sanitize_prefixed_name_field(field, prefixes=(FIELD_ENABLED_PLUGINS,))
+        lines.append(f"⚠ settings.json[{e.scope.value}]: {field} — {reason}")
+    return lines
+
+
+def print_unknown_subcommand(kind: str, sub: str) -> None:
+    """REPL 未知子命令提示（#295）：``sub`` 是用户**原样输入**，必须 ``escape``。
+
+    未转义时 rich 抛 ``MarkupError``；REPL 顶层兜底（``interactive_impl`` 的 ``except Exception``）若也未转义
+    就会二次抛出，令交互模式直接 traceback 退出。四个分派器（settings / plugin / skill / marketplace）共用本
+    函数——新增分派器同样走它，避免再漏一处。
+    """
+    # 函数内惰性导入：``commands`` 是每个命令模块都会 import 的包 init，不应把 rich / console 拉进所有导入链。
+    from rich.markup import escape
+
+    from a2c_smcp.computer.utils import console as console_util
+
+    console_util.console.print(f"[yellow]unknown {escape(kind)} subcommand: {escape(sub)}[/yellow]")

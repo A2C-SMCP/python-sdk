@@ -215,14 +215,50 @@ def load_settings_file(path: Path, scope: SettingsScope) -> tuple[dict[str, Any]
         # ``UnicodeDecodeError`` 是 ``ValueError`` 子类而非 ``OSError``：原样漏捕会让非 UTF-8 的 settings.json
         # （如 Windows 记事本存成 UTF-16LE）在启动解析处直接崩溃，而不是按文档契约「容错 + 记错、留盘」。
         # #246 独立审查 🔴1 同族问题（写侧已在 ``settings/raw.py`` 归入 fail-closed）。
-        logger.warning("Settings file %s unreadable/corrupt, ignored (kept on disk): %s", p, exc)
-        return {}, [SettingsValidationError(scope=scope, field="<file>", reason=f"unreadable or corrupt JSON: {exc}", source_path=str(p))]
+        # #304 item 2（审查 🔴）：WARNING 与 reason 均不得回显原始路径 / 原始异常——默认 INFO 下
+        # ``a2c_smcp`` 的 StreamHandler 直接写 stdout。路径走 ``sanitize_source_path``（lazy import 避开
+        # ``scope ↔ recovery`` 环），异常侧只留 ``strerror``（非 OSError 走 ``exception_text``）；
+        # **转换本身不得可抛**（在 except 内运行）。
+        try:
+            from a2c_smcp.computer.settings.recovery import sanitize_source_path
+            from a2c_smcp.utils.diagnostics import exception_text
+
+            safe_src = sanitize_source_path(str(p))
+            detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exception_text(exc)
+        except Exception:  # noqa: BLE001 - 错误转换自身不得可抛
+            safe_src, detail = "<redacted-source>", "<unprintable>"
+        logger.warning("Settings file %s unreadable/corrupt, ignored (kept on disk): %s", safe_src, detail)
+        return {}, [
+            SettingsValidationError(
+                scope=scope, field="<file>", reason=f"unreadable or corrupt JSON: {detail}", source_path=str(p)
+            )
+        ]
     return validate_settings(raw, scope, source_path=str(p))
 
 
 # ---------------------------------------------------------------------------
 # 解析编排 / Resolution orchestration
 # ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SettingsAxes:
+    """
+    :func:`resolve_settings` 的**原始轴**（#296）/ Raw axes for :func:`resolve_settings`.
+
+    供需要「同一五层视图」的多个消费面共用（治理恢复的 ``_resolve_declared_settings`` 与 REPL 的
+    marketplace 引用守卫），避免两处各自拼装导致漂移。各字段语义与 :func:`resolve_settings`
+    同名参数一致；``None`` 保持既有回退（env → ambient、cwd → 进程 cwd、flag / policy → 空层）。
+
+    Raw axes shared by consumers that must see the same five-layer view (#296), so that governance
+    recovery and the REPL marketplace reference guard cannot drift apart. Field semantics match the
+    same-named ``resolve_settings`` parameters; ``None`` keeps the existing fallbacks.
+    """
+
+    env: Mapping[str, str] | None = None
+    cwd: Path | None = None
+    flag_settings_path: Path | None = None
+    policy_settings: Mapping[str, Any] | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedSettings:
     """

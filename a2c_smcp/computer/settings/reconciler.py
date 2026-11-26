@@ -39,15 +39,18 @@ SDK 设计 / Design: python-sdk docs/design-0.2.1-cli-marketplace-ux.md §7.1（
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from a2c_smcp.computer.settings.schema import is_valid_enabled_plugin_key, is_valid_marketplace_name
 from a2c_smcp.computer.settings.store import (
     InstalledPluginsFile,
     KnownMarketplacesFile,
+    known_marketplace_source,
     load_installed_plugins,
     load_known_marketplaces,
     update_installed_plugins,
@@ -60,10 +63,12 @@ from a2c_smcp.computer.skills.manifest import (
     load_bundled_servers,
     read_marketplace_manifest,
 )
+from a2c_smcp.computer.skills.marketplace_identity import MarketplaceNameChangeError, display_source, same_source
 from a2c_smcp.computer.skills.registry import SkillRegistry
 from a2c_smcp.computer.skills.staging import (
     _EXTERNAL_PLUGINS_NS,
     DEFAULT_GIT_TIMEOUT,
+    external_plugin_dir,
     stage_marketplace_skills,
 )
 from a2c_smcp.utils.logger import get_logger
@@ -76,20 +81,41 @@ logger = get_logger(__name__)
 # 对账报告 / Reconcile report
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
+class ReconcileRejection:
+    """
+    一次 ``validation`` 拒绝（#260 / runtime-contract §5.14）/ One validation rejection.
+
+    **结构化到可判别**：``reason`` 是机器码（``manifest-name-changed`` = 刷新改名拒绝 /
+    ``source-conflict`` = 声明式换源拒绝），``details`` 携带脱敏后的诊断（如 ``manifestName`` /
+    ``baselineManifestName`` / 两侧 source 展示值）。调用方据此区分「改名拒绝」与普通失败，
+    **不要**只按名字列表猜。
+
+    .. note::
+       ``details`` 只放**脱敏值**：账本键 / source 一律过展示原语；不得直接回显原始 URL。
+    """
+
+    reason: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ReconcileReport:
     """
     一次 :func:`reconcile` 的结果（镜像 CC reconcile 返回值；**无 removed** —— additive-only）。
     The result of one :func:`reconcile` run (mirrors CC's return shape; **no removed** — additive-only)。
 
-    各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / skipped 之一；
+    各 marketplace 名互斥地归入 installed / updated / up_to_date / failed / validation / skipped 之一；
     ``registered_skills`` 汇总本次成功注册 / 刷新的全部 SKILL 名（供 watcher / emit diff）。
     """
 
     installed: list[str] = field(default_factory=list)  # 本次新 clone 的 marketplace
-    updated: list[str] = field(default_factory=list)  # autoUpdate pull / sourceChanged 重 clone
+    updated: list[str] = field(default_factory=list)  # autoUpdate refresh（#260 起重 clone + 原子换入）
     up_to_date: list[str] = field(default_factory=list)  # 声明且已在、未刷新
     failed: list[str] = field(default_factory=list)  # 声明但 stage 后 clone 树仍缺失（clone 失败，已降级）
     skipped: list[str] = field(default_factory=list)  # 预留（trust 门控落 #68 / strict 延后 #80）
+    # #260 / §5.14：`validation` 拒绝（name → :class:`ReconcileRejection`）。声明式换源与 refresh 改名
+    # 都 MUST 拒绝且**不** wipe——旧注册与旧能力保持 active，故**不**归 `failed`（那是降级桶）。
+    validation: dict[str, ReconcileRejection] = field(default_factory=dict)
     registered_skills: list[str] = field(default_factory=list)
 
 
@@ -157,22 +183,117 @@ def _enabled_plugin_names_for(marketplace: str, declared: Mapping[str, object]) 
 # ---------------------------------------------------------------------------
 # 安全删除 / Guarded removal
 # ---------------------------------------------------------------------------
-def _safe_rmtree(path: Path, home: Path) -> None:
+def _safe_rmtree(path: Path, home: Path) -> bool:
     """
-    仅当 ``path`` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ rmtree only within SKILL Home。
+    仅当 ``path`` 词法位于 SKILL Home 内才递归删除（防越权删盘外目录）/ rmtree only within SKILL Home.
 
-    ``path`` 不存在 → no-op；越界 → 记 ERROR + 拒删（不抛）。删除失败 → 记 WARN（不阻断后续清理）。
+    ``path`` 本身是符号链接 → 记 WARN + 拒删（``resolve`` 后 ``rmtree`` 会删链接目标，可指向 Home 内共享树）；
+    路径不可解析（软链环 / 权限 / 内嵌 NUL）→ 记 WARN + 拒删；``path`` 不存在 → no-op；越界 → 记 ERROR + 拒删。
+    **本函数不抛**；删除失败 → 记 WARN（不阻断后续清理）。
+
+    :return: ``True`` 表示目标已不存在（删除成功或本来就不存在）；``False`` 表示拒删 / 删除失败（目标可能仍在）。
+        调用方需要区分「已清空」与「静默失败」时必须检查返回值。消费方：``prune_marketplaces``（marketplace 级）与
+        ``remove_plugin_install_path``（plugin 独占 clone，uninstall/gc 路径）；#260 起 reconcile 的换源分支已**不再**
+        wipe。
     """
-    rp = path.resolve()
-    if not is_within(rp, home.resolve()):
+    if path.is_symlink():
+        logger.warning("reconcile: refusing to remove symlink %s", path)
+        return False
+    try:
+        rp = path.resolve()
+        home_rp = home.resolve()
+    except (OSError, RuntimeError, ValueError) as e:  # 软链环 / 权限 / 内嵌 NUL / 平台路径错误 → 拒删
+        logger.warning("reconcile: cannot resolve %s (%s); refusing to remove", path, e)
+        return False
+    if not is_within(rp, home_rp):
         logger.error("reconcile: refusing to remove %s outside SKILL Home %s", rp, home)
-        return
+        return False
+    # 父组件软链守卫：``path`` 下任一组件（如 ``.plugins`` / ``<mp>``）为软链时，``resolve`` 的落点会偏离
+    # 「仅解析 home、其余按词法拼接」的预期——直接 rmtree 会删到链接目标（可在 Home 内）。
+    try:
+        rel = _lexical_normalize(path).relative_to(_lexical_normalize(home))
+    except ValueError:
+        rel = None
+    if rel is not None and rp != _lexical_normalize(home_rp / rel):
+        logger.warning("reconcile: refusing to remove %s (symlinked path component)", path)
+        return False
     if not rp.exists():
-        return
+        return True
     try:
         shutil.rmtree(rp)
     except OSError as e:  # 失败降级：删除受阻不阻断其余清理
         logger.warning("reconcile: failed to remove %s: %s", rp, e)
+        return False
+    return True
+
+
+def _lexical_normalize(path: Path) -> Path:
+    """纯词法归一（折叠 ``.`` / ``..``，**不**解析符号链接）/ Lexically normalize without resolving symlinks."""
+    return Path(os.path.normpath(str(path)))
+
+
+def is_external_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool:
+    """
+    ``installPath`` 是否位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``
+    （含 ``git-subdir`` 的后代子目录）/ Whether installPath lives in the plugin-exclusive external clone.
+
+    判定为**纯词法**（折叠 ``.`` / ``..`` 后 :func:`is_within` 分量级，**不** ``resolve`` 符号链接）——与
+    rust-sdk#271 终版对齐：installPath 链上可能含仓库携带的符号链接组件（如 git-subdir 的 ``pkg``），解析软链会
+    把 clone 内路径误判为 clone 外，导致单 scope 卸载残留 / 多 scope 误删仍被引用的 clone。
+    空 / 相对路径、非法 marketplace / plugin 名 → ``False``（无法识别归属 ⇒ uninstall 门控按「不引用」处理；
+    删除侧另有 canonicalize + SKILL Home 守卫兜底）。
+
+    供删除谓词与 uninstall 的「retained 记录是否仍引用该 clone」判定共用。
+    """
+    if not install_path.is_absolute():
+        return False
+    if not is_valid_marketplace_name(marketplace) or not is_valid_marketplace_name(plugin):
+        return False
+    return is_within(_lexical_normalize(install_path), _lexical_normalize(external_plugin_dir(home, marketplace, plugin)))
+
+
+class InstallPathRemovalError(Exception):
+    """独占外部 clone 删除失败（软链重定向 / 路径不可解析 / rmtree 失败）/ Exclusive-clone removal failure."""
+
+
+def remove_plugin_install_path(install_path: Path, home: Path, marketplace: str, plugin: str) -> bool | None:
+    """
+    按 **plugin 文件归属** 删除 ``installPath``（#258 / rust-sdk#271 方案 A）/ Remove installPath by ownership.
+
+    仅当 ``installPath`` 位于该 plugin **独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``（含
+    ``git-subdir`` 的后代）时，删除**整个 clone 根**并返回 ``True``；**非独占路径**（共享 catalog 等）保留并
+    返回 ``None``；**拒绝 / 删除失败**抛 :class:`InstallPathRemovalError`（消息含路径与原因）：
+
+    - 相对源（``source: "./plugins/x"``）的 ``installPath`` 落在**共享 catalog clone** ``<home>/marketplace/<mp>/…``
+      ——该树是 marketplace 级缓存，兄弟 plugin、剩余 scope 与重装都依赖它，归 ``marketplace remove`` /
+      ``prune`` 清理（#260 起 reconcile 对声明换源一律 ``validation`` 拒绝，不再 wipe 重 clone），
+      ``uninstall`` / plugin-gc MUST NOT 删除（#258 方案 A）；
+    - 空 / 相对 ``installPath``、非法 marketplace / plugin 名 → 无法识别归属，保守保留；
+    - ext root（或 ``.plugins/<mp>`` 段）被符号链接重定向 → 拒删：``_safe_rmtree`` 按 canonicalize 后的路径
+      ``rmtree``，跟随软链会误删链接目标（可指向 Home 内共享 catalog，令 #258 破坏经 symlink 复活）。
+
+    归属判定用纯词法（不解析 installPath 链上的软链）；实际删除仍由 canonicalize + SKILL Home 越界守卫兜底。
+
+    :return: ``True`` = 独占 clone 已删除或原本就不存在；``None`` = **非独占路径**，按设计保留（共享 catalog 等）。
+    :raises InstallPathRemovalError: 软链重定向 / 路径不可解析（软链环、权限、NUL）/ rmtree 失败——调用方
+        （uninstall / gc）必须保留账本记录，不得当作「已删除」。
+    """
+    if not is_external_plugin_install_path(install_path, home, marketplace, plugin):
+        logger.debug("keeping installPath %s (shared marketplace catalog / non-exclusive path)", install_path)
+        return None
+    lexical_root = external_plugin_dir(home, marketplace, plugin)
+    try:
+        resolved_root = lexical_root.resolve()
+        canonical_root = external_plugin_dir(home.resolve(), marketplace, plugin)
+    except (OSError, RuntimeError, ValueError) as e:
+        raise InstallPathRemovalError(
+            f"cannot remove {lexical_root}: path resolve failed ({type(e).__name__}: {e})",
+        ) from e
+    if resolved_root != canonical_root:  # 任一路径段是符号链接 → 删除会作用于链接目标
+        raise InstallPathRemovalError(f"cannot remove {lexical_root}: symlinked external clone")
+    if not _safe_rmtree(resolved_root, home):
+        raise InstallPathRemovalError(f"cannot remove {resolved_root}: filesystem removal failed")
+    return True
 
 
 def _unregister_marketplace_skills(registry: SkillRegistry, marketplace: str, *, plugin: str | None = None) -> None:
@@ -180,12 +301,14 @@ def _unregister_marketplace_skills(registry: SkillRegistry, marketplace: str, *,
     从 Registry 注销某 marketplace（可选限定单 plugin）的 SKILL / Unregister a marketplace's SKILLs。
 
     按 ``A2CSkillRef.source == "marketplace:<mp>"`` 反查（marketplace SKILL name 形如 ``<plugin>:<skill>``，
-    ``plugin`` 给定时再按 ``<plugin>:`` 前缀过滤）。additive-only 模型下 marketplace clone 树不上 watcher，
-    其 SKILL 在 prune/gc 前恒活跃，故经 :meth:`SkillRegistry.active_refs` 枚举即可。
+    ``plugin`` 给定时再按 ``<plugin>:`` 前缀过滤）。
+
+    **孤儿一并枚举**（#257 审查 🔴2）：原假设「其 SKILL 在 prune/gc 前恒活跃」被 ``disable``（置孤儿）证伪；
+    残留孤儿会被注册点跨 source 守卫当作「先到者」，令 ``marketplace remove`` / gc / prune 都清不干净。
     """
     want_source = f"{SOURCE_MARKETPLACE}:{marketplace}"
     prefix = f"{plugin}:" if plugin is not None else None
-    for ref in registry.active_refs():
+    for ref, _orphaned in registry.all_refs():
         if ref.get("source") != want_source:
             continue
         name = ref.get("name")
@@ -213,9 +336,10 @@ async def reconcile(
 
     四分支（§7.1 step 3）/ Four branches:
     - **missing**（declared∖materialized）→ clone（``stage_marketplace_skills`` 缺失即 clone）。
-    - **sourceChanged**（``record.source != decl.source``）→ 先 ``rmtree`` 旧 clone 树（含外部 plugin 树）
-      再重 clone（**reconciler 兜底**：:func:`stage_marketplace_skills` 仅 pull 不换库）。
-    - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ ``git pull``。
+    - **sourceChanged**（``not same_source(record.source, decl.source)``）→ **`validation` 拒绝**：不 wipe、
+      不重 clone、不 stage，旧注册/旧内容/旧能力原样保留（协议 §5.14 同名不同源 MUST 拒绝；换源只能经
+      显式 remove / re-add）。记入 :attr:`ReconcileReport.validation`，其余 source 继续。
+    - **autoUpdate**（``decl.autoUpdate==True`` 或显式 ``refresh=True``）→ 重 clone + 原子换入（#260）。
     - **orphan**（materialized∖declared）→ **完全不动**（不进循环；靠 :func:`prune_marketplaces` 显式清）。
 
     每个 declared marketplace 物化其**活跃**（installed ∧ ``enabledPlugins[id] is True``，v0.3.0）plugin 的
@@ -241,43 +365,63 @@ async def reconcile(
     updated: list[str] = []
     up_to_date: list[str] = []
     failed: list[str] = []
+    rejected: dict[str, ReconcileRejection] = {}
     registered_skills: list[str] = []
 
-    ext_root = home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS
     for name, decl in declared_mps.items():
         source = decl.get("source")
         record = materialized.get(name)
-        source_changed = record is not None and record.get("source") != source
+        # #260 / §5.14：同源判定走 SDK 单一权威 `same_source`（不做 ssh/https 归一，无法确定即不同源）。
+        source_changed = record is not None and not same_source(record.get("source"), source)
         clone_dir = marketplace_skill_dir(home, name)
 
         if source_changed:
-            # 源已变更：旧 clone 是「别的仓库」，必须 wipe 后重 clone（stage 只 pull 不换库）。
-            logger.info("reconcile: marketplace %r source changed, wiping stale clone for re-clone", name)
-            _unregister_marketplace_skills(registry, name)
-            _safe_rmtree(clone_dir, home)
-            _safe_rmtree(ext_root / name, home)
+            # §5.14：声明式换源 MUST 以 `validation` 拒绝——**不 wipe、不重 clone**，旧内容与旧能力原样保留；
+            # 换源只经显式 remove / re-add。此前「wipe + 重 clone」会静默把既有注册绑到新仓库。
+            logger.error(
+                "reconcile: marketplace %r is declared from a source different from its registration; refused "
+                "(remove it explicitly to switch the source, runtime-contract §5.14)",
+                name,
+            )
+            rejected[name] = ReconcileRejection(
+                reason="source-conflict",
+                details={
+                    "existingSource": display_source(record.get("source") if isinstance(record, Mapping) else None),
+                    "declaredSource": display_source(source),
+                },
+            )
+            continue
 
         present_before = clone_dir.exists()
         do_refresh = bool(decl.get("autoUpdate")) or refresh
         plugin_filter = _enabled_plugin_names_for(name, declared)
 
-        names = await stage_marketplace_skills(
-            name,
-            source if isinstance(source, Mapping) else {},
-            registry,
-            home,
-            plugin_filter=plugin_filter,
-            auto_update=bool(decl.get("autoUpdate")),
-            refresh=do_refresh,
-            timeout=timeout,
-            env=env,
-        )
+        try:
+            names = await stage_marketplace_skills(
+                name,
+                source if isinstance(source, Mapping) else {},
+                registry,
+                home,
+                plugin_filter=plugin_filter,
+                auto_update=bool(decl.get("autoUpdate")),
+                refresh=do_refresh,
+                timeout=timeout,
+                env=env,
+            )
+        except MarketplaceNameChangeError as e:
+            # §5.14 refresh 改名拒绝：**不进入 degraded**（协议明文「返回 validation，旧注册的既有能力保持
+            # active」），故归 ``validation`` 而非 ``failed``——后者在调用方眼里等于「能力已降级 / 需回收」。
+            logger.error(
+                "reconcile: marketplace %r refresh rejected (%s); keeping the existing registration and skills",
+                name,
+                e.reason,
+            )
+            rejected[name] = ReconcileRejection(reason=e.reason, details=dict(e.details))
+            continue
         registered_skills.extend(names)
 
         if not clone_dir.exists():
             failed.append(name)
-        elif source_changed:
-            updated.append(name)
         elif not present_before:
             installed.append(name)
         elif do_refresh:
@@ -290,6 +434,7 @@ async def reconcile(
         updated=updated,
         up_to_date=up_to_date,
         failed=failed,
+        validation=rejected,
         registered_skills=registered_skills,
     )
 
@@ -328,7 +473,10 @@ def prune_marketplaces(
     经用户确认后传入）。非法名跳过；删除越界守卫见 :func:`_safe_rmtree`。**不**触碰 ``installed_plugins.json``
     （plugin 账本归 #63 / :func:`gc_plugins`）。
 
-    :return: 实际清理的 marketplace 名列表。
+    clone / 外部树任一未能真正清空（软链 / OSError）→ **保留** ``known_marketplaces`` 条目、不计入返回列表
+    （避免残留树脱离 orphan 发现面而永久不可清理）；其余名字继续处理（失败不阻断）。SKILL 注销在清空成功之后。
+
+    :return: 实际清理的 marketplace 名列表（失败项不在其中，调用方据此暴露失败）。
     """
     ext_root = home / SOURCE_MARKETPLACE / _EXTERNAL_PLUGINS_NS
     removed: list[str] = []
@@ -336,9 +484,13 @@ def prune_marketplaces(
         if not is_valid_marketplace_name(name):
             logger.warning("prune: invalid marketplace name %r, skipped", name)
             continue
+        if not _safe_rmtree(marketplace_skill_dir(home, name), home):
+            logger.error("prune: could not remove clone tree for %r; keeping known entry", name)
+            continue
+        if not _safe_rmtree(ext_root / name, home):
+            logger.error("prune: could not remove external plugin tree for %r; keeping known entry", name)
+            continue
         _unregister_marketplace_skills(registry, name)
-        _safe_rmtree(marketplace_skill_dir(home, name), home)
-        _safe_rmtree(ext_root / name, home)
 
         def _drop(data: KnownMarketplacesFile, _n: str = name) -> None:
             data.get("marketplaces", {}).pop(_n, None)
@@ -449,8 +601,9 @@ def other_plugin_mcp_deps(
 
     :param plugins: 账本 ``plugins`` 映射（**移除本次记录之前**的视图——§4.9.1-3 要求停摘名单在账本移除前取得）。
     :param exclude_pid: 正在 disable/uninstall/gc 的 plugin id（其记录不算「其他 plugin」）。
-    :param retained_records: ``exclude_pid`` 本次**未被移除**的记录（scoped uninstall 时的其余 scope）——它们
-        仍声明依赖，故仍算依赖者。整 pid 移除（disable / 全 scope uninstall / gc）时传空。
+    :param retained_records: ``exclude_pid`` **本次写盘后仍存在**的记录（scoped uninstall 时的其余 scope；
+        被 §4.9.1-4 sweep 的 legacy 记录**不在内**，#275）——它们仍声明依赖，故仍算依赖者。整 pid 移除
+        （disable / 全 scope uninstall / gc）时传空。
 
     「其他 plugin」= 账本中的 **installed** 记录（**含 disabled**），不按 enabled 过滤：协议 §4.9.1-2 字面为
     「无其他 plugin **声明依赖** X」（声明 = 账本有记录），``conformance-tests.md`` §285「**最后一个依赖者卸载**
@@ -545,8 +698,9 @@ def list_dangling_plugin_intents(
         if ledger_entry_materialized(ledger.get(pid)):
             continue
         plugin, _, marketplace = pid.partition("@")
-        record = known.get(marketplace)
-        if not isinstance(record, Mapping) or not isinstance(record.get("source"), Mapping):
+        # 「无可用已注册源」= 记录缺失 / 记录非映射 / source 非映射——与 recovery 的 stage 循环与声明源诊断
+        # 共用同一判据（:func:`~a2c_smcp.computer.settings.store.known_marketplace_source`），三处不得各写副本。
+        if known_marketplace_source(known, marketplace) is None:
             out.append((pid, DANGLING_MARKETPLACE_NOT_ADDED))
             continue
         catalog_dir = marketplace_skill_dir(home, marketplace)
@@ -574,12 +728,14 @@ async def gc_plugins(
     mcp_teardown: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> list[str]:
     """
-    清理孤儿 plugin（installPath 树 + installed_plugins.json 条目 + Registry SKILL + MCP 依赖回收）/ GC plugins。
+    清理孤儿 plugin（独占外部 clone + installed_plugins.json 条目 + Registry SKILL + MCP 依赖回收）/ GC plugins。
 
     y/N 确认交 CLI 层（#68）；``plugin_ids`` 应为 :func:`list_orphan_plugins` 的子集（用户确认后传入）。
-    每条记录的 ``installPath`` 仅在词法位于 SKILL Home 内才删（:func:`_safe_rmtree`）；其声明依赖的 MCP Server
-    经 **§4.9.1-2 回收判据**（:func:`reclaimable_mcp_deps`）过滤后才交 ``mcp_teardown`` 停/摘——gc 是 uninstall
-    的批量形态，同样 **MUST NOT 连坐用户自有 server**（#153）。
+    每条记录的 ``installPath`` **仅当位于该 plugin 独占外部 clone** ``<home>/marketplace/.plugins/<mp>/<plugin>``
+    内才删（:func:`remove_plugin_install_path`）；共享 catalog clone 内的相对源 installPath 保留，归
+    ``marketplace remove`` / prune 清理（#258 方案 A；无 ``@`` 的 pid 无法识别归属 ⇒ 文件保守保留）。其声明依赖的
+    MCP Server 经 **§4.9.1-2 回收判据**（:func:`reclaimable_mcp_deps`）过滤后才交 ``mcp_teardown`` 停/摘——gc 是
+    uninstall 的批量形态，同样 **MUST NOT 连坐用户自有 server**（#153）。
 
     逐 pid 处理且账本随之逐个删除 ⇒ 同批两 plugin 共享同一依赖时，先处理者因后者仍在账本而保留、后处理者
     （前者已删）回收 —— 自动满足「最后一个依赖者回收」。
@@ -601,12 +757,23 @@ async def gc_plugins(
             other_deps=other_plugin_mcp_deps(plugins, exclude_pid=pid),
             user_declared=non_plugin_bundle_ids(),
         )
+        plugin, _, marketplace = pid.partition("@")
+        delete_failed = False
         for rec in records:
             install_path = rec.get("installPath")
             if isinstance(install_path, str) and install_path:
-                _safe_rmtree(Path(install_path), home)
+                # #258：只删 plugin 独占外部 clone；共享 catalog 内的相对源落点返回 None（按设计保留）。
+                try:
+                    remove_plugin_install_path(Path(install_path), home, marketplace, plugin)
+                except InstallPathRemovalError as e:
+                    logger.error("gc: %s; keeping ledger record for %r", e, pid)
+                    delete_failed = True
+                    break
+        if delete_failed:
+            # 删除失败 → 保留账本 / SKILL / server，该 pid 不计入 removed，残留 clone 仍有索引可重试
+            # （#258 复审 🔴1）。
+            continue
 
-        plugin, _, marketplace = pid.partition("@")
         if marketplace:
             _unregister_marketplace_skills(registry, marketplace, plugin=plugin)
 

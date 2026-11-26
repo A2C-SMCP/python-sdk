@@ -12,8 +12,65 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 > **A2C-SMCP 协议 v0.5.0 实现**：`PROTOCOL_VERSION` 由 `0.4.0` 抬至 `0.5.0`（v0.x 下 `MINOR` 严格匹配，
 > 抬位后握手层才会正确拒绝 `0.4.x` 对端）。SDK 包版本（`__version__`）由发版流程另行推进。
 
+### Upgrade Notes（0.5.0 → 0.5.1：marketplace catalog 子树恢复）
+
+- **0.5.0 上卸载过相对 source 插件的环境需要手工恢复（#267，镜像 rust-sdk#278）**：0.5.0 的
+  `plugin uninstall` / `plugin gc` 会删除插件的安装目录；相对 source（`"source": "./plugin"`）插件落在
+  marketplace 的**共享** clone 内（`<A2C_SKILL_HOME>/marketplace/<mp>/<rel_path>`），连带删掉父子 / 同源 / 多 scope
+  的文件，其后再安装报 `plugin root not found after resolve`。0.5.1 起卸载不再删除该共享子树，但**已损坏的本地
+  clone 不会自愈**。
+- 恢复路径：`a2c-computer marketplace remove <name>`（默认级联卸载其下所有已安装插件并撤销 trust）→
+  `a2c-computer marketplace add <git-url> --trust` → 逐个 `plugin install <plugin>@<name>` + `plugin enable <plugin>@<name>`。
+- **不要使用 `marketplace remove --keep-plugins`**：它保留 installed 状态与账本，留下指向已删 clone 的孤儿记录。
+- `marketplace refresh`（`refresh=true`）**会**还原上游仍存在的被删文件（#260 起为「重新 clone 到 staging + 原子换入」，
+  不再原地 `git pull`）；但上游本身已删的路径、以及本地 clone 与上游一致时仍无变化。`plugin install` 与 boot 重物化
+  都复用既有 clone。
+- 详见 [`docs/upgrade-0.5.1-marketplace-catalog-recovery.md`](docs/upgrade-0.5.1-marketplace-catalog-recovery.md)。
+
 ### Breaking Changes
 
+- **marketplace 注册名改为清单 `name`（#260，镜像 rust-sdk#272）**：协议 `runtime-contract §5.14` 只约束
+  「名称唯一性 / 禁静默改名」（派生算法属 SDK 自治，protocol#79）。行为变更：
+  - **`marketplace add` 的注册名取 `marketplace.json` 顶层 `name`**，不再从 URL 末段派生，也与 `--name` 无关。
+    `<plugin>@<marketplace>` 中的 `<marketplace>` 随之取清单名——仓库名与清单名不同时，插件 id 会改变。
+  - **`--name` 不再是别名**（D6 B）：只作「期望清单名」校验，与清单不符即 `validation` 失败。
+  - **`--no-clone` 对新源一律 `validation`**（D5：无 pending、无临时派生名）；仅对已注册源或可确认的本地
+    缓存生效。
+  - **交互式 `marketplace add` 一律弹 trust 确认**：`trustedMarketplaces` 不再豁免 prompt；trust 在**注册成功后**
+    才写入 user settings（注册失败零残留，settings 损坏仍在 clone 前 fail-closed）。非交互恒需 `--trust`（不变）。
+  - **同名不同源 → `validation` 拒绝**（不替换、不自动后缀）；同名同源重复 add 幂等；同一 source 已以旧名注册时
+    新名 add → `validation`（诊断给旧名与处置）；remove（含 `--keep-plugins`）后 re-add 且仍有
+    `<plugin>@<name>` 意图引用 → 拒绝（登记已删、无法证同源，同源 re-add 亦 fail-closed）。
+  - **`marketplace refresh` 遇清单改名 → `validation` 结构化失败**（不再报 updated/unchanged），旧内容 / 账本 /
+    运行时能力保留；legacy 注册（账本无 `manifestNameBaseline`）首次成功 clone/refresh 记 baseline、保留旧名、
+    不报改名拒绝，仅 baseline 之后再改名才拒绝。refresh 改为「重新 clone + 原子换入」，不再原地 `git pull`。
+  - **declared 换源拒绝**：`extraKnownMarketplaces` 中同名 source 变更 → `validation`，**不** wipe / 重 clone；
+    换源需显式 remove / re-add。
+  - **`--json` 错误载荷形状变更（breaking）**：此前为 `{"error": "<人读文案>"}`；现在统一为
+    `{"error": "<类别>", "message": "<人读文案>", …诊断}`，机读原因在 **`reason`** 键（`error` 为
+    `validation` / `error`）。类别与 reason 取值：`validation` × {`manifest-name-invalid` /
+    `manifest-name-changed` / `name-conflict` / `source-conflict` / `expected-name-mismatch` /
+    `dangling-references` / `unresolvable-name` / `invalid-name` / `invalid-source`}。
+    消费方需改为读 `message`/`reason`（旧的「整个 `error` 就是文案」读法不再成立）。
+  - **存量迁移不在本版**：已有 URL 派生名 / `--name` 别名的注册**不追溯改名**，由 #268 的
+    `marketplace migrate` 处理（账本字段 `manifestNameBaseline` 已就位供其消费）。
+- **flag / policy 层的 `<plugin>@<name>` 引用纳入 §5.14 re-add 守卫（#296，镜像 rust-sdk#267 item 3）**：
+  此前 `intent_reference_pids` 只读 user/project/local，`--settings` flag 层、policy 层与实例 cwd 轴不在视图内
+  ⇒「policy/flag 有引用 → `marketplace remove` → 同名不同源 re-add」可绕过 §5.14 的 MUST 拒绝。现在：
+  - 非交互 CLI 的**根级** `--settings`（flag 层）参与守卫；policy 层由库层按 `env` 现解析。REPL 的
+    marketplace / settings / plugin 三个分派器统一经 `settings_axes_of(comp)` 跟随运行中 Computer 实例的
+    env / cwd / flag / policy（settings 的 `show/get/set/edit` 也读取实例 `--settings`、实例 cwd 与实例
+    policy），不再各自读 ambient `os.environ` / 进程 cwd。
+  - **行为变化**：此前能成功的同名不同源 re-add，在 flag/policy 仍存在引用时现在以 `validation` +
+    `reason: dangling-references` 失败（`details` 仍为 `{"name","references","referenceCount"}`，不新增层来源）。
+  - **库层默认对齐 rust#300**：`policy_settings=None` 时按 `env` 现解析 ambient policy（`resolve_policy_settings`）
+    ——`add_marketplace_source` / `commit_marketplace_registration` 的公开调用方即使不显式接线也不会漏掉 policy 层；
+    显式传入 mapping 覆盖，`{}` = 显式「无 policy」（测试与嵌入式宿主的 hermetic 开关）。
+  - 范围：显式 `marketplace add` 与 `--no-clone` 两处守卫完成 cwd / flag / policy 接线；复用路径
+    （`_record_known_marketplace`）与 reconcile / recovery / installer 的 **cwd / flag 接线**、错误 details
+    层来源为后续跟进。注意 `policy_settings=None` 的库层默认值使**所有**提交路径都会读到 policy 层。
+    迁移（#268）不绕过守卫，也不追溯改写 flag/policy 旧引用——见
+    [`docs/upgrade-0.5.1-marketplace-name-migration.md`](docs/upgrade-0.5.1-marketplace-name-migration.md) §6.5。
 - **一房至多一台 Computer：「每 role 一席」（#230，protocol#66）**：房间收紧为一房 ≤1 Agent、≤1 Computer
   ⇒ 一个 Agent 同一时刻至多连一台 Computer。无新事件、无能力字段（随 0.5 MINOR 握手生效）。
   - **第二台 Computer 入房被拒 `4101`**（此前允许任意多台）：不替换、不驱逐已在房的 Computer；同名与否都一样。
@@ -124,13 +181,81 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Added
 
+- **CLI 治理恢复分三类展示（#294）**：`a2c-computer` REPL 启动期的 `run_governance_remount` 此前只打印
+  `failed_marketplaces`，另外两类信号只在日志里（日志级别调高 / `A2C_SMCP_LOG_SILENT` 时不可见）。现在
+  **只消费 `GovernanceRecoveryReport` 字段**（不重新检测、不重新解析 settings），分三类各打一行，文案锚点
+  各不相同、不合并计数：
+  - **声明错误**（配置错误，**未参与**恢复）：`⚠ settings.json[<scope>]: <field> — <reason> (declaration ignored; existing registration unchanged)`；
+  - **源冲突**（声明源 ≠ 已注册源，仍按**旧源**恢复）：`⚠ marketplace '<name>': declared source differs from, or cannot be proven equivalent to, the registered source; …`；
+  - **降级**（`failed_marketplaces`）：`⚠ marketplace '<name>' degraded during governance recovery (skills/servers not restored)`（沿用 #287 起的既有文案）。
+  - 冲突与降级**只展示脱敏后的市场名**（name-only，两侧 source 明细仍只在 recovery 的逐条 `DEBUG` 里）。
+    文案与顺序均对拍 rust `cli/commands/mod.rs`：**降级 → 源冲突 → 声明错误**，文本逐字一致（仅引号风格不同：
+    python `!r` 给 `'acme'`、rust `{:?}` 给 `"acme"`）。rust 只有前两条是同名纯函数（降级行内联），python 侧
+    三条都提成纯函数以便单测钉措辞。
+  - **每条记录一行**（0 条不打、n 条 n 行），三类不合并计数。
+  - 行文本一律经 `rich.markup.escape()`。这不是纯粹的防崩溃：rich 会把 `settings.json[<scope>]` 里的
+    `[<scope>]` 当样式标签**吞掉**（实测未转义时只剩 `settings.json:`，scope 信息丢失），`field` 里的
+    `[/]` / `[bold]` 同样会消失；形状不巧时还会抛 `MarkupError`。可达的注入点是**声明行的 `field`**——
+    校验器用原始 JSON 键拼点路径，而 `sanitize_marketplace_name` 保留 `[`/`]` ⇒ 手编 settings 键即可注入。
+    **既有降级行此前没有转义，本版一并修掉**。
+  - **不提供 `--json`**：`run_governance_remount` 是 REPL 启动路径的内部函数（非 Typer 子命令），root `--json`
+    不覆盖该路径，输出仅面向人类。
+  - 同一次启动可能出现多条同义提示——`WARN` 是库契约，本版不回收（用户 2026-11-22 裁决接受）。常见 2–3 条
+    （boot `WARN` + 重挂 `WARN` + 新 CLI 行）；当 `.tfrobot/mcp.json` 解析出 ≥1 个 server 时还会多一条
+    `run_mcp_approval` 的 `format_settings_errors` 行（**第 4 条**，其脱敏已由
+    [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口，措辞差异保留），合计约 4 条（见设计文档 §7 已知边界）。
+- **`marketplace migrate`：存量 marketplace 注册名迁移（#268 / D3）**：把 0.5.1 之前以 URL 派生名 /
+  显式 `--name` 别名注册的 marketplace 迁移到清单顶层 `name`，并同步改写全部引用面：
+  - 权威面（user scope）：`installedPlugins` / `enabledPlugins`（含显式 `false`）/ `trustedMarketplaces` /
+    `blockedMarketplaces` / plugin-scoped input 值（`input-values.json`）/ keyring secret；`extraKnownMarketplaces`
+    默认只报告，`--update-declarations` 才改写 user scope。project/local 一律**只报告不改**（输出文件、JSON 指针、
+    建议值与后果）。
+  - 派生面：`known_marketplaces.json` 新记录（`installLocation` 重算、`manifestNameBaseline` 重置为新名）、
+    catalog clone 与 `.plugins` 外树搬迁、账本记录按新 pid 重建（重建成功才删旧记录）。
+  - **默认 dry-run、零写入**（`--apply` 才写盘）；迁移全程离线。
+  - 退出码：`0` 成功 / `1` 冲突**整体 abort**（零写入）/ `3` 部分完成（unresolved / blocked /
+    keyring 不可用 / project-local 手动引用）。REPL 只允许 dry-run。
+  - 幂等可续（无 journal / 备份 / 回滚）：崩溃后重跑会自动认领「`known[new]` 已写、目录未搬」与
+    「目录已搬、旧键未删」两个窗口；无法归因的孤儿目录不会被认领。
+  - 详见 [`docs/upgrade-0.5.1-marketplace-name-migration.md`](docs/upgrade-0.5.1-marketplace-name-migration.md)
+    与 [`docs/design-0.5.1-marketplace-name-migration.md`](docs/design-0.5.1-marketplace-name-migration.md)。
+- **`marketplace info` 新增 `manifestName` / `manifestNameInvalid` / `legacyName`（#268 / §10.4）**：
+  自查注册名是否为 legacy；清单名属不可信输入，非法 / 疑似凭据一律不原值回显。
+- **boot 治理恢复诊断声明源变化（#287，语义镜像 rust-sdk#295；检测范围按 2026-11-20 用户裁决收窄）**：
+  此前 boot 只按 `known_marketplaces.json` 的已注册源恢复，用户改了
+  `extraKnownMarketplaces[name].source` 后**静默沿用旧源**、无诊断。现在：
+  - `GovernanceRecoveryReport` 新增 additive 字段 `marketplace_source_conflicts：
+    list[MarketplaceSourceConflict]`，条目含 `marketplace` / `declared_source_display` /
+    `known_source_display`（三者均为**展示值**：账本键走 `redact_ledger_key`，两侧 source 走
+    `display_source`，不可用于再克隆）。
+  - 检测范围 = **`installedPlugins` 意图涉及**的 marketplace（无安装意图的市场不检测，空意图早退行为不变）；
+    无声明条目、或无**可用** known 记录（缺失 / 记录非映射 / `source` 非映射）的市场不在此报告——后者由
+    stage 循环记入 `failed_marketplaces`，但**全惰性市场**（`installed_disabled` ∧ 账本完好）在 stage 循环
+    里零动作 `continue`，因此两处报告都不出现。
+  - 同源判据 = `same_source`（SDK 单一权威，与 `reconcile` 同一函数）：**只做字符串级比较**，
+    `ssh://` / `https://` / scp-like / `.git` 后缀等等价写法**不归一**，任一侧面目不可识别即视为不同源
+    ——协议 §5.14「无法确定时 MUST fail-closed」。
+  - 可见面：recovery `WARNING` 汇总（冲突数 + **脱敏后的市场名列表**，不含 URL）+ 逐条 `DEBUG`（两侧脱敏
+    URL）；`Computer.boot_up` 的恢复汇总行纳入冲突数。CLI `run_governance_remount` 的展示当时留 follow-up
+    [#294](https://github.com/A2C-SMCP/python-sdk/issues/294)——**已由 #294 实现**（见同段 `### Added`；
+    这是与 rust-sdk#295 的两处有意差异之一，见设计文档 §6）。
+  - **只诊断、不换源**：恢复仍用已注册源 stage，旧能力保留，`failed_marketplaces` 与降级语义**不变**。
+    boot 自动换源即 §5.14 禁止的「静默替换」；换源只经显式 `marketplace remove` → `add`。与 #268 的迁移
+    模型互不替代——该迁移**仅由显式 `marketplace migrate` 触发**（boot 不执行它，也不跑 `reconciler.reconcile`），
+    且不改 `extraKnownMarketplaces`。
+  - **已知边界（已由 [#293](https://github.com/A2C-SMCP/python-sdk/issues/293) 收口）**：当时若声明本身
+    **不合法**（`source` 缺失 / 非 `git` / URL 畸形，如少写 scheme），settings 校验会把该声明整条丢弃，
+    boot 只看到「无声明」⇒ 仍静默用旧源、无诊断。#293 起这类声明进入
+    `GovernanceRecoveryReport.marketplace_declaration_errors` 并打 WARN 汇总（见 `### Fixed`）。
+    详见 [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md)。
 - **按路径读取 `client:resolve_path` + `readRoots` 授权（#236，protocol#65）**：新增事件
   `client:resolve_path`（`ResolvePathReq` / `ResolvePathRet`）与错误码 `4020 Path Not Accessible`
   （`details.reason ∈ {invalid_path, forbidden, not_found, not_a_file}`，开放枚举；resolve 成功后
   拉取期的撤权 / 删除仍走 `4018 forbidden` / `gone`，**`4018` 枚举不变**）。
   - **授权边界 = settings `readRoots`**（默认空 = 不可读，fail-closed）：仅受信 scope 可设，
     `project` scope 提供该键**整字段拒绝**；跨 scope 按数组语义拼接去重；逐项须为绝对路径且通过
-    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。
+    `normalize_path`（宿主平台）形态校验，非法项**逐条**过滤并记配置诊断。（0.5.1 起改为
+    `normalize_path` **单一判据**，见 `### Fixed（#304 item 3 …）`。）
   - **授权每请求现读、无进程内缓存**：拉取期 `get_blob` 按**当前** `readRoots` 与**当前文件系统状态**
     重施围栏（覆盖 resolve 后的撤权、root 符号链接换指向）；正确性不依赖宿主调用任何失效入口。
   - **固定拒绝集**（即便在 `readRoots` 内也拒绝）：`.skillenv`、SDK 配置/状态/凭据目录
@@ -237,6 +362,72 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Fixed
 
+- **enable 失败回滚未恢复「操作前状态」，且失败不结构化（#289，对齐 [protocol#83](https://github.com/A2C-SMCP/a2c-smcp-protocol/issues/83) / [Discussion #82](https://github.com/A2C-SMCP/a2c-smcp-protocol/discussions/82) 裁决 C，镜像 rust-sdk#306）**：
+  `plugin enable` 失败时此前只保证恢复本 scope 的 `enabledPlugins` raw 值，不判定合并视图、不清理 register
+  失败的 server、且 register / staging 阶段的裸异常会以 traceback 逃出 CLI。现按 runtime-contract §2.4 对齐：
+  - **预检失败零写**：被写 scope 的 raw pre-state 保持（absent 不写 `false`、`false` / `true` 精确保持）；
+    有效 prior-true 时既有 skills / server / 能力不动。
+  - **写后失败**：本 scope `enabledPlugins` 精确恢复调用前原值（absent → 删键）；本次 stage 的 SKILL 撤销、
+    操作前既有 orphan / 活跃条目保持 pre-state；只清理**本次 attempt 新挂**的 server（含 register 失败者
+    ——manager 先登记 config 再启动、启动失败不回滚登记，此前会留下「未启用却出现在运行期权威配置集」的
+    半态），按 §4.9.1-2 判据分类（可回收 / 只移除本 plugin 贡献；用户声明与他 plugin 依赖**折叠同档**，与 rust 一致）记日志。
+  - **结构化诊断**：回滚**前 ∧ 回滚后**合并视图（`user < project < local`）均 enabled → 抛
+    `EnableFailedRetainedError`（消息带 `existing enabled state retained`；`--json` 增
+    `enabledStateRetained: true`；`reason` 保留 #296 的源 reason 如 `manifest-name-changed`，源无自有 reason
+    或为通用归一值时给 `enable-failed-retained`）。其余 enable 失败统一为 `PluginInstallError`——裸异常
+    （register / staging 回调、宿主 `existing_bundle_ids` 等）归一时 `--json` 的 `reason` 为
+    **`enable-failed`**（新机读键值）；原异常保留在 `__cause__`，CLI 不再吐裸 traceback。异常文本先脱敏
+    （pydantic `ValidationError` 只报字段/条数，不透出 `input_value`——渲染后配置可能含已解析 secret）。
+  - **顺带修复 enable 挂载失败链路上的既有 secret 日志泄露**（不在本单原始范围，复审发现）：MCP client
+    连接/保活失败日志此前原样输出**渲染后**的 `server_parameters`（`env` / `headers` 值、`command` / `args`、
+    URL 的 userinfo/query/**path 段**都可能含已解析 `${input:secret}`）；`Computer` 渲染/校验失败、boot 初始化
+    失败、治理重挂失败、REPL 启动展示与**分发兜底**（`server add` / `inputs` 预校验）、`settings` 校验错误的
+    `reason`、plugin input 畸形告警、输入 resolver 失败，此前都可能原样带出 pydantic `ValidationError` 的
+    `input_value` / traceback。现统一走新增的 `a2c_smcp.utils.diagnostics`（`loggable_params` fail-closed
+    打码：保留字段名与 args 条数、URL 只留 `scheme://host[:port]`；`pydantic_error_text` / `exception_text`
+    只报字段/条数、自身不抛；REPL 文案另经 rich 转义），各落点均有 caplog / 断言回归锁。连接失败日志同时携带
+    **非 secret 的运行期身份**（bundle_id），避免打码后无法定位 server；DEBUG 级参数渲染改为惰性守卫。
+  - **回滚健壮性加固**：写 `enabledPlugins=true` 若在 `os.replace` 成功后收尾抛错，现无条件 best-effort 恢复
+    raw pre-state 再判定 retained；SKILL 回滚改为**逐条** best-effort（单条失败不放弃其余条目）。
+  - **retained 判定纳入 ambient policy**：库层缺省 provider 在 `user < project < local` 之上加进程级 policy
+    （admin 强停 `enabledPlugins: false` 时不再把「有效 disabled」反向误报成 `enabledStateRetained: true`）；
+    flag 层仍由宿主 / CLI 注入。一次性 CLI 与 REPL 共用 `commands.make_settings_provider`（单一实现，避免
+    #296 同款层组合漂移）。
+  - conformance：`conformance-tests.md` §5 的预检 ①②③ 与写后 ④/④b 四景新增 Python 映射用例（含跨 scope
+    `user=true / project absent` 失败后 bundled server verdict 回 `ENABLED`，并配 project-only `PENDING` 正对照）。
+- **非法 marketplace 声明被静默丢弃（#293）**：`extraKnownMarketplaces` 的声明若不合 schema（漏 scheme、
+  `owner/repo` 简写、`source.type` 非 `git`、缺 `source`），`validate_settings` 会把它**整条丢弃**，而
+  `Computer` 从不读 `ResolvedSettings.errors` ⇒ 用户把声明 URL 改出 typo 后重启，boot 只看到「无声明」，
+  既不报冲突也不报错，仍静默按旧源恢复。
+  - 新增 `GovernanceRecoveryReport.marketplace_declaration_errors: list[MarketplaceDeclarationError]`
+    （字段 `scope` / `marketplace` / `field` / `reason` / `source_path`，**逐条 + scope**，不聚合
+    「该市场无声明」；**含无安装意图的市场与 flag 层**），镜像 rust 同名 DTO。
+  - 与 `marketplace_source_conflicts` **正交、不重复计数**：被丢弃的声明不在 `declared` 视图里，冲突检测
+    看不到它；恢复源 / `failed_marketplaces` / 降级语义 / 账本**完全不变**。
+  - 可见面：recovery `WARNING` 汇总（条数 + **脱敏后的市场名列表**）+ 逐条 `DEBUG`；
+    `Computer.boot_up` 汇总行新增 `M marketplace declaration errors`，且该计数**单独即可触发**汇总行
+    （「零恢复 + 有错误」不再静默）。
+  - **显式 `declared=` 契约**：`Computer.reconcile_governance(declared=...)` 现接受
+    `ResolvedSettings`（携带 `.errors`，并取其 `.per_scope_layers`）与裸 `Mapping`（遗留形态、
+    无错误、无 per-scope 层，docstring 已注明）；CLI `run_governance_remount` 改传整对象并**返回**
+    report（additive），供 [#294](https://github.com/A2C-SMCP/python-sdk/issues/294) 的三类展示消费。
+  - **行为变化（修正）**：显式 `declared=ResolvedSettings` 路径此前丢弃 `.per_scope_layers` ⇒
+    `enabled_origin` 恒 `None`，project-scope 激活的 bundled MCP server **绕过** #159 Option B 的
+    PENDING 审批门被自动挂载。现与 `declared=None` 路径同门（与 rust 一致）：这类 server 落
+    `pending_bundled_servers` 等用户批准，不再静默挂载。裸 `Mapping` 调用方无 per-scope 信息，
+    行为不变。**已知边界**：CLI 目前对 bundled PENDING 只打 INFO 日志、**没有批准入口**
+    （`run_mcp_approval` 不覆盖 bundled 声明面）——审批由 client / 宿主承担，批准 UI 另开单跟踪
+    （见设计文档 §7）。
+  - **脱敏**：`field` 的市场名段走 `redact_ledger_key`（段漏斗，比散文脱敏更严），`reason` 走散文脱敏，
+    两者再经控制字符 / 方向覆写（U+202E 等 Cf 族）清洗；`source_path` 的判据是「**能否排除 userinfo**」——
+    不能就整值 fail-closed，能则走路径轴脱敏保留结构。判据 = 剥掉 Windows 盘符后「最后一个 `@` 在第一个
+    `:` 之后」，在原文与每一轮 `percent-decode → NFKC` 形态上各判一次（覆盖控制字符穿插、`#`/`?` 夹在 `:` 与
+    `@` 之间、段内空白、凭据内字面 `/` 与 `\`、percent-encoded、全角、多层编码）。负对照：Windows
+    `alice@corp`、纯 `100%25done`、`?` 尾部照常展示（详见设计文档 §6.1）。
+    `settings show` 的凭据回显已由 [#295](https://github.com/A2C-SMCP/python-sdk/issues/295) 收口（展示漏斗
+    `format_settings_errors` 复用本函数脱敏，见下方 `### Fixed（#295 …）`）。
+  - 与 rust 的实现口径差异（脱敏落点 / flag 过滤 / 名字脱敏强度 / `source_path` 脱敏强度）见
+    [`docs/design-0.5.1-boot-recovery-source-diagnostics.md`](docs/design-0.5.1-boot-recovery-source-diagnostics.md) §6.1。
 - **Computer 停机卡死 + 外部取消信号被吞（#211）**：`_keep_alive_task` 拆除窗口内服务端消息到达时
   `aclose()` 抛 `ExceptionGroup`，跳过关闭信号 ⇒ `Computer.shutdown()` 永不返回。关闭信号与状态清理改为
   无条件执行，断开等待加上界（超时强杀子进程）。
@@ -282,6 +473,17 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
 
 ### Changed
 
+- **`enable_plugin` 注入回调成组 + 异常类型统一（#289，嵌入式宿主升级面）**：`register_server` 现要求同时提供
+  `existing_bundle_ids` **与** `remove_server`（写后失败必须能运行期摘除本次 attempt 新挂的 server；无摘除需求
+  请传 no-op），缺任一即 `PluginInstallError`；enable 阶段异常统一为 `PluginInstallError`（此前可能原样抛
+  `RuntimeError` / `SkillSourceError` / 回调自定义异常），按类型捕获的宿主需改捕 `PluginInstallError` 并从
+  `__cause__` 取原始异常。
+- **`enable_plugin` 的 `remove_server` 回调契约收窄为「运行期-only + 覆盖全部 attempt」（#289）**：写后失败时
+  对**本次 attempt** 的全部 server（含 register 失败者）调用，不再只对 §4.9.1-2 判定的可回收者；实现
+  **MUST** 仅做运行期 unmount，**MUST NOT** 删 durable 声明（`mcp.json` / settings / 账本）——用户声明或他
+  plugin 依赖的条目「只移除本 plugin 贡献、不回收条目本身」。仓内参考实现
+  `Computer.aunmount_server_by_id` 本就运行期-only；外部宿主若把该回调接到会删声明的实现，须改用运行期
+  unmount。`disable` / `uninstall` / `gc` 的回收调用语义不变。
 - **`SMCPComputerClient.update_config` 与 `emit_update_config` 收敛为同一实现（#223）**：`update_config`
   此前**无守卫**（无条件发送），与其孪生 `emit_update_config` 行为分叉；现委托后者（同判据、同补发）。
   宿主若曾在「未确认在房」时依赖它把包发上线，请改用其它通道——那个包本来也会被服务端丢弃。
@@ -410,6 +612,409 @@ and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) version
   - 交互式输入 / 控制台渲染在依赖缺失时抛携带 `pip install "a2c-smcp[cli]"` 的 `ImportError`；
   - 新增子进程回归锁（阻断 rich / prompt_toolkit）与 `clean_install_smoke.sh none` 制品级闸门（CI 双跑）。
   - 注：`a2c-computer` 命令行入口本身仍需要 `a2c-smcp[cli]`（typer）。
+
+### Fixed（#261 marketplace URL 展示脱敏）
+
+- **marketplace CLI 原样展示 `source.url`，userinfo / token 可能外显**（#261，安全）：新增单一展示权威
+  `a2c_smcp/utils/git_url.py`（与 rust-sdk 同一展示契约，非镜像）：
+  - `list` / `info` / `add` 的表格、JSON、确认提示中的 `url` 改为**展示值**——去除 userinfo（用户名与
+    密码 / token）、query、fragment；scp-like `user@host:path` 显示 `host:path`。展示值不可用于 re-clone，
+    `known_marketplaces.json` 存储与 git clone/pull 入参保持原始 URL。
+  - 错误 / 诊断 / 日志走严格 fail-closed：不可解析 / host 缺失 / scp-like → `<redacted-git-source>`；
+    `_run_git` 异常（argv + git stderr）、SSH→HTTPS 回退日志、marketplace source 非法与 clone/refresh
+    失败日志均做 token 级脱敏，不再泄漏 git stderr 中的凭据。
+  - 与 rust-sdk#273 决策（2026-11-16）对齐；rust#154 fail-closed 边界不变。
+
+### Fixed（#248 可选依赖惰性导入契约统一）
+
+- **两套 extra 惰性导入实现合流为单一 helper**（#248）：新增 `a2c_smcp/utils/optional_deps.py`
+  的 `require_extra(module, hint)`——`a2c_smcp.computer`（`[cli]`）与 `a2c_smcp.testing`（`[server]`）
+  共用同一套异常粒度与文案格式 `"{hint} (missing: {module})"`。旧路径
+  `a2c_smcp/computer/utils/optional_deps.py` 保留为 re-export shim（`require_cli_dependency` /
+  `CLI_EXTRA_HINT` 均可用，v0.5.0 已发布面不破）。
+  - **对下游可见的行为变化**：`a2c_smcp.testing` 的 runner 在**已装** `[server]` extra 但传递依赖
+    损坏（如 `click` / `markupsafe` 缺失）时，改为原样抛出 `ModuleNotFoundError`，不再一律改写成
+    「请安装 `a2c-smcp[server]`」——后者把坏安装指成缺 extra，按提示重装依然失败。真·未装 extra 时
+    的提示不变，仅追加 `(missing: <模块名>)` 便于定位。
+  - `[cli]` 侧文案与行为保持不变。`secret_store.py` 的 keyring 探测降级语义不在本单范围。
+  - 打包守卫补位：`uvicorn` 转为动态导入后失去 AST 静态见证，新增「`server` extra 恰含
+    werkzeug + uvicorn」单点断言（`tests/unit_tests/test_packaging_dependencies.py`）。
+
+### Fixed（#263 plugin source / validator 错误与日志脱敏）
+
+- **plugin source 解析 / `plugin validate` 诊断 / plugin staging 失败日志 / CLI 未捕获路径回显凭据 URL**
+  （#263，安全；#261 未覆盖的同类面）：
+  - `SkillSourceError` 改为**构造期脱敏**（对齐 rust `SkillSourceError::new`）：`raw` 与 `reason` 存已脱敏
+    文本，`str(e)` / traceback / 日志 / `plugin validate`（文本与 `--json`）自动安全。`raw` 口径改为
+    紧凑 JSON（对象形态）/ 原字符串（字符串形态），与 rust 同形；全仓无 `.raw` 读取方，无兼容负担。
+  - `url` / `repo` 字段走 `git_url_for_display` 严格展示（可解析 scheme URL 保留 scheme/host/path，去
+    userinfo / query / fragment；scp-like / opaque / ftp / 裸 token → `<redacted-git-source>`）；其余
+    name / entry / 本地路径按 `redact_git_urls_in_text` 脱敏（合法 kebab 名逐字保留）。
+  - `plugin install` 遇 marketplace source 非法：由 `SkillSourceError` 未捕获（traceback）改为 installer
+    边界包装成 `PluginInstallError`，CLI 走既有结构化错误输出（红字 + 非零退出码；`--json` 同 payload），
+    回滚语义不变。
+  - 存储与 git 入参保持原始 URL（`marketplace add` 落盘断言 + `plugin clone` argv 断言）。
+  - 对拍 rust-sdk#154 五向量（ftp 带凭据 / `key=` 前缀 URL / scp-like / name 内嵌凭据 / 本地路径内嵌凭据）；
+    另覆盖字典**键**脱敏、字段名大小写不敏感、`url` 值被写成数组、控制字符（ESC/BEL/换行）转义。
+  - CLI 错误输出对 rich 标记转义（`[/red]` 这类不可信文本不再把结构化错误变成 `MarkupError` traceback）。
+  - 复审补口（同一 PR，七轮）：`plugin install` 的 `SkillSourceError` 分支与 boot 重物化 WARN 改走
+    `safe_exception_text`（无 scheme 的 `x/r.git?token=…` 不再漏）；`UnicodeDecodeError` 统一归一为
+    `<undecodable content (non-UTF-8)>`（不回显原始字节 / 解码细节）；staging 的 `skill_dir.name` /
+    `name` / `skill_md` 回显分支补齐路径脱敏。已知降级（本单接受）：对**构造期已脱敏 JSON 回显**再做
+    token 级路径脱敏时，值里的 `?`/`#` 会截断尾部——仅影响诊断可读性，不降低脱敏强度（JSON 感知的保真
+    处理另立 follow-up）。
+  - 复审补口（同一 PR，六轮）：新增 `safe_exception_text` 统一异常文本出口——**裸**异常文本（OSError /
+    git / manifest）先散文脱敏再 token 级路径脱敏（scp-like `user@host:path` 只有散文规则能识别，
+    上一轮去掉 R 属真实回退），`SkillSourceError` 的 JSON 回显只做 token 级；SKILL.md 读取点的
+    `UnicodeDecodeError` 归一（GBK/UTF-16 不再 traceback；mcp 源单 SKILL 失败隔离，不中止整个 run）；
+    covered-root DEBUG 的 uri / coverer 与其余 root_uri 分支统一脱敏。
+  - 复审补口（同一 PR，五轮）：plugin 源 SKILL.md 不可读分支的 `OSError` 全文与 mcp 源各跳过分支的
+    `root_uri` 统一走脱敏漏斗；`_read_json_object` / validator 的 JSON 读取并入 `UnicodeDecodeError`
+    （非 UTF-8 manifest 归一为诊断/`PluginManifestError`，不再 traceback）；消费端不再对**构造期已脱敏**的
+    文本二次 `redact_git_urls_in_text`（对象源 JSON 回显曾被改写成 percent-encoded 乱码）；散文脱敏只放行
+    空格 / `\n` / `\t`（CR、VT、FS、NEL 等空白类 Cc 转义，防日志行伪造）；authority 判据改用 scheme 尾形态
+    （`[A-Za-z][A-Za-z0-9+.-]+:`），Windows 盘符 `C:` 不再被当作 scheme。
+  - 复审补口（同一 PR，四轮）：路径轴在 `?`/`#` 截断**之前**先判凭据（`alice:pw@host?token=x`
+    不再把 userinfo 留在截断前缀里）；authority 判据取代「有 `@` 就遮」，`file:///home/alice@corp/repo.git`
+    与 `repo@2.git` 保留；散文 token 一律转义 Cc/Cs（换行/缩进保留），无 scheme 的 `./x/r.git?token=…`
+    也路由到路径脱敏；`plugin install` 预检阶段（catalog `marketplace.json` 损坏）同样归一为结构化错误。
+  - 复审补口（同一 PR，三轮）：scp-like 判据只看 `@` **之前**是否含 `://`（`alice:PW@host,https://…`
+    这类 `@` 在前的 token 仍是凭据）；路径轴把 PAT / username-only userinfo（URL 语境下的 `TOKEN@host`）
+    与 percent-encoded 冒号一并按凭据处理，同时不误伤 `alice@corp` 与 Windows 盘符；`plugin install` 把
+    `SkillStagingError` / `PluginManifestError` 也归一为结构化错误（仍脱敏）；manifest 的 pydantic 诊断
+    改为「字段:类型 + 条数」（不带 `input_value` / URL），stem / name 回显脱敏；`plugin validate` 的
+    `--json path` 与人类输出同一口径；message 轴改为**逐 token** 路径遮蔽（保留可读前缀与换行）。
+  - 复审补口（同一 PR，二轮）：validator 的 `message` 轴同样过路径级遮蔽（`_Collector.add()` 单一漏斗）；
+    `sanitize_path_for_diagnostics` 修正——`/` 与 `\` 都算段边界、query/fragment 从首个 `?`/`#` 起遮蔽余下整条
+    路径、仅遮蔽 userinfo 形态（`user:secret@`）不再误伤 `alice@corp`、控制字符先转义；
+    散文脱敏跳过已含 `://` 的 token（`file:///home/alice@corp/repo.git` 这类展示安全 URL 不再被吞）；
+    `PluginManifestError` 消息与 `stage_mcp_skills` 物化失败分支（原 `exc_info=True`）同口径脱敏。
+  - 复审补口（同一 PR，一轮）：`ValidationIssue.file` / `checked` 两条路径轴在 `_Collector` **单一漏斗**脱敏
+    （`sanitize_path_for_diagnostics` 逐段遮蔽 `@` / `?` / `#` 片段）；消息一律用**归一化前**的原始 source
+    回显（`://` 被路径归一折叠成 `:/` 后 URL 规则会失效，query / fragment 因而漏出）；staging 兜底
+    `except Exception` 的 traceback 改为「格式化后整体脱敏」输出（`exc_info=True` 绕不过 logging）；
+    非对象 plugin entry 只记类型名；manifest loader 侧 override / ignore 日志同口径脱敏；`raw` 对象形态的
+    DEL / C1 兜底转义改用 `\uXXXX`（`\xNN` 不是合法 JSON 转义）。
+
+### Fixed（#272 plugin entry name 路径穿越）
+
+- **`marketplace.json` 的 plugin `name` 未校验即作外部 clone 路径段 → 可删除任意目录**（#272，安全，高危；
+  既有缺陷，非 #263 引入）：`_entry_plugin_name` 仅判非空，`external_plugin_dir` 直接把 `entry.name` 拼进
+  `<home>/marketplace/.plugins/<marketplace>/<plugin>`，而 clone 落盘前会 `shutil.rmtree(dest)`；`marketplace
+  add` / `refresh` / boot recovery / reconciler 均以 `plugin_filter=None` 全量 stage ⇒ 恶意或被投毒
+  marketplace.json 写 `name: "../../../x"`（或绝对路径）即可删除任意目录并写入 clone。
+  - 修法：`_entry_plugin_name` 按协议 §4.1 严格 kebab 校验（`is_valid_marketplace_name`，固定错误文案、
+    不回显原值，对齐 rust `entry_plugin_name`）；`locate_plugin_root` 在 clone/rmtree 之前补
+    `is_within(ext_dir.resolve(), home.resolve())` 纵深守卫。显式 `plugin install` 路径本已校验，不受影响。
+
+### Fixed（#281 source 脱敏收尾）
+
+- **`SkillSourceError` 字符串形态的构造期脱敏不完整**（#281，安全；#263/#272 终审 4🟡 收口）：
+  字符串 `raw` 只做散文 token 级 `redact_git_urls_in_text`，没有 path/query 轴 ⇒
+  `SkillSourceError("x/r.git?token=SECRET#f", …)` 的 `.raw` / `str(e)` 仍带凭据。类 docstring「消费者无需
+  打补丁」的承诺因此不成立——仓内 sink 全靠 `safe_exception_text` 兜住，新增消费点会重新开洞。
+  - 修法：新增单一漏斗 **`utils.git_url.sanitize_value_for_diagnostics()`**（`escape_unsafe_chars` →
+    `redact_git_urls_in_text` → `sanitize_text_for_diagnostics`），**单个不可信值**（非散文）走它。
+    本单迁移的站点：字符串 `raw` / `reason`、对象形态 raw 的**每个字符串值与字典键**（`{"path":
+    "../x/r.git?token=…"}` 可达；`json_safe` 口径保证 JSON 合法）、`stage_user_skills` 的目录名与
+    `reason`、`_build_user_ref` 的 `SKILL.md` 路径与 `frontmatter.name`、发现期 DEBUG 的根/深层路径、
+    marketplace clone 的 skill 目录名与 `reason`。
+    `escape_unsafe_chars` **必须最先**：散文口径按设计**保留**换行与空白（单值里的换行可伪造日志行），
+    且不先转义时 `alice:pw\n@host` 会被切成两半而两半都不命中任何规则（漏遮）；先转义后整串退回单
+    token，散文轴（scp-like / `scheme:` opaque）与 path 轴均按整体判定。合法路径 / kebab 名
+    （`./../escape`、`https://example.com/r.git`、`file:///home/alice@corp/repo.git`）逐字不变。
+  - **单值模式的 token 边界不是空白**：`alice:pw @host`（ASCII 空格 / NBSP `U+00A0` / `U+2028` /
+    全角空格 `U+3000`，含 percent-encoded 冒号/空格如 `alice%3A pw@host`、`alice:my pass@host`）会被
+    散文轴劈成两半而两半都不命中规则 ⇒ 命中 `user:secret<空白>…@host` 形态时整值 fail-closed 为
+    `<redacted-git-source>`（判定前先 `unquote`；不放宽 path 谓词，避免误伤 `note: see @team` 这类散文）。
+  - **路径段 / 名字走「单值漏斗 + path 轴」复合**（`sanitize_segment_for_diagnostics`）：basename 天然不含
+    `/`，单值漏斗的 path-token 谓词不会触发 `?`/`#` 遮蔽（`foo?token=…` 会原样回显）——故 segment 漏斗
+    在单值漏斗之后再补 path 轴。user 源非法目录名与 marketplace 的 skill 目录名（4 处落点）均用它。
+  - **非法目录名日志保留定位**：只把不可信的 **basename** 过单值漏斗，parent 走 path 轴（段级遮蔽）——
+    既不让 `deploy-token@example.com:org` 这类名称外泄，也不让 `…/build:2024/alice@corp/…` 整行失去落点。
+  - **取舍（有意，安全优先）**：`_build_user_ref` 两处**整条路径** sink（`SKILL.md` 路径）走单值漏斗，
+    含「冒号早于 `@`」的普通路径（`…/build:2024/alice@corp/…`、Windows `C:\Users\alice@corp\…`）会被整串
+    遮为 `<redacted-git-source>`——该行仍有同行的 `%r` 名称标识。
+  - **未迁移（既有面，follow-up）**：`validator._Collector.rel()` 的 `issue.file`/`checked` 与 manifest
+    override 路径仍是 path-only 轴（scp-like 段不识别）；改它们会变更 `plugin validate` 的既有诊断
+    形状，不属本单。home / watcher 的 DEBUG 路径同理。
+  - `stage_user_skills` 非法目录名 ERROR 不再裸传 `Path`：scp-like 目录名（`deploy-token@example.com:org`）
+    与换行/TAB 形态均被遮蔽或转义（`sanitize_path_for_diagnostics` 不识别 scp-like，故统一走上述漏斗）。
+  - `parse_skill_frontmatter` 的 PyYAML 错误改走 `safe_exception_text`：其错误文本会回显出错行片段
+    （远端 SKILL.md 的凭据 URL）。`plugin validate` 与 staging 两条路径同时受益。
+  - 测试加固：decode 诊断三处恒真断言（`assert "\xff" not in text`——`UnicodeDecodeError.__str__` 只含
+    ASCII `0xff`）改为 `<undecodable content (non-UTF-8)>` 精确文案；validator 三处 decode 用例补固定文案
+    正向断言与「好 SKILL 仍被 check」正对照；user 源六处脱敏补真实凭据用例（userinfo 与 scp-like 两种
+    形态、换行/TAB 控制字符、DEBUG 路径），并统一补**占位符正向断言**（只断言「不存在」时，删掉脱敏参数
+    仍会绿）。
+  - **空白的取舍（有意，安全优先）**：判据无法区分 `alice: pw@host`（被空白劈开的 userinfo）与
+    `contact: alice@example.com`（普通散文），故一律 fail-closed（整值遮）；`note: see @team`
+    （`@` 前有空白）仍逐字保留，已入反例向量。
+  - 已知边界（不变）：无法按 URL/路径形态识别的 token 原样保留——裸 token（`glpat-…`）与**无分隔符的
+    query 形态**（`url?token=…`，如 `{"source": "url?token=…"}` 这类**对象值**；basename 落点不在其内，
+    已由 segment 漏斗的 path 轴覆盖）。放宽 path 谓词会误伤 `why?` 这类散文。
+  - 已知边界（既有，**非本单引入**，另案）：**percent-encoded 分隔符**把 userinfo 劈开时仍原样保留
+    （如 `alice:pw%2Fmore @host` / `alice:pw%5Cmore @host`：`unquote` 后含 `/`/`\`，被段判据排除）；
+    `frontmatter.name` 的 DEBUG 回显同理——该 sink 走单值漏斗，`name: foo?token=…` 形态无分隔符、
+    path 谓词不触发（改为 segment 漏斗会动这一行的行为面，留待另案）。
+  - JSON 感知的保真脱敏（`?`/`#` 截断影响可读性）仍属另案。
+
+### Fixed（#270 hostless git URL 与 marketplace 名称派生）
+
+- **hostless ssh/git/http(s) URL 通过校验，凭据被 slug 进 marketplace 注册名**（#270，安全）：注册名会进入
+  CLI 文案 / `--json`、`trustedMarketplaces`、`known_marketplaces.json` 键、`marketplace list` 与 staging
+  日志，并经 `A2CSkillRef.source = marketplace:<name>` 下发到 Agent。镜像 rust-sdk#285。
+  - **公共 API 收紧**（`settings.is_valid_git_url`，行为变更）：`ssh` / `git` / `http(s)` 必须有**形如主机名
+    的 host**——拒绝 `ssh:///alice:PW@example.com`、`git:///x`、`https:///x`、`ssh://user@:22/path`，
+    以及把 host 槽位填成非主机占位串的变体（空白 / `-` / `_` / `%20` / 纯点，如 `ssh:// /alice:PW@x`）；
+    `file:` 一律不要求 host（`file:///abs/path`、`file://host/path` 均合法）；scp-like 形态不变。
+    非法端口 / 畸形 netloc 一并 fail-closed（`file:` 除外——file 全例外，`file://C:\repos\repo` 保持合法；
+    比展示层 `git_url_for_display` 更严：展示层仍可展示 `ssh://-/x`，校验不认它）。percent-encoded host
+    （`https://ex%61mple.com/x`）有意拒绝；下划线 host、子域、IDN（IDNA 归一）、尾点 FQDN
+    （`example.com.`）、IPv6 字面量（含 zone-id）仍合法。既有消费者（`validate_settings`、plugin source
+    解析、`marketplace_clone_url`）随之 fail-closed。新增公开谓词 `settings.is_scp_like_git_url()`
+    （仅形态分类，合法性仍走 `is_valid_git_url`）；scp-like 形态改按整串匹配判定（尾随换行不再视为合法）。
+  - **派生名改解析式**（`marketplace.default_marketplace_name`）：只取解析后 **path 的末段**——userinfo /
+    query / fragment 不再参与命名（`https://host/repo?token=SECRET` → `repo`，此前 `repo-token-secret`；
+    `git@host:o/r?token=SECRET` → `r`）。末段含 userinfo/密码分隔符（`@` / `:`，如
+    `https://host/alice:PW@example.com`）同样不派生，且判定前做 NFKC 归一 + percent-decode
+    （`alice%3APW%40host`、全角 `：`/`＠` 等价变体一并挡）——凭据样文本交给 `--name` 显式命名。
+    无 path（`https://host`；`https://github.com` 此前派生 `github-com`）、hostless / junk host、非法、
+    末段构不成严格 kebab → `None`，CLI 提示 `--name`。scp-like 多冒号取最后一个 `:`（与 rust 一致）。
+    判定前迭代「percent-decode → NFKC」至**不动点**，且**残形 percent 转义一律 fail-closed**
+    （#282 修正：原固定 3 轮会被四层编码 `alice%2525253APW_LEAK` 旁路；口径对齐 rust-sdk#285
+    `seg.contains([':', '@', '%'])`）。故双重 / 三重 / 四层及更深编码、percent-encoded 全角分隔符
+    （`%EF%BC%9A` / `%EF%BC%A0`）、**全角百分号**（`alice％３ＡPW`），乃至解码后本可干净的
+    `repo%20name`（**行为变更**：此前派生 `repo-20name`），一律不派生名字 —— CLI 提示 `--name`
+    显式命名。`_MAX_DECODE_ROUNDS=10` 只保证解码循环终止，**不**承担覆盖面，不存在「N 层以上漏判」的
+    深度残余。
+  - **`marketplace add` 失败文案不再回显 path 段凭据**：在 #261 展示脱敏之上再挡一层，按 path **任意段**
+    判定（含尾斜杠、中间段、编码变体、残形 `%` 与上述不动点解码），命中 → `<redacted-git-source>`。
+    判定对象是**原始 source** 的 path 段（渲染才用展示串）：展示层会把空格 / 非 ASCII `quote()` 成 `%XX`，
+    若拿展示串当判据，`https://host/团队/repo`、`https://host/my team/repo` 这类干净 URL 会被误整条打码。
+    现在它们**不再整体占位符**，按 #261 展示契约输出（`团队` → `%E5%9B%A2%E9%98%9F`、`my team` → `my%20team`，
+    即源里本就存在的 percent 转义仍按 `%` 规则 fail-closed，展示层自己 quote 出来的不算）。
+    **无 path 时同样整体占位符**（#282 补记，行为自 #270 起即如此；无法判定即为 fail-closed）：
+    `marketplace add https://host` 的文案是
+    `cannot derive a valid marketplace name from <redacted-git-source>; pass --name`，不展示主机部分。
+    **范围仅限 add 失败文案**：
+    `marketplace list` / `info` / confirm 提示 / 成功 `--json` 的 `url` 仍按 #261 known-source 契约保留
+    path（path 内凭据的外显属 #261 显示契约面，未在本单扩大）。
+  - **只防新增**：存量已落盘的凭据 slug 不自动删除 / 改名（迁移归 #268 / #260）；`marketplace remove`
+    与 `--name` 显式命名不受影响；`--name` 不能绕过 URL 校验（校验先于命名）。
+  - 存储与 git argv 保持原始 URL（raw 保真），展示脱敏（#261）不变。
+  - **合并顺序（已满足）**：本改动让 hostless 的 plugin source 新走 fail-closed，该路径的原始 URL 回显面由
+    #263 / PR #276 修复，且 **#276 已先合入 develop（`319847c`）**——`SkillSourceError` 构造期脱敏已覆盖
+    本单新增的输入，无需另等。
+
+### Fixed（#275 legacy 账本 scoped 卸载残留 + uninstall 失败序）
+
+- **legacy 账本记录的 scoped 卸载不再留下 skills / clone 残留**：库层 `uninstall_plugin(..., scope=...)`（含嵌入
+  宿主经公开 API 的调用；CLI 不暴露 `--scope`，见下条触发面）的「存活记录」判据改与落盘视图同源——
+  含 `bundledMcpServers` 的 v0.2.x 旧格式记录按协议 §4.9.1-4 会被整条 sweep，
+  故**不再算作**「其余 scope 仍安装」的证据。此前该场景会留下账本/意图/enabled 全清、而同进程 registry
+  仍注册其 skills（可硬挡换源 enable）、plugin 独占外部 clone 无人引用（后续 `uninstall` 已 no-op、`gc`
+  只遍历账本 pid ⇒ 持久磁盘泄漏）的自相矛盾终态。判据以 `store.is_legacy_ledger_record` 单点导出，
+  sweep 本体与 clone 门控 / server 回收 / skills 注销共用，避免两处谓词漂移。
+- **`uninstall` 失败序：skills 注销后置到 `remove_server` 之后**（`§5.5`）：停摘 server 是本函数唯一可达的
+  可抛外部调用（`McpStartGateClosed` 关闸 / 状态机 / 传输异常）。原顺序下它一抛就是「账本说已安装、技能已丢」
+  半态；新顺序失败时账本、意图、技能一律原样保留，重试即可收敛（已删 clone 的重试按「缺失即视为已删除」）。
+  **非 best-effort**：吞掉停摘失败再提交账本会把「plugin 已卸但 server 仍可调用」写死。
+- 触发面：**库层 / 嵌入宿主的 scoped uninstall**——CLI 的 `plugin uninstall` / `marketplace remove` 均不传
+  `scope`；v0.2.x 账本在首次成功 boot 的治理恢复中通常已被整体重物化，窗口为「升级后未成功 boot + 库层 scoped
+  卸载」。`gc_plugins` 的同款失败序不在本单范围（另案）。
+
+### Fixed（#271 enable 复审残留）
+
+- **identity collapse 的结构化细节改用 `bundleId` 键**：`plugin enable` 预检发现同一 `bundle_id` 对应不同安装根
+  （或同根不同配置）时报 `error_code=validation`，`details` 由 `{"conflictWith": <bundle_id>}` 改为
+  `{"bundleId": <bundle_id>}`。`conflictWith` 恢复其既有值域——只承载 `<plugin>@<marketplace>` pid（跨
+  marketplace 同名冲突）。**按 `conflictWith` 解析 pid 的调用方**若曾把身份坍缩一并处理，需改读 `bundleId`。
+- **身份坍缩文案分档**：同根异配置现在明确报 `different configs under the same install root` 并点出两个
+  **server 名**（此前只报 `(/a vs /a)` 两段相同路径，无从判断差异）；异根档文案不变。两档均**不**回显
+  `command` / `args` / `env` / `headers` 等配置体。
+- **`plugin enable` 的 SKILL 零注册兜底文案不再绝对化**：`enabledPlugins` 的回滚写是 best-effort（写失败只记
+  `enable rollback: failed to restore ...` WARNING），故消息由「was restored to its previous value」改为
+  「a restore ... was attempted but may not have succeeded」。
+- **声明态判据单点**：`skills/manifest.py` 新增 `entry_declares_component(entry, key)`（镜像 rust 同名函数），
+  `manifest_declared_components` 与 installer 的 SKILL 声明判据共用；JSON 真值函数保持私有、不对外导出。
+  对 **JSON 解码值**逐值等价（纯结构收口）；唯一差异在非 JSON falsy 类型（如 `set()` / 自定义对象）——
+  现按「已声明」处理（fail-closed），而旧的 Python 真值按「未声明」。本仓调用方全部读 `json.loads` 结果，
+  该差异不可达；嵌入宿主若自行构造非 JSON 值需注意。
+
+### Fixed（#278 install 失败的恢复指引 + 迁移文档口径）
+
+- **损坏 catalog 上 `plugin install` 失败不再只丢一句根因**：`install_plugin` 把 `SkillStagingError` 归一为
+  `PluginInstallError` 时追加与 `plugin enable` 路径同源的 `Recovery:` 指引——`marketplace remove <name>` →
+  `marketplace add <source>` → `plugin install <plugin>@<name>` →（install 不激活）`plugin enable`。此前 PR #276
+  已消灭 traceback 并给出退出码 1 / `--json` 结构化错误，但用户仍需自行猜到这条恢复路径。
+  **该指引只给「相对源插件根缺失」**（0.5.0 旧卸载删共享 catalog 子树这一种损坏）：`marketplace remove` 会级联
+  卸载该 marketplace 的全部插件并撤销 trust，对独占 clone（`url` / `github` / `cnb` / `git-subdir`）的
+  根缺失、clone 失败或相对源越界声明既修不好又有损失，故这些情形**一律不给**恢复指引（与 rust-sdk 同单一致）；
+  `SkillSourceError` / `PluginManifestError` 分支同样不附。
+  不新增机读码（`--json` 仍是 `{"error": "error", "message": …}`）。
+- **迁移文档 §2 口径订正**：`docs/upgrade-0.5.1-marketplace-catalog-recovery.md` 不再写「可能以未处理异常、
+  带堆栈的形式打印」，改为 0.5.1 的实际行为（结构化错误 + 恢复指引，`--json` 形态），保留 remove/add/重装步骤。
+
+### Fixed（#296 marketplace 引用守卫纳入 flag/policy 层）
+
+- `intent_reference_pids` / `registration_violation` / `commit_marketplace_registration` /
+  `add_marketplace_source` / `stage_marketplace_skills` 增可选原始轴 `cwd` / `flag_settings_path` /
+  `policy_settings`，与 `env` 一起透传给 `resolve_settings`。`policy_settings=None` 时由
+  `intent_reference_pids` 按 `env` 现解析 ambient policy（与 rust#300 / `Computer._settings_axes` 同口径）；
+  显式 mapping 覆盖，`{}` = 显式无 policy（hermetic 测试与嵌入式宿主的开关）。
+- **两处守卫调用点共用同一五层视图**：注册提交点（`marketplace add` / clone 缺失修复）与 `--no-clone`
+  意图注册（`_register_intent_only`）。
+- 新增 `Computer._settings_axes()`（`SettingsAxes` 扁平原始轴），`_resolve_declared_settings` 与 REPL
+  marketplace 守卫同源。
+- **REPL 三面同源（marketplace / settings / plugin）**：统一经 `settings_axes_of(comp)` 取轴（优先
+  `Computer._settings_axes()`，缺失时退化为 env/cwd/flag）——所有 marketplace 子命令（add/list/info/
+  remove/refresh/migrate/set）与 settings 的 `show/get/set/edit` 均用**同一**实例 env；`settings show/get`
+  的 project/local cwd、flag 层与 policy 层也取实例轴（policy 直接消费 `axes.policy_settings`，不再从 env
+  重解析），plugin 的 project/local `project_path` 跟随实例 cwd。仅改 `marketplace` 一面会让
+  「`settings set enabledPlugins` 写 ambient、守卫读实例」在注入 env 的 `--computer-factory` 宿主里互相
+  看不见，引用可被静默重绑；三面同源后该缺口关闭。
+- **子进程环境与 ambient 合并**：实例 env 可为部分映射（只注入 `XDG_CONFIG_HOME` / `HOME` 等）——git 子进程
+  （`_git_env`）与 `settings edit` 的 `$EDITOR` 子进程改用 `{**os.environ, **instance_env}`，避免丢
+  `PATH` / `SSH_AUTH_SOCK` / `HTTPS_PROXY` / `EDITOR`；settings 解析仍只用实例 env。合并后**剥除 ambient 的
+  `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` /
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_NAMESPACE`**（实例 env 显式提供才保留），否则会覆盖
+  `git -C` / clone 落点；ambient `GIT_SSH_COMMAND` 缺 `-oBatchMode=yes` 时自动追加，避免挂 tty 等待口令。
+- 引用语义不变：`installedPlugins` ∪ `enabledPlugins` 键、`@<name>` 后缀匹配、true/false 均算、层并集去重；
+  不新增错误码。
+
+### Fixed（#304 item 3 settings 路径判据收尾）
+
+- **`readRoots` 改为单一判据（配置期 == 运行期）**：`_validate_read_roots` 去掉前置的「POSIX `/` 或
+  Windows 盘符」语法预判，只留 `normalize_path`（与运行期 `build_read_roots` 同源），并拆出
+  `_validate_read_roots_for(..., platform)` 平台显式接缝（与 rust `validate_read_roots_for` 同名同构，
+  CI 只有 Linux）。行为变化：**Windows verbatim 前缀 `\\?\C:\...` 在配置期不再被误拒**——
+  `normalize_path` 按协议向量 `win-verbatim-prefix` 接受并归一，此前「运行期读得了、配置期写不进」；
+  drive-relative `C:repos\` 两侧一致拒绝。相对路径项的诊断文案由 `must be an absolute path` 变为
+  `invalid path: …`（`settings show/get` 可见）。
+- **`landingRoot` 与 rust 对齐 `trim()`**：先按 Unicode `White_Space` trim（逐字节等价 rust
+  `str::trim()`——**不**含 U+001C–U+001F 四个信息分隔符，Python `strip()` 会多剥），trim 后为空 /
+  非绝对 → 整字段判废，通过则**存 trim 后的值**。升级面（前导 / 尾随不对称，都**不是**简单的
+  「从判废变为生效」）：
+  - **前导**空白：此前整字段判废（`startswith("/")` 失败、静默失效），现在 trim 后生效；
+  - **尾随**空白：此前**原样生效**——POSIX 上写入根就是带空格的目录（其中产物不会迁移），现在写入根
+    **静默改为 trim 后的路径**；Windows 上 Win32 本就会剥掉非 verbatim 路径分量末尾的空格/点（真实差异
+    是 `"C:\\x "` 此前因 `normalize_path` 拒绝空格结尾而丢掉 `.part` 拒绝集条目，trim 后该缺口一并修复）。
+- **判据边界文档化（不做谓词合并，2026-11-23 用户裁决）**：`landingRoot` / `permissions.additionalDirectories`
+  保持**语法**判据、不按宿主平台过滤，也不改用 `normalize_path`。由此的「外来平台形态」边界：
+  `readRoots` 运行期由 `build_read_roots` 丢弃外来形态；`additionalDirectories` 运行期无消费者；
+  **`landingRoot` 运行期不丢弃**——`Computer.landing_root` 直接 `Path(raw)`（POSIX 上 `D:\...` 是
+  相对 cwd 的路径、Windows 上 `/home/...` 是 current-drive-rooted），该**实际落盘目录**仍进
+  `.part` 拒绝集（见下条）。
+- **拒绝集先绝对化再归一（镜像 rust `std::path::absolute`）**：`build_protected_paths` 对每个候选
+  （含 `extra_paths` 与 `landingRoot`）先按宿主 cwd `abspath` 再 `normalize_path`。修复外来平台
+  `landingRoot`（如 POSIX 宿主配 `D:\uploads`）此前因 normalize 失败**静默退出** `.part` 拒绝集、
+  令在途上传可被 `client:resolve_path` 读出的缺口；相对注入项也不再被静默丢弃。
+- **`build_read_roots` 按配置形态去重**（镜像 rust）：verbatim `\\?\C:\data` 与 canonical
+  `/C:/data` 归一同根，只保留首次出现。
+- `build_read_roots` 增 keyword-only `platform` 注入接缝（缺省宿主平台），供「配置期/运行期同源」测试
+  在任意 OS 上对拍。
+### Fixed（#295 settings 校验错误展示面脱敏 + markup 安全）
+
+- **`settings show` / `settings get` 回显 marketplace 凭据（#295，镜像 rust PR #302）**：settings 校验错误的
+  `field` 用**原始 JSON 键**拼点路径，手编 `extraKnownMarketplaces` 键即可让诊断行回显
+  `https://alice:s3cret@example.com/repo.git`。现在 `format_settings_errors` 逐条复用
+  `recovery.sanitized_marketplace_error`（与恢复报告 `marketplace_declaration_errors` **同一口径**：名字走段
+  漏斗、reason 走散文脱敏、再清 Cf/Cc），覆盖 `settings show` / `settings get` / boot 批准流程；非
+  marketplace 子树的错误与 `validate_settings` 校验/丢弃语义**不变**（`ResolvedSettings.errors` 仍保留原值）。
+  - 脱敏口径：userinfo 剥离（`https://alice:s3cret@example.com/repo.git` → `https://example.com/repo.git`）、
+    path 段凭据 / 非 URL userinfo 整值 `<redacted-git-source>`、query/fragment 凭据丢弃；干净非法名
+    （`Bad_Name`、`repo@2.git`、`alice@corp`、`100%25done`）逐字保留。
+- **`settings show` / `settings get` 遇富文本标记抛 `MarkupError`（#295）**：手编键 `evil[/]a[/]b` 会让
+  `_emit_errors` 的 `console_err.print` 抛 `MarkupError`、命令 traceback。现整行经 `rich.markup.escape()`，
+  两条命令共用该函数一并修复；`settings.json[user]` 的 scope 文本也不再被当样式标签吞掉。
+  - 同族一并收口（`settings.py` 其余插值 print）：`_err` 的错误行、`✓ set <key>`、`✓ ignored <key>`、
+    `✓ edited … (<path>)`、REPL 未知子命令提示。此前 `settings set 'evil[/]a[/]b' 1` 会**先写盘、再在成功行
+    崩溃**（用户以为没写成功，实际文件已改）。
+- **审批门展示行的 server 名 markup 安全（#295；既存缺陷，非本单引入）**：`.tfrobot/mcp.json` 的 server
+  名是裸 `str`（无字符集约束、可随仓库分发），`run_mcp_approval` 的 mounted / skipped / denied 行与审批
+  prompt 未转义——`{"servers": {"evil[/]x": …}}` 这类**合法**配置即可让 rich 抛 `MarkupError`，而
+  `interactive_impl` 的 `except Exception` 会把**整个审批门**降级为一行 WARN（恶意名之后的 server 不再
+  挂载/摘除/提示，与 #294 同族）。现 server 名统一走 `escape(repr(name))`、异常文本走
+  `escape(exception_text(exc))`（#289 的诊断脱敏权威：pydantic `input_value` 不回显），
+  prompt 改用 `{name!r}`（不含引号/反斜杠的普通名渲染不变；含引号或控制字符时按 repr 转义，刻意如此）。
+  本项**不重开 #294 决策**，#304 的三项挂账不变。
+  - 同函数内**同族残余**一并收口：`_inject_inputs_collision_safe` 的 input id 冲突行（`mcp.json` 可声明
+    两个 `[/]` 形态 id，`env_segment` 坍缩到同一环境变量名，冲突行在审批门循环**之前**执行——未转义同样让
+    整门跳过）；id / env 名 / source 逐段 `escape`。
+  - **启动路径同族残余**：`run_governance_remount` 的 `✓ restored bundled MCP server …` 行同样插值
+    marketplace 分发的 bundled server 名（`mcp-servers/<name>.json`，裸 str）——未转义时该行抛 `MarkupError`
+    被 `reconcile_governance` 的 per-server 兜底吞成 WARN，**server 已挂载（`start=False`）却永不批量启动**。
+    现经 `escape(repr(name))` / `escape(plugin_id)` 收口。
+- **REPL 顶层兜底与未知子命令提示的 markup 安全（#295）**：`interactive_impl` 的 catch-all 降级行此前会把
+  异常文本直接拼进 markup——`MarkupError` 正文自带 `[/]`，兜底自身会二次抛出、令 REPL 直接 traceback 退出。
+  现三处按各自语义收口：批准门控 → `_print_degraded`（`escape(exception_text(exc))`）、治理重挂 → 内联
+  `escape(exception_text(e))`、命中命令 → `_repl_failure_line(e)`（#289 的脱敏 + escape），pydantic
+  `input_value` 在 REPL 兜底同样不回显。
+  四个 REPL 分派器（settings / plugin / skill / marketplace）的未知子命令提示同步改用共享的
+  `print_unknown_subcommand`（此前只修了 settings 一处）；`skill info` 的未知名提示改 `escape(repr(name))`
+  （一次性 CLI 无 REPL 兜底，此前 `skill info 'evil[/]x'` 直接 traceback）。
+- **脱敏边界（写入口径，非新行为）**：本版只脱敏**错误行**；`settings show` / `settings get` 对**合法**的
+  marketplace 声明值（如 `source.url` 里用户自己写的带凭据 URL）仍**忠实展示**——那是查看器语义，不是诊断回显。
+- 残余挂账 [#304](https://github.com/A2C-SMCP/python-sdk/issues/304)：`enabledPlugins` 非法键 / `mcp.json: {e}`
+  的 pydantic repr / drive 谓词一致性（同一展示漏斗，后续单处理）。
+
+### Fixed（#301 marketplace 迁移终审残留）
+
+- **P0.5 判据与 P2 重建逐条同构（行为修正）**：
+  - **`projectPath` 窄对齐**：仅「plugin 仍在新清单 + 账本记录 `installPath` 为非空字符串」的 project/local
+    记录缺 `projectPath` 才 `blocked` / `project-path-missing`（dry-run 即 exit 3、零写入）。
+  - **静态可知的 keep 形态计划期即预告**：plugin 不在新清单（含 `baseline_derived`）/ 记录缺 `installPath` /
+    记录非对象 / records 非数组 / 旧 source 非映射且无可合并的映射 `known[new]` → 项仍是 `rename`、只置
+    `incomplete`（`ledger-rebuild-failed`），其余面照常迁移；dry-run 与 apply 的退出码一致（均为 3）并给出
+    同一诊断——此前这些形态在 dry-run 报 0（违反设计 §12.2「dry-run 退出码 = apply 会得到的码」），或干脆
+    被预检整体阻断且重跑不收敛。诊断只在项仍为 `rename` 时落：整项被阻断时不留任何「keeping」文案。
+  - 判据与 `_rebuild_ledger` 共用 `_record_needs_project_path` / `_note_ledger_record_kept`，两侧不可漂移。
+- **D14 carve-out（secret 候选派生）**：**不在新清单**的 plugin（**含已安装但已出清单**、含 `baseline_derived`）
+  没有 rename 目标 ⇒ 跳过 secret/input 枚举、不重键、不阻断，旧值与既有 secret 原样保留（旧键成为孤儿，
+  但不会被任何新 pid 读取）；**已装且仍在新清单**的 plugin 根不可读（`plugin-root-unreadable`）/ `inputs.json`
+  畸形（`secret-inputs-unreadable`）时 D14 原样 fail-closed（整项 `blocked`、零写入）；未安装的清单内 plugin
+  维持「告警不阻断」。正对照由变异「carve-out 扩大」钉住。
+- **枚举集路径穿越加固（#272 不变量）**：候选枚举只收 strip 后仍合法的 kebab 名（绝对路径 / `../` 等
+  不可信条目名不参与枚举），GitCloneSpec 分支另加「解析后必须仍在 home 内」的纵深边界；反证用例覆盖
+  `../` 与绝对路径两形态（真实 plan/apply 路径，keyring 零 set/delete）。
+- `_rebuild_ledger` 的 `projectPath` raise 保留为**竞态**纵深防御（预检之后账本被并发写坏），并加直调用例。
+- 证据补强：P3「目标键为 null + 旧键缺失」abort 与「双 null 同值」正向用例、known 记录完全缺 `source`
+  的 plan+apply 正路（含与 F10 的交互）、P3 目标 value/secret 不被覆盖断言、`_rekey_values` P3 死分支清理。
+- 变异脚本自证（`scripts/mutation_marketplace_migration.py`）：基线绿跑 + 严格 KILLED 判定（仅
+  `rc == 1` 且 short summary 的 `FAILED`/`ERROR` 行列出全部目标用例，**禁止裸子串匹配**）+ 语法校验 +
+  单次超时 + sha256 逐字节还原（raise 式，不依赖 `assert`）+ 锚点演进校验；矩阵 33 → 44 条（补 P0.5
+  skip / 谓词守卫 / D14 carve-out 正对照 / 静态 keep 预告 / 裸字符串 source 预告 / 枚举集 strip+合法名 /
+  路径穿越两层同时拆 / keep 诊断「阻断项不得即时落」/ `_rebuild_ledger` raise / `_rebuild_ledger` 无
+  source 正路），并在严格判据下收紧既有变异的目标用例列表（其原列表含未被该变异打红的用例）。
+
+### Fixed（#304 item 1/2 settings 展示面脱敏残余）
+
+- **`enabledPlugins` 非法键脱敏（#304 item 1）**：`format_settings_errors` 对 `enabledPlugins.<key>` 的
+  map key **整值**过既有名字漏斗（`sanitize_prefixed_name_field` → `sanitize_marketplace_name`）——
+  非法键与值非 bool 两处错误共用同一形状，故一并覆盖。用户 2026-11-23 裁决：**不拆分**、不改「含 `:` 即遮」；
+  `alice:pw@mp` / `alice:pw@example.com@mp` 掩为 `<redacted-git-source>`，干净非法键（`Bad_Name@mp` /
+  `alice@corp@mp` / `evil[/]a[/]b`）仍逐字可读，控制字符 / Cf 族由漏斗清洗。
+- **`mcp.json` 行改摘要 + DEBUG 明细（#304 item 2）**：`run_mcp_approval` 不再把整条
+  `SettingsValidationError` dataclass repr（含原始 `source_path`）顶到终端——终端只留
+  `⚠ mcp.json[<scope>]: <field> — <reason>` 摘要，完整明细（scope / field / reason / 脱敏 source_path）
+  降 DEBUG 日志。`field` 的 `servers.<name>` / `inputs.<id>` 残段整值过名字漏斗（前缀常量
+  `MCP_DECLARATION_FIELD_PREFIXES` 与校验器同源），`source_path` 走 `sanitize_source_path`（userinfo 形态
+  整值 fail-closed）；控制字符 / 方向覆写清洗保持。
+- **`reason` 的用户值在构造处脱敏**：`mcp_config` 的 name-mismatch 文案内嵌原始 `name` / map key、
+  pydantic `loc` 含手编 extra key、`<file>` 的 `OSError` 文本内嵌文件路径——散文漏斗按空白分词，回收不了
+  「被空白劈开」的凭据（`alice:my pw@corp`）。故构造处改为：name 值走段漏斗
+  （`_sanitize_declaration_name`）、`pydantic_error_text(..., sanitize_segment=...)` 逐段脱敏、
+  `<file>` 只留 `strerror`（路径由脱敏 `source_path` 承载）。
+- **load 期 WARNING 同步脱敏**（审查 🔴）：`mcp_config` / `scope` 的读文件失败 WARNING 此前把**原始路径与
+  原始异常**直接写终端（默认 INFO 下 `a2c_smcp` 的 StreamHandler 走 stdout）；现路径走 `sanitize_source_path`、
+  异常侧只留 `strerror`（非 `OSError` 走 `exception_text`），与 `<file>` reason 同源，且转换自身不可抛。
+- **`_inject_inputs_collision_safe` 的 id / env 名过名字漏斗**：input-id 坍缩行不再回显 `alice:pw@mp` 这类
+  userinfo 形态 id（干净 id 仍可读）。
+- **边界（另单 [`#313`](https://github.com/A2C-SMCP/python-sdk/issues/313)，v0.5.2）**：`format_settings_errors`
+  对其它字段的 reason 仍原值透传（如 `readRoots[i]` 回显 `invalid path: ... 'alice:pw@mp'`；`<file>` 已由本单收口）；名字轴（`sanitize_marketplace_name`）只判**字面** `@`/`?`/`#`，
+  **percent-encoded**（`alice%3Apw%40mp`）与 **NFKC 全角**（`ａｌｉｃｅ：ｐｗ＠ｍｐ`）形态仍逐字回显。
+  与 rust 的展示差异同随该单对齐。
 
 ## [0.4.2] - 2026-09-29
 

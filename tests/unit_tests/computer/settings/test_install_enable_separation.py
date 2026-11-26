@@ -21,13 +21,17 @@ TDD 目标行为用例（settings 层；对应 conformance-tests §5「install �
 from __future__ import annotations
 
 import json
+import logging
 import os
-from collections.abc import Sequence
+import shutil
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
 from a2c_smcp.computer.settings.installer import (
+    EnableFailedRetainedError,
+    PluginInstallError,
     enable_plugin,
     install_plugin,
     uninstall_plugin,
@@ -41,6 +45,7 @@ from a2c_smcp.computer.settings.scope import user_settings_path, workdir_local_s
 from a2c_smcp.computer.settings.store import load_installed_plugins, save_installed_plugins, save_known_marketplaces
 from a2c_smcp.computer.skills.home import SOURCE_MARKETPLACE, marketplace_skill_dir
 from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.staging import external_plugin_dir
 from a2c_smcp.utils.bundle_id import resolve_bundle_id
 
 _SRC = {"type": "git", "url": "https://example.com/acme.git"}
@@ -166,10 +171,13 @@ class _FakeMCP:
         return set(self.existing)
 
     async def register(self, cfg) -> None:
+        bundle_id = resolve_bundle_id(cfg)
         if self.fail_on is not None and cfg.name == self.fail_on:
+            # #289：模拟生产残留——manager 先登记 `_servers_config` 再启动，启动失败不回滚登记。
+            self.existing.add(bundle_id)
             raise RuntimeError(f"register {cfg.name} boom")
-        self.registered.append(resolve_bundle_id(cfg))
-        self.existing.add(resolve_bundle_id(cfg))
+        self.registered.append(bundle_id)
+        self.existing.add(bundle_id)
 
     async def remove(self, bundle_id: str) -> None:
         self.removed.append(bundle_id)
@@ -270,15 +278,18 @@ async def test_enable_mount_failure_rolls_back_to_installed_disabled(tmp_path: P
     mcp.fail_on = "beta"
     reg = SkillRegistry()
 
-    with pytest.raises(RuntimeError, match="beta"):
+    with pytest.raises(PluginInstallError, match="beta") as ei:
         await enable_plugin(
             _PID, reg, home, env=env,
             existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
+    # #289：非 PluginInstallError 的 enable 失败归一为结构化错误，原异常经 __cause__ 保留（不吞）。
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert not isinstance(ei.value, EnableFailedRetainedError)  # prior absent → 不得报 retained
     settings = _read_user_settings(env)
     assert _PID not in settings.get("enabledPlugins", {})  # 原 absent → 回滚删键
-    assert mcp.removed == ["alpha"]  # 已挂 alpha 撤销
+    assert mcp.removed == ["alpha", "beta"]  # 已挂 alpha 撤销 + 失败者 beta 登记残留清理
     assert reg.resolve("audit:lint") is None  # 本次 stage 的 skill 撤销
     assert settings.get("installedPlugins") == [_PID]  # installation 保留
 
@@ -289,18 +300,19 @@ async def test_enable_mount_failure_restores_previous_false(tmp_path: Path, monk
     home = _home(tmp_path)
     env = _env(tmp_path)
     root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
-    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_NAME])]})
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: False}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
     mcp = _FakeMCP()
     mcp.fail_on = FIGMA_NAME
 
-    with pytest.raises(RuntimeError, match="figma"):
+    with pytest.raises(PluginInstallError, match="figma") as ei:
         await enable_plugin(
             _PID, SkillRegistry(), home, env=env,
             existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
+    assert not isinstance(ei.value, EnableFailedRetainedError)
     assert _read_user_settings(env)["enabledPlugins"][_PID] is False
 
 
@@ -311,7 +323,7 @@ async def test_uninstall_clears_intent_and_enabled_entries(tmp_path: Path, monke
     home = _home(tmp_path)
     env = _env(tmp_path)
     root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
-    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_NAME])]})
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
     mcp = _FakeMCP()
@@ -411,7 +423,7 @@ def test_collect_gates_on_installed_and_enabled(tmp_path: Path) -> None:
     """collect：intent 有但未启用 → 空；installed ∧ true → 可查询（§4.8 blockquote 的 enabled 门槛翻转）。"""
     home = _home(tmp_path)
     root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
-    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_NAME])]})
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
 
     assert collect_enabled_bundled_servers(home, {"installedPlugins": [_PID]}, env=_env(tmp_path)) == []
     records = collect_enabled_bundled_servers(
@@ -544,14 +556,27 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
     )
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     monkeypatch.setattr(_STAGE, _fake_stage([]))
+    # #262：预置**非空** registry——空 registry 会让「多 scope 卸载误删技能」完全失明（验收第 3 条）。
+    reg = SkillRegistry()
+    reg.register(
+        {
+            "name": "audit:lint",
+            "source": f"{SOURCE_MARKETPLACE}:acme",
+            "path": str(marketplace_skill_dir(home, "acme").resolve()),
+            "description": "d",
+        },
+    )
 
     ok = await uninstall_plugin(
-        _PID, SkillRegistry(), home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
+        _PID, reg, home, non_plugin_bundle_ids=lambda: set(), env=env, scope="project", keep_servers=True,
     )
 
     assert ok is True
+    # #258：catalog 内相对源落点由归属谓词无条件保留；多 scope 门控回归锁见 test_installer.py 的 scoped external clone 用例。
+    assert root.exists()
     remaining = load_installed_plugins(home=home)["plugins"][_PID]
     assert [r["scope"] for r in remaining] == ["user"]  # 仅删 project 记录
+    assert reg.resolve("audit:lint") is not None  # #262：retained 记录仍在 → 技能保留
     settings = _read_user_settings(env)
     assert settings["installedPlugins"] == [_PID]  # 安装事实未消失 → 意图保留
     assert settings["enabledPlugins"][_PID] is True  # enabled 条目保留
@@ -559,7 +584,7 @@ async def test_uninstall_scoped_keeps_intent_for_remaining_scopes(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monkeypatch) -> None:
-    """🟡#6：enable 失败且原值为显式 true（重复 enable / 另一 scope 已启用）→ 恢复 true，不误删。"""
+    """🟡#6 / #289 裁决 C：enable 失败且原值为显式 true → 保持 true，并明示「既有启用状态已保留」。"""
     home = _home(tmp_path)
     env = _env(tmp_path)
     root = _setup_catalog(home, "acme", "audit", servers=["alpha", "beta"], skills=["lint"])
@@ -569,12 +594,17 @@ async def test_enable_mount_failure_restores_previous_true(tmp_path: Path, monke
     mcp = _FakeMCP()
     mcp.fail_on = "beta"
 
-    with pytest.raises(RuntimeError, match="beta"):
+    with pytest.raises(EnableFailedRetainedError, match="beta") as ei:
         await enable_plugin(
             _PID, SkillRegistry(), home, env=env,
             existing_bundle_ids=mcp.existing_bundle_ids, register_server=mcp.register, remove_server=mcp.remove,
         )
 
+    assert "existing enabled state retained" in str(ei.value)
+    assert ei.value.details["enabledStateRetained"] is True
+    # 裸异常归一值 enable-failed 在 retained 语境下升级为专用码（否则按 reason 筛 retained 会漏这一半）
+    assert ei.value.details["reason"] == "enable-failed-retained"
+    assert isinstance(ei.value.__cause__, RuntimeError)
     assert _read_user_settings(env)["enabledPlugins"][_PID] is True
 
 
@@ -763,7 +793,7 @@ async def test_recover_repairs_mixed_health_records(tmp_path: Path, monkeypatch)
     (stale / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
     _seed_installed(
         home,
-        {_PID: [_record(root, servers=[FIGMA_NAME]), {"scope": "project", "installPath": str(stale), "projectPath": "/elsewhere"}]},
+        {_PID: [_record(root, servers=[FIGMA_BID]), {"scope": "project", "installPath": str(stale), "projectPath": "/elsewhere"}]},
     )
     _write_json(user_settings_path(env), {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}})
     declared = {"installedPlugins": [_PID], "enabledPlugins": {_PID: True}}
@@ -902,3 +932,811 @@ def test_schema_installed_plugins_whole_field_type_error_drops() -> None:
     cleaned, errors = validate_settings({"installedPlugins": {"audit@acme": True}}, SettingsScope.USER)
     assert "installedPlugins" not in cleaned
     assert len(errors) == 1
+
+
+# ── #259：账本记录失效时 enable 预检（fail-fast + 保持 installed_disabled）──────
+def _enable_kwargs(mcp: _FakeMCP) -> dict:
+    """enable_plugin 的 MCP 注入回调组（``existing_bundle_ids`` 与 ``register_server`` 须成对）。"""
+    return {
+        "existing_bundle_ids": mcp.existing_bundle_ids,
+        "register_server": mcp.register,
+        "remove_server": mcp.remove,
+    }
+
+
+def _declare_entry_skills(home: Path, mp: str, plugin: str, skills: object) -> None:
+    """给 marketplace 条目写 ``skills`` 声明（#259 声明态判据；支持畸形值以对齐 rust json_truthy）。"""
+    path = marketplace_skill_dir(home, mp) / ".tfrobot-plugin" / "marketplace.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    for entry in manifest["plugins"]:
+        if entry.get("name") == plugin:
+            entry["skills"] = skills
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _seed_enabled_intent(env: dict[str, str], value: bool | None = None) -> None:
+    """seed user settings：安装意图 + 可选 enabledPlugins 原值（None = 原 absent）。"""
+    settings: dict = {"installedPlugins": [_PID]}
+    if value is not None:
+        settings["enabledPlugins"] = {_PID: value}
+    _write_json(user_settings_path(env), settings)
+
+
+@pytest.mark.asyncio
+async def test_enable_missing_install_path_fails_before_any_side_effect(tmp_path: Path, monkeypatch) -> None:
+    """#259：installPath 目录缺失 → PluginInstallError，零副作用、原 absent 保持 absent（installed_disabled）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    shutil.rmtree(root)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+    mcp, reg = _FakeMCP(), SkillRegistry()
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(mcp))
+
+    message = str(ei.value)
+    assert str(root) in message  # 点名死路径
+    assert "enabledPlugins is unchanged" in message  # 不断言可能为 true 的 installed_disabled（审查 🟡7）
+    assert "marketplace remove acme" in message and "plugin install audit@acme" in message  # 可执行的恢复指引
+    settings = _read_user_settings(env)
+    assert _PID not in settings.get("enabledPlugins", {})  # 原 absent → 仍 absent
+    assert settings.get("installedPlugins") == [_PID]  # 安装意图保留
+    assert _PID in load_installed_plugins(home=home)["plugins"]  # 账本保留（可恢复）
+    assert calls == []  # 未进入 stage（不会因重 clone 成功而部分成功）
+    assert mcp.registered == []  # 未挂任何 server
+    assert reg.resolve("audit:lint") is None  # 未点亮任何 skill
+
+
+@pytest.mark.asyncio
+async def test_enable_missing_install_path_preserves_explicit_false(tmp_path: Path, monkeypatch) -> None:
+    """#259：原显式 false（用户停用意图）→ 失败后仍是 false，不被改写为 true。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env, value=False)
+    shutil.rmtree(root)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is False
+
+
+@pytest.mark.asyncio
+async def test_enable_skills_only_missing_root_fails(tmp_path: Path, monkeypatch) -> None:
+    """#259：``mcpServers: []`` 的 skills-only 记录，根缺失同样失败（原实现返回成功且零技能）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root)]})  # 无条件写空 mcpServers
+    _seed_enabled_intent(env)
+    shutil.rmtree(root)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError, match="install"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert calls == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_declared_bundled_server_missing_fails(tmp_path: Path, monkeypatch) -> None:
+    """#259：根在、但账本声明的 bundled server 文件被删 → 失败并点名 bundle_id（防静默少挂）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    (root / "mcp-servers" / f"{FIGMA_NAME}.json").unlink()  # 根仍在：目录存在 ∧ JSON 可解析（空集）
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+    mcp = _FakeMCP()
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    assert FIGMA_BID in str(ei.value)  # 点名缺的 bundle_id
+    assert calls == [] and mcp.registered == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_external_clone_missing_fails_without_reclone(tmp_path: Path, monkeypatch) -> None:
+    """#259：外部 clone 源（``.plugins/<mp>/<plugin>``）缺失同样失败，且失败发生在投影前（不重 clone）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    ext = external_plugin_dir(home, "acme", "audit")
+    assert not ext.exists()
+    _seed_installed(home, {_PID: [{"scope": "user", "installPath": str(ext), "mcpServers": []}]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert str(ext) in str(ei.value)
+    assert calls == []  # stage（会重 clone）根本没被调用 → 不可能「重 clone 后部分成功」
+
+
+@pytest.mark.asyncio
+async def test_enable_multi_scope_any_dead_record_fails_whole(tmp_path: Path, monkeypatch) -> None:
+    """#259 / 架构师裁决：多 scope 用 ∀——任一记录不可物化即整体失败，健康 scope 也不得先被启用。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    healthy = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    dead = tmp_path / "dead-project-copy"
+    _seed_installed(
+        home,
+        {
+            _PID: [
+                _record(healthy, scope="user", servers=[FIGMA_BID]),
+                {"scope": "project", "installPath": str(dead), "projectPath": str(tmp_path / "proj"), "mcpServers": []},
+            ]
+        },
+    )
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, SkillRegistry(), home, scope="user", env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert str(dead) in str(ei.value)  # 点名死路径
+    assert calls == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})  # 健康 scope 也未被写
+
+
+@pytest.mark.asyncio
+async def test_enable_root_exists_but_declared_skills_gone_fails(tmp_path: Path, monkeypatch) -> None:
+    """#259 裁决：声明了 skills 但零可投影（skills 包被删）→ 失败，不返回「启用成功但零技能」。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _declare_entry_skills(home, "acme", "audit", ["skills"])  # 声明态判据的触发条件
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    shutil.rmtree(root / "skills")  # 根仍在，skills 包全没
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert "SKILL" in str(ei.value)
+    assert calls == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_truly_empty_plugin_still_succeeds(tmp_path: Path, monkeypatch) -> None:
+    """#259 裁决正对照：真正未声明任何内容的空 plugin（无 skills / 无 bundled server）启用仍成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")  # 无 servers、无 skills、无覆写声明
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls, register_skill=False))
+    mcp = _FakeMCP()
+
+    await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+    assert mcp.registered == []
+
+
+@pytest.mark.asyncio
+async def test_enable_healthy_plugin_with_real_stage_succeeds(tmp_path: Path) -> None:
+    """#259 正对照（真实 ``stage_marketplace_skills``，非替身）：完好 plugin 启用后 skill + server 一并入投影。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME], skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    mcp, reg = _FakeMCP(), SkillRegistry()
+
+    await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(mcp))
+
+    assert reg.resolve("audit:lint") is not None  # 真 stage 注册了 skill
+    assert mcp.registered == [FIGMA_BID]
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
+@pytest.mark.asyncio
+async def test_enable_mcp_only_plugin_with_placeholder_skills_dir_succeeds(tmp_path: Path, monkeypatch) -> None:
+    """#259 审查 🔴1 正对照：MCP-only plugin 顺带提交 ``skills/README.md`` ≠ 声明 SKILL，启用仍成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    (root / "skills").mkdir(parents=True, exist_ok=True)
+    (root / "skills" / "README.md").write_text("placeholder\n", encoding="utf-8")
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls, register_skill=False))
+    mcp = _FakeMCP()
+
+    await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+    assert mcp.registered == [FIGMA_BID]
+
+
+@pytest.mark.asyncio
+async def test_enable_override_container_projects(tmp_path: Path, monkeypatch) -> None:
+    """#259 审查 🟡6：``entry.skills`` 覆写容器（非约定 ``skills/``）有包 → 可投影，启用成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    extra = root / "extra" / "lint"
+    extra.mkdir(parents=True)
+    (extra / "SKILL.md").write_text(_skill_md("lint"), encoding="utf-8")
+    _declare_entry_skills(home, "acme", "audit", ["extra"])
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([]))  # 替身注册 audit:lint（expects_skills 需非空注册）
+
+    await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
+@pytest.mark.asyncio
+async def test_enable_declared_override_missing_fails(tmp_path: Path, monkeypatch) -> None:
+    """#259 审查 🟡6：声明了覆写容器但目录被删 → 声明态零投影，失败。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    _declare_entry_skills(home, "acme", "audit", ["extra"])  # 声明存在，容器从未建/已删
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError, match="declares SKILL packages"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert calls == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_invalid_skill_frontmatter_rolls_back(tmp_path: Path) -> None:
+    """#259 审查 🔴2：SKILL.md 在但 frontmatter 非法 → 预检放行、真实 stage 零注册 → ③.6 抛错并回滚。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    (root / "skills" / "lint" / "SKILL.md").write_text(  # 缺 description → 装载 ERROR 跳过
+        "---\nname: lint\nlicense: MIT\n---\n# lint\nbody\n", encoding="utf-8",
+    )
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    # 不 monkeypatch _STAGE：走真实 stage_marketplace_skills（其降级不抛，正是要收口的通道）
+    reg, mcp = SkillRegistry(), _FakeMCP()
+
+    with pytest.raises(PluginInstallError, match="staging registered none"):
+        await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(mcp))
+
+    assert reg.resolve("audit:lint") is None  # 零注册
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})  # 回滚到原值（absent）
+    assert _PID in load_installed_plugins(home=home)["plugins"]  # 安装事实保留
+    assert mcp.registered == []
+
+
+@pytest.mark.asyncio
+async def test_enable_record_without_install_path_reports_it(tmp_path: Path, monkeypatch) -> None:
+    """#259 审查 🟡6：``installPath`` 缺失档位的消息可读（不是空白 / 不误报目录缺失）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _seed_installed(home, {_PID: [{"scope": "user", "mcpServers": []}]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    with pytest.raises(PluginInstallError, match="no installPath"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+
+def _write_plugin_json(plugin_root: Path, obj: dict) -> None:
+    """写 plugin.json（strict 组件声明 / 冲突场景用）。"""
+    _write_json(plugin_root / ".tfrobot-plugin" / "plugin.json", obj)
+
+
+def _set_entry_strict(home: Path, mp: str, plugin: str, strict: bool) -> None:
+    """改 marketplace 条目的 ``strict``（§4.4 冲突场景用）。"""
+    path = marketplace_skill_dir(home, mp) / ".tfrobot-plugin" / "marketplace.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    for entry in manifest["plugins"]:
+        if entry.get("name") == plugin:
+            entry["strict"] = strict
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_enable_plugin_json_declares_servers_but_zero_projection_fails(tmp_path: Path, monkeypatch) -> None:
+    """#259 架构师审查 🔴1：strict plugin.json 声明了 ``mcpServers`` 但零投影 → 失败（对齐 rust declared_components）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")  # 无 mcp-servers/
+    _write_plugin_json(root, {"name": "audit", "version": "1.2.0", "mcpServers": ["./mcp-servers"]})
+    _seed_installed(home, {_PID: [_record(root)]})  # 账本 mcpServers: []（install 解析为空）
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError, match="declares bundled MCP servers"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert calls == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_plugin_json_declared_servers_with_files_succeeds(tmp_path: Path, monkeypatch) -> None:
+    """#259 架构师审查 🔴1 正对照：同样声明 ``mcpServers`` 但文件在 → 可投影，启用成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _write_plugin_json(root, {"name": "audit", "version": "1.2.0", "mcpServers": ["./mcp-servers"]})
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([], register_skill=False))
+    mcp = _FakeMCP()
+
+    await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+    assert mcp.registered == [FIGMA_BID]
+
+
+@pytest.mark.asyncio
+async def test_enable_plugin_json_skills_strict_true_zero_projection_fails(tmp_path: Path, monkeypatch) -> None:
+    """#271：strict=true（默认）+ ``plugin.json.skills`` 声明但零投影 → 预检失败。
+
+    既有用例只覆盖 strict=false 的清单冲突档（走 ``manifests conflict``），走不进「声明了 SKILL 内容」这支；
+    这里补 strict=true 下缺 ``skills/`` 容器的失败路径，与 ``test_enable_root_exists_but_declared_skills_gone_fails``
+    （声明源是 ``entry.skills``）互为对照——两条声明源都归 :func:`entry_declares_component` 判。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")  # 无 skills/
+    _write_plugin_json(root, {"name": "audit", "version": "1.2.0", "skills": ["skills"]})
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError, match="declares SKILL packages"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert calls == []  # 预检即失败，未进 stage
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+def test_declares_skills_delegates_to_manifest_authority(monkeypatch) -> None:
+    """#271：installer 的 SKILL 声明判据**结构上**经 manifest 的单一权威。
+
+    只断言 ``_declares_skills`` 的返回值不够——把委托换成 ``bool((entry or {}).get("skills"))`` 在 JSON 值上
+    结果完全相同，全量仍绿（审查 🟡2）。故 spy 住 ``installer.entry_declares_component``，断言两条声明源
+    各经一次委托，且 entry 命中时短路、不再问 plugin.json。
+    """
+    from a2c_smcp.computer.settings import installer as installer_mod
+
+    seen: list[tuple[dict, str]] = []
+    original = installer_mod.entry_declares_component
+
+    def _spy(entry, key: str) -> bool:
+        seen.append((dict(entry), key))
+        return original(entry, key)
+
+    monkeypatch.setattr(installer_mod, "entry_declares_component", _spy)
+
+    # entry 未声明 + plugin.json 声明（strict 默认 true）→ 只有经 plugin.json 的那次委托能得 True
+    assert installer_mod._declares_skills(None, {"skills": ["skills"]}) is True
+    assert seen == [({}, "skills"), ({"skills": ["skills"]}, "skills")]
+
+    # entry 侧命中即短路，同样经委托
+    seen.clear()
+    assert installer_mod._declares_skills({"skills": ["x"]}, {}) is True
+    assert seen == [({"skills": ["x"]}, "skills")]
+
+
+@pytest.mark.asyncio
+async def test_enable_staging_zero_registration_not_masked_by_old_active(tmp_path: Path) -> None:
+    """#259 架构师审查 🟡2：旧活跃 refs 不得掩盖**本次** stage 零注册——判据取 stage 返回值。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    (root / "skills" / "lint" / "SKILL.md").write_text(  # 本次装载会跳过（缺 description）
+        "---\nname: lint\nlicense: MIT\n---\n", encoding="utf-8",
+    )
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    reg = SkillRegistry()
+    # 旧投影：上一次成功 stage 留下的活跃 ref
+    assert reg.register({"name": "audit:lint", "source": f"{SOURCE_MARKETPLACE}:acme", "path": str(root / "skills" / "lint")})
+
+    with pytest.raises(PluginInstallError, match="staging registered none"):
+        await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert reg.resolve("audit:lint") is not None  # 预存条目不是本次新增 → 回滚不动它
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_staging_zero_registration_restores_explicit_false(tmp_path: Path) -> None:
+    """#259 架构师审查：③.6 失败回滚时，原显式 false 恢复 false。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    (root / "skills" / "lint" / "SKILL.md").write_text("---\nname: lint\nlicense: MIT\n---\n", encoding="utf-8")
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env, value=False)
+
+    with pytest.raises(PluginInstallError, match="staging registered none"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is False
+
+
+@pytest.mark.asyncio
+async def test_enable_staging_zero_registration_restore_write_failure_warns(
+    tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#271：回滚写本身失败时 → 记 WARN、**原异常不被顶替**，且 ③.6 文案不得声称一定已恢复。
+
+    回滚是 best-effort（``except Exception`` 吞掉写失败后 ``raise`` 原异常）；消息若写死
+    「enabledPlugins was restored」就是在撒谎。本用例钉住「WARN + 原异常仍上抛」+ 措辞带不确定性。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    (root / "skills" / "lint" / "SKILL.md").write_text("---\nname: lint\nlicense: MIT\n---\n", encoding="utf-8")
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    mcp = _FakeMCP()
+    from a2c_smcp.computer.settings import installer as installer_mod
+
+    orig_write = installer_mod._write_enabled_plugin
+    writes: list[bool | None] = []
+
+    def _flaky_write(plugin_id: str, value: bool | None, scope: str, project_path: str | None,
+                     env: Mapping[str, str] | None) -> None:
+        writes.append(value)
+        if len(writes) > 1:  # 第一次 = 成功路径写 true；第二次 = 回滚恢复 → 磁盘故障
+            raise OSError("no space left on device (test)")
+        orig_write(plugin_id, value, scope, project_path, env)
+
+    monkeypatch.setattr(installer_mod, "_write_enabled_plugin", _flaky_write)
+
+    # ``a2c_smcp`` 根 logger 为 ``propagate=False``，caplog 的 root handler 收不到 → 直接挂到模块 logger
+    # （仓库既有写法：test_plugin_name_uniqueness.py 的 ``capture_registry_errors``）。**级别也要设在同一个
+    # logger 名上**：``a2c_smcp`` 的级别在 import 时由 ``A2C_SMCP_LOG_LEVEL`` 固定，只调 root 级别的话，
+    # 环境里设了 ``A2C_SMCP_LOG_LEVEL=error`` 就会在 ``isEnabledFor`` 处把 WARNING 过滤掉 → 测试假红（审查 🟡3）。
+    installer_mod.logger.addHandler(caplog.handler)
+    # 用 ``logger.name`` 而不是手写点号路径：``get_logger`` 会再前缀一层 ``a2c_smcp.``（实测 name 形如
+    # ``a2c_smcp.a2c_smcp.computer.…``），手写路径会设在另一个 logger 上、对 ``isEnabledFor`` 无效。
+    caplog.set_level(logging.WARNING, logger=installer_mod.logger.name)
+    try:
+        with pytest.raises(PluginInstallError) as ei:
+            await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+    finally:
+        installer_mod.logger.removeHandler(caplog.handler)
+
+    assert writes == [True, None]  # 回滚确实尝试过恢复（prev absent → None）
+    # #289：回滚前 effective=false（prior absent）→ 即便回滚写失败留下 true，也不得包装成「既有状态已保留」
+    assert not isinstance(ei.value, EnableFailedRetainedError)
+    assert "failed to restore enabledPlugins" in caplog.text  # best-effort 失败只告警
+    assert "no space left on device" in caplog.text  # 原因入日志
+    assert "staging registered none" in str(ei.value)  # 原异常未被 OSError 顶替
+    assert "was attempted but may not have succeeded" in str(ei.value)
+    assert "was restored to its previous value" not in str(ei.value)  # 绝对化措辞已去掉
+    # 回滚写失败 ⇒ enabledPlugins 仍是成功路径写下的 true（如实反映「没恢复」）
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
+@pytest.mark.asyncio
+async def test_enable_multi_scope_same_root_registers_server_once(tmp_path: Path, monkeypatch) -> None:
+    """#259 架构师审查 🟡5：多 scope 同根记录聚合按 bundle_id 去重，不得重复 register。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _seed_installed(
+        home,
+        {
+            _PID: [
+                _record(root, scope="user", servers=[FIGMA_BID]),
+                _record(root, scope="project", servers=[FIGMA_BID]),
+            ]
+        },
+    )
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([], register_skill=False))
+    mcp = _FakeMCP()
+
+    await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    assert mcp.registered == [FIGMA_BID]  # 只挂一次
+
+
+@pytest.mark.asyncio
+async def test_enable_bundle_id_identity_collapse_within_record_fails(tmp_path: Path, monkeypatch) -> None:
+    """#259 复审 🟡1/🟡4 + #271：同一记录内两文件显式同 bundle_id 但配置不同 → 身份坍缩，硬错。
+
+    #271 两点：``details`` 的键是 ``bundleId``（``conflictWith`` 专属 pid 值域，塌缩场景没有第二方 pid）；
+    同根异配置的文案必须点名「同根」+ 可区分字段（server 名），且**不得**回显命令 / env 等配置体。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    # 夹具刻意在**四种**配置体里各埋一个哨兵（command / args / env / headers）：只要消息回显任一配置体，
+    # 对应哨兵就会出现在 message 里。仅放 command 不够——夹具为空时「不回显 env」的断言永远绿（审查 🟡1）。
+    bodies = {
+        "alpha": {
+            "name": "alpha",
+            "type": "stdio",
+            "server_parameters": {
+                "command": "node",
+                "args": ["--token", "s3cr3t-args"],
+                "env": {"API_TOKEN": "s3cr3t-env"},
+            },
+            "bundle_id": "shared",
+        },
+        "beta": {
+            "name": "beta",
+            "type": "streamable",
+            "server_parameters": {
+                "url": "https://example.invalid/mcp",
+                "headers": {"Authorization": "Bearer s3cr3t-hdr"},
+            },
+            "bundle_id": "shared",
+        },
+    }
+    for name, body in bodies.items():
+        _write_json(root / "mcp-servers" / f"{name}.json", body)
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+    mcp = _FakeMCP()
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    message = str(ei.value)
+    assert ei.value.error_code == "validation"
+    assert ei.value.details == {"bundleId": "shared", "reason": "enable-failed"}  # 非 retained 出口补默认机读 reason
+    assert "conflictWith" not in ei.value.details  # 该键专属 `<plugin>@<marketplace>` pid，不得混入 bundle_id
+    assert "collapses distinct identities under the same install root" in message
+    assert "different configs under the same install root" in message
+    assert "'alpha'" in message and "'beta'" in message  # 可区分字段：server 名（= 文件 stem）
+    # 配置体不得回显（可能含凭据）：command / args / env / headers 四个哨兵一个都不许出现
+    for sentinel in ("s3cr3t", "s3cr3t-args", "s3cr3t-env", "s3cr3t-hdr", "--token", "Bearer", "API_TOKEN"):
+        assert sentinel not in message, f"config body leaked into the message: {sentinel!r}"
+    assert "node" not in message and "example.invalid" not in message
+    assert calls == [] and mcp.registered == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior", [None, False, True], ids=["absent", "explicit-false", "prior-true"])
+async def test_enable_bundle_id_identity_collapse_across_roots_fails(
+    tmp_path: Path, monkeypatch, prior: bool | None
+) -> None:
+    """#259 复审 🟡1 + #271 + #289：异安装根的同 bundle_id（即使配置相同）也是身份坍缩 → 硬错，不静默首胜。
+
+    #289 补 prior-true 档：预检零写 → key 保持 true，且诊断经 ``EnableFailedRetainedError`` 明示保留，
+    ``error_code`` / ``bundleId`` 原样透出（#296 的 reason/error_code 契约不受 retained 包装破坏）。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    root_b = tmp_path / "other-root"
+    shutil.copytree(root_a / "mcp-servers", root_b / "mcp-servers")
+    _seed_installed(
+        home,
+        {
+            _PID: [
+                _record(root_a, scope="user", servers=[FIGMA_BID]),
+                _record(root_b, scope="project", servers=[FIGMA_BID]),
+            ]
+        },
+    )
+    _seed_enabled_intent(env, value=prior)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+    reg, mcp = SkillRegistry(), _FakeMCP()
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(mcp))
+
+    message = str(ei.value)
+    assert ei.value.error_code == "validation"
+    expected_details: dict = {"bundleId": FIGMA_BID, "reason": "enable-failed"}
+    if prior is True:
+        assert isinstance(ei.value, EnableFailedRetainedError)
+        assert "existing enabled state retained" in message
+        expected_details = {"bundleId": FIGMA_BID, "reason": "enable-failed-retained", "enabledStateRetained": True}
+    else:
+        assert not isinstance(ei.value, EnableFailedRetainedError)
+    assert ei.value.details == expected_details
+    assert "conflictWith" not in ei.value.details
+    assert "collapses distinct identities" in message
+    assert str(root_a) in message and str(root_b) in message
+    assert "under the same install root" not in message  # 异根档沿用现文案，与同根档构成对照
+    assert calls == [] and mcp.registered == [] and len(reg) == 0
+    if prior is None:
+        assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+    else:
+        assert _read_user_settings(env)["enabledPlugins"][_PID] is prior
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decl", [[123], {"x": 1}], ids=["list-int", "dict"])
+async def test_enable_malformed_skills_declaration_counts_as_declared(
+    tmp_path: Path, monkeypatch, decl: object
+) -> None:
+    """#259 复审 🟡2 + #271：畸形 ``skills`` 声明按 JSON 真值算「已声明」→ 零投影失败。
+
+    ``[123]``（list）与 ``{"x": 1}``（dict）同属「声明了但不可投影」——后者此前无任何用例，
+    正好覆盖 ``_json_truthy`` 的 dict 分支（与 rust ``json_truthy`` 同口径）。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    _declare_entry_skills(home, "acme", "audit", decl)
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    with pytest.raises(PluginInstallError, match="declares SKILL packages"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+
+@pytest.mark.asyncio
+async def test_enable_empty_string_skills_declaration_is_not_a_declaration(tmp_path: Path, monkeypatch) -> None:
+    """#259 复审 🟡2 反向：``skills: ""`` 按 JSON 真值为假 → 不算声明，空插件仍可启用。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    _declare_entry_skills(home, "acme", "audit", "")
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([], register_skill=False))
+
+    await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
+@pytest.mark.asyncio
+async def test_enable_load_bundled_servers_permission_error_is_structured(tmp_path: Path, monkeypatch) -> None:
+    """#259 复审 🟡5：强制走**内层** ``except OSError``（物化判据通过后读取失败）→ 结构化错误、零副作用。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+    from a2c_smcp.computer.settings import installer as installer_mod
+
+    def _boom(_root: Path):
+        raise PermissionError("denied by test")
+
+    monkeypatch.setattr(installer_mod, "load_bundled_servers", _boom)  # 只影响 installer 的引用（判据走 reconciler）
+    mcp = _FakeMCP()
+
+    with pytest.raises(PluginInstallError, match="cannot be read"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(mcp))
+
+    assert calls == [] and mcp.registered == []
+    assert _PID not in _read_user_settings(env).get("enabledPlugins", {})
+
+
+@pytest.mark.asyncio
+async def test_enable_already_enabled_plugin_re_enables(tmp_path: Path) -> None:
+    """#259 复审 🟡6 正对照：已启用 + 有效 SKILL.md 再 enable 成功（staged 非空，幂等不误伤）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    reg, mcp = SkillRegistry(), _FakeMCP()
+
+    await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(mcp))  # 首次
+    assert reg.resolve("audit:lint") is not None
+    await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(mcp))  # 幂等重启用
+
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+    assert reg.resolve("audit:lint") is not None
+
+
+@pytest.mark.asyncio
+async def test_enable_restage_revives_orphaned_skill(tmp_path: Path) -> None:
+    """#271 正对照（真 staging）：③ 的 re-stage 走 ``register_or_update``，孤儿同名条目必须翻回活跃。
+
+    上一用例只证明「二次 enable 不丢 skill」；若 re-stage 被跳过（如擅自改成短路返回），skill 仍活跃、
+    断言照样绿。这里以**孤儿**为基线，翻活只能来自本次 re-stage。
+    """
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", skills=["lint"])
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    reg = SkillRegistry()
+    assert reg.register(
+        {"name": "audit:lint", "source": f"{SOURCE_MARKETPLACE}:acme", "path": str(root / "skills" / "lint")}
+    )
+    reg.mark_orphan("audit:lint")  # 模拟 disable 后的隐藏态
+    assert reg.resolve("audit:lint") is None and reg.is_orphan("audit:lint") is True
+
+    await enable_plugin(_PID, reg, home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert reg.is_orphan("audit:lint") is False
+    assert reg.resolve("audit:lint") is not None
+    assert _read_user_settings(env)["enabledPlugins"][_PID] is True
+
+
+@pytest.mark.asyncio
+async def test_enable_strict_conflict_reported_as_structured_error(tmp_path: Path, monkeypatch) -> None:
+    """#259 架构师审查 🟡6：strict=false 且 plugin.json 声明组件（staging 会整体拒绝）→ 预检即结构化错误。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    _set_entry_strict(home, "acme", "audit", False)
+    _write_plugin_json(root, {"name": "audit", "skills": ["skills"]})
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    calls: list[dict] = []
+    monkeypatch.setattr(_STAGE, _fake_stage(calls))
+
+    with pytest.raises(PluginInstallError, match="manifests conflict"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_enable_unreadable_bundled_dir_is_structured_error(tmp_path: Path, monkeypatch) -> None:
+    """#259 架构师审查 🟡7：``load_bundled_servers`` 的 OSError（权限）不得裸逸出，归一为 PluginInstallError。"""
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:  # 仓库既有写法（Windows 无 geteuid；root 绕过权限位）
+        pytest.skip("POSIX 权限位（非 root）才有效")
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit", servers=[FIGMA_NAME])
+    _seed_installed(home, {_PID: [_record(root, servers=[FIGMA_BID])]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+    blocked = root / "mcp-servers"
+    os.chmod(blocked, 0o000)
+    try:
+        with pytest.raises(PluginInstallError, match="cannot inspect|cannot be read"):
+            await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))
+    finally:
+        os.chmod(blocked, 0o755)
+
+
+@pytest.mark.asyncio
+async def test_enable_corrupt_bundled_json_reports_unparsable(tmp_path: Path, monkeypatch) -> None:
+    """#259 审查 🟡6：目录在、bundled JSON 损坏档位的消息可读（并归一为 PluginInstallError，不再裸抛）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root = _setup_catalog(home, "acme", "audit")
+    (root / "mcp-servers").mkdir(parents=True, exist_ok=True)
+    (root / "mcp-servers" / "bad.json").write_text("{not json", encoding="utf-8")
+    _seed_installed(home, {_PID: [_record(root)]})
+    _seed_enabled_intent(env)
+    monkeypatch.setattr(_STAGE, _fake_stage([]))
+
+    with pytest.raises(PluginInstallError, match="unparsable"):
+        await enable_plugin(_PID, SkillRegistry(), home, env=env, **_enable_kwargs(_FakeMCP()))

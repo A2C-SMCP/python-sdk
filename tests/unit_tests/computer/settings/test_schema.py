@@ -32,9 +32,11 @@ from a2c_smcp.computer.settings.schema import (
     STRING_ARRAY_FIELDS,
     TRUSTED_SCOPE_ONLY_FIELDS,
     SettingsScope,
+    is_marketplace_declaration_field,
     is_valid_enabled_plugin_key,
     is_valid_git_url,
     is_valid_marketplace_name,
+    scrub_diagnostic_chars,
     validate_settings,
 )
 
@@ -51,10 +53,49 @@ from a2c_smcp.computer.settings.schema import (
         ("ssh://git@host:22/team/skills.git", True),
         ("git://host/path", True),
         ("file:///abs/path/repo", True),
+        # #270：file: 一律不要求 host，带 host 形态同样合法
+        ("file://host/path/repo", True),
+        # #270：userinfo 里的凭据不使 URL 非法（host 存在即可）；query 合法（不进派生名即可）
+        ("ssh://alice:PW@example.com/repo", True),
+        ("https://host/repo?token=SECRET", True),
+        ("ssh://[::1]:22/repo", True),
+        # #270 hostless：ssh/git/http(s) 必须有非空 host（否则凭据段会滑进派生名）
+        ("ssh:///alice:PW_LEAK@example.com", False),
+        ("git:///x", False),
+        ("https:///x", False),
+        ("http:///x", False),
+        ("ssh://user@:22/path", False),
+        ("ssh://", False),
+        ("file://", False),
+        # host 槽位填「非 host 占位串」同样拒绝：否则 hostless 攻击串只要填个非空 junk 就复活
+        ("ssh:// /alice:PW_LEAK@example.com", False),
+        ("ssh://-/x", False),
+        ("ssh://_/x", False),
+        ("ssh://%20/x", False),
+        ("ssh://./x", False),
+        ("https://ho st/repo", False),
+        # 下划线 / 子域 / IDN / 尾点 FQDN / IPv6 zone-id 是真实主机名形态，不误伤
+        ("ssh://my_host/x", True),
+        ("https://sub.example.com/x", True),
+        ("https://例子.测试/repo", True),
+        ("https://example.com./repo", True),
+        ("ssh://[fe80::1%25eth0]/x", True),
+        # percent-encoded host / 非法 IPv6：fail-closed（有意拒绝，见 CHANGELOG）
+        ("https://ex%61mple.com/x", False),
+        ("ssh://[a:b]/x", False),
+        # file: 全例外——端口形态也不校验（`file://C:\repos\repo` 在收紧前一直合法）
+        ("file://C:\\repos\\repo", True),
+        # 非法端口 / 畸形 IPv6：fail-closed（比展示层更严）
+        ("https://host:abc/x", False),
+        ("file://[bad", False),
+        # scp-like 按整串判定：尾随换行不再视为合法
+        ("git@host:p\n", False),
         ("not a url", False),
         ("ftp://host/x", False),
         ("", False),
         ("   ", False),
+        # 既有边界：不 strip 入参（归一在 normalize_marketplace_url 做）
+        (" https://host/x", False),
     ],
 )
 def test_is_valid_git_url(url: str, ok: bool) -> None:
@@ -249,6 +290,12 @@ def test_extra_marketplaces_valid_entry_normalized() -> None:
         ("Bad_Name", {"source": {"type": "git", "url": "git@h:p"}}, "extraKnownMarketplaces.Bad_Name"),
         ("ok-mp", {"source": {"type": "svn", "url": "x"}}, "extraKnownMarketplaces.ok-mp.source.type"),
         ("ok-mp", {"source": {"type": "git", "url": "garbage"}}, "extraKnownMarketplaces.ok-mp.source.url"),
+        # #270：hostless URL 在 settings 加载层同样 fail-closed（整条剔除，文件不被改写）
+        (
+            "ok-mp",
+            {"source": {"type": "git", "url": "ssh:///alice:PW_LEAK@example.com"}},
+            "extraKnownMarketplaces.ok-mp.source.url",
+        ),
         ("ok-mp", {"noSource": 1}, "extraKnownMarketplaces.ok-mp.source"),
         ("ok-mp", {"source": {"type": "git", "url": "git@h:p"}, "autoUpdate": "yes"}, "extraKnownMarketplaces.ok-mp.autoUpdate"),
     ],
@@ -289,6 +336,19 @@ def test_permissions_additional_directories_absolute_only() -> None:
     assert cleaned["permissions"]["additionalDirectories"] == ["/abs/ok"]
     assert cleaned["permissions"]["unknownSub"] == "kept"  # permissions 下未知子键 passthrough
     assert len(errors) == 2  # relative + 非 string
+
+
+def test_permissions_additional_directories_syntactic_predicate_unchanged() -> None:
+    """#304 item 3：``additionalDirectories`` **保持语法判据**（不做谓词合并、不按宿主平台过滤）.
+
+    盘符形态在 POSIX 宿主上照样保留（语法绝对即通过）；verbatim ``\\\\?\\`` / 前导空白被拒。
+    该字段运行期无消费者，故「外来平台形态」不会进入任何授权集合。
+    """
+    raw = {"permissions": {"additionalDirectories": ["D:\\data", "\\\\?\\C:\\x", "  /abs"]}}
+    cleaned, errors = validate_settings(raw, SettingsScope.USER)
+
+    assert cleaned["permissions"]["additionalDirectories"] == ["D:\\data"]
+    assert len(errors) == 2
 
 
 def test_source_path_backfilled_into_errors() -> None:
@@ -334,6 +394,71 @@ class TestLandingRoot:
         assert cleaned["landingRoot"] == "D:\\a2c\\landing"
         assert errors == []
 
+    def test_leading_whitespace_trimmed_and_activated(self) -> None:
+        """#304 item 3（对齐 rust ``trim()``）：**前导**空白此前令字段整字段判废.
+
+        旧判据 ``_is_absolute_path`` 对 ``/srv/...`` 这类 POSIX 路径用 ``startswith("/")``，
+        前导空格使其失败；现在 trim 后生效。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "  /srv/landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_trailing_whitespace_retargets_to_trimmed_root(self) -> None:
+        """**尾随**空白此前**原样生效**，现在写入根静默改为 trim 后的路径.
+
+        这是 0.5.1 的升级面：带尾随空白的配置不是「从判废变为生效」，而是写入目录被规范化——
+        POSIX 上旧写入根是带空格的目录（其中产物不会迁移）；Windows 上 Win32 本就会剥掉分量末尾
+        空格/点（真实差异是 ``.part`` 拒绝集条目恢复）。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "/srv/landing \t"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    @pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x1f"])
+    def test_trim_matches_rust_white_space_set(self, sep: str) -> None:
+        """trim 逐字节等价 rust ``str::trim()``：U+001C–U+001F **不**算空白（前导 + 尾随两个方向）.
+
+        ``str.strip()`` 会剥这四个信息分隔符（``isspace()`` 为真、``White_Space`` 为假），而 Rust
+        ``trim()`` 不会。两个方向都要钉：**前导**分歧是「python 启用 / rust 判废（fail-closed）」，
+        **尾随**分歧是「两侧都启用、写入根不同」（静默，更难察觉）。
+        U+3000（IDEOGRAPHIC SPACE）属 ``White_Space``，两侧都剥。
+        """
+        # 前导 SEP：不被 trim → 仍非绝对 → 整字段判废（rust 同）
+        cleaned, errors = validate_settings({"landingRoot": f"{sep}/srv/landing"}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+
+        # 尾随 SEP：不被 trim → 原样存值（`str.strip()` 变异会剥掉它，写入根静默变化）
+        cleaned, errors = validate_settings({"landingRoot": f"/srv/landing{sep}"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == f"/srv/landing{sep}"
+        assert errors == []
+
+        cleaned, errors = validate_settings({"landingRoot": "\u3000/srv/landing\u3000"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "/srv/landing"
+        assert errors == []
+
+    def test_whitespace_only_dropped(self) -> None:
+        """trim 后为空 → 仍按非绝对路径判废（不因 trim 放宽空值）。"""
+        cleaned, errors = validate_settings({"landingRoot": " \t\n "}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned
+        assert len(errors) == 1
+
+    def test_syntactic_predicate_is_deliberately_not_merged(self) -> None:
+        """**刻意的不对称**（用户 2026-11-23 裁决：不做谓词合并）.
+
+        两半合起来才能钉住语法判据：① 盘符形态在 POSIX 宿主照样通过（``normalize_path`` 会拒）；
+        ② ``normalize_path`` 能接受的 verbatim ``\\\\?\\C:\\...`` 反而被拒。若后人「顺手」把
+        ``landingRoot`` 也改用 ``normalize_path``，① 立刻红。
+        """
+        cleaned, errors = validate_settings({"landingRoot": "D:\\a2c\\landing"}, SettingsScope.USER)
+        assert cleaned["landingRoot"] == "D:\\a2c\\landing"  # 语法绝对即通过，不按宿主平台过滤
+        assert errors == []
+
+        cleaned, errors = validate_settings({"landingRoot": "\\\\?\\C:\\a2c\\landing"}, SettingsScope.USER)
+        assert "landingRoot" not in cleaned  # normalize 接受的形态反而被语法判据拒
+        assert len(errors) == 1
+
     @pytest.mark.parametrize("bad", ["relative/path", "./here", "", 123, True, ["/abs"]])
     def test_relative_or_non_string_dropped(self, bad: object) -> None:
         cleaned, errors = validate_settings({"landingRoot": bad}, SettingsScope.USER)
@@ -355,3 +480,56 @@ class TestLandingRoot:
         cleaned, errors = validate_settings({"landingRoot": "/srv/landing"}, scope)
         assert cleaned["landingRoot"] == "/srv/landing"
         assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# #293：声明子树谓词 + 诊断字符清洗 / declaration-subtree predicate + scrub
+# ---------------------------------------------------------------------------
+class TestIsMarketplaceDeclarationField:
+    """``extraKnownMarketplaces`` 子树判定（镜像 rust ``is_marketplace_declaration_field``）。"""
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "extraKnownMarketplaces",  # 整字段类型错
+            "extraKnownMarketplaces.acme",
+            "extraKnownMarketplaces.acme.source",
+            "extraKnownMarketplaces.acme.source.url",
+            "extraKnownMarketplaces.acme.source.type",
+            "extraKnownMarketplaces.acme.autoUpdate",
+        ],
+    )
+    def test_hits_prefix_and_subtree(self, field: str) -> None:
+        assert is_marketplace_declaration_field(field) is True
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            # 裸 startswith 会把这两个误收进来——`.` 边界承重。
+            "extraKnownMarketplacesBackup.acme",
+            "extraKnownMarketplacesBackup",
+            "enabledPlugins.BAD KEY",
+            "installedPlugins[0]",
+            "",
+        ],
+    )
+    def test_misses_unrelated_fields(self, field: str) -> None:
+        assert is_marketplace_declaration_field(field) is False
+
+
+class TestScrubDiagnosticChars:
+    """控制 / 方向覆写字符 → 空格（终端行倒序显示与伪造换行的唯一止血点）。"""
+
+    def test_replaces_bidi_and_line_separators(self) -> None:
+        # 正对照：原串确实含这些字符，否则「输出干净」可能只是输入本就干净。
+        raw = "evil‮gnp.exe FAKE\nLINE\x1b[31m﻿"
+        for needle in ("‮", " ", "\n", "\x1b", "﻿"):
+            assert needle in raw
+        scrubbed = scrub_diagnostic_chars(raw)
+        for needle in ("‮", " ", "\n", "\x1b", "﻿"):
+            assert needle not in scrubbed
+        assert scrubbed.startswith("evil gnp.exe FAKE LINE ")
+
+    def test_clean_text_is_returned_unchanged(self) -> None:
+        """正/负对照：无危险字符时逐字不变（不得吞掉正常空白与标点）。"""
+        assert scrub_diagnostic_chars("acme.source.url — 普通文本") == "acme.source.url — 普通文本"

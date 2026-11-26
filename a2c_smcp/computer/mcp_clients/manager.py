@@ -969,6 +969,7 @@ class MCPServerManager:
             if coordinator is not None:
                 self._retire_oauth_bundle(bundle_id)
             client = client_factory(config, message_handler=self._message_handler)
+            client.log_label = bundle_id  # #289 终审 🟡7：非 secret 身份，供连接失败日志区分 server
             try:
                 await client.aconnect()
             except Exception:
@@ -991,6 +992,7 @@ class MCPServerManager:
             client = cast(
                 HttpMCPClient, client_factory(config, message_handler=self._message_handler)
             )
+            client.log_label = bundle_id  # #289 终审 🟡7
             try:
                 signal = await self._bounded_connect(client)
             except (UpstreamRedirectStoppedError, TimeoutError, ConnectionError):
@@ -1050,6 +1052,7 @@ class MCPServerManager:
                         config, message_handler=self._message_handler, oauth_coordinator=coordinator
                     ),
                 )
+                client.log_label = bundle_id  # #289 终审 🟡7
                 try:
                     signal = await self._bounded_connect(client, coordinator)
                 except (UpstreamRedirectStoppedError, TimeoutError, ConnectionError):
@@ -1423,6 +1426,7 @@ class MCPServerManager:
             HttpMCPClient,
             client_factory(config, message_handler=self._message_handler, oauth_coordinator=coordinator),
         )
+        client.log_label = bundle_id  # #289 终审 🟡7
         connect_task = asyncio.create_task(client.aconnect())
         aborted_wait = asyncio.create_task(coordinator.flow_aborted_event().wait())
         redirect_stop_wait = asyncio.create_task(client.connect_redirect_event().wait())

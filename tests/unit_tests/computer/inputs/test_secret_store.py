@@ -95,3 +95,31 @@ def test_probe_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss, "_load_keyring", lambda: None)
     assert keyring_available() is True
     assert keyring_available(force_recheck=True) is False
+
+
+def test_get_strict_returns_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeKeyring("keyring.backends.macOS")
+    fake.set_password(ss.SERVICE_NAME, "k", "v")
+    monkeypatch.setattr(ss, "_load_keyring", lambda: fake)
+    assert SecretStore().get_strict("k") == "v"
+
+
+def test_get_strict_missing_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ss, "_load_keyring", lambda: _FakeKeyring("keyring.backends.macOS"))
+    assert SecretStore().get_strict("absent") is None
+
+
+def test_get_strict_unavailable_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ss, "_load_keyring", lambda: None)
+    with pytest.raises(ss.SecretStoreError):
+        SecretStore().get_strict("k")
+
+
+def test_get_strict_backend_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Broken(_FakeKeyring):
+        def get_password(self, service: str, key: str) -> str | None:
+            raise RuntimeError("backend exploded")
+
+    monkeypatch.setattr(ss, "_load_keyring", lambda: _Broken("keyring.backends.macOS"))
+    with pytest.raises(ss.SecretStoreError):
+        SecretStore().get_strict("k")

@@ -49,8 +49,9 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, TypeVar
 
+from a2c_smcp.computer.settings.raw import SettingsFileCorruptError
 from a2c_smcp.computer.settings.schema import GitSource
 from a2c_smcp.computer.skills.home import resolve_skill_home
 from a2c_smcp.utils.atomic_io import atomic_write_text
@@ -95,6 +96,10 @@ class MarketplaceRecord(TypedDict):
     lastUpdated: NotRequired[str]  # ISO-8601 UTC
     commitSha: NotRequired[str]
     autoUpdate: NotRequired[bool]
+    # 该注册**锚定**的清单顶层 `name`（#260；与 rust-sdk#289 提案同名）。缺省 = 旧账本 / legacy。
+    # 写入点：注册提交（add / 首次 clone）必写；legacy 记录首次成功 clone/refresh 补写；已有**永不改写**。
+    # refresh 观测到 ≠ 该值 ⇒ `validation` 改名拒绝（runtime-contract §5.14）。
+    manifestNameBaseline: NotRequired[str]
 
 
 class KnownMarketplacesFile(TypedDict):
@@ -121,6 +126,8 @@ class InstalledPluginRecord(TypedDict):
     """
 
     scope: str  # managed | user | project | local
+    # plugin 物化落点。删除仅限 plugin 独占外部 clone ``<home>/marketplace/.plugins/<mp>/<plugin>``；相对源的
+    # 共享 catalog 内路径由 marketplace 级 remove/prune 清理（#258 / remove_plugin_install_path）。
     installPath: str
     projectPath: NotRequired[str]  # project / local scope 必填 / required for project/local
     version: NotRequired[str]
@@ -368,6 +375,20 @@ def _coerce_known_marketplaces(data: Mapping[str, Any], path: Path) -> KnownMark
     return {"version": MATERIALIZED_VERSION, "marketplaces": marketplaces}
 
 
+def is_legacy_ledger_record(record: object) -> bool:
+    """
+    该账本记录是否会被 legacy sweep **整条丢弃**（协议 §4.9.1-4）/ Whether the sweep drops this ledger record。
+
+    单一权威：:func:`_drop_legacy_mcp_dep_records` 本体与「写入后该记录是否还存在」的**存活判据**共用本谓词
+    （#275：``installer.uninstall_plugin`` 的 ``retained`` 经它剔除旧格式记录——原始视图（``drop_legacy=False``）
+    里它们还在，落盘视图里已不在；两边判据分叉会让 scoped uninstall 留下 skills / 外部 clone 残留）。
+
+    判据同 sweep 本体：**含** ``_LEGACY_MCP_DEPS_KEY`` 键即旧格式；非 ``Mapping`` 记录与非法结构原样透传，
+    故返回 ``False``（不被 sweep 丢弃）。
+    """
+    return isinstance(record, Mapping) and _LEGACY_MCP_DEPS_KEY in record
+
+
 def _drop_legacy_mcp_dep_records(plugins: dict[str, Any], path: Path) -> dict[str, Any]:
     """
     丢弃旧格式（``bundledMcpServers`` = display name 数组）的账本记录（协议 §4.9.1-4，#153）/ Drop legacy records。
@@ -386,7 +407,7 @@ def _drop_legacy_mcp_dep_records(plugins: dict[str, Any], path: Path) -> dict[st
         if not isinstance(records, list):
             out[pid] = records  # 非法结构原样透传（与本模块既有容错姿态一致，不在此处收敛）
             continue
-        kept = [r for r in records if not (isinstance(r, Mapping) and _LEGACY_MCP_DEPS_KEY in r)]
+        kept = [r for r in records if not is_legacy_ledger_record(r)]
         if len(kept) != len(records):
             logger.warning(
                 "Ledger record(s) for %r in %s use the legacy %r (display-name) format; discarded and will be "
@@ -439,6 +460,26 @@ def load_known_marketplaces(home: Path | None = None, env: Mapping[str, str] | N
     return _coerce_known_marketplaces(data, path)
 
 
+def known_marketplace_source(known: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    """
+    ``known_marketplaces.json`` 中某 marketplace 的**可用** ``source``（单一判据）/ Usable recorded source.
+
+    "可用" = 记录在 **且** ``source`` 是映射。账本可被手编（``_coerce_known_marketplaces`` 不校验记录内容），
+    故 ``source`` 可能是裸字符串 / ``None``。三个消费方必须用同一判据，否则同一次恢复会打出互斥诊断：
+
+    - :func:`~a2c_smcp.computer.settings.recovery.recover_marketplace_skills`：不可用 → ``failed_marketplaces``；
+    - :func:`~a2c_smcp.computer.settings.recovery.detect_marketplace_source_conflicts`：不可用 → 无可比对象，跳过；
+    - :func:`~a2c_smcp.computer.settings.reconciler.list_dangling_plugin_intents`：不可用 → ``marketplace-not-added``。
+
+    :return: 可用的 ``source`` 映射；记录缺失 / 非映射 / ``source`` 非映射 → ``None``。
+    """
+    record = known.get(name)
+    if not isinstance(record, Mapping):
+        return None
+    source = record.get("source")
+    return source if isinstance(source, Mapping) else None
+
+
 def load_installed_plugins(
     home: Path | None = None,
     env: Mapping[str, str] | None = None,
@@ -451,11 +492,20 @@ def load_installed_plugins(
     :param drop_legacy: 是否丢弃旧格式记录（协议 §4.9.1-4，见 :func:`_drop_legacy_mcp_dep_records`）。默认 ``True``
         ——**几乎所有调用方都应该用默认值**，旧格式记录的依赖信息（display name 数组）不可用于任何判定。
 
-        ⚠️ **唯一的例外是 v0.2.x→v0.3.0 意图迁移**（:func:`~a2c_smcp.computer.settings.installer
-        .migrate_legacy_installs`）：它从账本 **pid（key）** 回填 ``installedPlugins`` 意图，而账本格式迁移
-        （丢弃 → 从意图重建）**恰恰依赖该意图已存在**。两者顺序颠倒则 v0.2.x 存量用户的带 MCP server 的
-        plugin 会连 pid 一起消失、意图无从回填 ⇒ 升级后 plugin 静默全丢。故迁移路径 MUST 传 ``False``
-        （它只读 key，不碰旧格式的字段值）。
+        ⚠️ **例外共三处调用点，语义分两组**：
+        - **只读 pid（key），不碰旧格式字段值**：
+          - v0.2.x→v0.3.0 意图迁移（:func:`~a2c_smcp.computer.settings.installer.migrate_legacy_installs`）——
+            它从账本 pid 回填 ``installedPlugins`` 意图，而账本格式迁移（丢弃 → 从意图重建）**恰恰依赖该意图
+            已存在**。两者顺序颠倒则 v0.2.x 存量用户的带 MCP server 的 plugin 会连 pid 一起消失、意图无从回填
+            ⇒ 升级后 plugin 静默全丢。
+          - ``installer._ledger_pids``——**同一调用点服务两个消费方**：install/enable 预检与冲突诊断分档
+            （经 :func:`~a2c_smcp.computer.settings.installer._install_facts`），以及 install 的锁内裸名复核
+            （直接调用，因为它同时要锁内 ``entries`` 快照）。默认视图会丢旧格式记录的 pid，令存量 home 在
+            检查时隐身、随后迁移才「冒出来」⇒ 绕过拦截。
+        - **消费 legacy 记录字段做删除**：``installer.uninstall_plugin`` 用 ``False`` 读 ``installPath`` /
+          ``scope`` / ``projectPath`` 以删树与清意图——若改回默认视图，v0.2.x home 的 uninstall 会退化成
+          「not installed (no-op)」，令冲突诊断给出的补救命令永久失效（#257 审查 🔴3）。
+        故这三处 MUST 传 ``False``；其余调用方一律保持默认。
     """
     path = installed_plugins_path(home, env)
     data = read_jsonc_with_recovery(path)
@@ -507,6 +557,46 @@ def save_installed_plugins(
     return path
 
 
+_RmwT = TypeVar("_RmwT", bound=Mapping[str, Any])
+
+
+def _locked_jsonc_rmw(
+    path: Path,
+    read: Callable[[Path], dict[str, Any] | None],
+    empty: Callable[[], _RmwT],
+    coerce: Callable[[Mapping[str, Any], Path], _RmwT],
+    mutator: Callable[[_RmwT], _RmwT | None],
+) -> _RmwT:
+    """
+    持锁 JSONC 读-改-写的**单点实现**（tolerant / strict 仅注入不同 loader）/ Single locked RMW.
+
+    #268 审查：tolerant 与 strict 两份 RMW 逐行重复会在后续语义变更时漂移（dry-run 与写入视图分叉），
+    统一到本函数；``read`` 决定容错（``read_jsonc_with_recovery``）或严格（``read_jsonc_strict`` + 形状校验）。
+    """
+    with file_lock(path):
+        raw = read(path)
+        current = empty() if raw is None else coerce(raw, path)
+        result = mutator(current)
+        to_save: dict[str, Any] = dict(result if result is not None else current)
+        to_save.setdefault("version", MATERIALIZED_VERSION)
+        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
+    return coerce(to_save, path)
+
+
+def _read_known_strict(path: Path) -> dict[str, Any] | None:
+    raw = read_jsonc_strict(path)
+    if raw is not None:
+        _require_strict_object_field(raw, "marketplaces", path)
+    return raw
+
+
+def _read_installed_strict(path: Path) -> dict[str, Any] | None:
+    raw = read_jsonc_strict(path)
+    if raw is not None:
+        _require_strict_object_field(raw, "plugins", path)
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # 持锁原子读-改-写 / Locked atomic read-modify-write（供 reconciler #62 等）
 # ---------------------------------------------------------------------------
@@ -516,27 +606,18 @@ def update_known_marketplaces(
     env: Mapping[str, str] | None = None,
 ) -> KnownMarketplacesFile:
     """
-    持锁原子读-改-写 ``known_marketplaces.json``（§6.3）/ Locked atomic read-modify-write。
+    持锁原子读-改-写 ``known_marketplaces.json``（§6.3）/ Locked atomic read-modify-write.
 
-    **单把锁**覆盖 load→mutate→save，杜绝并发进程间的丢更新窗口——供 reconciler（#62）等 RMW 场景。
-    ``mutator`` 收到当前（已规整；缺失 / 损坏则为空）结构，可**就地改并返回 ``None``**，或返回新结构；
-    二者皆补齐 ``version`` 后原子落盘。返回最终写入的结构。
-    A single lock spans load→mutate→save (no lost-update window) — for the reconciler etc. The
-    mutator may mutate in place and return ``None``, or return a new structure; either way
-    ``version`` is backfilled and atomically written. Returns the final written structure.
-
-    这是「持锁 RMW」的推荐入口；**不要**自行 ``with file_lock(p): ...; save_*(...)``（save_* 会再次
-    加锁 → :class:`SettingsLockError`，见 :func:`save_known_marketplaces`）。
+    容错视图：缺失 / 损坏 → 空配置（损坏先备份，见 :func:`read_jsonc_with_recovery`）。
     """
     path = known_marketplaces_path(home, env)
-    with file_lock(path):
-        raw = read_jsonc_with_recovery(path)
-        current = empty_known_marketplaces() if raw is None else _coerce_known_marketplaces(raw, path)
-        result = mutator(current)
-        to_save: dict[str, Any] = dict(result if result is not None else current)
-        to_save.setdefault("version", MATERIALIZED_VERSION)
-        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
-    return _coerce_known_marketplaces(to_save, path)
+    return _locked_jsonc_rmw(
+        path,
+        read_jsonc_with_recovery,
+        empty_known_marketplaces,
+        _coerce_known_marketplaces,
+        mutator,
+    )
 
 
 def update_installed_plugins(
@@ -544,13 +625,129 @@ def update_installed_plugins(
     home: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> InstalledPluginsFile:
-    """持锁原子读-改-写 ``installed_plugins.json``（语义同 :func:`update_known_marketplaces`）/ Locked atomic RMW。"""
+    """持锁原子读-改-写 ``installed_plugins.json``（语义同 :func:`update_known_marketplaces`）/ Locked atomic RMW."""
     path = installed_plugins_path(home, env)
-    with file_lock(path):
-        raw = read_jsonc_with_recovery(path)
-        current = empty_installed_plugins() if raw is None else _coerce_installed_plugins(raw, path)
-        result = mutator(current)
-        to_save: dict[str, Any] = dict(result if result is not None else current)
-        to_save.setdefault("version", MATERIALIZED_VERSION)
-        atomic_write_json(path, to_save, header=WRITE_PROTECTION_HEADER)
-    return _coerce_installed_plugins(to_save, path)
+    return _locked_jsonc_rmw(
+        path,
+        read_jsonc_with_recovery,
+        empty_installed_plugins,
+        _coerce_installed_plugins,
+        mutator,
+    )
+
+
+def update_known_marketplaces_strict(
+    mutator: Callable[[KnownMarketplacesFile], KnownMarketplacesFile | None],
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> KnownMarketplacesFile:
+    """strict RMW（#268）：锁内严格读，损坏/形状不符即抛、不备份、不降级。"""
+    path = known_marketplaces_path(home, env)
+    return _locked_jsonc_rmw(
+        path,
+        _read_known_strict,
+        empty_known_marketplaces,
+        _coerce_known_marketplaces,
+        mutator,
+    )
+
+
+def update_installed_plugins_strict(
+    mutator: Callable[[InstalledPluginsFile], InstalledPluginsFile | None],
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    drop_legacy: bool = False,
+) -> InstalledPluginsFile:
+    """strict RMW ``installed_plugins.json``（语义同 :func:`update_known_marketplaces_strict`）。"""
+    path = installed_plugins_path(home, env)
+    return _locked_jsonc_rmw(
+        path,
+        _read_installed_strict,
+        empty_installed_plugins,
+        lambda data, p: _coerce_installed_plugins(data, p, drop_legacy=drop_legacy),
+        mutator,
+    )
+
+
+# ---------------------------------------------------------------------------
+# strict 只读通道（#268 迁移专用）/ Strict read-only channel
+# ---------------------------------------------------------------------------
+# 背景（#268 / D13）：日常 ``load_*`` 走 :func:`read_jsonc_with_recovery`——损坏文件会被**改名**为
+# ``.corrupt-<ts>.bak`` 后按空配置继续。迁移的 dry-run 要求**零写入**，且按「空账本」计算计划会造成
+# 灾难性误判；因此迁移另立 strict 通道：损坏即抛、不 rename、不降级。既有容错 loader 语义**不变**。
+def read_jsonc_strict(path: Path) -> dict[str, Any] | None:
+    """
+    严格只读 JSONC 物化文件（不备份、不降级）/ Read a materialized file strictly (no backup, no degrade).
+
+    - 文件缺失 → ``None``（空配置语义仍由调用方决定）/ missing → ``None``.
+    - IO 不可读 / 非 UTF-8 / 空文件 / JSON 畸形 / 根非对象 → :class:`SettingsFileCorruptError`，
+      **原文件逐字节不动**、不产生 ``.corrupt-*.bak``。
+    """
+    p = Path(path)
+    try:
+        if not p.exists():
+            return None
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SettingsFileCorruptError(p, f"unreadable ({exc}); fix the file permissions or re-save it as UTF-8") from exc
+    if not text.strip():
+        raise SettingsFileCorruptError(p, "empty file (expected a JSON object); repair or delete the file, then retry")
+    try:
+        data = json.loads(_strip_jsonc_header(text))
+    except json.JSONDecodeError as exc:
+        raise SettingsFileCorruptError(
+            p, f"invalid JSON ({exc}); repair or delete the file, then retry — it was NOT overwritten"
+        ) from exc
+    if not isinstance(data, dict):
+        raise SettingsFileCorruptError(
+            p, f"root must be a JSON object, got {type(data).__name__}; repair or delete the file, then retry"
+        )
+    return data
+
+
+def _require_strict_object_field(data: Mapping[str, Any], key: str, path: Path) -> None:
+    """
+    strict 读面的**字段级**形状校验（#268 审查 🟡7）/ Field-level strict shape check.
+
+    根是对象还不够：``marketplaces`` / ``plugins`` 若存在但形状错误（含显式 ``null``），容错规整会 WARN 后
+    按空处理——迁移据此算计划等于「按空账本给出无操作」，正是 D13 要防的灾难性误判。strict 通道必须抛。
+    """
+    if key in data and not isinstance(data[key], dict):
+        raise SettingsFileCorruptError(path, f"{key!r} must be a JSON object, got {type(data[key]).__name__}")
+
+
+def load_known_marketplaces_strict(home: Path | None = None, env: Mapping[str, str] | None = None) -> KnownMarketplacesFile:
+    """
+    :func:`load_known_marketplaces` 的**严格只读**变体（#268）/ Strict read-only variant.
+
+    :raises SettingsFileCorruptError: 文件存在但不可读 / 畸形 / 根或字段形状错误（不备份、不降级）。
+    """
+    path = known_marketplaces_path(home, env)
+    data = read_jsonc_strict(path)
+    if data is None:
+        return empty_known_marketplaces()
+    _require_strict_object_field(data, "marketplaces", path)
+    return _coerce_known_marketplaces(data, path)
+
+
+def load_installed_plugins_strict(
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    drop_legacy: bool = False,
+) -> InstalledPluginsFile:
+    """
+    :func:`load_installed_plugins` 的**严格只读**变体（#268）/ Strict read-only variant.
+
+    ``drop_legacy`` 默认 ``False``：迁移必须看到旧格式记录的 pid/installPath（默认视图会整条丢弃），
+    否则 v0.2.x 存量记录的引用面会隐身。
+
+    :raises SettingsFileCorruptError: 同上。
+    """
+    path = installed_plugins_path(home, env)
+    data = read_jsonc_strict(path)
+    if data is None:
+        return empty_installed_plugins()
+    _require_strict_object_field(data, "plugins", path)
+    return _coerce_installed_plugins(data, path, drop_legacy=drop_legacy)

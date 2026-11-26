@@ -1,0 +1,655 @@
+# -*- coding: utf-8 -*-
+# filename: test_plugin_name_uniqueness.py
+# @Time    : 2026/11/16
+# @Author  : JQQ
+# @Email   : jqq1716@gmail.com
+# @Software: PyCharm
+"""
+跨 marketplace 同名 plugin 安装层拦截（#257）/ Cross-marketplace bare-name uniqueness。
+
+协议依据 / Protocol: a2c-smcp-protocol ``docs/specification/skill.md`` §1.2 note / §1.5（`<plugin>` 裸名跨
+marketplace 全局唯一，`<plugin>@<marketplace>` 是完整安装 id）。
+验收锚 / Acceptance anchor: ``conformance-tests.md`` §5「跨 marketplace 同名 plugin 安装」——
+已安装 ``alpha@mp-a`` 后 install ``alpha@mp-b`` MUST 在安装层拒绝；``alpha@mp-a`` 及其 SKILL 保持原
+``source``；``installedPlugins`` 不新增 ``alpha@mp-b``。
+
+测试意图 / Test intentions:
+- install 前置：同名不同 marketplace → 结构化 ``validation`` 拒绝，且拒绝**先于**迁移 / settings / 账本任何写
+  （含 legacy 账本 + 无意图键的存量 home）。
+- enable 防御：存量双装下 enable 任一 pid 均 fail-closed，且 ``enabledPlugins`` / stage / 挂载零副作用。
+- 注册点守卫（存量双装 boot 重扫）：保留先注册者、记 ERROR、后注册源不覆盖。
+- 负对照：同 pid 重装幂等；同 marketplace 刷新不误拒。
+- 夹具 **merge-aware**（``load_known_marketplaces`` → 改 → ``save_known_marketplaces``），两 marketplace 共存。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import threading
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+import a2c_smcp.computer.skills.registry as registry_mod
+from a2c_smcp.computer.settings.installer import (
+    PluginInstallError,
+    disable_plugin,
+    enable_plugin,
+    install_plugin,
+    uninstall_plugin,
+)
+from a2c_smcp.computer.settings.recovery import recover_marketplace_skills
+from a2c_smcp.computer.settings.scope import resolve_settings, user_settings_path, workdir_project_settings_path
+from a2c_smcp.computer.settings.store import (
+    load_installed_plugins,
+    load_known_marketplaces,
+    save_installed_plugins,
+    save_known_marketplaces,
+)
+from a2c_smcp.computer.skills.home import marketplace_skill_dir
+from a2c_smcp.computer.skills.registry import SkillRegistry
+from a2c_smcp.computer.skills.staging import stage_marketplace_skills
+
+_SRC = {"type": "git", "url": "https://example.com/acme.git"}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """project/local 层锚定 cwd（#116）——chdir 隔离，避免读进真实仓库 ``.tfrobot/``。"""
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture
+def capture_registry_errors(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """捕获 registry 模块 ERROR（项目 logger 关闭 propagate，直接挂 handler）。"""
+    registry_mod.logger.addHandler(caplog.handler)
+    caplog.set_level(logging.ERROR)
+    try:
+        yield caplog
+    finally:
+        registry_mod.logger.removeHandler(caplog.handler)
+
+
+# ── 辅助 / helpers ───────────────────────────────────────────────────────────
+def _home(tmp_path: Path) -> Path:
+    h = tmp_path / "skill-home"
+    h.mkdir()
+    return h
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    """重定向 XDG_CONFIG_HOME → tmp，隔离 user settings.json 写。"""
+    return {**os.environ, "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+
+def _write_json(path: Path, obj: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj), encoding="utf-8")
+
+
+def _skill_md(name: str, description: str) -> str:
+    return f"---\nname: {name}\ndescription: {description}\nlicense: MIT\n---\n# {name}\nbody\n"
+
+
+def _setup_marketplace(home: Path, mp: str, plugin: str, *, skill: str, description: str) -> Path:
+    """造 catalog 树（相对源 plugin）+ skills/<skill>/SKILL.md，并 **合并** seed known_marketplaces。"""
+    catalog = marketplace_skill_dir(home, mp)
+    manifest = {
+        "name": mp,
+        "owner": {"name": "X"},
+        "metadata": {"pluginRoot": "./plugins"},
+        "plugins": [{"name": plugin, "source": plugin, "version": "1.0.0"}],
+    }
+    _write_json(catalog / ".tfrobot-plugin" / "marketplace.json", manifest)
+    plugin_root = catalog / "plugins" / plugin
+    skill_dir = plugin_root / "skills" / skill
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(_skill_md(skill, description), encoding="utf-8")
+    known = load_known_marketplaces(home=home)
+    known["marketplaces"][mp] = {"source": _SRC, "installLocation": str(catalog.resolve()), "commitSha": "abc123"}
+    save_known_marketplaces(known, home=home)
+    return plugin_root
+
+
+def _record(plugin_root: Path, *, scope: str = "user") -> dict:
+    return {"scope": scope, "installPath": str(plugin_root), "version": "1.0.0", "mcpServers": []}
+
+
+def _seed_ledger(home: Path, plugins: dict[str, list[dict]]) -> None:
+    save_installed_plugins({"version": 1, "plugins": plugins}, home=home)
+
+
+def _read_settings(env: dict[str, str]) -> dict:
+    path = user_settings_path(env)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ── install 前置：跨 marketplace 同名拒绝 ─────────────────────────────────────
+async def test_install_second_marketplace_same_bare_name_rejected(tmp_path: Path) -> None:
+    """conformance §5：install `alpha@mp-b` MUST 拒绝；mp-a 及其 SKILL 原 source 不变；意图不新增。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await enable_plugin("alpha@mp-a", reg, home, env=env)
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"
+    before = _read_settings(env)
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+
+    assert ei.value.error_code == "validation"
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+    message = str(ei.value)
+    assert "alpha@mp-a" in message
+    assert "uninstall" in message
+
+    # 零副作用：意图 / 账本 / 注册表均不变
+    assert _read_settings(env) == before
+    assert "alpha@mp-b" not in load_installed_plugins(home=home)["plugins"]
+    after = reg.resolve("alpha:foo")
+    assert after is not None
+    assert after["source"] == "marketplace:mp-a"
+    assert after["description"] == "from-a"
+
+
+async def test_reinstall_same_pid_still_idempotent(tmp_path: Path) -> None:
+    """负对照：同一 pid 重装幂等放行，意图只留一条。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    reg = SkillRegistry()
+
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    record = await install_plugin("alpha@mp-a", reg, home, env=env)
+
+    assert record["scope"] == "user"
+    assert _read_settings(env)["installedPlugins"] == ["alpha@mp-a"]
+    assert list(load_installed_plugins(home=home)["plugins"]) == ["alpha@mp-a"]
+
+
+async def test_legacy_ledger_blocks_before_migration_marker(tmp_path: Path) -> None:
+    """legacy 账本（``bundledMcpServers``）也参与冲突扫描，且拒绝先于迁移写标记键。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    plugin_root = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    # v0.2.x 账本：带 bundledMcpServers 的旧格式记录（drop_legacy=True 会整条丢弃）
+    _seed_ledger(
+        home,
+        {"alpha@mp-a": [{"scope": "user", "installPath": str(plugin_root), "bundledMcpServers": ["figma"]}]},
+    )
+    assert "installedPlugins" not in _read_settings(env)  # 迁移尚未发生
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", SkillRegistry(), home, env=env)
+
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+    assert "installedPlugins" not in _read_settings(env)  # 拒绝先于 migrate_legacy_installs 写标记键
+
+
+async def test_project_scope_intent_participates_in_conflict(tmp_path: Path) -> None:
+    """merged 视图：project 层 ``installedPlugins`` 声明同样能挡住 user 层安装。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(workdir_project_settings_path(tmp_path), {"installedPlugins": ["alpha@mp-a"]})
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", SkillRegistry(), home, env=env)
+
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+
+
+# ── enable 防御：存量双装 fail-closed + 零副作用 ──────────────────────────────
+async def _noop_remove(_bundle_id: str) -> None:
+    return None
+
+
+@pytest.mark.parametrize("target", ["alpha@mp-a", "alpha@mp-b"])
+async def test_enable_rejected_before_side_effects_in_double_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str) -> None:
+    """存量双装：enable 任一 pid 都被拒（fail-closed），enabledPlugins / stage / 挂载零副作用。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    root_b = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(
+        user_settings_path(env),
+        {"installedPlugins": ["alpha@mp-a", "alpha@mp-b"], "enabledPlugins": {"alpha@mp-a": True}},
+    )
+    _seed_ledger(home, {"alpha@mp-a": [_record(root_a)], "alpha@mp-b": [_record(root_b)]})
+    before = _read_settings(env)
+
+    staged: list[dict] = []
+
+    async def _spy_stage(*args, **kwargs):
+        staged.append({"args": args, "kwargs": kwargs})
+        return []
+
+    monkeypatch.setattr("a2c_smcp.computer.settings.installer.stage_marketplace_skills", _spy_stage)
+    mounted: list[object] = []
+
+    async def _register(cfg) -> None:
+        mounted.append(cfg)
+
+    reg = SkillRegistry()
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin(
+            target,
+            reg,
+            home,
+            env=env,
+            existing_bundle_ids=lambda: set(),
+            register_server=_register,
+            remove_server=_noop_remove,
+        )
+
+    assert ei.value.error_code == "validation"
+    assert staged == []
+    assert mounted == []
+    assert reg.active_refs() == []
+    assert _read_settings(env) == before  # enabledPlugins 未被写
+
+
+# ── 存量双装 boot 重扫：注册点保留先到者 ─────────────────────────────────────
+async def test_boot_rescan_double_install_keeps_first_registrant(
+    tmp_path: Path, capture_registry_errors: pytest.LogCaptureFixture,
+) -> None:
+    """存量双装（两意图 + 两 enabled + 两账本）boot 重扫：先注册者 mp-a 胜出，mp-b 被拒并记 ERROR。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    root_b = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(
+        user_settings_path(env),
+        {"installedPlugins": ["alpha@mp-a", "alpha@mp-b"], "enabledPlugins": {"alpha@mp-a": True, "alpha@mp-b": True}},
+    )
+    _seed_ledger(home, {"alpha@mp-a": [_record(root_a)], "alpha@mp-b": [_record(root_b)]})
+    declared = resolve_settings(env=env).settings
+
+    reg = SkillRegistry()
+    await recover_marketplace_skills(reg, home, declared, env=env)
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"  # 排序先到的 mp-a 胜出
+    assert got["description"] == "from-a"
+    messages = [r.getMessage() for r in capture_registry_errors.records if r.levelno == logging.ERROR]
+    assert any("alpha@mp-b" in m and "plugin uninstall" in m for m in messages), messages
+
+    # 幂等：重扫不改变结果
+    await recover_marketplace_skills(reg, home, declared, env=env)
+    again = reg.resolve("alpha:foo")
+    assert again is not None
+    assert again["source"] == "marketplace:mp-a"
+
+
+# ── 审查 🔴1：staging 的静默拒绝不得让 enable「假成功」────────────────────────
+async def test_enable_fails_closed_when_other_marketplace_shadows(tmp_path: Path) -> None:
+    """`marketplace add` 全量 stage 未安装 plugin → enable 本 pid 时必须报冲突并回滚，不得假成功。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    # 模拟 `marketplace add mp-b`：CLI 不传 plugin_filter → 全量 stage（含**未安装**的 alpha）
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+    shadow = reg.resolve("alpha:foo")
+    assert shadow is not None
+    assert shadow["source"] == "marketplace:mp-b"
+    before = _read_settings(env)
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    assert ei.value.error_code == "validation"
+    assert ei.value.details["conflictWith"] == "alpha@mp-b"
+    # 补救必须可执行：冲突方未安装 → 不得给 no-op 的 `plugin uninstall`（#257 复审 🔴2）
+    message = str(ei.value)
+    assert "marketplace remove mp-b" in message
+    assert "plugin uninstall alpha@mp-b" not in message
+    after = _read_settings(env)
+    assert after.get("installedPlugins") == before.get("installedPlugins")
+    # 回滚语义：enabledPlugins 恢复为「原 absent」（DELETE 后可能留下空对象，等价于未启用）
+    assert "alpha@mp-a" not in (after.get("enabledPlugins") or {})
+
+
+async def test_enable_succeeds_when_other_marketplace_has_different_skill_names(tmp_path: Path) -> None:
+    """复核面只认真正的 name 冲突：另一 marketplace 的同 plugin **不同 skill 名**不得把 enable 打死（复审 🔴1）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="baz", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+    assert reg.resolve("alpha:baz") is not None  # marketplace add 的全量 stage 既存行为
+
+    await enable_plugin("alpha@mp-a", reg, home, env=env)  # 无 name 冲突 → 必须成功
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"
+    assert (_read_settings(env).get("enabledPlugins") or {}).get("alpha@mp-a") is True
+
+
+async def test_enable_remedy_then_retry_succeeds(tmp_path: Path) -> None:
+    """错误给出的补救必须真的能清冲突：按提示移除 marketplace 后重试 enable 应成功（复审 🔴2 闭环）。"""
+    from a2c_smcp.computer.settings.reconciler import _unregister_marketplace_skills
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+
+    with pytest.raises(PluginInstallError) as ei:
+        await enable_plugin("alpha@mp-a", reg, home, env=env)
+    assert "marketplace remove mp-b" in str(ei.value)
+
+    _unregister_marketplace_skills(reg, "mp-b")  # `marketplace remove` 的注销效果
+    await enable_plugin("alpha@mp-a", reg, home, env=env)  # 重试成功
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"
+
+
+async def test_install_rejects_declaration_only_pid_carve_out(tmp_path: Path) -> None:
+    """幂等 carve-out 只认账本：project 层**纯声明**的同名 pid 不得成为「装第二个」的通行证（复审 🔴3）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    # 仅声明（无账本记录）一个从未安装的同名 pid
+    _write_json(workdir_project_settings_path(tmp_path), {"installedPlugins": ["alpha@mp-b"]})
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+    assert "alpha@mp-b" not in load_installed_plugins(home=home)["plugins"]
+
+
+async def test_enable_rollback_restores_preexisting_orphan(tmp_path: Path) -> None:
+    """失败 enable 的净效果必须为零：本次复活的既有孤儿要回到孤儿态，不得被 unregister（复审 🟡5）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    baz_dir = root_a / "skills" / "baz"
+    baz_dir.mkdir(parents=True)
+    (baz_dir / "SKILL.md").write_text(_skill_md("baz", "from-a"), encoding="utf-8")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+
+    reg = SkillRegistry()
+    # 预置可达态：`marketplace add` 已把 mp-b 的 alpha:foo 全量 stage 成活跃；mp-a 的 alpha:baz 是既有孤儿
+    reg.register({"name": "alpha:foo", "source": "marketplace:mp-b", "path": "/abs/b/foo", "description": "from-b"})
+    reg.register({"name": "alpha:baz", "source": "marketplace:mp-a", "path": "/abs/a/baz", "description": "from-a"})
+    reg.mark_orphan("alpha:baz")
+    before = {ref["name"]: orphaned for ref, orphaned in reg.all_refs()}
+
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    with pytest.raises(PluginInstallError):
+        await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    after = {ref["name"]: orphaned for ref, orphaned in reg.all_refs()}
+    assert after == before
+
+
+def test_source_conflict_error_remedy_branches(tmp_path: Path) -> None:
+    """诊断三档文案直测：未安装冲突方 → marketplace remove；已安装（跨进程交错可达）→ uninstall；兜底形态。
+
+    #257 复审 🟡1/🟡2：`enable` 进程内到不了「已安装冲突方」档（step 0 会先拦），但并发进程可在 staging
+    窗口内安装它；三档都必须给出**可执行**补救，兜底档不得无机读身份。
+    """
+    from a2c_smcp.computer.settings.installer import _source_conflict_error
+    from a2c_smcp.computer.skills.registry import SourceConflict
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    plugin_root = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+
+    not_installed = _source_conflict_error(
+        "alpha@mp-a",
+        [SourceConflict(name="alpha:foo", existing_source="marketplace:mp-b", refused_source="marketplace:mp-a")],
+        home=home,
+        env=env,
+    )
+    assert not_installed.details["conflictWith"] == "alpha@mp-b"
+    assert "marketplace remove mp-b" in str(not_installed)
+    assert "plugin uninstall alpha@mp-b" not in str(not_installed)
+
+    _seed_ledger(home, {"alpha@mp-b": [_record(plugin_root)]})  # 模拟并发进程在 staging 窗口内完成安装
+    installed = _source_conflict_error(
+        "alpha@mp-a",
+        [SourceConflict(name="alpha:foo", existing_source="marketplace:mp-b", refused_source="marketplace:mp-a")],
+        home=home,
+        env=env,
+    )
+    assert "plugin uninstall alpha@mp-b" in str(installed)
+
+    fallback = _source_conflict_error(
+        "alpha@mp-a",
+        [SourceConflict(name="alpha:foo", existing_source="user", refused_source="marketplace:mp-a")],
+        home=home,
+        env=env,
+    )
+    assert "conflictWith" not in fallback.details  # 不塞裸 plugin 名冒充 pid
+    assert "Remove the shadowing source registration" in str(fallback)
+
+
+# ── 审查 🔴2：disable → uninstall 的孤儿残留必须一并清掉 ─────────────────────
+async def test_disable_then_uninstall_clears_orphan_allows_switch(tmp_path: Path) -> None:
+    """孤儿若不随 uninstall 注销，会被跨 source 守卫当作「先到者」永久拒绝新 source（本进程内不可自愈）。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    await disable_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env)
+    assert reg.is_orphan("alpha:foo") is True
+
+    assert await uninstall_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    assert "alpha:foo" not in reg  # 孤儿随 uninstall 一起注销
+
+    await install_plugin("alpha@mp-b", reg, home, env=env)
+    await enable_plugin("alpha@mp-b", reg, home, env=env)
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-b"
+    assert got["description"] == "from-b"
+
+
+def test_marketplace_unregister_includes_orphans() -> None:
+    """``marketplace remove`` / gc / prune 的注销路径同样要清孤儿（#257 审查 🔴2 第二条路径）。"""
+    from a2c_smcp.computer.settings.reconciler import _unregister_marketplace_skills
+
+    reg = SkillRegistry()
+    reg.register({"name": "alpha:foo", "source": "marketplace:mp-a", "path": "/abs/a", "description": "d"})
+    reg.mark_orphan("alpha:foo")
+    assert reg.is_orphan("alpha:foo") is True
+
+    _unregister_marketplace_skills(reg, "mp-a", plugin="alpha")
+
+    assert "alpha:foo" not in reg
+
+
+# ── 审查 🔴3：冲突诊断给出的 uninstall 补救必须在 legacy 账本 home 真生效 ─────
+async def test_legacy_home_uninstall_clears_conflict(tmp_path: Path) -> None:
+    """v0.2.x 旧格式账本下，``plugin uninstall <conflict>`` 不得因默认视图丢弃记录而退化成 no-op。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _seed_ledger(
+        home,
+        {"alpha@mp-a": [{"scope": "user", "installPath": str(root_a), "bundledMcpServers": ["figma"]}]},
+    )
+    reg = SkillRegistry()
+    with pytest.raises(PluginInstallError):
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+
+    assert await uninstall_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    await install_plugin("alpha@mp-b", reg, home, env=env)  # 冲突解除，可换源安装
+
+
+# ── 复审 🟡1：锁内复核必须复制预检的账本 carve-out ───────────────────────────
+async def test_reinstall_with_missing_user_intent_allowed_in_double_install(tmp_path: Path) -> None:
+    """存量双装 + user 意图缺目标 pid（手编 / 回滚失败 / 部分 prune）：预检放行的重装，锁内不得误拒。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    root_b = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(user_settings_path(env), {"installedPlugins": ["alpha@mp-b"]})  # 缺 alpha@mp-a
+    _seed_ledger(home, {"alpha@mp-a": [_record(root_a)], "alpha@mp-b": [_record(root_b)]})
+
+    record = await install_plugin("alpha@mp-a", SkillRegistry(), home, env=env)  # 不得抛
+
+    assert record["scope"] == "user"
+    assert "alpha@mp-a" in (_read_settings(env).get("installedPlugins") or [])
+
+
+def test_write_installed_plugin_guard_requires_home(tmp_path: Path) -> None:
+    """安全守卫不得静默 fail-open：``guard_bare_name=True`` 而缺 ``home`` 时直接报错（复审 🟡6）。"""
+    from a2c_smcp.computer.settings.installer import _write_installed_plugin
+
+    env = _env(tmp_path)
+    with pytest.raises(ValueError):
+        _write_installed_plugin("alpha@mp-a", True, env, guard_bare_name=True)
+
+
+# ── 决策 1 的幂等：存量双装下同一 pid 重装仍放行 ─────────────────────────────
+async def test_reinstall_same_pid_allowed_in_double_install(tmp_path: Path) -> None:
+    """同一 pid 重装不改变安装集、不新增第二个 ``<plugin>`` → 不得误拒（决策 1）；新 marketplace 仍拒。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    root_a = _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    root_b = _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    _write_json(
+        user_settings_path(env),
+        {"installedPlugins": ["alpha@mp-a", "alpha@mp-b"], "enabledPlugins": {"alpha@mp-a": True}},
+    )
+    _seed_ledger(home, {"alpha@mp-a": [_record(root_a)], "alpha@mp-b": [_record(root_b)]})
+    reg = SkillRegistry()
+
+    record = await install_plugin("alpha@mp-a", reg, home, env=env)  # 不抛
+    assert record["scope"] == "user"
+
+    _setup_marketplace(home, "mp-c", "alpha", skill="foo", description="from-c")
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-c", reg, home, env=env)
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+
+
+# ── 架构师审查 🔴1：install 预检与意图写必须同临界区（跨进程并发）──────────
+def test_concurrent_install_same_bare_name_only_one_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个线程同时 install 同名不同 marketplace：只允许一个成功，意图与账本都不得出现双装。
+
+    用 ``threading.Barrier`` 卡在预检之后，强制两边都先「看到空安装集」再进写意图路径——这正是
+    「预检无锁、写意图才持锁」的 TOCTOU 窗口。修复后由 ``_write_installed_plugin`` 的锁内复核兜住。
+    """
+    import a2c_smcp.computer.settings.installer as installer_mod
+
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+
+    barrier = threading.Barrier(2, timeout=15)
+    real_conflicts = installer_mod._bare_name_conflicts
+
+    def _rendezvous(*args, **kwargs):
+        result = real_conflicts(*args, **kwargs)
+        barrier.wait()  # 两个线程都完成预检后才继续
+        return result
+
+    monkeypatch.setattr(installer_mod, "_bare_name_conflicts", _rendezvous)
+
+    outcomes: dict[str, object] = {}
+
+    def _run(pid: str) -> None:
+        try:
+            asyncio.run(install_plugin(pid, SkillRegistry(), home, env=env))
+            outcomes[pid] = "ok"
+        except PluginInstallError as exc:  # noqa: BLE001 - 记录竞争结果
+            outcomes[pid] = exc
+
+    threads = [threading.Thread(target=_run, args=(pid,), daemon=True) for pid in ("alpha@mp-a", "alpha@mp-b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(value == "ok" for value in outcomes.values()) == [False, True], outcomes
+    errors = [value for value in outcomes.values() if isinstance(value, PluginInstallError)]
+    assert len(errors) == 1
+    assert errors[0].error_code == "validation"  # 败者是结构化冲突，而非其它异常
+    settings = _read_settings(env)
+    assert len(settings.get("installedPlugins") or []) == 1
+    assert len(load_installed_plugins(home=home)["plugins"]) == 1
+
+
+# ── 字面 add-after-enable 全链（架构师审查测试补强）─────────────────────────
+async def test_add_marketplace_after_enable_then_install_rejected(tmp_path: Path) -> None:
+    """install+enable mp-a 之后才 add mp-b（全量 stage）：已启用技能保持 mp-a，install mp-b 被拒。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    await enable_plugin("alpha@mp-a", reg, home, env=env)
+
+    # 用户此后添加 mp-b：`marketplace add` 的行为 = 合并 known_marketplaces + 不带 filter 的全量 stage
+    _setup_marketplace(home, "mp-b", "alpha", skill="foo", description="from-b")
+    await stage_marketplace_skills("mp-b", _SRC, reg, home, env=env)
+
+    got = reg.resolve("alpha:foo")
+    assert got is not None
+    assert got["source"] == "marketplace:mp-a"  # 注册点守卫：先到者保留
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-b", reg, home, env=env)
+    assert ei.value.details["conflictWith"] == "alpha@mp-a"
+
+
+# ── 架构师审查 🟡2：纯声明冲突的文案分档与补救可执行性 ─────────────────────
+async def test_declaration_only_conflict_remedy_is_executable(tmp_path: Path) -> None:
+    """冲突集混合「已安装」与「仅声明」：文案分别给 uninstall / 删声明，且按提示执行后能装第三个。"""
+    home = _home(tmp_path)
+    env = _env(tmp_path)
+    _setup_marketplace(home, "mp-a", "alpha", skill="foo", description="from-a")
+    _setup_marketplace(home, "mp-c", "alpha", skill="foo", description="from-c")
+    reg = SkillRegistry()
+    await install_plugin("alpha@mp-a", reg, home, env=env)
+    declaration = workdir_project_settings_path(tmp_path)
+    _write_json(declaration, {"installedPlugins": ["alpha@mp-b"]})  # 仅声明、从未安装
+
+    with pytest.raises(PluginInstallError) as ei:
+        await install_plugin("alpha@mp-c", reg, home, env=env)
+    message = str(ei.value)
+    assert "'plugin uninstall alpha@mp-a'" in message  # 已安装 → uninstall
+    assert "declaration" in message and "alpha@mp-b" in message  # 仅声明 → 删声明键
+    # 分档核心：仅声明的 pid 不得被建议 `plugin uninstall`（该命令清不掉声明，是永久 no-op）
+    assert "'plugin uninstall alpha@mp-b'" not in message
+
+    # 按提示执行补救：删声明 + 卸载已装的 mp-a
+    declaration.unlink()
+    assert await uninstall_plugin("alpha@mp-a", reg, home, non_plugin_bundle_ids=lambda: set(), env=env) is True
+    await install_plugin("alpha@mp-c", reg, home, env=env)  # 冲突解除

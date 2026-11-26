@@ -17,8 +17,8 @@ BundleID 生成 / 校验 / connection-identity TLV 摘要（单一权威）/ Det
     SHA-256 与 rust 对齐，禁语言内建 hash()（进程级随机化）、禁 base32/64（大小写/padding 变体）。
 
 ✅ P0 一致性夹具 / Conformance vectors (LOCKED)：
-    TLV 字节帧已由协议仓一致性向量「定死」并**逐字节对拍全绿**（`a2c-smcp-protocol` develop `57c2f9f`，
-    16 条，`tests/unit_tests/utils/test_bundle_id_conformance.py`）。rust-sdk#117 回执确认 3 处契约：
+    TLV 字节帧已由协议仓一致性向量「定死」并**逐字节对拍全绿**（`a2c-smcp-protocol` develop `e811757`，
+    25 条，`tests/unit_tests/utils/test_bundle_id_conformance.py`）。rust-sdk#117 回执确认 3 处契约：
       [1] ✅ 类型判别符（"stdio"/"streamable"/"sse"）与普通字符串字段同构，走 u32 长度前缀（非裸拼接）。
       [3] ✅ 顶层帧为判别符起的扁平拼接，无外层长度 / 计数包裹。
       [2] ⚠️ **raw（协议 #17 已定，`57c2f9f`）**：connection-identity 取 **raw / 未注入**配置——

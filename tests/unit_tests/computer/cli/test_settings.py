@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
 from a2c_smcp.computer.cli.commands import settings as settings_cmd
-from a2c_smcp.computer.settings.scope import user_settings_path
+from a2c_smcp.computer.settings.scope import SettingsAxes, user_settings_path
 
 
 def _home(tmp_path: Path) -> Path:
@@ -176,11 +178,12 @@ def test_show_policy_surfaces_validation_errors(
     home, env = _home(tmp_path), _env(tmp_path)
     capsys.readouterr()
 
-    # 模拟 policy 返回含类型错的 dict：allowedMcpServers 应为 array，这里给 string
-    import a2c_smcp.computer.cli.commands.settings as settings_cmd_mod
+    # 模拟 policy 返回含类型错的 dict：allowedMcpServers 应为 array，这里给 string。
+    # #296：settings 读路径改为函数内惰性导入，patch 目标随之改为 policy 模块属性。
+    import a2c_smcp.computer.settings.policy as policy_mod
 
     monkeypatch.setattr(
-        settings_cmd_mod,
+        policy_mod,
         "resolve_policy_settings",
         lambda **kw: {"allowedMcpServers": "not-a-list", "trustedMarketplaces": ["mp"]},
     )
@@ -204,10 +207,10 @@ def test_show_policy_valid_fields_silent(
     home, env = _home(tmp_path), _env(tmp_path)
     capsys.readouterr()
 
-    import a2c_smcp.computer.cli.commands.settings as settings_cmd_mod
+    import a2c_smcp.computer.settings.policy as policy_mod
 
     monkeypatch.setattr(
-        settings_cmd_mod,
+        policy_mod,
         "resolve_policy_settings",
         lambda **kw: {"allowedMcpServers": ["a"], "trustedMarketplaces": ["mp"]},
     )
@@ -219,6 +222,114 @@ def test_show_policy_valid_fields_silent(
     assert data["allowedMcpServers"] == ["a"]
     assert data["trustedMarketplaces"] == ["mp"]
     assert captured.err == ""
+
+
+# ── #295 展示面脱敏 / markup 安全 ───────────────────────────────────────────────
+_MARKETPLACE_SECRET_KEY = "https://alice:s3cret@example.com/repo.git"
+
+
+def _write_user_settings(env: dict[str, str], data: object) -> None:
+    path = user_settings_path(env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _no_ws(text: str) -> str:
+    """去掉全部空白：rich 按终端宽度折行，人类输出断言不得依赖换行位置。"""
+    return "".join(text.split())
+
+
+@pytest.mark.parametrize("command", ["show", "get"])
+def test_settings_commands_redact_marketplace_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    """#295：``settings show`` / ``settings get`` 的错误行不回显 marketplace 键里的 userinfo 凭据。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    _write_user_settings(env, {"extraKnownMarketplaces": {_MARKETPLACE_SECRET_KEY: {}}})
+    capsys.readouterr()
+
+    if command == "show":
+        assert settings_cmd.settings_show(home, env, scope="user", json_output=True) == 0
+    else:
+        assert settings_cmd.settings_get(home, env, "strictKnownMarketplaces", scope="user", json_output=True) == 1
+    captured = capsys.readouterr()
+
+    err = _no_ws(captured.err)
+    assert "s3cret" not in err  # 凭据不落 stderr
+    assert "https://example.com/repo.git" in err  # userinfo 剥离但名字仍可定位
+    if command == "show":
+        # stdout 是**忠实展示**、不是脱敏面：非法声明已被校验整条丢弃，只剩空对象（诊断只走 stderr）。
+        # 钉住这个结构形态——若 `settings show` 开始把原始错误/被丢弃的键塞回 stdout，此断言转红。
+        assert json.loads(captured.out) == {"extraKnownMarketplaces": {}}
+
+
+@pytest.mark.parametrize("command", ["show", "get"])
+def test_settings_commands_escape_markup_in_error_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    """#295（可达崩溃）：手编键 ``evil[/]a[/]b`` 让错误行含 rich 结束标签——未 escape 时抛 MarkupError。
+
+    两条命令共用 :func:`_emit_errors`；本用例对两处调用点分别钉住「不抛 + 原文可见 + scope 文本不被吞」。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    _write_user_settings(env, {"extraKnownMarketplaces": {"evil[/]a[/]b": {}}})
+    capsys.readouterr()
+
+    if command == "show":
+        assert settings_cmd.settings_show(home, env, scope="user", json_output=True) == 0
+    else:
+        assert settings_cmd.settings_get(home, env, "strictKnownMarketplaces", scope="user", json_output=True) == 1
+    err = _no_ws(capsys.readouterr().err)
+
+    assert "settings.json[user]" in err  # scope 文本没被当标签吃掉
+    assert "evil[/]a[/]b" in err  # field 原文逐字可见
+
+
+def test_settings_get_markup_key_reports_without_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#295（隔离审查 🟡）：``_err`` 的 ``key!r`` 未 escape 时，``settings get 'evil[/]a[/]b'`` 抛 MarkupError。"""
+    home, env = _home(tmp_path), _env(tmp_path)
+    capsys.readouterr()
+
+    assert settings_cmd.settings_get(home, env, "evil[/]a[/]b", scope="user") == 1  # 不得在 _err 处崩溃
+
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]a[/]b" in out  # 原文逐字可见（非 --json 分支的错误行走 stdout）
+
+
+def test_settings_set_markup_key_writes_then_reports(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#295（隔离审查 🟡）：``settings set`` 的 markup 键**先写盘、后在成功行崩溃**——修后写盘成功且不抛。
+
+    这是最坏形态：用户看到 traceback 会以为没写成功，实际文件已改；回归锁须同时断言「文件已写」与「成功行可见」。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    capsys.readouterr()
+
+    assert settings_cmd.settings_set(home, env, "evil[/]a[/]b", "1", scope="user") == 0
+
+    data = json.loads(user_settings_path(env).read_text(encoding="utf-8"))
+    assert data["evil[/]a[/]b"] == 1  # 写盘成功
+    out = _no_ws(capsys.readouterr().out)
+    assert "evil[/]a[/]b" in out  # 成功行原文可见（未崩溃）
+
+
+def test_settings_edit_markup_path_reports_without_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#295（隔离审查 🟡）：``✓ edited … ({path})`` 的 path 来自 env——含 rich 标签形态时不得被吞。
+
+    ``cfg[bold]`` 是合法目录名；未 escape 时 rich 把 ``[bold]`` 当样式标签**吞掉**（实测），路径不可见。
+    """
+    cfg = tmp_path / "cfg[bold]"
+    env = {**os.environ, "XDG_CONFIG_HOME": str(cfg)}
+    capsys.readouterr()
+
+    code, _ = settings_cmd.settings_edit(_home(tmp_path), env, scope="user", editor="true")
+
+    assert code == 0
+    out = _no_ws(capsys.readouterr().out)
+    assert "cfg[bold]" in out  # path 原文可见（未被当标签吞掉）
 
 
 # ── edit ──────────────────────────────────────────────────────────────────────
@@ -249,13 +360,33 @@ def test_edit_readonly_scopes_exit1(tmp_path: Path, scope: str) -> None:
 
 # ── repl_dispatch（REPL 解析胶水层；fix-review #2/#3）/ REPL parse glue ─────────
 class _FakeComp:
-    """settings repl_dispatch 所需最小 fake（repl 用 os.environ 作 env，故 XDG 经 monkeypatch 隔离）。"""
+    """settings repl_dispatch 所需最小 fake（#296 起可注入实例 settings 轴）。"""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(
+        self,
+        home: Path,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+        flag_settings_path: Path | None = None,
+        policy_settings: Mapping[str, object] | None = None,
+    ) -> None:
         self.skill_home = home
         self._registered_workdirs: tuple[Path, ...] = ()
         self.active_workdir: Path | None = None
         self.dirty = 0
+        self.env = env
+        self._cwd = cwd
+        self._flag_settings_path = flag_settings_path
+        self._policy_settings = policy_settings
+
+    def _settings_axes(self) -> SettingsAxes:
+        return SettingsAxes(
+            env=self.env,
+            cwd=self._cwd,
+            flag_settings_path=self._flag_settings_path,
+            policy_settings=self._policy_settings,
+        )
 
     def mark_skills_dirty(self) -> None:
         self.dirty += 1
@@ -295,7 +426,159 @@ async def test_repl_set_emit_key_marks_dirty(tmp_path: Path, monkeypatch: pytest
 async def test_repl_get_and_unknown_subcommand_no_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     comp = _FakeComp(tmp_path / "home")
-    # 缺失键 get（退出码 1，不抛）+ 未知子命令（no-op，不抛）
+    # 缺失键 get（退出码 1，不抛）+ 未知子命令（no-op，不抛）+ markup 形态子命令（#295：提示行不得抛 MarkupError）
     await settings_cmd.repl_dispatch(comp, ["settings", "get", "neverset"], session=None)
     await settings_cmd.repl_dispatch(comp, ["settings", "bogus"], session=None)
+    await settings_cmd.repl_dispatch(comp, ["settings", "evil[/]x"], session=None)
     assert comp.dirty == 0
+
+
+# ── #296：REPL settings 面跟随实例 cwd / flag ────────────────────────────────
+@pytest.mark.asyncio
+async def test_repl_settings_project_scope_uses_instance_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#296：REPL ``settings set --scope project`` 写**实例 cwd**，不写进程 cwd。
+
+    与 plugin 的 ``project_path``、marketplace 守卫的 cwd 轴同源，避免注入 project_root 的宿主三面分叉。
+    """
+    monkeypatch.chdir(tmp_path)  # 进程 cwd 无 .tfrobot
+    project = tmp_path / "project"
+    comp = _FakeComp(tmp_path / "home", cwd=project)
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "set", "note", "hello", "--scope", "project"], session=None)
+
+    instance_settings = project / ".tfrobot" / "settings.json"
+    assert json.loads(instance_settings.read_text(encoding="utf-8"))["note"] == "hello"
+    assert not (tmp_path / ".tfrobot" / "settings.json").exists(), "不得写进程 cwd"
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_show_reads_instance_flag_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：REPL ``settings get --scope flag`` 读**实例** ``--settings`` 文件（与 marketplace 守卫同源）。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    flag = tmp_path / "flag.json"
+    flag.write_text(json.dumps({"enabledPlugins": {"audit@acme": False}}), encoding="utf-8")
+    comp = _FakeComp(tmp_path / "home", flag_settings_path=flag)
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "get", "enabledPlugins", "--scope", "flag", "--json"], session=None)
+
+    assert json.loads(capsys.readouterr().out) == {"enabledPlugins": {"audit@acme": False}}
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_show_project_and_local_scopes_use_instance_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：``show --scope project|local`` 读**实例 cwd** 的真实文件（进程 cwd 无声明）。"""
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "project"
+    (project / ".tfrobot").mkdir(parents=True)
+    (project / ".tfrobot" / "settings.json").write_text(json.dumps({"projKey": 1}), encoding="utf-8")
+    (project / ".tfrobot" / "settings.local.json").write_text(json.dumps({"localKey": 2}), encoding="utf-8")
+    comp = _FakeComp(tmp_path / "home", cwd=project)
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "project", "--json"], session=None)
+    assert json.loads(capsys.readouterr().out) == {"projKey": 1}
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "local", "--json"], session=None)
+    assert json.loads(capsys.readouterr().out) == {"localKey": 2}
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_show_flag_scope_reads_instance_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：``show --scope flag`` 读**实例** ``--settings`` 文件（与 marketplace 守卫同源）。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    flag = tmp_path / "flag.json"
+    flag.write_text(json.dumps({"fromFlag": True}), encoding="utf-8")
+    comp = _FakeComp(tmp_path / "home", flag_settings_path=flag)
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "flag", "--json"], session=None)
+
+    assert json.loads(capsys.readouterr().out) == {"fromFlag": True}
+
+
+@pytest.mark.asyncio
+async def test_repl_settings_policy_scope_and_merged_use_instance_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：REPL 直接消费 ``axes.policy_settings``（与守卫同一视图），不从 env 重解析。"""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    # conftest autouse 把 resolver 固定为 {}；若 REPL 丢弃实例 policy，则读不到 True。
+    comp = _FakeComp(tmp_path / "home", policy_settings={"strictKnownMarketplaces": True})
+
+    await settings_cmd.repl_dispatch(comp, ["settings", "show", "--scope", "policy", "--json"], session=None)
+    assert json.loads(capsys.readouterr().out) == {"strictKnownMarketplaces": True}
+    await settings_cmd.repl_dispatch(
+        comp, ["settings", "get", "strictKnownMarketplaces", "--json"], session=None
+    )
+    assert json.loads(capsys.readouterr().out) == {"strictKnownMarketplaces": True}
+
+
+def test_show_policy_scope_uses_lazy_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#296：settings 读路径的 policy 解析为**函数内惰性导入**——模块属性 patch 可覆盖（此前顶层导入不可）。"""
+    import a2c_smcp.computer.settings.policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "resolve_policy_settings", lambda **_kw: {"strictKnownMarketplaces": True})
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+
+    assert settings_cmd.settings_show(_home(tmp_path), env, scope="policy", json_output=True) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"strictKnownMarketplaces": True}
+
+
+def test_edit_subprocess_env_merges_ambient_with_partial_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#296：实例 env 是**部分**映射时，编辑器子进程环境须与 ambient 合并（否则丢 PATH / EDITOR 等）。"""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    captured: dict[str, object] = {}
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    instance_env = {"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "EDITOR": "true"}
+
+    code, _ = settings_cmd.settings_edit(_home(tmp_path), instance_env, scope="user")
+
+    assert code == 0
+    sub_env = captured["env"]
+    assert isinstance(sub_env, dict)
+    assert sub_env["XDG_CONFIG_HOME"] == str(tmp_path / "cfg")  # 实例轴保留
+    assert sub_env["PATH"] == "/usr/bin:/bin"  # ambient 透传（git / 编辑器可用）
+    assert captured["argv"][0] == "true"  # $EDITOR 取自合并后环境
+
+
+@pytest.mark.parametrize("command", ["show", "get"])
+def test_settings_commands_redact_enabled_plugins_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str,
+) -> None:
+    """#304 item 1：``settings show`` / ``settings get`` 的错误行不回显 enabledPlugins 键里的凭据。
+
+    负对照：干净非法键（``Bad_Name@mp``）仍逐字可见，反「一律遮蔽」。
+    """
+    home, env = _home(tmp_path), _env(tmp_path)
+    _write_user_settings(env, {"enabledPlugins": {"alice:pw@mp": True, "Bad_Name@mp": True}})
+    capsys.readouterr()
+
+    if command == "show":
+        assert settings_cmd.settings_show(home, env, scope="user", json_output=True) == 0
+    else:
+        assert settings_cmd.settings_get(home, env, "strictKnownMarketplaces", scope="user", json_output=True) == 1
+    captured = capsys.readouterr()
+
+    err = _no_ws(captured.err)
+    assert "alice:" not in err and "pw@mp" not in err  # 凭据不落 stderr
+    assert "enabledPlugins.<redacted-git-source>" in err
+    assert "enabledPlugins.Bad_Name@mp" in err  # 干净键仍可定位
+    if command == "show":
+        # stdout 是忠实展示：非法键已被校验丢弃，只剩空对象。
+        assert json.loads(captured.out) == {"enabledPlugins": {}}
